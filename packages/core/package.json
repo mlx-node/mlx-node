@@ -1,0 +1,25 @@
+{
+  "name": "@mlx-node/core",
+  "version": "0.0.0",
+  "description": "Internal native bindings - import from @mlx-node/lm or @mlx-node/trl instead",
+  "type": "module",
+  "main": "./index.cjs",
+  "types": "./index.d.cts",
+  "exports": {
+    ".": {
+      "types": "./index.d.cts",
+      "import": "./index.cjs",
+      "require": "./index.cjs"
+    }
+  },
+  "files": [
+    "index.cjs",
+    "index.d.cts"
+  ],
+  "napi": {
+    "binaryName": "mlx-core",
+    "targets": [
+      "aarch64-apple-darwin"
+    ]
+  }
+}

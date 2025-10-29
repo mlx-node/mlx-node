@@ -1,0 +1,151 @@
+# GRPO Training Configuration for Qwen3-0.6B
+#
+# This is a production-ready configuration for training Qwen3 models
+# with GRPO on the GSM8K dataset.
+#
+# Usage: node examples/grpo/train-full.ts --config examples/grpo/config.toml
+
+# ==============================================================================
+# Model Configuration
+# ==============================================================================
+
+[model]
+# Model identifier (use built-in config or path to model directory)
+name = "qwen3-0.6b"
+
+# Path to pretrained model (optional, overrides name if provided)
+# Note: Use the MLX float32 converted model for best training stability
+path = ".cache/models/qwen3-0.6b-mlx-bf16"
+
+# ==============================================================================
+# Dataset Configuration
+# ==============================================================================
+
+[dataset]
+# Dataset split to use for training
+split = "train"
+
+# Maximum number of training examples (null = use all)
+max_train_samples = 100
+
+# Include one-shot example in prompts
+include_one_shot = true
+
+# ==============================================================================
+# Training Hyperparameters
+# ==============================================================================
+
+[training]
+# Learning rate for Adam optimizer
+learning_rate = 1e-6
+
+# Number of epochs (passes through the dataset)
+num_epochs = 1
+
+# Batch size (number of prompts processed simultaneously)
+batch_size = 1
+
+# Gradient accumulation steps (effective batch size = batch_size * gradient_accumulation_steps)
+gradient_accumulation_steps = 4
+
+# Weight decay for regularization
+weight_decay = 0.01
+
+# Gradient clipping
+gradient_clip_norm = 1.0
+# gradient_clip_value = 1.0  # Optional: clip by value instead of norm
+
+# ==============================================================================
+# GRPO Parameters
+# ==============================================================================
+
+[grpo]
+# Number of generations per prompt (group size)
+group_size = 8
+
+# PPO-style clipping parameter
+clip_epsilon = 0.2
+
+# KL divergence penalty coefficient (0.0 = no penalty, as in TRL)
+kl_coef = 0.0
+
+# Whether to normalize advantages within each group
+advantage_normalization = true
+
+# Loss variant: "grpo", "dapo", "dr_grpo", "bnpo"
+loss_type = "grpo"
+
+# ==============================================================================
+# Generation Parameters
+# ==============================================================================
+
+[generation]
+# Maximum number of new tokens to generate
+max_new_tokens = 256
+
+# Sampling temperature (0 = greedy, higher = more random)
+temperature = 0.7
+
+# Top-p (nucleus) sampling
+top_p = 0.95
+
+# Top-k sampling (0 = disabled)
+top_k = 50
+
+# Min-p sampling (0.0 = disabled)
+min_p = 0.0
+
+# ==============================================================================
+# Reward Configuration
+# ==============================================================================
+
+[reward]
+# Reward type: "function" or "model"
+type = "function"
+
+# Which reward functions to use (all are enabled by default)
+use_correctness = true      # +2.0 for correct answer
+use_integer = true          # +0.5 for integer format
+use_strict_format = true    # +0.5 for strict XML format
+use_soft_format = true      # +0.5 for soft XML format
+use_xml_count = true        # +0.25 per tag, -0.001 per trailing char
+
+# Path to reward model (only used if type = "model")
+# model_path = ".cache/models/reward-model"
+
+# ==============================================================================
+# Logging and Checkpointing
+# ==============================================================================
+
+[logging]
+# Log to console
+console = true
+
+# Log to JSONL file
+jsonl = true
+
+# Log interval (steps)
+log_interval = 10
+
+# Save checkpoint interval (steps)
+save_interval = 50
+
+# Evaluation interval (steps)
+eval_interval = 25
+
+# Output directory for checkpoints and logs
+output_dir = "outputs/grpo-demo"
+
+# Run name (for organizing experiments)
+run_name = "qwen3-gsm8k"
+
+# ==============================================================================
+# Advanced Options
+# ==============================================================================
+
+[advanced]
+# Device (always "metal" for MLX on Apple Silicon)
+device = "metal"
+
+# Random seed (optional, for reproducibility)
+# seed = 42

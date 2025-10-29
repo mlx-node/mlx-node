@@ -1,0 +1,185 @@
+/**
+ * Qwen3 Model - Generation Types
+ *
+ * Type definitions for text generation API.
+ */
+use napi_derive::napi;
+
+use crate::array::MxArray;
+
+/// Configuration for text generation
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct GenerationConfig {
+    /// Maximum number of new tokens to generate (default: 100)
+    pub max_new_tokens: Option<i32>,
+
+    /// Sampling temperature (0 = greedy, higher = more random) (default: 1.0)
+    pub temperature: Option<f64>,
+
+    /// Top-k sampling: keep only top k tokens (0 = disabled) (default: 0)
+    pub top_k: Option<i32>,
+
+    /// Top-p (nucleus) sampling: keep tokens with cumulative prob < p (default: 1.0)
+    pub top_p: Option<f64>,
+
+    /// Min-p sampling: keep tokens with prob > min_p * max_prob (default: 0.0)
+    pub min_p: Option<f64>,
+
+    /// Repetition penalty factor (1.0 = no penalty, 1.1-1.5 typical) (default: 1.0)
+    pub repetition_penalty: Option<f64>,
+
+    /// Number of recent tokens to consider for repetition penalty (default: 20)
+    /// Matches mlx-lm default. Larger values catch longer patterns but use more memory
+    pub repetition_context_size: Option<i32>,
+
+    /// EOS token ID (generation stops when this is generated)
+    pub eos_token_id: Option<i32>,
+
+    /// Whether to return log probabilities (always true for GRPO)
+    pub return_logprobs: Option<bool>,
+}
+
+impl Default for GenerationConfig {
+    fn default() -> Self {
+        Self {
+            max_new_tokens: Some(100),
+            temperature: Some(1.0),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+            repetition_penalty: Some(1.0),
+            repetition_context_size: Some(20),
+            eos_token_id: None,
+            return_logprobs: Some(true),
+        }
+    }
+}
+
+/// Result from text generation with detailed metadata
+#[napi]
+pub struct GenerationResult {
+    /// Decoded text output (only populated by generate API)
+    pub(crate) text: Option<String>,
+
+    /// Generated token IDs [seq_len]
+    pub(crate) tokens: MxArray,
+
+    /// Log probabilities for each generated token [seq_len]
+    pub(crate) logprobs: MxArray,
+
+    /// Whether generation stopped due to EOS token (true) or max_tokens (false)
+    pub(crate) finish_reason: String, // "eos" or "length"
+
+    /// Number of tokens generated
+    pub(crate) num_tokens: usize,
+}
+
+#[napi]
+impl GenerationResult {
+    /// Get the decoded text (if available)
+    #[napi(getter)]
+    pub fn get_text(&self) -> Option<String> {
+        self.text.clone()
+    }
+
+    /// Get the generated tokens
+    #[napi(getter)]
+    pub fn get_tokens(&self) -> MxArray {
+        self.tokens.clone()
+    }
+
+    /// Get the log probabilities
+    #[napi(getter)]
+    pub fn get_logprobs(&self) -> MxArray {
+        self.logprobs.clone()
+    }
+
+    /// Get the finish reason ("eos" or "length")
+    #[napi(getter, ts_return_type = "'eos' | 'length'")]
+    pub fn get_finish_reason(&self) -> String {
+        self.finish_reason.clone()
+    }
+
+    /// Get the number of tokens generated
+    #[napi(getter)]
+    pub fn get_num_tokens(&self) -> u32 {
+        self.num_tokens as u32
+    }
+}
+
+/// Result from batch text generation
+///
+/// Contains results for N prompts × G completions per prompt.
+/// Results are stored flat in arrays of length N*G, where:
+/// - First G elements are completions for prompt 0
+/// - Next G elements are completions for prompt 1
+/// - etc.
+#[napi]
+pub struct BatchGenerationResult {
+    /// All generated token arrays [N*G arrays of variable length]
+    pub(crate) tokens: Vec<MxArray>,
+
+    /// All log probability arrays [N*G arrays of variable length]
+    pub(crate) logprobs: Vec<MxArray>,
+
+    /// All decoded completion texts [N*G strings]
+    pub(crate) texts: Vec<String>,
+
+    /// Finish reasons grouped by prompt [N arrays of G finish reasons each]
+    pub(crate) finish_reasons: Vec<Vec<String>>,
+
+    /// Token counts grouped by prompt [N arrays of G token counts each]
+    pub(crate) token_counts: Vec<Vec<u32>>,
+
+    /// Number of prompts (N)
+    pub(crate) num_prompts: usize,
+
+    /// Number of completions per prompt (G)
+    pub(crate) group_size: u32,
+}
+
+#[napi]
+impl BatchGenerationResult {
+    /// Get all generated token arrays (N*G arrays)
+    #[napi(getter)]
+    pub fn get_tokens(&self) -> Vec<MxArray> {
+        self.tokens.clone()
+    }
+
+    /// Get all log probability arrays (N*G arrays)
+    #[napi(getter)]
+    pub fn get_logprobs(&self) -> Vec<MxArray> {
+        self.logprobs.clone()
+    }
+
+    /// Get all decoded texts (N*G strings)
+    #[napi(getter)]
+    pub fn get_texts(&self) -> Vec<String> {
+        self.texts.clone()
+    }
+
+    /// Get finish reasons grouped by prompt (N arrays of G finish reasons)
+    #[napi(getter)]
+    pub fn get_finish_reasons(&self) -> Vec<Vec<String>> {
+        self.finish_reasons.clone()
+    }
+
+    /// Get token counts grouped by prompt (N arrays of G counts)
+    #[napi(getter)]
+    pub fn get_token_counts(&self) -> Vec<Vec<u32>> {
+        self.token_counts.clone()
+    }
+
+    /// Get number of prompts
+    #[napi(getter)]
+    pub fn get_num_prompts(&self) -> u32 {
+        self.num_prompts as u32
+    }
+
+    /// Get group size (completions per prompt)
+    #[napi(getter)]
+    pub fn get_group_size(&self) -> u32 {
+        self.group_size
+    }
+}

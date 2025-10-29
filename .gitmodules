@@ -1,0 +1,3 @@
+[submodule "crates/mlx-sys/mlx"]
+	path = crates/mlx-sys/mlx
+	url = https://github.com/ml-explore/mlx.git

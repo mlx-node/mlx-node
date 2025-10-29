@@ -1,0 +1,36 @@
+# Quick smoke test - ultra-light settings for fast testing
+# Use your CONVERTED model (not HuggingFace)
+
+model_name = "utils/mlx_model"    # ← YOUR converted model (quantized!)
+output_dir = "outputs/smoke-test"
+run_name   = "smoke-test-run"
+
+# training (absolute minimum like ultra-light)
+learning_rate = 1e-6
+num_epochs = 1
+batch_size = 1
+gradient_accumulation_steps = 1    # No accumulation
+max_train_samples = 50             # ← Only 50 examples for quick test!
+warmup_ratio = 0.1
+max_grad_norm = 0.1
+logging_steps = 1
+
+# sampling / rollout (MINIMAL like ultra-light)
+num_generations = 2                # ← Just 2 samples
+max_new_tokens = 32                # ← Even shorter
+temperature = 0.7
+clip_eps = 0.2
+kl_coeff = 0.0
+
+# eval & logging
+eval_steps = 5                     # ← More frequent
+eval_samples = 10                  # ← Way less
+eval_every_updates = 5             # ← More frequent
+eval_subset_size = 10              # ← Way less
+eval_max_new_tokens = 32           # ← Shorter
+save_steps = 25                    # ← Save checkpoints every 25 steps
+log_jsonl = true
+
+# system
+seed = 42
+use_compile = false                # ← Disable compilation for debugging

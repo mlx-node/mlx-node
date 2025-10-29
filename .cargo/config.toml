@@ -1,0 +1,4 @@
+# Environment variables for cargo test
+# MLX uses a shared Metal device/stream, so tests must run sequentially
+[env]
+RUST_TEST_THREADS = "1"

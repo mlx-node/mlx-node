@@ -1,0 +1,36 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+rust-version = "1.89.0"
+edition = "2024"
+version = "0.0.0"
+
+[workspace.dependencies]
+cc = "1"
+cmake = "0.1"
+futures = "0.3"
+half = "2.4"
+mimalloc-safe = { version = "0.1" }
+parquet = { version = "57", features = ["arrow"] }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.19", default-features = false, features = ["std", "fmt", "json"] }
+tokenizers = "0.22"
+
+# NAPI-RS
+napi = { version = "3", features = ["napi10", "async", "tokio_fs", "serde-json"] }
+napi-derive = "3"
+napi-build = "2"
+
+# Workspace packages
+mlx-sys = { path = "crates/mlx-sys" }
+mlx-core = { path = "crates/mlx-core" }
+
+[profile.release]
+lto = true
+codegen-units = 1

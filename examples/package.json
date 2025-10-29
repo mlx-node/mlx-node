@@ -1,0 +1,9 @@
+{
+  "name": "examples",
+  "private": true,
+  "dependencies": {
+    "@mlx-node/core": "workspace:*",
+    "@mlx-node/lm": "workspace:*",
+    "@mlx-node/trl": "workspace:*"
+  }
+}

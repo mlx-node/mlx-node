@@ -1,0 +1,29 @@
+{
+  "name": "@mlx-node/trl",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "test:trainer": "TEST_TRAINER=1 vitest run"
+  },
+  "dependencies": {
+    "@mlx-node/core": "workspace:*",
+    "@mlx-node/lm": "workspace:*",
+    "@std/toml": "npm:@jsr/std__toml@^1.0.11"
+  },
+  "devDependencies": {
+    "@huggingface/hub": "^2.7.1"
+  }
+}
