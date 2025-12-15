@@ -23,9 +23,9 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
+            Constraint::Length(4),
+            Constraint::Length(4),
+            Constraint::Length(4),
         ])
         .split(inner);
 

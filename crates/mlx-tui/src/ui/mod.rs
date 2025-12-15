@@ -47,9 +47,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9), // Metrics with sparklines
-            Constraint::Length(5), // Progress bars
-            Constraint::Min(5),    // Stats (3 lines + borders)
+            Constraint::Length(15), // Metrics with sparklines (4 lines per metric)
+            Constraint::Length(5),  // Progress bars
+            Constraint::Min(5),     // Stats (3 lines + borders)
         ])
         .split(main_chunks[0]);
 
