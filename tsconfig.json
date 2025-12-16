@@ -1,9 +1,6 @@
 {
   "files": [],
-  "references": [
-    { "path": "./packages/lm" },
-    { "path": "./packages/trl" }
-  ],
+  "references": [{ "path": "./packages/lm" }, { "path": "./packages/trl" }, { "path": "./__test__" }],
   "compilerOptions": {
     "strict": true,
     "esModuleInterop": true,

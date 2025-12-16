@@ -5,6 +5,5 @@
     "outDir": "dist",
     "composite": true
   },
-  "include": ["./**/*.ts"],
-  "references": [{ "path": "../packages/lm" }, { "path": "../packages/trl" }]
+  "include": ["./**/*.ts"]
 }

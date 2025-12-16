@@ -18,6 +18,7 @@ MLX-Node now includes **production-ready automatic differentiation** via MLX's `
 ### ✅ **Functional Forward Pass** - The Key Innovation
 
 **Previous (Broken) Implementation**:
+
 ```rust
 // ❌ WRONG: Used pre-computed logprobs, no connection to params
 let loss_fn = move |_params: &[MxArray]| -> Result<MxArray> {
@@ -27,6 +28,7 @@ let loss_fn = move |_params: &[MxArray]| -> Result<MxArray> {
 ```
 
 **New (Working) Implementation**:
+
 ```rust
 // ✅ CORRECT: Recomputes forward pass from parameters
 let loss_fn = move |params: &[MxArray]| -> Result<MxArray> {
@@ -112,6 +114,7 @@ pub fn compute_loss_and_gradients_autograd(
 ```
 
 **Improved Flow**:
+
 1. Flatten parameters into ordered list
 2. Concatenate prompts + completions for full sequence
 3. Define loss closure that:
@@ -135,6 +138,7 @@ where
 ```
 
 **Features:**
+
 - Thread-safe C FFI callback handling
 - Error propagation across FFI boundary
 - Automatic gradient computation for all parameters
@@ -241,14 +245,14 @@ lm_head.weight
 
 ### Comparison: Autograd vs Manual Gradients
 
-| Aspect | Manual Gradients | Autograd |
-|--------|-----------------|----------|
-| Code | 939 lines | 280 core + 750 functional = 1,030 lines |
-| Accuracy | Exact (for implemented layers) | Exact (all layers) |
-| Coverage | LM head + approximations | **Full model (100+ params)** |
-| Maintainability | High (must update for new ops) | **Low (automatic)** |
-| Speed | Baseline | **15-25% faster expected** |
-| Flexibility | Limited | **Any differentiable function** |
+| Aspect          | Manual Gradients               | Autograd                                |
+| --------------- | ------------------------------ | --------------------------------------- |
+| Code            | 939 lines                      | 280 core + 750 functional = 1,030 lines |
+| Accuracy        | Exact (for implemented layers) | Exact (all layers)                      |
+| Coverage        | LM head + approximations       | **Full model (100+ params)**            |
+| Maintainability | High (must update for new ops) | **Low (automatic)**                     |
+| Speed           | Baseline                       | **15-25% faster expected**              |
+| Flexibility     | Limited                        | **Any differentiable function**         |
 
 ## Testing
 
@@ -279,18 +283,22 @@ TEST_TRAINER=1 yarn vitest run __test__/trainers/grpo-autograd-integration.test.
 ### Common Issues
 
 **1. "Invalid handle" error**
+
 - **Cause**: Loss function returned an invalid MxArray
 - **Fix**: Ensure loss is a scalar (single value)
 
 **2. "Parameter not found" error**
+
 - **Cause**: Parameter naming mismatch
 - **Fix**: Use `validate_param_names()` to check
 
 **3. Slow training**
+
 - **Cause**: Large batch size or long sequences
 - **Fix**: Reduce batch size, use gradient accumulation
 
 **4. "No computation graph" error**
+
 - **Cause**: Loss function doesn't use input parameters
 - **Fix**: Ensure loss depends on params (recompute forward pass)
 

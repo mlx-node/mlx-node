@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { resolve } from 'node:path';
-import { applyOverrides, ConfigError, getDefaultConfig, loadTomlConfig } from '../../src/index';
+import { applyOverrides, ConfigError, getDefaultConfig, loadTomlConfig } from '@mlx-node/trl';
 
 describe('MLX GRPO configuration', () => {
   it('returns a mutable copy of the default configuration', () => {

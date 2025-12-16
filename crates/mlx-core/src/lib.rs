@@ -18,6 +18,7 @@ pub mod sampling;
 pub mod stream;
 pub mod tensor;
 pub mod tokenizer;
+pub mod tools;
 pub mod tracing;
 pub mod transformer;
 pub mod utils;

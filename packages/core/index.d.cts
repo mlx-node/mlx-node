@@ -248,6 +248,51 @@ export declare class BatchKVCache {
   getLeftPadding(): Int32Array
 }
 
+/**
+ * Result from the high-level `chat()` API
+ *
+ * Contains structured responses with:
+ * - Tool calls parsed as native JavaScript objects
+ * - Thinking/reasoning extracted from `<think>` tags
+ * - Clean text with all special tags stripped
+ *
+ * ## Example
+ * ```typescript
+ * const result = await model.chat(messages, { tools });
+ * console.log(result.text);       // Clean response
+ * console.log(result.thinking);   // Chain-of-thought (if any)
+ * console.log(result.toolCalls);  // Parsed tool calls
+ * ```
+ */
+export declare class ChatResult {
+  /** Get the cleaned text (tool_call and think tags removed) */
+  get text(): string
+  /** Get the extracted tool calls */
+  get toolCalls(): Array<ToolCallResult>
+  /**
+   * Get the extracted thinking/reasoning content
+   *
+   * Returns the content from within `<think>...</think>` tags, or null if
+   * no thinking tags were present in the response.
+   *
+   * This is useful for:
+   * - Debugging model reasoning
+   * - Displaying chain-of-thought to users (optional)
+   * - Analyzing model decision-making
+   */
+  get thinking(): string | null
+  /** Get the generated tokens */
+  get tokens(): MxArray
+  /** Get the log probabilities */
+  get logprobs(): MxArray
+  /** Get the finish reason ("stop", "length", or "tool_calls") */
+  get finishReason(): 'stop' | 'length' | 'tool_calls'
+  /** Get the number of tokens generated */
+  get numTokens(): number
+  /** Get the raw text before tool call stripping (for debugging) */
+  get rawText(): string
+}
+
 export declare class Embedding {
   /** Create a new Embedding layer */
   constructor(numEmbeddings: number, embeddingDim: number)
@@ -303,8 +348,8 @@ export declare class FusedAttention {
 
 /** Result from text generation with detailed metadata */
 export declare class GenerationResult {
-  /** Get the decoded text (if available) */
-  get text(): string | null
+  /** Get the decoded text */
+  get text(): string
   /** Get the generated tokens */
   get tokens(): MxArray
   /** Get the log probabilities */
@@ -1082,29 +1127,6 @@ export declare class Qwen3Model {
    */
   applyGradients(gradients: Record<string, MxArray>, learningRate: number): void
   /**
-   * Generate text with log probabilities (CRITICAL for GRPO training)
-   *
-   * This method performs autoregressive generation with:
-   * - KV caching for efficient inference
-   * - Sampling (temperature, top-k, top-p, min-p)
-   * - Repetition penalty to reduce repetitive text
-   * - Log probability tracking for policy gradient computation
-   *
-   * Reference: MLX-LM generate.py:410 (logprobs = logits - mx.logsumexp(logits))
-   *
-   * # Arguments
-   * * `input_ids` - Initial input tokens [1, seq_len] or [seq_len]
-   * * `config` - Generation configuration
-   *
-   * # Returns
-   * * GenerationResult with tokens, logprobs, finish reason, and token count
-   *
-   * This is the primary generation API for training workloads (e.g., GRPO).
-   * Uses fused C++ implementation for maximum performance.
-   * For text-to-text generation with chat messages, use `generate()` instead.
-   */
-  generateForTraining(inputIds: MxArray, config?: GenerationConfig | undefined | null): Promise<GenerationResult>
-  /**
    * Text-to-text generation with integrated tokenization
    *
    * This is a high-level API that handles chat template formatting, tokenization,
@@ -1135,6 +1157,77 @@ export declare class Qwen3Model {
    * ```
    */
   generate(messages: Array<ChatMessage>, config?: GenerationConfig | undefined | null): Promise<GenerationResult>
+  /**
+   * High-level chat API with structured response parsing
+   *
+   * The primary API for conversational AI. Handles:
+   * - Chat message formatting with Jinja2 templates
+   * - Tool/function calling with structured output
+   * - Thinking extraction from `<think>` tags
+   * - Clean response text with all special tags stripped
+   *
+   * ## `chat()` vs `generate()`
+   *
+   * | Feature | `chat()` | `generate()` |
+   * |---------|----------|--------------|
+   * | **Purpose** | Conversational AI with tools | Raw text generation |
+   * | **Input** | Chat messages | Token IDs (MxArray) |
+   * | **Tool Support** | Built-in parsing | None |
+   * | **Thinking** | Extracts `<think>` content | Raw text only |
+   * | **Output** | Structured `ChatResult` | Basic `GenerationResult` |
+   * | **Use Case** | Chat apps, agents, assistants | Training, low-level control |
+   *
+   * ## When to use `chat()`
+   * - Building conversational applications
+   * - Need tool/function calling
+   * - Want structured responses with thinking separated
+   * - Working with chat message format
+   *
+   * ## When to use `generate()`
+   * - Training and fine-tuning (need raw logprobs)
+   * - Custom tokenization pipeline
+   * - Low-level generation control
+   * - Non-chat use cases
+   *
+   * # Arguments
+   * * `messages` - Array of chat messages (user/assistant/system roles)
+   * * `config` - Chat configuration including optional tools and generation params
+   *
+   * # Returns
+   * * `ChatResult` containing:
+   *   - `text`: Clean response (tool_call and think tags stripped)
+   *   - `thinking`: Extracted chain-of-thought reasoning (or null)
+   *   - `toolCalls`: Parsed tool calls with native JS object arguments
+   *   - `finishReason`: "stop" | "length" | "tool_calls"
+   *   - `rawText`: Original text before processing (for debugging)
+   *
+   * # Example
+   * ```typescript
+   * // Simple chat
+   * const result = await model.chat(messages);
+   * console.log(result.text);
+   *
+   * // With tools
+   * const result = await model.chat(messages, {
+   *   tools: [{ type: 'function', function: { name: 'get_weather' } }],
+   *   maxNewTokens: 2048,
+   *   temperature: 0.7,
+   * });
+   *
+   * // Handle tool calls
+   * for (const call of result.toolCalls) {
+   *   if (call.status === 'ok') {
+   *     console.log(call.name, call.arguments);  // Arguments is a JS object!
+   *   }
+   * }
+   *
+   * // Access thinking (chain-of-thought)
+   * if (result.thinking) {
+   *   console.log('Model reasoning:', result.thinking);
+   * }
+   * ```
+   */
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>
   /**
    * Generate multiple completions for multiple prompts in batch
    *
@@ -1187,17 +1280,19 @@ export declare class Qwen3Model {
   /**
    * Apply chat template and encode to token IDs
    *
-   * Formats messages using ChatML format and encodes to tokens.
+   * Formats messages using ChatML format (or Jinja2 template with tools) and encodes to tokens.
    * The model must have been loaded via load_pretrained() to have a tokenizer available.
    *
    * # Arguments
    * * `messages` - Array of chat messages
    * * `add_generation_prompt` - Whether to add generation prompt (default: true)
+   * * `tools` - Optional array of tool definitions for function calling
+   * * `enable_thinking` - Optional flag to enable thinking mode (<think> tags)
    *
    * # Returns
    * * Encoded token IDs as Uint32Array
    */
-  applyChatTemplate(messages: Array<ChatMessage>, addGenerationPrompt?: boolean | undefined | null): Promise<Uint32Array>
+  applyChatTemplate(messages: Array<ChatMessage>, addGenerationPrompt?: boolean | undefined | null, tools?: Array<ToolDefinition> | undefined | null, enableThinking?: boolean | undefined | null): Promise<Uint32Array>
   /**
    * Load a pretrained model from disk
    *
@@ -1301,13 +1396,15 @@ export declare class Qwen3Tokenizer {
   /**
    * Apply chat template to messages and encode
    *
-   * Formats messages using ChatML format:
-   * <|im_start|>role
-  content<|im_end|>
+   * Supports both simple ChatML format and full Jinja2 template rendering with tools.
+   * When tools are provided or a chat template exists, uses Jinja2 rendering.
+   * Otherwise falls back to simple ChatML format.
    *
    * # Arguments
    * * `messages` - Array of chat messages
    * * `add_generation_prompt` - Whether to add assistant prompt at end (default: true)
+   * * `tools` - Optional array of tool definitions for function calling
+   * * `enable_thinking` - Optional flag to enable thinking mode (<think> tags)
    *
    * # Returns
    * Encoded token IDs ready for model input
@@ -1319,9 +1416,16 @@ export declare class Qwen3Tokenizer {
    *   { role: "user", content: "What is 2+2?" }
    * ];
    * const tokens = tokenizer.applyChatTemplate(messages, true);
+   *
+   * // With tools
+   * const tools = [{
+   *   type: "function",
+   *   function: { name: "get_weather", description: "Get weather info" }
+   * }];
+   * const tokens = tokenizer.applyChatTemplate(messages, true, tools);
    * ```
    */
-  applyChatTemplate(messages: Array<ChatMessage>, addGenerationPrompt?: boolean | undefined | null): Promise<Uint32Array>
+  applyChatTemplate(messages: Array<ChatMessage>, addGenerationPrompt?: boolean | undefined | null, tools?: Array<ToolDefinition> | undefined | null, enableThinking?: boolean | undefined | null): Promise<Uint32Array>
   /** Get vocabulary size */
   vocabSize(): number
   /** Get PAD token ID */
@@ -1671,12 +1775,65 @@ export declare const enum BuiltinRewardType {
   JsonSchema = 'JsonSchema'
 }
 
-/** Chat message role */
+/**
+ * Configuration for the high-level `chat()` API
+ *
+ * Combines tool definitions with generation parameters in a single config object.
+ * Tools are optional - when not provided, `chat()` works as a simple conversational API.
+ *
+ * ## Example
+ * ```typescript
+ * // Simple chat (no tools)
+ * const result = await model.chat(messages);
+ *
+ * // With tools
+ * const result = await model.chat(messages, {
+ *   tools: [weatherTool, searchTool],
+ *   maxNewTokens: 2048,
+ *   temperature: 0.7,
+ * });
+ * ```
+ */
+export interface ChatConfig {
+  /**
+   * Tool definitions for function calling (optional)
+   *
+   * When provided, the model can invoke these tools during generation.
+   * Tool calls are parsed and returned in `ChatResult.toolCalls`.
+   */
+  tools?: Array<ToolDefinition>
+  /** Maximum number of new tokens to generate (default: 2048 for chat) */
+  maxNewTokens?: number
+  /** Sampling temperature (0 = greedy, higher = more random) (default: 0.7) */
+  temperature?: number
+  /** Top-k sampling: keep only top k tokens (0 = disabled) (default: 0) */
+  topK?: number
+  /** Top-p (nucleus) sampling: keep tokens with cumulative prob < p (default: 0.9) */
+  topP?: number
+  /** Min-p sampling: keep tokens with prob > min_p * max_prob (default: 0.0) */
+  minP?: number
+  /** Repetition penalty factor (1.0 = no penalty) (default: 1.0) */
+  repetitionPenalty?: number
+  /** Number of recent tokens to consider for repetition penalty (default: 20) */
+  repetitionContextSize?: number
+  /** EOS token ID (generation stops when this is generated) */
+  eosTokenId?: number
+  /** Whether to return log probabilities (default: true) */
+  returnLogprobs?: boolean
+}
+
+/** Chat message with tool calling support */
 export interface ChatMessage {
-  /** Role: "system", "user", or "assistant" */
+  /** Role: "system", "user", "assistant", or "tool" */
   role: string
   /** Message content */
   content: string
+  /** Tool calls made by the assistant (for assistant messages) */
+  toolCalls?: Array<ToolCall>
+  /** Tool call ID this message is responding to (for tool messages) */
+  toolCallId?: string
+  /** Reasoning content for thinking mode (used with <think> tags) */
+  reasoningContent?: string
 }
 
 /**
@@ -1894,6 +2051,26 @@ export interface EngineStepMetrics {
   generationTimeMs: number
   /** Time for training (ms) */
   trainingTimeMs: number
+}
+
+/** Function definition for tool calling */
+export interface FunctionDefinition {
+  /** Name of the function */
+  name: string
+  /** Description of what the function does */
+  description?: string
+  /** Parameter schema */
+  parameters?: FunctionParameters
+}
+
+/** Function parameters schema (JSON Schema subset) */
+export interface FunctionParameters {
+  /** Type (usually "object") */
+  type: string
+  /** JSON string of property definitions */
+  properties?: string
+  /** List of required parameter names */
+  required?: Array<string>
 }
 
 /** Result from generate_batch_for_training with all data needed for training */
@@ -2187,3 +2364,35 @@ export declare function setMemoryLimit(limit: number): number
  * This is the recommended function for long-running training loops
  */
 export declare function synchronizeAndClearCache(): void
+
+/** Tool call made by an assistant */
+export interface ToolCall {
+  /** Optional unique identifier for the tool call */
+  id?: string
+  /** Name of the tool/function to call */
+  name: string
+  /** JSON string of arguments to pass to the tool */
+  arguments: string
+}
+
+/** Structured tool call with parsed arguments */
+export interface ToolCallResult {
+  /** Unique identifier for this tool call (format: call_<uuid>) */
+  id: string
+  /** Name of the tool/function to call */
+  name: string
+  /** Parsed arguments as native object (serde_json::Value → JS object) */
+  arguments: Record<string, unknown>
+  /** Parsing status: "ok" | "invalid_json" | "missing_name" */
+  status: string
+  /** Error message if status != "ok" */
+  error?: string
+}
+
+/** OpenAI-compatible tool definition */
+export interface ToolDefinition {
+  /** Tool type (currently only "function" is supported) */
+  type: string
+  /** Function definition */
+  function: FunctionDefinition
+}

@@ -6,6 +6,7 @@
 use napi_derive::napi;
 
 use crate::array::MxArray;
+use crate::tools::ToolCallResult;
 
 /// Configuration for text generation
 #[napi(object)]
@@ -56,11 +57,66 @@ impl Default for GenerationConfig {
     }
 }
 
+/// Configuration for the high-level `chat()` API
+///
+/// Combines tool definitions with generation parameters in a single config object.
+/// Tools are optional - when not provided, `chat()` works as a simple conversational API.
+///
+/// ## Example
+/// ```typescript
+/// // Simple chat (no tools)
+/// const result = await model.chat(messages);
+///
+/// // With tools
+/// const result = await model.chat(messages, {
+///   tools: [weatherTool, searchTool],
+///   maxNewTokens: 2048,
+///   temperature: 0.7,
+/// });
+/// ```
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ChatConfig {
+    /// Tool definitions for function calling (optional)
+    ///
+    /// When provided, the model can invoke these tools during generation.
+    /// Tool calls are parsed and returned in `ChatResult.toolCalls`.
+    #[napi(ts_type = "Array<ToolDefinition>")]
+    pub tools: Option<Vec<crate::tokenizer::ToolDefinition>>,
+
+    /// Maximum number of new tokens to generate (default: 2048 for chat)
+    pub max_new_tokens: Option<i32>,
+
+    /// Sampling temperature (0 = greedy, higher = more random) (default: 0.7)
+    pub temperature: Option<f64>,
+
+    /// Top-k sampling: keep only top k tokens (0 = disabled) (default: 0)
+    pub top_k: Option<i32>,
+
+    /// Top-p (nucleus) sampling: keep tokens with cumulative prob < p (default: 0.9)
+    pub top_p: Option<f64>,
+
+    /// Min-p sampling: keep tokens with prob > min_p * max_prob (default: 0.0)
+    pub min_p: Option<f64>,
+
+    /// Repetition penalty factor (1.0 = no penalty) (default: 1.0)
+    pub repetition_penalty: Option<f64>,
+
+    /// Number of recent tokens to consider for repetition penalty (default: 20)
+    pub repetition_context_size: Option<i32>,
+
+    /// EOS token ID (generation stops when this is generated)
+    pub eos_token_id: Option<i32>,
+
+    /// Whether to return log probabilities (default: true)
+    pub return_logprobs: Option<bool>,
+}
+
 /// Result from text generation with detailed metadata
 #[napi]
 pub struct GenerationResult {
-    /// Decoded text output (only populated by generate API)
-    pub(crate) text: Option<String>,
+    /// Decoded text output (empty string for training APIs, populated by generate API)
+    pub(crate) text: String,
 
     /// Generated token IDs [seq_len]
     pub(crate) tokens: MxArray,
@@ -77,9 +133,9 @@ pub struct GenerationResult {
 
 #[napi]
 impl GenerationResult {
-    /// Get the decoded text (if available)
+    /// Get the decoded text
     #[napi(getter)]
-    pub fn get_text(&self) -> Option<String> {
+    pub fn get_text(&self) -> String {
         self.text.clone()
     }
 
@@ -105,6 +161,106 @@ impl GenerationResult {
     #[napi(getter)]
     pub fn get_num_tokens(&self) -> u32 {
         self.num_tokens as u32
+    }
+}
+
+/// Result from the high-level `chat()` API
+///
+/// Contains structured responses with:
+/// - Tool calls parsed as native JavaScript objects
+/// - Thinking/reasoning extracted from `<think>` tags
+/// - Clean text with all special tags stripped
+///
+/// ## Example
+/// ```typescript
+/// const result = await model.chat(messages, { tools });
+/// console.log(result.text);       // Clean response
+/// console.log(result.thinking);   // Chain-of-thought (if any)
+/// console.log(result.toolCalls);  // Parsed tool calls
+/// ```
+#[napi]
+pub struct ChatResult {
+    /// Response text with tool_call and think tags stripped
+    pub(crate) text: String,
+
+    /// Extracted tool calls with parsed arguments
+    pub(crate) tool_calls: Vec<ToolCallResult>,
+
+    /// Extracted thinking/reasoning content (None if no <think> tags)
+    pub(crate) thinking: Option<String>,
+
+    /// Generated token IDs [seq_len]
+    pub(crate) tokens: MxArray,
+
+    /// Log probabilities for each generated token [seq_len]
+    pub(crate) logprobs: MxArray,
+
+    /// Finish reason: "stop" | "length" | "tool_calls"
+    pub(crate) finish_reason: String,
+
+    /// Number of tokens generated
+    pub(crate) num_tokens: usize,
+
+    /// Raw text before processing (for debugging)
+    pub(crate) raw_text: String,
+}
+
+#[napi]
+impl ChatResult {
+    /// Get the cleaned text (tool_call and think tags removed)
+    #[napi(getter)]
+    pub fn get_text(&self) -> String {
+        self.text.clone()
+    }
+
+    /// Get the extracted tool calls
+    #[napi(getter)]
+    pub fn get_tool_calls(&self) -> Vec<ToolCallResult> {
+        self.tool_calls.clone()
+    }
+
+    /// Get the extracted thinking/reasoning content
+    ///
+    /// Returns the content from within `<think>...</think>` tags, or null if
+    /// no thinking tags were present in the response.
+    ///
+    /// This is useful for:
+    /// - Debugging model reasoning
+    /// - Displaying chain-of-thought to users (optional)
+    /// - Analyzing model decision-making
+    #[napi(getter)]
+    pub fn get_thinking(&self) -> Option<String> {
+        self.thinking.clone()
+    }
+
+    /// Get the generated tokens
+    #[napi(getter)]
+    pub fn get_tokens(&self) -> MxArray {
+        self.tokens.clone()
+    }
+
+    /// Get the log probabilities
+    #[napi(getter)]
+    pub fn get_logprobs(&self) -> MxArray {
+        self.logprobs.clone()
+    }
+
+    /// Get the finish reason ("stop", "length", or "tool_calls")
+    #[napi(getter, ts_return_type = "'stop' | 'length' | 'tool_calls'")]
+    pub fn get_finish_reason(&self) -> String {
+        self.finish_reason.clone()
+    }
+
+    /// Get the number of tokens generated
+    #[napi(getter)]
+    pub fn get_num_tokens(&self) -> u32 {
+        self.num_tokens as u32
+    }
+
+    /// Get the raw text before tool call stripping (for debugging)
+    #[napi(getter)]
+    pub fn get_raw_text(&self) -> String {
+        self.raw_text.clone()
     }
 }
 

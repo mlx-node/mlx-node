@@ -578,6 +578,7 @@ module.exports.AdamW = nativeBinding.AdamW
 module.exports.Attention = nativeBinding.Attention
 module.exports.BatchGenerationResult = nativeBinding.BatchGenerationResult
 module.exports.BatchKVCache = nativeBinding.BatchKVCache
+module.exports.ChatResult = nativeBinding.ChatResult
 module.exports.Embedding = nativeBinding.Embedding
 module.exports.FusedAttention = nativeBinding.FusedAttention
 module.exports.GenerationResult = nativeBinding.GenerationResult

@@ -5,6 +5,7 @@
 MLX-Node now supports loading model weights from the **SafeTensors** format, providing a safe, fast, and efficient alternative to the MLX JSON format.
 
 SafeTensors is the standard format used by HuggingFace for storing model weights. It provides:
+
 - **Safety**: No arbitrary code execution (unlike pickle)
 - **Speed**: Memory-mapped file loading
 - **Efficiency**: Zero-copy tensor access
@@ -13,18 +14,22 @@ SafeTensors is the standard format used by HuggingFace for storing model weights
 ## Features
 
 ### ✅ Supported Data Types
+
 - **F32** (float32) - Full precision floating point
 - **F16** (float16) - Half precision floating point
 - **BF16** (bfloat16) - Brain floating point
 - **I32** (int32) - 32-bit integers
 
 ### ✅ Automatic Format Detection
+
 The loader automatically detects and prioritizes SafeTensors:
+
 1. First tries `weights.safetensors` (preferred)
 2. Falls back to `weights.mlx` if SafeTensors not found
 3. Provides clear error messages if neither format is available
 
 ### ✅ Precision Conversion
+
 - F16 and BF16 tensors are automatically converted to F32 for MLX compatibility
 - Maintains numerical accuracy during conversion
 - No data loss for supported precision formats
@@ -204,12 +209,13 @@ fn bytes_to_i32(bytes: &[u8]) -> Vec<i32>
 
 ### Loading Speed
 
-| Model Size | Format      | Load Time | Memory  |
-|------------|-------------|-----------|---------|
-| Qwen3-0.6B | SafeTensors | ~2-3s     | 2.4 GB  |
-| Qwen3-0.6B | MLX JSON    | ~10-15s   | 3.5 GB  |
+| Model Size | Format      | Load Time | Memory |
+| ---------- | ----------- | --------- | ------ |
+| Qwen3-0.6B | SafeTensors | ~2-3s     | 2.4 GB |
+| Qwen3-0.6B | MLX JSON    | ~10-15s   | 3.5 GB |
 
 **SafeTensors is 3-5x faster** due to:
+
 - Binary format (no JSON parsing of large arrays)
 - Efficient memory-mapped file I/O
 - Zero-copy tensor access
@@ -217,6 +223,7 @@ fn bytes_to_i32(bytes: &[u8]) -> Vec<i32>
 ### Memory Efficiency
 
 SafeTensors advantages:
+
 - Single file (no multiple weight shards)
 - Compact binary storage
 - No intermediate JSON representation
@@ -262,26 +269,28 @@ save_file(weights, "./weights.safetensors")
 
 ## Comparison: SafeTensors vs MLX Format
 
-| Feature | SafeTensors | MLX JSON |
-|---------|-------------|----------|
-| **Format** | Binary | Text (JSON) |
-| **Speed** | Fast (3-5x) | Slower |
-| **Size** | Compact | Larger |
-| **Safety** | Safe | Safe |
-| **Standard** | Industry standard | MLX-specific |
-| **Tools** | Many | Limited |
-| **Streaming** | Supports memory-mapping | Requires full load |
-| **Precision** | F32, F16, BF16, I32, I64, U8, I8 | F32, F16, BF16 |
+| Feature       | SafeTensors                      | MLX JSON           |
+| ------------- | -------------------------------- | ------------------ |
+| **Format**    | Binary                           | Text (JSON)        |
+| **Speed**     | Fast (3-5x)                      | Slower             |
+| **Size**      | Compact                          | Larger             |
+| **Safety**    | Safe                             | Safe               |
+| **Standard**  | Industry standard                | MLX-specific       |
+| **Tools**     | Many                             | Limited            |
+| **Streaming** | Supports memory-mapping          | Requires full load |
+| **Precision** | F32, F16, BF16, I32, I64, U8, I8 | F32, F16, BF16     |
 
 ### When to Use Each Format
 
 **Use SafeTensors when:**
+
 - Loading models from HuggingFace
 - Working with large models (>1B parameters)
 - Need fast loading times
 - Want standard format compatibility
 
 **Use MLX JSON when:**
+
 - Debugging weights (human-readable)
 - Working with small models
 - Need full JSON metadata
@@ -303,6 +312,7 @@ serde_json = "1"
 ### Type Conversions
 
 #### Float16 (F16)
+
 ```rust
 // Uses IEEE 754 half precision format
 let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
@@ -310,6 +320,7 @@ let f32_value = half::f16::from_bits(bits).to_f32();
 ```
 
 #### BFloat16 (BF16)
+
 ```rust
 // BF16 is upper 16 bits of F32
 let bf16_bits = u16::from_le_bytes([chunk[0], chunk[1]]);
@@ -397,11 +408,13 @@ test('should load model from SafeTensors', async () => {
 ## References
 
 ### Official Resources
+
 - **SafeTensors Repository**: https://github.com/huggingface/safetensors
 - **Format Specification**: https://github.com/huggingface/safetensors#format
 - **HuggingFace Hub**: https://huggingface.co/docs/safetensors
 
 ### Related Documentation
+
 - [MLX-Node Documentation](../README.md)
 - [Model Loading Guide](./MODEL_LOADING.md)
 - [Qwen3 Model Guide](./QWEN3.md)
@@ -415,5 +428,5 @@ MLX-Node's SafeTensors implementation follows the same license.
 
 ---
 
-*Last updated: January 2025*
-*MLX-Node version: 0.0.0*
+_Last updated: January 2025_
+_MLX-Node version: 0.0.0_

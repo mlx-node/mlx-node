@@ -28,6 +28,7 @@ Thank you for your interest in contributing to MLX-Node! We welcome contribution
 ### Making Changes
 
 1. **Create a feature branch**:
+
    ```bash
    git checkout -b feature/your-feature-name
    ```
@@ -37,6 +38,7 @@ Thank you for your interest in contributing to MLX-Node! We welcome contribution
 3. **Add tests** for new functionality
 
 4. **Run tests** to ensure nothing is broken:
+
    ```bash
    yarn test
    yarn typecheck
@@ -51,6 +53,7 @@ Thank you for your interest in contributing to MLX-Node! We welcome contribution
 ### Submitting a Pull Request
 
 1. **Push your branch** to your fork:
+
    ```bash
    git push origin feature/your-feature-name
    ```

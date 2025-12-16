@@ -15,22 +15,24 @@ Based on analysis of HuggingFace TRL and MLX-LM reference implementations, this 
 
 ## Implementation Status Overview
 
-| Phase | Original Timeline | Status | Completion Date |
-|-------|------------------|--------|-----------------|
-| Phase 1: Text Generation & Sampling | 2 weeks | ✅ COMPLETE | January 2025 |
-| Phase 2: Logprobs & Metadata | 2 weeks | ✅ COMPLETE | January 2025 |
-| Phase 3: Batch Generation | 2 weeks | ✅ COMPLETE | January 2025 |
-| Phase 4: GRPO Loss & Advantages | 2 weeks | ✅ COMPLETE | January 2025 |
-| Phase 5: Training Loop | 2 weeks | ✅ COMPLETE | January 2025 |
-| Phase 6: Optimization & Testing | 2 weeks | ✅ COMPLETE | January 2025 |
-| **BONUS**: Autograd Integration | N/A | ✅ COMPLETE | January 2025 |
+| Phase                               | Original Timeline | Status      | Completion Date |
+| ----------------------------------- | ----------------- | ----------- | --------------- |
+| Phase 1: Text Generation & Sampling | 2 weeks           | ✅ COMPLETE | January 2025    |
+| Phase 2: Logprobs & Metadata        | 2 weeks           | ✅ COMPLETE | January 2025    |
+| Phase 3: Batch Generation           | 2 weeks           | ✅ COMPLETE | January 2025    |
+| Phase 4: GRPO Loss & Advantages     | 2 weeks           | ✅ COMPLETE | January 2025    |
+| Phase 5: Training Loop              | 2 weeks           | ✅ COMPLETE | January 2025    |
+| Phase 6: Optimization & Testing     | 2 weeks           | ✅ COMPLETE | January 2025    |
+| **BONUS**: Autograd Integration     | N/A               | ✅ COMPLETE | January 2025    |
 
 ## Phase 1: Text Generation & Sampling ✅ COMPLETE
 
 ### Goal
+
 Complete the text generation pipeline with proper sampling methods to replace current argmax-based generation.
 
 ### Implementation Status
+
 - ✅ Basic model architecture (Qwen3)
 - ✅ Forward pass with KV caching
 - ✅ Temperature scaling
@@ -69,6 +71,7 @@ pub fn categorical_sample(logits: &MxArray, temperature: f32) -> Result<MxArray>
 **Reference**: `./mlx-lm/mlx_lm/sample_utils.py` (lines 112-310)
 
 **Key Operations**:
+
 - `mx::random::categorical()`: Sample from probability distribution
 - `mx::argsort()`: Sort indices
 - `mx::argpartition()`: Partition for top-k
@@ -79,10 +82,12 @@ pub fn categorical_sample(logits: &MxArray, temperature: f32) -> Result<MxArray>
 #### 1.2 Integrate Sampling into Generation (Week 1-2)
 
 **Files**:
+
 - `src/grpo/models/qwen3-model.ts` (update)
 - `src/grpo/sampling/sampler.ts` (new)
 
 **Updates**:
+
 ```typescript
 // Replace argmax in generateSample() with proper sampling
 const nextToken = categoricalSample(filteredProbs, temperature);
@@ -99,6 +104,7 @@ class Sampler {
 **File**: `src/grpo/__test__/sampling.test.ts`
 
 Tests:
+
 - ✅ Top-k filters to k tokens
 - ✅ Top-p maintains cumulative probability
 - ✅ Min-p scales by max probability
@@ -107,6 +113,7 @@ Tests:
 - ✅ Complete pipeline integrates all filters
 
 ### Deliverables
+
 - [ ] Rust sampling functions in `node/src/sampling.rs`
 - [ ] TypeScript Sampler class
 - [ ] Updated generation methods in MLXCausalLM
@@ -114,6 +121,7 @@ Tests:
 - [ ] Documentation for sampling API
 
 ### Success Criteria
+
 - All sampling methods produce valid probability distributions
 - Generation with sampling is non-deterministic (temp > 0)
 - Performance: < 5ms overhead per token vs argmax
@@ -123,6 +131,7 @@ Tests:
 ## Phase 2: GRPO Loss Computation (2 weeks)
 
 ### Goal
+
 Implement the core GRPO loss computation with clipped surrogate objective and all loss variants.
 
 ### Tasks
@@ -158,6 +167,7 @@ pub fn grpo_loss(
 **Reference**: `./trl/trl/trainer/grpo_trainer.py` (lines 1730-1858)
 
 **Key Operations**:
+
 - Importance sampling ratio: `exp(log π_θ - log π_old)`
 - Clipped objective: `min(r*A, clip(r,1-ε,1+ε)*A)`
 - KL penalty: `exp(log π_ref - log π_θ) - (log π_ref - log π_θ) - 1`
@@ -203,6 +213,7 @@ This computes `log π_θ(token_i | context)` for each token in the sequence.
 **File**: `src/grpo/__test__/grpo-loss.test.ts`
 
 Tests:
+
 - ✅ Clipping works correctly (r < 1-ε, r > 1+ε)
 - ✅ Loss increases with negative advantages
 - ✅ Loss decreases with positive advantages
@@ -210,6 +221,7 @@ Tests:
 - ✅ KL penalty reduces divergence
 
 ### Deliverables
+
 - [ ] GRPO loss in Rust
 - [ ] Advantage computation in TypeScript
 - [ ] Selective log-softmax function
@@ -217,6 +229,7 @@ Tests:
 - [ ] Documentation for loss API
 
 ### Success Criteria
+
 - Loss computation matches TRL reference (within 1e-3)
 - All 4 loss types implemented and tested
 - Gradients flow correctly through loss
@@ -226,6 +239,7 @@ Tests:
 ## Phase 3: Tokenization (1 week)
 
 ### Goal
+
 Integrate tiktoken tokenizer for Qwen3 to enable end-to-end text generation.
 
 ### Tasks
@@ -281,12 +295,14 @@ class MLXCausalLM {
 ```
 
 ### Deliverables
+
 - [ ] Qwen3Tokenizer class
 - [ ] Integration with MLXCausalLM
 - [ ] Text-to-text generation API
 - [ ] Tokenizer tests
 
 ### Success Criteria
+
 - Can tokenize and detokenize text correctly
 - Matches HuggingFace tokenizer output
 - End-to-end text generation works
@@ -296,6 +312,7 @@ class MLXCausalLM {
 ## Phase 4: Generation & Scoring Pipeline (2 weeks)
 
 ### Goal
+
 Build complete pipeline for batch generation with group sampling and reward computation.
 
 ### Tasks
@@ -326,6 +343,7 @@ export class Generator {
 ```
 
 **Features**:
+
 - Group-based generation: G completions per prompt
 - KV cache management
 - Token-level log-probability tracking
@@ -353,6 +371,7 @@ export class RewardManager {
 ```
 
 **Built-in Rewards**:
+
 ```typescript
 // Length reward: prefer longer completions
 export function lengthReward(prompts: string[], completions: string[]): Float32Array;
@@ -384,6 +403,7 @@ export class GRPOPipeline {
 ```
 
 ### Deliverables
+
 - [ ] Batch generation with group sampling
 - [ ] Reward function interface
 - [ ] Built-in reward functions
@@ -391,6 +411,7 @@ export class GRPOPipeline {
 - [ ] Pipeline tests
 
 ### Success Criteria
+
 - Can generate multiple completions per prompt
 - Reward computation works correctly
 - Advantages are zero-mean within groups
@@ -400,6 +421,7 @@ export class GRPOPipeline {
 ## Phase 5: Training Loop (3 weeks)
 
 ### Goal
+
 Implement complete GRPO training loop with gradient accumulation.
 
 ### Tasks
@@ -489,6 +511,7 @@ export class PromptDataset {
 ```
 
 **Format**:
+
 ```json
 [
   {"prompt": "What is 2+2?"},
@@ -498,6 +521,7 @@ export class PromptDataset {
 ```
 
 ### Deliverables
+
 - [ ] Complete training loop
 - [ ] Gradient accumulation
 - [ ] Multiple iterations support
@@ -505,6 +529,7 @@ export class PromptDataset {
 - [ ] Training tests
 
 ### Success Criteria
+
 - Training loop completes without errors
 - Loss decreases over time
 - Metrics are logged correctly
@@ -514,6 +539,7 @@ export class PromptDataset {
 ## Phase 6: Monitoring & CLI (2 weeks)
 
 ### Goal
+
 Add comprehensive logging, monitoring, and a CLI for easy training.
 
 ### Tasks
@@ -532,6 +558,7 @@ export class MetricsLogger {
 ```
 
 **Metrics to Track**:
+
 - Loss (total, policy, KL)
 - Rewards (mean, std, per function)
 - Advantages (mean, std)
@@ -570,6 +597,7 @@ program.parse();
 ```
 
 **Usage**:
+
 ```bash
 mlx-grpo train \
   --model qwen3-0.6b \
@@ -596,6 +624,7 @@ async loadCheckpoint(path: string): Promise<void> {
 ```
 
 ### Deliverables
+
 - [ ] Metrics logging system
 - [ ] CLI for training
 - [ ] Checkpointing
@@ -603,6 +632,7 @@ async loadCheckpoint(path: string): Promise<void> {
 - [ ] Documentation
 
 ### Success Criteria
+
 - Can train from CLI with simple command
 - Metrics are logged clearly
 - Can resume from checkpoints
@@ -612,6 +642,7 @@ async loadCheckpoint(path: string): Promise<void> {
 ## Phase 7: Testing & Documentation (2 weeks)
 
 ### Goal
+
 Comprehensive tests and documentation for production use.
 
 ### Tasks
@@ -644,6 +675,7 @@ describe('GRPO Integration', () => {
 #### 7.2 Write Documentation (Week 12)
 
 **Files**:
+
 - `src/grpo/README.md`: Overview and quick start
 - `src/grpo/docs/api.md`: API reference
 - `src/grpo/docs/training.md`: Training guide
@@ -651,6 +683,7 @@ describe('GRPO Integration', () => {
 - `src/grpo/examples/`: Example scripts
 
 ### Deliverables
+
 - [ ] 100+ integration tests
 - [ ] Complete API documentation
 - [ ] Training tutorials
@@ -658,6 +691,7 @@ describe('GRPO Integration', () => {
 - [ ] Troubleshooting guide
 
 ### Success Criteria
+
 - All tests pass
 - Documentation is clear and comprehensive
 - Examples work out of the box
@@ -667,16 +701,19 @@ describe('GRPO Integration', () => {
 ## Success Metrics
 
 ### Performance
+
 - **Training speed**: > 100 tokens/sec on M1 Max
 - **Memory usage**: < 16GB for Qwen3-0.6B
 - **Loss convergence**: Similar to TRL reference
 
 ### Quality
+
 - **Test coverage**: > 90%
 - **Type safety**: Full TypeScript types
 - **Documentation**: All public APIs documented
 
 ### Functionality
+
 - ✅ Supports Qwen3-0.6B and Qwen3-1.8B
 - ✅ All 4 loss types (GRPO, DAPO, Dr. GRPO, BNPO)
 - ✅ All sampling methods (top-k, top-p, min-p)
@@ -697,6 +734,7 @@ describe('GRPO Integration', () => {
 4. Continue with top-p, min-p, categorical
 
 **Weekly Checkpoints**:
+
 - End of Week 2: All sampling methods working
 - End of Week 4: GRPO loss computation complete
 - End of Week 5: Tokenization integrated

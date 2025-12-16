@@ -42,25 +42,25 @@
 
 ### ✅ What We Implemented Correctly
 
-| Feature | MLX-LM | Our Implementation | Status |
-|---------|--------|-------------------|--------|
-| QK Normalization | ✅ Always enabled | ✅ `useQkNorm: true` | ✅ MATCH |
-| Grouped Query Attention | ✅ Configurable ratios | ✅ `numHeads: 16, numKvHeads: 8` | ✅ MATCH |
-| RoPE Theta | ✅ 1,000,000 | ✅ `ropeTheta: 1000000.0` | ✅ MATCH |
-| SwiGLU MLP | ✅ gate/up/down | ✅ TransformerBlock with MLP | ✅ MATCH |
-| Pre-norm Architecture | ✅ RMSNorm before attn/mlp | ✅ `norm(x)` pattern | ✅ MATCH |
-| Tied Embeddings | ✅ Configurable | ✅ `tieWordEmbeddings` | ✅ MATCH |
-| KV Caching | ✅ Incremental generation | ✅ KVCache per layer | ✅ MATCH |
+| Feature                 | MLX-LM                     | Our Implementation               | Status   |
+| ----------------------- | -------------------------- | -------------------------------- | -------- |
+| QK Normalization        | ✅ Always enabled          | ✅ `useQkNorm: true`             | ✅ MATCH |
+| Grouped Query Attention | ✅ Configurable ratios     | ✅ `numHeads: 16, numKvHeads: 8` | ✅ MATCH |
+| RoPE Theta              | ✅ 1,000,000               | ✅ `ropeTheta: 1000000.0`        | ✅ MATCH |
+| SwiGLU MLP              | ✅ gate/up/down            | ✅ TransformerBlock with MLP     | ✅ MATCH |
+| Pre-norm Architecture   | ✅ RMSNorm before attn/mlp | ✅ `norm(x)` pattern             | ✅ MATCH |
+| Tied Embeddings         | ✅ Configurable            | ✅ `tieWordEmbeddings`           | ✅ MATCH |
+| KV Caching              | ✅ Incremental generation  | ✅ KVCache per layer             | ✅ MATCH |
 
 **Verdict**: Architecture is **production-ready** and matches MLX-LM reference.
 
 ### ⚠️ Minor Differences (Non-blocking)
 
-| Feature | MLX-LM | Our Implementation | Impact |
-|---------|--------|-------------------|--------|
-| Attention Mask Creation | ✅ `create_attention_mask()` | ❌ Pass `mask?: MxArray` | Low - can create externally |
-| Input Embeddings Support | ✅ `input_embeddings` param | ❌ Token IDs only | Low - not needed for GRPO |
-| Model Type Detection | ✅ Detect Qwen3 vs Qwen3-MoE | ❌ Manual config | Low - we focus on Qwen3 |
+| Feature                  | MLX-LM                       | Our Implementation       | Impact                      |
+| ------------------------ | ---------------------------- | ------------------------ | --------------------------- |
+| Attention Mask Creation  | ✅ `create_attention_mask()` | ❌ Pass `mask?: MxArray` | Low - can create externally |
+| Input Embeddings Support | ✅ `input_embeddings` param  | ❌ Token IDs only        | Low - not needed for GRPO   |
+| Model Type Detection     | ✅ Detect Qwen3 vs Qwen3-MoE | ❌ Manual config         | Low - we focus on Qwen3     |
 
 ---
 
@@ -136,6 +136,7 @@ def _generate(self, prompts: list):
 ```
 
 **What GRPO Needs**:
+
 1. ❌ **Logprobs per token**: `log P(token_t | context)` for policy gradient
 2. ❌ **Multiple completions**: `num_generations=8` per prompt
 3. ⚠️ **Sampling methods**: top-k, top-p for diversity
@@ -154,6 +155,7 @@ def _generate(self, prompts: list):
 **Required**: Track `log P(token | context)` for each generated token.
 
 **Reference** (TRL, lines 820-891):
+
 ```python
 def _get_per_token_logps_and_entropies(self, model, input_ids, attention_mask, logits_to_keep):
     logits = model(input_ids, attention_mask).logits[:, :-1, :]  # Exclude last
@@ -167,6 +169,7 @@ def _get_per_token_logps_and_entropies(self, model, input_ids, attention_mask, l
 ```
 
 **What We Need**:
+
 ```typescript
 interface GenerationResult {
   tokens: Int32Array;           // Generated token IDs
@@ -184,6 +187,7 @@ generateWithLogprobs(
 ```
 
 **Implementation Steps**:
+
 1. After each token generation, extract logits for that position
 2. Apply softmax to get probabilities
 3. Take log to get log-probabilities
@@ -197,12 +201,14 @@ generateWithLogprobs(
 **Required**: Sample from probability distribution, not just take argmax.
 
 **Reference** (MLX-LM, sample_utils.py line 275-276):
+
 ```python
 def categorical_sampling(logits, temp):
     return mx.random.categorical(logits * (1 / temp))
 ```
 
 **What We Need**:
+
 ```rust
 // In node/src/array.rs:
 #[napi]
@@ -216,6 +222,7 @@ impl MxArray {
 ```
 
 **Importance**: Without this, we can't:
+
 - Explore diverse completions (stuck with greedy)
 - Implement proper GRPO (needs diverse samples for advantage computation)
 - Use temperature/top-p/top-k effectively
@@ -227,6 +234,7 @@ impl MxArray {
 **Required**: Generate `num_generations` completions per prompt.
 
 **Reference** (TRL, lines 1404-1430):
+
 ```python
 def _generate_and_score_completions(self, prompts: list):
     # Generate G completions per prompt
@@ -247,6 +255,7 @@ def _generate_and_score_completions(self, prompts: list):
 ```
 
 **What We Need**:
+
 ```typescript
 generateBatch(
   prompts: MxArray[],           // B prompts
@@ -257,6 +266,7 @@ generateBatch(
 ```
 
 **Why It's Critical**:
+
 - GRPO requires multiple completions per prompt for advantage computation
 - Advantages are computed relative to group mean: `A = R - mean(R_group)`
 - Can't compute group statistics with only 1 completion
@@ -270,6 +280,7 @@ generateBatch(
 **Status**: ⚠️ **PLACEHOLDER** (TODO comment)
 
 **Reference** (MLX-LM, sample_utils.py lines 111-133):
+
 ```python
 def apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
     vocab_size = logprobs.shape[-1]
@@ -283,6 +294,7 @@ def apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
 ```
 
 **What We Need**:
+
 ```rust
 // In node/src/sampling.rs:
 #[napi]
@@ -294,6 +306,7 @@ pub fn apply_top_k(logprobs: &MxArray, top_k: i32) -> Result<MxArray>
 **Status**: ⚠️ **PLACEHOLDER** (TODO comment)
 
 **Reference** (MLX-LM, sample_utils.py lines 201-234):
+
 ```python
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     probs = mx.exp(logprobs)
@@ -318,6 +331,7 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
 ```
 
 **What We Need**:
+
 ```rust
 #[napi]
 pub fn apply_top_p(logprobs: &MxArray, top_p: f32) -> Result<MxArray>
@@ -328,6 +342,7 @@ pub fn apply_top_p(logprobs: &MxArray, top_p: f32) -> Result<MxArray>
 **Status**: ⚠️ **PARTIAL** (detect EOS but don't return metadata)
 
 **What TRL Tracks** (lines 1390-1400):
+
 ```python
 # Track completion statistics
 is_truncated = [ids[-1] not in eos_and_pad for ids in completion_ids]
@@ -339,6 +354,7 @@ mean_terminated_length = lengths[~is_truncated].mean()
 ```
 
 **What We Need**:
+
 ```typescript
 interface GenerationResult {
   tokens: Int32Array;
@@ -355,6 +371,7 @@ interface GenerationResult {
 #### 3.7 Min-P Sampling
 
 **Reference** (MLX-LM, sample_utils.py lines 136-198):
+
 ```python
 def apply_min_p(logprobs, min_p, min_tokens_to_keep=1):
     # Keep tokens with prob > min_p * max_prob
@@ -369,6 +386,7 @@ def apply_min_p(logprobs, min_p, min_tokens_to_keep=1):
 #### 3.8 Repetition Penalty
 
 **Reference** (MLX-LM, sample_utils.py lines 279-309):
+
 ```python
 def make_repetition_penalty(penalty: float, context_size: int = 20):
     def repetition_penalty_processor(tokens, logits):
@@ -513,6 +531,7 @@ def model_test_runner(model, config):
 ### 🔴 CRITICAL Tests to Add
 
 #### Test 1: Logprobs Correctness
+
 ```typescript
 it('should compute correct logprobs for generated tokens', () => {
   const model = new MLXCausalLM('qwen3-0.6b');
@@ -531,6 +550,7 @@ it('should compute correct logprobs for generated tokens', () => {
 ```
 
 #### Test 2: Categorical Sampling Distribution
+
 ```typescript
 it('should sample from correct distribution', () => {
   const logits = MxArray.fromFloat32(
@@ -555,6 +575,7 @@ it('should sample from correct distribution', () => {
 ```
 
 #### Test 3: Batch Generation
+
 ```typescript
 it('should generate multiple completions per prompt', () => {
   const model = new MLXCausalLM('qwen3-0.6b');
@@ -580,6 +601,7 @@ it('should generate multiple completions per prompt', () => {
 ### 🟡 HIGH Priority Tests
 
 #### Test 4: Top-K Filtering
+
 ```typescript
 it('should keep only top k tokens', () => {
   const logprobs = MxArray.randomNormal(shape(1, 100), 0, 1);
@@ -599,6 +621,7 @@ it('should keep only top k tokens', () => {
 ```
 
 #### Test 5: Top-P (Nucleus) Filtering
+
 ```typescript
 it('should keep tokens with cumulative prob < top_p', () => {
   const logprobs = MxArray.fromFloat32(
@@ -619,6 +642,7 @@ it('should keep tokens with cumulative prob < top_p', () => {
 ```
 
 #### Test 6: EOS vs Truncated Detection
+
 ```typescript
 it('should detect EOS vs max_length termination', () => {
   const model = new MLXCausalLM('qwen3-0.6b');
@@ -637,6 +661,7 @@ it('should detect EOS vs max_length termination', () => {
 ### 🟢 MEDIUM Priority Tests
 
 #### Test 7: Temperature Scaling
+
 ```typescript
 it('should increase randomness with higher temperature', () => {
   const model = new MLXCausalLM('qwen3-0.6b');
@@ -663,6 +688,7 @@ it('should increase randomness with higher temperature', () => {
 ```
 
 #### Test 8: Repetition Penalty
+
 ```typescript
 it('should reduce repetitive tokens', () => {
   const model = new MLXCausalLM('qwen3-0.6b');
@@ -696,18 +722,21 @@ it('should reduce repetitive tokens', () => {
 **Goal**: Enable basic GRPO training with logprobs and sampling
 
 1. **Add categorical sampling** (Rust)
+
    ```rust
    // node/src/array.rs
    pub fn categorical(&self, temperature: f32) -> Result<MxArray>
    ```
 
 2. **Implement logprobs tracking** (TypeScript)
+
    ```typescript
    // src/grpo/models/qwen3-model.ts
    generateWithLogprobs(...): GenerationResult
    ```
 
 3. **Add GenerationResult interface** (TypeScript)
+
    ```typescript
    interface GenerationResult {
      tokens: Int32Array;
@@ -727,6 +756,7 @@ it('should reduce repetitive tokens', () => {
 **Goal**: Generate multiple completions per prompt for GRPO
 
 1. **Implement batch generation**
+
    ```typescript
    generateBatch(prompts: MxArray[], numCompletions: number, ...): GenerationResult[]
    ```
@@ -745,6 +775,7 @@ it('should reduce repetitive tokens', () => {
    - Min-p: `apply_min_p()`
 
 2. **Create sampling pipeline** (TypeScript)
+
    ```typescript
    class Sampler {
      sample(logits: MxArray, config: SamplingConfig): MxArray
@@ -814,12 +845,14 @@ Our Qwen3 implementation perfectly matches MLX-LM reference with all key feature
 
 **Generation**: ❌ **Needs Work**
 Missing critical features for GRPO:
+
 1. Logprobs tracking (CRITICAL)
 2. Categorical sampling (CRITICAL)
 3. Batch generation (HIGH)
 4. Sampling filters (HIGH)
 
 **Path Forward**:
+
 - Week 1-2: Add logprobs + categorical sampling
 - Week 2-3: Batch generation
 - Week 3-4: Complete sampling pipeline

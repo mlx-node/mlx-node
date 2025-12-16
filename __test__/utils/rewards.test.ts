@@ -6,7 +6,7 @@ import {
   softFormatReward,
   strictFormatReward,
   xmlCountReward,
-} from '../../src/index';
+} from '@mlx-node/trl';
 
 // Helper to create test inputs with the new simpler signature
 function createInput(

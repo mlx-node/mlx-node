@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractHashAnswer, extractXmlAnswer, parseXmlCot } from '../../src/index';
+import { extractHashAnswer, extractXmlAnswer, parseXmlCot } from '@mlx-node/trl';
 
 describe('XML chain-of-thought parser', () => {
   it('parses MLX-style strict XML format with surrounding whitespace', () => {

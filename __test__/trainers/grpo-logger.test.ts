@@ -3,10 +3,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { GRPOLogger, createLogger, MetricsAggregator, type LoggerConfig } from '../../src/index';
+import { GRPOLogger, createLogger, MetricsAggregator, type LoggerConfig, type TrainingMetrics } from '@mlx-node/trl';
 import { readFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import type { TrainingMetrics } from '../../src/index';
 
 const TEST_OUTPUT_DIR = './test-logs';
 

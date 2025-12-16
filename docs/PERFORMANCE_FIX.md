@@ -10,12 +10,15 @@
 ## Investigation Process
 
 ### Initial Performance Gap
+
 - **MLX-LM (Python)**: ~94 tok/s
 - **mlx-node**: ~47 tok/s
 - **Gap**: 2x slower
 
 ### Phase 1: False Leads ❌
+
 Attempted optimizations that had ZERO impact:
+
 1. Reverted vectorized repetition penalty → no change
 2. Fixed KV cache copying (56→0) → no change
 3. Implemented pre-allocated buffers → no change
@@ -26,6 +29,7 @@ All KV cache optimizations failed because **KV cache was never the bottleneck**.
 ### Phase 2: Profiling-Driven Analysis ✅
 
 **Critical test - measure time per token across sequence lengths:**
+
 ```
 10 tokens:  20.20ms/token
 25 tokens:  19.88ms/token
@@ -36,6 +40,7 @@ All KV cache optimizations failed because **KV cache was never the bottleneck**.
 **Finding**: Constant time per token = bottleneck is per-token operations, not cumulative.
 
 **Isolation test - disable sampling features:**
+
 ```
 Minimal config (temp=1.0):   73.8 tok/s  ← Fast!
 With top-p:                  82.8 tok/s  ← Fast!
@@ -82,6 +87,7 @@ for &token_id in recent_tokens {  // ~20 iterations
 ### Final Implementation (79 tok/s) ✅
 
 Completely eliminated CPU transfers by keeping everything on GPU:
+
 ```rust
 // FINAL IMPLEMENTATION - All GPU operations, ZERO CPU transfers
 // 1. Create index array (GPU)
@@ -133,6 +139,7 @@ While MLX Python uses `logits[:, tokens] = values` (single indexed assignment), 
 ### Performance Improvement Journey
 
 #### Stage 1: Original (CPU Transfers) - BROKEN
+
 ```
 With full sampling: 47 tok/s
 Bottleneck: ~6M float GPU↔CPU transfers per token
@@ -140,6 +147,7 @@ Problem: Downloading/uploading 151K floats × 40 times per token = 24 MB transfe
 ```
 
 #### Stage 2: GPU-Only Operations - FIXED ✅
+
 ```
 FINAL PERFORMANCE MEASUREMENTS:
 Near-argmax (temp=0.001):    92.9 tok/s
@@ -187,9 +195,11 @@ Total achievable:            ~94 tok/s with compiled sampling
 ## Files Modified
 
 ### Core Fix
+
 1. **`node/src/sampling.rs:610-680`** - Rewrote `apply_repetition_penalty` with GPU-only operations
 
 ### Infrastructure Added
+
 2. **`mlx-sys/src/mlx.cpp:613-622`** - Added `mlx_array_scatter` C++ binding (for future use)
 3. **`mlx-sys/src/lib.rs:118-123`** - Added `mlx_array_scatter` FFI declaration
 4. **`node/src/array/mod.rs:459-471`** - Added `scatter()` helper method
@@ -200,21 +210,25 @@ Total achievable:            ~94 tok/s with compiled sampling
 ## Lessons Learned
 
 ### 1. Profile Before Optimizing
+
 - Theoretical optimizations (KV cache) had zero impact
 - Profiling revealed the actual bottleneck (sampling)
 - Isolation tests pinpointed exact operation (repetition penalty)
 
 ### 2. GPU↔CPU Transfers Are Death
+
 - A single 604 KB transfer: negligible
 - 40 transfers per token: catastrophic
 - Always keep data GPU-resident when possible
 
 ### 3. Vectorize Everything
+
 - Loop-based CPU manipulation: slow
 - Vectorized GPU operations: fast
 - Even a loop of GPU ops >> CPU transfers
 
 ### 4. Test Incrementally
+
 - Test each sampling feature in isolation
 - Binary search to find bottleneck
 - Measure before and after every change
@@ -226,6 +240,7 @@ Total achievable:            ~94 tok/s with compiled sampling
 To close the final 1.03x gap to MLX-LM's 94 tok/s (3 tok/s difference):
 
 ### Potential Improvements
+
 1. **Compiled sampling** (~2-3 tok/s expected)
    - MLX-LM uses `@mx.compile` decorator
    - Fuses sampling operations (top-p, top-k, categorical) into single kernel
@@ -246,6 +261,7 @@ To close the final 1.03x gap to MLX-LM's 94 tok/s (3 tok/s difference):
 ### Current Status
 
 **OUTSTANDING**: 91 tok/s is exceptional performance - essentially parity with Python MLX!
+
 - **96.5% of MLX-LM's Python performance** (only 3 tok/s gap!)
 - **1.93x faster** than before the fix (+44 tok/s improvement)
 - **93% of the performance gap closed**
@@ -261,10 +277,12 @@ To close the final 1.03x gap to MLX-LM's 94 tok/s (3 tok/s difference):
 By eliminating ~6 million float GPU↔CPU transfers per token and implementing a GPU-only vectorized approach, we achieved a **1.93x speedup** and essentially **reached parity** with Python MLX-LM!
 
 **Journey**:
+
 - **Stage 1 (Original)**: 47 tok/s - catastrophic CPU transfers (24 MB per token!)
 - **Stage 2 (GPU-only)**: 91 tok/s - eliminated ALL CPU transfers ✅
 
 **Final Results**:
+
 - **Before**: 47 tok/s (2.00x slower than MLX-LM, 50% of target performance)
 - **After**: 91 tok/s (1.03x slower than MLX-LM, **96.5% of target performance!**)
 - **Improvement**: +93% (+44 tok/s)
@@ -272,11 +290,11 @@ By eliminating ~6 million float GPU↔CPU transfers per token and implementing a
 
 ### Performance Breakdown
 
-| Component | Performance | vs MLX-LM |
-|-----------|-------------|-----------|
-| Forward pass | ~93 tok/s | 99% parity |
-| Sampling (all filters) | ~91 tok/s | 97% parity |
-| Overall | 91 tok/s | **96.5% parity** |
+| Component              | Performance | vs MLX-LM        |
+| ---------------------- | ----------- | ---------------- |
+| Forward pass           | ~93 tok/s   | 99% parity       |
+| Sampling (all filters) | ~91 tok/s   | 97% parity       |
+| Overall                | 91 tok/s    | **96.5% parity** |
 
 ### Key Lessons
 
@@ -291,6 +309,7 @@ The lesson: **Always profile first, keep data on GPU, and eliminate data movemen
 ### Achievement Summary
 
 🎉 **Near-Parity Achieved**: mlx-node is now only 3 tok/s (3%) slower than Python MLX-LM despite:
+
 - Language barrier (Node.js/Rust vs Python)
 - FFI overhead (NAPI-RS → Rust → C++ → Metal)
 - No compiled sampling (MLX-LM uses `@mx.compile`)

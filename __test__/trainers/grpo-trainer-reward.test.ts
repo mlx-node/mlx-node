@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { NativeRewardRegistry } from '@mlx-node/core';
 import type { BuiltinRewardType } from '@mlx-node/core';
-import { DEFAULT_GRPO_CONFIG, createRewardRegistry } from '../../src/index';
+import { DEFAULT_GRPO_CONFIG, createRewardRegistry } from '@mlx-node/trl';
 
 describe('NativeRewardRegistry NAPI Bindings', () => {
   it('should create registry and register rewards', () => {

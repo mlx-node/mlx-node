@@ -11,12 +11,14 @@
 MLX supports two mask types with different semantics:
 
 ### Additive Masks (What We Tested)
+
 ```python
 mask[i,j] = 0.0    # Keep (add 0)
 mask[i,j] = -inf   # Mask (add -inf)
 ```
 
 ### Boolean Masks (What We Got Wrong)
+
 ```python
 # MLX: True = keep, False = mask
 # PyTorch: True = mask, False = keep  ← OPPOSITE!
@@ -54,12 +56,12 @@ def test_causal_mask():
 
 ## Lessons
 
-| What Went Wrong | Prevention |
-|----------------|------------|
-| Wrong boolean semantics | Test mask values directly |
-| Only tested additive masks | Test both mask types |
-| Assumed PyTorch semantics | Read MLX source/tests |
-| No mask shape validation | Add unit tests like mlx-lm |
+| What Went Wrong            | Prevention                 |
+| -------------------------- | -------------------------- |
+| Wrong boolean semantics    | Test mask values directly  |
+| Only tested additive masks | Test both mask types       |
+| Assumed PyTorch semantics  | Read MLX source/tests      |
+| No mask shape validation   | Add unit tests like mlx-lm |
 
 **Bottom line**: Testing the interface (mask values) catches bugs that testing outcomes (attention results) might miss.
 
