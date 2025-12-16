@@ -7,12 +7,13 @@
 
 MLX and PyTorch have **opposite boolean mask semantics**:
 
-| Library | `True` | `False` |
-|---------|--------|---------|
-| PyTorch | Mask out (`-inf`) | Keep |
-| **MLX** | **Keep** | **Mask out (`-inf`)** |
+| Library | `True`            | `False`               |
+| ------- | ----------------- | --------------------- |
+| PyTorch | Mask out (`-inf`) | Keep                  |
+| **MLX** | **Keep**          | **Mask out (`-inf`)** |
 
 Our implementation used PyTorch semantics (`linds < rinds`), creating an **upper triangular** mask that:
+
 - ✅ Kept future positions (WRONG in MLX)
 - ❌ Masked past positions (WRONG in MLX)
 
@@ -24,7 +25,7 @@ Our implementation used PyTorch semantics (`linds < rinds`), creating an **upper
 // Before (WRONG - PyTorch semantics)
 let mask = linds.less(&rinds)?;  // Upper triangular
 
-// After (CORRECT - MLX semantics)  
+// After (CORRECT - MLX semantics)
 let mask = linds.greater_equal(&rinds)?;  // Lower triangular + diagonal
 ```
 
@@ -48,6 +49,7 @@ let mask = if seq_len > 1 {
 ## Verification
 
 **Predictions now match HuggingFace transformers**:
+
 - Test: "Once upon a time" → Token 11 (',')
   - MLX: logit 19.0968 ✅
   - Transformers: logit 19.0000 ✅

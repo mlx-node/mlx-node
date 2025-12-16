@@ -7,6 +7,7 @@ Group Relative Policy Optimization (GRPO) is a state-of-the-art reinforcement le
 ## What is GRPO?
 
 GRPO improves upon traditional PPO (Proximal Policy Optimization) by:
+
 - Using group-based advantage normalization for more stable training
 - Supporting multiple loss variants (GRPO, DAPO, Dr.GRPO, BNPO)
 - Implementing importance sampling for off-policy correction
@@ -80,26 +81,34 @@ await trainer.train(dataset, {
 ### Loss Variants
 
 #### 1. GRPO (Group Relative Policy Optimization)
+
 Standard GRPO loss with group-based advantage normalization:
+
 ```
 L = -E[min(r(θ) * A, clip(r(θ), 1-ε, 1+ε) * A)]
 where r(θ) = π(a|s) / π_old(a|s)
 ```
 
 #### 2. DAPO (Direct Advantage Policy Optimization)
+
 Simplified version without importance sampling:
+
 ```
 L = -E[A * log π(a|s)]
 ```
 
 #### 3. Dr.GRPO (Dropout-Regularized GRPO)
+
 GRPO with additional regularization term:
+
 ```
 L = L_GRPO + β * KL(π || π_ref)
 ```
 
 #### 4. BNPO (Bounded Negative Policy Optimization)
+
 Focuses on improving negative examples:
+
 ```
 L = -E[min(r(θ) * A_neg, clip(r(θ), 1-ε, 1+ε) * A_neg)]
 ```
@@ -148,12 +157,14 @@ const mask = entropy > threshold;
 The GRPO implementation is split across Rust (performance-critical) and TypeScript (orchestration):
 
 ### Rust Components (`node/src/`)
+
 - `grpo/loss.rs` - Loss computation (GRPO, DAPO, Dr.GRPO, BNPO)
 - `grpo/advantages.rs` - Advantage normalization
 - `grpo/entropy.rs` - Entropy filtering
 - `grpo/autograd.rs` - Automatic differentiation integration
 
 ### TypeScript Components (`src/`)
+
 - `trainers/grpo-trainer.ts` - Main training loop
 - `trainers/grpo-config.ts` - Configuration management
 - `trainers/grpo-logger.ts` - Metrics and logging
@@ -162,16 +173,19 @@ The GRPO implementation is split across Rust (performance-critical) and TypeScri
 ## Performance Considerations
 
 ### Memory Optimization
+
 - Use `BatchKVCache` for efficient batch processing
 - Enable gradient accumulation for larger effective batch sizes
 - Use `RotatingKVCache` for long sequences
 
 ### Speed Optimization
+
 - Leverage Metal GPU acceleration on Apple Silicon
 - Use lazy evaluation for operation fusion
 - Enable mixed precision training when available
 
 ### Training Stability
+
 - Start with small learning rates (1e-5 to 1e-6)
 - Use gradient clipping (max norm: 1.0)
 - Monitor KL divergence from reference policy
@@ -180,6 +194,7 @@ The GRPO implementation is split across Rust (performance-critical) and TypeScri
 ## Benchmarks
 
 Performance on Qwen3-0.6B model (Apple M2):
+
 - **Training Speed**: ~15 tokens/second/batch
 - **Memory Usage**: ~4GB for model + optimizer states
 - **Convergence**: Typically within 1000-2000 steps
@@ -218,5 +233,5 @@ Performance on Qwen3-0.6B model (Apple M2):
 
 ---
 
-*Last Updated: January 2025*
-*Status: Production Ready*
+_Last Updated: January 2025_
+_Status: Production Ready_

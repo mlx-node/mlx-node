@@ -33,16 +33,19 @@ Welcome to the MLX-Node documentation! This directory contains detailed technica
 ## 🚀 Quick Links
 
 ### For Users
+
 - [Getting Started](../README.md#quick-start)
 - [API Examples](../README.md#basic-usage)
 - [Performance Guide](PERFORMANCE_OPTIMIZATIONS.md)
 
 ### For Contributors
+
 - [Contributing Guide](../CONTRIBUTING.md)
 - [Development History](DEVELOPMENT_HISTORY.md)
 - [Architecture Overview](../README.md#architecture)
 
 ### For Researchers
+
 - [GRPO Algorithm](grpo/algorithm.md)
 - [Autograd System](AUTOGRAD_INTEGRATION.md)
 - [Model Architecture](grpo/architecture.md)
@@ -80,4 +83,4 @@ All documentation in this directory follows these standards:
 
 ---
 
-*Last Updated: January 2025*
+_Last Updated: January 2025_

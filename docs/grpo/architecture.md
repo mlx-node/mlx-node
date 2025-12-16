@@ -12,6 +12,7 @@ This document compares our MLX-Node Qwen3 implementation with the official MLX-L
 ## Architecture Overview
 
 ### Qwen3 Key Features (from MLX-LM)
+
 1. **QK Normalization**: Always enabled - core feature of Qwen3
 2. **Grouped Query Attention (GQA)**: Different num_heads and num_kv_heads
 3. **RoPE**: Rotary Position Embeddings (non-traditional mode)
@@ -25,6 +26,7 @@ This document compares our MLX-Node Qwen3 implementation with the official MLX-L
 ### 1. Attention Layer
 
 #### MLX-LM Reference (`qwen3.py`)
+
 ```python
 class Attention(nn.Module):
     def __init__(self, args):
@@ -67,7 +69,9 @@ class Attention(nn.Module):
 ```
 
 #### Our Implementation Status
+
 ✅ **Implemented**: Using existing `Attention` class from mlx-node core
+
 - Separate Q/K/V projections: ✅
 - QK normalization support: ✅ (via `useQkNorm` flag)
 - RoPE support: ✅
@@ -81,6 +85,7 @@ class Attention(nn.Module):
 ### 2. MLP Layer
 
 #### MLX-LM Reference
+
 ```python
 class MLP(nn.Module):
     def __init__(self, dim, hidden_dim):
@@ -94,7 +99,9 @@ class MLP(nn.Module):
 ```
 
 #### Our Implementation Status
+
 ✅ **Implemented**: Using existing `MLP` class from mlx-node core
+
 - Three projections (gate, up, down): ✅
 - SwiGLU activation: ✅
 - No bias: ✅
@@ -104,6 +111,7 @@ class MLP(nn.Module):
 ### 3. Transformer Block
 
 #### MLX-LM Reference
+
 ```python
 class TransformerBlock(nn.Module):
     def __init__(self, args):
@@ -122,7 +130,9 @@ class TransformerBlock(nn.Module):
 ```
 
 #### Our Implementation Status
+
 ✅ **Implemented**: Using existing `TransformerBlock` class from mlx-node core
+
 - Pre-norm architecture: ✅
 - Two RMSNorm layers: ✅
 - Residual connections: ✅
@@ -133,6 +143,7 @@ class TransformerBlock(nn.Module):
 ### 4. Full Model Structure
 
 #### MLX-LM Reference
+
 ```python
 class Qwen3Model(nn.Module):
     def __init__(self, args):
@@ -156,7 +167,9 @@ class Model(nn.Module):
 ```
 
 #### Our Implementation Status
+
 ✅ **Implemented**: `MLXCausalLM` class
+
 - Embedding layer: ✅
 - Transformer layers: ✅
 - Final normalization: ✅
@@ -169,20 +182,21 @@ class Model(nn.Module):
 
 ### HuggingFace Config → Our Config
 
-| HF Config | Our Config | Qwen3-0.6B Value |
-|-----------|------------|------------------|
-| `vocab_size` | `vocabSize` | 151,936 |
-| `hidden_size` | `hiddenSize` | 1,024 |
-| `num_hidden_layers` | `numLayers` | 28 |
-| `num_attention_heads` | `numHeads` | 16 |
-| `num_key_value_heads` | `numKvHeads` | 8 |
-| `intermediate_size` | `intermediateSize` | 3,072 |
-| `rms_norm_eps` | `rmsNormEps` | 1e-6 |
-| `rope_theta` | `ropeTheta` | 1,000,000 |
-| `max_position_embeddings` | `maxPositionEmbeddings` | 40,960 |
-| `tie_word_embeddings` | `tieWordEmbeddings` | true |
+| HF Config                 | Our Config              | Qwen3-0.6B Value |
+| ------------------------- | ----------------------- | ---------------- |
+| `vocab_size`              | `vocabSize`             | 151,936          |
+| `hidden_size`             | `hiddenSize`            | 1,024            |
+| `num_hidden_layers`       | `numLayers`             | 28               |
+| `num_attention_heads`     | `numHeads`              | 16               |
+| `num_key_value_heads`     | `numKvHeads`            | 8                |
+| `intermediate_size`       | `intermediateSize`      | 3,072            |
+| `rms_norm_eps`            | `rmsNormEps`            | 1e-6             |
+| `rope_theta`              | `ropeTheta`             | 1,000,000        |
+| `max_position_embeddings` | `maxPositionEmbeddings` | 40,960           |
+| `tie_word_embeddings`     | `tieWordEmbeddings`     | true             |
 
 ### Qwen3-Specific Features (Not in HF config)
+
 - `useQkNorm`: **Always true** for Qwen3 (architectural feature)
 - `qkNormEps`: Same as `rms_norm_eps` (1e-6)
 
@@ -191,6 +205,7 @@ class Model(nn.Module):
 ## Generation Pipeline
 
 ### MLX-LM Generation Flow
+
 From `mlx-lm/mlx_lm/generate.py` and `sample_utils.py`:
 
 ```python
@@ -215,6 +230,7 @@ def generate_step(model, prompt, temp=1.0, top_p=1.0):
 ```
 
 #### Our Implementation Status
+
 - Basic generation: ✅ (greedy decoding works)
 - Temperature scaling: ✅ (implemented in `node/src/sampling.rs`)
 - Top-p (nucleus) sampling: ✅ (implemented with `top_p` parameter)
@@ -229,6 +245,7 @@ def generate_step(model, prompt, temp=1.0, top_p=1.0):
 ## Action Items
 
 ### Completed ✅
+
 1. ✅ **QK Normalization**: Implemented and enabled for Qwen3
 2. ✅ **Attention Implementation**: Core `Attention` properly applies QK norm before RoPE
 3. ✅ **Categorical Sampling**: Implemented with `categorical()` method
@@ -244,6 +261,7 @@ def generate_step(model, prompt, temp=1.0, top_p=1.0):
 13. ✅ **Entropy Filtering**: Selective training on high-uncertainty tokens
 
 ### Future Work
+
 14. ⏳ **Qwen3-MoE Support**: Implement MoE variant (~700 lines estimated)
 15. ⏳ **Autograd Backward Pass**: Phase 6 - automatic differentiation (not critical for GRPO)
 16. ⏳ **Performance Optimization**: Profile and optimize generation speed further

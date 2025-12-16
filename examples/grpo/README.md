@@ -80,6 +80,7 @@ yarn download:qwen3
 Downloads Qwen3-0.6B (~1.2GB) to `.cache/models/qwen3-0.6b/`.
 
 **Important**: After downloading, convert to MLX float32 format for training:
+
 ```bash
 yarn convert:model -i .cache/models/qwen3-0.6b -o .cache/models/qwen3-0.6b-mlx
 ```
@@ -155,6 +156,7 @@ MODEL_OUTPUT_DIR=".cache/models/my-model" node scripts/download-qwen3.ts
 ```
 
 **What it does**:
+
 - Downloads `config.json`, `tokenizer.json`, `model.safetensors`
 - Renames `model.safetensors` → `weights.safetensors` (for compatibility)
 - Verifies all required files are present
@@ -162,9 +164,11 @@ MODEL_OUTPUT_DIR=".cache/models/my-model" node scripts/download-qwen3.ts
 **Output**: `.cache/models/qwen3-0.6b/` (~1.2GB base model)
 
 **Important**: Convert to MLX float32 format before training:
+
 ```bash
 yarn convert:model -i .cache/models/qwen3-0.6b -o .cache/models/qwen3-0.6b-mlx
 ```
+
 This converts the model to float32 (~2.4GB) for better training stability.
 
 ### 2. Test Generation
@@ -182,12 +186,14 @@ MODEL_PATH=".cache/models/qwen3-0.6b-mlx" node examples/grpo/test-generation.ts
 ```
 
 **What it tests**:
+
 - Model loads from SafeTensors
 - Tokenizer applies chat template correctly
 - Generation produces XML-formatted output
 - Reasoning and answer tags are present
 
 **Expected output**:
+
 ```
 ═══════════════════════════════════════════════════════════
 Model Response:
@@ -221,6 +227,7 @@ OUTPUT_DIR="outputs/my-training" node examples/grpo/train-simple.ts
 ```
 
 **Configuration**:
+
 - **Training examples**: 50 (default)
 - **Group size**: 2 generations per prompt
 - **Learning rate**: 1e-6
@@ -228,6 +235,7 @@ OUTPUT_DIR="outputs/my-training" node examples/grpo/train-simple.ts
 - **Estimated time**: 15-20 minutes
 
 **What it does**:
+
 1. Loads model and tokenizer
 2. Loads 50 GSM8K training examples
 3. Generates 2 completions per prompt
@@ -236,6 +244,7 @@ OUTPUT_DIR="outputs/my-training" node examples/grpo/train-simple.ts
 6. Saves checkpoints every 25 steps
 
 **Output**: `outputs/grpo-simple/`
+
 - `log.jsonl` - Training metrics
 - `checkpoint-25/` - Intermediate checkpoint
 - `final/` - Final trained model
@@ -260,6 +269,7 @@ CONFIG_PATH="config.toml" OUTPUT_DIR="outputs/prod" node examples/grpo/train-ful
 **Configuration**: See [Configuration](#configuration) section.
 
 **What it does**:
+
 1. Loads configuration from TOML
 2. Supports full dataset (7,473 examples)
 3. Uses 8 generations per prompt (production setting)
@@ -277,6 +287,7 @@ The demo includes a production-ready config file: `examples/grpo/config.toml`
 #### Key Sections
 
 **Model Configuration**
+
 ```toml
 [model]
 name = "qwen3-0.6b"                        # Use built-in config
@@ -284,6 +295,7 @@ path = ".cache/models/qwen3-0.6b-mlx"     # Path to MLX float32 model
 ```
 
 **Dataset Configuration**
+
 ```toml
 [dataset]
 split = "train"                   # "train" or "test"
@@ -292,6 +304,7 @@ include_one_shot = true          # Include example in prompts
 ```
 
 **Training Hyperparameters**
+
 ```toml
 [training]
 learning_rate = 1e-6             # Adam learning rate
@@ -303,6 +316,7 @@ gradient_clip_norm = 1.0         # Gradient clipping
 ```
 
 **GRPO Parameters**
+
 ```toml
 [grpo]
 group_size = 8                   # Generations per prompt
@@ -313,6 +327,7 @@ loss_type = "grpo"               # grpo|dapo|dr_grpo|bnpo
 ```
 
 **Generation Parameters**
+
 ```toml
 [generation]
 max_new_tokens = 256             # Max tokens per generation
@@ -322,6 +337,7 @@ top_k = 50                       # Top-k sampling
 ```
 
 **Reward Configuration**
+
 ```toml
 [reward]
 type = "function"                # "function" or "model"
@@ -333,6 +349,7 @@ use_xml_count = true             # +0.25 per tag
 ```
 
 **Logging Configuration**
+
 ```toml
 [logging]
 console = true                   # Log to console
@@ -393,6 +410,7 @@ Step 2 | Batch 2/50 | Loss: 0.0012 | Reward: 2.7500 | Adv: 0.1200 | Tokens: 498 
 ```
 
 **Control output frequency:**
+
 ```typescript
 const config: GRPOConfig = {
   logConsole: true,    // Enable/disable console output
@@ -417,6 +435,7 @@ cat outputs/grpo/run.jsonl | jq 'select(.event == "training_complete")'
 ```
 
 **Log format:**
+
 ```json
 {
   "event": "step",
@@ -443,6 +462,7 @@ node examples/grpo/utils/monitor-training.ts outputs/grpo/run.jsonl
 ```
 
 **Monitor displays:**
+
 ```
 ╔═══════════════════════════════════════════════════════════╗
 ║           GRPO Training Progress Monitor                  ║
@@ -493,6 +513,7 @@ outputs/grpo/
 ```
 
 **Load and resume from checkpoint:**
+
 ```typescript
 const trainer = new GRPOTrainer(config);
 await trainer.loadCheckpoint('./outputs/grpo/checkpoint-25');
@@ -521,6 +542,7 @@ node examples/grpo/utils/explore-dataset.ts --examples 5
 ```
 
 **Shows**:
+
 - Dataset statistics (size, length distributions)
 - Format validation (system prompts, one-shot examples)
 - Example problems with full prompts and answers
@@ -541,6 +563,7 @@ node examples/grpo/utils/inspect-checkpoint.ts outputs/grpo-simple/final --progr
 ```
 
 **Shows**:
+
 - Configuration (learning rate, group size, etc.)
 - Training metrics (step, loss, reward, advantage)
 - Model weights info (file size, format)
@@ -565,6 +588,7 @@ node examples/grpo/utils/evaluate.ts outputs/grpo-simple/final --tokenizer path/
 ```
 
 **Computes**:
+
 - Accuracy (% correct answers)
 - Format compliance (% with proper XML tags)
 - Average generation length
@@ -575,14 +599,17 @@ node examples/grpo/utils/evaluate.ts outputs/grpo-simple/final --tokenizer path/
 ### Simple Training (50 examples, 2 generations)
 
 **Before training**:
+
 - Accuracy: ~5-15% (untrained model guessing)
 - Format compliance: ~60-70% (model knows XML from pretraining)
 
 **After training** (~15 min):
+
 - Accuracy: ~15-25% (improvement on trained examples)
 - Format compliance: ~85-95% (learns format quickly)
 
 **Training curve**:
+
 ```
 Step   Loss    Reward   Advantage
 1      2.345   0.50     0.12
@@ -594,10 +621,12 @@ Step   Loss    Reward   Advantage
 ### Full Training (100 examples, 8 generations)
 
 **After training** (~60 min):
+
 - Accuracy: ~25-35%
 - Format compliance: ~95%+
 
 **Full dataset** (7,473 examples, several hours):
+
 - Accuracy: ~40-50% (state-of-the-art for 0.6B model)
 - Format compliance: ~98%+
 
@@ -615,6 +644,7 @@ Step   Loss    Reward   Advantage
 **Problem**: `Failed to download model.safetensors`
 
 **Solution**:
+
 ```bash
 # Check internet connection
 curl -I https://huggingface.co
@@ -630,6 +660,7 @@ yarn download:qwen3
 **Problem**: `Metal out of memory` or process killed
 
 **Solution**:
+
 - Reduce `group_size` (8 → 4 or 2)
 - Reduce `max_new_tokens` (256 → 128)
 - Reduce `batch_size` (already 1, can't go lower)
@@ -641,6 +672,7 @@ yarn download:qwen3
 **Problem**: Training takes longer than expected
 
 **Solution**:
+
 - Reduce `num_examples` or `max_train_samples`
 - Reduce `group_size` (8 → 4 or 2)
 - Reduce `max_new_tokens` (256 → 128)
@@ -651,6 +683,7 @@ yarn download:qwen3
 **Problem**: Model accuracy not improving
 
 **Solution**:
+
 - Train longer (more epochs or examples)
 - Increase `group_size` (4 → 8)
 - Adjust `learning_rate` (try 5e-7 or 2e-6)
@@ -662,6 +695,7 @@ yarn download:qwen3
 **Problem**: Model not using XML tags
 
 **Solution**:
+
 - Check `include_one_shot = true` in config
 - Verify system prompt includes format instructions
 - Increase reward for format (`use_strict_format = true`)
@@ -672,6 +706,7 @@ yarn download:qwen3
 **Problem**: No checkpoints in output directory
 
 **Solution**:
+
 - Check `save_interval` in config (should be < total steps)
 - Verify `output_dir` exists and is writable
 - Check disk space

@@ -31,14 +31,14 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 
 ## Why MLX-Node?
 
-| | Feature | Description |
-|:--:|:--|:--|
-| ⚡ | **Metal GPU Acceleration** | Native Apple Silicon performance via MLX with lazy evaluation and operation fusion |
-| 🎯 | **GRPO Training** | Complete reinforcement learning pipeline with 4 loss variants (GRPO, DAPO, Dr.GRPO, BNPO) |
-| 🤖 | **Qwen3 Models** | Support for 0.6B, 1.7B, 4B, 8B, 14B, 32B parameter models with advanced sampling |
-| 🔄 | **Automatic Differentiation** | Compute gradients through entire models via functional forward pass |
-| 🚫 | **Zero Python Dependency** | Pure Rust/TypeScript implementation — no Python runtime required |
-| 📊 | **TypedArray-First API** | Zero-copy operations using native JavaScript typed arrays |
+|     | Feature                       | Description                                                                               |
+| :-: | :---------------------------- | :---------------------------------------------------------------------------------------- |
+| ⚡  | **Metal GPU Acceleration**    | Native Apple Silicon performance via MLX with lazy evaluation and operation fusion        |
+| 🎯  | **GRPO Training**             | Complete reinforcement learning pipeline with 4 loss variants (GRPO, DAPO, Dr.GRPO, BNPO) |
+| 🤖  | **Qwen3 Models**              | Support for 0.6B, 1.7B, 4B, 8B, 14B, 32B parameter models with advanced sampling          |
+| 🔄  | **Automatic Differentiation** | Compute gradients through entire models via functional forward pass                       |
+| 🚫  | **Zero Python Dependency**    | Pure Rust/TypeScript implementation — no Python runtime required                          |
+| 📊  | **TypedArray-First API**      | Zero-copy operations using native JavaScript typed arrays                                 |
 
 ---
 
@@ -49,6 +49,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 <td width="33%" valign="top">
 
 ### Model Inference
+
 - Qwen3 (0.6B, 1.7B, 4B, 8B, 14B, 32B)
 - Streaming generation [WIP]
 - KV cache variants
@@ -58,6 +59,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 <td width="33%" valign="top">
 
 ### GRPO Training
+
 - 4 loss variants
 - Custom reward functions
 - Gradient accumulation
@@ -67,6 +69,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 <td width="33%" valign="top">
 
 ### Sampling Strategies
+
 - Temperature scaling
 - Top-k / Top-p / Min-p
 - Repetition penalty
@@ -78,6 +81,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 <td width="33%" valign="top">
 
 ### Neural Network Layers
+
 - Linear, Embedding
 - RMSNorm, LayerNorm
 - Attention (GQA)
@@ -87,6 +91,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 <td width="33%" valign="top">
 
 ### Optimizers
+
 - Adam / AdamW
 - SGD (with momentum)
 - RMSprop
@@ -96,6 +101,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 <td width="33%" valign="top">
 
 ### Advanced Features
+
 - Autograd integration
 - Entropy filtering
 - Built-in rewards
@@ -221,12 +227,12 @@ trainer.registerBuiltinReward({
 
 ### Loss Variants
 
-| Variant | Description |
-|:--|:--|
-| `grpo` | Standard Group Relative Policy Optimization |
-| `dapo` | Dynamic Advantage Policy Optimization — adaptive clipping |
-| `dr_grpo` | Dropout-Regularized GRPO — improved stability |
-| `bnpo` | Batch-Normalized Policy Optimization — normalized advantages |
+| Variant   | Description                                                  |
+| :-------- | :----------------------------------------------------------- |
+| `grpo`    | Standard Group Relative Policy Optimization                  |
+| `dapo`    | Dynamic Advantage Policy Optimization — adaptive clipping    |
+| `dr_grpo` | Dropout-Regularized GRPO — improved stability                |
+| `bnpo`    | Batch-Normalized Policy Optimization — normalized advantages |
 
 ### Training Examples
 
@@ -261,28 +267,28 @@ The TUI wraps your Node.js training script and communicates via stdout (JSONL me
 
 ### TUI Features
 
-| Panel | Description |
-|:--|:--|
-| **Header** | Model name, epoch/step progress, training status |
-| **Metrics** | Loss, reward, and advantage with sparkline history |
-| **Progress** | Epoch and step progress bars with percentages |
-| **Stats** | Token count, elapsed time, step speed breakdown |
-| **Logs** | Real-time training logs (scrollable) |
-| **Samples** | Generated samples with rewards (best/worst/latest modes) |
-| **Config** | Current training configuration |
+| Panel        | Description                                              |
+| :----------- | :------------------------------------------------------- |
+| **Header**   | Model name, epoch/step progress, training status         |
+| **Metrics**  | Loss, reward, and advantage with sparkline history       |
+| **Progress** | Epoch and step progress bars with percentages            |
+| **Stats**    | Token count, elapsed time, step speed breakdown          |
+| **Logs**     | Real-time training logs (scrollable)                     |
+| **Samples**  | Generated samples with rewards (best/worst/latest modes) |
+| **Config**   | Current training configuration                           |
 
 ### Keyboard Controls
 
-| Key | Action |
-|:--|:--|
-| `p` | Pause training |
-| `r` | Resume training |
-| `s` | Save checkpoint |
-| `Tab` | Switch between tabs (Logs/Samples/Config) |
-| `↑` `↓` | Scroll within current tab |
-| `m` | Cycle sample display mode (Best → Worst → Latest) |
-| `?` | Toggle help overlay |
-| `q` | Quit TUI |
+| Key     | Action                                            |
+| :------ | :------------------------------------------------ |
+| `p`     | Pause training                                    |
+| `r`     | Resume training                                   |
+| `s`     | Save checkpoint                                   |
+| `Tab`   | Switch between tabs (Logs/Samples/Config)         |
+| `↑` `↓` | Scroll within current tab                         |
+| `m`     | Cycle sample display mode (Best → Worst → Latest) |
+| `?`     | Toggle help overlay                               |
+| `q`     | Quit TUI                                          |
 
 ### Enabling TUI Mode in Training Scripts
 
@@ -300,6 +306,7 @@ const trainer = await GRPOTrainer.create({
 ```
 
 When `tuiMode` is enabled:
+
 - All logging output uses JSONL format for TUI parsing
 - The trainer listens for stdin commands (pause, resume, save)
 - Progress updates are sent as structured messages
@@ -309,6 +316,7 @@ When `tuiMode` is enabled:
 The TUI communicates with training scripts via a simple protocol:
 
 **Training → TUI** (stdout, JSONL):
+
 ```json
 {"type": "step", "epoch": 1, "step": 10, "loss": 0.5, "reward": 4.2}
 {"type": "log", "level": "info", "message": "Starting epoch 2"}
@@ -316,6 +324,7 @@ The TUI communicates with training scripts via a simple protocol:
 ```
 
 **TUI → Training** (stdin, line commands):
+
 ```
 pause
 resume
@@ -366,10 +375,10 @@ MLX-Node uses a clean two-layer architecture: **Rust for compute**, **TypeScript
 
 ### Package Overview
 
-| Package | Purpose | Use For |
-|:--|:--|:--|
-| `@mlx-node/lm` | Model loading & inference | Loading models, generating text, model configs |
-| `@mlx-node/trl` | Training & optimization | GRPO training, custom rewards, optimizers |
+| Package          | Purpose                    | Use For                                          |
+| :--------------- | :------------------------- | :----------------------------------------------- |
+| `@mlx-node/lm`   | Model loading & inference  | Loading models, generating text, model configs   |
+| `@mlx-node/trl`  | Training & optimization    | GRPO training, custom rewards, optimizers        |
 | `@mlx-node/core` | Native bindings (internal) | Low-level operations (usually import via lm/trl) |
 
 ### Import Patterns
@@ -427,14 +436,14 @@ await model.saveModel('outputs/fine-tuned');
 
 ### Sampling Strategies
 
-| Strategy | Parameter | Description |
-|:--|:--|:--|
-| Temperature | `temperature: 0.8` | Controls randomness (lower = more focused) |
-| Top-K | `topK: 50` | Keep top K most likely tokens |
-| Top-P (Nucleus) | `topP: 0.95` | Cumulative probability threshold |
-| Min-P | `minP: 0.05` | Minimum probability relative to max |
-| Repetition Penalty | `repetitionPenalty: 1.2` | Reduce repetitive text |
-| XTC | `xtcThreshold: 0.1` | eXclude Top Choices (stochastic) |
+| Strategy           | Parameter                | Description                                |
+| :----------------- | :----------------------- | :----------------------------------------- |
+| Temperature        | `temperature: 0.8`       | Controls randomness (lower = more focused) |
+| Top-K              | `topK: 50`               | Keep top K most likely tokens              |
+| Top-P (Nucleus)    | `topP: 0.95`             | Cumulative probability threshold           |
+| Min-P              | `minP: 0.05`             | Minimum probability relative to max        |
+| Repetition Penalty | `repetitionPenalty: 1.2` | Reduce repetitive text                     |
+| XTC                | `xtcThreshold: 0.1`      | eXclude Top Choices (stochastic)           |
 
 ### Low-Level Operations
 
@@ -539,14 +548,14 @@ mlx-node/
 
 ## Project Status
 
-| Phase | Status | Description |
-|:--|:--|:--|
-| Core Operations | ✅ Complete | 90+ array/tensor operations |
-| Neural Networks | ✅ Complete | Layers, activations, losses |
-| Gradients | ✅ Complete | Manual + automatic differentiation |
-| Transformers | ✅ Complete | Attention, KVCache variants, MLP |
-| GRPO Training | ✅ Complete | Production-ready with 4 loss variants |
-| Autograd | ✅ Complete | Functional forward pass architecture |
+| Phase           | Status      | Description                           |
+| :-------------- | :---------- | :------------------------------------ |
+| Core Operations | ✅ Complete | 90+ array/tensor operations           |
+| Neural Networks | ✅ Complete | Layers, activations, losses           |
+| Gradients       | ✅ Complete | Manual + automatic differentiation    |
+| Transformers    | ✅ Complete | Attention, KVCache variants, MLP      |
+| GRPO Training   | ✅ Complete | Production-ready with 4 loss variants |
+| Autograd        | ✅ Complete | Functional forward pass architecture  |
 
 **Test Coverage:** 1,036/1,039 tests passing (100%)
 

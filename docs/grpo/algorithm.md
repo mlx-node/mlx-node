@@ -7,6 +7,7 @@ This document captures the core GRPO (Group Relative Policy Optimization) algori
 GRPO is a reinforcement learning algorithm for training language models, introduced in the DeepSeek-Math paper. It's essentially PPO with group-based advantage normalization instead of using a value function.
 
 **Key Differences from PPO**:
+
 - **No value function**: Advantages computed relative to group mean
 - **Group-based sampling**: Generate G completions per prompt, normalize within groups
 - **Simpler**: No separate critic network to train
@@ -40,6 +41,7 @@ for each training step:
 ## 1. Sampling and Generation
 
 **Configuration** (from `GRPOConfig`):
+
 - `num_generations` (G): 8 completions per prompt
 - `temperature`: 1.0 (default, standard sampling)
 - `top_p`: 1.0 (nucleus sampling threshold)
@@ -50,6 +52,7 @@ for each training step:
 **Implementation** (from `mlx-lm/mlx_lm/sample_utils.py`):
 
 ### Top-K Sampling
+
 ```python
 def apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
     """Keep only top-k tokens by probability."""
@@ -61,6 +64,7 @@ def apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
 ```
 
 ### Top-P (Nucleus) Sampling
+
 ```python
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     """Keep tokens with cumulative probability < top_p."""
@@ -90,6 +94,7 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
 ```
 
 ### Min-P Sampling
+
 ```python
 def apply_min_p(logprobs: mx.array, min_p: float, min_tokens_to_keep: int = 1) -> mx.array:
     """Keep tokens with prob > min_p * max_prob."""
@@ -120,6 +125,7 @@ def apply_min_p(logprobs: mx.array, min_p: float, min_tokens_to_keep: int = 1) -
 ```
 
 ### Categorical Sampling
+
 ```python
 def categorical_sampling(logits: mx.array, temp: float) -> mx.array:
     """Sample from categorical distribution."""
@@ -127,6 +133,7 @@ def categorical_sampling(logits: mx.array, temp: float) -> mx.array:
 ```
 
 ### Complete Sampling Pipeline
+
 ```python
 def sample_token(logits: mx.array, temp: float = 1.0, top_p: float = 1.0,
                  top_k: int = None, min_p: float = None) -> mx.array:
@@ -194,6 +201,7 @@ def compute_advantages(rewards: torch.Tensor, num_generations: int,
 ```
 
 **Key Points**:
+
 1. Advantages are **zero-mean within each group**
 2. Group-based normalization prevents cross-prompt comparison
 3. Standard deviation scaling optional but recommended for stability
@@ -305,12 +313,12 @@ def compute_grpo_loss(
 
 ### Loss Type Comparison
 
-| Loss Type | Normalization | Length Bias | Notes |
-|-----------|---------------|-------------|-------|
-| **grpo** | Per-sequence: `sum(loss) / seq_len` | ⚠️ Yes | Prefers short seqs with +A, long with -A |
-| **bnpo** | Local batch: `sum(loss) / sum(mask)` | ✅ No | Varies with local batch size |
-| **dr_grpo** | Global constant: `sum(loss) / (B * max_len)` | ✅ No | Fixed normalization |
-| **dapo** | Global batch: `sum(loss) / total_tokens` | ✅ No | **Recommended** (default) |
+| Loss Type   | Normalization                                | Length Bias | Notes                                    |
+| ----------- | -------------------------------------------- | ----------- | ---------------------------------------- |
+| **grpo**    | Per-sequence: `sum(loss) / seq_len`          | ⚠️ Yes      | Prefers short seqs with +A, long with -A |
+| **bnpo**    | Local batch: `sum(loss) / sum(mask)`         | ✅ No       | Varies with local batch size             |
+| **dr_grpo** | Global constant: `sum(loss) / (B * max_len)` | ✅ No       | Fixed normalization                      |
+| **dapo**    | Global batch: `sum(loss) / total_tokens`     | ✅ No       | **Recommended** (default)                |
 
 ### Why DAPO is Recommended
 
@@ -321,6 +329,7 @@ def compute_grpo_loss(
 ## 4. Implementation Requirements for MLX-Node
 
 ### Phase 1: Sampling (Urgent)
+
 - [x] **Temperature scaling**: Already works
 - [ ] **Top-K sampling**: Implement using argpartition + put_along_axis
 - [ ] **Top-P sampling**: Implement sort + cumsum + rearrange
@@ -328,12 +337,14 @@ def compute_grpo_loss(
 - [ ] **Categorical sampling**: Replace argmax with mx.random.categorical
 
 ### Phase 2: GRPO Core Logic
+
 - [ ] **Advantage computation**: Group-based normalization
 - [ ] **Log-prob computation**: Selective log-softmax per token
 - [ ] **GRPO loss**: Clipped surrogate objective
 - [ ] **Loss variants**: Support grpo, dapo, dr_grpo, bnpo
 
 ### Phase 3: Training Infrastructure
+
 - [ ] **Generation loop**: Batch generation with KV caching
 - [ ] **Reward computation**: Support function-based rewards
 - [ ] **Optimizer integration**: Adam/AdamW with gradient clipping
@@ -342,6 +353,7 @@ def compute_grpo_loss(
 ## 5. Key Configuration Parameters
 
 **From TRL Default Config**:
+
 ```typescript
 {
   // Model and training
@@ -400,4 +412,4 @@ def compute_grpo_loss(
 
 ---
 
-*This document was created by analyzing the TRL and MLX-LM reference implementations to serve as a blueprint for our MLX-Node GRPO implementation.*
+_This document was created by analyzing the TRL and MLX-LM reference implementations to serve as a blueprint for our MLX-Node GRPO implementation._

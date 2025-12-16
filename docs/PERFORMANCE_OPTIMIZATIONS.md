@@ -7,11 +7,13 @@ Successfully optimized Qwen3Model#generate performance, improving from **~82 tok
 ## Performance Results
 
 ### Before Optimizations
+
 - **mlx-node**: ~82 tokens/s
 - **mlx-lm**: ~97 tokens/s (high variance: 81-109)
 - **Gap**: ~18% slower
 
 ### After Optimizations
+
 - **mlx-node**: 89.23 ± 2.14 tokens/s (2.4% variance)
 - **mlx-lm**: ~97 tokens/s (14% variance)
 - **Gap**: ~8% slower (within acceptable range given measurement variance)
@@ -19,11 +21,13 @@ Successfully optimized Qwen3Model#generate performance, improving from **~82 tok
 ## Optimizations Implemented
 
 ### 1. Eliminated Unnecessary Logits Evaluation (4-5% improvement) 🎯
+
 **The Key Bottleneck**
 
 **Problem**: We were calling `async_eval_arrays(&[&token, &logprobs, &logits])` which evaluated the full logits array (151K floats = 604KB) at every token, even though logits were never used after sampling.
 
 **Solution** (`model.rs:1342-1345, 1364-1369`):
+
 ```rust
 // BEFORE
 MxArray::async_eval_arrays(&[&token, &logprobs, &logits]);
@@ -37,14 +41,17 @@ if let Some(ref lp) = logprobs {
 ```
 
 **Impact**:
+
 - Reduced GPU memory bandwidth per token by 604KB
 - Reduced cache pollution
 - **4-5% performance improvement**
 
 ### 2. Conditional Logprobs Computation (1-2% improvement)
+
 **Problem**: Computing logprobs (logsumexp + subtraction on 151K floats) at every token even when not needed.
 
 **Solution** (`model.rs:1324-1330`):
+
 ```rust
 // OPTIMIZATION: Only compute logprobs when needed
 let all_logprobs = if return_logprobs {
@@ -56,14 +63,17 @@ let all_logprobs = if return_logprobs {
 ```
 
 **Impact**:
+
 - Skip expensive logsumexp reduction operation
 - Skip 604KB array creation
 - **1-2% performance improvement**
 
 ### 3. Removed Unnecessary Logits Clone (0.5% improvement)
+
 **Problem**: Cloning logits array when temperature=1.0 and no filters applied.
 
 **Solution** (`sampling.rs:343-356`):
+
 ```rust
 let needs_filters = top_k > 0 || top_p < 1.0 || min_p > 0.0;
 
@@ -77,13 +87,16 @@ let mut current = if temperature != 1.0 {
 ```
 
 **Impact**:
+
 - Avoid unnecessary clone for common case
 - **0.5% performance improvement**
 
 ## Performance Analysis
 
 ### Detailed Timing Breakdown (Before Cleanup)
+
 From profiling instrumentation:
+
 ```
 Forward pass:       4.4%  (graph building - lightweight)
 Sampling:           0.1%  (negligible)
@@ -111,12 +124,15 @@ The remaining gap with mlx-lm is acceptable because:
 ## Code Changes
 
 ### Files Modified
+
 1. `node/src/models/qwen3/model.rs` - Lines 1220, 1324-1330, 1342-1345, 1364-1369
 2. `node/src/sampling.rs` - Lines 343-356
 3. `node/src/models/qwen3/generation.rs` - Added `return_logprobs` flag (line 39)
 
 ### API Changes
+
 Added `returnLogprobs: boolean` option to GenerationConfig:
+
 ```typescript
 const result = await model.generate(messages, {
   returnLogprobs: false,  // Skip logprobs computation (default: true for GRPO)
@@ -142,11 +158,13 @@ These are minor compared to the gains already achieved.
 ## Benchmarking
 
 ### Quick Test
+
 ```bash
 yarn oxnode examples/test-converted-model.ts
 ```
 
 ### Rigorous Benchmark
+
 ```bash
 yarn oxnode examples/benchmark-final.ts
 ```
@@ -160,5 +178,6 @@ Successfully optimized mlx-node generation performance by **8.5%** through targe
 The optimization demonstrates that Node.js+Rust can match Python performance for GPU-bound ML workloads when properly optimized.
 
 ---
-*Optimization Session: November 2025*
-*Final Performance: 89.23 ± 2.14 tokens/s (Qwen3-0.6B on Apple Silicon)*
+
+_Optimization Session: November 2025_
+_Final Performance: 89.23 ± 2.14 tokens/s (Qwen3-0.6B on Apple Silicon)_

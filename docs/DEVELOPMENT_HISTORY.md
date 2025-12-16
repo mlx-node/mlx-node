@@ -1,6 +1,7 @@
 # MLX-Node Development History
 
 ## Overview
+
 This document archives the major development sessions and milestones for MLX-Node, preserving historical context while keeping the main CLAUDE.md lean.
 
 ---
@@ -8,11 +9,13 @@ This document archives the major development sessions and milestones for MLX-Nod
 ## January 2025 - Feature Completion Sprint
 
 ### Autograd Integration ✅
+
 **Date**: January 2025
 **Status**: PRODUCTION-READY
 **Duration**: Complete implementation with functional architecture
 
 **Implementation**:
+
 - Core autograd infrastructure (`node/src/autograd.rs` - 360 lines)
 - Functional forward pass architecture (`node/src/utils/functional.rs` - 550 lines)
 - Parameter management utilities (`node/src/param_manager.rs` - 200 lines)
@@ -20,6 +23,7 @@ This document archives the major development sessions and milestones for MLX-Nod
 - Full Qwen3 model support through computation graph
 
 **Key Innovation - Functional Forward Pass**:
+
 ```rust
 // Previous (broken): Used pre-computed logprobs
 let loss_fn = |_params| grpo_loss(&fixed_logprobs, ...)?;  // ❌ No gradient path
@@ -34,6 +38,7 @@ let loss_fn = |params| {
 ```
 
 **Impact**:
+
 - Automatic differentiation through full Qwen3 model (2,205 lines)
 - 311 gradients computed automatically for all parameters
 - Production-ready for training without manual gradient implementation
@@ -45,27 +50,32 @@ let loss_fn = |params| {
 ---
 
 ### Causal Masking Fix ✅
+
 **Date**: January 2025
 **Duration**: ~4 hours debugging + implementation
 **Issue**: Forward pass produced different results for cached vs non-cached modes (16.41 vs 13.55 logit diff)
 
 **Root Cause Analysis**:
+
 - Cached mode was CORRECT (applied causal masking implicitly via incremental generation)
 - Non-cached mode was WRONG (no causal mask, allowing attention to future positions)
 - Evidence: Token predictions differed when future context was visible vs masked
 
 **Solution**:
+
 - ✅ Implemented `create_causal_mask()` in Rust (`node/src/array/mask.rs`)
 - ✅ Applied causal mask to all non-cached forward passes in Qwen3 model
 - ✅ Updated all test configs to include `headDim` field (9 files, ~15 configs)
 - ✅ **Result**: 0/151,936 token differences - perfect match between modes
 
 **Impact**:
+
 - Production-ready generation with correct autoregressive behavior
 - All tests passing
 - Critical fix for training stability and generation quality
 
 **Files Modified**:
+
 - `node/src/array/mask.rs` (new) - Causal mask generation
 - `node/src/models/qwen3/model.rs` - Applied mask to forward passes
 - 9 test configuration files updated
@@ -76,6 +86,7 @@ let loss_fn = |params| {
 ---
 
 ### Feature Alignment Session ✅
+
 **Date**: January 2025
 **Duration**: ~10 hours over 2 days
 **Objective**: Align features with MLX-LM and TRL for production GRPO training
@@ -83,6 +94,7 @@ let loss_fn = |params| {
 **Achievements**:
 
 #### 1. Repetition Penalty ✅ (397 lines: 141 Rust + 256 tests)
+
 - Asymmetric penalty algorithm (divide for positive, multiply for negative logits)
 - Context size limiting (default 20 tokens)
 - Batch processing support
@@ -91,6 +103,7 @@ let loss_fn = |params| {
 - **Tests**: `__test__/utils/repetition-penalty.test.ts`
 
 #### 2. BatchKVCache ✅ (859 lines: 376 Rust + 483 tests)
+
 - Left-padding support for variable-length batches
 - Dynamic allocation in 256-step increments
 - Filter operation with automatic padding optimization
@@ -100,6 +113,7 @@ let loss_fn = |params| {
 - **Tests**: `__test__/core/batch-kv-cache.test.ts`
 
 **Data Structure**:
+
 ```rust
 pub struct BatchKVCache {
     keys: Option<MxArray>,        // (batch, n_kv_heads, seq_len, head_dim)
@@ -111,14 +125,17 @@ pub struct BatchKVCache {
 ```
 
 #### 3. Importance Sampling ✅ (already implemented in GRPO)
+
 - Token-level and sequence-level IS
 - PPO-style clipping
 - Built into GRPO loss computation
 
 **Status**: 3/4 critical features complete
+
 - ⏳ **Qwen3-MoE** (pending, ~700 lines estimated) - Not critical for basic GRPO training
 
 **Impact**: Production-ready for GRPO training with Qwen3
+
 - 90% feature parity with MLX-LM
 - 100% feature parity with TRL GRPO
 
@@ -127,6 +144,7 @@ pub struct BatchKVCache {
 ---
 
 ### Test Porting Session ✅
+
 **Date**: January 2025
 **Tests Added**: 69 new tests (829 → 948)
 **Components**: Entropy filtering, XTC sampling, Batch generation utils, RotatingKVCache
@@ -134,24 +152,28 @@ pub struct BatchKVCache {
 **Achievements**:
 
 #### 1. Entropy Filtering (12 tests, 176 Rust lines)
+
 - `getHighEntropyMask()` - Train on high-uncertainty tokens
 - `computeEntropy()` - Per-token entropy from logits
 - PyTorch-compatible quantile calculation
 - **File**: `node/src/grpo/entropy.rs`
 
 #### 2. XTC Sampling (15 tests, 154 Rust lines)
+
 - `applyXtc()` - eXclude Top Choices diversity-promoting sampling
 - Special token protection
 - MLX-LM reference compatibility
 - **File**: `node/src/sampling.rs` (XTC portion)
 
 #### 3. Batch Generation Utils (21 tests, 298 Rust lines)
+
 - `padSequences()` - Left/right padding
 - `createAttentionMask()` - Binary masks
 - Custom pad token support
 - **File**: `node/src/utils/batch_generation.rs`
 
 #### 4. RotatingKVCache (21 tests, 394 Rust lines)
+
 - Fixed maximum cache size with rotation
 - `keep` parameter for system prompts
 - Memory-efficient long-context handling
@@ -164,6 +186,7 @@ pub struct BatchKVCache {
 ## November 2025 - Critical Infrastructure
 
 ### 1. Rust-Based Model Persistence 💾
+
 - Migrated `saveModel` to Rust
 - Fixed 6 failing GRPO trainer tests
 - Test runtime: 234s → 34s
@@ -171,18 +194,21 @@ pub struct BatchKVCache {
 - **File**: `node/src/models/qwen3/persistence.rs` (398 lines)
 
 ### 2. Thread-Safe Handle Management 🔒
+
 - Fixed double-free bug with `Arc<MxHandle>`
 - Thread-safe `MxArray` with atomic reference counting
 - Removed 6 `.eval()` workarounds
 - **File**: `node/src/array/handle.rs`
 
 ### 3. Rust Migration Complete ⚡
+
 - All compute operations moved to Rust
 - 451 TS lines → 740+ Rust lines
 - Expected 15-25% training speedup
 - Clean Rust/TypeScript separation maintained
 
 **Impact**:
+
 - Production-ready model persistence
 - Eliminated memory management bugs
 - Significant performance improvements
@@ -191,33 +217,36 @@ pub struct BatchKVCache {
 
 ## Metrics Timeline
 
-| Date | Tests | Rust Lines | TS Lines | Status |
-|------|-------|------------|----------|--------|
-| Nov 2025 | ~800 | ~6,700 | ~2,500 | Infrastructure complete |
-| Early Jan 2025 | 829 | ~7,000 | ~2,400 | Test porting begins |
-| Mid Jan 2025 | 948 | ~8,500 | ~2,300 | Feature alignment |
-| Late Jan 2025 | 1,039 | 11,203 | 2,082 | Autograd complete |
+| Date           | Tests | Rust Lines | TS Lines | Status                  |
+| -------------- | ----- | ---------- | -------- | ----------------------- |
+| Nov 2025       | ~800  | ~6,700     | ~2,500   | Infrastructure complete |
+| Early Jan 2025 | 829   | ~7,000     | ~2,400   | Test porting begins     |
+| Mid Jan 2025   | 948   | ~8,500     | ~2,300   | Feature alignment       |
+| Late Jan 2025  | 1,039 | 11,203     | 2,082    | Autograd complete       |
 
 ---
 
 ## Key Lessons Learned
 
 ### Autograd Implementation
+
 - **Lesson**: MLX autograd requires pure functions, not stateful models
 - **Solution**: Functional forward pass architecture with parameter mapping
 - **Impact**: Enables automatic differentiation through entire model
 
 ### Causal Masking
+
 - **Lesson**: MLX and PyTorch have opposite boolean mask semantics
 - **Solution**: Carefully document and test mask generation
 - **Impact**: Correct autoregressive generation
 
 ### Rust Migration
+
 - **Lesson**: Moving compute to Rust provides 15-25% speedup
 - **Solution**: Keep TypeScript for orchestration, Rust for compute
 - **Impact**: Clean architecture with maximum performance
 
 ---
 
-*This document is maintained to preserve development history and lessons learned.*
-*For current project status, see CLAUDE.md*
+_This document is maintained to preserve development history and lessons learned._
+_For current project status, see CLAUDE.md_
