@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
-import { GRPOTrainer } from '../../src/index';
+import { GRPOTrainer } from '@mlx-node/trl';
 import { clearCache } from '@mlx-node/core';
 import { existsSync, rmSync } from 'node:fs';
 import { createTempModel } from '../test-model-utils';

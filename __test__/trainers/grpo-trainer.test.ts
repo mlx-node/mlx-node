@@ -1,8 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { GRPOTrainer } from '../../src/index';
+import { GRPOTrainer, type ChatMessage } from '@mlx-node/trl';
 import { clearCache } from '@mlx-node/core';
 import { createTempModel } from '../test-model-utils';
-import type { ChatMessage } from '../../src/index';
 
 // Shared temp model for all tests
 let tempModel: { modelPath: string; cleanup: () => void };

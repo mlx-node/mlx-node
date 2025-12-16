@@ -6,8 +6,21 @@
   "workspaces": [
     "packages/*"
   ],
+  "scripts": {
+    "build": "yarn build:native && yarn build:ts",
+    "build:native": "napi build --manifest-path crates/mlx-core/Cargo.toml --platform -o packages/core --js index.cjs --dts index.d.cts --release",
+    "build:debug": "napi build --manifest-path crates/mlx-core/Cargo.toml --platform -o packages/core --js index.cjs --dts index.d.cts",
+    "build:ts": "tsc -b",
+    "clean": "rm -rf packages/*/dist",
+    "test": "vitest run && TEST_TRAINER=1 vitest run",
+    "lint": "oxlint",
+    "format": "oxfmt --config oxfmtrc.json",
+    "typecheck": "tsc -b",
+    "download:gsm8k": "yarn oxnode scripts/download-gsm8k.ts",
+    "download:qwen3": "yarn oxnode scripts/download-qwen3.ts"
+  },
   "devDependencies": {
-    "@ast-grep/napi": "^0.40.0",
+    "@ast-grep/napi": "^0.40.3",
     "@huggingface/hub": "^2.7.1",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/trl": "workspace:*",
@@ -15,24 +28,11 @@
     "@oxc-node/cli": "^0.0.35",
     "@oxc-node/core": "^0.0.35",
     "@std/toml": "npm:@jsr/std__toml@^1.0.11",
-    "@types/node": "^24.10.1",
-    "oxfmt": "^0.16.0",
-    "oxlint": "^1.31.0",
+    "@types/node": "^25.0.2",
+    "oxfmt": "^0.18.0",
+    "oxlint": "^1.33.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.15"
-  },
-  "scripts": {
-    "build": "yarn build:native && yarn build:ts",
-    "build:native": "napi build --manifest-path crates/mlx-core/Cargo.toml --platform -o packages/core --js index.cjs --dts index.d.cts --release",
-    "build:debug": "napi build --manifest-path crates/mlx-core/Cargo.toml --platform -o packages/core --js index.cjs --dts index.d.cts",
-    "build:ts": "tsc -b",
-    "clean": "rm -rf packages/*/dist",
-    "test": "vitest run",
-    "lint": "oxlint",
-    "format": "oxfmt --config oxfmtrc.json",
-    "typecheck": "tsc -b --noEmit",
-    "download:gsm8k": "yarn oxnode scripts/download-gsm8k.ts",
-    "download:qwen3": "yarn oxnode scripts/download-qwen3.ts"
   },
   "packageManager": "yarn@4.12.0"
 }

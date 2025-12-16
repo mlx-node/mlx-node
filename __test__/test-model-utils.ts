@@ -5,7 +5,8 @@
 import { mkdtempSync, rmSync, copyFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Qwen3Model, type Qwen3Config } from '../packages/training/src/index';
+import { Qwen3Model } from '@mlx-node/core';
+import type { Qwen3Config } from '@mlx-node/lm';
 
 /**
  * Tiny test configuration for fast model creation

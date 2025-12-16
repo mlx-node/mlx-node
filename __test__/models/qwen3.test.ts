@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { QWEN3_CONFIGS, getQwen3Config } from '../../src/index';
+import { QWEN3_CONFIGS, getQwen3Config } from '@mlx-node/lm';
 import { MxArray, Qwen3Model } from '@mlx-node/core';
 import { shape } from '../test-utils';
 
@@ -132,7 +132,7 @@ describe.sequential('Qwen3 Model', () => {
       expect(result).toBeDefined();
       expect(result.text).toBeDefined();
       expect(typeof result.text).toBe('string');
-      expect(result.text!.length).toBeGreaterThan(0);
+      expect(result.text.length).toBeGreaterThan(0);
 
       // These are also available for GRPO training
       expect(result.tokens).toBeDefined();

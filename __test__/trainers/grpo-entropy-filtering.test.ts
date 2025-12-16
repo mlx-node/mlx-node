@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { getHighEntropyMask } from '../../src/index';
+import { getHighEntropyMask } from '@mlx-node/core';
 import { MxArray } from '@mlx-node/core';
 import { createFloat32Array, createInt32Array, float32, int32 } from '../test-utils';
 

@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { resolve } from 'node:path';
-import { SYSTEM_PROMPT, loadLocalGsm8kDataset, LocalGsm8kDatasetLoader } from '../../src/index';
-import { type ChatMessage } from '../../src/index';
+import { SYSTEM_PROMPT, loadLocalGsm8kDataset, LocalGsm8kDatasetLoader, type ChatMessage } from '@mlx-node/trl';
 
 describe('Local GSM8K dataset loader', () => {
   it('loads a limited number of training examples and extracts answers', async () => {

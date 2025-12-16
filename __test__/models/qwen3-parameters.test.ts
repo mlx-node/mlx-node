@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import type { Qwen3Config } from '../../src/index';
+import type { Qwen3Config } from '@mlx-node/lm';
 import { MxArray, Qwen3Model } from '@mlx-node/core';
 import { shape, int32 } from '../test-utils.js';
 

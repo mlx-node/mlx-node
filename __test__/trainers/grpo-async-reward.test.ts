@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { GRPOTrainer } from '../../src/index';
+import { GRPOTrainer } from '@mlx-node/trl';
 import { createTempModel } from '../test-model-utils.js';
 
 describe('GRPO Async Reward Functions', () => {

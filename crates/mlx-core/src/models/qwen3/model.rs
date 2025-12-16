@@ -16,10 +16,13 @@ use crate::grpo::{advantages::compute_advantages, autograd::compute_loss_and_gra
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, apply_repetition_penalty, sample, sample_and_logprobs};
 use crate::stream::{DeviceType, Stream, StreamContext};
-use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
+use crate::tools;
 use crate::transformer::{KVCache, TransformerBlock};
 
-use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
+use super::{
+    BatchGenerationResult, ChatConfig, ChatResult, GenerationConfig, GenerationResult, Qwen3Config,
+};
 
 /// Qwen3 Model with automatic differentiation support
 #[napi]
@@ -730,7 +733,7 @@ impl Qwen3Model {
         };
 
         Ok(GenerationResult {
-            text: None, // Training doesn't need decoded text
+            text: String::new(), // Training doesn't need decoded text
             tokens: tokens_array,
             logprobs: logprobs_array,
             finish_reason: finish_reason.to_string(),
@@ -1665,8 +1668,6 @@ impl Qwen3Model {
         Ok(())
     }
 
-    /// Generate text with log probabilities (CRITICAL for GRPO training)
-    ///
     /// This method performs autoregressive generation with:
     /// - KV caching for efficient inference
     /// - Sampling (temperature, top-k, top-p, min-p)
@@ -1685,7 +1686,6 @@ impl Qwen3Model {
     /// This is the primary generation API for training workloads (e.g., GRPO).
     /// Uses fused C++ implementation for maximum performance.
     /// For text-to-text generation with chat messages, use `generate()` instead.
-    #[napi]
     pub async fn generate_for_training(
         &self,
         input_ids: &MxArray,
@@ -1970,7 +1970,7 @@ impl Qwen3Model {
             };
 
             Ok(GenerationResult {
-                text: None, // Only populated by generate() API
+                text: String::new(), // Only populated by generate() API
                 tokens,
                 logprobs,
                 finish_reason: finish_reason.to_string(),
@@ -2071,9 +2071,168 @@ impl Qwen3Model {
         })??;
 
         // Populate the text field
-        result.text = Some(decoded_text);
+        result.text = decoded_text;
 
         Ok(result)
+    }
+
+    /// High-level chat API with structured response parsing
+    ///
+    /// The primary API for conversational AI. Handles:
+    /// - Chat message formatting with Jinja2 templates
+    /// - Tool/function calling with structured output
+    /// - Thinking extraction from `<think>` tags
+    /// - Clean response text with all special tags stripped
+    ///
+    /// ## `chat()` vs `generate()`
+    ///
+    /// | Feature | `chat()` | `generate()` |
+    /// |---------|----------|--------------|
+    /// | **Purpose** | Conversational AI with tools | Raw text generation |
+    /// | **Input** | Chat messages | Token IDs (MxArray) |
+    /// | **Tool Support** | Built-in parsing | None |
+    /// | **Thinking** | Extracts `<think>` content | Raw text only |
+    /// | **Output** | Structured `ChatResult` | Basic `GenerationResult` |
+    /// | **Use Case** | Chat apps, agents, assistants | Training, low-level control |
+    ///
+    /// ## When to use `chat()`
+    /// - Building conversational applications
+    /// - Need tool/function calling
+    /// - Want structured responses with thinking separated
+    /// - Working with chat message format
+    ///
+    /// ## When to use `generate()`
+    /// - Training and fine-tuning (need raw logprobs)
+    /// - Custom tokenization pipeline
+    /// - Low-level generation control
+    /// - Non-chat use cases
+    ///
+    /// # Arguments
+    /// * `messages` - Array of chat messages (user/assistant/system roles)
+    /// * `config` - Chat configuration including optional tools and generation params
+    ///
+    /// # Returns
+    /// * `ChatResult` containing:
+    ///   - `text`: Clean response (tool_call and think tags stripped)
+    ///   - `thinking`: Extracted chain-of-thought reasoning (or null)
+    ///   - `toolCalls`: Parsed tool calls with native JS object arguments
+    ///   - `finishReason`: "stop" | "length" | "tool_calls"
+    ///   - `rawText`: Original text before processing (for debugging)
+    ///
+    /// # Example
+    /// ```typescript
+    /// // Simple chat
+    /// const result = await model.chat(messages);
+    /// console.log(result.text);
+    ///
+    /// // With tools
+    /// const result = await model.chat(messages, {
+    ///   tools: [{ type: 'function', function: { name: 'get_weather' } }],
+    ///   maxNewTokens: 2048,
+    ///   temperature: 0.7,
+    /// });
+    ///
+    /// // Handle tool calls
+    /// for (const call of result.toolCalls) {
+    ///   if (call.status === 'ok') {
+    ///     console.log(call.name, call.arguments);  // Arguments is a JS object!
+    ///   }
+    /// }
+    ///
+    /// // Access thinking (chain-of-thought)
+    /// if (result.thinking) {
+    ///   console.log('Model reasoning:', result.thinking);
+    /// }
+    /// ```
+    #[napi]
+    pub async fn chat(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        // Check if tokenizer is available
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
+            Error::new(
+                Status::InvalidArg,
+                "Tokenizer not available. Model must be loaded via load_pretrained() to use chat().",
+            )
+        })?;
+
+        // Extract tools from config (optional)
+        let tools = config.as_ref().and_then(|c| c.tools.clone());
+
+        // Convert ChatConfig to GenerationConfig for the internal generate call
+        let gen_config = config.map(|c| GenerationConfig {
+            max_new_tokens: c.max_new_tokens.or(Some(2048)), // Default 2048 for chat
+            temperature: c.temperature.or(Some(0.7)),        // Default 0.7 for chat
+            top_k: c.top_k,
+            top_p: c.top_p.or(Some(0.9)), // Default 0.9 for chat
+            min_p: c.min_p,
+            repetition_penalty: c.repetition_penalty,
+            repetition_context_size: c.repetition_context_size,
+            eos_token_id: c.eos_token_id,
+            return_logprobs: c.return_logprobs,
+        });
+
+        // Apply chat template with tools and encode in a blocking task
+        let tokenizer_clone = tokenizer.clone();
+        let input_ids = napi::bindgen_prelude::spawn_blocking(move || {
+            // Use the tokenizer's apply_chat_template_sync method which handles Jinja2 + tools
+            let token_ids = tokenizer_clone.apply_chat_template_sync(
+                &messages,
+                Some(true),
+                tools.as_deref(),
+                None,
+            )?;
+
+            // Create MxArray from token IDs
+            MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Chat template task failed: {}", e),
+            )
+        })??;
+
+        // Generate tokens using the internal generate method
+        let result = self.generate_for_training(&input_ids, gen_config).await?;
+
+        // Decode the generated tokens in a blocking task
+        let result_tokens = result.tokens.clone();
+        let raw_text = napi::bindgen_prelude::spawn_blocking(move || {
+            let generated_ids = result_tokens.to_uint32()?;
+            tokenizer.decode_sync(&generated_ids, true)
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Decoding task failed: {}", e),
+            )
+        })??;
+
+        // Parse tool calls and thinking from the generated text
+        let (cleaned_text, tool_calls, thinking) = tools::parse_generation_output(&raw_text);
+
+        // Determine finish reason - if we have valid tool calls, it's "tool_calls"
+        let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            result.finish_reason.clone()
+        };
+
+        Ok(ChatResult {
+            text: cleaned_text,
+            tool_calls,
+            thinking,
+            tokens: result.tokens,
+            logprobs: result.logprobs,
+            finish_reason,
+            num_tokens: result.num_tokens,
+            raw_text,
+        })
     }
 
     /// Generate multiple completions for multiple prompts in batch
@@ -2261,12 +2420,14 @@ impl Qwen3Model {
 
     /// Apply chat template and encode to token IDs
     ///
-    /// Formats messages using ChatML format and encodes to tokens.
+    /// Formats messages using ChatML format (or Jinja2 template with tools) and encodes to tokens.
     /// The model must have been loaded via load_pretrained() to have a tokenizer available.
     ///
     /// # Arguments
     /// * `messages` - Array of chat messages
     /// * `add_generation_prompt` - Whether to add generation prompt (default: true)
+    /// * `tools` - Optional array of tool definitions for function calling
+    /// * `enable_thinking` - Optional flag to enable thinking mode (<think> tags)
     ///
     /// # Returns
     /// * Encoded token IDs as Uint32Array
@@ -2276,6 +2437,8 @@ impl Qwen3Model {
         env: &'env Env,
         messages: Vec<ChatMessage>,
         add_generation_prompt: Option<bool>,
+        tools: Option<Vec<ToolDefinition>>,
+        enable_thinking: Option<bool>,
     ) -> Result<PromiseRaw<'env, Uint32ArraySlice<'env>>> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
@@ -2284,39 +2447,7 @@ impl Qwen3Model {
             )
         })?;
 
-        let add_prompt = add_generation_prompt.unwrap_or(true);
-
-        env.spawn_future_with_callback(
-            async move {
-                napi::bindgen_prelude::spawn_blocking(move || {
-                    // Format messages using ChatML template
-                    let mut formatted = String::new();
-                    for msg in &messages {
-                        formatted.push_str(&format!(
-                            "<|im_start|>{}\n{}<|im_end|>\n",
-                            msg.role, msg.content
-                        ));
-                    }
-
-                    if add_prompt {
-                        formatted.push_str("<|im_start|>assistant\n");
-                    }
-
-                    // Encode the formatted text
-                    tokenizer.encode_sync(&formatted, Some(false))
-                })
-                .await
-                .map_err(|e| {
-                    Error::new(
-                        Status::GenericFailure,
-                        format!("Chat template task failed: {}", e),
-                    )
-                })?
-            },
-            |env, token_ids| {
-                let ids_vec = token_ids;
-                Uint32ArraySlice::from_data(env, ids_vec)
-            },
-        )
+        // Delegate to tokenizer which handles both simple ChatML and Jinja2 with tools
+        tokenizer.apply_chat_template(env, messages, add_generation_prompt, tools, enable_thinking)
     }
 }
