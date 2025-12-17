@@ -2,6 +2,11 @@
 //!
 //! A terminal user interface for monitoring and controlling GRPO training runs.
 //! This binary wraps a Node.js training script and provides real-time visualization.
+//!
+//! Features:
+//! - Auto-restart on crash with 5s countdown
+//! - Automatically adds --resume flag on restart
+//! - Press 'c' to cancel restart countdown
 
 mod app;
 mod commands;
@@ -9,7 +14,8 @@ mod messages;
 mod ui;
 
 use std::io;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
 
 use clap::Parser;
 use color_eyre::eyre::{Result, eyre};
@@ -24,14 +30,18 @@ use crossterm::{
 use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
+use tokio::time::interval;
 
 use app::App;
 use commands::{ControlCommand, send_command};
 use messages::TrainingMessage;
 
+/// Restart countdown duration in seconds
+const RESTART_COUNTDOWN_SECS: u8 = 5;
+
 /// MLX Training TUI - Monitor and control GRPO training
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "mlx-train")]
 #[command(about = "TUI for monitoring and controlling MLX-Node GRPO training")]
 #[command(version)]
@@ -48,9 +58,70 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Append)]
     import: Vec<String>,
 
+    /// Disable auto-restart on crash
+    #[arg(long)]
+    no_auto_restart: bool,
+
     /// Additional arguments to pass to the training script
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
+}
+
+/// Holds references to the spawned child process I/O
+struct ChildProcess {
+    child: Child,
+    stdin: tokio::process::ChildStdin,
+    stdout_reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr_reader: tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+}
+
+/// Spawn a new training process
+fn spawn_training_process(cli: &Cli, is_restart: bool) -> Result<ChildProcess> {
+    let mut cmd = Command::new("node");
+
+    // Add --import flags to node (e.g., --import tsx for TypeScript)
+    for import in &cli.import {
+        cmd.arg("--import").arg(import);
+    }
+
+    cmd.arg(&cli.script);
+
+    // Add original args
+    for arg in &cli.args {
+        cmd.arg(arg);
+    }
+
+    // Add --resume flag on restart if not already present
+    if is_restart && !cli.args.iter().any(|a| a == "--resume" || a == "-r") {
+        cmd.arg("--resume");
+    }
+
+    cmd.env("MLX_TUI_MODE", "1") // Signal to use TUI-compatible output
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(ref workdir) = cli.workdir {
+        cmd.current_dir(workdir);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| eyre!("Failed to spawn training script: {e}"))?;
+
+    let stdin = child.stdin.take().expect("Failed to get stdin");
+    let stdout_pipe = child.stdout.take().expect("Failed to get stdout");
+    let stderr_pipe = child.stderr.take().expect("Failed to get stderr");
+
+    let stdout_reader = BufReader::new(stdout_pipe).lines();
+    let stderr_reader = BufReader::new(stderr_pipe).lines();
+
+    Ok(ChildProcess {
+        child,
+        stdin,
+        stdout_reader,
+        stderr_reader,
+    })
 }
 
 #[tokio::main]
@@ -65,38 +136,8 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Build the command
-    let mut cmd = Command::new("node");
-
-    // Add --import flags to node (e.g., --import tsx for TypeScript)
-    for import in &cli.import {
-        cmd.arg("--import").arg(import);
-    }
-
-    cmd.arg(&cli.script)
-        .args(&cli.args)
-        .env("MLX_TUI_MODE", "1") // Signal to use TUI-compatible output
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if let Some(ref workdir) = cli.workdir {
-        cmd.current_dir(workdir);
-    }
-
-    // Spawn child process
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| eyre!("Failed to spawn training script: {e}"))?;
-
-    let mut stdin = child.stdin.take().expect("Failed to get stdin");
-    let stdout_pipe = child.stdout.take().expect("Failed to get stdout");
-    let stderr_pipe = child.stderr.take().expect("Failed to get stderr");
-
-    let mut stdout_reader = BufReader::new(stdout_pipe).lines();
-    let mut stderr_reader = BufReader::new(stderr_pipe).lines();
-
     let mut app = App::new();
+    app.auto_restart_enabled = !cli.no_auto_restart;
 
     // Add initial log
     app.handle_message(TrainingMessage::Log {
@@ -104,15 +145,8 @@ async fn main() -> Result<()> {
         message: format!("Starting: {} {}", cli.script, cli.args.join(" ")),
     });
 
-    // Main event loop
-    let result = run_event_loop(
-        &mut terminal,
-        &mut app,
-        &mut stdin,
-        &mut stdout_reader,
-        &mut stderr_reader,
-    )
-    .await;
+    // Outer loop for restart handling
+    let result = run_with_restart(&mut terminal, &mut app, &cli).await;
 
     // Cleanup terminal
     disable_raw_mode()?;
@@ -123,19 +157,217 @@ async fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    // Kill child if still running
-    let _ = child.kill().await;
-
     result
+}
+
+/// Run the training process with automatic restart on crash
+async fn run_with_restart(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    cli: &Cli,
+) -> Result<()> {
+    let mut is_restart = false;
+
+    loop {
+        // Spawn the training process
+        let process = match spawn_training_process(cli, is_restart) {
+            Ok(p) => p,
+            Err(e) => {
+                app.handle_message(TrainingMessage::Log {
+                    level: messages::LogLevel::Error,
+                    message: format!("Failed to spawn process: {e}"),
+                });
+                app.state = app::TrainingState::Error;
+                app.child_exited = true;
+                // Wait for user to quit
+                wait_for_quit(terminal, app).await?;
+                return Ok(());
+            }
+        };
+
+        let ChildProcess {
+            mut child,
+            mut stdin,
+            mut stdout_reader,
+            mut stderr_reader,
+        } = process;
+
+        if is_restart {
+            app.handle_message(TrainingMessage::Log {
+                level: messages::LogLevel::Info,
+                message: format!(
+                    "Restarted with --resume flag (restart #{})",
+                    app.restart_count
+                ),
+            });
+        }
+
+        // Run the main event loop
+        let exit_status = run_event_loop(
+            terminal,
+            app,
+            &mut child,
+            &mut stdin,
+            &mut stdout_reader,
+            &mut stderr_reader,
+        )
+        .await;
+
+        // Kill child if still running
+        let _ = child.kill().await;
+
+        // Check if user requested quit
+        if app.should_quit {
+            return Ok(());
+        }
+
+        // Handle exit status
+        match exit_status {
+            Ok(Some(status)) => {
+                let code = status.code();
+                app.last_exit_code = code;
+
+                if status.success() {
+                    // Clean exit - don't restart
+                    app.handle_message(TrainingMessage::Log {
+                        level: messages::LogLevel::Info,
+                        message: "Training process exited successfully".to_string(),
+                    });
+                    app.state = app::TrainingState::Complete;
+                    wait_for_quit(terminal, app).await?;
+                    return Ok(());
+                } else {
+                    // Non-zero exit - potentially restart
+                    app.handle_message(TrainingMessage::Log {
+                        level: messages::LogLevel::Error,
+                        message: format!(
+                            "Training process crashed (exit code: {})",
+                            code.map_or("unknown".to_string(), |c| c.to_string())
+                        ),
+                    });
+
+                    if app.auto_restart_enabled {
+                        // Start countdown and wait
+                        if !run_restart_countdown(terminal, app).await? {
+                            // User cancelled restart
+                            wait_for_quit(terminal, app).await?;
+                            return Ok(());
+                        }
+                        // Prepare for restart
+                        app.prepare_for_restart();
+                        is_restart = true;
+                        continue;
+                    } else {
+                        app.state = app::TrainingState::Error;
+                        wait_for_quit(terminal, app).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(None) => {
+                // Process still running but we exited loop (shouldn't happen)
+                app.handle_message(TrainingMessage::Log {
+                    level: messages::LogLevel::Warn,
+                    message: "Event loop exited unexpectedly".to_string(),
+                });
+                wait_for_quit(terminal, app).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                app.handle_message(TrainingMessage::Log {
+                    level: messages::LogLevel::Error,
+                    message: format!("Error: {e}"),
+                });
+                app.state = app::TrainingState::Error;
+                wait_for_quit(terminal, app).await?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Run the restart countdown, returns true if restart should proceed
+async fn run_restart_countdown(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<bool> {
+    app.start_restart_countdown(RESTART_COUNTDOWN_SECS);
+
+    let mut ticker = interval(Duration::from_secs(1));
+    let mut event_stream = crossterm::event::EventStream::new();
+
+    loop {
+        // Render
+        terminal.draw(|f| ui::draw(f, app))?;
+
+        tokio::select! {
+            biased;
+
+            // Handle keyboard events
+            maybe_event = event_stream.next() => {
+                if let Some(Ok(Event::Key(key))) = maybe_event {
+                    match key.code {
+                        KeyCode::Char('c') => {
+                            // Cancel restart
+                            app.cancel_restart();
+                            return Ok(false);
+                        }
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            // Quit entirely
+                            app.should_quit = true;
+                            return Ok(false);
+                        }
+                        KeyCode::Enter => {
+                            // Skip countdown and restart now
+                            return Ok(true);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Tick the countdown
+            _ = ticker.tick() => {
+                if app.tick_restart_countdown() {
+                    // Countdown reached zero
+                    return Ok(true);
+                }
+            }
+        }
+    }
+}
+
+/// Wait for user to quit (after training completes or errors)
+async fn wait_for_quit(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    app.child_exited = true;
+    let mut event_stream = crossterm::event::EventStream::new();
+
+    loop {
+        terminal.draw(|f| ui::draw(f, app))?;
+
+        if let Some(Ok(Event::Key(key))) = event_stream.next().await {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    app.should_quit = true;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
+    child: &mut Child,
     stdin: &mut tokio::process::ChildStdin,
     stdout_reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     stderr_reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
-) -> Result<()> {
+) -> Result<Option<ExitStatus>> {
     let mut event_stream = crossterm::event::EventStream::new();
 
     loop {
@@ -143,114 +375,106 @@ async fn run_event_loop(
         terminal.draw(|f| ui::draw(f, app))?;
 
         if app.should_quit {
-            break;
+            // Try to get exit status if available
+            let status = child.try_wait().ok().flatten();
+            return Ok(status);
         }
 
         // Handle events using tokio::select!
-        // Once child has exited, only wait for keyboard events
+        // Once child has exited, return to let outer loop handle restart
         if app.child_exited {
-            // Child process has exited - only handle keyboard events
-            if let Some(Ok(event)) = event_stream.next().await {
-                match event {
-                    Event::Key(key) => match handle_key(key, app, stdin).await {
-                        Ok(true) => break,
-                        Ok(false) => {}
-                        Err(_) => {}
-                    },
-                    Event::Mouse(mouse) => {
-                        handle_mouse(mouse, app);
-                    }
-                    _ => {}
-                }
-            }
-        } else {
-            // Child is running - handle all events
-            tokio::select! {
-                biased;
+            // Get the exit status
+            let status = child.try_wait().ok().flatten();
+            return Ok(status);
+        }
 
-                // Keyboard and mouse events (highest priority for responsive UI)
-                maybe_event = event_stream.next() => {
-                    if let Some(Ok(event)) = maybe_event {
-                        match event {
-                            Event::Key(key) => {
-                                match handle_key(key, app, stdin).await {
-                                    Ok(true) => break, // Quit requested
-                                    Ok(false) => {}
-                                    Err(e) => {
-                                        app.handle_message(TrainingMessage::Log {
-                                            level: messages::LogLevel::Error,
-                                            message: format!("Command error: {e}"),
-                                        });
-                                    }
+        // Child is running - handle all events
+        tokio::select! {
+            biased;
+
+            // Keyboard and mouse events (highest priority for responsive UI)
+            maybe_event = event_stream.next() => {
+                if let Some(Ok(event)) = maybe_event {
+                    match event {
+                        Event::Key(key) => {
+                            match handle_key(key, app, stdin).await {
+                                Ok(true) => {
+                                    let status = child.try_wait().ok().flatten();
+                                    return Ok(status);
                                 }
-                            }
-                            Event::Mouse(mouse) => {
-                                handle_mouse(mouse, app);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                // Child stdout (JSONL messages)
-                maybe_line = stdout_reader.next_line() => {
-                    match maybe_line {
-                        Ok(Some(line)) => {
-                            // Try to parse as JSONL message
-                            match serde_json::from_str::<TrainingMessage>(&line) {
-                                Ok(msg) => app.handle_message(msg),
-                                Err(_) => {
-                                    // Non-JSON output, treat as log
+                                Ok(false) => {}
+                                Err(e) => {
                                     app.handle_message(TrainingMessage::Log {
-                                        level: messages::LogLevel::Info,
-                                        message: line.to_string(),
+                                        level: messages::LogLevel::Error,
+                                        message: format!("Command error: {e}"),
                                     });
                                 }
                             }
                         }
-                        Ok(None) => {
-                            // Child process ended - mark as exited but don't quit yet
-                            app.child_exited = true;
-                            app.handle_message(TrainingMessage::Log {
-                                level: messages::LogLevel::Info,
-                                message: "Training process exited. Press 'q' to quit.".to_string(),
-                            });
-                            app.state = app::TrainingState::Complete;
+                        Event::Mouse(mouse) => {
+                            handle_mouse(mouse, app);
                         }
-                        Err(e) => {
-                            app.handle_message(TrainingMessage::Log {
-                                level: messages::LogLevel::Error,
-                                message: format!("Read error: {e}"),
-                            });
-                            app.state = app::TrainingState::Error;
-                            app.child_exited = true;
-                        }
+                        _ => {}
                     }
                 }
+            }
 
-                // Child stderr (log as warnings/errors)
-                maybe_line = stderr_reader.next_line() => {
-                    match maybe_line {
-                        Ok(Some(line)) => {
-                            // Skip empty lines
-                            if !line.trim().is_empty() {
+            // Child stdout (JSONL messages)
+            maybe_line = stdout_reader.next_line() => {
+                match maybe_line {
+                    Ok(Some(line)) => {
+                        // Try to parse as JSONL message
+                        match serde_json::from_str::<TrainingMessage>(&line) {
+                            Ok(msg) => app.handle_message(msg),
+                            Err(_) => {
+                                // Non-JSON output, treat as log
                                 app.handle_message(TrainingMessage::Log {
-                                    level: messages::LogLevel::Warn,
+                                    level: messages::LogLevel::Info,
                                     message: line.to_string(),
                                 });
                             }
                         }
-                        Ok(None) => {
-                            // Stderr closed - ignore
-                        }
-                        Err(_) => {} // Ignore stderr errors
                     }
+                    Ok(None) => {
+                        // Child process ended - wait for actual exit status
+                        app.child_exited = true;
+                        // Wait for process to fully exit
+                        let status = child.wait().await.ok();
+                        return Ok(status);
+                    }
+                    Err(e) => {
+                        app.handle_message(TrainingMessage::Log {
+                            level: messages::LogLevel::Error,
+                            message: format!("Read error: {e}"),
+                        });
+                        app.state = app::TrainingState::Error;
+                        app.child_exited = true;
+                        let status = child.wait().await.ok();
+                        return Ok(status);
+                    }
+                }
+            }
+
+            // Child stderr (log as warnings/errors)
+            maybe_line = stderr_reader.next_line() => {
+                match maybe_line {
+                    Ok(Some(line)) => {
+                        // Skip empty lines
+                        if !line.trim().is_empty() {
+                            app.handle_message(TrainingMessage::Log {
+                                level: messages::LogLevel::Warn,
+                                message: line.to_string(),
+                            });
+                        }
+                    }
+                    Ok(None) => {
+                        // Stderr closed - ignore
+                    }
+                    Err(_) => {} // Ignore stderr errors
                 }
             }
         }
     }
-
-    Ok(())
 }
 
 /// Handle keyboard input, returns true if should quit

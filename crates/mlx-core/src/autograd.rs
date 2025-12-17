@@ -158,8 +158,8 @@ extern "C" fn loss_function_callback(
 /// # Example
 ///
 /// ```no_run
-/// # use mlx_node::array::MxArray;
-/// # use mlx_node::autograd::value_and_grad;
+/// # use mlx_core::array::MxArray;
+/// # use mlx_core::autograd::value_and_grad;
 /// # let param1 = MxArray::zeros(&[1], None).unwrap();
 /// # let param2 = MxArray::zeros(&[1], None).unwrap();
 /// # let param3 = MxArray::zeros(&[1], None).unwrap();

@@ -13,7 +13,7 @@
 ///
 /// ## Usage
 /// ```no_run
-/// use mlx_node::grpo::{RewardRegistry, ToolUseReward, LengthReward};
+/// use mlx_core::grpo::{RewardRegistry, ToolUseReward, LengthReward};
 ///
 /// let mut registry = RewardRegistry::new();
 /// registry.register_builtin("tool_use", ToolUseReward::new(&["search", "calculate"], true), 1.0);

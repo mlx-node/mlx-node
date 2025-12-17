@@ -7,18 +7,18 @@ MLX-Node is a high-performance machine learning framework for Node.js that ports
 ### Core Technology Stack
 
 - **MLX**: Apple's ML framework with Metal GPU acceleration
-- **Rust**: High-performance implementation layer (11,203 lines across 55 files)
+- **Rust**: High-performance implementation layer (~25,000 lines across 3 crates)
 - **NAPI-RS**: Native Node.js bindings
-- **TypeScript**: Type-safe JavaScript APIs with full TypedArray support (2,082 source + 20,211 test lines)
-- **Vitest**: Comprehensive test suite (1,039 tests: 1,036 passing, 3 skipped)
+- **TypeScript**: Type-safe JavaScript APIs with full TypedArray support (3,712 source + 13,702 test lines)
+- **Vitest**: Comprehensive test suite (614 tests: 611 passing, 3 skipped)
 
 ## 📊 Current Status Summary
 
-### Implementation Progress (January 2025)
+### Implementation Progress (December 2025)
 
-- **Total Code**: 33,496+ lines (11,203 Rust + 2,082 TS source + 20,211 TS tests)
+- **Total Code**: ~42,400+ lines (25,000 Rust + 3,712 TS source + 13,702 TS tests)
 - **Functions Implemented**: 245+ public NAPI exports + TypeScript orchestration layer
-- **Test Coverage**: **100% pass rate** (1,036 tests passing, 3 skipped = 1,039 total) ✅
+- **Test Coverage**: **100% pass rate** (611 tests passing, 3 skipped = 614 total) ✅
 - **Code Quality**: 0 lint errors, 9 minor warnings (unused variables) ✅
 - **Build Time**: ~4.8 seconds (incremental)
 - **Binary Size**: 23 MB (Metal-optimized)
@@ -34,14 +34,14 @@ MLX-Node is a high-performance machine learning framework for Node.js that ports
 
 ### Phase Completion Status
 
-| Phase       | Status      | Completion | Tests       | Description                                    |
-| ----------- | ----------- | ---------- | ----------- | ---------------------------------------------- |
-| **Phase 1** | ✅ Complete | 100%       | Passing     | Core MLX operations (90 ops)                   |
-| **Phase 2** | ✅ Complete | 100%       | ✅          | Neural network layers & losses (21 components) |
-| **Phase 3** | ✅ Complete | 100%       | ✅          | Manual gradients & optimizers (4 optimizers)   |
-| **Phase 4** | ✅ Complete | 100%       | ✅          | Transformer architecture (8 components)        |
-| **Phase 5** | ✅ Complete | 100%       | 187 passing | GRPO training (production-ready)               |
-| **Phase 6** | ✅ Complete | 100%       | 3 passing   | **Autograd with functional forward pass**      |
+| Phase       | Status      | Completion | Tests            | Description                                    |
+| ----------- | ----------- | ---------- | ---------------- | ---------------------------------------------- |
+| **Phase 1** | ✅ Complete | 100%       | Passing          | Core MLX operations (90 ops)                   |
+| **Phase 2** | ✅ Complete | 100%       | ✅               | Neural network layers & losses (21 components) |
+| **Phase 3** | ✅ Complete | 100%       | ✅               | Manual gradients & optimizers (4 optimizers)   |
+| **Phase 4** | ✅ Complete | 100%       | ✅               | Transformer architecture (8 components)        |
+| **Phase 5** | ✅ Complete | 100%       | 128 TS + 62 Rust | GRPO training (production-ready)               |
+| **Phase 6** | ✅ Complete | 100%       | 3 passing        | **Autograd with functional forward pass**      |
 
 ---
 
@@ -90,6 +90,28 @@ Rust-based model persistence, thread-safe handle management, complete Rust migra
 - **Performance**: Test runtime 234s → 34s
 - **Speedup**: Expected 15-25% training improvement
 
+### GRPO Trainer Refactoring ✅ (December 2025)
+
+Unified reward API with pre-parsed tool calls, 62 Rust tests, improved tool-use training.
+
+**Reward API Changes:**
+
+- Old: `RewardFunction = (prompts, completions, answers) => rewards`
+- New: `RewardFunction = (outputs: RewardOutput[]) => rewards`
+- `RewardOutput` includes pre-parsed `toolCalls`, extracted `thinking`, `numTokens`
+
+**Rust Tests Added (62 total):**
+
+- `advantages.rs`: 16 tests for advantage computation
+- `entropy.rs`: 21 tests for entropy filtering
+- `loss.rs`: 25 tests for GRPO/DAPO/Dr.GRPO/BNPO loss variants
+
+**Tool-Use Training:**
+
+- New `ast-grep-dataset.ts` (817 lines) with curriculum learning (50+ patterns)
+- Enhanced system prompt with concrete examples
+- Simplified reward function using pre-parsed tool calls
+
 📚 **Full History**: See [`DEVELOPMENT_HISTORY.md`](docs/DEVELOPMENT_HISTORY.md) for detailed session notes
 
 ---
@@ -100,23 +122,24 @@ Rust-based model persistence, thread-safe handle management, complete Rust migra
 
 ```
 ┌─────────────────────────────────────────┐
-│  TypeScript Layer (2,082 lines)         │  ← Orchestration, I/O, config
+│  TypeScript Layer (3,712 lines)         │  ← Orchestration, I/O, config
 │  - GRPO trainer, logging, config        │
 │  - Model configs & loader               │
 │  - Dataset, rewards, XML parsing        │
 ├─────────────────────────────────────────┤
-│  Rust Compute Layer (11,203 lines)     │  ← 245+ NAPI exports
+│  Rust Compute Layer (~25,000 lines)    │  ← 245+ NAPI exports
 │  - Qwen3 model (2,205 lines)            │  ← 5 modules (model, config, generation, persistence)
 │  - Transformers (2,100 lines)           │  ← Attention, KVCache, BatchKVCache, RotatingKVCache
 │  - Array ops (extensive)                │  ← Core ops, padding, masking
-│  - GRPO components (933 lines)          │  ← Loss, advantages, entropy, autograd
+│  - GRPO components (~3,000 lines)       │  ← Loss, advantages, entropy, engine, 62 tests
 │  - Gradients (manual, 3 modules)        │  ← Activation, loss, nn gradients
 │  - Optimizers (4 types, 5 modules)      │  ← Adam, AdamW, SGD, RMSprop
 │  - Sampling (583 lines)                 │  ← All strategies + XTC + repetition
 │  - Autograd (360 lines)                 │  ← MLX value_and_grad integration
 │  - Functional (550 lines)               │  ← Stateless forward pass components
 │  - Param Manager (200 lines)            │  ← Parameter flattening/mapping
-│  - Tokenizer (327 lines)                │  ← HuggingFace integration
+│  - Tokenizer (781 lines)                │  ← HuggingFace integration + Jinja2
+│  - Tools (147 lines)                    │  ← Tool call/thinking parsing
 │  - Utilities (batch gen, safetensors)   │  ← Supporting utilities
 ├─────────────────────────────────────────┤
 │  NAPI-RS → FFI → C++ Bridge → MLX      │
@@ -133,22 +156,22 @@ Rust-based model persistence, thread-safe handle management, complete Rust migra
 
 #### mlx-core Modules
 
-| Module          | Purpose                                                                          |
-| --------------- | -------------------------------------------------------------------------------- |
-| `array/`        | 90+ core ops, padding, masking, thread-safe handles                              |
-| `nn/`           | Activations (SiLU, GELU, etc.), Linear, RMSNorm, Embedding, Losses               |
-| `transformer/`  | Attention, KVCache, BatchKVCache, RotatingKVCache, MLP, TransformerBlock         |
-| `models/qwen3/` | Complete Qwen3 implementation (model, config, generation, persistence)           |
-| `sampling.rs`   | Temperature, top-k/p, min-p, XTC, repetition penalty                             |
-| `tokenizer.rs`  | HuggingFace tokenizers integration                                               |
-| `grpo/`         | GRPO/DAPO/Dr.GRPO/BNPO loss, advantages, entropy filtering, autograd integration |
-| `optimizers/`   | Adam, AdamW, SGD, RMSprop                                                        |
-| `gradients/`    | Manual backward passes for activations, losses, nn layers                        |
-| `autograd.rs`   | MLX value_and_grad integration                                                   |
-| `tools/`        | Tool call parsing (`<tool_call>` tags), thinking extraction (`<think>` tags)     |
-| `utils/`        | Batch generation, SafeTensors loading, functional components                     |
+| Module          | Purpose                                                                      |
+| --------------- | ---------------------------------------------------------------------------- |
+| `array/`        | 90+ core ops, padding, masking, thread-safe handles                          |
+| `nn/`           | Activations (SiLU, GELU, etc.), Linear, RMSNorm, Embedding, Losses           |
+| `transformer/`  | Attention, KVCache, BatchKVCache, RotatingKVCache, MLP, TransformerBlock     |
+| `models/qwen3/` | Complete Qwen3 implementation (model, config, generation, persistence)       |
+| `sampling.rs`   | Temperature, top-k/p, min-p, XTC, repetition penalty                         |
+| `tokenizer.rs`  | HuggingFace tokenizers integration                                           |
+| `grpo/`         | GRPO/DAPO/Dr.GRPO/BNPO loss, advantages, entropy, engine, 62 Rust tests      |
+| `optimizers/`   | Adam, AdamW, SGD, RMSprop                                                    |
+| `gradients/`    | Manual backward passes for activations, losses, nn layers                    |
+| `autograd.rs`   | MLX value_and_grad integration                                               |
+| `tools/`        | Tool call parsing (`<tool_call>` tags), thinking extraction (`<think>` tags) |
+| `utils/`        | Batch generation, SafeTensors loading, functional components                 |
 
-**Total**: ~11,600 lines of Rust across 2 crates
+**Total**: ~25,000 lines of Rust across 3 crates (mlx-sys, mlx-core, mlx-tui)
 
 ---
 
@@ -217,7 +240,7 @@ mlx-node/
 │           ├── rewards.ts          # Reward functions
 │           └── utils/              # XML parser
 │
-├── __test__/                       # Test suite (600+ tests)
+├── __test__/                       # Test suite (~600 tests)
 │   ├── core/                       # Core ops, layers, transformers
 │   ├── trainers/                   # GRPO training tests
 │   ├── models/                     # Qwen3 model tests
@@ -417,7 +440,7 @@ All production features for GRPO training with Qwen3 are now implemented and tes
 - High-quality text generation with repetition control
 - Entropy-based selective training
 - Memory-efficient caching (standard, batch, rotating)
-- Comprehensive test coverage (1,039 tests, 100% pass rate)
+- Comprehensive test coverage (614 tests, 100% pass rate)
 
 ### ✅ Phase 6: Autograd (COMPLETE)
 
@@ -520,7 +543,7 @@ See `docs/FEATURE_ALIGNMENT_SESSION.md` for detailed examples
 - **Zero-copy TypedArray operations**
 - **Lazy evaluation** for operation fusion
 - **Build**: ~4.8s (incremental)
-- **Tests**: ~70s (993 tests, 60 files)
+- **Tests**: ~60s (614 tests, 41 files)
 - **Achieved speedups**: Sampling (3-5x), advantages (2-3x), padding (5-10x)
 - **Memory efficiency**: BatchKVCache, RotatingKVCache for bounded memory usage
 
@@ -549,9 +572,9 @@ See `docs/FEATURE_ALIGNMENT_SESSION.md` for detailed examples
 - Core: `crates/mlx-core/src/array/`, `crates/mlx-core/src/transformer/`
 - Masking: `crates/mlx-core/src/array/mask.rs` (causal mask generation)
 - Models: `crates/mlx-core/src/models/qwen3/`
-- Sampling: `crates/mlx-inference/src/sampling.rs` (all strategies)
-- GRPO: `crates/mlx-training/src/grpo/`
-- Orchestration: `packages/training/src/trainers/grpo-trainer.ts`
+- Sampling: `crates/mlx-core/src/sampling.rs` (all strategies)
+- GRPO: `crates/mlx-core/src/grpo/` (loss, advantages, entropy, engine)
+- Orchestration: `packages/trl/src/trainers/grpo-trainer.ts`
 
 ---
 
@@ -585,19 +608,21 @@ See `docs/FEATURE_ALIGNMENT_SESSION.md` for detailed examples
 
 **Recent Achievements:**
 
-- ✅ 1,039 tests passing (100% pass rate)
-- ✅ 11,203 lines of Rust compute code
-- ✅ 20,211 lines of test code
+- ✅ 614 tests passing (100% pass rate)
+- ✅ ~25,000 lines of Rust compute code
+- ✅ 13,702 lines of test code
 - ✅ Production-ready GRPO training
 - ✅ Autograd with functional forward pass
 - ✅ 90% feature parity with MLX-LM
 - ✅ 100% feature parity with TRL GRPO
+- ✅ Unified RewardOutput API with pre-parsed tool calls
+- ✅ 62 Rust tests for GRPO components
 
 ---
 
-_Last updated: January 2025_
+_Last updated: December 2025_
 _Status: Production-ready for GRPO training with Qwen3_
-_Test Coverage: 100% (1,036/1,039 tests passing, 3 skipped)_
-_Code: 11,203 Rust lines + 2,082 TypeScript lines + 20,211 test lines_
+_Test Coverage: 100% (611/614 tests passing, 3 skipped)_
+_Code: ~25,000 Rust lines + 3,712 TypeScript lines + 13,702 test lines_
 _Feature Parity: 90% MLX-LM, 100% TRL GRPO_
 _Phase 6 Autograd: ✅ Complete and production-ready_

@@ -1,3 +1,7 @@
+// Re-export types from @mlx-node/core
+export type { CompletionInfo, RewardOutput } from '@mlx-node/core';
+import type { RewardOutput } from '@mlx-node/core';
+
 export type ChatRole = 'system' | 'user' | 'assistant';
 
 export interface ChatMessage {
@@ -32,16 +36,12 @@ export interface RewardComputationInput {
 }
 
 /**
- * Unified reward function type for GRPO training
+ * Unified reward function type for GRPO training.
  *
- * Takes pre-formatted prompts, decoded completions, and ground-truth answers.
- * Returns rewards for each completion (one per completion string).
+ * Takes an array of RewardOutput objects containing structured completion data.
+ * Returns rewards for each completion (one per output).
  */
-export type RewardFunction = (
-  prompts: string[],
-  completions: string[],
-  answers: (string | null)[],
-) => number[] | Float32Array | Promise<number[] | Float32Array>;
+export type RewardFunction = (outputs: RewardOutput[]) => number[] | Float32Array | Promise<number[] | Float32Array>;
 
 export interface PromptFormatterOptions {
   includeOneShot?: boolean;

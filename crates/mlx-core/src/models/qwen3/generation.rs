@@ -34,6 +34,18 @@ pub struct GenerationConfig {
     /// Matches mlx-lm default. Larger values catch longer patterns but use more memory
     pub repetition_context_size: Option<i32>,
 
+    /// Stop if same token repeats this many times consecutively (default: 16)
+    /// Set to 0 to disable. Prevents OOM from degenerate repetitive generation.
+    pub max_consecutive_tokens: Option<i32>,
+
+    /// Stop if an n-gram pattern repeats this many times (default: 8)
+    /// Set to 0 to disable. Detects patterns like "A B A B A B A B".
+    pub max_ngram_repeats: Option<i32>,
+
+    /// N-gram size for repetition detection (default: 3)
+    /// Used with max_ngram_repeats to detect repeating patterns.
+    pub ngram_size: Option<i32>,
+
     /// EOS token ID (generation stops when this is generated)
     pub eos_token_id: Option<i32>,
 
@@ -51,6 +63,9 @@ impl Default for GenerationConfig {
             min_p: Some(0.0),
             repetition_penalty: Some(1.0),
             repetition_context_size: Some(20),
+            max_consecutive_tokens: Some(16),
+            max_ngram_repeats: Some(8),
+            ngram_size: Some(3),
             eos_token_id: None,
             return_logprobs: Some(true),
         }
@@ -105,6 +120,15 @@ pub struct ChatConfig {
     /// Number of recent tokens to consider for repetition penalty (default: 20)
     pub repetition_context_size: Option<i32>,
 
+    /// Stop if same token repeats this many times consecutively (default: 16)
+    pub max_consecutive_tokens: Option<i32>,
+
+    /// Stop if an n-gram pattern repeats this many times (default: 8)
+    pub max_ngram_repeats: Option<i32>,
+
+    /// N-gram size for repetition detection (default: 3)
+    pub ngram_size: Option<i32>,
+
     /// EOS token ID (generation stops when this is generated)
     pub eos_token_id: Option<i32>,
 
@@ -151,8 +175,8 @@ impl GenerationResult {
         self.logprobs.clone()
     }
 
-    /// Get the finish reason ("eos" or "length")
-    #[napi(getter, ts_return_type = "'eos' | 'length'")]
+    /// Get the finish reason ("eos", "length", or "repetition")
+    #[napi(getter, ts_return_type = "'eos' | 'length' | 'repetition'")]
     pub fn get_finish_reason(&self) -> String {
         self.finish_reason.clone()
     }
@@ -245,8 +269,11 @@ impl ChatResult {
         self.logprobs.clone()
     }
 
-    /// Get the finish reason ("stop", "length", or "tool_calls")
-    #[napi(getter, ts_return_type = "'stop' | 'length' | 'tool_calls'")]
+    /// Get the finish reason ("stop", "length", "tool_calls", or "repetition")
+    #[napi(
+        getter,
+        ts_return_type = "'stop' | 'length' | 'tool_calls' | 'repetition'"
+    )]
     pub fn get_finish_reason(&self) -> String {
         self.finish_reason.clone()
     }

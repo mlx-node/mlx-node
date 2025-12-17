@@ -20,7 +20,7 @@ use napi_derive::napi;
 ///
 /// # Examples
 /// ```no_run
-/// # use mlx_node::array::mask::create_causal_mask;
+/// # use mlx_core::array::mask::create_causal_mask;
 /// // Basic causal mask (offset=0)
 /// let mask = create_causal_mask(5, None, None).unwrap();
 ///

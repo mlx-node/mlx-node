@@ -29,24 +29,30 @@
 import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
-import { GRPOTrainer, type GRPOConfig, loadLocalGsm8kDataset, ALL_REWARD_FUNCTIONS } from '@mlx-node/trl';
+import {
+  GRPOTrainer,
+  type GRPOConfig,
+  loadLocalGsm8kDataset,
+  ALL_REWARD_FUNCTIONS,
+  type RewardOutput,
+} from '@mlx-node/trl';
 
 const DEFAULT_MODEL_PATH = resolve(process.cwd(), '.cache', 'models', 'qwen3-0.6b-mlx-bf16');
 const DEFAULT_NUM_EXAMPLES = 50;
 const DEFAULT_OUTPUT_DIR = resolve(process.cwd(), 'outputs', 'grpo-simple');
 
-// Combined reward function (accuracy + format)
-// Uses the unified reward function signature: (prompts, completions, answers) => number[] | Float32Array
-async function combinedReward(
-  prompts: string[],
-  completions: string[],
-  answers: (string | null)[],
-): Promise<Float32Array> {
+/**
+ * Combined reward function (accuracy + format)
+ *
+ * Takes an array of RewardOutput objects with structured completion data.
+ * Each output contains: prompt, completion (with text, toolCalls, thinking), expectedAnswer
+ */
+async function combinedReward(outputs: RewardOutput[]): Promise<Float32Array> {
   // Apply all reward functions and sum their scores
-  const allScores = await Promise.all(ALL_REWARD_FUNCTIONS.map((fn) => fn(prompts, completions, answers)));
+  const allScores = await Promise.all(ALL_REWARD_FUNCTIONS.map((fn) => fn(outputs)));
 
   // Sum scores for each completion
-  const numCompletions = completions.length;
+  const numCompletions = outputs.length;
   const combinedScores = new Float32Array(numCompletions);
 
   for (const scores of allScores) {

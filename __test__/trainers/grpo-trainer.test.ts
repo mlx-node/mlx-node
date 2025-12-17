@@ -1,6 +1,5 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { GRPOTrainer, type ChatMessage } from '@mlx-node/trl';
-import { clearCache } from '@mlx-node/core';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { GRPOTrainer, type ChatMessage, type RewardOutput } from '@mlx-node/trl';
 import { createTempModel } from '../test-model-utils';
 
 // Shared temp model for all tests
@@ -12,11 +11,6 @@ beforeAll(async () => {
 
 afterAll(() => {
   tempModel?.cleanup();
-});
-
-afterEach(() => {
-  // Clear GPU cache to prevent memory accumulation between tests
-  clearCache();
 });
 
 describe.sequential('GRPOTrainer - generateBatch()', () => {
@@ -292,8 +286,8 @@ describe.sequential('GRPOTrainer - scoreGenerations()', () => {
   describe('Basic Functionality', () => {
     it('should score completions with custom reward function', async () => {
       // Simple reward function: length-based
-      const rewardFn = (_prompts: string[], completions: string[], _answers: (string | null)[]) => {
-        return Float32Array.from(completions.map((c) => c.length / 100));
+      const rewardFn = (outputs: RewardOutput[]) => {
+        return Float32Array.from(outputs.map((o) => o.completion.rawText.length / 100));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -325,8 +319,8 @@ describe.sequential('GRPOTrainer - scoreGenerations()', () => {
     });
 
     it('should validate completion count matches prompts × groupSize', async () => {
-      const rewardFn = (_prompts: string[], completions: string[], _answers: (string | null)[]) => {
-        return Float32Array.from(completions.map(() => 1.0));
+      const rewardFn = (outputs: RewardOutput[]) => {
+        return Float32Array.from(outputs.map(() => 1.0));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -365,7 +359,7 @@ describe.sequential('GRPOTrainer - scoreGenerations()', () => {
 
   describe('Edge Cases', () => {
     it('should handle empty batch', async () => {
-      const rewardFn = (_prompts: string[], _completions: string[], _answers: (string | null)[]) => {
+      const rewardFn = (_outputs: RewardOutput[]) => {
         return new Float32Array(0);
       };
 
@@ -386,8 +380,8 @@ describe.sequential('GRPOTrainer - scoreGenerations()', () => {
 describe.sequential('GRPOTrainer - trainStep()', () => {
   describe('Basic Functionality', () => {
     it('should execute a training step and return metrics', async () => {
-      const rewardFn = (_prompts: string[], completions: string[], _answers: (string | null)[]) => {
-        return Float32Array.from(completions.map(() => 1.0));
+      const rewardFn = (outputs: RewardOutput[]) => {
+        return Float32Array.from(outputs.map(() => 1.0));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -416,8 +410,8 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
     });
 
     it('should increment step counter', async () => {
-      const rewardFn = (_prompts: string[], completions: string[], _answers: (string | null)[]) => {
-        return Float32Array.from(completions.map(() => 1.0));
+      const rewardFn = (outputs: RewardOutput[]) => {
+        return Float32Array.from(outputs.map(() => 1.0));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -441,8 +435,8 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
     });
 
     it('should handle multiple prompts', async () => {
-      const rewardFn = (_prompts: string[], completions: string[], _answers: (string | null)[]) => {
-        return Float32Array.from(completions.map(() => Math.random()));
+      const rewardFn = (outputs: RewardOutput[]) => {
+        return Float32Array.from(outputs.map(() => Math.random()));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -469,8 +463,8 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
   describe('Metrics Validation', () => {
     it('should return correct mean reward', async () => {
       const fixedReward = 2.5;
-      const rewardFn = (_prompts: string[], completions: string[], _answers: (string | null)[]) => {
-        return Float32Array.from(completions.map(() => fixedReward));
+      const rewardFn = (outputs: RewardOutput[]) => {
+        return Float32Array.from(outputs.map(() => fixedReward));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -494,7 +488,7 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
     it('should compute advantages correctly', async () => {
       // Advantages should be zero-mean per group
-      const rewardFn = (_prompts: string[], _completions: string[], _answers: (string | null)[]) => {
+      const rewardFn = (_outputs: RewardOutput[]) => {
         // Different rewards
         return Float32Array.from([1.0, 2.0, 3.0, 4.0]);
       };
@@ -517,8 +511,8 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
     });
 
     it('should track total tokens', async () => {
-      const rewardFn = (_prompts: string[], completions: string[], _answers: (string | null)[]) => {
-        return Float32Array.from(completions.map(() => 1.0));
+      const rewardFn = (outputs: RewardOutput[]) => {
+        return Float32Array.from(outputs.map(() => 1.0));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -541,8 +535,8 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
   describe('Loss Computation', () => {
     it('should compute GRPO loss without errors', async () => {
-      const rewardFn = (_prompts: string[], completions: string[], _answers: (string | null)[]) => {
-        return Float32Array.from(completions.map((_, i) => i * 0.5));
+      const rewardFn = (outputs: RewardOutput[]) => {
+        return Float32Array.from(outputs.map((_, i) => i * 0.5));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -564,8 +558,8 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
     });
 
     it('should work with different loss types', async () => {
-      const rewardFn = (_prompts: string[], completions: string[], _answers: (string | null)[]) => {
-        return Float32Array.from(completions.map(() => Math.random()));
+      const rewardFn = (outputs: RewardOutput[]) => {
+        return Float32Array.from(outputs.map(() => Math.random()));
       };
 
       const lossTypes: Array<'grpo' | 'bnpo'> = ['grpo', 'bnpo'];
@@ -592,7 +586,7 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
   describe('Edge Cases', () => {
     it('should handle single prompt with groupSize 1', async () => {
-      const rewardFn = (_prompts: string[], _completions: string[], _answers: (string | null)[]) => {
+      const rewardFn = (_outputs: RewardOutput[]) => {
         return Float32Array.from([0.5]);
       };
 
@@ -614,7 +608,7 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
     });
 
     it('should handle varying reward values', async () => {
-      const rewardFn = (_prompts: string[], _completions: string[], _answers: (string | null)[]) => {
+      const rewardFn = (_outputs: RewardOutput[]) => {
         // Very different rewards
         return Float32Array.from([10.0, 0.1, 5.0, -2.0]);
       };
@@ -640,9 +634,9 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
     it('should integrate generateBatch, scoreGenerations, and loss computation', async () => {
       let scoreCalled = 0;
 
-      const rewardFn = (_prompts: string[], completions: string[], _answers: (string | null)[]) => {
+      const rewardFn = (outputs: RewardOutput[]) => {
         scoreCalled++;
-        return Float32Array.from(completions.map(() => 1.0));
+        return Float32Array.from(outputs.map(() => 1.0));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -667,8 +661,8 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
     });
 
     it('should handle multiple training steps in sequence', async () => {
-      const rewardFn = (_prompts: string[], completions: string[], _answers: (string | null)[]) => {
-        return Float32Array.from(completions.map(() => Math.random()));
+      const rewardFn = (outputs: RewardOutput[]) => {
+        return Float32Array.from(outputs.map(() => Math.random()));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -716,8 +710,8 @@ describe.sequential('GRPOTrainer - train()', () => {
         logInterval: 1,
         saveInterval: 1000, // Don't save during test
         outputDir: './test-output',
-        rewardFunction: (_prompts, _completions) => {
-          return new Float32Array([1.0, 1.0, 1.0, 1.0]);
+        rewardFunction: (outputs) => {
+          return new Float32Array(outputs.length).fill(1.0);
         },
       });
 
@@ -742,8 +736,8 @@ describe.sequential('GRPOTrainer - train()', () => {
         logInterval: 1000,
         saveInterval: 1000,
         outputDir: './test-output',
-        rewardFunction: (_prompts, _completions) => {
-          return new Float32Array([1.0, 1.0]);
+        rewardFunction: (outputs) => {
+          return new Float32Array(outputs.length).fill(1.0);
         },
       });
 
@@ -766,9 +760,9 @@ describe.sequential('GRPOTrainer - train()', () => {
         logInterval: 1000,
         saveInterval: 1000,
         outputDir: './test-output',
-        rewardFunction: (_prompts, completions) => {
+        rewardFunction: (outputs) => {
           // Should be called with batch_size * group_size completions
-          return new Float32Array(completions.length).fill(1.0);
+          return new Float32Array(outputs.length).fill(1.0);
         },
       });
 
@@ -795,8 +789,8 @@ describe.sequential('GRPOTrainer - train()', () => {
         logInterval: 1000,
         saveInterval: 1000,
         outputDir: './test-output',
-        rewardFunction: (_prompts, _completions) => {
-          return new Float32Array(0);
+        rewardFunction: (outputs) => {
+          return new Float32Array(outputs.length);
         },
       });
 
@@ -816,8 +810,8 @@ describe.sequential('GRPOTrainer - train()', () => {
         logInterval: 1000,
         saveInterval: 1000,
         outputDir: './test-output',
-        rewardFunction: (_prompts, _completions) => {
-          return new Float32Array([1.0, 1.0]);
+        rewardFunction: (outputs) => {
+          return new Float32Array(outputs.length).fill(1.0);
         },
       });
 
@@ -837,8 +831,8 @@ describe.sequential('GRPOTrainer - train()', () => {
         logInterval: 1000,
         saveInterval: 1000,
         outputDir: './test-output',
-        rewardFunction: (_prompts, _completions) => {
-          return new Float32Array([1.0, 1.0]);
+        rewardFunction: (outputs) => {
+          return new Float32Array(outputs.length).fill(1.0);
         },
       });
 

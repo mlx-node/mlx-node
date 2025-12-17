@@ -24,6 +24,73 @@ use super::{
     BatchGenerationResult, ChatConfig, ChatResult, GenerationConfig, GenerationResult, Qwen3Config,
 };
 
+/// Check if generation has fallen into a repetitive loop.
+///
+/// Returns Some("repetition") if should stop, None otherwise.
+/// Checks for two types of repetition:
+/// 1. Consecutive identical tokens (e.g., "A A A A A")
+/// 2. N-gram repetition (e.g., "A B C A B C A B C")
+fn check_repetition_cutoff(
+    tokens: &[u32],
+    max_consecutive: i32,
+    max_ngram_repeats: i32,
+    ngram_size: i32,
+) -> Option<&'static str> {
+    let len = tokens.len();
+    if len < 2 {
+        return None;
+    }
+
+    // Skip check if disabled (values <= 0)
+    let check_consecutive = max_consecutive > 0;
+    let check_ngram = max_ngram_repeats > 0 && ngram_size > 0;
+
+    // 1. Check consecutive identical tokens (fast path)
+    if check_consecutive {
+        let last = tokens[len - 1];
+        let mut consecutive = 1usize;
+        for i in (0..len - 1).rev() {
+            if tokens[i] == last {
+                consecutive += 1;
+                if consecutive >= max_consecutive as usize {
+                    return Some("repetition");
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    // 2. Check n-gram repetition (e.g., "A B C A B C A B C")
+    if check_ngram {
+        let ngram_size = ngram_size as usize;
+        let max_ngram_repeats = max_ngram_repeats as usize;
+
+        if len >= ngram_size * 2 {
+            let ngram = &tokens[len - ngram_size..];
+            let mut repeats = 1usize;
+            let mut pos = len - ngram_size * 2;
+
+            loop {
+                if &tokens[pos..pos + ngram_size] == ngram {
+                    repeats += 1;
+                    if repeats >= max_ngram_repeats {
+                        return Some("repetition");
+                    }
+                } else {
+                    break; // Must be consecutive repetitions
+                }
+                if pos < ngram_size {
+                    break;
+                }
+                pos -= ngram_size;
+            }
+        }
+    }
+
+    None
+}
+
 /// Qwen3 Model with automatic differentiation support
 #[napi]
 pub struct Qwen3Model {
@@ -554,6 +621,9 @@ impl Qwen3Model {
         let min_p = config.min_p.unwrap_or(0.0);
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(8);
+        let ngram_size = config.ngram_size.unwrap_or(3);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
 
@@ -649,11 +719,21 @@ impl Qwen3Model {
         };
 
         // DECODE loop
-        for _step in 0..max_new_tokens {
+        // Cleanup interval to release intermediate tensors and prevent memory accumulation
+        // Every 64 tokens is a good balance between memory savings and performance
+        const DECODE_CLEANUP_INTERVAL: i32 = 64;
+
+        for step in 0..max_new_tokens {
             let _stream_ctx = StreamContext::new(generation_stream);
 
             // Sync to materialize the token
             token.eval();
+
+            // Periodic cleanup to release computation graph memory
+            // This prevents O(n) memory growth during long generations
+            if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
+                synchronize_and_clear_cache();
+            }
 
             // Extract current token value
             let token_value = token.item_at_int32(0)? as u32;
@@ -665,6 +745,17 @@ impl Qwen3Model {
             if return_logprobs && let Some(ref lp) = logprobs_arr {
                 let token_logprob = lp.item_at_float32(token_value as usize)?;
                 generated_logprobs.push(token_logprob);
+            }
+
+            // Check for repetitive generation (prevents OOM from degenerate loops)
+            if let Some(reason) = check_repetition_cutoff(
+                &generated_tokens,
+                max_consecutive_tokens,
+                max_ngram_repeats,
+                ngram_size,
+            ) {
+                finish_reason = reason;
+                break;
             }
 
             // Check for EOS
@@ -1584,17 +1675,16 @@ impl Qwen3Model {
             })?;
 
             // param = param - lr * grad
-            // Scale the gradient: lr * grad
+            // Build computation graph lazily - let MLX fuse operations
             let scaled_grad = lr_scalar.mul(grad)?;
-            // Evaluate to materialize before using in operations
-            scaled_grad.eval();
-
-            // Update parameter: param - scaled_grad
             let updated_param = param.sub(&scaled_grad)?;
-            // Evaluate to materialize the computation before storing
-            updated_param.eval();
-
             updated_params.insert(name.clone(), updated_param);
+        }
+
+        // Batch eval all updated parameters at once
+        // This allows MLX to fuse operations and reduce memory usage
+        for param in updated_params.values() {
+            param.eval();
         }
 
         let layers = Arc::get_mut(&mut self.layers).ok_or_else(|| {
@@ -1701,6 +1791,9 @@ impl Qwen3Model {
         let min_p = config.min_p.unwrap_or(0.0);
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(8);
+        let ngram_size = config.ngram_size.unwrap_or(3);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
 
@@ -1861,6 +1954,21 @@ impl Qwen3Model {
                 if return_logprobs && let Some(ref lp) = logprobs {
                     let token_logprob = lp.item_at_float32(token_value as usize)?;
                     generated_logprobs.push(token_logprob);
+                }
+
+                // Check for repetitive generation (prevents OOM from degenerate loops)
+                if let Some(reason) = check_repetition_cutoff(
+                    &generated_tokens,
+                    max_consecutive_tokens,
+                    max_ngram_repeats,
+                    ngram_size,
+                ) {
+                    finish_reason = reason;
+                    info!(
+                        "Generation stopped at step {} due to repetitive pattern",
+                        step + 1
+                    );
+                    break;
                 }
 
                 // Check EOS early - no need to compute next token if we're stopping
@@ -2170,6 +2278,9 @@ impl Qwen3Model {
             min_p: c.min_p,
             repetition_penalty: c.repetition_penalty,
             repetition_context_size: c.repetition_context_size,
+            max_consecutive_tokens: c.max_consecutive_tokens,
+            max_ngram_repeats: c.max_ngram_repeats,
+            ngram_size: c.ngram_size,
             eos_token_id: c.eos_token_id,
             return_logprobs: c.return_logprobs,
         });
@@ -2326,13 +2437,12 @@ impl Qwen3Model {
         let mut all_token_counts = Vec::with_capacity(num_prompts);
 
         // For each prompt, generate G completions
-        for prompt_tokens in prompt_token_arrays {
+        for prompt_tokens in prompt_token_arrays.into_iter() {
             let mut prompt_finish_reasons = Vec::with_capacity(group_size_usize);
             let mut prompt_token_counts = Vec::with_capacity(group_size_usize);
 
             // Generate G completions for this prompt
-            for _ in 0..group_size {
-                // Call generate_for_training for each generation
+            for _group_idx in 0..group_size {
                 let result = self
                     .generate_for_training(&prompt_tokens, config.clone())
                     .await?;
@@ -2449,5 +2559,105 @@ impl Qwen3Model {
 
         // Delegate to tokenizer which handles both simple ChatML and Jinja2 with tools
         tokenizer.apply_chat_template(env, messages, add_generation_prompt, tools, enable_thinking)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_repetition_cutoff_disabled() {
+        // When all thresholds are 0, should never trigger
+        assert_eq!(check_repetition_cutoff(&[1, 1, 1, 1, 1], 0, 0, 0), None);
+        assert_eq!(
+            check_repetition_cutoff(&[1, 2, 1, 2, 1, 2, 1, 2], 0, 0, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn test_repetition_cutoff_consecutive_triggers() {
+        // 5 consecutive tokens with max=5 → triggers
+        assert_eq!(
+            check_repetition_cutoff(&[1, 1, 1, 1, 1], 5, 8, 3),
+            Some("repetition")
+        );
+
+        // 6 consecutive tokens with max=5 → triggers
+        assert_eq!(
+            check_repetition_cutoff(&[1, 1, 1, 1, 1, 1], 5, 8, 3),
+            Some("repetition")
+        );
+    }
+
+    #[test]
+    fn test_repetition_cutoff_consecutive_no_trigger() {
+        // 4 consecutive tokens with max=5 → no trigger
+        assert_eq!(check_repetition_cutoff(&[1, 1, 1, 1], 5, 8, 3), None);
+
+        // Varied tokens → no trigger
+        assert_eq!(check_repetition_cutoff(&[1, 2, 3, 4, 5], 5, 8, 3), None);
+
+        // Pattern broken at end → no trigger
+        assert_eq!(check_repetition_cutoff(&[1, 1, 1, 1, 2], 5, 8, 3), None);
+    }
+
+    #[test]
+    fn test_repetition_cutoff_ngram_triggers() {
+        // 4 repetitions of 2-gram [1, 2] with max=4 → triggers
+        assert_eq!(
+            check_repetition_cutoff(&[1, 2, 1, 2, 1, 2, 1, 2], 16, 4, 2),
+            Some("repetition")
+        );
+
+        // 3 repetitions of 3-gram [1, 2, 3] with max=3 → triggers
+        assert_eq!(
+            check_repetition_cutoff(&[1, 2, 3, 1, 2, 3, 1, 2, 3], 16, 3, 3),
+            Some("repetition")
+        );
+    }
+
+    #[test]
+    fn test_repetition_cutoff_ngram_no_trigger() {
+        // Only 3 repetitions with max=4 → no trigger
+        assert_eq!(check_repetition_cutoff(&[1, 2, 1, 2, 1, 2], 16, 4, 2), None);
+
+        // Pattern broken → no trigger
+        assert_eq!(
+            check_repetition_cutoff(&[1, 2, 1, 2, 3, 2, 1, 2], 16, 4, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn test_repetition_cutoff_short_sequences() {
+        // Very short sequences should not trigger
+        assert_eq!(check_repetition_cutoff(&[], 5, 4, 2), None);
+        assert_eq!(check_repetition_cutoff(&[1], 5, 4, 2), None);
+        assert_eq!(check_repetition_cutoff(&[1, 1], 5, 4, 2), None);
+    }
+
+    #[test]
+    fn test_repetition_cutoff_default_thresholds() {
+        // Test with default thresholds (16 consecutive, 8 n-gram repeats, 3-gram size)
+
+        // 16 consecutive → triggers
+        let tokens: Vec<u32> = vec![1; 16];
+        assert_eq!(
+            check_repetition_cutoff(&tokens, 16, 8, 3),
+            Some("repetition")
+        );
+
+        // 15 consecutive → no trigger
+        let tokens: Vec<u32> = vec![1; 15];
+        assert_eq!(check_repetition_cutoff(&tokens, 16, 8, 3), None);
+
+        // 8 repetitions of 3-gram → triggers
+        let tokens: Vec<u32> = (0..24).map(|i| (i % 3) as u32 + 1).collect(); // [1,2,3,1,2,3,...]
+        assert_eq!(
+            check_repetition_cutoff(&tokens, 16, 8, 3),
+            Some("repetition")
+        );
     }
 }

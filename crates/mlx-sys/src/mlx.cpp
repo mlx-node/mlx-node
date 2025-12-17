@@ -2128,6 +2128,29 @@ mlx_array* mlx_array_log1p(mlx_array* handle) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
+// NaN/Inf checking operations (GPU-native)
+mlx_array* mlx_array_isnan(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = mlx::core::isnan(*arr);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_isinf(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = mlx::core::isinf(*arr);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+mlx_array* mlx_array_isfinite(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  // isfinite = !isnan && !isinf
+  array nan_mask = mlx::core::isnan(*arr);
+  array inf_mask = mlx::core::isinf(*arr);
+  array bad_mask = mlx::core::logical_or(nan_mask, inf_mask);
+  array result = mlx::core::logical_not(bad_mask);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
 // Fast operations
 mlx_array* mlx_fast_rope(mlx_array* handle,
                          int32_t dims,

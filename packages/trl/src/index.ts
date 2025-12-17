@@ -129,4 +129,7 @@ export type {
   DatasetLoader,
   RewardFunction,
   PromptFormatter,
+  // Reward function types
+  CompletionInfo,
+  RewardOutput,
 } from './types';
