@@ -14,7 +14,7 @@
     "clean": "rm -rf packages/*/dist",
     "test": "vitest run && TEST_TRAINER=1 vitest run",
     "lint": "oxlint",
-    "format": "oxfmt --config oxfmtrc.json",
+    "format": "oxfmt --config .oxfmtrc.json",
     "typecheck": "tsc -b",
     "download:gsm8k": "yarn oxnode scripts/download-gsm8k.ts",
     "download:qwen3": "yarn oxnode scripts/download-qwen3.ts"

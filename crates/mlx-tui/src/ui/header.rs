@@ -8,7 +8,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use crate::app::App;
+use crate::app::{App, TrainingState};
 
 /// Draw the header bar
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
@@ -35,7 +35,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .fg(state.color())
         .add_modifier(Modifier::BOLD);
 
-    let spans = vec![
+    let mut spans = vec![
         Span::raw(" "), // Left padding
         Span::styled(
             "@mlx-node/trl",
@@ -54,6 +54,41 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(state.display(), state_style),
     ];
+
+    // Show restart count if > 0
+    if app.restart_count > 0 {
+        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            format!("↻{}", app.restart_count),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    // Show countdown when restarting
+    if state == TrainingState::Restarting
+        && let Some(countdown) = app.restart_countdown
+    {
+        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        if countdown == 0 {
+            spans.push(Span::styled(
+                "Restarting now...",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!("Restart in {}s", countdown),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                " [c]=cancel [Enter]=now",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
 
     let paragraph = Paragraph::new(Line::from(spans));
     f.render_widget(paragraph, area);

@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 /// Structured tool call with parsed arguments
 #[napi(object)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolCallResult {
     /// Unique identifier for this tool call (format: call_<uuid>)
     pub id: String,
@@ -230,6 +230,70 @@ pub fn has_thinking(text: &str) -> bool {
     text.contains("<think>")
 }
 
+/// Result of parsing tool calls from text
+#[napi(object)]
+pub struct ParseToolCallsResult {
+    /// Cleaned text with tool_call tags removed
+    pub text: String,
+    /// Parsed tool calls
+    pub tool_calls: Vec<ToolCallResult>,
+}
+
+/// Structured completion information aligned with ChatResult.
+/// Contains pre-parsed tool calls, thinking, and clean text.
+#[napi(object)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompletionInfo {
+    /// Clean text with <tool_call> and <think> tags removed
+    pub text: String,
+    /// Raw output before tag stripping (for debugging/XML parsing)
+    pub raw_text: String,
+    /// Parsed tool calls (arguments are already JS objects)
+    pub tool_calls: Vec<ToolCallResult>,
+    /// Extracted thinking/reasoning from <think> tags (null if none)
+    pub thinking: Option<String>,
+    /// Number of tokens generated
+    pub num_tokens: u32,
+    /// Finish reason: "stop" | "length" | "tool_calls"
+    pub finish_reason: String,
+}
+
+/// Reward function input for a single completion.
+/// Provides all context needed to compute a reward score.
+#[napi(object)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RewardOutput {
+    /// The input prompt text
+    pub prompt: String,
+    /// Structured completion data aligned with ChatResult
+    pub completion: CompletionInfo,
+    /// Ground truth answer from dataset (if available)
+    pub expected_answer: Option<String>,
+}
+
+/// Parse tool calls from text (NAPI export)
+///
+/// Extracts tool calls from model-generated text and returns both the cleaned text
+/// and the parsed tool calls.
+///
+/// # Example
+/// ```typescript
+/// import { parseToolCallsFromText } from '@mlx-node/core';
+///
+/// const result = parseToolCallsFromText('<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>');
+/// console.log(result.text); // ""
+/// console.log(result.toolCalls[0].name); // "search"
+/// console.log(result.toolCalls[0].arguments.q); // "test"
+/// ```
+#[napi]
+pub fn parse_tool_calls_from_text(text: String) -> ParseToolCallsResult {
+    let (cleaned_text, tool_calls) = parse_tool_calls(&text);
+    ParseToolCallsResult {
+        text: cleaned_text,
+        tool_calls,
+    }
+}
+
 /// Parse both tool calls and thinking from generated text
 ///
 /// Convenience function that extracts both structured components.
@@ -243,6 +307,93 @@ pub fn parse_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Opti
     let (cleaned_text, thinking) = parse_thinking(&text_without_tools);
 
     (cleaned_text, tool_calls, thinking)
+}
+
+/// Build RewardOutput array from generation results.
+///
+/// Parses tool calls and thinking from completions, creating structured outputs
+/// aligned with the ChatResult structure.
+///
+/// # Arguments
+/// * `prompts` - Array of prompt texts (one per unique prompt, will be expanded by group_size)
+/// * `completions` - Array of completion texts (prompts.len() * group_size total)
+/// * `answers` - Array of expected answers (one per unique prompt, will be expanded by group_size)
+/// * `token_counts` - Array of token counts for each completion
+/// * `finish_reasons` - Array of finish reasons from generation ("eos", "length", "stop", "repetition")
+/// * `group_size` - Number of completions per prompt
+///
+/// # Returns
+/// Array of RewardOutput objects with structured completion data
+///
+/// # Example
+/// ```typescript
+/// import { buildRewardOutputs } from '@mlx-node/core';
+///
+/// const outputs = buildRewardOutputs(
+///   ['What is 2+2?'],           // prompts
+///   ['<think>Let me calculate</think>\n\n4', '4'],  // completions (group_size=2)
+///   ['4'],                       // expected answers
+///   [10, 5],                     // token counts
+///   ['eos', 'length'],          // finish reasons
+///   2                            // group_size
+/// );
+///
+/// outputs[0].completion.thinking; // "Let me calculate"
+/// outputs[0].completion.text;     // "4"
+/// outputs[0].completion.finishReason; // "eos"
+/// outputs[0].expectedAnswer;      // "4"
+/// ```
+#[napi]
+pub fn build_reward_outputs(
+    prompts: Vec<String>,
+    completions: Vec<String>,
+    answers: Vec<Option<String>>,
+    token_counts: Vec<u32>,
+    finish_reasons: Vec<String>,
+    group_size: u32,
+) -> Vec<RewardOutput> {
+    let group_size = group_size as usize;
+    let mut outputs = Vec::with_capacity(completions.len());
+
+    for (i, completion_text) in completions.iter().enumerate() {
+        let prompt_idx = i / group_size;
+
+        // Parse tool calls and thinking
+        let (clean_text, tool_calls, thinking) = parse_generation_output(completion_text);
+
+        // Use provided finish reason, or infer from tool calls if not provided
+        let finish_reason = finish_reasons.get(i).cloned().unwrap_or_else(|| {
+            if !tool_calls.is_empty() {
+                "tool_calls".to_string()
+            } else {
+                "stop".to_string()
+            }
+        });
+
+        // Get token count (default to 0 if not available)
+        let num_tokens = token_counts.get(i).copied().unwrap_or(0);
+
+        // Get prompt text
+        let prompt = prompts.get(prompt_idx).cloned().unwrap_or_default();
+
+        // Get expected answer
+        let expected_answer = answers.get(prompt_idx).cloned().flatten();
+
+        outputs.push(RewardOutput {
+            prompt,
+            completion: CompletionInfo {
+                text: clean_text,
+                raw_text: completion_text.clone(),
+                tool_calls,
+                thinking,
+                num_tokens,
+                finish_reason,
+            },
+            expected_answer,
+        });
+    }
+
+    outputs
 }
 
 #[cfg(test)]

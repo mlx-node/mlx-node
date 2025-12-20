@@ -10,6 +10,11 @@
     "**/fixtures/**",
     ".yarn/**",
     "index.d.cts",
-    "index.cjs"
+    "index.cjs",
+    "/trl",
+    "/transformers",
+    "/mlx-lm",
+    "/mlx-rs",
+    "/crates/mlx-sys/mlx"
   ]
 }

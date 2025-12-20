@@ -5,8 +5,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
-import { GRPOTrainer } from '@mlx-node/trl';
-import { clearCache } from '@mlx-node/core';
+import { GRPOTrainer, type RewardOutput } from '@mlx-node/trl';
 import { existsSync, rmSync } from 'node:fs';
 import { createTempModel } from '../test-model-utils';
 
@@ -36,8 +35,6 @@ describe.sequential('GRPO Integration Tests', () => {
     if (existsSync(TEST_OUTPUT_DIR)) {
       rmSync(TEST_OUTPUT_DIR, { recursive: true, force: true });
     }
-    // Clear GPU cache to prevent memory accumulation between tests
-    clearCache();
   });
 
   describe.sequential('End-to-End Training', () => {
@@ -54,8 +51,8 @@ describe.sequential('GRPO Integration Tests', () => {
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
         logJsonl: false,
-        rewardFunction: (_prompts, completions) => {
-          return Float32Array.from(completions.map((c) => c.split(',').length / 10));
+        rewardFunction: (outputs: RewardOutput[]) => {
+          return Float32Array.from(outputs.map((o) => o.completion.rawText.split(',').length / 10));
         },
       });
 
@@ -83,9 +80,9 @@ describe.sequential('GRPO Integration Tests', () => {
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
         logJsonl: false,
-        rewardFunction: (_prompts, completions) => {
+        rewardFunction: (outputs: RewardOutput[]) => {
           // Reward longer completions
-          return Float32Array.from(completions.map((c) => c.split(',').length));
+          return Float32Array.from(outputs.map((o) => o.completion.rawText.split(',').length));
         },
       });
 
@@ -115,10 +112,10 @@ describe.sequential('GRPO Integration Tests', () => {
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
         logJsonl: false,
-        rewardFunction: (_prompts, completions) => {
+        rewardFunction: (outputs: RewardOutput[]) => {
           rewardCallCount++;
           // Varying rewards: some high, some low
-          return Float32Array.from(completions.map((_, i) => Math.sin(i) * 5 + 5));
+          return Float32Array.from(outputs.map((_, i) => Math.sin(i) * 5 + 5));
         },
       });
 
@@ -148,9 +145,9 @@ describe.sequential('GRPO Integration Tests', () => {
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
-        rewardFunction: (_prompts, completions) => {
+        rewardFunction: (outputs: RewardOutput[]) => {
           // Simple length-based reward
-          return Float32Array.from(completions.map((c) => c.length / 10));
+          return Float32Array.from(outputs.map((o) => o.completion.rawText.length / 10));
         },
       });
 
@@ -181,8 +178,8 @@ describe.sequential('GRPO Integration Tests', () => {
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
-        rewardFunction: (_prompts, _completions) => {
-          return Float32Array.from([1.0, 1.0]);
+        rewardFunction: (outputs: RewardOutput[]) => {
+          return Float32Array.from(outputs.map(() => 1.0));
         },
       });
 
@@ -225,8 +222,8 @@ describe.sequential('GRPO Integration Tests', () => {
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
-        rewardFunction: (_prompts, completions) => {
-          return Float32Array.from(completions.map((_, i) => i * 0.5));
+        rewardFunction: (outputs: RewardOutput[]) => {
+          return Float32Array.from(outputs.map((_, i) => i * 0.5));
         },
       });
 
@@ -253,8 +250,8 @@ describe.sequential('GRPO Integration Tests', () => {
           saveInterval: 1000,
           outputDir: TEST_OUTPUT_DIR,
           logConsole: false,
-          rewardFunction: (_prompts, _completions) => {
-            return Float32Array.from([1.0, 2.0, 3.0]);
+          rewardFunction: (outputs: RewardOutput[]) => {
+            return Float32Array.from(outputs.map((_, i) => i + 1.0));
           },
         });
 
@@ -281,8 +278,8 @@ describe.sequential('GRPO Integration Tests', () => {
           saveInterval: 1000,
           outputDir: TEST_OUTPUT_DIR,
           logConsole: false,
-          rewardFunction: (_prompts, _completions) => {
-            return Float32Array.from([1.0, 2.0]);
+          rewardFunction: (outputs: RewardOutput[]) => {
+            return Float32Array.from(outputs.map((_, i) => i + 1.0));
           },
         });
 
@@ -307,9 +304,9 @@ describe.sequential('GRPO Integration Tests', () => {
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
-        rewardFunction: (_prompts, _completions) => {
+        rewardFunction: (outputs: RewardOutput[]) => {
           // Varying rewards within group
-          return Float32Array.from([1.0, 2.0, 3.0, 4.0]);
+          return Float32Array.from(outputs.map((_, i) => i + 1.0));
         },
       });
 
@@ -331,9 +328,9 @@ describe.sequential('GRPO Integration Tests', () => {
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
-        rewardFunction: (_prompts, _completions) => {
+        rewardFunction: (outputs: RewardOutput[]) => {
           // All same reward
-          return Float32Array.from([5.0, 5.0, 5.0]);
+          return Float32Array.from(outputs.map(() => 5.0));
         },
       });
 
@@ -361,8 +358,8 @@ describe.sequential('GRPO Integration Tests', () => {
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
         logJsonl: false,
-        rewardFunction: (_prompts, completions) => {
-          return Float32Array.from(completions.map(() => Math.random()));
+        rewardFunction: (outputs: RewardOutput[]) => {
+          return Float32Array.from(outputs.map(() => Math.random()));
         },
       });
 
@@ -391,8 +388,8 @@ describe.sequential('GRPO Integration Tests', () => {
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
         logJsonl: false,
-        rewardFunction: (_prompts, _completions) => {
-          return Float32Array.from([1.0, 1.0]);
+        rewardFunction: (outputs: RewardOutput[]) => {
+          return Float32Array.from(outputs.map(() => 1.0));
         },
       });
 
@@ -419,8 +416,8 @@ describe.sequential('GRPO Integration Tests', () => {
           saveInterval: 1000,
           outputDir: TEST_OUTPUT_DIR,
           logConsole: false,
-          rewardFunction: (_prompts, _completions) => {
-            return Float32Array.from([1.0, 1.0, 1.0]);
+          rewardFunction: (outputs: RewardOutput[]) => {
+            return Float32Array.from(outputs.map(() => 1.0));
           },
         });
 
@@ -452,8 +449,8 @@ describe.sequential('GRPO Integration Tests', () => {
           saveInterval: 1000,
           outputDir: TEST_OUTPUT_DIR,
           logConsole: false,
-          rewardFunction: (_prompts, _completions) => {
-            return Float32Array.from([1.0, 1.0]);
+          rewardFunction: (outputs: RewardOutput[]) => {
+            return Float32Array.from(outputs.map(() => 1.0));
           },
         });
 
@@ -480,8 +477,8 @@ describe.sequential('GRPO Integration Tests', () => {
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
         logJsonl: false,
-        rewardFunction: (_prompts, _completions) => {
-          return new Float32Array(0);
+        rewardFunction: (outputs: RewardOutput[]) => {
+          return Float32Array.from(outputs.map(() => 1.0));
         },
       });
 
@@ -502,7 +499,7 @@ describe.sequential('GRPO Integration Tests', () => {
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
-        rewardFunction: (_prompts, _completions) => {
+        rewardFunction: (_outputs: RewardOutput[]) => {
           // Return wrong number of rewards
           return Float32Array.from([1.0, 2.0]); // Should be 3
         },
@@ -552,8 +549,8 @@ describe.sequential('GRPO Integration Tests', () => {
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
-        rewardFunction: (_prompts, _completions) => {
-          return Float32Array.from([1.0, 2.0, 3.0, 4.0]);
+        rewardFunction: (outputs: RewardOutput[]) => {
+          return Float32Array.from(outputs.map((_, i) => i + 1.0));
         },
       });
 
@@ -581,8 +578,8 @@ describe.sequential('GRPO Integration Tests', () => {
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
         logConsole: false,
-        rewardFunction: (_prompts, _completions) => {
-          return Float32Array.from([1.0, 1.0, 1.0]);
+        rewardFunction: (outputs: RewardOutput[]) => {
+          return Float32Array.from(outputs.map(() => 1.0));
         },
       });
 

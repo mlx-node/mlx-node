@@ -1252,6 +1252,83 @@ impl MxArray {
         MxArray::from_handle(handle, "log1p")
     }
 
+    // NaN/Inf checking operations (GPU-native)
+
+    /// Element-wise check for NaN values
+    ///
+    /// Returns a boolean array where True indicates the element is NaN.
+    /// This is a GPU-native operation that avoids CPU data transfer.
+    #[napi(js_name = "isnan")]
+    pub fn isnan(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_isnan(self.handle.0) };
+        MxArray::from_handle(handle, "isnan")
+    }
+
+    /// Element-wise check for Inf values
+    ///
+    /// Returns a boolean array where True indicates the element is +Inf or -Inf.
+    /// This is a GPU-native operation that avoids CPU data transfer.
+    #[napi(js_name = "isinf")]
+    pub fn isinf(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_isinf(self.handle.0) };
+        MxArray::from_handle(handle, "isinf")
+    }
+
+    /// Element-wise check for finite values
+    ///
+    /// Returns a boolean array where True indicates the element is finite (not NaN and not Inf).
+    /// This is a GPU-native operation that avoids CPU data transfer.
+    #[napi(js_name = "isfinite")]
+    pub fn isfinite(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_isfinite(self.handle.0) };
+        MxArray::from_handle(handle, "isfinite")
+    }
+
+    /// Check if array contains any NaN values (GPU-native)
+    ///
+    /// Returns true if any element is NaN. Uses GPU reduction instead of
+    /// transferring entire array to CPU for checking.
+    /// Only transfers a single scalar value (4 bytes).
+    pub fn has_nan(&self) -> Result<bool> {
+        let nan_mask = self.isnan()?;
+        // Cast bool to int32 and sum - if sum > 0, there's at least one NaN
+        let nan_int = nan_mask.astype(DType::Int32)?;
+        let sum = nan_int.sum(None, None)?;
+        sum.eval();
+        let count = sum.item_at_int32(0)?;
+        Ok(count > 0)
+    }
+
+    /// Check if array contains any Inf values (GPU-native)
+    ///
+    /// Returns true if any element is +Inf or -Inf. Uses GPU reduction instead of
+    /// transferring entire array to CPU for checking.
+    /// Only transfers a single scalar value (4 bytes).
+    pub fn has_inf(&self) -> Result<bool> {
+        let inf_mask = self.isinf()?;
+        let inf_int = inf_mask.astype(DType::Int32)?;
+        let sum = inf_int.sum(None, None)?;
+        sum.eval();
+        let count = sum.item_at_int32(0)?;
+        Ok(count > 0)
+    }
+
+    /// Check if array contains any NaN or Inf values (GPU-native)
+    ///
+    /// Returns true if any element is NaN or Inf. Uses GPU reduction instead of
+    /// transferring entire array to CPU for checking.
+    /// Only transfers a single scalar value (4 bytes).
+    pub fn has_nan_or_inf(&self) -> Result<bool> {
+        // Check for non-finite values: !isfinite = isnan | isinf
+        let finite_mask = self.isfinite()?;
+        let non_finite = finite_mask.logical_not()?;
+        let non_finite_int = non_finite.astype(DType::Int32)?;
+        let sum = non_finite_int.sum(None, None)?;
+        sum.eval();
+        let count = sum.item_at_int32(0)?;
+        Ok(count > 0)
+    }
+
     // Note: Attention functions (scaled_dot_product_attention, scaled_dot_product_attention_causal)
     // have been moved to array/attention.rs and are re-exported from this module.
 
@@ -1279,7 +1356,7 @@ impl Task for AsyncEvalTaskHandle {
 
 /// Clear the MLX memory cache to prevent memory pressure buildup
 /// Should be called periodically during long-running operations
-#[napi]
+/// Internal Rust-only function - memory management is handled automatically by the trainer
 pub fn clear_cache() {
     unsafe {
         sys::mlx_clear_cache();
@@ -1288,7 +1365,7 @@ pub fn clear_cache() {
 
 /// Synchronize and clear cache - prevents GPU timeout and memory pressure
 /// This is the recommended function for long-running training loops
-#[napi]
+/// Internal Rust-only function - memory management is handled automatically by the trainer
 pub fn synchronize_and_clear_cache() {
     unsafe {
         sys::mlx_synchronize();
@@ -1297,45 +1374,45 @@ pub fn synchronize_and_clear_cache() {
 }
 
 /// Get actively used memory in bytes (excludes cached memory)
-#[napi]
+/// Internal Rust-only function - use memoryCleanupThreshold config for memory-based cleanup
 pub fn get_active_memory() -> f64 {
     unsafe { sys::mlx_get_active_memory() as f64 }
 }
 
 /// Get cache memory size in bytes
-#[napi]
+/// Internal Rust-only function - use memoryCleanupThreshold config for memory-based cleanup
 pub fn get_cache_memory() -> f64 {
     unsafe { sys::mlx_get_cache_memory() as f64 }
 }
 
 /// Get peak memory usage in bytes
-#[napi]
+/// Internal Rust-only function
 pub fn get_peak_memory() -> f64 {
     unsafe { sys::mlx_get_peak_memory() as f64 }
 }
 
 /// Reset peak memory counter to zero
-#[napi]
+/// Internal Rust-only function
 pub fn reset_peak_memory() {
     unsafe { sys::mlx_reset_peak_memory() }
 }
 
 /// Set memory limit (guideline for max memory use)
 /// Returns the previous limit
-#[napi]
+/// Internal Rust-only function
 pub fn set_memory_limit(limit: f64) -> f64 {
     unsafe { sys::mlx_set_memory_limit(limit as usize) as f64 }
 }
 
 /// Get current memory limit
-#[napi]
+/// Internal Rust-only function
 pub fn get_memory_limit() -> f64 {
     unsafe { sys::mlx_get_memory_limit() as f64 }
 }
 
 /// Heavy cleanup: synchronize, clear cache, and reset peak memory tracking
 /// Use periodically (every 25-50 steps) to prevent GPU timeout in long-running training
-#[napi]
+/// Internal Rust-only function - memory management is handled automatically by the trainer
 pub fn heavy_cleanup() {
     unsafe {
         sys::mlx_synchronize();

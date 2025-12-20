@@ -29,6 +29,8 @@ pub enum TrainingState {
     Complete,
     /// Training encountered an error
     Error,
+    /// Waiting to restart after crash (countdown in progress)
+    Restarting,
 }
 
 impl TrainingState {
@@ -40,6 +42,7 @@ impl TrainingState {
             Self::Paused => "Paused",
             Self::Complete => "Complete",
             Self::Error => "Error",
+            Self::Restarting => "Restarting",
         }
     }
 
@@ -52,6 +55,7 @@ impl TrainingState {
             Self::Paused => Color::Yellow,
             Self::Complete => Color::Cyan,
             Self::Error => Color::Red,
+            Self::Restarting => Color::Magenta,
         }
     }
 
@@ -63,6 +67,7 @@ impl TrainingState {
             Self::Paused => "⏸",
             Self::Complete => "✓",
             Self::Error => "✗",
+            Self::Restarting => "↻",
         }
     }
 }
@@ -211,6 +216,16 @@ pub struct App {
 
     // Log level filter (show this level and above)
     pub log_level_filter: LogLevel,
+
+    // Auto-restart state
+    /// Number of times the process has been restarted
+    pub restart_count: u32,
+    /// Countdown seconds until restart (None = not restarting)
+    pub restart_countdown: Option<u8>,
+    /// Whether auto-restart is enabled
+    pub auto_restart_enabled: bool,
+    /// Exit code from last process exit
+    pub last_exit_code: Option<i32>,
 }
 
 impl Default for App {
@@ -266,6 +281,10 @@ impl App {
             show_quit_confirm: false,
             show_settings: false,
             log_level_filter: LogLevel::Info,
+            restart_count: 0,
+            restart_countdown: None,
+            auto_restart_enabled: true,
+            last_exit_code: None,
         }
     }
 
@@ -633,5 +652,47 @@ impl App {
         } else {
             "→"
         }
+    }
+
+    /// Prepare for restart - reset process state while keeping metrics
+    pub fn prepare_for_restart(&mut self) {
+        self.state = TrainingState::Starting;
+        self.child_exited = false;
+        self.restart_countdown = None;
+        self.restart_count += 1;
+        // Keep metrics history, logs, and samples for continuity
+        self.add_log(
+            LogLevel::Info,
+            format!("Restarting training (attempt #{})...", self.restart_count),
+        );
+    }
+
+    /// Start restart countdown
+    pub fn start_restart_countdown(&mut self, seconds: u8) {
+        self.state = TrainingState::Restarting;
+        self.restart_countdown = Some(seconds);
+    }
+
+    /// Decrement restart countdown, returns true if countdown reached zero
+    pub fn tick_restart_countdown(&mut self) -> bool {
+        if let Some(count) = self.restart_countdown {
+            if count <= 1 {
+                self.restart_countdown = Some(0);
+                true
+            } else {
+                self.restart_countdown = Some(count - 1);
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Cancel restart countdown
+    pub fn cancel_restart(&mut self) {
+        self.restart_countdown = None;
+        self.state = TrainingState::Error;
+        self.auto_restart_enabled = false;
+        self.add_log(LogLevel::Info, "Auto-restart cancelled".to_string());
     }
 }

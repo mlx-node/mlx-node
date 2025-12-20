@@ -60,9 +60,9 @@ use crate::utils::functional;
 /// # Example
 ///
 /// ```no_run
-/// # use mlx_node::grpo::compute_loss_and_gradients_autograd;
-/// # use mlx_node::models::qwen3::Qwen3Config;
-/// # use mlx_node::grpo::GRPOLossConfig;
+/// # use mlx_core::grpo::compute_loss_and_gradients_autograd;
+/// # use mlx_core::models::qwen3::Qwen3Config;
+/// # use mlx_core::grpo::GRPOLossConfig;
 /// # use std::collections::HashMap;
 /// # let config = Qwen3Config {
 /// #     vocab_size: 151936,
@@ -109,48 +109,33 @@ pub fn compute_loss_and_gradients_autograd(
     group_size: i32,
     loss_config: grpo_loss::GRPOLossConfig,
 ) -> Result<(f64, HashMap<String, MxArray>)> {
-    // 1. Flatten parameters into ordered list
+    // Early validation: KL penalty (beta > 0) requires reference model which isn't supported
+    if loss_config.beta > 0.0 {
+        return Err(Error::from_reason(
+            "KL penalty (beta > 0) requires reference model logprobs which is not yet supported in autograd mode. \
+             Set klCoef: 0.0 in your config to disable KL penalty.",
+        ));
+    }
+
+    // 1. Flatten parameters into ordered list (keep native dtype - bfloat16)
+    //
+    // NOTE: We no longer upcast parameters to float32. MLX-LM's official trainer
+    // runs in native bfloat16 throughout forward and backward passes. bfloat16
+    // has the same exponent range as float32, so it won't overflow like fp16.
+    // Only the loss scalar needs float32 for summation accuracy.
+    //
+    // This saves ~50% memory per training step (no float32 copies of all params).
     let mut param_names: Vec<String> = model_params.keys().cloned().collect();
     param_names.sort(); // Ensure consistent ordering
 
-    // CRITICAL FIX: Upcast ALL parameters to float32 BEFORE autograd
-    //
-    // Why this is necessary:
-    // - Pretrained models use bfloat16 (dtype=3) for memory efficiency
-    // - bfloat16 has only ~3 decimal digits of precision
-    // - When computing gradients through 28 transformer layers, precision loss
-    //   compounds through backpropagation, causing NaN gradients
-    // - Random weights (float32) work fine, pretrained weights (bfloat16) produce
-    //   307/311 NaN gradients without this fix
-    //
-    // The parameters are upcasted HERE (before value_and_grad), not inside
-    // the closure, because MLX computes gradients with respect to the arrays
-    // passed to value_and_grad. If we upcast inside the closure, the gradients
-    // still flow to the original bfloat16 parameters.
-    //
-    // We store the original dtype to convert gradients back at the end.
-    let original_dtypes: Vec<crate::array::DType> = param_names
+    let param_arrays: Vec<&MxArray> = param_names
         .iter()
         .map(|name| {
             model_params
                 .get(name)
                 .ok_or_else(|| Error::from_reason(format!("Parameter not found: {}", name)))
-                .and_then(|p| p.dtype())
         })
         .collect::<Result<Vec<_>>>()?;
-
-    // Upcast parameters to float32
-    let param_arrays_f32: Vec<MxArray> = param_names
-        .iter()
-        .map(|name| {
-            model_params
-                .get(name)
-                .ok_or_else(|| Error::from_reason(format!("Parameter not found: {}", name)))
-                .and_then(|p| p.astype(crate::array::DType::Float32))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let param_arrays: Vec<&MxArray> = param_arrays_f32.iter().collect();
 
     // 2. Prepare data for loss computation
     let rewards_f32: Vec<f32> = rewards.iter().map(|&x| x as f32).collect();
@@ -159,7 +144,42 @@ pub fn compute_loss_and_gradients_autograd(
     // Compute advantages (this doesn't need gradients)
     let advantages_array = compute_advantages(&rewards_array, group_size, "group".to_string())?;
 
-    // 3. Pad sequences
+    // 3. Truncate completions to max_completion_length if specified
+    // This prevents OOM from degenerate outputs that hit the max token limit
+    let max_completion_length = loss_config.max_completion_length.unwrap_or(1024);
+    let completion_tokens_truncated: Vec<MxArray> = completion_tokens
+        .iter()
+        .map(|tokens| {
+            let len = tokens.shape_at(0).unwrap_or(0);
+            if len > max_completion_length {
+                // Truncate to max_completion_length
+                tokens
+                    .slice_axis(0, 0, max_completion_length)
+                    .unwrap_or_else(|_| (*tokens).clone())
+            } else {
+                (*tokens).clone()
+            }
+        })
+        .collect();
+    let completion_tokens_refs: Vec<&MxArray> = completion_tokens_truncated.iter().collect();
+
+    // Also truncate old_logprobs to match
+    let old_logprobs_truncated: Vec<MxArray> = old_logprobs
+        .iter()
+        .map(|logprobs| {
+            let len = logprobs.shape_at(0).unwrap_or(0);
+            if len > max_completion_length {
+                logprobs
+                    .slice_axis(0, 0, max_completion_length)
+                    .unwrap_or_else(|_| (*logprobs).clone())
+            } else {
+                (*logprobs).clone()
+            }
+        })
+        .collect();
+    let old_logprobs_refs: Vec<&MxArray> = old_logprobs_truncated.iter().collect();
+
+    // 4. Pad sequences
     let prompts_expanded: Vec<&MxArray> = prompt_tokens
         .iter()
         .flat_map(|p| std::iter::repeat_n(*p, group_size as usize))
@@ -172,7 +192,7 @@ pub fn compute_loss_and_gradients_autograd(
     let padded_prompts_result = pad_sequences(prompts_expanded, pad_token_id)?;
     let padded_prompts = padded_prompts_result.get_padded()?;
 
-    let padded_completions_result = pad_sequences(completion_tokens.to_vec(), pad_token_id)?;
+    let padded_completions_result = pad_sequences(completion_tokens_refs, pad_token_id)?;
     let padded_completions = padded_completions_result.get_padded()?;
     let completion_masks = padded_completions_result.get_masks()?;
 
@@ -189,7 +209,7 @@ pub fn compute_loss_and_gradients_autograd(
     // - log_ratio at padded positions: new (-X) - (-5) = -(X-5), clamped to [-88, 88]
     // - Even if new is -100, log_ratio = -95, clamped to -88, exp(-88) ≈ 0
     // - Critical: if new_logprob is NaN, we need to handle it separately (see below)
-    let padded_old_logprobs_raw = pad_float_sequences(old_logprobs.to_vec(), -5.0)?;
+    let padded_old_logprobs_raw = pad_float_sequences(old_logprobs_refs, -5.0)?;
 
     // Clamp old_logprobs to reasonable range to prevent ratio explosion
     // This is defensive against very negative values from generation
@@ -210,13 +230,12 @@ pub fn compute_loss_and_gradients_autograd(
 
     // 5. Define loss function for autograd
     // This closure will be called by MLX with updated parameter values
-    // NOTE: Parameters are ALREADY in float32 (upcasted before value_and_grad call)
+    // Parameters are in native dtype (bfloat16 for pretrained models)
     let loss_fn = move |params: &[MxArray]| -> Result<MxArray> {
         // Map params to structured dictionary
         let param_dict = param_manager::map_params_to_dict(params, &param_names_clone)?;
 
-        // Recompute forward pass with parameters
-        // All computation happens in float32 for numerical stability
+        // Recompute forward pass with parameters in native dtype
         let logits =
             functional::qwen3_forward_functional(&config_clone, &param_dict, &input_ids_clone)?;
 
@@ -271,26 +290,36 @@ pub fn compute_loss_and_gradients_autograd(
     // 6. Compute value and gradients using MLX autograd
     let (loss_array, grad_arrays) = autograd::value_and_grad(param_arrays.clone(), loss_fn)?;
 
-    // 7. Extract loss value and force evaluation
+    // === CRITICAL MEMORY OPTIMIZATION: Eval ALL tensors IMMEDIATELY, then cleanup ===
+    //
+    // MLX builds a computation graph during value_and_grad. This graph holds references
+    // to ALL intermediate tensors. Calling eval() materializes the results and allows
+    // the graph nodes to be released. We MUST:
+    // Eval all outputs before extracting values
     loss_array.eval();
+
+    for grad in &grad_arrays {
+        grad.eval();
+    }
+
+    // CRITICAL: heavy_cleanup releases the autograd computation graph
+    // synchronize_and_clear_cache only clears MLX cache, not the graph
+    crate::array::heavy_cleanup();
+
+    // Extract the loss value
     let loss_value = loss_array.item_at_float32(0)? as f64;
 
-    // 8. Map gradients back to parameter names and force evaluation
-    // Gradients are computed in float32 for numerical stability.
-    // KEEP gradients in float32 - do NOT convert back to bfloat16 as that can
-    // reintroduce numerical issues. The optimizer should handle mixed precision.
+    // Step 5: Map gradients back to parameter names
+    // Gradients are in the same dtype as parameters (bfloat16 for pretrained models).
+    // The optimizer handles mixed precision - it can accumulate in float32 internally.
     let gradients = param_names
         .into_iter()
         .enumerate()
         .map(|(i, param_name)| {
             let grad = grad_arrays[i].clone();
-            grad.eval(); // Force evaluation to release computation graph
             (param_name, grad)
         })
         .collect::<HashMap<_, _>>();
-
-    // Note: original_dtypes is kept for future use if needed
-    let _ = original_dtypes;
 
     Ok((loss_value, gradients))
 }

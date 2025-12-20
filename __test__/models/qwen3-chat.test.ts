@@ -38,7 +38,7 @@ describe.sequential('Qwen3 Chat API', () => {
       expect(typeof result.text).toBe('string');
       expect(Array.isArray(result.toolCalls)).toBe(true);
       expect(result.thinking === null || typeof result.thinking === 'string').toBe(true);
-      expect(['stop', 'length', 'tool_calls']).toContain(result.finishReason);
+      expect(['stop', 'length', 'tool_calls', 'repetition']).toContain(result.finishReason);
       expect(typeof result.numTokens).toBe('number');
       expect(result.numTokens).toBeGreaterThan(0);
       expect(typeof result.rawText).toBe('string');
@@ -159,7 +159,7 @@ describe.sequential('Qwen3 Chat API', () => {
       });
 
       // With random weights, might hit either stop or length
-      expect(['stop', 'length', 'tool_calls']).toContain(result.finishReason);
+      expect(['stop', 'length', 'tool_calls', 'repetition']).toContain(result.finishReason);
     });
   });
 

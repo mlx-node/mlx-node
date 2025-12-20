@@ -164,6 +164,39 @@ export class GRPOLogger {
   }
 
   /**
+   * Initialize training logging (called by GRPOTrainer at start of training)
+   */
+  init(model: string, config: TrainingConfigFields, numExamples?: number): void {
+    // TUI mode: send init message
+    if (this.config.tuiMode) {
+      this.writeTui({
+        type: 'init',
+        model,
+        config: config as unknown as Record<string, unknown>,
+      });
+      return;
+    }
+
+    if (this.config.logConsole) {
+      console.log(`\n🚀 Starting GRPO training`);
+      if (numExamples) console.log(`   Examples: ${numExamples}`);
+      console.log(`   Epochs: ${config.numEpochs}`);
+      console.log(`   Batch size: ${config.batchSize}`);
+      console.log(`   Group size: ${config.groupSize}`);
+      console.log(`   Learning rate: ${config.learningRate}`);
+    }
+
+    if (this.jsonlPath && numExamples !== undefined) {
+      this.writeJsonl({
+        event: 'training_config',
+        num_examples: numExamples,
+        config: config as unknown as Record<string, unknown>,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  /**
    * Write TUI message to stdout (for TUI mode)
    */
   writeTui(msg: TuiMessage): void {

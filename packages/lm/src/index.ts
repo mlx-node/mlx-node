@@ -16,18 +16,7 @@
 // Model classes (for inference)
 export { Qwen3Model, Qwen3Tokenizer } from '@mlx-node/core';
 
-// Memory management
-export {
-  getActiveMemory,
-  getCacheMemory,
-  getPeakMemory,
-  resetPeakMemory,
-  clearCache,
-  synchronizeAndClearCache,
-  heavyCleanup,
-  getMemoryLimit,
-  setMemoryLimit,
-} from '@mlx-node/core';
+// Note: Memory management is handled internally by Rust - not exposed to JS
 
 // Types
 export type { DType } from '@mlx-node/core';

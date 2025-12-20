@@ -14,7 +14,7 @@ pub fn draw(f: &mut Frame) {
 
     // Center the help popup
     let popup_width = 50.min(area.width.saturating_sub(4));
-    let popup_height = 22.min(area.height.saturating_sub(4));
+    let popup_height = 28.min(area.height.saturating_sub(4));
 
     let popup_area = centered_rect(popup_width, popup_height, area);
 
@@ -85,6 +85,17 @@ pub fn draw(f: &mut Frame) {
         Line::from(vec![
             Span::styled("  ?         ", key_style),
             Span::styled("Toggle this help", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("─── Auto-Restart ───", section_style)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  c         ", key_style),
+            Span::styled("Cancel restart countdown", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter     ", key_style),
+            Span::styled("Skip countdown, restart now", desc_style),
         ]),
     ];
 

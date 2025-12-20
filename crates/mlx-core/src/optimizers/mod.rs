@@ -60,31 +60,46 @@ impl GradientUtils {
     /// doesn't exceed max_norm. This is the standard gradient clipping
     /// approach used in deep learning (same as PyTorch's clip_grad_norm_
     /// and MLX's clip_grad_norm).
+    ///
+    /// OPTIMIZED: Uses GPU for all computations and preserves original dtype.
+    /// Previous implementation used CPU transfers and converted to float32.
     #[napi]
     pub fn clip_grad_norm(
         gradients: HashMap<String, &MxArray>,
         max_norm: f64,
     ) -> Result<HashMap<String, MxArray>> {
-        // Step 1: Compute total norm using CPU
-        let mut total_sum_squared: f64 = 0.0;
-        for grad in gradients.values() {
-            let data = grad.to_float32()?;
-            let sum_sq: f64 = data.iter().map(|&x| (x as f64) * (x as f64)).sum();
-            total_sum_squared += sum_sq;
+        if gradients.is_empty() {
+            return Ok(HashMap::new());
         }
-        let total_norm = total_sum_squared.sqrt();
 
-        // Step 2: Compute scaling factor
+        // Step 1: Compute total norm on GPU by accumulating squared sums
+        let mut total_squared: Option<MxArray> = None;
+        for grad in gradients.values() {
+            let squared = grad.square()?;
+            let sum = squared.sum(None, None)?;
+            total_squared = Some(match total_squared {
+                None => sum,
+                Some(acc) => acc.add(&sum)?,
+            });
+        }
+        let total_norm = total_squared.unwrap().sqrt()?;
+
+        // Step 2: Compute scaling factor on GPU
+        // scale = min(max_norm / (total_norm + eps), 1.0)
         let eps = 1e-6;
-        let scale = (max_norm / (total_norm + eps)).min(1.0) as f32;
+        let max_norm_arr = MxArray::full(&[], napi::Either::A(max_norm), None)?;
+        let eps_arr = MxArray::full(&[], napi::Either::A(eps), None)?;
+        let one_arr = MxArray::full(&[], napi::Either::A(1.0), None)?;
 
-        // Step 3: Scale all gradients
+        let norm_plus_eps = total_norm.add(&eps_arr)?;
+        let scale = max_norm_arr.div(&norm_plus_eps)?;
+        let scale = scale.minimum(&one_arr)?;
+
+        // Step 3: Scale all gradients (preserves original dtype!)
         let mut clipped_grads = HashMap::new();
         for (name, grad) in gradients.iter() {
-            let data = grad.to_float32()?;
-            let shape = grad.shape()?;
-            let scaled: Vec<f32> = data.iter().map(|&x| x * scale).collect();
-            let clipped = MxArray::from_float32(&scaled, shape.as_ref())?;
+            // Multiply by scale - result keeps gradient's dtype
+            let clipped = grad.mul(&scale)?;
             clipped_grads.insert(name.clone(), clipped);
         }
 
@@ -95,31 +110,47 @@ impl GradientUtils {
     ///
     /// This combines `compute_gradient_norm` and `clip_grad_norm` into one call.
     /// Use this when you need both the clipped gradients and the original norm.
+    ///
+    /// OPTIMIZED: Uses GPU for all computations and preserves original dtype.
     #[napi]
     pub fn clip_grad_norm_with_norm(
         gradients: HashMap<String, &MxArray>,
         max_norm: f64,
     ) -> Result<(HashMap<String, MxArray>, f64)> {
-        // Step 1: Compute total norm using CPU
-        let mut total_sum_squared: f64 = 0.0;
-        for grad in gradients.values() {
-            let data = grad.to_float32()?;
-            let sum_sq: f64 = data.iter().map(|&x| (x as f64) * (x as f64)).sum();
-            total_sum_squared += sum_sq;
+        if gradients.is_empty() {
+            return Ok((HashMap::new(), 0.0));
         }
-        let total_norm = total_sum_squared.sqrt();
 
-        // Step 2: Compute scaling factor
+        // Step 1: Compute total norm on GPU by accumulating squared sums
+        let mut total_squared: Option<MxArray> = None;
+        for grad in gradients.values() {
+            let squared = grad.square()?;
+            let sum = squared.sum(None, None)?;
+            total_squared = Some(match total_squared {
+                None => sum,
+                Some(acc) => acc.add(&sum)?,
+            });
+        }
+        let total_norm_arr = total_squared.unwrap().sqrt()?;
+
+        // Extract norm value for return (single scalar, fast)
+        total_norm_arr.eval();
+        let total_norm = total_norm_arr.item_at_float32(0)? as f64;
+
+        // Step 2: Compute scaling factor on GPU
         let eps = 1e-6;
-        let scale = (max_norm / (total_norm + eps)).min(1.0) as f32;
+        let max_norm_arr = MxArray::full(&[], napi::Either::A(max_norm), None)?;
+        let eps_arr = MxArray::full(&[], napi::Either::A(eps), None)?;
+        let one_arr = MxArray::full(&[], napi::Either::A(1.0), None)?;
 
-        // Step 3: Scale all gradients
+        let norm_plus_eps = total_norm_arr.add(&eps_arr)?;
+        let scale = max_norm_arr.div(&norm_plus_eps)?;
+        let scale = scale.minimum(&one_arr)?;
+
+        // Step 3: Scale all gradients (preserves original dtype!)
         let mut clipped_grads = HashMap::new();
         for (name, grad) in gradients.iter() {
-            let data = grad.to_float32()?;
-            let shape = grad.shape()?;
-            let scaled: Vec<f32> = data.iter().map(|&x| x * scale).collect();
-            let clipped = MxArray::from_float32(&scaled, shape.as_ref())?;
+            let clipped = grad.mul(&scale)?;
             clipped_grads.insert(name.clone(), clipped);
         }
 
@@ -132,6 +163,66 @@ impl GradientUtils {
     #[napi]
     pub fn clip_grad_value(grad: &MxArray, min_val: f64, max_val: f64) -> Result<MxArray> {
         grad.clip(Some(min_val), Some(max_val))
+    }
+
+    /// Fused value and norm clipping for gradients (internal use)
+    ///
+    /// Combines value clipping and norm clipping into a single pass, avoiding
+    /// intermediate HashMap allocations. Operations are kept lazy until the end.
+    ///
+    /// OPTIMIZED: Uses GPU for all computations and preserves original dtype.
+    pub fn clip_grad_value_and_norm(
+        gradients: HashMap<String, &MxArray>,
+        clip_value: f64,
+        max_norm: Option<f64>,
+    ) -> Result<HashMap<String, MxArray>> {
+        if gradients.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Step 1: Value clip all gradients (lazy)
+        let mut value_clipped: Vec<(String, MxArray)> = Vec::with_capacity(gradients.len());
+        for (name, grad) in gradients.iter() {
+            let clipped = grad.clip(Some(-clip_value), Some(clip_value))?;
+            value_clipped.push((name.clone(), clipped));
+        }
+
+        // Step 2: If norm clipping enabled, compute scale factor
+        let scale = if let Some(max_norm) = max_norm {
+            // Compute total norm from value-clipped grads
+            let mut total_squared: Option<MxArray> = None;
+            for (_, grad) in value_clipped.iter() {
+                let squared = grad.square()?;
+                let sum = squared.sum(None, None)?;
+                total_squared = Some(match total_squared {
+                    None => sum,
+                    Some(acc) => acc.add(&sum)?,
+                });
+            }
+            let total_norm = total_squared.unwrap().sqrt()?;
+
+            let max_norm_arr = MxArray::full(&[], napi::Either::A(max_norm), None)?;
+            let eps_arr = MxArray::full(&[], napi::Either::A(1e-6), None)?;
+            let one_arr = MxArray::full(&[], napi::Either::A(1.0), None)?;
+            let norm_plus_eps = total_norm.add(&eps_arr)?;
+            let scale = max_norm_arr.div(&norm_plus_eps)?;
+            Some(scale.minimum(&one_arr)?)
+        } else {
+            None
+        };
+
+        // Step 3: Build final result (apply norm scale if needed)
+        let mut result = HashMap::new();
+        for (name, grad) in value_clipped {
+            let final_grad = if let Some(ref s) = scale {
+                grad.mul(s)?
+            } else {
+                grad
+            };
+            result.insert(name, final_grad);
+        }
+
+        Ok(result)
     }
 }
 

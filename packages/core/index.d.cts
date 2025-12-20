@@ -285,8 +285,8 @@ export declare class ChatResult {
   get tokens(): MxArray
   /** Get the log probabilities */
   get logprobs(): MxArray
-  /** Get the finish reason ("stop", "length", or "tool_calls") */
-  get finishReason(): 'stop' | 'length' | 'tool_calls'
+  /** Get the finish reason ("stop", "length", "tool_calls", or "repetition") */
+  get finishReason(): 'stop' | 'length' | 'tool_calls' | 'repetition'
   /** Get the number of tokens generated */
   get numTokens(): number
   /** Get the raw text before tool call stripping (for debugging) */
@@ -354,8 +354,8 @@ export declare class GenerationResult {
   get tokens(): MxArray
   /** Get the log probabilities */
   get logprobs(): MxArray
-  /** Get the finish reason ("eos" or "length") */
-  get finishReason(): 'eos' | 'length'
+  /** Get the finish reason ("eos", "length", or "repetition") */
+  get finishReason(): 'eos' | 'length' | 'repetition'
   /** Get the number of tokens generated */
   get numTokens(): number
 }
@@ -482,6 +482,9 @@ export declare class GradientUtils {
    * doesn't exceed max_norm. This is the standard gradient clipping
    * approach used in deep learning (same as PyTorch's clip_grad_norm_
    * and MLX's clip_grad_norm).
+   *
+   * OPTIMIZED: Uses GPU for all computations and preserves original dtype.
+   * Previous implementation used CPU transfers and converted to float32.
    */
   static clipGradNorm(gradients: Record<string, MxArray>, maxNorm: number): Record<string, MxArray>
   /**
@@ -489,6 +492,8 @@ export declare class GradientUtils {
    *
    * This combines `compute_gradient_norm` and `clip_grad_norm` into one call.
    * Use this when you need both the clipped gradients and the original norm.
+   *
+   * OPTIMIZED: Uses GPU for all computations and preserves original dtype.
    */
   static clipGradNormWithNorm(gradients: Record<string, MxArray>, maxNorm: number): [Record<string, MxArray>, number]
   /**
@@ -561,6 +566,21 @@ export declare class GrpoTrainingEngine {
    * * Training step metrics
    */
   trainStepWithGenerations(prompts: Array<Array<ChatMessage>>, rewards: Array<number>, generationResult: GenerateBatchResult): Promise<EngineStepMetrics>
+  /**
+   * Unified training step with JS reward callback
+   *
+   * This method combines generation, reward scoring, and training into a single call,
+   * keeping token data in Rust memory to eliminate FFI overhead.
+   *
+   * # Arguments
+   * * `prompts` - Array of chat conversations to use as prompts
+   * * `answers` - Expected answers for each prompt (for reward functions)
+   * * `reward_fn` - JavaScript function to compute rewards: (outputs: RewardOutput[]) => Promise<number[]>
+   *
+   * # Returns
+   * * Training step result including metrics, completions, and rewards
+   */
+  trainStepAuto(prompts: ChatMessage[][], answers: (string | null)[], rewardFn: (err: Error | null, outputsJson: string) => Promise<number[]>): Promise<TrainStepResult>
   /**
    * Score completions using registered built-in rewards
    *
@@ -931,6 +951,27 @@ export declare class MxArray {
   log10(): MxArray
   log2(): MxArray
   log1p(): MxArray
+  /**
+   * Element-wise check for NaN values
+   *
+   * Returns a boolean array where True indicates the element is NaN.
+   * This is a GPU-native operation that avoids CPU data transfer.
+   */
+  isnan(): MxArray
+  /**
+   * Element-wise check for Inf values
+   *
+   * Returns a boolean array where True indicates the element is +Inf or -Inf.
+   * This is a GPU-native operation that avoids CPU data transfer.
+   */
+  isinf(): MxArray
+  /**
+   * Element-wise check for finite values
+   *
+   * Returns a boolean array where True indicates the element is finite (not NaN and not Inf).
+   * This is a GPU-native operation that avoids CPU data transfer.
+   */
+  isfinite(): MxArray
 }
 
 /** NAPI-exported reward registry wrapper */
@@ -1741,6 +1782,46 @@ export interface BatchGenerationResult {
   numTokens: Array<number>
 }
 
+/**
+ * Build RewardOutput array from generation results.
+ *
+ * Parses tool calls and thinking from completions, creating structured outputs
+ * aligned with the ChatResult structure.
+ *
+ * # Arguments
+ * * `prompts` - Array of prompt texts (one per unique prompt, will be expanded by group_size)
+ * * `completions` - Array of completion texts (prompts.len() * group_size total)
+ * * `answers` - Array of expected answers (one per unique prompt, will be expanded by group_size)
+ * * `token_counts` - Array of token counts for each completion
+ * * `finish_reasons` - Array of finish reasons from generation ("eos", "length", "stop", "repetition")
+ * * `group_size` - Number of completions per prompt
+ *
+ * # Returns
+ * Array of RewardOutput objects with structured completion data
+ *
+ * # Example
+ * ```typescript
+ * import { buildRewardOutputs } from '@mlx-node/core';
+ *
+ * const outputs = buildRewardOutputs(
+ *   ['What is 2+2?'],           // prompts
+ *   ['<think>Let me calculate</think>
+
+4', '4'],  // completions (group_size=2)
+ *   ['4'],                       // expected answers
+ *   [10, 5],                     // token counts
+ *   ['eos', 'length'],          // finish reasons
+ *   2                            // group_size
+ * );
+ *
+ * outputs[0].completion.thinking; // "Let me calculate"
+ * outputs[0].completion.text;     // "4"
+ * outputs[0].completion.finishReason; // "eos"
+ * outputs[0].expectedAnswer;      // "4"
+ * ```
+ */
+export declare function buildRewardOutputs(prompts: Array<string>, completions: Array<string>, answers: Array<string | undefined | null>, tokenCounts: Array<number>, finishReasons: Array<string>, groupSize: number): Array<RewardOutput>
+
 /** Configuration for built-in rewards */
 export interface BuiltinRewardConfig {
   /** Type of reward function */
@@ -1816,6 +1897,12 @@ export interface ChatConfig {
   repetitionPenalty?: number
   /** Number of recent tokens to consider for repetition penalty (default: 20) */
   repetitionContextSize?: number
+  /** Stop if same token repeats this many times consecutively (default: 16) */
+  maxConsecutiveTokens?: number
+  /** Stop if an n-gram pattern repeats this many times (default: 8) */
+  maxNgramRepeats?: number
+  /** N-gram size for repetition detection (default: 3) */
+  ngramSize?: number
   /** EOS token ID (generation stops when this is generated) */
   eosTokenId?: number
   /** Whether to return log probabilities (default: true) */
@@ -1835,12 +1922,6 @@ export interface ChatMessage {
   /** Reasoning content for thinking mode (used with <think> tags) */
   reasoningContent?: string
 }
-
-/**
- * Clear the MLX memory cache to prevent memory pressure buildup
- * Should be called periodically during long-running operations
- */
-export declare function clearCache(): void
 
 /**
  * Clip gradients by global norm.
@@ -1882,6 +1963,25 @@ export declare function clipGradientsByGlobalNorm(gradients: Array<MxArray>, max
  * * Vector of clipped gradients
  */
 export declare function clipGradientsByValue(gradients: Array<MxArray>, minValue: number, maxValue: number): Array<MxArray>
+
+/**
+ * Structured completion information aligned with ChatResult.
+ * Contains pre-parsed tool calls, thinking, and clean text.
+ */
+export interface CompletionInfo {
+  /** Clean text with <tool_call> and <think> tags removed */
+  text: string
+  /** Raw output before tag stripping (for debugging/XML parsing) */
+  rawText: string
+  /** Parsed tool calls (arguments are already JS objects) */
+  toolCalls: Array<ToolCallResult>
+  /** Extracted thinking/reasoning from <think> tags (null if none) */
+  thinking?: string
+  /** Number of tokens generated */
+  numTokens: number
+  /** Finish reason: "stop" | "length" | "tool_calls" */
+  finishReason: string
+}
 
 /**
  * Compute advantages for GRPO from rewards
@@ -2083,6 +2183,8 @@ export interface GenerateBatchResult {
   completionLogprobs: Array<number>
   /** Lengths of each completion (for reconstruction) */
   completionLengths: Array<number>
+  /** Finish reasons for each completion ("eos", "length", or "repetition") */
+  finishReasons: Array<string>
 }
 
 /** Configuration for text generation */
@@ -2104,17 +2206,26 @@ export interface GenerationConfig {
    * Matches mlx-lm default. Larger values catch longer patterns but use more memory
    */
   repetitionContextSize?: number
+  /**
+   * Stop if same token repeats this many times consecutively (default: 16)
+   * Set to 0 to disable. Prevents OOM from degenerate repetitive generation.
+   */
+  maxConsecutiveTokens?: number
+  /**
+   * Stop if an n-gram pattern repeats this many times (default: 8)
+   * Set to 0 to disable. Detects patterns like "A B A B A B A B".
+   */
+  maxNgramRepeats?: number
+  /**
+   * N-gram size for repetition detection (default: 3)
+   * Used with max_ngram_repeats to detect repeating patterns.
+   */
+  ngramSize?: number
   /** EOS token ID (generation stops when this is generated) */
   eosTokenId?: number
   /** Whether to return log probabilities (always true for GRPO) */
   returnLogprobs?: boolean
 }
-
-/** Get actively used memory in bytes (excludes cached memory) */
-export declare function getActiveMemory(): number
-
-/** Get cache memory size in bytes */
-export declare function getCacheMemory(): number
 
 /**
  * Returns a binary mask identifying tokens whose entropy exceeds a given quantile threshold.
@@ -2150,12 +2261,6 @@ export declare function getCacheMemory(): number
  */
 export declare function getHighEntropyMask(entropies: MxArray, mask: MxArray, threshold: number): MxArray
 
-/** Get current memory limit */
-export declare function getMemoryLimit(): number
-
-/** Get peak memory usage in bytes */
-export declare function getPeakMemory(): number
-
 /** Configuration for the GRPO training engine */
 export interface GrpoEngineConfig {
   /** Learning rate (default: 1e-6) */
@@ -2179,6 +2284,13 @@ export interface GrpoEngineConfig {
   lossType?: string
   /** Maximum tokens to generate (default: 256) */
   maxNewTokens?: number
+  /**
+   * Maximum completion length for training/autograd (default: 1024)
+   * Completions longer than this are truncated before computing gradients.
+   * Separate from max_new_tokens to allow generating long outputs
+   * while limiting memory usage during training.
+   */
+  maxCompletionLengthForTraining?: number
   /** Sampling temperature (default: 0.8) */
   temperature?: number
   /** Top-p (nucleus) sampling (default: 0.95) */
@@ -2192,6 +2304,11 @@ export interface GrpoEngineConfig {
    * Heavy cleanup forces complete GPU drain including peak memory reset
    */
   heavyCleanupInterval?: number
+  /**
+   * Memory threshold for triggering cleanup (bytes). Default: 80% of system memory.
+   * When memory usage exceeds this threshold, cleanup is triggered regardless of step interval.
+   */
+  memoryCleanupThreshold?: number
   /**
    * Maximum allowed NaN gradient occurrences before stopping training (default: 100)
    * When exceeded, training will stop with an error to prevent model corruption.
@@ -2225,12 +2342,6 @@ export interface GrpoLossConfig {
 }
 
 /**
- * Heavy cleanup: synchronize, clear cache, and reset peak memory tracking
- * Use periodically (every 25-50 steps) to prevent GPU timeout in long-running training
- */
-export declare function heavyCleanup(): void
-
-/**
  * Pad variable-length float sequences to uniform length
  *
  * Takes a list of 1D float sequences (e.g., log probabilities) and pads them to the maximum length.
@@ -2259,6 +2370,32 @@ export declare function padFloatSequences(sequences: Array<MxArray>, padValue: n
  */
 export declare function padSequences(sequences: Array<MxArray>, padValue: number): PaddedSequences
 
+/**
+ * Parse tool calls from text (NAPI export)
+ *
+ * Extracts tool calls from model-generated text and returns both the cleaned text
+ * and the parsed tool calls.
+ *
+ * # Example
+ * ```typescript
+ * import { parseToolCallsFromText } from '@mlx-node/core';
+ *
+ * const result = parseToolCallsFromText('<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>');
+ * console.log(result.text); // ""
+ * console.log(result.toolCalls[0].name); // "search"
+ * console.log(result.toolCalls[0].arguments.q); // "test"
+ * ```
+ */
+export declare function parseToolCallsFromText(text: string): ParseToolCallsResult
+
+/** Result of parsing tool calls from text */
+export interface ParseToolCallsResult {
+  /** Cleaned text with tool_call tags removed */
+  text: string
+  /** Parsed tool calls */
+  toolCalls: Array<ToolCallResult>
+}
+
 /** Qwen3 model configuration */
 export interface Qwen3Config {
   vocabSize: number
@@ -2278,8 +2415,18 @@ export interface Qwen3Config {
   bosTokenId: number
 }
 
-/** Reset peak memory counter to zero */
-export declare function resetPeakMemory(): void
+/**
+ * Reward function input for a single completion.
+ * Provides all context needed to compute a reward score.
+ */
+export interface RewardOutput {
+  /** The input prompt text */
+  prompt: string
+  /** Structured completion data aligned with ChatResult */
+  completion: CompletionInfo
+  /** Ground truth answer from dataset (if available) */
+  expectedAnswer?: string
+}
 
 /**
  * Configuration for sampling strategies
@@ -2353,18 +2500,6 @@ export declare function scaledDotProductAttentionCausal(queries: MxArray, keys: 
  */
 export declare function selectiveLogSoftmax(logits: MxArray, targetIds: MxArray): MxArray
 
-/**
- * Set memory limit (guideline for max memory use)
- * Returns the previous limit
- */
-export declare function setMemoryLimit(limit: number): number
-
-/**
- * Synchronize and clear cache - prevents GPU timeout and memory pressure
- * This is the recommended function for long-running training loops
- */
-export declare function synchronizeAndClearCache(): void
-
 /** Tool call made by an assistant */
 export interface ToolCall {
   /** Optional unique identifier for the tool call */
@@ -2395,4 +2530,14 @@ export interface ToolDefinition {
   type: string
   /** Function definition */
   function: FunctionDefinition
+}
+
+/** Result from train_step_auto including metrics, completions, and rewards */
+export interface TrainStepResult {
+  /** Training metrics */
+  metrics: EngineStepMetrics
+  /** Generated completion texts (for TUI logging) */
+  completions: Array<string>
+  /** Computed reward values (for TUI logging) */
+  rewards: Array<number>
 }

@@ -58,7 +58,7 @@ impl Stream {
 ///
 /// # Example
 /// ```no_run
-/// # use mlx_node::stream::{Stream, StreamContext, DeviceType};
+/// # use mlx_core::stream::{Stream, StreamContext, DeviceType};
 /// let generation_stream = Stream::new(DeviceType::Gpu);
 /// {
 ///     let _ctx = StreamContext::new(generation_stream);
@@ -112,7 +112,7 @@ impl Drop for StreamContext {
 ///
 /// # Example
 /// ```no_run
-/// # use mlx_node::stream::{Stream, WiredLimitContext, DeviceType};
+/// # use mlx_core::stream::{Stream, WiredLimitContext, DeviceType};
 /// # let model_size_bytes = 1024;
 /// let generation_stream = Stream::new(DeviceType::Gpu);
 /// {

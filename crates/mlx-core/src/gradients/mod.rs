@@ -85,8 +85,8 @@ where
 ///
 /// # Example
 /// ```no_run
-/// # use mlx_node::array::MxArray;
-/// # use mlx_node::gradients::compute_gradients;
+/// # use mlx_core::array::MxArray;
+/// # use mlx_core::gradients::compute_gradients;
 /// // Compute gradient of f(x) = x^2 at x = 3
 /// let x = MxArray::from_float32(&[3.0], &[1]).unwrap();
 /// let grads = compute_gradients(
@@ -150,8 +150,8 @@ where
 ///
 /// # Example
 /// ```no_run
-/// # use mlx_node::array::MxArray;
-/// # use mlx_node::gradients::value_and_gradients;
+/// # use mlx_core::array::MxArray;
+/// # use mlx_core::gradients::value_and_gradients;
 /// // Compute f(x) = x^2 and df/dx at x = 3
 /// let x = MxArray::from_float32(&[3.0], &[1]).unwrap();
 /// let (loss, grads) = value_and_gradients(

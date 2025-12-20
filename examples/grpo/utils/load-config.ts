@@ -6,7 +6,7 @@
 
 import { readFileSync } from 'node:fs';
 import { parse as parseToml } from '@std/toml';
-import type { GRPOConfig, RewardFunction } from '@mlx-node/trl';
+import type { GRPOConfig, RewardFunction, RewardOutput } from '@mlx-node/trl';
 import { ALL_REWARD_FUNCTIONS } from '@mlx-node/trl';
 
 /**
@@ -80,7 +80,7 @@ export interface DatasetConfig {
 
 /**
  * Combined reward function based on configuration
- * Uses the unified reward function signature: (prompts, completions, answers) => number[] | Float32Array
+ * Uses the unified reward function signature: (outputs: RewardOutput[]) => number[] | Float32Array
  */
 function createRewardFunction(config: TomlConfig): RewardFunction {
   const rewardConfig = config.reward ?? {};
@@ -108,15 +108,15 @@ function createRewardFunction(config: TomlConfig): RewardFunction {
   const funcs = enabledFunctions.length > 0 ? enabledFunctions : ALL_REWARD_FUNCTIONS;
 
   // Return combined reward function with unified signature
-  return async (prompts: string[], completions: string[], answers: (string | null)[]): Promise<Float32Array> => {
-    // Apply all reward functions (which now take plain strings directly)
-    const allScores = await Promise.all(funcs.map((fn) => fn(prompts, completions, answers)));
-    const numCompletions = completions.length;
-    const combinedScores = new Float32Array(numCompletions);
+  return async (outputs: RewardOutput[]): Promise<Float32Array> => {
+    // Apply all reward functions with the structured outputs
+    const allScores = await Promise.all(funcs.map((fn) => fn(outputs)));
+    const numOutputs = outputs.length;
+    const combinedScores = new Float32Array(numOutputs);
 
     for (const scores of allScores) {
       const scoresArray = scores instanceof Float32Array ? Array.from(scores) : scores;
-      for (let i = 0; i < numCompletions; i++) {
+      for (let i = 0; i < numOutputs; i++) {
         combinedScores[i] += scoresArray[i];
       }
     }

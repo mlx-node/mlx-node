@@ -45,6 +45,8 @@ pub fn map_params_to_dict(
     let mut param_dict = HashMap::new();
 
     for (param, name) in params.iter().zip(param_names.iter()) {
+        // Use clone() not copy() - clone just increments Arc reference count (O(1))
+        // while copy() creates a full tensor copy with eval() (O(n))
         param_dict.insert(name.clone(), param.clone());
     }
 

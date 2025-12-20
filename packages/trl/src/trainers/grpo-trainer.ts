@@ -57,32 +57,35 @@ import {
   GrpoTrainingEngine,
   NativeRewardRegistry,
   Qwen3Model,
+  buildRewardOutputs,
   type GrpoEngineConfig,
   type EngineEpochMetrics,
   type BuiltinRewardConfig,
   type GenerateBatchResult as NativeGenerateBatchResult,
   type EngineStepMetrics,
+  type TrainStepResult,
+  type RewardOutput,
 } from '@mlx-node/core';
 
-import type { ChatMessage, DatasetExample } from '../types';
+import type { ChatMessage, DatasetExample, RewardFunction } from '../types';
 import { createTrainingLogger, type TrainingLogger } from './training-logger';
 
 // Re-export native types
 export { GrpoTrainingEngine, NativeRewardRegistry } from '@mlx-node/core';
-export type { GrpoEngineConfig, EngineStepMetrics, EngineEpochMetrics, BuiltinRewardConfig } from '@mlx-node/core';
+export type {
+  GrpoEngineConfig,
+  EngineStepMetrics,
+  EngineEpochMetrics,
+  BuiltinRewardConfig,
+  TrainStepResult,
+  RewardOutput,
+} from '@mlx-node/core';
 
 /**
- * Reward function type for custom rewards
- *
- * @param prompts - Prompt texts (one per completion)
- * @param completions - Generated completion texts
- * @param answers - Expected answers (for accuracy-based rewards), can be ignored
+ * Reward function type for custom rewards.
+ * Takes an array of RewardOutput objects with structured completion data.
  */
-export type RewardFn = (
-  prompts: string[],
-  completions: string[],
-  answers: (string | null)[],
-) => number[] | Float32Array | Promise<number[] | Float32Array>;
+export type RewardFn = RewardFunction;
 
 /**
  * Configuration for GRPOTrainer
@@ -111,6 +114,11 @@ export interface GRPOTrainerConfig {
 
   // Generation parameters
   maxNewTokens?: number;
+  /** Maximum completion length for training (autograd). Defaults to 1024.
+   * Completions longer than this are truncated before computing gradients.
+   * This is separate from maxNewTokens to allow generating long outputs
+   * while limiting memory usage during training. */
+  maxCompletionLengthForTraining?: number;
   temperature?: number;
   topP?: number;
   topK?: number;
@@ -166,6 +174,8 @@ export interface GenerateBatchResult {
   nativeResult: NativeGenerateBatchResult;
   /** Completion token counts (derived from nativeResult) */
   tokenCounts: number[];
+  /** Finish reasons for each completion ("eos", "length", or "repetition") */
+  finishReasons: string[];
 }
 
 /**
@@ -184,6 +194,7 @@ export const DEFAULT_GRPO_CONFIG: GRPOTrainerConfig = {
   lossType: 'grpo',
   advantageNormalization: true,
   maxNewTokens: 256,
+  maxCompletionLengthForTraining: 1024,
   temperature: 0.8,
   topP: 0.95,
   repetitionPenalty: 1.1,
@@ -225,6 +236,9 @@ export interface TrainStepMetrics {
  * Legacy type alias for backward compatibility
  */
 export type TrainingMetrics = TrainStepMetrics;
+
+// Note: RewardOutput is now built using the Rust buildRewardOutputs function
+// which handles tool call parsing and thinking extraction natively.
 
 /**
  * GRPO Trainer - Rust-Native Training Engine
@@ -290,6 +304,7 @@ export class GRPOTrainer {
       klCoef: this.config.klCoef,
       lossType: this.config.lossType,
       maxNewTokens: this.config.maxNewTokens,
+      maxCompletionLengthForTraining: this.config.maxCompletionLengthForTraining,
       temperature: this.config.temperature,
       topP: this.config.topP,
       topK: this.config.topK,
@@ -574,8 +589,10 @@ export class GRPOTrainer {
           completionTokens: [],
           completionLogprobs: [],
           completionLengths: [],
+          finishReasons: [],
         },
         tokenCounts: [],
+        finishReasons: [],
       };
     }
 
@@ -586,6 +603,7 @@ export class GRPOTrainer {
       completionTexts: nativeResult.completionTexts,
       nativeResult,
       tokenCounts: nativeResult.completionLengths,
+      finishReasons: nativeResult.finishReasons,
     };
   }
 
@@ -601,12 +619,16 @@ export class GRPOTrainer {
   }
 
   /**
-   * Score generations using the configured reward function (legacy API)
+   * Score generations using the configured reward function.
+   *
+   * Builds RewardOutput array with structured completion data and passes to reward function.
    *
    * @param prompts - Array of chat conversations
    * @param completions - Generated completion texts
    * @param answers - Expected answers (for accuracy rewards)
-   * @param groupSize - Number of completions per prompt
+   * @param groupSize - Number of completions per prompt (optional, defaults to config.groupSize)
+   * @param tokenCounts - Token counts for each completion (optional, defaults to 0s)
+   * @param finishReasons - Finish reasons from generation (optional, e.g. "eos", "length", "repetition")
    * @returns Promise<Float32Array> of reward scores
    */
   async scoreGenerations(
@@ -614,6 +636,8 @@ export class GRPOTrainer {
     completions: string[],
     answers: (string | null)[],
     groupSize?: number,
+    tokenCounts?: number[],
+    finishReasons?: string[],
   ): Promise<Float32Array> {
     const effectiveGroupSize = groupSize ?? this.config.groupSize ?? 4;
     const expectedCompletions = prompts.length * effectiveGroupSize;
@@ -628,23 +652,34 @@ export class GRPOTrainer {
       throw new Error('No reward function configured. Set rewardFunction in config or call setRewardFunction()');
     }
 
-    // Convert prompts to text format
-    const promptTexts = prompts.flatMap((msgs) =>
-      Array(effectiveGroupSize).fill(msgs.map((m) => `${m.role}: ${m.content}`).join('\n')),
-    );
+    // Convert ChatMessage[][] to string[] for Rust function
+    const promptTexts = prompts.map((msgs) => msgs.map((m) => `${m.role}: ${m.content}`).join('\n'));
 
-    // Expand answers to match completions
-    const expandedAnswers =
-      answers.length > 0
-        ? prompts.flatMap((_, i) => Array(effectiveGroupSize).fill(answers[i] ?? null))
-        : completions.map(() => null);
+    // Use provided token counts or default to 0
+    const effectiveTokenCounts = tokenCounts ?? completions.map(() => 0);
+
+    // Use provided finish reasons or default to empty (triggers inference fallback in Rust)
+    const effectiveFinishReasons = finishReasons ?? [];
+
+    // Build structured reward outputs using Rust function
+    const rewardOutputs = buildRewardOutputs(
+      promptTexts,
+      completions,
+      answers,
+      effectiveTokenCounts,
+      effectiveFinishReasons,
+      effectiveGroupSize,
+    );
 
     let rewards: number[] | Float32Array;
 
     if (this.rewardFn) {
-      rewards = await this.rewardFn(promptTexts, completions, expandedAnswers);
+      rewards = await this.rewardFn(rewardOutputs);
     } else {
-      rewards = this.scoreCompletions(promptTexts, completions);
+      // For built-in rewards, extract prompts and completions for legacy API
+      const promptStrings = rewardOutputs.map((o) => o.prompt);
+      const completionTexts = rewardOutputs.map((o) => o.completion.rawText);
+      rewards = this.scoreCompletions(promptStrings, completionTexts);
     }
 
     const rewardsArray = rewards instanceof Float32Array ? rewards : Float32Array.from(rewards);
@@ -665,62 +700,127 @@ export class GRPOTrainer {
    * 3. Trains using the SAME completions that were scored (no double-generation)
    *
    * @param prompts - Array of chat conversations
-   * @param answers - Expected answers (for legacy reward functions)
+   * @param answers - Expected answers (for reward functions)
    * @returns Training step metrics
    */
   async trainStep(prompts: ChatMessage[][], answers: (string | null)[]): Promise<TrainStepMetrics> {
-    // Generate completions with full data (tokens, logprobs)
-    const result = await this.generateBatch(prompts);
-    const completions = result.completionTexts;
-
-    // Compute rewards on the generated completions
-    const rewards = await this.scoreGenerations(prompts, completions, answers);
-
-    // Train using the SAME completions that were scored
-    // This fixes the double-generation bug where rewards were computed on
-    // different completions than what was used for training
-    const metrics = await this.engine.trainStepWithGenerations(prompts, Array.from(rewards), result.nativeResult);
-
-    this.currentStep++;
-
-    return {
-      ...metrics,
-      epoch: this.currentEpoch,
-    };
+    const { metrics } = await this.trainStepAuto(prompts, answers);
+    return metrics;
   }
 
   /**
    * Run a complete training step with automatic reward computation
    *
-   * 1. Generates completions with full token/logprob data
-   * 2. Computes rewards (using built-in or custom function)
-   * 3. Performs training update using the SAME completions
+   * This method combines generation, reward scoring, and training into a single
+   * Rust call, eliminating FFI overhead by keeping token data in Rust memory.
+   *
+   * 1. Generates completions with full token/logprob data (stays in Rust)
+   * 2. Calls JS reward function with RewardOutput[]
+   * 3. Performs training update using the in-memory data
    *
    * @param prompts - Array of chat conversations
-   * @param answers - Expected answers (for legacy reward functions)
+   * @param answers - Expected answers (for reward functions)
    * @returns Training metrics and generated completions
    */
   async trainStepAuto(
     prompts: ChatMessage[][],
     answers: (string | null)[] = [],
   ): Promise<{ metrics: TrainStepMetrics; completions: string[]; rewards: number[] }> {
-    // Generate completions with full data
-    const result = await this.generateBatch(prompts);
-    const completions = result.completionTexts;
+    if (!this.rewardFn && !this.engine.hasBuiltinRewards) {
+      throw new Error('No reward function configured. Set rewardFunction in config or call setRewardFunction()');
+    }
 
-    // Compute rewards
-    const rewardsArray = await this.scoreGenerations(prompts, completions, answers);
-    const rewards = Array.from(rewardsArray);
+    // Create reward callback that parses JSON and converts output to number[]
+    // The Rust side serializes Vec<RewardOutput> to JSON because complex nested types
+    // don't convert properly through ThreadsafeFunction
+    // Note: With CalleeHandled=true (default), callback receives (err, value) format
+    // Using ThreadsafeFunction<T, Promise<R>> pattern so Rust can await the Promise
+    const rewardCallback = async (err: Error | null, outputsJson: string): Promise<number[]> => {
+      if (err) {
+        throw new Error(`Reward callback error from Rust: ${err.message}`);
+      }
 
-    // Train using the SAME completions that were scored
-    const metrics = await this.engine.trainStepWithGenerations(prompts, rewards, result.nativeResult);
+      // Debug: log what we received
+      if (process.env.DEBUG_REWARDS) {
+        console.log('[rewardCallback] Received JSON length:', outputsJson?.length);
+      }
+
+      if (!outputsJson || outputsJson === 'null') {
+        throw new Error(`Invalid JSON received from Rust: ${outputsJson}`);
+      }
+      // Parse JSON and convert snake_case to camelCase for TypeScript compatibility
+      // Rust's serde serializes as snake_case but TypeScript expects camelCase
+      const rawOutputs = JSON.parse(outputsJson) as Array<{
+        prompt: string;
+        completion: {
+          text: string;
+          raw_text: string;
+          tool_calls: unknown[];
+          thinking: string | null;
+          num_tokens: number;
+          finish_reason: string;
+        };
+        expected_answer: string | null;
+      }>;
+
+      // Convert to RewardOutput format with proper camelCase properties
+      const outputs: RewardOutput[] = rawOutputs.map((o) => ({
+        prompt: o.prompt,
+        completion: {
+          text: o.completion.text,
+          rawText: o.completion.raw_text,
+          toolCalls: o.completion.tool_calls as RewardOutput['completion']['toolCalls'],
+          thinking: o.completion.thinking ?? undefined,
+          numTokens: o.completion.num_tokens,
+          finishReason: o.completion.finish_reason,
+        },
+        expectedAnswer: o.expected_answer ?? undefined,
+      }));
+
+      if (process.env.DEBUG_REWARDS) {
+        console.log('[rewardCallback] Parsed outputs count:', outputs.length);
+      }
+
+      let rewards: number[] | Float32Array;
+      if (this.rewardFn) {
+        if (process.env.DEBUG_REWARDS) {
+          console.log('[rewardCallback] Calling rewardFn...');
+        }
+        rewards = await this.rewardFn(outputs);
+        if (process.env.DEBUG_REWARDS) {
+          console.log('[rewardCallback] rewardFn returned:', rewards?.constructor?.name);
+        }
+      } else {
+        // Use built-in rewards
+        const promptStrings = outputs.map((o) => o.prompt);
+        const completionTexts = outputs.map((o) => o.completion.rawText);
+        rewards = this.scoreCompletions(promptStrings, completionTexts);
+      }
+
+      // Convert Float32Array to plain number[] for NAPI compatibility
+      let result: number[];
+      if (rewards instanceof Float32Array) {
+        result = Array.from(rewards, (v) => Number(v));
+      } else {
+        result = rewards.map((v) => Number(v));
+      }
+
+      if (process.env.DEBUG_REWARDS) {
+        console.log('[rewardCallback] Returning rewards:', result);
+      }
+
+      return result;
+    };
+
+    // Call unified Rust method - generation, scoring, and training in one FFI call
+    const result: TrainStepResult = await this.engine.trainStepAuto(prompts, answers, rewardCallback);
 
     this.currentStep++;
 
     return {
-      metrics: { ...metrics, epoch: this.currentEpoch },
-      completions,
-      rewards,
+      metrics: { ...result.metrics, epoch: this.currentEpoch },
+      completions: result.completions,
+      rewards: result.rewards,
     };
   }
 

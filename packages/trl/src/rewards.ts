@@ -1,27 +1,10 @@
 import { parseXmlCot, extractXmlAnswer } from './utils/xml-parser';
 import type { RewardFunction } from './types';
+import type { RewardOutput } from '@mlx-node/core';
 
-// Re-export the type for convenience
+// Re-export the types for convenience
 export type { RewardFunction } from './types';
-
-function assertConsistentLengths(prompts: string[], completions: string[], answers: (string | null)[]): void {
-  if (prompts.length !== completions.length) {
-    throw new Error(
-      `Expected prompts and completions to have equal length, got ${prompts.length} vs ${completions.length}.`,
-    );
-  }
-  if (!(answers.length === 1 || answers.length === completions.length)) {
-    throw new Error(
-      `Answers must contain either one shared value or align with completions. Received ${answers.length} entries for ${completions.length} completions.`,
-    );
-  }
-}
-
-function getAnswerForIndex(answers: (string | null)[], index: number): string | null {
-  if (answers.length === 0) return null;
-  if (answers.length === 1) return answers[0] ?? null;
-  return answers[index] ?? null;
-}
+export type { RewardOutput } from '@mlx-node/core';
 
 function normalizeAnswerValue(value: string | null | undefined): string | null {
   if (value == null) return null;
@@ -38,30 +21,29 @@ function normalizeAnswerValue(value: string | null | undefined): string | null {
   return trimmed;
 }
 
-export const correctnessReward: RewardFunction = (prompts, completions, answers) => {
-  assertConsistentLengths(prompts, completions, answers);
-  const scores: number[] = [];
-
-  completions.forEach((completion, index) => {
-    const answer = getAnswerForIndex(answers, index);
-    if (!answer) {
-      scores.push(0);
-      return;
+/**
+ * Reward for correct answers.
+ * Extracts answer from XML tags and compares with expected answer.
+ * Returns 2.0 for correct, 0.0 for incorrect.
+ */
+export const correctnessReward: RewardFunction = (outputs) => {
+  return outputs.map((output) => {
+    const expectedAnswer = output.expectedAnswer;
+    if (!expectedAnswer) {
+      return 0;
     }
 
-    const extractedAnswer = extractXmlAnswer(completion);
+    // Use rawText to preserve original XML structure for parsing
+    const extractedAnswer = extractXmlAnswer(output.completion.rawText);
 
-    const normalizedGold = normalizeAnswerValue(answer);
+    const normalizedGold = normalizeAnswerValue(expectedAnswer);
     const normalizedPrediction = normalizeAnswerValue(extractedAnswer);
 
     if (normalizedGold != null && normalizedPrediction === normalizedGold) {
-      scores.push(2.0);
-    } else {
-      scores.push(0.0);
+      return 2.0;
     }
+    return 0.0;
   });
-
-  return scores;
 };
 
 function isIntegerString(value: string | null): boolean {
@@ -74,26 +56,35 @@ function isIntegerString(value: string | null): boolean {
   return Number.isFinite(parsed);
 }
 
-export const integerReward: RewardFunction = (prompts, completions, answers) => {
-  assertConsistentLengths(prompts, completions, answers);
-  return completions.map((completion) => {
-    const parsed = extractXmlAnswer(completion);
+/**
+ * Reward for integer-formatted answers.
+ * Returns 0.5 if the extracted answer is a valid integer, 0.0 otherwise.
+ */
+export const integerReward: RewardFunction = (outputs) => {
+  return outputs.map((output) => {
+    const parsed = extractXmlAnswer(output.completion.rawText);
     return isIntegerString(parsed) ? 0.5 : 0.0;
   });
 };
 
-export const strictFormatReward: RewardFunction = (prompts, completions, answers) => {
-  assertConsistentLengths(prompts, completions, answers);
-  return completions.map((completion) => {
-    const result = parseXmlCot(completion);
+/**
+ * Reward for strict XML format adherence.
+ * Returns 0.5 if format matches strictly, 0.0 otherwise.
+ */
+export const strictFormatReward: RewardFunction = (outputs) => {
+  return outputs.map((output) => {
+    const result = parseXmlCot(output.completion.rawText);
     return result.isStrictMatch ? 0.5 : 0.0;
   });
 };
 
-export const softFormatReward: RewardFunction = (prompts, completions, answers) => {
-  assertConsistentLengths(prompts, completions, answers);
-  return completions.map((completion) => {
-    const result = parseXmlCot(completion);
+/**
+ * Reward for soft XML format adherence.
+ * Returns 0.5 if format matches loosely, 0.0 otherwise.
+ */
+export const softFormatReward: RewardFunction = (outputs) => {
+  return outputs.map((output) => {
+    const result = parseXmlCot(output.completion.rawText);
     return result.isSoftMatch ? 0.5 : 0.0;
   });
 };
@@ -114,9 +105,14 @@ function trailingCharactersAfterAnswer(content: string): number {
   return trailing.length;
 }
 
-export const xmlCountReward: RewardFunction = (prompts, completions, answers) => {
-  assertConsistentLengths(prompts, completions, answers);
-  return completions.map((completion) => {
+/**
+ * Reward for XML tag presence and penalize trailing content.
+ * +0.25 for <reasoning> tags, +0.25 for <answer> tags.
+ * -0.001 per character after </answer>.
+ */
+export const xmlCountReward: RewardFunction = (outputs) => {
+  return outputs.map((output) => {
+    const completion = output.completion.rawText;
     let score = 0.0;
     if (hasEnclosedTag(completion, '<reasoning>', '</reasoning>')) {
       score += 0.25;

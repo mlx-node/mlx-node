@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { GRPOTrainer } from '@mlx-node/trl';
+import { GRPOTrainer, type RewardOutput } from '@mlx-node/trl';
 import { createTempModel } from '../test-model-utils.js';
 
 describe('GRPO Async Reward Functions', () => {
@@ -23,14 +23,10 @@ describe('GRPO Async Reward Functions', () => {
   describe('Async Reward Function Support', () => {
     it('should work with async reward function', async () => {
       // Async reward function that simulates API call
-      const asyncRewardFn = async (
-        _prompts: string[],
-        completions: string[],
-        _answers: (string | null)[],
-      ): Promise<Float32Array> => {
+      const asyncRewardFn = async (outputs: RewardOutput[]): Promise<Float32Array> => {
         // Simulate async operation (e.g., API call)
         await new Promise((resolve) => setTimeout(resolve, 10));
-        return Float32Array.from(completions.map((c) => c.length / 100));
+        return Float32Array.from(outputs.map((o) => o.completion.rawText.length / 100));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -52,8 +48,8 @@ describe('GRPO Async Reward Functions', () => {
 
     it('should work with synchronous reward function (backward compatibility)', async () => {
       // Synchronous reward function
-      const syncRewardFn = (_prompts: string[], completions: string[], _answers: (string | null)[]): Float32Array => {
-        return Float32Array.from(completions.map((c) => c.length / 100));
+      const syncRewardFn = (outputs: RewardOutput[]): Float32Array => {
+        return Float32Array.from(outputs.map((o) => o.completion.rawText.length / 100));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -75,16 +71,12 @@ describe('GRPO Async Reward Functions', () => {
 
     it('should handle async reward function with parallel processing', async () => {
       // Async reward function that processes in parallel
-      const parallelRewardFn = async (
-        _prompts: string[],
-        completions: string[],
-        _answers: (string | null)[],
-      ): Promise<Float32Array> => {
+      const parallelRewardFn = async (outputs: RewardOutput[]): Promise<Float32Array> => {
         // Simulate parallel processing
         const rewards = await Promise.all(
-          completions.map(async (completion) => {
+          outputs.map(async (output) => {
             await new Promise((resolve) => setTimeout(resolve, 5));
-            return completion.length / 100;
+            return output.completion.rawText.length / 100;
           }),
         );
         return Float32Array.from(rewards);
@@ -109,13 +101,9 @@ describe('GRPO Async Reward Functions', () => {
 
     it('should execute training step with async reward function', async () => {
       // Async reward function
-      const asyncRewardFn = async (
-        _prompts: string[],
-        completions: string[],
-        _answers: (string | null)[],
-      ): Promise<Float32Array> => {
+      const asyncRewardFn = async (outputs: RewardOutput[]): Promise<Float32Array> => {
         await new Promise((resolve) => setTimeout(resolve, 5));
-        return Float32Array.from(completions.map(() => 1.0));
+        return Float32Array.from(outputs.map(() => 1.0));
       };
 
       const trainer = await GRPOTrainer.create({
@@ -139,16 +127,12 @@ describe('GRPO Async Reward Functions', () => {
 
     it('should handle async reward function that accesses answers', async () => {
       // Async reward function that uses answers
-      const answerAwareRewardFn = async (
-        _prompts: string[],
-        completions: string[],
-        answers: (string | null)[],
-      ): Promise<Float32Array> => {
+      const answerAwareRewardFn = async (outputs: RewardOutput[]): Promise<Float32Array> => {
         await new Promise((resolve) => setTimeout(resolve, 5));
 
-        const rewards = completions.map((completion, i) => {
-          const answer = answers[i];
-          if (answer && completion.includes(answer)) {
+        const rewards = outputs.map((output) => {
+          const answer = output.expectedAnswer;
+          if (answer && output.completion.rawText.includes(answer)) {
             return 1.0;
           }
           return 0.5;

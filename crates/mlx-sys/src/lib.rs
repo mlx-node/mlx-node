@@ -523,6 +523,11 @@ unsafe extern "C" {
     pub fn mlx_array_log2(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log1p(handle: *mut mlx_array) -> *mut mlx_array;
 
+    // NaN/Inf checking operations (GPU-native)
+    pub fn mlx_array_isnan(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_isinf(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_isfinite(handle: *mut mlx_array) -> *mut mlx_array;
+
     // Fast operations (mlx::fast namespace)
     pub fn mlx_fast_rope(
         handle: *mut mlx_array,
