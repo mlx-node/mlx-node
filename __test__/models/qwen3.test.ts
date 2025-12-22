@@ -149,13 +149,20 @@ describe.sequential('Qwen3 Model', () => {
       // After Rust migration, use getParameters() to access all model weights
       const model = new Qwen3Model(QWEN3_CONFIGS['qwen3-0.6b']);
       const params = model.getParameters();
+      const config = QWEN3_CONFIGS['qwen3-0.6b'];
 
       expect(params).toBeDefined();
       expect(typeof params).toBe('object');
 
-      // Should have key model parameters
-      expect(params['lm_head.weight']).toBeDefined();
+      // Should have embedding and final_norm (always present)
+      expect(params['embedding.weight']).toBeDefined();
       expect(params['final_norm.weight']).toBeDefined();
+
+      // lm_head.weight is only present when tieWordEmbeddings is false
+      // Qwen3-0.6b has tieWordEmbeddings: true, so lm_head.weight is NOT separate
+      if (!config.tieWordEmbeddings) {
+        expect(params['lm_head.weight']).toBeDefined();
+      }
 
       // Should have first layer attention parameters
       expect(params['layers.0.self_attn.q_proj.weight']).toBeDefined();
@@ -164,10 +171,10 @@ describe.sequential('Qwen3 Model', () => {
       expect(params['layers.0.self_attn.o_proj.weight']).toBeDefined();
 
       // Parameters should be MxArrays with proper shapes
-      const lmHeadWeight = params['lm_head.weight'];
-      expect(lmHeadWeight).toBeDefined();
-      const shape = lmHeadWeight.shape();
-      expect(shape.length).toBe(2); // [vocab_size, hidden_size]
+      const embeddingWeight = params['embedding.weight'];
+      expect(embeddingWeight).toBeDefined();
+      const embShape = embeddingWeight.shape();
+      expect(embShape.length).toBe(2); // [vocab_size, hidden_size]
     });
   });
 

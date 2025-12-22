@@ -15,6 +15,7 @@ pub mod nn;
 pub mod optimizers;
 pub mod param_manager;
 pub mod sampling;
+pub mod sft;
 pub mod stream;
 pub mod tensor;
 pub mod tokenizer;

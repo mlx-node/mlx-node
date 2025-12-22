@@ -939,7 +939,13 @@ impl Qwen3Model {
             "final_norm.weight".to_string(),
             self.final_norm.get_weight(),
         );
-        params.insert("lm_head.weight".to_string(), self.lm_head.get_weight());
+
+        // Only save lm_head.weight if tie_word_embeddings is false.
+        // When tie_word_embeddings=true, the embedding weight is used for logits
+        // (matches HuggingFace behavior where lm_head is not a separate parameter).
+        if !self.config.tie_word_embeddings {
+            params.insert("lm_head.weight".to_string(), self.lm_head.get_weight());
+        }
 
         params
     }
@@ -1649,6 +1655,10 @@ impl Qwen3Model {
     ///
     /// This performs a simple SGD update: param = param - lr * grad
     /// Only updates parameters that have gradients; others remain unchanged.
+    ///
+    /// IMPORTANT: This function preserves the original dtype of parameters.
+    /// The learning rate scalar is cast to match param dtype to prevent
+    /// promotion to float32 during arithmetic operations.
     #[napi]
     pub fn apply_gradients(
         &mut self,
@@ -1663,7 +1673,8 @@ impl Qwen3Model {
         let mut updated_params: HashMap<String, MxArray> = HashMap::new();
 
         // Create learning rate scalar once (empty shape for proper broadcasting)
-        let lr_scalar = MxArray::full(&[], Either::A(learning_rate), None)?;
+        // Start with f64, we'll cast it per-parameter to match dtype
+        let lr_scalar_f32 = MxArray::full(&[], Either::A(learning_rate), None)?;
 
         for (name, grad) in gradients.iter() {
             // Get the current parameter value
@@ -1674,10 +1685,25 @@ impl Qwen3Model {
                 )
             })?;
 
+            // Get original parameter dtype to preserve it
+            let param_dtype = param.dtype()?;
+
+            // Cast learning rate to match parameter dtype to prevent promotion to f32
+            let lr_scalar = lr_scalar_f32.astype(param_dtype)?;
+
             // param = param - lr * grad
             // Build computation graph lazily - let MLX fuse operations
             let scaled_grad = lr_scalar.mul(grad)?;
             let updated_param = param.sub(&scaled_grad)?;
+
+            // Ensure the updated parameter has the same dtype as the original
+            // (extra safety in case MLX promotes during arithmetic)
+            let updated_param = if updated_param.dtype()? != param_dtype {
+                updated_param.astype(param_dtype)?
+            } else {
+                updated_param
+            };
+
             updated_params.insert(name.clone(), updated_param);
         }
 

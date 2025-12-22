@@ -96,35 +96,49 @@ impl Losses {
                 };
 
                 // Handle ignore_index if provided
-                let final_loss = if let Some(ignore_idx) = ignore_index {
-                    // Create mask for valid targets
+                // Key fix: Normalize by valid token count, not total tokens
+                // This ensures correct gradient scale when most tokens are masked
+                let mean_loss = if let Some(ignore_idx) = ignore_index {
+                    // Create mask for valid targets (1 for valid, 0 for ignored)
                     let ignore_val = sys::mlx_array_scalar_int(ignore_idx);
                     let mask = sys::mlx_array_not_equal(targets.handle.0, ignore_val);
 
-                    // Apply mask
+                    // Apply mask: zero out ignored positions
                     let masked_loss = sys::mlx_array_mul(loss, mask);
+
+                    // Sum of masked losses
+                    let sum_loss = sys::mlx_array_sum(masked_loss, std::ptr::null(), 0, false);
+
+                    // Count of valid tokens
+                    let valid_count = sys::mlx_array_sum(mask, std::ptr::null(), 0, false);
+
+                    // Guard against divide-by-zero: use max(valid_count, 1.0)
+                    // When no valid tokens, sum_loss is already 0, so 0/1 = 0
+                    let one = sys::mlx_array_scalar_float(1.0);
+                    let safe_count = sys::mlx_array_maximum(valid_count, one);
+
+                    // Normalize: sum / count (not mean over all)
+                    let normalized_loss = sys::mlx_array_div(sum_loss, safe_count);
 
                     // Clean up
                     sys::mlx_array_delete(ignore_val);
                     sys::mlx_array_delete(mask);
+                    sys::mlx_array_delete(masked_loss);
+                    sys::mlx_array_delete(sum_loss);
+                    sys::mlx_array_delete(valid_count);
+                    sys::mlx_array_delete(one);
+                    sys::mlx_array_delete(safe_count);
 
-                    masked_loss
+                    normalized_loss
                 } else {
-                    loss
+                    sys::mlx_array_mean(loss, std::ptr::null(), 0, false)
                 };
-
-                // Compute mean loss
-                let mean_loss = sys::mlx_array_mean(final_loss, std::ptr::null(), 0, false);
 
                 // Clean up intermediates
                 sys::mlx_array_delete(logsumexp_logits);
                 sys::mlx_array_delete(expanded_targets);
                 sys::mlx_array_delete(gathered);
                 sys::mlx_array_delete(score);
-
-                if ignore_index.is_some() {
-                    sys::mlx_array_delete(final_loss);
-                }
                 sys::mlx_array_delete(loss);
 
                 mean_loss

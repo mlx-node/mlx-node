@@ -35,7 +35,7 @@ import {
 } from '@mlx-node/trl';
 import { generateCurriculumDataset, type AstGrepPattern } from './ast-grep-dataset';
 
-const DEFAULT_MODEL_PATH = resolve(process.cwd(), '.cache', 'models', 'qwen3-0.6b-mlx-bf16');
+const DEFAULT_MODEL_PATH = resolve(process.cwd(), 'outputs/sft-ast-grep/final-bf16');
 const DEFAULT_NUM_EXAMPLES = 100;
 const DEFAULT_OUTPUT_DIR = resolve(process.cwd(), 'outputs', 'grpo-tool-use');
 
@@ -134,7 +134,11 @@ ${pattern.codeContext}
  * Get the language enum for ast-grep
  */
 function getLang(language: string): Lang {
-  return language === 'typescript' ? Lang.TypeScript : Lang.JavaScript;
+  const normalized = language.toLowerCase();
+  if (normalized === 'typescript' || normalized === 'ts') return Lang.TypeScript;
+  if (normalized === 'tsx') return Lang.Tsx;
+  if (normalized === 'jsx') return Lang.JavaScript;
+  return Lang.JavaScript;
 }
 
 /**
