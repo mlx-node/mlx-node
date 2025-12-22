@@ -622,3 +622,5 @@ module.exports.parseToolCallsFromText = nativeBinding.parseToolCallsFromText
 module.exports.scaledDotProductAttention = nativeBinding.scaledDotProductAttention
 module.exports.scaledDotProductAttentionCausal = nativeBinding.scaledDotProductAttentionCausal
 module.exports.selectiveLogSoftmax = nativeBinding.selectiveLogSoftmax
+module.exports.ContinuousBatchingScheduler = nativeBinding.ContinuousBatchingScheduler
+module.exports.PagedKVCache = nativeBinding.PagedKVCache

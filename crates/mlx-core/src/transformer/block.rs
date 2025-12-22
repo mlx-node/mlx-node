@@ -1,8 +1,9 @@
 use crate::array::MxArray;
 use crate::nn::RMSNorm;
-use crate::transformer::attention::Attention;
+use crate::transformer::attention::{Attention, QKVResult};
 use crate::transformer::kv_cache::KVCache;
 use crate::transformer::mlp::MLP;
+use crate::transformer::paged_attention::PagedAttentionLayer;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -180,6 +181,144 @@ impl TransformerBlock {
         let out = h.add(&mlp_out)?; // Residual connection
 
         Ok(out)
+    }
+
+    /// Forward pass with paged attention.
+    ///
+    /// This method uses paged KV cache for memory-efficient inference with
+    /// variable-length sequences and continuous batching.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor, shape: [batch, seq_len, hidden_size]
+    /// * `paged_layer` - PagedAttentionLayer for paged cache operations
+    /// * `layer_idx` - Index of this layer in the model
+    /// * `slot_mapping` - Slot indices for cache updates, shape: [num_tokens]
+    /// * `block_tables` - Block table mapping sequences to cache blocks
+    /// * `context_lens` - Context length for each sequence
+    /// * `rope_offset` - RoPE position offset (for incremental generation)
+    ///
+    /// # Returns
+    /// Output tensor, shape: [num_seqs, 1, hidden_size] for decode
+    pub fn forward_paged(
+        &self,
+        x: &MxArray, // [num_seqs, 1, hidden_size] for decode
+        paged_layer: &PagedAttentionLayer,
+        layer_idx: u32,
+        slot_mapping: &MxArray,
+        block_tables: &MxArray,
+        context_lens: &MxArray,
+        positions: &MxArray, // [num_seqs] - per-sequence RoPE positions
+    ) -> Result<MxArray> {
+        let num_seqs = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+
+        // 1. Input layer norm
+        let normed = self.input_layernorm.forward(x)?;
+
+        // 2. Compute Q, K, V with per-sequence RoPE applied
+        let qkv = self
+            .self_attn
+            .compute_qkv_paged_decode(&normed, positions)?;
+
+        // 3. Update paged cache with K, V
+        paged_layer
+            .update_cache(layer_idx, &qkv.keys, &qkv.values, slot_mapping)
+            .map_err(napi::Error::from_reason)?;
+
+        // 4. Run paged attention
+        let scale = self.self_attn.get_scale();
+        let attn_output = paged_layer
+            .forward(&qkv.queries, block_tables, context_lens, scale, layer_idx)
+            .map_err(napi::Error::from_reason)?;
+
+        // 5. Output projection
+        let attn_out = self
+            .self_attn
+            .output_projection(&attn_output, num_seqs, seq_len)?;
+
+        // 6. Residual connection
+        let h = x.add(&attn_out)?;
+
+        // 7. MLP with pre-norm and residual
+        let normed = self.post_attention_layernorm.forward(&h)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        let out = h.add(&mlp_out)?;
+
+        Ok(out)
+    }
+
+    /// Compute Q, K, V for this layer's attention.
+    ///
+    /// This is useful for manually controlling paged attention updates.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor, shape: [batch, seq_len, hidden_size]
+    /// * `rope_offset` - RoPE position offset
+    ///
+    /// # Returns
+    /// QKVResult with queries, keys, values
+    pub fn compute_qkv(&self, x: &MxArray, rope_offset: i32) -> Result<QKVResult> {
+        let normed = self.input_layernorm.forward(x)?;
+        self.self_attn.compute_qkv(&normed, rope_offset)
+    }
+
+    /// Forward pass for prefill that returns K/V pairs.
+    ///
+    /// This is used for prefill in paged attention mode. It runs standard
+    /// attention (not paged) and returns the K/V pairs so they can be written
+    /// to the paged cache after the forward pass.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor, shape: [1, seq_len, hidden_size]
+    ///
+    /// # Returns
+    /// Tuple of (output, keys, values) where:
+    /// - output: [1, seq_len, hidden_size]
+    /// - keys: [seq_len, num_kv_heads, head_dim]
+    /// - values: [seq_len, num_kv_heads, head_dim]
+    pub fn forward_for_prefill(&self, x: &MxArray) -> Result<(MxArray, MxArray, MxArray)> {
+        // 1. Self-attention with pre-norm and residual
+        // Use rope_offset=0 for prefill (positions start from 0)
+        let normed = self.input_layernorm.forward(x)?;
+        let qkv = self.self_attn.compute_qkv(&normed, 0)?;
+
+        // 2. Reshape Q/K/V from paged format to attention format
+        // Paged format: [num_tokens, n_heads, head_dim]
+        // Attention format: [batch, n_heads, seq_len, head_dim]
+        // For prefill: batch=1, num_tokens=seq_len
+        let seq_len = qkv.queries.shape_at(0)?;
+        let n_heads = qkv.queries.shape_at(1)?;
+        let n_kv_heads = qkv.keys.shape_at(1)?;
+        let head_dim = qkv.queries.shape_at(2)?;
+
+        // Reshape: [seq_len, n_heads, head_dim] -> [1, seq_len, n_heads, head_dim]
+        let q_reshaped = qkv.queries.reshape(&[1, seq_len, n_heads, head_dim])?;
+        let k_reshaped = qkv.keys.reshape(&[1, seq_len, n_kv_heads, head_dim])?;
+        let v_reshaped = qkv.values.reshape(&[1, seq_len, n_kv_heads, head_dim])?;
+
+        // Transpose: [1, seq_len, n_heads, head_dim] -> [1, n_heads, seq_len, head_dim]
+        let q_attn = q_reshaped.transpose(Some(&[0, 2, 1, 3]))?;
+        let k_attn = k_reshaped.transpose(Some(&[0, 2, 1, 3]))?;
+        let v_attn = v_reshaped.transpose(Some(&[0, 2, 1, 3]))?;
+
+        // 3. Run attention with pre-computed Q/K/V (avoids redundant computation)
+        // Use causal masking for prefill (seq_len > 1)
+        let attn_out = self
+            .self_attn
+            .forward_with_qkv(&q_attn, &k_attn, &v_attn, true)?;
+        let h = x.add(&attn_out)?; // Residual connection
+
+        // 4. MLP with pre-norm and residual
+        let normed = self.post_attention_layernorm.forward(&h)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        let out = h.add(&mlp_out)?; // Residual connection
+
+        Ok((out, qkv.keys, qkv.values))
+    }
+
+    /// Get attention scale factor
+    pub fn get_attn_scale(&self) -> f64 {
+        self.self_attn.get_scale()
     }
 
     /// Debug method: Forward pass with intermediate states captured

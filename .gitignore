@@ -183,6 +183,7 @@ mlx-lm
 transformers
 mlx-rs
 /trl/
+/mistral.rs/
 
 outputs
 test-output

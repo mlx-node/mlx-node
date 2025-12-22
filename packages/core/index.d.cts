@@ -115,6 +115,22 @@ export declare class Attention {
    * Output tensor, shape: (batch, seq_len, hidden_size)
    */
   forward(x: MxArray, mask?: MxArray | undefined | null, cache?: KVCache | undefined | null): MxArray
+  /**
+   * Forward pass with pre-computed Q/K/V tensors.
+   *
+   * This method skips the Q/K/V computation and uses provided tensors directly.
+   * Useful for paged attention prefill where Q/K/V are already computed for cache.
+   *
+   * # Arguments
+   * * `queries` - Pre-computed Q tensor, shape: (batch, n_heads, seq_len, head_dim)
+   * * `keys` - Pre-computed K tensor, shape: (batch, n_kv_heads, kv_len, head_dim)
+   * * `values` - Pre-computed V tensor, shape: (batch, n_kv_heads, kv_len, head_dim)
+   * * `use_causal` - Whether to use causal masking
+   *
+   * # Returns
+   * Output tensor, shape: (batch, seq_len, hidden_size)
+   */
+  forwardWithQkv(queries: MxArray, keys: MxArray, values: MxArray, useCausal: boolean): MxArray
   /** Debug method: Forward pass with intermediate Q/K/V states captured */
   forwardDebug(x: MxArray, mask?: MxArray | undefined | null, cache?: KVCache | undefined | null): Record<string, MxArray>
   setQProjWeight(weight: MxArray): void
@@ -764,6 +780,7 @@ export declare class MLP {
 
 export declare class MxArray {
   static fromInt32(data: Int32Array, shape: BigInt64Array): MxArray
+  static fromInt64(data: BigInt64Array, shape: BigInt64Array): MxArray
   static fromUint32(data: Uint32Array, shape: BigInt64Array): MxArray
   static fromFloat32(data: Float32Array, shape: BigInt64Array): MxArray
   static zeros(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray
@@ -1024,6 +1041,20 @@ export declare class Qwen3Model {
    * Clears cached key-value states. Call this between different generation sequences.
    */
   resetKvCaches(): void
+  /** Check if paged attention is enabled for this model */
+  hasPagedAttention(): boolean
+  /**
+   * Get paged attention memory statistics (if enabled)
+   *
+   * Returns memory usage statistics for the paged KV cache.
+   */
+  pagedCacheStats(): PagedCacheStats | null
+  /**
+   * Get scheduler statistics (if paged attention is enabled)
+   *
+   * Returns the number of waiting, running, and completed sequences.
+   */
+  schedulerStats(): SchedulerStatsNapi | null
   /**
    * Forward pass with KV caching for incremental generation
    *
@@ -1035,6 +1066,85 @@ export declare class Qwen3Model {
    * * Logits, shape: [batch_size, seq_len, vocab_size]
    */
   forwardWithCache(inputIds: MxArray, useCache: boolean): MxArray
+  /**
+   * Forward pass with paged attention for memory-efficient inference.
+   *
+   * This method uses block-based KV cache management for:
+   * - Variable-length sequences with efficient memory usage
+   * - Continuous batching with dynamic batch composition
+   * - Long context support beyond GPU memory limits
+   *
+   * # Arguments
+   * * `input_ids` - Token IDs, shape: [batch_size, seq_len]
+   * * `slot_mapping` - Slot indices for cache updates, shape: [batch_size * seq_len]
+   * * `block_tables` - Block table for each sequence, shape: [batch_size, max_blocks]
+   * * `context_lens` - Context length for each sequence, shape: [batch_size]
+   * * `positions` - Token positions for RoPE, shape: [batch_size] (position of first token in each seq)
+   *
+   * # Returns
+   * * Logits, shape: [num_seqs, 1, vocab_size] for decode
+   */
+  forwardPaged(inputIds: MxArray, slotMapping: MxArray, blockTables: MxArray, contextLens: MxArray, positions: MxArray): MxArray
+  /**
+   * Prefill a sequence using standard attention and write K/V to paged cache.
+   *
+   * This method should be called before `step_paged_generation()` for each
+   * new prompt. It runs the full forward pass using standard attention
+   * (which is faster for long sequences), then writes the K/V cache to
+   * the paged cache for subsequent decode steps.
+   *
+   * # Arguments
+   * * `prompt_tokens` - Token IDs for the prompt (as u32 array)
+   * * `seq_id` - Sequence ID (obtained from scheduler)
+   *
+   * # Returns
+   * * Logits for the last token, shape: [1, vocab_size]
+   */
+  prefillPaged(promptTokens: Array<number>, seqId: number): MxArray
+  /**
+   * Add a request to the paged attention scheduler.
+   *
+   * The scheduler queues requests and allocates blocks for KV cache.
+   * Use `step_paged_generation()` to process the scheduled batch.
+   *
+   * Note: The actual sequence ID is assigned during scheduling, not when the
+   * request is added. Use the `request_id` to track your requests through
+   * the generation process.
+   *
+   * # Arguments
+   * * `request_id` - Unique identifier for the request (returned in outputs)
+   * * `prompt_tokens` - Token IDs for the prompt
+   * * `max_new_tokens` - Maximum new tokens to generate
+   * * `priority` - Optional priority (higher = scheduled first)
+   *
+   * # Returns
+   * * Number of pending requests in the queue
+   */
+  addPagedRequest(requestId: string, promptTokens: Array<number>, maxNewTokens: number, priority?: number | undefined | null): number
+  /**
+   * Schedule and execute one step of paged generation.
+   *
+   * This method:
+   * 1. Schedules the next batch of sequences
+   * 2. Runs forward pass with paged attention
+   * 3. Samples next tokens
+   * 4. Returns the generated tokens for each sequence
+   *
+   * # Arguments
+   * * `config` - Generation configuration (temperature, top_k, etc.)
+   *
+   * # Returns
+   * * `PagedGenerationStep` with token outputs for each sequence
+   */
+  stepPagedGeneration(config?: GenerationConfig | undefined | null): PagedGenerationStep | null
+  /**
+   * Get completed sequences from the scheduler.
+   *
+   * Call this after `step_paged_generation()` returns outputs with `is_finished: true`.
+   */
+  getCompletedSequences(): Array<PagedCompletedSequence>
+  /** Check if the scheduler has pending work. */
+  hasPagedWork(): boolean
   /** Get model configuration */
   getConfig(): Qwen3Config
   /** Count total number of parameters in the model */
@@ -1795,43 +1905,6 @@ export declare class TransformerBlock {
   setPostAttentionLayernormWeight(weight: MxArray): void
 }
 
-/** Configuration for batch generation */
-export interface BatchGenerationConfig {
-  /** Maximum number of new tokens to generate */
-  maxNewTokens?: number
-  /** Sampling temperature (default: 1.0) */
-  temperature?: number
-  /** Top-k sampling (default: 0 = disabled) */
-  topK?: number
-  /** Top-p sampling (default: 1.0 = disabled) */
-  topP?: number
-  /** Min-p sampling (default: 0.0 = disabled) */
-  minP?: number
-  /** EOS token ID(s) - generation stops when any of these is generated */
-  eosTokenIds?: Array<number>
-  /** Pad token ID for padding shorter sequences */
-  padTokenId?: number
-}
-
-/** Result from batch text generation */
-export interface BatchGenerationResult {
-  /**
-   * Generated token IDs for each sequence
-   * Flattened array: tokens for sequence i start at index i * max_gen_len
-   * Padded with -1 for sequences that finished early
-   */
-  tokensFlat: Array<number>
-  /** Shape of tokens array [batch_size, max_gen_len] */
-  tokensShape: Array<number>
-  /**
-   * Finish reason for each sequence
-   * "eos" if stopped by EOS token, "length" if hit max_tokens
-   */
-  finishReasons: Array<string>
-  /** Number of tokens generated for each sequence */
-  numTokens: Array<number>
-}
-
 /**
  * Build RewardOutput array from generation results.
  *
@@ -2420,6 +2493,56 @@ export declare function padFloatSequences(sequences: Array<MxArray>, padValue: n
  */
 export declare function padSequences(sequences: Array<MxArray>, padValue: number): PaddedSequences
 
+/** Paged attention memory statistics (NAPI-compatible) */
+export interface PagedCacheStats {
+  /** Total number of blocks in the pool */
+  totalBlocks: number
+  /** Number of free blocks */
+  freeBlocks: number
+  /** Number of allocated blocks */
+  allocatedBlocks: number
+  /** Total memory in MB */
+  totalMemoryMb: number
+  /** Used memory in MB */
+  usedMemoryMb: number
+  /** Utilization percentage */
+  utilizationPercent: number
+}
+
+/** A completed sequence from paged generation */
+export interface PagedCompletedSequence {
+  /** Original request ID */
+  requestId: string
+  /** All generated tokens (excluding prompt) */
+  tokens: Array<number>
+  /** Reason for completion ("eos", "max_tokens", etc.) */
+  finishReason: string
+}
+
+/** Result of a paged generation step */
+export interface PagedGenerationStep {
+  /** Token outputs for each sequence in the batch */
+  outputs: Array<PagedTokenOutput>
+  /** Number of sequences that were in prefill phase */
+  numPrefill: number
+  /** Number of sequences that were in decode phase */
+  numDecode: number
+}
+
+/** Output from a single token generation step in paged attention */
+export interface PagedTokenOutput {
+  /** Sequence ID in the scheduler */
+  seqId: number
+  /** Request ID for this sequence */
+  requestId: string
+  /** Generated token ID */
+  token: number
+  /** Log probability of the token (f64 for NAPI compatibility) */
+  logprob: number
+  /** Whether this sequence has finished */
+  isFinished: boolean
+}
+
 /**
  * Parse tool calls from text (NAPI export)
  *
@@ -2463,6 +2586,29 @@ export interface Qwen3Config {
   padTokenId: number
   eosTokenId: number
   bosTokenId: number
+  /**
+   * Enable paged attention for memory-efficient inference.
+   * Default: false (use standard KVCache)
+   */
+  usePagedAttention?: boolean | undefined
+  /**
+   * GPU memory budget for paged KV cache in megabytes.
+   * Only used when use_paged_attention is true.
+   * Default: 2048 (2GB)
+   */
+  pagedCacheMemoryMb?: number | undefined
+  /**
+   * Block size for paged attention (tokens per block).
+   * Only used when use_paged_attention is true.
+   * Default: 16
+   */
+  pagedBlockSize?: number | undefined
+  /**
+   * Use FP8 cache for 2x memory reduction (experimental).
+   * Only used when use_paged_attention is true.
+   * Default: false
+   */
+  useFp8Cache?: boolean | undefined
 }
 
 /** Result of resume position computation */
@@ -2537,6 +2683,22 @@ export declare function scaledDotProductAttention(queries: MxArray, keys: MxArra
  * Attention output with same shape as values
  */
 export declare function scaledDotProductAttentionCausal(queries: MxArray, keys: MxArray, values: MxArray, scale: number): MxArray
+
+/** Scheduler statistics (NAPI-compatible) */
+export interface SchedulerStatsNapi {
+  /** Number of requests waiting to be scheduled */
+  numWaiting: number
+  /** Number of sequences currently running */
+  numRunning: number
+  /** Number of completed sequences */
+  numCompleted: number
+  /** Number of sequences in prefill phase */
+  numPrefill: number
+  /** Number of sequences in decode phase */
+  numDecode: number
+  /** Total tokens across all running sequences */
+  totalRunningTokens: number
+}
 
 /**
  * Compute selective log-softmax: extract log P(token_i | context) for selected tokens only
@@ -2654,4 +2816,288 @@ export interface TrainStepResult {
   completions: Array<string>
   /** Computed reward values (for TUI logging) */
   rewards: Array<number>
+}
+/**
+ * Continuous Batching Scheduler
+ *
+ * Manages dynamic batch composition for efficient LLM serving.
+ * Handles request queuing, memory allocation, and sequence lifecycle.
+ */
+export declare class ContinuousBatchingScheduler {
+  /**
+   * Create a new scheduler
+   *
+   * # Arguments
+   * * `block_size` - Block size from PagedKVCache config
+   * * `config` - Scheduler configuration
+   */
+  constructor(blockSize: number, config?: SchedulerConfig | undefined | null)
+  /** Add a new request to the waiting queue */
+  addRequest(request: PendingRequest): void
+  /**
+   * Schedule the next step
+   *
+   * Returns a batch of sequences to process, or None if nothing to do.
+   * Allocates memory for new sequences from the waiting queue.
+   *
+   * # Arguments
+   * * `cache` - PagedKVCache for memory allocation
+   */
+  scheduleStep(cache: PagedKVCache): ScheduledBatch | null
+  /**
+   * Process token outputs from a forward pass
+   *
+   * Updates sequence state and handles completion.
+   *
+   * # Arguments
+   * * `outputs` - Token outputs for each sequence
+   * * `cache` - PagedKVCache for memory management
+   */
+  processOutputs(outputs: Array<TokenOutput>, cache: PagedKVCache): void
+  /** Get and clear completed sequences */
+  getCompleted(): Array<CompletedSequence>
+  /** Check if there's any work to do */
+  isEmpty(): boolean
+  /** Check if there are completed sequences to retrieve */
+  hasCompleted(): boolean
+  /** Get number of waiting requests */
+  numWaiting(): number
+  /** Get number of running sequences */
+  numRunning(): number
+  /** Get number of completed sequences */
+  numCompleted(): number
+  /**
+   * Abort a request by ID
+   *
+   * Removes from waiting queue or running list and frees memory.
+   */
+  abortRequest(requestId: string, cache: PagedKVCache): boolean
+  /** Get statistics about current scheduler state */
+  getStats(): SchedulerStats
+}
+
+/**
+ * PagedKVCache for efficient KV cache management
+ *
+ * Uses block-based memory allocation inspired by OS virtual memory,
+ * achieving near-zero memory waste compared to traditional pre-allocated caches.
+ *
+ * ## Example
+ * ```typescript
+ * const cache = new PagedKVCache({
+ *   blockSize: 32,
+ *   gpuMemoryMb: 4096,
+ *   headSize: 128,
+ *   numKvHeads: 4,
+ *   numLayers: 28,
+ * });
+ *
+ * // Add a sequence
+ * const seqId = cache.addSequence(100); // 100-token prompt
+ *
+ * // Generate tokens
+ * for (let i = 0; i < maxTokens; i++) {
+ *   // Update cache with new K/V
+ *   cache.update(layerIdx, keys, values);
+ *
+ *   // Run paged attention
+ *   const output = cache.attention(layerIdx, queries, scale);
+ * }
+ *
+ * // Remove when done
+ * cache.removeSequence(seqId);
+ * ```
+ */
+export declare class PagedKVCache {
+  /**
+   * Create a new PagedKVCache
+   *
+   * # Arguments
+   * * `config` - Configuration for the paged attention system
+   */
+  constructor(config: PagedAttentionConfig)
+  /**
+   * Add a new sequence to the cache
+   *
+   * # Arguments
+   * * `prompt_len` - Number of tokens in the prompt
+   *
+   * # Returns
+   * * Sequence ID for future operations
+   */
+  addSequence(promptLen: number): number
+  /**
+   * Remove a sequence from the cache
+   *
+   * Frees all blocks associated with the sequence.
+   *
+   * # Arguments
+   * * `seq_id` - Sequence ID to remove
+   */
+  removeSequence(seqId: number): void
+  /**
+   * Check if we can allocate blocks for a new sequence
+   *
+   * # Arguments
+   * * `num_blocks` - Number of blocks needed
+   *
+   * # Returns
+   * * true if allocation is possible
+   */
+  canAllocate(numBlocks: number): boolean
+  /** Get the number of active sequences */
+  numSequences(): number
+  /** Get the number of free blocks */
+  numFreeBlocks(): number
+  /** Get the total number of blocks */
+  totalBlocks(): number
+  /** Get context lengths for all sequences */
+  getContextLens(): Array<number>
+  /** Get sequence IDs */
+  getSeqIds(): Array<number>
+  /** Get the block size */
+  getBlockSize(): number
+  /**
+   * Extend a sequence with additional tokens
+   * Allocates new blocks if needed
+   */
+  extendSequence(seqId: number, numNewTokens: number): void
+  /** Get memory usage statistics */
+  getMemoryStats(): MemoryStats
+}
+
+/** Result for a completed sequence */
+export interface CompletedSequence {
+  /** Original request ID */
+  requestId: string
+  /** All generated tokens */
+  generatedTokens: Array<number>
+  /** Finish reason: "stop", "length", or "error" */
+  finishReason: string
+  /** Total tokens (prompt + generated) */
+  totalTokens: number
+}
+
+/** Memory usage statistics */
+export interface MemoryStats {
+  /** Total number of blocks in the pool */
+  totalBlocks: number
+  /** Number of free blocks */
+  freeBlocks: number
+  /** Number of allocated blocks */
+  allocatedBlocks: number
+  /** Total memory in MB */
+  totalMemoryMb: number
+  /** Used memory in MB */
+  usedMemoryMb: number
+  /** Utilization percentage */
+  utilizationPercent: number
+}
+
+/** Configuration for PagedAttention */
+export interface PagedAttentionConfig {
+  /**
+   * Block size in tokens (8, 16, or 32)
+   * Default: 32
+   */
+  blockSize: number
+  /**
+   * Total GPU memory for KV cache in MB
+   * Default: 4096 (4GB)
+   */
+  gpuMemoryMb: number
+  /** Head size (must match model: 64, 80, 96, 112, 120, 128, 192, or 256) */
+  headSize: number
+  /** Number of KV heads (for GQA, typically < num_query_heads) */
+  numKvHeads: number
+  /** Number of transformer layers */
+  numLayers: number
+  /**
+   * Whether to use FP8 quantization for cache
+   * Reduces memory by ~50% with minimal quality loss
+   * Default: false
+   */
+  useFp8Cache?: boolean
+  /**
+   * Maximum sequence length supported
+   * Default: 8192
+   */
+  maxSeqLen?: number
+  /**
+   * Maximum batch size for continuous batching
+   * Default: 256
+   */
+  maxBatchSize?: number
+}
+
+/** A pending request waiting to be scheduled */
+export interface PendingRequest {
+  /** Unique request identifier */
+  requestId: string
+  /** Prompt token IDs */
+  promptTokens: Array<number>
+  /** Maximum new tokens to generate */
+  maxNewTokens: number
+  /** Optional: priority (higher = scheduled first) */
+  priority?: number
+}
+
+/** Output from scheduling a step */
+export interface ScheduledBatch {
+  /** Sequence IDs in this batch */
+  seqIds: Array<number>
+  /** Request IDs corresponding to each sequence */
+  requestIds: Array<string>
+  /** Input token IDs for each sequence (prompt for prefill, last token for decode) */
+  inputTokens: Array<Array<number>>
+  /** Whether each sequence is in prefill phase */
+  isPrefill: Array<boolean>
+  /** Context lengths for each sequence */
+  contextLens: Array<number>
+  /** Total number of tokens in this batch (for memory planning) */
+  totalTokens: number
+  /** Number of prefill sequences */
+  numPrefill: number
+  /** Number of decode sequences */
+  numDecode: number
+}
+
+/** Scheduler configuration */
+export interface SchedulerConfig {
+  /** Maximum sequences in a batch */
+  maxBatchSize: number
+  /** Maximum tokens per scheduling step (prefill + decode combined) */
+  maxTokensPerStep?: number
+  /** Maximum number of prefill sequences per step (to balance latency) */
+  maxPrefillPerStep?: number
+  /** Whether to prioritize decode over prefill (reduces latency for active sequences) */
+  prioritizeDecode?: boolean
+  /** EOS token ID for stopping generation */
+  eosTokenId?: number
+}
+
+/** Scheduler statistics */
+export interface SchedulerStats {
+  /** Number of requests in waiting queue */
+  numWaiting: number
+  /** Number of running sequences */
+  numRunning: number
+  /** Number of completed sequences */
+  numCompleted: number
+  /** Number of sequences in prefill phase */
+  numPrefill: number
+  /** Number of sequences in decode phase */
+  numDecode: number
+  /** Total tokens across all running sequences */
+  totalRunningTokens: number
+}
+
+/** Token output for processing */
+export interface TokenOutput {
+  /** Sequence ID */
+  seqId: number
+  /** Generated token */
+  token: number
+  /** Whether this token is an EOS token */
+  isEos: boolean
 }

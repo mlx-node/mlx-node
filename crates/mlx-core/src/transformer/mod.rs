@@ -15,13 +15,19 @@ pub mod block;
 pub mod fused_attention;
 pub mod kv_cache;
 pub mod mlp;
+pub mod paged_attention;
 pub mod rotating_kv_cache;
 
 // Re-export all public types
-pub use attention::Attention;
+pub use attention::{Attention, QKVResult};
 pub use batch_kv_cache::BatchKVCache;
 pub use block::TransformerBlock;
 pub use fused_attention::FusedAttention;
 pub use kv_cache::KVCache;
 pub use mlp::MLP;
+pub use paged_attention::{
+    CompletedSequence, ContinuousBatchingScheduler, MemoryStats, PagedAttentionConfig,
+    PagedAttentionLayer, PagedKVCache, PendingRequest, ScheduledBatch, SchedulerConfig,
+    SchedulerStats, TokenOutput,
+};
 pub use rotating_kv_cache::RotatingKVCache;

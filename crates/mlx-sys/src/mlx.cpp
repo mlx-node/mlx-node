@@ -7,6 +7,9 @@
 #include "mlx/compile.h"
 #include "mlx/backend/metal/metal.h"
 
+// Paged attention Metal kernel source (for future GPU dispatch)
+#include "paged_attn_kernels.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -302,6 +305,14 @@ mlx_array* mlx_array_from_int32(const int32_t* data,
                                 size_t ndim) {
   Shape target_shape = make_shape(shape, ndim);
   auto arr = new mlx::core::array(data, target_shape, mlx::core::int32);
+  return reinterpret_cast<mlx_array*>(arr);
+}
+
+mlx_array* mlx_array_from_int64(const int64_t* data,
+                                const int64_t* shape,
+                                size_t ndim) {
+  Shape target_shape = make_shape(shape, ndim);
+  auto arr = new mlx::core::array(data, target_shape, mlx::core::int64);
   return reinterpret_cast<mlx_array*>(arr);
 }
 
@@ -3750,6 +3761,577 @@ void mlx_qwen3_forward_step(
         out_cache_offsets[i] = cache_offsets[i];
         out_cache_capacities[i] = cache_capacities[i];
     }
+}
+
+// ============================================================================
+// PagedAttention Implementation
+// ============================================================================
+
+// Metal kernel dispatch helpers
+// NOTE: Full Metal dispatch requires integrating with MLX's Metal build system.
+// The kernel source is available in paged_attn_kernels.h for future use.
+// For now, we use MLX's lazy evaluation which runs on GPU automatically.
+
+namespace paged_attn_metal {
+
+// Check if Metal is available (for logging/debugging)
+static bool is_metal_available() {
+    return mlx::core::metal::is_available();
+}
+
+// Get kernel name based on dtype (for future Metal dispatch)
+static std::string get_reshape_and_cache_kernel_name(mlx::core::Dtype dtype) {
+    using namespace mlx::core;
+    switch (dtype) {
+        case float32: return "reshape_and_cache_kv_float_cache_float";
+        case bfloat16: return "reshape_and_cache_kv_bfloat16_t_cache_bfloat16_t";
+        case float16:
+        default: return "reshape_and_cache_kv_half_cache_half";
+    }
+}
+
+} // namespace paged_attn_metal
+
+/// PagedAttention configuration (matches Rust FFI)
+struct PagedAttnConfig {
+    uint32_t block_size;
+    uint32_t num_blocks;
+    uint32_t head_size;
+    uint32_t num_kv_heads;
+    uint32_t num_layers;
+    uint32_t dtype;  // 0=float16, 1=bfloat16, 2=float32
+};
+
+/// PagedAttention cache state (per-layer key and value caches)
+struct PagedAttnCache {
+    std::vector<array> key_caches;    // [num_layers] of [num_blocks, num_kv_heads, head_size/x, block_size, x]
+    std::vector<array> value_caches;  // [num_layers] of [num_blocks, num_kv_heads, head_size, block_size]
+    PagedAttnConfig config;
+
+    // Metal kernel support (optional - when GPU dispatch is enabled)
+    bool use_metal_kernels = false;
+
+    // ALiBi slopes for positional encoding (optional)
+    std::optional<array> alibi_slopes;
+
+    // FP8 quantization scales (optional)
+    std::optional<array> k_scale;
+    std::optional<array> v_scale;
+};
+
+/// Create a new PagedAttention KV cache
+PagedAttnCache* mlx_paged_attn_create_cache(const PagedAttnConfig* config) {
+    if (!config) return nullptr;
+
+    auto cache = new PagedAttnCache();
+    cache->config = *config;
+
+    // Determine dtype
+    mlx::core::Dtype dtype = mlx::core::float16;  // Default to float16
+    switch (config->dtype) {
+        case 0: dtype = mlx::core::float16; break;
+        case 1: dtype = mlx::core::bfloat16; break;
+        case 2: dtype = mlx::core::float32; break;
+        default: break;
+    }
+
+    // Key cache layout: [num_blocks, num_kv_heads, head_size/x, block_size, x]
+    // where x is a vectorization factor (typically 8 for half, 4 for float)
+    // For simplicity, we use x=8 for half types, x=4 for float32
+    int x = (dtype == mlx::core::float32) ? 4 : 8;
+    int head_size_x = config->head_size / x;
+
+    // Value cache layout: [num_blocks, num_kv_heads, head_size, block_size]
+    for (uint32_t i = 0; i < config->num_layers; i++) {
+        // Key cache: [num_blocks, num_kv_heads, head_size/x, block_size, x]
+        array key_cache = zeros({
+            static_cast<int>(config->num_blocks),
+            static_cast<int>(config->num_kv_heads),
+            head_size_x,
+            static_cast<int>(config->block_size),
+            x
+        }, dtype);
+        cache->key_caches.push_back(std::move(key_cache));
+
+        // Value cache: [num_blocks, num_kv_heads, head_size, block_size]
+        array value_cache = zeros({
+            static_cast<int>(config->num_blocks),
+            static_cast<int>(config->num_kv_heads),
+            static_cast<int>(config->head_size),
+            static_cast<int>(config->block_size)
+        }, dtype);
+        cache->value_caches.push_back(std::move(value_cache));
+    }
+
+    return cache;
+}
+
+/// Free a PagedAttention KV cache
+void mlx_paged_attn_free_cache(PagedAttnCache* cache) {
+    delete cache;
+}
+
+/// Get the key cache tensor for a layer
+mlx_array* mlx_paged_attn_get_key_cache(PagedAttnCache* cache, uint32_t layer_idx) {
+    if (!cache || layer_idx >= cache->key_caches.size()) return nullptr;
+    return reinterpret_cast<mlx_array*>(new array(cache->key_caches[layer_idx]));
+}
+
+/// Get the value cache tensor for a layer
+mlx_array* mlx_paged_attn_get_value_cache(PagedAttnCache* cache, uint32_t layer_idx) {
+    if (!cache || layer_idx >= cache->value_caches.size()) return nullptr;
+    return reinterpret_cast<mlx_array*>(new array(cache->value_caches[layer_idx]));
+}
+
+/// Update the cache with new keys and values.
+///
+/// This function updates the paged KV cache with new key/value vectors.
+/// Uses a software implementation with MLX operations for correctness.
+/// For production, integrate Metal kernels via MLX's metal_kernel API.
+///
+/// Inputs:
+/// - keys: [num_tokens, num_kv_heads, head_size]
+/// - values: [num_tokens, num_kv_heads, head_size]
+/// - slot_mapping: [num_tokens] - linear slot indices for each token
+///
+/// Cache layout:
+/// - key_cache: [num_blocks, num_kv_heads, head_size/x, block_size, x]
+/// - value_cache: [num_blocks, num_kv_heads, head_size, block_size]
+void mlx_paged_attn_reshape_and_cache(
+    PagedAttnCache* cache,
+    uint32_t layer_idx,
+    mlx_array* keys,
+    mlx_array* values,
+    mlx_array* slot_mapping
+) {
+    if (!cache || !keys || !values || !slot_mapping) return;
+    if (layer_idx >= cache->key_caches.size()) return;
+
+    auto& k = *reinterpret_cast<array*>(keys);
+    auto& v = *reinterpret_cast<array*>(values);
+    auto& slots = *reinterpret_cast<array*>(slot_mapping);
+
+    // Get cache references
+    auto& key_cache = cache->key_caches[layer_idx];
+    auto& value_cache = cache->value_caches[layer_idx];
+
+    int num_tokens = k.shape(0);
+    int num_heads = k.shape(1);
+    int head_size = k.shape(2);
+    int block_size = cache->config.block_size;
+    int x = key_cache.shape(4);  // Vectorization factor
+
+    // Implementation using MLX operations (runs on GPU via lazy evaluation)
+    //
+    // METAL KERNEL STATUS:
+    // - Kernel source: READY in paged_attn_kernels.h (get_reshape_and_cache_source())
+    // - Rust dispatch: READY in mlx-paged-attn/src/metal/reshape_and_cache.rs
+    // - Precompiled lib: paged_attn.metallib (4.7 MB)
+    //
+    // BLOCKING ISSUE: MLX's metal_kernel() API doesn't support function constants
+    // (use_fp8_scales), which the kernel requires. Options:
+    // 1. Contribute paged attention to MLX as a first-class primitive
+    // 2. Use MLX's internal Metal dispatch when API becomes available
+    // 3. Fork the kernel to use template arguments instead of function constants
+    //
+    // For now, the software implementation is functionally correct.
+
+    int num_blocks = key_cache.shape(0);
+    int head_size_x = head_size / x;
+
+    auto block_indices = divide(slots, array(block_size, slots.dtype()));
+    auto block_offsets = remainder(slots, array(block_size, slots.dtype()));
+
+    for (int i = 0; i < num_tokens; i++) {
+        array key_token = slice(k, {i, 0, 0}, {i + 1, num_heads, head_size});
+        key_token = squeeze(key_token, 0);
+
+        array value_token = slice(v, {i, 0, 0}, {i + 1, num_heads, head_size});
+        value_token = squeeze(value_token, 0);
+
+        array block_idx_arr = slice(block_indices, {i}, {i + 1});
+        array block_off_arr = slice(block_offsets, {i}, {i + 1});
+        block_idx_arr.eval();
+        block_off_arr.eval();
+
+        int block_idx = static_cast<int>(block_idx_arr.item<int32_t>());
+        int block_off = static_cast<int>(block_off_arr.item<int32_t>());
+
+        // Update value cache
+        array v_block = slice(value_cache, {block_idx, 0, 0, 0}, {block_idx + 1, num_heads, head_size, block_size});
+        v_block = squeeze(v_block, 0);
+
+        std::vector<array> v_slices;
+        for (int j = 0; j < block_size; j++) {
+            if (j == block_off) {
+                v_slices.push_back(expand_dims(value_token, -1));
+            } else {
+                v_slices.push_back(slice(v_block, {0, 0, j}, {num_heads, head_size, j + 1}));
+            }
+        }
+        array updated_v = expand_dims(concatenate(v_slices, -1), 0);
+
+        std::vector<array> v_parts;
+        if (block_idx > 0) {
+            v_parts.push_back(slice(value_cache, {0, 0, 0, 0}, {block_idx, num_heads, head_size, block_size}));
+        }
+        v_parts.push_back(updated_v);
+        if (block_idx + 1 < num_blocks) {
+            v_parts.push_back(slice(value_cache, {block_idx + 1, 0, 0, 0}, {num_blocks, num_heads, head_size, block_size}));
+        }
+        value_cache = concatenate(v_parts, 0);
+
+        // Update key cache
+        array k_block = slice(key_cache, {block_idx, 0, 0, 0, 0}, {block_idx + 1, num_heads, head_size_x, block_size, x});
+        k_block = squeeze(k_block, 0);
+        array key_reshaped = reshape(key_token, {num_heads, head_size_x, x});
+
+        std::vector<array> k_slices;
+        for (int j = 0; j < block_size; j++) {
+            if (j == block_off) {
+                k_slices.push_back(expand_dims(key_reshaped, 2));
+            } else {
+                k_slices.push_back(slice(k_block, {0, 0, j, 0}, {num_heads, head_size_x, j + 1, x}));
+            }
+        }
+        array updated_k = expand_dims(concatenate(k_slices, 2), 0);
+
+        std::vector<array> k_parts;
+        if (block_idx > 0) {
+            k_parts.push_back(slice(key_cache, {0, 0, 0, 0, 0}, {block_idx, num_heads, head_size_x, block_size, x}));
+        }
+        k_parts.push_back(updated_k);
+        if (block_idx + 1 < num_blocks) {
+            k_parts.push_back(slice(key_cache, {block_idx + 1, 0, 0, 0, 0}, {num_blocks, num_heads, head_size_x, block_size, x}));
+        }
+        key_cache = concatenate(k_parts, 0);
+    }
+
+    cache->key_caches[layer_idx] = key_cache;
+    cache->value_caches[layer_idx] = value_cache;
+}
+
+/// Run paged attention forward pass
+/// Software implementation using MLX operations.
+///
+/// METAL KERNEL STATUS:
+/// - Kernel source: READY in paged_attn_kernels.h (get_paged_attention_source())
+/// - Rust dispatch: READY in mlx-paged-attn/src/metal/paged_attention.rs
+/// - V1 kernel (short sequences): paged_attention_half_cache_half_hs128_bs16_nt256_nsl32_ps0
+/// - V2 kernel (long sequences with partitioning): partition_size=512
+///
+/// BLOCKING ISSUE: MLX's metal_kernel() API doesn't support:
+/// 1. Function constants (use_partitioning, use_alibi, use_fp8_scales)
+/// 2. The 18-buffer binding pattern used by the kernel
+///
+/// The software implementation runs on GPU via MLX's lazy evaluation and is
+/// functionally correct, though slower than the optimized Metal kernel.
+///
+/// This implements the paged attention algorithm:
+/// 1. Gather K/V blocks for each sequence using block_tables
+/// 2. Reshape gathered blocks to contiguous K/V tensors
+/// 3. Run scaled dot-product attention
+///
+/// Inputs:
+/// - queries: [num_seqs, num_heads, head_size]
+/// - key_cache: [num_blocks, num_kv_heads, head_size/x, block_size, x] (vectorized)
+/// - value_cache: [num_blocks, num_kv_heads, head_size, block_size]
+/// - block_tables: [num_seqs, max_blocks_per_seq]
+/// - context_lens: [num_seqs]
+mlx_array* mlx_paged_attn_forward(
+    mlx_array* queries,
+    mlx_array* key_cache,
+    mlx_array* value_cache,
+    mlx_array* block_tables,
+    mlx_array* context_lens,
+    float scale,
+    uint32_t block_size,
+    uint32_t max_context_len
+) {
+    if (!queries || !key_cache || !value_cache || !block_tables || !context_lens) {
+        return nullptr;
+    }
+
+    auto& q = *reinterpret_cast<array*>(queries);
+    auto& k_cache = *reinterpret_cast<array*>(key_cache);
+    auto& v_cache = *reinterpret_cast<array*>(value_cache);
+    auto& block_table = *reinterpret_cast<array*>(block_tables);
+    auto& ctx_lens = *reinterpret_cast<array*>(context_lens);
+
+    int num_seqs = q.shape(0);
+    int num_heads = q.shape(1);
+    int head_size = q.shape(2);
+    int num_kv_heads = v_cache.shape(1);
+    int heads_per_kv = num_heads / num_kv_heads;
+
+    // Key cache vectorization factor
+    int x = k_cache.shape(4);
+    int head_size_x = k_cache.shape(2);
+
+    // Evaluate context lengths to CPU for the loop
+    ctx_lens.eval();
+    auto ctx_lens_vec = std::vector<int32_t>(num_seqs);
+    std::memcpy(ctx_lens_vec.data(), ctx_lens.data<int32_t>(), num_seqs * sizeof(int32_t));
+
+    // Process each sequence (software path - Metal kernel does this in parallel)
+    std::vector<array> outputs;
+    outputs.reserve(num_seqs);
+
+    for (int seq_idx = 0; seq_idx < num_seqs; seq_idx++) {
+        int context_len = ctx_lens_vec[seq_idx];
+        int num_blocks_needed = (context_len + block_size - 1) / block_size;
+
+        if (context_len == 0 || num_blocks_needed == 0) {
+            // Empty context - return zeros for this sequence
+            outputs.push_back(zeros({num_heads, head_size}, q.dtype()));
+            continue;
+        }
+
+        // Get block indices for this sequence: block_table[seq_idx, :num_blocks_needed]
+        array seq_blocks = slice(block_table, {seq_idx, 0}, {seq_idx + 1, num_blocks_needed});
+        seq_blocks = reshape(seq_blocks, {num_blocks_needed});
+
+        // Gather key blocks: [num_blocks_needed, num_kv_heads, head_size/x, block_size, x]
+        array gathered_keys = take(k_cache, seq_blocks, 0);
+
+        // Reshape keys to [num_kv_heads, context_len, head_size]
+        // First: [num_blocks_needed, num_kv_heads, head_size/x, block_size, x]
+        //     -> [num_kv_heads, num_blocks_needed, head_size/x, block_size, x]
+        gathered_keys = transpose(gathered_keys, {1, 0, 2, 3, 4});
+        // -> [num_kv_heads, num_blocks_needed, block_size, head_size/x, x]
+        gathered_keys = transpose(gathered_keys, {0, 1, 3, 2, 4});
+        // -> [num_kv_heads, num_blocks_needed * block_size, head_size]
+        gathered_keys = reshape(gathered_keys, {num_kv_heads, num_blocks_needed * (int)block_size, head_size});
+        // Trim to actual context length
+        gathered_keys = slice(gathered_keys, {0, 0, 0}, {num_kv_heads, context_len, head_size});
+
+        // Gather value blocks: [num_blocks_needed, num_kv_heads, head_size, block_size]
+        array gathered_values = take(v_cache, seq_blocks, 0);
+
+        // Reshape values to [num_kv_heads, context_len, head_size]
+        // [num_blocks_needed, num_kv_heads, head_size, block_size]
+        // -> [num_kv_heads, num_blocks_needed, head_size, block_size]
+        gathered_values = transpose(gathered_values, {1, 0, 2, 3});
+        // -> [num_kv_heads, num_blocks_needed, block_size, head_size]
+        gathered_values = transpose(gathered_values, {0, 1, 3, 2});
+        // -> [num_kv_heads, num_blocks_needed * block_size, head_size]
+        gathered_values = reshape(gathered_values, {num_kv_heads, num_blocks_needed * (int)block_size, head_size});
+        // Trim to actual context length
+        gathered_values = slice(gathered_values, {0, 0, 0}, {num_kv_heads, context_len, head_size});
+
+        // Handle GQA: repeat K/V heads to match query heads
+        if (heads_per_kv > 1) {
+            // Expand K/V from [num_kv_heads, ctx_len, head_size] to [num_heads, ctx_len, head_size]
+            // Use repeat to duplicate each KV head heads_per_kv times
+            std::vector<array> expanded_k, expanded_v;
+            for (int kv_head = 0; kv_head < num_kv_heads; kv_head++) {
+                array k_head = slice(gathered_keys, {kv_head, 0, 0}, {kv_head + 1, context_len, head_size});
+                array v_head = slice(gathered_values, {kv_head, 0, 0}, {kv_head + 1, context_len, head_size});
+                for (int r = 0; r < heads_per_kv; r++) {
+                    expanded_k.push_back(k_head);
+                    expanded_v.push_back(v_head);
+                }
+            }
+            gathered_keys = concatenate(expanded_k, 0);
+            gathered_values = concatenate(expanded_v, 0);
+        }
+
+        // Get query for this sequence: [num_heads, head_size]
+        array seq_query = slice(q, {seq_idx, 0, 0}, {seq_idx + 1, num_heads, head_size});
+        seq_query = reshape(seq_query, {num_heads, 1, head_size});
+
+        // Attention scores: Q @ K^T -> [num_heads, 1, context_len]
+        array k_transposed = transpose(gathered_keys, {0, 2, 1}); // [num_heads, head_size, context_len]
+        array scores = matmul(seq_query, k_transposed);
+        scores = multiply(scores, array(scale, q.dtype()));
+
+        // Softmax over context dimension
+        array weights = softmax(scores, -1);
+
+        // Weighted sum: weights @ V -> [num_heads, 1, head_size]
+        array output = matmul(weights, gathered_values);
+        output = reshape(output, {num_heads, head_size});
+
+        outputs.push_back(output);
+    }
+
+    // Stack outputs: [num_seqs, num_heads, head_size]
+    array result = stack(outputs, 0);
+
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+/// Copy blocks for copy-on-write semantics.
+///
+/// This is used during beam search to copy KV cache blocks when forking sequences.
+/// Uses MLX operations for portability. For production, integrate Metal kernel.
+///
+/// block_mapping: [num_pairs, 2] where each pair is (src_block_id, dst_block_id)
+void mlx_paged_attn_copy_blocks(
+    PagedAttnCache* cache,
+    uint32_t layer_idx,
+    mlx_array* block_mapping
+) {
+    if (!cache || !block_mapping) return;
+    if (layer_idx >= cache->key_caches.size()) return;
+
+    auto& mapping = *reinterpret_cast<array*>(block_mapping);
+    auto& key_cache = cache->key_caches[layer_idx];
+    auto& value_cache = cache->value_caches[layer_idx];
+
+    // Evaluate mapping to get block indices
+    mapping.eval();
+
+    // Handle both 1D [num_pairs * 2] and 2D [num_pairs, 2] formats
+    int num_pairs;
+    bool is_2d = (mapping.ndim() == 2 && mapping.shape(1) == 2);
+    if (is_2d) {
+        num_pairs = mapping.shape(0);  // 2D: [num_pairs, 2]
+    } else {
+        num_pairs = mapping.shape(0) / 2;  // 1D: [num_pairs * 2]
+    }
+    if (num_pairs == 0) return;
+
+    // Copy each block pair using MLX gather/scatter
+    for (int i = 0; i < num_pairs; i++) {
+        // Extract block indices from the mapping array
+        array src_arr = is_2d
+            ? slice(mapping, {i, 0}, {i + 1, 1})
+            : slice(mapping, {2 * i}, {2 * i + 1});
+        array dst_arr = is_2d
+            ? slice(mapping, {i, 1}, {i + 1, 2})
+            : slice(mapping, {2 * i + 1}, {2 * i + 2});
+        src_arr.eval();
+        dst_arr.eval();
+        int64_t src_block = src_arr.item<int64_t>();
+        int64_t dst_block = dst_arr.item<int64_t>();
+
+        // Copy key cache block
+        // key_cache: [num_blocks, num_kv_heads, head_size/x, block_size, x]
+        int num_heads = key_cache.shape(1);
+        int head_size_x = key_cache.shape(2);
+        int block_size = key_cache.shape(3);
+        int x = key_cache.shape(4);
+
+        array src_k_block = slice(key_cache,
+            {static_cast<int>(src_block), 0, 0, 0, 0},
+            {static_cast<int>(src_block + 1), num_heads, head_size_x, block_size, x});
+
+        // Rebuild key cache with copied block at dst position
+        int num_blocks = key_cache.shape(0);
+        std::vector<array> k_parts;
+        if (dst_block > 0) {
+            k_parts.push_back(slice(key_cache, {0, 0, 0, 0, 0},
+                {static_cast<int>(dst_block), num_heads, head_size_x, block_size, x}));
+        }
+        k_parts.push_back(src_k_block);
+        if (dst_block + 1 < num_blocks) {
+            k_parts.push_back(slice(key_cache, {static_cast<int>(dst_block + 1), 0, 0, 0, 0},
+                {num_blocks, num_heads, head_size_x, block_size, x}));
+        }
+        key_cache = concatenate(k_parts, 0);
+
+        // Copy value cache block
+        // value_cache: [num_blocks, num_kv_heads, head_size, block_size]
+        int head_size = value_cache.shape(2);
+
+        array src_v_block = slice(value_cache,
+            {static_cast<int>(src_block), 0, 0, 0},
+            {static_cast<int>(src_block + 1), num_heads, head_size, block_size});
+
+        std::vector<array> v_parts;
+        if (dst_block > 0) {
+            v_parts.push_back(slice(value_cache, {0, 0, 0, 0},
+                {static_cast<int>(dst_block), num_heads, head_size, block_size}));
+        }
+        v_parts.push_back(src_v_block);
+        if (dst_block + 1 < num_blocks) {
+            v_parts.push_back(slice(value_cache, {static_cast<int>(dst_block + 1), 0, 0, 0},
+                {num_blocks, num_heads, head_size, block_size}));
+        }
+        value_cache = concatenate(v_parts, 0);
+    }
+
+    // Store updated caches back
+    cache->key_caches[layer_idx] = key_cache;
+    cache->value_caches[layer_idx] = value_cache;
+}
+
+// ========================================================================
+// Metal Buffer Extraction for External Kernel Dispatch
+// ========================================================================
+//
+// These functions extract Metal buffer pointers from MLX arrays for use
+// with external Metal kernel dispatch (e.g., from Rust metal crate).
+//
+// The extracted pointers are only valid after eval() and before any
+// MLX operations that could reallocate the buffer.
+//
+// IMPORTANT: Only valid when Metal backend is available. On CPU-only
+// builds or when GPU is unavailable, buffer pointers are NOT MTLBuffer*.
+//
+// Note: mlx_metal_is_available() is already defined earlier in this file.
+
+/// Get the raw Metal buffer pointer from an MLX array
+/// Returns the MTLBuffer* as a void* for FFI compatibility
+/// Returns nullptr if:
+///   - handle is null
+///   - Metal backend is not available (buffer would not be MTLBuffer*)
+///   - array has no data
+void* mlx_array_get_metal_buffer(mlx_array* handle) {
+    if (!handle) return nullptr;
+
+    // Use Metal-specific availability check (not generic GPU)
+    // This ensures we only return pointers when using Metal backend,
+    // not when CUDA or other GPU backends might be in use
+    if (!mlx::core::metal::is_available()) return nullptr;
+
+    auto& arr = *reinterpret_cast<array*>(handle);
+
+    // Ensure array is evaluated
+    eval(arr);
+
+    // Check if array has data
+    if (arr.data_size() == 0) return nullptr;
+
+    // When Metal backend is available, all MLX buffers use MTLBuffer
+    // (Metal uses unified memory architecture on Apple Silicon)
+    return const_cast<void*>(arr.buffer().ptr());
+}
+
+/// Get the byte offset into the Metal buffer for this array
+/// This is needed for sliced/strided arrays that share a buffer
+/// Note: offset() already returns bytes (used with char* in MLX internals)
+size_t mlx_array_get_buffer_offset(mlx_array* handle) {
+    if (!handle) return 0;
+    auto& arr = *reinterpret_cast<array*>(handle);
+
+    // eval not strictly needed for offset, but ensure consistency
+    eval(arr);
+
+    // offset() returns byte offset (see array.h line 374: char* + offset)
+    return arr.data_size() > 0 ? static_cast<size_t>(arr.offset()) : 0;
+}
+
+/// Get the data size of the array in number of elements (NOT bytes)
+/// To get bytes, multiply by itemsize
+size_t mlx_array_get_data_size(mlx_array* handle) {
+    if (!handle) return 0;
+    auto& arr = *reinterpret_cast<array*>(handle);
+    return arr.data_size();
+}
+
+/// Get the item size in bytes for the array's dtype
+size_t mlx_array_get_itemsize(mlx_array* handle) {
+    if (!handle) return 0;
+    auto& arr = *reinterpret_cast<array*>(handle);
+    return arr.itemsize();
+}
+
+/// Synchronize - ensure all MLX operations are complete
+/// Call this before dispatching external Metal kernels
+void mlx_metal_synchronize() {
+    mlx::core::synchronize();
 }
 
 }  // End extern "C"

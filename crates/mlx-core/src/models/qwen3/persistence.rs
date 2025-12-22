@@ -143,6 +143,22 @@ impl Qwen3Model {
                     .or_else(|| raw_config["eosTokenId"].as_i64())
                     .unwrap_or(151645) as i32, // Qwen3 default
                 bos_token_id,
+
+                // Paged attention options (opt-in)
+                use_paged_attention: raw_config["use_paged_attention"]
+                    .as_bool()
+                    .or_else(|| raw_config["usePagedAttention"].as_bool()),
+                paged_cache_memory_mb: raw_config["paged_cache_memory_mb"]
+                    .as_i64()
+                    .or_else(|| raw_config["pagedCacheMemoryMb"].as_i64())
+                    .map(|x| x as u32),
+                paged_block_size: raw_config["paged_block_size"]
+                    .as_i64()
+                    .or_else(|| raw_config["pagedBlockSize"].as_i64())
+                    .map(|x| x as u32),
+                use_fp8_cache: raw_config["use_fp8_cache"]
+                    .as_bool()
+                    .or_else(|| raw_config["useFp8Cache"].as_bool()),
             };
 
             // Try to load weights from SafeTensors format first (preferred)

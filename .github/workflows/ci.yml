@@ -11,8 +11,14 @@ env:
 
 jobs:
   build-and-test:
-    name: Build & Test
+    name: Build & ${{ matrix.test }}
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - 'yarn test'
+          - 'cargo test'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -59,7 +65,7 @@ jobs:
           yarn download:qwen3
           yarn oxnode ./scripts/convert-model.ts --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models/qwen3-0.6b-mlx-bf16
           yarn download:gsm8k
-          yarn test
+          ${{ matrix.test }}
 
   lint:
     name: Rust Lint

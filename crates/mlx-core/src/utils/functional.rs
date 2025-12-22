@@ -533,6 +533,11 @@ mod forward_pass_equivalence_tests {
             pad_token_id: 0,
             eos_token_id: 1,
             bos_token_id: 0,
+            // Paged attention options (disabled for test)
+            use_paged_attention: None,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_fp8_cache: None,
         }
     }
 

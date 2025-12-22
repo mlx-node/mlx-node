@@ -212,6 +212,53 @@ impl Attention {
         MxArray::from_handle(handle, "fused_attention_output")
     }
 
+    /// Forward pass with pre-computed Q/K/V tensors.
+    ///
+    /// This method skips the Q/K/V computation and uses provided tensors directly.
+    /// Useful for paged attention prefill where Q/K/V are already computed for cache.
+    ///
+    /// # Arguments
+    /// * `queries` - Pre-computed Q tensor, shape: (batch, n_heads, seq_len, head_dim)
+    /// * `keys` - Pre-computed K tensor, shape: (batch, n_kv_heads, kv_len, head_dim)
+    /// * `values` - Pre-computed V tensor, shape: (batch, n_kv_heads, kv_len, head_dim)
+    /// * `use_causal` - Whether to use causal masking
+    ///
+    /// # Returns
+    /// Output tensor, shape: (batch, seq_len, hidden_size)
+    #[napi]
+    pub fn forward_with_qkv(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        values: &MxArray,
+        use_causal: bool,
+    ) -> Result<MxArray> {
+        // Get output projection weight
+        let w_o = self.o_proj.get_weight();
+
+        // Fused SDPA + output projection
+        let handle = unsafe {
+            sys::mlx_fused_attention_output(
+                queries.handle.0,
+                keys.handle.0,
+                values.handle.0,
+                w_o.handle.0,
+                self.n_heads as i32,
+                self.head_dim as i32,
+                self.scale as f32,
+                use_causal,
+            )
+        };
+
+        if handle.is_null() {
+            return Err(napi::Error::from_reason(
+                "mlx_fused_attention_output returned null pointer",
+            ));
+        }
+
+        MxArray::from_handle(handle, "fused_attention_output")
+    }
+
     /// Debug method: Forward pass with intermediate Q/K/V states captured
     #[napi]
     pub fn forward_debug(
@@ -468,6 +515,223 @@ impl Attention {
             attn_output_transposed,
             attn_output_reshaped,
         ])
+    }
+}
+
+/// Result of Q/K/V computation for paged attention
+pub struct QKVResult {
+    /// Query tensor: [num_tokens, num_heads, head_dim]
+    pub queries: MxArray,
+    /// Key tensor: [num_tokens, num_kv_heads, head_dim]
+    pub keys: MxArray,
+    /// Value tensor: [num_tokens, num_kv_heads, head_dim]
+    pub values: MxArray,
+}
+
+impl Attention {
+    /// Compute Q, K, V tensors for paged attention.
+    ///
+    /// This method computes the query, key, and value tensors with RoPE applied,
+    /// formatted for use with paged attention kernels.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor, shape: [batch, seq_len, hidden_size]
+    /// * `rope_offset` - Position offset for RoPE (from cache position)
+    ///
+    /// # Returns
+    /// QKVResult containing:
+    /// - queries: [batch * seq_len, num_heads, head_dim]
+    /// - keys: [batch * seq_len, num_kv_heads, head_dim]
+    /// - values: [batch * seq_len, num_kv_heads, head_dim]
+    pub fn compute_qkv(&self, x: &MxArray, rope_offset: i32) -> Result<QKVResult> {
+        // Get weight handles
+        let w_q = self.q_proj.get_weight();
+        let w_k = self.k_proj.get_weight();
+        let w_v = self.v_proj.get_weight();
+
+        // Get optional QK norm weights
+        let q_norm_w = self.q_norm.as_ref().map(|n| n.get_weight());
+        let k_norm_w = self.k_norm.as_ref().map(|n| n.get_weight());
+
+        // Use fused Q/K/V computation with RoPE
+        let mut q_out: *mut sys::mlx_array = ptr::null_mut();
+        let mut k_out: *mut sys::mlx_array = ptr::null_mut();
+        let mut v_out: *mut sys::mlx_array = ptr::null_mut();
+
+        unsafe {
+            sys::mlx_fused_attention_qkv(
+                x.handle.0,
+                w_q.handle.0,
+                w_k.handle.0,
+                w_v.handle.0,
+                q_norm_w
+                    .as_ref()
+                    .map(|w| w.handle.0)
+                    .unwrap_or(ptr::null_mut()),
+                k_norm_w
+                    .as_ref()
+                    .map(|w| w.handle.0)
+                    .unwrap_or(ptr::null_mut()),
+                self.n_heads as i32,
+                self.n_kv_heads as i32,
+                self.head_dim as i32,
+                self.rope_base,
+                self.head_dim as i32,
+                self.qk_norm_eps,
+                rope_offset,
+                &mut q_out,
+                &mut k_out,
+                &mut v_out,
+            );
+        }
+
+        if q_out.is_null() || k_out.is_null() || v_out.is_null() {
+            return Err(napi::Error::from_reason(
+                "mlx_fused_attention_qkv returned null pointer",
+            ));
+        }
+
+        // Q, K, V are in attention layout: [B, num_heads, L, head_dim]
+        // For paged attention, we need: [B * L, num_heads, head_dim]
+        let queries_attn = MxArray::from_handle(q_out, "compute_qkv_q")?;
+        let keys_attn = MxArray::from_handle(k_out, "compute_qkv_k")?;
+        let values_attn = MxArray::from_handle(v_out, "compute_qkv_v")?;
+
+        // Reshape from [B, num_heads, L, head_dim] to [B * L, num_heads, head_dim]
+        let batch = queries_attn.shape_at(0)?;
+        let seq_len = queries_attn.shape_at(2)?;
+        let num_tokens = batch * seq_len;
+
+        // Transpose from [B, num_heads, L, head_dim] to [B, L, num_heads, head_dim]
+        // Then reshape to [B * L, num_heads, head_dim]
+        let queries = queries_attn.transpose(Some(&[0, 2, 1, 3]))?;
+        let queries = queries.reshape(&[num_tokens, self.n_heads as i64, self.head_dim as i64])?;
+
+        let keys = keys_attn.transpose(Some(&[0, 2, 1, 3]))?;
+        let keys = keys.reshape(&[num_tokens, self.n_kv_heads as i64, self.head_dim as i64])?;
+
+        let values = values_attn.transpose(Some(&[0, 2, 1, 3]))?;
+        let values = values.reshape(&[num_tokens, self.n_kv_heads as i64, self.head_dim as i64])?;
+
+        Ok(QKVResult {
+            queries,
+            keys,
+            values,
+        })
+    }
+
+    /// Compute Q, K, V for paged attention decode with per-sequence RoPE.
+    ///
+    /// For decode, each sequence has exactly 1 token but different context lengths,
+    /// so each needs a different RoPE position offset.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor, shape: [num_seqs, 1, hidden_dim]
+    /// * `positions` - Per-sequence positions, shape: [num_seqs]
+    ///
+    /// # Returns
+    /// QKVResult with:
+    /// - queries: [num_seqs, num_heads, head_dim]
+    /// - keys: [num_seqs, num_kv_heads, head_dim]
+    /// - values: [num_seqs, num_kv_heads, head_dim]
+    pub fn compute_qkv_paged_decode(&self, x: &MxArray, positions: &MxArray) -> Result<QKVResult> {
+        let num_seqs = x.shape_at(0)? as usize;
+        let hidden_dim = x.shape_at(2)?;
+
+        // Extract positions as Vec<i32>
+        positions.eval();
+        let positions_vec = positions.to_int32()?;
+
+        if positions_vec.len() != num_seqs {
+            return Err(napi::Error::from_reason(format!(
+                "positions length {} doesn't match num_seqs {}",
+                positions_vec.len(),
+                num_seqs
+            )));
+        }
+
+        // Process each sequence with its own RoPE offset
+        let mut q_list = Vec::with_capacity(num_seqs);
+        let mut k_list = Vec::with_capacity(num_seqs);
+        let mut v_list = Vec::with_capacity(num_seqs);
+
+        for i in 0..num_seqs {
+            // Extract single sequence: [1, 1, hidden_dim]
+            let seq_input = x.slice(&[i as i64, 0, 0], &[i as i64 + 1, 1, hidden_dim])?;
+            let rope_offset = positions_vec[i];
+
+            // Compute QKV with this sequence's RoPE offset
+            let qkv = self.compute_qkv(&seq_input, rope_offset)?;
+
+            // QKV shape is [1, num_heads, head_dim] for single token
+            // Squeeze removes the batch dimension: -> [num_heads, head_dim]
+            let q = qkv.queries.squeeze(Some(&[0]))?;
+            let k = qkv.keys.squeeze(Some(&[0]))?;
+            let v = qkv.values.squeeze(Some(&[0]))?;
+
+            q_list.push(q);
+            k_list.push(k);
+            v_list.push(v);
+        }
+
+        // Stack results: [num_seqs, num_heads, head_dim]
+        let q_refs: Vec<&MxArray> = q_list.iter().collect();
+        let k_refs: Vec<&MxArray> = k_list.iter().collect();
+        let v_refs: Vec<&MxArray> = v_list.iter().collect();
+
+        let queries = MxArray::stack(q_refs, Some(0))?;
+        let keys = MxArray::stack(k_refs, Some(0))?;
+        let values = MxArray::stack(v_refs, Some(0))?;
+
+        Ok(QKVResult {
+            queries,
+            keys,
+            values,
+        })
+    }
+
+    /// Run output projection on attention output.
+    ///
+    /// # Arguments
+    /// * `attn_output` - Attention output, shape: [batch * seq_len, num_heads, head_dim]
+    /// * `batch` - Original batch size
+    /// * `seq_len` - Original sequence length
+    ///
+    /// # Returns
+    /// Output tensor, shape: [batch, seq_len, hidden_size]
+    pub fn output_projection(
+        &self,
+        attn_output: &MxArray,
+        batch: i64,
+        seq_len: i64,
+    ) -> Result<MxArray> {
+        // attn_output: [batch * seq_len, num_heads, head_dim]
+        // -> [batch, seq_len, num_heads * head_dim]
+        let hidden_size = (self.n_heads * self.head_dim) as i64;
+        let reshaped = attn_output.reshape(&[batch, seq_len, hidden_size])?;
+
+        // Apply output projection
+        self.o_proj.forward(&reshaped)
+    }
+
+    /// Get attention scale factor
+    pub fn get_scale(&self) -> f64 {
+        self.scale
+    }
+
+    /// Get number of heads
+    pub fn get_n_heads(&self) -> u32 {
+        self.n_heads
+    }
+
+    /// Get number of KV heads
+    pub fn get_n_kv_heads(&self) -> u32 {
+        self.n_kv_heads
+    }
+
+    /// Get head dimension
+    pub fn get_head_dim(&self) -> u32 {
+        self.head_dim
     }
 }
 

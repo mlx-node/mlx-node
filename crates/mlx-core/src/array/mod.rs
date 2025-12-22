@@ -59,6 +59,18 @@ impl MxArray {
             handle: Arc::new(MxHandle(check_handle(handle, context)?)),
         })
     }
+
+    /// Get the raw MLX array pointer for FFI operations
+    ///
+    /// This is primarily used for Metal buffer extraction to enable
+    /// GPU kernel dispatch with external Metal infrastructure.
+    ///
+    /// # Safety
+    /// The returned pointer is only valid as long as this MxArray exists.
+    /// Do not use the pointer after the MxArray is dropped.
+    pub fn as_raw_ptr(&self) -> *mut sys::mlx_array {
+        self.handle.0
+    }
 }
 
 impl Clone for MxArray {
@@ -76,6 +88,13 @@ impl MxArray {
         let handle =
             unsafe { sys::mlx_array_from_int32(data.as_ptr(), shape.as_ptr(), shape.len()) };
         MxArray::from_handle(handle, "array_from_int32")
+    }
+
+    #[napi]
+    pub fn from_int64(data: &[i64], shape: &[i64]) -> Result<Self> {
+        let handle =
+            unsafe { sys::mlx_array_from_int64(data.as_ptr(), shape.as_ptr(), shape.len()) };
+        MxArray::from_handle(handle, "array_from_int64")
     }
 
     #[napi]
@@ -2740,6 +2759,190 @@ mod array_ops_tests {
                 .to_float32()
                 .unwrap()[0];
             assert!(max_val.is_finite());
+        }
+    }
+
+    // ========================================
+    // Metal Buffer Extraction Tests
+    // ========================================
+
+    mod metal_buffer {
+        use super::*;
+
+        // Basic as_raw_ptr tests work on all platforms
+        #[test]
+        fn test_as_raw_ptr_not_null() {
+            let arr = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+            arr.eval();
+            let ptr = arr.as_raw_ptr();
+            assert!(!ptr.is_null(), "Raw pointer should not be null");
+        }
+
+        #[test]
+        fn test_as_raw_ptr_different_arrays() {
+            let arr1 = MxArray::from_float32(&[1.0, 2.0], &[2]).unwrap();
+            let arr2 = MxArray::from_float32(&[3.0, 4.0], &[2]).unwrap();
+            arr1.eval();
+            arr2.eval();
+
+            let ptr1 = arr1.as_raw_ptr();
+            let ptr2 = arr2.as_raw_ptr();
+
+            // Different arrays should have different handles
+            assert_ne!(ptr1, ptr2, "Different arrays should have different handles");
+        }
+
+        #[test]
+        fn test_as_raw_ptr_after_eval() {
+            let arr = MxArray::random_normal(&[100, 100], 0.0, 1.0, None).unwrap();
+            arr.eval();
+
+            let ptr = arr.as_raw_ptr();
+            assert!(!ptr.is_null());
+
+            // The array should still be usable after getting ptr
+            let data = arr.to_float32().unwrap();
+            assert_eq!(data.len(), 10000);
+        }
+
+        // Metal-specific tests only run on macOS
+        #[cfg(target_os = "macos")]
+        mod macos_metal_tests {
+            use super::*;
+
+            #[test]
+            fn test_metal_buffer_extraction() {
+                use mlx_paged_attn::metal::{MlxMetalBuffer, synchronize_mlx};
+
+                let arr = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[4]).unwrap();
+                arr.eval();
+                synchronize_mlx();
+
+                let ptr = arr.as_raw_ptr();
+                let buffer_info = unsafe { MlxMetalBuffer::from_mlx_array(ptr) };
+
+                assert!(
+                    buffer_info.is_some(),
+                    "Should extract Metal buffer from evaluated array"
+                );
+
+                let info = buffer_info.unwrap();
+                assert!(
+                    !info.buffer_ptr.is_null(),
+                    "Buffer pointer should not be null"
+                );
+                assert!(info.data_size > 0, "Data size should be positive");
+                assert_eq!(info.itemsize, 4, "Float32 should have itemsize 4");
+            }
+
+            #[test]
+            fn test_metal_buffer_offset() {
+                use mlx_paged_attn::metal::{MlxMetalBuffer, synchronize_mlx};
+
+                // Create a sliced array to test offset
+                let arr = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6]).unwrap();
+                arr.eval();
+                synchronize_mlx();
+
+                let ptr = arr.as_raw_ptr();
+                let buffer_info = unsafe { MlxMetalBuffer::from_mlx_array(ptr) };
+
+                assert!(buffer_info.is_some());
+                let info = buffer_info.unwrap();
+
+                // Full array should have offset 0
+                assert_eq!(info.offset, 0, "Full array should have zero offset");
+            }
+
+            #[test]
+            fn test_metal_buffer_data_size() {
+                use mlx_paged_attn::metal::{MlxMetalBuffer, synchronize_mlx};
+
+                // 8 float32 elements
+                let arr =
+                    MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[8]).unwrap();
+                arr.eval();
+                synchronize_mlx();
+
+                let ptr = arr.as_raw_ptr();
+                let buffer_info = unsafe { MlxMetalBuffer::from_mlx_array(ptr) };
+
+                assert!(buffer_info.is_some());
+                let info = buffer_info.unwrap();
+
+                // data_size returns number of elements, not bytes
+                assert_eq!(info.data_size, 8, "Data size should be 8 elements");
+                assert_eq!(info.itemsize, 4, "Float32 itemsize should be 4 bytes");
+                assert_eq!(info.data_size_bytes(), 32, "Total size should be 32 bytes");
+            }
+
+            #[test]
+            fn test_metal_synchronize() {
+                use mlx_paged_attn::metal::synchronize_mlx;
+
+                // Create and evaluate a large array to ensure GPU work is queued
+                let arr = MxArray::random_normal(&[1000, 1000], 0.0, 1.0, None).unwrap();
+                let result = arr.matmul(&arr.transpose(None).unwrap()).unwrap();
+                result.eval();
+
+                // Should not panic
+                synchronize_mlx();
+
+                // Array should be fully evaluated now
+                let data = result.to_float32().unwrap();
+                assert_eq!(data.len(), 1000 * 1000);
+            }
+
+            #[test]
+            fn test_metal_extraction_supported() {
+                use mlx_paged_attn::metal::is_metal_extraction_supported;
+
+                // On macOS, Metal extraction is typically supported but may not be
+                // available on headless CI, VMs, or systems without Metal GPU.
+                // We just verify the function runs and returns a valid boolean.
+                let supported = is_metal_extraction_supported();
+                eprintln!("Metal extraction supported: {}", supported);
+                // Don't assert - headless CI may not have Metal
+            }
+
+            #[test]
+            fn test_sliced_array_metal_buffer() {
+                use mlx_paged_attn::metal::{MlxMetalBuffer, synchronize_mlx};
+
+                // Create array and take a slice
+                let full_arr =
+                    MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[8]).unwrap();
+                let sliced = full_arr.slice(&[2], &[6]).unwrap();
+                sliced.eval();
+                synchronize_mlx();
+
+                let ptr = sliced.as_raw_ptr();
+                let buffer_info = unsafe { MlxMetalBuffer::from_mlx_array(ptr) };
+
+                assert!(
+                    buffer_info.is_some(),
+                    "Should extract buffer from sliced array"
+                );
+            }
+
+            #[test]
+            fn test_2d_array_metal_buffer() {
+                use mlx_paged_attn::metal::{MlxMetalBuffer, synchronize_mlx};
+
+                let arr = MxArray::random_normal(&[16, 32], 0.0, 1.0, None).unwrap();
+                arr.eval();
+                synchronize_mlx();
+
+                let ptr = arr.as_raw_ptr();
+                let buffer_info = unsafe { MlxMetalBuffer::from_mlx_array(ptr) };
+
+                assert!(buffer_info.is_some());
+                let info = buffer_info.unwrap();
+
+                // 16 * 32 = 512 elements (data_size returns element count, not bytes)
+                assert_eq!(info.data_size, 512, "Data size should be 512 elements");
+                assert_eq!(info.data_size_bytes(), 2048, "Total bytes should be 2048");
+            }
         }
     }
 }

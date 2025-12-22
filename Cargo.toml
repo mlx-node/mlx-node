@@ -34,6 +34,7 @@ napi-build = "2"
 # Workspace packages
 mlx-sys = { path = "crates/mlx-sys" }
 mlx-core = { path = "crates/mlx-core" }
+mlx-paged-attn = { path = "crates/mlx-paged-attn" }
 
 [profile.release]
 lto = true

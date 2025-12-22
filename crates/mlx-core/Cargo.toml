@@ -23,6 +23,7 @@ uuid = { workspace = true }
 regex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+mlx-paged-attn = { workspace = true }
 
 [dependencies.mimalloc-safe]
 workspace = true
