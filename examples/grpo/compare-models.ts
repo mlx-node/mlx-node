@@ -78,7 +78,11 @@ CRITICAL: The tool_call MUST contain valid JSON with "name" and "arguments" keys
 // ============================================================================
 
 function getLang(language: string): Lang {
-  return language === 'typescript' ? Lang.TypeScript : Lang.JavaScript;
+  const normalized = language.toLowerCase();
+  if (normalized === 'typescript' || normalized === 'ts') return Lang.TypeScript;
+  if (normalized === 'tsx') return Lang.Tsx;
+  if (normalized === 'jsx') return Lang.JavaScript;
+  return Lang.JavaScript;
 }
 
 interface EvalResult {
@@ -321,10 +325,12 @@ ${pattern.codeContext}
 
       const evalResult = evaluateCompletion(
         {
+          prompt: messages[1].content,
           completion: {
+            text: result.text,
             rawText: result.rawText,
             toolCalls: result.toolCalls,
-            thinking: result.thinking,
+            thinking: result.thinking ?? undefined,
             numTokens: result.numTokens,
             finishReason: result.finishReason,
           },

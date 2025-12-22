@@ -43,7 +43,7 @@ describe('Cross Entropy - Extended', () => {
     expect(value).toBeCloseTo(manual, 5);
   });
 
-  it('zeros ignored targets but keeps batch mean', () => {
+  it('zeros ignored targets and normalizes by valid token count only', () => {
     const logits = createFloat32Array([3.0, 0.0, 0.0, 3.0], [2, 2]);
     const targets = MxArray.fromInt32(new Int32Array([0, -1]), BigInt64Array.from([2n]));
 
@@ -54,10 +54,28 @@ describe('Cross Entropy - Extended', () => {
       [3.0, 0.0],
       [0.0, 3.0],
     ];
-    const manualLosses = [logSumExp(logitsRows[0]) - logitsRows[0][0], 0];
-    const manual = manualLosses.reduce((acc, x) => acc + x, 0) / manualLosses.length;
+    // Only compute loss for valid (non-ignored) targets
+    // Normalize by valid token count (1), not total tokens (2)
+    const validLoss = logSumExp(logitsRows[0]) - logitsRows[0][0];
+    const validCount = 1;
+    const manual = validLoss / validCount;
 
     expect(value).toBeCloseTo(manual, 5);
+  });
+
+  it('returns zero loss when all labels are ignored (no NaN)', () => {
+    // Edge case: all labels are -100 (ignore_index)
+    // Should return 0.0, not NaN from divide-by-zero
+    const logits = createFloat32Array([1.0, 2.0, 3.0, 4.0], [2, 2]);
+    const targets = MxArray.fromInt32(new Int32Array([-100, -100]), BigInt64Array.from([2n]));
+
+    const loss = Losses.crossEntropy(logits, targets, 2, -100);
+    const value = loss.toFloat32()[0];
+
+    // No valid tokens, but masked_loss is also 0, so 0/1 = 0
+    expect(value).toBe(0.0);
+    expect(Number.isNaN(value)).toBe(false);
+    expect(Number.isFinite(value)).toBe(true);
   });
 
   it('supports probability targets', () => {

@@ -1165,6 +1165,10 @@ export declare class Qwen3Model {
    *
    * This performs a simple SGD update: param = param - lr * grad
    * Only updates parameters that have gradients; others remain unchanged.
+   *
+   * IMPORTANT: This function preserves the original dtype of parameters.
+   * The learning rate scalar is cast to match param dtype to prevent
+   * promotion to float32 during arithmetic operations.
    */
   applyGradients(gradients: Record<string, MxArray>, learningRate: number): void
   /**
@@ -1610,6 +1614,52 @@ export declare class RotatingKVCache {
   getKeep(): number
   /** Returns the current write index (for rotation). */
   getIdx(): number
+}
+
+/** SFT Training Engine */
+export declare class SftTrainingEngine {
+  /** Create a new SFT training engine */
+  constructor(model: Qwen3Model, config: SftEngineConfig)
+  /** Run a single training step */
+  trainStep(inputIds: MxArray, labels: MxArray): Promise<SftStepMetrics>
+  /** Get current step number */
+  getStep(): number
+  /** Get current epoch */
+  getEpoch(): number
+  /**
+   * Flush any accumulated gradients at epoch end
+   *
+   * When stepsPerEpoch % gradient_accumulation_steps != 0, there may be
+   * leftover gradients from the final micro-batches. This method applies
+   * them with proper averaging, matching TRL behavior.
+   */
+  flushGradients(): boolean
+  /**
+   * Compute the resume position given current state and dataset info
+   *
+   * This centralizes all resume logic in Rust for correctness.
+   * Uses i64 math internally to avoid overflow on long runs.
+   */
+  computeResumePosition(stepsPerEpoch: number): ResumePosition
+  /** Check if emergency save is needed */
+  needsEmergencySave(): boolean
+  /** Clear emergency save flag */
+  clearEmergencySave(): void
+  /**
+   * Signal start of a new epoch
+   *
+   * Takes the epoch number directly from TypeScript to ensure synchronization.
+   * The epoch is 0-indexed to match the TypeScript training loop.
+   */
+  startEpoch(epoch: number): void
+  /** End current epoch and return metrics */
+  endEpoch(epochTimeSecs: number): SftEpochMetrics
+  /** Reset training state (for new training run) */
+  reset(): void
+  /** Restore training state (for resuming from checkpoint) */
+  restoreState(step: number, epoch: number): void
+  /** Get the underlying model for checkpointing */
+  getModel(): Qwen3Model
 }
 
 /**
@@ -2415,6 +2465,16 @@ export interface Qwen3Config {
   bosTokenId: number
 }
 
+/** Result of resume position computation */
+export interface ResumePosition {
+  /** Epoch to start from (0-indexed) */
+  startEpoch: number
+  /** Batch index within epoch to start from */
+  startBatchIdx: number
+  /** Whether we're at an epoch boundary */
+  isEpochBoundary: boolean
+}
+
 /**
  * Reward function input for a single completion.
  * Provides all context needed to compute a reward score.
@@ -2499,6 +2559,60 @@ export declare function scaledDotProductAttentionCausal(queries: MxArray, keys: 
  *   2. Extract value at target_ids[b,t]
  */
 export declare function selectiveLogSoftmax(logits: MxArray, targetIds: MxArray): MxArray
+
+/** Configuration for the SFT training engine */
+export interface SftEngineConfig {
+  /** Learning rate (default: 2e-5) */
+  learningRate?: number
+  /** Gradient accumulation steps (default: 1) */
+  gradientAccumulationSteps?: number
+  /** Maximum gradient norm for clipping (default: 1.0) */
+  gradientClipNorm?: number
+  /** Maximum gradient value for element-wise clipping (optional) */
+  gradientClipValue?: number
+  /** Weight decay (L2 regularization) (default: 0.01) */
+  weightDecay?: number
+  /** Label smoothing factor (default: 0.0) */
+  labelSmoothing?: number
+  /** Steps between heavy cleanup (default: 25) */
+  heavyCleanupInterval?: number
+  /** Maximum allowed NaN gradient occurrences (default: 100) */
+  maxNanGradients?: number
+  /** Consecutive NaN gradients that trigger emergency checkpoint (default: 5) */
+  emergencySaveThreshold?: number
+  /** Compute token accuracy (requires extra forward pass) (default: false) */
+  computeAccuracy?: boolean
+}
+
+/** Metrics from a training epoch */
+export interface SftEpochMetrics {
+  /** Epoch number */
+  epoch: number
+  /** Average loss for the epoch */
+  avgLoss: number
+  /** Total steps in the epoch */
+  totalSteps: number
+  /** Total tokens processed */
+  totalTokens: number
+  /** Time for the epoch (seconds) */
+  epochTimeSecs: number
+}
+
+/** Metrics from a single training step */
+export interface SftStepMetrics {
+  /** Current step number */
+  step: number
+  /** Cross-entropy loss value */
+  loss: number
+  /** Total tokens processed this step (non-ignored) */
+  totalTokens: number
+  /** Token-level accuracy (if compute_accuracy enabled) */
+  tokenAccuracy?: number
+  /** Whether gradients were applied (vs accumulated) */
+  gradientsApplied: boolean
+  /** Time for training step (ms) */
+  trainingTimeMs: number
+}
 
 /** Tool call made by an assistant */
 export interface ToolCall {

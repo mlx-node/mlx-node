@@ -105,8 +105,39 @@ export {
 // Entropy configuration
 export { type EntropyFilteringConfig, DEFAULT_ENTROPY_CONFIG } from './trainers/grpo-entropy';
 
+// SFT Trainer
+export {
+  SFTTrainer,
+  SftTrainingEngine,
+  type SFTTrainStepResult,
+  type SFTTrainingState,
+  type SftEngineConfig,
+  type SftStepMetrics,
+  type SftEpochMetrics,
+} from './trainers/sft-trainer';
+
+export {
+  type SFTTrainerConfig,
+  SFTConfigError,
+  getDefaultSFTConfig,
+  mergeSFTConfig,
+  loadSFTTomlConfig,
+  applySFTOverrides,
+  DEFAULT_SFT_CONFIG,
+} from './trainers/sft-config';
+
 // Data
 export * from './data/dataset';
+export {
+  SFTDataset,
+  loadSFTDataset,
+  createSFTDataset,
+  type SFTExample,
+  type SFTPromptCompletionExample,
+  type SFTConversationExample,
+  type SFTBatch,
+  type SFTDatasetConfig,
+} from './data/sft-dataset';
 
 // Utils
 export * from './utils/xml-parser';

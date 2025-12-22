@@ -601,6 +601,7 @@ module.exports.RMSNorm = nativeBinding.RMSNorm
 module.exports.RMSprop = nativeBinding.RMSprop
 module.exports.RoPE = nativeBinding.RoPE
 module.exports.RotatingKVCache = nativeBinding.RotatingKVCache
+module.exports.SftTrainingEngine = nativeBinding.SftTrainingEngine
 module.exports.SGD = nativeBinding.SGD
 module.exports.Tensor = nativeBinding.Tensor
 module.exports.TransformerBlock = nativeBinding.TransformerBlock
