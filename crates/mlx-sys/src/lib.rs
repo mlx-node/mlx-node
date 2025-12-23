@@ -18,6 +18,8 @@ unsafe extern "C" {
     pub fn mlx_seed(seed: u64);
     pub fn mlx_array_from_int32(data: *const i32, shape: *const i64, ndim: usize)
     -> *mut mlx_array;
+    pub fn mlx_array_from_int64(data: *const i64, shape: *const i64, ndim: usize)
+    -> *mut mlx_array;
     pub fn mlx_array_from_uint32(
         data: *const u32,
         shape: *const i64,
@@ -678,6 +680,165 @@ unsafe extern "C" {
         out_cache_offsets: *mut i32,        // [num_layers]
         out_cache_capacities: *mut i32,     // [num_layers] (updated pre-allocated sizes)
     );
+}
+
+// ============================================================================
+// PagedAttention FFI
+// ============================================================================
+
+/// Configuration for paged attention
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct PagedAttnConfig {
+    /// Block size in tokens (8, 16, or 32)
+    pub block_size: u32,
+    /// Number of KV cache blocks to allocate
+    pub num_blocks: u32,
+    /// Head dimension (e.g., 128 for Qwen3)
+    pub head_size: u32,
+    /// Number of KV heads
+    pub num_kv_heads: u32,
+    /// Number of transformer layers
+    pub num_layers: u32,
+    /// Data type (0=float16, 1=bfloat16, 2=float32)
+    pub dtype: u32,
+}
+
+/// Opaque handle for the PagedAttention KV cache
+#[repr(C)]
+pub struct PagedAttnCache {
+    _unused: [u8; 0],
+}
+
+unsafe extern "C" {
+    /// Create a new PagedAttention KV cache
+    ///
+    /// # Arguments
+    /// * `config` - Configuration for the cache
+    ///
+    /// # Returns
+    /// Handle to the cache, or null on failure
+    pub fn mlx_paged_attn_create_cache(config: *const PagedAttnConfig) -> *mut PagedAttnCache;
+
+    /// Free a PagedAttention KV cache
+    pub fn mlx_paged_attn_free_cache(cache: *mut PagedAttnCache);
+
+    /// Get the key cache tensor for a layer
+    ///
+    /// # Arguments
+    /// * `cache` - The cache handle
+    /// * `layer_idx` - Layer index
+    ///
+    /// # Returns
+    /// Key cache array [num_blocks, num_kv_heads, head_size/x, block_size, x]
+    pub fn mlx_paged_attn_get_key_cache(
+        cache: *mut PagedAttnCache,
+        layer_idx: u32,
+    ) -> *mut mlx_array;
+
+    /// Get the value cache tensor for a layer
+    ///
+    /// # Arguments
+    /// * `cache` - The cache handle
+    /// * `layer_idx` - Layer index
+    ///
+    /// # Returns
+    /// Value cache array [num_blocks, num_kv_heads, head_size, block_size]
+    pub fn mlx_paged_attn_get_value_cache(
+        cache: *mut PagedAttnCache,
+        layer_idx: u32,
+    ) -> *mut mlx_array;
+
+    /// Update the cache with new keys and values (reshape_and_cache kernel)
+    ///
+    /// # Arguments
+    /// * `cache` - The cache handle
+    /// * `layer_idx` - Layer index
+    /// * `keys` - New keys [num_tokens, num_heads, head_size]
+    /// * `values` - New values [num_tokens, num_heads, head_size]
+    /// * `slot_mapping` - Slot indices for each token [num_tokens]
+    pub fn mlx_paged_attn_reshape_and_cache(
+        cache: *mut PagedAttnCache,
+        layer_idx: u32,
+        keys: *mut mlx_array,
+        values: *mut mlx_array,
+        slot_mapping: *mut mlx_array,
+    );
+
+    /// Run paged attention forward pass
+    ///
+    /// # Arguments
+    /// * `queries` - Query tensor [num_seqs, num_heads, head_size]
+    /// * `key_cache` - Key cache [num_blocks, num_kv_heads, head_size/x, block_size, x]
+    /// * `value_cache` - Value cache [num_blocks, num_kv_heads, head_size, block_size]
+    /// * `block_tables` - Block table [num_seqs, max_blocks_per_seq]
+    /// * `context_lens` - Context lengths [num_seqs]
+    /// * `scale` - Attention scale factor
+    /// * `block_size` - Number of tokens per block
+    /// * `max_context_len` - Maximum context length
+    ///
+    /// # Returns
+    /// Output tensor [num_seqs, num_heads, head_size]
+    pub fn mlx_paged_attn_forward(
+        queries: *mut mlx_array,
+        key_cache: *mut mlx_array,
+        value_cache: *mut mlx_array,
+        block_tables: *mut mlx_array,
+        context_lens: *mut mlx_array,
+        scale: f32,
+        block_size: u32,
+        max_context_len: u32,
+    ) -> *mut mlx_array;
+
+    /// Copy blocks for copy-on-write semantics
+    ///
+    /// # Arguments
+    /// * `cache` - The cache handle
+    /// * `layer_idx` - Layer index
+    /// * `block_mapping` - Pairs of (src_block, dst_block) [num_pairs, 2]
+    pub fn mlx_paged_attn_copy_blocks(
+        cache: *mut PagedAttnCache,
+        layer_idx: u32,
+        block_mapping: *mut mlx_array,
+    );
+}
+
+// ============================================================================
+// Metal Buffer Extraction FFI
+// ============================================================================
+//
+// These functions extract Metal buffer pointers from MLX arrays for use
+// with external Metal kernel dispatch (e.g., Rust metal crate).
+//
+// IMPORTANT: Only valid when Metal backend is available (macOS with GPU).
+// On CPU-only builds or non-macOS platforms, buffer pointers are NOT MTLBuffer*.
+//
+// Note: mlx_metal_is_available() is already declared earlier in this file.
+
+unsafe extern "C" {
+    /// Get the raw Metal buffer pointer from an MLX array
+    /// Returns the MTLBuffer* as a void* for FFI compatibility
+    /// Returns nullptr if:
+    ///   - handle is null
+    ///   - Metal/GPU is not available (buffer would not be MTLBuffer*)
+    ///   - array has no data
+    pub fn mlx_array_get_metal_buffer(handle: *mut mlx_array) -> *mut std::ffi::c_void;
+
+    /// Get the byte offset into the Metal buffer for this array
+    /// This is needed for sliced/strided arrays that share a buffer
+    /// Note: Returns bytes (MLX's offset() is already in bytes)
+    pub fn mlx_array_get_buffer_offset(handle: *mut mlx_array) -> usize;
+
+    /// Get the data size of the array in number of ELEMENTS (not bytes)
+    /// To get bytes, multiply by itemsize from mlx_array_get_itemsize()
+    pub fn mlx_array_get_data_size(handle: *mut mlx_array) -> usize;
+
+    /// Get the item size in bytes for the array's dtype
+    pub fn mlx_array_get_itemsize(handle: *mut mlx_array) -> usize;
+
+    /// Synchronize - ensure all MLX operations are complete
+    /// Call this before dispatching external Metal kernels
+    pub fn mlx_metal_synchronize();
 }
 
 // Gradient computation types

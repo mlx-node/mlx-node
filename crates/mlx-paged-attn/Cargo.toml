@@ -1,0 +1,19 @@
+[package]
+name = "mlx-paged-attn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "PagedAttention for MLX-Node - efficient KV cache management with Metal kernels"
+license = "Apache-2.0"
+authors = ["Brooklyn Zelenka"]
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+mlx-sys.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"
+objc = "0.2"
+block = "0.1"

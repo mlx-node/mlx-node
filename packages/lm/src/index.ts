@@ -20,7 +20,7 @@ export { Qwen3Model, Qwen3Tokenizer } from '@mlx-node/core';
 
 // Types
 export type { DType } from '@mlx-node/core';
-export type { SamplingConfig, BatchGenerationConfig, BatchGenerationResult } from '@mlx-node/core';
+export type { SamplingConfig, BatchGenerationResult } from '@mlx-node/core';
 
 // Chat API types from core (for model.chat() API)
 export type { ToolCallResult, ChatResult, ChatConfig } from '@mlx-node/core';

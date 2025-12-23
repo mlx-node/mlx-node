@@ -80,6 +80,10 @@ use crate::utils::functional;
 /// #     pad_token_id: 151643,
 /// #     eos_token_id: 151645,
 /// #     bos_token_id: 151643,
+/// #     use_paged_attention: None,
+/// #     paged_cache_memory_mb: None,
+/// #     paged_block_size: None,
+/// #     use_fp8_cache: None,
 /// # };
 /// # let params = HashMap::new();
 /// # let prompt_tokens = vec![];
