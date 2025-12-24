@@ -183,6 +183,8 @@ pub enum MetalDtype {
     Float32,
     Float16,
     BFloat16,
+    /// FP8 E4M3 format (1 byte per element)
+    UChar,
 }
 
 impl MetalDtype {
@@ -192,6 +194,7 @@ impl MetalDtype {
             MetalDtype::Float32 => "float",
             MetalDtype::Float16 => "half",
             MetalDtype::BFloat16 => "bfloat16_t",
+            MetalDtype::UChar => "uchar",
         }
     }
 
@@ -200,7 +203,13 @@ impl MetalDtype {
         match self {
             MetalDtype::Float32 => 4,
             MetalDtype::Float16 | MetalDtype::BFloat16 => 2,
+            MetalDtype::UChar => 1,
         }
+    }
+
+    /// Check if this is an FP8 type
+    pub fn is_fp8(&self) -> bool {
+        matches!(self, MetalDtype::UChar)
     }
 }
 
