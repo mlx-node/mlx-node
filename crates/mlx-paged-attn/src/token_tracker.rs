@@ -175,12 +175,20 @@ impl TokenTracker {
     /// Copy tokens from one block to another
     ///
     /// Used during copy-on-write operations.
+    /// If the source block doesn't exist, this is a no-op.
     pub fn copy_block(&mut self, src_block_id: u32, dst_block_id: u32) {
         if !self.enabled {
             return;
         }
 
-        // Remove stale prefix_index entry for destination block if it exists and belongs to it
+        // First check if source exists and clone its tokens.
+        // If source doesn't exist, return early without modifying destination.
+        let Some(src_tokens) = self.block_tokens.get(&src_block_id).cloned() else {
+            return;
+        };
+
+        // Now that we know we'll perform the copy, remove stale prefix_index entry
+        // for destination block if it exists and belongs to it
         if let Some(dst_tokens) = self.block_tokens.get(&dst_block_id)
             && !dst_tokens.is_empty()
         {
@@ -190,14 +198,11 @@ impl TokenTracker {
             }
         }
 
-        if let Some(src_tokens) = self.block_tokens.get(&src_block_id) {
-            let tokens = src_tokens.clone();
-            let hash = Self::hash_tokens(&tokens);
-            let num_tokens = tokens.len() as u32;
+        let hash = Self::hash_tokens(&src_tokens);
+        let num_tokens = src_tokens.len() as u32;
 
-            self.block_tokens.insert(dst_block_id, tokens);
-            self.prefix_index.insert(hash, (dst_block_id, num_tokens));
-        }
+        self.block_tokens.insert(dst_block_id, src_tokens);
+        self.prefix_index.insert(hash, (dst_block_id, num_tokens));
     }
 
     /// Find blocks that match a token prefix
@@ -663,5 +668,35 @@ mod tests {
         let matches_new = tracker.find_prefix_matches(&[1, 2, 3, 4]);
         assert!(!matches_new.is_empty());
         assert_eq!(matches_new[0].0, 1);
+    }
+
+    #[test]
+    fn test_copy_block_nonexistent_source_preserves_destination() {
+        // Regression test: Copying from a non-existent source should be a no-op
+        // and should NOT remove the destination's prefix_index entry.
+        let mut tracker = TokenTracker::new(4);
+
+        // Block 1 has tokens [5, 6, 7, 8]
+        tracker.track_tokens(1, &[5, 6, 7, 8], 0);
+
+        // Verify block 1 is indexed
+        let matches_before = tracker.find_prefix_matches(&[5, 6, 7, 8]);
+        assert!(!matches_before.is_empty());
+        assert_eq!(matches_before[0].0, 1);
+
+        // Copy from non-existent block 99 to block 1
+        // This should be a no-op - block 1's state should be unchanged
+        tracker.copy_block(99, 1);
+
+        // Block 1 should still have its tokens
+        assert_eq!(tracker.get_block_tokens(1), &[5, 6, 7, 8]);
+
+        // Block 1's prefix_index entry should still exist
+        let matches_after = tracker.find_prefix_matches(&[5, 6, 7, 8]);
+        assert!(
+            !matches_after.is_empty(),
+            "Block 1's prefix_index entry was incorrectly removed when copying from non-existent source"
+        );
+        assert_eq!(matches_after[0].0, 1);
     }
 }
