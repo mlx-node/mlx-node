@@ -606,9 +606,11 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
 ) -> Result<PagedAttentionOutput, String> {
     let state = MetalState::get()?;
 
-    // Allocate output buffer
+    // Allocate output buffer - always use float16 size since kernel outputs float16
+    // even when using FP8 cache (kernel dequantizes internally)
+    let output_element_size = MetalDtype::Float16.size() as u64;
     let output_size =
-        (params.num_seqs * params.num_heads * params.head_size) as u64 * dtype.size() as u64;
+        (params.num_seqs * params.num_heads * params.head_size) as u64 * output_element_size;
     let output = state
         .device
         .new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate);
@@ -721,12 +723,13 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     command_buffer.commit();
     command_buffer.wait_until_completed();
 
+    // Output is always float16 regardless of cache dtype
     Ok(PagedAttentionOutput {
         buffer: output,
         num_seqs: params.num_seqs,
         num_heads: params.num_heads,
         head_size: params.head_size,
-        dtype,
+        dtype: MetalDtype::Float16,
     })
 }
 
@@ -749,9 +752,11 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
 ) -> Result<PagedAttentionOutput, String> {
     let state = MetalState::get()?;
 
-    // Allocate output buffer
+    // Allocate output buffer - always use float16 size since kernel outputs float16
+    // even when using FP8 cache (kernel dequantizes internally)
+    let output_element_size = MetalDtype::Float16.size() as u64;
     let output_size =
-        (params.num_seqs * params.num_heads * params.head_size) as u64 * dtype.size() as u64;
+        (params.num_seqs * params.num_heads * params.head_size) as u64 * output_element_size;
     let output = state
         .device
         .new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate);
@@ -759,13 +764,13 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
     // Calculate number of partitions
     let max_num_partitions = params.max_seq_len.div_ceil(PARTITION_SIZE);
 
-    // Allocate temporary buffers
+    // Allocate temporary buffers - tmp_out also uses float16 (kernel output dtype)
     let exp_sums_size = (params.num_seqs * params.num_heads * max_num_partitions) as usize
         * std::mem::size_of::<f32>();
     let max_logits_size = exp_sums_size;
     let tmp_out_size = (params.num_seqs * params.num_heads * max_num_partitions * params.head_size)
         as usize
-        * dtype.size();
+        * MetalDtype::Float16.size();
 
     let exp_sums = state.device.new_buffer(
         exp_sums_size as u64,
@@ -925,12 +930,13 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         command_buffer.wait_until_completed();
     }
 
+    // Output is always float16 regardless of cache dtype
     Ok(PagedAttentionOutput {
         buffer: output,
         num_seqs: params.num_seqs,
         num_heads: params.num_heads,
         head_size: params.head_size,
-        dtype,
+        dtype: MetalDtype::Float16,
     })
 }
 

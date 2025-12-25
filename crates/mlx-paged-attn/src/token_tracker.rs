@@ -84,6 +84,13 @@ impl TokenTracker {
             return 0;
         }
 
+        // Compute old hash before modifying (to remove stale entry from prefix_index)
+        let old_hash = self
+            .block_tokens
+            .get(&block_id)
+            .filter(|t| !t.is_empty())
+            .map(|t| Self::hash_tokens(t));
+
         // Get or create token vector for this block
         let block_tokens = self
             .block_tokens
@@ -109,7 +116,14 @@ impl TokenTracker {
         let hash = Self::hash_tokens(block_tokens);
         let num_tokens = block_tokens.len() as u32;
 
-        // Update prefix index
+        // Remove stale prefix_index entry if hash changed
+        if let Some(old) = old_hash
+            && old != hash
+        {
+            self.prefix_index.remove(&old);
+        }
+
+        // Update prefix index with new hash
         self.prefix_index.insert(hash, (block_id, num_tokens));
 
         hash
@@ -160,6 +174,14 @@ impl TokenTracker {
     pub fn copy_block(&mut self, src_block_id: u32, dst_block_id: u32) {
         if !self.enabled {
             return;
+        }
+
+        // Remove stale prefix_index entry for destination block if it exists
+        if let Some(dst_tokens) = self.block_tokens.get(&dst_block_id)
+            && !dst_tokens.is_empty()
+        {
+            let old_hash = Self::hash_tokens(dst_tokens);
+            self.prefix_index.remove(&old_hash);
         }
 
         if let Some(src_tokens) = self.block_tokens.get(&src_block_id) {
