@@ -116,9 +116,10 @@ impl TokenTracker {
         let hash = Self::hash_tokens(block_tokens);
         let num_tokens = block_tokens.len() as u32;
 
-        // Remove stale prefix_index entry if hash changed
+        // Remove stale prefix_index entry if hash changed and belongs to this block
         if let Some(old) = old_hash
             && old != hash
+            && self.prefix_index.get(&old).map(|(id, _)| *id) == Some(block_id)
         {
             self.prefix_index.remove(&old);
         }
@@ -160,9 +161,12 @@ impl TokenTracker {
         }
 
         // Compute hash before removing (for prefix index cleanup)
+        // Only remove from prefix_index if the entry belongs to this block
         if self.block_tokens.contains_key(&block_id) {
             let hash = self.compute_block_hash(block_id);
-            self.prefix_index.remove(&hash);
+            if self.prefix_index.get(&hash).map(|(id, _)| *id) == Some(block_id) {
+                self.prefix_index.remove(&hash);
+            }
         }
 
         self.block_tokens.remove(&block_id);
@@ -176,12 +180,14 @@ impl TokenTracker {
             return;
         }
 
-        // Remove stale prefix_index entry for destination block if it exists
+        // Remove stale prefix_index entry for destination block if it exists and belongs to it
         if let Some(dst_tokens) = self.block_tokens.get(&dst_block_id)
             && !dst_tokens.is_empty()
         {
             let old_hash = Self::hash_tokens(dst_tokens);
-            self.prefix_index.remove(&old_hash);
+            if self.prefix_index.get(&old_hash).map(|(id, _)| *id) == Some(dst_block_id) {
+                self.prefix_index.remove(&old_hash);
+            }
         }
 
         if let Some(src_tokens) = self.block_tokens.get(&src_block_id) {
@@ -562,5 +568,100 @@ mod tests {
         tracker.clear();
 
         assert_eq!(tracker.stats().num_tracked_blocks, 0);
+    }
+
+    #[test]
+    fn test_shared_hash_after_copy_block_track_tokens() {
+        // Regression test: When blocks share the same hash after copy_block,
+        // modifying one block should not remove the other's prefix_index entry.
+        let mut tracker = TokenTracker::new(4);
+
+        // Block 0 has tokens [1, 2, 3, 4]
+        tracker.track_tokens(0, &[1, 2, 3, 4], 0);
+
+        // Copy block 0 to block 1 - now both have same tokens and hash
+        // prefix_index now points to block 1 (last writer wins)
+        tracker.copy_block(0, 1);
+
+        // Verify block 1 is in the prefix_index
+        let matches_before = tracker.find_prefix_matches(&[1, 2, 3, 4]);
+        assert!(!matches_before.is_empty());
+        assert_eq!(matches_before[0].0, 1); // Block 1 should be indexed
+
+        // Now modify block 0 with different tokens
+        // This should NOT remove block 1's entry from prefix_index
+        tracker.track_tokens(0, &[5, 6, 7, 8], 0);
+
+        // Block 1's prefix_index entry should still exist
+        let matches_after = tracker.find_prefix_matches(&[1, 2, 3, 4]);
+        assert!(
+            !matches_after.is_empty(),
+            "Block 1's prefix_index entry was incorrectly removed"
+        );
+        assert_eq!(matches_after[0].0, 1); // Block 1 should still be indexed
+    }
+
+    #[test]
+    fn test_shared_hash_after_copy_block_remove_block() {
+        // Regression test: When blocks share the same hash after copy_block,
+        // removing one block should not remove the other's prefix_index entry.
+        let mut tracker = TokenTracker::new(4);
+
+        // Block 0 has tokens [1, 2, 3, 4]
+        tracker.track_tokens(0, &[1, 2, 3, 4], 0);
+
+        // Copy block 0 to block 1
+        // prefix_index now points to block 1
+        tracker.copy_block(0, 1);
+
+        // Verify block 1 is indexed
+        let matches_before = tracker.find_prefix_matches(&[1, 2, 3, 4]);
+        assert!(!matches_before.is_empty());
+        assert_eq!(matches_before[0].0, 1);
+
+        // Remove block 0 - this should NOT remove block 1's entry
+        tracker.remove_block(0);
+
+        // Block 1's prefix_index entry should still exist
+        let matches_after = tracker.find_prefix_matches(&[1, 2, 3, 4]);
+        assert!(
+            !matches_after.is_empty(),
+            "Block 1's prefix_index entry was incorrectly removed"
+        );
+        assert_eq!(matches_after[0].0, 1);
+    }
+
+    #[test]
+    fn test_shared_hash_copy_block_overwrites() {
+        // When copying to a block that has different tokens, the old entry
+        // for the destination block should be removed (if it owns the entry).
+        let mut tracker = TokenTracker::new(4);
+
+        // Block 0 has tokens [1, 2, 3, 4]
+        tracker.track_tokens(0, &[1, 2, 3, 4], 0);
+
+        // Block 1 has tokens [5, 6, 7, 8]
+        tracker.track_tokens(1, &[5, 6, 7, 8], 0);
+
+        // Both blocks should be findable
+        let matches0 = tracker.find_prefix_matches(&[1, 2, 3, 4]);
+        let matches1 = tracker.find_prefix_matches(&[5, 6, 7, 8]);
+        assert!(!matches0.is_empty());
+        assert!(!matches1.is_empty());
+
+        // Copy block 0 to block 1 - block 1's old entry should be removed
+        tracker.copy_block(0, 1);
+
+        // [5, 6, 7, 8] should no longer be findable
+        let matches_old = tracker.find_prefix_matches(&[5, 6, 7, 8]);
+        assert!(
+            matches_old.is_empty(),
+            "Block 1's old entry should have been removed"
+        );
+
+        // [1, 2, 3, 4] should now point to block 1
+        let matches_new = tracker.find_prefix_matches(&[1, 2, 3, 4]);
+        assert!(!matches_new.is_empty());
+        assert_eq!(matches_new[0].0, 1);
     }
 }
