@@ -40,9 +40,16 @@ impl SequenceBlockTable {
     }
 
     /// Replace a block at the given index (for copy-on-write)
-    pub fn replace_block(&mut self, index: usize, block: Arc<PhysicalBlock>) {
+    ///
+    /// # Returns
+    /// * `true` if the block was successfully replaced
+    /// * `false` if the index was out of bounds
+    pub fn replace_block(&mut self, index: usize, block: Arc<PhysicalBlock>) -> bool {
         if index < self.blocks.len() {
             self.blocks[index] = block;
+            true
+        } else {
+            false
         }
     }
 

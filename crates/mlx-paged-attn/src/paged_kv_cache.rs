@@ -138,9 +138,12 @@ impl PagedKVCache {
 
         // Free all blocks and clean up token tracking
         for block in table.blocks().iter() {
-            // Clean up token tracking data for this block
-            self.token_tracker.remove_block(block.block_id);
-            // Free the physical block
+            // Only remove token tracking if this is the last reference to the block.
+            // For shared blocks (e.g., from fork_sequence), keep tracking for remaining sequences.
+            if block.get_ref_count() == 1 {
+                self.token_tracker.remove_block(block.block_id);
+            }
+            // Free the physical block (decrements ref_count, only returns to pool if reaches 0)
             self.engine_manager.allocator_mut().free(block.clone());
         }
 
@@ -1509,7 +1512,12 @@ impl PagedKVCache {
 
         // Update block table with new block
         let table = self.block_table.get_mut(seq_id).unwrap();
-        table.replace_block(block_idx, new_block);
+        if !table.replace_block(block_idx, new_block) {
+            return Err(format!(
+                "Failed to replace block at index {} for sequence {} (out of bounds)",
+                block_idx, seq_id
+            ));
+        }
 
         Ok(Some((src_block_id, dst_block_id)))
     }

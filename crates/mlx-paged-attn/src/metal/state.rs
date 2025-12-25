@@ -114,65 +114,83 @@ impl MetalState {
     /// Get the reshape_and_cache kernel name for a dtype
     ///
     /// # Arguments
-    /// * `dtype` - Data type for KV
+    /// * `cache_dtype` - Data type for cache storage (UChar for FP8, Float16 otherwise)
     /// * `use_fp8` - Whether to use FP8 scaling
-    pub fn reshape_and_cache_kernel_name(dtype: MetalDtype, use_fp8: bool) -> String {
-        let type_str = dtype.type_string();
+    ///
+    /// Note: Input KV tensors are always float16 from the model.
+    pub fn reshape_and_cache_kernel_name(cache_dtype: MetalDtype, use_fp8: bool) -> String {
+        // Input is always float16 (from model), cache dtype varies
+        let input_type = MetalDtype::Float16.type_string();
+        let cache_type = cache_dtype.type_string();
         let suffix = if use_fp8 { "_fp8" } else { "" };
         format!(
             "reshape_and_cache_kv_{}_cache_{}{}",
-            type_str, type_str, suffix
+            input_type, cache_type, suffix
         )
     }
 
     /// Get the paged_attention V1 kernel name (no partitioning)
     ///
     /// # Arguments
-    /// * `dtype` - Data type
+    /// * `cache_dtype` - Data type for cache (UChar for FP8, Float16 otherwise)
     /// * `head_size` - Head dimension (64 or 128)
     /// * `block_size` - Block size (16 or 32)
     /// * `use_alibi` - Whether to use ALiBi positional encoding
+    ///
+    /// Note: Input queries are always float16, output is always float16.
     pub fn paged_attention_v1_kernel_name(
-        dtype: MetalDtype,
+        cache_dtype: MetalDtype,
         head_size: u32,
         block_size: u32,
         use_alibi: bool,
     ) -> String {
-        let type_str = dtype.type_string();
+        // Input/output are always float16, cache dtype varies
+        let io_type = MetalDtype::Float16.type_string();
+        let cache_type = cache_dtype.type_string();
         let suffix = if use_alibi { "_alibi" } else { "" };
         format!(
             "paged_attention_{}_cache_{}_hs{}_bs{}_nt256_nsl32_ps0{}",
-            type_str, type_str, head_size, block_size, suffix
+            io_type, cache_type, head_size, block_size, suffix
         )
     }
 
     /// Get the paged_attention V2 kernel name (with partitioning)
     ///
     /// # Arguments
-    /// * `dtype` - Data type
+    /// * `cache_dtype` - Data type for cache (UChar for FP8, Float16 otherwise)
     /// * `head_size` - Head dimension (64 or 128)
     /// * `block_size` - Block size (16 or 32)
     /// * `use_alibi` - Whether to use ALiBi positional encoding
+    ///
+    /// Note: Input queries are always float16, output is always float16.
     pub fn paged_attention_v2_kernel_name(
-        dtype: MetalDtype,
+        cache_dtype: MetalDtype,
         head_size: u32,
         block_size: u32,
         use_alibi: bool,
     ) -> String {
-        let type_str = dtype.type_string();
+        // Input/output are always float16, cache dtype varies
+        let io_type = MetalDtype::Float16.type_string();
+        let cache_type = cache_dtype.type_string();
         let suffix = if use_alibi { "_alibi" } else { "" };
         format!(
             "paged_attention_{}_cache_{}_hs{}_bs{}_nt256_nsl32_ps512{}",
-            type_str, type_str, head_size, block_size, suffix
+            io_type, cache_type, head_size, block_size, suffix
         )
     }
 
     /// Get the paged_attention V2 reduce kernel name
-    pub fn paged_attention_v2_reduce_kernel_name(dtype: MetalDtype, head_size: u32) -> String {
-        let type_str = dtype.type_string();
+    ///
+    /// Note: Reduce kernel always uses float16 since partitioned outputs are float16.
+    pub fn paged_attention_v2_reduce_kernel_name(
+        _cache_dtype: MetalDtype,
+        head_size: u32,
+    ) -> String {
+        // Reduce kernel always works with float16 outputs from partitions
+        let io_type = MetalDtype::Float16.type_string();
         format!(
             "paged_attention_v2_reduce_{}_hs{}_nt256_nsl32_ps512",
-            type_str, head_size
+            io_type, head_size
         )
     }
 }
@@ -230,6 +248,7 @@ mod tests {
     #[test]
     fn test_kernel_names() {
         // FORKED: Updated tests for new API with use_fp8/use_alibi parameters
+        // Float16 cache mode
         assert_eq!(
             MetalState::reshape_and_cache_kernel_name(MetalDtype::Float16, false),
             "reshape_and_cache_kv_half_cache_half"
@@ -253,6 +272,25 @@ mod tests {
         assert_eq!(
             MetalState::paged_attention_v2_kernel_name(MetalDtype::Float16, 128, 16, true),
             "paged_attention_half_cache_half_hs128_bs16_nt256_nsl32_ps512_alibi"
+        );
+
+        // FP8 cache mode (UChar cache, but input/output still float16)
+        assert_eq!(
+            MetalState::reshape_and_cache_kernel_name(MetalDtype::UChar, true),
+            "reshape_and_cache_kv_half_cache_uchar_fp8"
+        );
+        assert_eq!(
+            MetalState::paged_attention_v1_kernel_name(MetalDtype::UChar, 128, 16, false),
+            "paged_attention_half_cache_uchar_hs128_bs16_nt256_nsl32_ps0"
+        );
+        assert_eq!(
+            MetalState::paged_attention_v2_kernel_name(MetalDtype::UChar, 128, 16, false),
+            "paged_attention_half_cache_uchar_hs128_bs16_nt256_nsl32_ps512"
+        );
+        // Reduce kernel always uses float16 regardless of cache dtype
+        assert_eq!(
+            MetalState::paged_attention_v2_reduce_kernel_name(MetalDtype::UChar, 128),
+            "paged_attention_v2_reduce_half_hs128_nt256_nsl32_ps512"
         );
     }
 
