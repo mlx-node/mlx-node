@@ -6,27 +6,103 @@
 use crate::block_allocator::BlockAllocator;
 use crate::config::PagedAttentionConfig;
 
+#[cfg(target_os = "macos")]
+use metal::Buffer;
+
 /// Cache engine for a single transformer layer
+///
+/// Manages the GPU memory for KV cache of a single transformer layer.
+/// The cache layout follows vLLM conventions:
+/// - Key cache: [num_blocks, num_kv_heads, head_size/x, block_size, x]
+/// - Value cache: [num_blocks, num_kv_heads, head_size, block_size]
+///
+/// Where x is 16 / sizeof(dtype) for vectorized memory access.
 pub struct CacheEngine {
     /// Layer index
     layer_idx: u32,
 
-    /// Configuration (stored for future Metal buffer management)
-    #[allow(dead_code)]
+    /// Configuration
     config: PagedAttentionConfig,
+
+    /// Key cache buffer (only on macOS with Metal)
+    #[cfg(target_os = "macos")]
+    key_cache: Option<Buffer>,
+
+    /// Value cache buffer (only on macOS with Metal)
+    #[cfg(target_os = "macos")]
+    value_cache: Option<Buffer>,
 
     /// Whether the cache has been initialized
     initialized: bool,
 }
 
 impl CacheEngine {
-    /// Create a new cache engine
+    /// Create a new cache engine (uninitialized)
     pub fn new(layer_idx: u32, config: PagedAttentionConfig) -> Self {
         Self {
             layer_idx,
             config,
+            #[cfg(target_os = "macos")]
+            key_cache: None,
+            #[cfg(target_os = "macos")]
+            value_cache: None,
             initialized: false,
         }
+    }
+
+    /// Initialize the Metal cache buffers
+    ///
+    /// Must be called before using update() or attention().
+    /// Allocates GPU memory for key and value caches.
+    #[cfg(target_os = "macos")]
+    pub fn initialize(&mut self, num_blocks: u32) -> Result<(), String> {
+        use crate::metal::MetalState;
+        use metal::MTLResourceOptions;
+
+        if self.initialized {
+            return Ok(());
+        }
+
+        let state = MetalState::get()?;
+
+        // Calculate buffer sizes based on FP8 or FP16
+        let use_fp8 = self.config.use_fp8();
+        let element_size = if use_fp8 { 1u64 } else { 2u64 }; // FP8 = 1 byte, FP16 = 2 bytes
+
+        // Key cache: [num_blocks, num_kv_heads, head_size/x, block_size, x]
+        // where x = 16 / sizeof(dtype)
+        // For FP16: x = 16/2 = 8
+        // For FP8:  x = 16/1 = 16
+        let x = if use_fp8 { 16u32 } else { 8u32 };
+
+        let key_cache_size = num_blocks as u64
+            * self.config.num_kv_heads as u64
+            * (self.config.head_size as u64 / x as u64)
+            * self.config.block_size as u64
+            * x as u64
+            * element_size;
+
+        // Value cache: [num_blocks, num_kv_heads, head_size, block_size]
+        let value_cache_size = num_blocks as u64
+            * self.config.num_kv_heads as u64
+            * self.config.head_size as u64
+            * self.config.block_size as u64
+            * element_size;
+
+        // Allocate GPU buffers
+        let key_cache = state
+            .device
+            .new_buffer(key_cache_size, MTLResourceOptions::StorageModePrivate);
+
+        let value_cache = state
+            .device
+            .new_buffer(value_cache_size, MTLResourceOptions::StorageModePrivate);
+
+        self.key_cache = Some(key_cache);
+        self.value_cache = Some(value_cache);
+        self.initialized = true;
+
+        Ok(())
     }
 
     /// Get the layer index
@@ -39,10 +115,22 @@ impl CacheEngine {
         self.initialized
     }
 
-    // TODO: Implement Metal buffer management
-    // - Initialize key/value cache buffers
-    // - Call reshape_and_cache kernel
-    // - Call paged_attention kernel
+    /// Get the key cache buffer
+    #[cfg(target_os = "macos")]
+    pub fn key_cache(&self) -> Option<&Buffer> {
+        self.key_cache.as_ref()
+    }
+
+    /// Get the value cache buffer
+    #[cfg(target_os = "macos")]
+    pub fn value_cache(&self) -> Option<&Buffer> {
+        self.value_cache.as_ref()
+    }
+
+    /// Get the configuration
+    pub fn config(&self) -> &PagedAttentionConfig {
+        &self.config
+    }
 }
 
 /// Manager for all layer cache engines
@@ -55,6 +143,9 @@ pub struct CacheEngineManager {
 
     /// Configuration
     config: PagedAttentionConfig,
+
+    /// Number of blocks allocated
+    num_blocks: u32,
 }
 
 impl CacheEngineManager {
@@ -73,7 +164,24 @@ impl CacheEngineManager {
             engines,
             allocator,
             config,
+            num_blocks,
         })
+    }
+
+    /// Initialize all cache engines (allocates GPU memory)
+    ///
+    /// Must be called before using update() or attention().
+    #[cfg(target_os = "macos")]
+    pub fn initialize(&mut self) -> Result<(), String> {
+        for engine in &mut self.engines {
+            engine.initialize(self.num_blocks)?;
+        }
+        Ok(())
+    }
+
+    /// Get the number of blocks
+    pub fn num_blocks(&self) -> u32 {
+        self.num_blocks
     }
 
     /// Get the allocator

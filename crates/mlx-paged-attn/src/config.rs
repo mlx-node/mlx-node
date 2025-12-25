@@ -72,10 +72,10 @@ impl PagedAttentionConfig {
             return Err("num_kv_heads must be > 0".to_string());
         }
 
-        // FP8 cache is not yet implemented - reject early with clear error
-        if self.use_fp8_cache.unwrap_or(false) {
+        // FP8 cache requires block_size 16 or 32 for optimal memory alignment
+        if self.use_fp8_cache.unwrap_or(false) && self.block_size == 8 {
             return Err(
-                "FP8 cache is not yet implemented. Set use_fp8_cache to false or None.".to_string(),
+                "FP8 cache requires block_size 16 or 32 for optimal alignment.".to_string(),
             );
         }
 
@@ -207,18 +207,31 @@ mod tests {
     }
 
     #[test]
-    fn test_fp8_validation_rejected() {
+    fn test_fp8_validation() {
+        // FP8 with block_size 32 should work
         let config = PagedAttentionConfig {
             use_fp8_cache: Some(true),
+            block_size: 32,
             ..Default::default()
         };
+        assert!(config.validate().is_ok());
 
+        // FP8 with block_size 16 should work
+        let config = PagedAttentionConfig {
+            use_fp8_cache: Some(true),
+            block_size: 16,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        // FP8 with block_size 8 should fail (alignment)
+        let config = PagedAttentionConfig {
+            use_fp8_cache: Some(true),
+            block_size: 8,
+            ..Default::default()
+        };
         let result = config.validate();
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("FP8 cache is not yet implemented")
-        );
+        assert!(result.unwrap_err().contains("block_size 16 or 32"));
     }
 }

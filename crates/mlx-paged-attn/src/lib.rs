@@ -18,22 +18,28 @@
 //! - [PagedAttention Paper](https://arxiv.org/abs/2309.06180)
 //! - [HuggingFace kernels-community](https://huggingface.co/kernels-community/paged-attention)
 
+mod attention_layer;
 mod block_allocator;
 mod block_table;
 mod cache_engine;
 mod config;
+mod input_metadata;
 mod paged_kv_cache;
 mod scheduler;
+mod token_tracker;
 
 #[cfg(target_os = "macos")]
 pub mod metal;
 
+pub use attention_layer::*;
 pub use block_allocator::*;
 pub use block_table::*;
 pub use cache_engine::*;
 pub use config::*;
+pub use input_metadata::*;
 pub use paged_kv_cache::*;
 pub use scheduler::*;
+pub use token_tracker::*;
 
 /// Path to the compiled Metal library (set at build time)
 /// Only valid on macOS; empty string on other platforms

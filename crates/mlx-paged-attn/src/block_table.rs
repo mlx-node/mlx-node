@@ -39,6 +39,13 @@ impl SequenceBlockTable {
         self.blocks.push(block);
     }
 
+    /// Replace a block at the given index (for copy-on-write)
+    pub fn replace_block(&mut self, index: usize, block: Arc<PhysicalBlock>) {
+        if index < self.blocks.len() {
+            self.blocks[index] = block;
+        }
+    }
+
     /// Get the number of blocks
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()

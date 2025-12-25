@@ -9,12 +9,21 @@
 //! - `reshape_and_cache` - Updates KV cache with new tokens
 //! - `paged_attention` - Computes attention using paged KV cache
 //!
-//! Currently, operations use the C++ software fallback in `mlx-sys`.
-//! Full Metal kernel dispatch requires extracting MTLBuffer from MLX arrays,
-//! which is not yet supported by the MLX public API.
+//! Operations use the C++ implementation in `mlx-sys`. For direct Metal
+//! kernel dispatch, use `PagedKVCache` from `mlx-paged-attn` directly:
 //!
-//! The Metal dispatch infrastructure is ready in `mlx_paged_attn::metal` and
-//! can be enabled once buffer extraction is available.
+//! ```ignore
+//! use mlx_paged_attn::{PagedKVCache, PagedAttentionConfig};
+//!
+//! let mut cache = PagedKVCache::new(config)?;
+//! cache.initialize()?;  // Allocate Metal buffers
+//!
+//! // Direct Metal kernel dispatch
+//! unsafe {
+//!     cache.update(layer_idx, keys_ptr, values_ptr, slot_mapping_ptr)?;
+//!     let output = cache.attention(layer_idx, queries_ptr, &seq_ids, num_heads, scale)?;
+//! }
+//! ```
 
 use crate::array::MxArray;
 use mlx_sys as sys;
