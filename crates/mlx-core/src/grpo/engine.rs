@@ -209,6 +209,21 @@ pub struct TrainStepResult {
     pub rewards: Vec<f64>,
 }
 
+/// Result from train_step_auto_with_recording including optional full RewardOutput data
+#[napi(object)]
+#[derive(Clone)]
+pub struct TrainStepResultWithOutputs {
+    /// Training metrics
+    pub metrics: EngineStepMetrics,
+    /// Generated completion texts (for TUI logging)
+    pub completions: Vec<String>,
+    /// Computed reward values (for TUI logging)
+    pub rewards: Vec<f64>,
+    /// Full RewardOutput data as JSON (only populated when record_outputs is true)
+    /// This enables zero-copy persistence of training outputs
+    pub outputs_json: Option<String>,
+}
+
 /// Internal training state
 struct EngineState {
     /// Accumulated gradients
@@ -1861,6 +1876,569 @@ impl GRPOTrainingEngine {
             metrics,
             completions: completion_texts,
             rewards,
+        })
+    }
+
+    /// Unified training step with JS reward callback and optional output recording
+    ///
+    /// Same as `train_step_auto` but optionally captures the full RewardOutput data
+    /// for persistence to an output store database.
+    ///
+    /// # Arguments
+    /// * `prompts` - Array of chat conversations to use as prompts
+    /// * `answers` - Expected answers for each prompt (for reward functions)
+    /// * `reward_fn` - JavaScript function to compute rewards
+    /// * `record_outputs` - If true, return the serialized RewardOutput JSON
+    ///
+    /// # Returns
+    /// * Training step result including metrics, completions, rewards, and optionally outputs_json
+    #[napi(
+        ts_args_type = "prompts: ChatMessage[][], answers: (string | null)[], rewardFn: (err: Error | null, outputsJson: string) => Promise<number[]>, recordOutputs: boolean"
+    )]
+    pub async fn train_step_auto_with_recording(
+        &self,
+        prompts: Vec<Vec<ChatMessage>>,
+        answers: Vec<Option<String>>,
+        reward_fn: ThreadsafeFunction<String, Promise<Vec<f64>>>,
+        record_outputs: bool,
+    ) -> Result<TrainStepResultWithOutputs> {
+        let num_prompts = prompts.len();
+        let group_size = self.config.group_size.unwrap_or(4) as usize;
+        let expected_completions = num_prompts * group_size;
+
+        let generation_start = std::time::Instant::now();
+
+        // Clone Arcs for the blocking task
+        let model_arc = Arc::clone(&self.model);
+        let model_config = self.model_config.clone();
+        let config = self.config.clone();
+
+        // Build generation config
+        let gen_config = GenerationConfig {
+            max_new_tokens: config.max_new_tokens,
+            temperature: config.temperature,
+            top_p: config.top_p,
+            top_k: config.top_k,
+            min_p: None,
+            repetition_penalty: config.repetition_penalty,
+            repetition_context_size: Some(256),
+            max_consecutive_tokens: Some(16),
+            max_ngram_repeats: Some(8),
+            ngram_size: Some(3),
+            eos_token_id: Some(model_config.eos_token_id),
+            return_logprobs: Some(true),
+        };
+
+        // === Phase 1: Generate completions ===
+        let gen_result = napi::bindgen_prelude::spawn_blocking(move || {
+            let mut completion_texts: Vec<String> = Vec::with_capacity(expected_completions);
+            let mut prompt_texts: Vec<String> = Vec::with_capacity(num_prompts);
+            let mut prompt_tokens_all: Vec<MxArray> = Vec::with_capacity(num_prompts);
+            let mut completion_tokens_all: Vec<MxArray> = Vec::with_capacity(expected_completions);
+            let mut completion_logprobs_all: Vec<MxArray> =
+                Vec::with_capacity(expected_completions);
+            let mut token_counts_all: Vec<u32> = Vec::with_capacity(expected_completions);
+            let mut finish_reasons_all: Vec<String> = Vec::with_capacity(expected_completions);
+
+            for prompt_messages in prompts.into_iter() {
+                let prompt_token_ids = {
+                    let model = model_arc.read().map_err(|_| {
+                        Error::new(Status::GenericFailure, "Failed to acquire model read lock")
+                    })?;
+                    model.apply_chat_template_sync(&prompt_messages, Some(true))?
+                };
+
+                let prompt_array =
+                    MxArray::from_uint32(&prompt_token_ids, &[prompt_token_ids.len() as i64])?;
+                let prompt_text = {
+                    let model = model_arc.read().map_err(|_| {
+                        Error::new(Status::GenericFailure, "Failed to acquire model read lock")
+                    })?;
+                    model.decode_tokens_sync(&prompt_array)?
+                };
+                prompt_texts.push(prompt_text);
+                prompt_tokens_all.push(prompt_array.clone());
+
+                let prompt_2d =
+                    MxArray::from_uint32(&prompt_token_ids, &[1, prompt_token_ids.len() as i64])?;
+
+                for _g in 0..group_size {
+                    let result = {
+                        let model = model_arc.read().map_err(|_| {
+                            Error::new(Status::GenericFailure, "Failed to acquire model read lock")
+                        })?;
+                        model.generate_for_training_sync(&prompt_2d, Some(gen_config.clone()))?
+                    };
+
+                    let text = {
+                        let model = model_arc.read().map_err(|_| {
+                            Error::new(Status::GenericFailure, "Failed to acquire model read lock")
+                        })?;
+                        model.decode_tokens_sync(&result.tokens)?
+                    };
+                    completion_texts.push(text);
+                    finish_reasons_all.push(result.finish_reason.clone());
+
+                    token_counts_all.push(result.num_tokens as u32);
+                    completion_tokens_all.push(result.tokens.clone());
+                    completion_logprobs_all.push(result.logprobs.clone());
+                }
+            }
+
+            synchronize_and_clear_cache();
+
+            Ok::<_, Error>(IntermediateGenerationResult {
+                completion_texts,
+                prompt_texts,
+                prompt_tokens: prompt_tokens_all,
+                completion_tokens: completion_tokens_all,
+                completion_logprobs: completion_logprobs_all,
+                token_counts: token_counts_all,
+                finish_reasons: finish_reasons_all,
+            })
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("spawn_blocking error in generation: {}", e),
+            )
+        })??;
+
+        let generation_time_ms = generation_start.elapsed().as_secs_f64() * 1000.0;
+
+        let IntermediateGenerationResult {
+            completion_texts,
+            prompt_texts,
+            prompt_tokens,
+            completion_tokens,
+            completion_logprobs,
+            token_counts,
+            finish_reasons,
+        } = gen_result;
+
+        let finish_reasons_for_filter = finish_reasons.clone();
+
+        // === Phase 2: Build RewardOutput[] and call JS reward function ===
+        let reward_outputs = build_reward_outputs(
+            prompt_texts,
+            completion_texts.clone(),
+            answers,
+            token_counts.clone(),
+            finish_reasons,
+            group_size as u32,
+        );
+
+        // Serialize to JSON - always needed for reward callback
+        let reward_outputs_json = serde_json::to_string(&reward_outputs).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to serialize reward outputs: {}", e),
+            )
+        })?;
+
+        // Keep a copy for return value if recording is enabled
+        let outputs_json_for_return = if record_outputs {
+            Some(reward_outputs_json.clone())
+        } else {
+            None
+        };
+
+        // Call JS reward function
+        let promise: Promise<Vec<f64>> = reward_fn
+            .call_async(Ok(reward_outputs_json))
+            .await
+            .map_err(|e| {
+                Error::new(
+                    Status::GenericFailure,
+                    format!("Reward callback call failed: {}", e),
+                )
+            })?;
+
+        let rewards: Vec<f64> = promise.await.map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Reward Promise resolution failed: {}", e),
+            )
+        })?;
+
+        if rewards.len() != expected_completions {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "Expected {} rewards, got {}",
+                    expected_completions,
+                    rewards.len()
+                ),
+            ));
+        }
+
+        // === DEGENERATE OUTPUT FILTERING ===
+        let max_tokens_threshold = (self.config.max_new_tokens.unwrap_or(4096) as f64 * 0.9) as u32;
+        let valid_indices: Vec<usize> = finish_reasons_for_filter
+            .iter()
+            .enumerate()
+            .filter(|(i, reason)| *reason != "length" || token_counts[*i] < max_tokens_threshold)
+            .map(|(i, _)| i)
+            .collect();
+
+        let num_filtered = expected_completions - valid_indices.len();
+        if num_filtered > 0 {
+            info!(
+                "Filtered {} degenerate completions (finish_reason='length', tokens >= {})",
+                num_filtered, max_tokens_threshold
+            );
+        }
+
+        if valid_indices.is_empty() {
+            warn!(
+                "All {} completions hit token limit - skipping training step to prevent OOM",
+                expected_completions
+            );
+
+            let mut state = self.state.write().map_err(|_| {
+                Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+            })?;
+            state.step += 1;
+            let current_step = state.step;
+            drop(state);
+
+            let (mean_reward, std_reward) = compute_reward_stats(&rewards);
+            let total_tokens: u32 = token_counts.iter().sum();
+
+            heavy_cleanup();
+
+            return Ok(TrainStepResultWithOutputs {
+                metrics: EngineStepMetrics {
+                    step: current_step,
+                    loss: 0.0,
+                    mean_reward,
+                    std_reward,
+                    mean_advantage: 0.0,
+                    total_tokens: total_tokens as i32,
+                    gradients_applied: false,
+                    generation_time_ms,
+                    training_time_ms: 0.0,
+                },
+                completions: completion_texts,
+                rewards,
+                outputs_json: outputs_json_for_return,
+            });
+        }
+
+        let filtered_count = valid_indices.len();
+        let effective_group_size = if num_prompts > 0 {
+            filtered_count / num_prompts
+        } else {
+            group_size
+        };
+
+        if effective_group_size < 1 {
+            warn!(
+                "Only {} valid completions for {} prompts - skipping training",
+                filtered_count, num_prompts
+            );
+
+            let mut state = self.state.write().map_err(|_| {
+                Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+            })?;
+            state.step += 1;
+            let current_step = state.step;
+            drop(state);
+
+            let (mean_reward, std_reward) = compute_reward_stats(&rewards);
+            let total_tokens: u32 = token_counts.iter().sum();
+
+            heavy_cleanup();
+
+            return Ok(TrainStepResultWithOutputs {
+                metrics: EngineStepMetrics {
+                    step: current_step,
+                    loss: 0.0,
+                    mean_reward,
+                    std_reward,
+                    mean_advantage: 0.0,
+                    total_tokens: total_tokens as i32,
+                    gradients_applied: false,
+                    generation_time_ms,
+                    training_time_ms: 0.0,
+                },
+                completions: completion_texts,
+                rewards,
+                outputs_json: outputs_json_for_return,
+            });
+        }
+
+        let usable_count = num_prompts * effective_group_size;
+        let valid_indices: Vec<usize> = if usable_count < filtered_count {
+            valid_indices.into_iter().take(usable_count).collect()
+        } else {
+            valid_indices
+        };
+
+        let filtered_completion_tokens: Vec<MxArray> = valid_indices
+            .iter()
+            .map(|&i| completion_tokens[i].clone())
+            .collect();
+        let filtered_completion_logprobs: Vec<MxArray> = valid_indices
+            .iter()
+            .map(|&i| completion_logprobs[i].clone())
+            .collect();
+        let filtered_token_counts: Vec<u32> =
+            valid_indices.iter().map(|&i| token_counts[i]).collect();
+        let filtered_rewards: Vec<f64> = valid_indices.iter().map(|&i| rewards[i]).collect();
+
+        synchronize_and_clear_cache();
+
+        // === Phase 3: Train ===
+        let training_start = std::time::Instant::now();
+
+        let model_arc = Arc::clone(&self.model);
+        let state_arc = Arc::clone(&self.state);
+        let model_config = self.model_config.clone();
+        let config = self.config.clone();
+        let rewards_clone = filtered_rewards.clone();
+        let group_size_for_training = effective_group_size as i32;
+
+        let metrics = napi::bindgen_prelude::spawn_blocking(move || {
+            let loss_config = GRPOLossConfig {
+                epsilon_low: config.clip_epsilon.unwrap_or(0.2),
+                epsilon_high: None,
+                beta: config.kl_coef.unwrap_or(0.0),
+                loss_type: config
+                    .loss_type
+                    .clone()
+                    .unwrap_or_else(|| "grpo".to_string()),
+                importance_sampling_level: "token".to_string(),
+                max_completion_length: config
+                    .max_completion_length_for_training
+                    .or(config.max_new_tokens)
+                    .map(|n| n as i64),
+                num_items_in_batch: Some(usable_count as f64),
+                gradient_accumulation_steps: config.gradient_accumulation_steps.unwrap_or(1) as i64,
+            };
+
+            let params = {
+                let model = model_arc.read().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire model read lock")
+                })?;
+                model.get_parameters()
+            };
+
+            let prompt_refs: Vec<&MxArray> = prompt_tokens.iter().collect();
+            let completion_refs: Vec<&MxArray> = filtered_completion_tokens.iter().collect();
+            let logprob_refs: Vec<&MxArray> = filtered_completion_logprobs.iter().collect();
+
+            let (loss_value, gradients) = compute_loss_and_gradients_autograd(
+                &model_config,
+                &params,
+                &prompt_refs,
+                &completion_refs,
+                &logprob_refs,
+                &rewards_clone,
+                group_size_for_training,
+                loss_config,
+            )?;
+
+            if loss_value.is_nan() || loss_value.is_infinite() {
+                warn!("Skipping step due to invalid loss: {}", loss_value);
+                synchronize_and_clear_cache();
+
+                let (mean_reward, std_reward) = compute_reward_stats(&rewards_clone);
+                let total_tokens: u32 = filtered_token_counts.iter().sum();
+
+                let mut state = state_arc.write().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                })?;
+                state.step += 1;
+
+                return Ok::<EngineStepMetrics, Error>(EngineStepMetrics {
+                    step: state.step,
+                    loss: loss_value,
+                    mean_reward,
+                    std_reward,
+                    mean_advantage: 0.0,
+                    total_tokens: total_tokens as i32,
+                    gradients_applied: false,
+                    generation_time_ms,
+                    training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
+                });
+            }
+
+            // Validate gradients
+            for (name, grad) in gradients.iter() {
+                grad.eval();
+                let sum = grad.sum(None, None)?;
+                sum.eval();
+                let sum_val = sum.item_at_float32(0)?;
+                if sum_val.is_nan() || sum_val.is_infinite() {
+                    warn!(
+                        "Gradient '{}' contains NaN/Inf values (sum={}) - SKIPPING STEP",
+                        name, sum_val
+                    );
+
+                    let mut state = state_arc.write().map_err(|_| {
+                        Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                    })?;
+                    state.nan_gradient_count += 1;
+                    state.consecutive_nan_count += 1;
+                    let max_nan = config.max_nan_gradients.unwrap_or(100) as u64;
+
+                    if state.nan_gradient_count >= max_nan {
+                        return Err(Error::new(
+                            Status::GenericFailure,
+                            format!(
+                                "Training stopped: exceeded maximum NaN gradient count ({}/{})",
+                                state.nan_gradient_count, max_nan
+                            ),
+                        ));
+                    }
+
+                    let emergency_threshold = config.emergency_save_threshold.unwrap_or(5) as u32;
+                    if state.consecutive_nan_count >= emergency_threshold {
+                        state.needs_emergency_save = true;
+                    }
+
+                    state.step += 1;
+                    let current_step = state.step;
+                    drop(state);
+
+                    let (mean_reward, std_reward) = compute_reward_stats(&rewards_clone);
+                    let total_tokens: u32 = filtered_token_counts.iter().sum();
+                    synchronize_and_clear_cache();
+
+                    return Ok::<EngineStepMetrics, Error>(EngineStepMetrics {
+                        step: current_step,
+                        loss: loss_value,
+                        mean_reward,
+                        std_reward,
+                        mean_advantage: 0.0,
+                        total_tokens: total_tokens as i32,
+                        gradients_applied: false,
+                        generation_time_ms,
+                        training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
+                    });
+                }
+            }
+
+            // Clip gradients
+            let grad_clip_value = config.gradient_clip_value.unwrap_or(1.0);
+            let grad_refs: HashMap<String, &MxArray> =
+                gradients.iter().map(|(k, v)| (k.clone(), v)).collect();
+            let gradients = GradientUtils::clip_grad_value_and_norm(
+                grad_refs,
+                grad_clip_value,
+                config.gradient_clip_norm,
+            )?;
+
+            // Apply gradients
+            let mut state = state_arc.write().map_err(|_| {
+                Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+            })?;
+            state.consecutive_nan_count = 0;
+
+            accumulate_gradients(&mut state, gradients)?;
+            state.micro_step += 1;
+
+            let grad_acc_steps = config.gradient_accumulation_steps.unwrap_or(1);
+            let gradients_applied = if state.micro_step >= grad_acc_steps {
+                let grads = state.accumulated_gradients.take().ok_or_else(|| {
+                    Error::new(Status::GenericFailure, "No accumulated gradients")
+                })?;
+
+                let lr = config.learning_rate.unwrap_or(1e-6) / grad_acc_steps as f64;
+                drop(state);
+
+                let mut model_mut = model_arc.write().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire model write lock")
+                })?;
+
+                let grads_refs: HashMap<String, &MxArray> =
+                    grads.iter().map(|(k, v)| (k.clone(), v)).collect();
+                model_mut.apply_gradients(grads_refs, lr)?;
+                drop(model_mut);
+                drop(grads);
+
+                let mut state = state_arc.write().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                })?;
+                state.accumulated_gradients = None;
+                state.micro_step = 0;
+                state.step += 1;
+                state.epoch_steps += 1;
+                drop(state);
+
+                heavy_cleanup();
+                true
+            } else {
+                state.step += 1;
+                state.epoch_steps += 1;
+                drop(state);
+                heavy_cleanup();
+                false
+            };
+
+            let (mean_reward, std_reward) = compute_reward_stats(&rewards_clone);
+            let total_tokens: u32 = filtered_token_counts.iter().sum();
+
+            {
+                let mut state = state_arc.write().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                })?;
+                state.epoch_loss_sum += loss_value;
+                state.epoch_reward_sum += mean_reward;
+                state.epoch_tokens += total_tokens as i64;
+            }
+
+            let rewards_f32: Vec<f32> = rewards_clone.iter().map(|&r| r as f32).collect();
+            let rewards_array = MxArray::from_float32(&rewards_f32, &[rewards_clone.len() as i64])?;
+            let advantages =
+                compute_advantages(&rewards_array, group_size_for_training, "group".to_string())?;
+            let adv_data = advantages.to_float32()?;
+            let mean_advantage =
+                adv_data.iter().map(|&a| a as f64).sum::<f64>() / adv_data.len() as f64;
+
+            synchronize_and_clear_cache();
+
+            let heavy_cleanup_interval = config.heavy_cleanup_interval.unwrap_or(25);
+            let memory_cleanup_threshold = config.memory_cleanup_threshold.unwrap_or(0.0);
+            {
+                let mut state = state_arc.write().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                })?;
+                maybe_heavy_cleanup(&mut state, heavy_cleanup_interval, memory_cleanup_threshold);
+            }
+
+            let step = state_arc
+                .read()
+                .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?
+                .step;
+
+            Ok(EngineStepMetrics {
+                step,
+                loss: loss_value,
+                mean_reward,
+                std_reward,
+                mean_advantage,
+                total_tokens: total_tokens as i32,
+                gradients_applied,
+                generation_time_ms,
+                training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
+            })
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("spawn_blocking error in training: {}", e),
+            )
+        })??;
+
+        Ok(TrainStepResultWithOutputs {
+            metrics,
+            completions: completion_texts,
+            rewards,
+            outputs_json: outputs_json_for_return,
         })
     }
 

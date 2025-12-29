@@ -117,6 +117,7 @@ describe.sequential('Qwen3 Chat API', () => {
         arguments: { key: 'value' },
         status: 'ok',
         error: undefined,
+        rawContent: '<tool_call>{"name": "test_function", "arguments": {"key": "value"}}</tool_call>',
       };
 
       expect(mockToolCall.id).toMatch(/^call_/);
@@ -132,6 +133,7 @@ describe.sequential('Qwen3 Chat API', () => {
         arguments: {},
         status: 'missing_name',
         error: 'Tool call missing name',
+        rawContent: '<tool_call>{"arguments": {}}</tool_call>',
       };
 
       expect(errorCall.status).toBe('missing_name');

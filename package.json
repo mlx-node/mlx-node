@@ -29,6 +29,7 @@
     "@oxc-node/core": "^0.0.35",
     "@std/toml": "npm:@jsr/std__toml@^1.0.11",
     "@types/node": "^25.0.2",
+    "oxc-parser": "^0.105.0",
     "oxfmt": "^0.18.0",
     "oxlint": "^1.33.0",
     "typescript": "^5.9.3",

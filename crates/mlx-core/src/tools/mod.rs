@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 /// Structured tool call with parsed arguments
 #[napi(object)]
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallResult {
     /// Unique identifier for this tool call (format: call_<uuid>)
     pub id: String,
@@ -24,28 +24,34 @@ pub struct ToolCallResult {
     pub status: String,
     /// Error message if status != "ok"
     pub error: Option<String>,
+    /// Raw content from <tool_call> tag (preserved for debugging/persistence)
+    /// Defaults to empty string for backward compatibility with older JSON
+    #[serde(default)]
+    pub raw_content: String,
 }
 
 impl ToolCallResult {
     /// Create a successful tool call result
-    pub fn ok(name: String, arguments: Value) -> Self {
+    pub fn ok(name: String, arguments: Value, raw_content: String) -> Self {
         Self {
             id: generate_tool_call_id(),
             name,
             arguments,
             status: "ok".to_string(),
             error: None,
+            raw_content,
         }
     }
 
     /// Create a tool call result with invalid JSON arguments
-    pub fn invalid_json(name: String, error_msg: String) -> Self {
+    pub fn invalid_json(name: String, error_msg: String, raw_content: String) -> Self {
         Self {
             id: generate_tool_call_id(),
             name,
             arguments: Value::Object(serde_json::Map::new()),
             status: "invalid_json".to_string(),
             error: Some(error_msg),
+            raw_content,
         }
     }
 
@@ -56,7 +62,8 @@ impl ToolCallResult {
             name: String::new(),
             arguments: Value::Object(serde_json::Map::new()),
             status: "missing_name".to_string(),
-            error: Some(format!("Tool call missing name: {}", raw_content)),
+            error: Some(format!("Tool call missing name: {}", &raw_content)),
+            raw_content,
         }
     }
 }
@@ -91,7 +98,7 @@ static THINK_TAG: LazyLock<Regex> =
 /// Parse a JSON format tool call
 ///
 /// Format: `<tool_call>{"name": "func", "arguments": {...}}</tool_call>`
-fn parse_json_tool_call(json_str: &str) -> ToolCallResult {
+fn parse_json_tool_call(json_str: &str, raw_content: &str) -> ToolCallResult {
     match serde_json::from_str::<Value>(json_str) {
         Ok(parsed) => {
             let name = parsed
@@ -114,40 +121,54 @@ fn parse_json_tool_call(json_str: &str) -> ToolCallResult {
                         _ => arguments,
                     };
 
-                    ToolCallResult::ok(name, arguments)
+                    ToolCallResult::ok(name, arguments, raw_content.to_string())
                 }
-                _ => ToolCallResult::missing_name(json_str.to_string()),
+                _ => ToolCallResult::missing_name(raw_content.to_string()),
             }
         }
-        Err(e) => ToolCallResult::invalid_json(String::new(), format!("Invalid JSON: {}", e)),
+        Err(e) => ToolCallResult::invalid_json(
+            String::new(),
+            format!("Invalid JSON: {}", e),
+            raw_content.to_string(),
+        ),
     }
 }
 
 /// Parse an XML format tool call
 ///
 /// Format: `<tool_call><name>func</name><arguments>{...}</arguments></tool_call>`
-fn parse_xml_tool_call(name: &str, arguments: Option<&str>) -> ToolCallResult {
+fn parse_xml_tool_call(name: &str, arguments: Option<&str>, raw_content: &str) -> ToolCallResult {
     let name = name.trim().to_string();
 
     if name.is_empty() {
-        return ToolCallResult::missing_name(format!("name={:?}, arguments={:?}", name, arguments));
+        return ToolCallResult::missing_name(raw_content.to_string());
     }
 
     match arguments {
         Some(args_str) => {
             let args_str = args_str.trim();
             if args_str.is_empty() {
-                ToolCallResult::ok(name, Value::Object(serde_json::Map::new()))
+                ToolCallResult::ok(
+                    name,
+                    Value::Object(serde_json::Map::new()),
+                    raw_content.to_string(),
+                )
             } else {
                 match serde_json::from_str::<Value>(args_str) {
-                    Ok(args) => ToolCallResult::ok(name, args),
-                    Err(e) => {
-                        ToolCallResult::invalid_json(name, format!("Invalid arguments JSON: {}", e))
-                    }
+                    Ok(args) => ToolCallResult::ok(name, args, raw_content.to_string()),
+                    Err(e) => ToolCallResult::invalid_json(
+                        name,
+                        format!("Invalid arguments JSON: {}", e),
+                        raw_content.to_string(),
+                    ),
                 }
             }
         }
-        None => ToolCallResult::ok(name, Value::Object(serde_json::Map::new())),
+        None => ToolCallResult::ok(
+            name,
+            Value::Object(serde_json::Map::new()),
+            raw_content.to_string(),
+        ),
     }
 }
 
@@ -165,17 +186,25 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCallResult>) {
 
     // Try JSON format first (Qwen3 native)
     for cap in JSON_PATTERN.captures_iter(text) {
+        // cap.get(0) is the full match including <tool_call> tags
+        let raw_content = cap.get(0).map(|m| m.as_str()).unwrap_or("");
         if let Some(json_match) = cap.get(1) {
-            tool_calls.push(parse_json_tool_call(json_match.as_str()));
+            tool_calls.push(parse_json_tool_call(json_match.as_str(), raw_content));
         }
     }
 
     // If no JSON matches, try XML format (training/legacy)
     if tool_calls.is_empty() {
         for cap in XML_PATTERN.captures_iter(text) {
+            // cap.get(0) is the full match including <tool_call> tags
+            let raw_content = cap.get(0).map(|m| m.as_str()).unwrap_or("");
             if let Some(name_match) = cap.get(1) {
                 let arguments = cap.get(2).map(|m| m.as_str());
-                tool_calls.push(parse_xml_tool_call(name_match.as_str(), arguments));
+                tool_calls.push(parse_xml_tool_call(
+                    name_match.as_str(),
+                    arguments,
+                    raw_content,
+                ));
             }
         }
     }
@@ -242,7 +271,7 @@ pub struct ParseToolCallsResult {
 /// Structured completion information aligned with ChatResult.
 /// Contains pre-parsed tool calls, thinking, and clean text.
 #[napi(object)]
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompletionInfo {
     /// Clean text with <tool_call> and <think> tags removed
     pub text: String,
@@ -261,7 +290,7 @@ pub struct CompletionInfo {
 /// Reward function input for a single completion.
 /// Provides all context needed to compute a reward score.
 #[napi(object)]
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RewardOutput {
     /// The input prompt text
     pub prompt: String,

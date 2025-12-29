@@ -13,6 +13,7 @@ pub mod grpo;
 pub mod models;
 pub mod nn;
 pub mod optimizers;
+pub mod output_store;
 pub mod param_manager;
 pub mod sampling;
 pub mod sft;

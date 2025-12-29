@@ -24,6 +24,7 @@ regex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 mlx-paged-attn = { workspace = true }
+libsql = { workspace = true }
 
 [dependencies.mimalloc-safe]
 workspace = true

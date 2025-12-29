@@ -25,6 +25,8 @@ describe('chat() API Types', () => {
         arguments: { key: 'value', nested: { a: 1 } },
         status: 'ok',
         error: undefined,
+        rawContent:
+          '<tool_call>{"name": "test_function", "arguments": {"key": "value", "nested": {"a": 1}}}</tool_call>',
       };
 
       expect(mockToolCall.id).toBe('call_abc123');
@@ -41,6 +43,7 @@ describe('chat() API Types', () => {
         arguments: {},
         status: 'invalid_json',
         error: 'Failed to parse arguments JSON',
+        rawContent: '<tool_call>{"name": "broken_function", "arguments": {invalid}}</tool_call>',
       };
 
       expect(errorToolCall.status).toBe('invalid_json');
@@ -54,6 +57,7 @@ describe('chat() API Types', () => {
         arguments: {},
         status: 'missing_name',
         error: 'Tool call missing name',
+        rawContent: '<tool_call>{"arguments": {}}</tool_call>',
       };
 
       expect(missingNameCall.status).toBe('missing_name');
@@ -118,6 +122,8 @@ describe('Tool Arguments as Native Objects', () => {
       name: 'get_weather',
       arguments: { location: 'Paris', units: 'celsius' },
       status: 'ok',
+      rawContent:
+        '<tool_call>{"name": "get_weather", "arguments": {"location": "Paris", "units": "celsius"}}</tool_call>',
     };
 
     // Direct property access - no JSON.parse needed!
@@ -144,6 +150,8 @@ describe('Tool Arguments as Native Objects', () => {
         },
       },
       status: 'ok',
+      rawContent:
+        '<tool_call>{"name": "complex_tool", "arguments": {"config": {"setting1": true, "setting2": [1, 2, 3]}, "data": {"nested": {"deep": "value"}}}}</tool_call>',
     };
 
     const config = toolCall.arguments.config as { setting1: boolean; setting2: number[] };
