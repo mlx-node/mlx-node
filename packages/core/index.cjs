@@ -594,6 +594,7 @@ module.exports.LRScheduler = nativeBinding.LRScheduler
 module.exports.MLP = nativeBinding.MLP
 module.exports.MxArray = nativeBinding.MxArray
 module.exports.NativeRewardRegistry = nativeBinding.NativeRewardRegistry
+module.exports.OutputStore = nativeBinding.OutputStore
 module.exports.PaddedSequences = nativeBinding.PaddedSequences
 module.exports.Qwen3Model = nativeBinding.Qwen3Model
 module.exports.Qwen3Tokenizer = nativeBinding.Qwen3Tokenizer

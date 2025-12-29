@@ -25,6 +25,7 @@ tokenizers = "0.22"
 minijinja = { version = "2.5", features = ["json"] }
 uuid = { version = "1.11", features = ["v4"] }
 regex = "1.11"
+libsql = { version = "0.9", features = ["replication"] }
 
 # NAPI-RS
 napi = { version = "3", features = ["napi10", "async", "tokio_fs", "serde-json"] }

@@ -50,13 +50,14 @@ import {
   rmSync,
   statSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import * as readline from 'node:readline';
 
 import {
   GrpoTrainingEngine,
   NativeRewardRegistry,
   Qwen3Model,
+  OutputStore,
   buildRewardOutputs,
   type GrpoEngineConfig,
   type EngineEpochMetrics,
@@ -64,21 +65,25 @@ import {
   type GenerateBatchResult as NativeGenerateBatchResult,
   type EngineStepMetrics,
   type TrainStepResult,
+  type TrainStepResultWithOutputs,
   type RewardOutput,
+  type OutputStoreConfig,
 } from '@mlx-node/core';
 
 import type { ChatMessage, DatasetExample, RewardFunction } from '../types';
 import { createTrainingLogger, type TrainingLogger } from './training-logger';
 
 // Re-export native types
-export { GrpoTrainingEngine, NativeRewardRegistry } from '@mlx-node/core';
+export { GrpoTrainingEngine, NativeRewardRegistry, OutputStore } from '@mlx-node/core';
 export type {
   GrpoEngineConfig,
   EngineStepMetrics,
   EngineEpochMetrics,
   BuiltinRewardConfig,
   TrainStepResult,
+  TrainStepResultWithOutputs,
   RewardOutput,
+  OutputStoreConfig,
 } from '@mlx-node/core';
 
 /**
@@ -153,6 +158,21 @@ export interface GRPOTrainerConfig {
   // TUI mode
   /** Enable TUI mode - outputs structured JSONL to stdout and listens for commands on stdin */
   tuiMode?: boolean;
+
+  // Output recording
+  /** Output recording configuration (records all generations for debugging/research) */
+  outputStore?: {
+    /** Enable output recording (default: false) */
+    enabled: boolean;
+    /** Local database path (default: "{outputDir}/outputs.db") */
+    localPath?: string;
+    /** Remote Turso URL for cloud sync (optional) */
+    remoteUrl?: string;
+    /** Turso auth token (required if remoteUrl is set) */
+    authToken?: string;
+    /** Sync interval in seconds (default: 60, only for embedded replica mode) */
+    syncInterval?: number;
+  };
 }
 
 /**
@@ -262,6 +282,10 @@ export class GRPOTrainer {
   private stdinInterface?: import('readline').Interface;
   private logger: TrainingLogger;
 
+  // Output recording
+  private outputStore?: OutputStore;
+  private outputStoreInitPromise?: Promise<void>;
+
   /**
    * Create a new GRPO trainer from a model
    *
@@ -335,6 +359,80 @@ export class GRPOTrainer {
       const cmd = line.trim();
       this.handleStdinCommand(cmd);
     });
+  }
+
+  /**
+   * Initialize the output store for recording training outputs
+   */
+  private async initOutputStore(): Promise<void> {
+    // Guard against re-initialization (e.g., train() called after trainStepAuto())
+    if (this.outputStore) return;
+
+    const cfg = this.config.outputStore;
+    if (!cfg?.enabled) return;
+
+    const localPath = cfg.localPath ?? join(this.config.outputDir ?? '.', 'outputs.db');
+
+    // Ensure parent directory exists (for lazy init via trainStepAuto)
+    const parentDir = dirname(localPath);
+    if (parentDir !== '.' && !existsSync(parentDir)) {
+      mkdirSync(parentDir, { recursive: true });
+    }
+
+    if (cfg.remoteUrl && cfg.authToken) {
+      // Embedded replica mode (local cache + remote sync)
+      this.outputStore = await OutputStore.embeddedReplica(
+        localPath,
+        cfg.remoteUrl,
+        cfg.authToken,
+        cfg.syncInterval ?? 60,
+      );
+    } else {
+      // Local only
+      this.outputStore = await OutputStore.local(localPath);
+    }
+
+    // Start a new run with sanitized config (no auth token)
+    const modelName = this.config.modelConfig ?? 'qwen3';
+    const modelPath = this.originalModelPath ?? this.config.modelPath ?? undefined;
+    const sanitizedConfig = {
+      ...this.config,
+      outputStore: this.config.outputStore
+        ? { ...this.config.outputStore, authToken: undefined }
+        : undefined,
+    };
+    await this.outputStore.startRun(modelName, modelPath, JSON.stringify(sanitizedConfig));
+  }
+
+  /**
+   * Ensure output store is initialized (lazy initialization for low-level API users)
+   * Uses promise mutex to prevent race conditions from concurrent calls.
+   */
+  private async ensureOutputStoreInitialized(): Promise<void> {
+    if (this.outputStore) return; // Already initialized
+    if (!this.config.outputStore?.enabled) return; // Not enabled
+
+    // Use promise mutex to prevent concurrent initialization
+    if (this.outputStoreInitPromise) {
+      await this.outputStoreInitPromise;
+      return;
+    }
+
+    this.outputStoreInitPromise = this.initOutputStore();
+    try {
+      await this.outputStoreInitPromise;
+    } catch (err) {
+      // Clear promise on failure to allow retry
+      this.outputStoreInitPromise = undefined;
+      throw err;
+    }
+  }
+
+  /**
+   * Get the output store (for querying recorded data)
+   */
+  getOutputStore(): OutputStore | undefined {
+    return this.outputStore;
   }
 
   /**
@@ -726,6 +824,9 @@ export class GRPOTrainer {
     prompts: ChatMessage[][],
     answers: (string | null)[] = [],
   ): Promise<{ metrics: TrainStepMetrics; completions: string[]; rewards: number[] }> {
+    // Lazy initialize output store for low-level API users
+    await this.ensureOutputStoreInitialized();
+
     if (!this.rewardFn && !this.engine.hasBuiltinRewards) {
       throw new Error('No reward function configured. Set rewardFunction in config or call setRewardFunction()');
     }
@@ -769,7 +870,23 @@ export class GRPOTrainer {
         completion: {
           text: o.completion.text,
           rawText: o.completion.raw_text,
-          toolCalls: o.completion.tool_calls as RewardOutput['completion']['toolCalls'],
+          toolCalls: (
+            o.completion.tool_calls as Array<{
+              id: string;
+              name: string;
+              arguments: Record<string, unknown>;
+              status: string;
+              error?: string;
+              raw_content: string;
+            }>
+          ).map((tc) => ({
+            id: tc.id,
+            name: tc.name,
+            arguments: tc.arguments,
+            status: tc.status, // 'ok' | 'invalid_json' | 'missing_name'
+            error: tc.error,
+            rawContent: tc.raw_content,
+          })),
           thinking: o.completion.thinking ?? undefined,
           numTokens: o.completion.num_tokens,
           finishReason: o.completion.finish_reason,
@@ -813,9 +930,32 @@ export class GRPOTrainer {
     };
 
     // Call unified Rust method - generation, scoring, and training in one FFI call
-    const result: TrainStepResult = await this.engine.trainStepAuto(prompts, answers, rewardCallback);
+    // Use recording method if output store is enabled
+    const recordOutputs = !!this.outputStore;
+    const result: TrainStepResultWithOutputs = await this.engine.trainStepAutoWithRecording(
+      prompts,
+      answers,
+      rewardCallback,
+      recordOutputs,
+    );
 
     this.currentStep++;
+
+    // Record outputs to database if enabled
+    if (this.outputStore && result.outputsJson) {
+      try {
+        await this.outputStore.recordStepFromOutputs(
+          this.currentStep,
+          result.metrics,
+          result.outputsJson,
+          result.rewards,
+          this.config.groupSize ?? 4,
+        );
+      } catch (err) {
+        // Log error but don't fail training
+        console.error('[OutputStore] Failed to record step:', err);
+      }
+    }
 
     return {
       metrics: { ...result.metrics, epoch: this.currentEpoch },
@@ -850,6 +990,9 @@ export class GRPOTrainer {
     if (this.config.outputDir && !existsSync(this.config.outputDir)) {
       mkdirSync(this.config.outputDir, { recursive: true });
     }
+
+    // Initialize output store if enabled
+    await this.initOutputStore();
 
     // Calculate total steps per epoch for resumption
     const stepsPerEpoch = Math.ceil(dataset.length / batchSize);
@@ -977,6 +1120,13 @@ export class GRPOTrainer {
 
     // Log completion
     this.logger.complete(this.currentStep);
+
+    // End output store run if active
+    if (this.outputStore) {
+      const status = this.stopRequested ? 'stopped' : 'completed';
+      await this.outputStore.endRun(status);
+      await this.outputStore.flush();
+    }
 
     // Cleanup stdin interface
     if (this.stdinInterface) {

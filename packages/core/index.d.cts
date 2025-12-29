@@ -598,6 +598,22 @@ export declare class GrpoTrainingEngine {
    */
   trainStepAuto(prompts: ChatMessage[][], answers: (string | null)[], rewardFn: (err: Error | null, outputsJson: string) => Promise<number[]>): Promise<TrainStepResult>
   /**
+   * Unified training step with JS reward callback and optional output recording
+   *
+   * Same as `train_step_auto` but optionally captures the full RewardOutput data
+   * for persistence to an output store database.
+   *
+   * # Arguments
+   * * `prompts` - Array of chat conversations to use as prompts
+   * * `answers` - Expected answers for each prompt (for reward functions)
+   * * `reward_fn` - JavaScript function to compute rewards
+   * * `record_outputs` - If true, return the serialized RewardOutput JSON
+   *
+   * # Returns
+   * * Training step result including metrics, completions, rewards, and optionally outputs_json
+   */
+  trainStepAutoWithRecording(prompts: ChatMessage[][], answers: (string | null)[], rewardFn: (err: Error | null, outputsJson: string) => Promise<number[]>, recordOutputs: boolean): Promise<TrainStepResultWithOutputs>
+  /**
    * Score completions using registered built-in rewards
    *
    * # Arguments
@@ -1007,6 +1023,61 @@ export declare class NativeRewardRegistry {
   get names(): Array<string>
   /** Set whether to normalize scores */
   setNormalize(normalize: boolean): void
+}
+
+/**
+ * OutputStore - Persistence layer for training outputs
+ *
+ * Stores all model outputs during GRPO training for debugging and research.
+ * Supports local SQLite files and remote Turso cloud databases.
+ */
+export declare class OutputStore {
+  /** Create a new output store with local SQLite file */
+  static local(path: string): Promise<OutputStore>
+  /** Create a new output store with remote Turso database */
+  static remote(url: string, token: string): Promise<OutputStore>
+  /** Create embedded replica (local cache + remote sync) */
+  static embeddedReplica(localPath: string, remoteUrl: string, token: string, syncIntervalSecs?: number | undefined | null): Promise<OutputStore>
+  /** Create from config object */
+  static fromConfig(config: OutputStoreConfig): Promise<OutputStore>
+  /** Start a new training run */
+  startRun(modelName: string, modelPath: string | undefined | null, config: string): Promise<string>
+  /** End the current training run */
+  endRun(status: string): Promise<void>
+  /** Get current run ID */
+  currentRunId(): Promise<string | null>
+  /** Get store configuration */
+  get config(): OutputStoreConfig
+  /** Record a complete training step with all generations */
+  recordStep(step: StepRecord, generations: Array<GenerationRecord>, toolCalls: Array<Array<ToolCallRecord>>): Promise<number>
+  /** Record from RewardOutput JSON (direct integration with training engine) */
+  recordStepFromOutputs(step: number, metrics: EngineStepMetrics, outputsJson: string, rewards: Array<number>, groupSize: number): Promise<number>
+  /** Flush any pending writes */
+  flush(): Promise<void>
+  /** Sync with remote (for embedded replica mode) */
+  sync(): Promise<void>
+  /** List all training runs */
+  listRuns(limit?: number | undefined | null, status?: string | undefined | null): Promise<Array<TrainingRunRecord>>
+  /** Get a specific run */
+  getRun(runId: string): Promise<TrainingRunRecord | null>
+  /** Get step summaries for a run */
+  getStepSummaries(runId: string, startStep?: number | undefined | null, endStep?: number | undefined | null): Promise<Array<StepSummary>>
+  /** Get all generations for a step */
+  getGenerations(runId: string, step: number): Promise<Array<GenerationWithToolCalls>>
+  /** Get top/bottom generations by reward */
+  getGenerationsByReward(runId: string, topN?: number | undefined | null, bottomN?: number | undefined | null, stepRange?: Array<number> | undefined | null): Promise<Array<GenerationWithToolCalls>>
+  /** Get generations with specific finish reason */
+  getGenerationsByFinishReason(runId: string, finishReason: string, limit?: number | undefined | null): Promise<Array<GenerationWithToolCalls>>
+  /** Get generations containing tool calls */
+  getGenerationsWithToolCalls(runId: string, toolName?: string | undefined | null, status?: string | undefined | null, limit?: number | undefined | null): Promise<Array<GenerationWithToolCalls>>
+  /** Search generations by text content */
+  searchGenerations(runId: string, query: string, searchIn?: string | undefined | null, limit?: number | undefined | null): Promise<Array<GenerationWithToolCalls>>
+  /** Get reward distribution statistics */
+  getRewardStats(runId: string, stepRange?: Array<number> | undefined | null): Promise<RewardStats>
+  /** Export to JSONL file */
+  exportJsonl(runId: string, outputPath: string, includeToolCalls?: boolean | undefined | null): Promise<number>
+  /** Execute raw SQL query (for advanced users) */
+  queryRaw(sql: string): Promise<string>
 }
 
 /** Result from padding sequences with masks */
@@ -2350,6 +2421,38 @@ export interface GenerationConfig {
   returnLogprobs?: boolean
 }
 
+/** A generation record (one completion) */
+export interface GenerationRecord {
+  /** Index within the batch */
+  batchIndex: number
+  /** Index within the group (0 to group_size-1) */
+  groupIndex: number
+  /** The prompt text */
+  prompt: string
+  /** Expected answer (if available) */
+  expectedAnswer?: string
+  /** Cleaned completion text (tags removed) */
+  completionText: string
+  /** Raw completion text (with <think>/<tool_call> tags) */
+  completionRaw: string
+  /** Extracted thinking content from <think> tags */
+  thinking?: string
+  /** Number of tokens in the completion */
+  numTokens: number
+  /** Finish reason: "eos", "length", or "repetition" */
+  finishReason: string
+  /** Reward value for this completion */
+  reward: number
+}
+
+/** A generation with its associated tool calls */
+export interface GenerationWithToolCalls {
+  /** The generation record */
+  generation: GenerationRecord
+  /** Tool calls made in this generation */
+  toolCalls: Array<ToolCallRecord>
+}
+
 /**
  * Returns a binary mask identifying tokens whose entropy exceeds a given quantile threshold.
  *
@@ -2462,6 +2565,20 @@ export interface GrpoLossConfig {
   numItemsInBatch?: number
   /** Current gradient accumulation step (for loss scaling) */
   gradientAccumulationSteps: number
+}
+
+/** Configuration for creating an OutputStore connection */
+export interface OutputStoreConfig {
+  /** Local SQLite file path (e.g., "training_outputs.db") */
+  localPath?: string
+  /** Remote Turso URL (e.g., "libsql://db-name.turso.io") */
+  remoteUrl?: string
+  /** Turso auth token */
+  authToken?: string
+  /** Sync interval in seconds for embedded replica mode (default: 60) */
+  syncIntervalSecs?: number
+  /** Batch size for buffered inserts (default: 100) */
+  batchSize?: number
 }
 
 /**
@@ -2634,6 +2751,26 @@ export interface RewardOutput {
   expectedAnswer?: string
 }
 
+/** Reward distribution statistics */
+export interface RewardStats {
+  /** Total count of generations */
+  count: number
+  /** Mean reward */
+  mean: number
+  /** Standard deviation */
+  std: number
+  /** Minimum reward */
+  min: number
+  /** Maximum reward */
+  max: number
+  /** Median (50th percentile) */
+  median: number
+  /** 25th percentile */
+  p25: number
+  /** 75th percentile */
+  p75: number
+}
+
 /**
  * Configuration for sampling strategies
  * ⚡ PERFORMANCE: Made Copy to avoid cloning on every token
@@ -2776,6 +2913,50 @@ export interface SftStepMetrics {
   trainingTimeMs: number
 }
 
+/** A training step record */
+export interface StepRecord {
+  /** Run ID this step belongs to */
+  runId: string
+  /** Step number */
+  step: number
+  /** Epoch number */
+  epoch?: number
+  /** GRPO loss value */
+  loss: number
+  /** Mean reward across completions */
+  meanReward: number
+  /** Standard deviation of rewards */
+  stdReward: number
+  /** Mean advantage value */
+  meanAdvantage?: number
+  /** Total tokens generated this step */
+  totalTokens?: number
+  /** Time for generation phase (milliseconds) */
+  generationTimeMs?: number
+  /** Time for training phase (milliseconds) */
+  trainingTimeMs?: number
+  /** Whether gradients were applied this step */
+  gradientsApplied: boolean
+}
+
+/** Summary of a training step */
+export interface StepSummary {
+  /** Step number */
+  step: number
+  /** Loss value */
+  loss: number
+  /** Mean reward */
+  meanReward: number
+  /** Number of generations in this step */
+  numGenerations: number
+  /** Number of tool calls across all generations */
+  numToolCalls: number
+  /** Count of completions that ended with EOS */
+  eosCount: number
+  /** Count of completions that hit token limit */
+  lengthCount: number
+}
+
 /** Tool call made by an assistant */
 export interface ToolCall {
   /** Optional unique identifier for the tool call */
@@ -2784,6 +2965,22 @@ export interface ToolCall {
   name: string
   /** JSON string of arguments to pass to the tool */
   arguments: string
+}
+
+/** A tool call record */
+export interface ToolCallRecord {
+  /** Index of this call within the generation */
+  callIndex: number
+  /** Parse status: "ok", "parse_error", "json_error" */
+  status: string
+  /** Tool name (null if parse failed) */
+  toolName?: string
+  /** Tool arguments as JSON (null if parse failed) */
+  arguments?: string
+  /** Raw content from <tool_call> tag */
+  rawContent: string
+  /** Error message if parsing failed */
+  errorMessage?: string
 }
 
 /** Structured tool call with parsed arguments */
@@ -2798,6 +2995,11 @@ export interface ToolCallResult {
   status: string
   /** Error message if status != "ok" */
   error?: string
+  /**
+   * Raw content from <tool_call> tag (preserved for debugging/persistence)
+   * Defaults to empty string for backward compatibility with older JSON
+   */
+  rawContent: string
 }
 
 /** OpenAI-compatible tool definition */
@@ -2808,6 +3010,26 @@ export interface ToolDefinition {
   function: FunctionDefinition
 }
 
+/** A training run record */
+export interface TrainingRunRecord {
+  /** Unique run ID (UUID) */
+  id: string
+  /** Model name */
+  modelName: string
+  /** Path to model weights */
+  modelPath?: string
+  /** Serialized training config (JSON) */
+  config: string
+  /** Unix timestamp (milliseconds) when training started */
+  startedAt: number
+  /** Unix timestamp (milliseconds) when training ended */
+  endedAt?: number
+  /** Total number of training steps completed */
+  totalSteps: number
+  /** Run status: "running", "completed", "failed", "paused" */
+  status: string
+}
+
 /** Result from train_step_auto including metrics, completions, and rewards */
 export interface TrainStepResult {
   /** Training metrics */
@@ -2816,6 +3038,21 @@ export interface TrainStepResult {
   completions: Array<string>
   /** Computed reward values (for TUI logging) */
   rewards: Array<number>
+}
+
+/** Result from train_step_auto_with_recording including optional full RewardOutput data */
+export interface TrainStepResultWithOutputs {
+  /** Training metrics */
+  metrics: EngineStepMetrics
+  /** Generated completion texts (for TUI logging) */
+  completions: Array<string>
+  /** Computed reward values (for TUI logging) */
+  rewards: Array<number>
+  /**
+   * Full RewardOutput data as JSON (only populated when record_outputs is true)
+   * This enables zero-copy persistence of training outputs
+   */
+  outputsJson?: string
 }
 /**
  * Continuous Batching Scheduler
