@@ -63,77 +63,82 @@ pub fn compute_sft_loss_and_gradients(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // 2. Clone data needed by closure
-    let param_names_clone = param_names.clone();
-    let input_ids_clone = input_ids.clone();
-    let labels_clone = labels.clone();
-    let config_clone = model_config.clone();
-    let loss_config_clone = loss_config.clone();
+    // 2. Compute gradients in inner scope so closure captures are dropped before cleanup
+    let (loss_value, gradients) = {
+        // Clone data needed by closure
+        let param_names_clone = param_names.clone();
+        let input_ids_clone = input_ids.clone();
+        let labels_clone = labels.clone();
+        let config_clone = model_config.clone();
+        let loss_config_clone = loss_config.clone();
 
-    // 3. Define loss function for autograd
-    let loss_fn = move |params: &[MxArray]| -> Result<MxArray> {
-        // Map params to structured dictionary
-        let param_dict = param_manager::map_params_to_dict(params, &param_names_clone)?;
+        // Define loss function for autograd
+        let loss_fn = move |params: &[MxArray]| -> Result<MxArray> {
+            // Map params to structured dictionary
+            let param_dict = param_manager::map_params_to_dict(params, &param_names_clone)?;
 
-        // Forward pass using functional implementation
-        let logits =
-            functional::qwen3_forward_functional(&config_clone, &param_dict, &input_ids_clone)?;
+            // Forward pass using functional implementation
+            let logits =
+                functional::qwen3_forward_functional(&config_clone, &param_dict, &input_ids_clone)?;
 
-        // Get shapes
-        let batch_size = logits.shape_at(0)?;
-        let seq_len = logits.shape_at(1)?;
-        let vocab_size = logits.shape_at(2)?;
+            // Get shapes
+            let batch_size = logits.shape_at(0)?;
+            let seq_len = logits.shape_at(1)?;
+            let vocab_size = logits.shape_at(2)?;
 
-        // For autograd-compatible cross-entropy, we need to:
-        // 1. Shift logits and labels for next-token prediction
-        // 2. Reshape for cross_entropy
-        // 3. Apply ignore_index masking
+            // For autograd-compatible cross-entropy, we need to:
+            // 1. Shift logits and labels for next-token prediction
+            // 2. Reshape for cross_entropy
+            // 3. Apply ignore_index masking
 
-        // Shift: logits[:-1] predicts labels[1:]
-        // This is standard causal LM training
-        let shift_logits = logits.slice(&[0, 0, 0], &[batch_size, seq_len - 1, vocab_size])?;
-        let shift_labels = labels_clone.slice(&[0, 1], &[batch_size, seq_len])?;
+            // Shift: logits[:-1] predicts labels[1:]
+            // This is standard causal LM training
+            let shift_logits = logits.slice(&[0, 0, 0], &[batch_size, seq_len - 1, vocab_size])?;
+            let shift_labels = labels_clone.slice(&[0, 1], &[batch_size, seq_len])?;
 
-        // Reshape for cross_entropy
-        let logits_flat = shift_logits.reshape(&[(batch_size) * (seq_len - 1), vocab_size])?;
-        let labels_flat = shift_labels.reshape(&[(batch_size) * (seq_len - 1)])?;
+            // Reshape for cross_entropy
+            let logits_flat = shift_logits.reshape(&[(batch_size) * (seq_len - 1), vocab_size])?;
+            let labels_flat = shift_labels.reshape(&[(batch_size) * (seq_len - 1)])?;
 
-        // Compute cross-entropy loss
-        // The Losses::cross_entropy handles:
-        // - Numerical stability via logsumexp
-        // - ignore_index masking
-        // - Label smoothing
-        let ignore_idx = loss_config_clone.ignore_index.unwrap_or(-100);
-        let label_smoothing = loss_config_clone.label_smoothing.unwrap_or(0.0);
+            // Compute cross-entropy loss
+            // The Losses::cross_entropy handles:
+            // - Numerical stability via logsumexp
+            // - ignore_index masking
+            // - Label smoothing
+            let ignore_idx = loss_config_clone.ignore_index.unwrap_or(-100);
+            let label_smoothing = loss_config_clone.label_smoothing.unwrap_or(0.0);
 
-        Losses::cross_entropy(
-            &logits_flat,
-            &labels_flat,
-            None,
-            Some(ignore_idx),
-            Some(label_smoothing),
-        )
-    };
+            Losses::cross_entropy(
+                &logits_flat,
+                &labels_flat,
+                None,
+                Some(ignore_idx),
+                Some(label_smoothing),
+            )
+        };
 
-    // 4. Compute value and gradients using MLX autograd
-    let (loss_array, grad_arrays) = autograd::value_and_grad(param_arrays, loss_fn)?;
+        // Compute value and gradients using MLX autograd
+        let (loss_array, grad_arrays) = autograd::value_and_grad(param_arrays, loss_fn)?;
 
-    // 5. Eval all outputs and cleanup
-    loss_array.eval();
-    for grad in &grad_arrays {
-        grad.eval();
-    }
+        // Eval all outputs INSIDE the scope
+        loss_array.eval();
+        for grad in &grad_arrays {
+            grad.eval();
+        }
+
+        // Extract values before scope ends
+        let loss_val = loss_array.item_at_float32(0)? as f64;
+        let grads: HashMap<String, MxArray> = param_names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| (name, grad_arrays[i].clone()))
+            .collect();
+
+        (loss_val, grads)
+    }; // Closure and its captures (input_ids_clone, labels_clone, etc.) are dropped here!
+
+    // 3. NOW do cleanup - computation graph should be fully releasable
     crate::array::heavy_cleanup();
-
-    // 6. Extract loss value
-    let loss_value = loss_array.item_at_float32(0)? as f64;
-
-    // 7. Map gradients back to parameter names
-    let gradients = param_names
-        .into_iter()
-        .enumerate()
-        .map(|(i, param_name)| (param_name, grad_arrays[i].clone()))
-        .collect::<HashMap<_, _>>();
 
     Ok((loss_value, gradients))
 }

@@ -32,7 +32,7 @@ use crate::array::{MxArray, pad_float_sequences, pad_sequences};
 use crate::autograd;
 use crate::grpo::{advantages::compute_advantages, loss as grpo_loss};
 use crate::models::qwen3::Qwen3Config;
-use crate::nn::Activations;
+use crate::nn::efficient_selective_log_softmax;
 use crate::param_manager;
 use crate::utils::functional;
 
@@ -222,6 +222,32 @@ pub fn compute_loss_and_gradients_autograd(
     // 4. Concatenate prompts + completions for full sequence
     let input_ids = MxArray::concatenate(&padded_prompts, &padded_completions, 1)?;
 
+    // Check if we should use chunked autograd (separate autograd per chunk)
+    // This is different from chunked forward - it runs autograd multiple times
+    // and accumulates gradients, allowing memory to be freed between chunks.
+    let forward_chunk_size = loss_config.forward_chunk_size;
+    let batch_size = input_ids.shape_at(0)?;
+
+    if let Some(chunk_size) = forward_chunk_size
+        && batch_size > chunk_size
+    {
+        // CHUNKED AUTOGRAD PATH: Run autograd per chunk and accumulate gradients
+        // This allows MLX to release the computation graph after each chunk.
+        return compute_loss_and_gradients_chunked_autograd(
+            model_config,
+            &param_names,
+            &param_arrays,
+            &input_ids,
+            &padded_completions,
+            &padded_old_logprobs,
+            &advantages_array,
+            &completion_masks,
+            &loss_config,
+            chunk_size,
+        );
+    }
+
+    // STANDARD PATH: Single autograd call for entire batch
     // Clone data needed by closure (must be owned)
     let param_names_clone = param_names.clone();
     let input_ids_clone = input_ids.clone();
@@ -235,41 +261,84 @@ pub fn compute_loss_and_gradients_autograd(
     // 5. Define loss function for autograd
     // This closure will be called by MLX with updated parameter values
     // Parameters are in native dtype (bfloat16 for pretrained models)
+    let lm_head_chunk_size = loss_config.lm_head_chunk_size;
     let loss_fn = move |params: &[MxArray]| -> Result<MxArray> {
         // Map params to structured dictionary
         let param_dict = param_manager::map_params_to_dict(params, &param_names_clone)?;
 
-        // Recompute forward pass with parameters in native dtype
-        let logits =
-            functional::qwen3_forward_functional(&config_clone, &param_dict, &input_ids_clone)?;
-
-        // Extract logits for completion part
         // Use shape_at() to avoid allocating full shape vector
         let batch_size = input_ids_clone.shape_at(0)?;
         let total_seq_len = input_ids_clone.shape_at(1)?;
-
         let completion_len = padded_completions_clone.shape_at(1)?;
-
         let prompt_len = total_seq_len - completion_len;
 
-        // Get logits for completion tokens only
-        let completion_logits = logits.slice(
-            &[0, prompt_len, 0],
-            &[batch_size, total_seq_len, config_clone.vocab_size as i64],
-        )?;
+        // Get completion logprobs using either chunked LM head or full computation
+        // Note: forward_chunk_size is handled by chunked autograd path above
+        let completion_logprobs = if let Some(chunk_size) = lm_head_chunk_size {
+            // CHUNKED LM HEAD PATH: Memory-efficient computation for large batches
+            //
+            // Instead of computing full [B, T, V] logits tensor (1.2GB for Qwen3),
+            // we process the LM head in chunks to reduce peak memory.
 
-        // Following TRL/transformers pattern: upcast to float32 for numerical stability
-        // TRL's selective_log_softmax uses float32 for the computation
-        // No clamping - TRL doesn't clamp logits before log_softmax
-        let logits_f32 = completion_logits.astype(crate::array::DType::Float32)?;
+            // Get hidden states (before LM head)
+            let hidden_states = functional::qwen3_forward_hidden_states(
+                &config_clone,
+                &param_dict,
+                &input_ids_clone,
+            )?;
 
-        // Compute log probabilities in float32
-        let logprobs_3d = Activations::log_softmax(&logits_f32, Some(-1))?;
+            // Extract completion hidden states: [B, prompt_len:, :]
+            let completion_hidden = hidden_states.slice(
+                &[0, prompt_len, 0],
+                &[batch_size, total_seq_len, config_clone.hidden_size as i64],
+            )?;
 
-        // Extract per-token logprobs using completion token IDs as indices
-        let completion_logprobs = logprobs_3d
-            .take_along_axis(&padded_completions_clone.expand_dims(-1)?, -1)?
-            .squeeze(Some(&[-1]))?;
+            // Get LM head weight
+            let lm_head_weight = if config_clone.tie_word_embeddings {
+                param_dict
+                    .get("embedding.weight")
+                    .ok_or_else(|| Error::from_reason("Missing embedding.weight"))?
+            } else {
+                param_dict
+                    .get("lm_head.weight")
+                    .ok_or_else(|| Error::from_reason("Missing lm_head.weight"))?
+            };
+
+            // Compute chunked log-softmax
+            functional::chunked_lm_head_selective_logprobs(
+                &completion_hidden,
+                lm_head_weight,
+                &padded_completions_clone,
+                chunk_size,
+                config_clone.tie_word_embeddings,
+            )?
+        } else {
+            // FULL PATH: Standard computation (for small batches or testing)
+            //
+            // Recompute forward pass with parameters in native dtype
+            let logits =
+                functional::qwen3_forward_functional(&config_clone, &param_dict, &input_ids_clone)?;
+
+            // Get logits for completion tokens only
+            let completion_logits = logits.slice(
+                &[0, prompt_len, 0],
+                &[batch_size, total_seq_len, config_clone.vocab_size as i64],
+            )?;
+
+            // Memory-efficient log-softmax using logsumexp decomposition
+            // Avoids materializing full [B, T, V] tensor - 99.99% memory savings
+            //
+            // Math: log_softmax(x_i) = x_i - logsumexp(x)
+            // Instead of: [B,T,V] log_softmax -> [B,T,1] gather = 1.2GB intermediate
+            // We compute: [B,T,1] logsumexp + [B,T,1] gather = 16KB intermediate
+            efficient_selective_log_softmax(
+                &completion_logits,
+                &padded_completions_clone,
+                loss_config_clone.vocab_chunk_size,
+                None,
+                None,
+            )?
+        };
 
         // Clamp log probs to reasonable range to prevent numerical issues:
         // - Lower bound -20: prevents extreme ratios (exp(-20 - (-5)) = exp(-15) is tiny but stable)
@@ -326,4 +395,203 @@ pub fn compute_loss_and_gradients_autograd(
         .collect::<HashMap<_, _>>();
 
     Ok((loss_value, gradients))
+}
+
+/// Compute GRPO loss and gradients using chunked autograd
+///
+/// This function runs autograd separately for each chunk of sequences and accumulates
+/// gradients. This allows MLX to release the computation graph after each chunk,
+/// dramatically reducing peak memory usage.
+///
+/// # Memory Savings
+/// For batch=4, groupSize=4 (16 sequences), chunk_size=4:
+/// - Standard autograd: builds graph for all 16 sequences at once (~20GB)
+/// - Chunked autograd: builds graph for 4 sequences at a time (~5GB peak)
+///
+/// # Arguments
+/// * `model_config` - Model configuration
+/// * `param_names` - Sorted list of parameter names
+/// * `param_arrays` - Parameter arrays (references)
+/// * `input_ids` - Full input IDs [batch, seq_len]
+/// * `padded_completions` - Padded completion tokens [batch, completion_len]
+/// * `padded_old_logprobs` - Old log probabilities [batch, completion_len]
+/// * `advantages` - Pre-computed advantages [batch]
+/// * `completion_masks` - Masks for valid completion tokens [batch, completion_len]
+/// * `loss_config` - GRPO loss configuration
+/// * `chunk_size` - Number of sequences per chunk
+fn compute_loss_and_gradients_chunked_autograd(
+    model_config: &Qwen3Config,
+    param_names: &[String],
+    param_arrays: &[&MxArray],
+    input_ids: &MxArray,
+    padded_completions: &MxArray,
+    padded_old_logprobs: &MxArray,
+    advantages: &MxArray,
+    completion_masks: &MxArray,
+    loss_config: &grpo_loss::GRPOLossConfig,
+    chunk_size: i64,
+) -> Result<(f64, HashMap<String, MxArray>)> {
+    let batch_size = input_ids.shape_at(0)?;
+    let total_seq_len = input_ids.shape_at(1)?;
+    let completion_len = padded_completions.shape_at(1)?;
+
+    // Track accumulated loss and gradients
+    let mut total_loss = 0.0f64;
+    let mut accumulated_gradients: Option<Vec<MxArray>> = None;
+
+    // Process batch in chunks
+    let mut start = 0i64;
+    while start < batch_size {
+        let end = (start + chunk_size).min(batch_size);
+        let chunk_batch_size = end - start;
+
+        // Slice data for this chunk
+        let chunk_input_ids = input_ids.slice(&[start, 0], &[end, total_seq_len])?;
+        let chunk_completions = padded_completions.slice(&[start, 0], &[end, completion_len])?;
+        let chunk_old_logprobs = padded_old_logprobs.slice(&[start, 0], &[end, completion_len])?;
+        let chunk_advantages = advantages.slice(&[start], &[end])?;
+        let chunk_masks = completion_masks.slice(&[start, 0], &[end, completion_len])?;
+
+        // Clone data for closure
+        let param_names_clone = param_names.to_vec();
+        let chunk_input_ids_clone = chunk_input_ids.clone();
+        let chunk_completions_clone = chunk_completions.clone();
+        let chunk_old_logprobs_clone = chunk_old_logprobs.clone();
+        let chunk_advantages_clone = chunk_advantages.clone();
+        let chunk_masks_clone = chunk_masks.clone();
+        let config_clone = model_config.clone();
+        let loss_config_clone = loss_config.clone();
+        let lm_head_chunk_size = loss_config.lm_head_chunk_size;
+
+        // Define loss function for this chunk
+        let chunk_loss_fn = move |params: &[MxArray]| -> Result<MxArray> {
+            let param_dict = param_manager::map_params_to_dict(params, &param_names_clone)?;
+
+            let chunk_batch = chunk_input_ids_clone.shape_at(0)?;
+            let chunk_total_seq = chunk_input_ids_clone.shape_at(1)?;
+            let chunk_comp_len = chunk_completions_clone.shape_at(1)?;
+            let chunk_prompt_len = chunk_total_seq - chunk_comp_len;
+
+            // Compute logprobs for this chunk
+            let completion_logprobs = if let Some(lm_chunk) = lm_head_chunk_size {
+                // Chunked LM head path
+                let hidden_states = functional::qwen3_forward_hidden_states(
+                    &config_clone,
+                    &param_dict,
+                    &chunk_input_ids_clone,
+                )?;
+
+                let completion_hidden = hidden_states.slice(
+                    &[0, chunk_prompt_len, 0],
+                    &[
+                        chunk_batch,
+                        chunk_total_seq,
+                        config_clone.hidden_size as i64,
+                    ],
+                )?;
+
+                let lm_head_weight = if config_clone.tie_word_embeddings {
+                    param_dict
+                        .get("embedding.weight")
+                        .ok_or_else(|| Error::from_reason("Missing embedding.weight"))?
+                } else {
+                    param_dict
+                        .get("lm_head.weight")
+                        .ok_or_else(|| Error::from_reason("Missing lm_head.weight"))?
+                };
+
+                functional::chunked_lm_head_selective_logprobs(
+                    &completion_hidden,
+                    lm_head_weight,
+                    &chunk_completions_clone,
+                    lm_chunk,
+                    config_clone.tie_word_embeddings,
+                )?
+            } else {
+                // Full path
+                let logits = functional::qwen3_forward_functional(
+                    &config_clone,
+                    &param_dict,
+                    &chunk_input_ids_clone,
+                )?;
+
+                let completion_logits = logits.slice(
+                    &[0, chunk_prompt_len, 0],
+                    &[chunk_batch, chunk_total_seq, config_clone.vocab_size as i64],
+                )?;
+
+                efficient_selective_log_softmax(
+                    &completion_logits,
+                    &chunk_completions_clone,
+                    loss_config_clone.vocab_chunk_size,
+                    None,
+                    None,
+                )?
+            };
+
+            // Clamp logprobs
+            let clamped_logprobs = completion_logprobs.clip(Some(-20.0), Some(0.0))?;
+
+            // Compute GRPO loss for this chunk
+            // Note: We use the chunk's advantages which were pre-computed across the full batch
+            let loss = grpo_loss::grpo_loss(
+                &clamped_logprobs,
+                &chunk_old_logprobs_clone,
+                &chunk_advantages_clone,
+                &chunk_masks_clone,
+                loss_config_clone.clone(),
+                None,
+            )?;
+
+            Ok(loss)
+        };
+
+        // Run autograd for this chunk
+        let (chunk_loss_array, chunk_grad_arrays) =
+            autograd::value_and_grad(param_arrays.to_vec(), chunk_loss_fn)?;
+
+        // Eval immediately to materialize results
+        chunk_loss_array.eval();
+        for grad in &chunk_grad_arrays {
+            grad.eval();
+        }
+
+        // Extract loss value
+        let chunk_loss_value = chunk_loss_array.item_at_float32(0)? as f64;
+
+        // Accumulate loss (weighted by chunk size for proper averaging)
+        total_loss += chunk_loss_value * (chunk_batch_size as f64);
+
+        // Accumulate gradients
+        if let Some(ref mut acc_grads) = accumulated_gradients {
+            // Add to existing gradients
+            for (i, grad) in chunk_grad_arrays.into_iter().enumerate() {
+                acc_grads[i] = acc_grads[i].add(&grad)?;
+            }
+        } else {
+            // First chunk - initialize accumulated gradients
+            accumulated_gradients = Some(chunk_grad_arrays);
+        }
+
+        // CRITICAL: Release computation graph for this chunk
+        crate::array::heavy_cleanup();
+
+        start = end;
+    }
+
+    // Average the loss
+    let avg_loss = total_loss / (batch_size as f64);
+
+    // Get accumulated gradients (already summed, no need to average for GRPO)
+    let grad_arrays =
+        accumulated_gradients.ok_or_else(|| Error::from_reason("No gradients computed"))?;
+
+    // Map gradients back to parameter names
+    let gradients = param_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.clone(), grad_arrays[i].clone()))
+        .collect::<HashMap<_, _>>();
+
+    Ok((avg_loss, gradients))
 }

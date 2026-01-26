@@ -24,16 +24,30 @@ import { join } from 'node:path';
 
 /**
  * Training metrics from a training step
+ *
+ * Supports both SFT and GRPO training:
+ * - SFT: loss, perplexity, tokenAccuracy (no reward/advantage)
+ * - GRPO: loss, meanReward, stdReward, stdAdvantage
  */
 export interface TrainingMetrics {
   step: number;
   loss: number;
-  meanReward: number;
-  stdReward: number;
-  meanAdvantage: number;
   totalTokens: number;
+  // GRPO-specific (optional for SFT)
+  meanReward?: number;
+  stdReward?: number;
+  meanAdvantage?: number;
+  /** Std of advantages - indicates reward variance within groups */
+  stdAdvantage?: number;
+  // SFT-specific (optional for GRPO)
+  perplexity?: number;
+  tokenAccuracy?: number;
+  // Timing (optional)
   generationTimeMs?: number;
   trainingTimeMs?: number;
+  // Memory (optional)
+  peakMemoryMb?: number;
+  activeMemoryMb?: number;
 }
 
 /**
@@ -45,6 +59,7 @@ export interface GenerationSample {
   completion: string;
   reward: number;
   tokens: number;
+  rewardDetails?: Record<string, number>;
 }
 
 /**
@@ -55,6 +70,8 @@ export interface TrainingConfigFields {
   batchSize: number;
   groupSize: number;
   learningRate: number;
+  /** Training type: "sft" or "grpo" (default: "grpo") */
+  trainingType?: 'sft' | 'grpo';
   [key: string]: unknown;
 }
 
@@ -86,21 +103,127 @@ export type TuiMessage =
       type: 'step';
       step: number;
       loss: number;
-      meanReward: number;
-      stdReward: number;
-      meanAdvantage: number;
       totalTokens: number;
-      generationTimeMs: number;
-      trainingTimeMs: number;
+      // GRPO-specific (optional for SFT)
+      meanReward?: number;
+      stdReward?: number;
+      stdAdvantage?: number;
+      // SFT-specific (optional for GRPO)
+      perplexity?: number;
+      tokenAccuracy?: number;
+      // Timing (optional)
+      generationTimeMs?: number;
+      trainingTimeMs?: number;
+      // Memory (optional)
+      peakMemoryMb?: number;
+      activeMemoryMb?: number;
     }
-  | { type: 'generation'; index: number; prompt: string; completion: string; reward: number; tokens: number }
+  | {
+      type: 'generation';
+      index: number;
+      prompt: string;
+      completion: string;
+      reward: number;
+      tokens: number;
+      rewardDetails?: Record<string, number>;
+    }
   | { type: 'checkpoint'; path: string; step: number }
   | { type: 'epoch_end'; epoch: number; avgLoss: number; avgReward: number; epochTimeSecs: number }
   | { type: 'complete'; totalSteps: number; totalTimeSecs: number }
   | { type: 'log'; level: 'info' | 'warn' | 'error' | 'debug'; message: string }
   | { type: 'paused'; step: number }
   | { type: 'resumed'; step: number }
-  | { type: 'status'; phase: string; message: string };
+  | { type: 'status'; phase: string; message: string }
+  | { type: 'database_path'; path: string; runId: string; runName?: string }
+  | {
+      type: 'prompt';
+      id: string;
+      message: string;
+      choices: PromptChoice[];
+      default?: number[];
+      multiSelect: boolean;
+    }
+  | {
+      type: 'resume_state';
+      step: number;
+      epoch: number;
+      totalEpochs: number;
+      stepInEpoch: number;
+      totalStepsInEpoch: number;
+      metricsHistory: ResumeMetric[];
+      aggregates: ResumeAggregates;
+    };
+
+/**
+ * Choice for interactive TUI prompt
+ */
+export interface PromptChoice {
+  /** Value to return when selected */
+  value: string;
+  /** Display label */
+  label: string;
+  /** Optional description */
+  description?: string;
+}
+
+/**
+ * Options for TUI prompts
+ */
+export interface PromptOptions {
+  /** Default selection index (single) or indices (multi-select) */
+  default?: number | number[];
+  /** Enable multi-select mode (checkbox style) */
+  multiSelect?: boolean;
+}
+
+/**
+ * Historical metric for sparkline restoration
+ */
+export interface ResumeMetric {
+  step: number;
+  loss: number;
+  meanReward: number;
+  /** Std of advantages - indicates reward variance within groups */
+  stdAdvantage: number;
+  perplexity?: number;
+  tokenAccuracy?: number;
+  /** Time for generation phase (milliseconds) */
+  generationTimeMs?: number;
+  /** Time for training phase (milliseconds) */
+  trainingTimeMs?: number;
+}
+
+/**
+ * Aggregate statistics for resume state
+ */
+export interface ResumeAggregates {
+  bestReward: number;
+  avgReward: number;
+  rewardCount: number;
+  bestLoss: number;
+  avgLoss: number;
+  lossCount: number;
+  totalTokens: number;
+  /** Average generation time (milliseconds) */
+  avgGenerationTimeMs: number;
+  /** Average training time (milliseconds) */
+  avgTrainingTimeMs: number;
+}
+
+/**
+ * Resume state data sent when resuming from checkpoint
+ */
+export interface ResumeState {
+  step: number;
+  epoch: number;
+  totalEpochs: number;
+  /** Current batch within epoch */
+  stepInEpoch: number;
+  /** Total batches per epoch */
+  totalStepsInEpoch: number;
+  metricsHistory: ResumeMetric[];
+  aggregates: ResumeAggregates;
+}
 
 /**
  * JSONL log event types
@@ -280,14 +403,19 @@ export class TrainingLogger {
 
   /** Log training initialization */
   init(model: string, config: TrainingConfigFields, numExamples?: number): void {
+    const trainingType = config.trainingType ?? 'grpo';
+
     if (this.config.tuiMode) {
-      this.writeTui({ type: 'init', model, config: config as Record<string, unknown> });
+      this.writeTui({ type: 'init', model, config: { ...config, trainingType } });
     } else if (this.config.logConsole) {
-      console.log(`\n🚀 Starting GRPO training`);
+      const trainingLabel = trainingType === 'sft' ? 'SFT' : 'GRPO';
+      console.log(`\n Starting ${trainingLabel} training`);
       if (numExamples) console.log(`   Examples: ${numExamples}`);
       console.log(`   Epochs: ${config.numEpochs}`);
       console.log(`   Batch size: ${config.batchSize}`);
-      console.log(`   Group size: ${config.groupSize}`);
+      if (trainingType !== 'sft') {
+        console.log(`   Group size: ${config.groupSize}`);
+      }
       console.log(`   Learning rate: ${config.learningRate}`);
     }
 
@@ -295,7 +423,7 @@ export class TrainingLogger {
       this.writeJsonl({
         event: 'training_config',
         num_examples: numExamples,
-        config: config as Record<string, unknown>,
+        config: { ...config, trainingType },
         timestamp: new Date().toISOString(),
       });
     }
@@ -326,24 +454,61 @@ export class TrainingLogger {
 
   /** Log training step */
   step(metrics: TrainingMetrics, batchIdx?: number, numBatches?: number): void {
-    // Aggregate for epoch
+    // Aggregate for epoch (use available metrics)
     this.epochLoss.add(metrics.loss);
-    this.epochReward.add(metrics.meanReward);
-    this.epochAdvantage.add(metrics.meanAdvantage);
+    if (metrics.meanReward !== undefined) {
+      this.epochReward.add(metrics.meanReward);
+    }
+    if (metrics.meanAdvantage !== undefined) {
+      this.epochAdvantage.add(metrics.meanAdvantage);
+    }
     this.epochTokens.add(metrics.totalTokens);
 
     if (this.config.tuiMode) {
-      this.writeTui({
+      // Build step message with only available fields (no fake values!)
+      const stepMsg: TuiMessage & { type: 'step' } = {
         type: 'step',
         step: metrics.step,
         loss: metrics.loss,
-        meanReward: metrics.meanReward,
-        stdReward: metrics.stdReward,
-        meanAdvantage: metrics.meanAdvantage,
         totalTokens: metrics.totalTokens,
-        generationTimeMs: metrics.generationTimeMs ?? 0,
-        trainingTimeMs: metrics.trainingTimeMs ?? 0,
-      });
+      };
+
+      // Add GRPO-specific fields if present
+      if (metrics.meanReward !== undefined) {
+        stepMsg.meanReward = metrics.meanReward;
+      }
+      if (metrics.stdReward !== undefined) {
+        stepMsg.stdReward = metrics.stdReward;
+      }
+      if (metrics.stdAdvantage !== undefined) {
+        stepMsg.stdAdvantage = metrics.stdAdvantage;
+      }
+
+      // Add SFT-specific fields if present
+      if (metrics.perplexity !== undefined) {
+        stepMsg.perplexity = metrics.perplexity;
+      }
+      if (metrics.tokenAccuracy !== undefined) {
+        stepMsg.tokenAccuracy = metrics.tokenAccuracy;
+      }
+
+      // Add timing if present
+      if (metrics.generationTimeMs !== undefined) {
+        stepMsg.generationTimeMs = metrics.generationTimeMs;
+      }
+      if (metrics.trainingTimeMs !== undefined) {
+        stepMsg.trainingTimeMs = metrics.trainingTimeMs;
+      }
+
+      // Add memory if present
+      if (metrics.peakMemoryMb !== undefined) {
+        stepMsg.peakMemoryMb = metrics.peakMemoryMb;
+      }
+      if (metrics.activeMemoryMb !== undefined) {
+        stepMsg.activeMemoryMb = metrics.activeMemoryMb;
+      }
+
+      this.writeTui(stepMsg);
     } else if (this.config.logConsole && metrics.step % this.config.logInterval === 0) {
       const now = Date.now();
       const stepTime = (now - this.lastLogTime) / this.config.logInterval;
@@ -352,14 +517,26 @@ export class TrainingLogger {
       const batchInfo =
         batchIdx !== undefined && numBatches !== undefined ? ` | Batch ${batchIdx + 1}/${numBatches}` : '';
 
-      console.log(
-        `Step ${metrics.step}${batchInfo} | ` +
-          `Loss: ${metrics.loss.toFixed(4)} | ` +
-          `Reward: ${metrics.meanReward.toFixed(4)} | ` +
-          `Adv: ${metrics.meanAdvantage.toFixed(4)} | ` +
-          `Tokens: ${metrics.totalTokens} | ` +
-          `Time: ${stepTime.toFixed(0)}ms/step`,
-      );
+      // Build log message based on available metrics (SFT vs GRPO)
+      let logMsg = `Step ${metrics.step}${batchInfo} | Loss: ${metrics.loss.toFixed(4)}`;
+
+      if (metrics.perplexity !== undefined) {
+        // SFT format
+        logMsg += ` | Perplexity: ${metrics.perplexity.toFixed(2)}`;
+      }
+      if (metrics.tokenAccuracy !== undefined) {
+        logMsg += ` | Acc: ${(metrics.tokenAccuracy * 100).toFixed(1)}%`;
+      }
+      if (metrics.meanReward !== undefined) {
+        // GRPO format
+        logMsg += ` | Reward: ${metrics.meanReward.toFixed(4)}`;
+      }
+      if (metrics.meanAdvantage !== undefined) {
+        logMsg += ` | Adv: ${metrics.meanAdvantage.toFixed(4)}`;
+      }
+
+      logMsg += ` | Tokens: ${metrics.totalTokens} | Time: ${stepTime.toFixed(0)}ms/step`;
+      console.log(logMsg);
     }
 
     if (this.jsonlPath && metrics.step % this.config.logInterval === 0) {
@@ -367,9 +544,9 @@ export class TrainingLogger {
         event: 'step',
         step: metrics.step,
         loss: metrics.loss,
-        mean_reward: metrics.meanReward,
-        std_reward: metrics.stdReward,
-        mean_advantage: metrics.meanAdvantage,
+        mean_reward: metrics.meanReward ?? 0,
+        std_reward: metrics.stdReward ?? 0,
+        mean_advantage: metrics.meanAdvantage ?? 0,
         total_tokens: metrics.totalTokens,
         timestamp: new Date().toISOString(),
       });
@@ -470,6 +647,7 @@ export class TrainingLogger {
       completion: sample.completion,
       reward: sample.reward,
       tokens: sample.tokens,
+      rewardDetails: sample.rewardDetails,
     });
   }
 
@@ -483,6 +661,111 @@ export class TrainingLogger {
   resumed(step: number): void {
     if (!this.config.tuiMode) return;
     this.writeTui({ type: 'resumed', step });
+  }
+
+  /** Log database path for TUI DB tab */
+  databasePath(path: string, runId: string, runName?: string): void {
+    if (!this.config.tuiMode) return;
+    this.writeTui({ type: 'database_path', path, runId, runName });
+  }
+
+  /**
+   * Send resume state to TUI for sparkline and aggregate restoration.
+   * Called when resuming from checkpoint to restore TUI history.
+   */
+  resumeState(state: ResumeState): void {
+    if (!this.config.tuiMode) return;
+    this.writeTui({
+      type: 'resume_state',
+      step: state.step,
+      epoch: state.epoch,
+      totalEpochs: state.totalEpochs,
+      stepInEpoch: state.stepInEpoch,
+      totalStepsInEpoch: state.totalStepsInEpoch,
+      metricsHistory: state.metricsHistory,
+      aggregates: state.aggregates,
+    });
+  }
+
+  /**
+   * Send an interactive prompt to the TUI and wait for response.
+   * Only works in TUI mode - returns null in non-TUI mode.
+   *
+   * @param id - Unique ID for this prompt
+   * @param message - Message to display
+   * @param choices - Available choices
+   * @param options - Prompt options
+   * @returns The selected value(s), or null if not in TUI mode.
+   *          For multi-select, returns comma-separated values (use promptMulti for array).
+   */
+  async prompt(id: string, message: string, choices: PromptChoice[], options?: PromptOptions): Promise<string | null> {
+    if (!this.config.tuiMode) {
+      return null; // Caller should handle non-TUI mode
+    }
+
+    const defaultIndices =
+      options?.default !== undefined
+        ? Array.isArray(options.default)
+          ? options.default
+          : [options.default]
+        : undefined;
+
+    // Send prompt to TUI
+    this.writeTui({
+      type: 'prompt',
+      id,
+      message,
+      choices,
+      default: defaultIndices,
+      multiSelect: options?.multiSelect ?? false,
+    });
+
+    // Wait for response via stdin
+    return new Promise((resolve) => {
+      const onData = (data: Buffer) => {
+        const line = data.toString().trim();
+        // Expected format: PROMPT:<id>:<value>
+        // For multi-select, value is comma-separated
+        if (line.startsWith('PROMPT:')) {
+          const parts = line.split(':');
+          if (parts.length >= 3 && parts[1] === id) {
+            const value = parts.slice(2).join(':'); // Handle values with colons
+            process.stdin.removeListener('data', onData);
+            process.stdin.pause();
+            resolve(value);
+          }
+        }
+      };
+
+      process.stdin.resume();
+      process.stdin.on('data', onData);
+    });
+  }
+
+  /**
+   * Send a multi-select prompt to the TUI and wait for response.
+   * Convenience wrapper that returns an array of selected values.
+   *
+   * @param id - Unique ID for this prompt
+   * @param message - Message to display
+   * @param choices - Available choices
+   * @param defaultIndices - Optional default selection indices
+   * @returns Array of selected values, or null if not in TUI mode
+   */
+  async promptMulti(
+    id: string,
+    message: string,
+    choices: PromptChoice[],
+    defaultIndices?: number[],
+  ): Promise<string[] | null> {
+    const result = await this.prompt(id, message, choices, {
+      multiSelect: true,
+      default: defaultIndices,
+    });
+
+    if (result === null) return null;
+    if (result === '') return []; // No selections
+    return result.split(',');
   }
 
   // ==========================================================================

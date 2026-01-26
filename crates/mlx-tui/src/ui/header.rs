@@ -18,6 +18,13 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         &app.model_name
     };
 
+    // Show training type label (SFT or GRPO)
+    let training_label = if app.training_type == "sft" {
+        "SFT"
+    } else {
+        "GRPO"
+    };
+
     let epoch_info = if app.total_epochs > 0 {
         format!("Epoch {}/{}", app.current_epoch, app.total_epochs)
     } else {
@@ -25,9 +32,9 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let step_info = if app.total_steps_in_epoch > 0 {
-        format!("Step {}/{}", app.step_in_epoch, app.total_steps_in_epoch)
+        format!("Batch {}/{}", app.step_in_epoch, app.total_steps_in_epoch)
     } else {
-        format!("Step {}", app.current_step)
+        format!("Batch {}", app.current_step)
     };
 
     let state = app.state;
@@ -35,12 +42,19 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .fg(state.color())
         .add_modifier(Modifier::BOLD);
 
+    // Training type color: SFT = Blue, GRPO = Magenta
+    let training_type_color = if app.training_type == "sft" {
+        Color::Blue
+    } else {
+        Color::Magenta
+    };
+
     let mut spans = vec![
         Span::raw(" "), // Left padding
         Span::styled(
-            "@mlx-node/trl",
+            training_label,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(training_type_color)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),

@@ -11,7 +11,9 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tracing::{debug, error, info, warn};
 
-use crate::array::{MxArray, pad_float_sequences, pad_sequences, synchronize_and_clear_cache};
+use crate::array::{
+    MxArray, heavy_cleanup, pad_float_sequences, pad_sequences, synchronize_and_clear_cache,
+};
 use crate::grpo::{advantages::compute_advantages, autograd::compute_loss_and_gradients_autograd};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, apply_repetition_penalty, sample, sample_and_logprobs};
@@ -19,8 +21,8 @@ use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools;
 use crate::transformer::{
-    ContinuousBatchingScheduler, KVCache, PagedAttentionConfig, PagedAttentionLayer, PagedKVCache,
-    PendingRequest, SchedulerConfig, TransformerBlock,
+    ContinuousBatchingScheduler, KVCache, PagedAttentionConfig, PagedKVCache, PendingRequest,
+    SchedulerConfig, TransformerBlock,
 };
 
 use super::{
@@ -171,24 +173,28 @@ fn check_repetition_cutoff(
 }
 
 /// Qwen3 Model with automatic differentiation support
+///
+/// Uses interior mutability (RwLock) for layers, final_norm, and lm_head
+/// to allow gradient application without deep cloning the model.
+/// This eliminates the previous ~4GB memory overhead from clone_for_session().
 #[napi]
 pub struct Qwen3Model {
     config: Qwen3Config,
     embedding: Embedding,
-    layers: Arc<Vec<TransformerBlock>>,
-    final_norm: Arc<RMSNorm>,
-    lm_head: Arc<Linear>,
+    /// Transformer layers wrapped in RwLock for interior mutability during training.
+    layers: Arc<RwLock<Vec<TransformerBlock>>>,
+    /// Final layer norm wrapped in RwLock for interior mutability during training.
+    final_norm: Arc<RwLock<RMSNorm>>,
+    /// LM head wrapped in RwLock for interior mutability during training.
+    lm_head: Arc<RwLock<Linear>>,
     // KV caches for incremental generation (one per layer)
-    // Using RefCell for interior mutability
     kv_caches: Arc<RwLock<Option<Vec<KVCache>>>>,
     // Tokenizer for text-to-text generation (loaded via load_pretrained)
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
 
     // Paged attention state (opt-in, for memory-efficient inference)
-    /// PagedKVCache for block-based memory management
+    /// PagedKVCache for block-based memory management (uses Metal kernels directly)
     paged_cache: Option<Arc<RwLock<PagedKVCache>>>,
-    /// PagedAttentionLayer for computing attention with paged cache
-    paged_layer: Option<Arc<PagedAttentionLayer>>,
     /// Scheduler for continuous batching (optional)
     scheduler: Option<Arc<RwLock<ContinuousBatchingScheduler>>>,
 }
@@ -228,7 +234,7 @@ impl Qwen3Model {
         )?;
 
         // Initialize paged attention if enabled
-        let (paged_cache, paged_layer, scheduler) = if config.use_paged_attention.unwrap_or(false) {
+        let (paged_cache, scheduler) = if config.use_paged_attention.unwrap_or(false) {
             // Create paged attention config
             // FP8 validation is centralized in PagedAttentionConfig::validate()
             let paged_config = PagedAttentionConfig {
@@ -242,12 +248,17 @@ impl Qwen3Model {
                 max_batch_size: Some(32), // Default batch size for continuous batching
             };
 
-            let cache = PagedKVCache::new(paged_config.clone()).map_err(|e| {
+            let mut cache = PagedKVCache::new(paged_config.clone()).map_err(|e| {
                 napi::Error::from_reason(format!("Failed to create PagedKVCache: {}", e))
             })?;
 
-            let layer = PagedAttentionLayer::new(paged_config.clone()).map_err(|e| {
-                napi::Error::from_reason(format!("Failed to create PagedAttentionLayer: {}", e))
+            // Initialize GPU cache buffers (required before using Metal kernels)
+            #[cfg(target_os = "macos")]
+            cache.initialize().map_err(|e| {
+                napi::Error::from_reason(format!(
+                    "Failed to initialize PagedKVCache GPU buffers: {}",
+                    e
+                ))
             })?;
 
             let scheduler_config = SchedulerConfig {
@@ -269,23 +280,21 @@ impl Qwen3Model {
 
             (
                 Some(Arc::new(RwLock::new(cache))),
-                Some(Arc::new(layer)),
                 Some(Arc::new(RwLock::new(sched))),
             )
         } else {
-            (None, None, None)
+            (None, None)
         };
 
         Ok(Self {
             config,
             embedding,
-            layers: Arc::new(layers),
-            final_norm: Arc::new(final_norm),
-            lm_head: Arc::new(lm_head),
+            layers: Arc::new(RwLock::new(layers)),
+            final_norm: Arc::new(RwLock::new(final_norm)),
+            lm_head: Arc::new(RwLock::new(lm_head)),
             kv_caches: Arc::new(RwLock::new(None)),
             tokenizer: None,
             paged_cache,
-            paged_layer,
             scheduler,
         })
     }
@@ -302,16 +311,36 @@ impl Qwen3Model {
         // Embedding lookup
         let mut hidden_states = self.embedding.forward(input_ids)?;
 
+        // Acquire read locks for forward pass
+        let layers_guard = self.layers.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire layers read lock",
+            )
+        })?;
+        let final_norm_guard = self.final_norm.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire final_norm read lock",
+            )
+        })?;
+        let lm_head_guard = self.lm_head.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire lm_head read lock",
+            )
+        })?;
+
         // Pass through transformer layers
         // Note: We pass mask=None and let the Attention layer automatically use
         // the optimized "causal" mode during prefill (seq_len > 1).
-        for layer in self.layers.iter() {
+        for layer in layers_guard.iter() {
             // Each layer processes: x = x + attn(norm(x)) + mlp(norm(x))
             hidden_states = layer.forward(&hidden_states, None, None)?;
         }
 
         // Final layer norm
-        hidden_states = self.final_norm.forward(&hidden_states)?;
+        hidden_states = final_norm_guard.forward(&hidden_states)?;
 
         // LM head to get logits
         // CRITICAL: When tie_word_embeddings=true, we must use the embedding weight transposed
@@ -323,7 +352,7 @@ impl Qwen3Model {
             hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
         } else {
             // Use separate lm_head weights
-            self.lm_head.forward(&hidden_states)?
+            lm_head_guard.forward(&hidden_states)?
         };
 
         Ok(logits)
@@ -334,7 +363,17 @@ impl Qwen3Model {
     /// Creates one KV cache per transformer layer. Call this before starting generation.
     #[napi]
     pub fn init_kv_caches(&self) -> Result<()> {
-        let caches: Vec<KVCache> = (0..self.layers.len()).map(|_| KVCache::new()).collect();
+        let num_layers = self
+            .layers
+            .read()
+            .map_err(|_| {
+                Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire layers read lock",
+                )
+            })?
+            .len();
+        let caches: Vec<KVCache> = (0..num_layers).map(|_| KVCache::new()).collect();
 
         *self.kv_caches.write().map_err(|_| {
             Error::new(
@@ -371,7 +410,7 @@ impl Qwen3Model {
     /// Check if paged attention is enabled for this model
     #[napi]
     pub fn has_paged_attention(&self) -> bool {
-        self.paged_cache.is_some() && self.paged_layer.is_some()
+        self.paged_cache.is_some()
     }
 
     /// Get paged attention memory statistics (if enabled)
@@ -438,6 +477,26 @@ impl Qwen3Model {
     /// * Logits, shape: [batch_size, seq_len, vocab_size]
     #[napi]
     pub fn forward_with_cache(&self, input_ids: &MxArray, use_cache: bool) -> Result<MxArray> {
+        // Acquire read locks for model components
+        let layers_guard = self.layers.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire layers read lock",
+            )
+        })?;
+        let final_norm_guard = self.final_norm.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire final_norm read lock",
+            )
+        })?;
+        let lm_head_guard = self.lm_head.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire lm_head read lock",
+            )
+        })?;
+
         if use_cache {
             // Acquire lock for public API (used in training, batch generation, etc.)
             let mut caches_borrowed = self.kv_caches.write().map_err(|_| {
@@ -451,37 +510,36 @@ impl Qwen3Model {
                 input_ids,
                 caches_borrowed.as_mut(),
                 &self.embedding.get_weight(),
-                &self.layers,
+                &layers_guard,
                 self.config.tie_word_embeddings,
-                &self.final_norm,
-                &self.lm_head,
+                &final_norm_guard,
+                &lm_head_guard,
             )
         } else {
             Self::forward_with_cache_direct(
                 input_ids,
                 None,
                 &self.embedding.get_weight(),
-                &self.layers,
+                &layers_guard,
                 self.config.tie_word_embeddings,
-                &self.final_norm,
-                &self.lm_head,
+                &final_norm_guard,
+                &lm_head_guard,
             )
         }
     }
 
     /// Forward pass with paged attention for memory-efficient inference.
     ///
-    /// This method uses block-based KV cache management for:
+    /// This method uses block-based KV cache management via Metal kernels for:
     /// - Variable-length sequences with efficient memory usage
     /// - Continuous batching with dynamic batch composition
     /// - Long context support beyond GPU memory limits
     ///
     /// # Arguments
-    /// * `input_ids` - Token IDs, shape: [batch_size, seq_len]
-    /// * `slot_mapping` - Slot indices for cache updates, shape: [batch_size * seq_len]
-    /// * `block_tables` - Block table for each sequence, shape: [batch_size, max_blocks]
-    /// * `context_lens` - Context length for each sequence, shape: [batch_size]
-    /// * `positions` - Token positions for RoPE, shape: [batch_size] (position of first token in each seq)
+    /// * `input_ids` - Token IDs, shape: [num_seqs, 1] for decode
+    /// * `slot_mapping` - Slot indices for cache updates, shape: [num_seqs]
+    /// * `seq_ids` - Sequence IDs in the batch (for looking up block tables/context lens)
+    /// * `positions` - Token positions for RoPE, shape: [num_seqs] (per-sequence positions)
     ///
     /// # Returns
     /// * Logits, shape: [num_seqs, 1, vocab_size] for decode
@@ -490,12 +548,11 @@ impl Qwen3Model {
         &self,
         input_ids: &MxArray, // [num_seqs, 1] for decode
         slot_mapping: &MxArray,
-        block_tables: &MxArray,
-        context_lens: &MxArray,
+        seq_ids: Vec<u32>,
         positions: &MxArray, // [num_seqs] - per-sequence RoPE positions
     ) -> Result<MxArray> {
         // Ensure paged attention is enabled
-        let paged_layer = self.paged_layer.as_ref().ok_or_else(|| {
+        let paged_cache = self.paged_cache.as_ref().ok_or_else(|| {
             napi::Error::from_reason(
                 "Paged attention not enabled. Set use_paged_attention: true in config.",
             )
@@ -503,30 +560,64 @@ impl Qwen3Model {
 
         // Embedding lookup: [num_seqs, 1] -> [num_seqs, 1, hidden_dim]
         let mut hidden_states = self.embedding.forward(input_ids)?;
+        let num_seqs = hidden_states.shape_at(0)?;
+        let seq_len = hidden_states.shape_at(1)?;
 
-        // Pass through transformer layers with paged attention
-        // Each layer will use per-sequence positions for correct RoPE
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden_states = layer.forward_paged(
+        // Acquire read lock for paged cache
+        let paged_cache_guard = paged_cache.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire paged cache read lock",
+            )
+        })?;
+
+        // Acquire read locks for model components
+        let layers_guard = self.layers.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire layers read lock",
+            )
+        })?;
+        let final_norm_guard = self.final_norm.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire final_norm read lock",
+            )
+        })?;
+        let lm_head_guard = self.lm_head.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire lm_head read lock",
+            )
+        })?;
+
+        // Get model config for attention parameters
+        let num_query_heads = self.config.num_heads as u32;
+
+        // Pass through transformer layers with paged attention using Metal kernels directly
+        for (layer_idx, layer) in layers_guard.iter().enumerate() {
+            hidden_states = layer.forward_paged_metal(
                 &hidden_states,
-                paged_layer,
+                &paged_cache_guard,
                 layer_idx as u32,
                 slot_mapping,
-                block_tables,
-                context_lens,
-                positions, // Per-sequence positions for batched RoPE
+                &seq_ids,
+                num_query_heads,
+                positions,
+                num_seqs,
+                seq_len,
             )?;
         }
 
         // Final layer norm
-        hidden_states = self.final_norm.forward(&hidden_states)?;
+        hidden_states = final_norm_guard.forward(&hidden_states)?;
 
         // LM head to get logits
         let logits = if self.config.tie_word_embeddings {
             let embedding_weight = self.embedding.get_weight();
             hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
         } else {
-            self.lm_head.forward(&hidden_states)?
+            lm_head_guard.forward(&hidden_states)?
         };
 
         Ok(logits)
@@ -549,10 +640,6 @@ impl Qwen3Model {
     pub fn prefill_paged(&self, prompt_tokens: Vec<u32>, seq_id: u32) -> Result<MxArray> {
         let paged_cache = self
             .paged_cache
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
-        let paged_layer = self
-            .paged_layer
             .as_ref()
             .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
 
@@ -578,27 +665,67 @@ impl Qwen3Model {
 
         let slot_mapping_arr = MxArray::from_int64(&slot_mapping, &[slot_mapping.len() as i64])?;
 
+        // Acquire read locks for model components
+        let layers_guard = self.layers.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire layers read lock",
+            )
+        })?;
+        let final_norm_guard = self.final_norm.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire final_norm read lock",
+            )
+        })?;
+        let lm_head_guard = self.lm_head.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire lm_head read lock",
+            )
+        })?;
+
+        // Acquire read lock for paged cache
+        let paged_cache_guard = paged_cache
+            .read()
+            .map_err(|_| napi::Error::from_reason("Failed to acquire paged cache read lock"))?;
+
         // Process each layer with forward_for_prefill
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
+        for (layer_idx, layer) in layers_guard.iter().enumerate() {
             let (output, keys, values) = layer.forward_for_prefill(&hidden_states)?;
 
-            // Write K/V to paged cache
-            paged_layer
-                .update_cache(layer_idx as u32, &keys, &values, &slot_mapping_arr)
-                .map_err(napi::Error::from_reason)?;
+            // Write K/V to paged cache using Metal kernel directly
+            #[cfg(target_os = "macos")]
+            unsafe {
+                paged_cache_guard
+                    .update(
+                        layer_idx as u32,
+                        keys.handle.0,
+                        values.handle.0,
+                        slot_mapping_arr.handle.0,
+                    )
+                    .map_err(napi::Error::from_reason)?;
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err(napi::Error::from_reason(
+                    "Paged attention Metal kernels are only available on macOS",
+                ));
+            }
 
             hidden_states = output;
         }
 
         // Final layer norm
-        hidden_states = self.final_norm.forward(&hidden_states)?;
+        hidden_states = final_norm_guard.forward(&hidden_states)?;
 
         // LM head to get logits
         let logits = if self.config.tie_word_embeddings {
             let embedding_weight = self.embedding.get_weight();
             hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
         } else {
-            self.lm_head.forward(&hidden_states)?
+            lm_head_guard.forward(&hidden_states)?
         };
 
         // Return only the last token's logits: [1, vocab_size]
@@ -687,10 +814,6 @@ impl Qwen3Model {
             .paged_cache
             .as_ref()
             .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
-        let paged_layer = self
-            .paged_layer
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
 
         let config = config.unwrap_or_default();
 
@@ -762,27 +885,56 @@ impl Qwen3Model {
             let slot_mapping_arr =
                 MxArray::from_int64(&slot_mapping, &[slot_mapping.len() as i64])?;
 
+            // Acquire read locks for this prefill sequence
+            let layers_guard = self
+                .layers
+                .read()
+                .map_err(|_| napi::Error::from_reason("Failed to acquire layers read lock"))?;
+            let final_norm_guard = self
+                .final_norm
+                .read()
+                .map_err(|_| napi::Error::from_reason("Failed to acquire final_norm read lock"))?;
+            let lm_head_guard = self
+                .lm_head
+                .read()
+                .map_err(|_| napi::Error::from_reason("Failed to acquire lm_head read lock"))?;
+
             // Process each layer with forward_for_prefill
-            for (layer_idx, layer) in self.layers.iter().enumerate() {
+            for (layer_idx, layer) in layers_guard.iter().enumerate() {
                 let (output, keys, values) = layer.forward_for_prefill(&hidden_states)?;
 
-                // Write K/V to paged cache
-                paged_layer
-                    .update_cache(layer_idx as u32, &keys, &values, &slot_mapping_arr)
-                    .map_err(napi::Error::from_reason)?;
+                // Write K/V to paged cache using Metal kernel directly
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    cache_guard
+                        .update(
+                            layer_idx as u32,
+                            keys.handle.0,
+                            values.handle.0,
+                            slot_mapping_arr.handle.0,
+                        )
+                        .map_err(napi::Error::from_reason)?;
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return Err(napi::Error::from_reason(
+                        "Paged attention Metal kernels are only available on macOS",
+                    ));
+                }
 
                 hidden_states = output;
             }
 
             // Final layer norm
-            hidden_states = self.final_norm.forward(&hidden_states)?;
+            hidden_states = final_norm_guard.forward(&hidden_states)?;
 
             // LM head to get logits
             let logits = if self.config.tie_word_embeddings {
                 let embedding_weight = self.embedding.get_weight();
                 hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
             } else {
-                self.lm_head.forward(&hidden_states)?
+                lm_head_guard.forward(&hidden_states)?
             };
 
             // Get last token's logits: [vocab_size]
@@ -875,36 +1027,11 @@ impl Qwen3Model {
             let slot_mapping_arr =
                 MxArray::from_int64(&slot_mapping, &[slot_mapping.len() as i64])?;
 
-            // Build block tables
-            let block_tables = cache_guard
-                .build_block_tables_batch(&decode_seq_ids)
-                .map_err(napi::Error::from_reason)?;
-            let max_blocks = block_tables.iter().map(|t| t.len()).max().unwrap_or(1);
-            let mut block_table_flat: Vec<i32> = Vec::with_capacity(num_decode_seqs * max_blocks);
-            for table in &block_tables {
-                block_table_flat.extend(table.iter().map(|&b| b as i32));
-                block_table_flat.extend(vec![0i32; max_blocks - table.len()]);
-            }
-            let block_tables_arr = MxArray::from_int32(
-                &block_table_flat,
-                &[num_decode_seqs as i64, max_blocks as i64],
-            )?;
-
-            // Context lengths
-            let context_lens_arr = MxArray::from_int32(
-                &decode_context_lens
-                    .iter()
-                    .map(|&c| c as i32)
-                    .collect::<Vec<_>>(),
-                &[num_decode_seqs as i64],
-            )?;
-
-            // Run paged attention forward pass
+            // Run paged attention forward pass (now takes seq_ids instead of block_tables/context_lens)
             let logits = self.forward_paged(
                 &input_ids,
                 &slot_mapping_arr,
-                &block_tables_arr,
-                &context_lens_arr,
+                decode_seq_ids.clone(),
                 &positions_arr,
             )?;
 
@@ -1053,6 +1180,17 @@ impl Qwen3Model {
     /// Fused forward pass using C++ implementation for maximum performance.
     /// Reduces FFI calls from ~300 to 1 per forward pass.
     /// Updates KV cache in-place to avoid allocations (matches mlx-lm's overwrite_descriptor pattern).
+    /// Fused forward pass with array offsets for batched generation.
+    ///
+    /// Uses per-sequence RoPE offsets to enable correct batched generation
+    /// when group_size > 1. Each batch element can have a different position
+    /// offset for RoPE encoding.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Input token IDs [batch, seq_len]
+    /// * `cache_idx` - Current write position in KV cache (shared across all layers)
+    /// * `rope_offsets` - Per-sequence RoPE offsets [batch]
+    /// * `left_padding` - Per-sequence left padding amounts [batch]
     fn forward_fused(
         input_ids: &MxArray,
         embedding_weight: &MxArray,
@@ -1062,8 +1200,9 @@ impl Qwen3Model {
         config: &Qwen3Config,
         kv_keys: &mut [Option<MxArray>],
         kv_values: &mut [Option<MxArray>],
-        cache_offsets: &mut [i32],
-        cache_capacities: &mut [i32],
+        cache_idx: &mut i32,
+        rope_offsets: &MxArray,
+        left_padding: &MxArray,
     ) -> Result<MxArray> {
         use mlx_sys as sys;
         use std::ptr;
@@ -1116,8 +1255,9 @@ impl Qwen3Model {
         let mut out_logits: *mut sys::mlx_array = ptr::null_mut();
         let mut out_kv_keys: Vec<*mut sys::mlx_array> = vec![ptr::null_mut(); num_layers];
         let mut out_kv_values: Vec<*mut sys::mlx_array> = vec![ptr::null_mut(); num_layers];
+        let mut out_cache_idx: i32 = 0;
 
-        // Call the fused FFI function
+        // Call the fused FFI function with array offsets
         unsafe {
             sys::mlx_qwen3_forward_step(
                 input_ids.handle.0,
@@ -1135,15 +1275,18 @@ impl Qwen3Model {
                 config.rms_norm_eps as f32,
                 kv_keys_ptrs.as_ptr(),
                 kv_values_ptrs.as_ptr(),
-                cache_offsets.as_ptr(),
-                cache_capacities.as_ptr(),
+                *cache_idx,
+                rope_offsets.handle.0,
+                left_padding.handle.0,
                 &mut out_logits,
                 out_kv_keys.as_mut_ptr(),
                 out_kv_values.as_mut_ptr(),
-                cache_offsets.as_mut_ptr(),
-                cache_capacities.as_mut_ptr(),
+                &mut out_cache_idx,
             );
         }
+
+        // Update cache_idx
+        *cache_idx = out_cache_idx;
 
         // Update KV cache in place - reuse existing MxArray handles when possible
         for (i, (existing, new_ptr)) in kv_keys.iter_mut().zip(out_kv_keys.into_iter()).enumerate()
@@ -1201,27 +1344,26 @@ impl Qwen3Model {
 
     /// Clone the model for use in a training session
     ///
-    /// Creates a new model instance with its own copy of all parameters.
-    /// This is necessary because apply_gradients uses Arc::get_mut which
-    /// requires unique ownership of the Arcs.
+    /// This is now a cheap O(1) operation that just clones the Arcs.
+    /// Since we use RwLock for interior mutability, gradient application
+    /// through apply_gradients() works without needing unique Arc ownership.
+    /// This eliminates the ~4GB memory overhead that was previously required.
     ///
     /// Note: Paged attention is not cloned for training sessions since
     /// training uses standard KVCache with gradient flow.
     pub fn clone_for_session(&self) -> Result<Self> {
-        // Deep clone layers - creates a new Arc with cloned contents
-        let cloned_layers: Vec<_> = self.layers.iter().cloned().collect();
-
+        // Cheap Arc clones - O(1) operation, no deep copying of model weights
+        // The RwLock inside allows shared mutable access for gradient updates
         Ok(Self {
             config: self.config.clone(),
             embedding: self.embedding.clone(),
-            layers: Arc::new(cloned_layers),
-            final_norm: Arc::new((*self.final_norm).clone()),
-            lm_head: Arc::new((*self.lm_head).clone()),
+            layers: Arc::clone(&self.layers),
+            final_norm: Arc::clone(&self.final_norm),
+            lm_head: Arc::clone(&self.lm_head),
             kv_caches: Arc::new(RwLock::new(None)), // Fresh KV caches for session
             tokenizer: self.tokenizer.clone(),
             // Don't clone paged attention for training - use standard KVCache
             paged_cache: None,
-            paged_layer: None,
             scheduler: None,
         })
     }
@@ -1317,10 +1459,19 @@ impl Qwen3Model {
     /// Apply chat template and return token IDs as Vec<u32> (sync version)
     ///
     /// Internal sync method for use by training session - does not use spawn_blocking.
+    /// Delegates to the tokenizer's apply_chat_template_sync which handles Jinja2 + tools.
+    ///
+    /// # Arguments
+    /// * `messages` - Chat messages to format
+    /// * `add_generation_prompt` - Whether to add assistant prompt at end
+    /// * `tools` - Optional tool definitions for function calling
+    /// * `enable_thinking` - Optional flag to enable thinking mode (<think> tags)
     pub fn apply_chat_template_sync(
         &self,
         messages: &[ChatMessage],
         add_generation_prompt: Option<bool>,
+        tools: Option<&[ToolDefinition]>,
+        enable_thinking: Option<bool>,
     ) -> Result<Vec<u32>> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
@@ -1329,23 +1480,8 @@ impl Qwen3Model {
             )
         })?;
 
-        let add_prompt = add_generation_prompt.unwrap_or(true);
-
-        // Format messages using ChatML template
-        let mut formatted = String::new();
-        for msg in messages {
-            formatted.push_str(&format!(
-                "<|im_start|>{}\n{}<|im_end|>\n",
-                msg.role, msg.content
-            ));
-        }
-
-        if add_prompt {
-            formatted.push_str("<|im_start|>assistant\n");
-        }
-
-        // Encode the formatted text
-        tokenizer.encode_sync(&formatted, Some(false))
+        // Use the tokenizer's apply_chat_template_sync which handles Jinja2 + tools
+        tokenizer.apply_chat_template_sync(messages, add_generation_prompt, tools, enable_thinking)
     }
 
     /// Generate tokens for training (sync version)
@@ -1377,9 +1513,28 @@ impl Qwen3Model {
         let model_size_bytes = self.calculate_memory_size();
 
         let embedding_weight = self.embedding.get_weight();
-        let layers = &self.layers;
-        let final_norm = &self.final_norm;
-        let lm_head = &self.lm_head;
+        // Acquire read locks for model components
+        let layers_guard = self.layers.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire layers read lock",
+            )
+        })?;
+        let final_norm_guard = self.final_norm.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire final_norm read lock",
+            )
+        })?;
+        let lm_head_guard = self.lm_head.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire lm_head read lock",
+            )
+        })?;
+        let layers = &*layers_guard;
+        let final_norm = &*final_norm_guard;
+        let lm_head = &*lm_head_guard;
         let model_config = &self.config;
 
         debug!(
@@ -1398,8 +1553,11 @@ impl Qwen3Model {
         let num_layers = layers.len();
         let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];
         let mut kv_values: Vec<Option<MxArray>> = vec![None; num_layers];
-        let mut cache_offsets: Vec<i32> = vec![0; num_layers];
-        let mut cache_capacities: Vec<i32> = vec![0; num_layers];
+        let mut cache_idx: i32 = 0;
+
+        // For single-sequence generation: batch=1, no left padding, rope offset starts at 0
+        let mut rope_offsets = MxArray::from_int32(&[0], &[1])?;
+        let left_padding = MxArray::from_int32(&[0], &[1])?;
 
         // Get input tokens for repetition penalty context
         let input_tokens = input_ids.to_uint32()?;
@@ -1434,10 +1592,13 @@ impl Qwen3Model {
                 model_config,
                 &mut kv_keys,
                 &mut kv_values,
-                &mut cache_offsets,
-                &mut cache_capacities,
+                &mut cache_idx,
+                &rope_offsets,
+                &left_padding,
             )?
         };
+        // Update rope_offsets after prefill (sequence length tokens have been processed)
+        rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
 
         // Extract last token logits (shape: [1, seq_len, vocab_size] -> [vocab_size])
         let seq_len = logits.shape_at(1)?;
@@ -1523,9 +1684,13 @@ impl Qwen3Model {
                 model_config,
                 &mut kv_keys,
                 &mut kv_values,
-                &mut cache_offsets,
-                &mut cache_capacities,
+                &mut cache_idx,
+                &rope_offsets,
+                &left_padding,
             )?;
+            // Increment rope offset for next iteration (use int32 addition to preserve dtype)
+            let one_arr = MxArray::from_int32(&[1], &[1])?;
+            rope_offsets = rope_offsets.add(&one_arr)?;
 
             // Extract last token logits (shape: [1, 1, vocab_size] -> [vocab_size])
             let next_last_logits = next_logits.slice_axis(1, 0, 1)?.squeeze(Some(&[0, 1]))?;
@@ -1578,6 +1743,1099 @@ impl Qwen3Model {
         })
     }
 
+    /// Generate multiple completions for multiple prompts with batched GPU processing.
+    ///
+    /// This method generates G completions for each of the N prompts efficiently:
+    /// - For each prompt: prefill once, then batch all G completions during decode
+    /// - Significantly faster than N×G sequential calls
+    ///
+    /// # Arguments
+    /// * `prompt_arrays` - N prompt token arrays, each shape [1, prompt_len]
+    /// * `group_size` - Number of completions to generate per prompt (G)
+    /// * `config` - Generation configuration
+    ///
+    /// # Returns
+    /// BatchGenerationResult with N*G completions (G per prompt, N prompts)
+    pub fn generate_batch_for_training_sync(
+        &self,
+        prompt_arrays: &[MxArray],
+        group_size: usize,
+        config: Option<GenerationConfig>,
+    ) -> Result<BatchGenerationResult> {
+        use crate::stream::{DeviceType, Stream, StreamContext};
+        use tracing::debug;
+
+        let config = config.unwrap_or_default();
+        let num_prompts = prompt_arrays.len();
+        let total_completions = num_prompts * group_size;
+
+        // Extract configuration with defaults
+        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let temperature = config.temperature.unwrap_or(1.0);
+        let top_k = config.top_k.unwrap_or(0);
+        let top_p = config.top_p.unwrap_or(1.0);
+        let min_p = config.min_p.unwrap_or(0.0);
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(8);
+        let ngram_size = config.ngram_size.unwrap_or(3);
+        let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
+        let return_logprobs = config.return_logprobs.unwrap_or(true);
+
+        // Calculate model size for wired_limit context
+        let model_size_bytes = self.calculate_memory_size();
+
+        let embedding_weight = self.embedding.get_weight();
+        // Acquire read locks for model components
+        let layers_guard = self.layers.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire layers read lock",
+            )
+        })?;
+        let final_norm_guard = self.final_norm.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire final_norm read lock",
+            )
+        })?;
+        let lm_head_guard = self.lm_head.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire lm_head read lock",
+            )
+        })?;
+        let layers = &*layers_guard;
+        let final_norm = &*final_norm_guard;
+        let lm_head = &*lm_head_guard;
+        let model_config = &self.config;
+        let num_layers = layers.len();
+
+        debug!(
+            "Starting batched generation: {} prompts, {} group_size, max_tokens={}",
+            num_prompts, group_size, max_new_tokens
+        );
+
+        // Create dedicated generation stream
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        // Wired limit context for GPU memory management
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
+        // Sampling config
+        let sampling_config = SamplingConfig {
+            temperature: Some(temperature),
+            top_k: Some(top_k),
+            top_p: Some(top_p),
+            min_p: Some(min_p),
+        };
+
+        // Results storage
+        let mut all_tokens: Vec<MxArray> = Vec::with_capacity(total_completions);
+        let mut all_logprobs: Vec<MxArray> = Vec::with_capacity(total_completions);
+        let mut all_texts: Vec<String> = Vec::with_capacity(total_completions);
+        let mut all_finish_reasons: Vec<Vec<String>> = Vec::with_capacity(num_prompts);
+        let mut all_token_counts: Vec<Vec<u32>> = Vec::with_capacity(num_prompts);
+
+        // Process each prompt with batched generation for its G completions
+        for (prompt_idx, prompt_array) in prompt_arrays.iter().enumerate() {
+            debug!("Processing prompt {} of {}", prompt_idx + 1, num_prompts);
+
+            // Get prompt tokens for repetition penalty context (as Vec<u32> for cloning)
+            let prompt_tokens: Vec<u32> = prompt_array.to_uint32()?.to_vec();
+            let _prompt_len = prompt_array.shape_at(1)?; // Kept for potential future use
+
+            // === PREFILL: Single forward pass for the prompt ===
+            let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];
+            let mut kv_values: Vec<Option<MxArray>> = vec![None; num_layers];
+            let mut cache_idx: i32 = 0;
+
+            // For prefill: single batch element, no left padding, rope offset starts at 0
+            let prefill_rope_offsets = MxArray::from_int32(&[0], &[1])?;
+            let prefill_left_padding = MxArray::from_int32(&[0], &[1])?;
+
+            let prefill_logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                Self::forward_fused(
+                    prompt_array,
+                    &embedding_weight,
+                    layers,
+                    final_norm,
+                    lm_head,
+                    model_config,
+                    &mut kv_keys,
+                    &mut kv_values,
+                    &mut cache_idx,
+                    &prefill_rope_offsets,
+                    &prefill_left_padding,
+                )?
+            };
+
+            // Extract last token logits [1, vocab_size]
+            let seq_len = prefill_logits.shape_at(1)?;
+            let last_logits = prefill_logits
+                .slice_axis(1, seq_len - 1, seq_len)?
+                .squeeze(Some(&[1]))?; // [1, vocab_size]
+
+            // === EXPAND KV CACHE FOR GROUP ===
+            // Repeat each cache tensor along batch dimension for group_size copies
+            let mut batch_kv_keys: Vec<Option<MxArray>> = Vec::with_capacity(num_layers);
+            let mut batch_kv_values: Vec<Option<MxArray>> = Vec::with_capacity(num_layers);
+            let mut batch_cache_idx: i32 = cache_idx; // Shared cache index for all batch elements
+
+            for layer_idx in 0..num_layers {
+                if let Some(ref keys) = kv_keys[layer_idx] {
+                    // Repeat along batch dimension: [1, heads, seq, dim] -> [G, heads, seq, dim]
+                    let repeated_keys = keys.repeat_along_axis(0, group_size as i32)?;
+                    batch_kv_keys.push(Some(repeated_keys));
+                } else {
+                    batch_kv_keys.push(None);
+                }
+
+                if let Some(ref values) = kv_values[layer_idx] {
+                    let repeated_values = values.repeat_along_axis(0, group_size as i32)?;
+                    batch_kv_values.push(Some(repeated_values));
+                } else {
+                    batch_kv_values.push(None);
+                }
+            }
+
+            // Create per-sequence RoPE offsets and left padding for batched generation
+            // All sequences in the group start at the same position (cache_idx) with no left padding
+            let rope_offsets_vec: Vec<i32> = vec![cache_idx; group_size];
+            let mut batch_rope_offsets =
+                MxArray::from_int32(&rope_offsets_vec, &[group_size as i64])?;
+            let left_padding_vec: Vec<i32> = vec![0; group_size];
+            let mut batch_left_padding =
+                MxArray::from_int32(&left_padding_vec, &[group_size as i64])?;
+
+            // Expand last logits for group [1, vocab] -> [G, vocab]
+            let batch_logits = last_logits.repeat_along_axis(0, group_size as i32)?;
+
+            // Apply repetition penalty to initial logits
+            let batch_logits = if repetition_penalty != 1.0 && !prompt_tokens.is_empty() {
+                self.apply_batch_repetition_penalty(
+                    &batch_logits,
+                    &vec![prompt_tokens.clone(); group_size],
+                    repetition_penalty,
+                    repetition_context_size,
+                )?
+            } else {
+                batch_logits
+            };
+
+            // === BATCHED DECODE STATE ===
+            // Track per-sequence state
+            let mut generated_tokens: Vec<Vec<u32>> =
+                vec![Vec::with_capacity(max_new_tokens as usize); group_size];
+            let mut generated_logprobs: Vec<Vec<f32>> = if return_logprobs {
+                vec![Vec::with_capacity(max_new_tokens as usize); group_size]
+            } else {
+                vec![Vec::new(); group_size]
+            };
+            let mut token_histories: Vec<Vec<u32>> =
+                (0..group_size).map(|_| prompt_tokens.clone()).collect();
+            let mut active_mask: Vec<bool> = vec![true; group_size];
+
+            // Track original indices to restore order after remapping
+            // When sequences finish early and we filter arrays, this maps current index -> original index
+            let mut original_indices: Vec<usize> = (0..group_size).collect();
+
+            // Store completed sequence results before they get filtered out
+            // (original_idx, tokens, logprobs, finish_reason)
+            let mut completed_sequences: Vec<(usize, Vec<u32>, Vec<f32>, String)> = Vec::new();
+
+            // Sample first tokens for all group members
+            let (mut current_tokens, mut current_logprobs_arr) = if return_logprobs {
+                let (toks, lps) = sample_and_logprobs(&batch_logits, Some(sampling_config))?;
+                (toks, Some(lps))
+            } else {
+                let toks = sample(&batch_logits, Some(sampling_config))?;
+                (toks, None)
+            };
+
+            // === DECODE LOOP ===
+            const DECODE_CLEANUP_INTERVAL: i32 = 64;
+
+            for step in 0..max_new_tokens {
+                let _stream_ctx = StreamContext::new(generation_stream);
+
+                // Sync to materialize tokens
+                current_tokens.eval();
+
+                // Periodic cleanup
+                if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
+                    synchronize_and_clear_cache();
+                }
+
+                // Count active sequences
+                let active_count = active_mask.iter().filter(|&&x| x).count();
+                if active_count == 0 {
+                    break;
+                }
+
+                // Extract token values for active sequences
+                let token_values = current_tokens.to_int32()?;
+
+                // Update state for each sequence - collect deactivations first to avoid borrow conflict
+                let mut to_deactivate: Vec<(usize, String)> = Vec::new();
+
+                // Extract all logprobs at once if needed (avoids crashes from item_at_float32_2d)
+                // Also determine actual vocab_size from the logprobs array shape
+                let (logprobs_data, actual_vocab_size): (Option<Vec<f32>>, usize) =
+                    if return_logprobs {
+                        if let Some(ref lp) = current_logprobs_arr {
+                            lp.eval(); // Ensure materialized
+                            let shape: Vec<i64> = lp.shape()?.iter().copied().collect();
+                            // Shape is [batch, vocab_size], get vocab_size from last dim
+                            let vocab_size = if shape.len() >= 2 {
+                                shape[shape.len() - 1] as usize
+                            } else {
+                                151936 // Fallback for Qwen3
+                            };
+                            (Some(lp.to_float32()?.to_vec()), vocab_size)
+                        } else {
+                            (None, 151936)
+                        }
+                    } else {
+                        (None, 151936)
+                    };
+
+                for seq_idx in 0..active_mask.len() {
+                    if !active_mask[seq_idx] {
+                        continue;
+                    }
+
+                    let token_value = token_values[seq_idx] as u32;
+                    generated_tokens[seq_idx].push(token_value);
+                    token_histories[seq_idx].push(token_value);
+
+                    // Extract logprob using pre-loaded data
+                    if return_logprobs && let Some(ref data) = logprobs_data {
+                        let flat_idx = seq_idx * actual_vocab_size + token_value as usize;
+                        let token_logprob = data[flat_idx];
+                        generated_logprobs[seq_idx].push(token_logprob);
+                    }
+
+                    // Check for repetitive generation
+                    if let Some(reason) = check_repetition_cutoff(
+                        &generated_tokens[seq_idx],
+                        max_consecutive_tokens,
+                        max_ngram_repeats,
+                        ngram_size,
+                    ) {
+                        to_deactivate.push((seq_idx, reason.to_string()));
+                        continue;
+                    }
+
+                    // Check for EOS
+                    if let Some(eos_id) = eos_token_id
+                        && token_value == eos_id as u32
+                    {
+                        to_deactivate.push((seq_idx, "stop".to_string()));
+                        continue;
+                    }
+                }
+
+                // Apply deactivations - save completed sequence data before filtering
+                for (seq_idx, reason) in to_deactivate {
+                    // Save this completed sequence's data with its original index
+                    let orig_idx = original_indices[seq_idx];
+                    completed_sequences.push((
+                        orig_idx,
+                        generated_tokens[seq_idx].clone(),
+                        generated_logprobs[seq_idx].clone(),
+                        reason,
+                    ));
+                    active_mask[seq_idx] = false;
+                }
+
+                // Check if all sequences finished
+                let active_count = active_mask.iter().filter(|&&x| x).count();
+                if active_count == 0 {
+                    break;
+                }
+
+                // === BATCHED FORWARD PASS ===
+                // Build input tensor [active_count, 1] with next tokens for active sequences
+                let active_indices: Vec<usize> = active_mask
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, is_active)| **is_active)
+                    .map(|(idx, _)| idx)
+                    .collect();
+
+                // Get active tokens
+                let active_token_values: Vec<u32> = active_indices
+                    .iter()
+                    .map(|&idx| *generated_tokens[idx].last().unwrap())
+                    .collect();
+
+                // If not all sequences are active, we need to filter the KV cache
+                if active_count < group_size {
+                    let indices_i32: Vec<i32> = active_indices.iter().map(|&x| x as i32).collect();
+                    let indices_array =
+                        MxArray::from_int32(&indices_i32, &[indices_i32.len() as i64])?;
+
+                    for layer_idx in 0..num_layers {
+                        if let Some(ref keys) = batch_kv_keys[layer_idx] {
+                            batch_kv_keys[layer_idx] = Some(keys.take(&indices_array, 0)?);
+                        }
+                        if let Some(ref values) = batch_kv_values[layer_idx] {
+                            batch_kv_values[layer_idx] = Some(values.take(&indices_array, 0)?);
+                        }
+                    }
+
+                    // CRITICAL: Also filter rope_offsets and left_padding
+                    batch_rope_offsets = batch_rope_offsets.take(&indices_array, 0)?;
+                    batch_left_padding = batch_left_padding.take(&indices_array, 0)?;
+
+                    // Update active mask to reflect new indices
+                    active_mask = vec![true; active_count];
+
+                    // Remap generated_tokens, generated_logprobs, token_histories, original_indices
+                    // Note: completed sequence data is saved to completed_sequences BEFORE filtering
+                    generated_tokens = active_indices
+                        .iter()
+                        .map(|&i| std::mem::take(&mut generated_tokens[i]))
+                        .collect();
+                    generated_logprobs = active_indices
+                        .iter()
+                        .map(|&i| std::mem::take(&mut generated_logprobs[i]))
+                        .collect();
+                    token_histories = active_indices
+                        .iter()
+                        .map(|&i| std::mem::take(&mut token_histories[i]))
+                        .collect();
+                    original_indices = active_indices
+                        .iter()
+                        .map(|&i| original_indices[i])
+                        .collect();
+                }
+
+                // Create input tensor for forward pass [active_count, 1]
+                let next_input = MxArray::from_uint32(
+                    &active_token_values,
+                    &[active_token_values.len() as i64, 1],
+                )?;
+
+                // Forward pass with array offsets
+                let next_logits = Self::forward_fused(
+                    &next_input,
+                    &embedding_weight,
+                    layers,
+                    final_norm,
+                    lm_head,
+                    model_config,
+                    &mut batch_kv_keys,
+                    &mut batch_kv_values,
+                    &mut batch_cache_idx,
+                    &batch_rope_offsets,
+                    &batch_left_padding,
+                )?;
+
+                // Increment rope offsets for next iteration (each sequence advances by 1 token)
+                // Use int32 array addition to preserve dtype (add_scalar uses f64 which would promote to float)
+                let one_arr = MxArray::from_int32(&[1], &[1])?;
+                batch_rope_offsets = batch_rope_offsets.add(&one_arr)?;
+
+                // Extract logits [active_count, 1, vocab] -> [active_count, vocab]
+                let next_last_logits = next_logits.squeeze(Some(&[1]))?;
+
+                // Apply repetition penalty
+                let next_last_logits = if repetition_penalty != 1.0 {
+                    self.apply_batch_repetition_penalty(
+                        &next_last_logits,
+                        &token_histories,
+                        repetition_penalty,
+                        repetition_context_size,
+                    )?
+                } else {
+                    next_last_logits
+                };
+
+                // Sample next tokens
+                let (next_tokens, next_lp) = if return_logprobs {
+                    let (toks, lps) =
+                        sample_and_logprobs(&next_last_logits, Some(sampling_config))?;
+                    (toks, Some(lps))
+                } else {
+                    (sample(&next_last_logits, Some(sampling_config))?, None)
+                };
+
+                current_tokens = next_tokens;
+                current_logprobs_arr = next_lp;
+            }
+
+            // === COLLECT RESULTS FOR THIS PROMPT ===
+            // Merge completed sequences (finished early) with remaining active sequences
+            // Each entry: (original_idx, tokens, logprobs, finish_reason)
+            let mut all_sequence_results: Vec<(usize, Vec<u32>, Vec<f32>, String)> =
+                Vec::with_capacity(group_size);
+
+            // Track which original indices have already been saved to completed_sequences
+            // This is needed because when ALL sequences finish early (active_count == 0),
+            // the filtering block is skipped and original_indices remains unchanged
+            let completed_orig_indices: std::collections::HashSet<usize> = completed_sequences
+                .iter()
+                .map(|(orig_idx, _, _, _)| *orig_idx)
+                .collect();
+
+            // Add completed sequences (already have their data saved)
+            all_sequence_results.extend(completed_sequences);
+
+            // Add remaining active sequences (hit max_new_tokens) - only those not already completed
+            for (i, orig_idx) in original_indices.iter().enumerate() {
+                if !completed_orig_indices.contains(orig_idx) {
+                    all_sequence_results.push((
+                        *orig_idx,
+                        std::mem::take(&mut generated_tokens[i]),
+                        std::mem::take(&mut generated_logprobs[i]),
+                        "length".to_string(),
+                    ));
+                }
+            }
+
+            // Sort by original index to restore proper ordering
+            all_sequence_results.sort_by_key(|(orig_idx, _, _, _)| *orig_idx);
+
+            // Now collect in order
+            let mut prompt_finish_reasons = Vec::with_capacity(group_size);
+            let mut prompt_token_counts = Vec::with_capacity(group_size);
+
+            for (_orig_idx, tokens, logprobs, reason) in all_sequence_results {
+                prompt_finish_reasons.push(reason);
+                prompt_token_counts.push(tokens.len() as u32);
+
+                // Convert to MxArray
+                let tokens_arr = MxArray::from_uint32(&tokens, &[tokens.len() as i64])?;
+                all_tokens.push(tokens_arr);
+
+                if return_logprobs {
+                    let logprobs_arr = MxArray::from_float32(&logprobs, &[logprobs.len() as i64])?;
+                    all_logprobs.push(logprobs_arr);
+                } else {
+                    all_logprobs.push(MxArray::from_float32(&[], &[0])?);
+                }
+
+                all_texts.push(String::new()); // Text decoding handled separately
+            }
+
+            all_finish_reasons.push(prompt_finish_reasons);
+            all_token_counts.push(prompt_token_counts);
+
+            // Heavy cleanup after each prompt's generation
+            heavy_cleanup();
+        }
+
+        Ok(BatchGenerationResult {
+            tokens: all_tokens,
+            logprobs: all_logprobs,
+            texts: all_texts,
+            finish_reasons: all_finish_reasons,
+            token_counts: all_token_counts,
+            num_prompts,
+            group_size: group_size as u32,
+        })
+    }
+
+    /// True parallel batch generation with left-padding support.
+    ///
+    /// Unlike `generate_batch_for_training_sync` which processes prompts sequentially,
+    /// this method processes ALL N*G sequences in parallel using the batched FFI kernel.
+    /// This provides 2-4x speedup for GRPO training.
+    ///
+    /// # Arguments
+    /// * `prompt_arrays` - N prompt token arrays (1D, variable lengths)
+    /// * `group_size` - Number of completions to generate per prompt (G)
+    /// * `config` - Generation configuration
+    ///
+    /// # Returns
+    /// BatchGenerationResult with N*G completions
+    ///
+    /// # Performance
+    /// For N prompts with G completions each:
+    /// - Sequential: N prefills + N*G decode steps
+    /// - Parallel: 1 batched prefill + batched decode (all N*G sequences together)
+    pub fn generate_batch_parallel_sync(
+        &self,
+        prompt_arrays: &[MxArray],
+        group_size: usize,
+        config: Option<GenerationConfig>,
+    ) -> Result<BatchGenerationResult> {
+        use crate::array::left_pad_sequences;
+        use crate::stream::{DeviceType, Stream, StreamContext};
+        use crate::transformer::BatchKVCache;
+        use mlx_sys as sys;
+        use std::ptr;
+        use tracing::debug;
+
+        let config = config.unwrap_or_default();
+        let num_prompts = prompt_arrays.len();
+        let total_batch_size = num_prompts * group_size;
+
+        // Extract configuration with defaults
+        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let temperature = config.temperature.unwrap_or(1.0);
+        let top_k = config.top_k.unwrap_or(0);
+        let top_p = config.top_p.unwrap_or(1.0);
+        let min_p = config.min_p.unwrap_or(0.0);
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(8);
+        let ngram_size = config.ngram_size.unwrap_or(3);
+        let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
+        let return_logprobs = config.return_logprobs.unwrap_or(true);
+
+        // Calculate model size for wired_limit context
+        let model_size_bytes = self.calculate_memory_size();
+
+        let embedding_weight = self.embedding.get_weight();
+        // Acquire read locks for model components
+        let layers_guard = self.layers.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire layers read lock",
+            )
+        })?;
+        let final_norm_guard = self.final_norm.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire final_norm read lock",
+            )
+        })?;
+        let lm_head_guard = self.lm_head.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire lm_head read lock",
+            )
+        })?;
+        let layers = &*layers_guard;
+        let final_norm = &*final_norm_guard;
+        let lm_head = &*lm_head_guard;
+        let model_config = &self.config;
+        let num_layers = layers.len();
+
+        debug!(
+            "Starting parallel batch generation: {} prompts × {} group_size = {} total, max_tokens={}",
+            num_prompts, group_size, total_batch_size, max_new_tokens
+        );
+
+        // Create dedicated generation stream
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
+        // Sampling config
+        let sampling_config = SamplingConfig {
+            temperature: Some(temperature),
+            top_k: Some(top_k),
+            top_p: Some(top_p),
+            min_p: Some(min_p),
+        };
+
+        // === STEP 1: Left-pad and replicate prompts ===
+        // Convert to 1D arrays for left_pad_sequences
+        let prompt_1d: Vec<MxArray> = prompt_arrays
+            .iter()
+            .map(|p| {
+                if p.ndim()? == 2 {
+                    p.squeeze(Some(&[0])) // [1, seq] -> [seq]
+                } else {
+                    Ok(p.clone())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let prompt_refs: Vec<&MxArray> = prompt_1d.iter().collect();
+        let padded_result = left_pad_sequences(prompt_refs, 0)?;
+        let padded_prompts = padded_result.get_padded()?; // [N, max_len]
+        let base_left_padding = padded_result.get_left_padding(); // [N]
+
+        // Store original prompt tokens for repetition penalty
+        let prompt_tokens_vecs: Vec<Vec<u32>> = prompt_1d
+            .iter()
+            .map(|p| p.to_uint32().map(|v| v.to_vec()))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Replicate for group_size: [N, max_len] -> [N*G, max_len]
+        // Build batched input by stacking G copies of each prompt
+        let mut expanded_rows: Vec<MxArray> = Vec::with_capacity(total_batch_size);
+        for prompt_idx in 0..num_prompts {
+            // slice_axis keeps the dimension, so squeeze to get [max_len] from [1, max_len]
+            let prompt_row = padded_prompts
+                .slice_axis(0, prompt_idx as i64, (prompt_idx + 1) as i64)?
+                .squeeze(Some(&[0]))?;
+            for _g in 0..group_size {
+                expanded_rows.push(prompt_row.clone());
+            }
+        }
+        let expanded_refs: Vec<&MxArray> = expanded_rows.iter().collect();
+        let batched_input = MxArray::stack(expanded_refs, Some(0))?; // [N*G, max_len]
+
+        // Expand left_padding for all N*G sequences
+        let mut expanded_left_padding: Vec<i32> = Vec::with_capacity(total_batch_size);
+        for &padding in base_left_padding.iter().take(num_prompts) {
+            for _g in 0..group_size {
+                expanded_left_padding.push(padding);
+            }
+        }
+
+        // Create BatchKVCache with left padding
+        let mut batch_cache = BatchKVCache::new(expanded_left_padding.clone().into());
+
+        // === STEP 2: Batched Prefill using FFI ===
+        // Collect layer weights
+        let mut layer_weights: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_layers * 11);
+        for layer in layers.iter() {
+            layer_weights.push(layer.get_input_layernorm_weight().handle.0);
+            layer_weights.push(layer.get_post_attention_layernorm_weight().handle.0);
+            layer_weights.push(layer.self_attn.get_q_proj_weight().handle.0);
+            layer_weights.push(layer.self_attn.get_k_proj_weight().handle.0);
+            layer_weights.push(layer.self_attn.get_v_proj_weight().handle.0);
+            layer_weights.push(layer.self_attn.get_o_proj_weight().handle.0);
+            if let Some(q_norm) = layer.self_attn.get_q_norm_weight() {
+                layer_weights.push(q_norm.handle.0);
+            } else {
+                layer_weights.push(ptr::null_mut());
+            }
+            if let Some(k_norm) = layer.self_attn.get_k_norm_weight() {
+                layer_weights.push(k_norm.handle.0);
+            } else {
+                layer_weights.push(ptr::null_mut());
+            }
+            layer_weights.push(layer.mlp.get_gate_proj_weight().handle.0);
+            layer_weights.push(layer.mlp.get_up_proj_weight().handle.0);
+            layer_weights.push(layer.mlp.get_down_proj_weight().handle.0);
+        }
+
+        let final_norm_weight = final_norm.get_weight();
+        let lm_head_weight_handle = if model_config.tie_word_embeddings {
+            ptr::null_mut()
+        } else {
+            lm_head.get_weight().handle.0
+        };
+
+        // Get RoPE offsets and left padding as MxArrays
+        let rope_offsets = batch_cache.get_rope_offsets_array()?;
+        let left_padding_arr = batch_cache.get_left_padding_array()?;
+
+        // KV cache state - starts empty
+        let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];
+        let mut kv_values: Vec<Option<MxArray>> = vec![None; num_layers];
+        let mut cache_idx = batch_cache.get_idx();
+
+        // Prepare FFI input/output pointers
+        let kv_keys_ptrs: Vec<*mut sys::mlx_array> = kv_keys
+            .iter()
+            .map(|k| k.as_ref().map(|a| a.handle.0).unwrap_or(ptr::null_mut()))
+            .collect();
+        let kv_values_ptrs: Vec<*mut sys::mlx_array> = kv_values
+            .iter()
+            .map(|v| v.as_ref().map(|a| a.handle.0).unwrap_or(ptr::null_mut()))
+            .collect();
+
+        let mut out_logits: *mut sys::mlx_array = ptr::null_mut();
+        let mut out_kv_keys: Vec<*mut sys::mlx_array> = vec![ptr::null_mut(); num_layers];
+        let mut out_kv_values: Vec<*mut sys::mlx_array> = vec![ptr::null_mut(); num_layers];
+        let mut out_cache_idx: i32 = 0;
+
+        // Call batched FFI for prefill
+        {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            unsafe {
+                sys::mlx_qwen3_forward_step_batched(
+                    batched_input.handle.0,
+                    embedding_weight.handle.0,
+                    layer_weights.as_ptr(),
+                    num_layers as i32,
+                    final_norm_weight.handle.0,
+                    lm_head_weight_handle,
+                    model_config.tie_word_embeddings,
+                    model_config.hidden_size,
+                    model_config.num_heads,
+                    model_config.num_kv_heads,
+                    model_config.head_dim,
+                    model_config.rope_theta as f32,
+                    model_config.rms_norm_eps as f32,
+                    rope_offsets.handle.0,
+                    left_padding_arr.handle.0,
+                    kv_keys_ptrs.as_ptr(),
+                    kv_values_ptrs.as_ptr(),
+                    cache_idx,
+                    &mut out_logits,
+                    out_kv_keys.as_mut_ptr(),
+                    out_kv_values.as_mut_ptr(),
+                    &mut out_cache_idx,
+                );
+            }
+        }
+
+        // Update cache state from FFI outputs
+        cache_idx = out_cache_idx;
+        batch_cache.set_idx(cache_idx);
+
+        for i in 0..num_layers {
+            if !out_kv_keys[i].is_null() {
+                kv_keys[i] = Some(MxArray::from_handle(
+                    out_kv_keys[i],
+                    "batch_parallel prefill keys",
+                )?);
+            }
+            if !out_kv_values[i].is_null() {
+                kv_values[i] = Some(MxArray::from_handle(
+                    out_kv_values[i],
+                    "batch_parallel prefill values",
+                )?);
+            }
+        }
+
+        // Get prefill logits [N*G, seq_len, vocab]
+        let prefill_logits = MxArray::from_handle(out_logits, "batch_parallel prefill logits")?;
+        let seq_len = prefill_logits.shape_at(1)?;
+        let last_logits = prefill_logits
+            .slice_axis(1, seq_len - 1, seq_len)?
+            .squeeze(Some(&[1]))?; // [N*G, vocab]
+
+        // Update offsets to reflect prefill
+        let prefill_seq_len = batched_input.shape_at(1)? as i32;
+        batch_cache.advance_offsets(prefill_seq_len);
+
+        // === STEP 3: Initialize decode state ===
+        let mut generated_tokens: Vec<Vec<u32>> =
+            vec![Vec::with_capacity(max_new_tokens as usize); total_batch_size];
+        let mut generated_logprobs: Vec<Vec<f32>> = if return_logprobs {
+            vec![Vec::with_capacity(max_new_tokens as usize); total_batch_size]
+        } else {
+            vec![Vec::new(); total_batch_size]
+        };
+
+        // Token histories for repetition penalty (prompt + generated)
+        let mut token_histories: Vec<Vec<u32>> = (0..total_batch_size)
+            .map(|i| prompt_tokens_vecs[i / group_size].clone())
+            .collect();
+
+        let mut finish_reasons: Vec<Option<String>> = vec![None; total_batch_size];
+        let mut active_indices: Vec<usize> = (0..total_batch_size).collect();
+
+        // Apply repetition penalty to initial logits
+        let mut current_logits = if repetition_penalty != 1.0 {
+            self.apply_batch_repetition_penalty(
+                &last_logits,
+                &token_histories,
+                repetition_penalty,
+                repetition_context_size,
+            )?
+        } else {
+            last_logits
+        };
+
+        // Sample first tokens
+        let (mut current_tokens, mut current_logprobs_arr) = if return_logprobs {
+            let (toks, lps) = sample_and_logprobs(&current_logits, Some(sampling_config))?;
+            (toks, Some(lps))
+        } else {
+            (sample(&current_logits, Some(sampling_config))?, None)
+        };
+
+        // === STEP 4: Batched decode loop ===
+        const DECODE_CLEANUP_INTERVAL: i32 = 64;
+
+        for step in 0..max_new_tokens {
+            let _stream_ctx = StreamContext::new(generation_stream);
+
+            current_tokens.eval();
+
+            if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
+                synchronize_and_clear_cache();
+            }
+
+            if active_indices.is_empty() {
+                break;
+            }
+
+            // Extract token values
+            let token_values = current_tokens.to_int32()?;
+
+            // Track which sequences to deactivate
+            let mut to_deactivate: Vec<(usize, String)> = Vec::new();
+
+            for (local_idx, &global_idx) in active_indices.iter().enumerate() {
+                let token_value = token_values[local_idx] as u32;
+                generated_tokens[global_idx].push(token_value);
+                token_histories[global_idx].push(token_value);
+
+                if return_logprobs && let Some(ref lp) = current_logprobs_arr {
+                    let token_logprob = lp.item_at_float32_2d(local_idx, token_value as usize)?;
+                    generated_logprobs[global_idx].push(token_logprob);
+                }
+
+                // Check repetition
+                if let Some(reason) = check_repetition_cutoff(
+                    &generated_tokens[global_idx],
+                    max_consecutive_tokens,
+                    max_ngram_repeats,
+                    ngram_size,
+                ) {
+                    to_deactivate.push((local_idx, reason.to_string()));
+                    continue;
+                }
+
+                // Check EOS
+                if let Some(eos_id) = eos_token_id
+                    && token_value == eos_id as u32
+                {
+                    to_deactivate.push((local_idx, "stop".to_string()));
+                }
+            }
+
+            // Build filter_indices BEFORE modifying active_indices
+            // This tracks which local positions in the KV cache to keep
+            let positions_to_remove: std::collections::HashSet<usize> =
+                to_deactivate.iter().map(|(idx, _)| *idx).collect();
+            let old_batch_size = active_indices.len();
+            let filter_indices: Vec<i32> = (0..old_batch_size)
+                .filter(|i| !positions_to_remove.contains(i))
+                .map(|i| i as i32)
+                .collect();
+
+            // Apply deactivations (process in reverse to preserve indices)
+            to_deactivate.sort_by(|a, b| b.0.cmp(&a.0));
+            for (local_idx, reason) in to_deactivate {
+                let global_idx = active_indices[local_idx];
+                finish_reasons[global_idx] = Some(reason);
+                active_indices.remove(local_idx);
+            }
+
+            if active_indices.is_empty() {
+                break;
+            }
+
+            // Filter KV cache if needed
+            // active_indices contains global indices; filter_indices contains old local positions to keep
+            let current_batch_size = batch_cache.batch_size();
+            if filter_indices.len() < current_batch_size {
+                // filter_indices was computed before deactivation with the correct local positions
+
+                // Filter KV cache tensors
+                let indices_array =
+                    MxArray::from_int32(&filter_indices, &[filter_indices.len() as i64])?;
+                for i in 0..num_layers {
+                    if let Some(ref keys) = kv_keys[i] {
+                        kv_keys[i] = Some(keys.take(&indices_array, 0)?);
+                    }
+                    if let Some(ref values) = kv_values[i] {
+                        kv_values[i] = Some(values.take(&indices_array, 0)?);
+                    }
+                }
+
+                // Also update batch_cache filter
+                batch_cache.filter(&filter_indices)?;
+
+                // Note: active_indices already contains the correct global indices after deactivation
+                // We do NOT remap them - they are used to index into generated_tokens/finish_reasons
+            }
+
+            // Prepare next input tokens
+            // active_indices contains global indices, positions are local batch indices
+            let next_tokens: Vec<u32> = active_indices
+                .iter()
+                .map(|&global_idx| *generated_tokens[global_idx].last().unwrap())
+                .collect();
+
+            let next_input = MxArray::from_uint32(&next_tokens, &[next_tokens.len() as i64, 1])?;
+
+            // Get updated offsets for decode
+            let rope_offsets = batch_cache.get_rope_offsets_array()?;
+            let left_padding_arr = batch_cache.get_left_padding_array()?;
+
+            // Prepare KV cache pointers
+            let kv_keys_ptrs: Vec<*mut sys::mlx_array> = kv_keys
+                .iter()
+                .map(|k| k.as_ref().map(|a| a.handle.0).unwrap_or(ptr::null_mut()))
+                .collect();
+            let kv_values_ptrs: Vec<*mut sys::mlx_array> = kv_values
+                .iter()
+                .map(|v| v.as_ref().map(|a| a.handle.0).unwrap_or(ptr::null_mut()))
+                .collect();
+
+            let mut out_logits: *mut sys::mlx_array = ptr::null_mut();
+            let mut out_kv_keys: Vec<*mut sys::mlx_array> = vec![ptr::null_mut(); num_layers];
+            let mut out_kv_values: Vec<*mut sys::mlx_array> = vec![ptr::null_mut(); num_layers];
+            let mut out_cache_idx: i32 = 0;
+
+            // Batched forward for decode step
+            unsafe {
+                sys::mlx_qwen3_forward_step_batched(
+                    next_input.handle.0,
+                    embedding_weight.handle.0,
+                    layer_weights.as_ptr(),
+                    num_layers as i32,
+                    final_norm_weight.handle.0,
+                    lm_head_weight_handle,
+                    model_config.tie_word_embeddings,
+                    model_config.hidden_size,
+                    model_config.num_heads,
+                    model_config.num_kv_heads,
+                    model_config.head_dim,
+                    model_config.rope_theta as f32,
+                    model_config.rms_norm_eps as f32,
+                    rope_offsets.handle.0,
+                    left_padding_arr.handle.0,
+                    kv_keys_ptrs.as_ptr(),
+                    kv_values_ptrs.as_ptr(),
+                    batch_cache.get_idx(),
+                    &mut out_logits,
+                    out_kv_keys.as_mut_ptr(),
+                    out_kv_values.as_mut_ptr(),
+                    &mut out_cache_idx,
+                );
+            }
+
+            // Update cache
+            batch_cache.set_idx(out_cache_idx);
+            batch_cache.advance_offsets(1);
+
+            for i in 0..num_layers {
+                if !out_kv_keys[i].is_null() {
+                    kv_keys[i] = Some(MxArray::from_handle(
+                        out_kv_keys[i],
+                        "batch_parallel decode keys",
+                    )?);
+                }
+                if !out_kv_values[i].is_null() {
+                    kv_values[i] = Some(MxArray::from_handle(
+                        out_kv_values[i],
+                        "batch_parallel decode values",
+                    )?);
+                }
+            }
+
+            // Get logits [active, 1, vocab] -> [active, vocab]
+            let next_logits = MxArray::from_handle(out_logits, "batch_parallel decode logits")?
+                .squeeze(Some(&[1]))?;
+
+            // Apply repetition penalty (need to map to active histories)
+            let active_histories: Vec<Vec<u32>> = active_indices
+                .iter()
+                .map(|&global_idx| token_histories[global_idx].clone())
+                .collect();
+
+            current_logits = if repetition_penalty != 1.0 {
+                self.apply_batch_repetition_penalty(
+                    &next_logits,
+                    &active_histories,
+                    repetition_penalty,
+                    repetition_context_size,
+                )?
+            } else {
+                next_logits
+            };
+
+            // Sample next tokens
+            let (next_toks, next_lp) = if return_logprobs {
+                let (toks, lps) = sample_and_logprobs(&current_logits, Some(sampling_config))?;
+                (toks, Some(lps))
+            } else {
+                (sample(&current_logits, Some(sampling_config))?, None)
+            };
+
+            current_tokens = next_toks;
+            current_logprobs_arr = next_lp;
+        }
+
+        // === STEP 5: Collect results ===
+        let mut all_tokens: Vec<MxArray> = Vec::with_capacity(total_batch_size);
+        let mut all_logprobs: Vec<MxArray> = Vec::with_capacity(total_batch_size);
+        let mut all_finish_reasons: Vec<Vec<String>> = Vec::with_capacity(num_prompts);
+        let mut all_token_counts: Vec<Vec<u32>> = Vec::with_capacity(num_prompts);
+
+        for prompt_idx in 0..num_prompts {
+            let mut prompt_finish_reasons = Vec::with_capacity(group_size);
+            let mut prompt_token_counts = Vec::with_capacity(group_size);
+
+            for g in 0..group_size {
+                let global_idx = prompt_idx * group_size + g;
+                let reason = finish_reasons[global_idx]
+                    .take()
+                    .unwrap_or_else(|| "length".to_string());
+                prompt_finish_reasons.push(reason);
+                prompt_token_counts.push(generated_tokens[global_idx].len() as u32);
+
+                let tokens_arr = MxArray::from_uint32(
+                    &generated_tokens[global_idx],
+                    &[generated_tokens[global_idx].len() as i64],
+                )?;
+                all_tokens.push(tokens_arr);
+
+                if return_logprobs {
+                    let logprobs_arr = MxArray::from_float32(
+                        &generated_logprobs[global_idx],
+                        &[generated_logprobs[global_idx].len() as i64],
+                    )?;
+                    all_logprobs.push(logprobs_arr);
+                } else {
+                    all_logprobs.push(MxArray::from_float32(&[], &[0])?);
+                }
+            }
+
+            all_finish_reasons.push(prompt_finish_reasons);
+            all_token_counts.push(prompt_token_counts);
+        }
+
+        heavy_cleanup();
+
+        Ok(BatchGenerationResult {
+            tokens: all_tokens,
+            logprobs: all_logprobs,
+            texts: vec![String::new(); total_batch_size], // Text decoding handled separately
+            finish_reasons: all_finish_reasons,
+            token_counts: all_token_counts,
+            num_prompts,
+            group_size: group_size as u32,
+        })
+    }
+
+    /// Apply repetition penalty to batched logits
+    fn apply_batch_repetition_penalty(
+        &self,
+        logits: &MxArray,
+        token_histories: &[Vec<u32>],
+        penalty: f64,
+        context_size: i32,
+    ) -> Result<MxArray> {
+        let batch_size = logits.shape_at(0)? as usize;
+
+        if batch_size != token_histories.len() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "Batch size mismatch: logits batch {} vs histories {}",
+                    batch_size,
+                    token_histories.len()
+                ),
+            ));
+        }
+
+        // Apply penalty to each sequence
+        let mut penalized_rows = Vec::with_capacity(batch_size);
+        for (i, context) in token_histories.iter().enumerate().take(batch_size) {
+            let row_logits = logits
+                .slice_axis(0, i as i64, (i + 1) as i64)?
+                .squeeze(Some(&[0]))?;
+            let penalized =
+                apply_repetition_penalty(&row_logits, context, penalty, Some(context_size))?;
+            penalized_rows.push(penalized);
+        }
+
+        // Stack back into batch
+        let refs: Vec<&MxArray> = penalized_rows.iter().collect();
+        MxArray::stack(refs, Some(0))
+    }
+
     /// Count total number of parameters in the model
     #[napi]
     pub fn num_parameters(&self) -> Result<i64> {
@@ -1588,7 +2846,17 @@ impl Qwen3Model {
         total += emb_weight.size()? as i64;
 
         // Layers
-        for _ in 0..self.layers.len() {
+        let num_layers = self
+            .layers
+            .read()
+            .map_err(|_| {
+                Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire layers read lock",
+                )
+            })?
+            .len();
+        for _ in 0..num_layers {
             // Each layer has:
             // Q, K, V, O projections: 4 * (hidden_size * hidden_size)
             // MLP: gate, up, down projections
@@ -1621,11 +2889,25 @@ impl Qwen3Model {
     pub fn get_parameters(&self) -> HashMap<String, MxArray> {
         let mut params = HashMap::new();
 
+        // Acquire read locks for model components
+        let layers_guard = self
+            .layers
+            .read()
+            .expect("Failed to acquire layers read lock");
+        let final_norm_guard = self
+            .final_norm
+            .read()
+            .expect("Failed to acquire final_norm read lock");
+        let lm_head_guard = self
+            .lm_head
+            .read()
+            .expect("Failed to acquire lm_head read lock");
+
         // Embedding
         params.insert("embedding.weight".to_string(), self.embedding.get_weight());
 
         // Transformer layers
-        for (i, layer) in self.layers.iter().enumerate() {
+        for (i, layer) in layers_guard.iter().enumerate() {
             let prefix = format!("layers.{}", i);
 
             let attn = &layer.self_attn;
@@ -1683,14 +2965,14 @@ impl Qwen3Model {
         // Final norm and LM head
         params.insert(
             "final_norm.weight".to_string(),
-            self.final_norm.get_weight(),
+            final_norm_guard.get_weight(),
         );
 
         // Only save lm_head.weight if tie_word_embeddings is false.
         // When tie_word_embeddings=true, the embedding weight is used for logits
         // (matches HuggingFace behavior where lm_head is not a separate parameter).
         if !self.config.tie_word_embeddings {
-            params.insert("lm_head.weight".to_string(), self.lm_head.get_weight());
+            params.insert("lm_head.weight".to_string(), lm_head_guard.get_weight());
         }
 
         params
@@ -1721,24 +3003,25 @@ impl Qwen3Model {
             warn!("  ⚠️  embedding.weight not found in parameters");
         }
 
-        let layers = Arc::get_mut(&mut self.layers).ok_or_else(|| {
+        // Acquire write locks for model components
+        let mut layers = self.layers.write().map_err(|_| {
             Error::new(
                 napi::Status::GenericFailure,
-                "Failed to get mutable reference to layers Arc",
+                "Failed to acquire layers write lock",
             )
         })?;
 
-        let final_norm = Arc::get_mut(&mut self.final_norm).ok_or_else(|| {
+        let mut final_norm = self.final_norm.write().map_err(|_| {
             Error::new(
                 napi::Status::GenericFailure,
-                "Failed to get mutable reference to final_norm Arc",
+                "Failed to acquire final_norm write lock",
             )
         })?;
 
-        let lm_head = Arc::get_mut(&mut self.lm_head).ok_or_else(|| {
+        let mut lm_head = self.lm_head.write().map_err(|_| {
             Error::new(
                 napi::Status::GenericFailure,
-                "Failed to get mutable reference to lm_head Arc",
+                "Failed to acquire lm_head write lock",
             )
         })?;
 
@@ -1980,11 +3263,23 @@ impl Qwen3Model {
 
         // ===== LM Head Gradient (Exact) =====
         // Recompute final hidden states (input to LM head)
+        let layers_guard = self.layers.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire layers read lock",
+            )
+        })?;
+        let final_norm_guard = self.final_norm.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire final_norm read lock",
+            )
+        })?;
         let mut hidden_states = self.embedding.forward(input_ids)?;
-        for layer in self.layers.iter() {
+        for layer in layers_guard.iter() {
             hidden_states = layer.forward(&hidden_states, None, None)?;
         }
-        let final_hidden = self.final_norm.forward(&hidden_states)?;
+        let final_hidden = final_norm_guard.forward(&hidden_states)?;
 
         // Compute LM head gradients: grad_weight = final_hidden^T @ grad_logits
         // Manual gradient computation for linear layer
@@ -2411,8 +3706,28 @@ impl Qwen3Model {
         gradients: HashMap<String, &MxArray>,
         learning_rate: f64,
     ) -> Result<()> {
-        // Get current parameters
+        // Get current parameters (for NAPI callers who don't have params cached)
         let params = self.get_parameters();
+        self.apply_gradients_with_params(gradients, learning_rate, &params)
+    }
+
+    /// Apply gradients to model parameters using pre-fetched params
+    ///
+    /// This variant avoids calling get_parameters() internally, which is important
+    /// for memory efficiency when params are already available from earlier in the
+    /// training step. Each get_parameters() call clones ~70 parameter tensors.
+    ///
+    /// # Arguments
+    /// * `gradients` - Dictionary mapping parameter names to gradient arrays
+    /// * `learning_rate` - Learning rate for gradient descent
+    /// * `current_params` - Pre-fetched model parameters (from get_parameters())
+    pub fn apply_gradients_with_params(
+        &mut self,
+        gradients: HashMap<String, &MxArray>,
+        learning_rate: f64,
+        current_params: &HashMap<String, MxArray>,
+    ) -> Result<()> {
+        let params = current_params;
 
         // Only update parameters that have gradients
         // Parameters without gradients remain unchanged (no need to reload them)
@@ -2459,23 +3774,26 @@ impl Qwen3Model {
             param.eval();
         }
 
-        let layers = Arc::get_mut(&mut self.layers).ok_or_else(|| {
+        // Acquire write locks using interior mutability
+        // This avoids requiring Arc::get_mut (which needs unique ownership)
+        // and allows gradient application without deep cloning the model
+        let mut layers = self.layers.write().map_err(|_| {
             napi::Error::new(
                 napi::Status::GenericFailure,
-                "Failed to get mutable reference to layers",
+                "Failed to acquire layers write lock",
             )
         })?;
 
-        let lm_head = Arc::get_mut(&mut self.lm_head).ok_or_else(|| {
+        let mut lm_head = self.lm_head.write().map_err(|_| {
             napi::Error::new(
                 napi::Status::GenericFailure,
-                "Failed to get mutable reference to lm_head",
+                "Failed to acquire lm_head write lock",
             )
         })?;
-        let final_norm = Arc::get_mut(&mut self.final_norm).ok_or_else(|| {
+        let mut final_norm = self.final_norm.write().map_err(|_| {
             napi::Error::new(
                 napi::Status::GenericFailure,
-                "Failed to get mutable reference to final_norm",
+                "Failed to acquire final_norm write lock",
             )
         })?;
 
@@ -2573,9 +3891,9 @@ impl Qwen3Model {
         let model_size_bytes = self.calculate_memory_size();
 
         let embedding_weight = self.embedding.get_weight();
-        let layers = self.layers.clone();
-        let final_norm = self.final_norm.clone();
-        let lm_head = self.lm_head.clone();
+        let layers_arc = self.layers.clone();
+        let final_norm_arc = self.final_norm.clone();
+        let lm_head_arc = self.lm_head.clone();
         let model_config = self.config.clone(); // For fused forward
 
         napi::bindgen_prelude::spawn_blocking(move || {
@@ -2583,6 +3901,29 @@ impl Qwen3Model {
                 "Starting generation: max_tokens={}, temp={}, top_k={}, top_p={}, rep_penalty={}",
                 max_new_tokens, temperature, top_k, top_p, repetition_penalty
             );
+
+            // Acquire read locks inside the blocking closure
+            let layers_guard = layers_arc.read().map_err(|_| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire layers read lock",
+                )
+            })?;
+            let final_norm_guard = final_norm_arc.read().map_err(|_| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire final_norm read lock",
+                )
+            })?;
+            let lm_head_guard = lm_head_arc.read().map_err(|_| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire lm_head read lock",
+                )
+            })?;
+            let layers = &*layers_guard;
+            let final_norm = &*final_norm_guard;
+            let lm_head = &*lm_head_guard;
 
             // MLX-LM uses three stream contexts for async pipelining:
             //
@@ -2629,8 +3970,11 @@ impl Qwen3Model {
             let num_layers = layers.len();
             let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];
             let mut kv_values: Vec<Option<MxArray>> = vec![None; num_layers];
-            let mut cache_offsets: Vec<i32> = vec![0; num_layers];
-            let mut cache_capacities: Vec<i32> = vec![0; num_layers]; // Pre-allocated buffer sizes
+            let mut cache_idx: i32 = 0;
+
+            // For single-sequence generation: batch=1, no left padding, rope offset starts at 0
+            let mut rope_offsets = MxArray::from_int32(&[0], &[1])?;
+            let left_padding = MxArray::from_int32(&[0], &[1])?;
 
             // Get input tokens for repetition penalty context
             let input_tokens = input_ids.to_uint32()?;
@@ -2659,16 +4003,19 @@ impl Qwen3Model {
                 Self::forward_fused(
                     &current_ids,
                     &embedding_weight,
-                    &layers,
-                    &final_norm,
-                    &lm_head,
+                    layers,
+                    final_norm,
+                    lm_head,
                     &model_config,
                     &mut kv_keys,
                     &mut kv_values,
-                    &mut cache_offsets,
-                    &mut cache_capacities,
+                    &mut cache_idx,
+                    &rope_offsets,
+                    &left_padding,
                 )?
             };
+            // Update rope_offsets after prefill
+            rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
 
             // Extract last token logits and sample first token
             let seq_len = logits.shape_at(1)?;
@@ -2747,7 +4094,7 @@ impl Qwen3Model {
                 if let Some(eos_id) = eos_token_id
                     && token_value == eos_id as u32
                 {
-                    finish_reason = "eos";
+                    finish_reason = "stop";
                     info!("Generation stopped at step {} due to EOS token", step + 1);
                     break;
                 }
@@ -2763,15 +4110,19 @@ impl Qwen3Model {
                     let logits = Self::forward_fused(
                         &next_ids,
                         &embedding_weight,
-                        &layers,
-                        &final_norm,
-                        &lm_head,
+                        layers,
+                        final_norm,
+                        lm_head,
                         &model_config,
                         &mut kv_keys,
                         &mut kv_values,
-                        &mut cache_offsets,
-                        &mut cache_capacities,
+                        &mut cache_idx,
+                        &rope_offsets,
+                        &left_padding,
                     )?;
+                    // Increment rope offset for next iteration (use int32 addition to preserve dtype)
+                    let one_arr = MxArray::from_int32(&[1], &[1])?;
+                    rope_offsets = rope_offsets.add(&one_arr)?;
 
                     // Extract logits
                     let mut next_last_logits = logits.squeeze(Some(&[0, 1]))?;

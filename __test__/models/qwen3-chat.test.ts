@@ -5,7 +5,7 @@
  * Uses a tiny model with random weights for fast testing.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 import { ModelLoader, createToolDefinition } from '@mlx-node/lm';
 import type { ToolCallResult } from '@mlx-node/lm';
 import { createTempModel, TINY_TEST_CONFIG } from '../test-model-utils';

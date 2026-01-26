@@ -5,7 +5,7 @@
  * and that the trainer correctly awaits the result.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 import { GRPOTrainer, type RewardOutput } from '@mlx-node/trl';
 import { createTempModel } from '../test-model-utils.js';
 
@@ -31,9 +31,9 @@ describe('GRPO Async Reward Functions', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         rewardFunction: asyncRewardFn,
       });
 
@@ -54,9 +54,9 @@ describe('GRPO Async Reward Functions', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         rewardFunction: syncRewardFn,
       });
 
@@ -84,9 +84,9 @@ describe('GRPO Async Reward Functions', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 4,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         rewardFunction: parallelRewardFn,
       });
 
@@ -108,64 +108,19 @@ describe('GRPO Async Reward Functions', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 3,
+        maxCompletionLength: 3,
         rewardFunction: asyncRewardFn,
       });
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
-      const answers = [null];
-
-      const metrics = await trainer.trainStep(promptMessages, answers);
+      const metrics = await trainer.trainStep(promptMessages);
 
       expect(metrics).toBeDefined();
       expect(metrics.loss).toBeTypeOf('number');
       expect(metrics.meanReward).toBeCloseTo(1.0);
       expect(metrics.step).toBe(1);
-    });
-
-    it('should handle async reward function that accesses answers', async () => {
-      // Async reward function that uses answers
-      const answerAwareRewardFn = async (outputs: RewardOutput[]): Promise<Float32Array> => {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-
-        const rewards = outputs.map((output) => {
-          const answer = output.expectedAnswer;
-          if (answer && output.completion.rawText.includes(answer)) {
-            return 1.0;
-          }
-          return 0.5;
-        });
-
-        return Float32Array.from(rewards);
-      };
-
-      const trainer = await GRPOTrainer.create({
-        modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
-        groupSize: 2,
-        maxNewTokens: 5,
-        rewardFunction: answerAwareRewardFn,
-      });
-
-      const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
-      const genResult = await trainer.generateBatch(promptMessages);
-
-      const rewards = await trainer.scoreGenerations(
-        promptMessages,
-        genResult.completionTexts,
-        ['answer1', 'answer2'],
-        2,
-      );
-
-      expect(rewards).toBeInstanceOf(Float32Array);
-      expect(rewards.length).toBe(2);
-      // All rewards should be either 0.5 or 1.0
-      for (const reward of rewards) {
-        expect(reward).toBeGreaterThanOrEqual(0.5);
-        expect(reward).toBeLessThanOrEqual(1.0);
-      }
     });
   });
 });

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vite-plus/test';
 import { extractHashAnswer, extractXmlAnswer, parseXmlCot } from '@mlx-node/trl';
 
 describe('XML chain-of-thought parser', () => {

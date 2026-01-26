@@ -18,14 +18,14 @@ parquet = { version = "57", features = ["arrow"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = ["std", "fmt", "json"] }
 tokenizers = "0.22"
 minijinja = { version = "2.5", features = ["json"] }
 uuid = { version = "1.11", features = ["v4"] }
 regex = "1.11"
-libsql = { version = "0.9", features = ["replication"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 
 # NAPI-RS
 napi = { version = "3", features = ["napi10", "async", "tokio_fs", "serde-json"] }
@@ -36,6 +36,7 @@ napi-build = "2"
 mlx-sys = { path = "crates/mlx-sys" }
 mlx-core = { path = "crates/mlx-core" }
 mlx-paged-attn = { path = "crates/mlx-paged-attn" }
+mlx-db = { path = "crates/mlx-db" }
 
 [profile.release]
 lto = true

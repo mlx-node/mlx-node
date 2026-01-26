@@ -5,7 +5,7 @@
  * Based on TRL's parameter update verification pattern.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { MxArray, Linear, RMSNorm, Embedding, Adam } from '@mlx-node/core';
 import { shape, float32 } from '../test-utils.js';
 

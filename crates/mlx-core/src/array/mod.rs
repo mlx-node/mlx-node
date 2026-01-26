@@ -7,7 +7,9 @@ pub mod padding;
 // Re-exports
 pub use attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 pub(crate) use handle::{MxHandle, check_handle};
-pub use padding::{PaddedSequences, pad_float_sequences, pad_sequences};
+pub use padding::{
+    LeftPaddedSequences, PaddedSequences, left_pad_sequences, pad_float_sequences, pad_sequences,
+};
 
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -109,6 +111,24 @@ impl MxArray {
         let handle =
             unsafe { sys::mlx_array_from_float32(data.as_ptr(), shape.as_ptr(), shape.len()) };
         MxArray::from_handle(handle, "array_from_float32")
+    }
+
+    /// Create an MxArray from raw bfloat16 bytes (as u16 values).
+    /// This enables zero-copy loading of bf16 weights from safetensors.
+    /// The input is the raw bytes reinterpreted as u16 (2 bytes per element).
+    pub fn from_bfloat16(data: &[u16], shape: &[i64]) -> Result<Self> {
+        let handle =
+            unsafe { sys::mlx_array_from_bfloat16(data.as_ptr(), shape.as_ptr(), shape.len()) };
+        MxArray::from_handle(handle, "array_from_bfloat16")
+    }
+
+    /// Create an MxArray from raw float16 bytes (as u16 values).
+    /// This enables zero-copy loading of f16 weights from safetensors.
+    /// The input is the raw bytes reinterpreted as u16 (2 bytes per element).
+    pub fn from_float16(data: &[u16], shape: &[i64]) -> Result<Self> {
+        let handle =
+            unsafe { sys::mlx_array_from_float16(data.as_ptr(), shape.as_ptr(), shape.len()) };
+        MxArray::from_handle(handle, "array_from_float16")
     }
 
     #[napi]
@@ -701,6 +721,41 @@ impl MxArray {
                 index
             )))
         }
+    }
+
+    /// Extract float32 value at specific 2D index [row, col] without copying entire array
+    /// More efficient than to_float32_noeval()[row * cols + col] for large arrays
+    pub fn item_at_float32_2d(&self, row: usize, col: usize) -> Result<f32> {
+        let cols = self.shape_at(1)? as usize;
+        let flat_index = row * cols + col;
+        self.item_at_float32(flat_index)
+    }
+
+    /// Repeat the entire tensor along a specific axis
+    /// E.g., [1, heads, seq, dim] with repeat_along_axis(0, 4) -> [4, heads, seq, dim]
+    pub fn repeat_along_axis(&self, axis: i32, times: i32) -> Result<MxArray> {
+        if times <= 1 {
+            return Ok(self.clone());
+        }
+
+        let ndim = self.ndim()? as usize;
+        let axis_usize = if axis < 0 {
+            (ndim as i32 + axis) as usize
+        } else {
+            axis as usize
+        };
+
+        if axis_usize >= ndim {
+            return Err(Error::from_reason(format!(
+                "axis {} out of bounds for array with {} dimensions",
+                axis, ndim
+            )));
+        }
+
+        // Build tile reps: [1, 1, ..., times, ..., 1]
+        let mut reps = vec![1i32; ndim];
+        reps[axis_usize] = times;
+        self.tile(&reps)
     }
 
     #[napi]
@@ -1429,15 +1484,75 @@ pub fn get_memory_limit() -> f64 {
     unsafe { sys::mlx_get_memory_limit() as f64 }
 }
 
-/// Heavy cleanup: synchronize, clear cache, and reset peak memory tracking
+/// Set cache limit (controls memory pool/cache size)
+/// This limits how much memory MLX pre-allocates for caching.
+/// Returns the previous limit in bytes.
+///
+/// Use this to reduce memory pre-allocation, which can prevent the
+/// "100GB Alloc" issue on high-memory systems.
+///
+/// # Example
+/// ```ignore
+/// // Limit cache to 32GB
+/// set_cache_limit(32.0 * 1024.0 * 1024.0 * 1024.0);
+/// ```
+pub fn set_cache_limit(limit: f64) -> f64 {
+    unsafe { sys::mlx_set_cache_limit(limit as usize) as f64 }
+}
+
+/// Clear MLX's compiler cache (traced computation graphs)
+/// Call this after autograd operations to release traced graph memory
+/// Returns true on success, false on failure (error details printed to stderr)
+pub fn compile_clear_cache() -> bool {
+    unsafe { sys::mlx_compile_clear_cache() }
+}
+
+/// Heavy cleanup: synchronize, clear cache, clear compiler cache, and reset peak memory tracking
 /// Use periodically (every 25-50 steps) to prevent GPU timeout in long-running training
 /// Internal Rust-only function - memory management is handled automatically by the trainer
+/// Note: We ignore return values here since cleanup is best-effort (errors logged to stderr)
 pub fn heavy_cleanup() {
     unsafe {
         sys::mlx_synchronize();
         sys::mlx_clear_cache();
+        let _ = sys::mlx_compile_clear_cache(); // ignore result, errors logged to stderr
         sys::mlx_reset_peak_memory();
     }
+}
+
+/// Check if memory is safe for autograd graph construction
+///
+/// Returns (is_safe, memory_info_message) where:
+/// - is_safe: true if available memory > required_mb AND > 10% of limit
+/// - memory_info_message: formatted string with current memory state
+///
+/// # Arguments
+/// * `required_mb` - Minimum required memory in megabytes
+///
+/// # Example
+/// ```ignore
+/// let (is_safe, msg) = check_memory_safety(1000.0); // Need 1GB buffer
+/// if !is_safe {
+///     warn!("Memory pressure: {}", msg);
+///     heavy_cleanup();
+/// }
+/// ```
+pub fn check_memory_safety(required_mb: f64) -> (bool, String) {
+    let active = get_active_memory() / 1e6;
+    let cache = get_cache_memory() / 1e6;
+    let peak = get_peak_memory() / 1e6;
+    let limit = get_memory_limit() / 1e6;
+    let available = limit - active - cache;
+
+    // Safe if: available > required AND available > 10% of limit
+    let is_safe = available > required_mb && available > (limit * 0.1);
+
+    let msg = format!(
+        "active={:.0}MB cache={:.0}MB peak={:.0}MB available={:.0}MB/{:.0}MB",
+        active, cache, peak, available, limit
+    );
+
+    (is_safe, msg)
 }
 
 #[cfg(test)]
@@ -2943,6 +3058,68 @@ mod array_ops_tests {
                 assert_eq!(info.data_size, 512, "Data size should be 512 elements");
                 assert_eq!(info.data_size_bytes(), 2048, "Total bytes should be 2048");
             }
+        }
+    }
+
+    mod batched_generation_helpers {
+        use super::*;
+
+        #[test]
+        fn test_repeat_along_axis_basic() {
+            // Test: [1, 2, 3] repeated 3 times along axis 0
+            let arr = MxArray::from_int32(&[1, 2, 3], &[1, 3]).unwrap();
+            let repeated = arr.repeat_along_axis(0, 3).unwrap();
+
+            repeated.eval();
+            let shape = shape_to_vec(repeated.shape().unwrap());
+            assert_eq!(shape, vec![3, 3]);
+
+            let values = int32_to_vec(repeated.to_int32().unwrap());
+            // Each row should be [1, 2, 3]
+            assert_eq!(values, vec![1, 2, 3, 1, 2, 3, 1, 2, 3]);
+        }
+
+        #[test]
+        fn test_repeat_along_axis_4d() {
+            // Simulate KV cache expansion: [1, heads, seq, dim] -> [G, heads, seq, dim]
+            let arr = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 2, 1, 2]).unwrap();
+            let repeated = arr.repeat_along_axis(0, 4).unwrap();
+
+            repeated.eval();
+            let shape = shape_to_vec(repeated.shape().unwrap());
+            assert_eq!(shape, vec![4, 2, 1, 2]);
+
+            let values = repeated.to_float32().unwrap();
+            // All 4 batches should have the same values
+            assert_eq!(values.len(), 16);
+            for i in 0..4 {
+                assert_arrays_close(&values[i * 4..(i + 1) * 4], &[1.0, 2.0, 3.0, 4.0], 1e-5);
+            }
+        }
+
+        #[test]
+        fn test_repeat_along_axis_no_repeat() {
+            let arr = MxArray::from_int32(&[1, 2], &[2]).unwrap();
+            let repeated = arr.repeat_along_axis(0, 1).unwrap();
+
+            repeated.eval();
+            let shape = shape_to_vec(repeated.shape().unwrap());
+            assert_eq!(shape, vec![2]);
+        }
+
+        #[test]
+        fn test_item_at_float32_2d() {
+            // Create a 3x4 array
+            let values: Vec<f32> = (0..12).map(|x| x as f32).collect();
+            let arr = MxArray::from_float32(&values, &[3, 4]).unwrap();
+            arr.eval();
+
+            // Test various indices
+            assert_eq!(arr.item_at_float32_2d(0, 0).unwrap(), 0.0);
+            assert_eq!(arr.item_at_float32_2d(0, 3).unwrap(), 3.0);
+            assert_eq!(arr.item_at_float32_2d(1, 0).unwrap(), 4.0);
+            assert_eq!(arr.item_at_float32_2d(1, 2).unwrap(), 6.0);
+            assert_eq!(arr.item_at_float32_2d(2, 3).unwrap(), 11.0);
         }
     }
 }

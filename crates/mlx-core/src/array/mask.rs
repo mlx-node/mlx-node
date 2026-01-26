@@ -1,6 +1,5 @@
 use crate::array::MxArray;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 /// Creates a causal attention mask to prevent attention to future positions.
 ///
@@ -96,7 +95,6 @@ pub fn create_causal_mask(
 ///   1. Cached generation processes one token at a time (seq_len=1)
 ///   2. Previous tokens are in cache, new token only attends to past
 /// - For sliding window attention with cache, offset and window_size are used
-#[napi]
 pub fn create_attention_mask_for_transformer(
     seq_len: i32,
     use_causal: bool,

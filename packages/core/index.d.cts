@@ -583,21 +583,6 @@ export declare class GrpoTrainingEngine {
    */
   trainStepWithGenerations(prompts: Array<Array<ChatMessage>>, rewards: Array<number>, generationResult: GenerateBatchResult): Promise<EngineStepMetrics>
   /**
-   * Unified training step with JS reward callback
-   *
-   * This method combines generation, reward scoring, and training into a single call,
-   * keeping token data in Rust memory to eliminate FFI overhead.
-   *
-   * # Arguments
-   * * `prompts` - Array of chat conversations to use as prompts
-   * * `answers` - Expected answers for each prompt (for reward functions)
-   * * `reward_fn` - JavaScript function to compute rewards: (outputs: RewardOutput[]) => Promise<number[]>
-   *
-   * # Returns
-   * * Training step result including metrics, completions, and rewards
-   */
-  trainStepAuto(prompts: ChatMessage[][], answers: (string | null)[], rewardFn: (err: Error | null, outputsJson: string) => Promise<number[]>): Promise<TrainStepResult>
-  /**
    * Unified training step with JS reward callback and optional output recording
    *
    * Same as `train_step_auto` but optionally captures the full RewardOutput data
@@ -605,14 +590,13 @@ export declare class GrpoTrainingEngine {
    *
    * # Arguments
    * * `prompts` - Array of chat conversations to use as prompts
-   * * `answers` - Expected answers for each prompt (for reward functions)
    * * `reward_fn` - JavaScript function to compute rewards
    * * `record_outputs` - If true, return the serialized RewardOutput JSON
    *
    * # Returns
    * * Training step result including metrics, completions, rewards, and optionally outputs_json
    */
-  trainStepAutoWithRecording(prompts: ChatMessage[][], answers: (string | null)[], rewardFn: (err: Error | null, outputsJson: string) => Promise<number[]>, recordOutputs: boolean): Promise<TrainStepResultWithOutputs>
+  trainStepAuto(prompts: ChatMessage[][], rewardFn: (err: Error | null, outputsJson: string) => Promise<number[]>, recordOutputs: boolean): Promise<TrainStepResultWithOutputs>
   /**
    * Score completions using registered built-in rewards
    *
@@ -1029,33 +1013,64 @@ export declare class NativeRewardRegistry {
  * OutputStore - Persistence layer for training outputs
  *
  * Stores all model outputs during GRPO training for debugging and research.
- * Supports local SQLite files and remote Turso cloud databases.
+ * Supports local SQLite files.
  */
 export declare class OutputStore {
   /** Create a new output store with local SQLite file */
   static local(path: string): Promise<OutputStore>
-  /** Create a new output store with remote Turso database */
-  static remote(url: string, token: string): Promise<OutputStore>
-  /** Create embedded replica (local cache + remote sync) */
-  static embeddedReplica(localPath: string, remoteUrl: string, token: string, syncIntervalSecs?: number | undefined | null): Promise<OutputStore>
   /** Create from config object */
   static fromConfig(config: OutputStoreConfig): Promise<OutputStore>
   /** Start a new training run */
   startRun(modelName: string, modelPath: string | undefined | null, config: string): Promise<string>
+  /** Start a new training run with a name */
+  startRunWithName(name: string | undefined | null, modelName: string, modelPath: string | undefined | null, config: string): Promise<string>
   /** End the current training run */
   endRun(status: string): Promise<void>
   /** Get current run ID */
   currentRunId(): Promise<string | null>
+  /** Find a run by name */
+  findRunByName(name: string): Promise<TrainingRunRecord | null>
+  /** Resume an existing run (sets status to running and makes it current) */
+  resumeRun(runId: string): Promise<void>
+  /** Delete all steps after a given step number (for resume cleanup) */
+  deleteStepsAfter(runId: string, afterStep: number): Promise<number>
+  /**
+   * Delete all records after a given step (for checkpoint resume)
+   *
+   * Cascades through: training_steps → generations → tool_calls, and logs.
+   * Use this when resuming from checkpoint to ensure clean database state.
+   */
+  deleteAllAfterStep(runId: string, afterStep: number): Promise<CleanupStats>
+  /**
+   * Get recent step metrics for TUI sparkline restoration
+   *
+   * Returns metrics ordered by step (oldest first) for easy insertion into VecDeque.
+   */
+  getRecentStepMetrics(runId: string, limit: number): Promise<Array<StepMetricSummary>>
+  /**
+   * Get aggregate statistics for a training run
+   *
+   * Returns pre-computed aggregates for restoring TUI state on resume.
+   */
+  getRunAggregates(runId: string): Promise<RunAggregates>
+  /**
+   * Get recent generations for sample panel restoration
+   *
+   * Returns generations ordered by step DESC, reward DESC (most recent high-reward first).
+   */
+  getRecentGenerations(runId: string, limit: number): Promise<Array<GenerationRecord>>
   /** Get store configuration */
   get config(): OutputStoreConfig
-  /** Record a complete training step with all generations */
-  recordStep(step: StepRecord, generations: Array<GenerationRecord>, toolCalls: Array<Array<ToolCallRecord>>): Promise<number>
   /** Record from RewardOutput JSON (direct integration with training engine) */
   recordStepFromOutputs(step: number, metrics: EngineStepMetrics, outputsJson: string, rewards: Array<number>, groupSize: number): Promise<number>
+  /**
+   * Record a complete training step with all generations and tool calls
+   *
+   * Lower-level API for direct control over step recording.
+   */
+  recordStep(step: StepRecord, generations: Array<GenerationRecord>, toolCalls: Array<Array<ToolCallRecord>>): Promise<number>
   /** Flush any pending writes */
   flush(): Promise<void>
-  /** Sync with remote (for embedded replica mode) */
-  sync(): Promise<void>
   /** List all training runs */
   listRuns(limit?: number | undefined | null, status?: string | undefined | null): Promise<Array<TrainingRunRecord>>
   /** Get a specific run */
@@ -1080,13 +1095,13 @@ export declare class OutputStore {
   queryRaw(sql: string): Promise<string>
 }
 
-/** Result from padding sequences with masks */
-export declare class PaddedSequences {
-  get padded(): MxArray
-  get masks(): MxArray
-}
-
-/** Qwen3 Model with automatic differentiation support */
+/**
+ * Qwen3 Model with automatic differentiation support
+ *
+ * Uses interior mutability (RwLock) for layers, final_norm, and lm_head
+ * to allow gradient application without deep cloning the model.
+ * This eliminates the previous ~4GB memory overhead from clone_for_session().
+ */
 export declare class Qwen3Model {
   /** Create a new Qwen3 model with the given configuration */
   constructor(config: Qwen3Config)
@@ -1140,22 +1155,21 @@ export declare class Qwen3Model {
   /**
    * Forward pass with paged attention for memory-efficient inference.
    *
-   * This method uses block-based KV cache management for:
+   * This method uses block-based KV cache management via Metal kernels for:
    * - Variable-length sequences with efficient memory usage
    * - Continuous batching with dynamic batch composition
    * - Long context support beyond GPU memory limits
    *
    * # Arguments
-   * * `input_ids` - Token IDs, shape: [batch_size, seq_len]
-   * * `slot_mapping` - Slot indices for cache updates, shape: [batch_size * seq_len]
-   * * `block_tables` - Block table for each sequence, shape: [batch_size, max_blocks]
-   * * `context_lens` - Context length for each sequence, shape: [batch_size]
-   * * `positions` - Token positions for RoPE, shape: [batch_size] (position of first token in each seq)
+   * * `input_ids` - Token IDs, shape: [num_seqs, 1] for decode
+   * * `slot_mapping` - Slot indices for cache updates, shape: [num_seqs]
+   * * `seq_ids` - Sequence IDs in the batch (for looking up block tables/context lens)
+   * * `positions` - Token positions for RoPE, shape: [num_seqs] (per-sequence positions)
    *
    * # Returns
    * * Logits, shape: [num_seqs, 1, vocab_size] for decode
    */
-  forwardPaged(inputIds: MxArray, slotMapping: MxArray, blockTables: MxArray, contextLens: MxArray, positions: MxArray): MxArray
+  forwardPaged(inputIds: MxArray, slotMapping: MxArray, seqIds: Array<number>, positions: MxArray): MxArray
   /**
    * Prefill a sequence using standard attention and write K/V to paged cache.
    *
@@ -1985,7 +1999,6 @@ export declare class TransformerBlock {
  * # Arguments
  * * `prompts` - Array of prompt texts (one per unique prompt, will be expanded by group_size)
  * * `completions` - Array of completion texts (prompts.len() * group_size total)
- * * `answers` - Array of expected answers (one per unique prompt, will be expanded by group_size)
  * * `token_counts` - Array of token counts for each completion
  * * `finish_reasons` - Array of finish reasons from generation ("eos", "length", "stop", "repetition")
  * * `group_size` - Number of completions per prompt
@@ -2002,7 +2015,6 @@ export declare class TransformerBlock {
  *   ['<think>Let me calculate</think>
 
 4', '4'],  // completions (group_size=2)
- *   ['4'],                       // expected answers
  *   [10, 5],                     // token counts
  *   ['eos', 'length'],          // finish reasons
  *   2                            // group_size
@@ -2011,10 +2023,9 @@ export declare class TransformerBlock {
  * outputs[0].completion.thinking; // "Let me calculate"
  * outputs[0].completion.text;     // "4"
  * outputs[0].completion.finishReason; // "eos"
- * outputs[0].expectedAnswer;      // "4"
  * ```
  */
-export declare function buildRewardOutputs(prompts: Array<string>, completions: Array<string>, answers: Array<string | undefined | null>, tokenCounts: Array<number>, finishReasons: Array<string>, groupSize: number): Array<RewardOutput>
+export declare function buildRewardOutputs(prompts: Array<string>, completions: Array<string>, tokenCounts: Array<number>, finishReasons: Array<string>, groupSize: number): Array<RewardOutput>
 
 /** Configuration for built-in rewards */
 export interface BuiltinRewardConfig {
@@ -2115,6 +2126,18 @@ export interface ChatMessage {
   toolCallId?: string
   /** Reasoning content for thinking mode (used with <think> tags) */
   reasoningContent?: string
+}
+
+/** Statistics about cleanup operations (NAPI wrapper) */
+export interface CleanupStats {
+  /** Number of training steps deleted */
+  stepsDeleted: number
+  /** Number of generations deleted */
+  generationsDeleted: number
+  /** Number of tool calls deleted */
+  toolCallsDeleted: number
+  /** Number of logs deleted */
+  logsDeleted: number
 }
 
 /**
@@ -2276,31 +2299,6 @@ export declare function convertModel(options: ConversionOptions): Promise<Conver
 
 export declare function convertParquetToJsonl(inputPath: string, outputPath: string): void
 
-/**
- * Creates an attention mask for transformer models.
- *
- * This is a high-level helper that decides when to create a mask based on
- * sequence length and cache usage. Aligned with mlx-lm behavior.
- *
- * # Arguments
- * * `seq_len` - Sequence length (N)
- * * `use_causal` - Whether to use causal masking (for autoregressive models)
- * * `cache` - Whether KV caching is being used
- * * `offset` - Optional cache offset for incremental generation
- * * `window_size` - Optional sliding window size for local attention
- *
- * # Returns
- * * `None` if seq_len is 1 or cache is being used (no mask needed)
- * * Causal mask array if use_causal is true and seq_len > 1
- *
- * # Notes
- * - When using KV cache, mask is typically not needed because:
- *   1. Cached generation processes one token at a time (seq_len=1)
- *   2. Previous tokens are in cache, new token only attends to past
- * - For sliding window attention with cache, offset and window_size are used
- */
-export declare function createAttentionMaskForTransformer(seqLen: number, useCausal: boolean, cache: boolean, offset?: number | undefined | null, windowSize?: number | undefined | null): MxArray | null
-
 export declare const enum DType {
   Float32 = 0,
   Int32 = 1,
@@ -2337,6 +2335,8 @@ export interface EngineStepMetrics {
   stdReward: number
   /** Mean advantage value */
   meanAdvantage: number
+  /** Standard deviation of advantages */
+  stdAdvantage: number
   /** Total tokens generated this step */
   totalTokens: number
   /** Whether gradients were applied */
@@ -2345,6 +2345,10 @@ export interface EngineStepMetrics {
   generationTimeMs: number
   /** Time for training (ms) */
   trainingTimeMs: number
+  /** Peak memory usage this step (MB) */
+  peakMemoryMb: number
+  /** Active memory at end of step (MB) */
+  activeMemoryMb: number
 }
 
 /** Function definition for tool calling */
@@ -2421,35 +2425,23 @@ export interface GenerationConfig {
   returnLogprobs?: boolean
 }
 
-/** A generation record (one completion) */
+/** A generation record (NAPI wrapper) */
 export interface GenerationRecord {
-  /** Index within the batch */
   batchIndex: number
-  /** Index within the group (0 to group_size-1) */
   groupIndex: number
-  /** The prompt text */
   prompt: string
-  /** Expected answer (if available) */
   expectedAnswer?: string
-  /** Cleaned completion text (tags removed) */
   completionText: string
-  /** Raw completion text (with <think>/<tool_call> tags) */
   completionRaw: string
-  /** Extracted thinking content from <think> tags */
   thinking?: string
-  /** Number of tokens in the completion */
   numTokens: number
-  /** Finish reason: "eos", "length", or "repetition" */
   finishReason: string
-  /** Reward value for this completion */
   reward: number
 }
 
-/** A generation with its associated tool calls */
+/** A generation with its associated tool calls (NAPI wrapper) */
 export interface GenerationWithToolCalls {
-  /** The generation record */
   generation: GenerationRecord
-  /** Tool calls made in this generation */
   toolCalls: Array<ToolCallRecord>
 }
 
@@ -2508,15 +2500,11 @@ export interface GrpoEngineConfig {
   klCoef?: number
   /** Loss type: "grpo", "dapo", "dr_grpo", "bnpo" (default: "grpo") */
   lossType?: string
-  /** Maximum tokens to generate (default: 256) */
-  maxNewTokens?: number
   /**
-   * Maximum completion length for training/autograd (default: 1024)
-   * Completions longer than this are truncated before computing gradients.
-   * Separate from max_new_tokens to allow generating long outputs
-   * while limiting memory usage during training.
+   * Maximum completion length for both generation and training (default: 256)
+   * Matches Python TRL's max_completion_length config.
    */
-  maxCompletionLengthForTraining?: number
+  maxCompletionLength?: number
   /** Sampling temperature (default: 0.8) */
   temperature?: number
   /** Top-p (nucleus) sampling (default: 0.95) */
@@ -2525,16 +2513,6 @@ export interface GrpoEngineConfig {
   topK?: number
   /** Repetition penalty (default: 1.1) */
   repetitionPenalty?: number
-  /**
-   * Steps between heavy cleanup to prevent GPU timeout (default: 25)
-   * Heavy cleanup forces complete GPU drain including peak memory reset
-   */
-  heavyCleanupInterval?: number
-  /**
-   * Memory threshold for triggering cleanup (bytes). Default: 80% of system memory.
-   * When memory usage exceeds this threshold, cleanup is triggered regardless of step interval.
-   */
-  memoryCleanupThreshold?: number
   /**
    * Maximum allowed NaN gradient occurrences before stopping training (default: 100)
    * When exceeded, training will stop with an error to prevent model corruption.
@@ -2545,6 +2523,53 @@ export interface GrpoEngineConfig {
    * When reached, the needs_emergency_save flag is set for the TypeScript layer.
    */
   emergencySaveThreshold?: number
+  /**
+   * Enable thinking mode for Qwen3 models (default: true)
+   * When false, adds empty <think></think> tags to disable model thinking.
+   * This is useful for tool-use training where you want direct outputs.
+   */
+  enableThinking?: boolean
+  /**
+   * Tool definitions for function calling
+   * When provided, tools are included in the chat template so the model
+   * can generate tool calls. This is essential for tool-use training.
+   */
+  tools?: Array<ToolDefinition>
+  /**
+   * Batch chunk size for LM head computation (memory optimization).
+   * When set, the LM head (hidden_states -> logits) is computed in chunks
+   * of this size to reduce peak memory usage.
+   * Default: None (no chunking, full batch at once)
+   * Recommended: 2 for batch_size >= 4 with large vocabularies (e.g., 151936)
+   * This reduces peak memory from ~1.2GB to ~300MB for Qwen3 (vocab=151936).
+   */
+  lmHeadChunkSize?: number
+  /**
+   * Batch chunk size for transformer forward pass (memory optimization).
+   * When set, the transformer layers process the batch in chunks of this size,
+   * reducing peak memory from O(batch × heads × seq²) for attention.
+   * Default: None (no chunking, full batch at once)
+   * Recommended: 4 for batch_size >= 4 with groupSize >= 4
+   * Memory savings: ~70-80% for batch=4, groupSize=4 (16 sequences → 4 at a time)
+   */
+  forwardChunkSize?: number
+  /**
+   * Chunk size for vocabulary dimension in cross-entropy computation.
+   * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
+   * the computation is split into chunks of this size to reduce peak memory usage.
+   * Default: 65536 (2^16)
+   * Recommended: 65536 for Qwen3 (vocab=151936) splits into 3 chunks
+   * Set to a larger value to reduce chunking overhead or smaller for tighter memory constraints.
+   */
+  vocabChunkSize?: number
+  /**
+   * Enable true parallel batch generation (default: false).
+   * When true, all N*G sequences are processed in parallel using batched FFI
+   * with per-sequence RoPE offsets. This provides 2-4x speedup for GRPO training.
+   * When false, uses the sequential generation (process one prompt at a time,
+   * then expand KV cache for G completions).
+   */
+  useParallelBatchGeneration?: boolean
 }
 
 /** Configuration for GRPO loss computation */
@@ -2565,50 +2590,38 @@ export interface GrpoLossConfig {
   numItemsInBatch?: number
   /** Current gradient accumulation step (for loss scaling) */
   gradientAccumulationSteps: number
+  /**
+   * Batch chunk size for LM head computation (memory optimization).
+   * When set, the LM head (hidden_states -> logits) is computed in chunks
+   * of this size to reduce peak memory usage.
+   * Default: None (no chunking, full batch at once)
+   * Recommended: 2 for batch_size >= 4 with large vocabularies (e.g., 151936)
+   */
+  lmHeadChunkSize?: number
+  /**
+   * Batch chunk size for transformer forward pass (memory optimization).
+   * When set, the transformer layers process the batch in chunks of this size,
+   * reducing peak memory from O(batch × heads × seq²) for attention.
+   * Default: None (no chunking, full batch at once)
+   * Recommended: 4 for batch_size >= 4 with groupSize >= 4
+   * Memory savings: ~70-80% for batch=4, groupSize=4 (16 sequences → 4 at a time)
+   */
+  forwardChunkSize?: number
+  /**
+   * Chunk size for vocabulary dimension in cross-entropy computation.
+   * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
+   * the computation is split into chunks of this size to reduce peak memory usage.
+   * Default: 65536 (2^16)
+   * Recommended: 65536 for Qwen3 (vocab=151936) splits into 3 chunks
+   */
+  vocabChunkSize?: number
 }
 
 /** Configuration for creating an OutputStore connection */
 export interface OutputStoreConfig {
   /** Local SQLite file path (e.g., "training_outputs.db") */
-  localPath?: string
-  /** Remote Turso URL (e.g., "libsql://db-name.turso.io") */
-  remoteUrl?: string
-  /** Turso auth token */
-  authToken?: string
-  /** Sync interval in seconds for embedded replica mode (default: 60) */
-  syncIntervalSecs?: number
-  /** Batch size for buffered inserts (default: 100) */
-  batchSize?: number
+  localPath: string
 }
-
-/**
- * Pad variable-length float sequences to uniform length
- *
- * Takes a list of 1D float sequences (e.g., log probabilities) and pads them to the maximum length.
- *
- * # Arguments
- * * `sequences` - Vector of 1D float arrays with variable lengths
- * * `pad_value` - Value to use for padding (default: 0.0)
- *
- * # Returns
- * Padded array with shape [num_seqs, max_len]
- */
-export declare function padFloatSequences(sequences: Array<MxArray>, padValue: number): MxArray
-
-/**
- * Pad variable-length sequences to uniform length (for integers/tokens)
- *
- * Takes a list of 1D sequences and pads them to the maximum length.
- * Returns both the padded sequences and binary masks indicating real vs padded positions.
- *
- * # Arguments
- * * `sequences` - Vector of 1D arrays with variable lengths
- * * `pad_value` - Value to use for padding (default: 0)
- *
- * # Returns
- * Object with `padded` (shape: [num_seqs, max_len]) and `masks` (same shape, 1.0 for real tokens, 0.0 for padding)
- */
-export declare function padSequences(sequences: Array<MxArray>, padValue: number): PaddedSequences
 
 /** Paged attention memory statistics (NAPI-compatible) */
 export interface PagedCacheStats {
@@ -2747,28 +2760,42 @@ export interface RewardOutput {
   prompt: string
   /** Structured completion data aligned with ChatResult */
   completion: CompletionInfo
-  /** Ground truth answer from dataset (if available) */
-  expectedAnswer?: string
 }
 
-/** Reward distribution statistics */
+/** Reward distribution statistics (NAPI wrapper) */
 export interface RewardStats {
-  /** Total count of generations */
   count: number
-  /** Mean reward */
   mean: number
-  /** Standard deviation */
   std: number
-  /** Minimum reward */
   min: number
-  /** Maximum reward */
   max: number
-  /** Median (50th percentile) */
   median: number
-  /** 25th percentile */
   p25: number
-  /** 75th percentile */
   p75: number
+}
+
+/** Aggregate statistics for a training run for resume state (NAPI wrapper) */
+export interface RunAggregates {
+  /** Best (highest) reward seen */
+  bestReward: number
+  /** Average reward */
+  avgReward: number
+  /** Total reward count */
+  rewardCount: number
+  /** Best (lowest) loss seen */
+  bestLoss: number
+  /** Average loss */
+  avgLoss: number
+  /** Total loss count */
+  lossCount: number
+  /** Total tokens generated */
+  totalTokens: number
+  /** Current step number */
+  currentStep: number
+  /** Average generation time (milliseconds) */
+  avgGenerationTimeMs: number
+  /** Average training time (milliseconds) */
+  avgTrainingTimeMs: number
 }
 
 /**
@@ -2837,28 +2864,6 @@ export interface SchedulerStatsNapi {
   totalRunningTokens: number
 }
 
-/**
- * Compute selective log-softmax: extract log P(token_i | context) for selected tokens only
- *
- * This is more efficient than computing full softmax when we only need probabilities
- * for a small subset of tokens (e.g., the generated completion tokens).
- *
- * Reference: TRL grpo_trainer.py _get_per_token_logps_and_entropies
- *
- * # Arguments
- * * `logits` - Model logits, shape (B, T, V) where V=vocab_size
- * * `target_ids` - Token IDs to extract probabilities for, shape (B, T)
- *
- * # Returns
- * * Log probabilities for selected tokens, shape (B, T)
- *
- * # Algorithm
- * For each position (b, t):
- *   1. Compute log-softmax: logits[b,t,:] - logsumexp(logits[b,t,:])
- *   2. Extract value at target_ids[b,t]
- */
-export declare function selectiveLogSoftmax(logits: MxArray, targetIds: MxArray): MxArray
-
 /** Configuration for the SFT training engine */
 export interface SftEngineConfig {
   /** Learning rate (default: 2e-5) */
@@ -2913,47 +2918,54 @@ export interface SftStepMetrics {
   trainingTimeMs: number
 }
 
-/** A training step record */
-export interface StepRecord {
-  /** Run ID this step belongs to */
-  runId: string
-  /** Step number */
-  step: number
-  /** Epoch number */
-  epoch?: number
-  /** GRPO loss value */
-  loss: number
-  /** Mean reward across completions */
-  meanReward: number
-  /** Standard deviation of rewards */
-  stdReward: number
-  /** Mean advantage value */
-  meanAdvantage?: number
-  /** Total tokens generated this step */
-  totalTokens?: number
-  /** Time for generation phase (milliseconds) */
-  generationTimeMs?: number
-  /** Time for training phase (milliseconds) */
-  trainingTimeMs?: number
-  /** Whether gradients were applied this step */
-  gradientsApplied: boolean
-}
-
-/** Summary of a training step */
-export interface StepSummary {
+/** Metrics from a single training step for sparkline restoration (NAPI wrapper) */
+export interface StepMetricSummary {
   /** Step number */
   step: number
   /** Loss value */
   loss: number
-  /** Mean reward */
+  /** Mean reward (GRPO) */
   meanReward: number
-  /** Number of generations in this step */
+  /** Mean advantage (GRPO) */
+  meanAdvantage: number
+  /** Std advantage (GRPO) - indicates reward variance within groups */
+  stdAdvantage: number
+  /** Perplexity (SFT, optional) */
+  perplexity?: number
+  /** Token accuracy (SFT, optional) */
+  tokenAccuracy?: number
+  /** Total tokens this step */
+  totalTokens: number
+  /** Time for generation phase (milliseconds) */
+  generationTimeMs?: number
+  /** Time for training phase (milliseconds) */
+  trainingTimeMs?: number
+}
+
+/** A training step record (NAPI wrapper) */
+export interface StepRecord {
+  runId: string
+  step: number
+  epoch?: number
+  loss: number
+  meanReward: number
+  stdReward: number
+  meanAdvantage?: number
+  stdAdvantage: number
+  totalTokens?: number
+  generationTimeMs?: number
+  trainingTimeMs?: number
+  gradientsApplied: boolean
+}
+
+/** Summary of a training step (NAPI wrapper) */
+export interface StepSummary {
+  step: number
+  loss: number
+  meanReward: number
   numGenerations: number
-  /** Number of tool calls across all generations */
   numToolCalls: number
-  /** Count of completions that ended with EOS */
   eosCount: number
-  /** Count of completions that hit token limit */
   lengthCount: number
 }
 
@@ -2967,19 +2979,13 @@ export interface ToolCall {
   arguments: string
 }
 
-/** A tool call record */
+/** A tool call record (NAPI wrapper) */
 export interface ToolCallRecord {
-  /** Index of this call within the generation */
   callIndex: number
-  /** Parse status: "ok", "parse_error", "json_error" */
   status: string
-  /** Tool name (null if parse failed) */
   toolName?: string
-  /** Tool arguments as JSON (null if parse failed) */
   arguments?: string
-  /** Raw content from <tool_call> tag */
   rawContent: string
-  /** Error message if parsing failed */
   errorMessage?: string
 }
 
@@ -3010,23 +3016,16 @@ export interface ToolDefinition {
   function: FunctionDefinition
 }
 
-/** A training run record */
+/** A training run record (NAPI wrapper) */
 export interface TrainingRunRecord {
-  /** Unique run ID (UUID) */
   id: string
-  /** Model name */
+  name?: string
   modelName: string
-  /** Path to model weights */
   modelPath?: string
-  /** Serialized training config (JSON) */
   config: string
-  /** Unix timestamp (milliseconds) when training started */
   startedAt: number
-  /** Unix timestamp (milliseconds) when training ended */
   endedAt?: number
-  /** Total number of training steps completed */
   totalSteps: number
-  /** Run status: "running", "completed", "failed", "paused" */
   status: string
 }
 
@@ -3053,288 +3052,6 @@ export interface TrainStepResultWithOutputs {
    * This enables zero-copy persistence of training outputs
    */
   outputsJson?: string
-}
-/**
- * Continuous Batching Scheduler
- *
- * Manages dynamic batch composition for efficient LLM serving.
- * Handles request queuing, memory allocation, and sequence lifecycle.
- */
-export declare class ContinuousBatchingScheduler {
-  /**
-   * Create a new scheduler
-   *
-   * # Arguments
-   * * `block_size` - Block size from PagedKVCache config
-   * * `config` - Scheduler configuration
-   */
-  constructor(blockSize: number, config?: SchedulerConfig | undefined | null)
-  /** Add a new request to the waiting queue */
-  addRequest(request: PendingRequest): void
-  /**
-   * Schedule the next step
-   *
-   * Returns a batch of sequences to process, or None if nothing to do.
-   * Allocates memory for new sequences from the waiting queue.
-   *
-   * # Arguments
-   * * `cache` - PagedKVCache for memory allocation
-   */
-  scheduleStep(cache: PagedKVCache): ScheduledBatch | null
-  /**
-   * Process token outputs from a forward pass
-   *
-   * Updates sequence state and handles completion.
-   *
-   * # Arguments
-   * * `outputs` - Token outputs for each sequence
-   * * `cache` - PagedKVCache for memory management
-   */
-  processOutputs(outputs: Array<TokenOutput>, cache: PagedKVCache): void
-  /** Get and clear completed sequences */
-  getCompleted(): Array<CompletedSequence>
-  /** Check if there's any work to do */
-  isEmpty(): boolean
-  /** Check if there are completed sequences to retrieve */
-  hasCompleted(): boolean
-  /** Get number of waiting requests */
-  numWaiting(): number
-  /** Get number of running sequences */
-  numRunning(): number
-  /** Get number of completed sequences */
-  numCompleted(): number
-  /**
-   * Abort a request by ID
-   *
-   * Removes from waiting queue or running list and frees memory.
-   */
-  abortRequest(requestId: string, cache: PagedKVCache): boolean
-  /** Get statistics about current scheduler state */
-  getStats(): SchedulerStats
-}
-
-/**
- * PagedKVCache for efficient KV cache management
- *
- * Uses block-based memory allocation inspired by OS virtual memory,
- * achieving near-zero memory waste compared to traditional pre-allocated caches.
- *
- * ## Example
- * ```typescript
- * const cache = new PagedKVCache({
- *   blockSize: 32,
- *   gpuMemoryMb: 4096,
- *   headSize: 128,
- *   numKvHeads: 4,
- *   numLayers: 28,
- * });
- *
- * // Add a sequence
- * const seqId = cache.addSequence(100); // 100-token prompt
- *
- * // Generate tokens
- * for (let i = 0; i < maxTokens; i++) {
- *   // Update cache with new K/V
- *   cache.update(layerIdx, keys, values);
- *
- *   // Run paged attention
- *   const output = cache.attention(layerIdx, queries, scale);
- * }
- *
- * // Remove when done
- * cache.removeSequence(seqId);
- * ```
- */
-export declare class PagedKVCache {
-  /**
-   * Create a new PagedKVCache
-   *
-   * # Arguments
-   * * `config` - Configuration for the paged attention system
-   */
-  constructor(config: PagedAttentionConfig)
-  /**
-   * Add a new sequence to the cache
-   *
-   * # Arguments
-   * * `prompt_len` - Number of tokens in the prompt
-   *
-   * # Returns
-   * * Sequence ID for future operations
-   */
-  addSequence(promptLen: number): number
-  /**
-   * Remove a sequence from the cache
-   *
-   * Frees all blocks associated with the sequence.
-   *
-   * # Arguments
-   * * `seq_id` - Sequence ID to remove
-   */
-  removeSequence(seqId: number): void
-  /**
-   * Check if we can allocate blocks for a new sequence
-   *
-   * # Arguments
-   * * `num_blocks` - Number of blocks needed
-   *
-   * # Returns
-   * * true if allocation is possible
-   */
-  canAllocate(numBlocks: number): boolean
-  /** Get the number of active sequences */
-  numSequences(): number
-  /** Get the number of free blocks */
-  numFreeBlocks(): number
-  /** Get the total number of blocks */
-  totalBlocks(): number
-  /** Get context lengths for all sequences */
-  getContextLens(): Array<number>
-  /** Get sequence IDs */
-  getSeqIds(): Array<number>
-  /** Get the block size */
-  getBlockSize(): number
-  /**
-   * Extend a sequence with additional tokens
-   * Allocates new blocks if needed
-   */
-  extendSequence(seqId: number, numNewTokens: number): void
-  /** Get memory usage statistics */
-  getMemoryStats(): MemoryStats
-}
-
-/** Result for a completed sequence */
-export interface CompletedSequence {
-  /** Original request ID */
-  requestId: string
-  /** All generated tokens */
-  generatedTokens: Array<number>
-  /** Finish reason: "stop", "length", or "error" */
-  finishReason: string
-  /** Total tokens (prompt + generated) */
-  totalTokens: number
-}
-
-/** Memory usage statistics */
-export interface MemoryStats {
-  /** Total number of blocks in the pool */
-  totalBlocks: number
-  /** Number of free blocks */
-  freeBlocks: number
-  /** Number of allocated blocks */
-  allocatedBlocks: number
-  /** Total memory in MB */
-  totalMemoryMb: number
-  /** Used memory in MB */
-  usedMemoryMb: number
-  /** Utilization percentage */
-  utilizationPercent: number
-}
-
-/** Configuration for PagedAttention */
-export interface PagedAttentionConfig {
-  /**
-   * Block size in tokens (8, 16, or 32)
-   * Default: 32
-   */
-  blockSize: number
-  /**
-   * Total GPU memory for KV cache in MB
-   * Default: 4096 (4GB)
-   */
-  gpuMemoryMb: number
-  /** Head size (must match model: 64, 80, 96, 112, 120, 128, 192, or 256) */
-  headSize: number
-  /** Number of KV heads (for GQA, typically < num_query_heads) */
-  numKvHeads: number
-  /** Number of transformer layers */
-  numLayers: number
-  /**
-   * Whether to use FP8 quantization for cache
-   * Reduces memory by ~50% with minimal quality loss
-   * Default: false
-   */
-  useFp8Cache?: boolean
-  /**
-   * Maximum sequence length supported
-   * Default: 8192
-   */
-  maxSeqLen?: number
-  /**
-   * Maximum batch size for continuous batching
-   * Default: 256
-   */
-  maxBatchSize?: number
-}
-
-/** A pending request waiting to be scheduled */
-export interface PendingRequest {
-  /** Unique request identifier */
-  requestId: string
-  /** Prompt token IDs */
-  promptTokens: Array<number>
-  /** Maximum new tokens to generate */
-  maxNewTokens: number
-  /** Optional: priority (higher = scheduled first) */
-  priority?: number
-}
-
-/** Output from scheduling a step */
-export interface ScheduledBatch {
-  /** Sequence IDs in this batch */
-  seqIds: Array<number>
-  /** Request IDs corresponding to each sequence */
-  requestIds: Array<string>
-  /** Input token IDs for each sequence (prompt for prefill, last token for decode) */
-  inputTokens: Array<Array<number>>
-  /** Whether each sequence is in prefill phase */
-  isPrefill: Array<boolean>
-  /** Context lengths for each sequence */
-  contextLens: Array<number>
-  /** Total number of tokens in this batch (for memory planning) */
-  totalTokens: number
-  /** Number of prefill sequences */
-  numPrefill: number
-  /** Number of decode sequences */
-  numDecode: number
-}
-
-/** Scheduler configuration */
-export interface SchedulerConfig {
-  /** Maximum sequences in a batch */
-  maxBatchSize: number
-  /** Maximum tokens per scheduling step (prefill + decode combined) */
-  maxTokensPerStep?: number
-  /** Maximum number of prefill sequences per step (to balance latency) */
-  maxPrefillPerStep?: number
-  /** Whether to prioritize decode over prefill (reduces latency for active sequences) */
-  prioritizeDecode?: boolean
-  /** EOS token ID for stopping generation */
-  eosTokenId?: number
-}
-
-/** Scheduler statistics */
-export interface SchedulerStats {
-  /** Number of requests in waiting queue */
-  numWaiting: number
-  /** Number of running sequences */
-  numRunning: number
-  /** Number of completed sequences */
-  numCompleted: number
-  /** Number of sequences in prefill phase */
-  numPrefill: number
-  /** Number of sequences in decode phase */
-  numDecode: number
-  /** Total tokens across all running sequences */
-  totalRunningTokens: number
-}
-
-/** Token output for processing */
-export interface TokenOutput {
-  /** Sequence ID */
-  seqId: number
-  /** Generated token */
-  token: number
-  /** Whether this token is an EOS token */
-  isEos: boolean
+  /** Actual token counts for each completion (for accurate TUI display) */
+  completionLengths: Array<number>
 }

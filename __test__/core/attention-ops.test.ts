@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vite-plus/test';
 import { MxArray, scaledDotProductAttention } from '@mlx-node/core';
 import { shape } from '../test-utils';
 

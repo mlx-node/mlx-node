@@ -104,11 +104,11 @@ min_p = 0.0
 type = "function"
 
 # Which reward functions to use (all are enabled by default)
-use_correctness = true      # +2.0 for correct answer
-use_integer = true          # +0.5 for integer format
-use_strict_format = true    # +0.5 for strict XML format
-use_soft_format = true      # +0.5 for soft XML format
-use_xml_count = true        # +0.25 per tag, -0.001 per trailing char
+use_correctness = true # +2.0 for correct answer
+use_integer = true # +0.5 for integer format
+use_strict_format = true # +0.5 for strict XML format
+use_soft_format = true # +0.5 for soft XML format
+use_xml_count = true # +0.25 per tag, -0.001 per trailing char
 
 # Path to reward model (only used if type = "model")
 # model_path = ".cache/models/reward-model"

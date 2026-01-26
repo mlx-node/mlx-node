@@ -536,13 +536,17 @@ if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
       wasiBindingError = err
     }
   }
-  if (!nativeBinding) {
+  if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
     try {
       wasiBinding = require('mlx-node-wasm32-wasi')
       nativeBinding = wasiBinding
     } catch (err) {
       if (process.env.NAPI_RS_FORCE_WASI) {
-        wasiBindingError.cause = err
+        if (!wasiBindingError) {
+          wasiBindingError = err
+        } else {
+          wasiBindingError.cause = err
+        }
         loadErrors.push(err)
       }
     }
@@ -595,7 +599,6 @@ module.exports.MLP = nativeBinding.MLP
 module.exports.MxArray = nativeBinding.MxArray
 module.exports.NativeRewardRegistry = nativeBinding.NativeRewardRegistry
 module.exports.OutputStore = nativeBinding.OutputStore
-module.exports.PaddedSequences = nativeBinding.PaddedSequences
 module.exports.Qwen3Model = nativeBinding.Qwen3Model
 module.exports.Qwen3Tokenizer = nativeBinding.Qwen3Tokenizer
 module.exports.RMSNorm = nativeBinding.RMSNorm
@@ -614,14 +617,8 @@ module.exports.computeAdvantages = nativeBinding.computeAdvantages
 module.exports.computeEntropy = nativeBinding.computeEntropy
 module.exports.convertModel = nativeBinding.convertModel
 module.exports.convertParquetToJsonl = nativeBinding.convertParquetToJsonl
-module.exports.createAttentionMaskForTransformer = nativeBinding.createAttentionMaskForTransformer
 module.exports.DType = nativeBinding.DType
 module.exports.getHighEntropyMask = nativeBinding.getHighEntropyMask
-module.exports.padFloatSequences = nativeBinding.padFloatSequences
-module.exports.padSequences = nativeBinding.padSequences
 module.exports.parseToolCallsFromText = nativeBinding.parseToolCallsFromText
 module.exports.scaledDotProductAttention = nativeBinding.scaledDotProductAttention
 module.exports.scaledDotProductAttentionCausal = nativeBinding.scaledDotProductAttentionCausal
-module.exports.selectiveLogSoftmax = nativeBinding.selectiveLogSoftmax
-module.exports.ContinuousBatchingScheduler = nativeBinding.ContinuousBatchingScheduler
-module.exports.PagedKVCache = nativeBinding.PagedKVCache

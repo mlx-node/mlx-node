@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vite-plus/test';
 import { resolve } from 'node:path';
 import { SYSTEM_PROMPT, loadLocalGsm8kDataset, LocalGsm8kDatasetLoader, type ChatMessage } from '@mlx-node/trl';
 
@@ -8,7 +8,6 @@ describe('Local GSM8K dataset loader', () => {
     expect(examples).toHaveLength(2);
 
     const [first] = examples;
-    expect(first.answer).toBe('72');
     expect(first.prompt[0]).toEqual({ role: 'system', content: SYSTEM_PROMPT });
     expect(first.prompt[1].role).toBe('user');
     expect(first.prompt[1].content).toContain('Natalia sold clips');

@@ -117,8 +117,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
         // Prompt - show first line or truncate if too long
         let prompt_preview = sample.prompt.lines().next().unwrap_or("");
-        let prompt_display = if prompt_preview.len() > 60 {
-            format!("{}...", &prompt_preview[..60])
+        let prompt_display = if prompt_preview.chars().count() > 60 {
+            format!("{}...", prompt_preview.chars().take(60).collect::<String>())
         } else if sample.prompt.lines().count() > 1 {
             format!("{}...", prompt_preview)
         } else {
@@ -131,8 +131,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
         // Output - show first line only (click/Enter for full view)
         let output_preview = sample.completion.lines().next().unwrap_or("");
-        let output_display = if output_preview.len() > 80 {
-            format!("{}...", &output_preview[..80])
+        let output_display = if output_preview.chars().count() > 80 {
+            format!("{}...", output_preview.chars().take(80).collect::<String>())
         } else if sample.completion.lines().count() > 1 {
             format!("{}...", output_preview)
         } else {

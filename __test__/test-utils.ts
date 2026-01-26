@@ -2,7 +2,7 @@
  * Shared test utilities for MLX tests
  */
 
-import { expect } from 'vitest';
+import { expect } from 'vite-plus/test';
 
 import { MxArray as MxArrayClass, type MxArray } from '@mlx-node/core';
 

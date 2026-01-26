@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vite-plus/test';
 import { Qwen3Model, type ChatMessage } from '@mlx-node/core';
 import fs from 'node:fs';
 import path from 'node:path';

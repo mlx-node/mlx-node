@@ -7,7 +7,7 @@
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vite-plus/test';
 import { Qwen3Tokenizer, type ChatMessage } from '@mlx-node/core';
 
 describe('Qwen3Tokenizer', () => {

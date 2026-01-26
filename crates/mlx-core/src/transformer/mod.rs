@@ -10,6 +10,8 @@
 // - TransformerBlock: Complete transformer block (attention + MLP + norms)
 
 pub mod attention;
+#[cfg(test)]
+mod attention_vjp_test;
 pub mod batch_kv_cache;
 pub mod block;
 pub mod fused_attention;
@@ -27,7 +29,6 @@ pub use kv_cache::KVCache;
 pub use mlp::MLP;
 pub use paged_attention::{
     CompletedSequence, ContinuousBatchingScheduler, MemoryStats, PagedAttentionConfig,
-    PagedAttentionLayer, PagedKVCache, PendingRequest, ScheduledBatch, SchedulerConfig,
-    SchedulerStats, TokenOutput,
+    PagedKVCache, PendingRequest, ScheduledBatch, SchedulerConfig, SchedulerStats, TokenOutput,
 };
 pub use rotating_kv_cache::RotatingKVCache;

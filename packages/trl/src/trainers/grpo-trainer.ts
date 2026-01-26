@@ -16,7 +16,7 @@
  * ```typescript
  * const trainer = await GRPOTrainer.create({
  *   modelPath: './model',
- *   modelConfig: 'qwen3-0.6b',
+ *   modelName: 'qwen3-0.6b',
  *   rewardFunction: (prompts, completions) => [...scores],
  * });
  * await trainer.train(dataset);
@@ -63,11 +63,9 @@ import {
   type EngineEpochMetrics,
   type BuiltinRewardConfig,
   type GenerateBatchResult as NativeGenerateBatchResult,
-  type EngineStepMetrics,
-  type TrainStepResult,
   type TrainStepResultWithOutputs,
   type RewardOutput,
-  type OutputStoreConfig,
+  type ToolDefinition,
 } from '@mlx-node/core';
 
 import type { ChatMessage, DatasetExample, RewardFunction } from '../types';
@@ -87,18 +85,12 @@ export type {
 } from '@mlx-node/core';
 
 /**
- * Reward function type for custom rewards.
- * Takes an array of RewardOutput objects with structured completion data.
- */
-export type RewardFn = RewardFunction;
-
-/**
  * Configuration for GRPOTrainer
  */
-export interface GRPOTrainerConfig {
+export interface GRPOTrainerConfig<T = unknown> {
   // Model loading (for create() factory)
   modelPath?: string;
-  modelConfig?: string;
+  modelName?: string;
 
   // Training hyperparameters
   learningRate?: number;
@@ -118,20 +110,42 @@ export interface GRPOTrainerConfig {
   advantageNormalization?: boolean;
 
   // Generation parameters
-  maxNewTokens?: number;
-  /** Maximum completion length for training (autograd). Defaults to 1024.
-   * Completions longer than this are truncated before computing gradients.
-   * This is separate from maxNewTokens to allow generating long outputs
-   * while limiting memory usage during training. */
-  maxCompletionLengthForTraining?: number;
+  /** Maximum completion length for both generation and training (default: 256).
+   * Matches Python TRL's max_completion_length config. */
+  maxCompletionLength?: number;
   temperature?: number;
   topP?: number;
   topK?: number;
   repetitionPenalty?: number;
 
+  // Tool calling (for tool-use training)
+  /**
+   * Tool definitions for function calling.
+   * When provided, tools are included in the chat template so the model
+   * can generate tool calls. Essential for tool-use training.
+   *
+   * @example
+   * ```typescript
+   * import { createToolDefinition } from '@mlx-node/lm';
+   *
+   * const config: GRPOTrainerConfig = {
+   *   tools: [
+   *     createToolDefinition('lsp', 'Query API docs', { method: { type: 'string' } }, ['method']),
+   *     createToolDefinition('run_js', 'Execute code', { code: { type: 'string' } }, ['code']),
+   *   ],
+   * };
+   * ```
+   */
+  tools?: ToolDefinition[];
+
+  /** Enable thinking mode for Qwen3 models (default: true).
+   * When false, adds empty <think></think> tags to disable model thinking.
+   * This is useful for tool-use training where you want direct outputs. */
+  enableThinking?: boolean;
+
   // Reward configuration
   rewardType?: 'function' | 'builtin' | 'model';
-  rewardFunction?: RewardFn;
+  rewardFunction?: RewardFunction<T>;
   rewardModelPath?: string;
 
   // Optimization
@@ -158,6 +172,52 @@ export interface GRPOTrainerConfig {
   // TUI mode
   /** Enable TUI mode - outputs structured JSONL to stdout and listens for commands on stdin */
   tuiMode?: boolean;
+
+  // Memory optimization
+  /**
+   * Batch chunk size for LM head computation (memory optimization).
+   * When set, the LM head (hidden_states -> logits) is computed in chunks
+   * of this size to reduce peak memory usage.
+   * Default: undefined (no chunking, full batch at once)
+   * Recommended: 2 for batch_size >= 4 with large vocabularies (e.g., Qwen3 with 151936 vocab)
+   * This reduces peak memory from ~1.2GB to ~300MB for Qwen3.
+   */
+  lmHeadChunkSize?: number;
+
+  /**
+   * Batch chunk size for transformer forward pass (memory optimization).
+   * When set, the transformer layers process the batch in chunks of this size,
+   * reducing peak memory from O(batch × heads × seq²) for attention.
+   * Default: undefined (no chunking, full batch at once)
+   * Recommended: 4 for batch_size >= 4 with groupSize >= 4
+   * Memory savings: ~70-80% for batch=4, groupSize=4 (16 sequences → 4 at a time)
+   */
+  forwardChunkSize?: number;
+
+  /**
+   * Enable true parallel batch generation (default: false).
+   * When true, all N*G sequences are processed in parallel using batched FFI
+   * with per-sequence RoPE offsets. This provides 2-4x speedup for GRPO training.
+   * When false, uses sequential generation (process one prompt at a time,
+   * then expand KV cache for G completions).
+   */
+  useParallelBatchGeneration?: boolean;
+
+  /**
+   * Chunk size for vocabulary dimension in cross-entropy computation.
+   * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
+   * the computation is split into chunks of this size to reduce peak memory usage.
+   *
+   * Default: 65536 (2^16)
+   *
+   * Memory impact for Qwen3 (vocab=151936):
+   * - Standard: Full [B, T, 151936] intermediate tensor
+   * - Chunked (65536): 3 chunks, ~2.3x lower peak memory
+   *
+   * Set to a larger value (e.g., 262144) to reduce chunking overhead,
+   * or smaller value (e.g., 32768) for tighter memory constraints.
+   */
+  vocabChunkSize?: number;
 
   // Output recording
   /** Output recording configuration (records all generations for debugging/research) */
@@ -213,8 +273,7 @@ export const DEFAULT_GRPO_CONFIG: GRPOTrainerConfig = {
   klCoef: 0.0,
   lossType: 'grpo',
   advantageNormalization: true,
-  maxNewTokens: 256,
-  maxCompletionLengthForTraining: 1024,
+  maxCompletionLength: 256,
   temperature: 0.8,
   topP: 0.95,
   repetitionPenalty: 1.1,
@@ -240,6 +299,8 @@ export interface TrainStepMetrics {
   stdReward: number;
   /** Mean advantage value */
   meanAdvantage: number;
+  /** Std of advantages - indicates reward variance within groups */
+  stdAdvantage: number;
   /** Total tokens generated this step */
   totalTokens: number;
   /** Whether gradients were applied */
@@ -266,11 +327,11 @@ export type TrainingMetrics = TrainStepMetrics;
  * Provides a TypeScript-friendly interface to the Rust training engine.
  * Supports both high-level training (train()) and low-level step-by-step (trainStep()).
  */
-export class GRPOTrainer {
+export class GRPOTrainer<T = unknown> {
   private engine: GrpoTrainingEngine;
   private model: Qwen3Model;
-  private config: GRPOTrainerConfig;
-  private rewardFn?: RewardFn;
+  private config: GRPOTrainerConfig<T>;
+  private rewardFn?: RewardFunction<T>;
   private currentEpoch: number = 0;
   private currentStep: number = 0;
   /** Original model path (for tokenizer files when saving checkpoints) */
@@ -281,10 +342,17 @@ export class GRPOTrainer {
   private stopRequested: boolean = false;
   private stdinInterface?: import('readline').Interface;
   private logger: TrainingLogger;
+  private sampleDisplayMode: 'all' | 'best_worst' | 'random' = 'all';
 
   // Output recording
   private outputStore?: OutputStore;
   private outputStoreInitPromise?: Promise<void>;
+  private outputStoreRunId?: string;
+  private outputStorePath?: string;
+
+  // Crash recovery
+  private lastCheckpointStep: number = 0;
+  private signalHandlersInstalled: boolean = false;
 
   /**
    * Create a new GRPO trainer from a model
@@ -292,11 +360,16 @@ export class GRPOTrainer {
    * @param model - Pre-loaded Qwen3 model
    * @param config - Training configuration
    */
-  constructor(model: Qwen3Model, config: Partial<GRPOTrainerConfig> = {}, logger?: TrainingLogger) {
+  constructor(model: Qwen3Model, config: Partial<GRPOTrainerConfig<T>> = {}, logger?: TrainingLogger) {
     // Auto-detect TUI mode from environment variable (set by mlx-train TUI)
     const tuiModeFromEnv = process.env.MLX_TUI_MODE === '1';
     if (tuiModeFromEnv && config.tuiMode === undefined) {
       config.tuiMode = true;
+    }
+
+    // Auto-enable database persistence in TUI mode (enables Database tab)
+    if (tuiModeFromEnv && config.outputStore === undefined) {
+      config.outputStore = { enabled: true };
     }
 
     this.config = { ...DEFAULT_GRPO_CONFIG, ...config };
@@ -327,12 +400,20 @@ export class GRPOTrainer {
       clipEpsilon: this.config.clipEpsilon,
       klCoef: this.config.klCoef,
       lossType: this.config.lossType,
-      maxNewTokens: this.config.maxNewTokens,
-      maxCompletionLengthForTraining: this.config.maxCompletionLengthForTraining,
+      maxCompletionLength: this.config.maxCompletionLength,
       temperature: this.config.temperature,
       topP: this.config.topP,
       topK: this.config.topK,
       repetitionPenalty: this.config.repetitionPenalty,
+      // Tool calling support
+      tools: this.config.tools,
+      enableThinking: this.config.enableThinking,
+      // Memory optimization
+      lmHeadChunkSize: this.config.lmHeadChunkSize,
+      forwardChunkSize: this.config.forwardChunkSize,
+      vocabChunkSize: this.config.vocabChunkSize,
+      // Parallel batch generation
+      useParallelBatchGeneration: this.config.useParallelBatchGeneration,
     };
 
     this.engine = new GrpoTrainingEngine(model, engineConfig);
@@ -341,6 +422,9 @@ export class GRPOTrainer {
     if (this.config.tuiMode) {
       this.setupStdinHandler();
     }
+
+    // Always setup signal handlers for crash recovery
+    this.setupSignalHandlers();
   }
 
   /**
@@ -362,53 +446,264 @@ export class GRPOTrainer {
   }
 
   /**
+   * Setup OS signal handlers for graceful shutdown on crash/interrupt
+   *
+   * Catches SIGTERM, SIGINT, and uncaught exceptions to:
+   * - Save emergency checkpoint (if > 10 steps since last)
+   * - Finalize OutputStore with 'crashed' status
+   * - Exit cleanly
+   */
+  private setupSignalHandlers(): void {
+    if (this.signalHandlersInstalled) return;
+    this.signalHandlersInstalled = true;
+
+    const gracefulShutdown = async (signal: string) => {
+      this.logger.warn(`Received ${signal}, initiating graceful shutdown...`);
+      this.stopRequested = true;
+
+      try {
+        // Skip checkpoint if recent one exists (within 10 steps)
+        const stepsSinceCheckpoint = this.currentStep - this.lastCheckpointStep;
+        if (this.config.outputDir && stepsSinceCheckpoint > 10) {
+          this.logger.info(`Saving emergency checkpoint (${stepsSinceCheckpoint} steps since last)...`);
+          await this.saveCheckpoint(`emergency-${this.currentStep}`);
+        } else if (stepsSinceCheckpoint <= 10) {
+          this.logger.info(`Skipping checkpoint (only ${stepsSinceCheckpoint} steps since last)`);
+        }
+
+        // Finalize OutputStore with crashed status
+        if (this.outputStore) {
+          await this.outputStore.endRun('crashed');
+          await this.outputStore.flush();
+          this.logger.info('OutputStore finalized with crashed status');
+        }
+      } catch (e) {
+        console.error('Emergency save failed:', e);
+      }
+
+      // Cleanup stdin interface
+      if (this.stdinInterface) {
+        this.stdinInterface.close();
+      }
+
+      process.exit(0);
+    };
+
+    process.on('SIGTERM', () => {
+      gracefulShutdown('SIGTERM').catch(console.error);
+    });
+
+    process.on('SIGINT', () => {
+      gracefulShutdown('SIGINT').catch(console.error);
+    });
+
+    process.on('uncaughtException', (err) => {
+      console.error('Uncaught exception:', err);
+      gracefulShutdown('uncaughtException').catch(console.error);
+    });
+
+    process.on('unhandledRejection', (reason) => {
+      console.error('Unhandled rejection:', reason);
+      gracefulShutdown('unhandledRejection').catch(console.error);
+    });
+  }
+
+  /**
    * Initialize the output store for recording training outputs
    */
-  private async initOutputStore(): Promise<void> {
+  private async initOutputStore(stepsPerEpoch?: number): Promise<void> {
     // Guard against re-initialization (e.g., train() called after trainStepAuto())
     if (this.outputStore) return;
 
     const cfg = this.config.outputStore;
-    if (!cfg?.enabled) return;
+    if (!cfg?.enabled) {
+      // Even without outputStore, send UI resume state if resuming from checkpoint
+      if (this.config.resumeFromCheckpoint && this.currentStep > 0 && stepsPerEpoch) {
+        this.sendResumeStateUiOnly(stepsPerEpoch);
+      }
+      return;
+    }
 
     const localPath = cfg.localPath ?? join(this.config.outputDir ?? '.', 'outputs.db');
+    this.outputStorePath = localPath;
 
     // Ensure parent directory exists (for lazy init via trainStepAuto)
     const parentDir = dirname(localPath);
     if (parentDir !== '.' && !existsSync(parentDir)) {
       mkdirSync(parentDir, { recursive: true });
     }
+    this.outputStore = await OutputStore.local(localPath);
 
-    if (cfg.remoteUrl && cfg.authToken) {
-      // Embedded replica mode (local cache + remote sync)
-      this.outputStore = await OutputStore.embeddedReplica(
-        localPath,
-        cfg.remoteUrl,
-        cfg.authToken,
-        cfg.syncInterval ?? 60,
-      );
-    } else {
-      // Local only
-      this.outputStore = await OutputStore.local(localPath);
+    // If resuming from checkpoint AND we have a run name AND checkpoint was actually loaded,
+    // try to resume the existing database run. currentStep > 0 means checkpoint was loaded.
+    if (this.config.resumeFromCheckpoint && this.config.runName && this.currentStep > 0) {
+      const existingRun = await this.outputStore.findRunByName(this.config.runName);
+      if (existingRun) {
+        this.logger.info(`Resuming database run: ${this.config.runName} (${existingRun.id})`);
+        await this.outputStore.resumeRun(existingRun.id);
+        this.outputStoreRunId = existingRun.id;
+
+        // Clean up any database records that are ahead of the checkpoint step
+        // This prevents UNIQUE constraint errors when re-recording steps
+        // Uses cascade delete to also clean up orphaned generations, tool_calls, and logs
+        if (this.currentStep > 0) {
+          const cleanupStats = await this.outputStore.deleteAllAfterStep(existingRun.id, this.currentStep);
+          if (cleanupStats.stepsDeleted > 0) {
+            this.logger.info(
+              `Cleaned up stale records after step ${this.currentStep}: ` +
+                `${cleanupStats.stepsDeleted} steps, ${cleanupStats.generationsDeleted} generations, ` +
+                `${cleanupStats.logsDeleted} logs`,
+            );
+          }
+        }
+
+        this.logger.databasePath(localPath, this.outputStoreRunId, this.config.runName ?? undefined);
+
+        // Send resume state to TUI for sparkline and aggregate restoration
+        await this.sendResumeState(existingRun.id, stepsPerEpoch);
+        return;
+      } else {
+        // Run name specified but not found - warn and create new
+        this.logger.warn(`No existing run found with name: ${this.config.runName}. Starting new run.`);
+      }
     }
 
     // Start a new run with sanitized config (no auth token)
-    const modelName = this.config.modelConfig ?? 'qwen3';
+    const modelName = this.config.modelName ?? 'qwen3';
     const modelPath = this.originalModelPath ?? this.config.modelPath ?? undefined;
     const sanitizedConfig = {
       ...this.config,
-      outputStore: this.config.outputStore
-        ? { ...this.config.outputStore, authToken: undefined }
-        : undefined,
+      outputStore: this.config.outputStore ? { ...this.config.outputStore, authToken: undefined } : undefined,
     };
-    await this.outputStore.startRun(modelName, modelPath, JSON.stringify(sanitizedConfig));
+
+    // Use startRunWithName if a run name is provided, otherwise use startRun
+    if (this.config.runName) {
+      this.outputStoreRunId = await this.outputStore.startRunWithName(
+        this.config.runName,
+        modelName,
+        modelPath,
+        JSON.stringify(sanitizedConfig),
+      );
+    } else {
+      this.outputStoreRunId = await this.outputStore.startRun(modelName, modelPath, JSON.stringify(sanitizedConfig));
+    }
+
+    // Emit database path to TUI for the Database tab
+    this.logger.databasePath(localPath, this.outputStoreRunId, this.config.runName ?? undefined);
+
+    // If resuming from checkpoint but didn't find existing DB run, still send UI state
+    // This ensures TUI displays correct batch progress even without historical data
+    if (this.config.resumeFromCheckpoint && this.currentStep > 0 && stepsPerEpoch) {
+      await this.sendResumeStateUiOnly(stepsPerEpoch);
+    }
+  }
+
+  /**
+   * Send minimal resume state to TUI for UI display only (no historical data)
+   *
+   * Used when resuming from checkpoint without a matching database run.
+   * Ensures TUI shows correct epoch/batch progress.
+   */
+  private sendResumeStateUiOnly(stepsPerEpoch: number): void {
+    if (!this.logger.isTuiMode) return;
+
+    const totalEpochs = this.config.numEpochs ?? 1;
+    const stepInEpoch = this.currentStep > 0 ? ((this.currentStep - 1) % stepsPerEpoch) + 1 : 0;
+
+    this.logger.resumeState({
+      step: this.currentStep,
+      epoch: this.currentEpoch + 1, // 1-indexed
+      totalEpochs,
+      stepInEpoch,
+      totalStepsInEpoch: stepsPerEpoch,
+      metricsHistory: [], // No historical data
+      aggregates: {
+        bestReward: 0,
+        avgReward: 0,
+        rewardCount: 0,
+        bestLoss: Infinity,
+        avgLoss: 0,
+        lossCount: 0,
+        totalTokens: 0,
+        avgGenerationTimeMs: 0,
+        avgTrainingTimeMs: 0,
+      },
+    });
+
+    this.logger.info(`Sent UI resume state to TUI (step ${this.currentStep}, no historical data)`);
+  }
+
+  /**
+   * Send resume state to TUI for restoring sparklines and aggregates
+   *
+   * Queries the database for historical metrics and aggregates, then sends
+   * to TUI via the resumeState message.
+   *
+   * @param runId - Database run ID
+   * @param actualStepsPerEpoch - Actual steps per epoch from dataset (if known)
+   */
+  private async sendResumeState(runId: string, actualStepsPerEpoch?: number): Promise<void> {
+    if (!this.outputStore || !this.logger.isTuiMode) return;
+
+    try {
+      // Query historical metrics (last 60 for sparklines)
+      const metricsHistory = await this.outputStore.getRecentStepMetrics(runId, 60);
+
+      // Query aggregate statistics
+      const aggregates = await this.outputStore.getRunAggregates(runId);
+
+      // Use actual steps per epoch if provided, otherwise use a reasonable default
+      const totalEpochs = this.config.numEpochs ?? 1;
+      const stepsPerEpoch = actualStepsPerEpoch ?? 50;
+
+      // Calculate step within current epoch
+      const stepInEpoch = this.currentStep > 0 ? ((this.currentStep - 1) % stepsPerEpoch) + 1 : 0;
+
+      // Send resume state to TUI
+      // Note: epoch is 1-indexed to match epochStart() convention
+      this.logger.resumeState({
+        step: this.currentStep,
+        epoch: this.currentEpoch + 1,
+        totalEpochs,
+        stepInEpoch,
+        totalStepsInEpoch: stepsPerEpoch,
+        metricsHistory: metricsHistory.map((m) => ({
+          step: Number(m.step),
+          loss: m.loss,
+          meanReward: m.meanReward,
+          stdAdvantage: m.stdAdvantage,
+          perplexity: m.perplexity ?? undefined,
+          tokenAccuracy: m.tokenAccuracy ?? undefined,
+          generationTimeMs: m.generationTimeMs ?? undefined,
+          trainingTimeMs: m.trainingTimeMs ?? undefined,
+        })),
+        aggregates: {
+          bestReward: aggregates.bestReward,
+          avgReward: aggregates.avgReward,
+          rewardCount: Number(aggregates.rewardCount),
+          bestLoss: aggregates.bestLoss,
+          avgLoss: aggregates.avgLoss,
+          lossCount: Number(aggregates.lossCount),
+          totalTokens: Number(aggregates.totalTokens),
+          avgGenerationTimeMs: aggregates.avgGenerationTimeMs,
+          avgTrainingTimeMs: aggregates.avgTrainingTimeMs,
+        },
+      });
+
+      this.logger.info(`Sent ${metricsHistory.length} historical metrics to TUI`);
+    } catch (err) {
+      this.logger.warn(`Failed to send resume state to TUI: ${err}`);
+    }
   }
 
   /**
    * Ensure output store is initialized (lazy initialization for low-level API users)
    * Uses promise mutex to prevent race conditions from concurrent calls.
+   *
+   * Call this method from custom training loops before starting training
+   * to enable database recording and TUI database tab.
    */
-  private async ensureOutputStoreInitialized(): Promise<void> {
+  async ensureOutputStoreInitialized(): Promise<void> {
     if (this.outputStore) return; // Already initialized
     if (!this.config.outputStore?.enabled) return; // Not enabled
 
@@ -456,7 +751,20 @@ export class GRPOTrainer {
         this.stopRequested = true;
         break;
       default:
-        // Unknown command, ignore
+        // Handle SET commands (e.g., SET sample_display=best_worst)
+        if (cmd.startsWith('SET ')) {
+          const keyValue = cmd.slice(4); // Remove 'SET ' prefix
+          const eqIdx = keyValue.indexOf('=');
+          if (eqIdx > 0) {
+            const key = keyValue.slice(0, eqIdx);
+            const value = keyValue.slice(eqIdx + 1);
+            if (key === 'sample_display') {
+              if (value === 'all' || value === 'best_worst' || value === 'random') {
+                this.sampleDisplayMode = value;
+              }
+            }
+          }
+        }
         break;
     }
   }
@@ -479,9 +787,32 @@ export class GRPOTrainer {
    * @param config - Configuration including modelPath
    * @returns Promise<GRPOTrainer>
    */
-  static async create(config: GRPOTrainerConfig): Promise<GRPOTrainer> {
+  static async create<U>(config: GRPOTrainerConfig<U>): Promise<GRPOTrainer<U>> {
     if (!config.modelPath) {
       throw new Error('modelPath is required when using GRPOTrainer.create()');
+    }
+
+    // Validate unsupported config options (fail fast)
+    if (config.advantageNormalization === false) {
+      throw new Error('advantageNormalization=false is not yet supported. Remove this option or set to true.');
+    }
+    if (config.weightDecay !== undefined && config.weightDecay !== 0.01) {
+      throw new Error(
+        'Custom weightDecay is not yet implemented. Optimizer uses simple SGD. Remove weightDecay from config or use default (0.01).',
+      );
+    }
+    if (config.rewardType === 'model') {
+      throw new Error(
+        'rewardType="model" is not implemented. Use rewardType="function" with a custom reward function.',
+      );
+    }
+    if (config.rewardModelPath) {
+      throw new Error('rewardModelPath is not implemented. Use rewardType="function" with a custom reward function.');
+    }
+    if (config.device && config.device !== 'metal') {
+      throw new Error(
+        `device="${config.device}" is not supported. MLX only supports Metal GPU. Remove device from config.`,
+      );
     }
 
     // Create logger early (before model loading)
@@ -508,6 +839,25 @@ export class GRPOTrainer {
         const statePath = join(checkpointPath, 'training_state.json');
         if (existsSync(statePath)) {
           resumedState = JSON.parse(readFileSync(statePath, 'utf-8'));
+
+          // Fallback: If training_state.json has step 0 but checkpoint name suggests otherwise,
+          // derive step from checkpoint name (e.g., checkpoint-8 → step 8)
+          // This handles cases where training_state.json was corrupted or overwritten
+          if (resumedState && resumedState.step === 0) {
+            const checkpointName = checkpointPath.split('/').pop() ?? '';
+            const match = checkpointName.match(/^checkpoint-(\d+)$/);
+            if (match) {
+              const derivedStep = parseInt(match[1], 10);
+              if (derivedStep > 0) {
+                logger.warn(
+                  `Checkpoint ${checkpointName} has step 0 in training_state.json but name suggests step ${derivedStep}. Using ${derivedStep}.`,
+                );
+                resumedState.step = derivedStep;
+                // Estimate epoch from step (will be refined by actual training data)
+              }
+            }
+          }
+
           logger.info(
             `Resuming from checkpoint: ${checkpointPath} (step ${resumedState?.step}, epoch ${resumedState?.epoch})`,
           );
@@ -527,20 +877,6 @@ export class GRPOTrainer {
     const model = await Qwen3Model.loadPretrained(modelPath);
 
     logger.status('loading', `${modelName} loaded`);
-
-    // Validate checkpoint weights if resuming from checkpoint
-    if (resumedState && modelPath !== config.modelPath) {
-      logger.info('Validating checkpoint weights...');
-      const isHealthy = await GRPOTrainer.validateModelHealth(model);
-      if (!isHealthy) {
-        throw new Error(
-          `Checkpoint ${modelPath} appears corrupted (model generates only whitespace/newlines). ` +
-            `This usually happens when NaN gradients accumulate during training. ` +
-            `Please use an earlier checkpoint or start fresh training.`,
-        );
-      }
-      logger.info('Checkpoint weights validated');
-    }
 
     // Create trainer with the pre-created logger
     const trainer = new GRPOTrainer(model, config, logger);
@@ -577,50 +913,6 @@ export class GRPOTrainer {
       .sort((a, b) => b.step - a.step);
 
     return checkpoints.length > 0 ? checkpoints[0].path : null;
-  }
-
-  /**
-   * Validate model health by checking if it generates meaningful output
-   *
-   * A corrupted model (from NaN gradient accumulation) typically generates
-   * only whitespace/newlines.
-   *
-   * @param model - The model to validate
-   * @returns true if model appears healthy, false if corrupted
-   */
-  static async validateModelHealth(model: Qwen3Model): Promise<boolean> {
-    try {
-      // Generate a short completion with a simple prompt
-      const testPrompt: ChatMessage = { role: 'user', content: 'Hello, please respond with a single word:' };
-      const result = await model.generate([testPrompt], {
-        maxNewTokens: 20,
-        temperature: 0.7,
-      });
-
-      if (!result || !result.text) {
-        return false;
-      }
-
-      const output = result.text;
-
-      // Check if output is only whitespace/newlines (sign of corruption)
-      const trimmed = output.trim();
-      if (trimmed.length === 0) {
-        return false;
-      }
-
-      // Check if output is mostly newlines (another sign of corruption)
-      const newlineCount = (output.match(/\n/g) || []).length;
-      const nonNewlineChars = output.replace(/\n/g, '').length;
-      if (newlineCount > 10 && nonNewlineChars < 5) {
-        return false;
-      }
-
-      return true;
-    } catch {
-      // If generation fails, model might be corrupted
-      return false;
-    }
   }
 
   /**
@@ -665,7 +957,7 @@ export class GRPOTrainer {
    *
    * @param fn - Reward function that takes prompts and completions
    */
-  setRewardFunction(fn: RewardFn): void {
+  setRewardFunction(fn: RewardFunction<T>): void {
     this.rewardFn = fn;
   }
 
@@ -723,7 +1015,7 @@ export class GRPOTrainer {
    *
    * @param prompts - Array of chat conversations
    * @param completions - Generated completion texts
-   * @param answers - Expected answers (for accuracy rewards)
+   * @param context - Context for the reward function
    * @param groupSize - Number of completions per prompt (optional, defaults to config.groupSize)
    * @param tokenCounts - Token counts for each completion (optional, defaults to 0s)
    * @param finishReasons - Finish reasons from generation (optional, e.g. "eos", "length", "repetition")
@@ -732,7 +1024,7 @@ export class GRPOTrainer {
   async scoreGenerations(
     prompts: ChatMessage[][],
     completions: string[],
-    answers: (string | null)[],
+    context: T,
     groupSize?: number,
     tokenCounts?: number[],
     finishReasons?: string[],
@@ -763,7 +1055,6 @@ export class GRPOTrainer {
     const rewardOutputs = buildRewardOutputs(
       promptTexts,
       completions,
-      answers,
       effectiveTokenCounts,
       effectiveFinishReasons,
       effectiveGroupSize,
@@ -772,7 +1063,7 @@ export class GRPOTrainer {
     let rewards: number[] | Float32Array;
 
     if (this.rewardFn) {
-      rewards = await this.rewardFn(rewardOutputs);
+      rewards = await this.rewardFn(rewardOutputs, context);
     } else {
       // For built-in rewards, extract prompts and completions for legacy API
       const promptStrings = rewardOutputs.map((o) => o.prompt);
@@ -798,11 +1089,10 @@ export class GRPOTrainer {
    * 3. Trains using the SAME completions that were scored (no double-generation)
    *
    * @param prompts - Array of chat conversations
-   * @param answers - Expected answers (for reward functions)
    * @returns Training step metrics
    */
-  async trainStep(prompts: ChatMessage[][], answers: (string | null)[]): Promise<TrainStepMetrics> {
-    const { metrics } = await this.trainStepAuto(prompts, answers);
+  async trainStep(prompts: ChatMessage[][], context?: T): Promise<TrainStepMetrics> {
+    const { metrics } = await this.trainStepAuto(prompts, context);
     return metrics;
   }
 
@@ -817,13 +1107,13 @@ export class GRPOTrainer {
    * 3. Performs training update using the in-memory data
    *
    * @param prompts - Array of chat conversations
-   * @param answers - Expected answers (for reward functions)
+   * @param context - Context for the reward function
    * @returns Training metrics and generated completions
    */
   async trainStepAuto(
     prompts: ChatMessage[][],
-    answers: (string | null)[] = [],
-  ): Promise<{ metrics: TrainStepMetrics; completions: string[]; rewards: number[] }> {
+    context?: T,
+  ): Promise<{ metrics: TrainStepMetrics; completions: string[]; rewards: number[]; completionLengths: number[] }> {
     // Lazy initialize output store for low-level API users
     await this.ensureOutputStoreInitialized();
 
@@ -837,13 +1127,9 @@ export class GRPOTrainer {
     // Note: With CalleeHandled=true (default), callback receives (err, value) format
     // Using ThreadsafeFunction<T, Promise<R>> pattern so Rust can await the Promise
     const rewardCallback = async (err: Error | null, outputsJson: string): Promise<number[]> => {
+      const rewardStart = Date.now();
       if (err) {
         throw new Error(`Reward callback error from Rust: ${err.message}`);
-      }
-
-      // Debug: log what we received
-      if (process.env.DEBUG_REWARDS) {
-        console.log('[rewardCallback] Received JSON length:', outputsJson?.length);
       }
 
       if (!outputsJson || outputsJson === 'null') {
@@ -894,19 +1180,12 @@ export class GRPOTrainer {
         expectedAnswer: o.expected_answer ?? undefined,
       }));
 
-      if (process.env.DEBUG_REWARDS) {
-        console.log('[rewardCallback] Parsed outputs count:', outputs.length);
-      }
+      this.logger.info(`  → Computing rewards for ${outputs.length} completions...`);
 
       let rewards: number[] | Float32Array;
       if (this.rewardFn) {
-        if (process.env.DEBUG_REWARDS) {
-          console.log('[rewardCallback] Calling rewardFn...');
-        }
-        rewards = await this.rewardFn(outputs);
-        if (process.env.DEBUG_REWARDS) {
-          console.log('[rewardCallback] rewardFn returned:', rewards?.constructor?.name);
-        }
+        // @ts-expect-error context is optional
+        rewards = await this.rewardFn(outputs, context);
       } else {
         // Use built-in rewards
         const promptStrings = outputs.map((o) => o.prompt);
@@ -922,9 +1201,9 @@ export class GRPOTrainer {
         result = rewards.map((v) => Number(v));
       }
 
-      if (process.env.DEBUG_REWARDS) {
-        console.log('[rewardCallback] Returning rewards:', result);
-      }
+      const rewardDuration = Date.now() - rewardStart;
+      const avgReward = result.reduce((a, b) => a + b, 0) / result.length;
+      this.logger.info(`  → Rewards computed in ${rewardDuration}ms (avg=${avgReward.toFixed(2)})`);
 
       return result;
     };
@@ -932,12 +1211,7 @@ export class GRPOTrainer {
     // Call unified Rust method - generation, scoring, and training in one FFI call
     // Use recording method if output store is enabled
     const recordOutputs = !!this.outputStore;
-    const result: TrainStepResultWithOutputs = await this.engine.trainStepAutoWithRecording(
-      prompts,
-      answers,
-      rewardCallback,
-      recordOutputs,
-    );
+    const result: TrainStepResultWithOutputs = await this.engine.trainStepAuto(prompts, rewardCallback, recordOutputs);
 
     this.currentStep++;
 
@@ -961,7 +1235,104 @@ export class GRPOTrainer {
       metrics: { ...result.metrics, epoch: this.currentEpoch },
       completions: result.completions,
       rewards: result.rewards,
+      completionLengths: result.completionLengths,
     };
+  }
+
+  /**
+   * Increment the step counter (for custom training loops)
+   *
+   * Call this after each training step when using low-level APIs like
+   * engine.trainStepWithGenerations() instead of trainer.trainStepAuto().
+   */
+  incrementStep(): void {
+    this.currentStep++;
+  }
+
+  /**
+   * Get the current step number
+   */
+  getStep(): number {
+    return this.currentStep;
+  }
+
+  /**
+   * Get the current epoch number
+   */
+  getEpoch(): number {
+    return this.currentEpoch;
+  }
+
+  /**
+   * Record a training step to the output store database (for custom training loops)
+   *
+   * Use this when building custom training loops with engine.trainStepWithGenerations().
+   * The step number should be the value after incrementStep() was called.
+   *
+   * @param step - Step number
+   * @param metrics - Step metrics from the engine
+   * @param completions - Generated completion texts
+   * @param rewards - Reward values for each completion
+   * @param prompts - Prompt messages for each completion
+   */
+  async recordStepToDatabase(
+    step: number,
+    metrics: {
+      loss: number;
+      meanReward: number;
+      stdReward: number;
+      meanAdvantage: number;
+      stdAdvantage: number;
+      totalTokens: number;
+    },
+    completions: string[],
+    rewards: number[],
+    prompts: string[],
+  ): Promise<void> {
+    if (!this.outputStore) return;
+
+    const groupSize = this.config.groupSize ?? 4;
+
+    // Build outputs JSON in the format expected by recordStepFromOutputs
+    const outputs = completions.map((text, i) => ({
+      prompt: prompts[Math.floor(i / groupSize)] ?? '',
+      completion: {
+        text,
+        raw_text: text,
+        tool_calls: [],
+        thinking: null,
+        num_tokens: text.length, // Approximate
+        finish_reason: 'eos',
+      },
+      expected_answer: null,
+    }));
+
+    const outputsJson = JSON.stringify(outputs);
+
+    try {
+      await this.outputStore.recordStepFromOutputs(
+        step,
+        {
+          step,
+          loss: metrics.loss,
+          totalTokens: metrics.totalTokens,
+          meanReward: metrics.meanReward,
+          stdReward: metrics.stdReward,
+          meanAdvantage: metrics.meanAdvantage,
+          stdAdvantage: metrics.stdAdvantage,
+          generationTimeMs: 0,
+          trainingTimeMs: 0,
+          peakMemoryMb: 0,
+          activeMemoryMb: 0,
+          gradientsApplied: true,
+        },
+        outputsJson,
+        rewards,
+        groupSize,
+      );
+    } catch (err) {
+      console.error('[OutputStore] Failed to record step:', err);
+    }
   }
 
   /**
@@ -991,11 +1362,11 @@ export class GRPOTrainer {
       mkdirSync(this.config.outputDir, { recursive: true });
     }
 
-    // Initialize output store if enabled
-    await this.initOutputStore();
-
-    // Calculate total steps per epoch for resumption
+    // Calculate total steps per epoch BEFORE initOutputStore (needed for accurate resume state)
     const stepsPerEpoch = Math.ceil(dataset.length / batchSize);
+
+    // Initialize output store if enabled (pass stepsPerEpoch for accurate batch display on resume)
+    await this.initOutputStore(stepsPerEpoch);
 
     // Determine starting point based on resumed state
     const startEpoch = this.currentEpoch;
@@ -1009,6 +1380,7 @@ export class GRPOTrainer {
     this.logger.init(
       modelName,
       {
+        trainingType: 'grpo',
         numEpochs,
         batchSize,
         groupSize: this.config.groupSize ?? 4,
@@ -1052,18 +1424,65 @@ export class GRPOTrainer {
 
         // Extract prompts and answers from batch
         const prompts = batch.map((ex) => ex.prompt);
-        const answers = batch.map((ex) => ex.answer ?? null);
+
+        // Verbose logging for debugging stuck batches
+        const batchNum = Math.floor(i / batchSize) + 1;
+        this.logger.info(
+          `Batch ${batchNum}/${stepsPerEpoch} starting (${prompts.length} prompts × ${this.config.groupSize ?? 4} groups)`,
+        );
 
         // Run training step with auto reward computation
-        const { metrics, completions, rewards } = await this.trainStepAuto(prompts, answers);
+        const stepStartTime = Date.now();
+        const { metrics, completions, rewards, completionLengths } = await this.trainStepAuto(prompts);
+        const stepDuration = Date.now() - stepStartTime;
+        this.logger.info(
+          `Batch ${batchNum}/${stepsPerEpoch} done in ${(stepDuration / 1000).toFixed(1)}s ` +
+            `(gen=${metrics.generationTimeMs?.toFixed(0) ?? '?'}ms, train=${metrics.trainingTimeMs?.toFixed(0) ?? '?'}ms, loss=${metrics.loss.toFixed(4)})`,
+        );
 
         // Log step metrics (logger handles TUI/console mode internally)
         this.logger.step(metrics, Math.floor(i / batchSize), stepsPerEpoch);
 
-        // Report all generation samples to TUI (TUI handles display filtering)
+        // Report generation samples to TUI based on display mode
         // In console mode, logger.generation() is a no-op
         const groupSize = this.config.groupSize ?? 4;
-        for (let j = 0; j < completions.length; j++) {
+
+        // Determine which sample indices to report based on display mode
+        let indicesToReport: number[];
+        if (this.sampleDisplayMode === 'all') {
+          // Report all samples
+          indicesToReport = Array.from({ length: completions.length }, (_, i) => i);
+        } else if (this.sampleDisplayMode === 'best_worst') {
+          // Find indices of best (max reward) and worst (min reward) samples
+          let bestIdx = 0;
+          let worstIdx = 0;
+          let bestReward = rewards[0];
+          let worstReward = rewards[0];
+          for (let j = 1; j < rewards.length; j++) {
+            if (rewards[j] > bestReward) {
+              bestReward = rewards[j];
+              bestIdx = j;
+            }
+            if (rewards[j] < worstReward) {
+              worstReward = rewards[j];
+              worstIdx = j;
+            }
+          }
+          // Avoid duplicates if best and worst are the same
+          indicesToReport = bestIdx === worstIdx ? [bestIdx] : [bestIdx, worstIdx];
+        } else {
+          // random: pick 2 random samples (or fewer if completions.length < 2)
+          const numSamples = Math.min(2, completions.length);
+          const shuffled = Array.from({ length: completions.length }, (_, i) => i);
+          // Fisher-Yates partial shuffle for first numSamples
+          for (let k = 0; k < numSamples; k++) {
+            const randIdx = k + Math.floor(Math.random() * (shuffled.length - k));
+            [shuffled[k], shuffled[randIdx]] = [shuffled[randIdx], shuffled[k]];
+          }
+          indicesToReport = shuffled.slice(0, numSamples);
+        }
+
+        for (const j of indicesToReport) {
           // Get the prompt for this completion (each prompt has groupSize completions)
           const promptIdx = Math.floor(j / groupSize);
           const promptMessages = prompts[promptIdx] ?? [];
@@ -1076,7 +1495,7 @@ export class GRPOTrainer {
             prompt: promptText,
             completion: completions[j],
             reward: rewards[j],
-            tokens: this.config.maxNewTokens ?? 256,
+            tokens: completionLengths[j] ?? this.config.maxCompletionLength ?? 256,
           });
         }
 
@@ -1148,22 +1567,6 @@ export class GRPOTrainer {
     const outputDir = this.config.outputDir ?? './outputs';
     const checkpointPath = join(outputDir, checkpointName);
 
-    // Validate model health before saving (skip for emergency saves)
-    const isEmergency = name?.startsWith('emergency-');
-    if (!isEmergency) {
-      const isHealthy = await GRPOTrainer.validateModelHealth(this.model);
-      if (!isHealthy) {
-        this.logger.error(
-          `[CHECKPOINT] Model health check FAILED at step ${this.currentStep}. ` +
-            `Skipping checkpoint save to prevent corruption. ` +
-            `Consider reducing learning rate or checking training data.`,
-        );
-        return ''; // Return empty string to indicate save was skipped
-      }
-    } else {
-      this.logger.warn(`[CHECKPOINT] Saving emergency checkpoint without health validation (step ${this.currentStep})`);
-    }
-
     // Create checkpoint directory
     if (!existsSync(checkpointPath)) {
       mkdirSync(checkpointPath, { recursive: true });
@@ -1195,6 +1598,9 @@ export class GRPOTrainer {
     }
 
     this.logger.info(`Checkpoint saved: ${checkpointPath}`);
+
+    // Track last checkpoint step for emergency save throttling
+    this.lastCheckpointStep = this.currentStep;
 
     // Clean up old checkpoints to save disk space
     const maxCheckpoints = this.config.maxCheckpoints ?? 3;
@@ -1319,11 +1725,6 @@ export class GRPOTrainer {
     return this.engine;
   }
 }
-
-/**
- * Legacy type alias for backward compatibility
- */
-export type GRPOConfig = GRPOTrainerConfig;
 
 /**
  * Create a standalone reward registry for testing rewards

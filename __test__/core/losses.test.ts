@@ -3,7 +3,7 @@
  * Ported from mlx/python/tests/test_losses.py
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { MxArray, Losses, Activations } from '@mlx-node/core';
 import { createFloat32Array } from '../test-utils';
 

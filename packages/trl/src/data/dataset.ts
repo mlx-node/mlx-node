@@ -66,14 +66,9 @@ export const defaultPromptTemplate: PromptTemplate = (question, options) => {
   return messages;
 };
 
-export function createDatasetExample(
-  prompt: ChatMessage[],
-  answer: string | null,
-  metadata?: Record<string, unknown>,
-): DatasetExample {
+export function createDatasetExample(prompt: ChatMessage[], metadata?: Record<string, unknown>): DatasetExample {
   return {
     prompt: prompt.map((message) => ({ ...message })), // defensive copy
-    answer,
     metadata: metadata ? { ...metadata } : undefined,
   };
 }
@@ -155,8 +150,7 @@ export async function loadLocalGsm8kDataset(
       includeOneShot: options.includeOneShot,
       oneShotExample: options.oneShotExample,
     });
-    const answer = extractGsm8kAnswer(record.answer);
-    const example = createDatasetExample(prompt, answer, {
+    const example = createDatasetExample(prompt, {
       split,
       index,
       raw_answer: record.answer,

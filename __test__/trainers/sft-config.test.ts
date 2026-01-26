@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vite-plus/test';
 import { getDefaultSFTConfig, mergeSFTConfig, applySFTOverrides, SFTConfigError } from '@mlx-node/trl';
 
 describe('SFT configuration', () => {

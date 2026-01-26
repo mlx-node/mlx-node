@@ -6,7 +6,7 @@
  * after gradient updates, catching silent gradient flow bugs.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { MxArray, Linear, RMSNorm, Adam, AdamW, SGD, Losses, Activations, Gradients } from '@mlx-node/core';
 import { shape, float32 } from '../test-utils.js';
 

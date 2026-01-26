@@ -30,6 +30,16 @@ unsafe extern "C" {
         shape: *const i64,
         ndim: usize,
     ) -> *mut mlx_array;
+    pub fn mlx_array_from_bfloat16(
+        data: *const u16,
+        shape: *const i64,
+        ndim: usize,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_from_float16(
+        data: *const u16,
+        shape: *const i64,
+        ndim: usize,
+    ) -> *mut mlx_array;
     pub fn mlx_array_scalar_float(value: f64) -> *mut mlx_array;
     pub fn mlx_array_scalar_int(value: i32) -> *mut mlx_array;
     pub fn mlx_array_zeros(shape: *const i64, ndim: usize, dtype: i32) -> *mut mlx_array;
@@ -355,6 +365,7 @@ unsafe extern "C" {
     pub fn mlx_array_delete(arr: *mut mlx_array);
     pub fn mlx_synchronize();
     pub fn mlx_clear_cache();
+    pub fn mlx_compile_clear_cache() -> bool;
     pub fn mlx_compiled_categorical_sample(
         logits: *mut mlx_array,
         temperature: f32,
@@ -612,6 +623,7 @@ unsafe extern "C" {
     pub fn mlx_reset_peak_memory();
     pub fn mlx_set_memory_limit(limit: usize) -> usize;
     pub fn mlx_get_memory_limit() -> usize;
+    pub fn mlx_set_cache_limit(limit: usize) -> usize;
     pub fn mlx_array_nbytes(handle: *mut mlx_array) -> usize;
 
     // Fused generation loop - entire generation in one FFI call
@@ -651,6 +663,7 @@ unsafe extern "C" {
 
     // Fused forward step - single FFI call for entire forward pass
     // This reduces FFI overhead from ~300 calls to 1 call per token
+    // Uses array offsets for batched generation with proper per-sequence RoPE positions.
     pub fn mlx_qwen3_forward_step(
         // Input
         input_ids: *mut mlx_array, // [batch, seq_len]
@@ -671,135 +684,49 @@ unsafe extern "C" {
         // KV cache inputs (null for prefill without cache)
         kv_keys_in: *const *mut mlx_array,   // [num_layers] or null
         kv_values_in: *const *mut mlx_array, // [num_layers] or null
-        cache_offsets_in: *const i32,        // [num_layers] or null
-        cache_capacities_in: *const i32,     // [num_layers] or null (pre-allocated buffer sizes)
+        cache_idx_in: i32,                   // Shared cache write position
+        // Array offsets for batched generation
+        rope_offsets: *mut mlx_array, // [batch] - per-sequence RoPE offsets
+        left_padding: *mut mlx_array, // [batch] - left padding amounts
         // Outputs
         out_logits: *mut *mut mlx_array,    // [batch, seq_len, vocab]
         out_kv_keys: *mut *mut mlx_array,   // [num_layers]
         out_kv_values: *mut *mut mlx_array, // [num_layers]
-        out_cache_offsets: *mut i32,        // [num_layers]
-        out_cache_capacities: *mut i32,     // [num_layers] (updated pre-allocated sizes)
-    );
-}
-
-// ============================================================================
-// PagedAttention FFI
-// ============================================================================
-
-/// Configuration for paged attention
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct PagedAttnConfig {
-    /// Block size in tokens (8, 16, or 32)
-    pub block_size: u32,
-    /// Number of KV cache blocks to allocate
-    pub num_blocks: u32,
-    /// Head dimension (e.g., 128 for Qwen3)
-    pub head_size: u32,
-    /// Number of KV heads
-    pub num_kv_heads: u32,
-    /// Number of transformer layers
-    pub num_layers: u32,
-    /// Data type (0=float16, 1=bfloat16, 2=float32)
-    pub dtype: u32,
-}
-
-/// Opaque handle for the PagedAttention KV cache
-#[repr(C)]
-pub struct PagedAttnCache {
-    _unused: [u8; 0],
-}
-
-unsafe extern "C" {
-    /// Create a new PagedAttention KV cache
-    ///
-    /// # Arguments
-    /// * `config` - Configuration for the cache
-    ///
-    /// # Returns
-    /// Handle to the cache, or null on failure
-    pub fn mlx_paged_attn_create_cache(config: *const PagedAttnConfig) -> *mut PagedAttnCache;
-
-    /// Free a PagedAttention KV cache
-    pub fn mlx_paged_attn_free_cache(cache: *mut PagedAttnCache);
-
-    /// Get the key cache tensor for a layer
-    ///
-    /// # Arguments
-    /// * `cache` - The cache handle
-    /// * `layer_idx` - Layer index
-    ///
-    /// # Returns
-    /// Key cache array [num_blocks, num_kv_heads, head_size/x, block_size, x]
-    pub fn mlx_paged_attn_get_key_cache(
-        cache: *mut PagedAttnCache,
-        layer_idx: u32,
-    ) -> *mut mlx_array;
-
-    /// Get the value cache tensor for a layer
-    ///
-    /// # Arguments
-    /// * `cache` - The cache handle
-    /// * `layer_idx` - Layer index
-    ///
-    /// # Returns
-    /// Value cache array [num_blocks, num_kv_heads, head_size, block_size]
-    pub fn mlx_paged_attn_get_value_cache(
-        cache: *mut PagedAttnCache,
-        layer_idx: u32,
-    ) -> *mut mlx_array;
-
-    /// Update the cache with new keys and values (reshape_and_cache kernel)
-    ///
-    /// # Arguments
-    /// * `cache` - The cache handle
-    /// * `layer_idx` - Layer index
-    /// * `keys` - New keys [num_tokens, num_heads, head_size]
-    /// * `values` - New values [num_tokens, num_heads, head_size]
-    /// * `slot_mapping` - Slot indices for each token [num_tokens]
-    pub fn mlx_paged_attn_reshape_and_cache(
-        cache: *mut PagedAttnCache,
-        layer_idx: u32,
-        keys: *mut mlx_array,
-        values: *mut mlx_array,
-        slot_mapping: *mut mlx_array,
+        out_cache_idx: *mut i32,            // Updated write position
     );
 
-    /// Run paged attention forward pass
-    ///
-    /// # Arguments
-    /// * `queries` - Query tensor [num_seqs, num_heads, head_size]
-    /// * `key_cache` - Key cache [num_blocks, num_kv_heads, head_size/x, block_size, x]
-    /// * `value_cache` - Value cache [num_blocks, num_kv_heads, head_size, block_size]
-    /// * `block_tables` - Block table [num_seqs, max_blocks_per_seq]
-    /// * `context_lens` - Context lengths [num_seqs]
-    /// * `scale` - Attention scale factor
-    /// * `block_size` - Number of tokens per block
-    /// * `max_context_len` - Maximum context length
-    ///
-    /// # Returns
-    /// Output tensor [num_seqs, num_heads, head_size]
-    pub fn mlx_paged_attn_forward(
-        queries: *mut mlx_array,
-        key_cache: *mut mlx_array,
-        value_cache: *mut mlx_array,
-        block_tables: *mut mlx_array,
-        context_lens: *mut mlx_array,
-        scale: f32,
-        block_size: u32,
-        max_context_len: u32,
-    ) -> *mut mlx_array;
-
-    /// Copy blocks for copy-on-write semantics
-    ///
-    /// # Arguments
-    /// * `cache` - The cache handle
-    /// * `layer_idx` - Layer index
-    /// * `block_mapping` - Pairs of (src_block, dst_block) [num_pairs, 2]
-    pub fn mlx_paged_attn_copy_blocks(
-        cache: *mut PagedAttnCache,
-        layer_idx: u32,
-        block_mapping: *mut mlx_array,
+    // Batched forward step - true batch generation with array RoPE offsets
+    // Enables parallel batch generation with left-padded variable-length sequences
+    pub fn mlx_qwen3_forward_step_batched(
+        // Input
+        input_ids: *mut mlx_array, // [batch, seq_len]
+        // Model weights
+        embedding_weight: *mut mlx_array,     // [vocab, hidden]
+        layer_weights: *const *mut mlx_array, // [num_layers * 11]
+        num_layers: i32,
+        final_norm_weight: *mut mlx_array, // [hidden]
+        lm_head_weight: *mut mlx_array,    // null if tied
+        tie_word_embeddings: bool,
+        // Model config
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        norm_eps: f32,
+        // Batched RoPE offsets (key difference from scalar version)
+        rope_offsets: *mut mlx_array, // [batch] - per-sequence offsets
+        // Left padding info for attention mask
+        left_padding: *mut mlx_array, // [batch] - left padding amounts
+        // KV cache inputs (shared across batch, indexed by cache_idx)
+        kv_keys_in: *const *mut mlx_array,   // [num_layers] or null
+        kv_values_in: *const *mut mlx_array, // [num_layers] or null
+        cache_idx_in: i32,                   // Current write position (shared)
+        // Outputs
+        out_logits: *mut *mut mlx_array,    // [batch, seq_len, vocab]
+        out_kv_keys: *mut *mut mlx_array,   // [num_layers]
+        out_kv_values: *mut *mut mlx_array, // [num_layers]
+        out_cache_idx: *mut i32,            // Updated write position
     );
 }
 

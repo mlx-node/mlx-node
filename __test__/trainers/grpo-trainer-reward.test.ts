@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { NativeRewardRegistry } from '@mlx-node/core';
 import type { BuiltinRewardType } from '@mlx-node/core';
 import { DEFAULT_GRPO_CONFIG, createRewardRegistry } from '@mlx-node/trl';

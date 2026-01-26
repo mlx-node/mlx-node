@@ -24,11 +24,19 @@ regex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 mlx-paged-attn = { workspace = true }
-libsql = { workspace = true }
+mlx-db = { workspace = true }
+sqlx = { workspace = true }
 
 [dependencies.mimalloc-safe]
 workspace = true
 features = ["skip_collect_on_exit", "v3"]
 
+[dev-dependencies]
+criterion = "0.5"
+
 [build-dependencies]
 napi-build = { workspace = true }
+
+[[bench]]
+name = "attention_vjp_bench"
+harness = false

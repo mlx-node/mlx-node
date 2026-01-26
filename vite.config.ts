@@ -1,4 +1,4 @@
-import { defineConfig, type ViteUserConfig } from 'vitest/config';
+import { defineConfig, type ViteUserConfig } from 'vite-plus';
 import { resolve } from 'node:path';
 
 const regularTestConfig: ViteUserConfig['test'] = {
@@ -6,7 +6,7 @@ const regularTestConfig: ViteUserConfig['test'] = {
   environment: 'node',
   watch: false,
   testTimeout: 120000, // 2 minutes
-  include: ['__test__/**/*.{test,spec}.ts'],
+  include: ['__test__/**/*.{test,spec}.ts', 'examples/**/*.{test,spec}.ts'],
   exclude: ['**/node_modules/**', '**/.git/**', '**/trainers/**', '**/__test__/dist/**', '**/target/**'],
 };
 
@@ -19,6 +19,25 @@ const trainerTestConfig: ViteUserConfig['test'] = {
 };
 
 export default defineConfig({
+  fmt: {
+    printWidth: 120,
+    tabWidth: 2,
+    singleQuote: true,
+    ignorePatterns: [
+      '**/dist/**',
+      '**/tests/**',
+      '**/generated/**',
+      '**/fixtures/**',
+      '.yarn/**',
+      'index.d.cts',
+      'index.cjs',
+      '/trl',
+      '/transformers',
+      '/mlx-lm',
+      '/mlx-rs',
+      '/crates/mlx-sys/mlx',
+    ],
+  },
   test: process.env.TEST_TRAINER ? trainerTestConfig : regularTestConfig,
   resolve: {
     alias: {

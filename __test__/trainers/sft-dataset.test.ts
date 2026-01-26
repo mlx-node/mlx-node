@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeAll } from 'vitest';
+import { describe, expect, it, beforeAll } from 'vite-plus/test';
 import { resolve } from 'node:path';
 import {
   SFTDataset,

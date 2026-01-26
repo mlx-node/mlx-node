@@ -159,6 +159,10 @@ impl SftTrainingEngine {
     pub fn new(model: &Qwen3Model, config: SftEngineConfig) -> Result<Self> {
         let model_config = model.get_config();
 
+        // Let MLX manage memory dynamically - no explicit cache limits
+        // Previously set cache_limit which conflicted with other limit calls
+        // causing 93GB+ startup memory. MLX handles memory better without limits.
+
         info!(
             "Creating SFT training engine: {} layers, {} hidden, lr={}",
             model_config.num_layers,
@@ -167,11 +171,91 @@ impl SftTrainingEngine {
         );
 
         Ok(Self {
+            // clone_for_session() is now O(1) - just clones Arc pointers.
+            // The model uses RwLock for interior mutability, so apply_gradients()
+            // can acquire write locks without needing unique Arc ownership.
+            // This eliminates the previous ~4GB memory overhead from deep cloning.
             model: Arc::new(RwLock::new(model.clone_for_session()?)),
             model_config,
             config,
             state: Arc::new(RwLock::new(EngineState::default())),
         })
+    }
+
+    /// Estimate memory required for training in GB (comprehensive estimate)
+    ///
+    /// Components:
+    /// - Model weights: num_params * 2 bytes (bf16)
+    /// - Gradients: same as weights
+    /// - Forward pass intermediates: ~16x hidden_size per layer per token
+    /// - Attention weights: batch * heads * seq² * 4 bytes per layer
+    ///
+    /// Note: This comprehensive estimate was causing MLX to pre-allocate 100GB+.
+    /// Use `estimate_model_weights_only` for conservative cache limits instead.
+    #[allow(dead_code)]
+    fn _estimate_training_memory(config: &Qwen3Config) -> f64 {
+        // Estimate number of parameters
+        let hidden = config.hidden_size as f64;
+        let vocab = config.vocab_size as f64;
+        let layers = config.num_layers as f64;
+        let intermediate = config.intermediate_size as f64;
+
+        // Per-layer params: attention (4 * hidden²) + MLP (3 * hidden * intermediate) + norms
+        let per_layer_params = 4.0 * hidden * hidden + 3.0 * hidden * intermediate + 2.0 * hidden;
+        let embedding_params = vocab * hidden;
+        let total_params = per_layer_params * layers + embedding_params * 2.0; // embed + lm_head
+
+        // Weights + gradients (bf16 = 2 bytes each)
+        let weights_gb = total_params * 2.0 / 1e9;
+        let gradients_gb = weights_gb;
+
+        // Forward pass intermediates (rough estimate: 16 bytes per hidden per layer per token)
+        // Assuming batch_size=4, seq_len=2048
+        let batch = 4.0;
+        let seq = 2048.0;
+        let intermediates_gb = layers * batch * seq * hidden * 16.0 / 1e9;
+
+        // Attention weights: batch * heads * seq² * sizeof(float) per layer
+        let heads = config.num_heads as f64;
+        let attention_gb = layers * batch * heads * seq * seq * 4.0 / 1e9;
+
+        let total_gb = weights_gb + gradients_gb + intermediates_gb + attention_gb;
+
+        debug!(
+            "Memory estimate: weights={:.1}GB, grads={:.1}GB, intermediates={:.1}GB, attention={:.1}GB, total={:.1}GB",
+            weights_gb, gradients_gb, intermediates_gb, attention_gb, total_gb
+        );
+
+        total_gb
+    }
+
+    /// Estimate model weights only (for conservative cache limit)
+    ///
+    /// This provides a minimal memory estimate based only on model parameters,
+    /// avoiding aggressive pre-allocation that can cause 100GB+ memory usage.
+    /// Kept for potential future diagnostics.
+    #[allow(dead_code)]
+    fn estimate_model_weights_only(config: &Qwen3Config) -> f64 {
+        let hidden_size = config.hidden_size as f64;
+        let intermediate_size = config.intermediate_size as f64;
+        let num_layers = config.num_layers as f64;
+        let vocab_size = config.vocab_size as f64;
+
+        // Parameters per layer: attention (4 projections) + MLP (3 projections) + norms
+        let attention_params = 4.0 * hidden_size * hidden_size;
+        let mlp_params = 3.0 * hidden_size * intermediate_size;
+        let norm_params = 2.0 * hidden_size;
+        let layer_params = attention_params + mlp_params + norm_params;
+
+        // Total params: embeddings + layers + final norm + lm_head
+        let embedding_params = vocab_size * hidden_size;
+        let total_params = embedding_params
+            + (num_layers * layer_params)
+            + hidden_size
+            + (hidden_size * vocab_size);
+
+        // Convert to GB (assuming fp16 = 2 bytes per param)
+        total_params * 2.0 / (1024.0 * 1024.0 * 1024.0)
     }
 
     /// Run a single training step
@@ -194,7 +278,8 @@ impl SftTrainingEngine {
         // Run in spawn_blocking to avoid blocking the async runtime
         let result: std::result::Result<SftStepMetrics, Error> =
             tokio::task::spawn_blocking(move || {
-                // Get model parameters
+                // Get model parameters ONCE at the start - reuse throughout the step
+                // Each get_parameters() call clones ~70 parameter tensors (3-4GB for 1.7B model)
                 let params = {
                     let model = model_arc.read().map_err(|_| {
                         Error::new(Status::GenericFailure, "Failed to acquire model read lock")
@@ -216,6 +301,45 @@ impl SftTrainingEngine {
                     &labels,
                     loss_config,
                 )?;
+
+                // Check for NaN/Inf in gradients BEFORE accumulation
+                // This catches numerical instability earlier than loss-only checking
+                for (name, grad) in &gradients {
+                    grad.eval();
+                    // Sample a few values to check for NaN/Inf (checking all would be expensive)
+                    let grad_data = grad.to_float32()?;
+                    let has_nan = grad_data.iter().take(1000).any(|v| v.is_nan() || v.is_infinite());
+                    if has_nan {
+                        let mut state = state_arc.write().map_err(|_| {
+                            Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                        })?;
+                        state.nan_gradient_count += 1;
+                        state.consecutive_nan_count += 1;
+
+                        warn!(
+                            "NaN/Inf gradient detected in parameter '{}', skipping step (count: {})",
+                            name, state.nan_gradient_count
+                        );
+
+                        let emergency_threshold = config.emergency_save_threshold.unwrap_or(5) as u32;
+                        if state.consecutive_nan_count >= emergency_threshold {
+                            state.needs_emergency_save = true;
+                            warn!(
+                                "Emergency save triggered: {} consecutive NaN gradients",
+                                state.consecutive_nan_count
+                            );
+                        }
+
+                        return Ok(SftStepMetrics {
+                            step: state.step,
+                            loss: loss_value,
+                            total_tokens: 0,
+                            token_accuracy: None,
+                            gradients_applied: false,
+                            training_time_ms: training_start.elapsed().as_secs_f64() * 1000.0,
+                        });
+                    }
+                }
 
                 // Check for NaN loss
                 if loss_value.is_nan() || loss_value.is_infinite() {
@@ -283,6 +407,9 @@ impl SftTrainingEngine {
                         for (name, grad) in &gradients {
                             if let Some(acc_grad) = acc.get_mut(name) {
                                 *acc_grad = acc_grad.add(grad)?;
+                                // FORCE EVALUATION to break lazy chain and prevent memory growth
+                                // Without this, gradient_accumulation_steps=8 creates an 8-deep lazy chain
+                                acc_grad.eval();
                             }
                         }
                     } else {
@@ -332,6 +459,29 @@ impl SftTrainingEngine {
                         let lr = config.learning_rate.unwrap_or(2e-5);
                         let weight_decay = config.weight_decay.unwrap_or(0.0);
 
+                        // Apply weight decay to gradients if configured
+                        // Reuse `params` from start of step - no extra get_parameters() call
+                        let grads_with_decay = if weight_decay > 0.0 {
+                            final_grads
+                                .into_iter()
+                                .map(|(name, grad)| {
+                                    if let Some(param) = params.get(&name) {
+                                        // grad_with_decay = grad + weight_decay * param
+                                        if let Ok(decay_term) = param.mul_scalar(weight_decay)
+                                            && let Ok(new_grad) = grad.add(&decay_term)
+                                        {
+                                            return (name, new_grad);
+                                        }
+                                        (name, grad)
+                                    } else {
+                                        (name, grad)
+                                    }
+                                })
+                                .collect::<HashMap<_, _>>()
+                        } else {
+                            final_grads
+                        };
+
                         // Update model parameters
                         {
                             let mut model = model_arc.write().map_err(|_| {
@@ -341,34 +491,12 @@ impl SftTrainingEngine {
                                 )
                             })?;
 
-                            // Apply weight decay to gradients if configured
-                            let grads_with_decay = if weight_decay > 0.0 {
-                                let current_params = model.get_parameters();
-                                final_grads
-                                    .into_iter()
-                                    .map(|(name, grad)| {
-                                        if let Some(param) = current_params.get(&name) {
-                                            // grad_with_decay = grad + weight_decay * param
-                                            if let Ok(decay_term) = param.mul_scalar(weight_decay)
-                                                && let Ok(new_grad) = grad.add(&decay_term)
-                                            {
-                                                return (name, new_grad);
-                                            }
-                                            (name, grad)
-                                        } else {
-                                            (name, grad)
-                                        }
-                                    })
-                                    .collect::<HashMap<_, _>>()
-                            } else {
-                                final_grads
-                            };
-
                             let grads_refs: HashMap<String, &MxArray> = grads_with_decay
                                 .iter()
                                 .map(|(k, v)| (k.clone(), v))
                                 .collect();
-                            model.apply_gradients(grads_refs, lr)?;
+                            // Use apply_gradients_with_params to avoid another get_parameters() call
+                            model.apply_gradients_with_params(grads_refs, lr, &params)?;
                         }
 
                         state.step += 1;
@@ -397,12 +525,20 @@ impl SftTrainingEngine {
                 }
 
                 // Compute token accuracy if enabled (requires extra forward pass)
+                // Note: If gradients were applied, we need fresh params. Otherwise reuse existing.
                 let token_accuracy = if config.compute_accuracy.unwrap_or(false) {
-                    let model = model_arc.read().map_err(|_| {
-                        Error::new(Status::GenericFailure, "Failed to acquire model read lock")
-                    })?;
-                    let params = model.get_parameters();
-                    match compute_token_accuracy(&model_config, &params, &input_ids, &labels) {
+                    // If gradients were applied, model weights changed - get fresh params
+                    // Otherwise, reuse params from start of step
+                    let accuracy_params = if gradients_applied {
+                        let model = model_arc.read().map_err(|_| {
+                            Error::new(Status::GenericFailure, "Failed to acquire model read lock")
+                        })?;
+                        model.get_parameters()
+                    } else {
+                        // Reuse params from start of step - no weights changed
+                        params.clone()
+                    };
+                    match compute_token_accuracy(&model_config, &accuracy_params, &input_ids, &labels) {
                         Ok(acc) => Some(acc),
                         Err(e) => {
                             warn!("Failed to compute accuracy: {}", e);
@@ -507,37 +643,47 @@ impl SftTrainingEngine {
         let lr = config.learning_rate.unwrap_or(2e-5);
         let weight_decay = config.weight_decay.unwrap_or(0.0);
 
+        // Get params ONCE for both weight decay and apply_gradients
+        let params = {
+            let model = model_arc.read().map_err(|_| {
+                Error::new(Status::GenericFailure, "Failed to acquire model read lock")
+            })?;
+            model.get_parameters()
+        };
+
+        // Apply weight decay to gradients if configured
+        // Reuse `params` - no extra get_parameters() call
+        let grads_with_decay = if weight_decay > 0.0 {
+            final_grads
+                .into_iter()
+                .map(|(name, grad)| {
+                    if let Some(param) = params.get(&name) {
+                        if let Ok(decay_term) = param.mul_scalar(weight_decay)
+                            && let Ok(new_grad) = grad.add(&decay_term)
+                        {
+                            return (name, new_grad);
+                        }
+                        (name, grad)
+                    } else {
+                        (name, grad)
+                    }
+                })
+                .collect::<HashMap<_, _>>()
+        } else {
+            final_grads
+        };
+
         {
             let mut model = model_arc.write().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire model write lock")
             })?;
 
-            let grads_with_decay = if weight_decay > 0.0 {
-                let current_params = model.get_parameters();
-                final_grads
-                    .into_iter()
-                    .map(|(name, grad)| {
-                        if let Some(param) = current_params.get(&name) {
-                            if let Ok(decay_term) = param.mul_scalar(weight_decay)
-                                && let Ok(new_grad) = grad.add(&decay_term)
-                            {
-                                return (name, new_grad);
-                            }
-                            (name, grad)
-                        } else {
-                            (name, grad)
-                        }
-                    })
-                    .collect::<HashMap<_, _>>()
-            } else {
-                final_grads
-            };
-
             let grads_refs: HashMap<String, &MxArray> = grads_with_decay
                 .iter()
                 .map(|(k, v)| (k.clone(), v))
                 .collect();
-            model.apply_gradients(grads_refs, lr)?;
+            // Use apply_gradients_with_params to avoid another get_parameters() call
+            model.apply_gradients_with_params(grads_refs, lr, &params)?;
         }
 
         state.step += 1;

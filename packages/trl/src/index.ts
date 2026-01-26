@@ -23,6 +23,9 @@
 // Optimizers
 export { Adam, AdamW, SGD, RMSprop, LRScheduler } from '@mlx-node/core';
 
+// Tool calling types (for tool-use training)
+export type { ToolDefinition, FunctionDefinition, FunctionParameters } from '@mlx-node/core';
+
 // Gradient utilities
 export { Gradients, GradientUtils, clipGradientsByGlobalNorm, clipGradientsByValue } from '@mlx-node/core';
 
@@ -37,10 +40,7 @@ export { Attention, FusedAttention, TransformerBlock, MLP, RoPE } from '@mlx-nod
 export { KVCache, BatchKVCache, RotatingKVCache } from '@mlx-node/core';
 
 // GRPO utilities
-export { computeAdvantages, computeEntropy, getHighEntropyMask, selectiveLogSoftmax } from '@mlx-node/core';
-
-// Utility functions
-export { padSequences, padFloatSequences, createAttentionMaskForTransformer, PaddedSequences } from '@mlx-node/core';
+export { computeAdvantages, computeEntropy, getHighEntropyMask } from '@mlx-node/core';
 
 // Model conversion
 export { convertModel, convertParquetToJsonl } from '@mlx-node/core';
@@ -63,10 +63,8 @@ export {
 export {
   GRPOTrainer,
   type GRPOTrainerConfig,
-  type GRPOConfig,
   DEFAULT_GRPO_CONFIG,
   createRewardRegistry,
-  type RewardFn,
   type GenerateBatchResult,
   type TrainStepMetrics,
   type TrainingMetrics,
@@ -90,17 +88,9 @@ export {
   type TrainingConfigFields,
   type TuiMessage,
   type LogEvent,
+  type PromptChoice,
+  type PromptOptions,
 } from './trainers/training-logger';
-
-// Legacy Logger (deprecated - use TrainingLogger instead)
-export {
-  GRPOLogger,
-  createLogger,
-  MetricsAggregator,
-  type LoggerConfig,
-  type TrainingConfigFields as GRPOLoggerConfigFields,
-  type LogEvent as GRPOLogEvent,
-} from './trainers/grpo-logger';
 
 // Entropy configuration
 export { type EntropyFilteringConfig, DEFAULT_ENTROPY_CONFIG } from './trainers/grpo-entropy';
@@ -141,9 +131,6 @@ export {
 
 // Utils
 export * from './utils/xml-parser';
-
-// Rewards
-export * from './rewards';
 
 // Types
 export type {

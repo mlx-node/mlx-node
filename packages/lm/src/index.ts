@@ -23,7 +23,7 @@ export type { DType } from '@mlx-node/core';
 export type { SamplingConfig, BatchGenerationResult } from '@mlx-node/core';
 
 // Chat API types from core (for model.chat() API)
-export type { ToolCallResult, ChatResult, ChatConfig } from '@mlx-node/core';
+export type { ToolCallResult, ChatResult, ChatConfig, ChatMessage } from '@mlx-node/core';
 
 // Model utilities (TypeScript-only)
 export {

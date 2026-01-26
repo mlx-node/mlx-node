@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { TransformerBlock, KVCache, MxArray } from '@mlx-node/core';
 import { shape, assertShape, assertFinite } from '../test-utils';
 

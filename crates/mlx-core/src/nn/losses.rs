@@ -31,6 +31,37 @@ impl Losses {
             ));
         }
 
+        // Check for NaN/Inf in logits which would cause loss computation to fail
+        // This provides early detection of numerical instability in the forward pass
+        let logits_max = logits.max(None, None)?;
+        let logits_min = logits.min(None, None)?;
+        logits_max.eval();
+        logits_min.eval();
+
+        let max_val = logits_max.item_at_float32(0)?;
+        let min_val = logits_min.item_at_float32(0)?;
+
+        if max_val.is_nan() || max_val.is_infinite() || min_val.is_nan() || min_val.is_infinite() {
+            return Err(Error::new(
+                Status::GenericFailure,
+                format!(
+                    "Logits contain NaN or Inf values (min={}, max={}). \
+                    This indicates numerical instability in the forward pass. \
+                    Consider reducing learning rate or adding gradient clipping.",
+                    min_val, max_val
+                ),
+            ));
+        }
+
+        // Warn if logits are very large (potential overflow risk)
+        if max_val > 50.0 || min_val < -50.0 {
+            tracing::warn!(
+                "Large logits detected (min={}, max={}), potential numerical instability",
+                min_val,
+                max_val
+            );
+        }
+
         // Check if targets are probabilities (same ndim as logits) or class indices
         let logits_shape = logits.shape()?;
         let targets_shape = targets.shape()?;
@@ -55,45 +86,53 @@ impl Losses {
                 sys::mlx_array_mean(loss, std::ptr::null(), 0, false)
             } else {
                 // Targets are class indices
-                // Compute logsumexp for numerical stability
-                let logsumexp_logits = sys::mlx_array_logsumexp(logits.handle.0, -1, false);
+                // Use log_softmax directly (TRL pattern) - more stable than logsumexp for BF16
+                // TRL: logps = torch.gather(logits.log_softmax(-1), dim=-1, index=index.unsqueeze(-1))
+                let log_probs = sys::mlx_array_log_softmax(logits.handle.0, -1);
 
-                // Get score at target indices
+                // Get log probability at target indices
                 let expanded_targets = sys::mlx_array_expand_dims(targets.handle.0, -1);
-                let gathered =
-                    sys::mlx_array_take_along_axis(logits.handle.0, expanded_targets, -1);
-                let score = sys::mlx_array_squeeze(gathered, std::ptr::null(), 0);
+                let gathered = sys::mlx_array_take_along_axis(log_probs, expanded_targets, -1);
+                let target_log_probs = sys::mlx_array_squeeze(gathered, std::ptr::null(), 0);
 
                 let loss = if smoothing > 0.0 {
                     // Apply label smoothing
-                    // Adjusted score: (1 - label_smoothing) * score
+                    // With label smoothing: loss = (1-smooth)*(-log_prob) + smooth*(-mean(log_probs))
                     let one_minus_smooth = 1.0 - smoothing;
                     let one_minus_smooth_scalar = sys::mlx_array_scalar_float(one_minus_smooth);
-                    let adjusted_score = sys::mlx_array_mul(score, one_minus_smooth_scalar);
 
-                    // Calculate mean logits for smoothed loss
+                    // Negative log prob for target (main loss)
+                    let neg_target_log_prob = sys::mlx_array_negative(target_log_probs);
+                    let main_loss =
+                        sys::mlx_array_mul(neg_target_log_prob, one_minus_smooth_scalar);
+
+                    // Mean negative log prob across vocab (smoothing term)
                     let axes = [-1i32];
-                    let mean_logits = sys::mlx_array_mean(logits.handle.0, axes.as_ptr(), 1, false);
+                    let mean_log_probs = sys::mlx_array_mean(log_probs, axes.as_ptr(), 1, false);
+                    let neg_mean_log_probs = sys::mlx_array_negative(mean_log_probs);
                     let smooth_scalar = sys::mlx_array_scalar_float(smoothing);
-                    let smoothed_loss = sys::mlx_array_mul(mean_logits, smooth_scalar);
+                    let smooth_loss = sys::mlx_array_mul(neg_mean_log_probs, smooth_scalar);
 
-                    // Combine: logsumexp - adjusted_score - smoothed_loss
-                    let loss_part1 = sys::mlx_array_sub(logsumexp_logits, adjusted_score);
-                    let loss_part2 = sys::mlx_array_sub(loss_part1, smoothed_loss);
+                    // Combine: (1-smooth)*(-log_prob_target) + smooth*(-mean(log_probs))
+                    let combined_loss = sys::mlx_array_add(main_loss, smooth_loss);
 
                     // Clean up temporaries
                     sys::mlx_array_delete(one_minus_smooth_scalar);
-                    sys::mlx_array_delete(adjusted_score);
-                    sys::mlx_array_delete(mean_logits);
+                    sys::mlx_array_delete(neg_target_log_prob);
+                    sys::mlx_array_delete(main_loss);
+                    sys::mlx_array_delete(mean_log_probs);
+                    sys::mlx_array_delete(neg_mean_log_probs);
                     sys::mlx_array_delete(smooth_scalar);
-                    sys::mlx_array_delete(smoothed_loss);
-                    sys::mlx_array_delete(loss_part1);
+                    sys::mlx_array_delete(smooth_loss);
 
-                    loss_part2
+                    combined_loss
                 } else {
-                    // Standard cross entropy: logsumexp - score
-                    sys::mlx_array_sub(logsumexp_logits, score)
+                    // Standard cross entropy: -log_softmax(logits)[target]
+                    sys::mlx_array_negative(target_log_probs)
                 };
+
+                // Clean up log_probs (used in both paths)
+                sys::mlx_array_delete(log_probs);
 
                 // Handle ignore_index if provided
                 // Key fix: Normalize by valid token count, not total tokens
@@ -135,10 +174,9 @@ impl Losses {
                 };
 
                 // Clean up intermediates
-                sys::mlx_array_delete(logsumexp_logits);
                 sys::mlx_array_delete(expanded_targets);
                 sys::mlx_array_delete(gathered);
-                sys::mlx_array_delete(score);
+                sys::mlx_array_delete(target_log_probs);
                 sys::mlx_array_delete(loss);
 
                 mean_loss

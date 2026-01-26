@@ -9,6 +9,7 @@ mod help;
 mod logs;
 mod metrics;
 mod progress;
+mod prompt;
 mod sample_detail;
 mod samples;
 mod settings;
@@ -81,9 +82,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         help::draw(f);
     }
 
-    // Quit confirmation popup (highest priority)
+    // Quit confirmation popup
     if app.show_quit_confirm {
         confirm_quit::draw(f);
+    }
+
+    // Interactive prompt popup (highest priority - blocks everything)
+    if let Some(ref active_prompt) = app.active_prompt {
+        prompt::draw(f, active_prompt);
     }
 }
 
@@ -95,9 +101,11 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         widgets::{Block, Borders, Tabs},
     };
 
+    // Get available tabs based on training type (SFT hides Samples and DB)
+    let available_tabs = app.get_available_tabs();
+
     // Create tab titles using ActiveTab::title()
-    let all_tabs = [ActiveTab::Logs, ActiveTab::Samples, ActiveTab::Config];
-    let titles: Vec<Line> = all_tabs
+    let titles: Vec<Line> = available_tabs
         .iter()
         .map(|tab| {
             let style = if *tab == app.active_tab {
@@ -111,8 +119,14 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
+    // Find the index of the active tab in the available tabs
+    let selected_index = available_tabs
+        .iter()
+        .position(|t| *t == app.active_tab)
+        .unwrap_or(0);
+
     let tabs = Tabs::new(titles)
-        .select(app.active_tab.index())
+        .select(selected_index)
         .style(Style::default().fg(Color::White))
         .highlight_style(Style::default().fg(Color::Cyan));
 
@@ -158,46 +172,96 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
         app.generation_time_ms, app.training_time_ms
     );
 
-    // Best reward display (handle initial state)
-    let best_reward_str = if app.best_reward > f64::NEG_INFINITY {
-        format!("{:.2}", app.best_reward)
+    // First two lines are common to both SFT and GRPO
+    let line1 = Line::from(vec![
+        Span::raw("Tokens: "),
+        Span::styled(tokens_str, Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!(" ({tokens_per_sec})"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(" | Elapsed: "),
+        Span::styled(app.elapsed_str(), Style::default().fg(Color::Cyan)),
+        Span::raw(" | ETA: "),
+        Span::styled(app.eta_str(), Style::default().fg(Color::Yellow)),
+    ]);
+
+    // Memory display (convert MB to GB)
+    let memory_str = if app.peak_memory_mb > 0.0 {
+        format!(
+            "{:.1}GB peak, {:.1}GB active",
+            app.peak_memory_mb / 1024.0,
+            app.active_memory_mb / 1024.0
+        )
     } else {
         "-".to_string()
     };
 
-    let avg_reward_str = if app.reward_count > 0 {
-        format!("{:.2}", app.avg_reward())
-    } else {
-        "-".to_string()
-    };
+    let line2 = Line::from(vec![
+        Span::raw("Speed: "),
+        Span::styled(speed_str, Style::default().fg(Color::Yellow)),
+        Span::raw(" "),
+        Span::styled(gen_train, Style::default().fg(Color::DarkGray)),
+        Span::raw(" | Memory: "),
+        Span::styled(memory_str, Style::default().fg(Color::Magenta)),
+    ]);
 
-    let lines = vec![
+    // Third line differs based on training type
+    let line3 = if app.training_type == "sft" {
+        // SFT: Show best and average loss
+        let best_loss_str = if app.best_loss < f64::INFINITY {
+            format!("{:.4}", app.best_loss)
+        } else {
+            "-".to_string()
+        };
+
+        let avg_loss_str = if app.loss_count > 0 {
+            format!("{:.4}", app.avg_loss())
+        } else {
+            "-".to_string()
+        };
+
         Line::from(vec![
-            Span::raw("Tokens: "),
-            Span::styled(tokens_str, Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!(" ({tokens_per_sec})"),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw(" | Elapsed: "),
-            Span::styled(app.elapsed_str(), Style::default().fg(Color::Cyan)),
-            Span::raw(" | ETA: "),
-            Span::styled(app.eta_str(), Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(vec![
-            Span::raw("Speed: "),
-            Span::styled(speed_str, Style::default().fg(Color::Yellow)),
-            Span::raw(" "),
-            Span::styled(gen_train, Style::default().fg(Color::DarkGray)),
-        ]),
+            Span::raw("Loss: "),
+            Span::styled("Best ", Style::default().fg(Color::DarkGray)),
+            Span::styled(best_loss_str, Style::default().fg(Color::Green)),
+            Span::styled(" | Avg ", Style::default().fg(Color::DarkGray)),
+            Span::styled(avg_loss_str, Style::default().fg(Color::Cyan)),
+        ])
+    } else {
+        // GRPO: Show best and average reward
+        let best_reward_str = if app.best_reward > f64::NEG_INFINITY {
+            format!("{:.2}", app.best_reward)
+        } else {
+            "-".to_string()
+        };
+
+        let avg_reward_str = if app.reward_count > 0 {
+            format!("{:.2}", app.avg_reward())
+        } else {
+            "-".to_string()
+        };
+
+        let std_reward_str = if app.reward_count > 0 && app.current_std_reward > 0.0 {
+            format!("±{:.2}", app.current_std_reward)
+        } else {
+            String::new()
+        };
+
         Line::from(vec![
             Span::raw("Reward: "),
             Span::styled("Best ", Style::default().fg(Color::DarkGray)),
             Span::styled(best_reward_str, Style::default().fg(Color::Green)),
             Span::styled(" | Avg ", Style::default().fg(Color::DarkGray)),
             Span::styled(avg_reward_str, Style::default().fg(Color::Cyan)),
-        ]),
-    ];
+            Span::styled(
+                format!(" {}", std_reward_str),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    };
+
+    let lines = vec![line1, line2, line3];
 
     let block = Block::default()
         .borders(Borders::ALL)

@@ -2,38 +2,47 @@
   "name": "mlx-node",
   "version": "0.0.0",
   "private": true,
-  "type": "module",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "examples"
   ],
+  "type": "module",
   "scripts": {
     "build": "yarn build:native && yarn build:ts",
     "build:native": "napi build --manifest-path crates/mlx-core/Cargo.toml --platform -o packages/core --js index.cjs --dts index.d.cts --release",
     "build:debug": "napi build --manifest-path crates/mlx-core/Cargo.toml --platform -o packages/core --js index.cjs --dts index.d.cts",
     "build:ts": "tsc -b",
     "clean": "rm -rf packages/*/dist",
-    "test": "vitest run && TEST_TRAINER=1 vitest run",
-    "lint": "oxlint",
-    "format": "oxfmt --config .oxfmtrc.json",
+    "test": "vite test run && TEST_TRAINER=1 vite test run",
+    "lint": "vite lint",
+    "format": "vite fmt",
     "typecheck": "tsc -b",
     "download:gsm8k": "yarn oxnode scripts/download-gsm8k.ts",
     "download:qwen3": "yarn oxnode scripts/download-qwen3.ts"
   },
   "devDependencies": {
-    "@ast-grep/napi": "^0.40.3",
-    "@huggingface/hub": "^2.7.1",
+    "@ast-grep/napi": "^0.40.5",
+    "@huggingface/hub": "^2.7.2",
+    "@inquirer/prompts": "^8.2.0",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/trl": "workspace:*",
-    "@napi-rs/cli": "^3.5.0",
+    "@napi-rs/cli": "^3.5.1",
+    "@napi-rs/keyring": "^1.2.0",
+    "@napi-rs/simple-git": "^0.1.22",
     "@oxc-node/cli": "^0.0.35",
     "@oxc-node/core": "^0.0.35",
     "@std/toml": "npm:@jsr/std__toml@^1.0.11",
-    "@types/node": "^25.0.2",
-    "oxc-parser": "^0.105.0",
-    "oxfmt": "^0.18.0",
-    "oxlint": "^1.33.0",
+    "@types/node": "^25.0.10",
+    "octokit": "^5.0.5",
+    "oxc-parser": "^0.110.0",
+    "prettier": "^3.8.1",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.15"
+    "vite-plus": "catalog:",
+    "vitest": "catalog:"
+  },
+  "resolutions": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@latest",
+    "vitest": "npm:@voidzero-dev/vite-plus-test@latest"
   },
   "packageManager": "yarn@4.12.0"
 }

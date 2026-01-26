@@ -52,13 +52,13 @@ const model = await Qwen3Model.loadPretrained('./models/qwen3-0.6b');
 // Configure trainer
 const trainer = new GRPOTrainer({
   model,
-  lossType: 'grpo',              // or 'dapo', 'dr_grpo', 'bnpo'
+  lossType: 'grpo', // or 'dapo', 'dr_grpo', 'bnpo'
   learningRate: 1e-5,
   batchSize: 4,
-  groupSize: 4,                  // for advantage normalization
-  clipEpsilon: 0.2,              // PPO-style clipping
-  topEntropyQuantile: 0.8,       // train on top 20% uncertain tokens
-  importanceSamplingLevel: 'token'  // or 'sequence', 'none'
+  groupSize: 4, // for advantage normalization
+  clipEpsilon: 0.2, // PPO-style clipping
+  topEntropyQuantile: 0.8, // train on top 20% uncertain tokens
+  importanceSamplingLevel: 'token', // or 'sequence', 'none'
 });
 
 // Define reward function
@@ -72,7 +72,7 @@ await trainer.train(dataset, {
   epochs: 3,
   rewardFunction: rewardFn,
   saveCheckpoints: true,
-  checkpointDir: './checkpoints'
+  checkpointDir: './checkpoints',
 });
 ```
 
@@ -120,10 +120,10 @@ Advantages are computed using group-based normalization:
 ```typescript
 function computeAdvantages(rewards: number[], groupSize: number) {
   const groups = chunkArray(rewards, groupSize);
-  return groups.flatMap(group => {
+  return groups.flatMap((group) => {
     const mean = average(group);
     const std = standardDeviation(group);
-    return group.map(r => (r - mean) / (std + 1e-8));
+    return group.map((r) => (r - mean) / (std + 1e-8));
   });
 }
 ```

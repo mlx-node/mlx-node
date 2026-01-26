@@ -161,9 +161,9 @@ const [loss, grads] = valueAndGrad([x, y], (params) => {
   return xSq.add(ySq);
 });
 
-console.log(`Loss: ${loss.toFloat32()[0]}`);  // 25.0
-console.log(`Grad X: ${grads[0].toFloat32()[0]}`);  // 6.0
-console.log(`Grad Y: ${grads[1].toFloat32()[0]}`);  // 8.0
+console.log(`Loss: ${loss.toFloat32()[0]}`); // 25.0
+console.log(`Grad X: ${grads[0].toFloat32()[0]}`); // 6.0
+console.log(`Grad Y: ${grads[1].toFloat32()[0]}`); // 8.0
 ```
 
 ### 2. GRPO Training with Autograd
@@ -178,11 +178,11 @@ const model = await Qwen3Model.loadPretrained('path/to/model');
 const [loss, metrics] = model.trainStepGrpoAutograd(
   promptTokens,
   completionTokens,
-  completionLogprobs,  // From generation
+  completionLogprobs, // From generation
   rewards,
   groupSize,
   grpoConfig,
-  learningRate
+  learningRate,
 );
 
 console.log(`Loss: ${loss}, Gradients: ${metrics.num_gradients}`);

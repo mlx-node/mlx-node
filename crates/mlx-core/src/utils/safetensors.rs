@@ -225,17 +225,16 @@ impl SafeTensorsFile {
                 MxArray::from_float32(&float_data, &shape)
             }
             SafeTensorDType::F16 => {
-                // Load as f32 then convert to f16 to preserve original dtype
-                let float_data = f16_bytes_to_f32(&buffer);
-                let f32_array = MxArray::from_float32(&float_data, &shape)?;
-                f32_array.astype(DType::Float16)
+                // Load f16 directly without f32 conversion - saves ~2x memory
+                let u16_data = bytes_to_u16(&buffer);
+                MxArray::from_float16(&u16_data, &shape)
             }
             SafeTensorDType::BF16 => {
-                // Load as f32 then convert to bf16 for better performance
-                let float_data = bf16_bytes_to_f32(&buffer);
-                let f32_array = MxArray::from_float32(&float_data, &shape)?;
-                // Convert to bf16 to match original dtype
-                f32_array.astype(DType::BFloat16)
+                // Load bf16 directly without f32 conversion - saves ~2x memory
+                // Previously this created 3 copies: f32 Vec + f32 MxArray + bf16 MxArray
+                // Now we create just 1 copy: bf16 MxArray directly from raw bytes
+                let u16_data = bytes_to_u16(&buffer);
+                MxArray::from_bfloat16(&u16_data, &shape)
             }
             SafeTensorDType::I32 => {
                 // Convert bytes to i32 array
@@ -278,29 +277,12 @@ fn bytes_to_i32(bytes: &[u8]) -> Vec<i32> {
         .collect()
 }
 
-/// Convert f16 bytes to f32 (IEEE 754 half precision to single precision)
-fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+/// Convert bytes to u16 array (little-endian)
+/// Used for direct bf16/f16 loading without f32 conversion
+fn bytes_to_u16(bytes: &[u8]) -> Vec<u16> {
     bytes
         .chunks_exact(2)
-        .map(|chunk| {
-            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            half::f16::from_bits(bits).to_f32()
-        })
-        .collect()
-}
-
-/// Convert bf16 bytes to f32 (bfloat16 to single precision)
-/// bfloat16 is just f32 with the lower 16 bits truncated
-fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(2)
-        .map(|chunk| {
-            // BF16 is just the upper 16 bits of f32
-            let bf16_bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-            // Shift left 16 bits to get f32 representation
-            let f32_bits = (bf16_bits as u32) << 16;
-            f32::from_bits(f32_bits)
-        })
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect()
 }
 

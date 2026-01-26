@@ -5,7 +5,7 @@
  * used by the autograd system.
  */
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vite-plus/test';
 import { Qwen3Model, type Qwen3Config, MxArray } from '@mlx-node/core';
 import { shape } from '../test-utils';
 

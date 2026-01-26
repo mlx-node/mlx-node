@@ -35,6 +35,28 @@ pub struct GRPOLossConfig {
 
     /// Current gradient accumulation step (for loss scaling)
     pub gradient_accumulation_steps: i64,
+
+    /// Batch chunk size for LM head computation (memory optimization).
+    /// When set, the LM head (hidden_states -> logits) is computed in chunks
+    /// of this size to reduce peak memory usage.
+    /// Default: None (no chunking, full batch at once)
+    /// Recommended: 2 for batch_size >= 4 with large vocabularies (e.g., 151936)
+    pub lm_head_chunk_size: Option<i64>,
+
+    /// Batch chunk size for transformer forward pass (memory optimization).
+    /// When set, the transformer layers process the batch in chunks of this size,
+    /// reducing peak memory from O(batch × heads × seq²) for attention.
+    /// Default: None (no chunking, full batch at once)
+    /// Recommended: 4 for batch_size >= 4 with groupSize >= 4
+    /// Memory savings: ~70-80% for batch=4, groupSize=4 (16 sequences → 4 at a time)
+    pub forward_chunk_size: Option<i64>,
+
+    /// Chunk size for vocabulary dimension in cross-entropy computation.
+    /// When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
+    /// the computation is split into chunks of this size to reduce peak memory usage.
+    /// Default: 65536 (2^16)
+    /// Recommended: 65536 for Qwen3 (vocab=151936) splits into 3 chunks
+    pub vocab_chunk_size: Option<i64>,
 }
 
 impl Clone for GRPOLossConfig {
@@ -48,6 +70,9 @@ impl Clone for GRPOLossConfig {
             max_completion_length: self.max_completion_length,
             num_items_in_batch: self.num_items_in_batch,
             gradient_accumulation_steps: self.gradient_accumulation_steps,
+            lm_head_chunk_size: self.lm_head_chunk_size,
+            forward_chunk_size: self.forward_chunk_size,
+            vocab_chunk_size: self.vocab_chunk_size,
         }
     }
 }
@@ -63,6 +88,9 @@ impl Default for GRPOLossConfig {
             max_completion_length: Some(256),
             num_items_in_batch: None,
             gradient_accumulation_steps: 1,
+            lm_head_chunk_size: None,      // Default: no chunking
+            forward_chunk_size: None,      // Default: no chunking
+            vocab_chunk_size: Some(65536), // Default: 2^16 chunks for large vocabularies
         }
     }
 }
@@ -237,10 +265,7 @@ pub fn grpo_loss(
             let clamped_sum_mask = sum_mask.maximum(&MxArray::scalar_float(1.0)?)?;
 
             let per_seq_loss = sum_loss.div(&clamped_sum_mask)?;
-            let mean_loss = per_seq_loss.mean(None, Some(false))?;
-
-            // Scale by gradient accumulation steps
-            mean_loss.div_scalar(config.gradient_accumulation_steps as f64)?
+            per_seq_loss.mean(None, Some(false))?
         }
         "bnpo" => {
             // Batch-normalized: sum(loss * mask) / sum(mask)
@@ -250,8 +275,7 @@ pub fn grpo_loss(
             let total_mask = completion_mask.sum(None, Some(false))?;
             let clamped_total_mask = total_mask.maximum(&MxArray::scalar_float(1.0)?)?;
 
-            let loss = total_loss.div(&clamped_total_mask)?;
-            loss.div_scalar(config.gradient_accumulation_steps as f64)?
+            total_loss.div(&clamped_total_mask)?
         }
         "dr_grpo" => {
             // Distributional GRPO: sum(loss * mask) / (B * max_length)
@@ -266,8 +290,7 @@ pub fn grpo_loss(
             let total_loss = masked_loss.sum(None, Some(false))?;
 
             let normalizer = batch_size as f64 * max_len;
-            let loss = total_loss.div_scalar(normalizer)?;
-            loss.div_scalar(config.gradient_accumulation_steps as f64)?
+            total_loss.div_scalar(normalizer)?
         }
         "dapo" => {
             // DAPO (Data-Augmented Policy Optimization): sum(loss * mask) / num_items
@@ -291,7 +314,14 @@ pub fn grpo_loss(
         }
     };
 
-    Ok(loss)
+    // Scale loss by 1/gradient_accumulation_steps for proper gradient averaging
+    let scaled_loss = if config.gradient_accumulation_steps > 1 {
+        loss.div_scalar(config.gradient_accumulation_steps as f64)?
+    } else {
+        loss
+    };
+
+    Ok(scaled_loss)
 }
 
 /// Compute importance sampling ratios for GRPO

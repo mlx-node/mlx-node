@@ -95,11 +95,74 @@ static THINK_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 static THINK_TAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<think>[\s\S]*?</think>").expect("Invalid think tag regex"));
 
+/// Sanitize JSON string by escaping raw control characters inside string values.
+///
+/// LLMs often generate JSON with raw newlines inside strings for readability.
+/// This function escapes control characters (`\u0000-\u001F`) found inside
+/// quoted string values so that standard JSON parsers can handle them.
+///
+/// # Example
+/// ```ignore
+/// let input = r#"{"code": "line1
+/// line2"}"#;
+/// let sanitized = sanitize_json_string(input);
+/// // sanitized: {"code": "line1\nline2"}
+/// ```
+fn sanitize_json_string(input: &str) -> String {
+    let mut result = String::with_capacity(input.len() + 64);
+    let mut in_string = false;
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_string {
+            if c == '\\' {
+                // Escaped character - copy the backslash and the next char as-is
+                result.push(c);
+                if let Some(next) = chars.next() {
+                    result.push(next);
+                }
+            } else if c == '"' {
+                // End of string
+                in_string = false;
+                result.push(c);
+            } else if c.is_ascii_control() {
+                // Control character inside string - escape it
+                match c {
+                    '\n' => result.push_str("\\n"),
+                    '\r' => result.push_str("\\r"),
+                    '\t' => result.push_str("\\t"),
+                    '\x08' => result.push_str("\\b"),
+                    '\x0C' => result.push_str("\\f"),
+                    _ => {
+                        // Other control characters as \uXXXX
+                        result.push_str(&format!("\\u{:04x}", c as u32));
+                    }
+                }
+            } else {
+                result.push(c);
+            }
+        } else {
+            // Not in a string
+            if c == '"' {
+                in_string = true;
+            }
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 /// Parse a JSON format tool call
 ///
 /// Format: `<tool_call>{"name": "func", "arguments": {...}}</tool_call>`
+///
+/// This function is tolerant of raw control characters (newlines, tabs, etc.)
+/// inside JSON string values, which LLMs commonly generate for readability.
 fn parse_json_tool_call(json_str: &str, raw_content: &str) -> ToolCallResult {
-    match serde_json::from_str::<Value>(json_str) {
+    // Sanitize the JSON to escape raw control characters inside strings
+    let sanitized = sanitize_json_string(json_str);
+    match serde_json::from_str::<Value>(&sanitized) {
         Ok(parsed) => {
             let name = parsed
                 .get("name")
@@ -296,8 +359,6 @@ pub struct RewardOutput {
     pub prompt: String,
     /// Structured completion data aligned with ChatResult
     pub completion: CompletionInfo,
-    /// Ground truth answer from dataset (if available)
-    pub expected_answer: Option<String>,
 }
 
 /// Parse tool calls from text (NAPI export)
@@ -346,7 +407,6 @@ pub fn parse_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Opti
 /// # Arguments
 /// * `prompts` - Array of prompt texts (one per unique prompt, will be expanded by group_size)
 /// * `completions` - Array of completion texts (prompts.len() * group_size total)
-/// * `answers` - Array of expected answers (one per unique prompt, will be expanded by group_size)
 /// * `token_counts` - Array of token counts for each completion
 /// * `finish_reasons` - Array of finish reasons from generation ("eos", "length", "stop", "repetition")
 /// * `group_size` - Number of completions per prompt
@@ -361,7 +421,6 @@ pub fn parse_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Opti
 /// const outputs = buildRewardOutputs(
 ///   ['What is 2+2?'],           // prompts
 ///   ['<think>Let me calculate</think>\n\n4', '4'],  // completions (group_size=2)
-///   ['4'],                       // expected answers
 ///   [10, 5],                     // token counts
 ///   ['eos', 'length'],          // finish reasons
 ///   2                            // group_size
@@ -370,13 +429,11 @@ pub fn parse_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Opti
 /// outputs[0].completion.thinking; // "Let me calculate"
 /// outputs[0].completion.text;     // "4"
 /// outputs[0].completion.finishReason; // "eos"
-/// outputs[0].expectedAnswer;      // "4"
 /// ```
 #[napi]
 pub fn build_reward_outputs(
     prompts: Vec<String>,
     completions: Vec<String>,
-    answers: Vec<Option<String>>,
     token_counts: Vec<u32>,
     finish_reasons: Vec<String>,
     group_size: u32,
@@ -405,9 +462,6 @@ pub fn build_reward_outputs(
         // Get prompt text
         let prompt = prompts.get(prompt_idx).cloned().unwrap_or_default();
 
-        // Get expected answer
-        let expected_answer = answers.get(prompt_idx).cloned().flatten();
-
         outputs.push(RewardOutput {
             prompt,
             completion: CompletionInfo {
@@ -418,7 +472,6 @@ pub fn build_reward_outputs(
                 num_tokens,
                 finish_reason,
             },
-            expected_answer,
         });
     }
 
@@ -622,5 +675,125 @@ Here's the result."#;
         assert_eq!(text, "Just a plain response without any special tags.");
         assert!(tool_calls.is_empty());
         assert!(thinking.is_none());
+    }
+
+    // Tests for sanitize_json_string
+
+    #[test]
+    fn test_sanitize_json_string_with_raw_newlines() {
+        // Simulates model output with raw newlines inside a string value
+        let input = "{\n  \"code\": \"line1\nline2\nline3\"\n}";
+        let sanitized = sanitize_json_string(input);
+
+        // The newlines inside the string should be escaped
+        assert_eq!(sanitized, "{\n  \"code\": \"line1\\nline2\\nline3\"\n}");
+
+        // Should now be valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        assert_eq!(parsed["code"], "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn test_sanitize_json_string_with_tabs_and_carriage_returns() {
+        let input = "{\n  \"text\": \"has\ttab\rand\r\ncrlf\"\n}";
+        let sanitized = sanitize_json_string(input);
+
+        // Tabs and CRs inside string should be escaped
+        assert!(sanitized.contains("\\t"));
+        assert!(sanitized.contains("\\r"));
+
+        // Should now be valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        assert_eq!(parsed["text"], "has\ttab\rand\r\ncrlf");
+    }
+
+    #[test]
+    fn test_sanitize_json_string_with_escaped_quotes() {
+        // String containing escaped quotes should not confuse the parser
+        let input = r#"{"text": "he said \"hello\"\nand left"}"#;
+        let sanitized = sanitize_json_string(input);
+
+        // The escaped quote should remain, newline should be escaped
+        assert!(sanitized.contains(r#"\"hello\""#));
+
+        // Should be valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        assert_eq!(parsed["text"], "he said \"hello\"\nand left");
+    }
+
+    #[test]
+    fn test_sanitize_json_string_with_escaped_backslash() {
+        // A backslash-backslash before a quote: \\" means end of string
+        let input = "{\n  \"path\": \"C:\\\\\nD:\\\\\"\n}";
+        let sanitized = sanitize_json_string(input);
+
+        // Should be valid JSON - the \n between paths should be escaped
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        assert_eq!(parsed["path"], "C:\\\nD:\\");
+    }
+
+    #[test]
+    fn test_sanitize_json_string_multiline_code() {
+        // Real-world case: model generates code with newlines
+        let input = r#"{
+  "name": "run_js",
+  "arguments": {
+    "code": "import { foo } from './bar'
+export function main() {
+  console.log('hello')
+}"
+  }
+}"#;
+        let sanitized = sanitize_json_string(input);
+
+        // Should be valid JSON now
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        assert_eq!(parsed["name"], "run_js");
+        let code = parsed["arguments"]["code"].as_str().unwrap();
+        assert!(code.contains("import { foo }"));
+        assert!(code.contains("export function main()"));
+        assert!(code.contains("console.log"));
+    }
+
+    #[test]
+    fn test_sanitize_json_string_preserves_valid_json() {
+        // Already valid JSON should pass through unchanged (except the escapes are equivalent)
+        let input = r#"{"name": "test", "args": {"key": "value"}}"#;
+        let sanitized = sanitize_json_string(input);
+        assert_eq!(sanitized, input);
+    }
+
+    #[test]
+    fn test_sanitize_json_string_nested_objects() {
+        let input = "{\n  \"outer\": {\n    \"inner\": \"line1\nline2\"\n  }\n}";
+        let sanitized = sanitize_json_string(input);
+
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        assert_eq!(parsed["outer"]["inner"], "line1\nline2");
+    }
+
+    #[test]
+    fn test_sanitize_json_tool_call_integration() {
+        // Full integration test: tool call with raw newlines in code
+        let input = r#"<tool_call>
+{
+  "name": "run_js",
+  "arguments": {
+    "code": "const x = 1
+const y = 2
+console.log(x + y)"
+  }
+}
+</tool_call>"#;
+
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].status, "ok");
+        assert_eq!(calls[0].name, "run_js");
+        let code = calls[0].arguments["code"].as_str().unwrap();
+        assert!(code.contains("const x = 1"));
+        assert!(code.contains("const y = 2"));
+        assert!(code.contains("console.log"));
     }
 }

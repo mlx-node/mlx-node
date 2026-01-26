@@ -359,7 +359,7 @@ mean_terminated_length = lengths[~is_truncated].mean()
 interface GenerationResult {
   tokens: Int32Array;
   logprobs: Float32Array;
-  finishedReason: 'eos' | 'max_length';  // Why generation stopped
+  finishedReason: 'eos' | 'max_length'; // Why generation stopped
   length: number;
 }
 ```
@@ -554,8 +554,8 @@ it('should compute correct logprobs for generated tokens', () => {
 ```typescript
 it('should sample from correct distribution', () => {
   const logits = MxArray.fromFloat32(
-    float32(0.1, 0.7, 0.2),  // Probs after softmax
-    shape(1, 3)
+    float32(0.1, 0.7, 0.2), // Probs after softmax
+    shape(1, 3),
   );
 
   // Sample 1000 times
@@ -566,11 +566,11 @@ it('should sample from correct distribution', () => {
 
   // Check distribution matches expected probabilities
   const counts = [0, 0, 0];
-  samples.forEach(s => counts[s]++);
+  samples.forEach((s) => counts[s]++);
 
-  expect(counts[0]).toBeCloseTo(100, 20);  // ~10%
-  expect(counts[1]).toBeCloseTo(700, 50);  // ~70%
-  expect(counts[2]).toBeCloseTo(200, 30);  // ~20%
+  expect(counts[0]).toBeCloseTo(100, 20); // ~10%
+  expect(counts[1]).toBeCloseTo(700, 50); // ~70%
+  expect(counts[2]).toBeCloseTo(200, 30); // ~20%
 });
 ```
 
@@ -610,7 +610,7 @@ it('should keep only top k tokens', () => {
   const filtered = Sampling.applyTopK(logprobs, topK);
 
   // Count non -inf values
-  const valid = filtered.toFloat32().filter(x => x > -Infinity);
+  const valid = filtered.toFloat32().filter((x) => x > -Infinity);
   expect(valid.length).toBe(topK);
 
   // Verify top k tokens are the highest probability ones
@@ -625,8 +625,8 @@ it('should keep only top k tokens', () => {
 ```typescript
 it('should keep tokens with cumulative prob < top_p', () => {
   const logprobs = MxArray.fromFloat32(
-    float32(-1, -2, -3, -4, -5),  // Log probs
-    shape(1, 5)
+    float32(-1, -2, -3, -4, -5), // Log probs
+    shape(1, 5),
   );
   const topP = 0.7;
 
@@ -637,7 +637,7 @@ it('should keep tokens with cumulative prob < top_p', () => {
   const cumsum = probs.cumsum(0);
 
   // All kept tokens should have cumsum ≤ top_p
-  expect(cumsum.toFloat32().every(x => x <= topP + 0.01)).toBe(true);
+  expect(cumsum.toFloat32().every((x) => x <= topP + 0.01)).toBe(true);
 });
 ```
 
@@ -680,8 +680,8 @@ it('should increase randomness with higher temperature', () => {
   }
 
   // High temp should have more unique completions
-  const uniqueLow = new Set(lowTempResults.map(r => r.tokens.join(',')));
-  const uniqueHigh = new Set(highTempResults.map(r => r.tokens.join(',')));
+  const uniqueLow = new Set(lowTempResults.map((r) => r.tokens.join(',')));
+  const uniqueHigh = new Set(highTempResults.map((r) => r.tokens.join(',')));
 
   expect(uniqueHigh.size).toBeGreaterThan(uniqueLow.size);
 });
@@ -698,15 +698,13 @@ it('should reduce repetitive tokens', () => {
   const noPenalty = model.generate(inputIds, 50, 1.0);
 
   // Generate with repetition penalty
-  const withPenalty = model.generateWithRepetitionPenalty(
-    inputIds, 50, 1.0, penalty=1.5
-  );
+  const withPenalty = model.generateWithRepetitionPenalty(inputIds, 50, 1.0, (penalty = 1.5));
 
   // Count repeated tokens
   const countRepeats = (tokens: Int32Array) => {
     const counts = {};
-    tokens.forEach(t => counts[t] = (counts[t] || 0) + 1);
-    return Object.values(counts).filter(c => c > 1).length;
+    tokens.forEach((t) => (counts[t] = (counts[t] || 0) + 1));
+    return Object.values(counts).filter((c) => c > 1).length;
   };
 
   expect(countRepeats(withPenalty)).toBeLessThan(countRepeats(noPenalty));
@@ -778,7 +776,7 @@ it('should reduce repetitive tokens', () => {
 
    ```typescript
    class Sampler {
-     sample(logits: MxArray, config: SamplingConfig): MxArray
+     sample(logits: MxArray, config: SamplingConfig): MxArray;
    }
    ```
 

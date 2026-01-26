@@ -8,12 +8,19 @@ name = "mlx-train"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
-tokio = { version = "1", features = ["full", "process", "io-util"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+tokio = { version = "1", features = ["full", "process", "io-util", "signal"] }
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
 color-eyre = "0.6"
+mlx-db = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -13,7 +13,7 @@
  * Future work: Add explicit CPU stream testing when stream API is exposed.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { MxArray, Linear, RMSNorm, Attention, Losses, Activations, Gradients, Adam } from '@mlx-node/core';
 import { shape, float32 } from '../test-utils.js';
 

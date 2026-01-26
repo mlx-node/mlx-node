@@ -7,8 +7,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{List, ListItem},
 };
+use tracing::debug;
 
 use crate::app::App;
+use crate::messages::LogLevel;
 
 /// Draw the log viewer
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
@@ -21,6 +23,18 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .filter(|entry| entry.level >= app.log_level_filter)
         .collect();
+
+    // Debug: trace filter state when viewing Error filter with 0 results
+    if app.log_level_filter == LogLevel::Error && filtered_logs.is_empty() && !app.logs.is_empty() {
+        debug!(
+            "Error filter showing 0 entries. Total logs: {}, Error count: {}",
+            app.logs.len(),
+            app.logs
+                .iter()
+                .filter(|e| e.level == LogLevel::Error)
+                .count()
+        );
+    }
 
     // Header line showing filter level
     let filter_line = Line::from(vec![

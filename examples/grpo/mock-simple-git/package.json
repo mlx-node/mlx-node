@@ -1,0 +1,9 @@
+{
+  "name": "@napi-rs/simple-git",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  }
+}

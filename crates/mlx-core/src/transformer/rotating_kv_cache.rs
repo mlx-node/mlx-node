@@ -98,12 +98,18 @@ impl RotatingKVCache {
             let stops = vec![v_shape[0], v_shape[1], v_shape[2], v_shape[3]];
             let tail = v.slice(&starts, &stops)?;
 
-            // Slice [:, :, keep:idx, :]
-            let starts = vec![0, 0, self.keep as i64, 0];
-            let stops = vec![v_shape[0], v_shape[1], self.idx as i64, v_shape[3]];
-            let middle = v.slice(&starts, &stops)?;
+            // Only include middle section if keep < idx (otherwise it's empty)
+            if self.keep < self.idx {
+                // Slice [:, :, keep:idx, :]
+                let starts = vec![0, 0, self.keep as i64, 0];
+                let stops = vec![v_shape[0], v_shape[1], self.idx as i64, v_shape[3]];
+                let middle = v.slice(&starts, &stops)?;
 
-            MxArray::concatenate_many(vec![&keep_section, &tail, &middle], Some(2))
+                MxArray::concatenate_many(vec![&keep_section, &tail, &middle], Some(2))
+            } else {
+                // No middle section when keep >= idx
+                MxArray::concatenate(&keep_section, &tail, 2)
+            }
         } else {
             // Cache not yet full, slice off unused portion [:, :, 0:idx, :]
             let starts = [0, 0, 0, 0];

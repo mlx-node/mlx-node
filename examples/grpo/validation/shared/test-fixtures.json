@@ -1,0 +1,12 @@
+{
+  "owner": "mlx-node-training-example",
+  "repo": "mlx-node-test-repo",
+  "createdAt": "2026-01-02T06:29:06.528Z",
+  "branch": "test-fixture-branch",
+  "fileSha": "600fca30214072389b2aa2d2cf6b5cc748a0f1d9",
+  "prNumber": 2,
+  "prNodeId": "PR_kwDOQxAyvc67QIjC",
+  "reviewCommentId": 2656937671,
+  "issueCommentId": 3704598556,
+  "workflowExists": true
+}

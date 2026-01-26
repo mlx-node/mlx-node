@@ -2,7 +2,7 @@
 export type { CompletionInfo, RewardOutput } from '@mlx-node/core';
 import type { RewardOutput } from '@mlx-node/core';
 
-export type ChatRole = 'system' | 'user' | 'assistant';
+export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 
 export interface ChatMessage {
   role: ChatRole;
@@ -17,7 +17,6 @@ export type DatasetSplit = 'train' | 'test' | (string & {});
 
 export interface DatasetExample {
   prompt: ChatMessage[];
-  answer: string | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -41,7 +40,10 @@ export interface RewardComputationInput {
  * Takes an array of RewardOutput objects containing structured completion data.
  * Returns rewards for each completion (one per output).
  */
-export type RewardFunction = (outputs: RewardOutput[]) => number[] | Float32Array | Promise<number[] | Float32Array>;
+export type RewardFunction<T = unknown> = (
+  outputs: RewardOutput[],
+  context: T,
+) => number[] | Float32Array | Promise<number[] | Float32Array>;
 
 export interface PromptFormatterOptions {
   includeOneShot?: boolean;

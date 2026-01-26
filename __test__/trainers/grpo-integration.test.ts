@@ -4,7 +4,7 @@
  * These tests validate the entire training workflow end-to-end
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vite-plus/test';
 import { GRPOTrainer, type RewardOutput } from '@mlx-node/trl';
 import { existsSync, rmSync } from 'node:fs';
 import { createTempModel } from '../test-model-utils';
@@ -41,9 +41,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should complete a full training run with multiple epochs', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         numEpochs: 2,
         batchSize: 2,
         logInterval: 1,
@@ -69,9 +69,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should generate diverse completions across training', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 4,
-        maxNewTokens: 8,
+        maxCompletionLength: 8,
         temperature: 0.9, // High temperature for diversity
         numEpochs: 1,
         batchSize: 1,
@@ -102,9 +102,9 @@ describe.sequential('GRPO Integration Tests', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 6,
+        maxCompletionLength: 6,
         numEpochs: 1,
         batchSize: 2,
         logInterval: 1000,
@@ -137,9 +137,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should generate, score, and compute loss correctly', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         temperature: 0.8,
         logInterval: 1000,
         saveInterval: 1000,
@@ -162,7 +162,7 @@ describe.sequential('GRPO Integration Tests', () => {
       expect(rewards.length).toBe(3);
 
       // Execute training step
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
       expect(metrics.loss).toBeDefined();
       expect(isFinite(metrics.loss)).toBe(true);
       expect(metrics.meanReward).toBeGreaterThan(0);
@@ -171,9 +171,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should maintain consistency across multiple steps', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 4,
+        maxCompletionLength: 4,
         logInterval: 1000,
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
@@ -188,7 +188,7 @@ describe.sequential('GRPO Integration Tests', () => {
       // Run 5 training steps
       const metrics: any[] = [];
       for (let i = 0; i < 5; i++) {
-        const m = await trainer.trainStep(promptMessages, []);
+        const m = await trainer.trainStep(promptMessages);
         metrics.push(m);
       }
 
@@ -213,9 +213,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should compute GRPO loss correctly', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 4,
-        maxNewTokens: 6,
+        maxCompletionLength: 6,
         lossType: 'grpo',
         clipEpsilon: 0.2,
         logInterval: 1000,
@@ -229,7 +229,7 @@ describe.sequential('GRPO Integration Tests', () => {
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       expect(isFinite(metrics.loss)).toBe(true);
       expect(metrics.meanReward).toBeDefined();
@@ -242,9 +242,9 @@ describe.sequential('GRPO Integration Tests', () => {
       for (const lossType of lossTypes) {
         const trainer = await GRPOTrainer.create({
           modelPath: tempModel.modelPath,
-          modelConfig: 'qwen3-0.6b',
+          modelName: 'qwen3-0.6b',
           groupSize: 3,
-          maxNewTokens: 5,
+          maxCompletionLength: 5,
           lossType,
           logInterval: 1000,
           saveInterval: 1000,
@@ -257,7 +257,7 @@ describe.sequential('GRPO Integration Tests', () => {
 
         const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-        const metrics = await trainer.trainStep(promptMessages, []);
+        const metrics = await trainer.trainStep(promptMessages);
 
         expect(isFinite(metrics.loss)).toBe(true);
         expect(metrics.step).toBe(1);
@@ -270,9 +270,9 @@ describe.sequential('GRPO Integration Tests', () => {
       for (const epsilon of epsilons) {
         const trainer = await GRPOTrainer.create({
           modelPath: tempModel.modelPath,
-          modelConfig: 'qwen3-0.6b',
+          modelName: 'qwen3-0.6b',
           groupSize: 2,
-          maxNewTokens: 4,
+          maxCompletionLength: 4,
           clipEpsilon: epsilon,
           logInterval: 1000,
           saveInterval: 1000,
@@ -285,7 +285,7 @@ describe.sequential('GRPO Integration Tests', () => {
 
         const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-        const metrics = await trainer.trainStep(promptMessages, []);
+        const metrics = await trainer.trainStep(promptMessages);
 
         expect(isFinite(metrics.loss)).toBe(true);
       }
@@ -296,9 +296,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should normalize advantages per group', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 4,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         advantageNormalization: true,
         logInterval: 1000,
         saveInterval: 1000,
@@ -312,7 +312,7 @@ describe.sequential('GRPO Integration Tests', () => {
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       // Mean advantage should be close to 0 with group normalization
       expect(Math.abs(metrics.meanAdvantage)).toBeLessThan(1e-4);
@@ -321,9 +321,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should handle uniform rewards correctly', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 4,
+        maxCompletionLength: 4,
         logInterval: 1000,
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
@@ -336,7 +336,7 @@ describe.sequential('GRPO Integration Tests', () => {
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       // With uniform rewards, std should be 0
       expect(metrics.stdReward).toBeCloseTo(0, 5);
@@ -348,9 +348,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should handle large batches correctly', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         numEpochs: 1,
         batchSize: 5,
         logInterval: 1000,
@@ -378,9 +378,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should handle batch size larger than dataset', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         numEpochs: 1,
         batchSize: 20, // Larger than dataset
         logInterval: 1000,
@@ -408,9 +408,9 @@ describe.sequential('GRPO Integration Tests', () => {
       for (const temp of temperatures) {
         const trainer = await GRPOTrainer.create({
           modelPath: tempModel.modelPath,
-          modelConfig: 'qwen3-0.6b',
+          modelName: 'qwen3-0.6b',
           groupSize: 3,
-          maxNewTokens: 6,
+          maxCompletionLength: 6,
           temperature: temp,
           logInterval: 1000,
           saveInterval: 1000,
@@ -440,9 +440,9 @@ describe.sequential('GRPO Integration Tests', () => {
       for (const config of configs) {
         const trainer = await GRPOTrainer.create({
           modelPath: tempModel.modelPath,
-          modelConfig: 'qwen3-0.6b',
+          modelName: 'qwen3-0.6b',
           groupSize: 2,
-          maxNewTokens: 5,
+          maxCompletionLength: 5,
           temperature: 0.8,
           ...config,
           logInterval: 1000,
@@ -467,9 +467,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should handle empty dataset gracefully', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         numEpochs: 1,
         batchSize: 2,
         logInterval: 1000,
@@ -492,9 +492,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should throw error when reward function returns wrong count', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         logInterval: 1000,
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
@@ -518,9 +518,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should throw error when no reward function configured', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         logInterval: 1000,
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
@@ -542,9 +542,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should track all metrics correctly', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 4,
-        maxNewTokens: 6,
+        maxCompletionLength: 6,
         logInterval: 1000,
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
@@ -556,7 +556,7 @@ describe.sequential('GRPO Integration Tests', () => {
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       // Validate all metrics are present and valid
       expect(metrics.step).toBe(1);
@@ -571,9 +571,9 @@ describe.sequential('GRPO Integration Tests', () => {
     it('should track token counts accurately', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 10,
+        maxCompletionLength: 10,
         logInterval: 1000,
         saveInterval: 1000,
         outputDir: TEST_OUTPUT_DIR,
@@ -585,7 +585,7 @@ describe.sequential('GRPO Integration Tests', () => {
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       // Should have generated some tokens (3 completions × up to 10 tokens)
       expect(metrics.totalTokens).toBeGreaterThan(0);

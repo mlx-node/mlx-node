@@ -1,0 +1,9 @@
+{
+  "name": "octokit",
+  "version": "5.0.5",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  }
+}

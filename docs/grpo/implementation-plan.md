@@ -181,7 +181,7 @@ pub fn grpo_loss(
 export function computeAdvantages(
   rewards: MxArray,
   numGenerations: number,
-  scaleRewards: 'group' | 'batch' | 'none'
+  scaleRewards: 'group' | 'batch' | 'none',
 ): MxArray {
   // 1. Group rewards: reshape to (B/G, G)
   // 2. Compute mean per group
@@ -289,7 +289,7 @@ class MLXCausalLM {
     maxNewTokens: number = 100,
     temperature: number = 0.8,
     topP: number = 0.95,
-    topK?: number
+    topK?: number,
   ): string;
 }
 ```
@@ -323,16 +323,9 @@ Build complete pipeline for batch generation with group sampling and reward comp
 
 ```typescript
 export class Generator {
-  constructor(
-    model: MLXCausalLM,
-    tokenizer: Qwen3Tokenizer,
-    config: GenerationConfig
-  );
+  constructor(model: MLXCausalLM, tokenizer: Qwen3Tokenizer, config: GenerationConfig);
 
-  async generateBatch(
-    prompts: string[],
-    numGenerations: number
-  ): Promise<GenerationOutput> {
+  async generateBatch(prompts: string[], numGenerations: number): Promise<GenerationOutput> {
     // Output:
     // - promptIds: number[][]
     // - completionIds: number[][]
@@ -354,19 +347,12 @@ export class Generator {
 **File**: `src/grpo/rewards/reward-function.ts`
 
 ```typescript
-export type RewardFunction = (
-  prompts: string[],
-  completions: string[],
-  metadata?: Record<string, any>
-) => Float32Array;
+export type RewardFunction = (prompts: string[], completions: string[], metadata?: Record<string, any>) => Float32Array;
 
 export class RewardManager {
   constructor(rewardFuncs: RewardFunction[], weights?: number[]);
 
-  async computeRewards(
-    prompts: string[],
-    completions: string[]
-  ): Promise<Float32Array>;
+  async computeRewards(prompts: string[], completions: string[]): Promise<Float32Array>;
 }
 ```
 
@@ -389,9 +375,7 @@ export function formatReward(pattern: RegExp): RewardFunction;
 
 ```typescript
 export class GRPOPipeline {
-  async generateAndScore(
-    prompts: string[]
-  ): Promise<{
+  async generateAndScore(prompts: string[]): Promise<{
     promptIds: number[][];
     completionIds: number[][];
     completionMask: number[][];
@@ -437,10 +421,7 @@ export class GRPOTrainer {
     const batch = await this.pipeline.generateAndScore(prompts);
 
     // 2. Forward pass to get current log-probs
-    const perTokenLogProbs = this.model.computeLogProbs(
-      batch.promptIds,
-      batch.completionIds
-    );
+    const perTokenLogProbs = this.model.computeLogProbs(batch.promptIds, batch.completionIds);
 
     // 3. Compute loss
     const loss = Losses.grpoLoss(
@@ -448,7 +429,7 @@ export class GRPOTrainer {
       batch.oldPerTokenLogProbs,
       batch.advantages,
       batch.completionMask,
-      this.config
+      this.config,
     );
 
     // 4. Backward pass
@@ -655,7 +636,7 @@ Comprehensive tests and documentation for production use.
 describe('GRPO Integration', () => {
   it('should train for 10 steps without errors', async () => {
     const trainer = new GRPOTrainer({
-      modelConfig: 'qwen3-0.6b',
+      modelName: 'qwen3-0.6b',
       learningRate: 1e-6,
       // ...
     });

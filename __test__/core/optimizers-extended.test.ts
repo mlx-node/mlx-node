@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { MxArray, Adam, AdamW, SGD, RMSprop, GradientUtils } from '@mlx-node/core';
 import { createFloat32Array } from '../test-utils';
 

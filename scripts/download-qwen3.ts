@@ -7,12 +7,13 @@
  * The model will be downloaded to: .cache/models/qwen3-0.6b/
  *
  * Usage:
- *   node scripts/download-qwen3.ts
+ *   node scripts/download-qwen3.ts [options]
  *   yarn download:qwen3
  *
- * Environment variables:
- *   MODEL_NAME - HuggingFace model name (default: Qwen/Qwen3-0.6B)
- *   MODEL_OUTPUT_DIR - Output directory (default: .cache/models/qwen3-0.6b)
+ * Options:
+ *   -m, --model <name>    HuggingFace model name (default: Qwen/Qwen3-0.6B)
+ *   -o, --output <dir>    Output directory (default: .cache/models/qwen3-0.6b)
+ *   -h, --help            Show this help message
  *
  * After downloading, convert to MLX float32 format:
  *   cd mlx-lm
@@ -21,10 +22,13 @@
  */
 
 import { mkdir, readdir, stat, copyFile } from 'node:fs/promises';
+import { parseArgs } from 'node:util';
 import { existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { snapshotDownload } from '@huggingface/hub';
+import { listFiles, whoAmI, downloadFileToCacheDir, type ListFileEntry } from '@huggingface/hub';
+import { AsyncEntry } from '@napi-rs/keyring';
+import { input } from '@inquirer/prompts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -33,22 +37,117 @@ const __dirname = dirname(__filename);
 const DEFAULT_MODEL = 'Qwen/Qwen3-0.6B';
 const DEFAULT_OUTPUT_DIR = resolve(__dirname, '..', '.cache', 'models', 'qwen3-0.6b');
 
-// Files we need to download from base model
-// Note: Base models may have model.safetensors or pytorch_model.bin
-// The conversion script will handle the actual weights
-const REQUIRED_FILES = [
+const keyringEntry = new AsyncEntry('mlx-node', 'huggingface-token');
+
+const HUGGINGFACE_TOKEN = await keyringEntry.getPassword();
+
+if (!HUGGINGFACE_TOKEN) {
+  console.warn('No HuggingFace token found, the model will download with anonymous access');
+}
+
+// Parse command-line arguments
+const { values: args } = parseArgs({
+  options: {
+    model: {
+      type: 'string',
+      short: 'm',
+      default: DEFAULT_MODEL,
+    },
+    output: {
+      type: 'string',
+      short: 'o',
+      default: DEFAULT_OUTPUT_DIR,
+    },
+    help: {
+      type: 'boolean',
+      short: 'h',
+      default: false,
+    },
+    ['set-token']: {
+      type: 'boolean',
+      default: false,
+    },
+  },
+});
+
+function printHelp(): void {
+  console.log(`
+Download ${args.model} base model from HuggingFace
+
+Usage:
+  node scripts/download-qwen3.ts [options]
+  yarn download:qwen3
+
+Options:
+  -m, --model <name>    HuggingFace model name (default: ${DEFAULT_MODEL})
+  -o, --output <dir>    Output directory (default: .cache/models/qwen3-0.6b)
+  -h, --help            Show this help message
+  --set-token           Set HuggingFace token
+
+Examples:
+  node scripts/download-qwen3.ts
+  node scripts/download-qwen3.ts --model Qwen/Qwen3-1.7B --output .cache/models/qwen3-1.7b
+`);
+}
+
+async function setToken() {
+  const token = await input({
+    message: 'Enter your HuggingFace token:',
+    required: true,
+    theme: {
+      validationFailureMode: 'clear',
+    },
+    validate: async (value) => {
+      if (!value) {
+        return 'Token is required';
+      }
+      if (!value.startsWith('hf_')) {
+        return 'HuggingFace token must start with "hf_"';
+      }
+      try {
+        const { auth } = await whoAmI({ accessToken: value });
+        if (!auth) {
+          return 'Invalid token';
+        }
+        return true;
+      } catch {
+        return 'Invalid token';
+      }
+    },
+  });
+  if (token) {
+    keyringEntry.setPassword(token);
+  }
+}
+
+// Core files we need to download from base model (weights handled separately)
+const CORE_FILES = [
   'config.json',
   'tokenizer.json',
   'tokenizer_config.json',
+  'special_tokens_map.json',
   'vocab.json',
   'merges.txt',
-  'model.safetensors', // Base model weights (will be converted to MLX format)
 ];
 
 async function ensureDir(path: string): Promise<void> {
   if (!existsSync(path)) {
     await mkdir(path, { recursive: true });
   }
+}
+
+async function getModelFiles(modelName: string) {
+  let totalSize = 0;
+  const filesToDownload: ListFileEntry[] = [];
+  for await (const file of listFiles({ repo: { type: 'model', name: modelName } })) {
+    if (CORE_FILES.includes(file.path) || file.path.endsWith('.safetensors') || file.path.endsWith('.json')) {
+      filesToDownload.push(file);
+      if (file.size) {
+        totalSize += file.size;
+      }
+    }
+  }
+  return { totalSize, filesToDownload };
 }
 
 async function formatBytes(bytes: number): Promise<string> {
@@ -62,64 +161,25 @@ async function formatBytes(bytes: number): Promise<string> {
   return `${size.toFixed(2)} ${units[unitIndex]}`;
 }
 
-async function findFileInSnapshot(snapshotPath: string, filename: string): Promise<string | null> {
-  // HuggingFace snapshots have a flat structure with symlinks to blobs
-  // Check if file exists directly in snapshot directory
-  const filePath = join(snapshotPath, filename);
-
-  if (existsSync(filePath)) {
-    return filePath;
-  }
-
-  return null;
-}
-
-async function copyModelFile(snapshotPath: string, filename: string, outputDir: string): Promise<void> {
-  const outputPath = join(outputDir, filename);
-
-  console.log(`  Copying ${filename}...`);
-
-  try {
-    const sourcePath = await findFileInSnapshot(snapshotPath, filename);
-
-    if (!sourcePath) {
-      throw new Error(`File ${filename} not found in snapshot`);
-    }
-
-    await copyFile(sourcePath, outputPath);
-
-    // Get file size
-    const stats = await stat(outputPath);
-    const sizeStr = await formatBytes(stats.size);
-    console.log(`  ✓ ${filename} (${sizeStr})`);
-  } catch (error) {
-    console.error(`  ✗ Failed to copy ${filename}:`, error);
-    throw error;
-  }
-}
-
-async function renameWeightsFile(outputDir: string): Promise<void> {
-  // For base models, keep the original name (model.safetensors)
-  // The MLX conversion script will handle the format
-  const sourcePath = join(outputDir, 'model.safetensors');
-
-  if (existsSync(sourcePath)) {
-    console.log('\n✓ Weights file present: model.safetensors');
-    console.log('  (Will be converted to MLX format in next step)');
-  }
-}
-
-async function verifyDownload(outputDir: string): Promise<boolean> {
+async function verifyDownload(outputDir: string, weightFiles: string[]): Promise<boolean> {
   console.log('\nVerifying download...');
 
-  // For base model, we just need config and weights
-  const requiredForLoading = ['config.json', 'model.safetensors'];
   let allPresent = true;
 
-  for (const file of requiredForLoading) {
+  // Check config
+  const configPath = join(outputDir, 'config.json');
+  if (!existsSync(configPath)) {
+    console.error('  ✗ Missing required file: config.json');
+    allPresent = false;
+  } else {
+    console.log('  ✓ config.json');
+  }
+
+  // Check weight files
+  for (const file of weightFiles) {
     const path = join(outputDir, file);
     if (!existsSync(path)) {
-      console.error(`  ✗ Missing required file: ${file}`);
+      console.error(`  ✗ Missing weight file: ${file}`);
       allPresent = false;
     } else {
       console.log(`  ✓ ${file}`);
@@ -129,72 +189,83 @@ async function verifyDownload(outputDir: string): Promise<boolean> {
   return allPresent;
 }
 
-async function main() {
-  const modelName = process.env.MODEL_NAME ?? DEFAULT_MODEL;
-  const outputDir = process.env.MODEL_OUTPUT_DIR ? resolve(process.env.MODEL_OUTPUT_DIR) : DEFAULT_OUTPUT_DIR;
+if (args.help) {
+  printHelp();
+  process.exit(0);
+}
 
-  console.log('╔════════════════════════════════════════════════════════╗');
-  console.log('║   Qwen3-0.6B Base Model Download from HuggingFace      ║');
-  console.log('╚════════════════════════════════════════════════════════╝\n');
+if (args['set-token']) {
+  await setToken();
+  process.exit(0);
+}
 
-  console.log(`Model: ${modelName}`);
-  console.log(`Format: Base model (needs MLX conversion)`);
-  console.log(`Output: ${outputDir}\n`);
+const modelName = args.model!;
+const outputDir = resolve(args.output!);
 
-  console.log('⚠️  Note: After download, convert to MLX float16:');
-  console.log(
-    '    yarn oxnode ./scripts/convert-model.ts --input .cache/models/qwen3-0.6b --output .cache/models/qwen3-0.6b-mlx-bf16',
-  );
+const title = `${modelName} Base Model Download from HuggingFace`;
+const boxWidth = Math.max(title.length + 6, 58);
+const padding = Math.floor((boxWidth - title.length - 2) / 2);
+const rightPadding = boxWidth - title.length - padding;
+console.log('╔' + '═'.repeat(boxWidth) + '╗');
+console.log('║' + ' '.repeat(padding) + title + ' '.repeat(rightPadding) + '║');
+console.log('╚' + '═'.repeat(boxWidth) + '╝\n');
 
-  // Check if already downloaded
-  if (existsSync(outputDir)) {
-    const files = await readdir(outputDir);
-    if (files.includes('config.json') && files.includes('model.safetensors')) {
-      console.log('✅ Model already downloaded!\n');
-      console.log('To re-download, delete the output directory first:');
-      console.log(`   rm -rf ${outputDir}\n`);
-      return;
-    }
-  }
+console.log(`Model: ${modelName}`);
+console.log(`Format: Base model (needs MLX conversion)`);
+console.log(`Output: ${outputDir}\n`);
 
-  // Create output directory
-  await ensureDir(outputDir);
+console.log('⚠️  Note: After download, convert to MLX float16:');
+console.log(`    yarn oxnode ./scripts/convert-model.ts --input ${args.output} --output ${args.output}-mlx-bf16`);
 
-  console.log('📦 Downloading base model from HuggingFace...\n');
-  console.log('This may take a while (model is ~1.1 GB)...\n');
+// Check if already downloaded (single or sharded model)
+if (existsSync(outputDir)) {
+  const files = await readdir(outputDir);
+  const hasConfig = files.includes('config.json');
+  const hasSingleModel = files.includes('model.safetensors');
+  const hasShardedModel = files.includes('model.safetensors.index.json');
 
-  // Download entire model snapshot
-  const snapshotPath = await snapshotDownload({
-    repo: { type: 'model', name: modelName },
-    cacheDir: join(__dirname, '..', '.cache', 'huggingface'),
-  });
-
-  console.log(`\nSnapshot downloaded to: ${snapshotPath}\n`);
-  console.log('Copying required files...\n');
-
-  // Copy required files from snapshot to output directory
-  for (const file of REQUIRED_FILES) {
-    await copyModelFile(snapshotPath, file, outputDir);
-  }
-
-  // Rename weights file to match loader expectations
-  await renameWeightsFile(outputDir);
-
-  // Verify download
-  const success = await verifyDownload(outputDir);
-
-  if (success) {
-    console.log('\n✅ Model downloaded successfully!\n');
-    console.log('You can now run the training demo:');
-    console.log('   node examples/grpo/train-simple.ts\n');
-  } else {
-    console.error('\n❌ Download incomplete. Please try again.\n');
-    process.exitCode = 1;
+  if (hasConfig && (hasSingleModel || hasShardedModel)) {
+    console.log('\n✅ Model already downloaded!\n');
+    console.log('To re-download, delete the output directory first:');
+    console.log(`   rm -rf ${outputDir}\n`);
+    process.exit(0);
   }
 }
 
-main().catch((error) => {
-  console.error('\n[download-model] Error:', error.message);
-  console.error('\nStack trace:', error.stack);
-  process.exitCode = 1;
-});
+// Create output directory
+await ensureDir(outputDir);
+
+console.log('📦 Downloading base model from HuggingFace...\n');
+
+// Fetch model size from HuggingFace
+const { totalSize, filesToDownload } = await getModelFiles(modelName);
+const sizeStr = await formatBytes(totalSize);
+console.log(`This may take a while (model is ~${sizeStr})...\n`);
+
+const weightFiles: string[] = [];
+
+for (const file of filesToDownload) {
+  const snapshotPath = await downloadFileToCacheDir({
+    repo: { type: 'model', name: modelName },
+    path: file.path,
+    cacheDir: join(__dirname, '..', '.cache', 'huggingface'),
+    accessToken: HUGGINGFACE_TOKEN,
+  });
+  // Get file size
+  const stats = await stat(snapshotPath);
+  const sizeStr = await formatBytes(stats.size);
+  await copyFile(snapshotPath, join(outputDir, file.path));
+  if (file.path.endsWith('.safetensors')) {
+    weightFiles.push(file.path);
+  }
+  console.log(`  ✓ ${file.path} (${sizeStr})`);
+}
+
+const success = await verifyDownload(outputDir, weightFiles);
+
+if (success) {
+  console.log('\n✅ Model downloaded successfully!\n');
+} else {
+  console.error('\n❌ Download incomplete. Please try again.\n');
+  process.exit(1);
+}

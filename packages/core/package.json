@@ -2,8 +2,13 @@
   "name": "@mlx-node/core",
   "version": "0.0.0",
   "description": "Internal native bindings - import from @mlx-node/lm or @mlx-node/trl instead",
+  "files": [
+    "index.cjs",
+    "index.d.cts"
+  ],
   "type": "module",
   "main": "./index.cjs",
+  "types": "./index.d.cts",
   "exports": {
     ".": {
       "types": "./index.d.cts",
@@ -11,11 +16,6 @@
       "require": "./index.cjs"
     }
   },
-  "types": "./index.d.cts",
-  "files": [
-    "index.cjs",
-    "index.d.cts"
-  ],
   "napi": {
     "binaryName": "mlx-core",
     "targets": [

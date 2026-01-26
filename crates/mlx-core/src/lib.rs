@@ -41,5 +41,6 @@ pub(crate) static GENERATION_STREAM: LazyLock<Stream> = LazyLock::new(|| {
 
 #[napi_derive::napi(module_exports)]
 pub fn init() {
+    // Initialize the generation stream
     let _ = &*GENERATION_STREAM;
 }

@@ -19,6 +19,7 @@ fn add_link_search(path: &Path) {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/mlx.cpp");
+    println!("cargo:rerun-if-changed=mlx");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let mlx_dir = manifest_dir.join("mlx");

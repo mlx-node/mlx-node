@@ -369,3 +369,64 @@ impl BatchKVCache {
         &mut self.left_padding
     }
 }
+
+// ============================================================================
+// Non-NAPI methods for internal Rust use (batched forward pass integration)
+// ============================================================================
+impl BatchKVCache {
+    /// Returns the RoPE offsets as an MxArray for use with the C++ batched forward kernel.
+    ///
+    /// The offset for each sequence represents the actual number of real tokens
+    /// (not counting padding) that have been processed.
+    pub fn get_rope_offsets_array(&self) -> Result<MxArray> {
+        MxArray::from_int32(&self.offset, &[self.offset.len() as i64])
+    }
+
+    /// Returns the left padding amounts as an MxArray for use with batched attention masking.
+    pub fn get_left_padding_array(&self) -> Result<MxArray> {
+        let left_pad_vec: Vec<i32> = self.left_padding.iter().copied().collect();
+        MxArray::from_int32(&left_pad_vec, &[left_pad_vec.len() as i64])
+    }
+
+    /// Returns the raw keys array if present (for direct FFI use).
+    pub fn get_keys(&self) -> Option<&MxArray> {
+        self.keys.as_ref()
+    }
+
+    /// Returns the raw values array if present (for direct FFI use).
+    pub fn get_values(&self) -> Option<&MxArray> {
+        self.values.as_ref()
+    }
+
+    /// Sets the keys array directly (for FFI integration after batched forward).
+    pub fn set_keys(&mut self, keys: MxArray) {
+        self.keys = Some(keys);
+    }
+
+    /// Sets the values array directly (for FFI integration after batched forward).
+    pub fn set_values(&mut self, values: MxArray) {
+        self.values = Some(values);
+    }
+
+    /// Sets the current cache index (write position).
+    pub fn set_idx(&mut self, idx: i32) {
+        self.idx = idx;
+    }
+
+    /// Updates offsets after a decode step (adds seq_len to each offset).
+    /// Updates offsets after a step. Note: idx should be updated via set_idx()
+    /// from the FFI's out_cache_idx, NOT by this method.
+    pub fn advance_offsets(&mut self, seq_len: i32) {
+        for offset in &mut self.offset {
+            *offset += seq_len;
+        }
+        // NOTE: Do NOT update self.idx here! The FFI returns the updated cache_idx
+        // and it's set via set_idx(). Previously this was doubling the idx:
+        // set_idx(12) -> advance_offsets(12) -> idx becomes 24 instead of 12!
+    }
+
+    /// Returns the batch size.
+    pub fn batch_size(&self) -> usize {
+        self.offset.len()
+    }
+}

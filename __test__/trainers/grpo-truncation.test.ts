@@ -10,7 +10,7 @@
  * to avoid rewarding incomplete responses.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { MxArray } from '@mlx-node/core';
 import { shape, int32 } from '../test-utils.js';
 

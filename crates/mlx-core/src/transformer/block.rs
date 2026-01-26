@@ -1,9 +1,9 @@
 use crate::array::MxArray;
 use crate::nn::RMSNorm;
+use crate::transformer::PagedKVCache;
 use crate::transformer::attention::{Attention, QKVResult};
 use crate::transformer::kv_cache::KVCache;
 use crate::transformer::mlp::MLP;
-use crate::transformer::paged_attention::PagedAttentionLayer;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -183,35 +183,37 @@ impl TransformerBlock {
         Ok(out)
     }
 
-    /// Forward pass with paged attention.
+    /// Forward pass with paged attention using Metal kernels directly.
     ///
-    /// This method uses paged KV cache for memory-efficient inference with
-    /// variable-length sequences and continuous batching.
+    /// This method uses PagedKVCache's Metal kernel methods for memory-efficient
+    /// inference with variable-length sequences and continuous batching.
     ///
     /// # Arguments
-    /// * `x` - Input tensor, shape: [batch, seq_len, hidden_size]
-    /// * `paged_layer` - PagedAttentionLayer for paged cache operations
+    /// * `x` - Input tensor, shape: [num_seqs, 1, hidden_size] for decode
+    /// * `paged_cache` - PagedKVCache for Metal kernel operations
     /// * `layer_idx` - Index of this layer in the model
     /// * `slot_mapping` - Slot indices for cache updates, shape: [num_tokens]
-    /// * `block_tables` - Block table mapping sequences to cache blocks
-    /// * `context_lens` - Context length for each sequence
-    /// * `rope_offset` - RoPE position offset (for incremental generation)
+    /// * `seq_ids` - Sequence IDs for looking up block tables/context lens
+    /// * `num_query_heads` - Number of query heads (for GQA)
+    /// * `positions` - Per-sequence RoPE positions, shape: [num_seqs]
+    /// * `num_seqs` - Number of sequences in the batch
+    /// * `seq_len` - Sequence length (typically 1 for decode)
     ///
     /// # Returns
     /// Output tensor, shape: [num_seqs, 1, hidden_size] for decode
-    pub fn forward_paged(
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_paged_metal(
         &self,
         x: &MxArray, // [num_seqs, 1, hidden_size] for decode
-        paged_layer: &PagedAttentionLayer,
+        paged_cache: &PagedKVCache,
         layer_idx: u32,
         slot_mapping: &MxArray,
-        block_tables: &MxArray,
-        context_lens: &MxArray,
+        seq_ids: &[u32],
+        num_query_heads: u32,
         positions: &MxArray, // [num_seqs] - per-sequence RoPE positions
+        num_seqs: i64,
+        seq_len: i64,
     ) -> Result<MxArray> {
-        let num_seqs = x.shape_at(0)?;
-        let seq_len = x.shape_at(1)?;
-
         // 1. Input layer norm
         let normed = self.input_layernorm.forward(x)?;
 
@@ -220,16 +222,58 @@ impl TransformerBlock {
             .self_attn
             .compute_qkv_paged_decode(&normed, positions)?;
 
-        // 3. Update paged cache with K, V
-        paged_layer
-            .update_cache(layer_idx, &qkv.keys, &qkv.values, slot_mapping)
-            .map_err(napi::Error::from_reason)?;
+        // 3. Update paged cache with K, V using Metal kernel
+        #[cfg(target_os = "macos")]
+        unsafe {
+            paged_cache
+                .update(
+                    layer_idx,
+                    qkv.keys.handle.0,
+                    qkv.values.handle.0,
+                    slot_mapping.handle.0,
+                )
+                .map_err(napi::Error::from_reason)?;
+        }
 
-        // 4. Run paged attention
-        let scale = self.self_attn.get_scale();
-        let attn_output = paged_layer
-            .forward(&qkv.queries, block_tables, context_lens, scale, layer_idx)
-            .map_err(napi::Error::from_reason)?;
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Err(napi::Error::from_reason(
+                "Paged attention Metal kernels are only available on macOS",
+            ));
+        }
+
+        // 4. Run paged attention using Metal kernel
+        let scale = self.self_attn.get_scale() as f32;
+
+        #[cfg(target_os = "macos")]
+        let attn_output = {
+            let metal_output = unsafe {
+                paged_cache
+                    .attention(
+                        layer_idx,
+                        qkv.queries.handle.0,
+                        seq_ids,
+                        num_query_heads,
+                        scale,
+                    )
+                    .map_err(napi::Error::from_reason)?
+            };
+
+            // Convert Metal output to MxArray
+            let output_ptr = unsafe {
+                metal_output
+                    .to_mlx_array()
+                    .map_err(napi::Error::from_reason)?
+            };
+            MxArray::from_handle(output_ptr, "paged_attention_output")?
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        let attn_output: MxArray = {
+            return Err(napi::Error::from_reason(
+                "Paged attention Metal kernels are only available on macOS",
+            ));
+        };
 
         // 5. Output projection
         let attn_out = self

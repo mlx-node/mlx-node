@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 import { GRPOTrainer, type ChatMessage, type RewardOutput } from '@mlx-node/trl';
 import { createTempModel } from '../test-model-utils';
 
@@ -18,9 +18,9 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
     it('should generate completions for single prompt', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 4,
-        maxNewTokens: 10,
+        maxCompletionLength: 10,
         temperature: 0.8,
         topP: 0.95,
       });
@@ -41,16 +41,16 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
       for (let i = 0; i < 4; i++) {
         expect(result.completionTexts[i]).toBeDefined();
         expect(result.tokenCounts[i]).toBeGreaterThan(0);
-        expect(result.tokenCounts[i]).toBeLessThanOrEqual(10); // maxNewTokens
+        expect(result.tokenCounts[i]).toBeLessThanOrEqual(10); // maxCompletionLength
       }
     });
 
     it('should generate completions for multiple prompts', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 8,
+        maxCompletionLength: 8,
       });
 
       // Create 2 prompts
@@ -68,9 +68,9 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
     it('should use default groupSize from config', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 5,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
       });
 
       const messages: ChatMessage[] = [{ role: 'user', content: 'Test prompt' }];
@@ -83,18 +83,18 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
   });
 
   describe('Generation Configuration', () => {
-    it('should respect maxNewTokens parameter', async () => {
+    it('should respect maxCompletionLength parameter', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
       });
 
       const messages: ChatMessage[] = [{ role: 'user', content: 'Test prompt' }];
       const result = await trainer.generateBatch([messages]);
 
-      // All generations should have <= maxNewTokens
+      // All generations should have <= maxCompletionLength
       for (let i = 0; i < result.tokenCounts.length; i++) {
         expect(result.tokenCounts[i]).toBeLessThanOrEqual(5);
       }
@@ -103,9 +103,9 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
     it('should generate diverse completions with temperature > 0', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 5,
-        maxNewTokens: 10,
+        maxCompletionLength: 10,
         temperature: 1.0, // High temperature for diversity
       });
 
@@ -121,9 +121,9 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
     it('should apply top-p filtering when configured', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 8,
+        maxCompletionLength: 8,
         temperature: 0.8,
         topP: 0.9, // Nucleus sampling
       });
@@ -138,9 +138,9 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
     it('should apply top-k filtering when configured', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 8,
+        maxCompletionLength: 8,
         temperature: 0.8,
         topK: 50, // Top-k sampling
       });
@@ -157,9 +157,9 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
     it('should return log probabilities in native result', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 6,
+        maxCompletionLength: 6,
       });
 
       const messages: ChatMessage[] = [{ role: 'user', content: 'Test prompt' }];
@@ -179,9 +179,9 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
     it('should have consistent lengths across native result fields', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
       });
 
       const messages: ChatMessage[] = [{ role: 'user', content: 'Test prompt' }];
@@ -198,9 +198,9 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
     it('should handle empty batch', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
       });
 
       const result = await trainer.generateBatch([]);
@@ -212,9 +212,9 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
     it('should handle groupSize of 1', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 1,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
       });
 
       const messages: ChatMessage[] = [{ role: 'user', content: 'Test prompt' }];
@@ -223,12 +223,12 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
       expect(result.completionTexts.length).toBe(1);
     });
 
-    it('should handle very short maxNewTokens', async () => {
+    it('should handle very short maxCompletionLength', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 1,
+        maxCompletionLength: 1,
       });
 
       const messages: ChatMessage[] = [{ role: 'user', content: 'Test prompt' }];
@@ -244,9 +244,9 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
     it('should handle large batch of prompts', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
       });
 
       // Create 10 prompts
@@ -262,23 +262,23 @@ describe.sequential('GRPOTrainer - generateBatch()', () => {
 
 describe.sequential('GRPOTrainer - Constructor', () => {
   it('should create trainer with default config', async () => {
-    const trainer = await GRPOTrainer.create({ modelPath: tempModel.modelPath, modelConfig: 'qwen3-0.6b' });
+    const trainer = await GRPOTrainer.create({ modelPath: tempModel.modelPath, modelName: 'qwen3-0.6b' });
     expect(trainer).toBeDefined();
   });
 
   it('should create trainer with custom config', async () => {
     const trainer = await GRPOTrainer.create({
       modelPath: tempModel.modelPath,
-      modelConfig: 'qwen3-0.6b',
+      modelName: 'qwen3-0.6b',
       groupSize: 16,
-      maxNewTokens: 512,
+      maxCompletionLength: 512,
       temperature: 1.0,
     });
     expect(trainer).toBeDefined();
   });
 
   it('should throw error for missing model path', async () => {
-    await expect(GRPOTrainer.create({ modelConfig: 'qwen3-0.6b' })).rejects.toThrow('modelPath is required');
+    await expect(GRPOTrainer.create({ modelName: 'qwen3-0.6b' })).rejects.toThrow('modelPath is required');
   });
 });
 
@@ -292,9 +292,9 @@ describe.sequential('GRPOTrainer - scoreGenerations()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         rewardFunction: rewardFn,
       });
 
@@ -325,7 +325,7 @@ describe.sequential('GRPOTrainer - scoreGenerations()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 4,
         rewardFunction: rewardFn,
       });
@@ -343,7 +343,7 @@ describe.sequential('GRPOTrainer - scoreGenerations()', () => {
     it('should throw error if no reward function configured', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
         // No rewardFunction
       });
@@ -365,7 +365,7 @@ describe.sequential('GRPOTrainer - scoreGenerations()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
         rewardFunction: rewardFn,
       });
@@ -386,15 +386,15 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         rewardFunction: rewardFn,
       });
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       // Should return valid metrics
       expect(metrics).toBeDefined();
@@ -416,21 +416,21 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 3,
+        maxCompletionLength: 3,
         rewardFunction: rewardFn,
       });
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics1 = await trainer.trainStep(promptMessages, []);
+      const metrics1 = await trainer.trainStep(promptMessages);
       expect(metrics1.step).toBe(1);
 
-      const metrics2 = await trainer.trainStep(promptMessages, []);
+      const metrics2 = await trainer.trainStep(promptMessages);
       expect(metrics2.step).toBe(2);
 
-      const metrics3 = await trainer.trainStep(promptMessages, []);
+      const metrics3 = await trainer.trainStep(promptMessages);
       expect(metrics3.step).toBe(3);
     });
 
@@ -441,9 +441,9 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 4,
+        maxCompletionLength: 4,
         rewardFunction: rewardFn,
       });
 
@@ -452,7 +452,7 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
         [{ role: 'user' as const, content: 'Test prompt 2' }],
       ];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       expect(metrics).toBeDefined();
       expect(metrics.totalTokens).toBeGreaterThan(0);
@@ -469,15 +469,15 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 4,
-        maxNewTokens: 3,
+        maxCompletionLength: 3,
         rewardFunction: rewardFn,
       });
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       // All rewards are 2.5, so mean should be 2.5
       expect(metrics.meanReward).toBeCloseTo(fixedReward, 5);
@@ -495,16 +495,15 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 4,
-        maxNewTokens: 3,
+        maxCompletionLength: 3,
         rewardFunction: rewardFn,
-        advantageNormalization: false, // Just zero-mean, no std normalization
       });
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       // Mean advantage should be close to 0 (group normalization)
       expect(Math.abs(metrics.meanAdvantage)).toBeLessThan(1e-5);
@@ -517,15 +516,15 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 5,
+        maxCompletionLength: 5,
         rewardFunction: rewardFn,
       });
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       // Should have generated some tokens (3 completions × up to 5 tokens each)
       expect(metrics.totalTokens).toBeGreaterThan(0);
@@ -541,16 +540,16 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 4,
-        maxNewTokens: 4,
+        maxCompletionLength: 4,
         rewardFunction: rewardFn,
         lossType: 'grpo',
       });
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       // Loss should be finite
       expect(isFinite(metrics.loss)).toBe(true);
@@ -567,16 +566,16 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
       for (const lossType of lossTypes) {
         const trainer = await GRPOTrainer.create({
           modelPath: tempModel.modelPath,
-          modelConfig: 'qwen3-0.6b',
+          modelName: 'qwen3-0.6b',
           groupSize: 3,
-          maxNewTokens: 3,
+          maxCompletionLength: 3,
           rewardFunction: rewardFn,
           lossType,
         });
 
         const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-        const metrics = await trainer.trainStep(promptMessages, []);
+        const metrics = await trainer.trainStep(promptMessages);
 
         expect(isFinite(metrics.loss)).toBe(true);
         expect(metrics.step).toBe(1);
@@ -592,15 +591,15 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 1,
-        maxNewTokens: 3,
+        maxCompletionLength: 3,
         rewardFunction: rewardFn,
       });
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       expect(metrics).toBeDefined();
       expect(metrics.step).toBe(1);
@@ -615,15 +614,15 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 4,
-        maxNewTokens: 3,
+        maxCompletionLength: 3,
         rewardFunction: rewardFn,
       });
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       expect(metrics.stdReward).toBeGreaterThan(0); // Should have variance
       expect(isFinite(metrics.loss)).toBe(true);
@@ -641,15 +640,15 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 3,
-        maxNewTokens: 4,
+        maxCompletionLength: 4,
         rewardFunction: rewardFn,
       });
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
-      const metrics = await trainer.trainStep(promptMessages, []);
+      const metrics = await trainer.trainStep(promptMessages);
 
       // Reward function should have been called
       expect(scoreCalled).toBe(1);
@@ -667,18 +666,18 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
 
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 3,
+        maxCompletionLength: 3,
         rewardFunction: rewardFn,
       });
 
       const promptMessages = [[{ role: 'user' as const, content: 'Test prompt' }]];
 
       // Run 3 training steps
-      const metrics1 = await trainer.trainStep(promptMessages, []);
-      const metrics2 = await trainer.trainStep(promptMessages, []);
-      const metrics3 = await trainer.trainStep(promptMessages, []);
+      const metrics1 = await trainer.trainStep(promptMessages);
+      const metrics2 = await trainer.trainStep(promptMessages);
+      const metrics3 = await trainer.trainStep(promptMessages);
 
       // Steps should increment
       expect(metrics1.step).toBe(1);
@@ -702,9 +701,9 @@ describe.sequential('GRPOTrainer - train()', () => {
     it('should execute training loop with dataset', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 10,
+        maxCompletionLength: 10,
         numEpochs: 1,
         batchSize: 2,
         logInterval: 1,
@@ -728,9 +727,9 @@ describe.sequential('GRPOTrainer - train()', () => {
     it('should iterate through multiple epochs', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 10,
+        maxCompletionLength: 10,
         numEpochs: 2, // Multiple epochs
         batchSize: 1,
         logInterval: 1000,
@@ -752,9 +751,9 @@ describe.sequential('GRPOTrainer - train()', () => {
     it('should handle batching correctly', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 10,
+        maxCompletionLength: 10,
         numEpochs: 1,
         batchSize: 2, // Batch size of 2
         logInterval: 1000,
@@ -781,9 +780,9 @@ describe.sequential('GRPOTrainer - train()', () => {
     it('should handle empty dataset', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 10,
+        maxCompletionLength: 10,
         numEpochs: 1,
         batchSize: 2,
         logInterval: 1000,
@@ -802,9 +801,9 @@ describe.sequential('GRPOTrainer - train()', () => {
     it('should handle single example', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 10,
+        maxCompletionLength: 10,
         numEpochs: 1,
         batchSize: 2,
         logInterval: 1000,
@@ -823,9 +822,9 @@ describe.sequential('GRPOTrainer - train()', () => {
     it('should handle batch size larger than dataset', async () => {
       const trainer = await GRPOTrainer.create({
         modelPath: tempModel.modelPath,
-        modelConfig: 'qwen3-0.6b',
+        modelName: 'qwen3-0.6b',
         groupSize: 2,
-        maxNewTokens: 10,
+        maxCompletionLength: 10,
         numEpochs: 1,
         batchSize: 10, // Larger than dataset
         logInterval: 1000,

@@ -86,6 +86,7 @@ export class SFTTrainer {
   private stopRequested: boolean = false;
   private stdinInterface?: readline.Interface;
   private logger: TrainingLogger;
+  private sampleDisplayMode: 'all' | 'best_worst' | 'random' = 'all';
 
   /**
    * Create a new SFT trainer from a model
@@ -177,6 +178,20 @@ export class SFTTrainer {
         this.stopRequested = true;
         break;
       default:
+        // Handle SET commands (e.g., SET sample_display=best_worst)
+        if (cmd.startsWith('SET ')) {
+          const keyValue = cmd.slice(4); // Remove 'SET ' prefix
+          const eqIdx = keyValue.indexOf('=');
+          if (eqIdx > 0) {
+            const key = keyValue.slice(0, eqIdx);
+            const value = keyValue.slice(eqIdx + 1);
+            if (key === 'sample_display') {
+              if (value === 'all' || value === 'best_worst' || value === 'random') {
+                this.sampleDisplayMode = value;
+              }
+            }
+          }
+        }
         break;
     }
   }
@@ -358,9 +373,10 @@ export class SFTTrainer {
     this.logger.init(
       modelName,
       {
+        trainingType: 'sft',
         numEpochs,
         batchSize,
-        groupSize: 1, // SFT doesn't use groups, but logger requires this field
+        groupSize: 1, // SFT doesn't use groups
         learningRate: this.config.learning_rate,
       },
       sftDataset.length,
@@ -419,9 +435,10 @@ export class SFTTrainer {
               step: this.currentStep,
               loss: metrics.loss,
               totalTokens: metrics.totalTokens,
-              meanReward: 0, // SFT doesn't use rewards
-              stdReward: 0,
-              meanAdvantage: 0,
+              // SFT-specific metrics (no reward/advantage!)
+              perplexity: Math.exp(metrics.loss),
+              // Token accuracy is not currently tracked in the SFT engine
+              // Could be added later if the Rust engine exposes it
               trainingTimeMs: metrics.trainingTimeMs,
             },
             batchIdx,

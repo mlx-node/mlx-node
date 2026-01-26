@@ -5,8 +5,13 @@
 
 use std::collections::VecDeque;
 
+use tracing::{debug, error, info, warn};
+
 use crate::commands::SampleDisplayMode;
-use crate::messages::{LogLevel, TrainingConfig, TrainingMessage};
+use crate::messages::{
+    LogLevel, PromptChoice, ResumeAggregates, ResumeMetric, TrainingConfig, TrainingMessage,
+};
+use mlx_db::{GenerationFilter, GenerationRecord, SyncDbReader};
 
 /// Maximum number of data points to keep for sparklines
 const SPARKLINE_HISTORY: usize = 60;
@@ -14,6 +19,19 @@ const SPARKLINE_HISTORY: usize = 60;
 const LOG_HISTORY: usize = 500;
 /// Maximum number of generation samples to keep
 const SAMPLE_HISTORY: usize = 50;
+
+/// Pending database action that needs to be processed in blocking context
+#[derive(Debug, Clone)]
+pub enum DbAction {
+    /// Refresh generations list with current filter
+    RefreshGenerations,
+    /// Load historical metrics for sparklines (on resume)
+    LoadMetrics,
+    /// Load historical logs from DB (on resume)
+    LoadHistoricalLogs,
+    /// Load historical samples from DB (on resume)
+    LoadHistoricalSamples,
+}
 
 /// Current training state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -85,33 +103,6 @@ pub enum ActiveTab {
 }
 
 impl ActiveTab {
-    /// Cycle to next tab
-    pub fn next(self) -> Self {
-        match self {
-            Self::Logs => Self::Samples,
-            Self::Samples => Self::Config,
-            Self::Config => Self::Logs,
-        }
-    }
-
-    /// Cycle to previous tab
-    pub fn prev(self) -> Self {
-        match self {
-            Self::Logs => Self::Config,
-            Self::Samples => Self::Logs,
-            Self::Config => Self::Samples,
-        }
-    }
-
-    /// Get tab index (0-based)
-    pub fn index(self) -> usize {
-        match self {
-            Self::Logs => 0,
-            Self::Samples => 1,
-            Self::Config => 2,
-        }
-    }
-
     /// Get tab title
     pub fn title(self) -> &'static str {
         match self {
@@ -130,6 +121,7 @@ pub struct GenerationSample {
     pub completion: String,
     pub reward: f64,
     pub tokens: u32,
+    pub reward_details: Option<std::collections::HashMap<String, f64>>,
 }
 
 /// A log entry
@@ -146,6 +138,8 @@ pub struct App {
     pub state: TrainingState,
     pub model_name: String,
     pub config: Option<TrainingConfig>,
+    /// Training type: "sft" or "grpo" (default: "grpo")
+    pub training_type: String,
 
     // Progress tracking
     pub current_epoch: u32,
@@ -156,27 +150,50 @@ pub struct App {
 
     // Metrics history (for sparklines)
     pub loss_history: VecDeque<f64>,
+    // GRPO-specific metric histories
     pub reward_history: VecDeque<f64>,
-    pub advantage_history: VecDeque<f64>,
+    pub std_advantage_history: VecDeque<f64>,
+    // SFT-specific metric histories
+    pub perplexity_history: VecDeque<f64>,
+    pub token_accuracy_history: VecDeque<f64>,
 
-    // Current metrics
+    // Current metrics (common)
     pub current_loss: f64,
-    pub current_reward: f64,
-    pub current_advantage: f64,
-    pub current_std_reward: f64,
     pub total_tokens: u64,
     pub generation_time_ms: f64,
     pub training_time_ms: f64,
 
-    // Aggregated metrics for stats display
+    // Current metrics (GRPO-specific)
+    pub current_reward: f64,
+    pub current_std_advantage: f64,
+    pub current_std_reward: f64,
+
+    // Current metrics (SFT-specific)
+    pub current_perplexity: f64,
+    pub current_token_accuracy: f64,
+
+    // Current metrics (Memory)
+    pub peak_memory_mb: f64,
+    pub active_memory_mb: f64,
+
+    // Aggregated metrics for stats display (GRPO)
     pub best_reward: f64,
     pub reward_sum: f64,
     pub reward_count: u64,
 
-    // Previous values for trend indicators
+    // Aggregated metrics for stats display (SFT)
+    pub best_loss: f64,
+    pub loss_sum: f64,
+    pub loss_count: u64,
+
+    // Previous values for trend indicators (common)
     pub prev_loss: f64,
+    // Previous values for trend indicators (GRPO)
     pub prev_reward: f64,
-    pub prev_advantage: f64,
+    pub prev_std_advantage: f64,
+    // Previous values for trend indicators (SFT)
+    pub prev_perplexity: f64,
+    pub prev_token_accuracy: f64,
 
     // Logs and samples
     pub logs: VecDeque<LogEntry>,
@@ -226,6 +243,53 @@ pub struct App {
     pub auto_restart_enabled: bool,
     /// Exit code from last process exit
     pub last_exit_code: Option<i32>,
+
+    // Database state
+    /// Database reader (if database is open)
+    pub db_reader: Option<SyncDbReader>,
+    /// Path to the database file
+    pub db_path: Option<String>,
+    /// Run ID to display (from run or from message)
+    pub db_run_id: Option<String>,
+    /// Generations loaded from database
+    pub db_generations: Vec<GenerationRecord>,
+    /// Currently selected generation index in the list
+    pub db_selected: usize,
+    /// Current filter for database queries
+    pub db_filter: GenerationFilter,
+    /// Total count of generations matching filter
+    pub db_total_count: usize,
+    /// Pending database action to process in blocking context
+    pub pending_db_action: Option<DbAction>,
+    /// Whether ResumeState was received (indicates this is a resumed training run)
+    /// Used to trigger loading of historical logs and samples when DatabasePath is received
+    pub resume_state_received: bool,
+
+    // Interactive prompt state
+    /// Active prompt from training process (blocks UI until answered)
+    pub active_prompt: Option<ActivePrompt>,
+
+    // Captured prompt responses for restart
+    /// Prompt responses that should be replayed on restart (e.g., training-targets)
+    /// Key is prompt ID, value is the response (comma-separated for multi-select)
+    pub captured_prompt_responses: std::collections::HashMap<String, String>,
+}
+
+/// State for an active interactive prompt
+#[derive(Debug, Clone)]
+pub struct ActivePrompt {
+    /// Unique ID to send back with response
+    pub id: String,
+    /// Message to display
+    pub message: String,
+    /// Available choices
+    pub choices: Vec<PromptChoice>,
+    /// Currently focused index (cursor position)
+    pub cursor: usize,
+    /// Selected state for each choice (multi-select mode)
+    pub selected: Vec<bool>,
+    /// Whether this is a multi-select prompt
+    pub multi_select: bool,
 }
 
 impl Default for App {
@@ -241,6 +305,7 @@ impl App {
             state: TrainingState::Starting,
             model_name: String::new(),
             config: None,
+            training_type: "grpo".to_string(), // Default to GRPO
             current_epoch: 0,
             total_epochs: 0,
             current_step: 0,
@@ -248,20 +313,38 @@ impl App {
             total_steps_in_epoch: 0,
             loss_history: VecDeque::with_capacity(SPARKLINE_HISTORY),
             reward_history: VecDeque::with_capacity(SPARKLINE_HISTORY),
-            advantage_history: VecDeque::with_capacity(SPARKLINE_HISTORY),
+            std_advantage_history: VecDeque::with_capacity(SPARKLINE_HISTORY),
+            perplexity_history: VecDeque::with_capacity(SPARKLINE_HISTORY),
+            token_accuracy_history: VecDeque::with_capacity(SPARKLINE_HISTORY),
+            // Common metrics
             current_loss: 0.0,
-            current_reward: 0.0,
-            current_advantage: 0.0,
-            current_std_reward: 0.0,
             total_tokens: 0,
             generation_time_ms: 0.0,
             training_time_ms: 0.0,
+            // GRPO metrics
+            current_reward: 0.0,
+            current_std_advantage: 0.0,
+            current_std_reward: 0.0,
+            // SFT metrics
+            current_perplexity: 0.0,
+            current_token_accuracy: 0.0,
+            // Memory metrics
+            peak_memory_mb: 0.0,
+            active_memory_mb: 0.0,
+            // GRPO aggregates
             best_reward: f64::NEG_INFINITY,
             reward_sum: 0.0,
             reward_count: 0,
+            // SFT aggregates
+            best_loss: f64::INFINITY,
+            loss_sum: 0.0,
+            loss_count: 0,
+            // Trend indicators
             prev_loss: 0.0,
             prev_reward: 0.0,
-            prev_advantage: 0.0,
+            prev_std_advantage: 0.0,
+            prev_perplexity: 0.0,
+            prev_token_accuracy: 0.0,
             logs: VecDeque::with_capacity(LOG_HISTORY),
             samples: VecDeque::with_capacity(SAMPLE_HISTORY),
             sample_display_mode: SampleDisplayMode::default(),
@@ -280,23 +363,60 @@ impl App {
             sample_detail_scroll: 0,
             show_quit_confirm: false,
             show_settings: false,
-            log_level_filter: LogLevel::Info,
+            log_level_filter: LogLevel::Debug,
             restart_count: 0,
             restart_countdown: None,
             auto_restart_enabled: true,
             last_exit_code: None,
+            // Database state
+            db_reader: None,
+            db_path: None,
+            db_run_id: None,
+            db_generations: Vec::new(),
+            db_selected: 0,
+            db_filter: GenerationFilter::default(),
+            db_total_count: 0,
+            pending_db_action: None,
+            resume_state_received: false,
+            // Interactive prompt
+            active_prompt: None,
+            // Captured prompt responses for restart
+            captured_prompt_responses: std::collections::HashMap::new(),
         }
     }
 
     /// Handle an incoming training message
     pub fn handle_message(&mut self, msg: TrainingMessage) {
+        debug!(msg_type = ?std::mem::discriminant(&msg), "handle_message");
         match msg {
             TrainingMessage::Init { model, config } => {
+                debug!(%model, "Init message received");
                 self.model_name = model;
                 self.total_epochs = config.num_epochs.unwrap_or(1);
+                // Extract training type, default to "grpo" if not specified
+                self.training_type = config
+                    .training_type
+                    .clone()
+                    .unwrap_or_else(|| "grpo".to_string());
                 self.config = Some(config);
                 self.state = TrainingState::Running;
-                self.add_log(LogLevel::Info, "Training initialized".to_string());
+
+                // Ensure active tab is valid for the training type
+                // SFT mode doesn't have Samples or Database tabs
+                let available_tabs = self.get_available_tabs();
+                if !available_tabs.contains(&self.active_tab) {
+                    self.active_tab = available_tabs[0];
+                }
+
+                let training_label = if self.training_type == "sft" {
+                    "SFT"
+                } else {
+                    "GRPO"
+                };
+                self.add_log(
+                    LogLevel::Info,
+                    format!("{} training initialized", training_label),
+                );
             }
 
             TrainingMessage::EpochStart {
@@ -304,10 +424,18 @@ impl App {
                 total_epochs,
                 num_batches,
             } => {
+                // Preserve step_in_epoch if this is the same epoch we restored from resume_state
+                // This prevents resetting progress when resuming mid-epoch
+                let should_reset_step = !self.resume_state_received || epoch != self.current_epoch;
+
                 self.current_epoch = epoch;
                 self.total_epochs = total_epochs;
                 self.total_steps_in_epoch = num_batches;
-                self.step_in_epoch = 0;
+
+                if should_reset_step {
+                    self.step_in_epoch = 0;
+                }
+
                 self.add_log(
                     LogLevel::Info,
                     format!("Epoch {epoch}/{total_epochs} started ({num_batches} batches)"),
@@ -319,50 +447,93 @@ impl App {
                 loss,
                 mean_reward,
                 std_reward,
-                mean_advantage,
+                std_advantage,
+                perplexity,
+                token_accuracy,
                 total_tokens,
                 generation_time_ms,
                 training_time_ms,
+                peak_memory_mb,
+                active_memory_mb,
             } => {
                 // Store previous values for trend indicators
                 self.prev_loss = self.current_loss;
                 self.prev_reward = self.current_reward;
-                self.prev_advantage = self.current_advantage;
+                self.prev_std_advantage = self.current_std_advantage;
+                self.prev_perplexity = self.current_perplexity;
+                self.prev_token_accuracy = self.current_token_accuracy;
 
+                // Update common metrics
                 self.current_step = step;
                 self.step_in_epoch += 1;
                 self.current_loss = loss;
-                self.current_reward = mean_reward;
-                self.current_std_reward = std_reward;
-                self.current_advantage = mean_advantage;
                 self.total_tokens += total_tokens as u64;
-                self.generation_time_ms = generation_time_ms;
-                self.training_time_ms = training_time_ms;
+                self.generation_time_ms = generation_time_ms.unwrap_or(0.0);
+                self.training_time_ms = training_time_ms.unwrap_or(0.0);
 
-                // Track best and average reward
-                if mean_reward > self.best_reward {
-                    self.best_reward = mean_reward;
-                }
-                self.reward_sum += mean_reward;
-                self.reward_count += 1;
+                // Update memory metrics
+                self.peak_memory_mb = peak_memory_mb.unwrap_or(0.0);
+                self.active_memory_mb = active_memory_mb.unwrap_or(0.0);
 
-                // Update sparkline history
-                self.push_history(&mut self.loss_history.clone(), loss);
-                self.push_history(&mut self.reward_history.clone(), mean_reward);
-                self.push_history(&mut self.advantage_history.clone(), mean_advantage);
-                // Actually mutate (workaround for borrow checker)
+                // Update loss history (common to both SFT and GRPO)
                 if self.loss_history.len() >= SPARKLINE_HISTORY {
                     self.loss_history.pop_front();
                 }
                 self.loss_history.push_back(loss);
-                if self.reward_history.len() >= SPARKLINE_HISTORY {
-                    self.reward_history.pop_front();
+
+                // Track training type-specific metrics
+                if self.training_type == "sft" {
+                    // SFT metrics
+                    let ppl = perplexity.unwrap_or_else(|| loss.exp());
+                    self.current_perplexity = ppl;
+                    self.current_token_accuracy = token_accuracy.unwrap_or(0.0);
+
+                    // Update SFT sparkline histories
+                    if self.perplexity_history.len() >= SPARKLINE_HISTORY {
+                        self.perplexity_history.pop_front();
+                    }
+                    self.perplexity_history.push_back(ppl);
+
+                    if let Some(acc) = token_accuracy {
+                        if self.token_accuracy_history.len() >= SPARKLINE_HISTORY {
+                            self.token_accuracy_history.pop_front();
+                        }
+                        self.token_accuracy_history.push_back(acc);
+                    }
+
+                    // Track best and average loss (SFT)
+                    if loss < self.best_loss {
+                        self.best_loss = loss;
+                    }
+                    self.loss_sum += loss;
+                    self.loss_count += 1;
+                } else {
+                    // GRPO metrics
+                    let reward = mean_reward.unwrap_or(0.0);
+                    let std_adv = std_advantage.unwrap_or(0.0);
+
+                    self.current_reward = reward;
+                    self.current_std_reward = std_reward.unwrap_or(0.0);
+                    self.current_std_advantage = std_adv;
+
+                    // Update GRPO sparkline histories
+                    if self.reward_history.len() >= SPARKLINE_HISTORY {
+                        self.reward_history.pop_front();
+                    }
+                    self.reward_history.push_back(reward);
+
+                    if self.std_advantage_history.len() >= SPARKLINE_HISTORY {
+                        self.std_advantage_history.pop_front();
+                    }
+                    self.std_advantage_history.push_back(std_adv);
+
+                    // Track best and average reward (GRPO)
+                    if reward > self.best_reward {
+                        self.best_reward = reward;
+                    }
+                    self.reward_sum += reward;
+                    self.reward_count += 1;
                 }
-                self.reward_history.push_back(mean_reward);
-                if self.advantage_history.len() >= SPARKLINE_HISTORY {
-                    self.advantage_history.pop_front();
-                }
-                self.advantage_history.push_back(mean_advantage);
             }
 
             TrainingMessage::Generation {
@@ -371,6 +542,7 @@ impl App {
                 completion,
                 reward,
                 tokens,
+                reward_details,
             } => {
                 if self.samples.len() >= SAMPLE_HISTORY {
                     self.samples.pop_front();
@@ -381,6 +553,7 @@ impl App {
                     completion,
                     reward,
                     tokens,
+                    reward_details,
                 });
             }
 
@@ -437,11 +610,328 @@ impl App {
                 }
                 self.add_log(LogLevel::Info, message);
             }
+
+            TrainingMessage::DatabasePath {
+                path,
+                run_id,
+                run_name,
+            } => {
+                // Open database and set run ID
+                if let Err(e) = self.open_database(&path) {
+                    self.add_log(LogLevel::Error, e);
+                } else {
+                    self.set_database_run_id(run_id.clone());
+                    if let Some(name) = &run_name {
+                        self.add_log(LogLevel::Info, format!("Database run: {name} ({run_id})"));
+                    } else {
+                        self.add_log(LogLevel::Info, format!("Database run: {run_id}"));
+                    }
+                    // Handle resume state restoration
+                    if self.resume_state_received {
+                        // ResumeState already populated sparklines, so load logs and samples
+                        if self.logs.is_empty() && self.pending_db_action.is_none() {
+                            self.pending_db_action = Some(DbAction::LoadHistoricalLogs);
+                        }
+                    } else if self.loss_history.is_empty() && self.pending_db_action.is_none() {
+                        // Fallback: load metrics if sparklines are empty
+                        self.pending_db_action = Some(DbAction::LoadMetrics);
+                    }
+                }
+            }
+
+            TrainingMessage::Prompt {
+                id,
+                message,
+                choices,
+                default,
+                multi_select,
+            } => {
+                debug!(%id, %message, num_choices = choices.len(), multi_select, "Prompt received");
+                let num_choices = choices.len();
+                let mut selected = vec![false; num_choices];
+                // Initialize cursor to first default index (for single-select)
+                let mut cursor = 0usize;
+
+                // Apply default selections
+                if let Some(ref defaults) = default {
+                    for &idx in defaults {
+                        if idx < num_choices {
+                            selected[idx] = true;
+                            // For single-select, set cursor to first default
+                            if cursor == 0 {
+                                cursor = idx;
+                            }
+                        }
+                    }
+                }
+
+                self.active_prompt = Some(ActivePrompt {
+                    id,
+                    message,
+                    choices,
+                    cursor,
+                    selected,
+                    multi_select,
+                });
+            }
+
+            TrainingMessage::ResumeState {
+                step,
+                epoch,
+                total_epochs,
+                step_in_epoch,
+                total_steps_in_epoch,
+                metrics_history,
+                aggregates,
+            } => {
+                info!(
+                    "Restoring TUI state: step={}, epoch={}/{}, batch={}/{}, {} historical metrics",
+                    step,
+                    epoch,
+                    total_epochs,
+                    step_in_epoch,
+                    total_steps_in_epoch,
+                    metrics_history.len()
+                );
+                self.restore_from_resume(
+                    step,
+                    epoch,
+                    total_epochs,
+                    step_in_epoch,
+                    total_steps_in_epoch,
+                    metrics_history,
+                    aggregates,
+                );
+            }
+        }
+    }
+
+    /// Restore TUI state from resume data
+    ///
+    /// Called when training script sends ResumeState message to restore
+    /// sparklines, aggregates, and progress state.
+    #[allow(clippy::too_many_arguments)]
+    fn restore_from_resume(
+        &mut self,
+        step: u64,
+        epoch: u32,
+        total_epochs: u32,
+        step_in_epoch: u32,
+        total_steps_in_epoch: u32,
+        metrics_history: Vec<ResumeMetric>,
+        aggregates: ResumeAggregates,
+    ) {
+        // Restore progress state
+        self.current_step = step;
+        self.current_epoch = epoch;
+        self.total_epochs = total_epochs;
+
+        // Restore batch progress within epoch
+        if total_steps_in_epoch > 0 {
+            self.step_in_epoch = step_in_epoch;
+            self.total_steps_in_epoch = total_steps_in_epoch;
+        }
+
+        // Clear existing histories and restore from metrics_history (oldest first)
+        self.loss_history.clear();
+        self.reward_history.clear();
+        self.std_advantage_history.clear();
+        self.perplexity_history.clear();
+        self.token_accuracy_history.clear();
+
+        // Track last timing values from metrics
+        let mut last_generation_time_ms: Option<f64> = None;
+        let mut last_training_time_ms: Option<f64> = None;
+
+        for metric in metrics_history {
+            // Only keep up to SPARKLINE_HISTORY entries
+            if self.loss_history.len() >= SPARKLINE_HISTORY {
+                self.loss_history.pop_front();
+            }
+            self.loss_history.push_back(metric.loss);
+
+            if self.reward_history.len() >= SPARKLINE_HISTORY {
+                self.reward_history.pop_front();
+            }
+            self.reward_history.push_back(metric.mean_reward);
+
+            if self.std_advantage_history.len() >= SPARKLINE_HISTORY {
+                self.std_advantage_history.pop_front();
+            }
+            self.std_advantage_history.push_back(metric.std_advantage);
+
+            // SFT-specific metrics
+            if let Some(ppl) = metric.perplexity {
+                if self.perplexity_history.len() >= SPARKLINE_HISTORY {
+                    self.perplexity_history.pop_front();
+                }
+                self.perplexity_history.push_back(ppl);
+            }
+            if let Some(acc) = metric.token_accuracy {
+                if self.token_accuracy_history.len() >= SPARKLINE_HISTORY {
+                    self.token_accuracy_history.pop_front();
+                }
+                self.token_accuracy_history.push_back(acc);
+            }
+
+            // Track timing from last metric
+            if metric.generation_time_ms.is_some() {
+                last_generation_time_ms = metric.generation_time_ms;
+            }
+            if metric.training_time_ms.is_some() {
+                last_training_time_ms = metric.training_time_ms;
+            }
+        }
+
+        // Update current values from last entry
+        if let Some(&loss) = self.loss_history.back() {
+            self.current_loss = loss;
+            self.prev_loss = loss;
+        }
+        if let Some(&reward) = self.reward_history.back() {
+            self.current_reward = reward;
+            self.prev_reward = reward;
+        }
+        if let Some(&adv) = self.std_advantage_history.back() {
+            self.current_std_advantage = adv;
+            self.prev_std_advantage = adv;
+        }
+        if let Some(&ppl) = self.perplexity_history.back() {
+            self.current_perplexity = ppl;
+            self.prev_perplexity = ppl;
+        }
+        if let Some(&acc) = self.token_accuracy_history.back() {
+            self.current_token_accuracy = acc;
+            self.prev_token_accuracy = acc;
+        }
+
+        // Restore aggregates
+        self.best_reward = aggregates.best_reward;
+        self.reward_sum = aggregates.avg_reward * aggregates.reward_count as f64;
+        self.reward_count = aggregates.reward_count as u64;
+        self.best_loss = aggregates.best_loss;
+        self.loss_sum = aggregates.avg_loss * aggregates.loss_count as f64;
+        self.loss_count = aggregates.loss_count as u64;
+        self.total_tokens = aggregates.total_tokens as u64;
+
+        // Restore timing from last metric entry, or fall back to aggregates average
+        self.generation_time_ms =
+            last_generation_time_ms.unwrap_or(aggregates.avg_generation_time_ms);
+        self.training_time_ms = last_training_time_ms.unwrap_or(aggregates.avg_training_time_ms);
+
+        // Mark that we received resume state - this triggers historical log/sample loading
+        // when DatabasePath is processed
+        self.resume_state_received = true;
+
+        self.add_log(
+            LogLevel::Info,
+            format!(
+                "Restored {} historical metrics from database (step {}, epoch {}/{})",
+                self.loss_history.len(),
+                step,
+                epoch,
+                total_epochs
+            ),
+        );
+    }
+
+    /// Restore historical logs from database
+    ///
+    /// Called when resuming to populate the logs panel with previous log entries.
+    /// Logs are prepended (oldest first) to maintain chronological order.
+    pub fn restore_historical_logs(&mut self, logs: Vec<mlx_db::LogRecord>) {
+        let error_count_before = self
+            .logs
+            .iter()
+            .filter(|e| e.level == LogLevel::Error)
+            .count();
+        debug!(
+            "restore_historical_logs called. Current logs: {}, errors: {}, incoming: {}",
+            self.logs.len(),
+            error_count_before,
+            logs.len()
+        );
+
+        // Insert logs at the front (they're ordered oldest first from DB)
+        for log in logs.into_iter().rev() {
+            let level = match log.level.as_str() {
+                "debug" => LogLevel::Debug,
+                "info" => LogLevel::Info,
+                "warn" => LogLevel::Warn,
+                "error" => LogLevel::Error,
+                _ => LogLevel::Info,
+            };
+            // Insert at front to maintain order (newest at back)
+            self.logs.push_front(LogEntry {
+                level,
+                message: log.message,
+                timestamp: chrono::DateTime::from_timestamp_millis(log.created_at)
+                    .map(|dt| dt.with_timezone(&chrono::Local))
+                    .unwrap_or_else(chrono::Local::now),
+            });
+        }
+        // Trim to max size - but pop from front (oldest) not back (newest)!
+        // This preserves the most recent logs including any crash errors
+        while self.logs.len() > LOG_HISTORY {
+            self.logs.pop_front();
+        }
+
+        let error_count_after = self
+            .logs
+            .iter()
+            .filter(|e| e.level == LogLevel::Error)
+            .count();
+        debug!(
+            "restore_historical_logs done. Final logs: {}, errors: {}",
+            self.logs.len(),
+            error_count_after
+        );
+    }
+
+    /// Restore historical samples from database generations
+    ///
+    /// Called when resuming to populate the samples panel with previous generations.
+    pub fn restore_historical_samples(&mut self, generations: Vec<GenerationRecord>) {
+        // Insert samples at the front (they're ordered most recent first from DB)
+        for record in generations.into_iter().rev() {
+            if self.samples.len() >= SAMPLE_HISTORY {
+                self.samples.pop_back();
+            }
+            self.samples.push_front(GenerationSample {
+                index: record.id.unwrap_or(0) as u32,
+                prompt: record.prompt,
+                completion: record.completion_text,
+                reward: record.reward,
+                tokens: record.num_tokens as u32,
+                reward_details: None,
+            });
         }
     }
 
     /// Add a log entry
-    fn add_log(&mut self, level: LogLevel, message: String) {
+    pub fn add_log(&mut self, level: LogLevel, message: String) {
+        // Emit to tracing (writes to file for crash recovery)
+        match level {
+            LogLevel::Debug => debug!(target: "ui", "{}", message),
+            LogLevel::Info => info!(target: "ui", "{}", message),
+            LogLevel::Warn => warn!(target: "ui", "{}", message),
+            LogLevel::Error => error!(target: "ui", "{}", message),
+        }
+
+        // Debug: trace error logs specifically
+        if level == LogLevel::Error {
+            debug!(
+                "Adding ERROR log to UI: '{}' (total logs before: {})",
+                message,
+                self.logs.len()
+            );
+        }
+
+        // NOTE: Database log persistence removed - block_on cannot be called
+        // from within the async tokio runtime (causes nested runtime panic).
+        // Logs are persisted via tracing to file instead.
+
+        // Keep in memory for UI display
         if self.logs.len() >= LOG_HISTORY {
             self.logs.pop_front();
         }
@@ -450,26 +940,66 @@ impl App {
             message,
             timestamp: chrono::Local::now(),
         });
+
+        // Debug: trace error count after adding
+        if level == LogLevel::Error {
+            let error_count = self
+                .logs
+                .iter()
+                .filter(|e| e.level == LogLevel::Error)
+                .count();
+            debug!(
+                "After adding: total logs = {}, error logs = {}",
+                self.logs.len(),
+                error_count
+            );
+        }
+
         // Auto-scroll to bottom
         self.log_scroll = self.logs.len().saturating_sub(1) as u16;
     }
 
-    /// Push a value to a history deque, maintaining max size
-    fn push_history(&self, history: &mut VecDeque<f64>, value: f64) {
-        if history.len() >= SPARKLINE_HISTORY {
-            history.pop_front();
+    /// Get the list of available tabs based on training type
+    /// SFT mode only shows Logs and Config (no Samples)
+    pub fn get_available_tabs(&self) -> Vec<ActiveTab> {
+        if self.training_type == "sft" {
+            vec![ActiveTab::Logs, ActiveTab::Config]
+        } else {
+            vec![ActiveTab::Logs, ActiveTab::Samples, ActiveTab::Config]
         }
-        history.push_back(value);
     }
 
-    /// Toggle to next tab
+    /// Toggle to next tab (respects training type)
     pub fn next_tab(&mut self) {
-        self.active_tab = self.active_tab.next();
+        let available = self.get_available_tabs();
+        if let Some(idx) = available.iter().position(|t| *t == self.active_tab) {
+            let next_idx = (idx + 1) % available.len();
+            self.switch_to_tab(available[next_idx]);
+        } else {
+            // Current tab not in available list, switch to first available
+            self.switch_to_tab(available[0]);
+        }
     }
 
-    /// Toggle to previous tab
+    /// Toggle to previous tab (respects training type)
     pub fn prev_tab(&mut self) {
-        self.active_tab = self.active_tab.prev();
+        let available = self.get_available_tabs();
+        if let Some(idx) = available.iter().position(|t| *t == self.active_tab) {
+            let prev_idx = if idx == 0 {
+                available.len() - 1
+            } else {
+                idx - 1
+            };
+            self.switch_to_tab(available[prev_idx]);
+        } else {
+            // Current tab not in available list, switch to last available
+            self.switch_to_tab(available[available.len() - 1]);
+        }
+    }
+
+    /// Switch to a specific tab
+    pub fn switch_to_tab(&mut self, tab: ActiveTab) {
+        self.active_tab = tab;
     }
 
     /// Scroll up in current tab
@@ -594,12 +1124,21 @@ impl App {
         self.generation_time_ms + self.training_time_ms
     }
 
-    /// Get average reward
+    /// Get average reward (GRPO)
     pub fn avg_reward(&self) -> f64 {
         if self.reward_count == 0 {
             0.0
         } else {
             self.reward_sum / self.reward_count as f64
+        }
+    }
+
+    /// Get average loss (SFT)
+    pub fn avg_loss(&self) -> f64 {
+        if self.loss_count == 0 {
+            0.0
+        } else {
+            self.loss_sum / self.loss_count as f64
         }
     }
 
@@ -655,16 +1194,49 @@ impl App {
     }
 
     /// Prepare for restart - reset process state while keeping metrics
-    pub fn prepare_for_restart(&mut self) {
+    /// Returns the old db_reader if any, which must be dropped via spawn_blocking
+    pub fn prepare_for_restart(&mut self) -> Option<SyncDbReader> {
+        let error_count_before = self
+            .logs
+            .iter()
+            .filter(|e| e.level == LogLevel::Error)
+            .count();
+        debug!(
+            "prepare_for_restart called. Logs before: {}, errors: {}",
+            self.logs.len(),
+            error_count_before
+        );
+
         self.state = TrainingState::Starting;
         self.child_exited = false;
         self.restart_countdown = None;
         self.restart_count += 1;
+
+        // Take database connection for safe drop via spawn_blocking
+        // The new training process will send a DatabasePath message
+        let old_reader = self.db_reader.take();
+        if old_reader.is_some() {
+            debug!("Closing database connection for restart");
+        }
+
         // Keep metrics history, logs, and samples for continuity
         self.add_log(
             LogLevel::Info,
             format!("Restarting training (attempt #{})...", self.restart_count),
         );
+
+        let error_count_after = self
+            .logs
+            .iter()
+            .filter(|e| e.level == LogLevel::Error)
+            .count();
+        debug!(
+            "prepare_for_restart done. Logs after: {}, errors: {}",
+            self.logs.len(),
+            error_count_after
+        );
+
+        old_reader
     }
 
     /// Start restart countdown
@@ -694,5 +1266,155 @@ impl App {
         self.state = TrainingState::Error;
         self.auto_restart_enabled = false;
         self.add_log(LogLevel::Info, "Auto-restart cancelled".to_string());
+    }
+
+    // === Database Methods ===
+
+    /// Open a database file
+    /// WARNING: This calls block_on internally, do NOT call from async context!
+    /// Use spawn_blocking in main.rs instead.
+    pub fn open_database(&mut self, path: &str) -> Result<(), String> {
+        debug!(%path, "open_database");
+        match SyncDbReader::open(path) {
+            Ok(reader) => {
+                debug!("SyncDbReader::open succeeded");
+                self.db_reader = Some(reader);
+                self.db_path = Some(path.to_string());
+                self.add_log(LogLevel::Info, format!("Opened database: {path}"));
+                // Request data fetch (will be processed in event loop via spawn_blocking)
+                self.pending_db_action = Some(DbAction::RefreshGenerations);
+                debug!("open_database complete, refresh pending");
+                Ok(())
+            }
+            Err(e) => {
+                debug!(%e, "SyncDbReader::open failed");
+                let msg = format!("Failed to open database: {e}");
+                self.add_log(LogLevel::Error, msg.clone());
+                Err(msg)
+            }
+        }
+    }
+
+    /// Set the database run ID (from training process message)
+    pub fn set_database_run_id(&mut self, run_id: String) {
+        debug!(%run_id, "set_database_run_id");
+        self.db_run_id = Some(run_id);
+        // Request data fetch (will be processed in event loop via spawn_blocking)
+        self.pending_db_action = Some(DbAction::RefreshGenerations);
+    }
+
+    /// Store generations result (called after spawn_blocking fetch)
+    pub fn set_generations(&mut self, generations: Vec<GenerationRecord>, total: usize) {
+        self.db_total_count = total;
+        self.db_generations = generations;
+        if self.db_selected >= self.db_generations.len() && !self.db_generations.is_empty() {
+            self.db_selected = self.db_generations.len() - 1;
+        }
+    }
+
+    /// Restore metrics history from database query results
+    /// Called on resume to populate sparklines with historical data
+    pub fn restore_metrics_history(&mut self, metrics: Vec<(f64, f64, f64)>) {
+        // metrics is Vec<(loss, mean_reward, std_advantage)> ordered by step
+        self.loss_history.clear();
+        self.reward_history.clear();
+        self.std_advantage_history.clear();
+
+        // Take last SPARKLINE_HISTORY entries
+        let start = metrics.len().saturating_sub(SPARKLINE_HISTORY);
+        for (loss, reward, std_adv) in metrics.into_iter().skip(start) {
+            self.loss_history.push_back(loss);
+            self.reward_history.push_back(reward);
+            self.std_advantage_history.push_back(std_adv);
+        }
+
+        // Update current values to last entry
+        if let Some(&loss) = self.loss_history.back() {
+            self.current_loss = loss;
+        }
+        if let Some(&reward) = self.reward_history.back() {
+            self.current_reward = reward;
+        }
+        if let Some(&adv) = self.std_advantage_history.back() {
+            self.current_std_advantage = adv;
+        }
+
+        self.add_log(
+            crate::messages::LogLevel::Info,
+            format!(
+                "Restored {} historical metrics from database",
+                self.loss_history.len()
+            ),
+        );
+    }
+
+    /// Take pending db action (clears it)
+    pub fn take_pending_db_action(&mut self) -> Option<DbAction> {
+        self.pending_db_action.take()
+    }
+
+    // === Prompt Methods ===
+
+    /// Move cursor up in active prompt
+    pub fn prompt_select_prev(&mut self) {
+        if let Some(ref mut prompt) = self.active_prompt {
+            prompt.cursor = prompt.cursor.saturating_sub(1);
+        }
+    }
+
+    /// Move cursor down in active prompt
+    pub fn prompt_select_next(&mut self) {
+        if let Some(ref mut prompt) = self.active_prompt {
+            let max = prompt.choices.len().saturating_sub(1);
+            prompt.cursor = (prompt.cursor + 1).min(max);
+        }
+    }
+
+    /// Toggle selection at cursor (for multi-select mode)
+    pub fn prompt_toggle(&mut self) {
+        if let Some(ref mut prompt) = self.active_prompt
+            && prompt.multi_select
+            && let Some(selected) = prompt.selected.get_mut(prompt.cursor)
+        {
+            *selected = !*selected;
+        }
+    }
+
+    /// Get the selected value(s) and clear the prompt
+    /// Returns (id, value) where value is comma-separated for multi-select
+    /// Also captures certain prompts (like training-targets) for replay on restart
+    pub fn prompt_confirm(&mut self) -> Option<(String, String)> {
+        let prompt = self.active_prompt.take()?;
+
+        let (id, value) = if prompt.multi_select {
+            // Collect all selected values
+            let values: Vec<&str> = prompt
+                .choices
+                .iter()
+                .zip(prompt.selected.iter())
+                .filter(|(_, selected)| **selected)
+                .map(|(choice, _)| choice.value.as_str())
+                .collect();
+            (prompt.id, values.join(","))
+        } else {
+            // Single-select: return the cursor position's value
+            let value = prompt.choices.get(prompt.cursor)?.value.clone();
+            (prompt.id, value)
+        };
+
+        // Capture all prompt responses for replay on restart
+        // This allows the TUI to remember user selections (like training targets)
+        // and automatically replay them when the training script restarts
+        if !value.is_empty() {
+            self.captured_prompt_responses
+                .insert(id.clone(), value.clone());
+        }
+
+        Some((id, value))
+    }
+
+    /// Check if there's an active prompt blocking UI
+    pub fn has_active_prompt(&self) -> bool {
+        self.active_prompt.is_some()
     }
 }

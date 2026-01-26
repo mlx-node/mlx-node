@@ -55,7 +55,7 @@ Terminal User Interface for monitoring and controlling GRPO training runs using 
 - **Files**: `crates/mlx-tui/` (14 Rust source files)
 - **Features**: Real-time metrics with sparklines, progress bars, tabbed panels (Logs/Samples/Config), keyboard controls (pause/resume/save/scroll)
 - **Communication**: Wrapper pattern - TUI spawns Node.js training script, communicates via stdout (JSONL messages) and stdin (line commands)
-- **TypeScript Integration**: `tuiMode` option in GRPOLogger and GRPOTrainer for JSONL output and stdin command handling
+- **TypeScript Integration**: `tuiMode` option in TrainingLogger and GRPOTrainer for JSONL output and stdin command handling
 - **Usage**: `./target/release/mlx-train --script train.ts -- --model ./models/qwen3`
 - **Docs**: See plan at `/Users/brooklyn/.claude/plans/elegant-cooking-lampson.md`
 
@@ -358,7 +358,7 @@ const token = sample(logits, {
   minP: 0.05,
   repetitionPenalty: 1.2,
   xtcThreshold: 0.1,
-  xtcProbability: 0.5
+  xtcProbability: 0.5,
 });
 
 // BatchKVCache for variable-length batches
@@ -373,10 +373,10 @@ const output = block.forward(x, null, cache);
 
 // GRPO training with entropy filtering
 const config = {
-  topEntropyQuantile: 0.8,  // Train on top 20% uncertain tokens
+  topEntropyQuantile: 0.8, // Train on top 20% uncertain tokens
   lossType: 'grpo',
   importanceSamplingLevel: 'token',
-  clipEpsilon: 0.2
+  clipEpsilon: 0.2,
 };
 ```
 
@@ -399,7 +399,7 @@ const result = await model.chat(messages, {
 // Handle tool calls
 for (const call of result.toolCalls) {
   if (call.status === 'ok') {
-    console.log(call.name, call.arguments);  // Arguments is already a JS object!
+    console.log(call.name, call.arguments); // Arguments is already a JS object!
   }
 }
 
@@ -626,3 +626,58 @@ _Test Coverage: 100% (611/614 tests passing, 3 skipped)_
 _Code: ~25,000 Rust lines + 3,712 TypeScript lines + 13,702 test lines_
 _Feature Parity: 90% MLX-LM, 100% TRL GRPO_
 _Phase 6 Autograd: ✅ Complete and production-ready_
+
+<!--VITE PLUS START-->
+
+# Using Vite+, the Unified Toolchain for the Web
+
+This project is using Vite+, a modern toolchain built on top of Vite, Rolldown, Vitest, tsdown, Oxlint, and Oxfmt. Vite+ wraps these tools and package manager commands in a single, global CLI called `vite`. Vite+ is distinct from Vite, but it invokes Vite through `vite dev` and `vite build`.
+
+## Vite+ Workflow
+
+`vite` is a global binary that handles the full development lifecycle. Run `vite help` to print a list of commands and `vite <command> --help` for information about a specific command.
+
+### Vite+ Commands
+
+- dev - Run the development server
+- build - Build for production
+- lint - Lint code
+- test - Run tests
+- fmt - Format code
+- lib - Build library
+- migrate - Migrate an existing project to Vite+
+- new - Create a new monorepo package (in-project) or a new project (global)
+- run - Run tasks from `package.json` scripts
+
+These commands map to their corresponding tools. For example, `vite dev --port 3000` runs Vite's dev server and works the same as Vite. `vite test` runs JavaScript tests through the bundled Vitest. The version of all tools can be checked using `vite --version`. This is useful when researching documentation, features, and bugs.
+
+### Package Manager Commands
+
+Vite+ automatically detects and wraps the underlying package manager such as pnpm, npm, or Yarn through the `packageManager` field in `package.json` or package manager-specific lockfiles.
+
+- install - Install all dependencies, or add packages if package names are provided
+- add - Add packages to dependencies
+- remove - Remove packages from dependencies
+- dlx - Execute a package binary without installing it as a dependency
+- info - View package information from the registry, including latest versions
+- link - Link packages for local development
+- outdated - Check for outdated packages
+- pm - Forward a command to the package manager
+- unlink - Unlink packages
+- update - Update packages to their latest versions
+- why - Show why a package is installed
+
+## Common Pitfalls
+
+- **Using the package manager directly:** Do not use pnpm, npm, or Yarn directly. Vite+ can handle all package manager operations.
+- **Always use Vite commands to run tools:** Don't attempt to run `vite vitest` or `vite oxlint`. They do not exist. Use `vite test` and `vite lint` instead.
+- **Running scripts:** Vite+ commands take precedence over `package.json` scripts. If there is a `test` script defined in `scripts` that conflicts with the built-in `vite test` command, run it using `vite run test`.
+- **Do not install Vitest, Oxlint, Oxfmt, or tsdown directly:** Vite+ wraps these tools. They must not be installed directly. You cannot upgrade these tools by installing their latest versions. Always use Vite+ commands.
+- **Import JavaScript modules from `vite-plus`:** Instead of importing from `vite` or `vitest`, all modules should be imported from the project's `vite-plus` dependency. For example, `import { defineConfig } from 'vite-plus';` or `import { expect, test, vi } from 'vite-plus/test';`. You must not install `vitest` to import test utilities.
+- **Type-Aware Linting:** There is no need to install `oxlint-tsgolint`, `vite lint --type-aware` works out of the box.
+
+## Review Checklist for Agents
+
+- [ ] Run `vite install` after pulling remote changes and before getting started.
+- [ ] Run `vite lint`, `vite fmt`, and `vite test` to validate changes.
+<!--VITE PLUS END-->

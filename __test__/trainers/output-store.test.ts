@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vite-plus/test';
 import { existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -101,6 +101,7 @@ describe('OutputStore', () => {
         meanReward: 0.7,
         stdReward: 0.1,
         meanAdvantage: 0.3,
+        stdAdvantage: 0.15,
         totalTokens: 100,
         generationTimeMs: 500.0,
         trainingTimeMs: 200.0,
@@ -154,6 +155,7 @@ describe('OutputStore', () => {
         meanReward: 0.8,
         stdReward: 0.1,
         meanAdvantage: 0.2,
+        stdAdvantage: 0.1,
         totalTokens: 50,
         generationTimeMs: 100.0,
         trainingTimeMs: 50.0,
@@ -167,7 +169,6 @@ describe('OutputStore', () => {
             batchIndex: 0,
             groupIndex: 0,
             prompt: 'Q',
-            expectedAnswer: 'A',
             completionText: 'A',
             completionRaw: 'A',
             thinking: undefined,
@@ -200,6 +201,7 @@ describe('OutputStore', () => {
         meanReward: 0.5,
         stdReward: 0.1,
         meanAdvantage: 0.0,
+        stdAdvantage: 0.0,
         totalTokens: 20,
         generationTimeMs: 100.0,
         trainingTimeMs: 50.0,
@@ -213,7 +215,6 @@ describe('OutputStore', () => {
             batchIndex: 0,
             groupIndex: 0,
             prompt: 'Hello',
-            expectedAnswer: 'World',
             completionText: 'World',
             completionRaw: 'World',
             thinking: 'Let me think...',
@@ -245,6 +246,7 @@ describe('OutputStore', () => {
         meanReward: 0.5,
         stdReward: 0.3,
         meanAdvantage: 0.0,
+        stdAdvantage: 0.0,
         totalTokens: 30,
         generationTimeMs: 100.0,
         trainingTimeMs: 50.0,
@@ -258,7 +260,6 @@ describe('OutputStore', () => {
             batchIndex: 0,
             groupIndex: 0,
             prompt: 'P1',
-            expectedAnswer: undefined,
             completionText: 'C1',
             completionRaw: 'C1',
             thinking: undefined,
@@ -270,7 +271,6 @@ describe('OutputStore', () => {
             batchIndex: 0,
             groupIndex: 1,
             prompt: 'P1',
-            expectedAnswer: undefined,
             completionText: 'C2',
             completionRaw: 'C2',
             thinking: undefined,
@@ -282,7 +282,6 @@ describe('OutputStore', () => {
             batchIndex: 0,
             groupIndex: 2,
             prompt: 'P1',
-            expectedAnswer: undefined,
             completionText: 'C3',
             completionRaw: 'C3',
             thinking: undefined,
@@ -317,6 +316,7 @@ describe('OutputStore', () => {
         meanReward: 0.7,
         stdReward: 0.1,
         meanAdvantage: 0.2,
+        stdAdvantage: 0.1,
         totalTokens: 50,
         generationTimeMs: 100.0,
         trainingTimeMs: 50.0,
@@ -330,7 +330,6 @@ describe('OutputStore', () => {
             batchIndex: 0,
             groupIndex: 0,
             prompt: 'Q',
-            expectedAnswer: 'A',
             completionText: 'A',
             completionRaw: 'A',
             thinking: undefined,
@@ -363,6 +362,7 @@ describe('OutputStore', () => {
         meanReward: 0.7,
         stdReward: 0.1,
         meanAdvantage: 0.2,
+        stdAdvantage: 0.1,
         totalTokens: 50,
         generationTimeMs: 100.0,
         trainingTimeMs: 50.0,
@@ -376,7 +376,6 @@ describe('OutputStore', () => {
             batchIndex: 0,
             groupIndex: 0,
             prompt: 'Use a tool',
-            expectedAnswer: undefined,
             completionText: 'I used a tool',
             completionRaw: '<tool_call>{"name": "test"}</tool_call>',
             thinking: undefined,
@@ -418,10 +417,13 @@ describe('OutputStore', () => {
         meanReward: 0.7,
         stdReward: 0.1,
         meanAdvantage: 0.2,
+        stdAdvantage: 0.1,
         totalTokens: 50,
         generationTimeMs: 100.0,
         trainingTimeMs: 50.0,
         gradientsApplied: true,
+        peakMemoryMb: 1000.0,
+        activeMemoryMb: 500.0,
       };
 
       const outputsJson = JSON.stringify([
@@ -460,6 +462,7 @@ describe('OutputStore', () => {
         meanReward: 0.5,
         stdReward: 0.1,
         meanAdvantage: 0.0,
+        stdAdvantage: 0.0,
         totalTokens: 20,
         generationTimeMs: 100.0,
         trainingTimeMs: 50.0,
@@ -473,7 +476,6 @@ describe('OutputStore', () => {
             batchIndex: 0,
             groupIndex: 0,
             prompt: 'apple banana',
-            expectedAnswer: undefined,
             completionText: 'fruit salad',
             completionRaw: 'fruit salad',
             thinking: undefined,
@@ -485,7 +487,6 @@ describe('OutputStore', () => {
             batchIndex: 0,
             groupIndex: 1,
             prompt: 'orange grape',
-            expectedAnswer: undefined,
             completionText: 'citrus blend',
             completionRaw: 'citrus blend',
             thinking: undefined,
@@ -508,6 +509,109 @@ describe('OutputStore', () => {
       const citrusResults = await store.searchGenerations(runId, 'citrus', 'completion', 10);
       expect(citrusResults.length).toBe(1);
       expect(citrusResults[0].generation.completionText).toContain('citrus');
+    });
+  });
+
+  describe('resume cleanup', () => {
+    it('should delete steps after a given step number', async () => {
+      const runId = await store.startRun('cleanup-test', undefined, '{}');
+
+      // Record 3 steps
+      for (let step = 1; step <= 3; step++) {
+        const stepRecord = {
+          runId,
+          step,
+          epoch: undefined,
+          loss: 0.5 - step * 0.1,
+          meanReward: 0.5 + step * 0.1,
+          stdReward: 0.1,
+          meanAdvantage: 0.0,
+          stdAdvantage: 0.0,
+          totalTokens: 50,
+          generationTimeMs: 100.0,
+          trainingTimeMs: 50.0,
+          gradientsApplied: true,
+        };
+
+        await store.recordStep(
+          stepRecord,
+          [
+            {
+              batchIndex: 0,
+              groupIndex: 0,
+              prompt: `Step ${step} prompt`,
+              completionText: `Step ${step} completion`,
+              completionRaw: `Step ${step} completion`,
+              thinking: undefined,
+              numTokens: 5,
+              finishReason: 'eos',
+              reward: 0.5,
+            },
+          ],
+          [],
+        );
+      }
+
+      // Verify we have 3 steps
+      let summaries = await store.getStepSummaries(runId, undefined, undefined);
+      expect(summaries.length).toBe(3);
+
+      // Delete steps after step 1 (should delete steps 2 and 3)
+      const deleted = await store.deleteStepsAfter(runId, 1);
+      expect(deleted).toBe(2);
+
+      // Verify only step 1 remains
+      summaries = await store.getStepSummaries(runId, undefined, undefined);
+      expect(summaries.length).toBe(1);
+      expect(summaries[0].step).toBe(1);
+
+      await store.endRun('completed');
+    });
+
+    it('should return 0 when no steps to delete', async () => {
+      const runId = await store.startRun('no-delete-test', undefined, '{}');
+
+      // Record step 1
+      await store.recordStep(
+        {
+          runId,
+          step: 1,
+          epoch: undefined,
+          loss: 0.5,
+          meanReward: 0.5,
+          stdReward: 0.1,
+          meanAdvantage: 0.0,
+          stdAdvantage: 0.0,
+          totalTokens: 50,
+          generationTimeMs: 100.0,
+          trainingTimeMs: 50.0,
+          gradientsApplied: true,
+        },
+        [
+          {
+            batchIndex: 0,
+            groupIndex: 0,
+            prompt: 'Test prompt',
+            completionText: 'Test completion',
+            completionRaw: 'Test completion',
+            thinking: undefined,
+            numTokens: 5,
+            finishReason: 'eos',
+            reward: 0.5,
+          },
+        ],
+        [],
+      );
+
+      // Try to delete steps after step 10 (none exist)
+      const deleted = await store.deleteStepsAfter(runId, 10);
+      expect(deleted).toBe(0);
+
+      // Verify step 1 still exists
+      const summaries = await store.getStepSummaries(runId, undefined, undefined);
+      expect(summaries.length).toBe(1);
+
+      await store.endRun('completed');
     });
   });
 });

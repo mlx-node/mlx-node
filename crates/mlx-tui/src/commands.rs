@@ -18,6 +18,8 @@ pub enum ControlCommand {
     Stop,
     /// Set the sample display mode
     SetSampleDisplay(SampleDisplayMode),
+    /// Response to an interactive prompt
+    PromptResponse { id: String, value: String },
 }
 
 /// How to display generated samples
@@ -71,6 +73,7 @@ impl ControlCommand {
             Self::SaveCheckpoint => "SAVE_CHECKPOINT".to_string(),
             Self::Stop => "STOP".to_string(),
             Self::SetSampleDisplay(mode) => format!("SET sample_display={mode}"),
+            Self::PromptResponse { id, value } => format!("PROMPT:{id}:{value}"),
         }
     }
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { MxArray, Qwen3Model } from '@mlx-node/core';
 import { shape } from '../test-utils';
 

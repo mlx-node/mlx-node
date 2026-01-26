@@ -151,10 +151,10 @@ import { Qwen3Model } from '@mlx-node/lm';
 
 const model = await Qwen3Model.loadPretrained('.cache/models/qwen3-0.6b-mlx-bf16');
 
-const result = await model.generate(
-  [{ role: 'user', content: 'Write a haiku about TypeScript.' }],
-  { maxNewTokens: 50, temperature: 0.8 }
-);
+const result = await model.generate([{ role: 'user', content: 'Write a haiku about TypeScript.' }], {
+  maxNewTokens: 50,
+  temperature: 0.8,
+});
 
 console.log(result.text);
 ```
@@ -186,7 +186,7 @@ const trainer = await GRPOTrainer.create({
   // GRPO parameters
   clipEpsilon: 0.2,
   klCoef: 0.1,
-  lossType: 'grpo',  // or 'dapo', 'dr_grpo', 'bnpo'
+  lossType: 'grpo', // or 'dapo', 'dr_grpo', 'bnpo'
 
   // Custom reward function
   rewardFunction: async (prompts, completions, answers) => {
@@ -300,7 +300,7 @@ import { GRPOTrainer } from '@mlx-node/trl';
 const trainer = await GRPOTrainer.create({
   modelPath: '.cache/models/qwen3-0.6b-mlx-bf16',
   outputDir: 'outputs/training',
-  tuiMode: true,  // Enable TUI-compatible output
+  tuiMode: true, // Enable TUI-compatible output
   // ... other options
 });
 ```
@@ -389,17 +389,30 @@ import { Qwen3Model, Qwen3Tokenizer, QWEN3_CONFIGS, ModelLoader } from '@mlx-nod
 
 // For training
 import {
-  GRPOTrainer, GRPOConfig,
-  Adam, AdamW, SGD, RMSprop,
+  GRPOTrainer,
+  GRPOConfig,
+  Adam,
+  AdamW,
+  SGD,
+  RMSprop,
   loadLocalGsm8kDataset,
-  correctnessReward, strictFormatReward,
+  correctnessReward,
+  strictFormatReward,
 } from '@mlx-node/trl';
 
 // For low-level operations (via trl re-exports)
 import {
-  MxArray, Linear, RMSNorm, Attention, TransformerBlock,
-  KVCache, BatchKVCache, RotatingKVCache,
-  Activations, Losses, Gradients,
+  MxArray,
+  Linear,
+  RMSNorm,
+  Attention,
+  TransformerBlock,
+  KVCache,
+  BatchKVCache,
+  RotatingKVCache,
+  Activations,
+  Losses,
+  Gradients,
 } from '@mlx-node/trl';
 ```
 
@@ -453,13 +466,13 @@ import { MxArray, Linear, RMSNorm, Activations } from '@mlx-node/trl';
 // Create arrays using TypedArrays
 const x = MxArray.fromFloat32(
   new Float32Array([1, 2, 3, 4, 5, 6]),
-  BigInt64Array.from([2n, 3n])  // shape: [2, 3]
+  BigInt64Array.from([2n, 3n]), // shape: [2, 3]
 );
 
 // Matrix operations
 const y = x.matmul(weights);
 const sum = x.sum();
-const mean = x.mean(0);  // Along axis 0
+const mean = x.mean(0); // Along axis 0
 
 // Neural network layers
 const linear = new Linear(512, 1024);
@@ -479,9 +492,9 @@ import { KVCache, BatchKVCache, RotatingKVCache } from '@mlx-node/trl';
 const cache = new KVCache();
 
 // Batch cache for variable-length sequences with left-padding
-const batchCache = new BatchKVCache([1, 2, 0]);  // Padding per sequence
+const batchCache = new BatchKVCache([1, 2, 0]); // Padding per sequence
 const [keys, values] = batchCache.updateAndFetch(newKeys, newValues);
-batchCache.filter([0, 2]);  // Keep only certain sequences
+batchCache.filter([0, 2]); // Keep only certain sequences
 
 // Rotating cache for bounded memory
 const rotatingCache = new RotatingKVCache({ maxSize: 2048, keep: 128 });

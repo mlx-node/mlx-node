@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { BatchKVCache, MxArray } from '@mlx-node/core';
 import { shape, assertShape, int32 } from '../test-utils';
 

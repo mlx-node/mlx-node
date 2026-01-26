@@ -58,6 +58,39 @@ pub fn draw(f: &mut Frame, app: &App, sample_idx: usize) {
     ]));
     lines.push(Line::from(""));
 
+    // Reward breakdown section (if available)
+    if let Some(ref details) = sample.reward_details {
+        lines.push(Line::from(vec![Span::styled(
+            "━━━ Reward Breakdown ━━━",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )]));
+
+        // Sort keys for consistent display
+        let mut keys: Vec<_> = details.keys().collect();
+        keys.sort();
+
+        for key in keys {
+            if let Some(&value) = details.get(key) {
+                // Color based on whether it's a gate pass/fail indicator
+                let value_color = if value >= 7.0 {
+                    Color::Green
+                } else if value >= 4.0 {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}: ", key), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{:.2}", value), Style::default().fg(value_color)),
+                ]));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+
     // Prompt section
     lines.push(Line::from(vec![Span::styled(
         "━━━ Prompt ━━━",

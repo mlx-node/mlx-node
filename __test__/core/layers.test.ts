@@ -3,7 +3,7 @@
  * Ported from mlx/python/tests/test_nn.py
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { MxArray, Linear, RMSNorm, LayerNorm, Embedding } from '@mlx-node/core';
 import { createFloat32Array, assertArrayClose } from '../test-utils';
 

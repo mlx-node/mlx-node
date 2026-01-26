@@ -4,6 +4,9 @@
   "dependencies": {
     "@mlx-node/core": "workspace:*",
     "@mlx-node/lm": "workspace:*",
-    "@mlx-node/trl": "workspace:*"
+    "@mlx-node/trl": "workspace:*",
+    "@openrouter/ai-sdk-provider": "^1.5.4",
+    "ai": "^6.0.12",
+    "zod": "^4.3.5"
   }
 }

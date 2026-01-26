@@ -3,17 +3,26 @@
  *
  * Converts HuggingFace SafeTensors models to MLX float32 format.
  * This is essential for GRPO training which requires full float32 precision.
+ * Supports both single-file and sharded models.
  */
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::utils::safetensors::{SafeTensorsFile, save_safetensors};
+
+/// Structure for parsing model.safetensors.index.json
+#[derive(Debug, Deserialize)]
+struct ShardedModelIndex {
+    /// Maps tensor names to shard filenames
+    weight_map: HashMap<String, String>,
+}
 
 #[napi(object)]
 pub struct ConversionOptions {
@@ -96,23 +105,6 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         )));
     }
 
-    // Find model weights file (try both common names)
-    let weights_path = if input_dir.join("model.safetensors").exists() {
-        input_dir.join("model.safetensors")
-    } else if input_dir.join("weights.safetensors").exists() {
-        input_dir.join("weights.safetensors")
-    } else if input_dir.join("model.safetensors.index.json").exists() {
-        return Err(Error::from_reason(
-            "Sharded models not yet supported. Please provide a single safetensors file."
-                .to_string(),
-        ));
-    } else {
-        return Err(Error::from_reason(format!(
-            "No model weights found in input directory.\nExpected: model.safetensors or weights.safetensors\nPath: {}",
-            input_dir.display()
-        )));
-    };
-
     info!("Loading model from: {}", input_dir.display());
     info!("Target dtype: {}", target_dtype);
 
@@ -125,18 +117,6 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         ))
     })?;
 
-    // Load SafeTensors file
-    info!("Loading SafeTensors from: {}", weights_path.display());
-    let st_file = SafeTensorsFile::load(&weights_path)?;
-
-    let num_tensors = st_file.tensors.len();
-    let num_parameters = st_file.num_parameters();
-
-    info!(
-        "Loaded {} tensors ({} parameters)",
-        num_tensors, num_parameters
-    );
-
     // Load config to check for tied embeddings
     let config_data = fs::read_to_string(&config_path)?;
     let config: serde_json::Value = serde_json::from_str(&config_data)?;
@@ -146,9 +126,96 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         info!("Model uses tied embeddings - will skip lm_head.weight");
     }
 
-    // Load all tensors and convert to target dtype
+    // Load tensors - handle both single file and sharded models
+    let tensors: HashMap<String, MxArray>;
+    let num_tensors: usize;
+    let num_parameters: usize;
+
+    let index_path = input_dir.join("model.safetensors.index.json");
+    let single_weights_path = input_dir.join("model.safetensors");
+    let alt_weights_path = input_dir.join("weights.safetensors");
+
+    if single_weights_path.exists() {
+        // Single file model
+        info!(
+            "Loading single SafeTensors file: {}",
+            single_weights_path.display()
+        );
+        let st_file = SafeTensorsFile::load(&single_weights_path)?;
+        num_tensors = st_file.tensors.len();
+        num_parameters = st_file.num_parameters();
+        info!(
+            "Loaded {} tensors ({} parameters)",
+            num_tensors, num_parameters
+        );
+        tensors = st_file.load_tensors(&single_weights_path)?;
+    } else if alt_weights_path.exists() {
+        // Alternative single file model
+        info!(
+            "Loading single SafeTensors file: {}",
+            alt_weights_path.display()
+        );
+        let st_file = SafeTensorsFile::load(&alt_weights_path)?;
+        num_tensors = st_file.tensors.len();
+        num_parameters = st_file.num_parameters();
+        info!(
+            "Loaded {} tensors ({} parameters)",
+            num_tensors, num_parameters
+        );
+        tensors = st_file.load_tensors(&alt_weights_path)?;
+    } else if index_path.exists() {
+        // Sharded model
+        info!("Loading sharded model from index: {}", index_path.display());
+
+        // Parse the index file
+        let index_data = fs::read_to_string(&index_path)?;
+        let index: ShardedModelIndex = serde_json::from_str(&index_data)
+            .map_err(|e| Error::from_reason(format!("Failed to parse model index: {}", e)))?;
+
+        // Find unique shard files
+        let shard_files: HashSet<String> = index.weight_map.values().cloned().collect();
+        info!("Found {} shard files", shard_files.len());
+
+        // Load tensors from each shard
+        let mut all_tensors: HashMap<String, MxArray> = HashMap::new();
+        let mut total_params = 0usize;
+
+        for shard_name in shard_files.iter() {
+            let shard_path = input_dir.join(shard_name);
+            if !shard_path.exists() {
+                return Err(Error::from_reason(format!(
+                    "Shard file not found: {}",
+                    shard_path.display()
+                )));
+            }
+
+            info!("  Loading shard: {}", shard_name);
+            let st_file = SafeTensorsFile::load(&shard_path)?;
+            total_params += st_file.num_parameters();
+
+            let shard_tensors = st_file.load_tensors(&shard_path)?;
+            all_tensors.extend(shard_tensors);
+        }
+
+        num_tensors = all_tensors.len();
+        num_parameters = total_params;
+        tensors = all_tensors;
+
+        info!(
+            "Loaded {} tensors ({} parameters) from {} shards",
+            num_tensors,
+            num_parameters,
+            shard_files.len()
+        );
+    } else {
+        return Err(Error::from_reason(format!(
+            "No model weights found in input directory.\nExpected: model.safetensors, weights.safetensors, or model.safetensors.index.json\nPath: {}",
+            input_dir.display()
+        )));
+    }
+
+    // Convert tensors to target dtype
     info!("Converting tensors to {}...", target_dtype);
-    let tensors = st_file.load_tensors(&weights_path)?;
 
     let mut converted_tensors: HashMap<String, MxArray> = HashMap::new();
     let mut tensor_names = Vec::new();

@@ -204,3 +204,4 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+/unsloth

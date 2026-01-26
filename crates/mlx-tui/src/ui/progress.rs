@@ -37,10 +37,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray));
     f.render_widget(epoch_gauge, chunks[0]);
 
-    // Step progress within epoch
+    // Batch progress within epoch (not optimizer steps)
     let step_progress = app.step_progress();
     let step_label = format!(
-        "Step {}/{} ({:.0}%)",
+        "Batch {}/{} ({:.0}%)",
         app.step_in_epoch,
         app.total_steps_in_epoch,
         step_progress * 100.0

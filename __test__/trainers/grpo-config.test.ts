@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vite-plus/test';
 import { resolve } from 'node:path';
 import { applyOverrides, ConfigError, getDefaultConfig, loadTomlConfig } from '@mlx-node/trl';
 

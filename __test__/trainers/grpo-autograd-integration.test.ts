@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { QWEN3_CONFIGS } from '@mlx-node/lm';
 import { MxArray, Qwen3Model } from '@mlx-node/core';
 import { shape, int32, float32, float64 } from '../test-utils';
@@ -70,6 +70,130 @@ describe('GRPO Autograd Integration', () => {
       console.log('Autograd Training Step Results:');
       console.log(`  Loss: ${loss.toFixed(6)}`);
       console.log(`  Mean Reward: ${metrics.mean_reward.toFixed(4)}`);
+      console.log(`  Num Gradients: ${metrics.num_gradients}`);
+    });
+
+    it('should handle variable-length prompts with correct masking', () => {
+      const model = new Qwen3Model(QWEN3_CONFIGS['qwen3-0.6b']);
+
+      // Use prompts with DIFFERENT lengths to test padding/masking
+      const promptTokens = [
+        MxArray.fromInt32(int32(1, 2, 3), shape(3)), // 3 tokens
+        MxArray.fromInt32(int32(4, 5, 6, 7, 8), shape(5)), // 5 tokens
+        MxArray.fromInt32(int32(9, 10), shape(2)), // 2 tokens
+        MxArray.fromInt32(int32(11, 12, 13, 14), shape(4)), // 4 tokens
+      ];
+
+      const groupSize = 2;
+
+      // 4 prompts × 2 completions each = 8 completions
+      const completionTokens = [
+        MxArray.fromInt32(int32(100, 101, 102), shape(3)),
+        MxArray.fromInt32(int32(103, 104, 105), shape(3)),
+        MxArray.fromInt32(int32(106, 107, 108), shape(3)),
+        MxArray.fromInt32(int32(109, 110, 111), shape(3)),
+        MxArray.fromInt32(int32(112, 113, 114), shape(3)),
+        MxArray.fromInt32(int32(115, 116, 117), shape(3)),
+        MxArray.fromInt32(int32(118, 119, 120), shape(3)),
+        MxArray.fromInt32(int32(121, 122, 123), shape(3)),
+      ];
+
+      const completionLogprobs = completionTokens.map(() => MxArray.fromFloat32(float32(-0.1, -0.15, -0.12), shape(3)));
+
+      const rewards = float64(1.0, 0.8, 0.9, 0.7, 0.6, 0.85, 0.75, 0.95);
+
+      const config = {
+        epsilonLow: 0.2,
+        epsilonHigh: undefined,
+        beta: 0.0,
+        lossType: 'grpo',
+        importanceSamplingLevel: 'token',
+        maxCompletionLength: 256,
+        numItemsInBatch: undefined,
+        gradientAccumulationSteps: 1,
+      };
+
+      // Execute with variable-length prompts
+      const [loss, metrics] = model.trainStepGrpoAutograd(
+        promptTokens,
+        completionTokens,
+        completionLogprobs,
+        rewards,
+        groupSize,
+        config,
+        0.0001,
+      );
+
+      // Verify results are valid (not NaN, not infinite)
+      expect(loss).toBeTypeOf('number');
+      expect(isFinite(loss)).toBe(true);
+      expect(Number.isNaN(loss)).toBe(false);
+
+      // Gradients should be computed
+      expect(metrics.num_gradients).toBeGreaterThan(0);
+
+      console.log('Variable-Length Prompts Test Results:');
+      console.log(`  Prompt lengths: [3, 5, 2, 4]`);
+      console.log(`  Loss: ${loss.toFixed(6)}`);
+      console.log(`  Num Gradients: ${metrics.num_gradients}`);
+    });
+
+    it('should handle variable-length completions with correct masking', () => {
+      const model = new Qwen3Model(QWEN3_CONFIGS['qwen3-0.6b']);
+
+      const promptTokens = [
+        MxArray.fromInt32(int32(1, 2, 3, 4), shape(4)),
+        MxArray.fromInt32(int32(5, 6, 7, 8), shape(4)),
+      ];
+
+      const groupSize = 2;
+
+      // Completions with DIFFERENT lengths to test masking
+      const completionTokens = [
+        MxArray.fromInt32(int32(100, 101), shape(2)), // 2 tokens
+        MxArray.fromInt32(int32(102, 103, 104, 105), shape(4)), // 4 tokens
+        MxArray.fromInt32(int32(106), shape(1)), // 1 token
+        MxArray.fromInt32(int32(107, 108, 109), shape(3)), // 3 tokens
+      ];
+
+      const completionLogprobs = [
+        MxArray.fromFloat32(float32(-0.1, -0.15), shape(2)),
+        MxArray.fromFloat32(float32(-0.1, -0.15, -0.12, -0.18), shape(4)),
+        MxArray.fromFloat32(float32(-0.1), shape(1)),
+        MxArray.fromFloat32(float32(-0.1, -0.15, -0.12), shape(3)),
+      ];
+
+      const rewards = float64(1.0, 0.8, 0.9, 0.7);
+
+      const config = {
+        epsilonLow: 0.2,
+        epsilonHigh: undefined,
+        beta: 0.0,
+        lossType: 'grpo',
+        importanceSamplingLevel: 'token',
+        maxCompletionLength: 256,
+        numItemsInBatch: undefined,
+        gradientAccumulationSteps: 1,
+      };
+
+      const [loss, metrics] = model.trainStepGrpoAutograd(
+        promptTokens,
+        completionTokens,
+        completionLogprobs,
+        rewards,
+        groupSize,
+        config,
+        0.0001,
+      );
+
+      expect(loss).toBeTypeOf('number');
+      expect(isFinite(loss)).toBe(true);
+      expect(Number.isNaN(loss)).toBe(false);
+      expect(metrics.num_gradients).toBeGreaterThan(0);
+
+      console.log('Variable-Length Completions Test Results:');
+      console.log(`  Completion lengths: [2, 4, 1, 3]`);
+      console.log(`  Loss: ${loss.toFixed(6)}`);
       console.log(`  Num Gradients: ${metrics.num_gradients}`);
     });
 

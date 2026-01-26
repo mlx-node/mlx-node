@@ -190,8 +190,8 @@ export class SFTDataset {
     );
 
     // Convert to regular arrays for manipulation
-    const promptArr = Array.from(promptTokens).map((t) => Number(t));
-    const inputIds = Array.from(fullTokens).map((t) => Number(t));
+    const promptArr = Array.from(promptTokens, Number);
+    const inputIds = Array.from(fullTokens, Number);
 
     // Use common prefix detection to handle chat template quirks
     // (some templates may not produce prompt tokens as exact prefix of full tokens)
@@ -221,85 +221,62 @@ export class SFTDataset {
    * For conversations, we train on all assistant turns.
    * Non-assistant tokens (system, user) are masked with -100.
    *
-   * Complexity: O(k) where k is the number of assistant messages,
-   * instead of O(n) for all messages.
+   * Uses single-pass tokenization with token-based boundary detection.
    */
   private async tokenizeConversation(
     example: SFTConversationExample,
   ): Promise<{ inputIds: number[]; labels: number[] }> {
     const messages = example.messages;
 
-    // Tokenize full conversation once
-    const fullTokens = await this.tokenizer.applyChatTemplate(
-      messages,
-      false, // no generation prompt
-      null,
-      this.config.enableThinking,
-    );
+    // Single tokenization pass
+    const fullTokens = await this.tokenizer.applyChatTemplate(messages, false, null, this.config.enableThinking);
 
-    const inputIds = Array.from(fullTokens).map((t) => Number(t));
+    const inputIds = Array.from(fullTokens, Number);
 
     // If not masking prompts, all tokens are trainable
     if (!this.config.completionOnly) {
-      return { inputIds, labels: [...inputIds] };
+      return { inputIds, labels: inputIds.slice() };
     }
 
-    // Find assistant message indices
-    const assistantIndices = messages.map((m, i) => (isAssistantMessage(m) ? i : -1)).filter((i) => i >= 0);
+    // Token-based boundary detection using special tokens
+    const IM_START = 151644; // <|im_start|>
+    const IM_END = 151645; // <|im_end|>
 
-    if (assistantIndices.length === 0) {
-      // No assistant messages - mask everything
-      const labels = inputIds.map(() => IGNORE_INDEX);
-      return { inputIds, labels };
-    }
+    // Get "assistant" token ID (it's a single token in Qwen3)
+    const assistantTokenId = this.tokenizer.tokenToId('assistant');
 
-    // Only tokenize at assistant boundaries - O(k) where k = # assistant messages
-    // Instead of O(n) for every message
-    const boundaries: Array<{ start: number; end: number; isAssistant: boolean }> = [];
-    let prevEnd = 0;
+    const labels = new Array(inputIds.length).fill(IGNORE_INDEX);
+    let inAssistant = false;
 
-    for (const assistantIdx of assistantIndices) {
-      // Tokenize up to but not including this assistant message
-      if (assistantIdx > 0) {
-        const beforeAssistant = await this.tokenizer.applyChatTemplate(
-          messages.slice(0, assistantIdx),
-          false,
-          null,
-          this.config.enableThinking,
-        );
-        const start = beforeAssistant.length;
-        if (start > prevEnd) {
-          boundaries.push({ start: prevEnd, end: start, isAssistant: false });
+    for (let i = 0; i < inputIds.length; i++) {
+      // Detect assistant region: <|im_start|> followed by "assistant" token
+      if (inputIds[i] === IM_START && i + 1 < inputIds.length && inputIds[i + 1] === assistantTokenId) {
+        // Skip the <|im_start|>assistant\n header, start training from content
+        // Find the newline after "assistant"
+        let j = i + 2;
+        while (j < inputIds.length && inputIds[j] !== IM_END) {
+          // Look for newline token (198 is common for \n)
+          if (inputIds[j] === 198 || inputIds[j] === 220) {
+            inAssistant = true;
+            i = j; // Skip to after header
+            break;
+          }
+          j++;
         }
-        prevEnd = start;
+        if (!inAssistant) {
+          // Fallback: just start after assistant token
+          inAssistant = true;
+          i = i + 1;
+        }
+        continue;
       }
 
-      // Tokenize including this assistant message
-      const afterAssistant = await this.tokenizer.applyChatTemplate(
-        messages.slice(0, assistantIdx + 1),
-        false,
-        null,
-        this.config.enableThinking,
-      );
-      const end = afterAssistant.length;
-      if (end > prevEnd) {
-        boundaries.push({ start: prevEnd, end, isAssistant: true });
+      if (inAssistant && inputIds[i] !== IM_END) {
+        labels[i] = inputIds[i];
       }
-      prevEnd = end;
-    }
 
-    // Handle any trailing non-assistant messages
-    if (prevEnd < fullTokens.length) {
-      boundaries.push({ start: prevEnd, end: fullTokens.length, isAssistant: false });
-    }
-
-    // Build labels based on boundaries
-    const labels = Array.from({ length: inputIds.length }, () => IGNORE_INDEX);
-    for (const { start, end, isAssistant } of boundaries) {
-      if (isAssistant) {
-        for (let i = start; i < end; i++) {
-          labels[i] = inputIds[i];
-        }
+      if (inputIds[i] === IM_END) {
+        inAssistant = false;
       }
     }
 
@@ -324,7 +301,10 @@ export class SFTDataset {
     const examples = indices.map((i) => this.examples[this.shuffledIndices[i]]);
 
     // Tokenize all examples
-    const tokenized = await Promise.all(examples.map((example) => this.tokenizeExample(example)));
+    const tokenized: Array<{ inputIds: number[]; labels: number[] }> = [];
+    for (const example of examples) {
+      tokenized.push(await this.tokenizeExample(example));
+    }
 
     // Find max length (capped at maxSeqLength)
     const maxLen = Math.min(this.config.maxSeqLength, Math.max(...tokenized.map((t) => t.inputIds.length)));

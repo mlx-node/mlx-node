@@ -4,7 +4,7 @@
  * for the subset of losses currently exposed through the bindings.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vite-plus/test';
 import { MxArray, Losses } from '@mlx-node/core';
 import { createFloat32Array } from '../test-utils';
 

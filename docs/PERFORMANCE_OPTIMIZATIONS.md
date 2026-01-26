@@ -135,7 +135,7 @@ Added `returnLogprobs: boolean` option to GenerationConfig:
 
 ```typescript
 const result = await model.generate(messages, {
-  returnLogprobs: false,  // Skip logprobs computation (default: true for GRPO)
+  returnLogprobs: false, // Skip logprobs computation (default: true for GRPO)
 });
 ```
 
