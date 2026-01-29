@@ -768,6 +768,34 @@ unsafe extern "C" {
     pub fn mlx_metal_synchronize();
 }
 
+// ================================================================================
+// Quantization Operations (for QuantizedKVCache)
+// ================================================================================
+
+unsafe extern "C" {
+    /// Quantize a matrix along its last axis using affine quantization.
+    /// Returns quantized weights, scales, and biases via output pointers.
+    pub fn mlx_quantize(
+        w: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        out_quantized: *mut *mut mlx_array,
+        out_scales: *mut *mut mlx_array,
+        out_biases: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Dequantize a matrix that was quantized with mlx_quantize.
+    /// Reconstructs the original values using: value = quantized * scale + bias
+    pub fn mlx_dequantize(
+        quantized: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array, // nullable
+        group_size: i32,
+        bits: i32,
+        out_dtype: i32, // -1 for input dtype
+    ) -> *mut mlx_array;
+}
+
 // Gradient computation types
 pub type LossFunctionPtr = extern "C" fn(
     inputs: *const *mut mlx_array,

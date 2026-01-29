@@ -98,14 +98,14 @@ pub fn get_high_entropy_mask(
     }
 
     // Step 2: Replace padding positions with +inf so they sort to the end
-    // masked_entropies = entropies * mask + inf * (1 - mask)
-    // Where mask=1 (valid): entropies * 1 + inf * 0 = entropies
-    // Where mask=0 (padding): entropies * 0 + inf * 1 = inf
-    let mask_f32 = mask.astype(crate::array::DType::Float32)?;
-    let one = MxArray::full(&shape, napi::Either::A(1.0), None)?;
-    let inv_mask = one.sub(&mask_f32)?; // 1 - mask
-    let inf_val = MxArray::full(&shape, napi::Either::A(f32::MAX as f64), None)?; // Use MAX instead of INFINITY
-    let masked_entropies = entropies.mul(&mask_f32)?.add(&inf_val.mul(&inv_mask)?)?;
+    // Use where_ to avoid NaN from inf * 0 arithmetic
+    // masked_entropies = where(mask > 0, entropies, inf)
+    // Where mask=1 (valid): entropies
+    // Where mask=0 (padding): inf
+    let zero = MxArray::full(&shape, napi::Either::A(0.0), None)?;
+    let mask_bool = mask.greater(&zero)?; // Convert int mask to boolean
+    let inf_val = MxArray::full(&shape, napi::Either::A(f64::INFINITY), None)?;
+    let masked_entropies = mask_bool.where_(entropies, &inf_val)?;
 
     // Step 3: Flatten (reshape to 1D) and sort on GPU
     let total_elements = shape[0] * shape[1];
@@ -115,7 +115,7 @@ pub fn get_high_entropy_mask(
 
     // Step 4: Compute quantile threshold
     // The first n_valid elements are valid entropies (sorted ascending)
-    // The remaining elements are f32::MAX (padding)
+    // The remaining elements are +inf (padding)
     let index = threshold * ((n_valid - 1) as f64);
     let lower_index = index.floor() as usize;
     let upper_index = (index.ceil() as usize).min(n_valid - 1);

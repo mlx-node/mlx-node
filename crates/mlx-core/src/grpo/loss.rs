@@ -27,7 +27,8 @@ pub struct GRPOLossConfig {
     /// Importance sampling level: "token" or "sequence"
     pub importance_sampling_level: String,
 
-    /// Maximum completion length (needed for dr_grpo)
+    /// Maximum completion length (legacy, no longer used by dr_grpo)
+    /// Kept for backwards compatibility but ignored in current implementation.
     pub max_completion_length: Option<i64>,
 
     /// Total number of items in batch across all processes (needed for dapo)
@@ -211,7 +212,14 @@ pub fn grpo_loss(
     // exp(88) ≈ 1.65e38 (near f32 max), exp(-88) ≈ 6e-39 (near f32 min)
     // Without clamping, large log ratios cause inf, and inf * 0 = NaN
     let clamped_log_weights = log_importance_weights.clip(Some(-88.0), Some(88.0))?;
-    let coef_1 = clamped_log_weights.exp()?;
+    let coef_1_raw = clamped_log_weights.exp()?;
+
+    // CRITICAL: Also clamp the importance ratio after exp() to prevent overflow
+    // when multiplied by advantages. Even with log clamping, exp(88) ≈ 1.65e38
+    // which when multiplied by advantages (e.g., 10.0) causes Inf.
+    // Ratios outside [1e-6, 1e6] indicate extreme policy divergence and should be bounded.
+    // This prevents Inf * mask(0) = NaN propagation in loss computation.
+    let coef_1 = coef_1_raw.clip(Some(1e-6), Some(1e6))?;
 
     // coef_2 = clip(r_t, 1-epsilon_low, 1+epsilon_high)
     let lower_bound = 1.0 - config.epsilon_low;
@@ -221,11 +229,16 @@ pub fn grpo_loss(
     // Expand advantages from (B,) to (B, 1) for broadcasting
     let advantages_expanded = advantages.reshape(&[batch_size, 1])?;
 
-    // per_token_loss1 = r_t * A (unclipped)
-    let per_token_loss1 = coef_1.mul(&advantages_expanded)?;
+    // Clip advantages to prevent extreme values from causing overflow
+    // Typical normalized advantages are in [-3, 3], values outside [-100, 100]
+    // indicate numerical issues and should be bounded
+    let advantages_clipped = advantages_expanded.clip(Some(-100.0), Some(100.0))?;
 
-    // per_token_loss2 = clip(r_t) * A (clipped)
-    let per_token_loss2 = coef_2.mul(&advantages_expanded)?;
+    // per_token_loss1 = r_t * A (unclipped ratio, clipped advantages)
+    let per_token_loss1 = coef_1.mul(&advantages_clipped)?;
+
+    // per_token_loss2 = clip(r_t) * A (clipped ratio, clipped advantages)
+    let per_token_loss2 = coef_2.mul(&advantages_clipped)?;
 
     // Take minimum (PPO clipping): -min(L1, L2)
     // This maximizes min(L1, L2), which is the PPO objective
@@ -278,19 +291,20 @@ pub fn grpo_loss(
             total_loss.div(&clamped_total_mask)?
         }
         "dr_grpo" => {
-            // Distributional GRPO: sum(loss * mask) / (B * max_length)
-            let max_len = config.max_completion_length.ok_or_else(|| {
-                Error::new(
-                    Status::InvalidArg,
-                    "max_completion_length required for dr_grpo loss type",
-                )
-            })? as f64;
-
+            // Dr.GRPO (Direct Relative GRPO): sum(loss * mask) / actual_token_count
+            // This properly weights each token equally regardless of sequence padding.
+            // Unlike the original implementation that used batch_size * max_length,
+            // we use the actual token count to avoid underfitting on shorter sequences.
             let masked_loss = per_token_loss.mul(completion_mask)?;
             let total_loss = masked_loss.sum(None, Some(false))?;
 
-            let normalizer = batch_size as f64 * max_len;
-            total_loss.div_scalar(normalizer)?
+            // Count actual valid tokens (not padding)
+            let actual_token_count = completion_mask.sum(None, Some(false))?;
+
+            // Clamp to avoid division by zero (minimum 1 token)
+            let clamped_count = actual_token_count.maximum(&MxArray::scalar_float(1.0)?)?;
+
+            total_loss.div(&clamped_count)?
         }
         "dapo" => {
             // DAPO (Data-Augmented Policy Optimization): sum(loss * mask) / num_items
@@ -466,7 +480,8 @@ mod tests {
 
     #[test]
     fn test_dr_grpo_loss_computation() {
-        // Dr.GRPO: sum(loss * mask) / (B * max_length)
+        // Dr.GRPO: sum(loss * mask) / actual_token_count
+        // Now uses actual token count instead of batch_size * max_length
         let per_token_logps = array_2d(&[-1.0, -1.0, -1.0, -1.0], 2, 2);
         let old_per_token_logps = array_2d(&[-1.0, -1.0, -1.0, -1.0], 2, 2);
         let advantages = array_1d(&[1.0, 2.0]);
@@ -474,7 +489,6 @@ mod tests {
 
         let config = GRPOLossConfig {
             loss_type: "dr_grpo".to_string(),
-            max_completion_length: Some(4), // Use max_length = 4
             ..default_config()
         };
 
@@ -488,12 +502,52 @@ mod tests {
         )
         .unwrap();
 
-        // Total loss = -6, normalizer = 2 * 4 = 8
-        // Dr.GRPO = -6 / 8 = -0.75
+        // Total loss = -6, normalizer = sum(mask) = 4 (actual token count)
+        // Dr.GRPO = -6 / 4 = -1.5
         let loss_val = to_scalar(&loss);
         assert!(
-            (loss_val - (-0.75)).abs() < 1e-5,
-            "Expected loss ~ -0.75, got {}",
+            (loss_val - (-1.5)).abs() < 1e-5,
+            "Expected loss ~ -1.5, got {}",
+            loss_val
+        );
+    }
+
+    #[test]
+    fn test_dr_grpo_with_padding() {
+        // Test Dr.GRPO with partial masking (simulating shorter sequences)
+        // This tests the key fix: shorter sequences should not be underweighted
+        let per_token_logps = array_2d(&[-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0], 2, 4);
+        let old_per_token_logps = array_2d(&[-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0], 2, 4);
+        let advantages = array_1d(&[1.0, 1.0]);
+        // First sequence: 2 real tokens, second: 1 real token (3 total, not 8)
+        let completion_mask = array_2d(&[1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], 2, 4);
+
+        let config = GRPOLossConfig {
+            loss_type: "dr_grpo".to_string(),
+            ..default_config()
+        };
+
+        let loss = grpo_loss(
+            &per_token_logps,
+            &old_per_token_logps,
+            &advantages,
+            &completion_mask,
+            config,
+            None,
+        )
+        .unwrap();
+
+        // With ratio=1 and advantages=1, per_token_loss = -1 for each token
+        // Only 3 tokens are real (mask=1), so total loss = -3
+        // Normalizer = sum(mask) = 3 (actual token count)
+        // Dr.GRPO = -3 / 3 = -1.0
+        //
+        // OLD behavior would have been: -3 / (2 * 4) = -3/8 = -0.375
+        // This caused underfitting as loss was artificially reduced for shorter sequences
+        let loss_val = to_scalar(&loss);
+        assert!(
+            (loss_val - (-1.0)).abs() < 1e-5,
+            "Expected loss ~ -1.0 (actual tokens), got {}",
             loss_val
         );
     }
@@ -986,6 +1040,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_overflow_with_large_advantages() {
+        // Test the specific overflow scenario: large log ratio + large advantage
+        // exp(88) ≈ 1.65e38, multiplied by 10.0 would cause Inf without post-exp clamping
+        let per_token_logps = array_2d(&[0.0], 1, 1);
+        let old_per_token_logps = array_2d(&[-100.0], 1, 1); // log ratio = 100 (clamped to 88)
+        let advantages = array_1d(&[10.0]); // Large advantage
+        let completion_mask = array_2d(&[1.0], 1, 1);
+
+        let config = GRPOLossConfig {
+            loss_type: "grpo".to_string(),
+            ..default_config()
+        };
+
+        let loss = grpo_loss(
+            &per_token_logps,
+            &old_per_token_logps,
+            &advantages,
+            &completion_mask,
+            config,
+            None,
+        )
+        .unwrap();
+
+        let loss_val = to_scalar(&loss);
+        assert!(
+            loss_val.is_finite(),
+            "Expected finite loss with large log ratio and large advantage, got {}",
+            loss_val
+        );
+    }
+
+    #[test]
+    fn test_no_nan_with_masked_overflow() {
+        // Test NaN prevention: overflow * 0 (masked) should not produce NaN
+        // This tests the specific bug where Inf * mask(0) = NaN
+        let per_token_logps = array_2d(&[0.0, -1.0], 1, 2);
+        let old_per_token_logps = array_2d(&[-100.0, -1.0], 1, 2); // First token has huge ratio
+        let advantages = array_1d(&[100.0]); // Large advantage to trigger overflow without fix
+        let completion_mask = array_2d(&[0.0, 1.0], 1, 2); // First token is masked (padding)
+
+        let config = GRPOLossConfig {
+            loss_type: "grpo".to_string(),
+            ..default_config()
+        };
+
+        let loss = grpo_loss(
+            &per_token_logps,
+            &old_per_token_logps,
+            &advantages,
+            &completion_mask,
+            config,
+            None,
+        )
+        .unwrap();
+
+        let loss_val = to_scalar(&loss);
+        assert!(
+            !loss_val.is_nan(),
+            "Expected non-NaN loss when masked overflow occurs, got NaN"
+        );
+        assert!(
+            loss_val.is_finite(),
+            "Expected finite loss, got {}",
+            loss_val
+        );
+    }
+
+    #[test]
+    fn test_extreme_advantages_clamped() {
+        // Test that extreme advantages are clamped to prevent overflow
+        let per_token_logps = array_2d(&[-1.0], 1, 1);
+        let old_per_token_logps = array_2d(&[-1.0], 1, 1); // ratio = 1
+        let advantages = array_1d(&[1000.0]); // Extremely large advantage
+        let completion_mask = array_2d(&[1.0], 1, 1);
+
+        let config = GRPOLossConfig {
+            loss_type: "grpo".to_string(),
+            ..default_config()
+        };
+
+        let loss = grpo_loss(
+            &per_token_logps,
+            &old_per_token_logps,
+            &advantages,
+            &completion_mask,
+            config,
+            None,
+        )
+        .unwrap();
+
+        let loss_val = to_scalar(&loss);
+        assert!(
+            loss_val.is_finite(),
+            "Expected finite loss with extreme advantages, got {}",
+            loss_val
+        );
+        // With clamping to [-100, 100], the effective advantage is 100
+        // loss = -min(1*100, 1*100) = -100 (but clips at 100 so stays bounded)
+        assert!(
+            (loss_val - (-100.0)).abs() < 1e-3,
+            "Expected loss ~ -100 (clamped), got {}",
+            loss_val
+        );
+    }
+
     // ==================== Input Validation ====================
 
     #[test]
@@ -1135,7 +1295,9 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_max_length_for_dr_grpo_error() {
+    fn test_dr_grpo_works_without_max_length() {
+        // Verify that dr_grpo no longer requires max_completion_length
+        // (it now uses actual token count from completion_mask)
         let per_token_logps = array_2d(&[-1.0], 1, 1);
         let old_per_token_logps = array_2d(&[-1.0], 1, 1);
         let advantages = array_1d(&[1.0]);
@@ -1143,7 +1305,7 @@ mod tests {
 
         let config = GRPOLossConfig {
             loss_type: "dr_grpo".to_string(),
-            max_completion_length: None, // Required for dr_grpo
+            max_completion_length: None, // No longer required for dr_grpo
             ..default_config()
         };
 
@@ -1156,14 +1318,18 @@ mod tests {
             None,
         );
 
-        match result {
-            Ok(_) => panic!("Expected error for missing max_completion_length"),
-            Err(e) => assert!(
-                e.to_string().contains("max_completion_length required"),
-                "Unexpected error: {}",
-                e
-            ),
-        }
+        // Should succeed without max_completion_length
+        assert!(
+            result.is_ok(),
+            "dr_grpo should work without max_completion_length"
+        );
+        let loss_val = to_scalar(&result.unwrap());
+        // ratio=1, adv=1, 1 token: loss = -1
+        assert!(
+            (loss_val - (-1.0)).abs() < 1e-5,
+            "Expected loss ~ -1.0, got {}",
+            loss_val
+        );
     }
 
     #[test]

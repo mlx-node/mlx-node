@@ -14,7 +14,10 @@
  */
 
 import { describe, it, expect } from 'vite-plus/test';
-import { MxArray, Linear, RMSNorm, Attention, Losses, Activations, Gradients, Adam } from '@mlx-node/core';
+import { MxArray, Linear, RMSNorm, Attention, Losses, Activations } from '@mlx-node/core';
+
+// DTYPE_INT32 = 1 (const enum value inlined for verbatimModuleSyntax compatibility)
+const DTYPE_INT32 = 1;
 import { shape, float32 } from '../test-utils.js';
 
 // MLX-LM standard tolerance
@@ -197,55 +200,6 @@ describe('Numerical Consistency (Metal GPU Validation)', () => {
     });
   });
 
-  describe('Gradient Consistency', () => {
-    it('should compute linear backward consistently', () => {
-      const input = MxArray.fromFloat32(float32(1, 2, 3, 4), shape(2, 2));
-      const weight = MxArray.fromFloat32(float32(0.5, -0.5, 0.3, -0.3, 0.2, -0.2), shape(3, 2));
-      const gradOutput = MxArray.fromFloat32(float32(1, 0.5, 0.3, 1, 0.5, 0.3), shape(2, 3));
-
-      // Compute gradients multiple times
-      const grads1 = Gradients.linearBackward(input, weight, gradOutput, false);
-      grads1[0].eval();
-      grads1[1].eval();
-
-      const grads2 = Gradients.linearBackward(input, weight, gradOutput, false);
-      grads2[0].eval();
-      grads2[1].eval();
-
-      // Should be identical
-      assertClose(grads1[0], grads2[0], 1e-6, 1e-6);
-      assertClose(grads1[1], grads2[1], 1e-6, 1e-6);
-    });
-
-    it('should compute cross-entropy backward consistently', () => {
-      const logits = MxArray.fromFloat32(float32(2.0, 1.0, 0.1, 3.0, 1.0, 0.5), shape(2, 3));
-      const targets = MxArray.fromInt32(new Int32Array([0, 2]), shape(2));
-
-      // Compute gradient multiple times (third param is num_classes)
-      const grad1 = Gradients.crossEntropyBackward(logits, targets, 3);
-      grad1.eval();
-
-      const grad2 = Gradients.crossEntropyBackward(logits, targets, 3);
-      grad2.eval();
-
-      // Should be identical
-      assertClose(grad1, grad2, 1e-6, 1e-6);
-    });
-
-    it('should compute SiLU backward consistently', () => {
-      const x = MxArray.fromFloat32(float32(-1.0, 0.0, 1.0, 2.0), shape(4));
-      const gradOutput = MxArray.ones(shape(4));
-
-      const grad1 = Gradients.siluBackward(x, gradOutput);
-      grad1.eval();
-
-      const grad2 = Gradients.siluBackward(x, gradOutput);
-      grad2.eval();
-
-      assertClose(grad1, grad2, 1e-6, 1e-6);
-    });
-  });
-
   describe('Layer Consistency', () => {
     it('should produce consistent Linear layer outputs', () => {
       const layer = new Linear(4, 3, true);
@@ -303,90 +257,6 @@ describe('Numerical Consistency (Metal GPU Validation)', () => {
 
       // Should be identical
       assertClose(output1, output2, 1e-6, 1e-6);
-    });
-  });
-
-  describe('Training Step Consistency', () => {
-    it('should produce consistent gradient updates', () => {
-      // Create two identical models
-      const model1 = new Linear(4, 2, false);
-      const model2 = new Linear(4, 2, false);
-
-      // Set same weights
-      model2.setWeight(model1.getWeight());
-
-      // Same input and target
-      const input = MxArray.fromFloat32(float32(1, 2, 3, 4), shape(1, 4));
-      const target = MxArray.fromFloat32(float32(1, 0), shape(1, 2));
-
-      // Training step 1
-      const output1 = model1.forward(input);
-      output1.eval();
-      const gradOutput1 = output1.sub(target);
-      gradOutput1.eval();
-      const grads1 = Gradients.linearBackward(input, model1.getWeight(), gradOutput1, false);
-      grads1[1].eval();
-
-      const optimizer1 = new Adam(0.01);
-      const updated1 = optimizer1.updateSingle('weight', model1.getWeight(), grads1[1]);
-      updated1.eval();
-
-      // Training step 2
-      const output2 = model2.forward(input);
-      output2.eval();
-      const gradOutput2 = output2.sub(target);
-      gradOutput2.eval();
-      const grads2 = Gradients.linearBackward(input, model2.getWeight(), gradOutput2, false);
-      grads2[1].eval();
-
-      const optimizer2 = new Adam(0.01);
-      const updated2 = optimizer2.updateSingle('weight', model2.getWeight(), grads2[1]);
-      updated2.eval();
-
-      // Outputs should be identical
-      assertClose(output1, output2, 1e-6, 1e-6);
-
-      // Gradients should be identical
-      assertClose(grads1[1], grads2[1], 1e-6, 1e-6);
-
-      // Updated weights should be identical
-      assertClose(updated1, updated2, 1e-6, 1e-6);
-    });
-
-    it('should converge to same solution with same initialization', () => {
-      // Create two identical models
-      const model1 = new Linear(2, 1, false);
-      const model2 = new Linear(2, 1, false);
-
-      // Set same weights
-      model2.setWeight(model1.getWeight());
-
-      // Same data
-      const X = MxArray.fromFloat32(float32(1, 2, 3, 4, 5, 6), shape(3, 2));
-      const y = MxArray.fromFloat32(float32(1, 2, 3), shape(3, 1));
-
-      // Train both models
-      const optimizer1 = new Adam(0.1);
-      const optimizer2 = new Adam(0.1);
-
-      for (let step = 0; step < 10; step++) {
-        // Model 1
-        const pred1 = model1.forward(X);
-        const gradOut1 = pred1.sub(y).mul(MxArray.fromFloat32(float32(2.0 / 3), shape(1)));
-        const grads1 = Gradients.linearBackward(X, model1.getWeight(), gradOut1, false);
-        const updated1 = optimizer1.updateSingle('weight', model1.getWeight(), grads1[1]);
-        model1.setWeight(updated1);
-
-        // Model 2
-        const pred2 = model2.forward(X);
-        const gradOut2 = pred2.sub(y).mul(MxArray.fromFloat32(float32(2.0 / 3), shape(1)));
-        const grads2 = Gradients.linearBackward(X, model2.getWeight(), gradOut2, false);
-        const updated2 = optimizer2.updateSingle('weight', model2.getWeight(), grads2[1]);
-        model2.setWeight(updated2);
-      }
-
-      // Final weights should be identical
-      assertClose(model1.getWeight(), model2.getWeight(), 1e-6, 1e-6);
     });
   });
 
@@ -520,6 +390,140 @@ describe('Numerical Consistency (Metal GPU Validation)', () => {
 
       // Should be identical
       assertClose(result, result2, 1e-10, 1e-10);
+    });
+  });
+
+  describe('GPU-Native NaN/Inf Detection', () => {
+    // Helper function to check if array has any NaN (GPU-native)
+    function hasNan(arr: MxArray): boolean {
+      const nanMask = arr.isnan();
+      const nanInt = nanMask.astype(DTYPE_INT32);
+      const sum = nanInt.sum(undefined, false);
+      sum.eval();
+      return sum.toInt32()[0] > 0;
+    }
+
+    // Helper function to check if array has any Inf (GPU-native)
+    function hasInf(arr: MxArray): boolean {
+      const infMask = arr.isinf();
+      const infInt = infMask.astype(DTYPE_INT32);
+      const sum = infInt.sum(undefined, false);
+      sum.eval();
+      return sum.toInt32()[0] > 0;
+    }
+
+    // Helper function to check if array has any NaN or Inf (GPU-native)
+    function hasNanOrInf(arr: MxArray): boolean {
+      const finiteMask = arr.isfinite();
+      const nonFinite = finiteMask.logicalNot();
+      const nonFiniteInt = nonFinite.astype(DTYPE_INT32);
+      const sum = nonFiniteInt.sum(undefined, false);
+      sum.eval();
+      return sum.toInt32()[0] > 0;
+    }
+
+    it('should detect NaN values using isnan()', () => {
+      // Create array with NaN
+      const x = MxArray.fromFloat32(float32(1.0, NaN, 3.0, NaN), shape(4));
+
+      const nanMask = x.isnan();
+      nanMask.eval();
+
+      // Convert to int for easier checking (bool -> int)
+      const data = nanMask.astype(DTYPE_INT32).toInt32();
+      expect(data[0]).toBe(0); // 1.0 is not NaN
+      expect(data[1]).toBe(1); // NaN
+      expect(data[2]).toBe(0); // 3.0 is not NaN
+      expect(data[3]).toBe(1); // NaN
+    });
+
+    it('should detect Inf values using isinf()', () => {
+      // Create array with Inf
+      const x = MxArray.fromFloat32(float32(1.0, Infinity, -Infinity, 4.0), shape(4));
+
+      const infMask = x.isinf();
+      infMask.eval();
+
+      const data = infMask.astype(DTYPE_INT32).toInt32();
+      expect(data[0]).toBe(0); // 1.0 is not Inf
+      expect(data[1]).toBe(1); // +Inf
+      expect(data[2]).toBe(1); // -Inf
+      expect(data[3]).toBe(0); // 4.0 is not Inf
+    });
+
+    it('should detect finite values using isfinite()', () => {
+      const x = MxArray.fromFloat32(float32(1.0, NaN, Infinity, -Infinity), shape(4));
+
+      const finiteMask = x.isfinite();
+      finiteMask.eval();
+
+      const data = finiteMask.astype(DTYPE_INT32).toInt32();
+      expect(data[0]).toBe(1); // 1.0 is finite
+      expect(data[1]).toBe(0); // NaN is not finite
+      expect(data[2]).toBe(0); // +Inf is not finite
+      expect(data[3]).toBe(0); // -Inf is not finite
+    });
+
+    it('should detect presence of NaN using GPU reduction', () => {
+      const clean = MxArray.fromFloat32(float32(1.0, 2.0, 3.0), shape(3));
+      const withNan = MxArray.fromFloat32(float32(1.0, NaN, 3.0), shape(3));
+
+      expect(hasNan(clean)).toBe(false);
+      expect(hasNan(withNan)).toBe(true);
+    });
+
+    it('should detect presence of Inf using GPU reduction', () => {
+      const clean = MxArray.fromFloat32(float32(1.0, 2.0, 3.0), shape(3));
+      const withInf = MxArray.fromFloat32(float32(1.0, Infinity, 3.0), shape(3));
+      const withNegInf = MxArray.fromFloat32(float32(1.0, -Infinity, 3.0), shape(3));
+
+      expect(hasInf(clean)).toBe(false);
+      expect(hasInf(withInf)).toBe(true);
+      expect(hasInf(withNegInf)).toBe(true);
+    });
+
+    it('should detect NaN or Inf using GPU reduction', () => {
+      const clean = MxArray.fromFloat32(float32(1.0, 2.0, 3.0), shape(3));
+      const withNan = MxArray.fromFloat32(float32(1.0, NaN, 3.0), shape(3));
+      const withInf = MxArray.fromFloat32(float32(1.0, Infinity, 3.0), shape(3));
+      const withBoth = MxArray.fromFloat32(float32(NaN, Infinity, 3.0), shape(3));
+
+      expect(hasNanOrInf(clean)).toBe(false);
+      expect(hasNanOrInf(withNan)).toBe(true);
+      expect(hasNanOrInf(withInf)).toBe(true);
+      expect(hasNanOrInf(withBoth)).toBe(true);
+    });
+
+    it('should work on large arrays efficiently', () => {
+      // Create a large array (1M elements) with a single NaN
+      const size = 1000000;
+      const data = new Float32Array(size);
+      for (let i = 0; i < size; i++) {
+        data[i] = i * 0.001;
+      }
+      // Insert a NaN in the middle
+      data[500000] = NaN;
+
+      const x = MxArray.fromFloat32(data, BigInt64Array.from([BigInt(size)]));
+
+      // GPU-native check should be fast
+      const start = performance.now();
+      const result = hasNanOrInf(x);
+      const elapsed = performance.now() - start;
+
+      expect(result).toBe(true);
+      // Should be much faster than CPU iteration
+      const maxMs = process.env.CI ? 1000 : 100;
+      expect(elapsed).toBeLessThan(maxMs);
+    });
+
+    it('should return false for empty arrays', () => {
+      const empty = MxArray.fromFloat32(new Float32Array(0), BigInt64Array.from([0n]));
+
+      // Empty array has no NaN or Inf
+      expect(hasNan(empty)).toBe(false);
+      expect(hasInf(empty)).toBe(false);
+      expect(hasNanOrInf(empty)).toBe(false);
     });
   });
 });

@@ -51,6 +51,32 @@ pub struct GenerationConfig {
 
     /// Whether to return log probabilities (always true for GRPO)
     pub return_logprobs: Option<bool>,
+
+    /// Prefill step size for chunked processing of long prompts (default: 2048)
+    /// When the prompt length exceeds this value, it will be processed in chunks
+    /// to improve memory efficiency and enable async pipelining.
+    /// Set to 0 to disable chunking and process the entire prompt at once.
+    pub prefill_step_size: Option<i32>,
+
+    /// KV cache quantization bits (default: 16 = no quantization)
+    /// - 16: Full precision (bfloat16/float16), no quantization
+    /// - 8: 8-bit quantization, ~2x memory savings, minimal quality loss
+    /// - 4: 4-bit quantization, ~4x memory savings, some quality degradation
+    ///
+    /// Quantized KV cache is useful for long sequences where memory becomes a bottleneck.
+    /// Note: Adds dequantization overhead per forward pass.
+    pub kv_cache_bits: Option<i32>,
+
+    /// KV cache quantization group size (default: 64)
+    /// Number of elements per quantization group. Smaller groups = better accuracy
+    /// but more overhead from storing scales/biases.
+    /// Only used when kv_cache_bits is 4 or 8.
+    pub kv_cache_group_size: Option<i32>,
+
+    /// Number of draft tokens to generate speculatively (default: 5)
+    /// Only used when a draft model is provided for speculative decoding.
+    /// Higher values can increase throughput but may reduce acceptance rate.
+    pub num_draft_tokens: Option<i32>,
 }
 
 impl Default for GenerationConfig {
@@ -68,6 +94,10 @@ impl Default for GenerationConfig {
             ngram_size: Some(3),
             eos_token_id: None,
             return_logprobs: Some(true),
+            prefill_step_size: Some(2048),
+            kv_cache_bits: Some(16),       // Default: no quantization
+            kv_cache_group_size: Some(64), // Default: 64 elements per group
+            num_draft_tokens: Some(5),     // Default: 5 draft tokens
         }
     }
 }

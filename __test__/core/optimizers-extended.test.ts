@@ -476,4 +476,210 @@ describe('Extended Optimizer Tests', () => {
       testReset(new RMSprop(0.01), new RMSprop(0.01), 'rmsprop');
     });
   });
+
+  describe('Step Counter Save/Restore (Checkpoint Support)', () => {
+    it('Adam should get and set step counter', () => {
+      const adam = new Adam(0.01, 0.9, 0.999, 1e-8, true); // Enable bias correction
+
+      const param = createFloat32Array([1.0, 2.0], [2]);
+      const grad = createFloat32Array([0.1, 0.2], [2]);
+
+      // Initial step should be 0
+      expect(adam.getStep()).toBe(0);
+
+      // Run a few updates
+      let current = param;
+      for (let i = 0; i < 100; i++) {
+        current = adam.updateSingle('param', current, grad);
+      }
+
+      // Step should be 100
+      expect(adam.getStep()).toBe(100);
+
+      // Set step to a different value (simulating resume)
+      adam.setStep(500);
+      expect(adam.getStep()).toBe(500);
+    });
+
+    it('AdamW should get and set step counter', () => {
+      const adamw = new AdamW(0.01, 0.9, 0.999, 1e-8, 0.01, true); // Enable bias correction
+
+      const param = createFloat32Array([1.0, 2.0], [2]);
+      const grad = createFloat32Array([0.1, 0.2], [2]);
+
+      // Initial step should be 0
+      expect(adamw.getStep()).toBe(0);
+
+      // Run a few updates
+      let current = param;
+      for (let i = 0; i < 100; i++) {
+        current = adamw.updateSingle('param', current, grad);
+      }
+
+      // Step should be 100
+      expect(adamw.getStep()).toBe(100);
+
+      // Set step to a different value (simulating resume)
+      adamw.setStep(500);
+      expect(adamw.getStep()).toBe(500);
+    });
+
+    it('Adam should produce different behavior with different step counts (bias correction)', () => {
+      // This test verifies that the step counter actually affects bias correction
+      const adamFresh = new Adam(0.01, 0.9, 0.999, 1e-8, true);
+      const adamResumed = new Adam(0.01, 0.9, 0.999, 1e-8, true);
+
+      // Set resumed optimizer to step 1000 (bias correction nearly converged)
+      adamResumed.setStep(1000);
+
+      const param = createFloat32Array([1.0, 2.0], [2]);
+      const grad = createFloat32Array([0.1, 0.2], [2]);
+
+      // Fresh optimizer at step 1
+      const freshResult = adamFresh.updateSingle('param', param, grad);
+
+      // Resumed optimizer at step 1001
+      const resumedResult = adamResumed.updateSingle('param', param, grad);
+
+      // Results should be different due to different bias correction factors
+      // At step 1: bias_correction1 = 1/(1-0.9^1) = 10, bias_correction2 = 1/(1-0.999^1) = 1000
+      // At step 1001: bias_correction1 ≈ 1, bias_correction2 ≈ 1
+      const freshData = freshResult.toFloat32();
+      const resumedData = resumedResult.toFloat32();
+
+      // With bias correction, results should be different
+      // Fresh optimizer at early steps has large bias correction factors
+      // The results shouldn't be equal
+      expect(freshData[0]).not.toBeCloseTo(resumedData[0], 3);
+      expect(freshData[1]).not.toBeCloseTo(resumedData[1], 3);
+    });
+
+    it('Adam should get and set moment state', () => {
+      const adam = new Adam(0.01);
+
+      const param = createFloat32Array([1.0, 2.0, 3.0], [3]);
+      const grad = createFloat32Array([0.1, 0.2, 0.3], [3]);
+
+      // Run some updates to build state
+      let current = param;
+      for (let i = 0; i < 5; i++) {
+        current = adam.updateSingle('my_param', current, grad);
+      }
+
+      // Get state keys
+      const keys = adam.getStateKeys();
+      expect(keys).toContain('my_param');
+
+      // Get moments
+      const m = adam.getFirstMoment('my_param');
+      const v = adam.getSecondMoment('my_param');
+
+      expect(m).toBeDefined();
+      expect(v).toBeDefined();
+
+      // Moments should not be zeros (they've been updated)
+      const mData = m!.toFloat32();
+      const vData = v!.toFloat32();
+
+      expect(mData[0]).not.toBe(0);
+      expect(vData[0]).not.toBe(0);
+
+      // Set moments on a new optimizer (simulating restore)
+      const adamRestored = new Adam(0.01);
+      adamRestored.setStep(adam.getStep());
+      adamRestored.setFirstMoment('my_param', m!);
+      adamRestored.setSecondMoment('my_param', v!);
+
+      // Both should produce same result on next update
+      const result1 = adam.updateSingle('my_param', current, grad);
+      const result2 = adamRestored.updateSingle('my_param', current, grad);
+
+      const r1Data = result1.toFloat32();
+      const r2Data = result2.toFloat32();
+
+      expect(r1Data[0]).toBeCloseTo(r2Data[0], 5);
+      expect(r1Data[1]).toBeCloseTo(r2Data[1], 5);
+      expect(r1Data[2]).toBeCloseTo(r2Data[2], 5);
+    });
+
+    it('AdamW should get and set moment state', () => {
+      const adamw = new AdamW(0.01);
+
+      const param = createFloat32Array([1.0, 2.0, 3.0], [3]);
+      const grad = createFloat32Array([0.1, 0.2, 0.3], [3]);
+
+      // Run some updates to build state
+      let current = param;
+      for (let i = 0; i < 5; i++) {
+        current = adamw.updateSingle('my_param', current, grad);
+      }
+
+      // Get state keys
+      const keys = adamw.getStateKeys();
+      expect(keys).toContain('my_param');
+
+      // Get moments
+      const m = adamw.getFirstMoment('my_param');
+      const v = adamw.getSecondMoment('my_param');
+
+      expect(m).toBeDefined();
+      expect(v).toBeDefined();
+
+      // Moments should not be zeros
+      const mData = m!.toFloat32();
+      const vData = v!.toFloat32();
+
+      expect(mData[0]).not.toBe(0);
+      expect(vData[0]).not.toBe(0);
+
+      // Set moments on a new optimizer (simulating restore)
+      const adamwRestored = new AdamW(0.01);
+      adamwRestored.setStep(adamw.getStep());
+      adamwRestored.setFirstMoment('my_param', m!);
+      adamwRestored.setSecondMoment('my_param', v!);
+
+      // Both should produce same result on next update
+      const result1 = adamw.updateSingle('my_param', current, grad);
+      const result2 = adamwRestored.updateSingle('my_param', current, grad);
+
+      const r1Data = result1.toFloat32();
+      const r2Data = result2.toFloat32();
+
+      expect(r1Data[0]).toBeCloseTo(r2Data[0], 5);
+      expect(r1Data[1]).toBeCloseTo(r2Data[1], 5);
+      expect(r1Data[2]).toBeCloseTo(r2Data[2], 5);
+    });
+
+    it('Non-existent parameter returns null for moments', () => {
+      const adam = new Adam(0.01);
+
+      const m = adam.getFirstMoment('nonexistent');
+      const v = adam.getSecondMoment('nonexistent');
+
+      // NAPI Option<T> returns null for None, not undefined
+      expect(m).toBeNull();
+      expect(v).toBeNull();
+    });
+
+    it('Setting moment on non-existent parameter creates state entry', () => {
+      const adam = new Adam(0.01);
+
+      // Create a moment array
+      const m = createFloat32Array([0.1, 0.2, 0.3], [3]);
+
+      // Set it for a parameter that doesn't exist yet
+      adam.setFirstMoment('new_param', m);
+
+      // Now it should exist
+      const keys = adam.getStateKeys();
+      expect(keys).toContain('new_param');
+
+      // First moment should be our value
+      const retrieved = adam.getFirstMoment('new_param');
+      expect(retrieved).toBeDefined();
+
+      const retrievedData = retrieved!.toFloat32();
+      expect(retrievedData[0]).toBeCloseTo(0.1, 5);
+    });
+  });
 });

@@ -10,8 +10,9 @@ import type {
   DatasetLoader,
 } from '../types';
 import { extractHashAnswer } from '../utils/xml-parser';
+import { validatePathContainment, getAllowedRoot, type PathValidationOptions } from '../utils/path-security';
 
-export interface LocalDatasetOptions extends PromptFormatterOptions {
+export interface LocalDatasetOptions extends PromptFormatterOptions, PathValidationOptions {
   basePath?: string;
   promptTemplate?: PromptTemplate;
   metadata?: Record<string, unknown>;
@@ -91,8 +92,19 @@ export function validateDatasetExample(example: DatasetExample): void {
   }
 }
 
-function resolveBasePath(optionPath?: string): string {
-  return optionPath ? resolvePath(process.cwd(), optionPath) : DEFAULT_BASE_PATH;
+function resolveBasePath(optionPath: string | undefined, options: PathValidationOptions): string {
+  const allowedRoot = getAllowedRoot(options);
+
+  if (!optionPath) {
+    // Default path - validate it's within allowed root
+    validatePathContainment(DEFAULT_BASE_PATH, allowedRoot);
+    return DEFAULT_BASE_PATH;
+  }
+
+  // Resolve and validate user-provided path
+  const resolved = resolvePath(allowedRoot, optionPath);
+  validatePathContainment(resolved, allowedRoot);
+  return resolved;
 }
 
 function datasetFileForSplit(split: DatasetSplit): string {
@@ -138,9 +150,13 @@ export async function loadLocalGsm8kDataset(
   split: DatasetSplit,
   options: LocalDatasetOptions & { limit?: number } = {},
 ): Promise<DatasetExample[]> {
-  const basePath = resolveBasePath(options.basePath);
+  const basePath = resolveBasePath(options.basePath, options);
   const fileName = datasetFileForSplit(split);
   const filePath = resolvePath(basePath, fileName);
+
+  // Additional validation: ensure the final file path stays within the base path
+  // This protects against any edge cases where the filename could escape
+  validatePathContainment(filePath, basePath);
 
   const promptTemplate = options.promptTemplate ?? defaultPromptTemplate;
   const records = readJsonl(filePath, options.limit);

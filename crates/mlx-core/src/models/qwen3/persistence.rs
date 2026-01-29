@@ -20,6 +20,176 @@ use crate::utils::safetensors::{SafeTensorsFile, save_safetensors};
 
 use super::{Qwen3Config, Qwen3Model};
 
+/// Validate that all required parameters were loaded with correct shapes
+///
+/// This function verifies:
+/// 1. All required weights exist in the parameter map
+/// 2. Loaded shapes match expected dimensions based on config
+///
+/// # Arguments
+/// * `params` - HashMap of parameter names to MxArray values
+/// * `config` - Qwen3Config specifying model dimensions
+///
+/// # Returns
+/// * Ok(()) if all validations pass
+/// * Err with descriptive message if validation fails
+fn validate_loaded_parameters(
+    params: &HashMap<String, MxArray>,
+    config: &Qwen3Config,
+) -> Result<()> {
+    let num_layers = config.num_layers as usize;
+    let hidden_size = config.hidden_size as usize;
+    let intermediate_size = config.intermediate_size as usize;
+    let num_heads = config.num_heads as usize;
+    let num_kv_heads = config.num_kv_heads as usize;
+    let head_dim = config.head_dim as usize;
+    let vocab_size = config.vocab_size as usize;
+
+    // Collect all required parameters with expected shapes
+    let mut required_params: Vec<(String, Vec<usize>)> = Vec::new();
+
+    // Embedding parameters (always required)
+    required_params.push((
+        "embedding.weight".to_string(),
+        vec![vocab_size, hidden_size],
+    ));
+    required_params.push(("final_norm.weight".to_string(), vec![hidden_size]));
+
+    // Per-layer parameters
+    for i in 0..num_layers {
+        let prefix = format!("layers.{}", i);
+
+        // Attention weights
+        required_params.push((
+            format!("{}.self_attn.q_proj.weight", prefix),
+            vec![num_heads * head_dim, hidden_size],
+        ));
+        required_params.push((
+            format!("{}.self_attn.k_proj.weight", prefix),
+            vec![num_kv_heads * head_dim, hidden_size],
+        ));
+        required_params.push((
+            format!("{}.self_attn.v_proj.weight", prefix),
+            vec![num_kv_heads * head_dim, hidden_size],
+        ));
+        required_params.push((
+            format!("{}.self_attn.o_proj.weight", prefix),
+            vec![hidden_size, num_heads * head_dim],
+        ));
+
+        // MLP weights
+        required_params.push((
+            format!("{}.mlp.gate_proj.weight", prefix),
+            vec![intermediate_size, hidden_size],
+        ));
+        required_params.push((
+            format!("{}.mlp.up_proj.weight", prefix),
+            vec![intermediate_size, hidden_size],
+        ));
+        required_params.push((
+            format!("{}.mlp.down_proj.weight", prefix),
+            vec![hidden_size, intermediate_size],
+        ));
+
+        // Layer norm weights
+        required_params.push((
+            format!("{}.input_layernorm.weight", prefix),
+            vec![hidden_size],
+        ));
+        required_params.push((
+            format!("{}.post_attention_layernorm.weight", prefix),
+            vec![hidden_size],
+        ));
+
+        // QK norm weights (if enabled)
+        if config.use_qk_norm {
+            required_params.push((
+                format!("{}.self_attn.q_norm.weight", prefix),
+                vec![head_dim],
+            ));
+            required_params.push((
+                format!("{}.self_attn.k_norm.weight", prefix),
+                vec![head_dim],
+            ));
+        }
+    }
+
+    // LM head (only if not tied to embeddings)
+    if !config.tie_word_embeddings {
+        required_params.push(("lm_head.weight".to_string(), vec![vocab_size, hidden_size]));
+    }
+
+    // Track missing and mismatched parameters for comprehensive error reporting
+    let mut missing_params: Vec<String> = Vec::new();
+    let mut shape_mismatches: Vec<String> = Vec::new();
+
+    // Validate all required parameters
+    for (name, expected_shape) in required_params.iter() {
+        match params.get(name) {
+            None => {
+                missing_params.push(name.clone());
+            }
+            Some(arr) => {
+                let actual_shape_result = arr.shape();
+                match actual_shape_result {
+                    Ok(shape_data) => {
+                        let actual_shape: Vec<usize> =
+                            shape_data.as_ref().iter().map(|&x| x as usize).collect();
+                        if actual_shape != *expected_shape {
+                            shape_mismatches.push(format!(
+                                "{}: expected {:?}, got {:?}",
+                                name, expected_shape, actual_shape
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        shape_mismatches.push(format!("{}: failed to get shape: {}", name, e));
+                    }
+                }
+            }
+        }
+    }
+
+    // Build comprehensive error message if there are any issues
+    if !missing_params.is_empty() || !shape_mismatches.is_empty() {
+        let mut error_msg = String::from("Parameter validation failed:\n");
+
+        if !missing_params.is_empty() {
+            error_msg.push_str(&format!(
+                "\nMissing {} parameter(s):\n",
+                missing_params.len()
+            ));
+            for name in missing_params.iter().take(10) {
+                error_msg.push_str(&format!("  - {}\n", name));
+            }
+            if missing_params.len() > 10 {
+                error_msg.push_str(&format!("  ... and {} more\n", missing_params.len() - 10));
+            }
+        }
+
+        if !shape_mismatches.is_empty() {
+            error_msg.push_str(&format!(
+                "\nShape mismatch for {} parameter(s):\n",
+                shape_mismatches.len()
+            ));
+            for mismatch in shape_mismatches.iter().take(10) {
+                error_msg.push_str(&format!("  - {}\n", mismatch));
+            }
+            if shape_mismatches.len() > 10 {
+                error_msg.push_str(&format!("  ... and {} more\n", shape_mismatches.len() - 10));
+            }
+        }
+
+        return Err(Error::new(Status::InvalidArg, error_msg));
+    }
+
+    info!(
+        "✅ Parameter validation passed: {} parameters verified",
+        required_params.len()
+    );
+    Ok(())
+}
+
 #[napi]
 impl Qwen3Model {
     /// Load a pretrained model from disk
@@ -114,15 +284,7 @@ impl Qwen3Model {
                     .unwrap_or(2048) as i32,
                 // Parse head_dim from config (e.g., 128 for Qwen3-0.6B)
                 // If not specified, calculate from hidden_size / num_heads
-                head_dim: raw_config["head_dim"]
-                    .as_i64()
-                    .or_else(|| raw_config["headDim"].as_i64())
-                    .map(|x| x as i32)
-                    .unwrap_or_else(|| {
-                        let hs = raw_config["hidden_size"].as_i64().unwrap_or(1024) as i32;
-                        let nh = raw_config["num_attention_heads"].as_i64().unwrap_or(16) as i32;
-                        hs / nh
-                    }),
+                head_dim: parse_head_dim(&raw_config)?,
                 // Qwen3 ALWAYS uses QK normalization (core architectural feature)
                 // This is NOT optional - transformers source shows q_norm and k_norm are always initialized
                 use_qk_norm: raw_config["use_qk_norm"]
@@ -231,6 +393,9 @@ impl Qwen3Model {
                     mapped_params.len()
                 );
 
+                // Validate all required parameters were loaded with correct shapes
+                validate_loaded_parameters(&mapped_params, &config)?;
+
                 // Load tokenizer
                 let tokenizer_path = path.join("tokenizer.json");
                 if !tokenizer_path.exists() {
@@ -319,6 +484,9 @@ impl Qwen3Model {
                     "✅ Loaded {} parameters from MLX format",
                     weights_obj.len()
                 );
+
+                // Validate all required parameters were loaded with correct shapes
+                validate_loaded_parameters(&param_map, &config)?;
 
                 // Load tokenizer
                 let tokenizer_path = path.join("tokenizer.json");
@@ -466,4 +634,65 @@ impl Qwen3Model {
 
         Ok(promise)
     }
+
+    /// Validate that a set of parameters has all required weights with correct shapes
+    ///
+    /// This is useful for validating parameters before loading them into a model,
+    /// or for checking that saved weights are valid before training.
+    ///
+    /// # Arguments
+    /// * `params` - HashMap of parameter names to MxArray values
+    ///
+    /// # Returns
+    /// * Ok(()) if all validations pass
+    /// * Err with descriptive message if validation fails
+    #[napi]
+    pub fn validate_parameters(&self, params: HashMap<String, &MxArray>) -> Result<()> {
+        let owned_params: HashMap<String, MxArray> = params
+            .iter()
+            .map(|(k, v)| (k.clone(), (*v).clone()))
+            .collect();
+        let config = self.get_config();
+        validate_loaded_parameters(&owned_params, &config)
+    }
+}
+
+/// Parse head_dim from config, validating that hidden_size is divisible by num_heads
+fn parse_head_dim(raw_config: &Value) -> Result<i32> {
+    // If head_dim is explicitly specified, use it directly
+    if let Some(hd) = raw_config["head_dim"]
+        .as_i64()
+        .or_else(|| raw_config["headDim"].as_i64())
+    {
+        return Ok(hd as i32);
+    }
+
+    // Otherwise, calculate from hidden_size / num_heads with validation
+    let hs = raw_config["hidden_size"]
+        .as_i64()
+        .or_else(|| raw_config["hiddenSize"].as_i64())
+        .unwrap_or(1024) as i32;
+    let nh = raw_config["num_attention_heads"]
+        .as_i64()
+        .or_else(|| raw_config["numAttentionHeads"].as_i64())
+        .unwrap_or(16) as i32;
+
+    if nh == 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "num_attention_heads cannot be zero",
+        ));
+    }
+
+    if hs % nh != 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "hidden_size ({}) must be divisible by num_attention_heads ({})",
+                hs, nh
+            ),
+        ));
+    }
+
+    Ok(hs / nh)
 }

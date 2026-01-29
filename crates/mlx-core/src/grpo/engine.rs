@@ -101,6 +101,12 @@ pub struct GRPOEngineConfig {
     /// Consecutive NaN gradients that trigger emergency checkpoint (default: 5)
     /// When reached, the needs_emergency_save flag is set for the TypeScript layer.
     pub emergency_save_threshold: Option<i32>,
+    /// Enable detailed NaN/Inf detection with per-element counts (default: false)
+    /// When false (default), uses GPU-native has_nan_or_inf() which only transfers a single
+    /// boolean to CPU. When true, transfers the entire gradient tensor to CPU for detailed
+    /// per-element analysis - useful for debugging but has significant performance overhead
+    /// for large models (e.g., 2.4GB for Qwen3-0.6B).
+    pub verbose_nan_detection: Option<bool>,
 
     // === Chat template parameters ===
     /// Enable thinking mode for Qwen3 models (default: true)
@@ -166,6 +172,7 @@ impl Default for GRPOEngineConfig {
             repetition_penalty: Some(1.1),
             max_nan_gradients: Some(100),
             emergency_save_threshold: Some(5),
+            verbose_nan_detection: Some(false),
             enable_thinking: Some(true),
             tools: None,
             lm_head_chunk_size: None,      // Default: no chunking
@@ -505,6 +512,10 @@ impl GRPOTrainingEngine {
             ngram_size: Some(3),
             eos_token_id: Some(model_config.eos_token_id),
             return_logprobs: Some(true),
+            prefill_step_size: None, // Use default (2048)
+            kv_cache_bits: None,     // Default: no quantization
+            kv_cache_group_size: None,
+            num_draft_tokens: None, // Speculative decoding not used in GRPO
         };
 
         // Run the entire training step in spawn_blocking
@@ -639,18 +650,35 @@ impl GRPOTrainingEngine {
 
             // Step 1: Validate ALL gradients first - if ANY has NaN/Inf, skip entire step
             // This prevents partial gradient application which can degrade model weights
+            // Uses GPU-native has_nan_or_inf() to avoid transferring entire gradient tensors to CPU
+            // (For Qwen3-0.6B: transfers ~4 bytes per gradient instead of ~2.4GB total)
+            let verbose_nan = config.verbose_nan_detection.unwrap_or(false);
             for (name, grad) in gradients.iter() {
                 grad.eval();
-                let data = grad.to_float32()?;
-                let invalid_count = data
-                    .iter()
-                    .filter(|v| v.is_nan() || v.is_infinite())
-                    .count();
-                if invalid_count > 0 {
-                    warn!(
-                        "Gradient '{}' contains {} invalid values (NaN/Inf) - SKIPPING ENTIRE STEP to prevent model corruption",
-                        name, invalid_count
-                    );
+                // GPU-native check: only transfers a single boolean to CPU
+                let has_invalid = grad.has_nan_or_inf()?;
+                if has_invalid {
+                    // Only do detailed CPU analysis in verbose mode (for debugging)
+                    let invalid_count = if verbose_nan {
+                        let data = grad.to_float32()?;
+                        data.iter()
+                            .filter(|v| v.is_nan() || v.is_infinite())
+                            .count()
+                    } else {
+                        0 // Unknown count in fast mode
+                    };
+
+                    if verbose_nan {
+                        warn!(
+                            "Gradient '{}' contains {} invalid values (NaN/Inf) - SKIPPING ENTIRE STEP to prevent model corruption",
+                            name, invalid_count
+                        );
+                    } else {
+                        warn!(
+                            "Gradient '{}' contains NaN/Inf values - SKIPPING ENTIRE STEP to prevent model corruption (enable verbose_nan_detection for counts)",
+                            name
+                        );
+                    }
 
                     // Update NaN tracking
                     let mut state = state_arc.write().map_err(|_| {
@@ -735,13 +763,39 @@ impl GRPOTrainingEngine {
             };
 
             // === Phase 3: Accumulate and apply gradients ===
-            // Reset consecutive NaN count since we're applying gradients
             let mut state = state_arc.write().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire state write lock")
             })?;
-            state.consecutive_nan_count = 0;
 
-            accumulate_gradients(&mut state, gradients)?;
+            // Accumulate gradients with NaN/Inf checking
+            let acc_result = accumulate_gradients(&mut state, gradients)?;
+
+            // Handle invalid gradients found during accumulation
+            if acc_result.had_invalid_gradients {
+                state.consecutive_nan_count += 1;
+                state.nan_gradient_count += acc_result.invalid_param_count as u64;
+                warn!(
+                    "Found {} parameters with NaN/Inf during accumulation: {:?} (consecutive: {})",
+                    acc_result.invalid_param_count,
+                    acc_result.invalid_param_names,
+                    state.consecutive_nan_count
+                );
+
+                // Check emergency save threshold
+                let emergency_threshold = config.emergency_save_threshold.unwrap_or(5) as u32;
+                if state.consecutive_nan_count >= emergency_threshold && !state.needs_emergency_save
+                {
+                    state.needs_emergency_save = true;
+                    warn!(
+                        "Emergency save triggered: {} consecutive steps with NaN/Inf gradients",
+                        state.consecutive_nan_count
+                    );
+                }
+            } else {
+                // Reset consecutive NaN count on fully successful accumulation
+                state.consecutive_nan_count = 0;
+            }
+
             state.micro_step += 1;
 
             let grad_acc_steps = config.gradient_accumulation_steps.unwrap_or(1);
@@ -900,6 +954,10 @@ impl GRPOTrainingEngine {
             ngram_size: Some(3),
             eos_token_id: Some(model_config.eos_token_id),
             return_logprobs: Some(true),
+            prefill_step_size: None, // Use default (2048)
+            kv_cache_bits: None,     // Default: no quantization
+            kv_cache_group_size: None,
+            num_draft_tokens: None, // Speculative decoding not used in GRPO
         };
 
         let result = napi::bindgen_prelude::spawn_blocking(move || {
@@ -1191,37 +1249,39 @@ impl GRPOTrainingEngine {
                 });
             }
 
-            // Step 1: Clamp gradient values to prevent extreme values
+            // Step 1: Validate and clamp gradient values to prevent extreme values
             // This happens BEFORE norm clipping, as Inf values break norm computation
             let grad_clip_value = config.gradient_clip_value.unwrap_or(1.0);
             let mut clamped_gradients: HashMap<String, MxArray> = HashMap::new();
             let mut has_invalid_grad = false;
+            let mut invalid_param_names: Vec<String> = Vec::new();
 
             for (name, grad) in gradients.iter() {
                 grad.eval();
-                let data = grad.to_float32()?;
-                let invalid_count = data
-                    .iter()
-                    .filter(|v| v.is_nan() || v.is_infinite())
-                    .count();
 
-                // Check for NaN/Inf - if present, replace with zeros (skip this gradient)
-                if invalid_count > 0 {
+                // GPU-native check: transfers only ~4 bytes instead of entire gradient tensor
+                if grad.has_nan_or_inf()? {
                     warn!(
-                        "Gradient '{}' contains {} invalid values (NaN/Inf), replacing with zeros",
-                        name, invalid_count
+                        "Gradient '{}' contains NaN/Inf values - will skip step",
+                        name
                     );
                     has_invalid_grad = true;
-                    // Create a zero gradient with the same shape
-                    let shape = grad.shape()?;
-                    let zero_grad = MxArray::zeros(&shape, None)?;
-                    clamped_gradients.insert(name.clone(), zero_grad);
-                    continue; // Continue with other gradients instead of breaking
+                    invalid_param_names.push(name.clone());
+                    continue; // Don't insert anything - skip this gradient entirely
                 }
 
                 // Clamp to reasonable range (lazy - let MLX fuse operations)
                 let clamped = grad.clip(Some(-grad_clip_value), Some(grad_clip_value))?;
                 clamped_gradients.insert(name.clone(), clamped);
+            }
+
+            // Log all invalid parameters if any were found
+            if !invalid_param_names.is_empty() {
+                warn!(
+                    "Found {} parameters with NaN/Inf gradients: {:?}",
+                    invalid_param_names.len(),
+                    invalid_param_names
+                );
             }
 
             // Step 2: Apply gradient norm clipping
@@ -1298,13 +1358,39 @@ impl GRPOTrainingEngine {
             }
 
             // === Phase 3: Accumulate and apply gradients ===
-            // Reset consecutive NaN count on successful gradient computation
             let mut state = state_arc.write().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire state write lock")
             })?;
-            state.consecutive_nan_count = 0;
 
-            accumulate_gradients(&mut state, gradients)?;
+            // Accumulate gradients with NaN/Inf checking
+            let acc_result = accumulate_gradients(&mut state, gradients)?;
+
+            // Handle invalid gradients found during accumulation
+            if acc_result.had_invalid_gradients {
+                state.consecutive_nan_count += 1;
+                state.nan_gradient_count += acc_result.invalid_param_count as u64;
+                warn!(
+                    "Found {} parameters with NaN/Inf during accumulation: {:?} (consecutive: {})",
+                    acc_result.invalid_param_count,
+                    acc_result.invalid_param_names,
+                    state.consecutive_nan_count
+                );
+
+                // Check emergency save threshold
+                let emergency_threshold = config.emergency_save_threshold.unwrap_or(5) as u32;
+                if state.consecutive_nan_count >= emergency_threshold && !state.needs_emergency_save
+                {
+                    state.needs_emergency_save = true;
+                    warn!(
+                        "Emergency save triggered: {} consecutive steps with NaN/Inf gradients",
+                        state.consecutive_nan_count
+                    );
+                }
+            } else {
+                // Reset consecutive NaN count on fully successful accumulation
+                state.consecutive_nan_count = 0;
+            }
+
             state.micro_step += 1;
 
             let grad_acc_steps = config.gradient_accumulation_steps.unwrap_or(1);
@@ -1469,6 +1555,10 @@ impl GRPOTrainingEngine {
             ngram_size: Some(3),
             eos_token_id: Some(model_config.eos_token_id),
             return_logprobs: Some(true),
+            prefill_step_size: None, // Use default (2048)
+            kv_cache_bits: None,     // Default: no quantization
+            kv_cache_group_size: None,
+            num_draft_tokens: None, // Speculative decoding not used in GRPO
         };
 
         // === Phase 1: Generate completions ===
@@ -1853,18 +1943,17 @@ impl GRPOTrainingEngine {
                 });
             }
 
-            // Validate gradients
+            // Validate gradients using GPU-native check (transfers only ~4 bytes per gradient)
             info!("Validating {} gradients...", gradients.len());
             let validate_start = std::time::Instant::now();
             for (name, grad) in gradients.iter() {
                 grad.eval();
-                let sum = grad.sum(None, None)?;
-                sum.eval();
-                let sum_val = sum.item_at_float32(0)?;
-                if sum_val.is_nan() || sum_val.is_infinite() {
+
+                // GPU-native check: more thorough than sum-based check, catches sparse NaN values
+                if grad.has_nan_or_inf()? {
                     warn!(
-                        "Gradient '{}' contains NaN/Inf values (sum={}) - SKIPPING STEP",
-                        name, sum_val
+                        "Gradient '{}' contains NaN/Inf values - SKIPPING STEP",
+                        name
                     );
 
                     let mut state = state_arc.write().map_err(|_| {
@@ -1934,9 +2023,36 @@ impl GRPOTrainingEngine {
             let mut state = state_arc.write().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire state write lock")
             })?;
-            state.consecutive_nan_count = 0;
 
-            accumulate_gradients(&mut state, gradients)?;
+            // Accumulate gradients with NaN/Inf checking
+            let acc_result = accumulate_gradients(&mut state, gradients)?;
+
+            // Handle invalid gradients found during accumulation
+            if acc_result.had_invalid_gradients {
+                state.consecutive_nan_count += 1;
+                state.nan_gradient_count += acc_result.invalid_param_count as u64;
+                warn!(
+                    "Found {} parameters with NaN/Inf during accumulation: {:?} (consecutive: {})",
+                    acc_result.invalid_param_count,
+                    acc_result.invalid_param_names,
+                    state.consecutive_nan_count
+                );
+
+                // Check emergency save threshold
+                let emergency_threshold = config.emergency_save_threshold.unwrap_or(5) as u32;
+                if state.consecutive_nan_count >= emergency_threshold && !state.needs_emergency_save
+                {
+                    state.needs_emergency_save = true;
+                    warn!(
+                        "Emergency save triggered: {} consecutive steps with NaN/Inf gradients",
+                        state.consecutive_nan_count
+                    );
+                }
+            } else {
+                // Reset consecutive NaN count on fully successful accumulation
+                state.consecutive_nan_count = 0;
+            }
+
             state.micro_step += 1;
 
             let grad_acc_steps = config.gradient_accumulation_steps.unwrap_or(1);
@@ -2238,19 +2354,46 @@ struct IntermediateGenerationResult {
 // Helper functions
 // =============================================================================
 
-/// Accumulate gradients into state
-/// Gradients are already validated before calling this function.
-/// We eval() each accumulated gradient to materialize it and allow MLX to free the computation graph.
+/// Result of gradient accumulation
+struct AccumulationResult {
+    /// Whether any gradients contained NaN/Inf values
+    had_invalid_gradients: bool,
+    /// Number of parameters that had invalid gradients
+    invalid_param_count: usize,
+    /// Names of parameters with invalid gradients (for logging)
+    invalid_param_names: Vec<String>,
+}
+
+/// Accumulate gradients into state with finite value checking.
+///
+/// Gradients are checked for NaN/Inf values before accumulating. If a gradient
+/// contains non-finite values, it is skipped to prevent corrupting the accumulated
+/// gradients. The function returns information about any skipped gradients.
+///
+/// We eval() each accumulated gradient to materialize it and allow MLX to free
+/// the computation graph.
 fn accumulate_gradients(
     state: &mut EngineState,
     new_grads: HashMap<String, MxArray>,
-) -> Result<()> {
-    // Skip redundant validation - already done in train_step_auto before calling this
-    // The expensive to_float32() validation was causing ~2GB memory overhead per step
+) -> Result<AccumulationResult> {
+    let mut invalid_param_names = Vec::new();
 
     match &mut state.accumulated_gradients {
         Some(acc) => {
             for (name, grad) in new_grads {
+                // Check for non-finite values before accumulating
+                // This uses GPU-native isfinite() which is efficient
+                grad.eval();
+                if grad.has_nan_or_inf()? {
+                    warn!(
+                        "Skipping gradient accumulation for '{}' due to NaN/Inf values",
+                        name
+                    );
+                    invalid_param_names.push(name);
+                    // Skip this gradient, keep existing accumulated value
+                    continue;
+                }
+
                 if let Some(existing) = acc.get_mut(&name) {
                     let summed = existing.add(&grad)?;
                     // CRITICAL: eval() to materialize the result, allowing MLX to free
@@ -2258,23 +2401,36 @@ fn accumulate_gradients(
                     summed.eval();
                     *existing = summed;
                 } else {
-                    // First accumulation - just eval and store
-                    grad.eval();
+                    // First accumulation for this parameter - just store
                     acc.insert(name, grad);
                 }
             }
         }
         None => {
-            // First step - eval all gradients to materialize them
+            // First step - filter out invalid gradients and eval valid ones
             let mut evaluated_grads = HashMap::with_capacity(new_grads.len());
             for (name, grad) in new_grads {
                 grad.eval();
+                if grad.has_nan_or_inf()? {
+                    warn!(
+                        "Skipping initial gradient for '{}' due to NaN/Inf values",
+                        name
+                    );
+                    invalid_param_names.push(name);
+                    continue;
+                }
                 evaluated_grads.insert(name, grad);
             }
             state.accumulated_gradients = Some(evaluated_grads);
         }
     }
-    Ok(())
+
+    let invalid_param_count = invalid_param_names.len();
+    Ok(AccumulationResult {
+        had_invalid_gradients: invalid_param_count > 0,
+        invalid_param_count,
+        invalid_param_names,
+    })
 }
 
 /// Compute reward statistics
@@ -2309,5 +2465,138 @@ mod tests {
         let (mean, std) = compute_reward_stats(&rewards);
         assert_eq!(mean, 0.0);
         assert_eq!(std, 0.0);
+    }
+
+    #[test]
+    fn test_accumulate_gradients_valid() {
+        let mut state = EngineState::default();
+        let mut grads = HashMap::new();
+        grads.insert(
+            "param1".to_string(),
+            MxArray::from_float32(&[1.0, 2.0, 3.0], &[3]).unwrap(),
+        );
+        grads.insert(
+            "param2".to_string(),
+            MxArray::from_float32(&[4.0, 5.0], &[2]).unwrap(),
+        );
+
+        let result = accumulate_gradients(&mut state, grads).unwrap();
+        assert!(!result.had_invalid_gradients);
+        assert_eq!(result.invalid_param_count, 0);
+        assert!(result.invalid_param_names.is_empty());
+        assert!(state.accumulated_gradients.is_some());
+        assert_eq!(state.accumulated_gradients.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_accumulate_gradients_with_nan() {
+        let mut state = EngineState::default();
+        let mut grads = HashMap::new();
+        grads.insert(
+            "valid".to_string(),
+            MxArray::from_float32(&[1.0, 2.0, 3.0], &[3]).unwrap(),
+        );
+        grads.insert(
+            "invalid_nan".to_string(),
+            MxArray::from_float32(&[1.0, f32::NAN, 3.0], &[3]).unwrap(),
+        );
+
+        let result = accumulate_gradients(&mut state, grads).unwrap();
+        assert!(result.had_invalid_gradients);
+        assert_eq!(result.invalid_param_count, 1);
+        assert!(
+            result
+                .invalid_param_names
+                .contains(&"invalid_nan".to_string())
+        );
+
+        // Valid gradient should still be accumulated
+        assert!(state.accumulated_gradients.is_some());
+        let acc = state.accumulated_gradients.as_ref().unwrap();
+        assert_eq!(acc.len(), 1);
+        assert!(acc.contains_key("valid"));
+    }
+
+    #[test]
+    fn test_accumulate_gradients_with_inf() {
+        let mut state = EngineState::default();
+        let mut grads = HashMap::new();
+        grads.insert(
+            "valid".to_string(),
+            MxArray::from_float32(&[1.0, 2.0], &[2]).unwrap(),
+        );
+        grads.insert(
+            "invalid_inf".to_string(),
+            MxArray::from_float32(&[f32::INFINITY, 2.0], &[2]).unwrap(),
+        );
+        grads.insert(
+            "invalid_neg_inf".to_string(),
+            MxArray::from_float32(&[1.0, f32::NEG_INFINITY], &[2]).unwrap(),
+        );
+
+        let result = accumulate_gradients(&mut state, grads).unwrap();
+        assert!(result.had_invalid_gradients);
+        assert_eq!(result.invalid_param_count, 2);
+
+        // Valid gradient should still be accumulated
+        assert!(state.accumulated_gradients.is_some());
+        let acc = state.accumulated_gradients.as_ref().unwrap();
+        assert_eq!(acc.len(), 1);
+        assert!(acc.contains_key("valid"));
+    }
+
+    #[test]
+    fn test_accumulate_gradients_multiple_steps() {
+        let mut state = EngineState::default();
+
+        // First step: valid gradients
+        let mut grads1 = HashMap::new();
+        grads1.insert(
+            "param".to_string(),
+            MxArray::from_float32(&[1.0, 1.0, 1.0], &[3]).unwrap(),
+        );
+        let result1 = accumulate_gradients(&mut state, grads1).unwrap();
+        assert!(!result1.had_invalid_gradients);
+
+        // Second step: also valid
+        let mut grads2 = HashMap::new();
+        grads2.insert(
+            "param".to_string(),
+            MxArray::from_float32(&[2.0, 2.0, 2.0], &[3]).unwrap(),
+        );
+        let result2 = accumulate_gradients(&mut state, grads2).unwrap();
+        assert!(!result2.had_invalid_gradients);
+
+        // Check accumulated values (should be sum: [3, 3, 3])
+        let acc = state.accumulated_gradients.as_ref().unwrap();
+        let values = acc.get("param").unwrap().to_float32().unwrap();
+        assert_eq!(values.as_ref(), &[3.0f32, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn test_accumulate_gradients_skips_nan_preserves_existing() {
+        let mut state = EngineState::default();
+
+        // First step: valid gradient
+        let mut grads1 = HashMap::new();
+        grads1.insert(
+            "param".to_string(),
+            MxArray::from_float32(&[1.0, 1.0, 1.0], &[3]).unwrap(),
+        );
+        let _ = accumulate_gradients(&mut state, grads1).unwrap();
+
+        // Second step: NaN gradient (should be skipped, preserving [1, 1, 1])
+        let mut grads2 = HashMap::new();
+        grads2.insert(
+            "param".to_string(),
+            MxArray::from_float32(&[f32::NAN, 2.0, 2.0], &[3]).unwrap(),
+        );
+        let result2 = accumulate_gradients(&mut state, grads2).unwrap();
+        assert!(result2.had_invalid_gradients);
+
+        // Accumulated values should still be [1, 1, 1] (NaN gradient was skipped)
+        let acc = state.accumulated_gradients.as_ref().unwrap();
+        let values = acc.get("param").unwrap().to_float32().unwrap();
+        assert_eq!(values.as_ref(), &[1.0f32, 1.0, 1.0]);
     }
 }

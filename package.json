@@ -13,7 +13,6 @@
     "build:debug": "napi build --manifest-path crates/mlx-core/Cargo.toml --platform -o packages/core --js index.cjs --dts index.d.cts",
     "build:ts": "tsc -b",
     "clean": "rm -rf packages/*/dist",
-    "test": "vite test run && TEST_TRAINER=1 vite test run",
     "lint": "vite lint",
     "format": "vite fmt",
     "typecheck": "tsc -b",

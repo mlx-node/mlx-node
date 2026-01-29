@@ -47,10 +47,75 @@ export declare class Adam {
    *   bias_correction: Whether to apply bias correction (default: false)
    */
   constructor(learningRate?: number | undefined | null, beta1?: number | undefined | null, beta2?: number | undefined | null, eps?: number | undefined | null, biasCorrection?: boolean | undefined | null)
-  /** Update a single parameter */
+  /**
+   * Update a single parameter (kept for backwards compatibility)
+   *
+   * For better performance when updating many parameters, use `update_batch` instead.
+   */
   updateSingle(paramName: string, param: MxArray, grad: MxArray): MxArray
+  /**
+   * Batch update all parameters in a single call
+   *
+   * This is more efficient than calling update_single repeatedly due to reduced FFI overhead.
+   * For Qwen3-0.6B with ~300 parameters, this reduces FFI calls from 300+ to 1.
+   *
+   * Args:
+   *   param_names: Vector of parameter names
+   *   params: Vector of parameter arrays (must match param_names length)
+   *   grads: Vector of gradient arrays (must match param_names length)
+   *
+   * Returns:
+   *   Vector of updated parameter arrays in the same order as input
+   */
+  updateBatch(paramNames: Array<string>, params: Array<MxArray>, grads: Array<MxArray>): Array<MxArray>
   /** Reset optimizer state */
   reset(): void
+  /**
+   * Get the current step count
+   *
+   * This is useful for checkpointing the optimizer state.
+   * The step count is used for bias correction in Adam.
+   */
+  getStep(): number
+  /**
+   * Set the step count
+   *
+   * This is typically used when resuming from a checkpoint to restore
+   * the optimizer's step counter for correct bias correction.
+   */
+  setStep(step: number): void
+  /**
+   * Get all parameter names that have optimizer state
+   *
+   * Useful for inspecting which parameters the optimizer is tracking.
+   */
+  getStateKeys(): Array<string>
+  /**
+   * Get the first moment (m) for a specific parameter
+   *
+   * Returns None if the parameter doesn't have optimizer state.
+   */
+  getFirstMoment(paramName: string): MxArray | null
+  /**
+   * Get the second moment (v) for a specific parameter
+   *
+   * Returns None if the parameter doesn't have optimizer state.
+   */
+  getSecondMoment(paramName: string): MxArray | null
+  /**
+   * Set the first moment (m) for a specific parameter
+   *
+   * This is used when restoring optimizer state from a checkpoint.
+   * The shape must match the parameter's shape.
+   */
+  setFirstMoment(paramName: string, m: MxArray): void
+  /**
+   * Set the second moment (v) for a specific parameter
+   *
+   * This is used when restoring optimizer state from a checkpoint.
+   * The shape must match the parameter's shape.
+   */
+  setSecondMoment(paramName: string, v: MxArray): void
 }
 
 /**
@@ -74,10 +139,75 @@ export declare class AdamW {
    *   bias_correction: Whether to apply bias correction (default: false)
    */
   constructor(learningRate?: number | undefined | null, beta1?: number | undefined | null, beta2?: number | undefined | null, eps?: number | undefined | null, weightDecay?: number | undefined | null, biasCorrection?: boolean | undefined | null)
-  /** Update a single parameter */
+  /**
+   * Update a single parameter (kept for backwards compatibility)
+   *
+   * For better performance when updating many parameters, use `update_batch` instead.
+   */
   updateSingle(paramName: string, param: MxArray, grad: MxArray): MxArray
+  /**
+   * Batch update all parameters in a single call
+   *
+   * This is more efficient than calling update_single repeatedly due to reduced FFI overhead.
+   * For Qwen3-0.6B with ~300 parameters, this reduces FFI calls from 300+ to 1.
+   *
+   * Args:
+   *   param_names: Vector of parameter names
+   *   params: Vector of parameter arrays (must match param_names length)
+   *   grads: Vector of gradient arrays (must match param_names length)
+   *
+   * Returns:
+   *   Vector of updated parameter arrays in the same order as input
+   */
+  updateBatch(paramNames: Array<string>, params: Array<MxArray>, grads: Array<MxArray>): Array<MxArray>
   /** Reset optimizer state */
   reset(): void
+  /**
+   * Get the current step count
+   *
+   * This is useful for checkpointing the optimizer state.
+   * The step count is used for bias correction in AdamW.
+   */
+  getStep(): number
+  /**
+   * Set the step count
+   *
+   * This is typically used when resuming from a checkpoint to restore
+   * the optimizer's step counter for correct bias correction.
+   */
+  setStep(step: number): void
+  /**
+   * Get all parameter names that have optimizer state
+   *
+   * Useful for inspecting which parameters the optimizer is tracking.
+   */
+  getStateKeys(): Array<string>
+  /**
+   * Get the first moment (m) for a specific parameter
+   *
+   * Returns None if the parameter doesn't have optimizer state.
+   */
+  getFirstMoment(paramName: string): MxArray | null
+  /**
+   * Get the second moment (v) for a specific parameter
+   *
+   * Returns None if the parameter doesn't have optimizer state.
+   */
+  getSecondMoment(paramName: string): MxArray | null
+  /**
+   * Set the first moment (m) for a specific parameter
+   *
+   * This is used when restoring optimizer state from a checkpoint.
+   * The shape must match the parameter's shape.
+   */
+  setFirstMoment(paramName: string, m: MxArray): void
+  /**
+   * Set the second moment (v) for a specific parameter
+   *
+   * This is used when restoring optimizer state from a checkpoint.
+   * The shape must match the parameter's shape.
+   */
+  setSecondMoment(paramName: string, v: MxArray): void
 }
 
 /**
@@ -485,13 +615,6 @@ export declare class Gradients {
 /** Gradient utilities */
 export declare class GradientUtils {
   /**
-   * Compute the global L2 norm of gradients
-   *
-   * Computes sqrt(sum of squared elements across all gradients).
-   * This can be used to monitor gradient magnitudes during training.
-   */
-  static computeGradientNorm(gradients: Record<string, MxArray>): number
-  /**
    * Clip gradients by global L2 norm
    *
    * Scales all gradients proportionally so that their global L2 norm
@@ -657,6 +780,21 @@ export declare class KVCache {
   reset(): void
   /** Returns the current offset (number of cached tokens). */
   getOffset(): number
+  /**
+   * Trim the cache to keep only the first `new_len` tokens.
+   *
+   * This is used in speculative decoding to rewind the cache when draft tokens
+   * are rejected. After trimming, subsequent calls to `update_and_fetch` will
+   * overwrite the trimmed portion.
+   *
+   * # Arguments
+   * * `new_len` - New length of the cache (must be <= current offset)
+   *
+   * # Note
+   * This doesn't actually deallocate memory - it just updates the offset.
+   * The next `update_and_fetch` call will overwrite the trimmed data in-place.
+   */
+  trim(newLen: number): void
 }
 
 export declare class LayerNorm {
@@ -1096,6 +1234,68 @@ export declare class OutputStore {
 }
 
 /**
+ * Quantized Key-Value Cache for memory-efficient transformer inference.
+ *
+ * Uses group-wise affine quantization to compress KV tensors to 4-bit or 8-bit.
+ * Memory savings: 8-bit = ~2x, 4-bit = ~4x compared to float16/bfloat16.
+ *
+ * # Example
+ * ```javascript
+ * // Create a quantized cache with 8-bit precision
+ * const cache = new QuantizedKVCache({ bits: 8, groupSize: 64 });
+ *
+ * // Update and fetch work the same as regular KVCache
+ * const [keys, values] = cache.updateAndFetch(newKeys, newValues);
+ * ```
+ */
+export declare class QuantizedKVCache {
+  /**
+   * Creates a new quantized KV cache.
+   *
+   * # Arguments
+   * * `config` - Optional configuration for bits, group_size, etc.
+   *
+   * # Example
+   * ```javascript
+   * // 8-bit quantization (recommended, minimal quality loss)
+   * const cache8bit = new QuantizedKVCache({ bits: 8 });
+   *
+   * // 4-bit quantization (maximum memory savings)
+   * const cache4bit = new QuantizedKVCache({ bits: 4 });
+   * ```
+   */
+  constructor(config?: QuantizedKvCacheConfig | undefined | null)
+  /** Get the quantization bits (4 or 8) */
+  get bits(): number
+  /** Get the quantization group size */
+  get groupSize(): number
+  /** Get the current offset (number of cached tokens) */
+  get offset(): number
+  /**
+   * Updates the cache with new keys and values, and returns all cached keys/values.
+   *
+   * New K/V tensors are quantized and appended to the cache, then the full
+   * cache is dequantized and returned for attention computation.
+   *
+   * # Arguments
+   * * `keys` - New keys to add, shape: (batch, n_kv_heads, seq_len, head_dim)
+   * * `values` - New values to add, shape: (batch, n_kv_heads, seq_len, head_dim)
+   *
+   * # Returns
+   * Tuple of (cached_keys, cached_values) in full precision
+   */
+  updateAndFetch(keys: MxArray, values: MxArray): [MxArray, MxArray]
+  /** Resets the cache, clearing all stored data. */
+  reset(): void
+  /**
+   * Get estimated memory usage in bytes.
+   *
+   * This is approximate based on the quantized tensor sizes.
+   */
+  memoryUsage(): number
+}
+
+/**
  * Qwen3 Model with automatic differentiation support
  *
  * Uses interior mutability (RwLock) for layers, final_norm, and lm_head
@@ -1232,6 +1432,41 @@ export declare class Qwen3Model {
   hasPagedWork(): boolean
   /** Get model configuration */
   getConfig(): Qwen3Config
+  /**
+   * Generate tokens using speculative decoding with a draft model.
+   *
+   * Speculative decoding uses a smaller draft model to generate tokens speculatively,
+   * then verifies them with the target model in a single forward pass. This can achieve
+   * 2-3x speedup when the draft model has high acceptance rate.
+   *
+   * # Algorithm
+   * 1. Draft model generates N tokens speculatively (cheap forward passes)
+   * 2. Target model (self) verifies all N tokens in one forward pass
+   * 3. Accept/reject using rejection sampling
+   * 4. On rejection, resample from adjusted distribution
+   * 5. Rewind caches and continue
+   *
+   * # Arguments
+   * * `draft_model` - Smaller model for speculative generation (should share tokenizer)
+   * * `input_ids` - Input token IDs [1, seq_len]
+   * * `config` - Generation configuration (includes num_draft_tokens)
+   *
+   * # Returns
+   * GenerationResult with tokens, logprobs, and speculative stats in finish_reason
+   *
+   * # Example (TypeScript)
+   * ```typescript
+   * const targetModel = await ModelLoader.loadPretrained('qwen3-7b');
+   * const draftModel = await ModelLoader.loadPretrained('qwen3-0.5b');
+   *
+   * const result = targetModel.generateSpeculativeSync(draftModel, inputIds, {
+   *   numDraftTokens: 5,
+   *   maxNewTokens: 100,
+   *   temperature: 0.7,
+   * });
+   * ```
+   */
+  generateSpeculativeSync(draftModel: Qwen3Model, inputIds: MxArray, config?: GenerationConfig | undefined | null): GenerationResult
   /** Count total number of parameters in the model */
   numParameters(): number
   /**
@@ -1560,6 +1795,20 @@ export declare class Qwen3Model {
    * * `save_path` - Directory to save the model
    */
   saveModel(savePath: string): Promise<undefined>
+  /**
+   * Validate that a set of parameters has all required weights with correct shapes
+   *
+   * This is useful for validating parameters before loading them into a model,
+   * or for checking that saved weights are valid before training.
+   *
+   * # Arguments
+   * * `params` - HashMap of parameter names to MxArray values
+   *
+   * # Returns
+   * * Ok(()) if all validations pass
+   * * Err with descriptive message if validation fails
+   */
+  validateParameters(params: Record<string, MxArray>): void
 }
 
 /** Qwen3 Tokenizer class with NAPI bindings */
@@ -1718,8 +1967,27 @@ export declare class RMSprop {
    *   weight_decay: Weight decay (L2 penalty) (default: 0)
    */
   constructor(learningRate?: number | undefined | null, alpha?: number | undefined | null, eps?: number | undefined | null, weightDecay?: number | undefined | null)
-  /** Update a single parameter */
+  /**
+   * Update a single parameter (kept for backwards compatibility)
+   *
+   * For better performance when updating many parameters, use `update_batch` instead.
+   */
   updateSingle(paramName: string, param: MxArray, grad: MxArray): MxArray
+  /**
+   * Batch update all parameters in a single call
+   *
+   * This is more efficient than calling update_single repeatedly due to reduced FFI overhead.
+   * For Qwen3-0.6B with ~300 parameters, this reduces FFI calls from 300+ to 1.
+   *
+   * Args:
+   *   param_names: Vector of parameter names
+   *   params: Vector of parameter arrays (must match param_names length)
+   *   grads: Vector of gradient arrays (must match param_names length)
+   *
+   * Returns:
+   *   Vector of updated parameter arrays in the same order as input
+   */
+  updateBatch(paramNames: Array<string>, params: Array<MxArray>, grads: Array<MxArray>): Array<MxArray>
   /** Reset optimizer state */
   reset(): void
 }
@@ -1878,8 +2146,27 @@ export declare class SGD {
    *   nesterov: Whether to use Nesterov momentum (default: false)
    */
   constructor(learningRate: number, momentum?: number | undefined | null, weightDecay?: number | undefined | null, dampening?: number | undefined | null, nesterov?: boolean | undefined | null)
-  /** Update a single parameter */
+  /**
+   * Update a single parameter (kept for backwards compatibility)
+   *
+   * For better performance when updating many parameters, use `update_batch` instead.
+   */
   updateSingle(paramName: string, param: MxArray, grad: MxArray): MxArray
+  /**
+   * Batch update all parameters in a single call
+   *
+   * This is more efficient than calling update_single repeatedly due to reduced FFI overhead.
+   * For Qwen3-0.6B with ~300 parameters, this reduces FFI calls from 300+ to 1.
+   *
+   * Args:
+   *   param_names: Vector of parameter names
+   *   params: Vector of parameter arrays (must match param_names length)
+   *   grads: Vector of gradient arrays (must match param_names length)
+   *
+   * Returns:
+   *   Vector of updated parameter arrays in the same order as input
+   */
+  updateBatch(paramNames: Array<string>, params: Array<MxArray>, grads: Array<MxArray>): Array<MxArray>
   /** Reset optimizer state */
   reset(): void
 }
@@ -2423,6 +2710,36 @@ export interface GenerationConfig {
   eosTokenId?: number
   /** Whether to return log probabilities (always true for GRPO) */
   returnLogprobs?: boolean
+  /**
+   * Prefill step size for chunked processing of long prompts (default: 2048)
+   * When the prompt length exceeds this value, it will be processed in chunks
+   * to improve memory efficiency and enable async pipelining.
+   * Set to 0 to disable chunking and process the entire prompt at once.
+   */
+  prefillStepSize?: number
+  /**
+   * KV cache quantization bits (default: 16 = no quantization)
+   * - 16: Full precision (bfloat16/float16), no quantization
+   * - 8: 8-bit quantization, ~2x memory savings, minimal quality loss
+   * - 4: 4-bit quantization, ~4x memory savings, some quality degradation
+   *
+   * Quantized KV cache is useful for long sequences where memory becomes a bottleneck.
+   * Note: Adds dequantization overhead per forward pass.
+   */
+  kvCacheBits?: number
+  /**
+   * KV cache quantization group size (default: 64)
+   * Number of elements per quantization group. Smaller groups = better accuracy
+   * but more overhead from storing scales/biases.
+   * Only used when kv_cache_bits is 4 or 8.
+   */
+  kvCacheGroupSize?: number
+  /**
+   * Number of draft tokens to generate speculatively (default: 5)
+   * Only used when a draft model is provided for speculative decoding.
+   * Higher values can increase throughput but may reduce acceptance rate.
+   */
+  numDraftTokens?: number
 }
 
 /** A generation record (NAPI wrapper) */
@@ -2524,6 +2841,14 @@ export interface GrpoEngineConfig {
    */
   emergencySaveThreshold?: number
   /**
+   * Enable detailed NaN/Inf detection with per-element counts (default: false)
+   * When false (default), uses GPU-native has_nan_or_inf() which only transfers a single
+   * boolean to CPU. When true, transfers the entire gradient tensor to CPU for detailed
+   * per-element analysis - useful for debugging but has significant performance overhead
+   * for large models (e.g., 2.4GB for Qwen3-0.6B).
+   */
+  verboseNanDetection?: boolean
+  /**
    * Enable thinking mode for Qwen3 models (default: true)
    * When false, adds empty <think></think> tags to disable model thinking.
    * This is useful for tool-use training where you want direct outputs.
@@ -2584,7 +2909,10 @@ export interface GrpoLossConfig {
   lossType: string
   /** Importance sampling level: "token" or "sequence" */
   importanceSamplingLevel: string
-  /** Maximum completion length (needed for dr_grpo) */
+  /**
+   * Maximum completion length (legacy, no longer used by dr_grpo)
+   * Kept for backwards compatibility but ignored in current implementation.
+   */
   maxCompletionLength?: number
   /** Total number of items in batch across all processes (needed for dapo) */
   numItemsInBatch?: number
@@ -2697,6 +3025,19 @@ export interface ParseToolCallsResult {
   text: string
   /** Parsed tool calls */
   toolCalls: Array<ToolCallResult>
+}
+
+/** Configuration options for QuantizedKVCache */
+export interface QuantizedKvCacheConfig {
+  /** Number of bits for quantization (4 or 8, default: 8) */
+  bits?: number
+  /**
+   * Number of elements per quantization group (default: 64)
+   * Smaller groups = better accuracy but more overhead
+   */
+  groupSize?: number
+  /** Pre-allocation step size (default: 256, matching KVCache) */
+  step?: number
 }
 
 /** Qwen3 model configuration */
@@ -2886,6 +3227,13 @@ export interface SftEngineConfig {
   emergencySaveThreshold?: number
   /** Compute token accuracy (requires extra forward pass) (default: false) */
   computeAccuracy?: boolean
+  /**
+   * Enable detailed NaN/Inf detection with per-element counts (default: false)
+   * When false (default), uses GPU-native has_nan_or_inf() which only transfers a single
+   * boolean to CPU. When true, transfers the entire gradient tensor to CPU for detailed
+   * per-element analysis - useful for debugging but has significant performance overhead.
+   */
+  verboseNanDetection?: boolean
 }
 
 /** Metrics from a training epoch */
@@ -2995,9 +3343,22 @@ export interface ToolCallResult {
   id: string
   /** Name of the tool/function to call */
   name: string
-  /** Parsed arguments as native object (serde_json::Value → JS object) */
-  arguments: Record<string, unknown>
-  /** Parsing status: "ok" | "invalid_json" | "missing_name" */
+  /**
+   * Parsed arguments as native object (serde_json::Value -> JS object)
+   *
+   * When status is "ok", this contains the parsed arguments object.
+   * When status is "parse_error", this contains the original unparsed string.
+   * Otherwise, this is an empty object {}.
+   */
+  arguments: Record<string, unknown> | string
+  /**
+   * Parsing status: "ok" | "invalid_json" | "missing_name" | "parse_error"
+   *
+   * - "ok": Successfully parsed tool call
+   * - "invalid_json": The tool_call tag content was not valid JSON
+   * - "missing_name": Valid JSON but no "name" field
+   * - "parse_error": Valid JSON but the "arguments" string field couldn't be parsed as JSON
+   */
   status: string
   /** Error message if status != "ok" */
   error?: string

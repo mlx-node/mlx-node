@@ -1508,6 +1508,7 @@ impl Qwen3Model {
         let ngram_size = config.ngram_size.unwrap_or(3);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
+        let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
 
         // Calculate model size for wired_limit context
         let model_size_bytes = self.calculate_memory_size();
@@ -1580,31 +1581,121 @@ impl Qwen3Model {
             min_p: Some(min_p),
         };
 
-        // PREFILL: Process entire prompt
-        let logits = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            Self::forward_fused(
-                &current_ids,
-                &embedding_weight,
-                layers,
-                final_norm,
-                lm_head,
-                model_config,
-                &mut kv_keys,
-                &mut kv_values,
-                &mut cache_idx,
-                &rope_offsets,
-                &left_padding,
-            )?
-        };
-        // Update rope_offsets after prefill (sequence length tokens have been processed)
-        rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
+        // PREFILL: Process prompt (chunked for long sequences)
+        // Get the sequence length from input shape [1, seq_len]
+        let total_seq_len = current_ids.shape_at(1)? as usize;
 
-        // Extract last token logits (shape: [1, seq_len, vocab_size] -> [vocab_size])
-        let seq_len = logits.shape_at(1)?;
-        let mut last_logits = logits
-            .slice_axis(1, seq_len - 1, seq_len)?
-            .squeeze(Some(&[0, 1]))?;
+        // Determine if we should use chunked prefill
+        // Use chunking if prefill_step_size > 0 and seq_len exceeds it
+        let use_chunked_prefill = prefill_step_size > 0 && total_seq_len > prefill_step_size;
+
+        let mut last_logits = if use_chunked_prefill {
+            // === CHUNKED PREFILL ===
+            // Process prompt in chunks to improve memory efficiency and enable async pipelining
+            debug!(
+                "Using chunked prefill: seq_len={}, step_size={}",
+                total_seq_len, prefill_step_size
+            );
+
+            let mut offset = 0usize;
+
+            // Process all chunks except the last one (we need logits only from the last chunk)
+            while offset + prefill_step_size < total_seq_len {
+                let chunk_end = offset + prefill_step_size;
+
+                // Slice the chunk: [1, seq_len] -> [1, chunk_size]
+                let chunk = current_ids.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
+
+                // Update rope_offsets for this chunk (starts at current offset)
+                rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
+
+                {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    // Forward pass updates KV cache but we discard intermediate logits
+                    let _ = Self::forward_fused(
+                        &chunk,
+                        &embedding_weight,
+                        layers,
+                        final_norm,
+                        lm_head,
+                        model_config,
+                        &mut kv_keys,
+                        &mut kv_values,
+                        &mut cache_idx,
+                        &rope_offsets,
+                        &left_padding,
+                    )?;
+                }
+
+                // Async eval for pipelining: start GPU work on cache while we prepare next chunk
+                // This allows overlap between GPU computation and CPU preparation
+                for kv_key in kv_keys.iter().flatten() {
+                    kv_key.eval();
+                }
+                for kv_value in kv_values.iter().flatten() {
+                    kv_value.eval();
+                }
+
+                // Clear cache after processing large chunks to prevent memory accumulation
+                synchronize_and_clear_cache();
+
+                offset = chunk_end;
+            }
+
+            // Process final chunk to get logits for sampling
+            let final_chunk = current_ids.slice(&[0, offset as i64], &[1, total_seq_len as i64])?;
+            rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
+
+            let logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                Self::forward_fused(
+                    &final_chunk,
+                    &embedding_weight,
+                    layers,
+                    final_norm,
+                    lm_head,
+                    model_config,
+                    &mut kv_keys,
+                    &mut kv_values,
+                    &mut cache_idx,
+                    &rope_offsets,
+                    &left_padding,
+                )?
+            };
+
+            // Extract last token logits from final chunk
+            let chunk_seq_len = logits.shape_at(1)?;
+            logits
+                .slice_axis(1, chunk_seq_len - 1, chunk_seq_len)?
+                .squeeze(Some(&[0, 1]))?
+        } else {
+            // === SINGLE-PASS PREFILL (original behavior for short sequences) ===
+            let logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                Self::forward_fused(
+                    &current_ids,
+                    &embedding_weight,
+                    layers,
+                    final_norm,
+                    lm_head,
+                    model_config,
+                    &mut kv_keys,
+                    &mut kv_values,
+                    &mut cache_idx,
+                    &rope_offsets,
+                    &left_padding,
+                )?
+            };
+
+            // Extract last token logits (shape: [1, seq_len, vocab_size] -> [vocab_size])
+            let seq_len = logits.shape_at(1)?;
+            logits
+                .slice_axis(1, seq_len - 1, seq_len)?
+                .squeeze(Some(&[0, 1]))?
+        };
+
+        // Update rope_offsets after prefill (all tokens have been processed)
+        rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
 
         // Apply repetition penalty to prefill logits if enabled
         if repetition_penalty != 1.0 && !input_tokens.is_empty() {
@@ -1628,7 +1719,10 @@ impl Qwen3Model {
         // DECODE loop
         // Cleanup interval to release intermediate tensors and prevent memory accumulation
         // Every 64 tokens is a good balance between memory savings and performance
-        const DECODE_CLEANUP_INTERVAL: i32 = 64;
+        const DECODE_CLEANUP_INTERVAL: i32 = 256; // Aligned with mlx-lm
+
+        // Pre-allocate constant array for incrementing rope offsets (avoids allocation per iteration)
+        let one_arr = MxArray::from_int32(&[1], &[1])?;
 
         for step in 0..max_new_tokens {
             let _stream_ctx = StreamContext::new(generation_stream);
@@ -1689,7 +1783,6 @@ impl Qwen3Model {
                 &left_padding,
             )?;
             // Increment rope offset for next iteration (use int32 addition to preserve dtype)
-            let one_arr = MxArray::from_int32(&[1], &[1])?;
             rope_offsets = rope_offsets.add(&one_arr)?;
 
             // Extract last token logits (shape: [1, 1, vocab_size] -> [vocab_size])
@@ -1743,6 +1836,498 @@ impl Qwen3Model {
         })
     }
 
+    /// Generate tokens using speculative decoding with a draft model.
+    ///
+    /// Speculative decoding uses a smaller draft model to generate tokens speculatively,
+    /// then verifies them with the target model in a single forward pass. This can achieve
+    /// 2-3x speedup when the draft model has high acceptance rate.
+    ///
+    /// # Algorithm
+    /// 1. Draft model generates N tokens speculatively (cheap forward passes)
+    /// 2. Target model (self) verifies all N tokens in one forward pass
+    /// 3. Accept/reject using rejection sampling
+    /// 4. On rejection, resample from adjusted distribution
+    /// 5. Rewind caches and continue
+    ///
+    /// # Arguments
+    /// * `draft_model` - Smaller model for speculative generation (should share tokenizer)
+    /// * `input_ids` - Input token IDs [1, seq_len]
+    /// * `config` - Generation configuration (includes num_draft_tokens)
+    ///
+    /// # Returns
+    /// GenerationResult with tokens, logprobs, and speculative stats in finish_reason
+    ///
+    /// # Example (TypeScript)
+    /// ```typescript
+    /// const targetModel = await ModelLoader.loadPretrained('qwen3-7b');
+    /// const draftModel = await ModelLoader.loadPretrained('qwen3-0.5b');
+    ///
+    /// const result = targetModel.generateSpeculativeSync(draftModel, inputIds, {
+    ///   numDraftTokens: 5,
+    ///   maxNewTokens: 100,
+    ///   temperature: 0.7,
+    /// });
+    /// ```
+    #[napi(js_name = "generateSpeculativeSync")]
+    pub fn generate_speculative_sync_napi(
+        &self,
+        draft_model: &Qwen3Model,
+        input_ids: &MxArray,
+        config: Option<GenerationConfig>,
+    ) -> Result<GenerationResult> {
+        self.generate_speculative_sync(draft_model, input_ids, config)
+    }
+
+    /// Internal implementation for speculative decoding (without NAPI wrapper)
+    ///
+    /// # Arguments
+    /// * `draft_model` - Smaller model for speculative generation (should share tokenizer)
+    /// * `input_ids` - Input token IDs [1, seq_len]
+    /// * `config` - Generation configuration (includes num_draft_tokens)
+    ///
+    /// # Returns
+    /// GenerationResult with tokens, logprobs, and speculative stats in finish_reason
+    pub fn generate_speculative_sync(
+        &self,
+        draft_model: &Qwen3Model,
+        input_ids: &MxArray,
+        config: Option<GenerationConfig>,
+    ) -> Result<GenerationResult> {
+        use super::speculative::{SpeculativeStats, trim_kv_caches, verify_draft_tokens};
+        use crate::stream::{DeviceType, Stream, StreamContext};
+
+        let config = config.unwrap_or_default();
+        let input_ids = input_ids.clone();
+
+        // Extract configuration
+        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let temperature = config.temperature.unwrap_or(1.0);
+        let top_k = config.top_k.unwrap_or(0);
+        let top_p = config.top_p.unwrap_or(1.0);
+        let min_p = config.min_p.unwrap_or(0.0);
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(8);
+        let ngram_size = config.ngram_size.unwrap_or(3);
+        let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
+        let return_logprobs = config.return_logprobs.unwrap_or(true);
+        let num_draft_tokens = config.num_draft_tokens.unwrap_or(5) as usize;
+
+        // Calculate model sizes for wired_limit context
+        let target_model_size = self.calculate_memory_size();
+        let draft_model_size = draft_model.calculate_memory_size();
+
+        // Get model components for both models
+        let target_embedding_weight = self.embedding.get_weight();
+        let draft_embedding_weight = draft_model.embedding.get_weight();
+
+        let target_layers_guard = self.layers.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire target layers read lock",
+            )
+        })?;
+        let target_final_norm_guard = self.final_norm.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire target final_norm read lock",
+            )
+        })?;
+        let target_lm_head_guard = self.lm_head.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire target lm_head read lock",
+            )
+        })?;
+
+        let draft_layers_guard = draft_model.layers.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire draft layers read lock",
+            )
+        })?;
+        let draft_final_norm_guard = draft_model.final_norm.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire draft final_norm read lock",
+            )
+        })?;
+        let draft_lm_head_guard = draft_model.lm_head.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire draft lm_head read lock",
+            )
+        })?;
+
+        let target_layers = &*target_layers_guard;
+        let target_final_norm = &*target_final_norm_guard;
+        let target_lm_head = &*target_lm_head_guard;
+        let target_config = &self.config;
+
+        let draft_layers = &*draft_layers_guard;
+        let draft_final_norm = &*draft_final_norm_guard;
+        let draft_lm_head = &*draft_lm_head_guard;
+        let draft_config = &draft_model.config;
+
+        debug!(
+            "Starting speculative generation: max_tokens={}, num_draft={}, temp={}",
+            max_new_tokens, num_draft_tokens, temperature
+        );
+
+        // Create dedicated generation stream
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        // Wired limit context for GPU memory management
+        let _wired_ctx = crate::stream::WiredLimitContext::new(
+            target_model_size + draft_model_size,
+            vec![generation_stream],
+        );
+
+        // Initialize KV caches for BOTH models
+        let target_num_layers = target_layers.len();
+        let draft_num_layers = draft_layers.len();
+
+        let mut target_kv_keys: Vec<Option<MxArray>> = vec![None; target_num_layers];
+        let mut target_kv_values: Vec<Option<MxArray>> = vec![None; target_num_layers];
+        let mut target_cache_idx: i32 = 0;
+
+        let mut draft_kv_keys: Vec<Option<MxArray>> = vec![None; draft_num_layers];
+        let mut draft_kv_values: Vec<Option<MxArray>> = vec![None; draft_num_layers];
+        let mut draft_cache_idx: i32 = 0;
+
+        // Rope offsets and padding
+        let mut target_rope_offsets = MxArray::from_int32(&[0], &[1])?;
+        let mut draft_rope_offsets = MxArray::from_int32(&[0], &[1])?;
+        let left_padding = MxArray::from_int32(&[0], &[1])?;
+
+        // Get input tokens for repetition penalty
+        let input_tokens = input_ids.to_uint32()?;
+
+        // Sampling config
+        let sampling_config = SamplingConfig {
+            temperature: Some(temperature),
+            top_k: Some(top_k),
+            top_p: Some(top_p),
+            min_p: Some(min_p),
+        };
+
+        // === PREFILL BOTH MODELS ===
+        // Target model prefill - capture logits for first token sampling
+        let prefill_logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            Self::forward_fused(
+                &input_ids,
+                &target_embedding_weight,
+                target_layers,
+                target_final_norm,
+                target_lm_head,
+                target_config,
+                &mut target_kv_keys,
+                &mut target_kv_values,
+                &mut target_cache_idx,
+                &target_rope_offsets,
+                &left_padding,
+            )?
+        };
+
+        // Draft model prefill
+        {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let _ = Self::forward_fused(
+                &input_ids,
+                &draft_embedding_weight,
+                draft_layers,
+                draft_final_norm,
+                draft_lm_head,
+                draft_config,
+                &mut draft_kv_keys,
+                &mut draft_kv_values,
+                &mut draft_cache_idx,
+                &draft_rope_offsets,
+                &left_padding,
+            )?;
+        }
+
+        // The prefill already filled the cache with the prompt, so update rope offsets
+        let prompt_len = input_ids.shape_at(1)? as i32;
+        target_rope_offsets = MxArray::from_int32(&[prompt_len], &[1])?;
+        draft_rope_offsets = MxArray::from_int32(&[prompt_len], &[1])?;
+
+        // Extract last token logits from prefill for first token sampling
+        let seq_len = prefill_logits.shape_at(1)?;
+        let last_logits = prefill_logits
+            .slice_axis(1, seq_len - 1, seq_len)?
+            .squeeze(Some(&[0, 1]))?;
+
+        // Apply repetition penalty to first token
+        let last_logits = if repetition_penalty != 1.0 && !input_tokens.is_empty() {
+            apply_repetition_penalty(
+                &last_logits,
+                &input_tokens,
+                repetition_penalty,
+                Some(repetition_context_size),
+            )?
+        } else {
+            last_logits
+        };
+
+        // Sample first token
+        let first_token_result = sample_and_logprobs(&last_logits, Some(sampling_config))?;
+        first_token_result.0.eval();
+        let mut current_token = first_token_result.0.item_at_int32(0)? as u32;
+
+        // Generation state
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut generated_logprobs: Vec<f32> = if return_logprobs {
+            Vec::with_capacity(max_new_tokens as usize)
+        } else {
+            Vec::new()
+        };
+
+        // Add first token
+        generated_tokens.push(current_token);
+        if return_logprobs {
+            let lp = first_token_result
+                .1
+                .item_at_float32(current_token as usize)?;
+            generated_logprobs.push(lp);
+        }
+
+        // Statistics
+        let mut stats = SpeculativeStats::default();
+        let mut finish_reason = "length";
+
+        // Pre-allocate constant for rope offset increment
+        let one_arr = MxArray::from_int32(&[1], &[1])?;
+
+        // Check for EOS from first token
+        if let Some(eos_id) = eos_token_id
+            && current_token == eos_id as u32
+        {
+            finish_reason = "stop";
+            let tokens_array =
+                MxArray::from_uint32(&generated_tokens, &[generated_tokens.len() as i64])?;
+            let logprobs_array = if return_logprobs {
+                MxArray::from_float32(&generated_logprobs, &[generated_logprobs.len() as i64])?
+            } else {
+                MxArray::from_float32(&[], &[0])?
+            };
+            return Ok(GenerationResult {
+                text: String::new(),
+                tokens: tokens_array,
+                logprobs: logprobs_array,
+                finish_reason: finish_reason.to_string(),
+                num_tokens: generated_tokens.len(),
+            });
+        }
+
+        // === SPECULATIVE DECODING LOOP ===
+        while generated_tokens.len() < max_new_tokens as usize {
+            let _stream_ctx = StreamContext::new(generation_stream);
+
+            // === Phase 1: Draft model generates N tokens speculatively ===
+            let mut draft_tokens: Vec<u32> = Vec::with_capacity(num_draft_tokens);
+            let mut draft_probs: Vec<MxArray> = Vec::with_capacity(num_draft_tokens);
+
+            let draft_start_cache_idx = draft_cache_idx;
+            let mut draft_current_token = current_token;
+
+            for _ in 0..num_draft_tokens {
+                // Forward pass through draft model
+                let draft_input = MxArray::from_uint32(&[draft_current_token], &[1, 1])?;
+                let draft_logits = Self::forward_fused(
+                    &draft_input,
+                    &draft_embedding_weight,
+                    draft_layers,
+                    draft_final_norm,
+                    draft_lm_head,
+                    draft_config,
+                    &mut draft_kv_keys,
+                    &mut draft_kv_values,
+                    &mut draft_cache_idx,
+                    &draft_rope_offsets,
+                    &left_padding,
+                )?;
+
+                // Update draft rope offset
+                draft_rope_offsets = draft_rope_offsets.add(&one_arr)?;
+
+                // Get logits for this position
+                let draft_last_logits = draft_logits.slice_axis(1, 0, 1)?.squeeze(Some(&[0, 1]))?;
+
+                // Sample from draft model and get logprobs
+                // Using sample_and_logprobs ensures draft_probs matches the actual sampling distribution
+                // (with temperature, top_k, top_p, min_p all applied consistently)
+                let (sampled, logprobs) =
+                    sample_and_logprobs(&draft_last_logits, Some(sampling_config))?;
+                sampled.eval();
+                logprobs.eval();
+
+                // Convert logprobs to probs for verification (this matches the sampling distribution exactly)
+                let probs = logprobs.exp()?;
+                draft_probs.push(probs);
+
+                draft_current_token = sampled.item_at_int32(0)? as u32;
+                draft_tokens.push(draft_current_token);
+
+                stats.draft_forward_passes += 1;
+
+                // Check for EOS in draft (stop drafting if EOS)
+                if let Some(eos_id) = eos_token_id
+                    && draft_current_token == eos_id as u32
+                {
+                    break;
+                }
+            }
+
+            stats.total_drafted += draft_tokens.len();
+
+            // === Phase 2: Target model verifies all draft tokens at once ===
+            // Create input with current token + all draft tokens
+            let mut verify_tokens: Vec<u32> = vec![current_token];
+            verify_tokens.extend(&draft_tokens);
+
+            let verify_input =
+                MxArray::from_uint32(&verify_tokens, &[1, verify_tokens.len() as i64])?;
+
+            let target_logits = Self::forward_fused(
+                &verify_input,
+                &target_embedding_weight,
+                target_layers,
+                target_final_norm,
+                target_lm_head,
+                target_config,
+                &mut target_kv_keys,
+                &mut target_kv_values,
+                &mut target_cache_idx,
+                &target_rope_offsets,
+                &left_padding,
+            )?;
+
+            stats.target_forward_passes += 1;
+
+            // Extract logits for verification: positions 1..N+1 correspond to draft tokens
+            // Position 0 is for the current_token we already have
+            // Positions 1..len-1 are for verifying draft_tokens[0..len-2]
+            // Position len-1 is the "bonus" position if all are accepted
+            let verify_seq_len = target_logits.shape_at(1)?;
+            let vocab_size = target_logits.shape_at(2)?;
+
+            // Skip position 0 (it's for current_token), get positions 1..end
+            let verification_logits = target_logits
+                .slice(&[0, 1, 0], &[1, verify_seq_len, vocab_size])?
+                .squeeze(Some(&[0]))?;
+
+            // === Phase 3: Accept/reject using rejection sampling ===
+            let verification_result = verify_draft_tokens(
+                &draft_tokens,
+                &draft_probs,
+                &verification_logits,
+                temperature,
+                eos_token_id,
+            )?;
+
+            // Track stats
+            stats.total_accepted += verification_result.num_accepted;
+
+            // Add accepted tokens to generated output
+            for (i, &token) in verification_result.accepted_tokens.iter().enumerate() {
+                generated_tokens.push(token);
+                if return_logprobs && i < verification_result.accepted_logprobs.len() {
+                    generated_logprobs.push(verification_result.accepted_logprobs[i]);
+                }
+
+                // Check repetition cutoff
+                if let Some(reason) = check_repetition_cutoff(
+                    &generated_tokens,
+                    max_consecutive_tokens,
+                    max_ngram_repeats,
+                    ngram_size,
+                ) {
+                    finish_reason = reason;
+                    break;
+                }
+            }
+
+            // Update current token for next iteration
+            current_token = verification_result.final_token;
+
+            // Check for stopping conditions
+            if verification_result.should_stop {
+                finish_reason = "stop";
+                break;
+            }
+
+            if finish_reason == "repetition" {
+                break;
+            }
+
+            if generated_tokens.len() >= max_new_tokens as usize {
+                break;
+            }
+
+            // === Phase 4: Trim caches based on acceptance ===
+            // Target cache: keep prompt_len + accepted tokens
+            let accepted_count = verification_result.num_accepted as i32;
+            let new_target_cache_len =
+                input_ids.shape_at(1)? as i32 + generated_tokens.len() as i32;
+            target_cache_idx = new_target_cache_len;
+            target_rope_offsets = MxArray::from_int32(&[target_cache_idx], &[1])?;
+
+            // Draft cache: rewind to match target (draft may have speculatively gone further)
+            // If some tokens were rejected, we need to trim the draft cache
+            let rejection_point = draft_start_cache_idx + accepted_count;
+            if draft_cache_idx > rejection_point {
+                trim_kv_caches(
+                    &mut draft_kv_keys,
+                    &mut draft_kv_values,
+                    &mut draft_cache_idx,
+                    rejection_point,
+                );
+            }
+            draft_cache_idx = new_target_cache_len;
+            draft_rope_offsets = MxArray::from_int32(&[draft_cache_idx], &[1])?;
+
+            // Periodic cleanup every 256 tokens (aligned with mlx-lm)
+            if generated_tokens.len().is_multiple_of(256) && !generated_tokens.is_empty() {
+                synchronize_and_clear_cache();
+            }
+        }
+
+        // Build result
+        let tokens_array =
+            MxArray::from_uint32(&generated_tokens, &[generated_tokens.len() as i64])?;
+        let logprobs_array = if return_logprobs {
+            MxArray::from_float32(&generated_logprobs, &[generated_logprobs.len() as i64])?
+        } else {
+            MxArray::from_float32(&[], &[0])?
+        };
+
+        // Include stats in finish_reason for debugging
+        let detailed_finish_reason = format!(
+            "{}|accept_rate:{:.2}|tok_per_pass:{:.2}",
+            finish_reason,
+            stats.acceptance_rate(),
+            stats.tokens_per_target_pass()
+        );
+
+        debug!(
+            "Speculative generation complete: {} tokens, acceptance_rate={:.2}%, tokens_per_pass={:.2}",
+            generated_tokens.len(),
+            stats.acceptance_rate() * 100.0,
+            stats.tokens_per_target_pass()
+        );
+
+        Ok(GenerationResult {
+            text: String::new(),
+            tokens: tokens_array,
+            logprobs: logprobs_array,
+            finish_reason: detailed_finish_reason,
+            num_tokens: generated_tokens.len(),
+        })
+    }
+
     /// Generate multiple completions for multiple prompts with batched GPU processing.
     ///
     /// This method generates G completions for each of the N prompts efficiently:
@@ -1782,6 +2367,7 @@ impl Qwen3Model {
         let ngram_size = config.ngram_size.unwrap_or(3);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
+        let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
 
         // Calculate model size for wired_limit context
         let model_size_bytes = self.calculate_memory_size();
@@ -1813,8 +2399,8 @@ impl Qwen3Model {
         let num_layers = layers.len();
 
         debug!(
-            "Starting batched generation: {} prompts, {} group_size, max_tokens={}",
-            num_prompts, group_size, max_new_tokens
+            "Starting batched generation: {} prompts, {} group_size, max_tokens={}, prefill_step_size={}",
+            num_prompts, group_size, max_new_tokens, prefill_step_size
         );
 
         // Create dedicated generation stream
@@ -1847,37 +2433,126 @@ impl Qwen3Model {
             let prompt_tokens: Vec<u32> = prompt_array.to_uint32()?.to_vec();
             let _prompt_len = prompt_array.shape_at(1)?; // Kept for potential future use
 
-            // === PREFILL: Single forward pass for the prompt ===
+            // === PREFILL: Process prompt (chunked for long sequences) ===
             let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];
             let mut kv_values: Vec<Option<MxArray>> = vec![None; num_layers];
             let mut cache_idx: i32 = 0;
 
-            // For prefill: single batch element, no left padding, rope offset starts at 0
-            let prefill_rope_offsets = MxArray::from_int32(&[0], &[1])?;
+            // For prefill: single batch element, no left padding
             let prefill_left_padding = MxArray::from_int32(&[0], &[1])?;
 
-            let prefill_logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                Self::forward_fused(
-                    prompt_array,
-                    &embedding_weight,
-                    layers,
-                    final_norm,
-                    lm_head,
-                    model_config,
-                    &mut kv_keys,
-                    &mut kv_values,
-                    &mut cache_idx,
-                    &prefill_rope_offsets,
-                    &prefill_left_padding,
-                )?
-            };
+            // Get the sequence length from prompt shape [1, seq_len]
+            let total_seq_len = prompt_array.shape_at(1)? as usize;
 
-            // Extract last token logits [1, vocab_size]
-            let seq_len = prefill_logits.shape_at(1)?;
-            let last_logits = prefill_logits
-                .slice_axis(1, seq_len - 1, seq_len)?
-                .squeeze(Some(&[1]))?; // [1, vocab_size]
+            // Determine if we should use chunked prefill
+            let use_chunked_prefill = prefill_step_size > 0 && total_seq_len > prefill_step_size;
+
+            let last_logits = if use_chunked_prefill {
+                // === CHUNKED PREFILL ===
+                debug!(
+                    "Prompt {}: Using chunked prefill: seq_len={}, step_size={}",
+                    prompt_idx + 1,
+                    total_seq_len,
+                    prefill_step_size
+                );
+
+                let mut offset = 0usize;
+
+                // Process all chunks except the last one
+                while offset + prefill_step_size < total_seq_len {
+                    let chunk_end = offset + prefill_step_size;
+
+                    // Slice the chunk: [1, seq_len] -> [1, chunk_size]
+                    let chunk = prompt_array.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
+
+                    // Update rope_offsets for this chunk
+                    let prefill_rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
+
+                    {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        let _ = Self::forward_fused(
+                            &chunk,
+                            &embedding_weight,
+                            layers,
+                            final_norm,
+                            lm_head,
+                            model_config,
+                            &mut kv_keys,
+                            &mut kv_values,
+                            &mut cache_idx,
+                            &prefill_rope_offsets,
+                            &prefill_left_padding,
+                        )?;
+                    }
+
+                    // Async eval for pipelining
+                    for kv_key in kv_keys.iter().flatten() {
+                        kv_key.eval();
+                    }
+                    for kv_value in kv_values.iter().flatten() {
+                        kv_value.eval();
+                    }
+
+                    // Clear cache after processing large chunks
+                    synchronize_and_clear_cache();
+
+                    offset = chunk_end;
+                }
+
+                // Process final chunk to get logits
+                let final_chunk =
+                    prompt_array.slice(&[0, offset as i64], &[1, total_seq_len as i64])?;
+                let prefill_rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
+
+                let prefill_logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    Self::forward_fused(
+                        &final_chunk,
+                        &embedding_weight,
+                        layers,
+                        final_norm,
+                        lm_head,
+                        model_config,
+                        &mut kv_keys,
+                        &mut kv_values,
+                        &mut cache_idx,
+                        &prefill_rope_offsets,
+                        &prefill_left_padding,
+                    )?
+                };
+
+                // Extract last token logits from final chunk [1, vocab_size]
+                let chunk_seq_len = prefill_logits.shape_at(1)?;
+                prefill_logits
+                    .slice_axis(1, chunk_seq_len - 1, chunk_seq_len)?
+                    .squeeze(Some(&[1]))?
+            } else {
+                // === SINGLE-PASS PREFILL (original behavior) ===
+                let prefill_rope_offsets = MxArray::from_int32(&[0], &[1])?;
+
+                let prefill_logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    Self::forward_fused(
+                        prompt_array,
+                        &embedding_weight,
+                        layers,
+                        final_norm,
+                        lm_head,
+                        model_config,
+                        &mut kv_keys,
+                        &mut kv_values,
+                        &mut cache_idx,
+                        &prefill_rope_offsets,
+                        &prefill_left_padding,
+                    )?
+                };
+
+                // Extract last token logits [1, vocab_size]
+                let seq_len = prefill_logits.shape_at(1)?;
+                prefill_logits
+                    .slice_axis(1, seq_len - 1, seq_len)?
+                    .squeeze(Some(&[1]))?
+            };
 
             // === EXPAND KV CACHE FOR GROUP ===
             // Repeat each cache tensor along batch dimension for group_size copies
@@ -1904,12 +2579,9 @@ impl Qwen3Model {
 
             // Create per-sequence RoPE offsets and left padding for batched generation
             // All sequences in the group start at the same position (cache_idx) with no left padding
-            let rope_offsets_vec: Vec<i32> = vec![cache_idx; group_size];
-            let mut batch_rope_offsets =
-                MxArray::from_int32(&rope_offsets_vec, &[group_size as i64])?;
-            let left_padding_vec: Vec<i32> = vec![0; group_size];
-            let mut batch_left_padding =
-                MxArray::from_int32(&left_padding_vec, &[group_size as i64])?;
+            // Track as Rust Vecs for efficient increments/filtering, convert to MxArray only when needed
+            let mut rope_offsets_vec: Vec<i32> = vec![cache_idx; group_size];
+            let mut left_padding_vec: Vec<i32> = vec![0; group_size];
 
             // Expand last logits for group [1, vocab] -> [G, vocab]
             let batch_logits = last_logits.repeat_along_axis(0, group_size as i32)?;
@@ -1957,13 +2629,22 @@ impl Qwen3Model {
             };
 
             // === DECODE LOOP ===
-            const DECODE_CLEANUP_INTERVAL: i32 = 64;
+            const DECODE_CLEANUP_INTERVAL: i32 = 256; // Aligned with mlx-lm
 
             for step in 0..max_new_tokens {
                 let _stream_ctx = StreamContext::new(generation_stream);
 
-                // Sync to materialize tokens
-                current_tokens.eval();
+                // Async eval for GPU-CPU pipelining - starts GPU work, returns immediately
+                // This allows overlap: GPU computes while CPU extracts from previous iteration
+                if return_logprobs {
+                    if let Some(ref lp) = current_logprobs_arr {
+                        MxArray::async_eval_arrays(&[&current_tokens, lp]);
+                    } else {
+                        MxArray::async_eval_arrays(&[&current_tokens]);
+                    }
+                } else {
+                    MxArray::async_eval_arrays(&[&current_tokens]);
+                }
 
                 // Periodic cleanup
                 if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
@@ -1976,7 +2657,7 @@ impl Qwen3Model {
                     break;
                 }
 
-                // Extract token values for active sequences
+                // Extract token values - will wait for async eval if not done yet
                 let token_values = current_tokens.to_int32()?;
 
                 // Update state for each sequence - collect deactivations first to avoid borrow conflict
@@ -1984,10 +2665,10 @@ impl Qwen3Model {
 
                 // Extract all logprobs at once if needed (avoids crashes from item_at_float32_2d)
                 // Also determine actual vocab_size from the logprobs array shape
+                // Note: async_eval_arrays already triggered eval, so to_float32 will wait if needed
                 let (logprobs_data, actual_vocab_size): (Option<Vec<f32>>, usize) =
                     if return_logprobs {
                         if let Some(ref lp) = current_logprobs_arr {
-                            lp.eval(); // Ensure materialized
                             let shape: Vec<i64> = lp.shape()?.iter().copied().collect();
                             // Shape is [batch, vocab_size], get vocab_size from last dim
                             let vocab_size = if shape.len() >= 2 {
@@ -2088,9 +2769,15 @@ impl Qwen3Model {
                         }
                     }
 
-                    // CRITICAL: Also filter rope_offsets and left_padding
-                    batch_rope_offsets = batch_rope_offsets.take(&indices_array, 0)?;
-                    batch_left_padding = batch_left_padding.take(&indices_array, 0)?;
+                    // CRITICAL: Also filter rope_offsets and left_padding Vecs
+                    rope_offsets_vec = active_indices
+                        .iter()
+                        .map(|&i| rope_offsets_vec[i])
+                        .collect();
+                    left_padding_vec = active_indices
+                        .iter()
+                        .map(|&i| left_padding_vec[i])
+                        .collect();
 
                     // Update active mask to reflect new indices
                     active_mask = vec![true; active_count];
@@ -2121,6 +2808,12 @@ impl Qwen3Model {
                     &[active_token_values.len() as i64, 1],
                 )?;
 
+                // Convert Vecs to MxArrays for forward pass (only when needed)
+                let batch_rope_offsets =
+                    MxArray::from_int32(&rope_offsets_vec, &[rope_offsets_vec.len() as i64])?;
+                let batch_left_padding =
+                    MxArray::from_int32(&left_padding_vec, &[left_padding_vec.len() as i64])?;
+
                 // Forward pass with array offsets
                 let next_logits = Self::forward_fused(
                     &next_input,
@@ -2136,10 +2829,10 @@ impl Qwen3Model {
                     &batch_left_padding,
                 )?;
 
-                // Increment rope offsets for next iteration (each sequence advances by 1 token)
-                // Use int32 array addition to preserve dtype (add_scalar uses f64 which would promote to float)
-                let one_arr = MxArray::from_int32(&[1], &[1])?;
-                batch_rope_offsets = batch_rope_offsets.add(&one_arr)?;
+                // Increment rope offsets for next iteration (pure Rust arithmetic - nanoseconds vs microseconds)
+                for offset in rope_offsets_vec.iter_mut() {
+                    *offset += 1;
+                }
 
                 // Extract logits [active_count, 1, vocab] -> [active_count, vocab]
                 let next_last_logits = next_logits.squeeze(Some(&[1]))?;
@@ -2542,12 +3235,22 @@ impl Qwen3Model {
         };
 
         // === STEP 4: Batched decode loop ===
-        const DECODE_CLEANUP_INTERVAL: i32 = 64;
+        const DECODE_CLEANUP_INTERVAL: i32 = 256; // Aligned with mlx-lm
 
         for step in 0..max_new_tokens {
             let _stream_ctx = StreamContext::new(generation_stream);
 
-            current_tokens.eval();
+            // Async eval for GPU-CPU pipelining - starts GPU work, returns immediately
+            // This allows overlap: GPU computes while CPU extracts from previous iteration
+            if return_logprobs {
+                if let Some(ref lp) = current_logprobs_arr {
+                    MxArray::async_eval_arrays(&[&current_tokens, lp]);
+                } else {
+                    MxArray::async_eval_arrays(&[&current_tokens]);
+                }
+            } else {
+                MxArray::async_eval_arrays(&[&current_tokens]);
+            }
 
             if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
                 synchronize_and_clear_cache();
@@ -2557,7 +3260,7 @@ impl Qwen3Model {
                 break;
             }
 
-            // Extract token values
+            // Extract token values - will wait for async eval if not done yet
             let token_values = current_tokens.to_int32()?;
 
             // Track which sequences to deactivate
@@ -3081,7 +3784,14 @@ impl Qwen3Model {
                     );
                     attn.set_q_norm_weight(w)?;
                 } else {
-                    warn!("  ⚠️  {}.self_attn.q_norm.weight not found", prefix);
+                    // Error: use_qk_norm=true but q_norm.weight not found
+                    return Err(Error::new(
+                        napi::Status::InvalidArg,
+                        format!(
+                            "Model config has use_qk_norm=true but {}.self_attn.q_norm.weight not found in parameters",
+                            prefix
+                        ),
+                    ));
                 }
                 if let Some(w) = params.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
                     info!(
@@ -3091,7 +3801,14 @@ impl Qwen3Model {
                     );
                     attn.set_k_norm_weight(w)?;
                 } else {
-                    warn!("  ⚠️  {}.self_attn.k_norm.weight not found", prefix);
+                    // Error: use_qk_norm=true but k_norm.weight not found
+                    return Err(Error::new(
+                        napi::Status::InvalidArg,
+                        format!(
+                            "Model config has use_qk_norm=true but {}.self_attn.k_norm.weight not found in parameters",
+                            prefix
+                        ),
+                    ));
                 }
             }
 
@@ -3886,6 +4603,7 @@ impl Qwen3Model {
         let ngram_size = config.ngram_size.unwrap_or(3);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
+        let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
 
         // Calculate model size for wired_limit context (matches mlx-lm line 234-236)
         let model_size_bytes = self.calculate_memory_size();
@@ -3997,31 +4715,107 @@ impl Qwen3Model {
                 min_p: Some(min_p),
             };
 
-            // ⚡ PREFILL: Process entire prompt with in-place cache updates (ZERO ALLOCATIONS!)
-            let logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                Self::forward_fused(
-                    &current_ids,
-                    &embedding_weight,
-                    layers,
-                    final_norm,
-                    lm_head,
-                    &model_config,
-                    &mut kv_keys,
-                    &mut kv_values,
-                    &mut cache_idx,
-                    &rope_offsets,
-                    &left_padding,
-                )?
+            // ⚡ PREFILL: Process prompt (chunked for long sequences)
+            let total_seq_len = current_ids.shape_at(1)? as usize;
+            let use_chunked_prefill = prefill_step_size > 0 && total_seq_len > prefill_step_size;
+
+            let mut last_logits = if use_chunked_prefill {
+                // === CHUNKED PREFILL ===
+                debug!(
+                    "Using chunked prefill: seq_len={}, step_size={}",
+                    total_seq_len, prefill_step_size
+                );
+
+                let mut offset = 0usize;
+
+                // Process all chunks except the last one
+                while offset + prefill_step_size < total_seq_len {
+                    let chunk_end = offset + prefill_step_size;
+                    let chunk = current_ids.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
+                    rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
+
+                    {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        let _ = Self::forward_fused(
+                            &chunk,
+                            &embedding_weight,
+                            layers,
+                            final_norm,
+                            lm_head,
+                            &model_config,
+                            &mut kv_keys,
+                            &mut kv_values,
+                            &mut cache_idx,
+                            &rope_offsets,
+                            &left_padding,
+                        )?;
+                    }
+
+                    // Async eval for pipelining
+                    for kv_key in kv_keys.iter().flatten() {
+                        kv_key.eval();
+                    }
+                    for kv_value in kv_values.iter().flatten() {
+                        kv_value.eval();
+                    }
+
+                    synchronize_and_clear_cache();
+                    offset = chunk_end;
+                }
+
+                // Process final chunk
+                let final_chunk =
+                    current_ids.slice(&[0, offset as i64], &[1, total_seq_len as i64])?;
+                rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
+
+                let logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    Self::forward_fused(
+                        &final_chunk,
+                        &embedding_weight,
+                        layers,
+                        final_norm,
+                        lm_head,
+                        &model_config,
+                        &mut kv_keys,
+                        &mut kv_values,
+                        &mut cache_idx,
+                        &rope_offsets,
+                        &left_padding,
+                    )?
+                };
+
+                let chunk_seq_len = logits.shape_at(1)?;
+                logits
+                    .slice_axis(1, chunk_seq_len - 1, chunk_seq_len)?
+                    .squeeze(Some(&[0, 1]))?
+            } else {
+                // === SINGLE-PASS PREFILL (original behavior) ===
+                let logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    Self::forward_fused(
+                        &current_ids,
+                        &embedding_weight,
+                        layers,
+                        final_norm,
+                        lm_head,
+                        &model_config,
+                        &mut kv_keys,
+                        &mut kv_values,
+                        &mut cache_idx,
+                        &rope_offsets,
+                        &left_padding,
+                    )?
+                };
+
+                let seq_len = logits.shape_at(1)?;
+                logits
+                    .slice_axis(1, seq_len - 1, seq_len)?
+                    .squeeze(Some(&[0, 1]))?
             };
+
             // Update rope_offsets after prefill
             rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
-
-            // Extract last token logits and sample first token
-            let seq_len = logits.shape_at(1)?;
-            let mut last_logits = logits
-                .slice_axis(1, seq_len - 1, seq_len)?
-                .squeeze(Some(&[0, 1]))?;
 
             // Apply repetition penalty if enabled
             if repetition_penalty != 1.0 && !input_tokens.is_empty() {
@@ -4051,6 +4845,9 @@ impl Qwen3Model {
             }
 
             // Main generation loop with in-place cache updates (ZERO ALLOCATIONS!)
+            // Pre-allocate constant array for incrementing rope offsets (avoids allocation per iteration)
+            let one_arr = MxArray::from_int32(&[1], &[1])?;
+
             for step in 0..max_new_tokens {
                 // CRITICAL FIX: Extract current token value FIRST before computing next token.
                 // This ensures the repetition penalty includes the current token.
@@ -4121,7 +4918,6 @@ impl Qwen3Model {
                         &left_padding,
                     )?;
                     // Increment rope offset for next iteration (use int32 addition to preserve dtype)
-                    let one_arr = MxArray::from_int32(&[1], &[1])?;
                     rope_offsets = rope_offsets.add(&one_arr)?;
 
                     // Extract logits
@@ -4168,8 +4964,8 @@ impl Qwen3Model {
                     }
                 }
 
-                // Clear cache with sync to prevent GPU timeout during long generation
-                if step % 128 == 0 && step > 0 {
+                // Periodic cleanup every 256 tokens (aligned with mlx-lm)
+                if step % 256 == 0 && step > 0 {
                     synchronize_and_clear_cache();
                 }
 
@@ -4406,6 +5202,10 @@ impl Qwen3Model {
             ngram_size: c.ngram_size,
             eos_token_id: c.eos_token_id,
             return_logprobs: c.return_logprobs,
+            prefill_step_size: None, // Use default (2048)
+            kv_cache_bits: None,     // Default: no quantization
+            kv_cache_group_size: None,
+            num_draft_tokens: None, // Speculative decoding not used in chat()
         });
 
         // Apply chat template with tools and encode in a blocking task

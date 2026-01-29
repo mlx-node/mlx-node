@@ -18,6 +18,9 @@ pub mod fused_attention;
 pub mod kv_cache;
 pub mod mlp;
 pub mod paged_attention;
+pub mod quantized_kv_cache;
+#[cfg(test)]
+mod quantized_kv_cache_test;
 pub mod rotating_kv_cache;
 
 // Re-export all public types
@@ -30,5 +33,8 @@ pub use mlp::MLP;
 pub use paged_attention::{
     CompletedSequence, ContinuousBatchingScheduler, MemoryStats, PagedAttentionConfig,
     PagedKVCache, PendingRequest, ScheduledBatch, SchedulerConfig, SchedulerStats, TokenOutput,
+};
+pub use quantized_kv_cache::{
+    QuantizedKVCache, QuantizedKVCacheConfig, UnifiedKVCache, create_unified_caches,
 };
 pub use rotating_kv_cache::RotatingKVCache;

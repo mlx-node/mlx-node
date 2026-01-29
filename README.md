@@ -73,7 +73,6 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 - Temperature scaling
 - Top-k / Top-p / Min-p
 - Repetition penalty
-- XTC sampling
 
 </td>
 </tr>
@@ -361,7 +360,7 @@ MLX-Node uses a clean two-layer architecture: **Rust for compute**, **TypeScript
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐     │
 │  │   nn/        │ │ models/qwen3 │ │  sampling    │ │  tokenizer   │     │
 │  │  Linear      │ │  Forward     │ │  Top-k/p     │ │  HuggingFace │     │
-│  │  RMSNorm     │ │  Generation  │ │  Min-p, XTC  │ │  Chat        │     │
+│  │  RMSNorm     │ │  Generation  │ │  Min-p       │ │  Chat        │     │
 │  │  Embedding   │ │  Persistence │ │  Rep. Pen.   │ │  Templates   │     │
 │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘     │
 ├──────────────────────────────────────────────────────────────────────────┤
@@ -436,8 +435,6 @@ const result = await model.generate(messages, {
   topP: 0.95,
   minP: 0.05,
   repetitionPenalty: 1.1,
-  xtcThreshold: 0.1,
-  xtcProbability: 0.5,
 });
 
 console.log(result.text);
@@ -456,7 +453,6 @@ await model.saveModel('outputs/fine-tuned');
 | Top-P (Nucleus)    | `topP: 0.95`             | Cumulative probability threshold           |
 | Min-P              | `minP: 0.05`             | Minimum probability relative to max        |
 | Repetition Penalty | `repetitionPenalty: 1.2` | Reduce repetitive text                     |
-| XTC                | `xtcThreshold: 0.1`      | eXclude Top Choices (stochastic)           |
 
 ### Low-Level Operations
 
@@ -582,6 +578,12 @@ mlx-node/
 - [Causal Mask Fix](docs/causal-mask-bug-fix.md)
 - [Development History](docs/DEVELOPMENT_HISTORY.md)
 - [SafeTensors Loader](docs/SAFETENSORS_LOADER.md)
+
+### Security Note
+
+MLX-Node loads model weights and tokenizer configurations from disk. **These files are assumed to be from trusted sources** (official Hugging Face repositories, your own models, verified providers).
+
+Do not load model files from untrusted sources. In particular, `tokenizer_config.json` contains Jinja2 chat templates that could potentially be crafted to cause denial of service. For more details, see the security documentation in `crates/mlx-core/src/tokenizer.rs`.
 
 ---
 

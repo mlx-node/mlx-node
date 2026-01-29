@@ -127,8 +127,9 @@ describe('Tool Arguments as Native Objects', () => {
     };
 
     // Direct property access - no JSON.parse needed!
-    const location = toolCall.arguments.location;
-    const units = toolCall.arguments.units;
+    const args = toolCall.arguments as Record<string, unknown>;
+    const location = args.location;
+    const units = args.units;
 
     expect(location).toBe('Paris');
     expect(units).toBe('celsius');
@@ -154,8 +155,9 @@ describe('Tool Arguments as Native Objects', () => {
         '<tool_call>{"name": "complex_tool", "arguments": {"config": {"setting1": true, "setting2": [1, 2, 3]}, "data": {"nested": {"deep": "value"}}}}</tool_call>',
     };
 
-    const config = toolCall.arguments.config as { setting1: boolean; setting2: number[] };
-    const data = toolCall.arguments.data as { nested: { deep: string } };
+    const args = toolCall.arguments as Record<string, unknown>;
+    const config = args.config as { setting1: boolean; setting2: number[] };
+    const data = args.data as { nested: { deep: string } };
     expect(config.setting1).toBe(true);
     expect(config.setting2).toEqual([1, 2, 3]);
     expect(data.nested.deep).toBe('value');

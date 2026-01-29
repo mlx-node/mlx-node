@@ -17,10 +17,19 @@ pub struct ToolCallResult {
     pub id: String,
     /// Name of the tool/function to call
     pub name: String,
-    /// Parsed arguments as native object (serde_json::Value → JS object)
-    #[napi(ts_type = "Record<string, unknown>")]
+    /// Parsed arguments as native object (serde_json::Value -> JS object)
+    ///
+    /// When status is "ok", this contains the parsed arguments object.
+    /// When status is "parse_error", this contains the original unparsed string.
+    /// Otherwise, this is an empty object {}.
+    #[napi(ts_type = "Record<string, unknown> | string")]
     pub arguments: Value,
-    /// Parsing status: "ok" | "invalid_json" | "missing_name"
+    /// Parsing status: "ok" | "invalid_json" | "missing_name" | "parse_error"
+    ///
+    /// - "ok": Successfully parsed tool call
+    /// - "invalid_json": The tool_call tag content was not valid JSON
+    /// - "missing_name": Valid JSON but no "name" field
+    /// - "parse_error": Valid JSON but the "arguments" string field couldn't be parsed as JSON
     pub status: String,
     /// Error message if status != "ok"
     pub error: Option<String>,
@@ -50,6 +59,27 @@ impl ToolCallResult {
             name,
             arguments: Value::Object(serde_json::Map::new()),
             status: "invalid_json".to_string(),
+            error: Some(error_msg),
+            raw_content,
+        }
+    }
+
+    /// Create a tool call result where the arguments string failed to parse
+    ///
+    /// This is distinct from `invalid_json` - it means the outer tool call JSON was valid,
+    /// but the arguments field contained a string that couldn't be parsed as JSON.
+    pub fn parse_error(
+        name: String,
+        raw_arguments: String,
+        error_msg: String,
+        raw_content: String,
+    ) -> Self {
+        Self {
+            id: generate_tool_call_id(),
+            name,
+            // Store the original string in arguments as a fallback
+            arguments: Value::String(raw_arguments),
+            status: "parse_error".to_string(),
             error: Some(error_msg),
             raw_content,
         }
@@ -177,14 +207,23 @@ fn parse_json_tool_call(json_str: &str, raw_content: &str) -> ToolCallResult {
                         .unwrap_or(Value::Object(serde_json::Map::new()));
 
                     // If arguments is a string, try to parse it as JSON
-                    let arguments = match &arguments {
-                        Value::String(s) => {
-                            serde_json::from_str(s).unwrap_or(Value::Object(serde_json::Map::new()))
-                        }
-                        _ => arguments,
-                    };
-
-                    ToolCallResult::ok(name, arguments, raw_content.to_string())
+                    match &arguments {
+                        Value::String(s) => match serde_json::from_str::<Value>(s) {
+                            Ok(parsed_args) => {
+                                ToolCallResult::ok(name, parsed_args, raw_content.to_string())
+                            }
+                            Err(e) => {
+                                // Return parse_error status with original string preserved
+                                ToolCallResult::parse_error(
+                                    name,
+                                    s.clone(),
+                                    format!("Failed to parse arguments string as JSON: {}", e),
+                                    raw_content.to_string(),
+                                )
+                            }
+                        },
+                        _ => ToolCallResult::ok(name, arguments, raw_content.to_string()),
+                    }
                 }
                 _ => ToolCallResult::missing_name(raw_content.to_string()),
             }
@@ -591,6 +630,43 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].status, "ok");
         assert_eq!(calls[0].arguments["key"], "value");
+    }
+
+    #[test]
+    fn test_string_arguments_invalid_json() {
+        // Test that invalid JSON string arguments result in parse_error status
+        let (_, calls) = parse_tool_calls(
+            r#"<tool_call>{"name": "test", "arguments": "not valid json"}</tool_call>"#,
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "test");
+        assert_eq!(calls[0].status, "parse_error");
+        assert!(calls[0].error.is_some());
+        assert!(
+            calls[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Failed to parse arguments string as JSON")
+        );
+        // Original string is preserved in arguments field
+        assert_eq!(calls[0].arguments, "not valid json");
+    }
+
+    #[test]
+    fn test_string_arguments_truncated_json() {
+        // Test with truncated/malformed JSON that looks like it should be valid
+        let (_, calls) = parse_tool_calls(
+            r#"<tool_call>{"name": "search", "arguments": "{\"query\": \"test"}</tool_call>"#,
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].status, "parse_error");
+        assert!(calls[0].error.is_some());
+        // Original malformed string is preserved
+        assert_eq!(calls[0].arguments, r#"{"query": "test"#);
     }
 
     #[test]

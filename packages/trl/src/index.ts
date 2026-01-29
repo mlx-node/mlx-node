@@ -27,7 +27,7 @@ export { Adam, AdamW, SGD, RMSprop, LRScheduler } from '@mlx-node/core';
 export type { ToolDefinition, FunctionDefinition, FunctionParameters } from '@mlx-node/core';
 
 // Gradient utilities
-export { Gradients, GradientUtils, clipGradientsByGlobalNorm, clipGradientsByValue } from '@mlx-node/core';
+export { GradientUtils } from '@mlx-node/core';
 
 // Core tensor (for custom rewards/models)
 export { MxArray } from '@mlx-node/core';
@@ -65,10 +65,13 @@ export {
   type GRPOTrainerConfig,
   DEFAULT_GRPO_CONFIG,
   createRewardRegistry,
+  computeDatasetHash,
+  RewardTimeoutError,
   type GenerateBatchResult,
   type TrainStepMetrics,
   type TrainingMetrics,
   type TrainingState,
+  type DatasetMetadata,
   // Re-export native types from trainer
   GrpoTrainingEngine,
   NativeRewardRegistry,
@@ -127,10 +130,18 @@ export {
   type SFTConversationExample,
   type SFTBatch,
   type SFTDatasetConfig,
+  type SpecialTokenIds,
 } from './data/sft-dataset';
 
 // Utils
 export * from './utils/xml-parser';
+export {
+  validatePathContainment,
+  resolveAndValidatePath,
+  getAllowedRoot,
+  PathTraversalError,
+  type PathValidationOptions,
+} from './utils/path-security';
 
 // Types
 export type {

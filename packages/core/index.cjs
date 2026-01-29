@@ -599,6 +599,7 @@ module.exports.MLP = nativeBinding.MLP
 module.exports.MxArray = nativeBinding.MxArray
 module.exports.NativeRewardRegistry = nativeBinding.NativeRewardRegistry
 module.exports.OutputStore = nativeBinding.OutputStore
+module.exports.QuantizedKVCache = nativeBinding.QuantizedKVCache
 module.exports.Qwen3Model = nativeBinding.Qwen3Model
 module.exports.Qwen3Tokenizer = nativeBinding.Qwen3Tokenizer
 module.exports.RMSNorm = nativeBinding.RMSNorm

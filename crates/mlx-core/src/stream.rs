@@ -147,6 +147,16 @@ impl WiredLimitContext {
 
         // Get Metal device info
         let device_info_ptr = unsafe { sys::mlx_metal_device_info() };
+
+        // Check for null pointer before converting to CStr
+        // This can happen if Metal initialization failed or device info is unavailable
+        if device_info_ptr.is_null() {
+            return Self {
+                old_limit: 0,
+                streams: Vec::new(),
+            };
+        }
+
         let device_info_str = unsafe {
             std::ffi::CStr::from_ptr(device_info_ptr)
                 .to_string_lossy()

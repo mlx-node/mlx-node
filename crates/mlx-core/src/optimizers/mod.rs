@@ -35,24 +35,8 @@ pub struct GradientUtils;
 
 #[napi]
 impl GradientUtils {
-    /// Compute the global L2 norm of gradients
-    ///
-    /// Computes sqrt(sum of squared elements across all gradients).
-    /// This can be used to monitor gradient magnitudes during training.
-    #[napi]
-    pub fn compute_gradient_norm(gradients: HashMap<String, &MxArray>) -> Result<f64> {
-        // Compute sum of squared norms for all gradients
-        let mut total_sum_squared: f64 = 0.0;
-
-        for grad in gradients.values() {
-            // Get data directly
-            let data = grad.to_float32()?;
-            let sum_sq: f64 = data.iter().map(|&x| (x as f64) * (x as f64)).sum();
-            total_sum_squared += sum_sq;
-        }
-
-        Ok(total_sum_squared.sqrt())
-    }
+    // NOTE: compute_gradient_norm was removed because it transferred all gradients to CPU
+    // (~2GB for large models). Use clip_grad_norm_with_norm with max_norm=Infinity instead.
 
     /// Clip gradients by global L2 norm
     ///

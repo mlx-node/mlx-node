@@ -146,4 +146,26 @@ impl KVCache {
     pub fn get_offset(&self) -> i32 {
         self.offset
     }
+
+    /// Trim the cache to keep only the first `new_len` tokens.
+    ///
+    /// This is used in speculative decoding to rewind the cache when draft tokens
+    /// are rejected. After trimming, subsequent calls to `update_and_fetch` will
+    /// overwrite the trimmed portion.
+    ///
+    /// # Arguments
+    /// * `new_len` - New length of the cache (must be <= current offset)
+    ///
+    /// # Note
+    /// This doesn't actually deallocate memory - it just updates the offset.
+    /// The next `update_and_fetch` call will overwrite the trimmed data in-place.
+    #[napi]
+    pub fn trim(&mut self, new_len: i32) {
+        if new_len < 0 {
+            self.offset = 0;
+        } else if new_len < self.offset {
+            self.offset = new_len;
+        }
+        // If new_len >= offset, do nothing (can't grow via trim)
+    }
 }

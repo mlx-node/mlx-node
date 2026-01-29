@@ -77,7 +77,7 @@ Fixed MLX/PyTorch boolean mask semantics mismatch. Achieved perfect 0/151,936 to
 
 ### Feature Alignment ✅
 
-Implemented repetition penalty, BatchKVCache, entropy filtering, XTC sampling, and RotatingKVCache for 90% MLX-LM parity.
+Implemented repetition penalty, BatchKVCache, entropy filtering, and RotatingKVCache for 90% MLX-LM parity.
 
 - **Added**: 1,308+ lines Rust code, 69+ tests
 - **Impact**: Production-ready GRPO training
@@ -134,7 +134,7 @@ Unified reward API with pre-parsed tool calls, 62 Rust tests, improved tool-use 
 │  - GRPO components (~3,000 lines)       │  ← Loss, advantages, entropy, engine, 62 tests
 │  - Gradients (manual, 3 modules)        │  ← Activation, loss, nn gradients
 │  - Optimizers (4 types, 5 modules)      │  ← Adam, AdamW, SGD, RMSprop
-│  - Sampling (583 lines)                 │  ← All strategies + XTC + repetition
+│  - Sampling (434 lines)                 │  ← All strategies + repetition penalty
 │  - Autograd (360 lines)                 │  ← MLX value_and_grad integration
 │  - Functional (550 lines)               │  ← Stateless forward pass components
 │  - Param Manager (200 lines)            │  ← Parameter flattening/mapping
@@ -162,7 +162,7 @@ Unified reward API with pre-parsed tool calls, 62 Rust tests, improved tool-use 
 | `nn/`           | Activations (SiLU, GELU, etc.), Linear, RMSNorm, Embedding, Losses           |
 | `transformer/`  | Attention, KVCache, BatchKVCache, RotatingKVCache, MLP, TransformerBlock     |
 | `models/qwen3/` | Complete Qwen3 implementation (model, config, generation, persistence)       |
-| `sampling.rs`   | Temperature, top-k/p, min-p, XTC, repetition penalty                         |
+| `sampling.rs`   | Temperature, top-k/p, min-p, repetition penalty                              |
 | `tokenizer.rs`  | HuggingFace tokenizers integration                                           |
 | `grpo/`         | GRPO/DAPO/Dr.GRPO/BNPO loss, advantages, entropy, engine, 62 Rust tests      |
 | `optimizers/`   | Adam, AdamW, SGD, RMSprop                                                    |
@@ -331,7 +331,6 @@ import { GRPOTrainer, GRPOConfig, Adam } from '@mlx-node/trl';
 - ✅ Top-k sampling
 - ✅ Top-p (nucleus) sampling
 - ✅ Min-p sampling
-- ✅ **XTC sampling** (eXclude Top Choices)
 - ✅ **Repetition penalty** (reduce repetitive text)
 
 **Batch Processing:**
@@ -357,8 +356,6 @@ const token = sample(logits, {
   topP: 0.95,
   minP: 0.05,
   repetitionPenalty: 1.2,
-  xtcThreshold: 0.1,
-  xtcProbability: 0.5,
 });
 
 // BatchKVCache for variable-length batches
@@ -493,8 +490,7 @@ yarn build:ts                     # Build TypeScript packages only
 cargo build --release -p mlx-tui  # Build mlx-train binary
 
 # Testing
-yarn test                         # Run all tests (excludes trainers)
-TEST_TRAINER=1 yarn test          # Run trainer tests (sequential)
+yarn vite run test                # Run all tests
 yarn vitest __test__/path/to.ts   # Run specific test
 ```
 
@@ -574,7 +570,12 @@ See `docs/FEATURE_ALIGNMENT_SESSION.md` for detailed examples
 - Models: `crates/mlx-core/src/models/qwen3/`
 - Sampling: `crates/mlx-core/src/sampling.rs` (all strategies)
 - GRPO: `crates/mlx-core/src/grpo/` (loss, advantages, entropy, engine)
+- Tokenizer: `crates/mlx-core/src/tokenizer.rs` (includes security model documentation)
 - Orchestration: `packages/trl/src/trainers/grpo-trainer.ts`
+
+**Security Model**:
+
+Model files (`tokenizer.json`, `tokenizer_config.json`, SafeTensors weights) are assumed to be from **trusted sources**. The tokenizer loads Jinja2 chat templates from `tokenizer_config.json` which are executed with user message content. While minijinja sandboxes execution (no file system access, no code execution), malicious templates could cause DoS. See `crates/mlx-core/src/tokenizer.rs` for full security documentation.
 
 ---
 

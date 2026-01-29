@@ -47,9 +47,11 @@ import {
   readFileSync,
   readdirSync,
   copyFileSync,
+  cpSync,
   rmSync,
   statSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import * as readline from 'node:readline';
 
@@ -173,6 +175,19 @@ export interface GRPOTrainerConfig<T = unknown> {
   /** Enable TUI mode - outputs structured JSONL to stdout and listens for commands on stdin */
   tuiMode?: boolean;
 
+  // Reward callback timeout
+  /**
+   * Timeout for the reward function callback in milliseconds.
+   *
+   * If your reward function calls external APIs or performs expensive
+   * computations, you may need to increase this value.
+   *
+   * Set to 0 to disable timeout (not recommended for production).
+   *
+   * @default 60000 (60 seconds)
+   */
+  rewardTimeout?: number;
+
   // Memory optimization
   /**
    * Batch chunk size for LM head computation (memory optimization).
@@ -236,12 +251,31 @@ export interface GRPOTrainerConfig<T = unknown> {
 }
 
 /**
+ * Dataset metadata for resume validation
+ *
+ * Stored in checkpoints to validate that the same dataset is used on resume.
+ * Prevents issues where batch indices don't align due to dataset changes.
+ */
+export interface DatasetMetadata {
+  /** Total number of examples in the dataset */
+  size: number;
+  /** Hash of first N example prompts for identity check */
+  contentHash: string;
+  /** Shuffle seed if deterministic shuffling was used */
+  shuffleSeed?: number;
+  /** Indices of batches already processed in current epoch */
+  processedBatchIndices?: number[];
+}
+
+/**
  * Training state saved with checkpoints for resumption
  */
 export interface TrainingState {
   step: number;
   epoch: number;
   timestamp: string;
+  /** Dataset information for resume validation */
+  dataset?: DatasetMetadata;
 }
 
 /**
@@ -318,8 +352,69 @@ export interface TrainStepMetrics {
  */
 export type TrainingMetrics = TrainStepMetrics;
 
+/**
+ * Compute a hash of dataset content for identity checking on resume.
+ *
+ * Hashes the first N examples to create a fingerprint that can detect
+ * if the dataset has been modified between training runs.
+ *
+ * @param dataset - Array of dataset examples
+ * @param sampleSize - Number of examples to hash (default: 10)
+ * @returns 16-character hex hash string
+ */
+export function computeDatasetHash(dataset: DatasetExample[], sampleSize = 10): string {
+  const samples = dataset.slice(0, sampleSize);
+  // Create a content string from prompts (stringified for consistency)
+  const content = samples.map((ex) => JSON.stringify(ex.prompt)).join('|||');
+  return createHash('sha256').update(content).digest('hex').slice(0, 16);
+}
+
 // Note: RewardOutput is now built using the Rust buildRewardOutputs function
 // which handles tool call parsing and thinking extraction natively.
+
+/**
+ * Error thrown when a reward function times out.
+ */
+export class RewardTimeoutError extends Error {
+  constructor(
+    message: string,
+    public readonly timeoutMs: number,
+  ) {
+    super(message);
+    this.name = 'RewardTimeoutError';
+  }
+}
+
+/**
+ * Wraps a promise with a timeout.
+ *
+ * @param promise - The promise to wrap
+ * @param timeoutMs - Timeout in milliseconds (0 = no timeout)
+ * @param errorMessage - Error message if timeout is reached
+ * @returns The promise result or throws RewardTimeoutError
+ */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
+  // Timeout of 0 means no timeout
+  if (timeoutMs <= 0) {
+    return promise;
+  }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new RewardTimeoutError(errorMessage, timeoutMs));
+    }, timeoutMs);
+
+    promise
+      .then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
+}
 
 /**
  * GRPO Trainer - Rust-Native Training Engine
@@ -353,6 +448,14 @@ export class GRPOTrainer<T = unknown> {
   // Crash recovery
   private lastCheckpointStep: number = 0;
   private signalHandlersInstalled: boolean = false;
+
+  // Last known good checkpoint tracking (for NaN gradient recovery)
+  private lastGoodCheckpointPath: string | null = null;
+  private lastGoodCheckpointStep: number = 0;
+
+  // Dataset tracking for resume validation
+  private datasetMetadata?: DatasetMetadata;
+  private processedBatchIndices: Set<number> = new Set();
 
   /**
    * Create a new GRPO trainer from a model
@@ -888,6 +991,33 @@ export class GRPOTrainer<T = unknown> {
     if (resumedState) {
       trainer.currentStep = resumedState.step;
       trainer.currentEpoch = resumedState.epoch;
+
+      // Restore dataset metadata for resume validation
+      if (resumedState.dataset) {
+        trainer.datasetMetadata = {
+          size: resumedState.dataset.size,
+          contentHash: resumedState.dataset.contentHash,
+          shuffleSeed: resumedState.dataset.shuffleSeed,
+        };
+
+        // Restore processed batch indices
+        if (resumedState.dataset.processedBatchIndices) {
+          trainer.processedBatchIndices = new Set(resumedState.dataset.processedBatchIndices);
+        }
+
+        logger.debug(
+          `Restored dataset metadata: size=${resumedState.dataset.size}, hash=${resumedState.dataset.contentHash}, ` +
+            `${trainer.processedBatchIndices.size} processed batches`,
+        );
+      }
+
+      // If resuming from a regular checkpoint (not emergency), track it as last known good
+      // This allows recovery to fall back to this checkpoint if NaN gradients occur
+      if (modelPath && !modelPath.includes('emergency-')) {
+        trainer.lastGoodCheckpointPath = modelPath;
+        trainer.lastGoodCheckpointStep = resumedState.step;
+        logger.debug(`Initialized last good checkpoint from resumed state: step ${resumedState.step}`);
+      }
     }
 
     return trainer;
@@ -1063,7 +1193,18 @@ export class GRPOTrainer<T = unknown> {
     let rewards: number[] | Float32Array;
 
     if (this.rewardFn) {
-      rewards = await this.rewardFn(rewardOutputs, context);
+      // Get timeout from config (default 60 seconds, 0 = no timeout)
+      const rewardTimeout = this.config.rewardTimeout ?? 60_000;
+
+      // Wrap reward function call with timeout
+      const rewardPromise = Promise.resolve(this.rewardFn(rewardOutputs, context));
+
+      rewards = await withTimeout(
+        rewardPromise,
+        rewardTimeout,
+        `Reward function timed out after ${rewardTimeout}ms. ` +
+          `Consider increasing rewardTimeout in config or optimizing your reward function.`,
+      );
     } else {
       // For built-in rewards, extract prompts and completions for legacy API
       const promptStrings = rewardOutputs.map((o) => o.prompt);
@@ -1184,8 +1325,21 @@ export class GRPOTrainer<T = unknown> {
 
       let rewards: number[] | Float32Array;
       if (this.rewardFn) {
-        // @ts-expect-error context is optional
-        rewards = await this.rewardFn(outputs, context);
+        // Get timeout from config (default 60 seconds, 0 = no timeout)
+        const rewardTimeout = this.config.rewardTimeout ?? 60_000;
+
+        // Wrap reward function call with timeout
+        const rewardPromise = Promise.resolve(
+          // @ts-expect-error context is optional
+          this.rewardFn(outputs, context),
+        );
+
+        rewards = await withTimeout(
+          rewardPromise,
+          rewardTimeout,
+          `Reward function timed out after ${rewardTimeout}ms. ` +
+            `Consider increasing rewardTimeout in config or optimizing your reward function.`,
+        );
       } else {
         // Use built-in rewards
         const promptStrings = outputs.map((o) => o.prompt);
@@ -1365,6 +1519,42 @@ export class GRPOTrainer<T = unknown> {
     // Calculate total steps per epoch BEFORE initOutputStore (needed for accurate resume state)
     const stepsPerEpoch = Math.ceil(dataset.length / batchSize);
 
+    // Compute current dataset metadata
+    const currentDatasetHash = computeDatasetHash(dataset);
+    const currentDatasetMetadata: DatasetMetadata = {
+      size: dataset.length,
+      contentHash: currentDatasetHash,
+    };
+
+    // Validate dataset on resume if we have previous metadata
+    if (this.datasetMetadata && this.currentStep > 0) {
+      const prevMeta = this.datasetMetadata;
+
+      if (prevMeta.size !== dataset.length) {
+        this.logger.warn(
+          `[Resume] Dataset size mismatch: checkpoint was trained on ${prevMeta.size} examples, ` +
+            `current dataset has ${dataset.length} examples. Batch indices may not align correctly.`,
+        );
+      }
+
+      if (prevMeta.contentHash !== currentDatasetHash) {
+        this.logger.warn(
+          `[Resume] Dataset content mismatch: checkpoint dataset hash ${prevMeta.contentHash}, ` +
+            `current dataset hash ${currentDatasetHash}. Dataset may have been modified or shuffled differently.`,
+        );
+      }
+
+      // Log validation result
+      if (prevMeta.size === dataset.length && prevMeta.contentHash === currentDatasetHash) {
+        this.logger.info(
+          `[Resume] Dataset validated: ${dataset.length} examples, hash ${currentDatasetHash} (matches checkpoint)`,
+        );
+      }
+    }
+
+    // Store current dataset metadata for future checkpoints
+    this.datasetMetadata = currentDatasetMetadata;
+
     // Initialize output store if enabled (pass stepsPerEpoch for accurate batch display on resume)
     await this.initOutputStore(stepsPerEpoch);
 
@@ -1420,13 +1610,22 @@ export class GRPOTrainer<T = unknown> {
           if (this.stopRequested) break;
         }
 
+        // Calculate batch index (0-indexed within epoch)
+        const batchIdx = Math.floor(i / batchSize);
+
+        // Skip already processed batches on resume (from checkpoint's processedBatchIndices)
+        if (this.processedBatchIndices.has(batchIdx)) {
+          this.logger.debug(`Skipping already processed batch ${batchIdx + 1}/${stepsPerEpoch} (from checkpoint)`);
+          continue;
+        }
+
         const batch = dataset.slice(i, Math.min(i + batchSize, dataset.length));
 
         // Extract prompts and answers from batch
         const prompts = batch.map((ex) => ex.prompt);
 
         // Verbose logging for debugging stuck batches
-        const batchNum = Math.floor(i / batchSize) + 1;
+        const batchNum = batchIdx + 1;
         this.logger.info(
           `Batch ${batchNum}/${stepsPerEpoch} starting (${prompts.length} prompts × ${this.config.groupSize ?? 4} groups)`,
         );
@@ -1441,7 +1640,10 @@ export class GRPOTrainer<T = unknown> {
         );
 
         // Log step metrics (logger handles TUI/console mode internally)
-        this.logger.step(metrics, Math.floor(i / batchSize), stepsPerEpoch);
+        this.logger.step(metrics, batchIdx, stepsPerEpoch);
+
+        // Track processed batch for resume
+        this.processedBatchIndices.add(batchIdx);
 
         // Report generation samples to TUI based on display mode
         // In console mode, logger.generation() is a no-op
@@ -1510,14 +1712,59 @@ export class GRPOTrainer<T = unknown> {
         // Check for emergency checkpoint (triggered by consecutive NaN gradients)
         if (this.config.outputDir && this.engine.needsEmergencySave) {
           this.logger.warn(
-            `[EMERGENCY] Saving emergency checkpoint at step ${this.currentStep} due to consecutive NaN gradients. ` +
-              `Total NaN gradient count: ${this.engine.nanGradientCount}`,
+            `[EMERGENCY] Emergency save triggered after ${this.engine.nanGradientCount} consecutive NaN gradients at step ${this.currentStep}`,
           );
-          await this.saveCheckpoint(`emergency-checkpoint-${this.currentStep}`);
+
+          // Save current (possibly corrupted) state for debugging
+          const debugCheckpointPath = `emergency-debug-step-${this.currentStep}`;
+          await this.saveCheckpoint(debugCheckpointPath, { isEmergency: true });
+          this.logger.info(
+            `[EMERGENCY] Saved debug checkpoint with current (possibly corrupted) state to ${debugCheckpointPath}`,
+          );
+
+          // If we have a last known good checkpoint, copy it for recovery
+          if (this.lastGoodCheckpointPath && existsSync(this.lastGoodCheckpointPath)) {
+            this.logger.warn(
+              `[EMERGENCY] Reverting to last good checkpoint from step ${this.lastGoodCheckpointStep}: ${this.lastGoodCheckpointPath}`,
+            );
+
+            // Copy last good checkpoint to a recovery location
+            const outputDir = this.config.outputDir ?? './outputs';
+            const recoveryPath = join(outputDir, `emergency-recovery-step-${this.lastGoodCheckpointStep}`);
+
+            try {
+              // Remove existing recovery checkpoint if it exists
+              if (existsSync(recoveryPath)) {
+                rmSync(recoveryPath, { recursive: true, force: true });
+              }
+
+              // Copy the last good checkpoint to recovery location
+              cpSync(this.lastGoodCheckpointPath, recoveryPath, { recursive: true });
+              this.logger.info(`[EMERGENCY] Copied last good checkpoint to ${recoveryPath}`);
+              this.logger.warn(
+                `[EMERGENCY] Recovery checkpoint available at: ${recoveryPath}\n` +
+                  `  To resume from the last good state, use: resumeFromCheckpoint: '${recoveryPath}'`,
+              );
+            } catch (copyError) {
+              this.logger.error(`[EMERGENCY] Failed to copy last good checkpoint: ${copyError}`);
+            }
+          } else {
+            this.logger.error(
+              `[EMERGENCY] No previous good checkpoint available for recovery! ` +
+                `The debug checkpoint contains the current (potentially corrupted) model state.`,
+            );
+          }
+
+          // Clear the emergency flag
           this.engine.clearEmergencySaveFlag();
+
+          // Log recovery guidance
           this.logger.warn(
-            `[EMERGENCY] Emergency checkpoint saved. Consider reducing learning rate or checking training data. ` +
-              `Training will continue but model quality may be degraded.`,
+            `[EMERGENCY] Training will continue, but model quality may be degraded.\n` +
+              `  Recommendations:\n` +
+              `  - Reduce learning rate (current: ${this.config.learningRate ?? 1e-6})\n` +
+              `  - Check training data for anomalies\n` +
+              `  - Consider stopping and resuming from the recovery checkpoint`,
           );
         }
       }
@@ -1527,6 +1774,9 @@ export class GRPOTrainer<T = unknown> {
       this.endEpoch(epochTimeSecs);
 
       this.logger.epochEnd(epoch, numEpochs, epochTimeSecs);
+
+      // Clear processed batch indices at epoch boundary (new epoch = new batches)
+      this.processedBatchIndices.clear();
     }
 
     // Save final checkpoint
@@ -1556,13 +1806,16 @@ export class GRPOTrainer<T = unknown> {
   /**
    * Save a checkpoint with model weights and training state
    *
-   * Validates model health before saving to prevent corrupted checkpoints.
-   * Emergency checkpoints (name starts with 'emergency-') skip validation.
+   * Regular checkpoints (non-emergency) are tracked as "last known good" checkpoints.
+   * When NaN gradients occur, the emergency save logic can restore from the last good checkpoint.
    *
    * @param name - Checkpoint name (default: "checkpoint-{step}")
+   * @param options - Optional settings for checkpoint save behavior
+   * @param options.isEmergency - If true, this is an emergency checkpoint (debug state, not "good")
    * @returns Path to saved checkpoint, or empty string if save was skipped due to corruption
    */
-  async saveCheckpoint(name?: string): Promise<string> {
+  async saveCheckpoint(name?: string, options?: { isEmergency?: boolean }): Promise<string> {
+    const isEmergency = options?.isEmergency ?? false;
     const checkpointName = name ?? `checkpoint-${this.currentStep}`;
     const outputDir = this.config.outputDir ?? './outputs';
     const checkpointPath = join(outputDir, checkpointName);
@@ -1572,11 +1825,19 @@ export class GRPOTrainer<T = unknown> {
       mkdirSync(checkpointPath, { recursive: true });
     }
 
-    // Save training state
+    // Save training state with dataset metadata for resume validation
     const state: TrainingState = {
       step: this.currentStep,
       epoch: this.currentEpoch,
       timestamp: new Date().toISOString(),
+      dataset: this.datasetMetadata
+        ? {
+            size: this.datasetMetadata.size,
+            contentHash: this.datasetMetadata.contentHash,
+            shuffleSeed: this.datasetMetadata.shuffleSeed,
+            processedBatchIndices: Array.from(this.processedBatchIndices),
+          }
+        : undefined,
     };
     const statePath = join(checkpointPath, 'training_state.json');
     writeFileSync(statePath, JSON.stringify(state, null, 2));
@@ -1601,6 +1862,13 @@ export class GRPOTrainer<T = unknown> {
 
     // Track last checkpoint step for emergency save throttling
     this.lastCheckpointStep = this.currentStep;
+
+    // Track as "last known good" checkpoint (only for regular saves, not emergency saves)
+    if (!isEmergency) {
+      this.lastGoodCheckpointPath = checkpointPath;
+      this.lastGoodCheckpointStep = this.currentStep;
+      this.logger.debug(`Tracked as last good checkpoint: step ${this.currentStep}`);
+    }
 
     // Clean up old checkpoints to save disk space
     const maxCheckpoints = this.config.maxCheckpoints ?? 3;

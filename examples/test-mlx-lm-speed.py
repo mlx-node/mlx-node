@@ -33,7 +33,7 @@ from mlx_lm.sample_utils import make_sampler
 
 # Get the project root (parent of node/ directory where script runs)
 PROJECT_ROOT = Path(__file__).parent.parent
-MODEL_PATH = PROJECT_ROOT / ".cache" / "models" / "qwen3-0.6b-mlx-bf16"
+MODEL_PATH = PROJECT_ROOT / ".cache" / "models" / "qwen3-1.7b-mlx-bf16"
 
 
 def main():

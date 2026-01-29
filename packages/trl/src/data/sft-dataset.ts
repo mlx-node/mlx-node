@@ -12,9 +12,71 @@ import { readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import type { Qwen3Tokenizer } from '@mlx-node/core';
 import type { ChatMessage } from '../types';
+import { validatePathContainment, getAllowedRoot, type PathValidationOptions } from '../utils/path-security';
 
 // -100 is the standard ignore index for cross-entropy loss
 const IGNORE_INDEX = -100;
+
+/**
+ * Special token IDs for SFT label masking
+ *
+ * These are used to detect assistant message boundaries in tokenized conversations.
+ * The IDs can be derived from the tokenizer or provided explicitly.
+ */
+export interface SpecialTokenIds {
+  /** Token ID for <|im_start|> */
+  imStart: number;
+  /** Token ID for <|im_end|> */
+  imEnd: number;
+  /** Token IDs that represent newlines (for detecting end of role header) */
+  newlineTokens: number[];
+}
+
+/**
+ * Get special token IDs from a tokenizer
+ *
+ * Queries the tokenizer to get the actual token IDs for special tokens.
+ * This ensures portability across different tokenizers/vocabularies.
+ *
+ * @param tokenizer - The tokenizer instance
+ * @returns Special token IDs derived from the tokenizer
+ * @throws Error if required special tokens are not found
+ */
+function getSpecialTokenIds(tokenizer: Qwen3Tokenizer): SpecialTokenIds {
+  // Get im_start and im_end tokens using the tokenizer's special token getters
+  const imStartToken = tokenizer.getImStartToken(); // "<|im_start|>"
+  const imEndToken = tokenizer.getImEndToken(); // "<|im_end|>"
+
+  const imStart = tokenizer.tokenToId(imStartToken);
+  const imEnd = tokenizer.tokenToId(imEndToken);
+
+  // Validate that we got valid IDs (tokenToId returns null for unknown tokens)
+  if (imStart === null || imEnd === null) {
+    throw new Error(
+      `Tokenizer does not have required special tokens for ChatML format. ` +
+        `Got im_start=${imStart}, im_end=${imEnd}. ` +
+        `This tokenizer may not be compatible with ChatML format.`,
+    );
+  }
+
+  // Get newline token IDs - these vary by tokenizer
+  // Try common newline representations
+  const newlineTokens: number[] = [];
+  const potentialNewlines = ['\n', ' \n', '\r\n', '\n\n'];
+  for (const nl of potentialNewlines) {
+    const id = tokenizer.tokenToId(nl);
+    if (id !== null && !newlineTokens.includes(id)) {
+      newlineTokens.push(id);
+    }
+  }
+
+  // If no newline tokens found, we'll rely on the fallback in tokenizeConversation
+  return {
+    imStart,
+    imEnd,
+    newlineTokens,
+  };
+}
 
 /**
  * Prompt-Completion format for tool-use training
@@ -53,6 +115,15 @@ export interface SFTDatasetConfig {
   completionOnly?: boolean; // If true, only train on completion tokens (default: false for TRL parity)
   enableThinking?: boolean; // Enable thinking mode for tokenizer
   seed?: number; // Random seed for reproducible shuffling (default: 42)
+
+  /**
+   * Special token IDs for label masking.
+   *
+   * If not provided, these are automatically derived from the tokenizer.
+   * This option allows explicit overriding for custom tokenizers or
+   * non-standard vocabularies.
+   */
+  specialTokenIds?: Partial<SpecialTokenIds>;
 }
 
 /**
@@ -69,22 +140,17 @@ function detectFormat(example: SFTExample): 'prompt-completion' | 'conversation'
 }
 
 /**
- * Check if a message is from an assistant
- */
-function isAssistantMessage(message: ChatMessage): boolean {
-  return message.role === 'assistant';
-}
-
-/**
  * SFT Dataset class for handling SFT training data
  */
 export class SFTDataset {
   private examples: SFTExample[];
   private tokenizer: Qwen3Tokenizer;
-  private config: Required<Omit<SFTDatasetConfig, 'seed'>> & { seed: number };
+  private config: Required<Omit<SFTDatasetConfig, 'seed' | 'specialTokenIds'>> & { seed: number };
   private format: 'prompt-completion' | 'conversation';
   private shuffledIndices: number[];
   private rng: () => number;
+  /** Cached special token IDs for label masking */
+  private specialTokenIds: SpecialTokenIds;
 
   constructor(examples: SFTExample[], tokenizer: Qwen3Tokenizer, config: SFTDatasetConfig = {}) {
     if (examples.length === 0) {
@@ -100,6 +166,14 @@ export class SFTDataset {
       seed: config.seed ?? 42,
     };
     this.rng = this.createSeededRandom(this.config.seed);
+
+    // Get special token IDs from tokenizer, with optional overrides
+    const derivedTokenIds = getSpecialTokenIds(tokenizer);
+    this.specialTokenIds = {
+      imStart: config.specialTokenIds?.imStart ?? derivedTokenIds.imStart,
+      imEnd: config.specialTokenIds?.imEnd ?? derivedTokenIds.imEnd,
+      newlineTokens: config.specialTokenIds?.newlineTokens ?? derivedTokenIds.newlineTokens,
+    };
 
     // Detect format from first example
     this.format = detectFormat(examples[0]);
@@ -216,12 +290,20 @@ export class SFTDataset {
   }
 
   /**
+   * Check if a token ID is a newline token
+   */
+  private isNewlineToken(tokenId: number): boolean {
+    return this.specialTokenIds.newlineTokens.includes(tokenId);
+  }
+
+  /**
    * Tokenize a conversation example
    *
    * For conversations, we train on all assistant turns.
    * Non-assistant tokens (system, user) are masked with -100.
    *
    * Uses single-pass tokenization with token-based boundary detection.
+   * Token IDs are derived from the tokenizer for portability across models.
    */
   private async tokenizeConversation(
     example: SFTConversationExample,
@@ -238,9 +320,8 @@ export class SFTDataset {
       return { inputIds, labels: inputIds.slice() };
     }
 
-    // Token-based boundary detection using special tokens
-    const IM_START = 151644; // <|im_start|>
-    const IM_END = 151645; // <|im_end|>
+    // Token-based boundary detection using special tokens (derived from tokenizer)
+    const { imStart, imEnd } = this.specialTokenIds;
 
     // Get "assistant" token ID (it's a single token in Qwen3)
     const assistantTokenId = this.tokenizer.tokenToId('assistant');
@@ -250,13 +331,13 @@ export class SFTDataset {
 
     for (let i = 0; i < inputIds.length; i++) {
       // Detect assistant region: <|im_start|> followed by "assistant" token
-      if (inputIds[i] === IM_START && i + 1 < inputIds.length && inputIds[i + 1] === assistantTokenId) {
+      if (inputIds[i] === imStart && i + 1 < inputIds.length && inputIds[i + 1] === assistantTokenId) {
         // Skip the <|im_start|>assistant\n header, start training from content
         // Find the newline after "assistant"
         let j = i + 2;
-        while (j < inputIds.length && inputIds[j] !== IM_END) {
-          // Look for newline token (198 is common for \n)
-          if (inputIds[j] === 198 || inputIds[j] === 220) {
+        while (j < inputIds.length && inputIds[j] !== imEnd) {
+          // Look for newline token (dynamically derived from tokenizer)
+          if (this.isNewlineToken(inputIds[j])) {
             inAssistant = true;
             i = j; // Skip to after header
             break;
@@ -271,11 +352,11 @@ export class SFTDataset {
         continue;
       }
 
-      if (inAssistant && inputIds[i] !== IM_END) {
+      if (inAssistant && inputIds[i] !== imEnd) {
         labels[i] = inputIds[i];
       }
 
-      if (inputIds[i] === IM_END) {
+      if (inputIds[i] === imEnd) {
         inAssistant = false;
       }
     }
@@ -450,13 +531,22 @@ function validateSFTExample(example: unknown, index: number): SFTExample {
  * Supports two formats:
  * 1. Prompt-Completion: {"prompt": [...], "completion": {...}}
  * 2. Conversation: {"messages": [...]}
+ *
+ * @param path - Path to the JSONL file (relative to cwd or allowedRoot)
+ * @param tokenizer - Qwen3 tokenizer instance
+ * @param config - Optional configuration including path validation options
  */
 export async function loadSFTDataset(
   path: string,
   tokenizer: Qwen3Tokenizer,
-  config?: SFTDatasetConfig & { limit?: number },
+  config?: SFTDatasetConfig & { limit?: number } & PathValidationOptions,
 ): Promise<SFTDataset> {
-  const absolutePath = resolvePath(path);
+  const allowedRoot = getAllowedRoot(config);
+  const absolutePath = resolvePath(allowedRoot, path);
+
+  // Validate the path stays within allowed root to prevent directory traversal
+  validatePathContainment(absolutePath, allowedRoot);
+
   const rawRecords = readJsonl<unknown>(absolutePath, config?.limit);
 
   // Validate and convert

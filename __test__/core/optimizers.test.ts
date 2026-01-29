@@ -290,22 +290,24 @@ describe('Optimizers', () => {
       expect(values[4]).toBeCloseTo(1.0, 5);
     });
 
-    it('should compute gradient norm correctly', () => {
+    it('should compute gradient norm correctly via clipGradNormWithNorm', () => {
       // Create gradients: [3, 4] has L2 norm = sqrt(9 + 16) = 5
+      // Use clipGradNormWithNorm with high max_norm to just get the norm
       const grad1 = createFloat32Array([3.0, 4.0], [2]);
       const gradients = { param1: grad1 };
 
-      const norm = GradientUtils.computeGradientNorm(gradients);
+      const [_clipped, norm] = GradientUtils.clipGradNormWithNorm(gradients, Infinity);
       expect(norm).toBeCloseTo(5.0, 5);
     });
 
-    it('should compute gradient norm across multiple parameters', () => {
+    it('should compute gradient norm across multiple parameters via clipGradNormWithNorm', () => {
       // grads: [1, 2] and [2] have total L2 norm = sqrt(1 + 4 + 4) = 3
+      // Use clipGradNormWithNorm with high max_norm to just get the norm
       const grad1 = createFloat32Array([1.0, 2.0], [2]);
       const grad2 = createFloat32Array([2.0], [1]);
       const gradients = { param1: grad1, param2: grad2 };
 
-      const norm = GradientUtils.computeGradientNorm(gradients);
+      const [_clipped, norm] = GradientUtils.clipGradNormWithNorm(gradients, Infinity);
       expect(norm).toBeCloseTo(3.0, 5);
     });
 
@@ -430,6 +432,116 @@ describe('Optimizers', () => {
       expect(lr10).toBeCloseTo(0.5, 5);
       expect(lr20).toBeCloseTo(0.25, 5);
       expect(lr30).toBeCloseTo(0.125, 5);
+    });
+  });
+
+  describe('Batch Update (Performance Optimization)', () => {
+    it('Adam updateBatch should produce same results as multiple updateSingle calls', () => {
+      const adamSingle = new Adam(0.01);
+      const adamBatch = new Adam(0.01);
+
+      // Create multiple parameters and gradients
+      const param1 = createFloat32Array([1.0, 2.0], [2]);
+      const param2 = createFloat32Array([3.0, 4.0, 5.0], [3]);
+      const param3 = createFloat32Array([6.0], [1]);
+
+      const grad1 = createFloat32Array([0.1, 0.2], [2]);
+      const grad2 = createFloat32Array([0.3, 0.4, 0.5], [3]);
+      const grad3 = createFloat32Array([0.6], [1]);
+
+      // Single updates
+      const single1 = adamSingle.updateSingle('p1', param1, grad1);
+      const single2 = adamSingle.updateSingle('p2', param2, grad2);
+      const single3 = adamSingle.updateSingle('p3', param3, grad3);
+
+      // Batch update
+      const batchResults = adamBatch.updateBatch(['p1', 'p2', 'p3'], [param1, param2, param3], [grad1, grad2, grad3]);
+
+      // Results should match
+      expect(batchResults.length).toBe(3);
+      expect(batchResults[0].toFloat32()[0]).toBeCloseTo(single1.toFloat32()[0], 5);
+      expect(batchResults[0].toFloat32()[1]).toBeCloseTo(single1.toFloat32()[1], 5);
+      expect(batchResults[1].toFloat32()[0]).toBeCloseTo(single2.toFloat32()[0], 5);
+      expect(batchResults[2].toFloat32()[0]).toBeCloseTo(single3.toFloat32()[0], 5);
+    });
+
+    it('AdamW updateBatch should produce same results as multiple updateSingle calls', () => {
+      const adamwSingle = new AdamW(0.01);
+      const adamwBatch = new AdamW(0.01);
+
+      const param1 = createFloat32Array([1.0, 2.0], [2]);
+      const param2 = createFloat32Array([3.0, 4.0], [2]);
+      const grad1 = createFloat32Array([0.1, 0.2], [2]);
+      const grad2 = createFloat32Array([0.3, 0.4], [2]);
+
+      // Single updates
+      const single1 = adamwSingle.updateSingle('p1', param1, grad1);
+      const single2 = adamwSingle.updateSingle('p2', param2, grad2);
+
+      // Batch update
+      const batchResults = adamwBatch.updateBatch(['p1', 'p2'], [param1, param2], [grad1, grad2]);
+
+      expect(batchResults.length).toBe(2);
+      expect(batchResults[0].toFloat32()[0]).toBeCloseTo(single1.toFloat32()[0], 5);
+      expect(batchResults[1].toFloat32()[0]).toBeCloseTo(single2.toFloat32()[0], 5);
+    });
+
+    it('SGD updateBatch should produce same results as multiple updateSingle calls', () => {
+      const sgdSingle = new SGD(0.1, 0.9); // with momentum
+      const sgdBatch = new SGD(0.1, 0.9);
+
+      const param1 = createFloat32Array([1.0, 2.0], [2]);
+      const param2 = createFloat32Array([3.0, 4.0], [2]);
+      const grad1 = createFloat32Array([0.1, 0.2], [2]);
+      const grad2 = createFloat32Array([0.3, 0.4], [2]);
+
+      // Single updates
+      const single1 = sgdSingle.updateSingle('p1', param1, grad1);
+      const single2 = sgdSingle.updateSingle('p2', param2, grad2);
+
+      // Batch update
+      const batchResults = sgdBatch.updateBatch(['p1', 'p2'], [param1, param2], [grad1, grad2]);
+
+      expect(batchResults.length).toBe(2);
+      expect(batchResults[0].toFloat32()[0]).toBeCloseTo(single1.toFloat32()[0], 5);
+      expect(batchResults[1].toFloat32()[0]).toBeCloseTo(single2.toFloat32()[0], 5);
+    });
+
+    it('RMSprop updateBatch should produce same results as multiple updateSingle calls', () => {
+      const rmspropSingle = new RMSprop(0.01);
+      const rmspropBatch = new RMSprop(0.01);
+
+      const param1 = createFloat32Array([1.0, 2.0], [2]);
+      const param2 = createFloat32Array([3.0, 4.0], [2]);
+      const grad1 = createFloat32Array([0.1, 0.2], [2]);
+      const grad2 = createFloat32Array([0.3, 0.4], [2]);
+
+      // Single updates
+      const single1 = rmspropSingle.updateSingle('p1', param1, grad1);
+      const single2 = rmspropSingle.updateSingle('p2', param2, grad2);
+
+      // Batch update
+      const batchResults = rmspropBatch.updateBatch(['p1', 'p2'], [param1, param2], [grad1, grad2]);
+
+      expect(batchResults.length).toBe(2);
+      expect(batchResults[0].toFloat32()[0]).toBeCloseTo(single1.toFloat32()[0], 5);
+      expect(batchResults[1].toFloat32()[0]).toBeCloseTo(single2.toFloat32()[0], 5);
+    });
+
+    it('updateBatch should throw on mismatched lengths', () => {
+      const adam = new Adam();
+
+      const param1 = createFloat32Array([1.0], [1]);
+      const grad1 = createFloat32Array([0.1], [1]);
+
+      // Mismatched: 2 names, 1 param, 1 grad
+      expect(() => adam.updateBatch(['p1', 'p2'], [param1], [grad1])).toThrow();
+    });
+
+    it('updateBatch with empty arrays should return empty', () => {
+      const adam = new Adam();
+      const results = adam.updateBatch([], [], []);
+      expect(results.length).toBe(0);
     });
   });
 

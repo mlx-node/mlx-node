@@ -45,6 +45,11 @@ pub struct SftEngineConfig {
     pub emergency_save_threshold: Option<i32>,
     /// Compute token accuracy (requires extra forward pass) (default: false)
     pub compute_accuracy: Option<bool>,
+    /// Enable detailed NaN/Inf detection with per-element counts (default: false)
+    /// When false (default), uses GPU-native has_nan_or_inf() which only transfers a single
+    /// boolean to CPU. When true, transfers the entire gradient tensor to CPU for detailed
+    /// per-element analysis - useful for debugging but has significant performance overhead.
+    pub verbose_nan_detection: Option<bool>,
 }
 
 impl Default for SftEngineConfig {
@@ -60,6 +65,7 @@ impl Default for SftEngineConfig {
             max_nan_gradients: Some(100),
             emergency_save_threshold: Some(5),
             compute_accuracy: Some(false),
+            verbose_nan_detection: Some(false),
         }
     }
 }
@@ -304,22 +310,34 @@ impl SftTrainingEngine {
 
                 // Check for NaN/Inf in gradients BEFORE accumulation
                 // This catches numerical instability earlier than loss-only checking
+                // Uses GPU-native has_nan_or_inf() to avoid transferring entire gradient tensors to CPU
+                let verbose_nan = config.verbose_nan_detection.unwrap_or(false);
                 for (name, grad) in &gradients {
                     grad.eval();
-                    // Sample a few values to check for NaN/Inf (checking all would be expensive)
-                    let grad_data = grad.to_float32()?;
-                    let has_nan = grad_data.iter().take(1000).any(|v| v.is_nan() || v.is_infinite());
-                    if has_nan {
+                    // GPU-native check: only transfers a single boolean to CPU
+                    let has_invalid = grad.has_nan_or_inf()?;
+                    if has_invalid {
                         let mut state = state_arc.write().map_err(|_| {
                             Error::new(Status::GenericFailure, "Failed to acquire state write lock")
                         })?;
                         state.nan_gradient_count += 1;
                         state.consecutive_nan_count += 1;
 
-                        warn!(
-                            "NaN/Inf gradient detected in parameter '{}', skipping step (count: {})",
-                            name, state.nan_gradient_count
-                        );
+                        // Only do detailed CPU analysis in verbose mode (for debugging)
+                        if verbose_nan {
+                            let grad_data = grad.to_float32()?;
+                            let nan_count = grad_data.iter().filter(|v| v.is_nan()).count();
+                            let inf_count = grad_data.iter().filter(|v| v.is_infinite()).count();
+                            warn!(
+                                "NaN/Inf gradient detected in parameter '{}': {} NaN, {} Inf (count: {})",
+                                name, nan_count, inf_count, state.nan_gradient_count
+                            );
+                        } else {
+                            warn!(
+                                "NaN/Inf gradient detected in parameter '{}', skipping step (count: {})",
+                                name, state.nan_gradient_count
+                            );
+                        }
 
                         let emergency_threshold = config.emergency_save_threshold.unwrap_or(5) as u32;
                         if state.consecutive_nan_count >= emergency_threshold {

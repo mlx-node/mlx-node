@@ -56,7 +56,9 @@ impl Adam {
         }
     }
 
-    /// Update a single parameter
+    /// Update a single parameter (kept for backwards compatibility)
+    ///
+    /// For better performance when updating many parameters, use `update_batch` instead.
     #[napi]
     pub fn update_single(
         &mut self,
@@ -64,13 +66,75 @@ impl Adam {
         param: &MxArray,
         grad: &MxArray,
     ) -> Result<MxArray> {
+        self.step += 1;
+        self.update_single_at_step(param_name, param, grad, self.step)
+    }
+
+    /// Batch update all parameters in a single call
+    ///
+    /// This is more efficient than calling update_single repeatedly due to reduced FFI overhead.
+    /// For Qwen3-0.6B with ~300 parameters, this reduces FFI calls from 300+ to 1.
+    ///
+    /// Args:
+    ///   param_names: Vector of parameter names
+    ///   params: Vector of parameter arrays (must match param_names length)
+    ///   grads: Vector of gradient arrays (must match param_names length)
+    ///
+    /// Returns:
+    ///   Vector of updated parameter arrays in the same order as input
+    #[napi]
+    pub fn update_batch(
+        &mut self,
+        param_names: Vec<String>,
+        params: Vec<&MxArray>,
+        grads: Vec<&MxArray>,
+    ) -> Result<Vec<MxArray>> {
+        if param_names.len() != params.len() || params.len() != grads.len() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "Mismatched lengths: {} names, {} params, {} grads",
+                    param_names.len(),
+                    params.len(),
+                    grads.len()
+                ),
+            ));
+        }
+
+        // Increment step ONCE for the entire batch
+        self.step += 1;
+        let current_step = self.step;
+
+        let mut updated_params = Vec::with_capacity(params.len());
+
+        for ((name, param), grad) in param_names
+            .into_iter()
+            .zip(params.into_iter())
+            .zip(grads.into_iter())
+        {
+            let updated = self.update_single_at_step(name, param, grad, current_step)?;
+            updated_params.push(updated);
+        }
+
+        Ok(updated_params)
+    }
+
+    /// Internal update that uses a specific step value for bias correction
+    ///
+    /// This method does NOT modify self.step - the caller is responsible for
+    /// incrementing the step counter appropriately.
+    fn update_single_at_step(
+        &mut self,
+        param_name: String,
+        param: &MxArray,
+        grad: &MxArray,
+        step: i64,
+    ) -> Result<MxArray> {
         // Initialize state if needed
         if !self.state.contains_key(&param_name) {
             let shape = param.shape()?;
             self.init_state(&param_name, &shape);
         }
-
-        self.step += 1;
 
         let state = self.state.get_mut(&param_name).unwrap();
 
@@ -88,7 +152,7 @@ impl Adam {
 
             // Apply bias correction if enabled
             let (corrected_m, corrected_v) = if self.bias_correction {
-                let step_f64 = self.step as f64;
+                let step_f64 = step as f64;
                 let bias_correction1 = 1.0 / (1.0 - self.beta1.powf(step_f64));
                 let bias_correction2 = 1.0 / (1.0 - self.beta2.powf(step_f64));
 
@@ -143,6 +207,82 @@ impl Adam {
     pub fn reset(&mut self) {
         self.state.clear();
         self.step = 0;
+    }
+
+    /// Get the current step count
+    ///
+    /// This is useful for checkpointing the optimizer state.
+    /// The step count is used for bias correction in Adam.
+    #[napi]
+    pub fn get_step(&self) -> i64 {
+        self.step
+    }
+
+    /// Set the step count
+    ///
+    /// This is typically used when resuming from a checkpoint to restore
+    /// the optimizer's step counter for correct bias correction.
+    #[napi]
+    pub fn set_step(&mut self, step: i64) {
+        self.step = step;
+    }
+
+    /// Get all parameter names that have optimizer state
+    ///
+    /// Useful for inspecting which parameters the optimizer is tracking.
+    #[napi]
+    pub fn get_state_keys(&self) -> Vec<String> {
+        self.state.keys().cloned().collect()
+    }
+
+    /// Get the first moment (m) for a specific parameter
+    ///
+    /// Returns None if the parameter doesn't have optimizer state.
+    #[napi]
+    pub fn get_first_moment(&self, param_name: String) -> Option<MxArray> {
+        self.state.get(&param_name).map(|s| s.m.clone())
+    }
+
+    /// Get the second moment (v) for a specific parameter
+    ///
+    /// Returns None if the parameter doesn't have optimizer state.
+    #[napi]
+    pub fn get_second_moment(&self, param_name: String) -> Option<MxArray> {
+        self.state.get(&param_name).map(|s| s.v.clone())
+    }
+
+    /// Set the first moment (m) for a specific parameter
+    ///
+    /// This is used when restoring optimizer state from a checkpoint.
+    /// The shape must match the parameter's shape.
+    #[napi]
+    pub fn set_first_moment(&mut self, param_name: String, m: &MxArray) -> Result<()> {
+        if let Some(state) = self.state.get_mut(&param_name) {
+            state.m = m.clone();
+        } else {
+            // Create new state entry with zeros for v
+            let shape = m.shape()?;
+            let v = MxArray::zeros(&shape, None)?;
+            self.state.insert(param_name, AdamState { m: m.clone(), v });
+        }
+        Ok(())
+    }
+
+    /// Set the second moment (v) for a specific parameter
+    ///
+    /// This is used when restoring optimizer state from a checkpoint.
+    /// The shape must match the parameter's shape.
+    #[napi]
+    pub fn set_second_moment(&mut self, param_name: String, v: &MxArray) -> Result<()> {
+        if let Some(state) = self.state.get_mut(&param_name) {
+            state.v = v.clone();
+        } else {
+            // Create new state entry with zeros for m
+            let shape = v.shape()?;
+            let m = MxArray::zeros(&shape, None)?;
+            self.state.insert(param_name, AdamState { m, v: v.clone() });
+        }
+        Ok(())
     }
 
     fn init_state(&mut self, param_name: &str, shape: &[i64]) {

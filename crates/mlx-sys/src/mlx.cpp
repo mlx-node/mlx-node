@@ -1495,11 +1495,13 @@ void mlx_async_eval(mlx_array** handles, size_t count) {
 }
 
 size_t mlx_array_size(mlx_array* handle) {
+  if (!handle) return 0;
   auto arr = reinterpret_cast<array*>(handle);
   return arr->size();
 }
 
 size_t mlx_array_ndim(mlx_array* handle) {
+  if (!handle) return 0;
   auto arr = reinterpret_cast<array*>(handle);
   return arr->ndim();
 }
@@ -1561,6 +1563,7 @@ bool mlx_array_get_batch_seq_hidden(mlx_array* handle, int64_t* batch, int64_t* 
 }
 
 bool mlx_array_item_at_float32(mlx_array* handle, size_t index, float* out) {
+  if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) {
     return false;  // Index out of bounds
@@ -1582,6 +1585,7 @@ bool mlx_array_item_at_float32(mlx_array* handle, size_t index, float* out) {
 }
 
 bool mlx_array_item_at_int32(mlx_array* handle, size_t index, int32_t* out) {
+  if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) {
     return false;  // Index out of bounds
@@ -1602,6 +1606,7 @@ bool mlx_array_item_at_int32(mlx_array* handle, size_t index, int32_t* out) {
 }
 
 bool mlx_array_item_at_uint32(mlx_array* handle, size_t index, uint32_t* out) {
+  if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) {
     return false;  // Index out of bounds
@@ -2602,7 +2607,10 @@ mlx_array* mlx_compiled_top_p(mlx_array* logprobs_handle, float top_p) {
   cumulative_probs = mlx::core::take_along_axis(cumulative_probs, inverse_indices, -1);
 
   // Select tokens with cumulative probs below threshold
-  auto threshold = mlx::core::array(1.0f - top_p);
+  // Subtract epsilon for numerical stability (consistent with Rust path)
+  // This prevents floating-point precision from excluding tokens at exact boundaries
+  constexpr float EPSILON = 1e-7f;  // Use 1e-7 for float32 (vs 1e-10 in Rust for f64)
+  auto threshold = mlx::core::array((1.0f - top_p) - EPSILON);
   auto mask = mlx::core::greater(cumulative_probs, threshold);
 
   auto neg_inf = mlx::core::array(-std::numeric_limits<float>::infinity(), logprobs.dtype());
@@ -2756,7 +2764,10 @@ mlx_array* mlx_compiled_sample_full(
     cumulative_probs = mlx::core::take_along_axis(cumulative_probs, inverse_indices, -1);
 
     // Select tokens with cumulative probs below threshold
-    auto threshold = mlx::core::array(1.0f - top_p);
+    // Subtract epsilon for numerical stability (consistent with Rust path)
+    // This prevents floating-point precision from excluding tokens at exact boundaries
+    constexpr float EPSILON = 1e-7f;  // Use 1e-7 for float32 (vs 1e-10 in Rust for f64)
+    auto threshold = mlx::core::array((1.0f - top_p) - EPSILON);
     auto mask = mlx::core::greater(cumulative_probs, threshold);
 
     auto neg_inf = mlx::core::array(-std::numeric_limits<float>::infinity(), logprobs.dtype());
@@ -2891,7 +2902,9 @@ void mlx_sample_and_logprobs(
     auto zeros = mlx::core::zeros_like(sorted_indices);
     auto inverse_indices = mlx::core::put_along_axis(zeros, sorted_indices, arange_vals, -1);
     cumulative_probs = mlx::core::take_along_axis(cumulative_probs, inverse_indices, -1);
-    auto threshold = mlx::core::array(1.0f - top_p);
+    // Subtract epsilon for numerical stability (consistent with Rust path)
+    constexpr float EPSILON = 1e-7f;
+    auto threshold = mlx::core::array((1.0f - top_p) - EPSILON);
     auto mask = mlx::core::greater(cumulative_probs, threshold);
     auto neg_inf = mlx::core::array(-std::numeric_limits<float>::infinity(), logprobs.dtype());
     logprobs = mlx::core::where(mask, logprobs, neg_inf);
@@ -3009,7 +3022,9 @@ void mlx_compiled_sample_and_logprobs(
     auto zeros = mlx::core::zeros_like(sorted_indices);
     auto inverse_indices = mlx::core::put_along_axis(zeros, sorted_indices, arange_vals, -1);
     cumulative_probs = mlx::core::take_along_axis(cumulative_probs, inverse_indices, -1);
-    auto threshold = mlx::core::array(1.0f - top_p);
+    // Subtract epsilon for numerical stability (consistent with Rust path)
+    constexpr float EPSILON = 1e-7f;
+    auto threshold = mlx::core::array((1.0f - top_p) - EPSILON);
     auto mask = mlx::core::greater(cumulative_probs, threshold);
     auto neg_inf = mlx::core::array(-std::numeric_limits<float>::infinity(), logprobs.dtype());
     logprobs = mlx::core::where(mask, logprobs, neg_inf);
@@ -3382,8 +3397,8 @@ static array transformer_block_forward_cached(
 
   // MLX SDPA: mask where true = attend (keep), false = mask out
   // create_batched_causal_mask returns true = attend, so pass directly
+  // NOTE: Do NOT call eval() here - this is called per-layer and would destroy pipelining
   auto attn_output = fast::scaled_dot_product_attention(queries, keys_valid, values_valid, attn_scale, "", mask, std::nullopt, {});
-  attn_output.eval();  // Force GPU sync after SDPA to prevent timeout
 
   attn_output = transpose(attn_output, {0, 2, 1, 3});
   attn_output = reshape(attn_output, {batch, seq_len, n_heads * head_dim});
@@ -3403,8 +3418,8 @@ static array transformer_block_forward_cached(
   auto mlp_output = matmul(activated, w_down_t);
 
   auto output = h + mlp_output;
-  output.eval();  // Force GPU sync after each transformer block to prevent timeout
-  mlx::core::synchronize();  // Wait for GPU completion to prevent context leaks
+  // NOTE: Do NOT call eval() or synchronize() here - it would be called 28 times per forward!
+  // MLX uses lazy evaluation and syncs are handled at appropriate boundaries
   return output;
 }
 
@@ -3472,11 +3487,10 @@ static array forward_all_layers(
   hidden = fast::rms_norm(hidden, std::optional<array>(final_norm_w), norm_eps, {});
 
   // LM head
+  // NOTE: Do NOT call eval() or synchronize() here - MLX uses lazy evaluation
   auto logits = tie_word_embeddings
     ? matmul(hidden, transpose(embedding_weight, {1, 0}))
     : matmul(hidden, transpose(*lm_head_w, {1, 0}));
-  logits.eval();  // Force GPU sync after large LM head matmul to prevent timeout
-  mlx::core::synchronize();  // Wait for GPU completion to prevent context leaks
   return logits;
 }
 
@@ -3538,7 +3552,9 @@ static array sample_with_filters(
     auto zeros_arr = zeros_like(sorted_indices);
     auto inverse_indices = put_along_axis(zeros_arr, sorted_indices, arange_vals, -1);
     cumulative_probs = take_along_axis(cumulative_probs, inverse_indices, -1);
-    auto threshold = array(1.0f - top_p);
+    // Subtract epsilon for numerical stability (consistent with Rust path)
+    constexpr float EPSILON = 1e-7f;
+    auto threshold = array((1.0f - top_p) - EPSILON);
     auto mask = greater(cumulative_probs, threshold);
     auto neg_inf = array(-std::numeric_limits<float>::infinity(), logprobs.dtype());
     logprobs = mlx::core::where(mask, logprobs, neg_inf);
@@ -3873,15 +3889,13 @@ void mlx_qwen3_forward_step(
     hidden = fast::rms_norm(hidden, std::optional<array>(final_norm_w), norm_eps, {});
 
     // LM head and store output
+    // NOTE: Do NOT call eval() or synchronize() here - MLX uses lazy evaluation
+    // and the Rust code handles synchronization when needed (e.g., for sampling)
     if (tie_word_embeddings) {
         auto logits = matmul(hidden, transpose(embedding_weight, {1, 0}));
-        logits.eval();
-        mlx::core::synchronize();
         *out_logits = reinterpret_cast<mlx_array*>(new array(std::move(logits)));
     } else {
         auto logits = matmul(hidden, transpose(*lm_head_w, {1, 0}));
-        logits.eval();
-        mlx::core::synchronize();
         *out_logits = reinterpret_cast<mlx_array*>(new array(std::move(logits)));
     }
 
@@ -4093,8 +4107,8 @@ static array transformer_block_forward_batched(
 
     // MLX SDPA: mask where true = attend (keep), false = mask out
     // create_batched_causal_mask returns true = attend, so pass directly
+    // NOTE: Do NOT call eval() here - this is called per-layer and would destroy pipelining
     auto attn_output = fast::scaled_dot_product_attention(queries, keys_valid, values_valid, attn_scale, "", mask, std::nullopt, {});
-    attn_output.eval();  // Force GPU sync after SDPA to prevent timeout
 
     attn_output = transpose(attn_output, {0, 2, 1, 3});
     attn_output = reshape(attn_output, {batch, seq_len, n_heads * head_dim});
@@ -4113,9 +4127,8 @@ static array transformer_block_forward_batched(
     auto activated = mlx::core::sigmoid(gate) * gate * up;  // SiLU(gate) * up
     auto mlp_output = matmul(activated, w_down_t);
 
+    // NOTE: Do NOT call eval() or synchronize() here - called 28 times per forward!
     auto output = h + mlp_output;
-    output.eval();  // Force GPU sync after each transformer block to prevent timeout
-    mlx::core::synchronize();  // Wait for GPU completion to prevent context leaks
     return output;
 }
 
@@ -4222,15 +4235,13 @@ void mlx_qwen3_forward_step_batched(
     hidden = fast::rms_norm(hidden, std::optional<array>(final_norm_w), norm_eps, {});
 
     // LM head and store output
+    // NOTE: Do NOT call eval() or synchronize() here - MLX uses lazy evaluation
+    // and the Rust code handles synchronization when needed (e.g., for sampling)
     if (tie_word_embeddings) {
         auto logits = matmul(hidden, transpose(embedding_weight, {1, 0}));
-        logits.eval();
-        mlx::core::synchronize();
         *out_logits = reinterpret_cast<mlx_array*>(new array(std::move(logits)));
     } else {
         auto logits = matmul(hidden, transpose(*lm_head_w, {1, 0}));
-        logits.eval();
-        mlx::core::synchronize();
         *out_logits = reinterpret_cast<mlx_array*>(new array(std::move(logits)));
     }
 
@@ -4325,6 +4336,113 @@ size_t mlx_array_get_itemsize(mlx_array* handle) {
 /// Call this before dispatching external Metal kernels
 void mlx_metal_synchronize() {
     mlx::core::synchronize();
+}
+
+// ================================================================================
+// Quantization Operations (for QuantizedKVCache)
+// ================================================================================
+
+/// Quantize a matrix along its last axis using affine quantization.
+/// Returns a QuantizeResult struct with pointers to quantized weights, scales, and biases.
+/// The caller is responsible for freeing all returned arrays.
+///
+/// @param w          Input array to quantize
+/// @param group_size Number of elements per quantization group (default: 64)
+/// @param bits       Number of bits for quantization (4 or 8, default: 4)
+/// @param out_quantized  Output: quantized weights (packed uint8/uint32)
+/// @param out_scales     Output: per-group scales
+/// @param out_biases     Output: per-group biases (zero points)
+/// @return true on success, false on error
+bool mlx_quantize(
+    mlx_array* w,
+    int32_t group_size,
+    int32_t bits,
+    mlx_array** out_quantized,
+    mlx_array** out_scales,
+    mlx_array** out_biases
+) {
+    if (!w || !out_quantized || !out_scales || !out_biases) {
+        return false;
+    }
+
+    try {
+        auto& w_arr = *reinterpret_cast<array*>(w);
+
+        // Call MLX quantize with affine mode
+        std::optional<int> gs = group_size > 0 ? std::optional<int>(group_size) : std::nullopt;
+        std::optional<int> b = bits > 0 ? std::optional<int>(bits) : std::nullopt;
+
+        auto result = mlx::core::quantize(w_arr, gs, b, "affine");
+
+        // Result is [quantized, scales, biases]
+        if (result.size() != 3) {
+            std::cerr << "[MLX] quantize returned unexpected number of arrays: " << result.size() << std::endl;
+            return false;
+        }
+
+        *out_quantized = reinterpret_cast<mlx_array*>(new array(std::move(result[0])));
+        *out_scales = reinterpret_cast<mlx_array*>(new array(std::move(result[1])));
+        *out_biases = reinterpret_cast<mlx_array*>(new array(std::move(result[2])));
+
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[MLX] Exception in mlx_quantize: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "[MLX] Unknown exception in mlx_quantize" << std::endl;
+        return false;
+    }
+}
+
+/// Dequantize a matrix that was quantized with mlx_quantize.
+/// Reconstructs the original values using: value = quantized * scale + bias
+///
+/// @param quantized  Quantized weights from mlx_quantize
+/// @param scales     Per-group scales from mlx_quantize
+/// @param biases     Per-group biases from mlx_quantize (nullable for symmetric quant)
+/// @param group_size Number of elements per quantization group (must match quantize)
+/// @param bits       Number of bits (must match quantize)
+/// @param out_dtype  Output dtype (0=float32, 5=bfloat16, 6=float16), -1 for input dtype
+/// @return Dequantized array, or nullptr on error
+mlx_array* mlx_dequantize(
+    mlx_array* quantized,
+    mlx_array* scales,
+    mlx_array* biases,
+    int32_t group_size,
+    int32_t bits,
+    int32_t out_dtype
+) {
+    if (!quantized || !scales) {
+        return nullptr;
+    }
+
+    try {
+        auto& q_arr = *reinterpret_cast<array*>(quantized);
+        auto& s_arr = *reinterpret_cast<array*>(scales);
+
+        std::optional<array> b_opt = std::nullopt;
+        if (biases) {
+            b_opt = *reinterpret_cast<array*>(biases);
+        }
+
+        std::optional<int> gs = group_size > 0 ? std::optional<int>(group_size) : std::nullopt;
+        std::optional<int> b = bits > 0 ? std::optional<int>(bits) : std::nullopt;
+        std::optional<mlx::core::Dtype> dtype = std::nullopt;
+
+        if (out_dtype >= 0) {
+            dtype = to_mlx_dtype(out_dtype);
+        }
+
+        auto result = mlx::core::dequantize(q_arr, s_arr, b_opt, gs, b, "affine", dtype);
+
+        return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+    } catch (const std::exception& e) {
+        std::cerr << "[MLX] Exception in mlx_dequantize: " << e.what() << std::endl;
+        return nullptr;
+    } catch (...) {
+        std::cerr << "[MLX] Unknown exception in mlx_dequantize" << std::endl;
+        return nullptr;
+    }
 }
 
 }  // End extern "C"

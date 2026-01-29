@@ -65,9 +65,66 @@ impl SGD {
         })
     }
 
-    /// Update a single parameter
+    /// Update a single parameter (kept for backwards compatibility)
+    ///
+    /// For better performance when updating many parameters, use `update_batch` instead.
     #[napi]
     pub fn update_single(
+        &mut self,
+        param_name: String,
+        param: &MxArray,
+        grad: &MxArray,
+    ) -> Result<MxArray> {
+        self.update_single_internal(param_name, param, grad)
+    }
+
+    /// Batch update all parameters in a single call
+    ///
+    /// This is more efficient than calling update_single repeatedly due to reduced FFI overhead.
+    /// For Qwen3-0.6B with ~300 parameters, this reduces FFI calls from 300+ to 1.
+    ///
+    /// Args:
+    ///   param_names: Vector of parameter names
+    ///   params: Vector of parameter arrays (must match param_names length)
+    ///   grads: Vector of gradient arrays (must match param_names length)
+    ///
+    /// Returns:
+    ///   Vector of updated parameter arrays in the same order as input
+    #[napi]
+    pub fn update_batch(
+        &mut self,
+        param_names: Vec<String>,
+        params: Vec<&MxArray>,
+        grads: Vec<&MxArray>,
+    ) -> Result<Vec<MxArray>> {
+        if param_names.len() != params.len() || params.len() != grads.len() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "Mismatched lengths: {} names, {} params, {} grads",
+                    param_names.len(),
+                    params.len(),
+                    grads.len()
+                ),
+            ));
+        }
+
+        let mut updated_params = Vec::with_capacity(params.len());
+
+        for ((name, param), grad) in param_names
+            .into_iter()
+            .zip(params.into_iter())
+            .zip(grads.into_iter())
+        {
+            let updated = self.update_single_internal(name, param, grad)?;
+            updated_params.push(updated);
+        }
+
+        Ok(updated_params)
+    }
+
+    /// Internal update without NAPI overhead
+    fn update_single_internal(
         &mut self,
         param_name: String,
         param: &MxArray,

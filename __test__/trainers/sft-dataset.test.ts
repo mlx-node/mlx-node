@@ -5,6 +5,7 @@ import {
   createSFTDataset,
   type SFTPromptCompletionExample,
   type SFTConversationExample,
+  type SpecialTokenIds,
 } from '@mlx-node/trl';
 import { Qwen3Tokenizer } from '@mlx-node/core';
 
@@ -188,6 +189,74 @@ describe('SFT Dataset', () => {
       ] as unknown as SFTPromptCompletionExample[];
 
       expect(() => createSFTDataset(mixedExamples, tokenizer)).toThrow('Inconsistent SFT data format');
+    });
+  });
+
+  describe('special token IDs', () => {
+    it('derives special token IDs from tokenizer automatically', () => {
+      const examples: SFTPromptCompletionExample[] = [
+        {
+          prompt: [{ role: 'user', content: 'Hi' }],
+          completion: { role: 'assistant', content: 'Hello!' },
+        },
+      ];
+
+      // Verify tokenizer has the expected special tokens
+      const imStartId = tokenizer.tokenToId('<|im_start|>');
+      const imEndId = tokenizer.tokenToId('<|im_end|>');
+      expect(imStartId).toBe(151644);
+      expect(imEndId).toBe(151645);
+
+      // Dataset should be created successfully (it derives token IDs internally)
+      const dataset = createSFTDataset(examples, tokenizer);
+      expect(dataset.length).toBe(1);
+    });
+
+    it('accepts custom special token IDs via config', () => {
+      const examples: SFTPromptCompletionExample[] = [
+        {
+          prompt: [{ role: 'user', content: 'Hi' }],
+          completion: { role: 'assistant', content: 'Hello!' },
+        },
+      ];
+
+      // Create dataset with custom token IDs (should not throw)
+      const customTokenIds: Partial<SpecialTokenIds> = {
+        imStart: 151644,
+        imEnd: 151645,
+        newlineTokens: [198], // Custom newline token
+      };
+
+      const dataset = createSFTDataset(examples, tokenizer, {
+        specialTokenIds: customTokenIds,
+      });
+      expect(dataset.length).toBe(1);
+    });
+
+    it('masks assistant content correctly in conversation format with completionOnly', async () => {
+      const examples: SFTConversationExample[] = [
+        {
+          messages: [
+            { role: 'system', content: 'You are a helpful assistant.' },
+            { role: 'user', content: 'Hello!' },
+            { role: 'assistant', content: 'Hi there!' },
+          ],
+        },
+      ];
+
+      const dataset = createSFTDataset(examples, tokenizer, {
+        maxSeqLength: 512,
+        completionOnly: true,
+      });
+      const batch = await dataset.collateBatch([0]);
+
+      // Some tokens should be -100 (masked - system and user)
+      const maskedCount = Array.from(batch.labels).filter((l) => l === -100).length;
+      // Some tokens should be > 0 (trainable - assistant content)
+      const trainableCount = Array.from(batch.labels).filter((l) => l > 0).length;
+
+      expect(maskedCount).toBeGreaterThan(0);
+      expect(trainableCount).toBeGreaterThan(0);
     });
   });
 });

@@ -1,13 +1,46 @@
-/**
- * Qwen3 Tokenizer Implementation using HuggingFace tokenizers
- *
- * Provides fast, production-ready tokenization for Qwen3 models with:
- * - BPE encoding/decoding
- * - Special token handling (EOS, BOS, PAD, etc.)
- * - ChatML format support
- * - Batch processing
- * - Tool/function calling support with Jinja2 template rendering
- */
+//! # Tokenizer Module
+//!
+//! Provides fast, production-ready tokenization for Qwen3 models with:
+//! - BPE encoding/decoding
+//! - Special token handling (EOS, BOS, PAD, etc.)
+//! - ChatML format support
+//! - Batch processing
+//! - Tool/function calling support with Jinja2 template rendering
+//!
+//! ## Security Model
+//!
+//! The tokenizer loads configuration files (`tokenizer.json`, `tokenizer_config.json`)
+//! from the model directory. **These files are assumed to be trusted.**
+//!
+//! Specifically:
+//! - `tokenizer.json` - Defines vocabulary and tokenization rules
+//! - `tokenizer_config.json` - May contain Jinja2 chat templates
+//!
+//! ### Warning: Untrusted Sources
+//!
+//! Loading tokenizer files from untrusted sources could pose security risks:
+//!
+//! - **Malicious templates**: While minijinja sandboxes execution (no file access,
+//!   no arbitrary code execution), a malicious template could cause denial of service
+//!   through excessive loops or memory allocation.
+//!
+//! - **Data extraction**: A malicious template could potentially extract sensitive
+//!   data from the context (messages, tool definitions) in unexpected ways.
+//!
+//! - **Vocabulary manipulation**: Malicious vocabulary could affect model behavior
+//!   in unexpected ways or enable prompt injection attacks.
+//!
+//! ### Recommended Sources
+//!
+//! Always use tokenizer files from trusted sources:
+//! - Official Hugging Face Hub repositories
+//! - Your own trained/fine-tuned models
+//! - Verified model providers
+//!
+//! **Do NOT load tokenizer files from:**
+//! - Random internet downloads
+//! - User-uploaded files without verification
+//! - Untrusted third-party sources
 use minijinja::{Environment, context};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -21,6 +54,9 @@ const ENDOFTEXT_TOKEN_ID: u32 = 151643;
 #[allow(dead_code)] // Reserved for future use (e.g., get_im_start_token_id())
 const IM_START_TOKEN_ID: u32 = 151644;
 const IM_END_TOKEN_ID: u32 = 151645;
+
+/// Valid roles for ChatML format (prevents role injection attacks)
+const VALID_CHATML_ROLES: &[&str] = &["system", "user", "assistant", "tool"];
 
 /// Tool call made by an assistant
 #[napi(object)]
@@ -143,7 +179,28 @@ impl Qwen3Tokenizer {
         })
     }
 
-    /// Load chat template from tokenizer_config.json file
+    /// Load chat template from tokenizer_config.json file.
+    ///
+    /// # Security Considerations
+    ///
+    /// The chat template loaded from `tokenizer_config.json` is a Jinja2 template
+    /// that will be rendered with user-provided message content. This function
+    /// assumes that the `tokenizer_config.json` file comes from a **trusted source**
+    /// (e.g., Hugging Face Hub, local model files you control).
+    ///
+    /// While minijinja provides sandboxed execution (no file system access, no
+    /// arbitrary code execution), loading templates from untrusted sources could:
+    /// - Cause denial of service through excessive template loops
+    /// - Extract/expose data from the template context unexpectedly
+    ///
+    /// **Do NOT use tokenizer files from untrusted sources.**
+    ///
+    /// # Arguments
+    /// * `tokenizer_path` - Path to the tokenizer.json file. The function looks for
+    ///   `tokenizer_config.json` in the same directory.
+    ///
+    /// # Returns
+    /// The chat template string if found and valid, `None` otherwise.
     fn load_chat_template(tokenizer_path: &str) -> Option<String> {
         let path = Path::new(tokenizer_path);
         let config_path = path.parent()?.join("tokenizer_config.json");
@@ -155,10 +212,66 @@ impl Qwen3Tokenizer {
         let config_content = std::fs::read_to_string(&config_path).ok()?;
         let config: serde_json::Value = serde_json::from_str(&config_content).ok()?;
 
-        config
+        let template = config
             .get("chat_template")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .map(|s| s.to_string())?;
+
+        // Basic template safety validation
+        if let Err(warning) = Self::validate_template_safety(&template) {
+            // Log warning but don't fail - the template may still work
+            #[cfg(debug_assertions)]
+            eprintln!("Warning: {}", warning);
+            let _ = warning; // Suppress unused warning in release builds
+        }
+
+        Some(template)
+    }
+
+    /// Validates a chat template for suspicious patterns that could indicate
+    /// denial of service risks.
+    ///
+    /// This is a defense-in-depth measure. Even if validation passes, templates
+    /// should only be loaded from trusted sources.
+    ///
+    /// # Arguments
+    /// * `template` - The Jinja2 template string to validate
+    ///
+    /// # Returns
+    /// `Ok(())` if the template passes basic safety checks, `Err(warning)` with
+    /// a description of the concern otherwise.
+    fn validate_template_safety(template: &str) -> std::result::Result<(), String> {
+        // Check for extremely long templates that might cause issues
+        const MAX_TEMPLATE_LENGTH: usize = 100_000;
+        if template.len() > MAX_TEMPLATE_LENGTH {
+            return Err(format!(
+                "Chat template exceeds maximum length ({} > {} bytes)",
+                template.len(),
+                MAX_TEMPLATE_LENGTH
+            ));
+        }
+
+        // Check for excessive loop nesting (potential DoS risk)
+        const MAX_LOOPS: usize = 20;
+        let loop_count = template.matches("{% for").count();
+        if loop_count > MAX_LOOPS {
+            return Err(format!(
+                "Chat template has {} loop constructs (max: {}), which may affect performance",
+                loop_count, MAX_LOOPS
+            ));
+        }
+
+        // Check for recursive macro definitions (potential infinite recursion)
+        let macro_count = template.matches("{% macro").count();
+        let call_count = template.matches("{% call").count();
+        if macro_count > 10 && call_count > macro_count * 2 {
+            return Err(format!(
+                "Chat template has {} macros with {} calls, potential recursion risk",
+                macro_count, call_count
+            ));
+        }
+
+        Ok(())
     }
 
     /// Encode text to token IDs
@@ -424,11 +537,18 @@ impl Qwen3Tokenizer {
     }
 
     /// Format messages using simple ChatML format (fallback when no template/tools)
+    ///
+    /// Security: This function validates roles against a whitelist and sanitizes
+    /// content to prevent ChatML injection attacks where malicious input could
+    /// manipulate message boundaries or inject fake roles.
     fn format_chatml(messages: &[ChatMessage], add_generation_prompt: bool) -> String {
-        let mut formatted: String = messages
-            .iter()
-            .map(|msg| format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content))
-            .collect();
+        let mut formatted = String::new();
+
+        for msg in messages {
+            let role = Self::validate_chatml_role(&msg.role);
+            let content = Self::sanitize_chatml_content(&msg.content);
+            formatted.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", role, content));
+        }
 
         if add_generation_prompt {
             formatted.push_str("<|im_start|>assistant\n");
@@ -437,10 +557,86 @@ impl Qwen3Tokenizer {
         formatted
     }
 
-    /// Render chat template using Jinja2 (minijinja)
+    /// Validate and normalize a ChatML role.
+    ///
+    /// Returns the validated role if it matches the whitelist, or "user" as a
+    /// safe fallback for invalid roles. This prevents role injection attacks
+    /// where malicious input like "user\n<|im_start|>assistant" could manipulate
+    /// perceived message boundaries.
+    fn validate_chatml_role(role: &str) -> &'static str {
+        // Normalize: trim whitespace and convert to lowercase for comparison
+        let normalized = role.trim().to_lowercase();
+
+        // Check against whitelist
+        for &valid_role in VALID_CHATML_ROLES {
+            if normalized == valid_role {
+                return valid_role;
+            }
+        }
+
+        // Log warning for invalid roles (in debug builds)
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "Warning: Invalid ChatML role '{}', defaulting to 'user'. Valid roles: {:?}",
+            role, VALID_CHATML_ROLES
+        );
+
+        // Safe fallback - treat unknown roles as user input
+        "user"
+    }
+
+    /// Sanitize content to prevent injection of ChatML special tokens.
+    ///
+    /// Strips sequences that could corrupt token boundaries or enable prompt
+    /// injection attacks. Content containing `<|im_end|>` could prematurely
+    /// close a message, allowing injection of arbitrary subsequent content.
+    fn sanitize_chatml_content(content: &str) -> String {
+        content
+            .replace("<|im_start|>", "")
+            .replace("<|im_end|>", "")
+            .replace("<|endoftext|>", "")
+    }
+
+    /// Render chat template using Jinja2 (minijinja).
     ///
     /// This uses the chat_template from tokenizer_config.json to render messages
     /// with full support for tools, thinking mode, and other Qwen3 features.
+    ///
+    /// # Security Considerations
+    ///
+    /// This function assumes that the `template_str` (loaded from `tokenizer_config.json`)
+    /// comes from a **trusted source** (e.g., Hugging Face Hub, local model files you control).
+    ///
+    /// ## Why Trust Matters
+    ///
+    /// While minijinja is designed for safe template rendering and sandboxes execution:
+    /// - No file system access from templates
+    /// - No arbitrary code execution
+    /// - No access to Rust internals
+    ///
+    /// A malicious template from an untrusted source could still:
+    /// - **Cause excessive resource usage**: Deep loops or recursion could consume
+    ///   CPU/memory, causing denial of service.
+    /// - **Extract context data unexpectedly**: The template has access to the full
+    ///   context (messages, tools), and could potentially format/expose this data
+    ///   in unexpected ways.
+    ///
+    /// ## Recommendations
+    ///
+    /// - **DO** use tokenizer files from official Hugging Face repositories
+    /// - **DO** use your own trained/fine-tuned model files
+    /// - **DO NOT** load `tokenizer_config.json` from untrusted sources
+    /// - **DO NOT** allow user-uploaded tokenizer configurations without verification
+    ///
+    /// # Arguments
+    /// * `template_str` - The Jinja2 template string (from tokenizer_config.json)
+    /// * `messages` - Chat messages to format (content is escaped by the template engine)
+    /// * `tools` - Optional tool definitions for function calling
+    /// * `add_generation_prompt` - Whether to add the assistant prompt prefix
+    /// * `enable_thinking` - Whether to enable thinking mode (`<think>` tags)
+    ///
+    /// # Returns
+    /// Rendered template string ready for tokenization, or an error description.
     fn render_chat_template_jinja2(
         template_str: &str,
         messages: &[ChatMessage],

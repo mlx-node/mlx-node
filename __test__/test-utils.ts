@@ -30,9 +30,6 @@ export function createInt32Array(data: number[] | Int32Array, shape: number[] | 
   return MxArrayClass.fromInt32(int32Data, int64Shape);
 }
 
-// Import Tensor class for factory methods
-const { Tensor: TensorClass } = require('@mlx-node/core');
-
 /**
  * Helper to create Int32Array from regular array
  */
@@ -59,36 +56,6 @@ export function float32(...values: number[]): Float32Array {
  */
 export function float64(...values: number[]): Float64Array {
   return new Float64Array(values);
-}
-
-/**
- * Helper function to create Tensor from regular arrays (float32)
- * @param data - Regular JavaScript array of numbers
- * @param shape - Regular JavaScript array of shape dimensions or BigInt64Array
- * @param requiresGrad - Whether the tensor requires gradients
- * @returns Tensor instance
- */
-export function createFloat32Tensor(
-  data: number[],
-  shape: number[] | BigInt64Array,
-  requiresGrad: boolean = false,
-): any {
-  const float32Data = new Float32Array(data);
-  const int64Shape = shape instanceof BigInt64Array ? shape : BigInt64Array.from(shape.map((x) => BigInt(x)));
-  return TensorClass.fromFloat32(float32Data, int64Shape, requiresGrad);
-}
-
-/**
- * Helper function to create Tensor from regular arrays (int32)
- * @param data - Regular JavaScript array of numbers
- * @param shape - Regular JavaScript array of shape dimensions or BigInt64Array
- * @param requiresGrad - Whether the tensor requires gradients
- * @returns Tensor instance
- */
-export function createInt32Tensor(data: number[], shape: number[] | BigInt64Array, requiresGrad: boolean = false): any {
-  const int32Data = new Int32Array(data);
-  const int64Shape = shape instanceof BigInt64Array ? shape : BigInt64Array.from(shape.map((x) => BigInt(x)));
-  return TensorClass.fromInt32(int32Data, int64Shape, requiresGrad);
 }
 
 /**
@@ -123,30 +90,6 @@ export function createOnesArray(shape: number[] | BigInt64Array, dtype?: any): M
 export function createFullArray(shape: number[] | BigInt64Array, fillValue: number | MxArray, dtype?: any): MxArray {
   const int64Shape = shape instanceof BigInt64Array ? shape : BigInt64Array.from(shape.map((x) => BigInt(x)));
   return MxArrayClass.full(int64Shape, fillValue, dtype);
-}
-
-/**
- * Helper function to create zeros tensor
- * @param shape - Regular JavaScript array of shape dimensions or BigInt64Array
- * @param dtype - Optional data type
- * @param requiresGrad - Whether the tensor requires gradients
- * @returns Tensor instance
- */
-export function createZerosTensor(shape: number[] | BigInt64Array, dtype?: any, requiresGrad: boolean = false): any {
-  const int64Shape = shape instanceof BigInt64Array ? shape : BigInt64Array.from(shape.map((x) => BigInt(x)));
-  return TensorClass.zeros(int64Shape, dtype, requiresGrad);
-}
-
-/**
- * Helper function to create ones tensor
- * @param shape - Regular JavaScript array of shape dimensions or BigInt64Array
- * @param dtype - Optional data type
- * @param requiresGrad - Whether the tensor requires gradients
- * @returns Tensor instance
- */
-export function createOnesTensor(shape: number[] | BigInt64Array, dtype?: any, requiresGrad: boolean = false): any {
-  const int64Shape = shape instanceof BigInt64Array ? shape : BigInt64Array.from(shape.map((x) => BigInt(x)));
-  return TensorClass.ones(int64Shape, dtype, requiresGrad);
 }
 
 /**

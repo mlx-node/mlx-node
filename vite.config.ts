@@ -46,4 +46,10 @@ export default defineConfig({
       '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),
     },
   },
+  tasks: {
+    test: {
+      command: 'vite test run && TEST_TRAINER=1 vite test run',
+      envs: ['TEST_TRAINER'],
+    },
+  },
 });
