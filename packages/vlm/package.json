@@ -1,0 +1,24 @@
+{
+  "name": "@mlx-node/vlm",
+  "version": "0.0.0",
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vite test run"
+  },
+  "dependencies": {
+    "@mlx-node/core": "workspace:*",
+    "@mlx-node/lm": "workspace:*"
+  }
+}

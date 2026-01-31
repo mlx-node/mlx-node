@@ -487,6 +487,15 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@mlx-node/vlm@workspace:*, @mlx-node/vlm@workspace:packages/vlm":
+  version: 0.0.0-use.local
+  resolution: "@mlx-node/vlm@workspace:packages/vlm"
+  dependencies:
+    "@mlx-node/core": "workspace:*"
+    "@mlx-node/lm": "workspace:*"
+  languageName: unknown
+  linkType: soft
+
 "@napi-rs/cli@npm:^3.5.1":
   version: 3.5.1
   resolution: "@napi-rs/cli@npm:3.5.1"
@@ -2662,6 +2671,7 @@ __metadata:
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/trl": "workspace:*"
+    "@mlx-node/vlm": "workspace:*"
     "@openrouter/ai-sdk-provider": "npm:^1.5.4"
     ai: "npm:^6.0.12"
     zod: "npm:^4.3.5"

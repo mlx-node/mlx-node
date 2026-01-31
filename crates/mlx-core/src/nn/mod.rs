@@ -9,6 +9,11 @@ pub mod losses;
 pub mod normalization;
 pub mod rope;
 
+#[cfg(test)]
+mod layers_test;
+#[cfg(test)]
+mod losses_test;
+
 // Re-export all public items
 pub use activations::Activations;
 pub use embedding::Embedding;

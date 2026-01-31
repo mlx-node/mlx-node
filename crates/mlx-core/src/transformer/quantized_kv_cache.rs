@@ -22,7 +22,6 @@
 use crate::array::MxArray;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 /// Quantized Key-Value Cache for memory-efficient transformer inference.
 ///
@@ -30,14 +29,14 @@ use napi_derive::napi;
 /// Memory savings: 8-bit = ~2x, 4-bit = ~4x compared to float16/bfloat16.
 ///
 /// # Example
-/// ```javascript
+/// ```rust
 /// // Create a quantized cache with 8-bit precision
-/// const cache = new QuantizedKVCache({ bits: 8, groupSize: 64 });
-///
-/// // Update and fetch work the same as regular KVCache
-/// const [keys, values] = cache.updateAndFetch(newKeys, newValues);
+/// let cache = QuantizedKVCache::new(Some(QuantizedKVCacheConfig {
+///     bits: Some(8),
+///     group_size: Some(64),
+///     step: None,
+/// }));
 /// ```
-#[napi(js_name = "QuantizedKVCache")]
 pub struct QuantizedKVCache {
     // Quantized storage
     keys_quantized: Option<MxArray>,   // Packed quantized keys
@@ -58,8 +57,7 @@ pub struct QuantizedKVCache {
 }
 
 /// Configuration options for QuantizedKVCache
-#[napi(object)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QuantizedKVCacheConfig {
     /// Number of bits for quantization (4 or 8, default: 8)
     pub bits: Option<i32>,
@@ -78,7 +76,6 @@ impl Default for QuantizedKVCache {
     }
 }
 
-#[napi]
 impl QuantizedKVCache {
     /// Creates a new quantized KV cache.
     ///
@@ -86,14 +83,19 @@ impl QuantizedKVCache {
     /// * `config` - Optional configuration for bits, group_size, etc.
     ///
     /// # Example
-    /// ```javascript
+    /// ```rust
     /// // 8-bit quantization (recommended, minimal quality loss)
-    /// const cache8bit = new QuantizedKVCache({ bits: 8 });
+    /// let cache8bit = QuantizedKVCache::new(Some(QuantizedKVCacheConfig {
+    ///     bits: Some(8),
+    ///     ..Default::default()
+    /// }));
     ///
     /// // 4-bit quantization (maximum memory savings)
-    /// const cache4bit = new QuantizedKVCache({ bits: 4 });
+    /// let cache4bit = QuantizedKVCache::new(Some(QuantizedKVCacheConfig {
+    ///     bits: Some(4),
+    ///     ..Default::default()
+    /// }));
     /// ```
-    #[napi(constructor)]
     pub fn new(config: Option<QuantizedKVCacheConfig>) -> Self {
         let config = config.unwrap_or(QuantizedKVCacheConfig {
             bits: Some(8),
@@ -131,19 +133,16 @@ impl QuantizedKVCache {
     }
 
     /// Get the quantization bits (4 or 8)
-    #[napi(getter)]
     pub fn get_bits(&self) -> i32 {
         self.bits
     }
 
     /// Get the quantization group size
-    #[napi(getter)]
     pub fn get_group_size(&self) -> i32 {
         self.group_size
     }
 
     /// Get the current offset (number of cached tokens)
-    #[napi(getter)]
     pub fn get_offset(&self) -> i32 {
         self.offset
     }
@@ -159,7 +158,6 @@ impl QuantizedKVCache {
     ///
     /// # Returns
     /// Tuple of (cached_keys, cached_values) in full precision
-    #[napi]
     pub fn update_and_fetch(
         &mut self,
         keys: &MxArray,
@@ -220,7 +218,6 @@ impl QuantizedKVCache {
     }
 
     /// Resets the cache, clearing all stored data.
-    #[napi]
     pub fn reset(&mut self) {
         self.keys_quantized = None;
         self.values_quantized = None;
@@ -234,7 +231,6 @@ impl QuantizedKVCache {
     /// Get estimated memory usage in bytes.
     ///
     /// This is approximate based on the quantized tensor sizes.
-    #[napi]
     pub fn memory_usage(&self) -> f64 {
         let mut total: f64 = 0.0;
 

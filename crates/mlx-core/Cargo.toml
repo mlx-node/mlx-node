@@ -24,6 +24,7 @@ uuid = { workspace = true }
 regex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+image = { workspace = true }
 mlx-paged-attn = { workspace = true }
 mlx-db = { workspace = true }
 sqlx = { workspace = true }

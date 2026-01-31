@@ -228,6 +228,29 @@ impl Qwen3Tokenizer {
         Some(template)
     }
 
+    /// Load tokenizer from file synchronously (for internal use)
+    ///
+    /// # Arguments
+    /// * `tokenizer_path` - Path to the tokenizer.json file
+    ///
+    /// # Returns
+    /// Qwen3Tokenizer instance or error
+    pub fn from_file(tokenizer_path: &Path) -> std::result::Result<Self, String> {
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+
+        // Load chat template from tokenizer_config.json (in same directory)
+        let chat_template = Self::load_chat_template(tokenizer_path.to_string_lossy().as_ref());
+
+        Ok(Self {
+            tokenizer: Arc::new(tokenizer),
+            pad_token_id: ENDOFTEXT_TOKEN_ID,
+            eos_token_id: IM_END_TOKEN_ID,
+            bos_token_id: None, // Qwen3 doesn't use BOS by default
+            chat_template,
+        })
+    }
+
     /// Validates a chat template for suspicious patterns that could indicate
     /// denial of service risks.
     ///
@@ -955,6 +978,18 @@ impl Qwen3Tokenizer {
         // Encode the formatted text (don't add extra special tokens)
         let encoding = Self::encode_internal(&self.tokenizer, formatted, Some(false))?;
         Ok(encoding.get_ids().to_vec())
+    }
+}
+
+impl Clone for Qwen3Tokenizer {
+    fn clone(&self) -> Self {
+        Self {
+            tokenizer: self.tokenizer.clone(),
+            pad_token_id: self.pad_token_id,
+            eos_token_id: self.eos_token_id,
+            bos_token_id: self.bos_token_id,
+            chat_template: self.chat_template.clone(),
+        }
     }
 }
 

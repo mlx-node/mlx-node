@@ -1,7 +1,6 @@
 use crate::array::MxArray;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 use std::collections::HashMap;
 
 /// SGD optimizer state for a single parameter
@@ -16,7 +15,6 @@ struct SGDState {
 /// w = w - lr * v
 ///
 /// With optional Nesterov momentum and weight decay
-#[napi(js_name = "SGD")]
 pub struct SGD {
     learning_rate: f64,
     momentum: f64,
@@ -26,7 +24,6 @@ pub struct SGD {
     state: HashMap<String, SGDState>,
 }
 
-#[napi]
 impl SGD {
     /// Create a new SGD optimizer
     ///
@@ -36,7 +33,6 @@ impl SGD {
     ///   weight_decay: Weight decay (L2 penalty) (default: 0)
     ///   dampening: Dampening for momentum (default: 0)
     ///   nesterov: Whether to use Nesterov momentum (default: false)
-    #[napi(constructor)]
     pub fn new(
         learning_rate: f64,
         momentum: Option<f64>,
@@ -68,7 +64,6 @@ impl SGD {
     /// Update a single parameter (kept for backwards compatibility)
     ///
     /// For better performance when updating many parameters, use `update_batch` instead.
-    #[napi]
     pub fn update_single(
         &mut self,
         param_name: String,
@@ -90,7 +85,6 @@ impl SGD {
     ///
     /// Returns:
     ///   Vector of updated parameter arrays in the same order as input
-    #[napi]
     pub fn update_batch(
         &mut self,
         param_names: Vec<String>,
@@ -210,7 +204,6 @@ impl SGD {
     }
 
     /// Reset optimizer state
-    #[napi]
     pub fn reset(&mut self) {
         self.state.clear();
     }

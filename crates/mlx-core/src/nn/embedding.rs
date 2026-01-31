@@ -1,22 +1,18 @@
 use crate::array::MxArray;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 // ============================================
 // Embedding Layer
 // ============================================
 
-#[napi]
 pub struct Embedding {
     weight: MxArray,
     num_embeddings: u32,
     embedding_dim: u32,
 }
 
-#[napi]
 impl Embedding {
     /// Create a new Embedding layer
-    #[napi(constructor)]
     pub fn new(num_embeddings: u32, embedding_dim: u32) -> Result<Self> {
         // Initialize with normal distribution
         let shape = [num_embeddings as i64, embedding_dim as i64];
@@ -30,14 +26,12 @@ impl Embedding {
     }
 
     /// Forward pass: look up embeddings for indices
-    #[napi]
     pub fn forward(&self, indices: &MxArray) -> Result<MxArray> {
         // Use take operation to gather embeddings
         self.weight.take(indices, 0)
     }
 
     /// Load pretrained embeddings
-    #[napi]
     pub fn load_weight(&mut self, weight: &MxArray) -> Result<()> {
         let ndim = weight.ndim()?;
         if ndim != 2
@@ -57,15 +51,23 @@ impl Embedding {
     }
 
     /// Get the embedding weight matrix
-    #[napi]
     pub fn get_weight(&self) -> MxArray {
         self.weight.clone()
     }
 
+    /// Get the embedding weight matrix (alias for get_weight)
+    pub fn weight(&self) -> MxArray {
+        self.weight.clone()
+    }
+
     /// Set the embedding weight matrix (alias for load_weight for consistency)
-    #[napi]
     pub fn set_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.load_weight(weight)
+    }
+
+    /// Get the embedding dimension
+    pub fn embedding_dim(&self) -> u32 {
+        self.embedding_dim
     }
 }
 
@@ -76,5 +78,27 @@ impl Clone for Embedding {
             num_embeddings: self.num_embeddings,
             embedding_dim: self.embedding_dim,
         }
+    }
+}
+
+impl Embedding {
+    /// Create an Embedding layer from pre-loaded weight
+    ///
+    /// # Arguments
+    /// * `weight` - Embedding matrix [num_embeddings, embedding_dim]
+    pub fn from_weight(weight: &MxArray) -> Result<Self> {
+        let shape = weight.shape()?;
+        if shape.len() != 2 {
+            return Err(Error::from_reason(format!(
+                "Embedding weight must be 2D, got shape {:?}",
+                shape.as_ref()
+            )));
+        }
+
+        Ok(Self {
+            weight: weight.clone(),
+            num_embeddings: shape[0] as u32,
+            embedding_dim: shape[1] as u32,
+        })
     }
 }

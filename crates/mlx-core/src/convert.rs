@@ -304,16 +304,23 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
     fs::copy(&config_path, &output_config_path)
         .map_err(|e| Error::from_reason(format!("Failed to copy config.json: {}", e)))?;
 
-    // Copy tokenizer files if they exist
-    let tokenizer_files = [
+    // Copy tokenizer and model config files if they exist
+    let config_files = [
+        // Tokenizer files
         "tokenizer.json",
         "tokenizer_config.json",
         "vocab.json",
         "merges.txt",
         "special_tokens_map.json",
+        "added_tokens.json",
+        // Generation config
+        "generation_config.json",
+        // VLM-specific files
+        "preprocessor_config.json",
+        "processor_config.json",
     ];
 
-    for file_name in tokenizer_files.iter() {
+    for file_name in config_files.iter() {
         let src = input_dir.join(file_name);
         let dst = output_dir.join(file_name);
 

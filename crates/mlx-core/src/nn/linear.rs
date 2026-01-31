@@ -1,12 +1,10 @@
 use crate::array::MxArray;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 // ============================================
 // Linear Layer
 // ============================================
 
-#[napi]
 pub struct Linear {
     weight: MxArray,
     bias: Option<MxArray>,
@@ -14,10 +12,8 @@ pub struct Linear {
     out_features: u32,
 }
 
-#[napi]
 impl Linear {
     /// Create a new Linear layer
-    #[napi(constructor)]
     pub fn new(in_features: u32, out_features: u32, use_bias: Option<bool>) -> Result<Self> {
         // Initialize weight with Xavier/Glorot uniform initialization
         let scale = (6.0 / (in_features + out_features) as f64).sqrt();
@@ -44,7 +40,6 @@ impl Linear {
 
     /// Forward pass: y = xW^T + b
     /// Uses fused addmm operation when bias is present for better performance
-    #[napi]
     pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
         // For 2D arrays, transpose swaps axes 0 and 1
         let axes = [1, 0];
@@ -60,7 +55,6 @@ impl Linear {
     }
 
     /// Set new weights
-    #[napi]
     pub fn set_weight(&mut self, weight: &MxArray) -> Result<()> {
         let ndim = weight.ndim()?;
         if ndim != 2
@@ -80,7 +74,6 @@ impl Linear {
     }
 
     /// Set new bias
-    #[napi]
     pub fn set_bias(&mut self, bias: Option<&MxArray>) -> Result<()> {
         if let Some(b) = bias {
             let ndim = b.ndim()?;
@@ -100,13 +93,11 @@ impl Linear {
     }
 
     /// Get the weight matrix
-    #[napi]
     pub fn get_weight(&self) -> MxArray {
         self.weight.clone()
     }
 
     /// Get the bias vector (if present)
-    #[napi]
     pub fn get_bias(&self) -> Option<MxArray> {
         self.bias.clone()
     }
@@ -120,5 +111,32 @@ impl Clone for Linear {
             in_features: self.in_features,
             out_features: self.out_features,
         }
+    }
+}
+
+impl Linear {
+    /// Create a Linear layer from pre-loaded weights
+    ///
+    /// # Arguments
+    /// * `weight` - Weight matrix [out_features, in_features]
+    /// * `bias` - Optional bias vector [out_features]
+    pub fn from_weights(weight: &MxArray, bias: Option<&MxArray>) -> Result<Self> {
+        let shape = weight.shape()?;
+        if shape.len() != 2 {
+            return Err(Error::from_reason(format!(
+                "Linear weight must be 2D, got shape {:?}",
+                shape.as_ref()
+            )));
+        }
+
+        let out_features = shape[0] as u32;
+        let in_features = shape[1] as u32;
+
+        Ok(Self {
+            weight: weight.clone(),
+            bias: bias.cloned(),
+            in_features,
+            out_features,
+        })
     }
 }

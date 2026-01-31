@@ -1,7 +1,6 @@
 use crate::array::MxArray;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 use std::collections::HashMap;
 
 /// AdamW optimizer state for a single parameter
@@ -16,7 +15,6 @@ struct AdamWState {
 /// m = β₁ * m + (1 - β₁) * g
 /// v = β₂ * v + (1 - β₂) * g²
 /// w = w * (1 - lr * weight_decay) - lr * m / (√v + ε)
-#[napi]
 pub struct AdamW {
     learning_rate: f64,
     beta1: f64,
@@ -28,7 +26,6 @@ pub struct AdamW {
     state: HashMap<String, AdamWState>,
 }
 
-#[napi]
 impl AdamW {
     /// Create a new AdamW optimizer
     ///
@@ -39,7 +36,6 @@ impl AdamW {
     ///   eps: Small constant for numerical stability (default: 1e-8)
     ///   weight_decay: Weight decay coefficient (default: 0.01)
     ///   bias_correction: Whether to apply bias correction (default: false)
-    #[napi(constructor)]
     pub fn new(
         learning_rate: Option<f64>,
         beta1: Option<f64>,
@@ -63,7 +59,6 @@ impl AdamW {
     /// Update a single parameter (kept for backwards compatibility)
     ///
     /// For better performance when updating many parameters, use `update_batch` instead.
-    #[napi]
     pub fn update_single(
         &mut self,
         param_name: String,
@@ -86,7 +81,6 @@ impl AdamW {
     ///
     /// Returns:
     ///   Vector of updated parameter arrays in the same order as input
-    #[napi]
     pub fn update_batch(
         &mut self,
         param_names: Vec<String>,
@@ -207,7 +201,6 @@ impl AdamW {
     }
 
     /// Reset optimizer state
-    #[napi]
     pub fn reset(&mut self) {
         self.state.clear();
         self.step = 0;
@@ -217,7 +210,6 @@ impl AdamW {
     ///
     /// This is useful for checkpointing the optimizer state.
     /// The step count is used for bias correction in AdamW.
-    #[napi]
     pub fn get_step(&self) -> i64 {
         self.step
     }
@@ -226,7 +218,6 @@ impl AdamW {
     ///
     /// This is typically used when resuming from a checkpoint to restore
     /// the optimizer's step counter for correct bias correction.
-    #[napi]
     pub fn set_step(&mut self, step: i64) {
         self.step = step;
     }
@@ -234,7 +225,6 @@ impl AdamW {
     /// Get all parameter names that have optimizer state
     ///
     /// Useful for inspecting which parameters the optimizer is tracking.
-    #[napi]
     pub fn get_state_keys(&self) -> Vec<String> {
         self.state.keys().cloned().collect()
     }
@@ -242,7 +232,6 @@ impl AdamW {
     /// Get the first moment (m) for a specific parameter
     ///
     /// Returns None if the parameter doesn't have optimizer state.
-    #[napi]
     pub fn get_first_moment(&self, param_name: String) -> Option<MxArray> {
         self.state.get(&param_name).map(|s| s.m.clone())
     }
@@ -250,7 +239,6 @@ impl AdamW {
     /// Get the second moment (v) for a specific parameter
     ///
     /// Returns None if the parameter doesn't have optimizer state.
-    #[napi]
     pub fn get_second_moment(&self, param_name: String) -> Option<MxArray> {
         self.state.get(&param_name).map(|s| s.v.clone())
     }
@@ -259,7 +247,6 @@ impl AdamW {
     ///
     /// This is used when restoring optimizer state from a checkpoint.
     /// The shape must match the parameter's shape.
-    #[napi]
     pub fn set_first_moment(&mut self, param_name: String, m: &MxArray) -> Result<()> {
         if let Some(state) = self.state.get_mut(&param_name) {
             state.m = m.clone();
@@ -277,7 +264,6 @@ impl AdamW {
     ///
     /// This is used when restoring optimizer state from a checkpoint.
     /// The shape must match the parameter's shape.
-    #[napi]
     pub fn set_second_moment(&mut self, param_name: String, v: &MxArray) -> Result<()> {
         if let Some(state) = self.state.get_mut(&param_name) {
             state.v = v.clone();

@@ -1,7 +1,6 @@
 use crate::array::MxArray;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 use std::collections::HashMap;
 
 /// RMSprop optimizer state for a single parameter
@@ -14,7 +13,6 @@ struct RMSpropState {
 /// Updates parameters using:
 /// v = α * v + (1 - α) * g²
 /// w = w - lr * g / (√v + ε)
-#[napi(js_name = "RMSprop")]
 pub struct RMSprop {
     learning_rate: f64,
     alpha: f64,
@@ -23,7 +21,6 @@ pub struct RMSprop {
     state: HashMap<String, RMSpropState>,
 }
 
-#[napi]
 impl RMSprop {
     /// Create a new RMSprop optimizer
     ///
@@ -32,7 +29,6 @@ impl RMSprop {
     ///   alpha: Smoothing constant (default: 0.99)
     ///   eps: Small constant for numerical stability (default: 1e-8)
     ///   weight_decay: Weight decay (L2 penalty) (default: 0)
-    #[napi(constructor)]
     pub fn new(
         learning_rate: Option<f64>,
         alpha: Option<f64>,
@@ -51,7 +47,6 @@ impl RMSprop {
     /// Update a single parameter (kept for backwards compatibility)
     ///
     /// For better performance when updating many parameters, use `update_batch` instead.
-    #[napi]
     pub fn update_single(
         &mut self,
         param_name: String,
@@ -73,7 +68,6 @@ impl RMSprop {
     ///
     /// Returns:
     ///   Vector of updated parameter arrays in the same order as input
-    #[napi]
     pub fn update_batch(
         &mut self,
         param_names: Vec<String>,
@@ -172,7 +166,6 @@ impl RMSprop {
     }
 
     /// Reset optimizer state
-    #[napi]
     pub fn reset(&mut self) {
         self.state.clear();
     }

@@ -1,7 +1,6 @@
 use crate::array::MxArray;
 use mlx_sys as sys;
 use napi::Result;
-use napi_derive::napi;
 
 // Module declarations
 mod activation_gradients;
@@ -9,7 +8,6 @@ mod loss_gradients;
 mod nn_gradients;
 
 /// Gradient computation utilities for backpropagation
-#[napi]
 pub struct Gradients;
 
 // ============================================
@@ -229,7 +227,6 @@ where
 /// else:
 ///     clipped_grads = gradients (unchanged)
 /// ```
-#[napi]
 pub fn clip_gradients_by_global_norm(
     gradients: Vec<&MxArray>,
     max_norm: f64,
@@ -295,7 +292,6 @@ pub fn clip_gradients_by_global_norm(
 ///
 /// # Returns
 /// * Vector of clipped gradients
-#[napi]
 pub fn clip_gradients_by_value(
     gradients: Vec<&MxArray>,
     min_value: f64,

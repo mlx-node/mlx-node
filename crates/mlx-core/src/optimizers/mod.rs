@@ -1,6 +1,5 @@
 use crate::array::MxArray;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 use std::collections::HashMap;
 
 // Module declarations
@@ -8,6 +7,9 @@ pub mod adam;
 pub mod adamw;
 pub mod rmsprop;
 pub mod sgd;
+
+#[cfg(test)]
+mod optimizers_test;
 
 // Re-exports
 pub use adam::Adam;
@@ -30,10 +32,8 @@ pub trait OptimizerImpl {
 }
 
 /// Gradient utilities
-#[napi]
 pub struct GradientUtils;
 
-#[napi]
 impl GradientUtils {
     // NOTE: compute_gradient_norm was removed because it transferred all gradients to CPU
     // (~2GB for large models). Use clip_grad_norm_with_norm with max_norm=Infinity instead.
@@ -47,7 +47,6 @@ impl GradientUtils {
     ///
     /// OPTIMIZED: Uses GPU for all computations and preserves original dtype.
     /// Previous implementation used CPU transfers and converted to float32.
-    #[napi]
     pub fn clip_grad_norm(
         gradients: HashMap<String, &MxArray>,
         max_norm: f64,
@@ -96,7 +95,6 @@ impl GradientUtils {
     /// Use this when you need both the clipped gradients and the original norm.
     ///
     /// OPTIMIZED: Uses GPU for all computations and preserves original dtype.
-    #[napi]
     pub fn clip_grad_norm_with_norm(
         gradients: HashMap<String, &MxArray>,
         max_norm: f64,
@@ -144,7 +142,6 @@ impl GradientUtils {
     /// Clip gradients by value
     ///
     /// Clips gradient values to be within [min_val, max_val]
-    #[napi]
     pub fn clip_grad_value(grad: &MxArray, min_val: f64, max_val: f64) -> Result<MxArray> {
         grad.clip(Some(min_val), Some(max_val))
     }
@@ -211,15 +208,12 @@ impl GradientUtils {
 }
 
 /// Learning rate schedulers
-#[napi(js_name = "LRScheduler")]
 pub struct LRScheduler;
 
-#[napi]
 impl LRScheduler {
     /// Linear decay scheduler
     ///
     /// Linearly decays learning rate from initial_lr to final_lr over total_steps
-    #[napi]
     pub fn linear_decay(
         initial_lr: f64,
         final_lr: f64,
@@ -237,7 +231,6 @@ impl LRScheduler {
     /// Exponential decay scheduler
     ///
     /// lr = initial_lr * decay_rate^(current_step / decay_steps)
-    #[napi]
     pub fn exponential_decay(
         initial_lr: f64,
         decay_rate: f64,
@@ -250,7 +243,6 @@ impl LRScheduler {
     /// Cosine annealing scheduler
     ///
     /// Uses cosine annealing to decay learning rate
-    #[napi]
     pub fn cosine_annealing(
         initial_lr: f64,
         min_lr: f64,
@@ -269,7 +261,6 @@ impl LRScheduler {
     /// Step decay scheduler
     ///
     /// Decreases learning rate by factor every step_size steps
-    #[napi]
     pub fn step_decay(initial_lr: f64, factor: f64, current_step: i64, step_size: i64) -> f64 {
         let num_decays = current_step / step_size;
         initial_lr * factor.powi(num_decays as i32)

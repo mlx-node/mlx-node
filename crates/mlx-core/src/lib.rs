@@ -24,6 +24,7 @@ pub mod tools;
 pub mod tracing;
 pub mod transformer;
 pub mod utils;
+pub mod vision;
 
 use std::sync::LazyLock;
 use stream::{DeviceType, Stream};

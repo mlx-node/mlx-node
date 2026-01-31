@@ -28,189 +28,6 @@ export declare class Activations {
 }
 
 /**
- * The Adam optimizer
- *
- * Updates parameters using:
- * m = β₁ * m + (1 - β₁) * g
- * v = β₂ * v + (1 - β₂) * g²
- * w = w - lr * m / (√v + ε)
- */
-export declare class Adam {
-  /**
-   * Create a new Adam optimizer
-   *
-   * Args:
-   *   learning_rate: The learning rate (default: 1e-3)
-   *   beta1: The exponential decay rate for the first moment (default: 0.9)
-   *   beta2: The exponential decay rate for the second moment (default: 0.999)
-   *   eps: Small constant for numerical stability (default: 1e-8)
-   *   bias_correction: Whether to apply bias correction (default: false)
-   */
-  constructor(learningRate?: number | undefined | null, beta1?: number | undefined | null, beta2?: number | undefined | null, eps?: number | undefined | null, biasCorrection?: boolean | undefined | null)
-  /**
-   * Update a single parameter (kept for backwards compatibility)
-   *
-   * For better performance when updating many parameters, use `update_batch` instead.
-   */
-  updateSingle(paramName: string, param: MxArray, grad: MxArray): MxArray
-  /**
-   * Batch update all parameters in a single call
-   *
-   * This is more efficient than calling update_single repeatedly due to reduced FFI overhead.
-   * For Qwen3-0.6B with ~300 parameters, this reduces FFI calls from 300+ to 1.
-   *
-   * Args:
-   *   param_names: Vector of parameter names
-   *   params: Vector of parameter arrays (must match param_names length)
-   *   grads: Vector of gradient arrays (must match param_names length)
-   *
-   * Returns:
-   *   Vector of updated parameter arrays in the same order as input
-   */
-  updateBatch(paramNames: Array<string>, params: Array<MxArray>, grads: Array<MxArray>): Array<MxArray>
-  /** Reset optimizer state */
-  reset(): void
-  /**
-   * Get the current step count
-   *
-   * This is useful for checkpointing the optimizer state.
-   * The step count is used for bias correction in Adam.
-   */
-  getStep(): number
-  /**
-   * Set the step count
-   *
-   * This is typically used when resuming from a checkpoint to restore
-   * the optimizer's step counter for correct bias correction.
-   */
-  setStep(step: number): void
-  /**
-   * Get all parameter names that have optimizer state
-   *
-   * Useful for inspecting which parameters the optimizer is tracking.
-   */
-  getStateKeys(): Array<string>
-  /**
-   * Get the first moment (m) for a specific parameter
-   *
-   * Returns None if the parameter doesn't have optimizer state.
-   */
-  getFirstMoment(paramName: string): MxArray | null
-  /**
-   * Get the second moment (v) for a specific parameter
-   *
-   * Returns None if the parameter doesn't have optimizer state.
-   */
-  getSecondMoment(paramName: string): MxArray | null
-  /**
-   * Set the first moment (m) for a specific parameter
-   *
-   * This is used when restoring optimizer state from a checkpoint.
-   * The shape must match the parameter's shape.
-   */
-  setFirstMoment(paramName: string, m: MxArray): void
-  /**
-   * Set the second moment (v) for a specific parameter
-   *
-   * This is used when restoring optimizer state from a checkpoint.
-   * The shape must match the parameter's shape.
-   */
-  setSecondMoment(paramName: string, v: MxArray): void
-}
-
-/**
- * The AdamW optimizer (Adam with decoupled weight decay)
- *
- * Updates parameters using:
- * m = β₁ * m + (1 - β₁) * g
- * v = β₂ * v + (1 - β₂) * g²
- * w = w * (1 - lr * weight_decay) - lr * m / (√v + ε)
- */
-export declare class AdamW {
-  /**
-   * Create a new AdamW optimizer
-   *
-   * Args:
-   *   learning_rate: The learning rate (default: 1e-3)
-   *   beta1: The exponential decay rate for the first moment (default: 0.9)
-   *   beta2: The exponential decay rate for the second moment (default: 0.999)
-   *   eps: Small constant for numerical stability (default: 1e-8)
-   *   weight_decay: Weight decay coefficient (default: 0.01)
-   *   bias_correction: Whether to apply bias correction (default: false)
-   */
-  constructor(learningRate?: number | undefined | null, beta1?: number | undefined | null, beta2?: number | undefined | null, eps?: number | undefined | null, weightDecay?: number | undefined | null, biasCorrection?: boolean | undefined | null)
-  /**
-   * Update a single parameter (kept for backwards compatibility)
-   *
-   * For better performance when updating many parameters, use `update_batch` instead.
-   */
-  updateSingle(paramName: string, param: MxArray, grad: MxArray): MxArray
-  /**
-   * Batch update all parameters in a single call
-   *
-   * This is more efficient than calling update_single repeatedly due to reduced FFI overhead.
-   * For Qwen3-0.6B with ~300 parameters, this reduces FFI calls from 300+ to 1.
-   *
-   * Args:
-   *   param_names: Vector of parameter names
-   *   params: Vector of parameter arrays (must match param_names length)
-   *   grads: Vector of gradient arrays (must match param_names length)
-   *
-   * Returns:
-   *   Vector of updated parameter arrays in the same order as input
-   */
-  updateBatch(paramNames: Array<string>, params: Array<MxArray>, grads: Array<MxArray>): Array<MxArray>
-  /** Reset optimizer state */
-  reset(): void
-  /**
-   * Get the current step count
-   *
-   * This is useful for checkpointing the optimizer state.
-   * The step count is used for bias correction in AdamW.
-   */
-  getStep(): number
-  /**
-   * Set the step count
-   *
-   * This is typically used when resuming from a checkpoint to restore
-   * the optimizer's step counter for correct bias correction.
-   */
-  setStep(step: number): void
-  /**
-   * Get all parameter names that have optimizer state
-   *
-   * Useful for inspecting which parameters the optimizer is tracking.
-   */
-  getStateKeys(): Array<string>
-  /**
-   * Get the first moment (m) for a specific parameter
-   *
-   * Returns None if the parameter doesn't have optimizer state.
-   */
-  getFirstMoment(paramName: string): MxArray | null
-  /**
-   * Get the second moment (v) for a specific parameter
-   *
-   * Returns None if the parameter doesn't have optimizer state.
-   */
-  getSecondMoment(paramName: string): MxArray | null
-  /**
-   * Set the first moment (m) for a specific parameter
-   *
-   * This is used when restoring optimizer state from a checkpoint.
-   * The shape must match the parameter's shape.
-   */
-  setFirstMoment(paramName: string, m: MxArray): void
-  /**
-   * Set the second moment (v) for a specific parameter
-   *
-   * This is used when restoring optimizer state from a checkpoint.
-   * The shape must match the parameter's shape.
-   */
-  setSecondMoment(paramName: string, v: MxArray): void
-}
-
-/**
  * Multi-head attention with separate Q/K/V projections (Qwen3 style).
  *
  * Supports:
@@ -439,19 +256,6 @@ export declare class ChatResult {
   get rawText(): string
 }
 
-export declare class Embedding {
-  /** Create a new Embedding layer */
-  constructor(numEmbeddings: number, embeddingDim: number)
-  /** Forward pass: look up embeddings for indices */
-  forward(indices: MxArray): MxArray
-  /** Load pretrained embeddings */
-  loadWeight(weight: MxArray): void
-  /** Get the embedding weight matrix */
-  getWeight(): MxArray
-  /** Set the embedding weight matrix (alias for load_weight for consistency) */
-  setWeight(weight: MxArray): void
-}
-
 /**
  * Multi-head attention with fused QKV projection (Phi3/Llama style).
  *
@@ -504,143 +308,6 @@ export declare class GenerationResult {
   get finishReason(): 'eos' | 'length' | 'repetition'
   /** Get the number of tokens generated */
   get numTokens(): number
-}
-
-/** Gradient computation utilities for backpropagation */
-export declare class Gradients {
-  /**
-   * Compute gradient of SiLU activation: x * sigmoid(x)
-   *
-   * Derivative: sigmoid(x) * (1 + x * (1 - sigmoid(x)))
-   */
-  static siluBackward(input: MxArray, gradOutput: MxArray): MxArray
-  /**
-   * Compute gradient of ReLU activation
-   *
-   * Derivative: mask(x > 0) * grad_output
-   */
-  static reluBackward(input: MxArray, gradOutput: MxArray): MxArray
-  /**
-   * Compute gradient of Sigmoid activation
-   *
-   * Derivative: sigmoid(x) * (1 - sigmoid(x)) * grad_output
-   */
-  static sigmoidBackward(input: MxArray, gradOutput: MxArray): MxArray
-  /**
-   * Compute gradient of cross-entropy loss w.r.t. logits
-   *
-   * Given:
-   * - loss = CrossEntropy(logits, targets)
-   *
-   * Returns:
-   * - d(loss)/d(logits) = softmax(logits) - one_hot(targets)
-   *
-   * This is the gradient you would use to backprop through a classifier.
-   */
-  static crossEntropyBackward(logits: MxArray, targets: MxArray, numClasses?: number | undefined | null): MxArray
-  /**
-   * Compute gradient of MSE loss w.r.t. predictions
-   *
-   * Given:
-   * - loss = MSE(predictions, targets) = mean((predictions - targets)^2)
-   *
-   * Returns:
-   * - d(loss)/d(predictions) = 2 * (predictions - targets) / n
-   */
-  static mseBackward(predictions: MxArray, targets: MxArray): MxArray
-  /**
-   * Compute gradient of Linear layer
-   *
-   * Given:
-   * - forward: y = xW^T + b
-   * - grad_output: gradient w.r.t. output
-   *
-   * Returns:
-   * - [grad_x, grad_weight, grad_bias]
-   *
-   * Where:
-   * - grad_x = grad_output @ W
-   * - grad_weight = grad_output^T @ x
-   * - grad_bias = sum(grad_output, axis=0) if bias exists
-   */
-  static linearBackward(input: MxArray, weight: MxArray, gradOutput: MxArray, hasBias: boolean): Array<MxArray>
-  /**
-   * Compute gradient of RMSNorm layer
-   *
-   * This is a complex gradient involving the normalization statistics.
-   */
-  static rmsNormBackward(input: MxArray, weight: MxArray, gradOutput: MxArray, eps: number): Array<MxArray>
-  /**
-   * Compute gradient of MLP (SwiGLU) layer
-   *
-   * Forward:
-   * - gate = x @ W_gate^T
-   * - up = x @ W_up^T
-   * - hidden = silu(gate) * up
-   * - out = hidden @ W_down^T
-   *
-   * Returns: [grad_x, grad_gate_weight, grad_up_weight, grad_down_weight]
-   */
-  static mlpBackward(gradOutput: MxArray, input: MxArray, gateWeight: MxArray, upWeight: MxArray, downWeight: MxArray): Array<MxArray>
-  /**
-   * Compute gradients for multi-head attention layer.
-   *
-   * This is a simplified implementation that computes gradients for the learned
-   * projection weights. It uses cached activations from forward_with_cache().
-   *
-   * # Arguments
-   * * `grad_output` - Gradient from next layer, shape: (batch, seq_len, hidden_size)
-   * * `cached_values` - Cached activations from forward_with_cache():
-   *   - `[0]`: input x
-   *   - `[1]`: queries_proj (after Q projection, before reshape)
-   *   - `[2]`: keys_proj (after K projection, before reshape)
-   *   - `[3]`: values_proj (after V projection, before reshape)
-   *   - `[4]`: queries_final (ready for attention)
-   *   - `[5]`: keys_final (ready for attention)
-   *   - `[6]`: values_final (ready for attention)
-   *   - `[7]`: attention_output (before transpose back)
-   *   - `[8]`: attention_output_transposed
-   *   - `[9]`: attention_output_reshaped (before o_proj)
-   * * `q_weight` - Query projection weight
-   * * `k_weight` - Key projection weight
-   * * `v_weight` - Value projection weight
-   * * `o_weight` - Output projection weight
-   *
-   * # Returns
-   * Vector of gradients: [grad_input, grad_q_weight, grad_k_weight, grad_v_weight, grad_o_weight]
-   */
-  static attentionBackward(gradOutput: MxArray, cachedValues: Array<MxArray>, qWeight: MxArray, kWeight: MxArray, vWeight: MxArray, oWeight: MxArray): Array<MxArray>
-}
-
-/** Gradient utilities */
-export declare class GradientUtils {
-  /**
-   * Clip gradients by global L2 norm
-   *
-   * Scales all gradients proportionally so that their global L2 norm
-   * doesn't exceed max_norm. This is the standard gradient clipping
-   * approach used in deep learning (same as PyTorch's clip_grad_norm_
-   * and MLX's clip_grad_norm).
-   *
-   * OPTIMIZED: Uses GPU for all computations and preserves original dtype.
-   * Previous implementation used CPU transfers and converted to float32.
-   */
-  static clipGradNorm(gradients: Record<string, MxArray>, maxNorm: number): Record<string, MxArray>
-  /**
-   * Clip gradients by global L2 norm and return both clipped gradients and norm
-   *
-   * This combines `compute_gradient_norm` and `clip_grad_norm` into one call.
-   * Use this when you need both the clipped gradients and the original norm.
-   *
-   * OPTIMIZED: Uses GPU for all computations and preserves original dtype.
-   */
-  static clipGradNormWithNorm(gradients: Record<string, MxArray>, maxNorm: number): [Record<string, MxArray>, number]
-  /**
-   * Clip gradients by value
-   *
-   * Clips gradient values to be within [min_val, max_val]
-   */
-  static clipGradValue(grad: MxArray, minVal: number, maxVal: number): MxArray
 }
 
 /**
@@ -756,6 +423,21 @@ export declare class GrpoTrainingEngine {
 }
 export type GRPOTrainingEngine = GrpoTrainingEngine
 
+/** Image Processor for PaddleOCR-VL */
+export declare class ImageProcessor {
+  constructor(config?: ImageProcessorConfig | undefined | null)
+  /** Get the resize factor (patch_size * merge_size) */
+  get resizeFactor(): number
+  /** Compute target size for an image */
+  getTargetSize(height: number, width: number): [number, number]
+  /** Get configuration */
+  get config(): ImageProcessorConfig
+  /** Process an image from file path */
+  processFile(path: string): ProcessedImage
+  /** Process an image from bytes (Buffer) */
+  processBytes(data: Uint8Array): ProcessedImage
+}
+
 /**
  * Key-Value cache for efficient transformer inference.
  *
@@ -795,125 +477,6 @@ export declare class KVCache {
    * The next `update_and_fetch` call will overwrite the trimmed data in-place.
    */
   trim(newLen: number): void
-}
-
-export declare class LayerNorm {
-  /** Create a new LayerNorm layer */
-  constructor(dims: number, eps?: number | undefined | null)
-  /**
-   * Forward pass: LayerNorm(x) = (x - mean) / sqrt(var + eps) * weight + bias
-   * Uses mx.fast.layer_norm for optimal performance (single fused Metal kernel)
-   */
-  forward(input: MxArray): MxArray
-}
-
-export declare class Linear {
-  /** Create a new Linear layer */
-  constructor(inFeatures: number, outFeatures: number, useBias?: boolean | undefined | null)
-  /**
-   * Forward pass: y = xW^T + b
-   * Uses fused addmm operation when bias is present for better performance
-   */
-  forward(input: MxArray): MxArray
-  /** Set new weights */
-  setWeight(weight: MxArray): void
-  /** Set new bias */
-  setBias(bias?: MxArray | undefined | null): void
-  /** Get the weight matrix */
-  getWeight(): MxArray
-  /** Get the bias vector (if present) */
-  getBias(): MxArray | null
-}
-
-export declare class Losses {
-  /**
-   * Cross-entropy loss
-   * Expects logits of shape [batch_size, vocab_size] and targets of shape [batch_size]
-   */
-  static crossEntropy(logits: MxArray, targets: MxArray, numClasses?: number | undefined | null, ignoreIndex?: number | undefined | null, labelSmoothing?: number | undefined | null): MxArray
-  /**
-   * KL Divergence loss: KL(P || Q) = sum(P * log(P/Q))
-   * Expects log probabilities for numerical stability
-   */
-  static klDivergence(logP: MxArray, logQ: MxArray): MxArray
-  /** Mean Squared Error loss */
-  static mse(predictions: MxArray, targets: MxArray): MxArray
-}
-
-/** Learning rate schedulers */
-export declare class LRScheduler {
-  /**
-   * Linear decay scheduler
-   *
-   * Linearly decays learning rate from initial_lr to final_lr over total_steps
-   */
-  static linearDecay(initialLr: number, finalLr: number, currentStep: number, totalSteps: number): number
-  /**
-   * Exponential decay scheduler
-   *
-   * lr = initial_lr * decay_rate^(current_step / decay_steps)
-   */
-  static exponentialDecay(initialLr: number, decayRate: number, currentStep: number, decaySteps: number): number
-  /**
-   * Cosine annealing scheduler
-   *
-   * Uses cosine annealing to decay learning rate
-   */
-  static cosineAnnealing(initialLr: number, minLr: number, currentStep: number, totalSteps: number): number
-  /**
-   * Step decay scheduler
-   *
-   * Decreases learning rate by factor every step_size steps
-   */
-  static stepDecay(initialLr: number, factor: number, currentStep: number, stepSize: number): number
-}
-
-/**
- * Multi-Layer Perceptron with SwiGLU activation.
- *
- * Uses the gated linear unit activation popularized by models like Llama and Qwen:
- * output = down_proj(silu(gate_proj(x)) * up_proj(x))
- *
- * This is more expressive than standard FFN and is the default in modern LLMs.
- */
-export declare class MLP {
-  /**
-   * Creates a new MLP (SwiGLU) layer.
-   *
-   * # Arguments
-   * * `hidden_size` - Input/output dimension
-   * * `intermediate_size` - Hidden dimension (typically 4x or more of hidden_size)
-   */
-  constructor(hiddenSize: number, intermediateSize: number)
-  /**
-   * Forward pass: down(silu(gate(x)) * up(x))
-   *
-   * Uses fused C++ implementation for maximum performance (1 FFI call vs 8).
-   *
-   * # Arguments
-   * * `x` - Input tensor, shape: (batch, seq_len, hidden_size)
-   *
-   * # Returns
-   * Output tensor, shape: (batch, seq_len, hidden_size)
-   */
-  forward(x: MxArray): MxArray
-  /**
-   * Forward pass with cached intermediates for backward pass
-   *
-   * Returns: [output, gate, up, gate_act, gated]
-   * - output: final output
-   * - gate: gate_proj(x)
-   * - up: up_proj(x)
-   * - gate_act: silu(gate)
-   * - gated: gate_act * up
-   */
-  forwardWithCache(x: MxArray): Array<MxArray>
-  setGateProjWeight(weight: MxArray): void
-  setUpProjWeight(weight: MxArray): void
-  setDownProjWeight(weight: MxArray): void
-  getGateProjWeight(): MxArray
-  getUpProjWeight(): MxArray
-  getDownProjWeight(): MxArray
 }
 
 export declare class MxArray {
@@ -1233,66 +796,20 @@ export declare class OutputStore {
   queryRaw(sql: string): Promise<string>
 }
 
-/**
- * Quantized Key-Value Cache for memory-efficient transformer inference.
- *
- * Uses group-wise affine quantization to compress KV tensors to 4-bit or 8-bit.
- * Memory savings: 8-bit = ~2x, 4-bit = ~4x compared to float16/bfloat16.
- *
- * # Example
- * ```javascript
- * // Create a quantized cache with 8-bit precision
- * const cache = new QuantizedKVCache({ bits: 8, groupSize: 64 });
- *
- * // Update and fetch work the same as regular KVCache
- * const [keys, values] = cache.updateAndFetch(newKeys, newValues);
- * ```
- */
-export declare class QuantizedKVCache {
-  /**
-   * Creates a new quantized KV cache.
-   *
-   * # Arguments
-   * * `config` - Optional configuration for bits, group_size, etc.
-   *
-   * # Example
-   * ```javascript
-   * // 8-bit quantization (recommended, minimal quality loss)
-   * const cache8bit = new QuantizedKVCache({ bits: 8 });
-   *
-   * // 4-bit quantization (maximum memory savings)
-   * const cache4bit = new QuantizedKVCache({ bits: 4 });
-   * ```
-   */
-  constructor(config?: QuantizedKvCacheConfig | undefined | null)
-  /** Get the quantization bits (4 or 8) */
-  get bits(): number
-  /** Get the quantization group size */
-  get groupSize(): number
-  /** Get the current offset (number of cached tokens) */
-  get offset(): number
-  /**
-   * Updates the cache with new keys and values, and returns all cached keys/values.
-   *
-   * New K/V tensors are quantized and appended to the cache, then the full
-   * cache is dequantized and returned for attention computation.
-   *
-   * # Arguments
-   * * `keys` - New keys to add, shape: (batch, n_kv_heads, seq_len, head_dim)
-   * * `values` - New values to add, shape: (batch, n_kv_heads, seq_len, head_dim)
-   *
-   * # Returns
-   * Tuple of (cached_keys, cached_values) in full precision
-   */
-  updateAndFetch(keys: MxArray, values: MxArray): [MxArray, MxArray]
-  /** Resets the cache, clearing all stored data. */
-  reset(): void
-  /**
-   * Get estimated memory usage in bytes.
-   *
-   * This is approximate based on the quantized tensor sizes.
-   */
-  memoryUsage(): number
+/** Processed image output */
+export declare class ProcessedImage {
+  /** Get pixel values [num_patches, channels, patch_h, patch_w] */
+  get pixelValues(): MxArray
+  /** Get grid dimensions [t, h, w] */
+  get imageGridThw(): Array<number>
+  /** Get image_grid_thw as MxArray for model input */
+  getGridThwArray(): MxArray
+  /** Get original image dimensions [height, width] */
+  get originalSize(): Array<number>
+  /** Get resized dimensions [height, width] */
+  get resizedSize(): Array<number>
+  /** Get number of vision tokens after spatial merge */
+  numVisionTokens(mergeSize: number): number
 }
 
 /**
@@ -1935,63 +1452,6 @@ export declare class Qwen3Tokenizer {
   getEndoftextToken(): string
 }
 
-export declare class RMSNorm {
-  /** Create a new RMSNorm layer */
-  constructor(dims: number, eps?: number | undefined | null)
-  /**
-   * Forward pass: RMSNorm(x) = x * weight / sqrt(mean(x^2) + eps)
-   * Uses mx.fast.rms_norm for optimal performance (single fused Metal kernel)
-   */
-  forward(input: MxArray): MxArray
-  /** Get the weight (scale) parameter */
-  getWeight(): MxArray
-  /** Set the weight (scale) parameter */
-  setWeight(weight: MxArray): void
-}
-
-/**
- * The RMSprop optimizer
- *
- * Updates parameters using:
- * v = α * v + (1 - α) * g²
- * w = w - lr * g / (√v + ε)
- */
-export declare class RMSprop {
-  /**
-   * Create a new RMSprop optimizer
-   *
-   * Args:
-   *   learning_rate: The learning rate (default: 1e-2)
-   *   alpha: Smoothing constant (default: 0.99)
-   *   eps: Small constant for numerical stability (default: 1e-8)
-   *   weight_decay: Weight decay (L2 penalty) (default: 0)
-   */
-  constructor(learningRate?: number | undefined | null, alpha?: number | undefined | null, eps?: number | undefined | null, weightDecay?: number | undefined | null)
-  /**
-   * Update a single parameter (kept for backwards compatibility)
-   *
-   * For better performance when updating many parameters, use `update_batch` instead.
-   */
-  updateSingle(paramName: string, param: MxArray, grad: MxArray): MxArray
-  /**
-   * Batch update all parameters in a single call
-   *
-   * This is more efficient than calling update_single repeatedly due to reduced FFI overhead.
-   * For Qwen3-0.6B with ~300 parameters, this reduces FFI calls from 300+ to 1.
-   *
-   * Args:
-   *   param_names: Vector of parameter names
-   *   params: Vector of parameter arrays (must match param_names length)
-   *   grads: Vector of gradient arrays (must match param_names length)
-   *
-   * Returns:
-   *   Vector of updated parameter arrays in the same order as input
-   */
-  updateBatch(paramNames: Array<string>, params: Array<MxArray>, grads: Array<MxArray>): Array<MxArray>
-  /** Reset optimizer state */
-  reset(): void
-}
-
 /**
  * Rotary Position Embedding (RoPE)
  *
@@ -2126,52 +1586,6 @@ export declare class SftTrainingEngine {
 }
 
 /**
- * The SGD (Stochastic Gradient Descent) optimizer
- *
- * Updates parameters using:
- * v = μ * v + (1 - dampening) * g
- * w = w - lr * v
- *
- * With optional Nesterov momentum and weight decay
- */
-export declare class SGD {
-  /**
-   * Create a new SGD optimizer
-   *
-   * Args:
-   *   learning_rate: The learning rate (required)
-   *   momentum: Momentum factor (default: 0)
-   *   weight_decay: Weight decay (L2 penalty) (default: 0)
-   *   dampening: Dampening for momentum (default: 0)
-   *   nesterov: Whether to use Nesterov momentum (default: false)
-   */
-  constructor(learningRate: number, momentum?: number | undefined | null, weightDecay?: number | undefined | null, dampening?: number | undefined | null, nesterov?: boolean | undefined | null)
-  /**
-   * Update a single parameter (kept for backwards compatibility)
-   *
-   * For better performance when updating many parameters, use `update_batch` instead.
-   */
-  updateSingle(paramName: string, param: MxArray, grad: MxArray): MxArray
-  /**
-   * Batch update all parameters in a single call
-   *
-   * This is more efficient than calling update_single repeatedly due to reduced FFI overhead.
-   * For Qwen3-0.6B with ~300 parameters, this reduces FFI calls from 300+ to 1.
-   *
-   * Args:
-   *   param_names: Vector of parameter names
-   *   params: Vector of parameter arrays (must match param_names length)
-   *   grads: Vector of gradient arrays (must match param_names length)
-   *
-   * Returns:
-   *   Vector of updated parameter arrays in the same order as input
-   */
-  updateBatch(paramNames: Array<string>, params: Array<MxArray>, grads: Array<MxArray>): Array<MxArray>
-  /** Reset optimizer state */
-  reset(): void
-}
-
-/**
  * A tensor that tracks gradients for automatic differentiation
  *
  * This is a wrapper around MxArray that provides:
@@ -2276,6 +1690,179 @@ export declare class TransformerBlock {
   setInputLayernormWeight(weight: MxArray): void
   setPostAttentionLayernormWeight(weight: MxArray): void
 }
+
+/** Result from VLM chat */
+export declare class VlmChatResult {
+  /** Get the response text */
+  get text(): string
+  /** Get the generated tokens */
+  get tokens(): MxArray
+  /** Get the log probabilities */
+  get logprobs(): MxArray
+  /** Get the finish reason */
+  get finishReason(): 'stop' | 'length' | 'repetition'
+  /** Get the number of tokens generated */
+  get numTokens(): number
+}
+export type VLMChatResult = VlmChatResult
+
+/**
+ * Vision-Language Model
+ *
+ * A generic VLM for OCR and document understanding tasks.
+ * Currently supports PaddleOCR-VL architecture (vision encoder + ERNIE language model).
+ */
+export declare class VLModel {
+  /** Create a new PaddleOCR-VL model */
+  constructor(config: ModelConfig)
+  /** Set the tokenizer */
+  setTokenizer(tokenizer: Qwen3Tokenizer): void
+  /** Check if tokenizer is available */
+  get hasTokenizer(): boolean
+  /**
+   * Chat with the VLM model
+   *
+   * High-level API for conversational interaction with images.
+   *
+   * # Arguments
+   * * `messages` - Chat messages (role + content)
+   * * `config` - Chat configuration (including image_paths for automatic processing)
+   *
+   * # Returns
+   * * VLMChatResult with generated text
+   *
+   * # Example
+   * ```typescript
+   * const result = model.chat(
+   *   [{ role: 'user', content: 'Describe this image.' }],
+   *   { imagePaths: ['./photo.jpg'], maxNewTokens: 256 }
+   * );
+   * ```
+   */
+  chat(messages: Array<VlmChatMessage>, config?: VlmChatConfig | undefined | null): VlmChatResult
+  /**
+   * Simple OCR: extract text from an image file
+   *
+   * Convenience method that processes an image and extracts all text.
+   *
+   * # Arguments
+   * * `image_path` - Path to the image file
+   * * `prompt` - Optional custom prompt (default: "Extract all text from this image.")
+   *
+   * # Returns
+   * * Extracted text as a string
+   *
+   * # Example
+   * ```typescript
+   * const text = await model.ocr('./receipt.jpg');
+   * console.log(text);
+   * ```
+   */
+  ocr(imagePath: string, prompt?: string | undefined | null): string
+  /**
+   * Get input embeddings with vision features merged
+   *
+   * # Arguments
+   * * `input_ids` - Token IDs [batch, seq_len]
+   * * `pixel_values` - Optional image patches [batch, seq, channels, patch_h, patch_w]
+   * * `image_grid_thw` - Optional grid dimensions [num_images, 3]
+   *
+   * # Returns
+   * * Input embeddings with vision features inserted at image token positions
+   */
+  getInputEmbeddings(inputIds: MxArray, pixelValues?: MxArray | undefined | null, imageGridThw?: MxArray | undefined | null): MxArray
+  /**
+   * Forward pass
+   *
+   * # Arguments
+   * * `input_ids` - Token IDs [batch, seq_len]
+   * * `pixel_values` - Optional image patches
+   * * `image_grid_thw` - Optional grid dimensions
+   * * `mask` - Optional attention mask
+   *
+   * # Returns
+   * * Logits [batch, seq_len, vocab_size]
+   */
+  forward(inputIds: MxArray, pixelValues?: MxArray | undefined | null, imageGridThw?: MxArray | undefined | null, mask?: MxArray | undefined | null): MxArray
+  /**
+   * Generate text tokens given input tokens and optional image
+   *
+   * Uses KV caching for efficient generation - each step only processes the
+   * new token(s) while reusing cached key-value states from previous tokens.
+   * Vision features are computed once at the start and cached.
+   *
+   * # Arguments
+   * * `input_ids` - Input token IDs [1, seq_len]
+   * * `pixel_values` - Optional image patches [1, num_patches, C, H, W]
+   * * `image_grid_thw` - Optional grid dimensions [1, 3]
+   * * `config` - Generation configuration
+   *
+   * # Returns
+   * * GenerationResult with tokens, logprobs, and finish reason
+   */
+  generate(inputIds: MxArray, pixelValues?: MxArray | undefined | null, imageGridThw?: MxArray | undefined | null, config?: GenerationConfig | undefined | null): GenerationResult
+  /** Get model configuration */
+  get config(): ModelConfig
+  /** Check if model is fully initialized */
+  get isInitialized(): boolean
+  /**
+   * Load a VLM from disk
+   *
+   * Loads a model from a directory containing:
+   * - config.json: Model configuration
+   * - model.safetensors or model-*.safetensors: Model weights in SafeTensors format
+   *
+   * # Arguments
+   * * `model_path` - Path to the model directory
+   *
+   * # Returns
+   * * A fully initialized VLModel with loaded weights
+   *
+   * # Example
+   * ```typescript
+   * import { VLModel } from '@mlx-node/vlm';
+   * const model = await VLModel.load('./models/paddleocr-vl');
+   * const result = model.chat(messages, { imagePaths: ['./image.jpg'] });
+   * ```
+   */
+  static load(modelPath: string): Promise<VLModel>
+  /**
+   * Load model configuration from disk without loading weights
+   *
+   * This is useful for inspecting model configuration before loading the full model.
+   *
+   * # Arguments
+   * * `model_path` - Path to the model directory containing config.json
+   *
+   * # Returns
+   * * ModelConfig with vision and text configuration
+   *
+   * # Example
+   * ```typescript
+   * import { VLModel } from '@mlx-node/vlm';
+   * const config = await VLModel.loadConfig('./models/paddleocr-vl');
+   * console.log(config.visionConfig.hiddenSize);
+   * ```
+   */
+  static loadConfig(modelPath: string): Promise<ModelConfig>
+}
+
+/**
+ * Bilinear interpolation for 2D spatial data (GPU-accelerated)
+ *
+ * Performs bilinear interpolation on an array whose first two dimensions
+ * are spatial (height, width). Supports extra trailing dimensions.
+ * All computation stays on GPU for maximum performance.
+ *
+ * # Arguments
+ * * `image` - Input array of shape [H, W, ...] where H and W are spatial dimensions
+ * * `new_height` - Target height
+ * * `new_width` - Target width
+ *
+ * # Returns
+ * * Interpolated array of shape [new_height, new_width, ...]
+ */
+export declare function bilinearInterpolate(image: MxArray, newHeight: number, newWidth: number): MxArray
 
 /**
  * Build RewardOutput array from generation results.
@@ -2415,6 +2002,16 @@ export interface ChatMessage {
   reasoningContent?: string
 }
 
+/** Chat message role */
+export declare const enum ChatRole {
+  /** User message */
+  User = 'User',
+  /** Assistant response */
+  Assistant = 'Assistant',
+  /** System prompt */
+  System = 'System'
+}
+
 /** Statistics about cleanup operations (NAPI wrapper) */
 export interface CleanupStats {
   /** Number of training steps deleted */
@@ -2426,47 +2023,6 @@ export interface CleanupStats {
   /** Number of logs deleted */
   logsDeleted: number
 }
-
-/**
- * Clip gradients by global norm.
- *
- * Computes the global L2 norm across all gradients and scales them
- * if the norm exceeds max_norm. This is the standard gradient clipping
- * technique used in deep learning to prevent gradient explosion.
- *
- * # Arguments
- * * `gradients` - Vector of gradient arrays to clip
- * * `max_norm` - Maximum allowed global norm
- *
- * # Returns
- * * Vector of clipped gradients with same shapes as inputs
- *
- * # Algorithm
- * ```text
- * global_norm = sqrt(sum(||grad_i||^2 for all grads))
- * if global_norm > max_norm:
- *     scale = max_norm / (global_norm + epsilon)
- *     clipped_grads = [grad_i * scale for all grads]
- * else:
- *     clipped_grads = gradients (unchanged)
- * ```
- */
-export declare function clipGradientsByGlobalNorm(gradients: Array<MxArray>, maxNorm: number): Array<MxArray>
-
-/**
- * Clip gradients by value (element-wise clipping).
- *
- * Clips each element of each gradient to [min_value, max_value].
- *
- * # Arguments
- * * `gradients` - Vector of gradient arrays to clip
- * * `min_value` - Minimum value
- * * `max_value` - Maximum value
- *
- * # Returns
- * * Vector of clipped gradients
- */
-export declare function clipGradientsByValue(gradients: Array<MxArray>, minValue: number, maxValue: number): Array<MxArray>
 
 /**
  * Structured completion information aligned with ChatResult.
@@ -2586,12 +2142,30 @@ export declare function convertModel(options: ConversionOptions): Promise<Conver
 
 export declare function convertParquetToJsonl(inputPath: string, outputPath: string): void
 
+/** Create a default PaddleOCR-VL 1.5 configuration (JS factory function) */
+export declare function createPaddleocrVlConfig(): ModelConfig
+
+/** Document element - either a table or paragraph */
+export interface DocumentElement {
+  elementType: ElementType
+  /** Table data (only present if element_type is Table) */
+  table?: Table
+  /** Paragraph data (only present if element_type is Paragraph) */
+  paragraph?: Paragraph
+}
+
 export declare const enum DType {
   Float32 = 0,
   Int32 = 1,
   Float16 = 2,
   BFloat16 = 3,
   Uint32 = 4
+}
+
+/** Document element type */
+export declare const enum ElementType {
+  Table = 'Table',
+  Paragraph = 'Paragraph'
 }
 
 /** Metrics from a training epoch */
@@ -2637,6 +2211,9 @@ export interface EngineStepMetrics {
   /** Active memory at end of step (MB) */
   activeMemoryMb: number
 }
+
+/** Format parsed document according to config */
+export declare function formatDocument(doc: ParsedDocument, config?: ParserConfig | undefined | null): string
 
 /** Function definition for tool calling */
 export interface FunctionDefinition {
@@ -2761,6 +2338,9 @@ export interface GenerationWithToolCalls {
   generation: GenerationRecord
   toolCalls: Array<ToolCallRecord>
 }
+
+/** Get expected weight keys for PaddleOCR-VL model */
+export declare function getExpectedWeightKeys(): Array<string>
 
 /**
  * Returns a binary mask identifying tokens whose entropy exceeds a given quantile threshold.
@@ -2945,6 +2525,54 @@ export interface GrpoLossConfig {
   vocabChunkSize?: number
 }
 
+/** Image processing configuration */
+export interface ImageProcessorConfig {
+  minPixels: number
+  maxPixels: number
+  patchSize: number
+  temporalPatchSize: number
+  mergeSize: number
+  imageMean: Array<number>
+  imageStd: Array<number>
+  doRescale: boolean
+  doNormalize: boolean
+}
+
+/** Weight loading result */
+export interface LoadedWeights {
+  /** Number of weights loaded */
+  count: number
+  /** Keys that were transformed */
+  transformedKeys: Array<string>
+  /** Keys that were ignored */
+  ignoredKeys: Array<string>
+}
+
+/** Full model configuration */
+export interface ModelConfig {
+  visionConfig: VisionConfig
+  textConfig: TextConfig
+  modelType: string
+  ignoreIndex: number
+  imageTokenId: number
+  videoTokenId: number
+  visionStartTokenId: number
+  visionEndTokenId: number
+  eosTokenId: number
+}
+
+/** Output format options */
+export declare const enum OutputFormat {
+  /** Raw output with minimal processing */
+  Raw = 'Raw',
+  /** Plain text with aligned columns */
+  Plain = 'Plain',
+  /** Markdown tables */
+  Markdown = 'Markdown',
+  /** HTML tables */
+  Html = 'Html'
+}
+
 /** Configuration for creating an OutputStore connection */
 export interface OutputStoreConfig {
   /** Local SQLite file path (e.g., "training_outputs.db") */
@@ -3001,6 +2629,55 @@ export interface PagedTokenOutput {
   isFinished: boolean
 }
 
+/** A text paragraph */
+export interface Paragraph {
+  content: string
+}
+
+/** Parsed document structure */
+export interface ParsedDocument {
+  elements: Array<DocumentElement>
+}
+
+/**
+ * Parse and format PaddleOCR-VL response in one step
+ *
+ * Convenience function that parses the VLM output and formats it
+ * according to the specified configuration.
+ *
+ * # Arguments
+ * * `text` - Raw VLM output containing table tokens
+ * * `config` - Optional parser configuration (format, trim_cells, etc.)
+ *
+ * # Returns
+ * * Formatted string in the requested format (markdown, plain, html, raw)
+ *
+ * # Example
+ * ```typescript
+ * import { parsePaddleResponse } from '@mlx-node/core';
+ *
+ * // Parse and format as markdown (default)
+ * const markdown = parsePaddleResponse(vlmResult.text);
+ *
+ * // Parse and format as HTML
+ * const html = parsePaddleResponse(vlmResult.text, { format: 'html' });
+ *
+ * // Parse and format as plain text
+ * const plain = parsePaddleResponse(vlmResult.text, { format: 'plain' });
+ * ```
+ */
+export declare function parsePaddleResponse(text: string, config?: ParserConfig | undefined | null): string
+
+/** Parser configuration */
+export interface ParserConfig {
+  /** Output format (default: 'markdown') */
+  format?: OutputFormat
+  /** Whether to trim whitespace from cells (default: true) */
+  trimCells?: boolean
+  /** Whether to collapse empty rows (default: true) */
+  collapseEmptyRows?: boolean
+}
+
 /**
  * Parse tool calls from text (NAPI export)
  *
@@ -3027,18 +2704,8 @@ export interface ParseToolCallsResult {
   toolCalls: Array<ToolCallResult>
 }
 
-/** Configuration options for QuantizedKVCache */
-export interface QuantizedKvCacheConfig {
-  /** Number of bits for quantization (4 or 8, default: 8) */
-  bits?: number
-  /**
-   * Number of elements per quantization group (default: 64)
-   * Smaller groups = better accuracy but more overhead
-   */
-  groupSize?: number
-  /** Pre-allocation step size (default: 256, matching KVCache) */
-  step?: number
-}
+/** Parse VLM output into structured document */
+export declare function parseVlmOutput(text: string): ParsedDocument
 
 /** Qwen3 model configuration */
 export interface Qwen3Config {
@@ -3266,6 +2933,21 @@ export interface SftStepMetrics {
   trainingTimeMs: number
 }
 
+/**
+ * Smart resize that maintains aspect ratio within pixel bounds
+ *
+ * # Arguments
+ * * `height` - Original image height
+ * * `width` - Original image width
+ * * `factor` - Resize factor (patch_size * merge_size, e.g., 28)
+ * * `min_pixels` - Minimum total pixels (default 147384)
+ * * `max_pixels` - Maximum total pixels (default 2822400)
+ *
+ * # Returns
+ * * Tuple of (new_height, new_width) that satisfies constraints
+ */
+export declare function smartResize(height: number, width: number, factor: number, minPixels: number, maxPixels: number): [number, number]
+
 /** Metrics from a single training step for sparkline restoration (NAPI wrapper) */
 export interface StepMetricSummary {
   /** Step number */
@@ -3315,6 +2997,44 @@ export interface StepSummary {
   numToolCalls: number
   eosCount: number
   lengthCount: number
+}
+
+/** A table structure */
+export interface Table {
+  rows: Array<TableRow>
+}
+
+/** A single cell in a table */
+export interface TableCell {
+  content: string
+  isEmpty: boolean
+}
+
+/** A row in a table */
+export interface TableRow {
+  cells: Array<TableCell>
+}
+
+/** Language model (text decoder) configuration */
+export interface TextConfig {
+  modelType: string
+  hiddenSize: number
+  numHiddenLayers: number
+  intermediateSize: number
+  numAttentionHeads: number
+  rmsNormEps: number
+  vocabSize: number
+  numKeyValueHeads: number
+  maxPositionEmbeddings: number
+  ropeTheta: number
+  ropeTraditional: boolean
+  useBias: boolean
+  headDim: number
+  /**
+   * Multimodal RoPE sections: [temporal, height, width]
+   * These define how the head_dim is split for 3D position encoding
+   */
+  mropeSection: Array<number>
 }
 
 /** Tool call made by an assistant */
@@ -3415,4 +3135,49 @@ export interface TrainStepResultWithOutputs {
   outputsJson?: string
   /** Actual token counts for each completion (for accurate TUI display) */
   completionLengths: Array<number>
+}
+
+/** Vision encoder configuration */
+export interface VisionConfig {
+  modelType: string
+  hiddenSize: number
+  intermediateSize: number
+  numHiddenLayers: number
+  numAttentionHeads: number
+  numChannels: number
+  imageSize: number
+  patchSize: number
+  hiddenAct: string
+  layerNormEps: number
+  attentionDropout: number
+  spatialMergeSize: number
+}
+
+/** Configuration for VLM chat */
+export interface VlmChatConfig {
+  /**
+   * Image paths to process (alternative to passing pre-processed images)
+   * These will be automatically processed using the ImageProcessor
+   */
+  imagePaths?: Array<string>
+  /** Maximum number of new tokens to generate (default: 512) */
+  maxNewTokens?: number
+  /** Sampling temperature (0 = greedy, higher = more random) (default: 0.0 for OCR) */
+  temperature?: number
+  /** Top-k sampling (default: 0) */
+  topK?: number
+  /** Top-p (nucleus) sampling (default: 1.0) */
+  topP?: number
+  /** Repetition penalty (default: 1.0) */
+  repetitionPenalty?: number
+  /** Whether to return log probabilities (default: false) */
+  returnLogprobs?: boolean
+}
+
+/** A chat message with optional image */
+export interface VlmChatMessage {
+  /** Role of the message sender */
+  role: ChatRole
+  /** Text content of the message */
+  content: string
 }

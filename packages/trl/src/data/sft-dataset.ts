@@ -326,7 +326,7 @@ export class SFTDataset {
     // Get "assistant" token ID (it's a single token in Qwen3)
     const assistantTokenId = this.tokenizer.tokenToId('assistant');
 
-    const labels = new Array(inputIds.length).fill(IGNORE_INDEX);
+    const labels = Array.from({ length: inputIds.length }, () => IGNORE_INDEX);
     let inAssistant = false;
 
     for (let i = 0; i < inputIds.length; i++) {

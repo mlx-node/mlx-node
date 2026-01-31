@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vite-plus/test';
-import { MxArray, Adam } from '@mlx-node/core';
+import { MxArray } from '@mlx-node/core';
 import { shape, float32 } from '../test-utils';
 
 describe('Autograd Training Examples', () => {
@@ -90,7 +90,7 @@ describe('Autograd Training Examples', () => {
     });
   });
 
-  describe('Gradient Descent with Adam', () => {
+  describe('Gradient Descent with Manual SGD', () => {
     it('should optimize quadratic function with manual gradients', () => {
       // Minimize f(x) = (x - 5)^2
       // Gradient: f'(x) = 2(x - 5)
@@ -99,7 +99,6 @@ describe('Autograd Training Examples', () => {
       let x = MxArray.fromFloat32(float32(0.0), shape(1));
 
       const learningRate = 0.1;
-      const adam = new Adam(learningRate);
       const iterations = 50;
 
       let initialLoss: number | null = null;
@@ -124,8 +123,9 @@ describe('Autograd Training Examples', () => {
         const xMinus5Val = xMinus5.toFloat32()[0];
         const gradX = MxArray.fromFloat32(float32(2 * xMinus5Val), shape(1));
 
-        // Update with Adam
-        x = adam.updateSingle('x', x, gradX);
+        // Update with manual SGD: x = x - lr * grad
+        const xUpdate = gradX.mulScalar(learningRate);
+        x = x.sub(xUpdate);
         x.eval();
       }
 
@@ -151,7 +151,6 @@ describe('Autograd Training Examples', () => {
       let b = MxArray.fromFloat32(float32(0.0), shape(1));
 
       const learningRate = 0.1;
-      const adam = new Adam(learningRate);
       const iterations = 50;
 
       let initialLoss: number | null = null;
@@ -183,9 +182,11 @@ describe('Autograd Training Examples', () => {
         const gradA = MxArray.fromFloat32(float32(2 * aMinus3Val), shape(1));
         const gradB = MxArray.fromFloat32(float32(2 * bMinus4Val), shape(1));
 
-        // Update with Adam
-        a = adam.updateSingle('a', a, gradA);
-        b = adam.updateSingle('b', b, gradB);
+        // Update with manual SGD: param = param - lr * grad
+        const aUpdate = gradA.mulScalar(learningRate);
+        const bUpdate = gradB.mulScalar(learningRate);
+        a = a.sub(aUpdate);
+        b = b.sub(bUpdate);
         a.eval();
         b.eval();
       }

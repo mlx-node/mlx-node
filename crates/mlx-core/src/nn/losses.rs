@@ -1,20 +1,16 @@
 use crate::array::MxArray;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 // ============================================
-// Loss Functions
+// Loss Functions (Internal - not exposed to TypeScript)
 // ============================================
 
-#[napi]
 pub struct Losses;
 
-#[napi]
 impl Losses {
     /// Cross-entropy loss
     /// Expects logits of shape [batch_size, vocab_size] and targets of shape [batch_size]
-    #[napi]
     pub fn cross_entropy(
         logits: &MxArray,
         targets: &MxArray,
@@ -188,7 +184,6 @@ impl Losses {
 
     /// KL Divergence loss: KL(P || Q) = sum(P * log(P/Q))
     /// Expects log probabilities for numerical stability
-    #[napi]
     pub fn kl_divergence(log_p: &MxArray, log_q: &MxArray) -> Result<MxArray> {
         let handle = unsafe {
             // Convert log probs to probs
@@ -221,7 +216,6 @@ impl Losses {
     }
 
     /// Mean Squared Error loss
-    #[napi]
     pub fn mse(predictions: &MxArray, targets: &MxArray) -> Result<MxArray> {
         let handle = unsafe {
             // (predictions - targets)^2

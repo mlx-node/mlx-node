@@ -1,6 +1,11 @@
 {
   "files": [],
-  "references": [{ "path": "./packages/lm" }, { "path": "./packages/trl" }, { "path": "./__test__" }],
+  "references": [
+    { "path": "./packages/lm" },
+    { "path": "./packages/trl" },
+    { "path": "./packages/vlm" },
+    { "path": "./__test__" }
+  ],
   "compilerOptions": {
     "strict": true,
     "esModuleInterop": true,
@@ -9,7 +14,6 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "target": "ESNext",
-    "verbatimModuleSyntax": true,
     "declaration": true,
     "declarationMap": true
   }

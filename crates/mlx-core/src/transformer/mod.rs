@@ -17,6 +17,8 @@ pub mod block;
 pub mod fused_attention;
 pub mod kv_cache;
 pub mod mlp;
+#[cfg(test)]
+mod mlp_test;
 pub mod paged_attention;
 pub mod quantized_kv_cache;
 #[cfg(test)]

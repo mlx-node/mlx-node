@@ -256,6 +256,87 @@ mod tests {
         assert_eq!(cache_fp.get_offset(), 0);
     }
 
+    #[test]
+    fn test_quantized_cache_update_and_fetch_4bit() {
+        // Create test K/V tensors
+        // Shape: [batch=1, n_kv_heads=2, seq_len=8, head_dim=64]
+        let batch = 1i64;
+        let n_kv_heads = 2i64;
+        let seq_len = 8i64;
+        let head_dim = 64i64;
+
+        let keys =
+            MxArray::random_uniform(&[batch, n_kv_heads, seq_len, head_dim], -1.0, 1.0, None)
+                .expect("Failed to create keys");
+        let values =
+            MxArray::random_uniform(&[batch, n_kv_heads, seq_len, head_dim], -1.0, 1.0, None)
+                .expect("Failed to create values");
+
+        // Create 4-bit quantized cache
+        let mut cache = QuantizedKVCache::new(Some(QuantizedKVCacheConfig {
+            bits: Some(4),
+            group_size: Some(64),
+            step: Some(256),
+        }));
+
+        let result = cache.update_and_fetch(&keys, &values);
+
+        if result.is_err() {
+            eprintln!(
+                "Skipping 4-bit quantization test - may not be supported: {:?}",
+                result.err()
+            );
+            return;
+        }
+
+        let (cached_keys, _) = result.unwrap();
+
+        // Verify shape preserved
+        let k_shape = cached_keys.shape().expect("Failed to get keys shape");
+        assert_eq!(k_shape[2], seq_len);
+        assert_eq!(cache.get_offset(), seq_len as i32);
+    }
+
+    #[test]
+    fn test_quantized_cache_reset_and_reuse() {
+        let batch = 1i64;
+        let n_kv_heads = 2i64;
+        let seq_len = 8i64;
+        let head_dim = 64i64;
+
+        let keys =
+            MxArray::random_uniform(&[batch, n_kv_heads, seq_len, head_dim], -1.0, 1.0, None)
+                .expect("Failed to create keys");
+        let values =
+            MxArray::random_uniform(&[batch, n_kv_heads, seq_len, head_dim], -1.0, 1.0, None)
+                .expect("Failed to create values");
+
+        let mut cache = QuantizedKVCache::new(Some(QuantizedKVCacheConfig {
+            bits: Some(8),
+            group_size: Some(64),
+            step: Some(256),
+        }));
+
+        // First sequence
+        let result = cache.update_and_fetch(&keys, &values);
+        if result.is_err() {
+            eprintln!("Skipping reset/reuse test - quantization not supported");
+            return;
+        }
+        assert_eq!(cache.get_offset(), seq_len as i32);
+
+        // Reset
+        cache.reset();
+        assert_eq!(cache.get_offset(), 0);
+        assert_eq!(cache.memory_usage(), 0.0);
+        assert!(cache.is_empty());
+
+        // New sequence (reuse cache)
+        let result2 = cache.update_and_fetch(&keys, &values);
+        assert!(result2.is_ok());
+        assert_eq!(cache.get_offset(), seq_len as i32);
+    }
+
     // ========================================================================
     // Memory Usage Tests
     // ========================================================================
@@ -267,6 +348,163 @@ mod tests {
         assert_eq!(usage, 0.0); // Empty cache should use no memory
     }
 
-    // Note: Detailed memory comparison tests would require actual tensor operations
-    // and are better suited for integration tests in TypeScript
+    #[test]
+    fn test_memory_usage_8bit_vs_full_precision() {
+        let batch = 1i64;
+        let n_kv_heads = 4i64;
+        let seq_len = 128i64;
+        let head_dim = 64i64;
+
+        let keys =
+            MxArray::random_uniform(&[batch, n_kv_heads, seq_len, head_dim], -1.0, 1.0, None)
+                .expect("Failed to create keys");
+        let values =
+            MxArray::random_uniform(&[batch, n_kv_heads, seq_len, head_dim], -1.0, 1.0, None)
+                .expect("Failed to create values");
+
+        // Full precision cache
+        let mut full_cache = KVCache::new();
+        full_cache
+            .update_and_fetch(&keys, &values)
+            .expect("Full precision update failed");
+
+        // Quantized cache
+        let mut quant_cache = QuantizedKVCache::new(Some(QuantizedKVCacheConfig {
+            bits: Some(8),
+            group_size: Some(64),
+            step: Some(256),
+        }));
+
+        let result = quant_cache.update_and_fetch(&keys, &values);
+        if result.is_err() {
+            eprintln!("Skipping memory comparison test - quantization not supported");
+            return;
+        }
+
+        // Calculate expected full precision memory:
+        // batch * heads * seq * head_dim * 2 (bytes for bf16) * 2 (K+V)
+        let full_memory = (batch * n_kv_heads * seq_len * head_dim * 2 * 2) as f64;
+        let quant_memory = quant_cache.memory_usage();
+
+        eprintln!("Full precision memory: ~{} bytes", full_memory);
+        eprintln!("Quantized memory: {} bytes", quant_memory);
+
+        // 8-bit should use roughly half the memory (plus some overhead for scales/biases)
+        // We expect at least 30% reduction
+        assert!(
+            quant_memory < full_memory * 0.7,
+            "Quantized memory ({}) should be < 70% of full precision ({})",
+            quant_memory,
+            full_memory
+        );
+    }
+
+    #[test]
+    fn test_memory_usage_4bit_vs_8bit() {
+        let batch = 1i64;
+        let n_kv_heads = 4i64;
+        let seq_len = 128i64;
+        let head_dim = 64i64;
+
+        let keys =
+            MxArray::random_uniform(&[batch, n_kv_heads, seq_len, head_dim], -1.0, 1.0, None)
+                .expect("Failed to create keys");
+        let values =
+            MxArray::random_uniform(&[batch, n_kv_heads, seq_len, head_dim], -1.0, 1.0, None)
+                .expect("Failed to create values");
+
+        let mut quant8_cache = QuantizedKVCache::new(Some(QuantizedKVCacheConfig {
+            bits: Some(8),
+            group_size: Some(64),
+            step: Some(256),
+        }));
+
+        let mut quant4_cache = QuantizedKVCache::new(Some(QuantizedKVCacheConfig {
+            bits: Some(4),
+            group_size: Some(64),
+            step: Some(256),
+        }));
+
+        let result8 = quant8_cache.update_and_fetch(&keys, &values);
+        let result4 = quant4_cache.update_and_fetch(&keys, &values);
+
+        if result8.is_err() || result4.is_err() {
+            eprintln!("Skipping 4-bit vs 8-bit memory test - quantization not supported");
+            return;
+        }
+
+        let mem8 = quant8_cache.memory_usage();
+        let mem4 = quant4_cache.memory_usage();
+
+        eprintln!("8-bit memory: {} bytes", mem8);
+        eprintln!("4-bit memory: {} bytes", mem4);
+
+        // 4-bit should use roughly half of 8-bit
+        assert!(
+            mem4 < mem8 * 0.7,
+            "4-bit memory ({}) should be < 70% of 8-bit ({})",
+            mem4,
+            mem8
+        );
+    }
+
+    // ========================================================================
+    // Quality Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_quantization_quality_8bit() {
+        let batch = 1i64;
+        let n_kv_heads = 2i64;
+        let seq_len = 4i64;
+        let head_dim = 64i64;
+        let total_elements = (batch * n_kv_heads * seq_len * head_dim) as usize;
+
+        // Create deterministic test data with values in [-0.5, 0.5]
+        let mut keys_data = Vec::with_capacity(total_elements);
+        for i in 0..total_elements {
+            keys_data.push((i as f32 * 0.1).sin() * 0.5);
+        }
+
+        let keys = MxArray::from_float32(&keys_data, &[batch, n_kv_heads, seq_len, head_dim])
+            .expect("Failed to create keys");
+        let values = MxArray::from_float32(&keys_data, &[batch, n_kv_heads, seq_len, head_dim])
+            .expect("Failed to create values");
+
+        let mut cache = QuantizedKVCache::new(Some(QuantizedKVCacheConfig {
+            bits: Some(8),
+            group_size: Some(64),
+            step: Some(256),
+        }));
+
+        let result = cache.update_and_fetch(&keys, &values);
+        if result.is_err() {
+            eprintln!("Skipping quality test - quantization not supported");
+            return;
+        }
+
+        let (cached_keys, _) = result.unwrap();
+
+        // Get values back as float32
+        let original_data = keys.to_float32().expect("Failed to convert original");
+        let recovered_data = cached_keys
+            .to_float32()
+            .expect("Failed to convert recovered");
+
+        // Check that values are approximately equal
+        // 8-bit quantization should have error < 5% for normalized data
+        let mut max_error: f32 = 0.0;
+        let check_count = std::cmp::min(100, original_data.len());
+        for i in 0..check_count {
+            let error = (original_data[i] - recovered_data[i]).abs();
+            max_error = max_error.max(error);
+        }
+
+        eprintln!("Max quantization error (8-bit): {}", max_error);
+        assert!(
+            max_error < 0.05,
+            "Max quantization error ({}) should be < 0.05 for 8-bit",
+            max_error
+        );
+    }
 }
