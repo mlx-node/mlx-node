@@ -150,8 +150,8 @@ mod tests {
         let loss_value = loss.to_float32().unwrap()[0];
 
         // Manual calculation
-        let logits_rows = vec![vec![2.0, -1.0, 0.0], vec![-1.0, 2.0, 0.0]];
-        let prob_rows = vec![vec![0.7, 0.2, 0.1], vec![0.1, 0.8, 0.1]];
+        let logits_rows = [vec![2.0, -1.0, 0.0], vec![-1.0, 2.0, 0.0]];
+        let prob_rows = [vec![0.7, 0.2, 0.1], vec![0.1, 0.8, 0.1]];
 
         let manual: f32 = logits_rows
             .iter()
@@ -186,7 +186,7 @@ mod tests {
         let loss_value = loss.to_float32().unwrap()[0];
 
         // Manual calculation with label smoothing
-        let logits_rows = vec![vec![2.0, -1.0], vec![-1.0, 2.0]];
+        let logits_rows = [vec![2.0, -1.0], vec![-1.0, 2.0]];
         let target_indices = [0, 1];
 
         let manual: f32 = logits_rows
@@ -239,7 +239,7 @@ mod tests {
             let logits =
                 MxArray::random_normal(&[batch_size as i64, vocab_size as i64], 0.0, 1.0, None)
                     .unwrap();
-            let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size as i32).unwrap();
+            let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size).unwrap();
 
             let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
             let shape = loss.shape().unwrap();
@@ -545,7 +545,7 @@ mod tests {
         let logits =
             MxArray::random_normal(&[batch_size as i64, vocab_size as i64], 0.0, 1.0, None)
                 .unwrap();
-        let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size as i32).unwrap();
+        let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size).unwrap();
 
         let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
         let shape = loss.shape().unwrap();
@@ -566,7 +566,7 @@ mod tests {
         let logits =
             MxArray::random_normal(&[batch_size as i64, vocab_size as i64], 0.0, 1.0, None)
                 .unwrap();
-        let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size as i32).unwrap();
+        let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size).unwrap();
 
         let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
@@ -584,7 +584,7 @@ mod tests {
         let logits =
             MxArray::random_normal(&[batch_size as i64, vocab_size as i64], 0.0, 1.0, None)
                 .unwrap();
-        let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size as i32).unwrap();
+        let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size).unwrap();
 
         let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
@@ -602,7 +602,7 @@ mod tests {
         let logits =
             MxArray::random_normal(&[batch_size as i64, vocab_size as i64], 0.0, 1.0, None)
                 .unwrap();
-        let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size as i32).unwrap();
+        let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size).unwrap();
 
         let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
@@ -620,7 +620,7 @@ mod tests {
         let logits =
             MxArray::random_normal(&[batch_size as i64, vocab_size as i64], 0.0, 1.0, None)
                 .unwrap();
-        let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size as i32).unwrap();
+        let targets = MxArray::randint(&[batch_size as i64], 0, vocab_size).unwrap();
 
         let loss = Losses::cross_entropy(&logits, &targets, None, None, None).unwrap();
         let loss_value = loss.to_float32().unwrap()[0];
@@ -705,7 +705,7 @@ mod tests {
 
         // Boundary cases: first, last, and middle indices
         let targets = MxArray::from_int32(
-            &[0, (vocab_size - 1) as i32, 0, (vocab_size - 1) as i32],
+            &[0, vocab_size - 1, 0, vocab_size - 1],
             &[batch_size as i64],
         )
         .unwrap();

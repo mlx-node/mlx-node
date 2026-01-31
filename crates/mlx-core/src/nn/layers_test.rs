@@ -150,7 +150,7 @@ mod tests {
         let weight = linear.get_weight();
         let values = get_values(&weight);
 
-        let scale = (6.0 / (100.0 + 50.0) as f64).sqrt();
+        let scale = (6.0_f64 / (100.0 + 50.0)).sqrt();
         for v in values.iter() {
             assert!(
                 (*v as f64).abs() <= scale * 1.5, // Some tolerance for random init
@@ -280,10 +280,9 @@ mod tests {
 
     #[test]
     fn test_layernorm_creation() {
-        let norm = LayerNorm::new(64, None).unwrap();
+        let _norm = LayerNorm::new(64, None).unwrap();
         // LayerNorm has both weight and bias (accessed through from_weights)
-        // We can verify creation works
-        assert!(true);
+        // We can verify creation works - if we get here without panic, it's successful
     }
 
     #[test]

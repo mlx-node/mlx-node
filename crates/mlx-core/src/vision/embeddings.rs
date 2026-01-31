@@ -184,7 +184,7 @@ mod tests {
         let patch_embed = PatchEmbedding::new(patch_size, &weight).unwrap();
 
         // Input: [1, 8, 8, 3] -> [1, 4, 16] (2x2 patches, 16 dim)
-        let input_data: Vec<f32> = (0..(1 * 8 * 8 * 3) as usize)
+        let input_data: Vec<f32> = (0..(8 * 8 * 3) as usize)
             .map(|i| (i % 256) as f32 / 255.0)
             .collect();
         let input = MxArray::from_float32(&input_data, &[1, 8, 8, 3]).unwrap();
