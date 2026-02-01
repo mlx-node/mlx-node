@@ -86,8 +86,8 @@ pub fn rotate_half(x: &MxArray) -> Result<MxArray> {
 /// Apply rotary position embedding to vision tensor (internal)
 ///
 /// # Arguments
-/// * `tensor` - Input tensor of shape [batch, seq_len, num_heads, head_dim]
-///   or [seq_len, num_heads, head_dim]
+/// * `tensor` - Input tensor of shape [batch, seq_len, num_heads, head_dim].
+///   Only 4D input is supported; 3D input will fail.
 /// * `freqs` - Frequency tensor of shape [seq_len, dim] where dim = head_dim/2
 ///
 /// # Returns

@@ -68,7 +68,12 @@ impl SpatialProjector {
     /// # Returns
     /// * Projected features [total_merged_patches, context_dim]
     pub fn forward(&self, x: &MxArray, grid_thw: &MxArray) -> Result<MxArray> {
+        // Validate grid_thw shape
         let grid_shape = grid_thw.shape()?;
+        if grid_shape.len() != 2 || grid_shape[1] != 3 {
+            return Err(Error::new(Status::InvalidArg,
+                format!("grid_thw must have shape [num_images, 3], got {:?}", grid_shape.as_ref())));
+        }
         let num_images = grid_shape[0];
 
         // Get grid values
@@ -82,6 +87,17 @@ impl SpatialProjector {
             let t = grid_data[img_idx * 3] as i64;
             let h = grid_data[img_idx * 3 + 1] as i64;
             let w = grid_data[img_idx * 3 + 2] as i64;
+
+            // Validate h and w are divisible by spatial_merge_size
+            let merge = self.spatial_merge_size as i64;
+            if h % merge != 0 {
+                return Err(Error::new(Status::InvalidArg,
+                    format!("Image {} height ({}) must be divisible by spatial_merge_size ({})", img_idx, h, merge)));
+            }
+            if w % merge != 0 {
+                return Err(Error::new(Status::InvalidArg,
+                    format!("Image {} width ({}) must be divisible by spatial_merge_size ({})", img_idx, w, merge)));
+            }
 
             let num_patches = t * h * w;
             let end_idx = start_idx + num_patches;

@@ -58,6 +58,19 @@ impl MultimodalRoPE {
             ));
         }
 
+        let section_sum: i32 = mrope_section.iter().map(|&x| x * 2).sum();
+        if section_sum != dim {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "mrope_section sum ({}) * 2 = {} must equal dim ({})",
+                    mrope_section.iter().sum::<i32>(),
+                    section_sum,
+                    dim
+                ),
+            ));
+        }
+
         let mrope_section_arr: [i32; 3] = [mrope_section[0], mrope_section[1], mrope_section[2]];
 
         // Compute inverse frequencies: 1 / (base^(2i/dim))
@@ -823,7 +836,7 @@ mod tests {
             rope_traditional: false,
             use_bias: false,
             head_dim: 64,
-            mrope_section: vec![8, 16, 16],
+            mrope_section: vec![8, 12, 12],
         }
     }
 

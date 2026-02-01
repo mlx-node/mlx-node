@@ -88,6 +88,17 @@ pub fn smart_resize(
         let beta = ((h as f64 * w as f64) / max_pixels as f64).sqrt();
         h_bar = ((h as f64 / beta / factor as f64).floor() * factor as f64) as i32;
         w_bar = ((w as f64 / beta / factor as f64).floor() * factor as f64) as i32;
+
+        // Guard against zero-sized output when max_pixels is too small
+        if h_bar <= 0 || w_bar <= 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "Invalid resize dimensions [{}, {}]: maxPixels ({}) may be too small for factor ({}). Minimum maxPixels should be {}.",
+                    h_bar, w_bar, max_pixels, factor, factor * factor
+                ),
+            ));
+        }
     } else if total_pixels < min_pixels {
         let beta = (min_pixels as f64 / (h as f64 * w as f64)).sqrt();
         h_bar = ((h as f64 * beta / factor as f64).ceil() * factor as f64) as i32;

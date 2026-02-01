@@ -52,11 +52,11 @@ pub fn should_ignore_key(key: &str) -> bool {
     false
 }
 
-/// Check if Conv2d weight needs transposition
+/// Check if Conv2d weight is already in MLX format.
 ///
-/// PyTorch Conv2d uses [out_channels, in_channels, kH, kW]
-/// MLX Conv2d expects [out_channels, kH, kW, in_channels]
-fn check_array_shape_for_conv(shape: &[i64]) -> bool {
+/// Returns true if array is in MLX format [out_channels, kH, kW, in_channels].
+/// Returns false if array needs transposition from PyTorch format [out_channels, in_channels, kH, kW].
+fn is_mlx_conv_format(shape: &[i64]) -> bool {
     if shape.len() != 4 {
         return false;
     }
@@ -151,7 +151,7 @@ pub fn load_paddleocr_vl_weights(
         // Handle conv2d weight transposition
         if key.contains("patch_embedding.weight") {
             let shape = value.shape()?;
-            if !check_array_shape_for_conv(&shape) {
+            if !is_mlx_conv_format(&shape) {
                 // Transpose from [O, I, H, W] to [O, H, W, I]
                 let transposed = value.transpose(Some(&[0, 2, 3, 1]))?;
                 new_weights.insert(new_key, transposed);
@@ -344,12 +344,12 @@ mod tests {
     }
 
     #[test]
-    fn test_check_array_shape() {
+    fn test_is_mlx_conv_format() {
         // Already in MLX format (out_ch, kH, kW, in_ch) where in_ch=3
-        assert!(check_array_shape_for_conv(&[1152, 14, 14, 3]));
+        assert!(is_mlx_conv_format(&[1152, 14, 14, 3]));
 
         // PyTorch format (out_ch, in_ch, kH, kW)
-        assert!(!check_array_shape_for_conv(&[1152, 3, 14, 14]));
+        assert!(!is_mlx_conv_format(&[1152, 3, 14, 14]));
     }
 
     #[test]

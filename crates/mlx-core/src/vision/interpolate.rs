@@ -44,7 +44,7 @@ pub fn bilinear_interpolate(image: &MxArray, new_height: i64, new_width: i64) ->
         let center_h = h_in / 2;
         let center_w = w_in / 2;
         let pixel = image.slice_axis(0, center_h, center_h + 1)?;
-        let pixel = pixel.slice_axis(0, center_w, center_w + 1)?;
+        let pixel = pixel.slice_axis(1, center_w, center_w + 1)?;
         return Ok(pixel);
     }
 

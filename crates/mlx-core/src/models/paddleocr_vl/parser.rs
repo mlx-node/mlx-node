@@ -13,6 +13,7 @@
  * - <rcel> : right cell boundary
  */
 use napi_derive::napi;
+use unicode_width::UnicodeWidthStr;
 
 /// A single cell in a table
 #[napi(object)]
@@ -217,10 +218,9 @@ fn parse_table_row(text: &str) -> TableRow {
             match marker {
                 "<fcel>" | "<lcel>" => {
                     // First cell or left cell - start new cell, save pending if any
-                    let trimmed = pending_content.trim();
-                    if !trimmed.is_empty() {
+                    if !pending_content.trim().is_empty() {
                         cells.push(TableCell {
-                            content: trimmed.to_string(),
+                            content: pending_content.clone(),
                             is_empty: false,
                         });
                     }
@@ -228,14 +228,13 @@ fn parse_table_row(text: &str) -> TableRow {
                 }
                 "<ecel>" => {
                     // Empty cell - save pending and add empty cell
-                    let trimmed = pending_content.trim();
-                    if !trimmed.is_empty() {
+                    if !pending_content.trim().is_empty() {
                         cells.push(TableCell {
-                            content: trimmed.to_string(),
+                            content: pending_content.clone(),
                             is_empty: false,
                         });
-                        pending_content.clear();
                     }
+                    pending_content.clear();
                     cells.push(TableCell {
                         content: String::new(),
                         is_empty: true,
@@ -243,25 +242,23 @@ fn parse_table_row(text: &str) -> TableRow {
                 }
                 "<rcel>" => {
                     // Right cell - end of cell, save content
-                    let trimmed = pending_content.trim();
-                    if !trimmed.is_empty() {
+                    if !pending_content.trim().is_empty() {
                         cells.push(TableCell {
-                            content: trimmed.to_string(),
+                            content: pending_content.clone(),
                             is_empty: false,
                         });
-                        pending_content.clear();
                     }
+                    pending_content.clear();
                 }
                 "<bcel>" => {
                     // Blank cell
-                    let trimmed = pending_content.trim();
-                    if !trimmed.is_empty() {
+                    if !pending_content.trim().is_empty() {
                         cells.push(TableCell {
-                            content: trimmed.to_string(),
+                            content: pending_content.clone(),
                             is_empty: false,
                         });
-                        pending_content.clear();
                     }
+                    pending_content.clear();
                     cells.push(TableCell {
                         content: String::new(),
                         is_empty: true,
@@ -289,10 +286,9 @@ fn parse_table_row(text: &str) -> TableRow {
     }
 
     // Handle any remaining content
-    let trimmed = pending_content.trim();
-    if !trimmed.is_empty() {
+    if !pending_content.trim().is_empty() {
         cells.push(TableCell {
-            content: trimmed.to_string(),
+            content: pending_content.clone(),
             is_empty: false,
         });
     }
@@ -384,7 +380,7 @@ fn format_plain(doc: &ParsedDocument, trim_cells: bool, collapse_empty_rows: boo
                         &cell.content
                     };
                     if i < col_widths.len() {
-                        col_widths[i] = col_widths[i].max(content.len());
+                        col_widths[i] = col_widths[i].max(UnicodeWidthStr::width(content));
                     }
                 }
             }

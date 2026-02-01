@@ -15,6 +15,9 @@ use std::sync::Arc;
 ///
 /// Applies a 2D convolution over an input signal composed of several input planes.
 /// MLX expects weight shape [out_channels, kernel_h, kernel_w, in_channels]
+///
+/// Note: Currently only supports the patch embedding case where stride == kernel_size
+/// and padding == 0. General convolution is not yet implemented.
 pub struct Conv2d {
     /// Convolution weights [out_channels, kernel_h, kernel_w, in_channels]
     weight: Arc<MxArray>,

@@ -8,7 +8,7 @@ use crate::models::paddleocr_vl::chat::{ChatRole, VLMChatConfig, VLMChatMessage,
 use crate::models::paddleocr_vl::config::{ModelConfig, TextConfig, VisionConfig};
 use crate::models::paddleocr_vl::language::{ERNIELanguageModel, PaddleOCRDecoderLayer};
 use crate::models::paddleocr_vl::persistence::load_paddleocr_vl_weights;
-use crate::models::paddleocr_vl::processing::ImageProcessor;
+use crate::models::paddleocr_vl::processing::{ImageProcessor, ImageProcessorConfig};
 use crate::models::paddleocr_vl::vision::PaddleOCRVisionModel;
 use crate::models::qwen3::{GenerationConfig, GenerationResult};
 use crate::nn::LayerNorm;
@@ -126,7 +126,12 @@ impl VLModel {
                 (None, None)
             } else {
                 // Process the first image (TODO: support multiple images)
-                let processor = ImageProcessor::new(None);
+                let processor_config = ImageProcessorConfig {
+                    patch_size: self.config.vision_config.patch_size,
+                    merge_size: self.config.vision_config.spatial_merge_size,
+                    ..ImageProcessorConfig::default()
+                };
+                let processor = ImageProcessor::new(Some(processor_config));
                 let processed = processor.process_file(paths[0].clone())?;
 
                 // Add batch dimension
@@ -823,6 +828,7 @@ impl VLModel {
                         finish_reason = "repetition";
                         // Keep only up to the first occurrence of the repeated pattern
                         generated_tokens.truncate(pattern2_start);
+                        generated_logprobs.truncate(pattern2_start);
                         break;
                     }
                 }

@@ -28,6 +28,7 @@ image = { workspace = true }
 mlx-paged-attn = { workspace = true }
 mlx-db = { workspace = true }
 sqlx = { workspace = true }
+unicode-width = { workspace = true }
 
 [dependencies.mimalloc-safe]
 workspace = true

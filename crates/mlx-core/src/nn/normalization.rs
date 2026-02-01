@@ -149,6 +149,14 @@ impl LayerNorm {
         }
 
         let bias_arr = if let Some(b) = bias {
+            let bias_shape = b.shape()?;
+            if bias_shape.as_ref() != shape.as_ref() {
+                return Err(Error::from_reason(format!(
+                    "LayerNorm bias shape {:?} must match weight shape {:?}",
+                    bias_shape.as_ref(),
+                    shape.as_ref()
+                )));
+            }
             b.clone()
         } else {
             MxArray::zeros(&shape, None)?

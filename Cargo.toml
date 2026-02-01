@@ -27,6 +27,7 @@ minijinja = { version = "2.5", features = ["json"] }
 uuid = { version = "1.11", features = ["v4"] }
 regex = "1.11"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+unicode-width = "0.2.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # NAPI-RS

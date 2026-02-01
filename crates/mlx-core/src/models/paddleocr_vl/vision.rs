@@ -103,6 +103,14 @@ impl PaddleOCRVisionEmbeddings {
             // Get interpolated position embeddings
             let pos_embed = self.position_embedding.forward(h as u32, w as u32)?;
 
+            // Repeat position embeddings for each temporal frame when t > 1
+            let pos_embed = if t > 1 {
+                let pos_embeds: Vec<&MxArray> = (0..t).map(|_| &pos_embed).collect();
+                MxArray::concatenate_many(pos_embeds, Some(0))?
+            } else {
+                pos_embed
+            };
+
             // Add position embeddings
             let img_with_pos = img_embeddings.add(&pos_embed)?;
 
@@ -288,8 +296,8 @@ impl PaddleOCRVisionModel {
             let t = grid_data[img_idx * 3];
             let h = grid_data[img_idx * 3 + 1];
             let w = grid_data[img_idx * 3 + 2];
-            let prev = *cu_seqlens.last().unwrap();
             for _ in 0..t {
+                let prev = *cu_seqlens.last().unwrap();
                 cu_seqlens.push(prev + h * w);
             }
         }

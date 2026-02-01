@@ -49,7 +49,7 @@ pub struct VLMChatConfig {
     /// Top-p (nucleus) sampling (default: 1.0)
     pub top_p: Option<f64>,
 
-    /// Repetition penalty (default: 1.0)
+    /// Repetition penalty (default: 1.5)
     pub repetition_penalty: Option<f64>,
 
     /// Whether to return log probabilities (default: false)

@@ -70,6 +70,14 @@ export function smartResizeJs(
     const beta = Math.sqrt((h * w) / maxPixels);
     hBar = Math.floor(h / beta / factor) * factor;
     wBar = Math.floor(w / beta / factor) * factor;
+
+    // Guard against zero-sized output when maxPixels is too small
+    if (hBar <= 0 || wBar <= 0) {
+      throw new Error(
+        `Invalid resize dimensions [${hBar}, ${wBar}]: maxPixels (${maxPixels}) may be too small for factor (${factor}). ` +
+          `Minimum maxPixels should be ${factor * factor}.`,
+      );
+    }
   } else if (hBar * wBar < minPixels) {
     const beta = Math.sqrt(minPixels / (h * w));
     hBar = Math.ceil((h * beta) / factor) * factor;
