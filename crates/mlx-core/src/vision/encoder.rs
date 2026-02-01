@@ -46,11 +46,19 @@ impl VisionAttention {
         out_bias: Option<&MxArray>,
     ) -> Result<Self> {
         if num_heads == 0 {
-            return Err(Error::new(Status::InvalidArg, "num_heads must be greater than 0"));
+            return Err(Error::new(
+                Status::InvalidArg,
+                "num_heads must be greater than 0",
+            ));
         }
         if !dim.is_multiple_of(num_heads) {
-            return Err(Error::new(Status::InvalidArg,
-                format!("dim ({}) must be divisible by num_heads ({})", dim, num_heads)));
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "dim ({}) must be divisible by num_heads ({})",
+                    dim, num_heads
+                ),
+            ));
         }
         let head_dim = dim / num_heads;
         let scale = (head_dim as f32).powf(-0.5);

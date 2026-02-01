@@ -71,8 +71,13 @@ impl SpatialProjector {
         // Validate grid_thw shape
         let grid_shape = grid_thw.shape()?;
         if grid_shape.len() != 2 || grid_shape[1] != 3 {
-            return Err(Error::new(Status::InvalidArg,
-                format!("grid_thw must have shape [num_images, 3], got {:?}", grid_shape.as_ref())));
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "grid_thw must have shape [num_images, 3], got {:?}",
+                    grid_shape.as_ref()
+                ),
+            ));
         }
         let num_images = grid_shape[0];
 
@@ -91,12 +96,22 @@ impl SpatialProjector {
             // Validate h and w are divisible by spatial_merge_size
             let merge = self.spatial_merge_size as i64;
             if h % merge != 0 {
-                return Err(Error::new(Status::InvalidArg,
-                    format!("Image {} height ({}) must be divisible by spatial_merge_size ({})", img_idx, h, merge)));
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "Image {} height ({}) must be divisible by spatial_merge_size ({})",
+                        img_idx, h, merge
+                    ),
+                ));
             }
             if w % merge != 0 {
-                return Err(Error::new(Status::InvalidArg,
-                    format!("Image {} width ({}) must be divisible by spatial_merge_size ({})", img_idx, w, merge)));
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "Image {} width ({}) must be divisible by spatial_merge_size ({})",
+                        img_idx, w, merge
+                    ),
+                ));
             }
 
             let num_patches = t * h * w;

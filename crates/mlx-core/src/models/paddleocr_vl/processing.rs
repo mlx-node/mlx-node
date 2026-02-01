@@ -95,7 +95,11 @@ pub fn smart_resize(
                 Status::InvalidArg,
                 format!(
                     "Invalid resize dimensions [{}, {}]: maxPixels ({}) may be too small for factor ({}). Minimum maxPixels should be {}.",
-                    h_bar, w_bar, max_pixels, factor, factor * factor
+                    h_bar,
+                    w_bar,
+                    max_pixels,
+                    factor,
+                    factor * factor
                 ),
             ));
         }
