@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Vision-Language Model
 ///
@@ -394,6 +394,16 @@ impl VLModel {
             }
 
             // Get grid dimensions (assume single image for now)
+            if grid_data.len() < 3 {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "grid_data must have at least 3 elements for [t, h, w], got {} elements. \
+                        Ensure image_grid_thw is properly set when image tokens are present in input.",
+                        grid_data.len()
+                    ),
+                ));
+            }
             let t = grid_data[0] as i64;
             let h = grid_data[1] as i64;
             let w = grid_data[2] as i64;
@@ -966,25 +976,38 @@ impl VLModel {
                             .as_str()
                             .unwrap_or("paddleocr_vl")
                             .to_string(),
-                        hidden_size: vision_raw["hidden_size"].as_i64().unwrap_or(1152) as i32,
+                        hidden_size: vision_raw["hidden_size"].as_i64().unwrap_or_else(|| {
+                            warn!("vision_config.hidden_size not found in config.json, using default 1152");
+                            1152
+                        }) as i32,
                         intermediate_size: vision_raw["intermediate_size"].as_i64().unwrap_or(4304)
                             as i32,
-                        num_hidden_layers: vision_raw["num_hidden_layers"].as_i64().unwrap_or(27)
-                            as i32,
+                        num_hidden_layers: vision_raw["num_hidden_layers"].as_i64().unwrap_or_else(|| {
+                            warn!("vision_config.num_hidden_layers not found in config.json, using default 27");
+                            27
+                        }) as i32,
                         num_attention_heads: vision_raw["num_attention_heads"]
                             .as_i64()
-                            .unwrap_or(16) as i32,
+                            .unwrap_or_else(|| {
+                                warn!("vision_config.num_attention_heads not found in config.json, using default 16");
+                                16
+                            }) as i32,
                         num_channels: vision_raw["num_channels"].as_i64().unwrap_or(3) as i32,
                         image_size: vision_raw["image_size"].as_i64().unwrap_or(384) as i32,
-                        patch_size: vision_raw["patch_size"].as_i64().unwrap_or(14) as i32,
+                        patch_size: vision_raw["patch_size"].as_i64().unwrap_or_else(|| {
+                            warn!("vision_config.patch_size not found in config.json, using default 14");
+                            14
+                        }) as i32,
                         hidden_act: vision_raw["hidden_act"]
                             .as_str()
                             .unwrap_or("gelu_pytorch_tanh")
                             .to_string(),
                         layer_norm_eps: vision_raw["layer_norm_eps"].as_f64().unwrap_or(1e-6),
                         attention_dropout: vision_raw["attention_dropout"].as_f64().unwrap_or(0.0),
-                        spatial_merge_size: vision_raw["spatial_merge_size"].as_i64().unwrap_or(2)
-                            as i32,
+                        spatial_merge_size: vision_raw["spatial_merge_size"].as_i64().unwrap_or_else(|| {
+                            warn!("vision_config.spatial_merge_size not found in config.json, using default 2");
+                            2
+                        }) as i32,
                     };
 
                     // Parse text config
@@ -1003,15 +1026,25 @@ impl VLModel {
                             .as_str()
                             .unwrap_or("paddleocr_vl")
                             .to_string(),
-                        hidden_size: text_raw["hidden_size"].as_i64().unwrap_or(1024) as i32,
-                        num_hidden_layers: text_raw["num_hidden_layers"].as_i64().unwrap_or(18)
-                            as i32,
+                        hidden_size: text_raw["hidden_size"].as_i64().unwrap_or_else(|| {
+                            warn!("text_config.hidden_size not found in config.json, using default 1024");
+                            1024
+                        }) as i32,
+                        num_hidden_layers: text_raw["num_hidden_layers"].as_i64().unwrap_or_else(|| {
+                            warn!("text_config.num_hidden_layers not found in config.json, using default 18");
+                            18
+                        }) as i32,
                         intermediate_size: text_raw["intermediate_size"].as_i64().unwrap_or(3072)
                             as i32,
-                        num_attention_heads: text_raw["num_attention_heads"].as_i64().unwrap_or(16)
-                            as i32,
+                        num_attention_heads: text_raw["num_attention_heads"].as_i64().unwrap_or_else(|| {
+                            warn!("text_config.num_attention_heads not found in config.json, using default 16");
+                            16
+                        }) as i32,
                         rms_norm_eps: text_raw["rms_norm_eps"].as_f64().unwrap_or(1e-5),
-                        vocab_size: text_raw["vocab_size"].as_i64().unwrap_or(103424) as i32,
+                        vocab_size: text_raw["vocab_size"].as_i64().unwrap_or_else(|| {
+                            warn!("text_config.vocab_size not found in config.json, using default 103424");
+                            103424
+                        }) as i32,
                         num_key_value_heads: text_raw["num_key_value_heads"].as_i64().unwrap_or(2)
                             as i32,
                         max_position_embeddings: text_raw["max_position_embeddings"]
@@ -1196,25 +1229,38 @@ impl VLModel {
                             .as_str()
                             .unwrap_or("paddleocr_vl")
                             .to_string(),
-                        hidden_size: vision_raw["hidden_size"].as_i64().unwrap_or(1152) as i32,
+                        hidden_size: vision_raw["hidden_size"].as_i64().unwrap_or_else(|| {
+                            warn!("vision_config.hidden_size not found in config.json, using default 1152");
+                            1152
+                        }) as i32,
                         intermediate_size: vision_raw["intermediate_size"].as_i64().unwrap_or(4304)
                             as i32,
-                        num_hidden_layers: vision_raw["num_hidden_layers"].as_i64().unwrap_or(27)
-                            as i32,
+                        num_hidden_layers: vision_raw["num_hidden_layers"].as_i64().unwrap_or_else(|| {
+                            warn!("vision_config.num_hidden_layers not found in config.json, using default 27");
+                            27
+                        }) as i32,
                         num_attention_heads: vision_raw["num_attention_heads"]
                             .as_i64()
-                            .unwrap_or(16) as i32,
+                            .unwrap_or_else(|| {
+                                warn!("vision_config.num_attention_heads not found in config.json, using default 16");
+                                16
+                            }) as i32,
                         num_channels: vision_raw["num_channels"].as_i64().unwrap_or(3) as i32,
                         image_size: vision_raw["image_size"].as_i64().unwrap_or(384) as i32,
-                        patch_size: vision_raw["patch_size"].as_i64().unwrap_or(14) as i32,
+                        patch_size: vision_raw["patch_size"].as_i64().unwrap_or_else(|| {
+                            warn!("vision_config.patch_size not found in config.json, using default 14");
+                            14
+                        }) as i32,
                         hidden_act: vision_raw["hidden_act"]
                             .as_str()
                             .unwrap_or("gelu_pytorch_tanh")
                             .to_string(),
                         layer_norm_eps: vision_raw["layer_norm_eps"].as_f64().unwrap_or(1e-6),
                         attention_dropout: vision_raw["attention_dropout"].as_f64().unwrap_or(0.0),
-                        spatial_merge_size: vision_raw["spatial_merge_size"].as_i64().unwrap_or(2)
-                            as i32,
+                        spatial_merge_size: vision_raw["spatial_merge_size"].as_i64().unwrap_or_else(|| {
+                            warn!("vision_config.spatial_merge_size not found in config.json, using default 2");
+                            2
+                        }) as i32,
                     };
 
                     // Parse text config
@@ -1233,15 +1279,25 @@ impl VLModel {
                             .as_str()
                             .unwrap_or("paddleocr_vl")
                             .to_string(),
-                        hidden_size: text_raw["hidden_size"].as_i64().unwrap_or(1024) as i32,
-                        num_hidden_layers: text_raw["num_hidden_layers"].as_i64().unwrap_or(18)
-                            as i32,
+                        hidden_size: text_raw["hidden_size"].as_i64().unwrap_or_else(|| {
+                            warn!("text_config.hidden_size not found in config.json, using default 1024");
+                            1024
+                        }) as i32,
+                        num_hidden_layers: text_raw["num_hidden_layers"].as_i64().unwrap_or_else(|| {
+                            warn!("text_config.num_hidden_layers not found in config.json, using default 18");
+                            18
+                        }) as i32,
                         intermediate_size: text_raw["intermediate_size"].as_i64().unwrap_or(3072)
                             as i32,
-                        num_attention_heads: text_raw["num_attention_heads"].as_i64().unwrap_or(16)
-                            as i32,
+                        num_attention_heads: text_raw["num_attention_heads"].as_i64().unwrap_or_else(|| {
+                            warn!("text_config.num_attention_heads not found in config.json, using default 16");
+                            16
+                        }) as i32,
                         rms_norm_eps: text_raw["rms_norm_eps"].as_f64().unwrap_or(1e-5),
-                        vocab_size: text_raw["vocab_size"].as_i64().unwrap_or(103424) as i32,
+                        vocab_size: text_raw["vocab_size"].as_i64().unwrap_or_else(|| {
+                            warn!("text_config.vocab_size not found in config.json, using default 103424");
+                            103424
+                        }) as i32,
                         num_key_value_heads: text_raw["num_key_value_heads"].as_i64().unwrap_or(2)
                             as i32,
                         max_position_embeddings: text_raw["max_position_embeddings"]

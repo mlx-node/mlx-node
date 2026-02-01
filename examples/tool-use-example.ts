@@ -123,7 +123,7 @@ async function runToolConversation(model: Awaited<ReturnType<typeof ModelLoader.
         console.log(`     ID: ${call.id}`);
 
         // Execute the tool
-        const toolResult = await executeTool(call.name, call.arguments);
+        const toolResult = await executeTool(call.name, call.arguments as Record<string, unknown>);
         const displayResult = toolResult.length > 200 ? toolResult.substring(0, 200) + '...' : toolResult;
         console.log(`\n[<-] Tool result: ${displayResult}`);
 
