@@ -19,8 +19,8 @@ use std::path::Path;
 /// * `height` - Original image height
 /// * `width` - Original image width
 /// * `factor` - Resize factor (patch_size * merge_size, e.g., 28)
-/// * `min_pixels` - Minimum total pixels (default 147384)
-/// * `max_pixels` - Maximum total pixels (default 2822400)
+/// * `min_pixels` - Minimum total pixels (typical value: 147384)
+/// * `max_pixels` - Maximum total pixels (typical value: 2822400)
 ///
 /// # Returns
 /// * Tuple of (new_height, new_width) that satisfies constraints

@@ -11,6 +11,7 @@
  *   oxnode examples/vlm-inference.ts ./examples/ocr.png html      # OCR with HTML output
  *   oxnode examples/vlm-inference.ts ./examples/ocr.png raw       # OCR with raw tokens
  */
+import { ChatRole } from '@mlx-node/core';
 import { VLModel, parsePaddleResponse, type OutputFormat } from '@mlx-node/vlm';
 
 const modelPath = '.cache/models/PaddleOCR-VL-1.5-mlx';
@@ -32,7 +33,7 @@ if (imagePath) {
   console.log(`\n--- OCR: ${imagePath} ---`);
   console.log(`   Output format: ${outputFormat}`);
   console.time('OCR');
-  const vlmResult = model.chat([{ role: 'user', content: 'Extract the text in this image' }], {
+  const vlmResult = model.chat([{ role: ChatRole.User, content: 'Extract the text in this image' }], {
     imagePaths: [imagePath],
   });
   console.timeEnd('OCR');
@@ -47,7 +48,7 @@ if (imagePath) {
   console.log('(Pass an image path to test with vision)');
 
   console.time('Chat');
-  const result = model.chat([{ role: 'user', content: 'Hello! What can you help me with?' }], {
+  const result = model.chat([{ role: ChatRole.User, content: 'Hello! What can you help me with?' }], {
     maxNewTokens: 100,
     temperature: 0.0, // Greedy decoding
     repetitionPenalty: 1.5,

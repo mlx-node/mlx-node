@@ -2940,8 +2940,8 @@ export interface SftStepMetrics {
  * * `height` - Original image height
  * * `width` - Original image width
  * * `factor` - Resize factor (patch_size * merge_size, e.g., 28)
- * * `min_pixels` - Minimum total pixels (default 147384)
- * * `max_pixels` - Maximum total pixels (default 2822400)
+ * * `min_pixels` - Minimum total pixels (typical value: 147384)
+ * * `max_pixels` - Maximum total pixels (typical value: 2822400)
  *
  * # Returns
  * * Tuple of (new_height, new_width) that satisfies constraints
@@ -3168,7 +3168,7 @@ export interface VlmChatConfig {
   topK?: number
   /** Top-p (nucleus) sampling (default: 1.0) */
   topP?: number
-  /** Repetition penalty (default: 1.0) */
+  /** Repetition penalty (default: 1.5) */
   repetitionPenalty?: number
   /** Whether to return log probabilities (default: false) */
   returnLogprobs?: boolean
