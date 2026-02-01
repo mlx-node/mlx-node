@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from 'vite-plus/test';
-import { Qwen3Model, Qwen3Tokenizer, type ChatMessage } from '@mlx-node/core';
+import { Qwen3Model, type ChatMessage } from '@mlx-node/core';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -17,7 +17,6 @@ import path from 'node:path';
 describe('Qwen3Model - Chunked Prefill', () => {
   describe('Integration Tests (with pretrained model)', () => {
     let model: Qwen3Model | null = null;
-    let tokenizer: Qwen3Tokenizer | null = null;
 
     beforeAll(async () => {
       const envModelPath = process.env.QWEN3_MODEL_PATH;
@@ -37,7 +36,6 @@ describe('Qwen3Model - Chunked Prefill', () => {
       }
 
       model = await Qwen3Model.loadPretrained(modelPath);
-      tokenizer = await Qwen3Tokenizer.fromPretrained(path.join(modelPath, 'tokenizer.json'));
     });
 
     it('should generate successfully with default prefill_step_size', async () => {

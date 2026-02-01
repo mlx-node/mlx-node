@@ -314,9 +314,9 @@ export class GitHubClient {
     return result.resolveReviewThread.thread;
   }
 
-  async getReviewThreadId(commentId: number): Promise<string | null> {
+  async getReviewThreadId(_commentId: number): Promise<string | null> {
     // Get the node ID for a review comment to use in GraphQL
-    const query = `
+    const _query = `
       query($owner: String!, $repo: String!, $number: Int!) {
         repository(owner: $owner, name: $repo) {
           pullRequest(number: $number) {
