@@ -99,7 +99,6 @@ impl TransformerBlock {
     ///
     /// # Returns
     /// Output tensor, shape: (batch, seq_len, hidden_size)
-
     pub fn forward(
         &self,
         x: &MxArray,
@@ -370,7 +369,6 @@ impl TransformerBlock {
     /// - "after_post_norm": after post-attention layer norm
     /// - "after_mlp": MLP output
     /// - "output": final block output
-
     pub fn forward_debug(
         &self,
         x: &MxArray,

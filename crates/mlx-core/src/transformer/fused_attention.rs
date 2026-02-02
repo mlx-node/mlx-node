@@ -89,7 +89,6 @@ impl FusedAttention {
     ///
     /// # Returns
     /// Output tensor, shape: (batch, seq_len, hidden_size)
-
     pub fn forward(
         &self,
         x: &MxArray,

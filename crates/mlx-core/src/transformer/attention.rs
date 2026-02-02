@@ -104,7 +104,6 @@ impl Attention {
     ///
     /// # Returns
     /// Output tensor, shape: (batch, seq_len, hidden_size)
-
     pub fn forward(
         &self,
         x: &MxArray,
@@ -221,7 +220,6 @@ impl Attention {
     ///
     /// # Returns
     /// Output tensor, shape: (batch, seq_len, hidden_size)
-
     pub fn forward_with_qkv(
         &self,
         queries: &MxArray,
@@ -256,7 +254,6 @@ impl Attention {
     }
 
     /// Debug method: Forward pass with intermediate Q/K/V states captured
-
     pub fn forward_debug(
         &self,
         x: &MxArray,
@@ -424,7 +421,6 @@ impl Attention {
     /// - [10]: attention output (after reshape, before o_proj)
     ///
     /// Note: This does NOT support KV caching - for training only
-
     pub fn forward_with_cache(&self, x: &MxArray) -> Result<Vec<MxArray>> {
         // Use shape_at() to avoid allocating full shape vector
         let batch = x.shape_at(0)?;
