@@ -16,6 +16,9 @@
       "require": "./index.cjs"
     }
   },
+  "scripts": {
+    "build": "napi build --manifest-path ../../crates/mlx-core/Cargo.toml --platform -o . --js index.cjs --dts index.d.cts --release"
+  },
   "napi": {
     "binaryName": "mlx-core",
     "targets": [

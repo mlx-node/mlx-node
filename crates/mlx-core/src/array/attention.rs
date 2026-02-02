@@ -4,7 +4,6 @@
 
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 use std::ffi::CString;
 
 use super::MxArray;
@@ -22,7 +21,6 @@ use super::MxArray;
 ///
 /// # Returns
 /// Attention output with same shape as values
-#[napi(js_name = "scaledDotProductAttention")]
 pub fn scaled_dot_product_attention(
     queries: &MxArray,
     keys: &MxArray,
@@ -74,7 +72,6 @@ pub fn scaled_dot_product_attention(
 ///
 /// # Returns
 /// Attention output with same shape as values
-#[napi(js_name = "scaledDotProductAttentionCausal")]
 pub fn scaled_dot_product_attention_causal(
     queries: &MxArray,
     keys: &MxArray,

@@ -6,7 +6,6 @@
  */
 use crate::array::{DType, MxArray};
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 /// Bilinear interpolation for 2D spatial data (GPU-accelerated)
 ///
@@ -21,7 +20,6 @@ use napi_derive::napi;
 ///
 /// # Returns
 /// * Interpolated array of shape [new_height, new_width, ...]
-#[napi]
 pub fn bilinear_interpolate(image: &MxArray, new_height: i64, new_width: i64) -> Result<MxArray> {
     let shape = image.shape()?;
     if shape.len() < 2 {

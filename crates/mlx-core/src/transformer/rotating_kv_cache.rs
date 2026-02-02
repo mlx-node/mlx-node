@@ -1,38 +1,21 @@
 use crate::array::MxArray;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
-/// Rotating Key-Value cache with fixed maximum size.
+/// Rotating Key-Value cache with fixed maximum size (internal).
 ///
 /// Once the cache reaches `max_size`, old entries are evicted (except for `keep` tokens).
-/// This is useful for long conversations where we want to limit memory usage while
-/// keeping important context (e.g., system prompts).
-///
-/// Reference: mlx-lm/mlx_lm/models/cache.py:RotatingKVCache
-#[napi(js_name = "RotatingKVCache")]
+/// Used internally by transformer models for long context generation.
 pub struct RotatingKVCache {
     keys: Option<MxArray>,
     values: Option<MxArray>,
-    offset: i32,   // Total number of tokens processed
-    max_size: i32, // Maximum cache size
-    keep: i32,     // Number of initial tokens to always keep
-    idx: i32,      // Current write position (for rotation)
+    offset: i32,
+    max_size: i32,
+    keep: i32,
+    idx: i32,
 }
 
-#[napi]
 impl RotatingKVCache {
     /// Creates a new rotating KV cache.
-    ///
-    /// # Arguments
-    /// * `max_size` - Maximum number of tokens to cache
-    /// * `keep` - Number of initial tokens to never evict (default: 0)
-    ///
-    /// # Example
-    /// ```js
-    /// // Keep system prompt (first 10 tokens), max cache 100 tokens
-    /// const cache = new RotatingKVCache(100, 10);
-    /// ```
-    #[napi(constructor)]
     pub fn new(max_size: i32, keep: Option<i32>) -> Self {
         Self {
             keys: None,
@@ -44,19 +27,17 @@ impl RotatingKVCache {
         }
     }
 
-    /// Helper: Trim cache by removing middle section (keep `keep` tokens, remove some, keep rest)
+    /// Helper: Trim cache by removing middle section
     fn trim(&self, trim_size: i32, v: &MxArray, append: Option<&MxArray>) -> Result<MxArray> {
         let mut to_cat: Vec<MxArray> = Vec::new();
         let v_shape = v.shape()?;
 
         if trim_size > 0 {
-            // Slice [:, :, 0:keep, :] - always keep first `keep` tokens
             let starts = vec![0, 0, 0, 0];
             let stops = vec![v_shape[0], v_shape[1], self.keep as i64, v_shape[3]];
             let keep_start = v.slice(&starts, &stops)?;
             to_cat.push(keep_start);
 
-            // Slice [:, :, trim_size + keep:, :] - keep tokens after the trimmed section
             let starts = vec![0, 0, (trim_size + self.keep) as i64, 0];
             let stops = vec![v_shape[0], v_shape[1], v_shape[2], v_shape[3]];
             let keep_end = v.slice(&starts, &stops)?;
@@ -75,101 +56,81 @@ impl RotatingKVCache {
         MxArray::concatenate_many(refs, Some(2))
     }
 
-    /// Helper: Rearrange cache into temporal order (handles rotation)
+    /// Helper: Rearrange cache into temporal order
     fn temporal_order(&self, v: &MxArray) -> Result<MxArray> {
         let v_shape = v.shape()?;
         let cache_len = v_shape[2] as i32;
 
         if self.idx == cache_len {
-            // No rotation needed, cache is in order
             let zero_scalar = MxArray::full(&[1], Either::A(0.0), None)?;
             Ok(v.add(&zero_scalar)?)
         } else if self.idx < self.offset {
-            // Cache has been rotated, need to reorder:
-            // [:, :, 0:keep, :] + [:, :, idx:, :] + [:, :, keep:idx, :]
-
-            // Slice [:, :, 0:keep, :]
             let starts = vec![0, 0, 0, 0];
             let stops = vec![v_shape[0], v_shape[1], self.keep as i64, v_shape[3]];
             let keep_section = v.slice(&starts, &stops)?;
 
-            // Slice [:, :, idx:, :]
             let starts = vec![0, 0, self.idx as i64, 0];
             let stops = vec![v_shape[0], v_shape[1], v_shape[2], v_shape[3]];
             let tail = v.slice(&starts, &stops)?;
 
-            // Only include middle section if keep < idx (otherwise it's empty)
             if self.keep < self.idx {
-                // Slice [:, :, keep:idx, :]
                 let starts = vec![0, 0, self.keep as i64, 0];
                 let stops = vec![v_shape[0], v_shape[1], self.idx as i64, v_shape[3]];
                 let middle = v.slice(&starts, &stops)?;
-
                 MxArray::concatenate_many(vec![&keep_section, &tail, &middle], Some(2))
             } else {
-                // No middle section when keep >= idx
                 MxArray::concatenate(&keep_section, &tail, 2)
             }
         } else {
-            // Cache not yet full, slice off unused portion [:, :, 0:idx, :]
             let starts = [0, 0, 0, 0];
             let stops = [v_shape[0], v_shape[1], self.idx as i64, v_shape[3]];
             v.slice(&starts, &stops)
         }
     }
 
-    /// Update with concatenation (used for multi-token updates)
+    /// Update with concatenation (multi-token updates)
     fn update_concat(&mut self, keys: &MxArray, values: &MxArray) -> Result<Vec<MxArray>> {
         let seq_len = keys.shape_at(2)? as i32;
 
         if self.keys.is_none() {
-            // First update - store copies
             let zero_scalar = MxArray::full(&[1], Either::A(0.0), None)?;
             self.keys = Some(keys.add(&zero_scalar)?);
             self.values = Some(values.add(&zero_scalar)?);
             self.offset = seq_len;
             self.idx = seq_len;
-
             return Ok(vec![keys.add(&zero_scalar)?, values.add(&zero_scalar)?]);
         }
 
-        // Put keys/values in temporal order to preserve context
         let ordered_keys = self.temporal_order(self.keys.as_ref().unwrap())?;
         let ordered_values = self.temporal_order(self.values.as_ref().unwrap())?;
 
         let current_len = ordered_keys.shape_at(2)? as i32;
         self.idx = current_len;
 
-        // The largest size is self.max_size + S - 1 to ensure
-        // every token gets at least self.max_size context
         let trim_size = current_len - self.max_size + 1;
 
         let new_keys = self.trim(trim_size, &ordered_keys, Some(keys))?;
         let new_values = self.trim(trim_size, &ordered_values, Some(values))?;
 
-        // Store copies
         let zero_scalar = MxArray::full(&[1], Either::A(0.0), None)?;
         self.keys = Some(new_keys.add(&zero_scalar)?);
         self.values = Some(new_values.add(&zero_scalar)?);
         self.offset += seq_len;
-
         self.idx = new_keys.shape_at(2)? as i32;
 
         Ok(vec![new_keys, new_values])
     }
 
-    /// Update in-place (used for single-token updates)
+    /// Update in-place (single-token updates)
     fn update_in_place(&mut self, keys: &MxArray, values: &MxArray) -> Result<Vec<MxArray>> {
-        // Extract dimensions without copying entire shape vectors
         let batch_size = keys.shape_at(0)? as i32;
         let n_kv_heads = keys.shape_at(1)? as i32;
-        let seq_len = keys.shape_at(2)? as i32; // Should be 1 for single-token
+        let seq_len = keys.shape_at(2)? as i32;
         let k_head_dim = keys.shape_at(3)? as i32;
         let v_head_dim = values.shape_at(3)? as i32;
 
         let prev = self.offset;
 
-        // May not have hit max size yet, so potentially keep growing the cache
         let needs_grow = if let Some(existing_keys) = &self.keys {
             let cache_size = existing_keys.shape_at(2)? as i32;
             prev >= cache_size && cache_size < self.max_size
@@ -219,7 +180,6 @@ impl RotatingKVCache {
             )
         })?;
 
-        // Trim if needed
         let current_cache_size = self_keys.shape_at(2)? as i32;
         let trim_size = current_cache_size - self.max_size;
         if trim_size > 0 {
@@ -230,17 +190,13 @@ impl RotatingKVCache {
             self.idx = self.max_size;
         }
 
-        // Rotate if we've reached max_size
         if self.idx == self.max_size {
             self.idx = self.keep;
         }
 
-        // Assign new keys/values at current position using OPTIMIZED in-place assignment
         let start = self.idx;
         let end = self.idx + seq_len;
 
-        // Use optimized in-place slice assignment - no concatenation needed!
-        // This directly modifies the rotating buffer without creating new arrays
         if let Some(cache_keys) = self.keys.as_mut() {
             cache_keys.slice_assign_axis_inplace(2, start as i64, end as i64, keys)?;
         }
@@ -260,7 +216,6 @@ impl RotatingKVCache {
             )
         })?;
 
-        // If the buffer is not full, slice off the end
         if self.offset < self.max_size {
             let result_shape = self_keys.shape()?;
             let starts = [0, 0, 0, 0];
@@ -282,22 +237,9 @@ impl RotatingKVCache {
         ])
     }
 
-    /// Updates the cache with new keys and values, and returns all cached keys/values.
-    ///
-    /// Uses different strategies based on sequence length:
-    /// - Single token (seq_len=1): In-place update with rotation
-    /// - Multiple tokens: Concatenation with temporal reordering
-    ///
-    /// # Arguments
-    /// * `keys` - New keys to add, shape: (batch, n_kv_heads, seq_len, head_dim)
-    /// * `values` - New values to add, shape: (batch, n_kv_heads, seq_len, head_dim)
-    ///
-    /// # Returns
-    /// Array containing [cached_keys, cached_values] including the new entries
-    #[napi]
+    /// Updates the cache with new keys and values.
     pub fn update_and_fetch(&mut self, keys: &MxArray, values: &MxArray) -> Result<Vec<MxArray>> {
         let seq_len = keys.shape_at(2)? as i32;
-
         if seq_len == 1 {
             self.update_in_place(keys, values)
         } else {
@@ -305,8 +247,7 @@ impl RotatingKVCache {
         }
     }
 
-    /// Resets the cache, clearing all stored keys and values.
-    #[napi]
+    /// Resets the cache.
     pub fn reset(&mut self) {
         self.keys = None;
         self.values = None;
@@ -314,27 +255,235 @@ impl RotatingKVCache {
         self.idx = 0;
     }
 
-    /// Returns the current offset (total number of tokens processed).
-    #[napi]
+    /// Returns the current offset.
     pub fn get_offset(&self) -> i32 {
         self.offset
     }
 
     /// Returns the maximum cache size.
-    #[napi]
     pub fn get_max_size(&self) -> i32 {
         self.max_size
     }
 
-    /// Returns the number of tokens to keep (never evict).
-    #[napi]
+    /// Returns the number of tokens to keep.
     pub fn get_keep(&self) -> i32 {
         self.keep
     }
 
-    /// Returns the current write index (for rotation).
-    #[napi]
+    /// Returns the current write index.
     pub fn get_idx(&self) -> i32 {
         self.idx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn random_kv(batch: i64, heads: i64, seq: i64, dim: i64) -> (MxArray, MxArray) {
+        let keys = MxArray::random_normal(&[batch, heads, seq, dim], 0.0, 1.0, None).unwrap();
+        let values = MxArray::random_normal(&[batch, heads, seq, dim], 0.0, 1.0, None).unwrap();
+        (keys, values)
+    }
+
+    fn assert_shape(arr: &MxArray, expected: &[i64]) {
+        let shape = arr.shape().unwrap();
+        assert_eq!(shape.len(), expected.len(), "Shape dimension mismatch");
+        for (i, &exp) in expected.iter().enumerate() {
+            assert_eq!(shape[i], exp, "Shape mismatch at dimension {}", i);
+        }
+    }
+
+    #[test]
+    fn test_cache_creation() {
+        let cache = RotatingKVCache::new(8, None);
+        assert_eq!(cache.get_offset(), 0);
+        assert_eq!(cache.get_max_size(), 8);
+        assert_eq!(cache.get_keep(), 0);
+        assert_eq!(cache.get_idx(), 0);
+    }
+
+    #[test]
+    fn test_cache_creation_with_keep() {
+        let cache = RotatingKVCache::new(8, Some(2));
+        assert_eq!(cache.get_max_size(), 8);
+        assert_eq!(cache.get_keep(), 2);
+    }
+
+    #[test]
+    fn test_update_below_max_size() {
+        let mut cache = RotatingKVCache::new(10, None);
+        let (keys, values) = random_kv(1, 2, 6, 8);
+
+        let result = cache.update_and_fetch(&keys, &values).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(cache.get_offset(), 6);
+        assert_shape(&result[0], &[1, 2, 6, 8]);
+        assert_shape(&result[1], &[1, 2, 6, 8]);
+    }
+
+    #[test]
+    fn test_multiple_updates_below_max() {
+        let mut cache = RotatingKVCache::new(10, None);
+
+        let (keys1, values1) = random_kv(1, 2, 4, 8);
+        cache.update_and_fetch(&keys1, &values1).unwrap();
+
+        let (keys2, values2) = random_kv(1, 2, 3, 8);
+        let result = cache.update_and_fetch(&keys2, &values2).unwrap();
+
+        assert_eq!(cache.get_offset(), 7);
+        assert_shape(&result[0], &[1, 2, 7, 8]);
+    }
+
+    #[test]
+    fn test_rotation_exceeds_max_size() {
+        let mut cache = RotatingKVCache::new(4, Some(0));
+        let (keys, values) = random_kv(1, 2, 10, 8);
+
+        let result = cache.update_and_fetch(&keys, &values).unwrap();
+
+        assert_eq!(cache.get_offset(), 10);
+        let seq_len = result[0].shape().unwrap()[2];
+        assert!(seq_len >= 4);
+        assert!(seq_len <= 13);
+    }
+
+    #[test]
+    fn test_keep_tokens_during_rotation() {
+        let mut cache = RotatingKVCache::new(8, Some(2));
+        let (keys, values) = random_kv(1, 2, 12, 8);
+
+        let result = cache.update_and_fetch(&keys, &values).unwrap();
+
+        assert_eq!(cache.get_offset(), 12);
+        let seq_len = result[0].shape().unwrap()[2];
+        assert!(seq_len >= 8);
+    }
+
+    #[test]
+    fn test_single_token_updates() {
+        let mut cache = RotatingKVCache::new(10, Some(0));
+
+        let (keys1, values1) = random_kv(1, 4, 5, 16);
+        cache.update_and_fetch(&keys1, &values1).unwrap();
+        assert_eq!(cache.get_offset(), 5);
+
+        for i in 0..3 {
+            let (key_token, value_token) = random_kv(1, 4, 1, 16);
+            let result = cache.update_and_fetch(&key_token, &value_token).unwrap();
+
+            assert_eq!(cache.get_offset(), 5 + i + 1);
+            assert_shape(&result[0], &[1, 4, 5 + i as i64 + 1, 16]);
+        }
+    }
+
+    #[test]
+    fn test_single_token_rotation() {
+        let mut cache = RotatingKVCache::new(6, Some(0));
+
+        let (keys1, values1) = random_kv(1, 2, 6, 8);
+        cache.update_and_fetch(&keys1, &values1).unwrap();
+
+        for i in 0..4 {
+            let (key_token, value_token) = random_kv(1, 2, 1, 8);
+            let result = cache.update_and_fetch(&key_token, &value_token).unwrap();
+
+            assert_eq!(cache.get_offset(), 6 + i + 1);
+            assert_shape(&result[0], &[1, 2, 6, 8]);
+        }
+    }
+
+    #[test]
+    fn test_reset() {
+        let mut cache = RotatingKVCache::new(8, Some(2));
+
+        let (keys, values) = random_kv(2, 8, 6, 32);
+        cache.update_and_fetch(&keys, &values).unwrap();
+        assert_eq!(cache.get_offset(), 6);
+
+        cache.reset();
+        assert_eq!(cache.get_offset(), 0);
+        assert_eq!(cache.get_idx(), 0);
+
+        let (keys2, values2) = random_kv(2, 8, 5, 32);
+        let result = cache.update_and_fetch(&keys2, &values2).unwrap();
+
+        assert_eq!(cache.get_offset(), 5);
+        assert_shape(&result[0], &[2, 8, 5, 32]);
+    }
+
+    #[test]
+    fn test_max_size_one() {
+        let mut cache = RotatingKVCache::new(1, Some(0));
+
+        for i in 0..3 {
+            let (keys, values) = random_kv(1, 2, 1, 8);
+            let result = cache.update_and_fetch(&keys, &values).unwrap();
+
+            assert_eq!(cache.get_offset(), i + 1);
+            assert_shape(&result[0], &[1, 2, 1, 8]);
+        }
+    }
+
+    #[test]
+    fn test_batch_size_greater_than_one() {
+        let mut cache = RotatingKVCache::new(10, Some(2));
+
+        let (keys, values) = random_kv(4, 2, 8, 16);
+        let result = cache.update_and_fetch(&keys, &values).unwrap();
+
+        assert_eq!(cache.get_offset(), 8);
+        assert_shape(&result[0], &[4, 2, 8, 16]);
+    }
+
+    #[test]
+    fn test_data_integrity() {
+        let mut cache = RotatingKVCache::new(10, Some(0));
+
+        let keys1 = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]).unwrap();
+        let values1 = MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0], &[1, 1, 4, 1]).unwrap();
+
+        let result1 = cache.update_and_fetch(&keys1, &values1).unwrap();
+        result1[0].eval();
+        result1[1].eval();
+        let keys1_data = result1[0].to_float32().unwrap().to_vec();
+        let values1_data = result1[1].to_float32().unwrap().to_vec();
+
+        assert_eq!(keys1_data, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(values1_data, vec![10.0, 20.0, 30.0, 40.0]);
+
+        let keys2 = MxArray::from_float32(&[5.0, 6.0], &[1, 1, 2, 1]).unwrap();
+        let values2 = MxArray::from_float32(&[50.0, 60.0], &[1, 1, 2, 1]).unwrap();
+
+        let result2 = cache.update_and_fetch(&keys2, &values2).unwrap();
+        result2[0].eval();
+        result2[1].eval();
+        let keys2_data = result2[0].to_float32().unwrap().to_vec();
+        let values2_data = result2[1].to_float32().unwrap().to_vec();
+
+        assert_eq!(keys2_data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(values2_data, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+    }
+
+    #[test]
+    fn test_long_generation_with_rotation() {
+        let mut cache = RotatingKVCache::new(8, Some(2));
+
+        let (keys1, values1) = random_kv(1, 2, 5, 8);
+        cache.update_and_fetch(&keys1, &values1).unwrap();
+
+        for i in 0..20 {
+            let (key_token, value_token) = random_kv(1, 2, 1, 8);
+            let result = cache.update_and_fetch(&key_token, &value_token).unwrap();
+
+            assert_eq!(cache.get_offset(), 5 + i + 1);
+            if 5 + i + 1 >= 8 {
+                assert_shape(&result[0], &[1, 2, 8, 8]);
+            }
+        }
+
+        assert_eq!(cache.get_offset(), 25);
     }
 }

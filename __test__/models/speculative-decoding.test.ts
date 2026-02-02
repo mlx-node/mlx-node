@@ -7,8 +7,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 import { existsSync } from 'node:fs';
-import { MxArray, KVCache } from '@mlx-node/core';
-import { createZerosArray } from '../test-utils';
+import { MxArray } from '@mlx-node/core';
 
 // Path to test models - can be configured via environment variable
 const MODEL_PATH = process.env.QWEN3_MODEL_PATH || './models/qwen3-0.6b';
@@ -133,42 +132,5 @@ describe('Speculative Decoding Unit Tests', () => {
     expect(true).toBe(true);
   });
 
-  it('should support KVCache trim operation', () => {
-    const cache = new KVCache();
-
-    // Create some dummy data - shape: [batch, n_kv_heads, seq_len, head_dim]
-    const keys = createZerosArray([1, 4, 8, 64]);
-    const values = createZerosArray([1, 4, 8, 64]);
-
-    // Update cache
-    cache.updateAndFetch(keys, values);
-    expect(cache.getOffset()).toBe(8);
-
-    // Trim cache
-    cache.trim(4);
-    expect(cache.getOffset()).toBe(4);
-
-    // Trim to 0
-    cache.trim(0);
-    expect(cache.getOffset()).toBe(0);
-
-    // Trim with negative value should clamp to 0
-    cache.trim(-5);
-    expect(cache.getOffset()).toBe(0);
-  });
-
-  it('should not grow cache via trim', () => {
-    const cache = new KVCache();
-
-    // Shape: [batch, n_kv_heads, seq_len, head_dim]
-    const keys = createZerosArray([1, 4, 4, 64]);
-    const values = createZerosArray([1, 4, 4, 64]);
-
-    cache.updateAndFetch(keys, values);
-    expect(cache.getOffset()).toBe(4);
-
-    // Trying to trim to a larger value should do nothing
-    cache.trim(10);
-    expect(cache.getOffset()).toBe(4);
-  });
+  // KVCache tests moved to Rust: crates/mlx-core/src/transformer/kv_cache.rs
 });

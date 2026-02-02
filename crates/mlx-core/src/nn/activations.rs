@@ -1,16 +1,13 @@
 use crate::array::MxArray;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 // ============================================
-// Activation Functions
+// Activation Functions (Internal)
 // ============================================
 
-#[napi]
 pub struct Activations;
 
-#[napi]
 impl Activations {
     /// Sigmoid Linear Unit (SiLU): x * sigmoid(x)
     /// This is the most common activation in modern LLMs (Llama, Qwen, Phi)
@@ -18,7 +15,6 @@ impl Activations {
     /// This version cleans up intermediate handles after use.
     /// It works well for generation but doesn't preserve the computation graph for autograd.
     /// Use `silu_for_autograd` in training contexts that need gradient computation.
-    #[napi]
     pub fn silu(input: &MxArray) -> Result<MxArray> {
         // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
         let handle = unsafe {
@@ -88,7 +84,6 @@ impl Activations {
 
     /// Gaussian Error Linear Unit (GELU)
     /// Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    #[napi]
     pub fn gelu(input: &MxArray) -> Result<MxArray> {
         let handle = unsafe {
             // Constants
@@ -142,7 +137,6 @@ impl Activations {
     }
 
     /// ReLU: max(0, x)
-    #[napi]
     pub fn relu(input: &MxArray) -> Result<MxArray> {
         let handle = unsafe {
             let zero = sys::mlx_array_scalar_float(0.0);
@@ -154,7 +148,6 @@ impl Activations {
     }
 
     /// Sigmoid: 1 / (1 + exp(-x))
-    #[napi]
     pub fn sigmoid(input: &MxArray) -> Result<MxArray> {
         let handle = unsafe {
             let neg_x = sys::mlx_array_negative(input.handle.0);
@@ -174,7 +167,6 @@ impl Activations {
     }
 
     /// Softmax along the last axis
-    #[napi]
     pub fn softmax(input: &MxArray, axis: Option<i32>) -> Result<MxArray> {
         let axis_val = axis.unwrap_or(-1);
 
@@ -202,7 +194,6 @@ impl Activations {
     }
 
     /// Log-Softmax along the specified axis
-    #[napi]
     pub fn log_softmax(input: &MxArray, axis: Option<i32>) -> Result<MxArray> {
         let axis_val = axis.unwrap_or(-1);
 
@@ -212,7 +203,6 @@ impl Activations {
     }
 
     /// Swish/SwiGLU: Used in gated variants
-    #[napi]
     pub fn swiglu(gate: &MxArray, up: &MxArray) -> Result<MxArray> {
         // swiglu(gate, up) = silu(gate) * up
         let silu_gate = Self::silu(gate)?;

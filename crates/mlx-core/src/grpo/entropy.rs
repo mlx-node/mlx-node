@@ -7,7 +7,6 @@
 use crate::array::MxArray;
 use crate::nn::Activations;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 /// Returns a binary mask identifying tokens whose entropy exceeds a given quantile threshold.
 ///
@@ -39,7 +38,6 @@ use napi_derive::napi;
 /// // Threshold: 0.5
 /// // Result: trains on top 50% (2 out of 4 non-pad tokens: 0.9 and 0.7)
 /// ```
-#[napi]
 pub fn get_high_entropy_mask(
     entropies: &MxArray,
     mask: &MxArray,
@@ -156,7 +154,6 @@ pub fn get_high_entropy_mask(
 /// // logits: [batch, seq_len, vocab_size]
 /// // returns: [batch, seq_len]
 /// ```
-#[napi]
 pub fn compute_entropy(logits: &MxArray) -> Result<MxArray> {
     // Compute softmax probabilities
     let probs = Activations::softmax(logits, Some(-1))?;

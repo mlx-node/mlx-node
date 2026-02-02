@@ -1,6 +1,5 @@
 use crate::array::MxArray;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 /// Batch Key-Value cache for efficient batch inference with left-padding support.
 ///
@@ -17,7 +16,6 @@ use napi_derive::napi;
 /// And `left_padding = [1, 3, 0]` specifies the padding for each batch element.
 ///
 /// Reference: mlx-lm/mlx_lm/models/cache.py:BatchKVCache (lines 662-787)
-#[napi(js_name = "BatchKVCache")]
 pub struct BatchKVCache {
     keys: Option<MxArray>,
     values: Option<MxArray>,
@@ -26,19 +24,11 @@ pub struct BatchKVCache {
     idx: i32,                 // Current write position (shared across batch)
 }
 
-#[napi]
 impl BatchKVCache {
     /// Creates a new batch KV cache with left-padding information.
     ///
     /// # Arguments
     /// * `left_padding` - Array specifying left padding for each batch element
-    ///
-    /// # Example
-    /// ```js
-    /// // Three sequences with different padding amounts
-    /// const cache = new BatchKVCache([1, 3, 0]);
-    /// ```
-    #[napi(constructor)]
     pub fn new(left_padding: Int32Array) -> Self {
         // Offset starts negative because of left padding
         let offset: Vec<i32> = left_padding.iter().map(|&l| -l).collect();
@@ -60,7 +50,6 @@ impl BatchKVCache {
     ///
     /// # Returns
     /// Array containing [cached_keys, cached_values] including the new entries
-    #[napi]
     pub fn update_and_fetch(&mut self, keys: &MxArray, values: &MxArray) -> Result<Vec<MxArray>> {
         // Extract dimensions without copying entire shape vectors
         let batch_size = keys.shape_at(0)? as usize;
@@ -162,11 +151,10 @@ impl BatchKVCache {
     /// * `batch_indices` - Indices of batch elements to keep
     ///
     /// # Example
-    /// ```js
+    /// ```ignore
     /// // Keep only batch elements 0 and 2
     /// cache.filter([0, 2]);
     /// ```
-    #[napi]
     pub fn filter(&mut self, batch_indices: &[i32]) -> Result<()> {
         // Filter offset and left_padding arrays (always do this, even if cache is empty)
         let new_offset: Vec<i32> = batch_indices
@@ -230,7 +218,6 @@ impl BatchKVCache {
     ///
     /// # Arguments
     /// * `other` - Another BatchKVCache to concatenate
-    #[napi]
     pub fn extend(&mut self, other: &BatchKVCache) -> Result<()> {
         if self.keys.is_none() || other.keys.is_none() {
             return Err(Error::new(
@@ -342,7 +329,6 @@ impl BatchKVCache {
     }
 
     /// Resets the cache, clearing all stored keys and values.
-    #[napi]
     pub fn reset(&mut self) {
         self.keys = None;
         self.values = None;
@@ -352,19 +338,16 @@ impl BatchKVCache {
     }
 
     /// Returns the current index (number of cached tokens, not accounting for padding).
-    #[napi]
     pub fn get_idx(&self) -> i32 {
         self.idx
     }
 
     /// Returns the offset array (per-batch offsets).
-    #[napi]
     pub fn get_offsets(&self) -> Vec<i32> {
         self.offset.clone()
     }
 
     /// Returns the left padding array.
-    #[napi]
     pub fn get_left_padding(&mut self) -> &mut Int32Array {
         &mut self.left_padding
     }
@@ -428,5 +411,121 @@ impl BatchKVCache {
     /// Returns the batch size.
     pub fn batch_size(&self) -> usize {
         self.offset.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_shape(arr: &MxArray, expected: &[i64]) {
+        let shape = arr.shape().unwrap();
+        assert_eq!(shape.len(), expected.len(), "Shape dimension mismatch");
+        for (i, &exp) in expected.iter().enumerate() {
+            assert_eq!(shape[i], exp, "Shape mismatch at dimension {}", i);
+        }
+    }
+
+    #[test]
+    fn test_cache_creation() {
+        let cache = BatchKVCache::new(vec![1, 3, 0].into());
+        assert_eq!(cache.get_idx(), 0);
+        assert_eq!(cache.batch_size(), 3);
+        assert_eq!(cache.get_offsets(), vec![-1, -3, 0]);
+    }
+
+    #[test]
+    fn test_single_update() {
+        let mut cache = BatchKVCache::new(vec![0, 0].into());
+        let keys = MxArray::zeros(&[2, 4, 6, 8], None).unwrap();
+        let values = MxArray::zeros(&[2, 4, 6, 8], None).unwrap();
+
+        let result = cache.update_and_fetch(&keys, &values).unwrap();
+
+        assert_eq!(cache.get_idx(), 6);
+        assert_eq!(result.len(), 2);
+        assert_shape(&result[0], &[2, 4, 6, 8]);
+        assert_shape(&result[1], &[2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn test_multiple_updates() {
+        let mut cache = BatchKVCache::new(vec![0, 0].into());
+
+        // First update
+        let keys1 = MxArray::zeros(&[2, 4, 5, 8], None).unwrap();
+        let values1 = MxArray::zeros(&[2, 4, 5, 8], None).unwrap();
+        cache.update_and_fetch(&keys1, &values1).unwrap();
+        assert_eq!(cache.get_idx(), 5);
+
+        // Second update
+        let keys2 = MxArray::zeros(&[2, 4, 3, 8], None).unwrap();
+        let values2 = MxArray::zeros(&[2, 4, 3, 8], None).unwrap();
+        let result = cache.update_and_fetch(&keys2, &values2).unwrap();
+
+        assert_eq!(cache.get_idx(), 8);
+        assert_shape(&result[0], &[2, 4, 8, 8]);
+    }
+
+    #[test]
+    fn test_offsets_with_padding() {
+        let mut cache = BatchKVCache::new(vec![2, 0, 1].into());
+
+        // Initial offsets should be negative of left_padding
+        assert_eq!(cache.get_offsets(), vec![-2, 0, -1]);
+
+        let keys = MxArray::zeros(&[3, 2, 4, 8], None).unwrap();
+        let values = MxArray::zeros(&[3, 2, 4, 8], None).unwrap();
+        cache.update_and_fetch(&keys, &values).unwrap();
+
+        // After update, offsets should increase by seq_len
+        assert_eq!(cache.get_offsets(), vec![2, 4, 3]);
+    }
+
+    #[test]
+    fn test_reset() {
+        let mut cache = BatchKVCache::new(vec![1, 2].into());
+
+        let keys = MxArray::zeros(&[2, 4, 6, 8], None).unwrap();
+        let values = MxArray::zeros(&[2, 4, 6, 8], None).unwrap();
+        cache.update_and_fetch(&keys, &values).unwrap();
+        assert_eq!(cache.get_idx(), 6);
+
+        cache.reset();
+        assert_eq!(cache.get_idx(), 0);
+        assert_eq!(cache.get_offsets(), vec![-1, -2]); // Reset to initial offsets
+    }
+
+    #[test]
+    fn test_filter() {
+        let mut cache = BatchKVCache::new(vec![0, 0, 0].into());
+
+        let keys = MxArray::zeros(&[3, 2, 4, 8], None).unwrap();
+        let values = MxArray::zeros(&[3, 2, 4, 8], None).unwrap();
+        cache.update_and_fetch(&keys, &values).unwrap();
+
+        // Keep only batch elements 0 and 2
+        cache.filter(&[0, 2]).unwrap();
+
+        assert_eq!(cache.batch_size(), 2);
+        assert_eq!(cache.get_offsets().len(), 2);
+    }
+
+    #[test]
+    fn test_advance_offsets() {
+        let mut cache = BatchKVCache::new(vec![1, 0].into());
+        assert_eq!(cache.get_offsets(), vec![-1, 0]);
+
+        cache.advance_offsets(5);
+        assert_eq!(cache.get_offsets(), vec![4, 5]);
+    }
+
+    #[test]
+    fn test_set_idx() {
+        let mut cache = BatchKVCache::new(vec![0].into());
+        assert_eq!(cache.get_idx(), 0);
+
+        cache.set_idx(10);
+        assert_eq!(cache.get_idx(), 10);
     }
 }

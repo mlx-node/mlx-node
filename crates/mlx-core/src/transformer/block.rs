@@ -6,7 +6,6 @@ use crate::transformer::kv_cache::KVCache;
 use crate::transformer::mlp::MLP;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 use std::ptr;
 
 /// Transformer block combining self-attention and MLP with pre-normalization.
@@ -14,7 +13,6 @@ use std::ptr;
 /// Architecture (Qwen3/Llama style):
 /// 1. x = x + self_attn(norm(x))  # Pre-norm + residual
 /// 2. x = x + mlp(norm(x))        # Pre-norm + residual
-#[napi(js_name = "TransformerBlock")]
 pub struct TransformerBlock {
     pub(crate) self_attn: Attention,
     pub(crate) mlp: MLP,
@@ -32,7 +30,6 @@ pub struct TransformerBlock {
     use_qk_norm: bool,
 }
 
-#[napi]
 impl TransformerBlock {
     /// Creates a new transformer block.
     ///
@@ -45,7 +42,6 @@ impl TransformerBlock {
     /// * `rope_theta` - RoPE base frequency (optional)
     /// * `use_qk_norm` - Whether to use QK normalization (optional)
     /// * `head_dim` - Dimension per head (optional)
-    #[napi(constructor)]
     pub fn new(
         hidden_size: u32,
         num_heads: u32,
@@ -103,7 +99,7 @@ impl TransformerBlock {
     ///
     /// # Returns
     /// Output tensor, shape: (batch, seq_len, hidden_size)
-    #[napi]
+
     pub fn forward(
         &self,
         x: &MxArray,
@@ -374,7 +370,7 @@ impl TransformerBlock {
     /// - "after_post_norm": after post-attention layer norm
     /// - "after_mlp": MLP output
     /// - "output": final block output
-    #[napi]
+
     pub fn forward_debug(
         &self,
         x: &MxArray,
@@ -413,23 +409,19 @@ impl TransformerBlock {
 
     // Norm weight getters/setters for parameter management
 
-    #[napi]
     pub fn get_input_layernorm_weight(&self) -> MxArray {
         self.input_layernorm.get_weight()
     }
 
-    #[napi]
     pub fn get_post_attention_layernorm_weight(&self) -> MxArray {
         self.post_attention_layernorm.get_weight()
     }
 
-    #[napi]
     pub fn set_input_layernorm_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.input_layernorm.set_weight(weight)?;
         Ok(())
     }
 
-    #[napi]
     pub fn set_post_attention_layernorm_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.post_attention_layernorm.set_weight(weight)?;
         Ok(())

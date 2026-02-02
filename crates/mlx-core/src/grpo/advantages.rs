@@ -9,7 +9,6 @@
 
 use crate::array::MxArray;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 /// Compute advantages for GRPO from rewards
 ///
@@ -31,7 +30,6 @@ use napi_derive::napi;
 ///
 /// # Returns
 /// Advantages, shape (B*G,)
-#[napi]
 pub fn compute_advantages(
     rewards: &MxArray,
     num_generations: i32,

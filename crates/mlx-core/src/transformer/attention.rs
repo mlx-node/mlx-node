@@ -3,7 +3,6 @@ use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::kv_cache::KVCache;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 use std::ptr;
 
 /// Multi-head attention with separate Q/K/V projections (Qwen3 style).
@@ -13,7 +12,6 @@ use std::ptr;
 /// - Optional QK normalization for training stability
 /// - RoPE (Rotary Position Embeddings)
 /// - KV caching for efficient inference
-#[napi(js_name = "Attention")]
 pub struct Attention {
     q_proj: Linear,
     k_proj: Linear,
@@ -31,7 +29,6 @@ pub struct Attention {
     qk_norm_eps: f32,
 }
 
-#[napi]
 impl Attention {
     /// Creates a new multi-head attention layer.
     ///
@@ -43,7 +40,6 @@ impl Attention {
     /// * `rope_theta` - RoPE base frequency (default: 10000)
     /// * `use_qk_norm` - Whether to use QK normalization (Qwen3 feature, default: false)
     /// * `qk_norm_eps` - Epsilon for QK normalization (default: 1e-6)
-    #[napi(constructor)]
     pub fn new(
         hidden_size: u32,
         num_heads: u32,
@@ -77,7 +73,7 @@ impl Attention {
         };
 
         // RoPE
-        let rope = RoPE::new(head_dim as i32, Some(false), Some(rope_theta), Some(1.0))?;
+        let rope = RoPE::new(head_dim as i32, Some(false), Some(rope_theta), Some(1.0));
 
         // Attention scale factor
         let scale = 1.0 / (head_dim as f64).sqrt();
@@ -108,7 +104,7 @@ impl Attention {
     ///
     /// # Returns
     /// Output tensor, shape: (batch, seq_len, hidden_size)
-    #[napi]
+
     pub fn forward(
         &self,
         x: &MxArray,
@@ -225,7 +221,7 @@ impl Attention {
     ///
     /// # Returns
     /// Output tensor, shape: (batch, seq_len, hidden_size)
-    #[napi]
+
     pub fn forward_with_qkv(
         &self,
         queries: &MxArray,
@@ -260,7 +256,7 @@ impl Attention {
     }
 
     /// Debug method: Forward pass with intermediate Q/K/V states captured
-    #[napi]
+
     pub fn forward_debug(
         &self,
         x: &MxArray,
@@ -344,31 +340,26 @@ impl Attention {
 
     // Weight setters for loading pretrained models
 
-    #[napi]
     pub fn set_q_proj_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.q_proj.set_weight(weight)?;
         Ok(())
     }
 
-    #[napi]
     pub fn set_k_proj_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.k_proj.set_weight(weight)?;
         Ok(())
     }
 
-    #[napi]
     pub fn set_v_proj_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.v_proj.set_weight(weight)?;
         Ok(())
     }
 
-    #[napi]
     pub fn set_o_proj_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.o_proj.set_weight(weight)?;
         Ok(())
     }
 
-    #[napi]
     pub fn set_q_norm_weight(&mut self, weight: &MxArray) -> Result<()> {
         if let Some(ref mut norm) = self.q_norm {
             norm.set_weight(weight)?;
@@ -380,7 +371,6 @@ impl Attention {
         }
     }
 
-    #[napi]
     pub fn set_k_norm_weight(&mut self, weight: &MxArray) -> Result<()> {
         if let Some(ref mut norm) = self.k_norm {
             norm.set_weight(weight)?;
@@ -394,32 +384,26 @@ impl Attention {
 
     // Weight getters for parameter extraction
 
-    #[napi]
     pub fn get_q_proj_weight(&self) -> MxArray {
         self.q_proj.get_weight()
     }
 
-    #[napi]
     pub fn get_k_proj_weight(&self) -> MxArray {
         self.k_proj.get_weight()
     }
 
-    #[napi]
     pub fn get_v_proj_weight(&self) -> MxArray {
         self.v_proj.get_weight()
     }
 
-    #[napi]
     pub fn get_o_proj_weight(&self) -> MxArray {
         self.o_proj.get_weight()
     }
 
-    #[napi]
     pub fn get_q_norm_weight(&self) -> Option<MxArray> {
         self.q_norm.as_ref().map(|n| n.get_weight())
     }
 
-    #[napi]
     pub fn get_k_norm_weight(&self) -> Option<MxArray> {
         self.k_norm.as_ref().map(|n| n.get_weight())
     }
@@ -440,7 +424,7 @@ impl Attention {
     /// - [10]: attention output (after reshape, before o_proj)
     ///
     /// Note: This does NOT support KV caching - for training only
-    #[napi]
+
     pub fn forward_with_cache(&self, x: &MxArray) -> Result<Vec<MxArray>> {
         // Use shape_at() to avoid allocating full shape vector
         let batch = x.shape_at(0)?;

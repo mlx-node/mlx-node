@@ -26,15 +26,13 @@ export type { ToolDefinition, FunctionDefinition, FunctionParameters } from '@ml
 // Core tensor (for custom rewards/models)
 export { MxArray } from '@mlx-node/core';
 
-// Activations (for custom architectures)
-export { Activations } from '@mlx-node/core';
+// Activations are internal-only (Rust) - used by transformers, sampling, GRPO
 
-// Transformer components
-export { Attention, FusedAttention, TransformerBlock, RoPE } from '@mlx-node/core';
-export { KVCache, BatchKVCache, RotatingKVCache } from '@mlx-node/core';
+// Transformer components are now internal-only (Rust)
+// Use model.chat() or model.generate() instead
 
-// GRPO utilities
-export { computeAdvantages, computeEntropy, getHighEntropyMask } from '@mlx-node/core';
+// GRPO utilities (computeAdvantages, computeEntropy, getHighEntropyMask) are internal-only
+// They are used by GRPOTrainingEngine in Rust
 
 // Model conversion
 export { convertModel, convertParquetToJsonl } from '@mlx-node/core';

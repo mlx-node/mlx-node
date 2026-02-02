@@ -311,3 +311,193 @@ where
 
     gradients
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper to create true scalar array (0-dimensional)
+    fn scalar(val: f32) -> MxArray {
+        MxArray::from_float32(&[val], &[]).unwrap()
+    }
+
+    // Helper to get scalar value
+    fn get_scalar(arr: &MxArray) -> f32 {
+        arr.eval();
+        arr.to_float32().unwrap()[0]
+    }
+
+    // Helper to convert result to scalar (reduce if needed)
+    fn to_scalar(arr: MxArray) -> Result<MxArray> {
+        let shape = arr.shape()?;
+        if shape.is_empty() {
+            Ok(arr)
+        } else {
+            // Sum to scalar
+            arr.sum(None, None)
+        }
+    }
+
+    #[test]
+    fn test_gradient_of_x_squared() {
+        // f(x) = x^2, f'(x) = 2x
+        // At x = 3, gradient should be 6
+        let x = scalar(3.0);
+
+        let (loss, grads) = value_and_grad(vec![&x], |params| {
+            let x = &params[0];
+            to_scalar(x.square()?)
+        })
+        .unwrap();
+
+        assert!((get_scalar(&loss) - 9.0).abs() < 1e-5, "loss should be 9.0");
+        assert_eq!(grads.len(), 1);
+        assert!(
+            (get_scalar(&grads[0]) - 6.0).abs() < 1e-5,
+            "gradient should be 6.0"
+        );
+    }
+
+    #[test]
+    fn test_gradient_of_sum() {
+        // f(a, b) = a + b, df/da = 1, df/db = 1
+        let a = scalar(2.0);
+        let b = scalar(3.0);
+
+        let (loss, grads) =
+            value_and_grad(vec![&a, &b], |params| to_scalar(params[0].add(&params[1])?)).unwrap();
+
+        assert!((get_scalar(&loss) - 5.0).abs() < 1e-5, "loss should be 5.0");
+        assert_eq!(grads.len(), 2);
+        assert!(
+            (get_scalar(&grads[0]) - 1.0).abs() < 1e-5,
+            "da should be 1.0"
+        );
+        assert!(
+            (get_scalar(&grads[1]) - 1.0).abs() < 1e-5,
+            "db should be 1.0"
+        );
+    }
+
+    #[test]
+    fn test_gradient_of_product() {
+        // f(a, b) = a * b, df/da = b, df/db = a
+        let a = scalar(2.0);
+        let b = scalar(3.0);
+
+        let (loss, grads) =
+            value_and_grad(vec![&a, &b], |params| to_scalar(params[0].mul(&params[1])?)).unwrap();
+
+        assert!((get_scalar(&loss) - 6.0).abs() < 1e-5, "loss should be 6.0");
+        assert_eq!(grads.len(), 2);
+        assert!(
+            (get_scalar(&grads[0]) - 3.0).abs() < 1e-5,
+            "da should be b = 3.0"
+        );
+        assert!(
+            (get_scalar(&grads[1]) - 2.0).abs() < 1e-5,
+            "db should be a = 2.0"
+        );
+    }
+
+    #[test]
+    fn test_gradient_of_sum_of_squares() {
+        // f(a, b) = a^2 + b^2, df/da = 2a, df/db = 2b
+        let a = scalar(2.0);
+        let b = scalar(3.0);
+
+        let (loss, grads) = value_and_grad(vec![&a, &b], |params| {
+            let a_sq = params[0].square()?;
+            let b_sq = params[1].square()?;
+            to_scalar(a_sq.add(&b_sq)?)
+        })
+        .unwrap();
+
+        assert!(
+            (get_scalar(&loss) - 13.0).abs() < 1e-5,
+            "loss should be 4+9=13"
+        );
+        assert_eq!(grads.len(), 2);
+        assert!(
+            (get_scalar(&grads[0]) - 4.0).abs() < 1e-5,
+            "da should be 2*2=4.0"
+        );
+        assert!(
+            (get_scalar(&grads[1]) - 6.0).abs() < 1e-5,
+            "db should be 2*3=6.0"
+        );
+    }
+
+    #[test]
+    fn test_gradient_chain_rule() {
+        // f(x) = (x^2)^2 = x^4, f'(x) = 4x^3
+        // At x = 2, gradient should be 4*8 = 32
+        let x = scalar(2.0);
+
+        let (loss, grads) = value_and_grad(vec![&x], |params| {
+            let x_sq = params[0].square()?;
+            to_scalar(x_sq.square()?)
+        })
+        .unwrap();
+
+        assert!(
+            (get_scalar(&loss) - 16.0).abs() < 1e-5,
+            "loss should be 16.0"
+        );
+        assert_eq!(grads.len(), 1);
+        assert!(
+            (get_scalar(&grads[0]) - 32.0).abs() < 1e-5,
+            "gradient should be 32.0"
+        );
+    }
+
+    #[test]
+    fn test_gradient_of_exp() {
+        // f(x) = exp(x), f'(x) = exp(x)
+        // At x = 1, gradient should be e ≈ 2.71828
+        let x = scalar(1.0);
+
+        let (loss, grads) = value_and_grad(vec![&x], |params| to_scalar(params[0].exp()?)).unwrap();
+
+        let e = std::f32::consts::E;
+        assert!((get_scalar(&loss) - e).abs() < 1e-4, "loss should be e");
+        assert_eq!(grads.len(), 1);
+        assert!(
+            (get_scalar(&grads[0]) - e).abs() < 1e-4,
+            "gradient should be e"
+        );
+    }
+
+    #[test]
+    fn test_gradient_of_log() {
+        // f(x) = log(x), f'(x) = 1/x
+        // At x = 2, gradient should be 0.5
+        let x = scalar(2.0);
+
+        let (loss, grads) = value_and_grad(vec![&x], |params| to_scalar(params[0].log()?)).unwrap();
+
+        assert!(
+            (get_scalar(&loss) - 2.0_f32.ln()).abs() < 1e-5,
+            "loss should be ln(2)"
+        );
+        assert_eq!(grads.len(), 1);
+        assert!(
+            (get_scalar(&grads[0]) - 0.5).abs() < 1e-5,
+            "gradient should be 0.5"
+        );
+    }
+
+    #[test]
+    fn test_compute_gradients_only() {
+        // Test compute_gradients (gradients without loss value)
+        let x = scalar(3.0);
+
+        let grads = compute_gradients(vec![&x], |params| to_scalar(params[0].square()?)).unwrap();
+
+        assert_eq!(grads.len(), 1);
+        assert!(
+            (get_scalar(&grads[0]) - 6.0).abs() < 1e-5,
+            "gradient should be 6.0"
+        );
+    }
+}

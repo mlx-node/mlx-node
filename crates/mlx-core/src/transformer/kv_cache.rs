@@ -1,12 +1,10 @@
 use crate::array::MxArray;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 /// Key-Value cache for efficient transformer inference.
 ///
 /// Uses pre-allocated buffers with in-place assignment to avoid O(N²) concatenation overhead.
 /// Allocates memory in 256-token chunks (matching MLX-LM's step size).
-#[napi(js_name = "KVCache")]
 pub struct KVCache {
     keys: Option<MxArray>,
     values: Option<MxArray>,
@@ -20,10 +18,8 @@ impl Default for KVCache {
     }
 }
 
-#[napi]
 impl KVCache {
     /// Creates a new empty KV cache.
-    #[napi(constructor)]
     pub fn new() -> Self {
         Self {
             keys: None,
@@ -41,7 +37,6 @@ impl KVCache {
     ///
     /// # Returns
     /// Array containing [cached_keys, cached_values] including the new entries
-    #[napi]
     pub fn update_and_fetch(
         &mut self,
         keys: &MxArray,
@@ -134,7 +129,6 @@ impl KVCache {
     }
 
     /// Resets the cache, clearing all stored keys and values.
-    #[napi]
     pub fn reset(&mut self) {
         self.keys = None;
         self.values = None;
@@ -142,7 +136,6 @@ impl KVCache {
     }
 
     /// Returns the current offset (number of cached tokens).
-    #[napi]
     pub fn get_offset(&self) -> i32 {
         self.offset
     }
@@ -159,7 +152,6 @@ impl KVCache {
     /// # Note
     /// This doesn't actually deallocate memory - it just updates the offset.
     /// The next `update_and_fetch` call will overwrite the trimmed data in-place.
-    #[napi]
     pub fn trim(&mut self, new_len: i32) {
         if new_len < 0 {
             self.offset = 0;
@@ -167,5 +159,195 @@ impl KVCache {
             self.offset = new_len;
         }
         // If new_len >= offset, do nothing (can't grow via trim)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_shape(arr: &MxArray, expected: &[i64]) {
+        let shape = arr.shape().unwrap();
+        assert_eq!(shape.len(), expected.len(), "Shape dimension mismatch");
+        for (i, &exp) in expected.iter().enumerate() {
+            assert_eq!(shape[i], exp, "Shape mismatch at dimension {}", i);
+        }
+    }
+
+    #[test]
+    fn test_cache_creation() {
+        let cache = KVCache::new();
+        assert_eq!(cache.get_offset(), 0);
+    }
+
+    #[test]
+    fn test_cache_default() {
+        let cache = KVCache::default();
+        assert_eq!(cache.get_offset(), 0);
+    }
+
+    #[test]
+    fn test_single_update() {
+        let mut cache = KVCache::new();
+        let keys = MxArray::zeros(&[1, 2, 4, 8], None).unwrap();
+        let values = MxArray::zeros(&[1, 2, 4, 8], None).unwrap();
+
+        let (result_k, result_v) = cache.update_and_fetch(&keys, &values).unwrap();
+
+        assert_eq!(cache.get_offset(), 4);
+        assert_shape(&result_k, &[1, 2, 4, 8]);
+        assert_shape(&result_v, &[1, 2, 4, 8]);
+    }
+
+    #[test]
+    fn test_multiple_updates() {
+        let mut cache = KVCache::new();
+
+        // First update: 4 tokens
+        let keys1 = MxArray::zeros(&[1, 2, 4, 8], None).unwrap();
+        let values1 = MxArray::zeros(&[1, 2, 4, 8], None).unwrap();
+        cache.update_and_fetch(&keys1, &values1).unwrap();
+        assert_eq!(cache.get_offset(), 4);
+
+        // Second update: 3 more tokens
+        let keys2 = MxArray::zeros(&[1, 2, 3, 8], None).unwrap();
+        let values2 = MxArray::zeros(&[1, 2, 3, 8], None).unwrap();
+        let (result_k, result_v) = cache.update_and_fetch(&keys2, &values2).unwrap();
+
+        assert_eq!(cache.get_offset(), 7);
+        assert_shape(&result_k, &[1, 2, 7, 8]);
+        assert_shape(&result_v, &[1, 2, 7, 8]);
+    }
+
+    #[test]
+    fn test_single_token_updates() {
+        let mut cache = KVCache::new();
+
+        // Initial prefill
+        let keys1 = MxArray::zeros(&[1, 4, 5, 16], None).unwrap();
+        let values1 = MxArray::zeros(&[1, 4, 5, 16], None).unwrap();
+        cache.update_and_fetch(&keys1, &values1).unwrap();
+        assert_eq!(cache.get_offset(), 5);
+
+        // Single token updates (generation)
+        for i in 0..3 {
+            let key_token = MxArray::zeros(&[1, 4, 1, 16], None).unwrap();
+            let value_token = MxArray::zeros(&[1, 4, 1, 16], None).unwrap();
+            let (result_k, _) = cache.update_and_fetch(&key_token, &value_token).unwrap();
+
+            assert_eq!(cache.get_offset(), 5 + i + 1);
+            assert_shape(&result_k, &[1, 4, 5 + i as i64 + 1, 16]);
+        }
+    }
+
+    #[test]
+    fn test_reset() {
+        let mut cache = KVCache::new();
+
+        let keys = MxArray::zeros(&[2, 8, 6, 32], None).unwrap();
+        let values = MxArray::zeros(&[2, 8, 6, 32], None).unwrap();
+        cache.update_and_fetch(&keys, &values).unwrap();
+        assert_eq!(cache.get_offset(), 6);
+
+        cache.reset();
+        assert_eq!(cache.get_offset(), 0);
+
+        // After reset, can add new data
+        let keys2 = MxArray::zeros(&[2, 8, 5, 32], None).unwrap();
+        let values2 = MxArray::zeros(&[2, 8, 5, 32], None).unwrap();
+        let (result_k, _) = cache.update_and_fetch(&keys2, &values2).unwrap();
+
+        assert_eq!(cache.get_offset(), 5);
+        assert_shape(&result_k, &[2, 8, 5, 32]);
+    }
+
+    #[test]
+    fn test_trim() {
+        let mut cache = KVCache::new();
+
+        let keys = MxArray::zeros(&[1, 2, 10, 8], None).unwrap();
+        let values = MxArray::zeros(&[1, 2, 10, 8], None).unwrap();
+        cache.update_and_fetch(&keys, &values).unwrap();
+        assert_eq!(cache.get_offset(), 10);
+
+        // Trim to 5
+        cache.trim(5);
+        assert_eq!(cache.get_offset(), 5);
+
+        // Add more tokens after trim
+        let keys2 = MxArray::zeros(&[1, 2, 3, 8], None).unwrap();
+        let values2 = MxArray::zeros(&[1, 2, 3, 8], None).unwrap();
+        let (result_k, _) = cache.update_and_fetch(&keys2, &values2).unwrap();
+
+        assert_eq!(cache.get_offset(), 8);
+        assert_shape(&result_k, &[1, 2, 8, 8]);
+    }
+
+    #[test]
+    fn test_trim_negative() {
+        let mut cache = KVCache::new();
+
+        let keys = MxArray::zeros(&[1, 2, 10, 8], None).unwrap();
+        let values = MxArray::zeros(&[1, 2, 10, 8], None).unwrap();
+        cache.update_and_fetch(&keys, &values).unwrap();
+
+        // Trim with negative value should reset to 0
+        cache.trim(-5);
+        assert_eq!(cache.get_offset(), 0);
+    }
+
+    #[test]
+    fn test_trim_larger_than_offset() {
+        let mut cache = KVCache::new();
+
+        let keys = MxArray::zeros(&[1, 2, 10, 8], None).unwrap();
+        let values = MxArray::zeros(&[1, 2, 10, 8], None).unwrap();
+        cache.update_and_fetch(&keys, &values).unwrap();
+
+        // Trim to larger than offset should do nothing
+        cache.trim(100);
+        assert_eq!(cache.get_offset(), 10);
+    }
+
+    #[test]
+    fn test_data_integrity() {
+        let mut cache = KVCache::new();
+
+        let keys1 = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]).unwrap();
+        let values1 = MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0], &[1, 1, 4, 1]).unwrap();
+
+        let (result_k, result_v) = cache.update_and_fetch(&keys1, &values1).unwrap();
+        result_k.eval();
+        result_v.eval();
+        let keys1_data = result_k.to_float32().unwrap().to_vec();
+        let values1_data = result_v.to_float32().unwrap().to_vec();
+
+        assert_eq!(keys1_data, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(values1_data, vec![10.0, 20.0, 30.0, 40.0]);
+
+        let keys2 = MxArray::from_float32(&[5.0, 6.0], &[1, 1, 2, 1]).unwrap();
+        let values2 = MxArray::from_float32(&[50.0, 60.0], &[1, 1, 2, 1]).unwrap();
+
+        let (result_k2, result_v2) = cache.update_and_fetch(&keys2, &values2).unwrap();
+        result_k2.eval();
+        result_v2.eval();
+        let keys2_data = result_k2.to_float32().unwrap().to_vec();
+        let values2_data = result_v2.to_float32().unwrap().to_vec();
+
+        assert_eq!(keys2_data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(values2_data, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+    }
+
+    #[test]
+    fn test_batch_size_greater_than_one() {
+        let mut cache = KVCache::new();
+
+        let keys = MxArray::zeros(&[4, 2, 8, 16], None).unwrap();
+        let values = MxArray::zeros(&[4, 2, 8, 16], None).unwrap();
+        let (result_k, result_v) = cache.update_and_fetch(&keys, &values).unwrap();
+
+        assert_eq!(cache.get_offset(), 8);
+        assert_shape(&result_k, &[4, 2, 8, 16]);
+        assert_shape(&result_v, &[4, 2, 8, 16]);
     }
 }

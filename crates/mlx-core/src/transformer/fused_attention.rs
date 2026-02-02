@@ -2,13 +2,11 @@ use crate::array::{MxArray, scaled_dot_product_attention};
 use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::kv_cache::KVCache;
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 /// Multi-head attention with fused QKV projection (Phi3/Llama style).
 ///
 /// More efficient than separate Q/K/V projections - uses a single matrix multiplication.
 /// Supports the same features as Attention: GQA, QK normalization, RoPE, KV caching.
-#[napi(js_name = "FusedAttention")]
 pub struct FusedAttention {
     qkv_proj: Linear,
     o_proj: Linear,
@@ -21,7 +19,6 @@ pub struct FusedAttention {
     scale: f64,
 }
 
-#[napi]
 impl FusedAttention {
     /// Creates a new multi-head attention layer with fused QKV projection.
     ///
@@ -33,7 +30,6 @@ impl FusedAttention {
     /// * `rope_theta` - RoPE base frequency (default: 10000)
     /// * `use_qk_norm` - Whether to use QK normalization (default: false)
     /// * `qk_norm_eps` - Epsilon for QK normalization (default: 1e-6)
-    #[napi(constructor)]
     pub fn new(
         hidden_size: u32,
         num_heads: u32,
@@ -66,7 +62,7 @@ impl FusedAttention {
         };
 
         // RoPE
-        let rope = RoPE::new(head_dim as i32, Some(false), Some(rope_theta), Some(1.0))?;
+        let rope = RoPE::new(head_dim as i32, Some(false), Some(rope_theta), Some(1.0));
 
         // Attention scale factor
         let scale = 1.0 / (head_dim as f64).sqrt();
@@ -93,7 +89,7 @@ impl FusedAttention {
     ///
     /// # Returns
     /// Output tensor, shape: (batch, seq_len, hidden_size)
-    #[napi]
+
     pub fn forward(
         &self,
         x: &MxArray,
@@ -175,13 +171,11 @@ impl FusedAttention {
 
     // Weight setters for loading pretrained models
 
-    #[napi]
     pub fn set_qkv_proj_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.qkv_proj.set_weight(weight)?;
         Ok(())
     }
 
-    #[napi]
     pub fn set_o_proj_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.o_proj.set_weight(weight)?;
         Ok(())
@@ -189,22 +183,18 @@ impl FusedAttention {
 
     // Weight getters for parameter extraction
 
-    #[napi]
     pub fn get_qkv_proj_weight(&self) -> MxArray {
         self.qkv_proj.get_weight()
     }
 
-    #[napi]
     pub fn get_o_proj_weight(&self) -> MxArray {
         self.o_proj.get_weight()
     }
 
-    #[napi]
     pub fn get_q_norm_weight(&self) -> Option<MxArray> {
         self.q_norm.as_ref().map(|norm| norm.get_weight())
     }
 
-    #[napi]
     pub fn get_k_norm_weight(&self) -> Option<MxArray> {
         self.k_norm.as_ref().map(|norm| norm.get_weight())
     }

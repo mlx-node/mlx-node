@@ -70,13 +70,13 @@ function requireNative() {
   } else if (process.platform === 'android') {
     if (process.arch === 'arm64') {
       try {
-        return require('./index.android-arm64.node')
+        return require('./mlx-core.android-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-android-arm64')
-        const bindingPackageVersion = require('mlx-node-android-arm64/package.json').version
+        const binding = require('@mlx-node/core-android-arm64')
+        const bindingPackageVersion = require('@mlx-node/core-android-arm64/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -86,13 +86,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm') {
       try {
-        return require('./index.android-arm-eabi.node')
+        return require('./mlx-core.android-arm-eabi.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-android-arm-eabi')
-        const bindingPackageVersion = require('mlx-node-android-arm-eabi/package.json').version
+        const binding = require('@mlx-node/core-android-arm-eabi')
+        const bindingPackageVersion = require('@mlx-node/core-android-arm-eabi/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -107,13 +107,13 @@ function requireNative() {
     if (process.arch === 'x64') {
       if (process.config?.variables?.shlib_suffix === 'dll.a' || process.config?.variables?.node_target_type === 'shared_library') {
         try {
-        return require('./index.win32-x64-gnu.node')
+        return require('./mlx-core.win32-x64-gnu.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-win32-x64-gnu')
-        const bindingPackageVersion = require('mlx-node-win32-x64-gnu/package.json').version
+        const binding = require('@mlx-node/core-win32-x64-gnu')
+        const bindingPackageVersion = require('@mlx-node/core-win32-x64-gnu/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -123,13 +123,13 @@ function requireNative() {
       }
       } else {
         try {
-        return require('./index.win32-x64-msvc.node')
+        return require('./mlx-core.win32-x64-msvc.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-win32-x64-msvc')
-        const bindingPackageVersion = require('mlx-node-win32-x64-msvc/package.json').version
+        const binding = require('@mlx-node/core-win32-x64-msvc')
+        const bindingPackageVersion = require('@mlx-node/core-win32-x64-msvc/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -140,13 +140,13 @@ function requireNative() {
       }
     } else if (process.arch === 'ia32') {
       try {
-        return require('./index.win32-ia32-msvc.node')
+        return require('./mlx-core.win32-ia32-msvc.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-win32-ia32-msvc')
-        const bindingPackageVersion = require('mlx-node-win32-ia32-msvc/package.json').version
+        const binding = require('@mlx-node/core-win32-ia32-msvc')
+        const bindingPackageVersion = require('@mlx-node/core-win32-ia32-msvc/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -156,13 +156,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm64') {
       try {
-        return require('./index.win32-arm64-msvc.node')
+        return require('./mlx-core.win32-arm64-msvc.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-win32-arm64-msvc')
-        const bindingPackageVersion = require('mlx-node-win32-arm64-msvc/package.json').version
+        const binding = require('@mlx-node/core-win32-arm64-msvc')
+        const bindingPackageVersion = require('@mlx-node/core-win32-arm64-msvc/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -175,13 +175,13 @@ function requireNative() {
     }
   } else if (process.platform === 'darwin') {
     try {
-      return require('./index.darwin-universal.node')
+      return require('./mlx-core.darwin-universal.node')
     } catch (e) {
       loadErrors.push(e)
     }
     try {
-      const binding = require('mlx-node-darwin-universal')
-      const bindingPackageVersion = require('mlx-node-darwin-universal/package.json').version
+      const binding = require('@mlx-node/core-darwin-universal')
+      const bindingPackageVersion = require('@mlx-node/core-darwin-universal/package.json').version
       if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
         throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
       }
@@ -191,13 +191,13 @@ function requireNative() {
     }
     if (process.arch === 'x64') {
       try {
-        return require('./index.darwin-x64.node')
+        return require('./mlx-core.darwin-x64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-darwin-x64')
-        const bindingPackageVersion = require('mlx-node-darwin-x64/package.json').version
+        const binding = require('@mlx-node/core-darwin-x64')
+        const bindingPackageVersion = require('@mlx-node/core-darwin-x64/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -207,13 +207,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm64') {
       try {
-        return require('./index.darwin-arm64.node')
+        return require('./mlx-core.darwin-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-darwin-arm64')
-        const bindingPackageVersion = require('mlx-node-darwin-arm64/package.json').version
+        const binding = require('@mlx-node/core-darwin-arm64')
+        const bindingPackageVersion = require('@mlx-node/core-darwin-arm64/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -227,13 +227,13 @@ function requireNative() {
   } else if (process.platform === 'freebsd') {
     if (process.arch === 'x64') {
       try {
-        return require('./index.freebsd-x64.node')
+        return require('./mlx-core.freebsd-x64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-freebsd-x64')
-        const bindingPackageVersion = require('mlx-node-freebsd-x64/package.json').version
+        const binding = require('@mlx-node/core-freebsd-x64')
+        const bindingPackageVersion = require('@mlx-node/core-freebsd-x64/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -243,13 +243,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm64') {
       try {
-        return require('./index.freebsd-arm64.node')
+        return require('./mlx-core.freebsd-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-freebsd-arm64')
-        const bindingPackageVersion = require('mlx-node-freebsd-arm64/package.json').version
+        const binding = require('@mlx-node/core-freebsd-arm64')
+        const bindingPackageVersion = require('@mlx-node/core-freebsd-arm64/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -264,13 +264,13 @@ function requireNative() {
     if (process.arch === 'x64') {
       if (isMusl()) {
         try {
-          return require('./index.linux-x64-musl.node')
+          return require('./mlx-core.linux-x64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('mlx-node-linux-x64-musl')
-          const bindingPackageVersion = require('mlx-node-linux-x64-musl/package.json').version
+          const binding = require('@mlx-node/core-linux-x64-musl')
+          const bindingPackageVersion = require('@mlx-node/core-linux-x64-musl/package.json').version
           if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -280,13 +280,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./index.linux-x64-gnu.node')
+          return require('./mlx-core.linux-x64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('mlx-node-linux-x64-gnu')
-          const bindingPackageVersion = require('mlx-node-linux-x64-gnu/package.json').version
+          const binding = require('@mlx-node/core-linux-x64-gnu')
+          const bindingPackageVersion = require('@mlx-node/core-linux-x64-gnu/package.json').version
           if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -298,13 +298,13 @@ function requireNative() {
     } else if (process.arch === 'arm64') {
       if (isMusl()) {
         try {
-          return require('./index.linux-arm64-musl.node')
+          return require('./mlx-core.linux-arm64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('mlx-node-linux-arm64-musl')
-          const bindingPackageVersion = require('mlx-node-linux-arm64-musl/package.json').version
+          const binding = require('@mlx-node/core-linux-arm64-musl')
+          const bindingPackageVersion = require('@mlx-node/core-linux-arm64-musl/package.json').version
           if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -314,13 +314,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./index.linux-arm64-gnu.node')
+          return require('./mlx-core.linux-arm64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('mlx-node-linux-arm64-gnu')
-          const bindingPackageVersion = require('mlx-node-linux-arm64-gnu/package.json').version
+          const binding = require('@mlx-node/core-linux-arm64-gnu')
+          const bindingPackageVersion = require('@mlx-node/core-linux-arm64-gnu/package.json').version
           if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -332,13 +332,13 @@ function requireNative() {
     } else if (process.arch === 'arm') {
       if (isMusl()) {
         try {
-          return require('./index.linux-arm-musleabihf.node')
+          return require('./mlx-core.linux-arm-musleabihf.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('mlx-node-linux-arm-musleabihf')
-          const bindingPackageVersion = require('mlx-node-linux-arm-musleabihf/package.json').version
+          const binding = require('@mlx-node/core-linux-arm-musleabihf')
+          const bindingPackageVersion = require('@mlx-node/core-linux-arm-musleabihf/package.json').version
           if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -348,13 +348,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./index.linux-arm-gnueabihf.node')
+          return require('./mlx-core.linux-arm-gnueabihf.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('mlx-node-linux-arm-gnueabihf')
-          const bindingPackageVersion = require('mlx-node-linux-arm-gnueabihf/package.json').version
+          const binding = require('@mlx-node/core-linux-arm-gnueabihf')
+          const bindingPackageVersion = require('@mlx-node/core-linux-arm-gnueabihf/package.json').version
           if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -366,13 +366,13 @@ function requireNative() {
     } else if (process.arch === 'loong64') {
       if (isMusl()) {
         try {
-          return require('./index.linux-loong64-musl.node')
+          return require('./mlx-core.linux-loong64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('mlx-node-linux-loong64-musl')
-          const bindingPackageVersion = require('mlx-node-linux-loong64-musl/package.json').version
+          const binding = require('@mlx-node/core-linux-loong64-musl')
+          const bindingPackageVersion = require('@mlx-node/core-linux-loong64-musl/package.json').version
           if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -382,13 +382,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./index.linux-loong64-gnu.node')
+          return require('./mlx-core.linux-loong64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('mlx-node-linux-loong64-gnu')
-          const bindingPackageVersion = require('mlx-node-linux-loong64-gnu/package.json').version
+          const binding = require('@mlx-node/core-linux-loong64-gnu')
+          const bindingPackageVersion = require('@mlx-node/core-linux-loong64-gnu/package.json').version
           if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -400,13 +400,13 @@ function requireNative() {
     } else if (process.arch === 'riscv64') {
       if (isMusl()) {
         try {
-          return require('./index.linux-riscv64-musl.node')
+          return require('./mlx-core.linux-riscv64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('mlx-node-linux-riscv64-musl')
-          const bindingPackageVersion = require('mlx-node-linux-riscv64-musl/package.json').version
+          const binding = require('@mlx-node/core-linux-riscv64-musl')
+          const bindingPackageVersion = require('@mlx-node/core-linux-riscv64-musl/package.json').version
           if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -416,13 +416,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./index.linux-riscv64-gnu.node')
+          return require('./mlx-core.linux-riscv64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('mlx-node-linux-riscv64-gnu')
-          const bindingPackageVersion = require('mlx-node-linux-riscv64-gnu/package.json').version
+          const binding = require('@mlx-node/core-linux-riscv64-gnu')
+          const bindingPackageVersion = require('@mlx-node/core-linux-riscv64-gnu/package.json').version
           if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -433,13 +433,13 @@ function requireNative() {
       }
     } else if (process.arch === 'ppc64') {
       try {
-        return require('./index.linux-ppc64-gnu.node')
+        return require('./mlx-core.linux-ppc64-gnu.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-linux-ppc64-gnu')
-        const bindingPackageVersion = require('mlx-node-linux-ppc64-gnu/package.json').version
+        const binding = require('@mlx-node/core-linux-ppc64-gnu')
+        const bindingPackageVersion = require('@mlx-node/core-linux-ppc64-gnu/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -449,13 +449,13 @@ function requireNative() {
       }
     } else if (process.arch === 's390x') {
       try {
-        return require('./index.linux-s390x-gnu.node')
+        return require('./mlx-core.linux-s390x-gnu.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-linux-s390x-gnu')
-        const bindingPackageVersion = require('mlx-node-linux-s390x-gnu/package.json').version
+        const binding = require('@mlx-node/core-linux-s390x-gnu')
+        const bindingPackageVersion = require('@mlx-node/core-linux-s390x-gnu/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -469,13 +469,13 @@ function requireNative() {
   } else if (process.platform === 'openharmony') {
     if (process.arch === 'arm64') {
       try {
-        return require('./index.openharmony-arm64.node')
+        return require('./mlx-core.openharmony-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-openharmony-arm64')
-        const bindingPackageVersion = require('mlx-node-openharmony-arm64/package.json').version
+        const binding = require('@mlx-node/core-openharmony-arm64')
+        const bindingPackageVersion = require('@mlx-node/core-openharmony-arm64/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -485,13 +485,13 @@ function requireNative() {
       }
     } else if (process.arch === 'x64') {
       try {
-        return require('./index.openharmony-x64.node')
+        return require('./mlx-core.openharmony-x64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-openharmony-x64')
-        const bindingPackageVersion = require('mlx-node-openharmony-x64/package.json').version
+        const binding = require('@mlx-node/core-openharmony-x64')
+        const bindingPackageVersion = require('@mlx-node/core-openharmony-x64/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -501,13 +501,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm') {
       try {
-        return require('./index.openharmony-arm.node')
+        return require('./mlx-core.openharmony-arm.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('mlx-node-openharmony-arm')
-        const bindingPackageVersion = require('mlx-node-openharmony-arm/package.json').version
+        const binding = require('@mlx-node/core-openharmony-arm')
+        const bindingPackageVersion = require('@mlx-node/core-openharmony-arm/package.json').version
         if (bindingPackageVersion !== '0.0.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.0.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -529,7 +529,7 @@ if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
   let wasiBinding = null
   let wasiBindingError = null
   try {
-    wasiBinding = require('./index.wasi.cjs')
+    wasiBinding = require('./mlx-core.wasi.cjs')
     nativeBinding = wasiBinding
   } catch (err) {
     if (process.env.NAPI_RS_FORCE_WASI) {
@@ -538,7 +538,7 @@ if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
   }
   if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
     try {
-      wasiBinding = require('mlx-node-wasm32-wasi')
+      wasiBinding = require('@mlx-node/core-wasm32-wasi')
       nativeBinding = wasiBinding
     } catch (err) {
       if (process.env.NAPI_RS_FORCE_WASI) {
@@ -576,35 +576,24 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
-module.exports.Activations = nativeBinding.Activations
-module.exports.Attention = nativeBinding.Attention
 module.exports.BatchGenerationResult = nativeBinding.BatchGenerationResult
-module.exports.BatchKVCache = nativeBinding.BatchKVCache
 module.exports.ChatResult = nativeBinding.ChatResult
-module.exports.FusedAttention = nativeBinding.FusedAttention
 module.exports.GenerationResult = nativeBinding.GenerationResult
 module.exports.GrpoTrainingEngine = nativeBinding.GrpoTrainingEngine
 module.exports.GRPOTrainingEngine = nativeBinding.GRPOTrainingEngine
-module.exports.KVCache = nativeBinding.KVCache
 module.exports.MxArray = nativeBinding.MxArray
 module.exports.NativeRewardRegistry = nativeBinding.NativeRewardRegistry
 module.exports.OutputStore = nativeBinding.OutputStore
 module.exports.Qwen3Model = nativeBinding.Qwen3Model
 module.exports.Qwen3Tokenizer = nativeBinding.Qwen3Tokenizer
-module.exports.RoPE = nativeBinding.RoPE
-module.exports.RotatingKVCache = nativeBinding.RotatingKVCache
 module.exports.SftTrainingEngine = nativeBinding.SftTrainingEngine
 module.exports.Tensor = nativeBinding.Tensor
-module.exports.TransformerBlock = nativeBinding.TransformerBlock
 module.exports.VlmChatResult = nativeBinding.VlmChatResult
 module.exports.VLMChatResult = nativeBinding.VLMChatResult
 module.exports.VLModel = nativeBinding.VLModel
-module.exports.bilinearInterpolate = nativeBinding.bilinearInterpolate
 module.exports.buildRewardOutputs = nativeBinding.buildRewardOutputs
 module.exports.BuiltinRewardType = nativeBinding.BuiltinRewardType
 module.exports.ChatRole = nativeBinding.ChatRole
-module.exports.computeAdvantages = nativeBinding.computeAdvantages
-module.exports.computeEntropy = nativeBinding.computeEntropy
 module.exports.convertModel = nativeBinding.convertModel
 module.exports.convertParquetToJsonl = nativeBinding.convertParquetToJsonl
 module.exports.createPaddleocrVlConfig = nativeBinding.createPaddleocrVlConfig
@@ -612,10 +601,7 @@ module.exports.DType = nativeBinding.DType
 module.exports.ElementType = nativeBinding.ElementType
 module.exports.formatDocument = nativeBinding.formatDocument
 module.exports.getExpectedWeightKeys = nativeBinding.getExpectedWeightKeys
-module.exports.getHighEntropyMask = nativeBinding.getHighEntropyMask
 module.exports.OutputFormat = nativeBinding.OutputFormat
 module.exports.parsePaddleResponse = nativeBinding.parsePaddleResponse
 module.exports.parseToolCallsFromText = nativeBinding.parseToolCallsFromText
 module.exports.parseVlmOutput = nativeBinding.parseVlmOutput
-module.exports.scaledDotProductAttention = nativeBinding.scaledDotProductAttention
-module.exports.scaledDotProductAttentionCausal = nativeBinding.scaledDotProductAttentionCausal

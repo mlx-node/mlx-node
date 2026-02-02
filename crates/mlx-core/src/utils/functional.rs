@@ -256,7 +256,7 @@ fn apply_rope(x: &MxArray, head_dim: u32, theta: f64, offset: i32) -> Result<MxA
     // This is a simplified version - in production, use the RoPE class from nn.rs
     // For now, use the existing RoPE::forward method
     use crate::nn::RoPE;
-    let rope = RoPE::new(head_dim as i32, Some(false), Some(theta), Some(1.0))?;
+    let rope = RoPE::new(head_dim as i32, Some(false), Some(theta), Some(1.0));
     rope.forward(x, Some(offset))
 }
 
