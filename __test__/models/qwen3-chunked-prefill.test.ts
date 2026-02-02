@@ -36,7 +36,7 @@ describe('Qwen3Model - Chunked Prefill', () => {
       }
 
       model = await Qwen3Model.loadPretrained(modelPath);
-    });
+    }, 60000); // 60s timeout for model loading
 
     it('should generate successfully with default prefill_step_size', async () => {
       if (!model) {
