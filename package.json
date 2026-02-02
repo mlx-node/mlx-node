@@ -13,7 +13,7 @@
     "build:debug": "napi build --manifest-path crates/mlx-core/Cargo.toml --platform -o packages/core --js index.cjs --dts index.d.cts",
     "build:ts": "tsc -b",
     "clean": "rm -rf packages/*/dist",
-    "lint": "vite lint",
+    "lint": "vite lint --type-aware --type-check",
     "format": "vite fmt",
     "typecheck": "tsc -b",
     "download:gsm8k": "yarn oxnode scripts/download-gsm8k.ts",

@@ -10,8 +10,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
-    name: Build and Test
+  build:
+    name: Build
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -48,22 +48,20 @@ jobs:
       - name: Build native module
         run: yarn build
 
-      - name: TypeCheck
-        run: yarn typecheck
-
-      - name: Lint
-        run: yarn lint
-
-      - name: Run tests
-        run: |
-          yarn oxnode ./scripts/download-model.ts
-          yarn oxnode ./scripts/convert-model.ts --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models/qwen3-0.6b-mlx-bf16
-          yarn download:gsm8k
-          yarn vite run test
-
-  cargo-test:
-    name: Cargo Test
+      - uses: actions/upload-artifact@v6
+        with:
+          name: mlx-node
+          path: packages/core/*.node
+  test:
+    name: ${{ matrix.test }}
     runs-on: macos-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - 'yarn vite run test'
+          - 'cargo test'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -96,12 +94,17 @@ jobs:
       - name: Install dependencies
         run: yarn install --immutable
 
+      - uses: actions/download-artifact@v7
+        with:
+          name: mlx-node
+          path: packages/core/*.node
+
       - name: Run tests
         run: |
           yarn oxnode ./scripts/download-model.ts
           yarn oxnode ./scripts/convert-model.ts --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models/qwen3-0.6b-mlx-bf16
           yarn download:gsm8k
-          cargo test
+          ${{ matrix.test }}
 
   lint:
     name: Rust Lint
@@ -110,6 +113,12 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'yarn'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -129,6 +138,15 @@ jobs:
           key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-lint-
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: TypeCheck
+        run: yarn typecheck
+
+      - name: Lint
+        run: yarn lint
 
       - name: Check formatting
         run: cargo fmt --all -- --check
