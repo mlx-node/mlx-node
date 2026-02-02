@@ -64,7 +64,7 @@ jobs:
       fail-fast: false
       matrix:
         test:
-          - 'yarn vite run test'
+          - 'yarn build:ts && yarn vite run test'
           - 'cargo test'
     steps:
       - uses: actions/checkout@v6
