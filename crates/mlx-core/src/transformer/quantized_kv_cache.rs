@@ -30,6 +30,8 @@ use napi::bindgen_prelude::*;
 ///
 /// # Example
 /// ```rust
+/// use mlx_core::transformer::{QuantizedKVCache, QuantizedKVCacheConfig};
+///
 /// // Create a quantized cache with 8-bit precision
 /// let cache = QuantizedKVCache::new(Some(QuantizedKVCacheConfig {
 ///     bits: Some(8),
@@ -84,6 +86,8 @@ impl QuantizedKVCache {
     ///
     /// # Example
     /// ```rust
+    /// use mlx_core::transformer::{QuantizedKVCache, QuantizedKVCacheConfig};
+    ///
     /// // 8-bit quantization (recommended, minimal quality loss)
     /// let cache8bit = QuantizedKVCache::new(Some(QuantizedKVCacheConfig {
     ///     bits: Some(8),
