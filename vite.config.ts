@@ -1,25 +1,8 @@
-import { defineConfig, type ViteUserConfig } from 'vite-plus';
+import { defineConfig } from 'vite-plus';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-const regularTestConfig: ViteUserConfig['test'] = {
-  globals: true,
-  environment: 'node',
-  watch: false,
-  testTimeout: 120000, // 2 minutes
-  include: ['__test__/**/*.{test,spec}.ts', 'examples/**/*.{test,spec}.ts'],
-  exclude: ['**/node_modules/**', '**/.git/**', '**/trainers/**', '**/__test__/dist/**', '**/target/**'],
-};
-
-// Run trainer tests sequentially (single worker) due to GPU memory constraints
-const trainerTestConfig: ViteUserConfig['test'] = {
-  ...regularTestConfig,
-  maxWorkers: 1,
-  exclude: ['**/node_modules/**', '**/.git/**', '**/__test__/dist/**', '**/target/**'],
-  include: ['__test__/trainers/*.{test,spec}.ts'],
-};
 
 export default defineConfig({
   fmt: {
@@ -41,18 +24,20 @@ export default defineConfig({
       '/crates/mlx-sys/mlx',
     ],
   },
-  test: process.env.TEST_TRAINER ? trainerTestConfig : regularTestConfig,
+  test: {
+    globals: true,
+    environment: 'node',
+    maxConcurrency: 1,
+    watch: false,
+    testTimeout: 120000, // 2 minutes
+    maxWorkers: 1,
+    include: ['__test__/**/*.{test,spec}.ts', 'examples/**/*.{test,spec}.ts'],
+  },
   resolve: {
     alias: {
       '@mlx-node/core': resolve(__dirname, './packages/core/index.cjs'),
       '@mlx-node/lm': resolve(__dirname, './packages/lm/src/index.ts'),
       '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),
-    },
-  },
-  tasks: {
-    test: {
-      command: 'vite test run && TEST_TRAINER=1 vite test run',
-      envs: ['TEST_TRAINER'],
     },
   },
 });

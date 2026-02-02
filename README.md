@@ -519,9 +519,8 @@ yarn build:native       # Native addon only
 yarn build:ts           # TypeScript packages only
 
 # Test
-yarn test               # All tests (except trainers)
-TEST_TRAINER=1 yarn test  # Include trainer tests (sequential)
-yarn vitest run <path>  # Specific test file
+yarn test                  # All tests
+yarn vite test run <path>  # Specific test file
 
 # Quality
 yarn typecheck          # TypeScript validation

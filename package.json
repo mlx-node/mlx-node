@@ -14,6 +14,7 @@
     "clean": "rm -rf packages/*/dist",
     "lint": "vite lint --type-aware --type-check",
     "format": "vite fmt",
+    "test": "vite test",
     "typecheck": "tsc -b",
     "download:gsm8k": "yarn oxnode scripts/download-gsm8k.ts",
     "download:qwen3": "yarn oxnode scripts/download-model.ts"
