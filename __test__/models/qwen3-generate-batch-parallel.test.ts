@@ -33,7 +33,7 @@ describe('GRPOTrainer - Parallel Batch Generation', () => {
 
     // Load model with tokenizer
     model = await Qwen3Model.loadPretrained(modelPath);
-  });
+  }, 30000);
 
   it('should generate completions using parallel batch generation', async () => {
     if (!model) {
