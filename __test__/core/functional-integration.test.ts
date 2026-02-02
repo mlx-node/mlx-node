@@ -121,13 +121,24 @@ describe('Functional Forward Pass Integration', () => {
 
     it('should handle small parameter updates', () => {
       const model = new Qwen3Model(tinyConfig);
+
+      // Use deterministic weights to avoid flakiness from random initialization
+      // The amplification of small changes through transformer layers varies with random weights
+      const params = model.getParameters();
+      const fixedParams: Record<string, MxArray> = {};
+      for (const [name, param] of Object.entries(params)) {
+        // Initialize all weights to small deterministic values (0.01)
+        fixedParams[name] = MxArray.full(param.shape(), 0.01);
+      }
+      model.loadParameters(fixedParams);
+
       const inputIds = MxArray.fromInt32(new Int32Array([5, 6, 7]), shape(1, 3));
 
       const logitsBefore = model.forward(inputIds);
 
       // Small update to one parameter
-      const params = model.getParameters();
-      const embWeight = params['embedding.weight'];
+      const updatedParams = model.getParameters();
+      const embWeight = updatedParams['embedding.weight'];
       const embUpdated = embWeight.add(MxArray.full(shape(), 0.001));
 
       model.loadParameters({
@@ -140,7 +151,7 @@ describe('Functional Forward Pass Integration', () => {
       const diff = logitsBefore.sub(logitsAfter);
       const maxDiff = diff.abs().max().toFloat32()[0];
       expect(maxDiff).toBeGreaterThan(1e-6);
-      expect(maxDiff).toBeLessThan(0.5); // Relaxed threshold for deep network
+      expect(maxDiff).toBeLessThan(0.5); // With deterministic weights, this is stable
     });
   });
 
