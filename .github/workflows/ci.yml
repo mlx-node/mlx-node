@@ -52,6 +52,10 @@ jobs:
         with:
           name: mlx-node
           path: packages/core/*.node
+      - uses: actions/upload-artifact@v6
+        with:
+          name: mlx-metallib
+          path: packages/core/mlx.metallib
   test:
     name: ${{ matrix.test }}
     runs-on: macos-latest
@@ -98,7 +102,10 @@ jobs:
         with:
           name: mlx-node
           path: packages/core/
-
+      - uses: actions/download-artifact@v7
+        with:
+          name: mlx-metallib
+          path: packages/core/mlx.metallib
       - name: Run tests
         run: |
           yarn oxnode ./scripts/download-model.ts

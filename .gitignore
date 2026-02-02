@@ -206,3 +206,4 @@ __pycache__/
 .Python
 /unsloth
 /mlx-vlm
+*.metallib
