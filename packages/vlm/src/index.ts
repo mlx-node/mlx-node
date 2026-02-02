@@ -3,7 +3,6 @@
  *
  * This package provides VLM capabilities including:
  * - VLModel for OCR and document understanding tasks
- * - Image processing utilities
  *
  * @example
  * ```typescript
@@ -12,10 +11,10 @@
  * // Load a model
  * const model = await VLModel.load('./models/paddleocr-vl');
  *
- * // Chat with an image
+ * // Chat with images
  * const result = model.chat(
- *   [{ role: 'user', content: 'What is in this image?' }],
- *   { imagePaths: ['./photo.jpg'] }
+ *   [{ role: 'user', content: 'What is in these images?' }],
+ *   { imagePaths: ['./photo1.jpg', './photo2.jpg'] }
  * );
  * console.log(result.text);
  *
@@ -28,17 +27,6 @@
 
 // Main model class and factory functions (exposed directly from Rust)
 export { VLModel, createPaddleocrVlConfig } from '@mlx-node/core';
-
-// Image processing (user-facing)
-export {
-  ImageProcessor,
-  ProcessedImage,
-  smartResize,
-  preprocessImage,
-  preprocessImageBytes,
-  DEFAULT_IMAGE_CONFIG,
-  type ImageProcessorConfig,
-} from './vision/index.js';
 
 // Configuration types
 export type { VisionConfig, TextConfig, ModelConfig, VlmChatConfig, VlmChatMessage } from '@mlx-node/core';
@@ -63,20 +51,6 @@ export {
   type ParserConfig,
   OutputFormat,
 } from '@mlx-node/core';
-
-// Convenience wrapper for parseAndFormat (calls parsePaddleResponse)
-import {
-  parsePaddleResponse as _parsePaddleResponse,
-  OutputFormat,
-  type ParserConfig as _ParserConfig,
-} from '@mlx-node/core';
-
-/** Parser config with lowercase format strings for convenience */
-export interface ParserConfigSimple {
-  format?: OutputFormat;
-  trimCells?: boolean;
-  collapseEmptyRows?: boolean;
-}
 
 // Re-export shared utilities
 export { Qwen3Tokenizer as Tokenizer } from '@mlx-node/lm';

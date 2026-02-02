@@ -17,7 +17,7 @@
     "format": "vite fmt",
     "typecheck": "tsc -b",
     "download:gsm8k": "yarn oxnode scripts/download-gsm8k.ts",
-    "download:qwen3": "yarn oxnode scripts/download-qwen3.ts"
+    "download:qwen3": "yarn oxnode scripts/download-model.ts"
   },
   "devDependencies": {
     "@ast-grep/napi": "^0.40.5",

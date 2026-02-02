@@ -169,7 +169,8 @@ export interface GRPOTrainerConfig<T = unknown> {
 
   // Checkpoint resumption
   /** Resume training from a checkpoint directory, or 'latest' to auto-find */
-  resumeFromCheckpoint?: string | 'latest';
+  // eslint-disable-next-line @typescript-eslint/no-redundant-type-constituents
+  resumeFromCheckpoint?: 'latest' | string;
 
   // TUI mode
   /** Enable TUI mode - outputs structured JSONL to stdout and listens for commands on stdin */
@@ -697,7 +698,7 @@ export class GRPOTrainer<T = unknown> {
     // If resuming from checkpoint but didn't find existing DB run, still send UI state
     // This ensures TUI displays correct batch progress even without historical data
     if (this.config.resumeFromCheckpoint && this.currentStep > 0 && stepsPerEpoch) {
-      await this.sendResumeStateUiOnly(stepsPerEpoch);
+      this.sendResumeStateUiOnly(stepsPerEpoch);
     }
   }
 
@@ -795,7 +796,7 @@ export class GRPOTrainer<T = unknown> {
 
       this.logger.info(`Sent ${metricsHistory.length} historical metrics to TUI`);
     } catch (err) {
-      this.logger.warn(`Failed to send resume state to TUI: ${err}`);
+      this.logger.warn(`Failed to send resume state to TUI: ${err as Error}`);
     }
   }
 
@@ -1746,7 +1747,7 @@ export class GRPOTrainer<T = unknown> {
                   `  To resume from the last good state, use: resumeFromCheckpoint: '${recoveryPath}'`,
               );
             } catch (copyError) {
-              this.logger.error(`[EMERGENCY] Failed to copy last good checkpoint: ${copyError}`);
+              this.logger.error(`[EMERGENCY] Failed to copy last good checkpoint: ${copyError as Error}`);
             }
           } else {
             this.logger.error(
@@ -1922,7 +1923,7 @@ export class GRPOTrainer<T = unknown> {
       }
     } catch (error) {
       // Don't fail training if cleanup fails
-      this.logger.warn(`Failed to cleanup old checkpoints: ${error}`);
+      this.logger.warn(`Failed to cleanup old checkpoints: ${error as Error}`);
     }
   }
 

@@ -423,21 +423,6 @@ export declare class GrpoTrainingEngine {
 }
 export type GRPOTrainingEngine = GrpoTrainingEngine
 
-/** Image Processor for PaddleOCR-VL */
-export declare class ImageProcessor {
-  constructor(config?: ImageProcessorConfig | undefined | null)
-  /** Get the resize factor (patch_size * merge_size) */
-  get resizeFactor(): number
-  /** Compute target size for an image */
-  getTargetSize(height: number, width: number): [number, number]
-  /** Get configuration */
-  get config(): ImageProcessorConfig
-  /** Process an image from file path */
-  processFile(path: string): ProcessedImage
-  /** Process an image from bytes (Buffer) */
-  processBytes(data: Uint8Array): ProcessedImage
-}
-
 /**
  * Key-Value cache for efficient transformer inference.
  *
@@ -794,22 +779,6 @@ export declare class OutputStore {
   exportJsonl(runId: string, outputPath: string, includeToolCalls?: boolean | undefined | null): Promise<number>
   /** Execute raw SQL query (for advanced users) */
   queryRaw(sql: string): Promise<string>
-}
-
-/** Processed image output */
-export declare class ProcessedImage {
-  /** Get pixel values [num_patches, channels, patch_h, patch_w] */
-  get pixelValues(): MxArray
-  /** Get grid dimensions [t, h, w] */
-  get imageGridThw(): Array<number>
-  /** Get image_grid_thw as MxArray for model input */
-  getGridThwArray(): MxArray
-  /** Get original image dimensions [height, width] */
-  get originalSize(): Array<number>
-  /** Get resized dimensions [height, width] */
-  get resizedSize(): Array<number>
-  /** Get number of vision tokens after spatial merge */
-  numVisionTokens(mergeSize: number): number
 }
 
 /**
@@ -2525,19 +2494,6 @@ export interface GrpoLossConfig {
   vocabChunkSize?: number
 }
 
-/** Image processing configuration */
-export interface ImageProcessorConfig {
-  minPixels: number
-  maxPixels: number
-  patchSize: number
-  temporalPatchSize: number
-  mergeSize: number
-  imageMean: Array<number>
-  imageStd: Array<number>
-  doRescale: boolean
-  doNormalize: boolean
-}
-
 /** Weight loading result */
 export interface LoadedWeights {
   /** Number of weights loaded */
@@ -2932,21 +2888,6 @@ export interface SftStepMetrics {
   /** Time for training step (ms) */
   trainingTimeMs: number
 }
-
-/**
- * Smart resize that maintains aspect ratio within pixel bounds
- *
- * # Arguments
- * * `height` - Original image height
- * * `width` - Original image width
- * * `factor` - Resize factor (patch_size * merge_size, e.g., 28)
- * * `min_pixels` - Minimum total pixels (typical value: 147384)
- * * `max_pixels` - Maximum total pixels (typical value: 2822400)
- *
- * # Returns
- * * Tuple of (new_height, new_width) that satisfies constraints
- */
-export declare function smartResize(height: number, width: number, factor: number, minPixels: number, maxPixels: number): [number, number]
 
 /** Metrics from a single training step for sparkline restoration (NAPI wrapper) */
 export interface StepMetricSummary {

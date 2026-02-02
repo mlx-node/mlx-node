@@ -84,7 +84,7 @@ async function main() {
     }
 
     console.log(`Converting ${parquetSource} → ${destinationPath}`);
-    await convertParquetToJsonl(parquetSource, destinationPath);
+    convertParquetToJsonl(parquetSource, destinationPath);
 
     const stats = await stat(destinationPath);
     console.log(`Saved ${spec.output} (${Math.round(stats.size / 1024)} KiB) → ${destinationPath}`);

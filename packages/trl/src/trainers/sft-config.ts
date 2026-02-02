@@ -184,7 +184,7 @@ export function mergeSFTConfig(base: SFTTrainerConfig, update: Partial<SFTTraine
   for (const [key, value] of Object.entries(update) as [SFTConfigKey, SFTTrainerConfig[SFTConfigKey]][]) {
     if (value === undefined) continue;
     if (!isConfigKey(key)) {
-      throw new SFTConfigError(`Unknown configuration key: ${key}`);
+      throw new SFTConfigError(`Unknown configuration key: ${key as string}`);
     }
     setConfigValue(result, key, value);
   }
@@ -228,7 +228,7 @@ export function applySFTOverrides(config: SFTTrainerConfig, overrides: string[])
     const key = entry.slice(0, idx).trim();
     const rawValue = entry.slice(idx + 1).trim();
     if (!isConfigKey(key)) {
-      throw new SFTConfigError(`Unknown configuration key in override: ${key}`);
+      throw new SFTConfigError(`Unknown configuration key in override: ${key as string}`);
     }
     setConfigValue(accumulated, key, coerceValue(key, rawValue));
   }

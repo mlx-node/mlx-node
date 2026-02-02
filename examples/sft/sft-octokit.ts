@@ -385,7 +385,7 @@ try {
     '',
   );
 } catch (error) {
-  logger.error(`Training failed: ${error}`);
+  logger.error(`Training failed: ${error as Error}`);
   if (error instanceof Error) {
     logger.error(`Details: ${error.message}`);
     if (error.stack) {

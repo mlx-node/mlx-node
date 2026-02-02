@@ -11,14 +11,8 @@ env:
 
 jobs:
   build-and-test:
-    name: Build & ${{ matrix.test }}
+    name: Build and Test
     runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        test:
-          - 'yarn vite run test'
-          - 'cargo test'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -62,10 +56,52 @@ jobs:
 
       - name: Run tests
         run: |
-          yarn download:qwen3
+          yarn oxnode ./scripts/download-model.ts
           yarn oxnode ./scripts/convert-model.ts --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models/qwen3-0.6b-mlx-bf16
           yarn download:gsm8k
-          ${{ matrix.test }}
+          yarn vite run test
+
+  cargo-test:
+    name: Cargo Test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'yarn'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Run tests
+        run: |
+          yarn oxnode ./scripts/download-model.ts
+          yarn oxnode ./scripts/convert-model.ts --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models/qwen3-0.6b-mlx-bf16
+          yarn download:gsm8k
+          cargo test
 
   lint:
     name: Rust Lint

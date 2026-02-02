@@ -1,30 +1,19 @@
 /**
- * Image Processing for PaddleOCR-VL
+ * Image Processing for PaddleOCR-VL (Internal)
  *
  * Handles image preprocessing including smart resizing,
  * normalization, and patch extraction.
+ *
+ * This module is internal - users interact via VLModel::chat() with imagePaths config.
  */
 use crate::array::MxArray;
 use image::ImageReader;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, RgbImage};
 use napi::bindgen_prelude::*;
-use napi_derive::napi;
-use std::io::Cursor;
 use std::path::Path;
 
-/// Smart resize that maintains aspect ratio within pixel bounds
-///
-/// # Arguments
-/// * `height` - Original image height
-/// * `width` - Original image width
-/// * `factor` - Resize factor (patch_size * merge_size, e.g., 28)
-/// * `min_pixels` - Minimum total pixels (typical value: 147384)
-/// * `max_pixels` - Maximum total pixels (typical value: 2822400)
-///
-/// # Returns
-/// * Tuple of (new_height, new_width) that satisfies constraints
-#[napi]
+/// Smart resize that maintains aspect ratio within pixel bounds (internal)
 pub fn smart_resize(
     height: i32,
     width: i32,
@@ -112,8 +101,7 @@ pub fn smart_resize(
     Ok((h_bar, w_bar))
 }
 
-/// Image processing configuration
-#[napi(object)]
+/// Image processing configuration (internal)
 #[derive(Debug, Clone)]
 pub struct ImageProcessorConfig {
     pub min_pixels: i32,
@@ -143,76 +131,56 @@ impl Default for ImageProcessorConfig {
     }
 }
 
-/// Processed image output
-#[napi(js_name = "ProcessedImage")]
+/// Processed single image output (internal)
 pub struct ProcessedImage {
     /// Pixel values as MxArray [num_patches, channels, patch_h, patch_w]
     pixel_values: MxArray,
     /// Grid dimensions [t, h, w]
     image_grid_thw: Vec<i32>,
-    /// Original image dimensions [height, width]
-    original_size: Vec<i32>,
-    /// Resized dimensions [height, width]
-    resized_size: Vec<i32>,
 }
 
-#[napi]
 impl ProcessedImage {
     /// Get pixel values [num_patches, channels, patch_h, patch_w]
-    #[napi(getter)]
     pub fn pixel_values(&self) -> MxArray {
         self.pixel_values.clone()
     }
 
     /// Get grid dimensions [t, h, w]
-    #[napi(getter)]
     pub fn image_grid_thw(&self) -> Vec<i32> {
         self.image_grid_thw.clone()
     }
+}
 
-    /// Get image_grid_thw as MxArray for model input
-    #[napi]
-    pub fn get_grid_thw_array(&self) -> Result<MxArray> {
-        MxArray::from_int32(&self.image_grid_thw, &[1, 3])
+/// Processed multiple images output (internal)
+///
+/// Used internally by VLModel::chat() to pass batch-processed image data.
+pub struct ProcessedImages {
+    /// Pixel values as MxArray [total_patches, channels, patch_h, patch_w]
+    pixel_values: MxArray,
+    /// Grid dimensions [num_images, 3] with [t, h, w] per image
+    grid_thw: MxArray,
+}
+
+impl ProcessedImages {
+    /// Get pixel values [total_patches, C, patch_h, patch_w]
+    pub fn pixel_values(&self) -> MxArray {
+        self.pixel_values.clone()
     }
 
-    /// Get original image dimensions [height, width]
-    #[napi(getter)]
-    pub fn original_size(&self) -> Vec<i32> {
-        self.original_size.clone()
-    }
-
-    /// Get resized dimensions [height, width]
-    #[napi(getter)]
-    pub fn resized_size(&self) -> Vec<i32> {
-        self.resized_size.clone()
-    }
-
-    /// Get number of vision tokens after spatial merge
-    #[napi]
-    pub fn num_vision_tokens(&self, merge_size: i32) -> Result<i32> {
-        if merge_size <= 0 {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!("merge_size must be positive, got {}", merge_size),
-            ));
-        }
-        let t = self.image_grid_thw[0];
-        let h = self.image_grid_thw[1];
-        let w = self.image_grid_thw[2];
-        Ok(t * (h / merge_size) * (w / merge_size))
+    /// Get grid dimensions [num_images, 3]
+    pub fn grid_thw(&self) -> MxArray {
+        self.grid_thw.clone()
     }
 }
 
-/// Image Processor for PaddleOCR-VL
-#[napi(js_name = "ImageProcessor")]
+/// Image Processor for PaddleOCR-VL (internal)
+///
+/// Users should use VLModel::chat() with imagePaths config instead.
 pub struct ImageProcessor {
     config: ImageProcessorConfig,
 }
 
-#[napi]
 impl ImageProcessor {
-    #[napi(constructor)]
     pub fn new(config: Option<ImageProcessorConfig>) -> Self {
         Self {
             config: config.unwrap_or_default(),
@@ -220,41 +188,49 @@ impl ImageProcessor {
     }
 
     /// Get the resize factor (patch_size * merge_size)
-    #[napi(getter)]
     pub fn resize_factor(&self) -> i32 {
         self.config.patch_size * self.config.merge_size
     }
 
-    /// Compute target size for an image
-    #[napi]
-    pub fn get_target_size(&self, height: i32, width: i32) -> Result<(i32, i32)> {
-        smart_resize(
-            height,
-            width,
-            self.resize_factor(),
-            self.config.min_pixels,
-            self.config.max_pixels,
-        )
-    }
-
-    /// Get configuration
-    #[napi(getter)]
-    pub fn config(&self) -> ImageProcessorConfig {
-        self.config.clone()
-    }
-
     /// Process an image from file path
-    #[napi]
     pub fn process_file(&self, path: String) -> Result<ProcessedImage> {
         let img = load_image_from_path(&path)?;
         self.process_image(img)
     }
 
-    /// Process an image from bytes (Buffer)
-    #[napi]
-    pub fn process_bytes(&self, data: &[u8]) -> Result<ProcessedImage> {
-        let img = load_image_from_bytes(data)?;
-        self.process_image(img)
+    /// Process multiple images from file paths
+    ///
+    /// Used internally by VLModel::chat() - users pass imagePaths to chat() directly.
+    pub fn process_files(&self, paths: Vec<String>) -> Result<ProcessedImages> {
+        if paths.is_empty() {
+            return Err(Error::new(Status::InvalidArg, "paths cannot be empty"));
+        }
+
+        let mut all_pixel_values: Vec<MxArray> = Vec::new();
+        let mut all_grid_thw: Vec<i32> = Vec::new();
+
+        for path in &paths {
+            let processed = self.process_file(path.clone())?;
+            all_pixel_values.push(processed.pixel_values());
+            all_grid_thw.extend_from_slice(&processed.image_grid_thw());
+        }
+
+        // Concatenate pixel values along axis 0
+        let pixel_values = if all_pixel_values.len() == 1 {
+            all_pixel_values.remove(0)
+        } else {
+            let refs: Vec<&MxArray> = all_pixel_values.iter().collect();
+            MxArray::concatenate_many(refs, Some(0))?
+        };
+
+        // Create grid_thw with shape [num_images, 3]
+        let num_images = paths.len() as i64;
+        let grid_thw = MxArray::from_int32(&all_grid_thw, &[num_images, 3])?;
+
+        Ok(ProcessedImages {
+            pixel_values,
+            grid_thw,
+        })
     }
 
     /// Internal: Process a loaded image
@@ -352,8 +328,6 @@ impl ImageProcessor {
         Ok(ProcessedImage {
             pixel_values,
             image_grid_thw: vec![grid_t as i32, grid_h as i32, grid_w as i32],
-            original_size: vec![orig_height as i32, orig_width as i32],
-            resized_size: vec![new_height, new_width],
         })
     }
 }
@@ -373,25 +347,6 @@ fn load_image_from_path(path: &str) -> Result<DynamicImage> {
             Error::new(
                 Status::GenericFailure,
                 format!("Failed to open image: {}", e),
-            )
-        })?
-        .decode()
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Failed to decode image: {}", e),
-            )
-        })
-}
-
-/// Load image from bytes
-fn load_image_from_bytes(data: &[u8]) -> Result<DynamicImage> {
-    ImageReader::new(Cursor::new(data))
-        .with_guessed_format()
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Failed to guess image format: {}", e),
             )
         })?
         .decode()

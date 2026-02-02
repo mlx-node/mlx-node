@@ -841,7 +841,7 @@ async function main() {
       '',
     );
   } catch (error) {
-    logger.error(`Training failed: ${error}`);
+    logger.error(`Training failed: ${error as Error}`);
     if (error instanceof Error) {
       logger.error(`Error details: ${error.message}`);
       logger.error(`Stack trace: ${error.stack}`);

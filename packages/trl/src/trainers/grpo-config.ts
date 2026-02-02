@@ -218,7 +218,7 @@ export function mergeConfig(base: MLXGRPOConfig, update: Partial<MLXGRPOConfig>)
   for (const [key, value] of Object.entries(update) as [ConfigKey, MLXGRPOConfig[ConfigKey]][]) {
     if (value === undefined) continue;
     if (!isConfigKey(key)) {
-      throw new ConfigError(`Unknown configuration key: ${key}`);
+      throw new ConfigError(`Unknown configuration key: ${key as string}`);
     }
     setConfigValue(result, key, value);
   }

@@ -7,7 +7,7 @@
  * The model will be downloaded to: .cache/models/qwen3-0.6b/
  *
  * Usage:
- *   node scripts/download-qwen3.ts [options]
+ *   node scripts/download-model.ts [options]
  *   yarn download:qwen3
  *
  * Options:
@@ -75,7 +75,7 @@ function printHelp(): void {
 Download ${args.model} base model from HuggingFace
 
 Usage:
-  node scripts/download-qwen3.ts [options]
+  node scripts/download-model.ts [options]
   yarn download:qwen3
 
 Options:
@@ -85,8 +85,8 @@ Options:
   --set-token           Set HuggingFace token
 
 Examples:
-  node scripts/download-qwen3.ts
-  node scripts/download-qwen3.ts --model Qwen/Qwen3-1.7B --output .cache/models/qwen3-1.7b
+  node scripts/download-model.ts
+  node scripts/download-model.ts --model Qwen/Qwen3-1.7B --output .cache/models/qwen3-1.7b
 `);
 }
 
@@ -116,7 +116,7 @@ async function setToken() {
     },
   });
   if (token) {
-    keyringEntry.setPassword(token);
+    await keyringEntry.setPassword(token);
   }
 }
 

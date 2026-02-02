@@ -588,7 +588,7 @@ export class SFTTrainer {
         }
       }
     } catch (error) {
-      this.logger.warn(`Failed to cleanup old checkpoints: ${error}`);
+      this.logger.warn(`Failed to cleanup old checkpoints: ${error as Error}`);
     }
   }
 

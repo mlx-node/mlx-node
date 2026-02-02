@@ -125,16 +125,16 @@ impl VLModel {
             if paths.is_empty() {
                 (None, None)
             } else {
-                // Process the first image (TODO: support multiple images)
+                // Process ALL images using batch processing
                 let processor_config = ImageProcessorConfig {
                     patch_size: self.config.vision_config.patch_size,
                     merge_size: self.config.vision_config.spatial_merge_size,
                     ..ImageProcessorConfig::default()
                 };
                 let processor = ImageProcessor::new(Some(processor_config));
-                let processed = processor.process_file(paths[0].clone())?;
+                let processed = processor.process_files(paths.clone())?;
 
-                // Add batch dimension
+                // Add batch dimension: [total_patches, C, H, W] -> [1, total_patches, C, H, W]
                 let pv = processed.pixel_values();
                 let pv_shape = pv.shape()?;
                 let new_shape = BigInt64Array::from(vec![
@@ -145,7 +145,9 @@ impl VLModel {
                     pv_shape[3],
                 ]);
                 let pixel_values = pv.reshape(&new_shape)?;
-                let grid_thw = processed.get_grid_thw_array()?;
+
+                // grid_thw already [num_images, 3] from process_files
+                let grid_thw = processed.grid_thw();
 
                 (Some(pixel_values), Some(grid_thw))
             }
@@ -393,94 +395,94 @@ impl VLModel {
                 continue;
             }
 
-            // Get grid dimensions (assume single image for now)
-            if grid_data.len() < 3 {
+            // Get grid dimensions for ALL images
+            let num_images = grid_data.len() / 3;
+            if num_images == 0 || grid_data.len() % 3 != 0 {
                 return Err(Error::new(
                     Status::InvalidArg,
                     format!(
-                        "grid_data must have at least 3 elements for [t, h, w], got {} elements. \
+                        "grid_data must have 3N elements for N images, got {} elements. \
                         Ensure image_grid_thw is properly set when image tokens are present in input.",
                         grid_data.len()
                     ),
                 ));
             }
-            let t = grid_data[0] as i64;
-            let h = grid_data[1] as i64;
-            let w = grid_data[2] as i64;
 
-            // Compute LLM grid dimensions after spatial merging
-            let llm_grid_t = t;
-            let llm_grid_h = h / spatial_merge_size as i64;
-            let llm_grid_w = w / spatial_merge_size as i64;
-            let num_image_tokens = (llm_grid_t * llm_grid_h * llm_grid_w) as usize;
+            // Calculate token info for each image
+            let mut total_expected_tokens = 0usize;
+            let mut image_token_info: Vec<(i64, i64, i64, usize)> = Vec::new();
 
-            // Validate image token count matches expected from grid dimensions
-            // This is a fatal error (aligned with mlx-vlm Python which uses assert)
-            if num_image_tokens != image_positions.len() {
+            for img_idx in 0..num_images {
+                let t = grid_data[img_idx * 3] as i64;
+                let h = grid_data[img_idx * 3 + 1] as i64;
+                let w = grid_data[img_idx * 3 + 2] as i64;
+
+                let llm_grid_t = t;
+                let llm_grid_h = h / spatial_merge_size as i64;
+                let llm_grid_w = w / spatial_merge_size as i64;
+                let num_tokens = (llm_grid_t * llm_grid_h * llm_grid_w) as usize;
+
+                image_token_info.push((llm_grid_t, llm_grid_h, llm_grid_w, num_tokens));
+                total_expected_tokens += num_tokens;
+            }
+
+            // Validate total image token count matches expected from grid dimensions
+            if total_expected_tokens != image_positions.len() {
                 return Err(Error::new(
                     Status::GenericFailure,
                     format!(
-                        "Image token count mismatch: expected {} tokens from grid dimensions \
-                        (t={}, h={}, w={}, spatial_merge_size={}), but found {} image tokens in prompt. \
+                        "Image token count mismatch: expected {} tokens from {} images, \
+                        but found {} image tokens in prompt. \
                         This likely indicates a bug in prompt formatting. Check that: \
                         1) The image placeholder tokens match the expected count from grid_thw \
-                        2) spatial_merge_size in config matches the vision encoder output \
-                        3) grid_thw dimensions are computed correctly for the input image",
-                        num_image_tokens,
-                        llm_grid_t,
-                        llm_grid_h,
-                        llm_grid_w,
-                        spatial_merge_size,
-                        image_positions.len()
+                        2) spatial_merge_size ({}) in config matches the vision encoder output \
+                        3) grid_thw dimensions are computed correctly for the input images",
+                        total_expected_tokens,
+                        num_images,
+                        image_positions.len(),
+                        spatial_merge_size
                     ),
                 ));
             }
 
             // Build position IDs
-            let image_start = if image_positions.is_empty() {
-                seq_len as usize
-            } else {
-                image_positions[0]
-            };
-            let image_end = if image_positions.is_empty() {
-                seq_len as usize
-            } else {
-                image_positions[image_positions.len() - 1] + 1
-            };
+            let image_start = image_positions[0];
+            let image_end = image_positions[image_positions.len() - 1] + 1;
 
-            // Text tokens before image: sequential positions
+            // Text tokens before images: sequential positions
             for i in 0..image_start {
                 all_position_ids[0].push(i as i64);
                 all_position_ids[1].push(i as i64);
                 all_position_ids[2].push(i as i64);
             }
 
-            // Image tokens: 2D spatial positions
-            // Position = text_len_before + spatial_coordinate
-            let text_len_before = image_start as i64;
+            // Each image's 2D spatial positions
+            let mut current_pos = image_start as i64;
+            let mut max_pos = image_start as i64;
 
-            for t_idx in 0..llm_grid_t {
-                for h_idx in 0..llm_grid_h {
-                    for w_idx in 0..llm_grid_w {
-                        // Each dimension gets its own position encoding
-                        all_position_ids[0].push(text_len_before + t_idx);
-                        all_position_ids[1].push(text_len_before + h_idx);
-                        all_position_ids[2].push(text_len_before + w_idx);
+            for (llm_grid_t, llm_grid_h, llm_grid_w, _) in &image_token_info {
+                for t_idx in 0..*llm_grid_t {
+                    for h_idx in 0..*llm_grid_h {
+                        for w_idx in 0..*llm_grid_w {
+                            all_position_ids[0].push(current_pos + t_idx);
+                            all_position_ids[1].push(current_pos + h_idx);
+                            all_position_ids[2].push(current_pos + w_idx);
+                        }
                     }
                 }
+                let img_max = current_pos
+                    + std::cmp::max(
+                        *llm_grid_t - 1,
+                        std::cmp::max(*llm_grid_h - 1, *llm_grid_w - 1),
+                    );
+                max_pos = std::cmp::max(max_pos, img_max);
+                current_pos = img_max + 1;
             }
 
-            // Text tokens after image: continue from max position
-            // Use max index (size - 1) not size
-            let max_pos = text_len_before
-                + std::cmp::max(
-                    llm_grid_t - 1,
-                    std::cmp::max(llm_grid_h - 1, llm_grid_w - 1),
-                )
-                + 1; // +1 because we want the NEXT position after the max
-            let remaining_start = image_end;
-            for i in remaining_start..seq_len as usize {
-                let pos = max_pos + (i - image_end) as i64;
+            // Text tokens after images: continue from max position
+            let next_pos = max_pos + 1;
+            for i in image_end..seq_len as usize {
+                let pos = next_pos + (i - image_end) as i64;
                 all_position_ids[0].push(pos);
                 all_position_ids[1].push(pos);
                 all_position_ids[2].push(pos);
@@ -1571,10 +1573,34 @@ mod tests {
     }
 
     #[test]
-    fn test_load_pretrained_nonexistent_path() {
-        // This test verifies that loading from a non-existent path fails
-        // We can't test this synchronously since loadPretrained is async
-        // but we can verify the function exists
-        // The actual async test would require a runtime
+    fn test_model_config_mrope_section() {
+        let config = ModelConfig::default();
+
+        // mRoPE section should sum to head_dim when doubled
+        // [16, 24, 24] * 2 = [32, 48, 48] -> total = 128 = head_dim
+        assert_eq!(config.text_config.mrope_section, vec![16, 24, 24]);
+        let total: i32 = config.text_config.mrope_section.iter().map(|x| x * 2).sum();
+        assert_eq!(total, config.text_config.head_dim);
+    }
+
+    #[test]
+    fn test_model_config_vision_defaults() {
+        let config = ModelConfig::default();
+
+        assert_eq!(config.vision_config.hidden_size, 1152);
+        assert_eq!(config.vision_config.num_hidden_layers, 27);
+        assert_eq!(config.vision_config.num_attention_heads, 16);
+        assert_eq!(config.vision_config.patch_size, 14);
+        assert_eq!(config.vision_config.spatial_merge_size, 2);
+    }
+
+    #[test]
+    fn test_model_config_text_defaults() {
+        let config = ModelConfig::default();
+
+        assert_eq!(config.text_config.hidden_size, 1024);
+        assert_eq!(config.text_config.num_hidden_layers, 18);
+        assert_eq!(config.text_config.num_attention_heads, 16);
+        assert_eq!(config.text_config.head_dim, 128);
     }
 }

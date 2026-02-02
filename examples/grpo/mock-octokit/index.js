@@ -235,8 +235,11 @@ class RestProxy {
             get: (__, methodName) => {
               // e.g., octokit.rest.pulls.list
               return async (params = {}) => {
-                const method = `rest.${namespace}.${methodName}`;
-                return recordAndRespond(method, params);
+                if (typeof namespace === 'string' && typeof methodName === 'string') {
+                  const method = `rest.${namespace}.${methodName}`;
+                  return recordAndRespond(method, params);
+                }
+                return null;
               };
             },
           },
