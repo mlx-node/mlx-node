@@ -1,0 +1,16 @@
+{
+  "name": "@mlx-node/core-darwin-arm64",
+  "version": "0.0.0",
+  "description": "Internal native bindings - import from @mlx-node/lm or @mlx-node/trl instead",
+  "files": [
+    "mlx-core.darwin-arm64.node",
+    "mlx.metallib"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "mlx-core.darwin-arm64.node"
+}

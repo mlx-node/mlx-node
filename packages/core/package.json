@@ -17,7 +17,10 @@
     }
   },
   "scripts": {
-    "build": "oxnode ./build.ts --release"
+    "build": "oxnode ./build.ts --release",
+    "prepublishOnly": "napi prepublish -t npm --no-gh-release",
+    "preversion": "oxnode ./build.ts && git add .",
+    "version": "napi version"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.5.1",
