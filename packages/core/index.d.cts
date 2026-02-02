@@ -2494,16 +2494,6 @@ export interface GrpoLossConfig {
   vocabChunkSize?: number
 }
 
-/** Weight loading result */
-export interface LoadedWeights {
-  /** Number of weights loaded */
-  count: number
-  /** Keys that were transformed */
-  transformedKeys: Array<string>
-  /** Keys that were ignored */
-  ignoredKeys: Array<string>
-}
-
 /** Full model configuration */
 export interface ModelConfig {
   visionConfig: VisionConfig

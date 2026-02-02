@@ -97,7 +97,7 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           name: mlx-node
-          path: packages/core/*.node
+          path: packages/core/
 
       - name: Run tests
         run: |

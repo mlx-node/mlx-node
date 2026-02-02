@@ -79,17 +79,6 @@ fn is_mlx_conv_format(shape: &[i64]) -> bool {
     false
 }
 
-/// Weight loading result
-#[napi(object)]
-pub struct LoadedWeights {
-    /// Number of weights loaded
-    pub count: u32,
-    /// Keys that were transformed
-    pub transformed_keys: Vec<String>,
-    /// Keys that were ignored
-    pub ignored_keys: Vec<String>,
-}
-
 /// Load and sanitize PaddleOCR-VL weights
 ///
 /// # Arguments
