@@ -201,10 +201,10 @@ jobs:
           npm install -g npm
           if git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+$";
           then
-            npm publish --access public
+            yarn workspaces foreach npm publish --access public --tolerate-republish
           elif git log -1 --pretty=%B | grep "^[0-9]\+\.[0-9]\+\.[0-9]\+";
           then
-            npm publish --tag next --access public
+            yarn workspaces foreach npm publish --tag next --access public --tolerate-republish
           else
             echo "Not a release, skipping publish"
           fi
