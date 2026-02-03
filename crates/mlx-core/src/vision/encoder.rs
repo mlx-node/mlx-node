@@ -4,6 +4,7 @@
 //! Transformer encoder layers for vision models.
 //! Uses GELU activation and LayerNorm (not RMSNorm like language models).
 
+use crate::array::attention::scaled_dot_product_attention;
 use crate::array::MxArray;
 use crate::nn::activations::Activations;
 use crate::nn::{LayerNorm, Linear};
@@ -75,6 +76,61 @@ impl VisionAttention {
         })
     }
 
+    /// Build attention mask from cumulative sequence lengths.
+    ///
+    /// Creates a mask where positions within the same sub-sequence can attend
+    /// to each other (mask=0) and positions in different sub-sequences are
+    /// penalized (mask=1). This matches the Python mlx-vlm implementation.
+    ///
+    /// # Arguments
+    /// * `cu_seqlens` - Cumulative sequence lengths, e.g. [0, 196, 392]
+    /// * `seq_len` - Total sequence length
+    /// * `dtype` - Output dtype for the mask
+    fn build_attention_mask(
+        cu_seqlens: &MxArray,
+        seq_len: i64,
+        dtype: crate::array::DType,
+    ) -> Result<MxArray> {
+        // Eval cu_seqlens so we can read values
+        cu_seqlens.eval();
+        let num_boundaries = cu_seqlens.size()? as usize;
+
+        // positions = arange(0, seq_len) as int32: [seq_len]
+        let positions =
+            MxArray::arange(0.0, seq_len as f64, Some(1.0), Some(crate::array::DType::Int32))?;
+
+        // Build segment_ids: for each position, which segment it belongs to.
+        // segment_ids[i] = number of boundaries in cu_seqlens[1..n-1] that are <= i
+        // Start with zeros
+        let mut segment_ids = MxArray::zeros(&[seq_len], Some(crate::array::DType::Int32))?;
+
+        // For each interior boundary (skip first=0 and last=seq_len),
+        // increment segment_ids where positions >= boundary
+        for b in 1..num_boundaries.saturating_sub(1) {
+            let boundary_val = cu_seqlens.item_at_int32(b)?;
+            let boundary =
+                MxArray::from_int32(&[boundary_val], &[1])?;
+            // (positions >= boundary) broadcasts [seq_len] >= [1] -> [seq_len] bool
+            let ge = positions.greater_equal(&boundary)?;
+            // Cast bool to int32 and accumulate
+            let ge_int = ge.astype(crate::array::DType::Int32)?;
+            segment_ids = segment_ids.add(&ge_int)?;
+        }
+
+        // Build mask: segment_ids[i] != segment_ids[j] -> 1.0, else 0.0
+        // row_ids: [seq_len, 1], col_ids: [1, seq_len] -> broadcast to [seq_len, seq_len]
+        let row_ids = segment_ids.reshape(&[seq_len, 1])?;
+        let col_ids = segment_ids.reshape(&[1, seq_len])?;
+        let mask_bool = row_ids.not_equal(&col_ids)?;
+
+        // Convert to additive mask: masked positions get large negative value
+        // SDPA adds mask to scores, so -1e9 makes cross-segment attention near-zero
+        let mask = mask_bool.astype(dtype)?;
+        let neg_inf = MxArray::full(&[1], napi::Either::A(-1e9), Some(dtype))?;
+        let mask = mask.mul(&neg_inf)?;
+        mask.reshape(&[1, seq_len, seq_len])
+    }
+
     /// Forward pass
     ///
     /// # Arguments
@@ -87,7 +143,7 @@ impl VisionAttention {
     pub fn forward(
         &self,
         x: &MxArray,
-        _cu_seqlens: &MxArray,
+        cu_seqlens: &MxArray,
         rotary_pos_emb: Option<&MxArray>,
     ) -> Result<MxArray> {
         let shape = x.shape()?;
@@ -103,7 +159,7 @@ impl VisionAttention {
         // Transpose to [3, seq_len, num_heads, head_dim]
         let qkv = qkv.transpose(Some(&[1, 0, 2, 3]))?;
 
-        // Split Q, K, V
+        // Split Q, K, V: each [1, seq_len, num_heads, head_dim] -> [seq_len, num_heads, head_dim]
         let q = qkv.slice_axis(0, 0, 1)?.squeeze(Some(&[0]))?;
         let k = qkv.slice_axis(0, 1, 2)?.squeeze(Some(&[0]))?;
         let v = qkv.slice_axis(0, 2, 3)?.squeeze(Some(&[0]))?;
@@ -125,23 +181,34 @@ impl VisionAttention {
             (q, k)
         };
 
-        // Transpose for attention: [num_heads, seq_len, head_dim]
-        let q = q.transpose(Some(&[1, 0, 2]))?;
-        let k = k.transpose(Some(&[1, 0, 2]))?;
-        let v = v.transpose(Some(&[1, 0, 2]))?;
+        // Reshape to [1, seq_len, num_heads, head_dim] then transpose to
+        // [1, num_heads, seq_len, head_dim] for SDPA
+        let q = q
+            .reshape(&[1, seq_len, self.num_heads as i64, self.head_dim as i64])?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let k = k
+            .reshape(&[1, seq_len, self.num_heads as i64, self.head_dim as i64])?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let v = v
+            .reshape(&[1, seq_len, self.num_heads as i64, self.head_dim as i64])?
+            .transpose(Some(&[0, 2, 1, 3]))?;
 
-        // Compute attention scores: [num_heads, seq_len, seq_len]
-        let k_t = k.transpose(Some(&[0, 2, 1]))?;
-        let scores = q.matmul(&k_t)?.mul_scalar(self.scale as f64)?;
+        // Build attention mask from cu_seqlens
+        let input_dtype = x.dtype()?;
+        let attention_mask = Self::build_attention_mask(cu_seqlens, seq_len, input_dtype)?;
 
-        // Apply softmax
-        let attn_weights = Activations::softmax(&scores, Some(-1))?;
+        // Use fused scaled dot-product attention (Metal kernel)
+        // mask shape [1, seq_len, seq_len] broadcasts to [1, num_heads, seq_len, seq_len]
+        let output = scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            self.scale as f64,
+            Some(&attention_mask),
+        )?;
 
-        // Apply attention to values: [num_heads, seq_len, head_dim]
-        let output = attn_weights.matmul(&v)?;
-
-        // Transpose back: [seq_len, num_heads, head_dim]
-        let output = output.transpose(Some(&[1, 0, 2]))?;
+        // Transpose back: [1, num_heads, seq_len, head_dim] -> [1, seq_len, num_heads, head_dim]
+        let output = output.transpose(Some(&[0, 2, 1, 3]))?;
 
         // Reshape: [seq_len, dim]
         let output = output.reshape(&[seq_len, (self.num_heads * self.head_dim) as i64])?;

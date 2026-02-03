@@ -3,7 +3,8 @@
  *
  * Combines vision encoder and language model for vision-language tasks.
  */
-use crate::array::MxArray;
+use crate::array::{MxArray, clear_cache};
+use crate::stream::{Stream, StreamContext, DeviceType, WiredLimitContext};
 use crate::models::paddleocr_vl::chat::{ChatRole, VLMChatConfig, VLMChatMessage, VLMChatResult};
 use crate::models::paddleocr_vl::config::{ModelConfig, TextConfig, VisionConfig};
 use crate::models::paddleocr_vl::language::{ERNIELanguageModel, PaddleOCRDecoderLayer};
@@ -677,6 +678,32 @@ impl VLModel {
             max_new_tokens, temperature, top_k, top_p, repetition_penalty
         );
 
+        // Create dedicated generation stream for GPU-CPU pipelining
+        // This allows GPU compute to overlap with CPU token extraction
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        // Estimate model size for wired memory limit context
+        // Vision: hidden_size^2 * num_layers * ~4 matrices * dtype_size
+        // Language: hidden_size^2 * num_layers * ~4 matrices * dtype_size + vocab embedding
+        let text_cfg = &self.config.text_config;
+        let vis_cfg = &self.config.vision_config;
+        let dtype_bytes: usize = 2; // float16/bfloat16
+        let text_size = (text_cfg.hidden_size as usize)
+            * (text_cfg.hidden_size as usize)
+            * (text_cfg.num_hidden_layers as usize)
+            * 4
+            * dtype_bytes
+            + (text_cfg.vocab_size as usize) * (text_cfg.hidden_size as usize) * dtype_bytes;
+        let vision_size = (vis_cfg.hidden_size as usize)
+            * (vis_cfg.hidden_size as usize)
+            * (vis_cfg.num_hidden_layers as usize)
+            * 4
+            * dtype_bytes;
+        let model_size_bytes = text_size + vision_size;
+
+        // Wired limit context for GPU memory management (RAII - cleaned up on exit)
+        let _wired_ctx = WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
         // Prepare sampling config
         let sampling_config = SamplingConfig {
             temperature: Some(temperature),
@@ -697,8 +724,8 @@ impl VLModel {
             )
         })?;
 
-        // Initialize KV caches for this generation
-        lm_guard.init_kv_caches();
+        // Initialize fused KV caches for this generation (C++ forward pass)
+        lm_guard.init_fused_kv_caches();
 
         // Reset position state for new generation (critical for multimodal)
         lm_guard.reset_position_state();
@@ -736,18 +763,15 @@ impl VLModel {
             inputs_embeds
         };
 
-        // Initial forward pass with cache (prefill) - pass position_ids for proper mRoPE
-        let logits = lm_guard.forward_with_cache(
-            input_ids,
-            Some(&inputs_embeds),
-            None,
-            Some(&position_ids),
-            true,
-        )?;
-        let seq_len = logits.shape_at(1)?;
-        let mut last_logits = logits
-            .slice_axis(1, seq_len - 1, seq_len)?
-            .squeeze(Some(&[0, 1]))?;
+        // Initial forward pass (prefill) using fused C++ path
+        let mut last_logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let logits = lm_guard.forward_fused(&inputs_embeds, &position_ids)?;
+            let seq_len = logits.shape_at(1)?;
+            logits
+                .slice_axis(1, seq_len - 1, seq_len)?
+                .squeeze(Some(&[0, 1]))?
+        };
 
         // Get input tokens for repetition penalty context
         let input_tokens = input_ids.to_uint32()?;
@@ -772,8 +796,7 @@ impl VLModel {
             (tok, None)
         };
 
-        // Async eval for GPU-CPU pipelining - starts GPU work, returns immediately
-        // This allows overlap: GPU computes while CPU extracts from previous iteration
+        // Async eval for GPU-CPU pipelining
         if return_logprobs {
             if let Some(ref lp) = logprobs_arr {
                 MxArray::async_eval_arrays(&[&token, lp]);
@@ -794,11 +817,67 @@ impl VLModel {
         let mut finish_reason = "length";
 
         // N-gram repetition detection: max pattern length to check (stop on first repeat)
-        let ngram_size = config.ngram_size.unwrap_or(20);
+        // Default to 0 (disabled) for VLM - mlx-vlm does NOT have this aggressive check.
+        // VLM outputs structured data that can trigger false positives.
+        let ngram_size = config.ngram_size.unwrap_or(0);
 
-        // === STEP 4: Decode loop - process one token at a time with KV cache ===
+        // === STEP 4: Pipelined decode loop ===
+        // Structure: Build next graph → async_eval → extract current token
+        // This overlaps GPU evaluation of the next step with CPU extraction of the current step,
+        // matching the pipelining pattern used by Python mlx-vlm's generate_step.
         #[allow(clippy::needless_range_loop)]
-        for _ in 0..max_new_tokens {
+        for step in 0..max_new_tokens {
+            // --- Phase 1: Build next step's graph while GPU evaluates current token ---
+            let (next_tok, next_lp) = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+
+                // Zero-copy reshape: keep token on GPU instead of CPU round-trip
+                let token_2d = token.reshape(&[1, 1])?;
+                let input_embeds = lm_guard.get_embeddings(&token_2d)?;
+
+                // Position from Rust-side state (no GPU dependency)
+                let rope_deltas = lm_guard.get_rope_deltas().unwrap_or(0);
+                let cache_offset = lm_guard.get_fused_cache_offset() as i64;
+                let pos_value = (cache_offset + rope_deltas) as f32;
+                let decode_pos = MxArray::from_float32(&[pos_value], &[1, 1, 1])?
+                    .broadcast_to(&[3, 1, 1])?;
+
+                let logits = lm_guard.forward_fused(&input_embeds, &decode_pos)?;
+                let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
+
+                // Apply repetition penalty if enabled
+                if repetition_penalty != 1.0 {
+                    next_logits = apply_repetition_penalty(
+                        &next_logits,
+                        &all_tokens,
+                        repetition_penalty,
+                        Some(repetition_context_size),
+                    )?;
+                }
+
+                // Sample next token
+                let (tok, lp): (MxArray, Option<MxArray>) = if return_logprobs {
+                    let (t, l) = sample_and_logprobs(&next_logits, Some(sampling_config))?;
+                    (t, Some(l))
+                } else {
+                    (sample(&next_logits, Some(sampling_config))?, None)
+                };
+
+                (tok, lp)
+            };
+
+            // Submit next step's graph to GPU (starts processing while we do CPU work below)
+            if return_logprobs {
+                if let Some(ref lp) = next_lp {
+                    MxArray::async_eval_arrays(&[&next_tok, lp]);
+                } else {
+                    MxArray::async_eval_arrays(&[&next_tok]);
+                }
+            } else {
+                MxArray::async_eval_arrays(&[&next_tok]);
+            }
+
+            // --- Phase 2: Extract current token (GPU already working on next step) ---
             token.eval();
             let token_value = token.item_at_int32(0)? as u32;
             generated_tokens.push(token_value);
@@ -806,7 +885,6 @@ impl VLModel {
 
             // Extract logprob if needed
             if return_logprobs && let Some(ref lp) = logprobs_arr {
-                // Must eval() logprobs array before item extraction
                 lp.eval();
                 let token_logprob = lp.item_at_float32(token_value as usize)?;
                 generated_logprobs.push(token_logprob);
@@ -821,7 +899,8 @@ impl VLModel {
             // Check for repetition (loop detection) - find any repeating pattern
             let min_pattern_len = 8; // Minimum pattern length to consider
             let max_pattern_len = ngram_size as usize;
-            if generated_tokens.len() >= (min_pattern_len * 2) {
+            // Skip repetition check entirely if ngram_size is 0 (disabled)
+            if ngram_size > 0 && generated_tokens.len() >= (min_pattern_len * 2) {
                 let len = generated_tokens.len();
 
                 // Check for patterns of various lengths
@@ -851,50 +930,19 @@ impl VLModel {
                 }
             }
 
-            // Forward pass with ONLY the new token (KV cache handles context)
-            // Position IDs are computed by the language model using stored rope_deltas
-            let new_token = MxArray::from_uint32(&[token_value], &[1, 1])?;
-            let logits = lm_guard.forward_with_cache(&new_token, None, None, None, true)?;
-
-            // Get logits (seq_len should be 1)
-            let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
-
-            // Apply repetition penalty if enabled
-            if repetition_penalty != 1.0 {
-                next_logits = apply_repetition_penalty(
-                    &next_logits,
-                    &all_tokens,
-                    repetition_penalty,
-                    Some(repetition_context_size),
-                )?;
-            }
-
-            // Sample next token
-            let (next_tok, next_lp): (MxArray, Option<MxArray>) = if return_logprobs {
-                let (tok, lp) = sample_and_logprobs(&next_logits, Some(sampling_config))?;
-                (tok, Some(lp))
-            } else {
-                (sample(&next_logits, Some(sampling_config))?, None)
-            };
-
-            // Async eval for next token - enables GPU-CPU pipelining
-            // GPU starts computing next forward pass while CPU extracts current token
-            if return_logprobs {
-                if let Some(ref lp) = next_lp {
-                    MxArray::async_eval_arrays(&[&next_tok, lp]);
-                } else {
-                    MxArray::async_eval_arrays(&[&next_tok]);
-                }
-            } else {
-                MxArray::async_eval_arrays(&[&next_tok]);
+            // Periodic cleanup to release intermediate tensors and prevent memory accumulation
+            // Every 256 tokens is a good balance (aligned with mlx-vlm)
+            // Only clear cache - do NOT synchronize, as that kills GPU-CPU pipelining
+            if step > 0 && step % 256 == 0 {
+                clear_cache();
             }
 
             token = next_tok;
             logprobs_arr = next_lp;
         }
 
-        // Reset caches after generation
-        lm_guard.reset_kv_caches();
+        // Reset fused caches after generation
+        lm_guard.reset_fused_kv_caches();
 
         // Build result
         let tokens_array =

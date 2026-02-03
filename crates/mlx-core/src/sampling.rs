@@ -445,14 +445,14 @@ pub(crate) fn apply_repetition_penalty(
         ));
     }
 
-    // If penalty is 1.0, no effect
+    // If penalty is 1.0, no effect - just return a reference (no copy needed)
     if (penalty - 1.0).abs() < 1e-10 {
-        return logits.copy();
+        return Ok(logits.clone());
     }
 
-    // If no tokens to penalize, return copy
+    // If no tokens to penalize, return as-is
     if tokens.is_empty() {
-        return logits.copy();
+        return Ok(logits.clone());
     }
 
     let context_size = context_size.unwrap_or(20);
@@ -471,9 +471,9 @@ pub(crate) fn apply_repetition_penalty(
     };
     let recent_tokens = &tokens[start_idx..];
 
-    // If no tokens after filtering, return copy
+    // If no tokens after filtering, return as-is
     if recent_tokens.is_empty() {
-        return logits.copy();
+        return Ok(logits.clone());
     }
 
     // OPTIMIZED: Get ndim and vocab_size without copying entire shape
@@ -499,42 +499,33 @@ pub(crate) fn apply_repetition_penalty(
         return Ok(logits.clone());
     }
 
-    // Create index array
-    let indices = MxArray::from_uint32(&valid_tokens, &[valid_tokens.len() as i64])?;
+    // Create index array for gathering/scattering
+    let ndim_val = logits.ndim()?;
+    let last_axis = ndim_val as i32 - 1;
 
-    // Gather logits at the penalized token positions - need shape for operations
-    let logits_len = logits.ndim()?;
-    let gathered = logits.take(&indices, logits_len as i32 - 1)?;
+    // For put_along_axis, indices must have the same ndim as the source array.
+    // 1D: indices shape [num_tokens], 2D: indices shape [1, num_tokens] (broadcasts over batch)
+    let indices = if ndim_val == 1 {
+        MxArray::from_uint32(&valid_tokens, &[valid_tokens.len() as i64])?
+    } else {
+        MxArray::from_uint32(&valid_tokens, &[1, valid_tokens.len() as i64])?
+    };
 
-    // Apply penalty to gathered values (vectorized)
+    // Gather logits at the penalized token positions (vectorized, 1 FFI call)
+    let gathered = logits.take_along_axis(&indices, last_axis)?;
+
+    // Apply penalty to gathered values (vectorized, 4 FFI calls)
     let zero = MxArray::scalar_float(0.0)?;
     let is_negative = gathered.less(&zero)?;
     let penalized_positive = gathered.div_scalar(penalty)?;
     let penalized_negative = gathered.mul_scalar(penalty)?;
     let penalized = is_negative.where_(&penalized_negative, &penalized_positive)?;
 
-    // Update using loop of GPU slice_assign operations (~20 iterations, all GPU-resident)
-    // Note: While a single scatter operation would be ideal, the MLX scatter semantics
-    // for 2D arrays are complex. This loop approach eliminates CPU transfers while
-    // maintaining correctness, achieving 76-80 tok/s (1.6x speedup).
-    let mut result = logits.clone();
-    for (i, &idx) in valid_tokens.iter().enumerate() {
-        // Extract the penalized value for this index
-        let update_slice = if logits_len == 1 {
-            penalized.slice(&[i as i64], &[i as i64 + 1])?
-        } else {
-            // For 2D case, extract column i from penalized
-            penalized.slice(&[0, i as i64], &[logits.shape_at(0)?, i as i64 + 1])?
-        };
-
-        // Update using slice_assign_axis (GPU operation, no CPU transfer!)
-        result = result.slice_assign_axis(
-            if logits_len == 1 { 0 } else { 1 },
-            idx as i64,
-            idx as i64 + 1,
-            &update_slice,
-        )?;
-    }
+    // Scatter penalized values back in ONE operation (1 FFI call)
+    // put_along_axis(self, indices, values, axis) is equivalent to:
+    //   result = self.copy(); result[..., indices] = values
+    // This replaces the previous loop of ~N slice_assign_axis calls.
+    let result = logits.put_along_axis(&indices, &penalized, last_axis)?;
 
     Ok(result)
 }

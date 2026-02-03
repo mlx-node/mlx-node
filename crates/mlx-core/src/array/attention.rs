@@ -21,6 +21,7 @@ use super::MxArray;
 ///
 /// # Returns
 /// Attention output with same shape as values
+#[inline]
 pub fn scaled_dot_product_attention(
     queries: &MxArray,
     keys: &MxArray,
@@ -31,7 +32,7 @@ pub fn scaled_dot_product_attention(
     let handle = unsafe {
         if let Some(m) = mask {
             // Use empty string with mask array - MLX will apply it as an array mask
-            let mask_mode = CString::new("").unwrap();
+            let mask_mode = c"";
             sys::mlx_fast_scaled_dot_product_attention(
                 queries.handle.0,
                 keys.handle.0,
@@ -43,7 +44,7 @@ pub fn scaled_dot_product_attention(
             )
         } else {
             // No mask - pass empty string
-            let mask_mode = CString::new("").unwrap();
+            let mask_mode = c"";
             sys::mlx_fast_scaled_dot_product_attention(
                 queries.handle.0,
                 keys.handle.0,

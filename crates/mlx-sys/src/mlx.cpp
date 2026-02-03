@@ -407,11 +407,8 @@ mlx_array* mlx_array_astype(mlx_array* handle, int32_t dtype) {
 
 mlx_array* mlx_array_copy(mlx_array* handle) {
   auto arr = reinterpret_cast<array*>(handle);
-  // Force evaluation before copying to avoid lazy evaluation issues
-  arr->eval();
   array result = copy(*arr);
-  // Evaluate the copy to ensure it's materialized
-  result.eval();
+  // Keep lazy - let caller decide when to evaluate (matches Python MLX behavior)
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -1963,6 +1960,24 @@ size_t mlx_array_split_multi(mlx_array* handle,
   return count;
 }
 
+// Split at specific indices along an axis, returns multiple array handles
+size_t mlx_array_split_at_indices(mlx_array* handle,
+                                  const int32_t* indices,
+                                  size_t indices_len,
+                                  int32_t axis,
+                                  uint64_t* out_handles,
+                                  size_t max_outputs) {
+  auto arr = reinterpret_cast<array*>(handle);
+  mlx::core::Shape idx_vec(indices, indices + indices_len);
+  auto splits = mlx::core::split(*arr, idx_vec, axis);
+  size_t count = std::min(splits.size(), max_outputs);
+  for (size_t i = 0; i < count; ++i) {
+    out_handles[i] =
+        reinterpret_cast<uint64_t>(new array(std::move(splits[i])));
+  }
+  return count;
+}
+
 // Keep the old single-output version for backwards compatibility
 mlx_array* mlx_array_split(mlx_array* handle,
                            int32_t indices_or_sections,
@@ -2234,7 +2249,6 @@ mlx_array* mlx_fast_scaled_dot_product_attention(mlx_array* queries,
 
   array result = fast::scaled_dot_product_attention(
       *q, *k, *v, scale, mask_mode, mask_arr, std::nullopt);
-  result.eval();  // Force GPU sync after expensive SDPA to prevent Metal timeout
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -4443,6 +4457,342 @@ mlx_array* mlx_dequantize(
         std::cerr << "[MLX] Unknown exception in mlx_dequantize" << std::endl;
         return nullptr;
     }
+}
+
+// =============================================================================
+// Fused Multimodal Rotary Position Embedding (mRoPE)
+// =============================================================================
+// Replaces ~38 individual graph ops per call with a single fused operation.
+// Called once per transformer layer (28x per decode step), saving ~1000 graph nodes.
+//
+// Equivalent Python:
+//   mrope_section = cumsum(mrope_section * 2)[:-1]
+//   cos = concat([m[i%3] for i,m in enumerate(split(cos, mrope_section, -1))], -1)
+//   sin = concat([m[i%3] for i,m in enumerate(split(sin, mrope_section, -1))], -1)
+//   q_embed = q * cos + rotate_half(q) * sin
+//   k_embed = k * cos + rotate_half(k) * sin
+
+// Helper: rotate_half - split last dim in half, negate second half, concatenate reversed
+static array rotate_half_impl(const array& x) {
+    int ndim = x.ndim();
+    ShapeElem last_dim = x.shape(ndim - 1);
+    ShapeElem half = last_dim / 2;
+
+    // Build start/end vectors for slice along last axis only
+    // slice(array, start, end) where start/end have one entry per dimension
+    Shape start_x1(ndim, 0);
+    Shape end_x1(x.shape().begin(), x.shape().end());
+    end_x1[ndim - 1] = half;
+
+    Shape start_x2(ndim, 0);
+    start_x2[ndim - 1] = half;
+    Shape end_x2(x.shape().begin(), x.shape().end());
+
+    auto x1 = slice(x, start_x1, end_x1);
+    auto x2 = slice(x, start_x2, end_x2);
+
+    // Negate x2 and concatenate: [-x2, x1]
+    auto neg_x2 = -x2;
+    return concatenate({neg_x2, x1}, ndim - 1);
+}
+
+// ============================================================================
+// Compiled SwiGLU activation
+// ============================================================================
+// Python's nn.silu uses @mx.compile to fuse sigmoid(x)*x into a single Metal
+// kernel. We do the same here for the full SwiGLU: silu(gate) * up.
+// This avoids 2 extra memory round-trips per layer (18 layers = 36 saved).
+
+static std::vector<array> swiglu_impl(const std::vector<array>& inputs) {
+    const auto& gate = inputs[0];
+    const auto& up = inputs[1];
+    return {mlx::core::sigmoid(gate) * gate * up};
+}
+
+static auto& compiled_swiglu() {
+    static auto fn = mlx::core::compile(swiglu_impl, /*shapeless=*/true);
+    return fn;
+}
+
+// ============================================================================
+// PaddleOCR-VL Fused Forward Pass
+// ============================================================================
+// Implements the full ERNIE language model forward pass in C++ to eliminate
+// ~1400 NAPI FFI calls per decode step, reducing them to ~6.
+// Uses mRoPE (multimodal rotary position embedding) instead of standard RoPE.
+
+// Helper: compute mRoPE cos/sin from inv_freq and position_ids
+// inv_freq: [1, 1, half_dim, 1], position_ids: [3, batch, seq_len]
+// Returns (cos, sin) each [3, batch, seq_len, head_dim]
+static std::pair<array, array> compute_mrope_cos_sin(
+    const array& inv_freq,
+    const array& position_ids,
+    int head_dim
+) {
+    int batch = static_cast<int>(position_ids.shape(1));
+    int seq_len = static_cast<int>(position_ids.shape(2));
+    int half_dim = head_dim / 2;
+
+    // Broadcast inv_freq to [3, batch, half_dim, 1]
+    auto inv_freq_expanded = broadcast_to(inv_freq, {3, batch, half_dim, 1});
+
+    // position_ids: [3, batch, seq_len] -> [3, batch, 1, seq_len]
+    auto pos_expanded = astype(reshape(position_ids, {3, batch, 1, seq_len}), mlx::core::float32);
+
+    // freqs = inv_freq @ position_ids -> [3, batch, half_dim, seq_len]
+    auto freqs = matmul(inv_freq_expanded, pos_expanded);
+
+    // Transpose to [3, batch, seq_len, half_dim]
+    freqs = transpose(freqs, {0, 1, 3, 2});
+
+    // Double the freqs: [3, batch, seq_len, head_dim]
+    auto emb = concatenate({freqs, freqs}, -1);
+
+    return {cos(emb), sin(emb)};
+}
+
+// Pre-compute sectioned mRoPE cos/sin from raw cos/sin [3, batch, seq_len, head_dim]
+// Returns cos_final, sin_final: [batch, 1, seq_len, head_dim] ready for direct multiply
+static std::pair<array, array> compute_mrope_sectioned(
+    const array& cos_in,
+    const array& sin_in,
+    const int* mrope_section
+) {
+    int b0 = mrope_section[0] * 2;
+    int b1 = b0 + mrope_section[1] * 2;
+
+    int batch = static_cast<int>(cos_in.shape(1));
+    int seq_len = static_cast<int>(cos_in.shape(2));
+    int head_dim_full = static_cast<int>(cos_in.shape(3));
+
+    Shape split_indices = {(ShapeElem)b0, (ShapeElem)b1};
+
+    auto cos_parts = split(cos_in, split_indices, -1);
+    auto sin_parts = split(sin_in, split_indices, -1);
+
+    std::vector<array> cos_selected, sin_selected;
+    for (int i = 0; i < 3; i++) {
+        ShapeElem sec_dim = cos_parts[i].shape(3);
+        auto ci = slice(cos_parts[i],
+                       {(ShapeElem)i, 0, 0, 0},
+                       {(ShapeElem)(i + 1), (ShapeElem)batch, (ShapeElem)seq_len, sec_dim});
+        auto si = slice(sin_parts[i],
+                       {(ShapeElem)i, 0, 0, 0},
+                       {(ShapeElem)(i + 1), (ShapeElem)batch, (ShapeElem)seq_len, sec_dim});
+        cos_selected.push_back(squeeze(ci, 0));
+        sin_selected.push_back(squeeze(si, 0));
+    }
+
+    auto cos_final = reshape(concatenate(cos_selected, -1), {batch, 1, seq_len, head_dim_full});
+    auto sin_final = reshape(concatenate(sin_selected, -1), {batch, 1, seq_len, head_dim_full});
+
+    return {cos_final, sin_final};
+}
+
+// Apply pre-computed mRoPE cos/sin to Q and K
+// q, k: [batch, n_heads, seq_len, head_dim]
+// cos_final, sin_final: [batch, 1, seq_len, head_dim] (already sectioned)
+static std::pair<array, array> apply_mrope_paddleocr(
+    const array& q,
+    const array& k,
+    const array& cos_final,
+    const array& sin_final
+) {
+    auto q_embed = q * cos_final + rotate_half_impl(q) * sin_final;
+    auto k_embed = k * cos_final + rotate_half_impl(k) * sin_final;
+    return {q_embed, k_embed};
+}
+
+// Helper: single PaddleOCR-VL transformer block forward with KV cache
+// Takes pre-sectioned cos/sin (no per-layer splitting) and pre-transposed weights
+static array paddleocr_vl_block_forward_cached(
+    const array& x,
+    const array& input_norm_w,
+    const array& post_attn_norm_w,
+    // Pre-transposed weight matrices [out, in] -> [in, out]
+    const array& w_q_t, const array& w_k_t, const array& w_v_t, const array& w_o_t,
+    const array& w_gate_t, const array& w_up_t, const array& w_down_t,
+    int n_heads, int n_kv_heads, int head_dim,
+    float attn_scale, float norm_eps,
+    // Pre-sectioned mRoPE: [batch, 1, seq_len, head_dim]
+    const array& cos_final, const array& sin_final,
+    std::optional<array>& cached_keys, std::optional<array>& cached_values,
+    int& cache_idx
+) {
+    int batch = static_cast<int>(x.shape(0));
+    int seq_len = static_cast<int>(x.shape(1));
+
+    // Self-Attention
+    auto normed = fast::rms_norm(x, std::optional<array>(input_norm_w), norm_eps, {});
+
+    auto queries = matmul(normed, w_q_t);
+    auto keys = matmul(normed, w_k_t);
+    auto values = matmul(normed, w_v_t);
+
+    // Reshape + transpose to [batch, n_heads, seq_len, head_dim]
+    queries = transpose(reshape(queries, {batch, seq_len, n_heads, head_dim}), {0, 2, 1, 3});
+    keys = transpose(reshape(keys, {batch, seq_len, n_kv_heads, head_dim}), {0, 2, 1, 3});
+    values = transpose(reshape(values, {batch, seq_len, n_kv_heads, head_dim}), {0, 2, 1, 3});
+
+    // Apply pre-sectioned mRoPE (just multiply, no splitting)
+    auto [q_rotated, k_rotated] = apply_mrope_paddleocr(queries, keys, cos_final, sin_final);
+
+    // KV Cache Update
+    int new_idx = cache_idx + seq_len;
+
+    if (!cached_keys.has_value()) {
+        int initial_capacity = ((seq_len + KV_CACHE_CHUNK_SIZE - 1) / KV_CACHE_CHUNK_SIZE) * KV_CACHE_CHUNK_SIZE;
+        initial_capacity = std::max(initial_capacity, KV_CACHE_CHUNK_SIZE);
+
+        auto buffer_shape = Shape{batch, n_kv_heads, initial_capacity, head_dim};
+        cached_keys = zeros(buffer_shape, k_rotated.dtype());
+        cached_values = zeros(buffer_shape, values.dtype());
+
+        cached_keys = slice_update(*cached_keys, k_rotated, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+        cached_values = slice_update(*cached_values, values, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+    } else {
+        int current_capacity = static_cast<int>(cached_keys->shape()[2]);
+        if (new_idx > current_capacity) {
+            int new_capacity = ((new_idx + KV_CACHE_CHUNK_SIZE - 1) / KV_CACHE_CHUNK_SIZE) * KV_CACHE_CHUNK_SIZE;
+            auto new_shape = Shape{batch, n_kv_heads, new_capacity, head_dim};
+            auto new_k_buffer = zeros(new_shape, cached_keys->dtype());
+            auto new_v_buffer = zeros(new_shape, cached_values->dtype());
+            new_k_buffer = slice_update(new_k_buffer, *cached_keys, {0, 0, 0, 0}, cached_keys->shape());
+            new_v_buffer = slice_update(new_v_buffer, *cached_values, {0, 0, 0, 0}, cached_values->shape());
+            cached_keys = new_k_buffer;
+            cached_values = new_v_buffer;
+        }
+        cached_keys = slice_update(*cached_keys, k_rotated, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+        cached_values = slice_update(*cached_values, values, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+    }
+
+    auto keys_valid = slice(*cached_keys, {0, 0, 0, 0}, {batch, n_kv_heads, new_idx, head_dim});
+    auto values_valid = slice(*cached_values, {0, 0, 0, 0}, {batch, n_kv_heads, new_idx, head_dim});
+    cache_idx = new_idx;
+
+    // SDPA: causal for prefill, no mask for decode
+    auto attn_output = (seq_len > 1)
+        ? fast::scaled_dot_product_attention(q_rotated, keys_valid, values_valid, attn_scale, "causal", std::nullopt, std::nullopt, {})
+        : fast::scaled_dot_product_attention(q_rotated, keys_valid, values_valid, attn_scale, "", std::nullopt, std::nullopt, {});
+
+    // Output projection + residual
+    attn_output = transpose(attn_output, {0, 2, 1, 3});
+    attn_output = reshape(attn_output, {batch, seq_len, n_heads * head_dim});
+    attn_output = matmul(attn_output, w_o_t);
+    auto h = x + attn_output;
+
+    // MLP (SwiGLU) + residual
+    auto mlp_input = fast::rms_norm(h, std::optional<array>(post_attn_norm_w), norm_eps, {});
+
+    auto gate = matmul(mlp_input, w_gate_t);
+    auto up = matmul(mlp_input, w_up_t);
+    auto activated = compiled_swiglu()({gate, up})[0];
+    auto mlp_output = matmul(activated, w_down_t);
+
+    return h + mlp_output;
+}
+
+// Main PaddleOCR-VL forward step: embedding → mRoPE cos/sin → 18 layers → norm → LM head
+void mlx_paddleocr_vl_forward_step(
+    mlx_array* input_embeds_handle,
+    mlx_array* const* layer_weights,
+    int num_layers,
+    mlx_array* final_norm_weight_handle,
+    mlx_array* lm_head_weight_handle,
+    mlx_array* inv_freq_handle,
+    mlx_array* position_ids_handle,
+    const int* mrope_section,
+    int hidden_size, int num_heads, int num_kv_heads, int head_dim,
+    float norm_eps,
+    mlx_array* const* kv_keys_in,
+    mlx_array* const* kv_values_in,
+    int cache_idx_in,
+    mlx_array** out_logits,
+    mlx_array** out_kv_keys,
+    mlx_array** out_kv_values,
+    int* out_cache_idx
+) {
+    auto& input_embeds = *reinterpret_cast<array*>(input_embeds_handle);
+    auto& final_norm_w = *reinterpret_cast<array*>(final_norm_weight_handle);
+    auto& lm_head_w = *reinterpret_cast<array*>(lm_head_weight_handle);
+    auto& inv_freq = *reinterpret_cast<array*>(inv_freq_handle);
+    auto& position_ids = *reinterpret_cast<array*>(position_ids_handle);
+
+    float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    // Compute mRoPE cos/sin once, then pre-section for all layers (saves ~306 ops)
+    auto [mrope_cos, mrope_sin] = compute_mrope_cos_sin(inv_freq, position_ids, head_dim);
+    auto [cos_final, sin_final] = compute_mrope_sectioned(mrope_cos, mrope_sin, mrope_section);
+
+    // Cast cos/sin to match input dtype (e.g. float16/bfloat16) to avoid promoting
+    // all downstream computations (Q*cos, K*cos, KV cache, SDPA) to float32.
+    // Python does: cos.astype(x.dtype), sin.astype(x.dtype)
+    cos_final = astype(cos_final, input_embeds.dtype());
+    sin_final = astype(sin_final, input_embeds.dtype());
+
+    // Pre-transpose all layer weights once (saves 7 transposes × (num_layers-1) = ~119 ops)
+    struct LayerWeightsT {
+        array norm_in, norm_post;
+        array q_t, k_t, v_t, o_t, gate_t, up_t, down_t;
+    };
+    std::vector<LayerWeightsT> layer_w;
+    layer_w.reserve(num_layers);
+    for (int i = 0; i < num_layers; i++) {
+        int base = i * 9;
+        auto& w_q = *reinterpret_cast<array*>(layer_weights[base + 2]);
+        auto& w_k = *reinterpret_cast<array*>(layer_weights[base + 3]);
+        auto& w_v = *reinterpret_cast<array*>(layer_weights[base + 4]);
+        auto& w_o = *reinterpret_cast<array*>(layer_weights[base + 5]);
+        auto& w_gate = *reinterpret_cast<array*>(layer_weights[base + 6]);
+        auto& w_up = *reinterpret_cast<array*>(layer_weights[base + 7]);
+        auto& w_down = *reinterpret_cast<array*>(layer_weights[base + 8]);
+        layer_w.push_back({
+            *reinterpret_cast<array*>(layer_weights[base + 0]),
+            *reinterpret_cast<array*>(layer_weights[base + 1]),
+            transpose(w_q, {1, 0}), transpose(w_k, {1, 0}),
+            transpose(w_v, {1, 0}), transpose(w_o, {1, 0}),
+            transpose(w_gate, {1, 0}), transpose(w_up, {1, 0}),
+            transpose(w_down, {1, 0})
+        });
+    }
+
+    // Initialize per-layer KV cache state
+    std::vector<std::optional<array>> kv_keys(num_layers);
+    std::vector<std::optional<array>> kv_values(num_layers);
+    std::vector<int> cache_indices(num_layers, cache_idx_in);
+
+    if (kv_keys_in != nullptr && kv_values_in != nullptr) {
+        for (int i = 0; i < num_layers; i++) {
+            if (kv_keys_in[i] != nullptr) kv_keys[i] = *reinterpret_cast<array*>(kv_keys_in[i]);
+            if (kv_values_in[i] != nullptr) kv_values[i] = *reinterpret_cast<array*>(kv_values_in[i]);
+        }
+    }
+
+    // Forward through all layers
+    auto hidden = input_embeds;
+    for (int i = 0; i < num_layers; i++) {
+        auto& lw = layer_w[i];
+        hidden = paddleocr_vl_block_forward_cached(
+            hidden, lw.norm_in, lw.norm_post,
+            lw.q_t, lw.k_t, lw.v_t, lw.o_t, lw.gate_t, lw.up_t, lw.down_t,
+            num_heads, num_kv_heads, head_dim,
+            attn_scale, norm_eps,
+            cos_final, sin_final,
+            kv_keys[i], kv_values[i], cache_indices[i]);
+    }
+
+    // Final norm + LM head
+    hidden = fast::rms_norm(hidden, std::optional<array>(final_norm_w), norm_eps, {});
+    auto logits = matmul(hidden, transpose(lm_head_w, {1, 0}));
+
+    *out_logits = reinterpret_cast<mlx_array*>(new array(std::move(logits)));
+
+    // Output KV caches
+    for (int i = 0; i < num_layers; i++) {
+        out_kv_keys[i] = kv_keys[i].has_value() ? reinterpret_cast<mlx_array*>(new array(std::move(*kv_keys[i]))) : nullptr;
+        out_kv_values[i] = kv_values[i].has_value() ? reinterpret_cast<mlx_array*>(new array(std::move(*kv_values[i]))) : nullptr;
+    }
+    *out_cache_idx = cache_indices[0];
 }
 
 }  // End extern "C"

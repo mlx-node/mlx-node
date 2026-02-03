@@ -4,11 +4,12 @@
  * The language model component uses multimodal RoPE (mRoPE) which splits
  * the head dimension into sections for temporal, height, and width positions.
  */
-use crate::array::{MxArray, scaled_dot_product_attention_causal};
+use crate::array::{MxArray, scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::models::paddleocr_vl::config::TextConfig;
 use crate::nn::activations::Activations;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::transformer::KVCache;
+use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use std::sync::Arc;
 
@@ -29,8 +30,10 @@ pub struct MultimodalRoPE {
     base: f32,
     /// mRoPE sections [temporal, height, width] (e.g., [16, 24, 24])
     mrope_section: [i32; 3],
-    /// Pre-computed inverse frequencies
+    /// Pre-computed inverse frequencies, pre-shaped to [1, 1, half_dim, 1] for broadcasting
     inv_freq: Arc<MxArray>,
+    /// Cached half_dim value to avoid FFI .shape() calls
+    inv_freq_dim: i64,
     /// Attention scaling factor
     attention_scaling: f32,
 }
@@ -75,18 +78,23 @@ impl MultimodalRoPE {
 
         // Compute inverse frequencies: 1 / (base^(2i/dim))
         let half_dim = dim / 2;
+        let inv_freq_dim = half_dim as i64;
         let mut inv_freq_data = Vec::with_capacity(half_dim as usize);
         for i in (0..dim).step_by(2) {
             let exp = i as f32 / dim as f32;
             inv_freq_data.push(1.0 / base.powf(exp));
         }
-        let inv_freq = MxArray::from_float32(&inv_freq_data, &[half_dim as i64])?;
+        // Pre-reshape to [1, 1, half_dim, 1] to avoid reshape+astype in every forward call.
+        // Already float32, so no astype needed.
+        let inv_freq =
+            MxArray::from_float32(&inv_freq_data, &[1, 1, inv_freq_dim, 1])?;
 
         Ok(Self {
             dim,
             base,
             mrope_section: mrope_section_arr,
             inv_freq: Arc::new(inv_freq),
+            inv_freq_dim,
             attention_scaling: 1.0,
         })
     }
@@ -100,45 +108,55 @@ impl MultimodalRoPE {
     /// # Returns
     /// * Tuple of (cos, sin) each of shape [batch, 1, seq_len, head_dim]
     pub fn forward(&self, x: &MxArray, position_ids: &MxArray) -> Result<(MxArray, MxArray)> {
-        let target_dtype = x.dtype()?;
-        let pos_shape = position_ids.shape()?;
+        let target_dtype = x.dtype()?; // 1 FFI call
+        let pos_shape = position_ids.shape()?; // 1 FFI call
 
         // position_ids: [3, batch, seq_len]
         let batch_size = pos_shape[1];
-        let _seq_len = pos_shape[2];
+        let seq_len = pos_shape[2];
 
-        // Expand inv_freq for broadcasting: [1, 1, half_dim, 1]
-        let inv_freq_expanded = self
-            .inv_freq
-            .reshape(&[1, 1, self.inv_freq.shape()?[0], 1])?
-            .astype(crate::array::DType::Float32)?;
-
-        // Broadcast to [3, batch, half_dim, 1]
+        // inv_freq is pre-shaped to [1, 1, half_dim, 1] and already float32.
+        // Broadcast to [3, batch, half_dim, 1] — uses cached inv_freq_dim.
         let inv_freq_expanded = MxArray::broadcast_to(
-            &inv_freq_expanded,
-            &[3, batch_size, self.inv_freq.shape()?[0], 1],
-        )?;
+            &self.inv_freq,
+            &[3, batch_size, self.inv_freq_dim, 1],
+        )?; // 1 FFI call
 
-        // Expand position_ids: [3, batch, 1, seq_len]
-        let pos_expanded = position_ids.reshape(&[3, batch_size, 1, pos_shape[2]])?;
-        let pos_expanded = pos_expanded.astype(crate::array::DType::Float32)?;
+        // Expand position_ids: [3, batch, 1, seq_len] and cast to float32
+        let pos_expanded = position_ids
+            .reshape(&[3, batch_size, 1, seq_len])? // 1 FFI call
+            .astype(crate::array::DType::Float32)?; // 1 FFI call
 
         // Compute freqs: inv_freq @ position_ids -> [3, batch, half_dim, seq_len]
-        let freqs = inv_freq_expanded.matmul(&pos_expanded)?;
+        let freqs = inv_freq_expanded.matmul(&pos_expanded)?; // 1 FFI call
 
         // Transpose: [3, batch, seq_len, half_dim]
-        let freqs = freqs.transpose(Some(&[0, 1, 3, 2]))?;
+        let freqs = freqs.transpose(Some(&[0, 1, 3, 2]))?; // 1 FFI call
 
         // Concatenate freqs with itself: [3, batch, seq_len, dim]
-        let emb = MxArray::concatenate_many(vec![&freqs, &freqs], Some(-1))?;
+        let emb = MxArray::concatenate_many(vec![&freqs, &freqs], Some(-1))?; // 1 FFI call
 
-        // Compute cos and sin
-        let cos = emb.cos()?.mul_scalar(self.attention_scaling as f64)?;
-        let sin = emb.sin()?.mul_scalar(self.attention_scaling as f64)?;
+        // Compute cos and sin.
+        // Skip mul_scalar when attention_scaling == 1.0 (saves 2 FFI calls).
+        let (cos, sin) = if (self.attention_scaling - 1.0).abs() < 1e-8 {
+            (emb.cos()?, emb.sin()?) // 2 FFI calls
+        } else {
+            let cos = emb.cos()?.mul_scalar(self.attention_scaling as f64)?;
+            let sin = emb.sin()?.mul_scalar(self.attention_scaling as f64)?;
+            (cos, sin)
+        };
 
-        // Cast to target dtype
-        let cos = cos.astype(target_dtype)?;
-        let sin = sin.astype(target_dtype)?;
+        // Cast to target dtype only if needed (saves 2 FFI calls when already float32)
+        let cos = if target_dtype == crate::array::DType::Float32 {
+            cos
+        } else {
+            cos.astype(target_dtype)? // conditional FFI call
+        };
+        let sin = if target_dtype == crate::array::DType::Float32 {
+            sin
+        } else {
+            sin.astype(target_dtype)? // conditional FFI call
+        };
 
         Ok((cos, sin))
     }
@@ -147,16 +165,26 @@ impl MultimodalRoPE {
     pub fn mrope_section(&self) -> Vec<i32> {
         self.mrope_section.to_vec()
     }
+
+    /// Get raw inv_freq pointer for C++ forward pass
+    pub fn get_inv_freq_ptr(&self) -> *mut sys::mlx_array {
+        self.inv_freq.handle.0
+    }
+
+    /// Get mRoPE section array reference
+    pub fn mrope_section_arr(&self) -> &[i32; 3] {
+        &self.mrope_section
+    }
 }
 
 /// Rotate half of the input tensor
-fn rotate_half(x: &MxArray) -> Result<MxArray> {
-    let shape = x.shape()?;
-    let last_dim = shape[shape.len() - 1];
+///
+/// Accepts pre-computed ndim and last_dim to avoid redundant .shape() FFI calls.
+fn rotate_half(x: &MxArray, ndim: usize, last_dim: i64) -> Result<MxArray> {
     let half_dim = last_dim / 2;
 
-    let x1 = x.slice_axis(shape.len() - 1, 0, half_dim)?;
-    let x2 = x.slice_axis(shape.len() - 1, half_dim, last_dim)?;
+    let x1 = x.slice_axis(ndim - 1, 0, half_dim)?;
+    let x2 = x.slice_axis(ndim - 1, half_dim, last_dim)?;
 
     let neg_x2 = x2.mul_scalar(-1.0)?;
     MxArray::concatenate_many(vec![&neg_x2, &x1], Some(-1))
@@ -164,15 +192,17 @@ fn rotate_half(x: &MxArray) -> Result<MxArray> {
 
 /// Apply multimodal rotary position embedding to Q and K (internal)
 ///
-/// # Arguments
-/// * `q` - Query tensor [batch, num_heads, seq_len, head_dim]
-/// * `k` - Key tensor [batch, num_heads, seq_len, head_dim]
-/// * `cos` - Cosine embeddings [3, batch, seq_len, head_dim]
-/// * `sin` - Sine embeddings [3, batch, seq_len, head_dim]
-/// * `mrope_section` - Section sizes [t, h, w]
+/// Uses split+concat pattern matching Python mlx-vlm for minimal FFI overhead.
+/// cos/sin shape: [3, batch, seq_len, head_dim] where dim 0 = [temporal, height, width]
 ///
-/// Note: This is an internal implementation detail used by PaddleOCRAttention.
-/// Not exposed to TypeScript - users interact with high-level VLModel API.
+/// The mrope_section (e.g. [16, 24, 24]) defines how the head_dim is partitioned.
+/// Each section i selects from spatial dimension i%3. After doubling (for sin/cos halves),
+/// we split the last axis at cumulative indices and pick the right spatial row for each part,
+/// then concatenate back. This mirrors Python's:
+///   mrope_section = cumsum(mrope_section * 2)[:-1]
+///   cos = concat([m[i%3] for i,m in enumerate(split(cos, mrope_section, axis=-1))], axis=-1)
+///
+/// Note: Internal implementation detail, not exposed to TypeScript.
 pub fn apply_multimodal_rotary_pos_emb(
     q: &MxArray,
     k: &MxArray,
@@ -189,12 +219,13 @@ pub fn apply_multimodal_rotary_pos_emb(
         boundaries.push(cumsum);
     }
 
-    // Split cos/sin by mRoPE sections and interleave
-    // For each section i, take cos/sin from position i mod 3
-    let cos_shape = cos.shape()?;
+    let cos_shape = cos.shape()?; // 1 FFI call — cache and reuse below
+    let batch_size = cos_shape[1];
+    let seq_len = cos_shape[2];
     let head_dim = cos_shape[3];
 
-    // Build interleaved cos and sin
+    // Split cos/sin by mRoPE sections and interleave
+    // For each section i, take cos/sin from position i mod 3
     let mut cos_parts: Vec<MxArray> = Vec::new();
     let mut sin_parts: Vec<MxArray> = Vec::new();
 
@@ -227,13 +258,14 @@ pub fn apply_multimodal_rotary_pos_emb(
     let sin_final = MxArray::concatenate_many(sin_refs, Some(-1))?;
 
     // Unsqueeze to [batch, 1, seq_len, head_dim] for broadcasting with heads
-    let cos_final = cos_final.reshape(&[cos_shape[1], 1, cos_shape[2], head_dim])?;
-    let sin_final = sin_final.reshape(&[cos_shape[1], 1, cos_shape[2], head_dim])?;
+    let cos_final = cos_final.reshape(&[batch_size, 1, seq_len, head_dim])?;
+    let sin_final = sin_final.reshape(&[batch_size, 1, seq_len, head_dim])?;
 
-    // Get rotary dimension (might not use all of head_dim)
-    let rotary_dim = cos_final.shape()?[3];
-    let q_shape = q.shape()?;
+    // rotary_dim == head_dim (from cos_shape, already cached above)
+    let rotary_dim = head_dim;
+    let q_shape = q.shape()?; // 1 FFI call
     let q_dim = q_shape[3];
+    let q_ndim = q_shape.len();
 
     // Split Q and K into rotary and pass-through parts
     let q_rot = q.slice_axis(3, 0, rotary_dim)?;
@@ -251,8 +283,9 @@ pub fn apply_multimodal_rotary_pos_emb(
     };
 
     // Apply rotary: q_rot * cos + rotate_half(q_rot) * sin
-    let q_rotated = rotate_half(&q_rot)?;
-    let k_rotated = rotate_half(&k_rot)?;
+    // Pass pre-computed ndim and last_dim to avoid .shape() calls inside rotate_half
+    let q_rotated = rotate_half(&q_rot, q_ndim, rotary_dim)?;
+    let k_rotated = rotate_half(&k_rot, q_ndim, rotary_dim)?;
 
     let q_embed = q_rot.mul(&cos_final)?.add(&q_rotated.mul(&sin_final)?)?;
     let k_embed = k_rot.mul(&cos_final)?.add(&k_rotated.mul(&sin_final)?)?;
@@ -290,6 +323,16 @@ pub struct PaddleOCRAttention {
 }
 
 impl PaddleOCRAttention {
+    /// Get raw weight pointers for C++ forward pass
+    pub fn get_weight_ptrs(&self) -> [*mut sys::mlx_array; 4] {
+        [
+            self.q_proj.get_weight().handle.0,
+            self.k_proj.get_weight().handle.0,
+            self.v_proj.get_weight().handle.0,
+            self.o_proj.get_weight().handle.0,
+        ]
+    }
+
     pub fn new(
         config: TextConfig,
         q_weight: &MxArray,
@@ -341,7 +384,7 @@ impl PaddleOCRAttention {
     pub fn forward_with_cache(
         &self,
         x: &MxArray,
-        mask: Option<&MxArray>,
+        _mask: Option<&MxArray>,
         position_embeddings: &MxArray,
         cache: Option<&mut KVCache>,
     ) -> Result<MxArray> {
@@ -384,55 +427,18 @@ impl PaddleOCRAttention {
             (k, v)
         };
 
-        // Get KV sequence length (may differ from query seq_len with cache)
-        let kv_seq_len = k.shape_at(2)?;
-
-        // Repeat KV heads for GQA
-        let n_rep = self.n_heads / self.n_kv_heads;
-        let k = if n_rep > 1 {
-            let k = k.reshape(&[
-                batch,
-                self.n_kv_heads as i64,
-                1,
-                kv_seq_len,
-                self.head_dim as i64,
-            ])?;
-            let k = MxArray::tile(&k, &[1, 1, n_rep, 1, 1])?;
-            k.reshape(&[batch, self.n_heads as i64, kv_seq_len, self.head_dim as i64])?
-        } else {
-            k
-        };
-        let v = if n_rep > 1 {
-            let v = v.reshape(&[
-                batch,
-                self.n_kv_heads as i64,
-                1,
-                kv_seq_len,
-                self.head_dim as i64,
-            ])?;
-            let v = MxArray::tile(&v, &[1, 1, n_rep, 1, 1])?;
-            v.reshape(&[batch, self.n_heads as i64, kv_seq_len, self.head_dim as i64])?
-        } else {
-            v
-        };
-
         // Compute attention with causal masking
+        // Note: MLX's SDPA handles GQA broadcasting internally - no need to
+        // tile/reshape KV heads to match Q heads. Q has n_heads, K/V have n_kv_heads.
         // Use causal SDPA for prefill (seq_len > 1) to enforce causality
         // For generation with cache (seq_len == 1), single token can attend to all cached K/V
         let output = if seq_len > 1 {
             // Prefill: use causal attention
             scaled_dot_product_attention_causal(&q, &k, &v, self.scale as f64)?
         } else {
-            // Generation: use regular attention (mask provided externally if needed)
-            let k_t = k.transpose(Some(&[0, 1, 3, 2]))?;
-            let scores = q.matmul(&k_t)?.mul_scalar(self.scale as f64)?;
-            let scores = if let Some(m) = mask {
-                scores.add(m)?
-            } else {
-                scores
-            };
-            let attn_weights = Activations::softmax(&scores, Some(-1))?;
-            attn_weights.matmul(&v)?
+            // Decode: use fused SDPA with no mask (most optimized Metal kernel path)
+            // For single-token generation, the token can attend to all cached K/V
+            scaled_dot_product_attention(&q, &k, &v, self.scale as f64, None)?
         };
 
         // Reshape back
@@ -457,6 +463,23 @@ pub struct PaddleOCRDecoderLayer {
 }
 
 impl PaddleOCRDecoderLayer {
+    /// Get all 9 weight pointers for this layer in the order expected by C++:
+    /// [input_norm, post_attn_norm, q, k, v, o, gate, up, down]
+    pub fn get_weight_ptrs(&self) -> [*mut sys::mlx_array; 9] {
+        let attn_ptrs = self.self_attn.get_weight_ptrs();
+        [
+            self.input_layernorm.get_weight().handle.0,
+            self.post_attention_layernorm.get_weight().handle.0,
+            attn_ptrs[0], // q_proj
+            attn_ptrs[1], // k_proj
+            attn_ptrs[2], // v_proj
+            attn_ptrs[3], // o_proj
+            self.mlp_gate.get_weight().handle.0,
+            self.mlp_up.get_weight().handle.0,
+            self.mlp_down.get_weight().handle.0,
+        ]
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: TextConfig,
@@ -554,6 +577,12 @@ pub struct ERNIELanguageModel {
     position_ids: Option<MxArray>,
     /// Stored rope deltas for decode phase offset calculation
     rope_deltas: Option<i64>,
+    /// Fused C++ KV cache keys (one per layer)
+    fused_kv_keys: Vec<Option<MxArray>>,
+    /// Fused C++ KV cache values (one per layer)
+    fused_kv_values: Vec<Option<MxArray>>,
+    /// Fused C++ cache write position
+    fused_cache_idx: i32,
 }
 
 impl ERNIELanguageModel {
@@ -586,6 +615,9 @@ impl ERNIELanguageModel {
             kv_caches: None,
             position_ids: None,
             rope_deltas: None,
+            fused_kv_keys: Vec::new(),
+            fused_kv_values: Vec::new(),
+            fused_cache_idx: 0,
         })
     }
 
@@ -626,7 +658,7 @@ impl ERNIELanguageModel {
             let seq_len = shape[1];
             let pos = MxArray::arange(0.0, seq_len as f64, Some(1.0), None)?;
             let pos = pos.reshape(&[1, 1, seq_len])?;
-            MxArray::tile(&pos, &[3, batch as i32, 1])?
+            pos.broadcast_to(&[3, batch, seq_len])?
         };
 
         let (cos, sin) = self.rotary_emb.forward(&h, &pos_ids)?;
@@ -741,21 +773,32 @@ impl ERNIELanguageModel {
             // During decode, we compute position = arange(seq_len) + cache_offset + rope_deltas
             let rope_deltas = self.rope_deltas.unwrap_or(0);
             let delta = (cache_offset as i64 + rope_deltas) as f64;
-            let pos = MxArray::arange(0.0, seq_len as f64, Some(1.0), None)?;
-            let delta_arr = MxArray::scalar_float(delta)?;
-            let pos = pos.add(&delta_arr)?;
-            let pos = pos.reshape(&[1, 1, seq_len])?;
-            MxArray::tile(&pos, &[3, batch as i32, 1])?
+            if seq_len == 1 {
+                // Fast path for single-token decode: create [3, batch, 1] directly
+                // Avoids arange + scalar_float + add + reshape (4 FFI calls → 2)
+                let pos = MxArray::from_float32(&[delta as f32], &[1, 1, 1])?;
+                pos.broadcast_to(&[3, batch, 1])?
+            } else {
+                let pos = MxArray::arange(delta, delta + seq_len as f64, Some(1.0), None)?;
+                let pos = pos.reshape(&[1, 1, seq_len])?;
+                pos.broadcast_to(&[3, batch, seq_len])?
+            }
         } else {
             // Text-only decode: simple sequential positions with cache offset
-            let pos = MxArray::arange(
-                cache_offset as f64,
-                (cache_offset as i64 + seq_len) as f64,
-                Some(1.0),
-                None,
-            )?;
-            let pos = pos.reshape(&[1, 1, seq_len])?;
-            MxArray::tile(&pos, &[3, batch as i32, 1])?
+            if seq_len == 1 {
+                // Fast path for single-token decode
+                let pos = MxArray::from_float32(&[cache_offset as f32], &[1, 1, 1])?;
+                pos.broadcast_to(&[3, batch, 1])?
+            } else {
+                let pos = MxArray::arange(
+                    cache_offset as f64,
+                    (cache_offset as i64 + seq_len) as f64,
+                    Some(1.0),
+                    None,
+                )?;
+                let pos = pos.reshape(&[1, 1, seq_len])?;
+                pos.broadcast_to(&[3, batch, seq_len])?
+            }
         };
 
         let (cos, sin) = self.rotary_emb.forward(&h, &pos_ids)?;
@@ -797,6 +840,127 @@ impl ERNIELanguageModel {
     pub fn num_layers(&self) -> u32 {
         self.layers.len() as u32
     }
+
+    /// Get fused cache write position
+    pub fn get_fused_cache_offset(&self) -> i32 {
+        self.fused_cache_idx
+    }
+
+    /// Initialize fused KV cache state for C++ forward pass
+    pub fn init_fused_kv_caches(&mut self) {
+        let n = self.layers.len();
+        self.fused_kv_keys = (0..n).map(|_| None).collect();
+        self.fused_kv_values = (0..n).map(|_| None).collect();
+        self.fused_cache_idx = 0;
+    }
+
+    /// Reset fused KV cache state
+    pub fn reset_fused_kv_caches(&mut self) {
+        for k in self.fused_kv_keys.iter_mut() {
+            *k = None;
+        }
+        for v in self.fused_kv_values.iter_mut() {
+            *v = None;
+        }
+        self.fused_cache_idx = 0;
+    }
+
+    /// Fused forward pass through C++ for minimal FFI overhead.
+    ///
+    /// This replaces the per-layer Rust forward_with_cache calls with a single
+    /// C++ function that builds the entire computation graph in one FFI call.
+    ///
+    /// # Arguments
+    /// * `input_embeds` - Input embeddings [batch, seq_len, hidden_size]
+    /// * `position_ids` - Position IDs [3, batch, seq_len] for mRoPE
+    ///
+    /// # Returns
+    /// * Logits [batch, seq_len, vocab_size]
+    pub fn forward_fused(
+        &mut self,
+        input_embeds: &MxArray,
+        position_ids: &MxArray,
+    ) -> Result<MxArray> {
+        let num_layers = self.layers.len() as i32;
+
+        // Collect all layer weight pointers (9 per layer)
+        let mut all_weight_ptrs: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_layers as usize * 9);
+        for layer in &self.layers {
+            let ptrs = layer.get_weight_ptrs();
+            all_weight_ptrs.extend_from_slice(&ptrs);
+        }
+
+        // Model-level weights
+        let final_norm_ptr = self.norm.get_weight().handle.0;
+        let lm_head_ptr = self.lm_head.get_weight().handle.0;
+        let inv_freq_ptr = self.rotary_emb.get_inv_freq_ptr();
+        let mrope_section = self.rotary_emb.mrope_section_arr();
+
+        // Prepare KV cache input pointers
+        let mut kv_keys_ptrs: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_layers as usize);
+        let mut kv_values_ptrs: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_layers as usize);
+
+        for i in 0..num_layers as usize {
+            kv_keys_ptrs.push(
+                self.fused_kv_keys[i]
+                    .as_ref()
+                    .map(|a| a.handle.0)
+                    .unwrap_or(std::ptr::null_mut()),
+            );
+            kv_values_ptrs.push(
+                self.fused_kv_values[i]
+                    .as_ref()
+                    .map(|a| a.handle.0)
+                    .unwrap_or(std::ptr::null_mut()),
+            );
+        }
+
+        // Prepare output buffers
+        let mut out_logits: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv_keys: Vec<*mut sys::mlx_array> = vec![std::ptr::null_mut(); num_layers as usize];
+        let mut out_kv_values: Vec<*mut sys::mlx_array> = vec![std::ptr::null_mut(); num_layers as usize];
+        let mut out_cache_idx: i32 = 0;
+
+        let config = &self.config;
+
+        unsafe {
+            sys::mlx_paddleocr_vl_forward_step(
+                input_embeds.handle.0,
+                all_weight_ptrs.as_ptr(),
+                num_layers,
+                final_norm_ptr,
+                lm_head_ptr,
+                inv_freq_ptr,
+                position_ids.handle.0,
+                mrope_section.as_ptr(),
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.rms_norm_eps as f32,
+                kv_keys_ptrs.as_ptr(),
+                kv_values_ptrs.as_ptr(),
+                self.fused_cache_idx,
+                &mut out_logits,
+                out_kv_keys.as_mut_ptr(),
+                out_kv_values.as_mut_ptr(),
+                &mut out_cache_idx,
+            );
+        }
+
+        // Update fused KV cache state from output
+        self.fused_cache_idx = out_cache_idx;
+        for i in 0..num_layers as usize {
+            if !out_kv_keys[i].is_null() {
+                self.fused_kv_keys[i] = Some(MxArray::from_handle(out_kv_keys[i], "fused_kv_key")?);
+            }
+            if !out_kv_values[i].is_null() {
+                self.fused_kv_values[i] = Some(MxArray::from_handle(out_kv_values[i], "fused_kv_value")?);
+            }
+        }
+
+        MxArray::from_handle(out_logits, "paddleocr_vl_forward_fused")
+    }
 }
 
 impl Clone for ERNIELanguageModel {
@@ -811,6 +975,9 @@ impl Clone for ERNIELanguageModel {
             kv_caches: None, // Don't clone caches - they should be initialized fresh
             position_ids: None, // Don't clone position state
             rope_deltas: None,
+            fused_kv_keys: Vec::new(),
+            fused_kv_values: Vec::new(),
+            fused_cache_idx: 0,
         }
     }
 }

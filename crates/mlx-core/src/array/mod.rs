@@ -411,6 +411,12 @@ impl MxArray {
         MxArray::from_handle(handle, "array_addmm")
     }
 
+    /// Fused multimodal rotary position embedding (mRoPE)
+    ///
+    /// Applies rotary position embedding with multimodal section interleaving.
+    /// Replaces ~38 individual graph ops per call with a single fused C++ operation.
+    ///
+    /// # Arguments
     #[napi]
     pub fn transpose(&self, axes: Option<&[i32]>) -> Result<MxArray> {
         let axes_vec = axes.unwrap_or_default();
@@ -1142,6 +1148,43 @@ impl MxArray {
         let mut result = Vec::with_capacity(count);
         for handle in handles.iter().take(count) {
             let array = MxArray::from_handle(*handle as *mut sys::mlx_array, "split")?;
+            result.push(array);
+        }
+
+        Ok(result)
+    }
+
+    /// Split array at specific indices along an axis
+    ///
+    /// Like numpy/MLX split with indices: splits the array at the given positions.
+    /// e.g., split_at_indices([32, 80], axis=-1) on a dim-128 tensor gives 3 parts:
+    /// [0:32], [32:80], [80:128]
+    pub fn split_at_indices(&self, indices: &[i32], axis: i32) -> Result<Vec<MxArray>> {
+        let max_splits = indices.len() + 1; // n indices -> n+1 parts
+        let mut handles = vec![0u64; max_splits];
+
+        let count = unsafe {
+            sys::mlx_array_split_at_indices(
+                self.handle.0,
+                indices.as_ptr(),
+                indices.len(),
+                axis,
+                handles.as_mut_ptr(),
+                max_splits,
+            )
+        };
+
+        if count == 0 && !indices.is_empty() {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "Failed to split array at indices",
+            ));
+        }
+
+        let mut result = Vec::with_capacity(count);
+        for handle in handles.iter().take(count) {
+            let array =
+                MxArray::from_handle(*handle as *mut sys::mlx_array, "split_at_indices")?;
             result.push(array);
         }
 
@@ -3123,3 +3166,4 @@ mod array_ops_tests {
         }
     }
 }
+

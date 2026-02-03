@@ -492,6 +492,14 @@ unsafe extern "C" {
         out_handles: *mut u64,
         max_outputs: usize,
     ) -> usize;
+    pub fn mlx_array_split_at_indices(
+        handle: *mut mlx_array,
+        indices: *const i32,
+        indices_len: usize,
+        axis: i32,
+        out_handles: *mut u64,
+        max_outputs: usize,
+    ) -> usize;
     pub fn mlx_array_tile(
         handle: *mut mlx_array,
         reps: *const i32,
@@ -794,6 +802,32 @@ unsafe extern "C" {
         bits: i32,
         out_dtype: i32, // -1 for input dtype
     ) -> *mut mlx_array;
+
+    /// Fused PaddleOCR-VL forward pass - entire transformer forward in one FFI call.
+    /// Uses mRoPE (multimodal rotary position embedding) instead of standard RoPE.
+    /// 9 weights per layer: [input_norm, post_attn_norm, q, k, v, o, gate, up, down]
+    pub fn mlx_paddleocr_vl_forward_step(
+        input_embeds: *mut mlx_array,            // [batch, seq_len, hidden_size]
+        layer_weights: *const *mut mlx_array,    // [num_layers * 9]
+        num_layers: i32,
+        final_norm_weight: *mut mlx_array,       // [hidden_size]
+        lm_head_weight: *mut mlx_array,          // [vocab_size, hidden_size]
+        inv_freq: *mut mlx_array,                // [1, 1, half_dim, 1]
+        position_ids: *mut mlx_array,            // [3, batch, seq_len]
+        mrope_section: *const i32,               // [3] e.g. {16, 24, 24}
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        norm_eps: f32,
+        kv_keys_in: *const *mut mlx_array,       // [num_layers] or null
+        kv_values_in: *const *mut mlx_array,     // [num_layers] or null
+        cache_idx_in: i32,
+        out_logits: *mut *mut mlx_array,
+        out_kv_keys: *mut *mut mlx_array,        // [num_layers]
+        out_kv_values: *mut *mut mlx_array,      // [num_layers]
+        out_cache_idx: *mut i32,
+    );
 }
 
 // Gradient computation types

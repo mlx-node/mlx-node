@@ -264,6 +264,14 @@ export declare class MxArray {
    * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
    */
   addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray;
+  /**
+   * Fused multimodal rotary position embedding (mRoPE)
+   *
+   * Applies rotary position embedding with multimodal section interleaving.
+   * Replaces ~38 individual graph ops per call with a single fused C++ operation.
+   *
+   * # Arguments
+   */
   transpose(axes?: Int32Array | undefined | null): MxArray;
   take(indices: MxArray, axis: number): MxArray;
   takeAlongAxis(indices: MxArray, axis: number): MxArray;
