@@ -500,23 +500,6 @@ impl MxArray {
         MxArray::from_handle(handle, "array_slice_axis")
     }
 
-    /// Slice assignment along a single axis
-    /// Returns a new array with the slice updated
-    /// Optimized to avoid shape allocation
-    pub(crate) fn slice_assign_axis(
-        &self,
-        axis: usize,
-        start: i64,
-        end: i64,
-        update: &MxArray,
-    ) -> Result<MxArray> {
-        let handle = unsafe {
-            sys::mlx_array_slice_assign_axis(self.handle.0, update.handle.0, axis, start, end)
-        };
-
-        MxArray::from_handle(handle, "array_slice_assign_axis")
-    }
-
     /// In-place slice assignment along a single axis
     /// Modifies the array in-place (no new allocation!)
     /// Optimized to avoid shape allocation during operation
@@ -1183,8 +1166,7 @@ impl MxArray {
 
         let mut result = Vec::with_capacity(count);
         for handle in handles.iter().take(count) {
-            let array =
-                MxArray::from_handle(*handle as *mut sys::mlx_array, "split_at_indices")?;
+            let array = MxArray::from_handle(*handle as *mut sys::mlx_array, "split_at_indices")?;
             result.push(array);
         }
 
@@ -3166,4 +3148,3 @@ mod array_ops_tests {
         }
     }
 }
-

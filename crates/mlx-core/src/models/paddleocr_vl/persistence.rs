@@ -89,6 +89,18 @@ fn is_mlx_conv_format(shape: &[i64]) -> bool {
 pub fn load_paddleocr_vl_weights(
     weights: HashMap<String, MxArray>,
 ) -> napi::Result<HashMap<String, MxArray>> {
+    // Detect format: if any key starts with "language_model.", weights are already in MLX format
+    let is_mlx_format = weights.keys().any(|k| k.starts_with("language_model."));
+
+    if is_mlx_format {
+        // Already sanitized - pass through, only filter ignored keys
+        return Ok(weights
+            .into_iter()
+            .filter(|(k, _)| !should_ignore_key(k))
+            .collect());
+    }
+
+    // HF format - apply full transformation (key renaming, Q/K/V merging, conv2d transposition)
     let mut new_weights: HashMap<String, MxArray> = HashMap::new();
     let mut pending_qkv: HashMap<String, (Option<MxArray>, Option<MxArray>, Option<MxArray>)> =
         HashMap::new();

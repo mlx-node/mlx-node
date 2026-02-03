@@ -4,8 +4,8 @@
 //! Transformer encoder layers for vision models.
 //! Uses GELU activation and LayerNorm (not RMSNorm like language models).
 
-use crate::array::attention::scaled_dot_product_attention;
 use crate::array::MxArray;
+use crate::array::attention::scaled_dot_product_attention;
 use crate::nn::activations::Activations;
 use crate::nn::{LayerNorm, Linear};
 use crate::vision::rope_vision::apply_rotary_pos_emb_vision;
@@ -96,8 +96,12 @@ impl VisionAttention {
         let num_boundaries = cu_seqlens.size()? as usize;
 
         // positions = arange(0, seq_len) as int32: [seq_len]
-        let positions =
-            MxArray::arange(0.0, seq_len as f64, Some(1.0), Some(crate::array::DType::Int32))?;
+        let positions = MxArray::arange(
+            0.0,
+            seq_len as f64,
+            Some(1.0),
+            Some(crate::array::DType::Int32),
+        )?;
 
         // Build segment_ids: for each position, which segment it belongs to.
         // segment_ids[i] = number of boundaries in cu_seqlens[1..n-1] that are <= i
@@ -108,8 +112,7 @@ impl VisionAttention {
         // increment segment_ids where positions >= boundary
         for b in 1..num_boundaries.saturating_sub(1) {
             let boundary_val = cu_seqlens.item_at_int32(b)?;
-            let boundary =
-                MxArray::from_int32(&[boundary_val], &[1])?;
+            let boundary = MxArray::from_int32(&[boundary_val], &[1])?;
             // (positions >= boundary) broadcasts [seq_len] >= [1] -> [seq_len] bool
             let ge = positions.greater_equal(&boundary)?;
             // Cast bool to int32 and accumulate
@@ -199,13 +202,8 @@ impl VisionAttention {
 
         // Use fused scaled dot-product attention (Metal kernel)
         // mask shape [1, seq_len, seq_len] broadcasts to [1, num_heads, seq_len, seq_len]
-        let output = scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            self.scale as f64,
-            Some(&attention_mask),
-        )?;
+        let output =
+            scaled_dot_product_attention(&q, &k, &v, self.scale as f64, Some(&attention_mask))?;
 
         // Transpose back: [1, num_heads, seq_len, head_dim] -> [1, seq_len, num_heads, head_dim]
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;

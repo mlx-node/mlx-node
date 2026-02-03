@@ -15,6 +15,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::models::paddleocr_vl::persistence::load_paddleocr_vl_weights;
 use crate::utils::safetensors::{SafeTensorsFile, save_safetensors};
 
 /// Structure for parsing model.safetensors.index.json
@@ -37,6 +38,9 @@ pub struct ConversionOptions {
 
     /// Whether to verbose logging (default: false)
     pub verbose: Option<bool>,
+
+    /// Model type for model-specific weight sanitization (e.g., "paddleocr-vl")
+    pub model_type: Option<String>,
 }
 
 #[napi(object)]
@@ -87,6 +91,7 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
     let output_dir = PathBuf::from(&options.output_dir);
     let target_dtype = options.dtype.unwrap_or_else(|| "float32".to_string());
     let verbose = options.verbose.unwrap_or(false);
+    let model_type = options.model_type;
 
     // Validate input directory
     if !input_dir.exists() {
@@ -281,6 +286,27 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         tensor_names.push(name.clone());
     }
 
+    // Apply model-specific weight sanitization
+    let converted_tensors = match model_type.as_deref() {
+        Some("paddleocr-vl") => {
+            info!(
+                "Applying PaddleOCR-VL weight sanitization (key renaming, Q/K/V merging, conv2d transposition)..."
+            );
+            load_paddleocr_vl_weights(converted_tensors)?
+        }
+        Some(other) => {
+            return Err(Error::from_reason(format!(
+                "Unknown model type: '{}'. Supported: paddleocr-vl",
+                other
+            )));
+        }
+        None => converted_tensors,
+    };
+
+    // Update tensor names after sanitization
+    let mut tensor_names: Vec<String> = converted_tensors.keys().cloned().collect();
+    tensor_names.sort();
+
     // Save converted model
     let output_weights_path = output_dir.join("model.safetensors");
     info!(
@@ -342,11 +368,8 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
     );
     info!("  Output: {}", output_dir.display());
 
-    // Sort tensor names for consistent output
-    tensor_names.sort();
-
     Ok(ConversionResult {
-        num_tensors: num_tensors as i32,
+        num_tensors: tensor_names.len() as i32,
         num_parameters: num_parameters as i64,
         output_path: output_dir.to_string_lossy().to_string(),
         tensor_names,

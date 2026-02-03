@@ -23,12 +23,14 @@
  */
 
 import { resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { convertModel } from '@mlx-node/core';
 
 interface Args {
   input?: string;
   output?: string;
   dtype?: string;
+  modelType?: string;
   verbose?: boolean;
   help?: boolean;
 }
@@ -54,6 +56,11 @@ function parseArgs(): Args {
       case '--dtype':
       case '-d':
         args.dtype = argv[++i];
+        break;
+
+      case '--model-type':
+      case '-m':
+        args.modelType = argv[++i];
         break;
 
       case '--verbose':
@@ -92,6 +99,8 @@ Required Arguments:
 Optional Arguments:
   --dtype, -d <type>    Target dtype (default: bfloat16)
                         Options: float32, float16, bfloat16
+  --model-type, -m      Model type for weight sanitization (e.g., paddleocr-vl)
+                        Auto-detected from config.json if not specified
   --verbose, -v         Enable verbose logging
   --help, -h            Show this help message
 
@@ -140,13 +149,32 @@ async function main() {
   const dtype = args.dtype || 'bfloat16';
   const verbose = args.verbose || false;
 
+  // Auto-detect model type from config.json if not specified
+  let modelType = args.modelType;
+  if (!modelType) {
+    try {
+      const configPath = resolve(inputDir, 'config.json');
+      const config = JSON.parse(readFileSync(configPath, 'utf-8'));
+      if (config.model_type === 'paddleocr_vl') {
+        modelType = 'paddleocr-vl';
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      }
+    } catch {
+      // config.json not found or invalid - will be caught later by convertModel
+    }
+  }
+
   console.log('╔════════════════════════════════════════════════════════╗');
   console.log('║   Converting HuggingFace Model to MLX Format           ║');
   console.log('╚════════════════════════════════════════════════════════╝\n');
 
-  console.log(`Input:  ${inputDir}`);
-  console.log(`Output: ${outputDir}`);
-  console.log(`Dtype:  ${dtype}\n`);
+  console.log(`Input:      ${inputDir}`);
+  console.log(`Output:     ${outputDir}`);
+  console.log(`Dtype:      ${dtype}`);
+  if (modelType) {
+    console.log(`Model Type: ${modelType}`);
+  }
+  console.log('');
 
   try {
     const startTime = Date.now();
@@ -156,6 +184,7 @@ async function main() {
       outputDir,
       dtype,
       verbose,
+      modelType,
     });
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);

@@ -86,8 +86,7 @@ impl MultimodalRoPE {
         }
         // Pre-reshape to [1, 1, half_dim, 1] to avoid reshape+astype in every forward call.
         // Already float32, so no astype needed.
-        let inv_freq =
-            MxArray::from_float32(&inv_freq_data, &[1, 1, inv_freq_dim, 1])?;
+        let inv_freq = MxArray::from_float32(&inv_freq_data, &[1, 1, inv_freq_dim, 1])?;
 
         Ok(Self {
             dim,
@@ -117,10 +116,8 @@ impl MultimodalRoPE {
 
         // inv_freq is pre-shaped to [1, 1, half_dim, 1] and already float32.
         // Broadcast to [3, batch, half_dim, 1] — uses cached inv_freq_dim.
-        let inv_freq_expanded = MxArray::broadcast_to(
-            &self.inv_freq,
-            &[3, batch_size, self.inv_freq_dim, 1],
-        )?; // 1 FFI call
+        let inv_freq_expanded =
+            MxArray::broadcast_to(&self.inv_freq, &[3, batch_size, self.inv_freq_dim, 1])?; // 1 FFI call
 
         // Expand position_ids: [3, batch, 1, seq_len] and cast to float32
         let pos_expanded = position_ids
@@ -854,6 +851,18 @@ impl ERNIELanguageModel {
         self.fused_cache_idx = 0;
     }
 
+    /// Evaluate all fused KV cache arrays to materialize them.
+    /// This is critical for chunked prefill - it forces the computation graph
+    /// to be evaluated between chunks, preventing unbounded graph growth.
+    pub fn eval_fused_kv_caches(&self) {
+        for arr in self.fused_kv_keys.iter().flatten() {
+            arr.eval();
+        }
+        for arr in self.fused_kv_values.iter().flatten() {
+            arr.eval();
+        }
+    }
+
     /// Reset fused KV cache state
     pub fn reset_fused_kv_caches(&mut self) {
         for k in self.fused_kv_keys.iter_mut() {
@@ -884,7 +893,8 @@ impl ERNIELanguageModel {
         let num_layers = self.layers.len() as i32;
 
         // Collect all layer weight pointers (9 per layer)
-        let mut all_weight_ptrs: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_layers as usize * 9);
+        let mut all_weight_ptrs: Vec<*mut sys::mlx_array> =
+            Vec::with_capacity(num_layers as usize * 9);
         for layer in &self.layers {
             let ptrs = layer.get_weight_ptrs();
             all_weight_ptrs.extend_from_slice(&ptrs);
@@ -917,8 +927,10 @@ impl ERNIELanguageModel {
 
         // Prepare output buffers
         let mut out_logits: *mut sys::mlx_array = std::ptr::null_mut();
-        let mut out_kv_keys: Vec<*mut sys::mlx_array> = vec![std::ptr::null_mut(); num_layers as usize];
-        let mut out_kv_values: Vec<*mut sys::mlx_array> = vec![std::ptr::null_mut(); num_layers as usize];
+        let mut out_kv_keys: Vec<*mut sys::mlx_array> =
+            vec![std::ptr::null_mut(); num_layers as usize];
+        let mut out_kv_values: Vec<*mut sys::mlx_array> =
+            vec![std::ptr::null_mut(); num_layers as usize];
         let mut out_cache_idx: i32 = 0;
 
         let config = &self.config;
@@ -955,7 +967,8 @@ impl ERNIELanguageModel {
                 self.fused_kv_keys[i] = Some(MxArray::from_handle(out_kv_keys[i], "fused_kv_key")?);
             }
             if !out_kv_values[i].is_null() {
-                self.fused_kv_values[i] = Some(MxArray::from_handle(out_kv_values[i], "fused_kv_value")?);
+                self.fused_kv_values[i] =
+                    Some(MxArray::from_handle(out_kv_values[i], "fused_kv_value")?);
             }
         }
 

@@ -1756,6 +1756,8 @@ export interface ConversionOptions {
   dtype?: string;
   /** Whether to verbose logging (default: false) */
   verbose?: boolean;
+  /** Model type for model-specific weight sanitization (e.g., "paddleocr-vl") */
+  modelType?: string;
 }
 
 export interface ConversionResult {
