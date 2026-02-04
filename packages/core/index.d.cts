@@ -1816,6 +1816,24 @@ export interface DocumentElement {
   paragraph?: Paragraph;
 }
 
+/**
+ * Convert a ParsedDocument to an XLSX buffer.
+ *
+ * Each Table element becomes a separate worksheet with bold headers.
+ * Paragraph elements are collected into a "Text" worksheet.
+ *
+ * # Example
+ * ```typescript
+ * import { parseVlmOutput, documentToXlsx } from '@mlx-node/core';
+ * import { writeFileSync } from 'fs';
+ *
+ * const doc = parseVlmOutput(vlmResult.text);
+ * const buffer = documentToXlsx(doc);
+ * writeFileSync('output.xlsx', buffer);
+ * ```
+ */
+export declare function documentToXlsx(doc: ParsedDocument): Buffer;
+
 export declare const enum DType {
   Float32 = 0,
   Int32 = 1,
@@ -2176,6 +2194,8 @@ export declare const enum OutputFormat {
   Markdown = 'Markdown',
   /** HTML tables */
   Html = 'Html',
+  /** JSON structured output */
+  Json = 'Json',
 }
 
 /** Configuration for creating an OutputStore connection */
@@ -2425,6 +2445,20 @@ export interface SamplingConfig {
   /** Minimum probability threshold relative to max (min-p sampling). 0 = disabled */
   minP?: number;
 }
+
+/**
+ * Parse VLM output and save directly as XLSX file.
+ *
+ * Convenience function that parses VLM output and writes it to an XLSX file.
+ *
+ * # Example
+ * ```typescript
+ * import { saveToXlsx } from '@mlx-node/core';
+ *
+ * saveToXlsx(vlmResult.text, 'output.xlsx');
+ * ```
+ */
+export declare function saveToXlsx(text: string, filePath: string): void;
 
 /** Scheduler statistics (NAPI-compatible) */
 export interface SchedulerStatsNapi {

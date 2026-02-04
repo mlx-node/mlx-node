@@ -52,6 +52,9 @@ export {
   OutputFormat,
 } from '@mlx-node/core';
 
+// XLSX export (Rust implementation)
+export { documentToXlsx, saveToXlsx } from '@mlx-node/core';
+
 // Re-export shared utilities
 export { Qwen3Tokenizer as Tokenizer } from '@mlx-node/lm';
 export { MxArray, type DType } from '@mlx-node/core';

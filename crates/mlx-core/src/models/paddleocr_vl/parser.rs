@@ -12,7 +12,10 @@
  * - <bcel> : blank/bottom cell
  * - <rcel> : right cell boundary
  */
+use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
+use rust_xlsxwriter::{Format, Workbook};
+use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
 
 /// A single cell in a table
@@ -83,6 +86,8 @@ pub enum OutputFormat {
     Markdown,
     /// HTML tables
     Html,
+    /// JSON structured output
+    Json,
 }
 
 /// Parser configuration
@@ -307,6 +312,7 @@ fn format_document_internal(doc: &ParsedDocument, config: &ParserConfig) -> Stri
         OutputFormat::Plain => format_plain(doc, trim_cells, collapse_empty_rows),
         OutputFormat::Markdown => format_markdown(doc, trim_cells, collapse_empty_rows),
         OutputFormat::Html => format_html(doc, trim_cells, collapse_empty_rows),
+        OutputFormat::Json => format_json(doc, trim_cells, collapse_empty_rows),
     }
 }
 
@@ -522,6 +528,66 @@ fn format_html(doc: &ParsedDocument, trim_cells: bool, collapse_empty_rows: bool
     parts.join("\n\n")
 }
 
+/// JSON format - structured output using serde_json
+fn format_json(doc: &ParsedDocument, trim_cells: bool, collapse_empty_rows: bool) -> String {
+    let elements: Vec<Value> = doc
+        .elements
+        .iter()
+        .filter_map(|el| {
+            if el.element_type == ElementType::Paragraph {
+                el.paragraph.as_ref().map(|p| {
+                    json!({
+                        "elementType": "Paragraph",
+                        "paragraph": { "content": p.content }
+                    })
+                })
+            } else {
+                el.table.as_ref().map(|table| {
+                    let rows: Vec<&TableRow> = if collapse_empty_rows {
+                        table
+                            .rows
+                            .iter()
+                            .filter(|r| r.cells.iter().any(|c| !c.is_empty))
+                            .collect()
+                    } else {
+                        table.rows.iter().collect()
+                    };
+
+                    let json_rows: Vec<Value> = rows
+                        .iter()
+                        .map(|row| {
+                            let cells: Vec<Value> = row
+                                .cells
+                                .iter()
+                                .map(|c| {
+                                    let content = if trim_cells {
+                                        c.content.trim().to_string()
+                                    } else {
+                                        c.content.clone()
+                                    };
+                                    json!({
+                                        "content": content,
+                                        "isEmpty": c.is_empty
+                                    })
+                                })
+                                .collect();
+                            json!({ "cells": cells })
+                        })
+                        .collect();
+
+                    json!({
+                        "elementType": "Table",
+                        "table": { "rows": json_rows }
+                    })
+                })
+            }
+        })
+        .collect();
+
+    let doc_json = json!({ "elements": elements });
+    serde_json::to_string_pretty(&doc_json).unwrap_or_else(|_| "{}".to_string())
+}
+
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -574,6 +640,118 @@ pub fn parse_paddle_response(text: String, config: Option<ParserConfig>) -> Stri
     let cfg = config.unwrap_or_default();
     let doc = parse_vlm_output_internal(&text);
     format_document_internal(&doc, &cfg)
+}
+
+/// Convert a ParsedDocument to XLSX bytes.
+///
+/// Each Table element becomes a separate worksheet. Paragraphs are collected
+/// into a "Text" worksheet if any exist.
+fn document_to_xlsx_internal(doc: &ParsedDocument) -> napi::Result<Vec<u8>> {
+    let mut workbook = Workbook::new();
+    let bold = Format::new().set_bold();
+
+    let table_count = doc
+        .elements
+        .iter()
+        .filter(|e| e.element_type == ElementType::Table)
+        .count();
+    let mut table_index = 0;
+    let mut paragraphs: Vec<&str> = Vec::new();
+
+    for element in &doc.elements {
+        if element.element_type == ElementType::Table {
+            if let Some(table) = &element.table {
+                table_index += 1;
+                let sheet_name = if table_count == 1 {
+                    "Table".to_string()
+                } else {
+                    format!("Table {table_index}")
+                };
+                let worksheet = workbook.add_worksheet();
+                worksheet
+                    .set_name(&sheet_name)
+                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+                for (row_idx, row) in table.rows.iter().enumerate() {
+                    for (col_idx, cell) in row.cells.iter().enumerate() {
+                        let r = row_idx as u32;
+                        let c = col_idx as u16;
+                        if row_idx == 0 {
+                            worksheet
+                                .write_string_with_format(r, c, &cell.content, &bold)
+                                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                        } else {
+                            worksheet
+                                .write_string(r, c, &cell.content)
+                                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                        }
+                    }
+                }
+
+                // Auto-fit column widths
+                worksheet.autofit();
+            }
+        } else if let Some(p) = &element.paragraph {
+            paragraphs.push(&p.content);
+        }
+    }
+
+    if !paragraphs.is_empty() {
+        let worksheet = workbook.add_worksheet();
+        worksheet
+            .set_name("Text")
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        for (i, text) in paragraphs.iter().enumerate() {
+            worksheet
+                .write_string(i as u32, 0, *text)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        }
+        worksheet.autofit();
+    }
+
+    let buf = workbook
+        .save_to_buffer()
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    Ok(buf)
+}
+
+/// Convert a ParsedDocument to an XLSX buffer.
+///
+/// Each Table element becomes a separate worksheet with bold headers.
+/// Paragraph elements are collected into a "Text" worksheet.
+///
+/// # Example
+/// ```typescript
+/// import { parseVlmOutput, documentToXlsx } from '@mlx-node/core';
+/// import { writeFileSync } from 'fs';
+///
+/// const doc = parseVlmOutput(vlmResult.text);
+/// const buffer = documentToXlsx(doc);
+/// writeFileSync('output.xlsx', buffer);
+/// ```
+#[napi]
+pub fn document_to_xlsx(doc: ParsedDocument) -> napi::Result<Buffer> {
+    let bytes = document_to_xlsx_internal(&doc)?;
+    Ok(Buffer::from(bytes))
+}
+
+/// Parse VLM output and save directly as XLSX file.
+///
+/// Convenience function that parses VLM output and writes it to an XLSX file.
+///
+/// # Example
+/// ```typescript
+/// import { saveToXlsx } from '@mlx-node/core';
+///
+/// saveToXlsx(vlmResult.text, 'output.xlsx');
+/// ```
+#[napi]
+pub fn save_to_xlsx(text: String, file_path: String) -> napi::Result<()> {
+    let doc = parse_vlm_output_internal(&text);
+    let bytes = document_to_xlsx_internal(&doc)?;
+    std::fs::write(&file_path, &bytes)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to write file: {e}")))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -789,5 +967,78 @@ mod tests {
         assert!(row.cells[1].is_empty); // <ecel> creates empty cell
         assert_eq!(row.cells[2].content, "Hello世界");
         assert!(!row.cells[2].is_empty);
+    }
+
+    #[test]
+    fn test_format_json_simple_table() {
+        let doc = parse_vlm_output_internal("<fcel>Name<ecel><ecel><nl><fcel>Alice<ecel><ecel>");
+        let cfg = ParserConfig {
+            format: Some(OutputFormat::Json),
+            ..Default::default()
+        };
+        let json_str = format_document_internal(&doc, &cfg);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        let elements = parsed["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0]["elementType"], "Table");
+
+        let rows = elements[0]["table"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["cells"][0]["content"], "Name");
+        assert_eq!(rows[0]["cells"][0]["isEmpty"], false);
+        assert_eq!(rows[1]["cells"][0]["content"], "Alice");
+    }
+
+    #[test]
+    fn test_format_json_mixed_content() {
+        let doc =
+            parse_vlm_output_internal("Title text<nl><fcel>Cell 1<ecel><ecel><nl>Footer text");
+        let cfg = ParserConfig {
+            format: Some(OutputFormat::Json),
+            ..Default::default()
+        };
+        let json_str = format_document_internal(&doc, &cfg);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        let elements = parsed["elements"].as_array().unwrap();
+        assert!(elements.len() >= 2);
+
+        // Find paragraph and table elements
+        let has_paragraph = elements.iter().any(|e| e["elementType"] == "Paragraph");
+        let has_table = elements.iter().any(|e| e["elementType"] == "Table");
+        assert!(has_paragraph);
+        assert!(has_table);
+    }
+
+    #[test]
+    fn test_format_json_roundtrip() {
+        // Use <lcel> between cells (left-cell boundary) to avoid empty cells from <ecel>
+        let doc = parse_vlm_output_internal(
+            "<fcel>Header A<lcel>Header B<ecel><nl><fcel>Val 1<lcel>Val 2<ecel>",
+        );
+        let cfg = ParserConfig {
+            format: Some(OutputFormat::Json),
+            ..Default::default()
+        };
+        let json_str = format_document_internal(&doc, &cfg);
+
+        // Parse back and verify structure
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let elements = parsed["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 1);
+
+        let rows = elements[0]["table"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // Verify header row
+        let header_cells = rows[0]["cells"].as_array().unwrap();
+        assert_eq!(header_cells[0]["content"], "Header A");
+        assert_eq!(header_cells[1]["content"], "Header B");
+
+        // Verify data row
+        let data_cells = rows[1]["cells"].as_array().unwrap();
+        assert_eq!(data_cells[0]["content"], "Val 1");
+        assert_eq!(data_cells[1]["content"], "Val 2");
     }
 }
