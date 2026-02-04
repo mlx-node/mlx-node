@@ -110,6 +110,7 @@ fn main() {
         .cpp(true)
         .std("c++17")
         .warnings(false)
+        .define("MLX_STATIC", None)
         .include(&include_source)
         .include(&mlx_dir);
 
