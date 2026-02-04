@@ -7,6 +7,7 @@
 #include "mlx/compile.h"
 #include "mlx/compile_impl.h"
 #include "mlx/backend/metal/metal.h"
+#include "mlx/backend/gpu/device_info.h"
 
 #include <algorithm>
 #include <cmath>
@@ -3175,7 +3176,7 @@ const char* mlx_metal_device_info() {
   }
 
   try {
-    const auto& device_info = mlx::core::metal::device_info();
+    const auto& device_info = mlx::core::gpu::device_info();
 
     // Build JSON string manually
     std::ostringstream json;
@@ -3650,7 +3651,7 @@ void mlx_qwen3_generate(
   // This keeps model weights in fast GPU memory
   size_t old_wired_limit = 0;
   if (mlx::core::metal::is_available()) {
-    auto& info = mlx::core::metal::device_info();
+    auto& info = mlx::core::gpu::device_info();
     size_t max_rec = std::get<size_t>(info.at("max_recommended_working_set_size"));
     old_wired_limit = mlx::core::set_wired_limit(max_rec);
   }
