@@ -4796,4 +4796,241 @@ void mlx_paddleocr_vl_forward_step(
     *out_cache_idx = cache_indices[0];
 }
 
+// Helper: single PaddleOCR-VL transformer block forward with KV cache + batched mask
+// Like paddleocr_vl_block_forward_cached but uses create_batched_causal_mask for
+// left-padding-aware attention masking needed during batched decode.
+static array paddleocr_vl_block_forward_batched(
+    const array& x,
+    const array& input_norm_w,
+    const array& post_attn_norm_w,
+    const array& w_q_t, const array& w_k_t, const array& w_v_t, const array& w_o_t,
+    const array& w_gate_t, const array& w_up_t, const array& w_down_t,
+    int n_heads, int n_kv_heads, int head_dim,
+    float attn_scale, float norm_eps,
+    const array& cos_final, const array& sin_final,
+    std::optional<array>& cached_keys, std::optional<array>& cached_values,
+    int& cache_idx,
+    const array& left_padding
+) {
+    int batch = static_cast<int>(x.shape(0));
+    int seq_len = static_cast<int>(x.shape(1));
+
+    // Self-Attention
+    auto normed = fast::rms_norm(x, std::optional<array>(input_norm_w), norm_eps, {});
+
+    auto queries = matmul(normed, w_q_t);
+    auto keys = matmul(normed, w_k_t);
+    auto values = matmul(normed, w_v_t);
+
+    queries = transpose(reshape(queries, {batch, seq_len, n_heads, head_dim}), {0, 2, 1, 3});
+    keys = transpose(reshape(keys, {batch, seq_len, n_kv_heads, head_dim}), {0, 2, 1, 3});
+    values = transpose(reshape(values, {batch, seq_len, n_kv_heads, head_dim}), {0, 2, 1, 3});
+
+    // Apply pre-sectioned mRoPE
+    auto [q_rotated, k_rotated] = apply_mrope_paddleocr(queries, keys, cos_final, sin_final);
+
+    // KV Cache Update
+    int prev_cache_idx = cache_idx;
+    int new_idx = cache_idx + seq_len;
+
+    if (!cached_keys.has_value()) {
+        int initial_capacity = ((seq_len + KV_CACHE_CHUNK_SIZE - 1) / KV_CACHE_CHUNK_SIZE) * KV_CACHE_CHUNK_SIZE;
+        initial_capacity = std::max(initial_capacity, KV_CACHE_CHUNK_SIZE);
+
+        auto buffer_shape = Shape{batch, n_kv_heads, initial_capacity, head_dim};
+        cached_keys = zeros(buffer_shape, k_rotated.dtype());
+        cached_values = zeros(buffer_shape, values.dtype());
+
+        cached_keys = slice_update(*cached_keys, k_rotated, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+        cached_values = slice_update(*cached_values, values, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+    } else {
+        int current_capacity = static_cast<int>(cached_keys->shape()[2]);
+        if (new_idx > current_capacity) {
+            int new_capacity = ((new_idx + KV_CACHE_CHUNK_SIZE - 1) / KV_CACHE_CHUNK_SIZE) * KV_CACHE_CHUNK_SIZE;
+            auto new_shape = Shape{batch, n_kv_heads, new_capacity, head_dim};
+            auto new_k_buffer = zeros(new_shape, cached_keys->dtype());
+            auto new_v_buffer = zeros(new_shape, cached_values->dtype());
+            new_k_buffer = slice_update(new_k_buffer, *cached_keys, {0, 0, 0, 0}, cached_keys->shape());
+            new_v_buffer = slice_update(new_v_buffer, *cached_values, {0, 0, 0, 0}, cached_values->shape());
+            cached_keys = new_k_buffer;
+            cached_values = new_v_buffer;
+        }
+        cached_keys = slice_update(*cached_keys, k_rotated, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+        cached_values = slice_update(*cached_values, values, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+    }
+
+    auto keys_valid = slice(*cached_keys, {0, 0, 0, 0}, {batch, n_kv_heads, new_idx, head_dim});
+    auto values_valid = slice(*cached_values, {0, 0, 0, 0}, {batch, n_kv_heads, new_idx, head_dim});
+    cache_idx = new_idx;
+
+    // Create left-padding-aware attention mask
+    auto mask = create_batched_causal_mask(left_padding, seq_len, new_idx, prev_cache_idx);
+    auto attn_output = fast::scaled_dot_product_attention(q_rotated, keys_valid, values_valid, attn_scale, "", mask, std::nullopt, {});
+
+    // Output projection + residual
+    attn_output = transpose(attn_output, {0, 2, 1, 3});
+    attn_output = reshape(attn_output, {batch, seq_len, n_heads * head_dim});
+    attn_output = matmul(attn_output, w_o_t);
+    auto h = x + attn_output;
+
+    // MLP (SwiGLU) + residual
+    auto mlp_input = fast::rms_norm(h, std::optional<array>(post_attn_norm_w), norm_eps, {});
+    auto gate = matmul(mlp_input, w_gate_t);
+    auto up = matmul(mlp_input, w_up_t);
+    auto activated = compiled_swiglu()({gate, up})[0];
+    auto mlp_output = matmul(activated, w_down_t);
+
+    return h + mlp_output;
+}
+
+// Batched PaddleOCR-VL forward step: input_embeds → mRoPE → layers → norm → LM head
+// Like mlx_paddleocr_vl_forward_step but with left_padding for batched decode.
+void mlx_paddleocr_vl_forward_step_batched(
+    mlx_array* input_embeds_handle,
+    mlx_array* const* layer_weights,
+    int num_layers,
+    mlx_array* final_norm_weight_handle,
+    mlx_array* lm_head_weight_handle,
+    mlx_array* inv_freq_handle,
+    mlx_array* position_ids_handle,
+    const int* mrope_section,
+    int hidden_size, int num_heads, int num_kv_heads, int head_dim,
+    float norm_eps,
+    mlx_array* left_padding_handle,
+    mlx_array* const* kv_keys_in,
+    mlx_array* const* kv_values_in,
+    int cache_idx_in,
+    mlx_array** out_logits,
+    mlx_array** out_kv_keys,
+    mlx_array** out_kv_values,
+    int* out_cache_idx
+) {
+    auto& input_embeds = *reinterpret_cast<array*>(input_embeds_handle);
+    auto& final_norm_w = *reinterpret_cast<array*>(final_norm_weight_handle);
+    auto& lm_head_w = *reinterpret_cast<array*>(lm_head_weight_handle);
+    auto& inv_freq = *reinterpret_cast<array*>(inv_freq_handle);
+    auto& position_ids = *reinterpret_cast<array*>(position_ids_handle);
+    auto& left_padding = *reinterpret_cast<array*>(left_padding_handle);
+
+    float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    // Compute mRoPE cos/sin once, then pre-section for all layers
+    auto [mrope_cos, mrope_sin] = compute_mrope_cos_sin(inv_freq, position_ids, head_dim);
+    auto [cos_final, sin_final] = compute_mrope_sectioned(mrope_cos, mrope_sin, mrope_section);
+
+    cos_final = astype(cos_final, input_embeds.dtype());
+    sin_final = astype(sin_final, input_embeds.dtype());
+
+    // Pre-transpose all layer weights once
+    struct LayerWeightsT {
+        array norm_in, norm_post;
+        array q_t, k_t, v_t, o_t, gate_t, up_t, down_t;
+    };
+    std::vector<LayerWeightsT> layer_w;
+    layer_w.reserve(num_layers);
+    for (int i = 0; i < num_layers; i++) {
+        int base = i * 9;
+        auto& w_q = *reinterpret_cast<array*>(layer_weights[base + 2]);
+        auto& w_k = *reinterpret_cast<array*>(layer_weights[base + 3]);
+        auto& w_v = *reinterpret_cast<array*>(layer_weights[base + 4]);
+        auto& w_o = *reinterpret_cast<array*>(layer_weights[base + 5]);
+        auto& w_gate = *reinterpret_cast<array*>(layer_weights[base + 6]);
+        auto& w_up = *reinterpret_cast<array*>(layer_weights[base + 7]);
+        auto& w_down = *reinterpret_cast<array*>(layer_weights[base + 8]);
+        layer_w.push_back({
+            *reinterpret_cast<array*>(layer_weights[base + 0]),
+            *reinterpret_cast<array*>(layer_weights[base + 1]),
+            transpose(w_q, {1, 0}), transpose(w_k, {1, 0}),
+            transpose(w_v, {1, 0}), transpose(w_o, {1, 0}),
+            transpose(w_gate, {1, 0}), transpose(w_up, {1, 0}),
+            transpose(w_down, {1, 0})
+        });
+    }
+
+    // Initialize per-layer KV cache state
+    std::vector<std::optional<array>> kv_keys(num_layers);
+    std::vector<std::optional<array>> kv_values(num_layers);
+    std::vector<int> cache_indices(num_layers, cache_idx_in);
+
+    if (kv_keys_in != nullptr && kv_values_in != nullptr) {
+        for (int i = 0; i < num_layers; i++) {
+            if (kv_keys_in[i] != nullptr) kv_keys[i] = *reinterpret_cast<array*>(kv_keys_in[i]);
+            if (kv_values_in[i] != nullptr) kv_values[i] = *reinterpret_cast<array*>(kv_values_in[i]);
+        }
+    }
+
+    // Forward through all layers with batched mask
+    auto hidden = input_embeds;
+    for (int i = 0; i < num_layers; i++) {
+        auto& lw = layer_w[i];
+        hidden = paddleocr_vl_block_forward_batched(
+            hidden, lw.norm_in, lw.norm_post,
+            lw.q_t, lw.k_t, lw.v_t, lw.o_t, lw.gate_t, lw.up_t, lw.down_t,
+            num_heads, num_kv_heads, head_dim,
+            attn_scale, norm_eps,
+            cos_final, sin_final,
+            kv_keys[i], kv_values[i], cache_indices[i],
+            left_padding);
+    }
+
+    // Final norm + LM head
+    hidden = fast::rms_norm(hidden, std::optional<array>(final_norm_w), norm_eps, {});
+    auto logits = matmul(hidden, transpose(lm_head_w, {1, 0}));
+
+    *out_logits = reinterpret_cast<mlx_array*>(new array(std::move(logits)));
+
+    for (int i = 0; i < num_layers; i++) {
+        out_kv_keys[i] = kv_keys[i].has_value() ? reinterpret_cast<mlx_array*>(new array(std::move(*kv_keys[i]))) : nullptr;
+        out_kv_values[i] = kv_values[i].has_value() ? reinterpret_cast<mlx_array*>(new array(std::move(*kv_values[i]))) : nullptr;
+    }
+    *out_cache_idx = cache_indices[0];
+}
+
+mlx_array* mlx_conv2d(
+    mlx_array* input,
+    mlx_array* weight,
+    int stride_h, int stride_w,
+    int padding_h, int padding_w,
+    int dilation_h, int dilation_w,
+    int groups
+) {
+    auto inp = reinterpret_cast<mlx::core::array*>(input);
+    auto wt = reinterpret_cast<mlx::core::array*>(weight);
+    mlx::core::array result = mlx::core::conv2d(
+        *inp, *wt,
+        {stride_h, stride_w},
+        {padding_h, padding_w},
+        {dilation_h, dilation_w},
+        groups
+    );
+    return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+}
+
+mlx_array* mlx_conv_transpose2d(
+    mlx_array* input,
+    mlx_array* weight,
+    int stride_h, int stride_w,
+    int padding_h, int padding_w,
+    int dilation_h, int dilation_w,
+    int groups
+) {
+    auto inp = reinterpret_cast<mlx::core::array*>(input);
+    auto wt = reinterpret_cast<mlx::core::array*>(weight);
+
+    // Output padding is hardcoded to (0, 0) since current usage (DBHead) requires
+    // exact upsampling with kernel=2, stride=2, padding=0:
+    //   output_h = (input_h - 1) * stride_h - 2*padding_h + kernel_h + output_padding_h
+    //            = (input_h - 1) * 2 - 0 + 2 + 0 = 2 * input_h (exact 2x)
+    // For future use cases requiring non-zero output_padding, expose as parameter.
+    mlx::core::array result = mlx::core::conv_transpose2d(
+        *inp, *wt,
+        std::pair<int,int>{stride_h, stride_w},
+        std::pair<int,int>{padding_h, padding_w},
+        std::pair<int,int>{dilation_h, dilation_w},
+        std::pair<int,int>{0, 0},
+        groups
+    );
+    return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+}
+
 }  // End extern "C"

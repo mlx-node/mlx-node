@@ -25,6 +25,11 @@ for (const output of outputs) {
     const { code } = await format(output.path, await readFile(output.path, 'utf-8'), viteConfig.fmt);
     await writeFile(output.path, code);
   }
+  if (output.kind === 'dts') {
+    const code = await readFile(output.path, 'utf-8');
+    const replaced = code.replace('export declare const enum OutputFormat {', 'export enum OutputFormat {');
+    await writeFile(output.path, replaced);
+  }
 }
 
 // Copy mlx.metallib for colocated Metal shader loading

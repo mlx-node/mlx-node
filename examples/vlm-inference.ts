@@ -1,60 +1,282 @@
 /**
- * VLM Inference Example (PaddleOCR-VL-1.5)
+ * Document Layout Analysis + OCR Pipeline
+ *
+ * Combines PP-DocLayoutV3 (layout detection) with PaddleOCR-VL-1.5 (OCR)
+ * to extract structured markdown from document images.
+ *
+ * Pipeline:
+ *   1. DocLayoutModel detects layout elements (titles, text, tables, figures...)
+ *   2. Each element is cropped from the source image
+ *   3. VLModel OCRs each cropped region with type-appropriate prompts
+ *   4. Results are assembled into formatted markdown following reading order
  *
  * Usage:
- *   oxnode examples/vlm-inference.ts [image_path] [format]
+ *   oxnode examples/vlm-inference.ts <image_path> [--threshold 0.5] [--vlm-only] [--layout-only]
  *
  * Examples:
- *   oxnode examples/vlm-inference.ts                              # Text-only chat
- *   oxnode examples/vlm-inference.ts ./examples/ocr.png           # OCR with markdown output
- *   oxnode examples/vlm-inference.ts ./examples/ocr.png plain     # OCR with plain text
- *   oxnode examples/vlm-inference.ts ./examples/ocr.png html      # OCR with HTML output
- *   oxnode examples/vlm-inference.ts ./examples/ocr.png raw       # OCR with raw tokens
+ *   oxnode examples/vlm-inference.ts ./examples/ocr.png                # Full pipeline
+ *   oxnode examples/vlm-inference.ts ./examples/ocr.png --vlm-only     # VLM OCR only
+ *   oxnode examples/vlm-inference.ts ./examples/ocr.png --layout-only  # Layout detection only
+ *   oxnode examples/vlm-inference.ts ./examples/ocr.png --threshold 0.3
  */
-import { ChatRole } from '@mlx-node/core';
-import { VLModel, parsePaddleResponse, type OutputFormat } from '@mlx-node/vlm';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { ChatRole, type LayoutElement } from '@mlx-node/core';
+import { DocLayoutModel, VLModel, parsePaddleResponse, OutputFormat } from '@mlx-node/vlm';
+import { Transformer } from '@napi-rs/image';
 
-const modelPath = '.cache/models/PaddleOCR-VL-1.5-mlx';
-const imagePath = process.argv[2];
-const outputFormat = (process.argv[3] || 'Markdown') as OutputFormat;
+// --- CLI args ---
+const args = process.argv.slice(2);
+const imagePath = args.find((a) => !a.startsWith('--'));
+const vlmOnly = args.includes('--vlm-only');
+const layoutOnly = args.includes('--layout-only');
+const thresholdIdx = args.indexOf('--threshold');
+const threshold = thresholdIdx !== -1 ? parseFloat(args[thresholdIdx + 1]) : 0.5;
 
-// === Load Model (includes tokenizer) ===
-console.log('Loading VLM...');
-console.time('Model load');
-const model = await VLModel.load(modelPath);
-console.timeEnd('Model load');
+const vlmModelPath = '.cache/models/PaddleOCR-VL-1.5-mlx';
+// Clone from HuggingFace: PaddlePaddle/PP-DocLayoutV3_safetensors (NOT PaddlePaddle/PP-DocLayoutV3)
+const layoutModelPath = '.cache/models/PP-DocLayoutV3';
 
-console.log('\n✅ Model loaded successfully!');
-console.log(`   Vision: ${model.config.visionConfig.numHiddenLayers} layers`);
-console.log(`   Language: ${model.config.textConfig.numHiddenLayers} layers`);
+if (!imagePath) {
+  console.log('Usage: oxnode examples/vlm-inference.ts <image_path> [options]');
+  console.log('Options:');
+  console.log('  --vlm-only       VLM OCR only (no layout detection)');
+  console.log('  --layout-only    Layout detection only (no OCR)');
+  console.log('  --threshold N    Detection confidence threshold (default: 0.5)');
+  process.exit(1);
+}
 
-if (imagePath) {
-  // === Simple OCR ===
+// --- VLM-only mode (original behavior) ---
+if (vlmOnly) {
+  console.log('Loading VLM...');
+  console.time('VLM load');
+  const vlm = await VLModel.load(vlmModelPath);
+  console.timeEnd('VLM load');
+
   console.log(`\n--- OCR: ${imagePath} ---`);
-  console.log(`   Output format: ${outputFormat}`);
   console.time('OCR');
-  const vlmResult = model.chat([{ role: ChatRole.User, content: 'Extract the text in this image' }], {
+  const result = vlm.chat([{ role: ChatRole.User, content: 'Extract the text in this image' }], {
     imagePaths: [imagePath],
   });
   console.timeEnd('OCR');
 
-  // Parse and format the output
-  const formatted = parsePaddleResponse(vlmResult.text, { format: outputFormat });
-
-  console.log(`\n📝 Extracted Text:\n${formatted}`);
-} else {
-  // === Text-only Chat ===
-  console.log('\n--- Text-only Chat ---');
-  console.log('(Pass an image path to test with vision)');
-
-  console.time('Chat');
-  const result = model.chat([{ role: ChatRole.User, content: 'Hello! What can you help me with?' }], {
-    maxNewTokens: 100,
-    temperature: 0.0, // Greedy decoding
-    repetitionPenalty: 1.5,
-  });
-  console.timeEnd('Chat');
-
-  console.log(`\n📝 Response:\n${result.text}`);
-  console.log(`\nTokens generated: ${result.numTokens}`);
+  const formatted = parsePaddleResponse(result.text, { format: OutputFormat.Markdown });
+  console.log(`\n${formatted}`);
+  process.exit(0);
 }
+
+// --- Layout-only mode ---
+if (layoutOnly) {
+  console.log('Loading DocLayoutModel...');
+  console.time('Layout model load');
+  const layout = DocLayoutModel.load(layoutModelPath);
+  console.timeEnd('Layout model load');
+
+  console.log(`\n--- Layout Detection: ${imagePath} (threshold=${threshold}) ---`);
+  console.time('Detection');
+  const elements = layout.detect(imagePath, threshold);
+  console.timeEnd('Detection');
+
+  console.log(`\nDetected ${elements.length} elements:\n`);
+  for (const el of elements) {
+    const [x1, y1, x2, y2] = el.bbox;
+    console.log(
+      `  [${el.order}] ${el.labelName} (${el.label}) - score: ${el.score.toFixed(3)} ` +
+        `bbox: [${x1.toFixed(0)}, ${y1.toFixed(0)}, ${x2.toFixed(0)}, ${y2.toFixed(0)}]`,
+    );
+  }
+  process.exit(0);
+}
+
+// --- Full pipeline: Layout + OCR → Markdown ---
+console.log('Loading models...');
+console.time('Models load');
+const layout = DocLayoutModel.load(layoutModelPath);
+const vlm = await VLModel.load(vlmModelPath);
+console.timeEnd('Models load');
+
+// Step 1: Detect layout
+console.log(`\n--- Layout Detection (threshold=${threshold}) ---`);
+console.time('Detection');
+const elements = layout.detect(imagePath, threshold);
+console.timeEnd('Detection');
+console.log(`Detected ${elements.length} elements`);
+
+if (elements.length === 0) {
+  console.log('No elements detected. Try lowering the threshold with --threshold 0.3');
+  process.exit(0);
+}
+
+// Step 2: Crop regions and OCR each element
+const imageBuffer = readFileSync(imagePath);
+const tmpDir = mkdtempSync(join(tmpdir(), 'vlm-crop-'));
+
+async function cropElement(el: LayoutElement): Promise<string> {
+  const [x1, y1, x2, y2] = el.bbox;
+  const x = Math.max(0, Math.round(x1));
+  const y = Math.max(0, Math.round(y1));
+  const w = Math.max(1, Math.round(x2 - x1));
+  const h = Math.max(1, Math.round(y2 - y1));
+
+  const cropped = await new Transformer(imageBuffer).crop(x, y, w, h).png();
+  const cropPath = join(tmpDir, `crop_${el.order}.png`);
+  await writeFile(cropPath, cropped);
+  return cropPath;
+}
+
+/** Get OCR prompt based on element type */
+function getPrompt(labelName: string): string {
+  switch (labelName) {
+    case 'table':
+      return 'Extract this table as a markdown table. Preserve all rows and columns.';
+    case 'isolate_formula':
+      return 'Extract this mathematical formula in LaTeX notation.';
+    case 'code_txt':
+      return 'Extract this code exactly as shown, preserving indentation.';
+    case 'chart':
+    case 'figure':
+      return 'Describe what is shown in this image briefly.';
+    default:
+      return 'Extract the text in this image exactly as shown.';
+  }
+}
+
+/** Elements that should be OCR'd */
+const ocrLabels = new Set([
+  'title',
+  'doc_title',
+  'paragraph_title',
+  'text',
+  'abstract',
+  'list',
+  'table',
+  'table_caption',
+  'table_footnote',
+  'figure_caption',
+  'chart_caption',
+  'isolate_formula',
+  'formula_caption',
+  'code_txt',
+  'header',
+  'footer',
+  'footnote',
+  'margin_note',
+  'reference',
+  'content',
+  'index',
+  'handwriting',
+]);
+
+/** Format OCR text based on element type */
+function formatElement(labelName: string, text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return '';
+
+  switch (labelName) {
+    case 'doc_title':
+      return `# ${trimmed}\n`;
+    case 'title':
+      return `## ${trimmed}\n`;
+    case 'paragraph_title':
+      return `### ${trimmed}\n`;
+    case 'abstract':
+      return `> ${trimmed}\n`;
+    case 'table':
+      return `${trimmed}\n`;
+    case 'table_caption':
+    case 'figure_caption':
+    case 'chart_caption':
+    case 'formula_caption':
+      return `*${trimmed}*\n`;
+    case 'isolate_formula':
+      return `$$\n${trimmed}\n$$\n`;
+    case 'code_txt':
+      return `\`\`\`\n${trimmed}\n\`\`\`\n`;
+    case 'figure':
+    case 'chart':
+      return `[${labelName}: ${trimmed}]\n`;
+    case 'header':
+    case 'footer':
+      return `<!-- ${labelName}: ${trimmed} -->\n`;
+    case 'footnote':
+    case 'table_footnote':
+      return `[^]: ${trimmed}\n`;
+    case 'list':
+      return `${trimmed}\n`;
+    default:
+      return `${trimmed}\n`;
+  }
+}
+
+// Step 3: Crop all elements and prepare batch OCR items
+type OcrItem = { index: number; label: string; cropPath: string; prompt: string };
+const ocrItems: OcrItem[] = [];
+const nonOcrParts: Map<number, string> = new Map(); // index -> markdown for non-OCR elements
+
+let idx = 0;
+for (const el of elements) {
+  const label = el.labelName;
+
+  // Skip non-content elements
+  if (label === 'abandon' || label === 'seal') {
+    continue;
+  }
+
+  // For figures/charts without text, just note their position
+  if (label === 'figure' || label === 'chart') {
+    nonOcrParts.set(idx, `[${label}]\n`);
+    idx++;
+    continue;
+  }
+
+  if (!ocrLabels.has(label)) {
+    continue;
+  }
+
+  const cropPath = await cropElement(el);
+  const prompt = getPrompt(label);
+  console.log(`  [${el.order}] ${label} (${el.score.toFixed(2)})`);
+  ocrItems.push({ index: idx, label, cropPath, prompt });
+  idx++;
+}
+
+// Step 4: Batch OCR all cropped elements
+console.log(`\n--- Batch OCR (${ocrItems.length} elements) ---`);
+console.time('Batch OCR');
+
+const batchItems = ocrItems.map((item) => ({
+  messages: [{ role: ChatRole.User as const, content: item.prompt }],
+  imagePaths: [item.cropPath],
+}));
+const batchResults = vlm.batch(batchItems);
+
+console.timeEnd('Batch OCR');
+
+// Step 5: Assemble markdown in reading order
+const markdownParts: string[] = [];
+let ocrResultIdx = 0;
+
+for (let i = 0; i < idx; i++) {
+  if (nonOcrParts.has(i)) {
+    markdownParts.push(nonOcrParts.get(i)!);
+  } else {
+    const item = ocrItems[ocrResultIdx];
+    const result = batchResults[ocrResultIdx];
+    const text = parsePaddleResponse(result.text, { format: OutputFormat.Markdown });
+    const formatted = formatElement(item.label, text);
+    if (formatted) {
+      markdownParts.push(formatted);
+    }
+    ocrResultIdx++;
+  }
+}
+
+// Cleanup temp files
+rmSync(tmpDir, { recursive: true, force: true });
+
+// Output
+const markdown = markdownParts.join('\n');
+console.log('\n--- Result ---\n');
+console.log(markdown);

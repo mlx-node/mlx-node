@@ -122,6 +122,16 @@ impl VLMChatResult {
     }
 }
 
+/// A batch item for VLM batch inference
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct VLMBatchItem {
+    /// Chat messages for this item
+    pub messages: Vec<VLMChatMessage>,
+    /// Image paths for this item (one image per item for OCR)
+    pub image_paths: Option<Vec<String>>,
+}
+
 /// Default PaddleOCR-VL chat template
 ///
 /// PaddleOCR-VL uses the following format:

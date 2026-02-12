@@ -6,5 +6,5 @@
     "composite": true
   },
   "include": ["./**/*.ts"],
-  "references": [{ "path": "../packages/lm" }, { "path": "../packages/trl" }]
+  "references": [{ "path": "../packages/lm" }, { "path": "../packages/trl" }, { "path": "../packages/vlm" }]
 }

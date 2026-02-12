@@ -974,6 +974,183 @@ impl ERNIELanguageModel {
 
         MxArray::from_handle(out_logits, "paddleocr_vl_forward_fused")
     }
+
+    /// Run fused forward pass and extract KV cache arrays for batch merging.
+    ///
+    /// Runs prefill through the existing single-item FFI, then clones out the
+    /// per-layer KV cache arrays and resets cache state for the next item.
+    ///
+    /// # Returns
+    /// * (logits, kv_keys, kv_values, cache_idx) where kv_keys/values are per-layer
+    pub fn forward_fused_extract_kv(
+        &mut self,
+        input_embeds: &MxArray,
+        position_ids: &MxArray,
+    ) -> Result<(MxArray, Vec<MxArray>, Vec<MxArray>, i32)> {
+        let logits = self.forward_fused(input_embeds, position_ids)?;
+
+        // Eval KV caches to materialize them before cloning
+        self.eval_fused_kv_caches();
+
+        // Clone out KV arrays
+        let num_layers = self.layers.len();
+        let mut kv_keys = Vec::with_capacity(num_layers);
+        let mut kv_values = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            kv_keys.push(
+                self.fused_kv_keys[i]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::new(
+                            Status::GenericFailure,
+                            format!("KV key cache missing for layer {}", i),
+                        )
+                    })?
+                    .clone(),
+            );
+            kv_values.push(
+                self.fused_kv_values[i]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::new(
+                            Status::GenericFailure,
+                            format!("KV value cache missing for layer {}", i),
+                        )
+                    })?
+                    .clone(),
+            );
+        }
+
+        let cache_idx = self.fused_cache_idx;
+
+        // Reset cache state for next item
+        self.reset_fused_kv_caches();
+
+        Ok((logits, kv_keys, kv_values, cache_idx))
+    }
+
+    /// Batched fused forward pass through C++ with left-padding-aware attention.
+    ///
+    /// Like forward_fused but takes external KV cache arrays and left_padding
+    /// for batched decode. Does NOT update internal cache state.
+    ///
+    /// # Arguments
+    /// * `input_embeds` - Input embeddings [batch, seq_len, hidden_size]
+    /// * `position_ids` - Position IDs [3, batch, seq_len] for mRoPE
+    /// * `left_padding` - Left padding amounts [batch]
+    /// * `kv_keys` - Per-layer KV keys [batch, heads, seq, dim]
+    /// * `kv_values` - Per-layer KV values [batch, heads, seq, dim]
+    /// * `cache_idx` - Current cache write position
+    ///
+    /// # Returns
+    /// * (logits, updated_kv_keys, updated_kv_values, new_cache_idx)
+    pub fn forward_fused_batched(
+        &self,
+        input_embeds: &MxArray,
+        position_ids: &MxArray,
+        left_padding: &MxArray,
+        kv_keys: &[Option<MxArray>],
+        kv_values: &[Option<MxArray>],
+        cache_idx: i32,
+    ) -> Result<(MxArray, Vec<Option<MxArray>>, Vec<Option<MxArray>>, i32)> {
+        let num_layers = self.layers.len() as i32;
+
+        // Collect layer weight pointers
+        let mut all_weight_ptrs: Vec<*mut sys::mlx_array> =
+            Vec::with_capacity(num_layers as usize * 9);
+        for layer in &self.layers {
+            let ptrs = layer.get_weight_ptrs();
+            all_weight_ptrs.extend_from_slice(&ptrs);
+        }
+
+        let final_norm_ptr = self.norm.get_weight().handle.0;
+        let lm_head_ptr = self.lm_head.get_weight().handle.0;
+        let inv_freq_ptr = self.rotary_emb.get_inv_freq_ptr();
+        let mrope_section = self.rotary_emb.mrope_section_arr();
+
+        // KV cache input pointers
+        let kv_keys_ptrs: Vec<*mut sys::mlx_array> = kv_keys
+            .iter()
+            .map(|k| {
+                k.as_ref()
+                    .map(|a| a.handle.0)
+                    .unwrap_or(std::ptr::null_mut())
+            })
+            .collect();
+        let kv_values_ptrs: Vec<*mut sys::mlx_array> = kv_values
+            .iter()
+            .map(|v| {
+                v.as_ref()
+                    .map(|a| a.handle.0)
+                    .unwrap_or(std::ptr::null_mut())
+            })
+            .collect();
+
+        // Output buffers
+        let mut out_logits: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_kv_keys: Vec<*mut sys::mlx_array> =
+            vec![std::ptr::null_mut(); num_layers as usize];
+        let mut out_kv_values: Vec<*mut sys::mlx_array> =
+            vec![std::ptr::null_mut(); num_layers as usize];
+        let mut out_cache_idx: i32 = 0;
+
+        let config = &self.config;
+
+        unsafe {
+            sys::mlx_paddleocr_vl_forward_step_batched(
+                input_embeds.handle.0,
+                all_weight_ptrs.as_ptr(),
+                num_layers,
+                final_norm_ptr,
+                lm_head_ptr,
+                inv_freq_ptr,
+                position_ids.handle.0,
+                mrope_section.as_ptr(),
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.rms_norm_eps as f32,
+                left_padding.handle.0,
+                kv_keys_ptrs.as_ptr(),
+                kv_values_ptrs.as_ptr(),
+                cache_idx,
+                &mut out_logits,
+                out_kv_keys.as_mut_ptr(),
+                out_kv_values.as_mut_ptr(),
+                &mut out_cache_idx,
+            );
+        }
+
+        // Convert output pointers to MxArrays
+        let mut new_kv_keys: Vec<Option<MxArray>> = Vec::with_capacity(num_layers as usize);
+        let mut new_kv_values: Vec<Option<MxArray>> = Vec::with_capacity(num_layers as usize);
+        for i in 0..num_layers as usize {
+            new_kv_keys.push(if !out_kv_keys[i].is_null() {
+                Some(MxArray::from_handle(out_kv_keys[i], "batched_kv_key")?)
+            } else {
+                None
+            });
+            new_kv_values.push(if !out_kv_values[i].is_null() {
+                Some(MxArray::from_handle(out_kv_values[i], "batched_kv_value")?)
+            } else {
+                None
+            });
+        }
+
+        let logits = MxArray::from_handle(out_logits, "paddleocr_vl_forward_batched")?;
+        Ok((logits, new_kv_keys, new_kv_values, out_cache_idx))
+    }
+
+    /// Get number of layers (needed for batch KV cache setup)
+    pub fn num_layers_usize(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Get the embedding layer (for external use during batch generation)
+    pub fn get_embedding_layer(&self) -> &Embedding {
+        &self.embed_tokens
+    }
 }
 
 impl Clone for ERNIELanguageModel {

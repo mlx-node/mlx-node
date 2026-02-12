@@ -71,6 +71,42 @@ export declare class ChatResult {
   get rawText(): string;
 }
 
+/**
+ * PP-DocLayoutV3 full model for document layout analysis.
+ *
+ * Combines HGNetV2 backbone, hybrid encoder, and RT-DETR decoder
+ * with mask-enhanced attention and reading order prediction.
+ *
+ * Weights must be downloaded from `PaddlePaddle/PP-DocLayoutV3_safetensors` on HuggingFace.
+ * The regular `PaddlePaddle/PP-DocLayoutV3` repo uses PaddlePaddle format and is not compatible.
+ */
+export declare class DocLayoutModel {
+  /**
+   * Load a PP-DocLayoutV3 model from a directory containing `config.json` and `model.safetensors`.
+   *
+   * The model directory should be cloned from `PaddlePaddle/PP-DocLayoutV3_safetensors` on HuggingFace.
+   *
+   * # Arguments
+   * * `model_path` - Path to model directory
+   *
+   * # Returns
+   * * Initialized DocLayoutModel ready for inference
+   */
+  static load(modelPath: string): DocLayoutModel;
+  /**
+   * Detect document layout elements in an image.
+   *
+   * # Arguments
+   * * `image_path` - Path to the input image
+   * * `threshold` - Optional confidence threshold (default 0.5)
+   *
+   * # Returns
+   * * Vec of LayoutElements sorted by reading order
+   */
+  detect(imagePath: string, threshold?: number | undefined | null): Array<LayoutElement>;
+}
+export type PPDocLayoutV3Model = DocLayoutModel;
+
 /** Result from text generation with detailed metadata */
 export declare class GenerationResult {
   /** Get the decoded text */
@@ -1392,6 +1428,80 @@ export declare class Tensor {
   eval(): void;
 }
 
+/**
+ * PP-OCRv5 Text Detection model (DBNet with PPHGNetV2 backbone).
+ *
+ * Detects text lines in document images and returns bounding boxes.
+ */
+export declare class TextDetModel {
+  /**
+   * Load a TextDetModel from a directory containing model.safetensors.
+   *
+   * # Arguments
+   * * `model_path` - Path to model directory
+   */
+  static load(modelPath: string): TextDetModel;
+  /**
+   * Detect text lines in an image.
+   *
+   * # Arguments
+   * * `image_path` - Path to the input image
+   * * `threshold` - Optional detection threshold (default from config, typically 0.3)
+   *
+   * # Returns
+   * * Vec of TextBox with bounding boxes and confidence scores
+   */
+  detect(imagePath: string, threshold?: number | undefined | null): Array<TextBox>;
+}
+
+/**
+ * PP-OCRv5 Text Recognition model (PPHGNetV2 + SVTR + CTC).
+ *
+ * Recognizes text from cropped text line images.
+ */
+export declare class TextRecModel {
+  /**
+   * Load a TextRecModel from a directory containing model.safetensors.
+   *
+   * # Arguments
+   * * `model_path` - Path to model directory
+   * * `dict_path` - Path to character dictionary text file
+   */
+  static load(modelPath: string, dictPath: string): TextRecModel;
+  /**
+   * Recognize text from a single image file.
+   *
+   * # Arguments
+   * * `image_path` - Path to a cropped text line image
+   *
+   * # Returns
+   * * RecResult with recognized text and confidence score
+   */
+  recognize(imagePath: string): RecResult;
+  /**
+   * Recognize text from multiple image files (batch).
+   *
+   * # Arguments
+   * * `image_paths` - Paths to cropped text line images
+   *
+   * # Returns
+   * * Vec of RecResult with recognized text and confidence scores
+   */
+  recognizeBatch(imagePaths: Array<string>): Array<RecResult>;
+  /**
+   * Recognize text from raw RGB crop data.
+   *
+   * # Arguments
+   * * `rgb_data` - Raw RGB pixel data of a cropped text line
+   * * `width` - Image width
+   * * `height` - Image height
+   *
+   * # Returns
+   * * RecResult with recognized text and confidence score
+   */
+  recognizeCrop(rgbData: Uint8Array, width: number, height: number): RecResult;
+}
+
 /** Result from VLM chat */
 export declare class VlmChatResult {
   /** Get the response text */
@@ -1516,6 +1626,37 @@ export declare class VLModel {
     imageGridThw?: MxArray | undefined | null,
     config?: GenerationConfig | undefined | null,
   ): GenerationResult;
+  /**
+   * Batch OCR: extract text from multiple images simultaneously
+   *
+   * Processes N images with sequential prefill + batched decode for ~N× decode throughput.
+   *
+   * # Arguments
+   * * `image_paths` - Paths to image files
+   * * `config` - Optional chat configuration (shared across all items)
+   *
+   * # Returns
+   * * Vec of extracted text strings, one per image
+   *
+   * # Example
+   * ```typescript
+   * const texts = model.ocrBatch(['page1.jpg', 'page2.jpg', 'page3.jpg']);
+   * ```
+   */
+  ocrBatch(imagePaths: Array<string>, config?: VlmChatConfig | undefined | null): Array<string>;
+  /**
+   * Batch chat: process multiple items simultaneously
+   *
+   * Sequential prefill + batched decode. Each item can have different images/prompts.
+   *
+   * # Arguments
+   * * `batch` - Batch items, each with messages and optional image_paths
+   * * `config` - Optional shared chat configuration
+   *
+   * # Returns
+   * * Vec of VLMChatResult, one per batch item
+   */
+  batch(batch: Array<VlmBatchItem>, config?: VlmChatConfig | undefined | null): Array<VlmChatResult>;
   /** Get model configuration */
   get config(): ModelConfig;
   /** Check if model is fully initialized */
@@ -2171,6 +2312,20 @@ export interface GrpoLossConfig {
   vocabChunkSize?: number;
 }
 
+/** A single detected layout element. */
+export interface LayoutElement {
+  /** Detection confidence score */
+  score: number;
+  /** Class label ID (0-24) */
+  label: number;
+  /** Human-readable label name (e.g., "title", "text", "table") */
+  labelName: string;
+  /** Bounding box in original image coordinates [x1, y1, x2, y2] */
+  bbox: Array<number>;
+  /** Reading order index (0 = first element to read) */
+  order: number;
+}
+
 /** Full model configuration */
 export interface ModelConfig {
   visionConfig: VisionConfig;
@@ -2185,7 +2340,7 @@ export interface ModelConfig {
 }
 
 /** Output format options */
-export declare const enum OutputFormat {
+export enum OutputFormat {
   /** Raw output with minimal processing */
   Raw = 'Raw',
   /** Plain text with aligned columns */
@@ -2372,6 +2527,14 @@ export interface Qwen3Config {
    * Default: false
    */
   useFp8Cache?: boolean | undefined;
+}
+
+/** Result of text recognition. */
+export interface RecResult {
+  /** Recognized text */
+  text: string;
+  /** Confidence score (mean character probability) */
+  score: number;
 }
 
 /** Result of resume position computation */
@@ -2604,6 +2767,14 @@ export interface TableRow {
   cells: Array<TableCell>;
 }
 
+/** A detected text bounding box. */
+export interface TextBox {
+  /** Bounding box in original image coordinates [x1, y1, x2, y2] */
+  bbox: Array<number>;
+  /** Detection confidence score (mean probability inside box) */
+  score: number;
+}
+
 /** Language model (text decoder) configuration */
 export interface TextConfig {
   modelType: string;
@@ -2740,6 +2911,14 @@ export interface VisionConfig {
   layerNormEps: number;
   attentionDropout: number;
   spatialMergeSize: number;
+}
+
+/** A batch item for VLM batch inference */
+export interface VlmBatchItem {
+  /** Chat messages for this item */
+  messages: Array<VlmChatMessage>;
+  /** Image paths for this item (one image per item for OCR) */
+  imagePaths?: Array<string>;
 }
 
 /** Configuration for VLM chat */

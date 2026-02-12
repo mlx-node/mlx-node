@@ -737,6 +737,8 @@ if (!nativeBinding) {
 module.exports = nativeBinding;
 module.exports.BatchGenerationResult = nativeBinding.BatchGenerationResult;
 module.exports.ChatResult = nativeBinding.ChatResult;
+module.exports.DocLayoutModel = nativeBinding.DocLayoutModel;
+module.exports.PPDocLayoutV3Model = nativeBinding.PPDocLayoutV3Model;
 module.exports.GenerationResult = nativeBinding.GenerationResult;
 module.exports.GrpoTrainingEngine = nativeBinding.GrpoTrainingEngine;
 module.exports.GRPOTrainingEngine = nativeBinding.GRPOTrainingEngine;
@@ -747,6 +749,8 @@ module.exports.Qwen3Model = nativeBinding.Qwen3Model;
 module.exports.Qwen3Tokenizer = nativeBinding.Qwen3Tokenizer;
 module.exports.SftTrainingEngine = nativeBinding.SftTrainingEngine;
 module.exports.Tensor = nativeBinding.Tensor;
+module.exports.TextDetModel = nativeBinding.TextDetModel;
+module.exports.TextRecModel = nativeBinding.TextRecModel;
 module.exports.VlmChatResult = nativeBinding.VlmChatResult;
 module.exports.VLMChatResult = nativeBinding.VLMChatResult;
 module.exports.VLModel = nativeBinding.VLModel;

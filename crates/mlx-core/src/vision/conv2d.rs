@@ -217,12 +217,39 @@ pub fn conv2d_forward(
         return Ok(output);
     }
 
-    // General convolution with im2col - more complex but handles all cases
-    // This is a fallback for non-patch-embedding cases
-    Err(Error::new(
-        Status::GenericFailure,
-        "General Conv2d not yet implemented. Only patch embedding (stride == kernel_size) is supported.",
-    ))
+    // General convolution using MLX native conv2d
+    unsafe {
+        let input_handle = input.handle.0;
+        let weight_handle = weight.handle.0;
+
+        let result_handle = mlx_sys::mlx_conv2d(
+            input_handle,
+            weight_handle,
+            stride.0 as i32,
+            stride.1 as i32,
+            padding.0 as i32,
+            padding.1 as i32,
+            _dilation.0 as i32,
+            _dilation.1 as i32,
+            _groups as i32,
+        );
+
+        if result_handle.is_null() {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "MLX conv2d returned null",
+            ));
+        }
+
+        let mut output = MxArray::from_handle(result_handle, "conv2d")?;
+
+        // Add bias if present
+        if let Some(b) = bias {
+            output = output.add(b)?;
+        }
+
+        Ok(output)
+    }
 }
 
 #[cfg(test)]
@@ -302,5 +329,248 @@ mod tests {
 
         let output_shape: Vec<i64> = output.shape().unwrap().as_ref().to_vec();
         assert_eq!(output_shape, vec![1, 1, 1, 8]);
+    }
+
+    // ---- General FFI path tests (mlx_conv2d) ----
+
+    #[test]
+    fn test_conv2d_general_3x3_stride1_pad1() {
+        // Standard 3x3 conv with stride=1, padding=1 (preserves spatial dims)
+        // This hits the general FFI path since kernel_size != stride
+        let batch = 1i64;
+        let h = 4i64;
+        let w = 4i64;
+        let in_c = 3i64;
+        let out_c = 8i64;
+        let k = 3i64;
+
+        // Deterministic input: sequential values scaled to [0, 1)
+        let input_data: Vec<f32> = (0..(batch * h * w * in_c) as usize)
+            .map(|i| (i % 256) as f32 / 255.0)
+            .collect();
+        let input = MxArray::from_float32(&input_data, &[batch, h, w, in_c]).unwrap();
+
+        // Deterministic weights: centered around zero
+        let weight_data: Vec<f32> = (0..(out_c * k * k * in_c) as usize)
+            .map(|i| ((i % 100) as f32 - 50.0) / 100.0)
+            .collect();
+        let weight = MxArray::from_float32(&weight_data, &[out_c, k, k, in_c]).unwrap();
+
+        let output = conv2d_forward(
+            &input,
+            &weight,
+            None,
+            (1, 1), // stride
+            (1, 1), // padding
+            (1, 1), // dilation
+            1,      // groups
+        )
+        .unwrap();
+
+        // With stride=1, padding=1, 3x3 kernel: out_dim = (4 + 2*1 - 3)/1 + 1 = 4
+        let output_shape: Vec<i64> = output.shape().unwrap().as_ref().to_vec();
+        assert_eq!(output_shape, vec![1, 4, 4, 8]);
+
+        // Verify output is not all zeros (FFI actually computed something)
+        output.eval();
+        let abs_output = output.abs().unwrap();
+        let sum = abs_output.sum(None, None).unwrap();
+        sum.eval();
+        let sum_data: Vec<f32> = sum.to_float32().unwrap().to_vec();
+        assert!(sum_data[0] > 0.0, "conv2d output should not be all zeros");
+    }
+
+    #[test]
+    fn test_conv2d_general_3x3_stride2_pad1() {
+        // 3x3 conv with stride=2, padding=1 (downsamples spatial dims by 2x)
+        // Used extensively in PP-DocLayoutV3 backbone for downsampling
+        let batch = 1i64;
+        let h = 8i64;
+        let w = 8i64;
+        let in_c = 3i64;
+        let out_c = 16i64;
+        let k = 3i64;
+
+        let input_data: Vec<f32> = (0..(batch * h * w * in_c) as usize)
+            .map(|i| (i % 256) as f32 / 255.0)
+            .collect();
+        let input = MxArray::from_float32(&input_data, &[batch, h, w, in_c]).unwrap();
+
+        let weight_data: Vec<f32> = (0..(out_c * k * k * in_c) as usize)
+            .map(|i| ((i % 100) as f32 - 50.0) / 100.0)
+            .collect();
+        let weight = MxArray::from_float32(&weight_data, &[out_c, k, k, in_c]).unwrap();
+
+        let output = conv2d_forward(
+            &input,
+            &weight,
+            None,
+            (2, 2), // stride
+            (1, 1), // padding
+            (1, 1), // dilation
+            1,      // groups
+        )
+        .unwrap();
+
+        // With stride=2, padding=1, 3x3 kernel: out_dim = (8 + 2*1 - 3)/2 + 1 = 4
+        let output_shape: Vec<i64> = output.shape().unwrap().as_ref().to_vec();
+        assert_eq!(output_shape, vec![1, 4, 4, 16]);
+
+        // Verify output is not all zeros
+        output.eval();
+        let abs_output = output.abs().unwrap();
+        let sum = abs_output.sum(None, None).unwrap();
+        sum.eval();
+        let sum_data: Vec<f32> = sum.to_float32().unwrap().to_vec();
+        assert!(sum_data[0] > 0.0, "conv2d output should not be all zeros");
+    }
+
+    #[test]
+    fn test_conv2d_general_1x1_stride1_pad0() {
+        // 1x1 pointwise convolution (channel projection)
+        // This also hits the general path since kernel_size (1) == stride (1)
+        // BUT padding is (0,0), so it actually hits the fast path.
+        // To force the general path, we use conv2d_forward directly and
+        // verify correctness of this common configuration regardless of path.
+        //
+        // Note: 1x1 with stride=1 and pad=0 matches the fast path condition
+        // (k_h == stride && k_w == stride && padding == 0). We still test it
+        // because it validates the output shape and computation for pointwise ops.
+        let batch = 1i64;
+        let h = 4i64;
+        let w = 4i64;
+        let in_c = 64i64;
+        let out_c = 32i64;
+        let k = 1i64;
+
+        let input_data: Vec<f32> = (0..(batch * h * w * in_c) as usize)
+            .map(|i| (i % 256) as f32 / 255.0)
+            .collect();
+        let input = MxArray::from_float32(&input_data, &[batch, h, w, in_c]).unwrap();
+
+        let weight_data: Vec<f32> = (0..(out_c * k * k * in_c) as usize)
+            .map(|i| ((i % 100) as f32 - 50.0) / 100.0)
+            .collect();
+        let weight = MxArray::from_float32(&weight_data, &[out_c, k, k, in_c]).unwrap();
+
+        let output = conv2d_forward(
+            &input,
+            &weight,
+            None,
+            (1, 1), // stride
+            (0, 0), // padding
+            (1, 1), // dilation
+            1,      // groups
+        )
+        .unwrap();
+
+        // With stride=1, padding=0, 1x1 kernel: out_dim = (4 + 0 - 1)/1 + 1 = 4
+        let output_shape: Vec<i64> = output.shape().unwrap().as_ref().to_vec();
+        assert_eq!(output_shape, vec![1, 4, 4, 32]);
+
+        // Verify output is not all zeros
+        output.eval();
+        let abs_output = output.abs().unwrap();
+        let sum = abs_output.sum(None, None).unwrap();
+        sum.eval();
+        let sum_data: Vec<f32> = sum.to_float32().unwrap().to_vec();
+        assert!(sum_data[0] > 0.0, "conv2d output should not be all zeros");
+    }
+
+    #[test]
+    fn test_conv2d_general_3x3_stride1_pad1_with_bias() {
+        // General path 3x3 conv with bias to verify bias addition works
+        // in the FFI path
+        let batch = 1i64;
+        let h = 4i64;
+        let w = 4i64;
+        let in_c = 3i64;
+        let out_c = 8i64;
+        let k = 3i64;
+
+        // Use all-ones input for predictable behavior
+        let input_data: Vec<f32> = vec![1.0; (batch * h * w * in_c) as usize];
+        let input = MxArray::from_float32(&input_data, &[batch, h, w, in_c]).unwrap();
+
+        // Use all-zeros weight so conv output is zero, then bias is the only contributor
+        let weight_data: Vec<f32> = vec![0.0; (out_c * k * k * in_c) as usize];
+        let weight = MxArray::from_float32(&weight_data, &[out_c, k, k, in_c]).unwrap();
+
+        let bias_data: Vec<f32> = (0..out_c as usize).map(|i| (i + 1) as f32).collect();
+        let bias = MxArray::from_float32(&bias_data, &[out_c]).unwrap();
+
+        let output = conv2d_forward(
+            &input,
+            &weight,
+            Some(&bias),
+            (1, 1), // stride
+            (1, 1), // padding
+            (1, 1), // dilation
+            1,      // groups
+        )
+        .unwrap();
+
+        let output_shape: Vec<i64> = output.shape().unwrap().as_ref().to_vec();
+        assert_eq!(output_shape, vec![1, 4, 4, 8]);
+
+        // With zero weights, output = bias broadcast over [1, 4, 4, 8]
+        // Each spatial position should have bias values [1, 2, 3, 4, 5, 6, 7, 8]
+        output.eval();
+        let data: Vec<f32> = output.to_float32().unwrap().to_vec();
+        // Check first spatial position has bias values
+        for (c, &val) in data.iter().enumerate().take(out_c as usize) {
+            assert!(
+                (val - (c + 1) as f32).abs() < 1e-5,
+                "Expected bias value {} at channel {}, got {}",
+                c + 1,
+                c,
+                val
+            );
+        }
+    }
+
+    #[test]
+    fn test_conv2d_general_5x5_stride1_pad2() {
+        // 5x5 conv with stride=1, padding=2 (preserves spatial dims)
+        // Verifies the general path works with larger kernels
+        let batch = 1i64;
+        let h = 6i64;
+        let w = 6i64;
+        let in_c = 3i64;
+        let out_c = 4i64;
+        let k = 5i64;
+
+        let input_data: Vec<f32> = (0..(batch * h * w * in_c) as usize)
+            .map(|i| (i % 256) as f32 / 255.0)
+            .collect();
+        let input = MxArray::from_float32(&input_data, &[batch, h, w, in_c]).unwrap();
+
+        let weight_data: Vec<f32> = (0..(out_c * k * k * in_c) as usize)
+            .map(|i| ((i % 100) as f32 - 50.0) / 100.0)
+            .collect();
+        let weight = MxArray::from_float32(&weight_data, &[out_c, k, k, in_c]).unwrap();
+
+        let output = conv2d_forward(
+            &input,
+            &weight,
+            None,
+            (1, 1), // stride
+            (2, 2), // padding
+            (1, 1), // dilation
+            1,      // groups
+        )
+        .unwrap();
+
+        // With stride=1, padding=2, 5x5 kernel: out_dim = (6 + 2*2 - 5)/1 + 1 = 6
+        let output_shape: Vec<i64> = output.shape().unwrap().as_ref().to_vec();
+        assert_eq!(output_shape, vec![1, 6, 6, 4]);
+
+        // Verify output is not all zeros
+        output.eval();
+        let abs_output = output.abs().unwrap();
+        let sum = abs_output.sum(None, None).unwrap();
+        sum.eval();
+        let sum_data: Vec<f32> = sum.to_float32().unwrap().to_vec();
+        assert!(sum_data[0] > 0.0, "conv2d output should not be all zeros");
     }
 }

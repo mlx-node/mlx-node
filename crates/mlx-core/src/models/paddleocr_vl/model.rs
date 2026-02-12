@@ -4,7 +4,9 @@
  * Combines vision encoder and language model for vision-language tasks.
  */
 use crate::array::{MxArray, clear_cache};
-use crate::models::paddleocr_vl::chat::{ChatRole, VLMChatConfig, VLMChatMessage, VLMChatResult};
+use crate::models::paddleocr_vl::chat::{
+    ChatRole, VLMBatchItem, VLMChatConfig, VLMChatMessage, VLMChatResult,
+};
 use crate::models::paddleocr_vl::config::{ModelConfig, TextConfig, VisionConfig};
 use crate::models::paddleocr_vl::language::{ERNIELanguageModel, PaddleOCRDecoderLayer};
 use crate::models::paddleocr_vl::persistence::load_paddleocr_vl_weights;
@@ -1019,6 +1021,676 @@ impl VLModel {
         })
     }
 
+    /// Batch OCR: extract text from multiple images simultaneously
+    ///
+    /// Processes N images with sequential prefill + batched decode for ~N× decode throughput.
+    ///
+    /// # Arguments
+    /// * `image_paths` - Paths to image files
+    /// * `config` - Optional chat configuration (shared across all items)
+    ///
+    /// # Returns
+    /// * Vec of extracted text strings, one per image
+    ///
+    /// # Example
+    /// ```typescript
+    /// const texts = model.ocrBatch(['page1.jpg', 'page2.jpg', 'page3.jpg']);
+    /// ```
+    #[napi]
+    pub fn ocr_batch(
+        &self,
+        image_paths: Vec<String>,
+        config: Option<VLMChatConfig>,
+    ) -> Result<Vec<String>> {
+        let prompt = "Extract all text from this image.".to_string();
+
+        let batch: Vec<VLMBatchItem> = image_paths
+            .into_iter()
+            .map(|path| VLMBatchItem {
+                messages: vec![VLMChatMessage {
+                    role: ChatRole::User,
+                    content: prompt.clone(),
+                }],
+                image_paths: Some(vec![path]),
+            })
+            .collect();
+
+        let results = self.batch(batch, config)?;
+
+        Ok(results
+            .into_iter()
+            .map(|r| {
+                let text = r.text;
+                text.strip_prefix("\\(\\text{")
+                    .and_then(|s| s.strip_suffix("}\\)"))
+                    .map(|s| s.to_string())
+                    .unwrap_or(text)
+            })
+            .collect())
+    }
+
+    /// Batch chat: process multiple items simultaneously
+    ///
+    /// Sequential prefill + batched decode. Each item can have different images/prompts.
+    ///
+    /// # Arguments
+    /// * `batch` - Batch items, each with messages and optional image_paths
+    /// * `config` - Optional shared chat configuration
+    ///
+    /// # Returns
+    /// * Vec of VLMChatResult, one per batch item
+    #[napi]
+    pub fn batch(
+        &self,
+        batch: Vec<VLMBatchItem>,
+        config: Option<VLMChatConfig>,
+    ) -> Result<Vec<VLMChatResult>> {
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            Error::new(
+                Status::GenericFailure,
+                "Tokenizer not set. Use set_tokenizer() first.",
+            )
+        })?;
+
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fall back to sequential for batch_size == 1
+        if batch.len() == 1 {
+            let item = &batch[0];
+            let c = match &config {
+                Some(c) => Some(VLMChatConfig {
+                    image_paths: item.image_paths.clone(),
+                    ..c.clone()
+                }),
+                None => Some(VLMChatConfig {
+                    image_paths: item.image_paths.clone(),
+                    ..Default::default()
+                }),
+            };
+            let result = self.chat(item.messages.clone(), c)?;
+            return Ok(vec![result]);
+        }
+
+        let default_config = VLMChatConfig::default();
+        let config = match config {
+            Some(c) => VLMChatConfig {
+                image_paths: None, // Per-item
+                max_new_tokens: c.max_new_tokens.or(default_config.max_new_tokens),
+                temperature: c.temperature.or(default_config.temperature),
+                top_k: c.top_k.or(default_config.top_k),
+                top_p: c.top_p.or(default_config.top_p),
+                repetition_penalty: c.repetition_penalty.or(default_config.repetition_penalty),
+                return_logprobs: c.return_logprobs.or(default_config.return_logprobs),
+            },
+            None => default_config,
+        };
+
+        let gen_config = GenerationConfig {
+            max_new_tokens: config.max_new_tokens,
+            temperature: config.temperature,
+            top_k: config.top_k,
+            top_p: config.top_p,
+            min_p: None,
+            repetition_penalty: config.repetition_penalty,
+            repetition_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            eos_token_id: Some(self.config.eos_token_id),
+            return_logprobs: config.return_logprobs,
+            prefill_step_size: None,
+            kv_cache_bits: None,
+            kv_cache_group_size: None,
+            num_draft_tokens: None,
+        };
+
+        // Prepare per-item inputs
+        let batch_size = batch.len();
+        let mut all_input_ids = Vec::with_capacity(batch_size);
+        let mut all_pixel_values = Vec::with_capacity(batch_size);
+        let mut all_grid_thws = Vec::with_capacity(batch_size);
+
+        for item in &batch {
+            // Process images
+            let (pixel_values, grid_thw) = if let Some(paths) = &item.image_paths {
+                if paths.is_empty() {
+                    (None, None)
+                } else {
+                    let processor_config = ImageProcessorConfig {
+                        patch_size: self.config.vision_config.patch_size,
+                        merge_size: self.config.vision_config.spatial_merge_size,
+                        ..ImageProcessorConfig::default()
+                    };
+                    let processor = ImageProcessor::new(Some(processor_config));
+                    let processed = processor.process_files(paths.clone())?;
+                    let pv = processed.pixel_values();
+                    let pv_shape = pv.shape()?;
+                    let new_shape = BigInt64Array::from(vec![
+                        1i64,
+                        pv_shape[0],
+                        pv_shape[1],
+                        pv_shape[2],
+                        pv_shape[3],
+                    ]);
+                    let pixel_values = pv.reshape(&new_shape)?;
+                    let grid_thw = processed.grid_thw();
+                    (Some(pixel_values), Some(grid_thw))
+                }
+            } else {
+                (None, None)
+            };
+
+            // Count image tokens
+            let num_image_tokens = if let Some(ref grid) = grid_thw {
+                grid.eval();
+                let grid_data = grid.to_int32()?;
+                let spatial_merge_size = self.config.vision_config.spatial_merge_size;
+                let merge_factor = spatial_merge_size * spatial_merge_size;
+                let mut total = 0i32;
+                for i in 0..(grid_data.len() / 3) {
+                    let t = grid_data[i * 3];
+                    let h = grid_data[i * 3 + 1];
+                    let w = grid_data[i * 3 + 2];
+                    total += (t * h * w) / merge_factor;
+                }
+                Some(total as usize)
+            } else {
+                None
+            };
+
+            // Format and tokenize
+            let formatted = crate::models::paddleocr_vl::chat::format_vlm_chat(
+                &item.messages,
+                num_image_tokens,
+            );
+            let token_ids = tokenizer.encode_sync(&formatted, None)?;
+            let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
+
+            all_input_ids.push(input_ids);
+            all_pixel_values.push(pixel_values);
+            all_grid_thws.push(grid_thw);
+        }
+
+        // Run batch generation
+        let results = self.generate_batch(
+            &all_input_ids,
+            &all_pixel_values,
+            &all_grid_thws,
+            Some(gen_config),
+        )?;
+
+        // Decode results
+        let mut chat_results = Vec::with_capacity(batch_size);
+        for result in results {
+            result.tokens.eval();
+            let tokens_vec = result.tokens.to_uint32()?;
+            let text = tokenizer.decode_sync(&tokens_vec, true)?;
+            let text = text.replace("<|im_end|>", "").trim().to_string();
+
+            chat_results.push(VLMChatResult {
+                text,
+                tokens: result.tokens,
+                logprobs: result.logprobs,
+                finish_reason: result.finish_reason,
+                num_tokens: result.num_tokens,
+            });
+        }
+
+        Ok(chat_results)
+    }
+
+    /// Batch generate: sequential prefill + batched decode
+    ///
+    /// Each item is prefilled independently (different image sizes → different vision tokens),
+    /// then KV caches are merged and decode runs in batch for ~N× throughput.
+    fn generate_batch(
+        &self,
+        all_input_ids: &[MxArray],
+        all_pixel_values: &[Option<MxArray>],
+        all_grid_thws: &[Option<MxArray>],
+        config: Option<GenerationConfig>,
+    ) -> Result<Vec<GenerationResult>> {
+        let config = config.unwrap_or_default();
+        let batch_size = all_input_ids.len();
+        let max_new_tokens = config.max_new_tokens.unwrap_or(256);
+        let temperature = config.temperature.unwrap_or(0.0);
+        let top_k = config.top_k.unwrap_or(0);
+        let top_p = config.top_p.unwrap_or(1.0);
+        let min_p = config.min_p.unwrap_or(0.0);
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(20);
+        let eos_token_id = config.eos_token_id.unwrap_or(self.config.eos_token_id);
+        let return_logprobs = config.return_logprobs.unwrap_or(false);
+
+        let sampling_config = SamplingConfig {
+            temperature: Some(temperature),
+            top_k: Some(top_k),
+            top_p: Some(top_p),
+            min_p: Some(min_p),
+        };
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        let lm = self
+            .language_model
+            .as_ref()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Language model not set"))?;
+        let visual = self.visual.as_ref();
+
+        let num_layers = {
+            let lm_guard = lm.read().map_err(|_| {
+                Error::new(Status::GenericFailure, "Failed to acquire LM read lock")
+            })?;
+            lm_guard.num_layers_usize()
+        };
+
+        // === STEP 1: Sequential per-item prefill ===
+        let mut item_kv_keys: Vec<Vec<MxArray>> = Vec::with_capacity(batch_size);
+        let mut item_kv_values: Vec<Vec<MxArray>> = Vec::with_capacity(batch_size);
+        let mut item_rope_deltas: Vec<i64> = Vec::with_capacity(batch_size);
+        let mut item_cache_idxs: Vec<i32> = Vec::with_capacity(batch_size);
+        let mut item_first_tokens: Vec<MxArray> = Vec::with_capacity(batch_size);
+        let mut item_first_logprobs: Vec<Option<MxArray>> = Vec::with_capacity(batch_size);
+        let mut item_all_tokens: Vec<Vec<u32>> = Vec::with_capacity(batch_size);
+
+        for i in 0..batch_size {
+            let input_ids = &all_input_ids[i];
+            let pixel_values = all_pixel_values[i].as_ref();
+            let grid_thw = all_grid_thws[i].as_ref();
+
+            let mut lm_guard = lm.write().map_err(|_| {
+                Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
+            })?;
+
+            lm_guard.init_fused_kv_caches();
+            lm_guard.reset_position_state();
+
+            // Vision features
+            let vision_features = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                if let (Some(pv), Some(grid)) = (pixel_values, grid_thw) {
+                    let v = visual.ok_or_else(|| {
+                        Error::new(Status::GenericFailure, "Vision model not set")
+                    })?;
+                    Some(v.forward(pv, grid)?)
+                } else {
+                    None
+                }
+            };
+
+            // Position IDs with mRoPE
+            let (position_ids, rope_deltas) = self.get_rope_index(input_ids, grid_thw)?;
+
+            // Merge embeddings
+            let inputs_embeds = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                let embeds = lm_guard.get_embeddings(input_ids)?;
+                if let Some(ref vf) = vision_features {
+                    let embed_dtype = embeds.dtype()?;
+                    let vf_cast = if vf.dtype()? != embed_dtype {
+                        vf.astype(embed_dtype)?
+                    } else {
+                        vf.clone()
+                    };
+                    self.merge_input_ids_with_image_features(
+                        self.config.image_token_id,
+                        &vf_cast,
+                        &embeds,
+                        input_ids,
+                    )?
+                } else {
+                    embeds
+                }
+            };
+
+            // Prefill and extract KV
+            let (logits, kv_keys, kv_values, cache_idx) = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                lm_guard.forward_fused_extract_kv(&inputs_embeds, &position_ids)?
+            };
+
+            clear_cache();
+
+            // Sample first token (with logprobs if requested)
+            let seq_len = logits.shape_at(1)?;
+            let mut last_logits = logits
+                .slice_axis(1, seq_len - 1, seq_len)?
+                .squeeze(Some(&[0, 1]))?;
+
+            // Apply repetition penalty to first token (matches single-item generate())
+            let input_tokens = input_ids.to_uint32()?;
+            if repetition_penalty != 1.0 {
+                let all_tokens: Vec<u32> = input_tokens.to_vec();
+                last_logits = apply_repetition_penalty(
+                    &last_logits,
+                    &all_tokens,
+                    repetition_penalty,
+                    Some(repetition_context_size),
+                )?;
+            }
+
+            let (first_token, first_logprobs) = if return_logprobs {
+                let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
+                (tok, Some(lp))
+            } else {
+                (sample(&last_logits, Some(sampling_config))?, None)
+            };
+            first_token.eval();
+
+            item_kv_keys.push(kv_keys);
+            item_kv_values.push(kv_values);
+            item_rope_deltas.push(rope_deltas);
+            item_cache_idxs.push(cache_idx);
+            item_first_tokens.push(first_token);
+            item_first_logprobs.push(first_logprobs);
+            item_all_tokens.push(input_tokens.to_vec());
+        }
+
+        // === STEP 2: Merge KV caches into batch ===
+        let max_cache_idx = *item_cache_idxs.iter().max().unwrap();
+        let mut left_padding_values: Vec<i32> = Vec::with_capacity(batch_size);
+
+        for &cache_idx in &item_cache_idxs {
+            left_padding_values.push(max_cache_idx - cache_idx);
+        }
+
+        // Left-pad and stack KV caches per layer
+        let mut batch_kv_keys: Vec<Option<MxArray>> = Vec::with_capacity(num_layers);
+        let mut batch_kv_values: Vec<Option<MxArray>> = Vec::with_capacity(num_layers);
+
+        for layer in 0..num_layers {
+            let mut padded_keys: Vec<MxArray> = Vec::with_capacity(batch_size);
+            let mut padded_values: Vec<MxArray> = Vec::with_capacity(batch_size);
+
+            for i in 0..batch_size {
+                let k = &item_kv_keys[i][layer];
+                let v = &item_kv_values[i][layer];
+                let pad_amount = left_padding_values[i];
+
+                if pad_amount > 0 {
+                    // KV shape: [1, heads, seq, dim] - pad along axis 2
+                    let k_shape = k.shape()?;
+                    let heads = k_shape[1];
+                    let dim = k_shape[3];
+                    let pad_zeros =
+                        MxArray::zeros(&[1, heads, pad_amount as i64, dim], Some(k.dtype()?))?;
+                    let padded_k = MxArray::concatenate_many(vec![&pad_zeros, k], Some(2))?;
+                    let padded_v = MxArray::concatenate_many(vec![&pad_zeros, v], Some(2))?;
+                    // Slice to max_cache_idx to ensure uniform size
+                    let padded_k = padded_k.slice_axis(2, 0, max_cache_idx as i64)?;
+                    let padded_v = padded_v.slice_axis(2, 0, max_cache_idx as i64)?;
+                    padded_keys.push(padded_k);
+                    padded_values.push(padded_v);
+                } else {
+                    // Slice to max_cache_idx
+                    let k_trimmed = k.slice_axis(2, 0, max_cache_idx as i64)?;
+                    let v_trimmed = v.slice_axis(2, 0, max_cache_idx as i64)?;
+                    padded_keys.push(k_trimmed);
+                    padded_values.push(v_trimmed);
+                }
+            }
+
+            // Stack along batch dim: [batch, heads, max_cache_idx, dim]
+            let key_refs: Vec<&MxArray> = padded_keys.iter().collect();
+            let value_refs: Vec<&MxArray> = padded_values.iter().collect();
+            let stacked_keys = MxArray::concatenate_many(key_refs, Some(0))?;
+            let stacked_values = MxArray::concatenate_many(value_refs, Some(0))?;
+
+            batch_kv_keys.push(Some(stacked_keys));
+            batch_kv_values.push(Some(stacked_values));
+        }
+
+        // Eval merged KV caches
+        for k in batch_kv_keys.iter().flatten() {
+            k.eval();
+        }
+        for v in batch_kv_values.iter().flatten() {
+            v.eval();
+        }
+        clear_cache();
+
+        // === STEP 3: Batched decode loop ===
+        let mut generated_tokens: Vec<Vec<u32>> =
+            vec![Vec::with_capacity(max_new_tokens as usize); batch_size];
+        let mut generated_logprobs: Vec<Vec<f32>> = vec![Vec::new(); batch_size];
+        let mut finish_reasons: Vec<Option<String>> = vec![None; batch_size];
+
+        // Track active batch items
+        let mut active_indices: Vec<usize> = (0..batch_size).collect();
+        let mut current_cache_idx = max_cache_idx;
+
+        // Build initial token + logprobs arrays from prefill results
+        let first_token_refs: Vec<&MxArray> = item_first_tokens.iter().collect();
+        let mut current_tokens = MxArray::stack(first_token_refs, Some(0))?;
+
+        // Build initial logprobs: stack per-item logprob distributions [batch, vocab]
+        let mut current_logprobs: Option<Vec<Option<MxArray>>> = if return_logprobs {
+            Some(item_first_logprobs)
+        } else {
+            None
+        };
+
+        // Get read lock for batched decode
+        let lm_guard = lm
+            .read()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire LM read lock"))?;
+
+        for step in 0..max_new_tokens {
+            if active_indices.is_empty() {
+                break;
+            }
+
+            // --- Phase 1: Build next step's graph ---
+            // Embed current tokens and run forward pass to get next logits
+            let active_batch_size = active_indices.len() as i64;
+
+            let embed_tokens: Vec<u32> = {
+                current_tokens.eval();
+                let tok_vals = current_tokens.to_int32()?;
+                active_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(local_idx, _)| tok_vals[local_idx] as u32)
+                    .collect()
+            };
+            let embed_input = MxArray::from_uint32(&embed_tokens, &[active_batch_size, 1])?;
+            let token_embeds = lm_guard.get_embedding_layer().forward(&embed_input)?;
+
+            // Build position_ids [3, active_batch, 1] for mRoPE decode
+            let mut pos_data: Vec<f32> = Vec::with_capacity(3 * active_indices.len());
+            for &global_idx in &active_indices {
+                let pos = (current_cache_idx as i64 - left_padding_values[global_idx] as i64
+                    + item_rope_deltas[global_idx]) as f32;
+                pos_data.push(pos);
+            }
+            let pos_1d = MxArray::from_float32(&pos_data, &[1, active_batch_size, 1])?;
+            let position_ids = MxArray::tile(&pos_1d, &[3, 1, 1])?;
+
+            // Build left_padding for active items
+            let active_left_padding: Vec<i32> = active_indices
+                .iter()
+                .map(|&idx| left_padding_values[idx])
+                .collect();
+            let left_padding_active =
+                MxArray::from_int32(&active_left_padding, &[active_batch_size])?;
+
+            // Batched forward
+            let (logits, new_kv_keys, new_kv_values, new_cache_idx) = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                lm_guard.forward_fused_batched(
+                    &token_embeds,
+                    &position_ids,
+                    &left_padding_active,
+                    &batch_kv_keys,
+                    &batch_kv_values,
+                    current_cache_idx,
+                )?
+            };
+
+            batch_kv_keys = new_kv_keys;
+            batch_kv_values = new_kv_values;
+            current_cache_idx = new_cache_idx;
+
+            // Sample next tokens [active_batch, 1, vocab] -> [active_batch, vocab]
+            let next_logits = logits.squeeze(Some(&[1]))?;
+
+            // Apply repetition penalty per item
+            let next_logits = if repetition_penalty != 1.0 {
+                let mut rows = Vec::with_capacity(active_indices.len());
+                for (local_idx, &global_idx) in active_indices.iter().enumerate() {
+                    let row = next_logits.slice_axis(0, local_idx as i64, local_idx as i64 + 1)?;
+                    let row = row.squeeze(Some(&[0]))?;
+                    let penalized = apply_repetition_penalty(
+                        &row,
+                        &item_all_tokens[global_idx],
+                        repetition_penalty,
+                        Some(repetition_context_size),
+                    )?;
+                    rows.push(penalized);
+                }
+                let row_refs: Vec<&MxArray> = rows.iter().collect();
+                MxArray::stack(row_refs, Some(0))?
+            } else {
+                next_logits
+            };
+
+            // Sample next tokens (with logprobs if requested)
+            let (mut next_tokens, mut next_logprobs) = if return_logprobs {
+                let (tok, lp) = sample_and_logprobs(&next_logits, Some(sampling_config))?;
+                (tok, Some(lp))
+            } else {
+                (sample(&next_logits, Some(sampling_config))?, None)
+            };
+
+            // --- Phase 2: Extract CURRENT tokens and CURRENT logprobs (aligned pair) ---
+            current_tokens.eval();
+            let token_values = current_tokens.to_int32()?;
+
+            // Extract logprobs for current tokens
+            if return_logprobs && let Some(ref lp_vec) = current_logprobs {
+                for (local_idx, &global_idx) in active_indices.iter().enumerate() {
+                    let token_value = token_values[local_idx] as u32;
+                    if let Some(ref lp) = lp_vec[global_idx] {
+                        lp.eval();
+                        let token_logprob = lp.item_at_float32(token_value as usize)?;
+                        generated_logprobs[global_idx].push(token_logprob);
+                    }
+                }
+            }
+
+            // Track deactivations
+            let mut to_deactivate: Vec<(usize, String)> = Vec::new();
+
+            for (local_idx, &global_idx) in active_indices.iter().enumerate() {
+                let token_value = token_values[local_idx] as u32;
+                generated_tokens[global_idx].push(token_value);
+                item_all_tokens[global_idx].push(token_value);
+
+                // Check EOS
+                if token_value == eos_token_id as u32 {
+                    to_deactivate.push((local_idx, "stop".to_string()));
+                }
+            }
+
+            // Build filter indices
+            let positions_to_remove: std::collections::HashSet<usize> =
+                to_deactivate.iter().map(|(idx, _)| *idx).collect();
+            let old_batch_size = active_indices.len();
+            let filter_indices: Vec<i32> = (0..old_batch_size)
+                .filter(|i| !positions_to_remove.contains(i))
+                .map(|i| i as i32)
+                .collect();
+
+            // Apply deactivations (reverse order)
+            to_deactivate.sort_by(|a, b| b.0.cmp(&a.0));
+            for (local_idx, reason) in to_deactivate {
+                let global_idx = active_indices[local_idx];
+                finish_reasons[global_idx] = Some(reason);
+                active_indices.remove(local_idx);
+            }
+
+            if active_indices.is_empty() {
+                break;
+            }
+
+            // Filter KV caches, tokens, and logprobs if batch shrank
+            if filter_indices.len() < old_batch_size {
+                let indices_array =
+                    MxArray::from_int32(&filter_indices, &[filter_indices.len() as i64])?;
+                for layer in 0..num_layers {
+                    if let Some(ref keys) = batch_kv_keys[layer] {
+                        batch_kv_keys[layer] = Some(keys.take(&indices_array, 0)?);
+                    }
+                    if let Some(ref values) = batch_kv_values[layer] {
+                        batch_kv_values[layer] = Some(values.take(&indices_array, 0)?);
+                    }
+                }
+                // Filter next_tokens to match the shrunken active set.
+                // Without this, tok_vals[local_idx] on the next iteration reads
+                // tokens from deactivated items, corrupting remaining outputs.
+                next_tokens = next_tokens.take(&indices_array, 0)?;
+                if let Some(ref lp) = next_logprobs {
+                    next_logprobs = Some(lp.take(&indices_array, 0)?);
+                }
+            }
+
+            // Advance: next becomes current
+            current_tokens = next_tokens;
+
+            // Update per-item logprobs for next iteration
+            if return_logprobs && let Some(ref next_lp) = next_logprobs {
+                let mut new_lp_vec: Vec<Option<MxArray>> = vec![None; batch_size];
+                for (local_idx, &global_idx) in active_indices.iter().enumerate() {
+                    let row = next_lp.slice_axis(0, local_idx as i64, local_idx as i64 + 1)?;
+                    let row = row.squeeze(Some(&[0]))?;
+                    new_lp_vec[global_idx] = Some(row);
+                }
+                current_logprobs = Some(new_lp_vec);
+            }
+
+            // Periodic cleanup
+            if step > 0 && step % 256 == 0 {
+                clear_cache();
+            }
+        }
+
+        // Set finish reason for items still active
+        for &global_idx in &active_indices {
+            if finish_reasons[global_idx].is_none() {
+                finish_reasons[global_idx] = Some("length".to_string());
+            }
+        }
+
+        // Build results
+        let mut results = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let tokens = &generated_tokens[i];
+            let tokens_array = MxArray::from_uint32(tokens, &[tokens.len() as i64])?;
+            let logprobs_array = if return_logprobs {
+                MxArray::from_float32(
+                    &generated_logprobs[i],
+                    &[generated_logprobs[i].len() as i64],
+                )?
+            } else {
+                MxArray::from_float32(&[], &[0])?
+            };
+
+            results.push(GenerationResult {
+                text: String::new(),
+                tokens: tokens_array,
+                logprobs: logprobs_array,
+                finish_reason: finish_reasons[i]
+                    .clone()
+                    .unwrap_or_else(|| "length".to_string()),
+                num_tokens: tokens.len(),
+            });
+        }
+
+        Ok(results)
+    }
+
     /// Get model configuration
     #[napi(getter)]
     pub fn config(&self) -> ModelConfig {
@@ -1707,5 +2379,89 @@ mod tests {
         assert_eq!(config.text_config.num_hidden_layers, 18);
         assert_eq!(config.text_config.num_attention_heads, 16);
         assert_eq!(config.text_config.head_dim, 128);
+    }
+
+    /// Regression test: batch decode must filter next_tokens when items are deactivated.
+    ///
+    /// Before the fix, after EOS filtering removed batch items from active_indices
+    /// and KV caches, next_tokens was NOT filtered. On the next iteration,
+    /// tok_vals[local_idx] would read tokens from deactivated items, causing
+    /// cross-item contamination.
+    ///
+    /// This test simulates the exact control flow from generate_batch's decode loop:
+    ///   1. Start with 3 active items producing tokens [10, 20, 30]
+    ///   2. Item 1 (middle) hits EOS → deactivated
+    ///   3. Verify remaining items [0, 2] read correct tokens [10, 30] not [10, 20]
+    #[test]
+    fn test_batch_decode_eos_filter_tokens() {
+        // Simulate next_tokens = [tok_A, tok_B, tok_C] from batch of 3
+        let next_tokens = MxArray::from_int32(&[10, 20, 30], &[3]).unwrap();
+
+        // Item B (local_idx=1) hits EOS. filter_indices keeps items 0 and 2.
+        let filter_indices = MxArray::from_int32(&[0, 2], &[2]).unwrap();
+
+        // The fix: filter next_tokens before assigning to current_tokens
+        let filtered = next_tokens.take(&filter_indices, 0).unwrap();
+        filtered.eval();
+        let vals = filtered.to_int32().unwrap();
+
+        // After filtering, position 0 should be tok_A (10), position 1 should be tok_C (30)
+        assert_eq!(vals.len(), 2);
+        assert_eq!(vals[0], 10, "local_idx=0 should map to item A's token");
+        assert_eq!(
+            vals[1], 30,
+            "local_idx=1 should map to item C's token (not B's)"
+        );
+    }
+
+    /// Regression test: KV cache filtering must stay aligned with token filtering.
+    ///
+    /// Simulates the batch decode scenario where KV caches [batch, heads, seq, dim]
+    /// and next_tokens [batch] must both be filtered by the same indices when
+    /// items are deactivated.
+    #[test]
+    fn test_batch_decode_kv_and_token_alignment() {
+        // Simulate KV cache: [3 items, 2 heads, 4 seq positions, 2 dim]
+        // Each item has distinguishable values: item0=1.0, item1=2.0, item2=3.0
+        let kv = MxArray::from_float32(
+            &[
+                // item 0: all 1s
+                1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                // item 1: all 2s
+                2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
+                // item 2: all 3s
+                3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0,
+            ],
+            &[3, 2, 4, 2],
+        )
+        .unwrap();
+        let tokens = MxArray::from_int32(&[100, 200, 300], &[3]).unwrap();
+
+        // Remove item 1 (middle)
+        let filter = MxArray::from_int32(&[0, 2], &[2]).unwrap();
+        let filtered_kv = kv.take(&filter, 0).unwrap();
+        let filtered_tokens = tokens.take(&filter, 0).unwrap();
+
+        filtered_kv.eval();
+        filtered_tokens.eval();
+
+        let kv_shape: Vec<i64> = filtered_kv.shape().unwrap().to_vec();
+        assert_eq!(
+            kv_shape,
+            vec![2, 2, 4, 2],
+            "KV batch dim should shrink to 2"
+        );
+
+        let tok_vals: Vec<i32> = filtered_tokens.to_int32().unwrap().to_vec();
+        assert_eq!(
+            tok_vals,
+            vec![100, 300],
+            "tokens should match filtered KV rows"
+        );
+
+        // Verify KV content: row 0 should be item 0 (1.0), row 1 should be item 2 (3.0)
+        let kv_data = filtered_kv.to_float32().unwrap();
+        assert_eq!(kv_data[0], 1.0, "KV row 0 should be item 0");
+        assert_eq!(kv_data[16], 3.0, "KV row 1 should be item 2 (not item 1)");
     }
 }

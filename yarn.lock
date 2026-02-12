@@ -5,38 +5,38 @@ __metadata:
   version: 8
   cacheKey: 10c0
 
-"@ai-sdk/gateway@npm:3.0.22":
-  version: 3.0.22
-  resolution: "@ai-sdk/gateway@npm:3.0.22"
+"@ai-sdk/gateway@npm:3.0.39":
+  version: 3.0.39
+  resolution: "@ai-sdk/gateway@npm:3.0.39"
   dependencies:
-    "@ai-sdk/provider": "npm:3.0.5"
-    "@ai-sdk/provider-utils": "npm:4.0.9"
+    "@ai-sdk/provider": "npm:3.0.8"
+    "@ai-sdk/provider-utils": "npm:4.0.14"
     "@vercel/oidc": "npm:3.1.0"
   peerDependencies:
     zod: ^3.25.76 || ^4.1.8
-  checksum: 10c0/94551537fe8cc4e3b2330d7876221b233c7daf3a56317775d13b0ef804aa26517ef1fc7e97d7cbf50d87283f3cace45f92b578b25d5e531f243b491a0e9a8df8
+  checksum: 10c0/b7a8ea6b1b6aa13ab264b683efc06529cadf21ab5a857bbc624158a24a59f95cc6d432f31a0e3819666da7ca82355ee4f7094f5c6ebb2ad836ca647ad0d89b95
   languageName: node
   linkType: hard
 
-"@ai-sdk/provider-utils@npm:4.0.9":
-  version: 4.0.9
-  resolution: "@ai-sdk/provider-utils@npm:4.0.9"
+"@ai-sdk/provider-utils@npm:4.0.14":
+  version: 4.0.14
+  resolution: "@ai-sdk/provider-utils@npm:4.0.14"
   dependencies:
-    "@ai-sdk/provider": "npm:3.0.5"
+    "@ai-sdk/provider": "npm:3.0.8"
     "@standard-schema/spec": "npm:^1.1.0"
     eventsource-parser: "npm:^3.0.6"
   peerDependencies:
     zod: ^3.25.76 || ^4.1.8
-  checksum: 10c0/b3b52357b27ddd7bd0489c42a2818ba3ce2c31e9f2aae424b324200de0491376ae9f422c58867140081e368a58ca8777427efa6327b878163b824342f4bc57fc
+  checksum: 10c0/613ec8c9efb2b3a5fd0083319e0e54e66737c071a0a7957be8248a23533325ba7a26149393a850a8e38c01bf62fe706f776687e01c3513d7558475a2856ca06e
   languageName: node
   linkType: hard
 
-"@ai-sdk/provider@npm:3.0.5":
-  version: 3.0.5
-  resolution: "@ai-sdk/provider@npm:3.0.5"
+"@ai-sdk/provider@npm:3.0.8":
+  version: 3.0.8
+  resolution: "@ai-sdk/provider@npm:3.0.8"
   dependencies:
     json-schema: "npm:^0.4.0"
-  checksum: 10c0/e3994d9b8b066bae69b160202c42fe1f3a8323484590bcf1d3f19f637f6548b398be7e774706239ae5ad61d65f7f998895dc0c6ce8dc30a977344cc7874ec4db
+  checksum: 10c0/c68637c0139a6ce8af17bac1d7d539f531860026237c5c971dcecda2daa8b1e42d8c05e1e664ece60c15edb325c0253fd5b091ee54d32f870a750a493acbb0b7
   languageName: node
   linkType: hard
 
@@ -497,6 +497,7 @@ __metadata:
   dependencies:
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
+    "@napi-rs/image": "npm:1.12.0"
   languageName: unknown
   linkType: soft
 
@@ -568,6 +569,147 @@ __metadata:
     "@napi-rs/cross-toolchain-x64-target-x86_64":
       optional: true
   checksum: 10c0/fcc7877c1e47ba6bf4801a4154240d3130703524b1fed17e736126ce58b53960872b9933f8434e3e86b4635e4c7fe881228be0d237210dd96c2087244523750f
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-android-arm64@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-android-arm64@npm:1.12.0"
+  conditions: os=android & cpu=arm64
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-darwin-arm64@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-darwin-arm64@npm:1.12.0"
+  conditions: os=darwin & cpu=arm64
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-darwin-x64@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-darwin-x64@npm:1.12.0"
+  conditions: os=darwin & cpu=x64
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-freebsd-x64@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-freebsd-x64@npm:1.12.0"
+  conditions: os=freebsd & cpu=x64
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-linux-arm-gnueabihf@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-linux-arm-gnueabihf@npm:1.12.0"
+  conditions: os=linux & cpu=arm
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-linux-arm64-gnu@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-linux-arm64-gnu@npm:1.12.0"
+  conditions: os=linux & cpu=arm64 & libc=glibc
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-linux-arm64-musl@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-linux-arm64-musl@npm:1.12.0"
+  conditions: os=linux & cpu=arm64 & libc=musl
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-linux-x64-gnu@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-linux-x64-gnu@npm:1.12.0"
+  conditions: os=linux & cpu=x64 & libc=glibc
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-linux-x64-musl@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-linux-x64-musl@npm:1.12.0"
+  conditions: os=linux & cpu=x64 & libc=musl
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-wasm32-wasi@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-wasm32-wasi@npm:1.12.0"
+  dependencies:
+    "@napi-rs/wasm-runtime": "npm:^1.1.0"
+  conditions: cpu=wasm32
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-win32-arm64-msvc@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-win32-arm64-msvc@npm:1.12.0"
+  conditions: os=win32 & cpu=arm64
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-win32-ia32-msvc@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-win32-ia32-msvc@npm:1.12.0"
+  conditions: os=win32 & cpu=ia32
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image-win32-x64-msvc@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image-win32-x64-msvc@npm:1.12.0"
+  conditions: os=win32 & cpu=x64
+  languageName: node
+  linkType: hard
+
+"@napi-rs/image@npm:1.12.0":
+  version: 1.12.0
+  resolution: "@napi-rs/image@npm:1.12.0"
+  dependencies:
+    "@napi-rs/image-android-arm64": "npm:1.12.0"
+    "@napi-rs/image-darwin-arm64": "npm:1.12.0"
+    "@napi-rs/image-darwin-x64": "npm:1.12.0"
+    "@napi-rs/image-freebsd-x64": "npm:1.12.0"
+    "@napi-rs/image-linux-arm-gnueabihf": "npm:1.12.0"
+    "@napi-rs/image-linux-arm64-gnu": "npm:1.12.0"
+    "@napi-rs/image-linux-arm64-musl": "npm:1.12.0"
+    "@napi-rs/image-linux-x64-gnu": "npm:1.12.0"
+    "@napi-rs/image-linux-x64-musl": "npm:1.12.0"
+    "@napi-rs/image-wasm32-wasi": "npm:1.12.0"
+    "@napi-rs/image-win32-arm64-msvc": "npm:1.12.0"
+    "@napi-rs/image-win32-ia32-msvc": "npm:1.12.0"
+    "@napi-rs/image-win32-x64-msvc": "npm:1.12.0"
+  dependenciesMeta:
+    "@napi-rs/image-android-arm64":
+      optional: true
+    "@napi-rs/image-darwin-arm64":
+      optional: true
+    "@napi-rs/image-darwin-x64":
+      optional: true
+    "@napi-rs/image-freebsd-x64":
+      optional: true
+    "@napi-rs/image-linux-arm-gnueabihf":
+      optional: true
+    "@napi-rs/image-linux-arm64-gnu":
+      optional: true
+    "@napi-rs/image-linux-arm64-musl":
+      optional: true
+    "@napi-rs/image-linux-x64-gnu":
+      optional: true
+    "@napi-rs/image-linux-x64-musl":
+      optional: true
+    "@napi-rs/image-wasm32-wasi":
+      optional: true
+    "@napi-rs/image-win32-arm64-msvc":
+      optional: true
+    "@napi-rs/image-win32-ia32-msvc":
+      optional: true
+    "@napi-rs/image-win32-x64-msvc":
+      optional: true
+  checksum: 10c0/35e9db81b29c1d7bcaaa48f929da1920cb1abf8bf169b3515d1f8fdaa4755063eb8c3c37eefb23dd47619587b199d4d9665f708e690ff827e0d610d0cc084d07
   languageName: node
   linkType: hard
 
@@ -1211,7 +1353,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/wasm-runtime@npm:^1.0.3, @napi-rs/wasm-runtime@npm:^1.0.7, @napi-rs/wasm-runtime@npm:^1.1.1":
+"@napi-rs/wasm-runtime@npm:^1.0.3, @napi-rs/wasm-runtime@npm:^1.0.7, @napi-rs/wasm-runtime@npm:^1.1.0, @napi-rs/wasm-runtime@npm:^1.1.1":
   version: 1.1.1
   resolution: "@napi-rs/wasm-runtime@npm:1.1.1"
   dependencies:
@@ -1682,24 +1824,13 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@openrouter/ai-sdk-provider@npm:^1.5.4":
-  version: 1.5.4
-  resolution: "@openrouter/ai-sdk-provider@npm:1.5.4"
-  dependencies:
-    "@openrouter/sdk": "npm:^0.1.27"
+"@openrouter/ai-sdk-provider@npm:^2.2.1":
+  version: 2.2.1
+  resolution: "@openrouter/ai-sdk-provider@npm:2.2.1"
   peerDependencies:
-    ai: ^5.0.0
-    zod: ^3.24.1 || ^v4
-  checksum: 10c0/6360a779a3b13de5df0fca9ff3dda4b18cce2652c6c0db26a3f1c1f558f5bb3f75b45d6553c14d5eed4ab1fac7fe4a4bd577195ff6652dbf5a5a14378460bbd2
-  languageName: node
-  linkType: hard
-
-"@openrouter/sdk@npm:^0.1.27":
-  version: 0.1.27
-  resolution: "@openrouter/sdk@npm:0.1.27"
-  dependencies:
-    zod: "npm:^3.25.0 || ^4.0.0"
-  checksum: 10c0/c63972851b4544a6585babacb2909b8af529444c6319e0a98b8e219f75295a25d433ba1978f24c0252fbb41ac2471bf209c2728649bf0c42b7a722c3868e267e
+    ai: ^6.0.0
+    zod: ^3.25.0 || ^4.0.0
+  checksum: 10c0/ee83fdf6e888fa6bc9653d0a2cb2ec677e3320b745e0c924b35ef8a5960ce033c65b130f959b60fb7c2a26044c848e0013f1b163831b31fabac775e4f4ac76ca
   languageName: node
   linkType: hard
 
@@ -2493,17 +2624,17 @@ __metadata:
   languageName: node
   linkType: hard
 
-"ai@npm:^6.0.12":
-  version: 6.0.49
-  resolution: "ai@npm:6.0.49"
+"ai@npm:^6.0.78":
+  version: 6.0.78
+  resolution: "ai@npm:6.0.78"
   dependencies:
-    "@ai-sdk/gateway": "npm:3.0.22"
-    "@ai-sdk/provider": "npm:3.0.5"
-    "@ai-sdk/provider-utils": "npm:4.0.9"
+    "@ai-sdk/gateway": "npm:3.0.39"
+    "@ai-sdk/provider": "npm:3.0.8"
+    "@ai-sdk/provider-utils": "npm:4.0.14"
     "@opentelemetry/api": "npm:1.9.0"
   peerDependencies:
     zod: ^3.25.76 || ^4.1.8
-  checksum: 10c0/01f48ed3eff7664c396166006d6e435564b2345ed14146e081596498d4f09c490ed415cee5007f6f29c5ebe6d25a99481ec8cda6e6f1fdee48c9f16a94089cbc
+  checksum: 10c0/875c63ecb10e9f79644f9969b090a982cbe914d41f8af9888808bf2e354ad38071d1540d6c6c2cfcc79aa2766f8c5857ef70735f661a4e455cea329c712cc693
   languageName: node
   linkType: hard
 
@@ -2732,8 +2863,9 @@ __metadata:
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/trl": "workspace:*"
     "@mlx-node/vlm": "workspace:*"
-    "@openrouter/ai-sdk-provider": "npm:^1.5.4"
-    ai: "npm:^6.0.12"
+    "@napi-rs/image": "npm:1.12.0"
+    "@openrouter/ai-sdk-provider": "npm:^2.2.1"
+    ai: "npm:^6.0.78"
     zod: "npm:^4.3.5"
   languageName: unknown
   linkType: soft
@@ -3906,7 +4038,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"zod@npm:^3.25.0 || ^4.0.0, zod@npm:^4.3.5":
+"zod@npm:^4.3.5":
   version: 4.3.6
   resolution: "zod@npm:4.3.6"
   checksum: 10c0/860d25a81ab41d33aa25f8d0d07b091a04acb426e605f396227a796e9e800c44723ed96d0f53a512b57be3d1520f45bf69c0cb3b378a232a00787a2609625307

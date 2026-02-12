@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "@mlx-node/core": "workspace:*",
-    "@mlx-node/lm": "workspace:*"
+    "@mlx-node/lm": "workspace:*",
+    "@napi-rs/image": "1.12.0"
   }
 }

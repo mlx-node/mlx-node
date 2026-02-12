@@ -13,7 +13,9 @@ pub mod processing;
 pub mod vision;
 
 // Re-export public items
-pub use chat::{ChatRole, VLMChatConfig, VLMChatMessage, VLMChatResult, format_vlm_chat};
+pub use chat::{
+    ChatRole, VLMBatchItem, VLMChatConfig, VLMChatMessage, VLMChatResult, format_vlm_chat,
+};
 pub use config::{ModelConfig, TextConfig, VisionConfig};
 pub use language::{ERNIELanguageModel, MultimodalRoPE, PaddleOCRAttention, PaddleOCRDecoderLayer};
 pub use model::VLModel;

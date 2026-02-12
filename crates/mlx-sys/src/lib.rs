@@ -803,6 +803,32 @@ unsafe extern "C" {
         out_dtype: i32, // -1 for input dtype
     ) -> *mut mlx_array;
 
+    // 2D Convolution using MLX native conv2d
+    pub fn mlx_conv2d(
+        input: *mut mlx_array,
+        weight: *mut mlx_array,
+        stride_h: i32,
+        stride_w: i32,
+        padding_h: i32,
+        padding_w: i32,
+        dilation_h: i32,
+        dilation_w: i32,
+        groups: i32,
+    ) -> *mut mlx_array;
+
+    // 2D Transposed Convolution using MLX native conv_transpose2d
+    pub fn mlx_conv_transpose2d(
+        input: *mut mlx_array,
+        weight: *mut mlx_array,
+        stride_h: i32,
+        stride_w: i32,
+        padding_h: i32,
+        padding_w: i32,
+        dilation_h: i32,
+        dilation_w: i32,
+        groups: i32,
+    ) -> *mut mlx_array;
+
     /// Fused PaddleOCR-VL forward pass - entire transformer forward in one FFI call.
     /// Uses mRoPE (multimodal rotary position embedding) instead of standard RoPE.
     /// 9 weights per layer: [input_norm, post_attn_norm, q, k, v, o, gate, up, down]
@@ -826,6 +852,32 @@ unsafe extern "C" {
         out_logits: *mut *mut mlx_array,
         out_kv_keys: *mut *mut mlx_array,   // [num_layers]
         out_kv_values: *mut *mut mlx_array, // [num_layers]
+        out_cache_idx: *mut i32,
+    );
+
+    /// Batched PaddleOCR-VL forward pass with left-padding-aware attention masking.
+    /// Like mlx_paddleocr_vl_forward_step but supports batch > 1 during decode.
+    pub fn mlx_paddleocr_vl_forward_step_batched(
+        input_embeds: *mut mlx_array,         // [batch, seq_len, hidden_size]
+        layer_weights: *const *mut mlx_array, // [num_layers * 9]
+        num_layers: i32,
+        final_norm_weight: *mut mlx_array,
+        lm_head_weight: *mut mlx_array,
+        inv_freq: *mut mlx_array,
+        position_ids: *mut mlx_array, // [3, batch, seq_len]
+        mrope_section: *const i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        norm_eps: f32,
+        left_padding: *mut mlx_array, // [batch] - left padding amounts
+        kv_keys_in: *const *mut mlx_array,
+        kv_values_in: *const *mut mlx_array,
+        cache_idx_in: i32,
+        out_logits: *mut *mut mlx_array,
+        out_kv_keys: *mut *mut mlx_array,
+        out_kv_values: *mut *mut mlx_array,
         out_cache_idx: *mut i32,
     );
 }

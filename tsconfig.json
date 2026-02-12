@@ -1,6 +1,7 @@
 {
   "files": [],
   "references": [
+    { "path": "./packages/core" },
     { "path": "./packages/lm" },
     { "path": "./packages/trl" },
     { "path": "./packages/vlm" },
@@ -13,8 +14,6 @@
     "forceConsistentCasingInFileNames": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "target": "ESNext",
-    "declaration": true,
-    "declarationMap": true
+    "target": "ESNext"
   }
 }
