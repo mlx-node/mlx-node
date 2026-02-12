@@ -121,6 +121,12 @@ impl GlobalPointer {
     /// * `d_model` - Input dimension (default: 256)
     /// * `head_size` - Size of each query/key head (default: 64)
     pub fn new(d_model: u32, head_size: i32) -> Result<Self> {
+        if head_size <= 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("head_size must be positive, got {head_size}"),
+            ));
+        }
         let dense = Linear::new(d_model, (head_size * 2) as u32, Some(true))?;
         Ok(Self { dense, head_size })
     }

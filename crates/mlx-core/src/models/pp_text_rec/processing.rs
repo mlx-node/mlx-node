@@ -28,9 +28,9 @@ pub struct TextRecImageProcessor {
     target_height: u32,
     /// Maximum image width (upper bound to prevent OOM)
     max_width: u32,
-    /// Image mean for normalization [R, G, B]
+    /// Image mean for normalization in BGR order (applied after RGB→BGR channel swap)
     mean: [f32; 3],
-    /// Image std for normalization [R, G, B]
+    /// Image std for normalization in BGR order (applied after RGB→BGR channel swap)
     std: [f32; 3],
 }
 
@@ -49,6 +49,9 @@ impl TextRecImageProcessor {
     /// Following PaddleOCR's `resize_norm_img`:
     ///   resized_w = ceil(imgH * (w / h)), clamped to [1, img_w_limit]
     fn compute_resized_width(&self, width: u32, height: u32, img_w_limit: u32) -> u32 {
+        if height == 0 {
+            return 1;
+        }
         let ratio = width as f64 / height as f64;
         let new_w = (self.target_height as f64 * ratio).ceil() as u32;
         new_w.max(1).min(img_w_limit)

@@ -199,6 +199,12 @@ impl TextRecModel {
 /// matching PyTorch/PaddlePaddle's truncation behavior for non-divisible inputs.
 fn avg_pool2d_k3x2(input: &MxArray) -> Result<MxArray> {
     let shape = input.shape()?;
+    if shape.len() != 4 {
+        return Err(Error::from_reason(format!(
+            "avg_pool2d_k3x2: expected 4D input [B, H, W, C], got {}D",
+            shape.len()
+        )));
+    }
     let batch = shape[0];
     let h = shape[1];
     let w = shape[2];

@@ -264,6 +264,12 @@ impl MultiscaleDeformableAttention {
     /// * `n_levels` - Number of feature levels (default 3)
     /// * `n_points` - Number of sampling points per head per level (default 4)
     pub fn new(d_model: i32, num_heads: i32, n_levels: i32, n_points: i32) -> Result<Self> {
+        if d_model % num_heads != 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("d_model ({d_model}) must be divisible by num_heads ({num_heads})"),
+            ));
+        }
         let total_points = (num_heads * n_levels * n_points * 2) as u32;
         let total_weights = (num_heads * n_levels * n_points) as u32;
         let dm = d_model as u32;

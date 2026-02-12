@@ -1253,6 +1253,11 @@ impl VLModel {
         config: Option<GenerationConfig>,
     ) -> Result<Vec<GenerationResult>> {
         let config = config.unwrap_or_default();
+
+        if all_input_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let batch_size = all_input_ids.len();
         let max_new_tokens = config.max_new_tokens.unwrap_or(256);
         let temperature = config.temperature.unwrap_or(0.0);

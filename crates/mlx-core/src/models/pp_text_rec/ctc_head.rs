@@ -59,6 +59,12 @@ impl CTCHead {
 /// * Vec of (char_indices, scores) per batch element
 pub fn ctc_greedy_decode(logits: &MxArray) -> Result<Vec<(Vec<usize>, Vec<f32>)>> {
     let shape = logits.shape()?;
+    if shape.len() != 3 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("CTC logits must be 3D [B, T, C], got {}D", shape.len()),
+        ));
+    }
     let batch = shape[0] as usize;
     let seq_len = shape[1] as usize;
     let num_classes = shape[2] as usize;

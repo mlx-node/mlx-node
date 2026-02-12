@@ -384,7 +384,7 @@ function formatElement(label: string, text: string): string {
       return `<!-- ${label}: ${trimmed} -->\n`;
     case 'footnote':
     case 'table_footnote':
-      return `[^]: ${trimmed}\n`;
+      return `[^note]: ${trimmed}\n`;
     case 'list':
       return `${trimmed}\n`;
     case 'seal':

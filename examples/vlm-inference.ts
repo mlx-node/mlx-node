@@ -33,7 +33,7 @@ const imagePath = args.find((a) => !a.startsWith('--'));
 const vlmOnly = args.includes('--vlm-only');
 const layoutOnly = args.includes('--layout-only');
 const thresholdIdx = args.indexOf('--threshold');
-const threshold = thresholdIdx !== -1 ? parseFloat(args[thresholdIdx + 1]) : 0.5;
+const threshold = thresholdIdx !== -1 && !isNaN(parseFloat(args[thresholdIdx + 1])) ? parseFloat(args[thresholdIdx + 1]) : 0.5;
 
 const vlmModelPath = '.cache/models/PaddleOCR-VL-1.5-mlx';
 // Clone from HuggingFace: PaddlePaddle/PP-DocLayoutV3_safetensors (NOT PaddlePaddle/PP-DocLayoutV3)
@@ -202,7 +202,7 @@ function formatElement(labelName: string, text: string): string {
       return `<!-- ${labelName}: ${trimmed} -->\n`;
     case 'footnote':
     case 'table_footnote':
-      return `[^]: ${trimmed}\n`;
+      return `[^note]: ${trimmed}\n`;
     case 'list':
       return `${trimmed}\n`;
     default:

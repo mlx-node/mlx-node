@@ -180,6 +180,16 @@ impl TextDetImageProcessor {
         width: u32,
         height: u32,
     ) -> Result<(MxArray, u32, u32)> {
+        if width == 0 || height == 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "Image dimensions must be non-zero, got {}x{}",
+                    width, height
+                ),
+            ));
+        }
+
         // Compute resize ratio using PaddleOCR's DetResizeForTest logic
         let ratio = self.compute_ratio(height, width);
         let new_h = (height as f64 * ratio) as u32;

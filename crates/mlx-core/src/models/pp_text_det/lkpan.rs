@@ -206,6 +206,12 @@ impl LKPAN {
     /// * Single fused feature map [B, H_finest, W_finest, out_channels]
     pub fn forward(&self, features: &[MxArray]) -> Result<MxArray> {
         let n = features.len();
+        if n != 4 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("LKPAN expects exactly 4 feature levels, got {}", n),
+            ));
+        }
 
         // 1. ins_conv: project all levels to out_channels (256)
         let mut ins: Vec<MxArray> = Vec::with_capacity(n);

@@ -401,10 +401,10 @@ impl EncoderLayer {
         };
 
         // FFN block
+        let residual = x.clone();
         if self.normalize_before {
             x = self.final_layer_norm.forward(&x)?;
         }
-        let residual = x.clone();
 
         x = self.fc1.forward(&x)?;
         x = super::apply_activation(&x, &self.activation)?;
