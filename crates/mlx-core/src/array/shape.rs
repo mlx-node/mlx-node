@@ -170,9 +170,7 @@ impl MxArray {
     #[napi]
     pub fn stack(arrays: Vec<&MxArray>, axis: Option<i32>) -> Result<MxArray> {
         if arrays.is_empty() {
-            return Err(Error::from_reason(
-                "stack requires at least one array",
-            ));
+            return Err(Error::from_reason("stack requires at least one array"));
         }
         let handles: Vec<*mut sys::mlx_array> = arrays.iter().map(|a| a.handle.0).collect();
         let handle =
