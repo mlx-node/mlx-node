@@ -243,6 +243,16 @@ export declare class GrpoTrainingEngine {
 export type GRPOTrainingEngine = GrpoTrainingEngine;
 
 export declare class MxArray {
+  equal(other: MxArray): MxArray;
+  notEqual(other: MxArray): MxArray;
+  less(other: MxArray): MxArray;
+  lessEqual(other: MxArray): MxArray;
+  greater(other: MxArray): MxArray;
+  greaterEqual(other: MxArray): MxArray;
+  logicalAnd(other: MxArray): MxArray;
+  logicalOr(other: MxArray): MxArray;
+  logicalNot(): MxArray;
+  where(x: MxArray, y: MxArray): MxArray;
   static fromInt32(data: Int32Array, shape: BigInt64Array): MxArray;
   static fromInt64(data: BigInt64Array, shape: BigInt64Array): MxArray;
   static fromUint32(data: Uint32Array, shape: BigInt64Array): MxArray;
@@ -270,68 +280,12 @@ export declare class MxArray {
     step?: number | undefined | null,
     dtype?: DType | undefined | null,
   ): MxArray;
-  reshape(shape: BigInt64Array): MxArray;
   astype(dtype: DType): MxArray;
   /**
    * Create a copy of this array with a new handle.
    * This is useful for parameter loading to avoid handle aliasing issues.
    */
   copy(): MxArray;
-  logSoftmax(axis: number): MxArray;
-  exp(): MxArray;
-  log(): MxArray;
-  sum(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
-  mean(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
-  clip(minimum?: number | undefined | null, maximum?: number | undefined | null): MxArray;
-  minimum(other: MxArray): MxArray;
-  maximum(other: MxArray): MxArray;
-  add(other: MxArray): MxArray;
-  sub(other: MxArray): MxArray;
-  mul(other: MxArray): MxArray;
-  div(other: MxArray): MxArray;
-  addScalar(value: number): MxArray;
-  mulScalar(value: number): MxArray;
-  subScalar(value: number): MxArray;
-  divScalar(value: number): MxArray;
-  matmul(other: MxArray): MxArray;
-  /**
-   * Fused matrix multiply-add: D = beta * C + alpha * (self @ B)
-   * where self is A. More efficient than separate matmul and add operations.
-   * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
-   */
-  addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray;
-  /**
-   * Fused multimodal rotary position embedding (mRoPE)
-   *
-   * Applies rotary position embedding with multimodal section interleaving.
-   * Replaces ~38 individual graph ops per call with a single fused C++ operation.
-   *
-   * # Arguments
-   */
-  transpose(axes?: Int32Array | undefined | null): MxArray;
-  take(indices: MxArray, axis: number): MxArray;
-  takeAlongAxis(indices: MxArray, axis: number): MxArray;
-  /**
-   * Put values into array at specified indices along an axis
-   * Equivalent to: result = array.copy(); result[..., indices] = values
-   * This matches MLX's put_along_axis for efficient in-place-style updates
-   */
-  putAlongAxis(indices: MxArray, values: MxArray, axis: number): MxArray;
-  slice(starts: BigInt64Array, stops: BigInt64Array): MxArray;
-  /**
-   * Concatenate two arrays along an axis
-   * Optimized for the common binary concatenation case
-   */
-  static concatenate(a: MxArray, b: MxArray, axis: number): MxArray;
-  /**
-   * Concatenate multiple arrays along an axis
-   * For concatenating 3 or more arrays
-   */
-  static concatenateMany(arrays: Array<MxArray>, axis?: number | undefined | null): MxArray;
-  sort(axis?: number | undefined | null): MxArray;
-  argsort(axis?: number | undefined | null): MxArray;
-  partition(kth: number, axis?: number | undefined | null): MxArray;
-  argpartition(kth: number, axis?: number | undefined | null): MxArray;
   eval(): void;
   evalAsync(): Promise<undefined>;
   size(): bigint;
@@ -358,7 +312,7 @@ export declare class MxArray {
   /**
    * Copy entire array from GPU to CPU as Float32Array
    *
-   * ⚠吅 **PERFORMANCE WARNING**: This triggers a FULL GPU→CPU memory transfer!
+   * **PERFORMANCE WARNING**: This triggers a FULL GPU->CPU memory transfer!
    *
    * **Performance impact**:
    * - Forces evaluation of lazy operations
@@ -379,7 +333,7 @@ export declare class MxArray {
   /**
    * Copy entire array from GPU to CPU as Int32Array
    *
-   * ⚠吅 **PERFORMANCE WARNING**: This triggers a FULL GPU→CPU memory transfer!
+   * **PERFORMANCE WARNING**: This triggers a FULL GPU->CPU memory transfer!
    *
    * See `to_float32()` documentation for performance implications and alternatives.
    * Prefer `item_int32()` for scalars.
@@ -388,57 +342,32 @@ export declare class MxArray {
   /**
    * Copy entire array from GPU to CPU as Uint32Array
    *
-   * ⚠吅 **PERFORMANCE WARNING**: This triggers a FULL GPU→CPU memory transfer!
+   * **PERFORMANCE WARNING**: This triggers a FULL GPU->CPU memory transfer!
    *
    * See `to_float32()` documentation for performance implications and alternatives.
    */
   toUint32(): Uint32Array;
-  static stack(arrays: Array<MxArray>, axis?: number | undefined | null): MxArray;
-  static randomUniform(shape: BigInt64Array, low: number, high: number, dtype?: DType | undefined | null): MxArray;
-  static randomNormal(shape: BigInt64Array, mean: number, std: number, dtype?: DType | undefined | null): MxArray;
-  static randomBernoulli(shape: BigInt64Array, prob: number): MxArray;
-  static randint(shape: BigInt64Array, low: number, high: number): MxArray;
+  logSoftmax(axis: number): MxArray;
+  exp(): MxArray;
+  log(): MxArray;
+  clip(minimum?: number | undefined | null, maximum?: number | undefined | null): MxArray;
+  minimum(other: MxArray): MxArray;
+  maximum(other: MxArray): MxArray;
+  add(other: MxArray): MxArray;
+  sub(other: MxArray): MxArray;
+  mul(other: MxArray): MxArray;
+  div(other: MxArray): MxArray;
+  addScalar(value: number): MxArray;
+  mulScalar(value: number): MxArray;
+  subScalar(value: number): MxArray;
+  divScalar(value: number): MxArray;
+  matmul(other: MxArray): MxArray;
   /**
-   * Sample from categorical distribution
-   * Takes logits and returns sampled indices
+   * Fused matrix multiply-add: D = beta * C + alpha * (self @ B)
+   * where self is A. More efficient than separate matmul and add operations.
+   * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
    */
-  categorical(axis?: number | undefined | null): MxArray;
-  equal(other: MxArray): MxArray;
-  notEqual(other: MxArray): MxArray;
-  less(other: MxArray): MxArray;
-  lessEqual(other: MxArray): MxArray;
-  greater(other: MxArray): MxArray;
-  greaterEqual(other: MxArray): MxArray;
-  logicalAnd(other: MxArray): MxArray;
-  logicalOr(other: MxArray): MxArray;
-  logicalNot(): MxArray;
-  where(x: MxArray, y: MxArray): MxArray;
-  argmax(axis: number, keepdims?: boolean | undefined | null): MxArray;
-  argmin(axis: number, keepdims?: boolean | undefined | null): MxArray;
-  max(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
-  min(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
-  prod(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
-  var(
-    axes?: Int32Array | undefined | null,
-    keepdims?: boolean | undefined | null,
-    ddof?: number | undefined | null,
-  ): MxArray;
-  std(
-    axes?: Int32Array | undefined | null,
-    keepdims?: boolean | undefined | null,
-    ddof?: number | undefined | null,
-  ): MxArray;
-  logsumexp(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
-  cumsum(axis: number): MxArray;
-  cumprod(axis: number): MxArray;
-  pad(padWidth: Int32Array, constantValue: number): MxArray;
-  roll(shift: number, axis: number): MxArray;
-  split(indicesOrSections: number, axis?: number | undefined | null): Array<MxArray>;
-  tile(reps: Int32Array): MxArray;
-  repeat(repeats: number, axis: number): MxArray;
-  squeeze(axes?: Int32Array | undefined | null): MxArray;
-  expandDims(axis: number): MxArray;
-  broadcastTo(shape: BigInt64Array): MxArray;
+  addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray;
   abs(): MxArray;
   negative(): MxArray;
   sign(): MxArray;
@@ -484,6 +413,69 @@ export declare class MxArray {
    * This is a GPU-native operation that avoids CPU data transfer.
    */
   isfinite(): MxArray;
+  static randomUniform(shape: BigInt64Array, low: number, high: number, dtype?: DType | undefined | null): MxArray;
+  static randomNormal(shape: BigInt64Array, mean: number, std: number, dtype?: DType | undefined | null): MxArray;
+  static randomBernoulli(shape: BigInt64Array, prob: number): MxArray;
+  static randint(shape: BigInt64Array, low: number, high: number): MxArray;
+  /**
+   * Sample from categorical distribution
+   * Takes logits and returns sampled indices
+   */
+  categorical(axis?: number | undefined | null): MxArray;
+  sum(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  mean(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  argmax(axis: number, keepdims?: boolean | undefined | null): MxArray;
+  argmin(axis: number, keepdims?: boolean | undefined | null): MxArray;
+  max(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  min(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  prod(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  var(
+    axes?: Int32Array | undefined | null,
+    keepdims?: boolean | undefined | null,
+    ddof?: number | undefined | null,
+  ): MxArray;
+  std(
+    axes?: Int32Array | undefined | null,
+    keepdims?: boolean | undefined | null,
+    ddof?: number | undefined | null,
+  ): MxArray;
+  logsumexp(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  cumsum(axis: number): MxArray;
+  cumprod(axis: number): MxArray;
+  reshape(shape: BigInt64Array): MxArray;
+  transpose(axes?: Int32Array | undefined | null): MxArray;
+  take(indices: MxArray, axis: number): MxArray;
+  takeAlongAxis(indices: MxArray, axis: number): MxArray;
+  /**
+   * Put values into array at specified indices along an axis
+   * Equivalent to: result = array.copy(); result[..., indices] = values
+   * This matches MLX's put_along_axis for efficient in-place-style updates
+   */
+  putAlongAxis(indices: MxArray, values: MxArray, axis: number): MxArray;
+  slice(starts: BigInt64Array, stops: BigInt64Array): MxArray;
+  /**
+   * Concatenate two arrays along an axis
+   * Optimized for the common binary concatenation case
+   */
+  static concatenate(a: MxArray, b: MxArray, axis: number): MxArray;
+  /**
+   * Concatenate multiple arrays along an axis
+   * For concatenating 3 or more arrays
+   */
+  static concatenateMany(arrays: Array<MxArray>, axis?: number | undefined | null): MxArray;
+  sort(axis?: number | undefined | null): MxArray;
+  argsort(axis?: number | undefined | null): MxArray;
+  partition(kth: number, axis?: number | undefined | null): MxArray;
+  argpartition(kth: number, axis?: number | undefined | null): MxArray;
+  static stack(arrays: Array<MxArray>, axis?: number | undefined | null): MxArray;
+  pad(padWidth: Int32Array, constantValue: number): MxArray;
+  roll(shift: number, axis: number): MxArray;
+  split(indicesOrSections: number, axis?: number | undefined | null): Array<MxArray>;
+  tile(reps: Int32Array): MxArray;
+  repeat(repeats: number, axis: number): MxArray;
+  squeeze(axes?: Int32Array | undefined | null): MxArray;
+  expandDims(axis: number): MxArray;
+  broadcastTo(shape: BigInt64Array): MxArray;
 }
 
 /** NAPI-exported reward registry wrapper */
