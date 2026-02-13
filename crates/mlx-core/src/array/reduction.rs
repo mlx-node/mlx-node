@@ -3,11 +3,35 @@ use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+/// Validate that all axes are within bounds for the array's dimensions.
+/// Negative axes are normalized (axis + ndim) before checking bounds [0, ndim).
+/// This prevents invalid axes from reaching the C++ FFI boundary where an
+/// uncaught exception would be undefined behavior.
+fn validate_axes(arr: &MxArray, axes: &[i32], context: &str) -> Result<()> {
+    let ndim = arr.ndim()? as i32;
+    for &axis in axes {
+        let normalized = if axis < 0 { axis + ndim } else { axis };
+        if normalized < 0 || normalized >= ndim {
+            return Err(Error::from_reason(format!(
+                "{}: axis {} is out of bounds for array with {} dimension{}",
+                context,
+                axis,
+                ndim,
+                if ndim == 1 { "" } else { "s" },
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[napi]
 impl MxArray {
     #[napi]
     pub fn sum(&self, axes: Option<&[i32]>, keepdims: Option<bool>) -> Result<MxArray> {
         let axes_vec = axes.unwrap_or_default();
+        if !axes_vec.is_empty() {
+            validate_axes(self, axes_vec, "sum")?;
+        }
         let handle = unsafe {
             sys::mlx_array_sum(
                 self.handle.0,
@@ -22,6 +46,9 @@ impl MxArray {
     #[napi]
     pub fn mean(&self, axes: Option<&[i32]>, keepdims: Option<bool>) -> Result<MxArray> {
         let axes_vec = axes.unwrap_or_default();
+        if !axes_vec.is_empty() {
+            validate_axes(self, axes_vec, "mean")?;
+        }
         let handle = unsafe {
             sys::mlx_array_mean(
                 self.handle.0,
@@ -50,6 +77,9 @@ impl MxArray {
     #[napi]
     pub fn max(&self, axes: Option<&[i32]>, keepdims: Option<bool>) -> Result<MxArray> {
         let axes_vec = axes.unwrap_or_default();
+        if !axes_vec.is_empty() {
+            validate_axes(self, axes_vec, "max")?;
+        }
         let handle = unsafe {
             sys::mlx_array_max(
                 self.handle.0,
@@ -64,6 +94,9 @@ impl MxArray {
     #[napi]
     pub fn min(&self, axes: Option<&[i32]>, keepdims: Option<bool>) -> Result<MxArray> {
         let axes_vec = axes.unwrap_or_default();
+        if !axes_vec.is_empty() {
+            validate_axes(self, axes_vec, "min")?;
+        }
         let handle = unsafe {
             sys::mlx_array_min(
                 self.handle.0,
@@ -78,6 +111,9 @@ impl MxArray {
     #[napi]
     pub fn prod(&self, axes: Option<&[i32]>, keepdims: Option<bool>) -> Result<MxArray> {
         let axes_vec = axes.unwrap_or_default();
+        if !axes_vec.is_empty() {
+            validate_axes(self, axes_vec, "prod")?;
+        }
         let handle = unsafe {
             sys::mlx_array_prod(
                 self.handle.0,
@@ -97,6 +133,9 @@ impl MxArray {
         ddof: Option<i32>,
     ) -> Result<MxArray> {
         let axes_vec = axes.unwrap_or_default();
+        if !axes_vec.is_empty() {
+            validate_axes(self, axes_vec, "var")?;
+        }
         let handle = unsafe {
             sys::mlx_array_var(
                 self.handle.0,
@@ -117,6 +156,9 @@ impl MxArray {
         ddof: Option<i32>,
     ) -> Result<MxArray> {
         let axes_vec = axes.unwrap_or_default();
+        if !axes_vec.is_empty() {
+            validate_axes(self, axes_vec, "std")?;
+        }
         let handle = unsafe {
             sys::mlx_array_std(
                 self.handle.0,
@@ -132,6 +174,9 @@ impl MxArray {
     #[napi]
     pub fn logsumexp(&self, axes: Option<&[i32]>, keepdims: Option<bool>) -> Result<MxArray> {
         let axes_vec = axes.unwrap_or_default();
+        if !axes_vec.is_empty() {
+            validate_axes(self, axes_vec, "logsumexp")?;
+        }
         let handle = unsafe {
             sys::mlx_array_logsumexp(
                 self.handle.0,

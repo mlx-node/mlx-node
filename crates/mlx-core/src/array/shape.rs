@@ -55,6 +55,14 @@ impl MxArray {
                 "slice starts/stops must have same length",
             ));
         }
+        let ndim = self.ndim()? as usize;
+        if starts.len() != ndim {
+            return Err(Error::from_reason(format!(
+                "slice: expected {} dimensions but got {}",
+                ndim,
+                starts.len()
+            )));
+        }
         let handle = unsafe {
             sys::mlx_array_slice(self.handle.0, starts.as_ptr(), stops.as_ptr(), starts.len())
         };
@@ -161,6 +169,11 @@ impl MxArray {
 
     #[napi]
     pub fn stack(arrays: Vec<&MxArray>, axis: Option<i32>) -> Result<MxArray> {
+        if arrays.is_empty() {
+            return Err(Error::from_reason(
+                "stack requires at least one array",
+            ));
+        }
         let handles: Vec<*mut sys::mlx_array> = arrays.iter().map(|a| a.handle.0).collect();
         let handle =
             unsafe { sys::mlx_array_stack(handles.as_ptr(), handles.len(), axis.unwrap_or(0)) };
@@ -175,6 +188,13 @@ impl MxArray {
             ));
         }
         let ndim = pad_width.len() / 2;
+        let actual_ndim = self.ndim()? as usize;
+        if ndim != actual_ndim {
+            return Err(Error::from_reason(format!(
+                "pad: pad_width specifies {} dimensions but array has {}",
+                ndim, actual_ndim
+            )));
+        }
         let handle = unsafe {
             sys::mlx_array_pad(
                 self.handle.0,
@@ -224,42 +244,6 @@ impl MxArray {
         let mut result = Vec::with_capacity(count);
         for handle in handles.iter().take(count) {
             let array = MxArray::from_handle(*handle as *mut sys::mlx_array, "split")?;
-            result.push(array);
-        }
-
-        Ok(result)
-    }
-
-    /// Split array at specific indices along an axis
-    ///
-    /// Like numpy/MLX split with indices: splits the array at the given positions.
-    /// e.g., split_at_indices([32, 80], axis=-1) on a dim-128 tensor gives 3 parts:
-    /// [0:32], [32:80], [80:128]
-    pub fn split_at_indices(&self, indices: &[i32], axis: i32) -> Result<Vec<MxArray>> {
-        let max_splits = indices.len() + 1; // n indices -> n+1 parts
-        let mut handles = vec![0u64; max_splits];
-
-        let count = unsafe {
-            sys::mlx_array_split_at_indices(
-                self.handle.0,
-                indices.as_ptr(),
-                indices.len(),
-                axis,
-                handles.as_mut_ptr(),
-                max_splits,
-            )
-        };
-
-        if count == 0 && !indices.is_empty() {
-            return Err(Error::new(
-                Status::GenericFailure,
-                "Failed to split array at indices",
-            ));
-        }
-
-        let mut result = Vec::with_capacity(count);
-        for handle in handles.iter().take(count) {
-            let array = MxArray::from_handle(*handle as *mut sys::mlx_array, "split_at_indices")?;
             result.push(array);
         }
 

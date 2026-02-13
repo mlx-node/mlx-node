@@ -496,14 +496,6 @@ unsafe extern "C" {
         out_handles: *mut u64,
         max_outputs: usize,
     ) -> usize;
-    pub fn mlx_array_split_at_indices(
-        handle: *mut mlx_array,
-        indices: *const i32,
-        indices_len: usize,
-        axis: i32,
-        out_handles: *mut u64,
-        max_outputs: usize,
-    ) -> usize;
     pub fn mlx_array_tile(
         handle: *mut mlx_array,
         reps: *const i32,

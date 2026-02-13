@@ -1967,24 +1967,6 @@ size_t mlx_array_split_multi(mlx_array* handle,
   return count;
 }
 
-// Split at specific indices along an axis, returns multiple array handles
-size_t mlx_array_split_at_indices(mlx_array* handle,
-                                  const int32_t* indices,
-                                  size_t indices_len,
-                                  int32_t axis,
-                                  uint64_t* out_handles,
-                                  size_t max_outputs) {
-  auto arr = reinterpret_cast<array*>(handle);
-  mlx::core::Shape idx_vec(indices, indices + indices_len);
-  auto splits = mlx::core::split(*arr, idx_vec, axis);
-  size_t count = std::min(splits.size(), max_outputs);
-  for (size_t i = 0; i < count; ++i) {
-    out_handles[i] =
-        reinterpret_cast<uint64_t>(new array(std::move(splits[i])));
-  }
-  return count;
-}
-
 // Keep the old single-output version for backwards compatibility
 mlx_array* mlx_array_split(mlx_array* handle,
                            int32_t indices_or_sections,
