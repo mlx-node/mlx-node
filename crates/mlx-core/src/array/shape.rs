@@ -197,6 +197,11 @@ impl MxArray {
         let axis_val = axis.unwrap_or(0);
 
         // split(N) produces exactly N equal parts
+        if indices_or_sections <= 0 {
+            return Err(Error::from_reason(
+                "split: indices_or_sections must be a positive integer",
+            ));
+        }
         let num_splits = indices_or_sections as usize;
         let mut handles = vec![0u64; num_splits];
 
