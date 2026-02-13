@@ -3,10 +3,22 @@ use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+fn validate_data_shape(data_len: usize, shape: &[i64], context: &str) -> Result<()> {
+    let expected: usize = shape.iter().map(|&d| d as usize).product();
+    if data_len != expected {
+        return Err(Error::from_reason(format!(
+            "{}: data length {} does not match shape {:?} (expected {})",
+            context, data_len, shape, expected
+        )));
+    }
+    Ok(())
+}
+
 #[napi]
 impl MxArray {
     #[napi]
     pub fn from_int32(data: &[i32], shape: &[i64]) -> Result<Self> {
+        validate_data_shape(data.len(), shape, "from_int32")?;
         let handle =
             unsafe { sys::mlx_array_from_int32(data.as_ptr(), shape.as_ptr(), shape.len()) };
         MxArray::from_handle(handle, "array_from_int32")
@@ -14,6 +26,7 @@ impl MxArray {
 
     #[napi]
     pub fn from_int64(data: &[i64], shape: &[i64]) -> Result<Self> {
+        validate_data_shape(data.len(), shape, "from_int64")?;
         let handle =
             unsafe { sys::mlx_array_from_int64(data.as_ptr(), shape.as_ptr(), shape.len()) };
         MxArray::from_handle(handle, "array_from_int64")
@@ -21,6 +34,7 @@ impl MxArray {
 
     #[napi]
     pub fn from_uint32(data: &[u32], shape: &[i64]) -> Result<Self> {
+        validate_data_shape(data.len(), shape, "from_uint32")?;
         let handle =
             unsafe { sys::mlx_array_from_uint32(data.as_ptr(), shape.as_ptr(), shape.len()) };
         MxArray::from_handle(handle, "array_from_uint32")
@@ -28,6 +42,7 @@ impl MxArray {
 
     #[napi]
     pub fn from_float32(data: &[f32], shape: &[i64]) -> Result<Self> {
+        validate_data_shape(data.len(), shape, "from_float32")?;
         let handle =
             unsafe { sys::mlx_array_from_float32(data.as_ptr(), shape.as_ptr(), shape.len()) };
         MxArray::from_handle(handle, "array_from_float32")
@@ -37,6 +52,7 @@ impl MxArray {
     /// This enables zero-copy loading of bf16 weights from safetensors.
     /// The input is the raw bytes reinterpreted as u16 (2 bytes per element).
     pub fn from_bfloat16(data: &[u16], shape: &[i64]) -> Result<Self> {
+        validate_data_shape(data.len(), shape, "from_bfloat16")?;
         let handle =
             unsafe { sys::mlx_array_from_bfloat16(data.as_ptr(), shape.as_ptr(), shape.len()) };
         MxArray::from_handle(handle, "array_from_bfloat16")
@@ -46,6 +62,7 @@ impl MxArray {
     /// This enables zero-copy loading of f16 weights from safetensors.
     /// The input is the raw bytes reinterpreted as u16 (2 bytes per element).
     pub fn from_float16(data: &[u16], shape: &[i64]) -> Result<Self> {
+        validate_data_shape(data.len(), shape, "from_float16")?;
         let handle =
             unsafe { sys::mlx_array_from_float16(data.as_ptr(), shape.as_ptr(), shape.len()) };
         MxArray::from_handle(handle, "array_from_float16")

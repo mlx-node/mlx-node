@@ -132,21 +132,13 @@ impl MxArray {
     #[napi]
     pub fn logsumexp(&self, axes: Option<&[i32]>, keepdims: Option<bool>) -> Result<MxArray> {
         let axes_vec = axes.unwrap_or_default();
-        // If no axes provided, compute over all dimensions
-        let handle = if axes_vec.is_empty() {
-            // Use -1 to indicate reduction over all axes
-            unsafe { sys::mlx_array_logsumexp(self.handle.0, -1, keepdims.unwrap_or(false)) }
-        } else if axes_vec.len() == 1 {
-            // Single axis case
-            unsafe {
-                sys::mlx_array_logsumexp(self.handle.0, axes_vec[0], keepdims.unwrap_or(false))
-            }
-        } else {
-            // Multiple axes not supported by the C++ interface currently
-            // Would need to add mlx_array_logsumexp_axes function
-            return Err(Error::from_reason(
-                "logsumexp with multiple axes is not yet supported",
-            ));
+        let handle = unsafe {
+            sys::mlx_array_logsumexp(
+                self.handle.0,
+                axes_vec.as_ptr(),
+                axes_vec.len(),
+                keepdims.unwrap_or(false),
+            )
         };
         MxArray::from_handle(handle, "logsumexp")
     }

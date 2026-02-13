@@ -196,10 +196,9 @@ impl MxArray {
     pub fn split(&self, indices_or_sections: i32, axis: Option<i32>) -> Result<Vec<MxArray>> {
         let axis_val = axis.unwrap_or(0);
 
-        // First, allocate space for the handles
-        // Maximum reasonable number of splits
-        let max_splits = 100;
-        let mut handles = vec![0u64; max_splits];
+        // split(N) produces exactly N equal parts
+        let num_splits = indices_or_sections as usize;
+        let mut handles = vec![0u64; num_splits];
 
         // Call the split function
         let count = unsafe {
@@ -208,7 +207,7 @@ impl MxArray {
                 indices_or_sections,
                 axis_val,
                 handles.as_mut_ptr(),
-                max_splits,
+                num_splits,
             )
         };
 

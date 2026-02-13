@@ -421,10 +421,14 @@ mlx_array* mlx_array_log_softmax(mlx_array* handle, int32_t axis) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
-mlx_array* mlx_array_logsumexp(mlx_array* handle, int32_t axis, bool keepdims) {
+mlx_array* mlx_array_logsumexp(mlx_array* handle,
+                               const int32_t* axes,
+                               size_t axes_len,
+                               bool keepdims) {
   auto arr = reinterpret_cast<array*>(handle);
-  std::vector<int> axes{axis};
-  array result = logsumexp(*arr, axes, keepdims);
+  array result = (axes_len == 0)
+                     ? logsumexp(*arr, keepdims)
+                     : logsumexp(*arr, make_axes(axes, axes_len), keepdims);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -1896,8 +1900,9 @@ mlx_array* mlx_array_var(mlx_array* handle,
                          bool keepdims,
                          int32_t ddof) {
   auto arr = reinterpret_cast<array*>(handle);
-  std::vector<int> target_axes = make_axes(axes, axes_len);
-  array result = mlx::core::var(*arr, target_axes, keepdims, ddof);
+  array result = (axes_len == 0)
+                     ? mlx::core::var(*arr, keepdims, ddof)
+                     : mlx::core::var(*arr, make_axes(axes, axes_len), keepdims, ddof);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -1907,8 +1912,9 @@ mlx_array* mlx_array_std(mlx_array* handle,
                          bool keepdims,
                          int32_t ddof) {
   auto arr = reinterpret_cast<array*>(handle);
-  std::vector<int> target_axes = make_axes(axes, axes_len);
-  array result = mlx::core::std(*arr, target_axes, keepdims, ddof);
+  array result = (axes_len == 0)
+                     ? mlx::core::std(*arr, keepdims, ddof)
+                     : mlx::core::std(*arr, make_axes(axes, axes_len), keepdims, ddof);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 

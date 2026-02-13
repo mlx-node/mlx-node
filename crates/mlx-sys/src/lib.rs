@@ -59,8 +59,12 @@ unsafe extern "C" {
     pub fn mlx_array_astype(handle: *mut mlx_array, dtype: i32) -> *mut mlx_array;
     pub fn mlx_array_copy(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log_softmax(handle: *mut mlx_array, axis: i32) -> *mut mlx_array;
-    pub fn mlx_array_logsumexp(handle: *mut mlx_array, axis: i32, keepdims: bool)
-    -> *mut mlx_array;
+    pub fn mlx_array_logsumexp(
+        handle: *mut mlx_array,
+        axes: *const i32,
+        axes_len: usize,
+        keepdims: bool,
+    ) -> *mut mlx_array;
     pub fn mlx_array_softmax(handle: *mut mlx_array, axis: i32) -> *mut mlx_array;
     pub fn mlx_array_sigmoid(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_exp(handle: *mut mlx_array) -> *mut mlx_array;
