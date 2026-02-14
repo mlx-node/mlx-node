@@ -2,7 +2,9 @@
 export type { CompletionInfo, RewardOutput } from '@mlx-node/core';
 import type { RewardOutput } from '@mlx-node/core';
 
-export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
+// Re-export ChatRole from @mlx-node/lm (single source of truth)
+import type { ChatRole } from '@mlx-node/lm';
+export type { ChatRole };
 
 export interface ChatMessage {
   role: ChatRole;
