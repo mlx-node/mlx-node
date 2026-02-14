@@ -62,6 +62,7 @@ impl MxArray {
 
     #[napi]
     pub fn argmax(&self, axis: i32, keepdims: Option<bool>) -> Result<MxArray> {
+        validate_axes(self, &[axis], "argmax")?;
         let handle =
             unsafe { sys::mlx_array_argmax(self.handle.0, axis, keepdims.unwrap_or(false)) };
         MxArray::from_handle(handle, "argmax")
@@ -69,6 +70,7 @@ impl MxArray {
 
     #[napi]
     pub fn argmin(&self, axis: i32, keepdims: Option<bool>) -> Result<MxArray> {
+        validate_axes(self, &[axis], "argmin")?;
         let handle =
             unsafe { sys::mlx_array_argmin(self.handle.0, axis, keepdims.unwrap_or(false)) };
         MxArray::from_handle(handle, "argmin")
@@ -190,12 +192,14 @@ impl MxArray {
 
     #[napi]
     pub fn cumsum(&self, axis: i32) -> Result<MxArray> {
+        validate_axes(self, &[axis], "cumsum")?;
         let handle = unsafe { sys::mlx_array_cumsum(self.handle.0, axis) };
         MxArray::from_handle(handle, "cumsum")
     }
 
     #[napi]
     pub fn cumprod(&self, axis: i32) -> Result<MxArray> {
+        validate_axes(self, &[axis], "cumprod")?;
         let handle = unsafe { sys::mlx_array_cumprod(self.handle.0, axis) };
         MxArray::from_handle(handle, "cumprod")
     }
