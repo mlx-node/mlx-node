@@ -530,6 +530,123 @@ mod tests {
     }
 
     // ========================================================================
+    // Optimizer State Lifecycle Tests
+    // ========================================================================
+
+    #[test]
+    fn test_adam_state_count_tracks_params() {
+        let mut adam = Adam::new(Some(0.001), None, None, None, None);
+        assert_eq!(adam.state_count(), 0);
+
+        let param1 = create_param(&[1.0, 2.0], &[2]);
+        let param2 = create_param(&[3.0, 4.0], &[2]);
+        let grad = create_param(&[0.1, 0.2], &[2]);
+
+        adam.update_single("p1".to_string(), &param1, &grad)
+            .unwrap();
+        assert_eq!(adam.state_count(), 1);
+
+        adam.update_single("p2".to_string(), &param2, &grad)
+            .unwrap();
+        assert_eq!(adam.state_count(), 2);
+
+        // Updating existing param doesn't increase count
+        adam.update_single("p1".to_string(), &param1, &grad)
+            .unwrap();
+        assert_eq!(adam.state_count(), 2);
+    }
+
+    #[test]
+    fn test_adam_reset_clears_all_state() {
+        let mut adam = Adam::new(Some(0.001), None, None, None, None);
+        let param = create_param(&[1.0, 2.0], &[2]);
+        let grad = create_param(&[0.1, 0.2], &[2]);
+
+        // Accumulate state for multiple params
+        for i in 0..5 {
+            adam.update_single(format!("param_{}", i), &param, &grad)
+                .unwrap();
+        }
+        assert_eq!(adam.state_count(), 5);
+        assert_eq!(adam.get_step(), 5);
+
+        // Reset should clear everything
+        adam.reset();
+        assert_eq!(adam.state_count(), 0);
+        assert_eq!(adam.get_step(), 0);
+        assert!(adam.get_state_keys().is_empty());
+    }
+
+    #[test]
+    fn test_adamw_reset_clears_all_state() {
+        let mut adamw = AdamW::new(Some(0.001), None, None, None, None, None);
+        let param = create_param(&[1.0, 2.0], &[2]);
+        let grad = create_param(&[0.1, 0.2], &[2]);
+
+        for i in 0..5 {
+            adamw
+                .update_single(format!("param_{}", i), &param, &grad)
+                .unwrap();
+        }
+        assert_eq!(adamw.state_count(), 5);
+
+        adamw.reset();
+        assert_eq!(adamw.state_count(), 0);
+        assert_eq!(adamw.get_step(), 0);
+    }
+
+    #[test]
+    fn test_sgd_reset_clears_all_state() {
+        let mut sgd = SGD::new(0.1, Some(0.9), None, None, None).unwrap();
+        let param = create_param(&[1.0, 2.0], &[2]);
+        let grad = create_param(&[0.1, 0.2], &[2]);
+
+        for i in 0..5 {
+            sgd.update_single(format!("param_{}", i), &param, &grad)
+                .unwrap();
+        }
+        assert_eq!(sgd.state_count(), 5);
+
+        sgd.reset();
+        assert_eq!(sgd.state_count(), 0);
+    }
+
+    #[test]
+    fn test_rmsprop_reset_clears_all_state() {
+        let mut rmsprop = RMSprop::new(Some(0.01), None, None, None);
+        let param = create_param(&[1.0, 2.0], &[2]);
+        let grad = create_param(&[0.1, 0.2], &[2]);
+
+        for i in 0..5 {
+            rmsprop
+                .update_single(format!("param_{}", i), &param, &grad)
+                .unwrap();
+        }
+        assert_eq!(rmsprop.state_count(), 5);
+
+        rmsprop.reset();
+        assert_eq!(rmsprop.state_count(), 0);
+    }
+
+    #[test]
+    fn test_batch_update_state_count() {
+        let mut adam = Adam::new(Some(0.001), None, None, None, None);
+        let param1 = create_param(&[1.0, 2.0], &[2]);
+        let param2 = create_param(&[3.0, 4.0], &[2]);
+        let grad1 = create_param(&[0.1, 0.2], &[2]);
+        let grad2 = create_param(&[0.3, 0.4], &[2]);
+
+        adam.update_batch(
+            vec!["p1".to_string(), "p2".to_string()],
+            vec![&param1, &param2],
+            vec![&grad1, &grad2],
+        )
+        .unwrap();
+
+        assert_eq!(adam.state_count(), 2);
+    }
+
+    // ========================================================================
     // Gradient Utils Tests
     // ========================================================================
 

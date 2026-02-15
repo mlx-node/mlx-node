@@ -170,6 +170,15 @@ impl RMSprop {
         self.state.clear();
     }
 
+    /// Returns the number of parameters with tracked optimizer state.
+    ///
+    /// Useful for monitoring memory usage. Each tracked parameter stores
+    /// a running average tensor (v) with the same shape as the parameter.
+    /// State is created on first update and cleared by `reset()`.
+    pub fn state_count(&self) -> usize {
+        self.state.len()
+    }
+
     fn init_state(&mut self, param_name: &str, shape: &[i64]) {
         let v = MxArray::zeros(shape, None).unwrap();
         self.state

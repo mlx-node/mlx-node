@@ -207,4 +207,13 @@ impl SGD {
     pub fn reset(&mut self) {
         self.state.clear();
     }
+
+    /// Returns the number of parameters with tracked optimizer state.
+    ///
+    /// Useful for monitoring memory usage. Each tracked parameter stores
+    /// a velocity tensor with the same shape as the parameter (when momentum > 0).
+    /// State is created on first update and cleared by `reset()`.
+    pub fn state_count(&self) -> usize {
+        self.state.len()
+    }
 }

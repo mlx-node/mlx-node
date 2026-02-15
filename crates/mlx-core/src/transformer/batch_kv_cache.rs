@@ -156,6 +156,20 @@ impl BatchKVCache {
     /// cache.filter([0, 2]);
     /// ```
     pub fn filter(&mut self, batch_indices: &[i32]) -> Result<()> {
+        // Validate all indices are in range
+        let batch_size = self.offset.len();
+        for &i in batch_indices {
+            if i < 0 || (i as usize) >= batch_size {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "Invalid batch index {} in filter: batch_size is {}",
+                        i, batch_size
+                    ),
+                ));
+            }
+        }
+
         // Filter offset and left_padding arrays (always do this, even if cache is empty)
         let new_offset: Vec<i32> = batch_indices
             .iter()
@@ -509,6 +523,79 @@ mod tests {
 
         assert_eq!(cache.batch_size(), 2);
         assert_eq!(cache.get_offsets().len(), 2);
+    }
+
+    #[test]
+    fn test_filter_out_of_bounds() {
+        let mut cache = BatchKVCache::new(vec![0, 0, 0].into());
+
+        let keys = MxArray::zeros(&[3, 2, 4, 8], None).unwrap();
+        let values = MxArray::zeros(&[3, 2, 4, 8], None).unwrap();
+        cache.update_and_fetch(&keys, &values).unwrap();
+
+        // Index 5 is out of bounds for batch_size 3
+        let result = cache.filter(&[0, 5]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid batch index")
+        );
+    }
+
+    #[test]
+    fn test_filter_negative_index() {
+        let mut cache = BatchKVCache::new(vec![0, 0, 0].into());
+
+        let keys = MxArray::zeros(&[3, 2, 4, 8], None).unwrap();
+        let values = MxArray::zeros(&[3, 2, 4, 8], None).unwrap();
+        cache.update_and_fetch(&keys, &values).unwrap();
+
+        // Negative index is invalid
+        let result = cache.filter(&[0, -1]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid batch index")
+        );
+    }
+
+    #[test]
+    fn test_filter_empty_indices() {
+        let mut cache = BatchKVCache::new(vec![0, 0, 0].into());
+
+        let keys = MxArray::zeros(&[3, 2, 4, 8], None).unwrap();
+        let values = MxArray::zeros(&[3, 2, 4, 8], None).unwrap();
+        cache.update_and_fetch(&keys, &values).unwrap();
+
+        // Filter to empty batch
+        cache.filter(&[]).unwrap();
+        assert_eq!(cache.batch_size(), 0);
+    }
+
+    #[test]
+    fn test_filter_duplicate_indices() {
+        let mut cache = BatchKVCache::new(vec![0, 0, 0].into());
+
+        let keys = MxArray::zeros(&[3, 2, 4, 8], None).unwrap();
+        let values = MxArray::zeros(&[3, 2, 4, 8], None).unwrap();
+        cache.update_and_fetch(&keys, &values).unwrap();
+
+        // Duplicate indices should work (duplicates batch element)
+        cache.filter(&[1, 1]).unwrap();
+        assert_eq!(cache.batch_size(), 2);
+    }
+
+    #[test]
+    fn test_filter_empty_cache() {
+        let mut cache = BatchKVCache::new(vec![0, 0, 0].into());
+
+        // Filter before any update (cache is empty, but metadata exists)
+        cache.filter(&[0, 2]).unwrap();
+        assert_eq!(cache.batch_size(), 2);
     }
 
     #[test]

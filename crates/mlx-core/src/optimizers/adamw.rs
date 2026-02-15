@@ -222,6 +222,15 @@ impl AdamW {
         self.step = step;
     }
 
+    /// Returns the number of parameters with tracked optimizer state.
+    ///
+    /// Useful for monitoring memory usage. Each tracked parameter stores
+    /// two moment tensors (m and v) with the same shape as the parameter.
+    /// State is created on first update and cleared by `reset()`.
+    pub fn state_count(&self) -> usize {
+        self.state.len()
+    }
+
     /// Get all parameter names that have optimizer state
     ///
     /// Useful for inspecting which parameters the optimizer is tracking.
