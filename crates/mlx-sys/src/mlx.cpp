@@ -5021,4 +5021,54 @@ mlx_array* mlx_conv_transpose2d(
     return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
 }
 
+// ============================================
+// Conv1d
+// ============================================
+
+mlx_array* mlx_conv1d(
+    mlx_array* input,
+    mlx_array* weight,
+    int stride,
+    int padding,
+    int dilation,
+    int groups
+) {
+    auto inp = reinterpret_cast<mlx::core::array*>(input);
+    auto wt = reinterpret_cast<mlx::core::array*>(weight);
+    mlx::core::array result = mlx::core::conv1d(
+        *inp, *wt, stride, padding, dilation, groups
+    );
+    return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+}
+
+// ============================================
+// Gather MM (for MoE / SwitchLinear)
+// ============================================
+
+mlx_array* mlx_gather_mm(
+    mlx_array* a,
+    mlx_array* b,
+    mlx_array* lhs_indices,
+    mlx_array* rhs_indices,
+    bool sorted_indices
+) {
+    auto a_arr = reinterpret_cast<mlx::core::array*>(a);
+    auto b_arr = reinterpret_cast<mlx::core::array*>(b);
+
+    // Build optional index arrays - nullptr means no indexing on that side
+    std::optional<mlx::core::array> lhs_opt = std::nullopt;
+    std::optional<mlx::core::array> rhs_opt = std::nullopt;
+    if (lhs_indices != nullptr) {
+        lhs_opt = *reinterpret_cast<mlx::core::array*>(lhs_indices);
+    }
+    if (rhs_indices != nullptr) {
+        rhs_opt = *reinterpret_cast<mlx::core::array*>(rhs_indices);
+    }
+
+    mlx::core::array result = mlx::core::gather_mm(
+        *a_arr, *b_arr, lhs_opt, rhs_opt, sorted_indices
+    );
+    return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+}
+
 }  // End extern "C"

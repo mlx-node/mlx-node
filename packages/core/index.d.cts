@@ -621,6 +621,48 @@ export declare class OutputStore {
 }
 
 /**
+ * Qwen3.5 Model — hybrid linear/full attention with optional MoE.
+ *
+ * Inference-only implementation. Supports both dense and MoE variants.
+ */
+export declare class Qwen35Model {
+  /** Create a new Qwen3.5 model with the given configuration. */
+  constructor(config: Qwen35Config);
+  /** Initialize caches for incremental generation. */
+  initCaches(): void;
+  /** Reset all caches. */
+  resetCaches(): void;
+  /**
+   * Forward pass through the model.
+   *
+   * # Arguments
+   * * `input_ids` - Token IDs [B, T]
+   *
+   * # Returns
+   * Logits [B, T, vocab_size]
+   */
+  forward(inputIds: MxArray): MxArray;
+  /** Forward pass with cache for incremental generation. */
+  forwardWithCache(inputIds: MxArray): MxArray;
+  /**
+   * Load a pretrained model from a directory.
+   *
+   * Expects the directory to contain:
+   * - config.json
+   * - model.safetensors (or model-*.safetensors)
+   * - tokenizer.json + tokenizer_config.json
+   */
+  static loadPretrained(path: string): Promise<Qwen35Model>;
+  /** Generate text from a prompt token sequence. */
+  generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Qwen35GenerationResult;
+  /** Chat API with tool calling support. */
+  chat(messages: Array<ChatMessage>, config?: Qwen35ChatConfig | undefined | null): Qwen35ChatResult;
+  /** Get the number of parameters in the model. */
+  numParameters(): number;
+}
+export type Qwen3_5Model = Qwen35Model;
+
+/**
  * Qwen3 Model with automatic differentiation support
  *
  * Uses interior mutability (RwLock) for layers, final_norm, and lm_head
@@ -2478,6 +2520,79 @@ export interface ParseToolCallsResult {
 
 /** Parse VLM output into structured document */
 export declare function parseVlmOutput(text: string): ParsedDocument;
+
+/** Chat configuration for Qwen3.5 */
+export interface Qwen35ChatConfig {
+  maxNewTokens?: number | undefined;
+  temperature?: number | undefined;
+  topK?: number | undefined;
+  topP?: number | undefined;
+  minP?: number | undefined;
+  tools?: object[] | undefined;
+}
+
+/** Chat result */
+export interface Qwen35ChatResult {
+  text: string;
+  thinking?: string;
+  numTokens: number;
+  finishReason: string;
+}
+
+/**
+ * Qwen3.5 model configuration.
+ *
+ * Supports both dense and MoE variants. MoE fields are optional -
+ * when `num_experts` is 0 or None, the model uses dense MLP layers.
+ */
+export interface Qwen35Config {
+  vocabSize: number;
+  hiddenSize: number;
+  numLayers: number;
+  numHeads: number;
+  numKvHeads: number;
+  intermediateSize: number;
+  rmsNormEps: number;
+  headDim: number;
+  tieWordEmbeddings: boolean;
+  attentionBias: boolean;
+  maxPositionEmbeddings: number;
+  padTokenId: number;
+  eosTokenId: number;
+  bosTokenId: number;
+  linearNumValueHeads: number;
+  linearNumKeyHeads: number;
+  linearKeyHeadDim: number;
+  linearValueHeadDim: number;
+  linearConvKernelDim: number;
+  fullAttentionInterval: number;
+  partialRotaryFactor: number;
+  ropeTheta: number;
+  numExperts?: number | undefined;
+  numExpertsPerTok?: number | undefined;
+  decoderSparseStep?: number | undefined;
+  sharedExpertIntermediateSize?: number | undefined;
+  moeIntermediateSize?: number | undefined;
+  normTopkProb?: boolean | undefined;
+  mlpOnlyLayers?: number[] | undefined;
+}
+
+/** Generation configuration for Qwen3.5 */
+export interface Qwen35GenerationConfig {
+  maxNewTokens: number;
+  temperature?: number | undefined;
+  topK?: number | undefined;
+  topP?: number | undefined;
+  minP?: number | undefined;
+}
+
+/** Generation result */
+export interface Qwen35GenerationResult {
+  tokens: Array<number>;
+  text: string;
+  numTokens: number;
+  finishReason: string;
+}
 
 /** Qwen3 model configuration */
 export interface Qwen3Config {

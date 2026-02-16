@@ -876,6 +876,29 @@ unsafe extern "C" {
         out_kv_values: *mut *mut mlx_array,
         out_cache_idx: *mut i32,
     );
+
+    // ============================================
+    // Conv1d
+    // ============================================
+    pub fn mlx_conv1d(
+        input: *mut mlx_array,
+        weight: *mut mlx_array,
+        stride: i32,
+        padding: i32,
+        dilation: i32,
+        groups: i32,
+    ) -> *mut mlx_array;
+
+    // ============================================
+    // Gather MM (for MoE / SwitchLinear)
+    // ============================================
+    pub fn mlx_gather_mm(
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        lhs_indices: *mut mlx_array,  // nullable
+        rhs_indices: *mut mlx_array,  // nullable
+        sorted_indices: bool,
+    ) -> *mut mlx_array;
 }
 
 // Gradient computation types

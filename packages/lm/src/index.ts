@@ -15,6 +15,7 @@
 
 // Model classes (for inference)
 export { Qwen3Model, Qwen3Tokenizer } from '@mlx-node/core';
+export { Qwen3_5Model } from '@mlx-node/core';
 
 // Note: Memory management is handled internally by Rust - not exposed to JS
 

@@ -208,4 +208,22 @@ impl Activations {
         let silu_gate = Self::silu(gate)?;
         silu_gate.mul(up)
     }
+
+    /// Softplus: log(1 + exp(x))
+    /// Used in GatedDeltaNet for computing decay rates.
+    pub fn softplus(input: &MxArray) -> Result<MxArray> {
+        let handle = unsafe {
+            let exp_x = sys::mlx_array_exp(input.handle.0);
+            let one = sys::mlx_array_scalar_float(1.0);
+            let one_plus_exp = sys::mlx_array_add(one, exp_x);
+            let result = sys::mlx_array_log(one_plus_exp);
+
+            sys::mlx_array_delete(exp_x);
+            sys::mlx_array_delete(one);
+            sys::mlx_array_delete(one_plus_exp);
+
+            result
+        };
+        MxArray::from_handle(handle, "softplus")
+    }
 }

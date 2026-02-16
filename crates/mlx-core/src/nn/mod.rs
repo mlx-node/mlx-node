@@ -3,6 +3,7 @@ use napi::bindgen_prelude::*;
 
 // Module declarations
 pub mod activations;
+pub mod conv1d;
 pub mod embedding;
 pub mod linear;
 pub mod losses;
@@ -16,6 +17,7 @@ mod losses_test;
 
 // Re-export all public items
 pub use activations::Activations;
+pub use conv1d::Conv1d;
 pub use embedding::Embedding;
 pub use linear::Linear;
 pub use losses::Losses;
