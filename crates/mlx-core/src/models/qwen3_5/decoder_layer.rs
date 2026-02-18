@@ -32,10 +32,14 @@ pub struct DecoderLayer {
     pub mlp: MLPType,
     input_layernorm: RMSNorm,
     post_attention_layernorm: RMSNorm,
-    pub is_linear: bool,
 }
 
 impl DecoderLayer {
+    /// Whether this layer uses linear attention (derived from attention type).
+    pub fn is_linear(&self) -> bool {
+        matches!(self.attn, AttentionType::Linear(_))
+    }
+
     pub fn new(config: &Qwen3_5Config, layer_idx: usize) -> Result<Self> {
         let is_linear = config.is_linear_layer(layer_idx);
 
@@ -64,7 +68,6 @@ impl DecoderLayer {
             mlp,
             input_layernorm,
             post_attention_layernorm,
-            is_linear,
         })
     }
 

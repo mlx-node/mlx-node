@@ -13,13 +13,13 @@ use super::config::Qwen3_5Config;
 /// 2. Partial RoPE: only rotates `head_dim * partial_rotary_factor` dimensions
 /// 3. Output is gated: `o_proj(sdpa_output * sigmoid(gate))`
 pub struct Qwen3_5Attention {
-    q_proj: Linear,     // hidden → num_heads * head_dim * 2 (queries + gate)
-    k_proj: Linear,     // hidden → num_kv_heads * head_dim
-    v_proj: Linear,     // hidden → num_kv_heads * head_dim
-    o_proj: Linear,     // num_heads * head_dim → hidden
+    q_proj: Linear, // hidden → num_heads * head_dim * 2 (queries + gate)
+    k_proj: Linear, // hidden → num_kv_heads * head_dim
+    v_proj: Linear, // hidden → num_kv_heads * head_dim
+    o_proj: Linear, // num_heads * head_dim → hidden
 
-    q_norm: RMSNorm,    // [head_dim]
-    k_norm: RMSNorm,    // [head_dim]
+    q_norm: RMSNorm, // [head_dim]
+    k_norm: RMSNorm, // [head_dim]
 
     rope: RoPE,
 
@@ -64,12 +64,7 @@ impl Qwen3_5Attention {
 
         // Partial RoPE: only rotate a fraction of dimensions
         let rope_dims = config.rope_dims();
-        let rope = RoPE::new(
-            rope_dims,
-            Some(false),
-            Some(config.rope_theta),
-            None,
-        );
+        let rope = RoPE::new(rope_dims, Some(false), Some(config.rope_theta), None);
 
         let scale = (head_dim as f32).powf(-0.5);
 
@@ -113,14 +108,15 @@ impl Qwen3_5Attention {
         //   reshape to [B, T, num_heads, head_dim*2]
         //   split on last axis → queries [B,T,H,D] and gate [B,T,H,D]
         let q_per_head = q_proj_output.reshape(&[
-            batch, seq_len, self.num_heads as i64, (self.head_dim * 2) as i64,
+            batch,
+            seq_len,
+            self.num_heads as i64,
+            (self.head_dim * 2) as i64,
         ])?;
         let queries = q_per_head.slice_axis(3, 0, self.head_dim as i64)?;
         let gate = q_per_head.slice_axis(3, self.head_dim as i64, (self.head_dim * 2) as i64)?;
         // Flatten gate for later: [B, T, H, D] → [B, T, H*D]
-        let gate = gate.reshape(&[
-            batch, seq_len, (self.num_heads * self.head_dim) as i64,
-        ])?;
+        let gate = gate.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
 
         // Project keys and values
         let keys = self.k_proj.forward(x)?;
@@ -129,10 +125,16 @@ impl Qwen3_5Attention {
         // Reshape to head format: [B, T, H, D]
         // queries already in [B, T, H, D] from per-head split above
         let keys = keys.reshape(&[
-            batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64,
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
         ])?;
         let values = values.reshape(&[
-            batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64,
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
         ])?;
 
         // Apply QK normalization (operates on last dim)
@@ -157,19 +159,12 @@ impl Qwen3_5Attention {
         };
 
         // Scaled dot-product attention using fast kernel
-        let output = scaled_dot_product_attention(
-            &queries,
-            &keys,
-            &values,
-            self.scale as f64,
-            mask,
-        )?;
+        let output =
+            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, mask)?;
 
         // Transpose back: [B, H, T, D] → [B, T, H, D] → flatten to [B, T, H*D]
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;
-        let output = output.reshape(&[
-            batch, seq_len, (self.num_heads * self.head_dim) as i64,
-        ])?;
+        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
 
         // Apply gate: output * sigmoid(gate)
         // gate is already [B, T, H*D] from the per-head split above

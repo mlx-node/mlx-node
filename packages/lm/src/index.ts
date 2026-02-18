@@ -15,7 +15,14 @@
 
 // Model classes (for inference)
 export { Qwen3Model, Qwen3Tokenizer } from '@mlx-node/core';
-export { Qwen3_5Model } from '@mlx-node/core';
+export { Qwen35Model, Qwen35Model as Qwen3_5Model } from '@mlx-node/core';
+export type {
+  Qwen35Config,
+  Qwen35ChatConfig,
+  Qwen35ChatResult,
+  Qwen35GenerationConfig,
+  Qwen35GenerationResult,
+} from '@mlx-node/core';
 
 // Note: Memory management is handled internally by Rust - not exposed to JS
 
@@ -36,6 +43,8 @@ export {
 } from './models/qwen3-configs';
 
 export { ModelLoader } from './models/model-loader';
+
+export { QWEN35_CONFIGS, getQwen35Config } from './models/qwen3_5-configs';
 
 // Tool calling utilities
 export * from './tools';

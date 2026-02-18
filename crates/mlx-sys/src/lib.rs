@@ -895,8 +895,8 @@ unsafe extern "C" {
     pub fn mlx_gather_mm(
         a: *mut mlx_array,
         b: *mut mlx_array,
-        lhs_indices: *mut mlx_array,  // nullable
-        rhs_indices: *mut mlx_array,  // nullable
+        lhs_indices: *mut mlx_array, // nullable
+        rhs_indices: *mut mlx_array, // nullable
         sorted_indices: bool,
     ) -> *mut mlx_array;
 }

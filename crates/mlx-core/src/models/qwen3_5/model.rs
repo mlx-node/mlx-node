@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
@@ -81,9 +81,7 @@ pub struct Qwen3_5Model {
     pub(crate) lm_head: Option<Linear>, // None when tie_word_embeddings
     caches: Option<Vec<Qwen3_5LayerCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
-    #[allow(dead_code)]
-    ssm_idx: usize,  // Index of first linear attention layer
-    fa_idx: usize,   // Index of first full attention layer
+    fa_idx: usize, // Index of first full attention layer
 }
 
 #[napi]
@@ -109,17 +107,16 @@ impl Qwen3_5Model {
             )?)
         };
 
-        // Find first linear and first full attention layer indices
-        let ssm_idx = (0..config.num_layers as usize)
-            .find(|&i| config.is_linear_layer(i))
-            .unwrap_or(0);
+        // Find first full attention layer index
         let fa_idx = (0..config.num_layers as usize)
             .find(|&i| !config.is_linear_layer(i))
-            .unwrap_or(config.full_attention_interval as usize - 1);
+            .unwrap_or(0);
 
         info!(
-            "Qwen3.5 model created: {} layers, ssm_idx={}, fa_idx={}, moe={}",
-            config.num_layers, ssm_idx, fa_idx, config.is_moe()
+            "Qwen3.5 model created: {} layers, fa_idx={}, moe={}",
+            config.num_layers,
+            fa_idx,
+            config.is_moe()
         );
 
         Ok(Self {
@@ -130,7 +127,6 @@ impl Qwen3_5Model {
             lm_head,
             caches: None,
             tokenizer: None,
-            ssm_idx,
             fa_idx,
         })
     }
@@ -203,6 +199,13 @@ impl Qwen3_5Model {
         prompt_tokens: &MxArray,
         config: Qwen3_5GenerationConfig,
     ) -> Result<Qwen3_5GenerationResult> {
+        if config.max_new_tokens <= 0 {
+            return Err(Error::from_reason(format!(
+                "max_new_tokens must be > 0, got {}",
+                config.max_new_tokens
+            )));
+        }
+
         self.reset_caches();
         self.init_caches();
 
@@ -227,8 +230,11 @@ impl Qwen3_5Model {
         let last_logits = last_logits.squeeze(Some(&[1]))?; // [1, vocab]
 
         // Sample first token
-        let next_token = sample(&last_logits, sampling_config.clone())?;
-        let mut token_id = next_token.to_int32()?[0] as u32;
+        let next_token = sample(&last_logits, sampling_config)?;
+        let token_data = next_token.to_int32()?;
+        let mut token_id = *token_data.first().ok_or_else(|| {
+            Error::from_reason("Sampling returned empty token array - logits may contain NaN")
+        })? as u32;
         generated_tokens.push(token_id);
 
         if token_id == eos_id {
@@ -247,8 +253,11 @@ impl Qwen3_5Model {
             let logits = logits.squeeze(Some(&[1]))?; // [1, vocab]
 
             // Sample
-            let token_arr = sample(&logits, sampling_config.clone())?;
-            let token_id_new = token_arr.to_int32()?[0] as u32;
+            let token_arr = sample(&logits, sampling_config)?;
+            let token_data = token_arr.to_int32()?;
+            let token_id_new = *token_data.first().ok_or_else(|| {
+                Error::from_reason("Sampling returned empty token array - logits may contain NaN")
+            })? as u32;
             generated_tokens.push(token_id_new);
 
             if token_id_new == eos_id {
@@ -261,8 +270,12 @@ impl Qwen3_5Model {
         // Decode text if tokenizer available
         let text = if let Some(ref tok) = self.tokenizer {
             tok.decode_sync(&generated_tokens, true)
-                .unwrap_or_default()
+                .unwrap_or_else(|e| {
+                    warn!("Failed to decode generated tokens: {}", e);
+                    String::new()
+                })
         } else {
+            warn!("No tokenizer loaded - text decoding unavailable, only token IDs returned");
             String::new()
         };
 
@@ -299,12 +312,7 @@ impl Qwen3_5Model {
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
 
         let tool_defs = config.tools.as_deref();
-        let tokens = tokenizer.apply_chat_template_sync(
-            &messages,
-            Some(true),
-            tool_defs,
-            None,
-        )?;
+        let tokens = tokenizer.apply_chat_template_sync(&messages, Some(true), tool_defs, None)?;
 
         // Create prompt tensor
         let prompt = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64])?;
@@ -334,11 +342,10 @@ impl Qwen3_5Model {
     /// Get the number of parameters in the model.
     #[napi]
     pub fn num_parameters(&self) -> i64 {
-        // Approximate based on config
         let h = self.config.hidden_size as i64;
         let v = self.config.vocab_size as i64;
-        let n = self.config.num_layers as i64;
-        let i = self.config.intermediate_size as i64;
+        let n = self.config.num_layers as usize;
+        let dense_i = self.config.intermediate_size as i64;
 
         // Embedding + LM head
         let mut total = v * h;
@@ -346,29 +353,51 @@ impl Qwen3_5Model {
             total += v * h;
         }
 
-        // Per-layer params (rough estimate)
-        // Full attention layers
-        let fa_layers = n / self.config.full_attention_interval as i64;
-        let linear_layers = n - fa_layers;
+        // MoE params
+        let num_experts = self.config.num_experts.unwrap_or(0) as i64;
+        let moe_i = self
+            .config
+            .moe_intermediate_size
+            .unwrap_or(self.config.intermediate_size) as i64;
+        let shared_i = self
+            .config
+            .shared_expert_intermediate_size
+            .unwrap_or(self.config.intermediate_size) as i64;
 
-        // Full attention: q(2x), k, v, o projections + norms + MLP
-        let fa_params = h * h * 2 // q_proj (2x for gate)
-            + h * (self.config.num_kv_heads as i64 * self.config.head_dim as i64) * 2 // k, v
-            + h * h // o_proj
-            + 3 * h * i // MLP
-            + h * 4; // norms
-        total += fa_layers * fa_params;
-
-        // Linear attention: projections + conv + delta params + MLP
         let kd = self.config.linear_key_dim() as i64;
         let vd = self.config.linear_value_dim() as i64;
-        let la_params = h * (kd * 2 + vd * 2) // in_proj_qkvz
-            + h * (self.config.linear_num_value_heads as i64 * 2) // in_proj_ba
-            + (kd + vd) * self.config.linear_conv_kernel_dim as i64 // conv1d
-            + vd * h // out_proj
-            + 3 * h * i // MLP
-            + h * 4; // norms + misc
-        total += linear_layers * la_params;
+
+        for layer_idx in 0..n {
+            let is_linear = self.config.is_linear_layer(layer_idx);
+            let is_moe = self.config.is_moe_layer(layer_idx);
+
+            // Attention params
+            if is_linear {
+                total += h * (kd * 2 + vd * 2) // in_proj_qkvz
+                    + h * (self.config.linear_num_value_heads as i64 * 2) // in_proj_ba
+                    + (kd * 2 + vd) * self.config.linear_conv_kernel_dim as i64 // conv1d
+                    + vd * h; // out_proj
+            } else {
+                // Full attention layer parameters
+                // Note: assumes num_heads * head_dim == hidden_size (true for standard configs)
+                total += h * h * 2 // q_proj (2x for gate)
+                    + h * (self.config.num_kv_heads as i64 * self.config.head_dim as i64) * 2 // k, v
+                    + h * h; // o_proj
+            }
+
+            // MLP params
+            if is_moe {
+                total += h * num_experts // router gate
+                    + num_experts * 3 * h * moe_i // expert gate/up/down projections
+                    + 3 * h * shared_i // shared expert
+                    + h; // shared expert gate
+            } else {
+                total += 3 * h * dense_i; // dense MLP gate/up/down
+            }
+
+            // Norms (2 per layer)
+            total += h * 2;
+        }
 
         total
     }
@@ -387,7 +416,7 @@ impl Qwen3_5Model {
         // Forward through layers
         let num_layers = self.layers.len();
         for i in 0..num_layers {
-            let mask = if self.layers[i].is_linear {
+            let mask = if self.layers[i].is_linear() {
                 ssm_mask.as_ref()
             } else {
                 fa_mask.as_ref()
@@ -430,22 +459,23 @@ impl Qwen3_5Model {
         // Create causal mask using existing utility
         create_causal_mask(
             seq_len as i32,
-            Some(offset as i32),
-            None,  // no sliding window
+            Some(offset),
+            None, // no sliding window
         )
         .map(Some)
     }
 
-    /// Create boolean mask for linear attention (SSM) layers.
-    ///
-    /// For SSM layers, the mask is simpler — just ones for valid positions.
+    /// Create mask for linear attention (SSM) layers.
+    /// Currently returns an all-ones mask (no masking applied).
+    /// TODO: Implement left-padding support for batched generation.
     fn create_ssm_mask(&self, hidden_states: &MxArray) -> Result<Option<MxArray>> {
         let batch = hidden_states.shape_at(0)?;
         let seq_len = hidden_states.shape_at(1)?;
 
         // For now, return all-ones mask (no masking)
+        // Use hidden_states' dtype to avoid f32 promotion for bf16/f16 models
         // TODO: Support left-padding mask for batched generation
-        let mask = MxArray::ones(&[batch, seq_len], None)?;
+        let mask = MxArray::ones(&[batch, seq_len], Some(hidden_states.dtype()?))?;
         Ok(Some(mask))
     }
 }

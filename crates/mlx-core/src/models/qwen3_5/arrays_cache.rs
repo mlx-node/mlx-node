@@ -21,10 +21,15 @@ impl ArraysCache {
     }
 
     /// Set the array at the given index.
+    /// Panics if index is out of bounds (indicates a programming bug).
     pub fn set(&mut self, idx: usize, value: MxArray) {
-        if idx < self.cache.len() {
-            self.cache[idx] = Some(value);
-        }
+        assert!(
+            idx < self.cache.len(),
+            "ArraysCache::set() index {} out of bounds (size {})",
+            idx,
+            self.cache.len()
+        );
+        self.cache[idx] = Some(value);
     }
 
     /// Check if a specific slot is populated.
@@ -42,6 +47,11 @@ impl ArraysCache {
     /// Number of slots in the cache.
     pub fn len(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Check if the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
     }
 }
 

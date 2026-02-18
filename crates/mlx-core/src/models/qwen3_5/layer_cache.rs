@@ -22,7 +22,7 @@ impl Qwen3_5LayerCache {
         Self::FullAttention(KVCache::new())
     }
 
-    /// Get as mutable ArraysCache (panics if wrong variant).
+    /// Get as mutable ArraysCache, or None if this is a full-attention cache.
     pub fn as_arrays_cache_mut(&mut self) -> Option<&mut ArraysCache> {
         match self {
             Self::Linear(c) => Some(c),
@@ -30,7 +30,7 @@ impl Qwen3_5LayerCache {
         }
     }
 
-    /// Get as mutable KVCache (panics if wrong variant).
+    /// Get as mutable KVCache, or None if this is a linear-attention cache.
     pub fn as_kv_cache_mut(&mut self) -> Option<&mut KVCache> {
         match self {
             Self::FullAttention(c) => Some(c),

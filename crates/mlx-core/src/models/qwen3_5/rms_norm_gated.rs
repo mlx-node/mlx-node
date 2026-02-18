@@ -23,8 +23,7 @@ impl RMSNormGated {
 
     /// Forward pass with optional gating.
     pub fn forward(&self, x: &MxArray, gate: Option<&MxArray>) -> Result<MxArray> {
-        let handle =
-            unsafe { sys::mlx_fast_rms_norm(x.handle.0, self.weight.handle.0, self.eps) };
+        let handle = unsafe { sys::mlx_fast_rms_norm(x.handle.0, self.weight.handle.0, self.eps) };
         let normed = MxArray::from_handle(handle, "rms_norm_gated")?;
         match gate {
             Some(g) => Activations::swiglu(g, &normed),

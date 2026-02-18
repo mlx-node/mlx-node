@@ -4,10 +4,11 @@ use napi::bindgen_prelude::*;
 
 use super::switch_linear::SwitchLinear;
 
-/// SwitchGLU: Expert-indexed SwiGLU MLP using SwitchLinear.
+/// SwitchGLU: Expert-indexed SwiGLU MLP using SwitchLinear (gather_mm).
 ///
 /// Each of the three projections (gate, up, down) has per-expert weights.
-/// When `indices.size >= 64`, sorts indices for memory-efficient gather_mm.
+/// Uses expand_dims to broadcast input across expert slots, matching
+/// the mlx-lm Python implementation.
 pub struct SwitchGLU {
     gate_proj: SwitchLinear,
     up_proj: SwitchLinear,
@@ -15,11 +16,7 @@ pub struct SwitchGLU {
 }
 
 impl SwitchGLU {
-    pub fn new(
-        input_dims: u32,
-        hidden_dims: u32,
-        num_experts: u32,
-    ) -> Result<Self> {
+    pub fn new(input_dims: u32, hidden_dims: u32, num_experts: u32) -> Result<Self> {
         let gate_proj = SwitchLinear::new(input_dims, hidden_dims, num_experts)?;
         let up_proj = SwitchLinear::new(input_dims, hidden_dims, num_experts)?;
         let down_proj = SwitchLinear::new(hidden_dims, input_dims, num_experts)?;
@@ -34,64 +31,33 @@ impl SwitchGLU {
     /// Forward pass.
     ///
     /// # Arguments
-    /// * `x` - Input tensor [B*T, 1, input_dims] (already expanded)
-    /// * `indices` - Expert indices [B*T, 1, 1] (int32)
+    /// * `x` - Input tensor [B*T, D]
+    /// * `indices` - Expert indices [B*T, k] (int32)
     ///
     /// # Returns
-    /// Output tensor [B*T, 1, input_dims]
+    /// Output tensor [B*T, k, D]
     pub fn forward(&self, x: &MxArray, indices: &MxArray) -> Result<MxArray> {
-        // Determine if we should sort for efficiency
-        let idx_shape = indices.shape()?;
-        let idx_size: i64 = idx_shape.iter().product();
-        let do_sort = idx_size >= 64;
+        let x_shape = x.shape()?;
+        let ne = x_shape[0];
+        let d = x_shape[1];
 
-        if do_sort {
-            // Sort indices for memory-efficient gather_mm
-            let flat_indices = indices.reshape(&[-1])?;
-            let sort_order = flat_indices.argsort(None)?;
-            let sorted_indices = flat_indices.take_along_axis(&sort_order, -1)?;
+        // Expand x: (ne, D) -> (ne, 1, 1, D) for gather_mm broadcasting.
+        // batch dims (ne, 1) broadcast with indices (ne, k) -> (ne, k)
+        // matrix dims (1, D) stay as-is for the matmul
+        let x_expanded = x.reshape(&[ne, 1, 1, d])?;
 
-            // Reshape sorted indices back
-            let sorted_indices = sorted_indices.reshape(idx_shape.as_ref())?;
+        // SwitchLinear via gather_mm: (ne, 1, 1, D) x (E, D, H) -> (ne, k, 1, H)
+        let gate_out = self.gate_proj.forward(&x_expanded, indices, false)?;
+        let up_out = self.up_proj.forward(&x_expanded, indices, false)?;
 
-            // Sort x to match
-            // Flatten x for reordering, then reshape back
-            let x_shape = x.shape()?;
-            let x_flat = x.reshape(&[idx_size, x_shape[x_shape.len() - 1]])?;
-            let sorted_x = x_flat.take_along_axis(
-                &sort_order.reshape(&[idx_size, 1])?,
-                0,
-            )?;
-            let sorted_x = sorted_x.reshape(x_shape.as_ref())?;
+        // SwiGLU activation: silu(gate) * up -> (ne, k, 1, H)
+        let activated = Activations::swiglu(&gate_out, &up_out)?;
 
-            // Apply SwitchLinear with sorted=true
-            let gate_out = self.gate_proj.forward(&sorted_x, &sorted_indices, true)?;
-            let up_out = self.up_proj.forward(&sorted_x, &sorted_indices, true)?;
+        // Down projection: (ne, k, 1, H) -> (ne, k, 1, D)
+        let out = self.down_proj.forward(&activated, indices, false)?;
 
-            // SwiGLU activation
-            let activated = Activations::swiglu(&gate_out, &up_out)?;
-
-            // Down projection
-            let out = self.down_proj.forward(&activated, &sorted_indices, true)?;
-
-            // Unsort: reverse the permutation
-            let unsort_order = sort_order.argsort(None)?;
-            let out_shape = out.shape()?;
-            let out_flat = out.reshape(&[idx_size, out_shape[out_shape.len() - 1]])?;
-            let unsorded = out_flat.take_along_axis(
-                &unsort_order.reshape(&[idx_size, 1])?,
-                0,
-            )?;
-            unsorded.reshape(out_shape.as_ref())
-        } else {
-            // Direct (unsorted) path
-            let gate_out = self.gate_proj.forward(x, indices, false)?;
-            let up_out = self.up_proj.forward(x, indices, false)?;
-
-            let activated = Activations::swiglu(&gate_out, &up_out)?;
-
-            self.down_proj.forward(&activated, indices, false)
-        }
+        // Squeeze: (ne, k, 1, D) -> (ne, k, D)
+        out.squeeze(Some(&[-2]))
     }
 
     // Weight accessors

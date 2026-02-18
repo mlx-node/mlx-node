@@ -211,16 +211,29 @@ impl Activations {
 
     /// Softplus: log(1 + exp(x))
     /// Used in GatedDeltaNet for computing decay rates.
+    ///
+    /// Numerically stable implementation:
+    ///   softplus(x) = max(x, 0) + log1p(exp(-|x|))
+    ///
+    /// The naive formula `log(1 + exp(x))` overflows for x > ~88 (float32)
+    /// because exp(x) → inf. The stable form avoids this because -|x| <= 0,
+    /// so exp(-|x|) is always in (0, 1] and never overflows.
     pub fn softplus(input: &MxArray) -> Result<MxArray> {
         let handle = unsafe {
-            let exp_x = sys::mlx_array_exp(input.handle.0);
-            let one = sys::mlx_array_scalar_float(1.0);
-            let one_plus_exp = sys::mlx_array_add(one, exp_x);
-            let result = sys::mlx_array_log(one_plus_exp);
+            let zero = sys::mlx_array_scalar_float(0.0);
+            let max_x_0 = sys::mlx_array_maximum(input.handle.0, zero);
+            let abs_x = sys::mlx_array_abs(input.handle.0);
+            let neg_abs_x = sys::mlx_array_negative(abs_x);
+            let exp_neg_abs_x = sys::mlx_array_exp(neg_abs_x);
+            let log1p_term = sys::mlx_array_log1p(exp_neg_abs_x);
+            let result = sys::mlx_array_add(max_x_0, log1p_term);
 
-            sys::mlx_array_delete(exp_x);
-            sys::mlx_array_delete(one);
-            sys::mlx_array_delete(one_plus_exp);
+            sys::mlx_array_delete(zero);
+            sys::mlx_array_delete(max_x_0);
+            sys::mlx_array_delete(abs_x);
+            sys::mlx_array_delete(neg_abs_x);
+            sys::mlx_array_delete(exp_neg_abs_x);
+            sys::mlx_array_delete(log1p_term);
 
             result
         };

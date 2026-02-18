@@ -62,10 +62,10 @@ fn gated_delta_step(
     let v_dim = v_t.shape_at(3)?;
 
     // Squeeze time dimension: [B, 1, H, D] → [B, H, D]
-    let q = q_t.squeeze(Some(&[1]))?;   // [B, Hv, Dk]
-    let k = k_t.squeeze(Some(&[1]))?;   // [B, Hv, Dk]
-    let v = v_t.squeeze(Some(&[1]))?;   // [B, Hv, Dv]
-    let g = g_t.squeeze(Some(&[1]))?;   // [B, Hv]
+    let q = q_t.squeeze(Some(&[1]))?; // [B, Hv, Dk]
+    let k = k_t.squeeze(Some(&[1]))?; // [B, Hv, Dk]
+    let v = v_t.squeeze(Some(&[1]))?; // [B, Hv, Dv]
+    let g = g_t.squeeze(Some(&[1]))?; // [B, Hv]
     let beta = beta_t.squeeze(Some(&[1]))?; // [B, Hv]
 
     // Save old state for mask restore
@@ -73,30 +73,30 @@ fn gated_delta_step(
 
     // 1. Decay existing state: state *= g[..., None, None]
     let g_4d = g.reshape(&[batch, num_v_heads, 1, 1])?;
-    let state = state.mul(&g_4d)?;  // [B, Hv, Dv, Dk]
+    let state = state.mul(&g_4d)?; // [B, Hv, Dv, Dk]
 
     // 2. Compute kv_mem = (state * k[..., None, :]).sum(-1) → [B, Hv, Dv]
     //    k: [B, Hv, Dk] → [B, Hv, 1, Dk]
     let k_4d = k.reshape(&[batch, num_v_heads, 1, k_dim])?;
-    let state_k = state.mul(&k_4d)?;  // [B, Hv, Dv, Dk]
-    let kv_mem = state_k.sum(Some(&[-1]), Some(false))?;  // [B, Hv, Dv]
+    let state_k = state.mul(&k_4d)?; // [B, Hv, Dv, Dk]
+    let kv_mem = state_k.sum(Some(&[-1]), Some(false))?; // [B, Hv, Dv]
 
     // 3. Compute delta = (v - kv_mem) * beta[..., None] → [B, Hv, Dv]
-    let v_minus_kv = v.sub(&kv_mem)?;  // [B, Hv, Dv]
+    let v_minus_kv = v.sub(&kv_mem)?; // [B, Hv, Dv]
     let beta_3d = beta.reshape(&[batch, num_v_heads, 1])?;
-    let delta = v_minus_kv.mul(&beta_3d)?;  // [B, Hv, Dv]
+    let delta = v_minus_kv.mul(&beta_3d)?; // [B, Hv, Dv]
 
     // 4. Update state: state += k[..., None, :] * delta[..., None]
     //    k[..., None, :]: [B, Hv, 1, Dk]
     //    delta[..., None]: [B, Hv, Dv, 1]
     let delta_4d = delta.reshape(&[batch, num_v_heads, v_dim, 1])?;
-    let k_delta = k_4d.mul(&delta_4d)?;  // [B, Hv, Dv, Dk]
-    let new_state = state.add(&k_delta)?;  // [B, Hv, Dv, Dk]
+    let k_delta = k_4d.mul(&delta_4d)?; // [B, Hv, Dv, Dk]
+    let new_state = state.add(&k_delta)?; // [B, Hv, Dv, Dk]
 
     // 5. Output: y = (new_state * q[..., None, :]).sum(-1) → [B, Hv, Dv]
     let q_4d = q.reshape(&[batch, num_v_heads, 1, k_dim])?;
-    let state_q = new_state.mul(&q_4d)?;  // [B, Hv, Dv, Dk]
-    let y = state_q.sum(Some(&[-1]), Some(false))?;  // [B, Hv, Dv]
+    let state_q = new_state.mul(&q_4d)?; // [B, Hv, Dv, Dk]
+    let y = state_q.sum(Some(&[-1]), Some(false))?; // [B, Hv, Dv]
 
     // Apply mask: restore old state for masked positions (not zero output)
     let new_state = if let Some(m) = mask_t {
@@ -156,18 +156,30 @@ pub fn gated_delta_update(
 
     // GQA head expansion: repeat q,k from Hk to Hv heads
     let (q, k) = if num_v_heads != num_k_heads {
+        if num_k_heads == 0 {
+            return Err(Error::from_reason(
+                "GatedDelta: num_k_heads is 0, cannot compute GQA repeat factor",
+            ));
+        }
+        if num_v_heads % num_k_heads != 0 {
+            return Err(Error::from_reason(format!(
+                "GatedDelta: num_v_heads ({}) must be divisible by num_k_heads ({})",
+                num_v_heads, num_k_heads
+            )));
+        }
         let repeat_factor = num_v_heads / num_k_heads;
-        let q_expanded = q.repeat(repeat_factor as i32, 2)?;  // [B, T, Hv, Dk]
-        let k_expanded = k.repeat(repeat_factor as i32, 2)?;  // [B, T, Hv, Dk]
+        let q_expanded = q.repeat(repeat_factor as i32, 2)?; // [B, T, Hv, Dk]
+        let k_expanded = k.repeat(repeat_factor as i32, 2)?; // [B, T, Hv, Dk]
         (q_expanded, k_expanded)
     } else {
         (q.clone(), k.clone())
     };
 
     // Initialize state if not provided: [B, Hv, Dv, Dk]
+    // Use v's dtype to avoid f32 promotion for bf16/f16 models
     let mut current_state = match state {
         Some(s) => s.clone(),
-        None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], None)?,
+        None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
     };
 
     // Sequential loop over timesteps
@@ -181,12 +193,17 @@ pub fn gated_delta_update(
         let g_t = g.slice_axis(1, t, t + 1)?;
         let beta_t = beta.slice_axis(1, t, t + 1)?;
 
-        let mask_t = mask
-            .map(|m| m.slice_axis(1, t, t + 1))
-            .transpose()?;
+        let mask_t = mask.map(|m| m.slice_axis(1, t, t + 1)).transpose()?;
 
-        let (y_t, new_state) =
-            gated_delta_step(&q_t, &k_t, &v_t, &g_t, &beta_t, &current_state, mask_t.as_ref())?;
+        let (y_t, new_state) = gated_delta_step(
+            &q_t,
+            &k_t,
+            &v_t,
+            &g_t,
+            &beta_t,
+            &current_state,
+            mask_t.as_ref(),
+        )?;
 
         outputs.push(y_t);
         current_state = new_state;

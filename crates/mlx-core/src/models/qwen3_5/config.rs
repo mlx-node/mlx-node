@@ -104,8 +104,12 @@ impl Qwen3_5Config {
     /// vs full attention (Qwen3NextAttention).
     ///
     /// Rule: `(layer_idx + 1) % full_attention_interval != 0` → linear attention
+    /// When `full_attention_interval <= 0`, all layers use linear attention.
     pub fn is_linear_layer(&self, layer_idx: usize) -> bool {
-        (layer_idx + 1) % (self.full_attention_interval as usize) != 0
+        if self.full_attention_interval <= 0 {
+            return true;
+        }
+        !(layer_idx + 1).is_multiple_of(self.full_attention_interval as usize)
     }
 
     /// Returns whether a given layer should use MoE MLP.
@@ -118,12 +122,12 @@ impl Qwen3_5Config {
             return false;
         }
         // Check if this layer is in the mlp_only_layers list (dense override)
-        if let Some(ref mlp_only) = self.mlp_only_layers {
-            if mlp_only.contains(&(layer_idx as i32)) {
-                return false;
-            }
+        if let Some(ref mlp_only) = self.mlp_only_layers
+            && mlp_only.contains(&(layer_idx as i32))
+        {
+            return false;
         }
-        (layer_idx + 1) % (step as usize) == 0
+        (layer_idx + 1).is_multiple_of(step as usize)
     }
 
     /// Compute the RoPE dimensions for partial rotary embedding.

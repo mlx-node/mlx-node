@@ -14,15 +14,15 @@ use super::rms_norm_gated::RMSNormGated;
 /// Uses depthwise convolution + state-space recurrence instead of softmax attention.
 pub struct GatedDeltaNet {
     // Projections
-    in_proj_qkvz: Linear,    // hidden → key_dim*2 + value_dim*2 (q,k,v,z combined)
-    in_proj_ba: Linear,       // hidden → num_v_heads * 2 (b and a combined)
-    conv1d: Conv1d,           // depthwise conv, groups = conv_dim
-    norm: RMSNormGated,       // per-head norm: weight dim = value_head_dim
-    out_proj: Linear,         // value_dim → hidden
+    in_proj_qkvz: Linear, // hidden → key_dim*2 + value_dim*2 (q,k,v,z combined)
+    in_proj_ba: Linear,   // hidden → num_v_heads * 2 (b and a combined)
+    conv1d: Conv1d,       // depthwise conv, groups = conv_dim
+    norm: RMSNormGated,   // per-head norm: weight dim = value_head_dim
+    out_proj: Linear,     // value_dim → hidden
 
     // Learnable parameters
-    dt_bias: MxArray,         // [num_v_heads]
-    a_log: MxArray,           // [num_v_heads]
+    dt_bias: MxArray, // [num_v_heads]
+    a_log: MxArray,   // [num_v_heads]
 
     // Dimensions
     num_k_heads: i32,
@@ -58,22 +58,18 @@ impl GatedDeltaNet {
         )?;
 
         // Combined projection for b and a
-        let in_proj_ba = Linear::new(
-            hidden_size as u32,
-            (num_v_heads * 2) as u32,
-            Some(false),
-        )?;
+        let in_proj_ba = Linear::new(hidden_size as u32, (num_v_heads * 2) as u32, Some(false))?;
 
         // Depthwise conv1d: groups = conv_dim (each channel has its own filter)
         let conv1d = Conv1d::new(
-            conv_dim as u32,    // in_channels
-            conv_dim as u32,    // out_channels
+            conv_dim as u32, // in_channels
+            conv_dim as u32, // out_channels
             conv_kernel_dim as u32,
-            Some(1),            // stride
-            Some(0),            // padding (no padding, we prepend conv_state manually)
-            Some(1),            // dilation
+            Some(1),               // stride
+            Some(0),               // padding (no padding, we prepend conv_state manually)
+            Some(1),               // dilation
             Some(conv_dim as u32), // groups = depthwise
-            Some(false),        // no bias
+            Some(false),           // no bias
         )?;
 
         // Norm operates per-head: weight dim = value_head_dim (NOT value_dim)
@@ -145,7 +141,8 @@ impl GatedDeltaNet {
         let qkv = if let Some(m) = mask {
             // m: [B, T] → [B, T, 1] for broadcasting
             let m_3d = m.reshape(&[batch, seq_len, 1])?;
-            m_3d.where_(&qkv, &MxArray::zeros(&[1], None)?)?
+            // Use qkv's dtype to avoid f32 promotion for bf16/f16 models
+            m_3d.where_(&qkv, &MxArray::zeros(&[1], Some(qkv.dtype()?))?)?
         } else {
             qkv
         };
@@ -164,8 +161,10 @@ impl GatedDeltaNet {
             }
             None => {
                 // No cache: prepend zeros of size (kernel_size - 1)
+                // Use qkv's dtype to avoid f32 promotion for bf16/f16 models
                 let pad_len = (self.conv_kernel_dim - 1) as i64;
-                let zeros = MxArray::zeros(&[batch, pad_len, self.conv_dim as i64], None)?;
+                let zeros =
+                    MxArray::zeros(&[batch, pad_len, self.conv_dim as i64], Some(qkv.dtype()?))?;
                 MxArray::concatenate(&zeros, &qkv, 1)?
             }
         };
@@ -198,27 +197,26 @@ impl GatedDeltaNet {
         // Split into q, k, v
         let q_flat = conv_out.slice_axis(2, 0, self.key_dim as i64)?;
         let k_flat = conv_out.slice_axis(2, self.key_dim as i64, (self.key_dim * 2) as i64)?;
-        let v_flat = conv_out.slice_axis(
-            2,
-            (self.key_dim * 2) as i64,
-            self.conv_dim as i64,
-        )?;
+        let v_flat = conv_out.slice_axis(2, (self.key_dim * 2) as i64, self.conv_dim as i64)?;
 
         // Reshape to head format
         // q, k: [B, T, key_dim] → [B, T, Hk, Dk]
         let q = q_flat.reshape(&[
-            batch, seq_len,
+            batch,
+            seq_len,
             self.num_k_heads as i64,
             self.key_head_dim as i64,
         ])?;
         let k = k_flat.reshape(&[
-            batch, seq_len,
+            batch,
+            seq_len,
             self.num_k_heads as i64,
             self.key_head_dim as i64,
         ])?;
         // v: [B, T, value_dim] → [B, T, Hv, Dv]
         let v = v_flat.reshape(&[
-            batch, seq_len,
+            batch,
+            seq_len,
             self.num_v_heads as i64,
             self.value_head_dim as i64,
         ])?;
@@ -236,8 +234,15 @@ impl GatedDeltaNet {
         // Run gated delta recurrence
         let recurrent_state = cache.as_deref().and_then(|c| c.get(1));
         let (y, new_state) = gated_delta_update(
-            &q, &k, &v, &a, &b, &self.a_log, &self.dt_bias,
-            recurrent_state, mask,
+            &q,
+            &k,
+            &v,
+            &a,
+            &b,
+            &self.a_log,
+            &self.dt_bias,
+            recurrent_state,
+            mask,
         )?;
 
         // Update recurrent state in cache
@@ -246,7 +251,12 @@ impl GatedDeltaNet {
         }
 
         // Reshape z to per-head format: [B, T, value_dim] → [B, T, Hv, Dv]
-        let z = z.reshape(&[batch, seq_len, self.num_v_heads as i64, self.value_head_dim as i64])?;
+        let z = z.reshape(&[
+            batch,
+            seq_len,
+            self.num_v_heads as i64,
+            self.value_head_dim as i64,
+        ])?;
 
         // Apply RMSNormGated on per-head tensors: [B, T, Hv, Dv]
         // Norm weight is [Dv], operates on last dimension
@@ -301,8 +311,11 @@ impl GatedDeltaNet {
 fn rms_norm_no_weight(x: &MxArray, eps: f32) -> Result<MxArray> {
     // Get the last dimension size for the ones weight
     let shape = x.shape()?;
-    let last_dim = *shape.last().ok_or_else(|| Error::from_reason("empty shape"))?;
-    let ones = MxArray::ones(&[last_dim], None)?;
+    let last_dim = *shape
+        .last()
+        .ok_or_else(|| Error::from_reason("empty shape"))?;
+    // Use input's dtype to avoid f32 promotion for bf16/f16 models
+    let ones = MxArray::ones(&[last_dim], Some(x.dtype()?))?;
     let handle = unsafe { sys::mlx_fast_rms_norm(x.handle.0, ones.handle.0, eps) };
     MxArray::from_handle(handle, "rms_norm_no_weight")
 }

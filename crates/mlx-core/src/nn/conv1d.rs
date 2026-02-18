@@ -8,7 +8,7 @@ use napi::bindgen_prelude::*;
 /// Used by GatedDeltaNet for depthwise convolution in Qwen3.5.
 ///
 /// Input shape: `[batch, seq_len, in_channels]`
-/// Weight shape: `[out_channels, kernel_size/groups, in_channels/groups]`  (MLX convention after sanitization)
+/// Weight shape: `[out_channels, kernel_size, in_channels/groups]`  (MLX convention after sanitization)
 /// Output shape: `[batch, seq_len_out, out_channels]`
 pub struct Conv1d {
     weight: MxArray,
@@ -36,7 +36,7 @@ impl Conv1d {
         let padding = padding.unwrap_or(0) as i32;
         let dilation = dilation.unwrap_or(1) as i32;
 
-        // Weight shape: [out_channels, kernel_size/groups, in_channels/groups]
+        // Weight shape: [out_channels, kernel_size, in_channels/groups]
         // For depthwise conv (groups == in_channels == out_channels):
         //   weight shape = [out_channels, kernel_size, 1]
         let weight_shape = [
