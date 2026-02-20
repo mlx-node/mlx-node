@@ -1,12 +1,40 @@
 import { describe, it, expect } from 'vite-plus/test';
 import { Qwen35Model, MxArray } from '@mlx-node/core';
-import { getQwen35Config } from '@mlx-node/lm';
+import type { Qwen35Config } from '@mlx-node/core';
 import { shape } from '../test-utils';
+
+// Tiny config for generation tests — the full 0.6B config is too slow
+// due to sequential GatedDeltaNet recurrence (21 linear attention layers).
+// This uses 4 layers (1 full cycle: 3 linear + 1 full attention) with
+// small dimensions to keep generation under a few seconds.
+const TINY_GEN_CONFIG: Qwen35Config = {
+  vocabSize: 1000,
+  hiddenSize: 128,
+  numLayers: 4,
+  numHeads: 4,
+  numKvHeads: 2,
+  intermediateSize: 256,
+  rmsNormEps: 1e-6,
+  headDim: 32,
+  tieWordEmbeddings: true,
+  attentionBias: false,
+  maxPositionEmbeddings: 512,
+  padTokenId: 0,
+  eosTokenId: 1,
+  bosTokenId: 0,
+  linearNumValueHeads: 8,
+  linearNumKeyHeads: 4,
+  linearKeyHeadDim: 32,
+  linearValueHeadDim: 16,
+  linearConvKernelDim: 4,
+  fullAttentionInterval: 4,
+  partialRotaryFactor: 0.25,
+  ropeTheta: 10000.0,
+};
 
 describe.sequential('Qwen3.5 Generation', () => {
   it('should generate tokens from prompt', () => {
-    const config = getQwen35Config('qwen3.5-0.6b');
-    const model = new Qwen35Model(config);
+    const model = new Qwen35Model(TINY_GEN_CONFIG);
 
     const prompt = MxArray.fromInt32(new Int32Array([1, 2, 3, 4, 5]), shape(1, 5));
     const result = model.generate(prompt, {
@@ -21,8 +49,7 @@ describe.sequential('Qwen3.5 Generation', () => {
   });
 
   it('should respect maxNewTokens limit', () => {
-    const config = getQwen35Config('qwen3.5-0.6b');
-    const model = new Qwen35Model(config);
+    const model = new Qwen35Model(TINY_GEN_CONFIG);
 
     const prompt = MxArray.fromInt32(new Int32Array([1, 2, 3]), shape(1, 3));
     const result = model.generate(prompt, {
