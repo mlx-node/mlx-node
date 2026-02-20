@@ -297,19 +297,35 @@ fn apply_weights(
     }
 
     // Final norm
-    if let Some(w) = params.get("final_norm.weight") {
-        model.final_norm.set_weight(w)?;
+    {
+        let mut final_norm = model
+            .final_norm
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm write lock"))?;
+        if let Some(w) = params.get("final_norm.weight") {
+            final_norm.set_weight(w)?;
+        }
     }
 
     // LM head
-    if let Some(ref mut head) = model.lm_head
-        && let Some(w) = params.get("lm_head.weight")
     {
-        head.set_weight(w)?;
+        let mut lm_head = model
+            .lm_head
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head write lock"))?;
+        if let Some(ref mut head) = *lm_head
+            && let Some(w) = params.get("lm_head.weight")
+        {
+            head.set_weight(w)?;
+        }
     }
 
     // Per-layer weights
-    for (i, layer) in model.layers.iter_mut().enumerate() {
+    let mut layers = model
+        .layers
+        .write()
+        .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+    for (i, layer) in layers.iter_mut().enumerate() {
         let prefix = format!("layers.{}", i);
 
         // Attention weights
@@ -473,7 +489,7 @@ fn apply_weights(
     // at least one MLP weight applied. A checkpoint with only some layers loaded (e.g.
     // partially downloaded or corrupted shards) would leave remaining layers randomly
     // initialized and produce garbage output.
-    let num_layers = model.layers.len();
+    let num_layers = layers.len();
     let mut layers_missing_attn: Vec<usize> = Vec::new();
     let mut layers_missing_mlp: Vec<usize> = Vec::new();
 

@@ -5033,12 +5033,17 @@ mlx_array* mlx_conv1d(
     int dilation,
     int groups
 ) {
-    auto inp = reinterpret_cast<mlx::core::array*>(input);
-    auto wt = reinterpret_cast<mlx::core::array*>(weight);
-    mlx::core::array result = mlx::core::conv1d(
-        *inp, *wt, stride, padding, dilation, groups
-    );
-    return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+    try {
+        auto inp = reinterpret_cast<mlx::core::array*>(input);
+        auto wt = reinterpret_cast<mlx::core::array*>(weight);
+        mlx::core::array result = mlx::core::conv1d(
+            *inp, *wt, stride, padding, dilation, groups
+        );
+        return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_conv1d error: " << e.what() << std::endl;
+        return nullptr;
+    }
 }
 
 // ============================================
@@ -5052,23 +5057,28 @@ mlx_array* mlx_gather_mm(
     mlx_array* rhs_indices,
     bool sorted_indices
 ) {
-    auto a_arr = reinterpret_cast<mlx::core::array*>(a);
-    auto b_arr = reinterpret_cast<mlx::core::array*>(b);
+    try {
+        auto a_arr = reinterpret_cast<mlx::core::array*>(a);
+        auto b_arr = reinterpret_cast<mlx::core::array*>(b);
 
-    // Build optional index arrays - nullptr means no indexing on that side
-    std::optional<mlx::core::array> lhs_opt = std::nullopt;
-    std::optional<mlx::core::array> rhs_opt = std::nullopt;
-    if (lhs_indices != nullptr) {
-        lhs_opt = *reinterpret_cast<mlx::core::array*>(lhs_indices);
-    }
-    if (rhs_indices != nullptr) {
-        rhs_opt = *reinterpret_cast<mlx::core::array*>(rhs_indices);
-    }
+        // Build optional index arrays - nullptr means no indexing on that side
+        std::optional<mlx::core::array> lhs_opt = std::nullopt;
+        std::optional<mlx::core::array> rhs_opt = std::nullopt;
+        if (lhs_indices != nullptr) {
+            lhs_opt = *reinterpret_cast<mlx::core::array*>(lhs_indices);
+        }
+        if (rhs_indices != nullptr) {
+            rhs_opt = *reinterpret_cast<mlx::core::array*>(rhs_indices);
+        }
 
-    mlx::core::array result = mlx::core::gather_mm(
-        *a_arr, *b_arr, lhs_opt, rhs_opt, sorted_indices
-    );
-    return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+        mlx::core::array result = mlx::core::gather_mm(
+            *a_arr, *b_arr, lhs_opt, rhs_opt, sorted_indices
+        );
+        return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_gather_mm error: " << e.what() << std::endl;
+        return nullptr;
+    }
 }
 
 }  // End extern "C"

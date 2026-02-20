@@ -32,6 +32,12 @@ impl Conv1d {
         use_bias: Option<bool>,
     ) -> Result<Self> {
         let groups = groups.unwrap_or(1) as i32;
+        if groups <= 0 {
+            return Err(Error::from_reason(format!(
+                "Conv1d: groups must be > 0, got {}",
+                groups
+            )));
+        }
         let stride = stride.unwrap_or(1) as i32;
         let padding = padding.unwrap_or(0) as i32;
         let dilation = dilation.unwrap_or(1) as i32;

@@ -621,9 +621,11 @@ export declare class OutputStore {
 }
 
 /**
- * Qwen3.5 Model — hybrid linear/full attention with optional MoE.
+ * Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
  *
- * Inference-only implementation. Supports both dense and MoE variants.
+ * Uses interior mutability (RwLock) for layers, final_norm, lm_head, and caches
+ * to allow async generation via spawn_blocking without blocking the Node.js event loop.
+ * This matches the pattern used by Qwen3Model.
  */
 export declare class Qwen35Model {
   /** Create a new Qwen3.5 model with the given configuration. */
@@ -653,10 +655,20 @@ export declare class Qwen35Model {
    * - tokenizer.json + tokenizer_config.json
    */
   static loadPretrained(path: string): Promise<Qwen35Model>;
-  /** Generate text from a prompt token sequence. */
-  generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Qwen35GenerationResult;
-  /** Chat API with tool calling support. */
-  chat(messages: Array<ChatMessage>, config?: Qwen35ChatConfig | undefined | null): Qwen35ChatResult;
+  /**
+   * Generate text from a prompt token sequence.
+   *
+   * Runs generation on a worker thread via spawn_blocking to avoid
+   * blocking the Node.js event loop.
+   */
+  generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
+  /**
+   * Chat API with tool calling support.
+   *
+   * Runs tokenization + generation on a worker thread via spawn_blocking
+   * to avoid blocking the Node.js event loop.
+   */
+  chat(messages: Array<ChatMessage>, config?: Qwen35ChatConfig | undefined | null): Promise<Qwen35ChatResult>;
   /** Get the number of parameters in the model. */
   numParameters(): number;
 }
@@ -2528,7 +2540,7 @@ export interface Qwen35ChatConfig {
   topK?: number | undefined;
   topP?: number | undefined;
   minP?: number | undefined;
-  tools?: object[] | undefined;
+  tools?: Array<ToolDefinition>;
 }
 
 /** Chat result */

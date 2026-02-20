@@ -33,11 +33,11 @@ const TINY_GEN_CONFIG: Qwen35Config = {
 };
 
 describe.sequential('Qwen3.5 Generation', () => {
-  it('should generate tokens from prompt', () => {
+  it('should generate tokens from prompt', async () => {
     const model = new Qwen35Model(TINY_GEN_CONFIG);
 
     const prompt = MxArray.fromInt32(new Int32Array([1, 2, 3, 4, 5]), shape(1, 5));
-    const result = model.generate(prompt, {
+    const result = await model.generate(prompt, {
       maxNewTokens: 5,
       temperature: 0.0, // greedy
     });
@@ -48,11 +48,11 @@ describe.sequential('Qwen3.5 Generation', () => {
     expect(['eos', 'length']).toContain(result.finishReason);
   });
 
-  it('should respect maxNewTokens limit', () => {
+  it('should respect maxNewTokens limit', async () => {
     const model = new Qwen35Model(TINY_GEN_CONFIG);
 
     const prompt = MxArray.fromInt32(new Int32Array([1, 2, 3]), shape(1, 3));
-    const result = model.generate(prompt, {
+    const result = await model.generate(prompt, {
       maxNewTokens: 3,
     });
 

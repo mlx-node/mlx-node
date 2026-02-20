@@ -1,12 +1,11 @@
 import { describe, it, expect } from 'vite-plus/test';
-import { QWEN3_CONFIGS } from '@mlx-node/lm';
 import { MxArray, Qwen3Model } from '@mlx-node/core';
 import type { Qwen3Config } from '@mlx-node/core';
 import { shape, int32, float32, float64 } from '../test-utils';
 
-// Tiny config for autograd comparison test — creating TWO 0.6B models
-// simultaneously and running both autograd + manual gradient paths exceeds
-// the 120s CI timeout. This small config completes in seconds.
+// Tiny config for autograd tests — the full 0.6B model (28 layers, 896 hidden)
+// takes 2-3 minutes per autograd call, exceeding the 120s CI timeout.
+// This small config completes in seconds.
 const TINY_AUTOGRAD_CONFIG: Qwen3Config = {
   vocabSize: 1000,
   hiddenSize: 64,
@@ -28,7 +27,7 @@ const TINY_AUTOGRAD_CONFIG: Qwen3Config = {
 describe('GRPO Autograd Integration', () => {
   describe('train_step_grpo_autograd Method', () => {
     it('should execute autograd training step without errors', () => {
-      const model = new Qwen3Model(QWEN3_CONFIGS['qwen3-0.6b']);
+      const model = new Qwen3Model(TINY_AUTOGRAD_CONFIG);
 
       // Create minimal training data
       const groupSize = 2;
@@ -96,7 +95,7 @@ describe('GRPO Autograd Integration', () => {
     });
 
     it('should handle variable-length prompts with correct masking', () => {
-      const model = new Qwen3Model(QWEN3_CONFIGS['qwen3-0.6b']);
+      const model = new Qwen3Model(TINY_AUTOGRAD_CONFIG);
 
       // Use prompts with DIFFERENT lengths to test padding/masking
       const promptTokens = [
@@ -161,7 +160,7 @@ describe('GRPO Autograd Integration', () => {
     });
 
     it('should handle variable-length completions with correct masking', () => {
-      const model = new Qwen3Model(QWEN3_CONFIGS['qwen3-0.6b']);
+      const model = new Qwen3Model(TINY_AUTOGRAD_CONFIG);
 
       const promptTokens = [
         MxArray.fromInt32(int32(1, 2, 3, 4), shape(4)),
@@ -220,7 +219,7 @@ describe('GRPO Autograd Integration', () => {
     });
 
     it('should compute gradients for all parameters', () => {
-      const model = new Qwen3Model(QWEN3_CONFIGS['qwen3-0.6b']);
+      const model = new Qwen3Model(TINY_AUTOGRAD_CONFIG);
 
       const groupSize = 2;
 
