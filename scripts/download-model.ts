@@ -140,7 +140,13 @@ async function getModelFiles(modelName: string) {
   let totalSize = 0;
   const filesToDownload: ListFileEntry[] = [];
   for await (const file of listFiles({ repo: { type: 'model', name: modelName } })) {
-    if (CORE_FILES.includes(file.path) || file.path.endsWith('.safetensors') || file.path.endsWith('.json')) {
+    if (
+      CORE_FILES.includes(file.path) ||
+      file.path.endsWith('.safetensors') ||
+      file.path.endsWith('.json') ||
+      file.path.endsWith('.pdiparams') ||
+      file.path.endsWith('.yml')
+    ) {
       filesToDownload.push(file);
       if (file.size) {
         totalSize += file.size;
@@ -224,7 +230,8 @@ if (existsSync(outputDir)) {
   const hasSingleModel = files.includes('model.safetensors');
   const hasShardedModel = files.includes('model.safetensors.index.json');
 
-  if (hasConfig && (hasSingleModel || hasShardedModel)) {
+  const hasPaddleModel = files.includes('inference.pdiparams');
+  if (hasConfig && (hasSingleModel || hasShardedModel || hasPaddleModel)) {
     console.log('\n✅ Model already downloaded!\n');
     console.log('To re-download, delete the output directory first:');
     console.log(`   rm -rf ${outputDir}\n`);
@@ -255,7 +262,7 @@ for (const file of filesToDownload) {
   const stats = await stat(snapshotPath);
   const sizeStr = await formatBytes(stats.size);
   await copyFile(snapshotPath, join(outputDir, file.path));
-  if (file.path.endsWith('.safetensors')) {
+  if (file.path.endsWith('.safetensors') || file.path.endsWith('.pdiparams')) {
     weightFiles.push(file.path);
   }
   console.log(`  ✓ ${file.path} (${sizeStr})`);

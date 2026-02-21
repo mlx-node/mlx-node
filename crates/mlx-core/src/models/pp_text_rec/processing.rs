@@ -13,14 +13,12 @@
 //! We swap R<->B channels before normalization to match PaddleOCR's convention.
 
 use crate::array::MxArray;
-use image::ImageReader;
 use image::imageops::FilterType;
 
 /// PaddleOCR uses cv2.INTER_LINEAR (bilinear). The closest equivalent
 /// in the `image` crate is `FilterType::Triangle` (bilinear interpolation).
 const RESIZE_FILTER: FilterType = FilterType::Triangle;
 use napi::bindgen_prelude::*;
-use std::path::Path;
 
 /// Image processor for text recognition.
 pub struct TextRecImageProcessor {
@@ -57,30 +55,19 @@ impl TextRecImageProcessor {
         new_w.max(1).min(img_w_limit)
     }
 
-    /// Process an image file for recognition.
+    /// Process encoded image bytes for recognition.
     ///
     /// The output width equals the actual resized width (based on aspect ratio),
     /// clamped to `max_width`. No zero-padding is applied for single images.
     ///
     /// Returns pixel_values: [1, target_height, resized_width, 3] normalized float32
-    pub fn process_file(&self, path: &str) -> Result<MxArray> {
-        let img_path = Path::new(path);
-        if !img_path.exists() {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!("Image file not found: {}", img_path.display()),
-            ));
-        }
-
-        let img = ImageReader::open(img_path)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to open image: {e}")))?
-            .decode()
-            .map_err(|e| {
-                Error::new(
-                    Status::GenericFailure,
-                    format!("Failed to decode image: {e}"),
-                )
-            })?;
+    pub fn process(&self, data: &[u8]) -> Result<MxArray> {
+        let img = image::load_from_memory(data).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to decode image: {e}"),
+            )
+        })?;
 
         let rgb_img = img.to_rgb8();
         self.process_rgb_single(&rgb_img, rgb_img.width(), rgb_img.height())

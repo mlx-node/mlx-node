@@ -153,17 +153,17 @@ impl PPDocLayoutV3Model {
     /// Detect document layout elements in an image.
     ///
     /// # Arguments
-    /// * `image_path` - Path to the input image
+    /// * `image_data` - Encoded image bytes (PNG/JPEG)
     /// * `threshold` - Optional confidence threshold (default 0.5)
     ///
     /// # Returns
     /// * Vec of LayoutElements sorted by reading order
     #[napi]
-    pub fn detect(&self, image_path: String, threshold: Option<f64>) -> Result<Vec<LayoutElement>> {
+    pub fn detect(&self, image_data: Buffer, threshold: Option<f64>) -> Result<Vec<LayoutElement>> {
         let threshold = threshold.unwrap_or(0.5);
 
         // 1. Preprocess image
-        let (pixel_values, orig_h, orig_w) = self.image_processor.process_file(&image_path)?;
+        let (pixel_values, orig_h, orig_w) = self.image_processor.process(&image_data)?;
 
         // 2. Run backbone
         let features = self.backbone.forward(&pixel_values)?;

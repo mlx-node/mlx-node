@@ -11,19 +11,19 @@
  */
 export declare class BatchGenerationResult {
   /** Get all generated token arrays (N*G arrays) */
-  get tokens(): Array<MxArray>
+  get tokens(): Array<MxArray>;
   /** Get all log probability arrays (N*G arrays) */
-  get logprobs(): Array<MxArray>
+  get logprobs(): Array<MxArray>;
   /** Get all decoded texts (N*G strings) */
-  get texts(): Array<string>
+  get texts(): Array<string>;
   /** Get finish reasons grouped by prompt (N arrays of G finish reasons) */
-  get finishReasons(): Array<Array<string>>
+  get finishReasons(): Array<Array<string>>;
   /** Get token counts grouped by prompt (N arrays of G counts) */
-  get tokenCounts(): Array<Array<number>>
+  get tokenCounts(): Array<Array<number>>;
   /** Get number of prompts */
-  get numPrompts(): number
+  get numPrompts(): number;
   /** Get group size (completions per prompt) */
-  get groupSize(): number
+  get groupSize(): number;
 }
 
 /**
@@ -44,9 +44,9 @@ export declare class BatchGenerationResult {
  */
 export declare class ChatResult {
   /** Get the cleaned text (tool_call and think tags removed) */
-  get text(): string
+  get text(): string;
   /** Get the extracted tool calls */
-  get toolCalls(): Array<ToolCallResult>
+  get toolCalls(): Array<ToolCallResult>;
   /**
    * Get the extracted thinking/reasoning content
    *
@@ -58,17 +58,17 @@ export declare class ChatResult {
    * - Displaying chain-of-thought to users (optional)
    * - Analyzing model decision-making
    */
-  get thinking(): string | null
+  get thinking(): string | null;
   /** Get the generated tokens */
-  get tokens(): MxArray
+  get tokens(): MxArray;
   /** Get the log probabilities */
-  get logprobs(): MxArray
+  get logprobs(): MxArray;
   /** Get the finish reason ("stop", "length", "tool_calls", or "repetition") */
-  get finishReason(): 'stop' | 'length' | 'tool_calls' | 'repetition'
+  get finishReason(): 'stop' | 'length' | 'tool_calls' | 'repetition';
   /** Get the number of tokens generated */
-  get numTokens(): number
+  get numTokens(): number;
   /** Get the raw text before tool call stripping (for debugging) */
-  get rawText(): string
+  get rawText(): string;
 }
 
 /**
@@ -92,33 +92,69 @@ export declare class DocLayoutModel {
    * # Returns
    * * Initialized DocLayoutModel ready for inference
    */
-  static load(modelPath: string): DocLayoutModel
+  static load(modelPath: string): DocLayoutModel;
   /**
    * Detect document layout elements in an image.
    *
    * # Arguments
-   * * `image_path` - Path to the input image
+   * * `image_data` - Encoded image bytes (PNG/JPEG)
    * * `threshold` - Optional confidence threshold (default 0.5)
    *
    * # Returns
    * * Vec of LayoutElements sorted by reading order
    */
-  detect(imagePath: string, threshold?: number | undefined | null): Array<LayoutElement>
+  detect(imageData: Buffer, threshold?: number | undefined | null): Array<LayoutElement>;
 }
-export type PPDocLayoutV3Model = DocLayoutModel
+export type PPDocLayoutV3Model = DocLayoutModel;
+
+/**
+ * PP-LCNet_x1_0 Document Orientation Classification model.
+ *
+ * Classifies document images into 4 orientation classes (0/90/180/270 degrees).
+ * Uses depthwise separable convolutions with HardSwish activation.
+ */
+export declare class DocOrientationModel {
+  /** Load a DocOrientationModel from a directory containing model.safetensors and config.json. */
+  static load(modelPath: string): DocOrientationModel;
+  /**
+   * Classify the orientation of a document image.
+   *
+   * Returns the detected orientation angle (0, 90, 180, 270) and confidence.
+   */
+  classify(imageData: Buffer): OrientationResult;
+  /**
+   * Classify orientation and return the corrected (upright) image bytes.
+   *
+   * Returns classification result plus corrected PNG image bytes.
+   */
+  classifyAndRotate(imageData: Buffer): ClassifyRotateResult;
+}
+
+/**
+ * UVDoc Document Unwarping model.
+ *
+ * Predicts a 2D displacement field and applies it to correct perspective
+ * distortion in camera-captured documents.
+ */
+export declare class DocUnwarpModel {
+  /** Load a DocUnwarpModel from a directory containing model.safetensors. */
+  static load(modelPath: string): DocUnwarpModel;
+  /** Unwarp a document image and return the corrected image bytes. */
+  unwarp(imageData: Buffer): UnwarpResult;
+}
 
 /** Result from text generation with detailed metadata */
 export declare class GenerationResult {
   /** Get the decoded text */
-  get text(): string
+  get text(): string;
   /** Get the generated tokens */
-  get tokens(): MxArray
+  get tokens(): MxArray;
   /** Get the log probabilities */
-  get logprobs(): MxArray
+  get logprobs(): MxArray;
   /** Get the finish reason ("eos", "length", or "repetition") */
-  get finishReason(): 'eos' | 'length' | 'repetition'
+  get finishReason(): 'eos' | 'length' | 'repetition';
   /** Get the number of tokens generated */
-  get numTokens(): number
+  get numTokens(): number;
 }
 
 /**
@@ -134,9 +170,9 @@ export declare class GrpoTrainingEngine {
    * * `model` - The Qwen3 model to train (will be cloned internally)
    * * `config` - Engine configuration
    */
-  constructor(model: Qwen3Model, config: GrpoEngineConfig)
+  constructor(model: Qwen3Model, config: GrpoEngineConfig);
   /** Register a built-in reward function */
-  registerBuiltinReward(config: BuiltinRewardConfig): void
+  registerBuiltinReward(config: BuiltinRewardConfig): void;
   /**
    * Run a training step with provided rewards
    *
@@ -153,21 +189,21 @@ export declare class GrpoTrainingEngine {
    * # Returns
    * * Training step metrics
    */
-  trainStep(prompts: Array<Array<ChatMessage>>, rewards: Array<number>): Promise<EngineStepMetrics>
+  trainStep(prompts: Array<Array<ChatMessage>>, rewards: Array<number>): Promise<EngineStepMetrics>;
   /**
    * Generate completions without training
    *
    * Use this to generate completions for scoring by external reward functions.
    * Returns completion texts along with the internal token data needed for training.
    */
-  generateBatch(prompts: Array<Array<ChatMessage>>): Promise<Array<string>>
+  generateBatch(prompts: Array<Array<ChatMessage>>): Promise<Array<string>>;
   /**
    * Generate completions with all data needed for training
    *
    * Returns completion texts, tokens, log probabilities, and lengths.
    * Use this when you need to score completions externally and then train.
    */
-  generateBatchForTraining(prompts: Array<Array<ChatMessage>>): Promise<GenerateBatchResult>
+  generateBatchForTraining(prompts: Array<Array<ChatMessage>>): Promise<GenerateBatchResult>;
   /**
    * Run a training step with pre-generated completions
    *
@@ -182,7 +218,11 @@ export declare class GrpoTrainingEngine {
    * # Returns
    * * Training step metrics
    */
-  trainStepWithGenerations(prompts: Array<Array<ChatMessage>>, rewards: Array<number>, generationResult: GenerateBatchResult): Promise<EngineStepMetrics>
+  trainStepWithGenerations(
+    prompts: Array<Array<ChatMessage>>,
+    rewards: Array<number>,
+    generationResult: GenerateBatchResult,
+  ): Promise<EngineStepMetrics>;
   /**
    * Unified training step with JS reward callback and optional output recording
    *
@@ -197,7 +237,11 @@ export declare class GrpoTrainingEngine {
    * # Returns
    * * Training step result including metrics, completions, rewards, and optionally outputs_json
    */
-  trainStepAuto(prompts: ChatMessage[][], rewardFn: (err: Error | null, outputsJson: string) => Promise<number[]>, recordOutputs: boolean): Promise<TrainStepResultWithOutputs>
+  trainStepAuto(
+    prompts: ChatMessage[][],
+    rewardFn: (err: Error | null, outputsJson: string) => Promise<number[]>,
+    recordOutputs: boolean,
+  ): Promise<TrainStepResultWithOutputs>;
   /**
    * Score completions using registered built-in rewards
    *
@@ -205,87 +249,102 @@ export declare class GrpoTrainingEngine {
    * * `prompts` - Prompt texts (expanded to match completions)
    * * `completions` - Completion texts to score
    */
-  scoreCompletions(prompts: Array<string>, completions: Array<string>): Array<number>
+  scoreCompletions(prompts: Array<string>, completions: Array<string>): Array<number>;
   /** Get current training step */
-  get step(): number
+  get step(): number;
   /** Get current epoch */
-  get epoch(): number
+  get epoch(): number;
   /** Start a new epoch */
-  startEpoch(): void
+  startEpoch(): void;
   /** End the current epoch and get metrics */
-  endEpoch(epochTimeSecs: number): EngineEpochMetrics
+  endEpoch(epochTimeSecs: number): EngineEpochMetrics;
   /** Reset the engine for a fresh training run */
-  reset(): void
+  reset(): void;
   /** Check if reward registry has any rewards registered */
-  get hasBuiltinRewards(): boolean
+  get hasBuiltinRewards(): boolean;
   /** Get names of registered reward functions */
-  get rewardNames(): Array<string>
+  get rewardNames(): Array<string>;
   /** Get current micro-step within gradient accumulation */
-  get microStep(): number
+  get microStep(): number;
   /**
    * Check if an emergency checkpoint should be saved
    * This flag is set when consecutive NaN gradients reach the threshold
    */
-  get needsEmergencySave(): boolean
+  get needsEmergencySave(): boolean;
   /** Get current NaN gradient count */
-  get nanGradientCount(): number
+  get nanGradientCount(): number;
   /** Clear the emergency save flag (call after saving emergency checkpoint) */
-  clearEmergencySaveFlag(): void
+  clearEmergencySaveFlag(): void;
 }
-export type GRPOTrainingEngine = GrpoTrainingEngine
+export type GRPOTrainingEngine = GrpoTrainingEngine;
 
 export declare class MxArray {
-  equal(other: MxArray): MxArray
-  notEqual(other: MxArray): MxArray
-  less(other: MxArray): MxArray
-  lessEqual(other: MxArray): MxArray
-  greater(other: MxArray): MxArray
-  greaterEqual(other: MxArray): MxArray
-  logicalAnd(other: MxArray): MxArray
-  logicalOr(other: MxArray): MxArray
-  logicalNot(): MxArray
-  where(x: MxArray, y: MxArray): MxArray
-  static fromInt32(data: Int32Array, shape: BigInt64Array): MxArray
-  static fromInt64(data: BigInt64Array, shape: BigInt64Array): MxArray
-  static fromUint32(data: Uint32Array, shape: BigInt64Array): MxArray
-  static fromFloat32(data: Float32Array, shape: BigInt64Array): MxArray
-  static zeros(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray
-  static scalarFloat(value: number): MxArray
-  static scalarInt(value: number): MxArray
-  static ones(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray
-  static full(shape: BigInt64Array, fillValue: number | MxArray, dtype?: DType | undefined | null): MxArray
-  static linspace(start: number, stop: number, num?: number | undefined | null, dtype?: DType | undefined | null): MxArray
-  static eye(n: number, m?: number | undefined | null, k?: number | undefined | null, dtype?: DType | undefined | null): MxArray
-  static arange(start: number, stop: number, step?: number | undefined | null, dtype?: DType | undefined | null): MxArray
-  astype(dtype: DType): MxArray
+  equal(other: MxArray): MxArray;
+  notEqual(other: MxArray): MxArray;
+  less(other: MxArray): MxArray;
+  lessEqual(other: MxArray): MxArray;
+  greater(other: MxArray): MxArray;
+  greaterEqual(other: MxArray): MxArray;
+  logicalAnd(other: MxArray): MxArray;
+  logicalOr(other: MxArray): MxArray;
+  logicalNot(): MxArray;
+  where(x: MxArray, y: MxArray): MxArray;
+  static fromInt32(data: Int32Array, shape: BigInt64Array): MxArray;
+  static fromInt64(data: BigInt64Array, shape: BigInt64Array): MxArray;
+  static fromUint32(data: Uint32Array, shape: BigInt64Array): MxArray;
+  static fromFloat32(data: Float32Array, shape: BigInt64Array): MxArray;
+  static zeros(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
+  static scalarFloat(value: number): MxArray;
+  static scalarInt(value: number): MxArray;
+  static ones(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
+  static full(shape: BigInt64Array, fillValue: number | MxArray, dtype?: DType | undefined | null): MxArray;
+  static linspace(
+    start: number,
+    stop: number,
+    num?: number | undefined | null,
+    dtype?: DType | undefined | null,
+  ): MxArray;
+  static eye(
+    n: number,
+    m?: number | undefined | null,
+    k?: number | undefined | null,
+    dtype?: DType | undefined | null,
+  ): MxArray;
+  static arange(
+    start: number,
+    stop: number,
+    step?: number | undefined | null,
+    dtype?: DType | undefined | null,
+  ): MxArray;
+  astype(dtype: DType): MxArray;
   /**
    * Create a copy of this array with a new handle.
    * This is useful for parameter loading to avoid handle aliasing issues.
    */
-  copy(): MxArray
-  eval(): void
-  evalAsync(): Promise<undefined>
-  size(): bigint
-  ndim(): number
-  shape(): BigInt64Array
+  copy(): MxArray;
+  eval(): void;
+  evalAsync(): Promise<undefined>;
+  size(): bigint;
+  ndim(): number;
+  shape(): BigInt64Array;
   /**
    * Get a single dimension from the array shape without copying the entire shape
    * This is more efficient when you only need one dimension
    *
    * Note: axis is u32 because NAPI doesn't support usize, but internally converted to usize
    */
-  shapeAt(axis: number): number
+  shapeAt(axis: number): number;
   /**
    * Get batch and sequence length for 2D arrays (common pattern in transformers)
    * More efficient than calling shape() and extracting dimensions
    */
-  getBatchSeqLen(): Array<number>
+  getBatchSeqLen(): Array<number>;
   /**
    * Get batch, sequence length, and hidden size for 3D arrays (common pattern in transformers)
    * More efficient than calling shape() and extracting dimensions
    */
-  getBatchSeqHidden(): Array<number>
-  dtype(): DType
+  getBatchSeqHidden(): Array<number>;
+  dtype(): DType;
   /**
    * Copy entire array from GPU to CPU as Float32Array
    *
@@ -306,7 +365,7 @@ export declare class MxArray {
    * - CPU-only operations (e.g., sorting for quantiles)
    * - Final output extraction
    */
-  toFloat32(): Float32Array
+  toFloat32(): Float32Array;
   /**
    * Copy entire array from GPU to CPU as Int32Array
    *
@@ -315,7 +374,7 @@ export declare class MxArray {
    * See `to_float32()` documentation for performance implications and alternatives.
    * Prefer `item_int32()` for scalars.
    */
-  toInt32(): Int32Array
+  toInt32(): Int32Array;
   /**
    * Copy entire array from GPU to CPU as Uint32Array
    *
@@ -323,146 +382,154 @@ export declare class MxArray {
    *
    * See `to_float32()` documentation for performance implications and alternatives.
    */
-  toUint32(): Uint32Array
-  logSoftmax(axis: number): MxArray
-  exp(): MxArray
-  log(): MxArray
-  clip(minimum?: number | undefined | null, maximum?: number | undefined | null): MxArray
-  minimum(other: MxArray): MxArray
-  maximum(other: MxArray): MxArray
-  add(other: MxArray): MxArray
-  sub(other: MxArray): MxArray
-  mul(other: MxArray): MxArray
-  div(other: MxArray): MxArray
-  addScalar(value: number): MxArray
-  mulScalar(value: number): MxArray
-  subScalar(value: number): MxArray
-  divScalar(value: number): MxArray
-  matmul(other: MxArray): MxArray
+  toUint32(): Uint32Array;
+  logSoftmax(axis: number): MxArray;
+  exp(): MxArray;
+  log(): MxArray;
+  clip(minimum?: number | undefined | null, maximum?: number | undefined | null): MxArray;
+  minimum(other: MxArray): MxArray;
+  maximum(other: MxArray): MxArray;
+  add(other: MxArray): MxArray;
+  sub(other: MxArray): MxArray;
+  mul(other: MxArray): MxArray;
+  div(other: MxArray): MxArray;
+  addScalar(value: number): MxArray;
+  mulScalar(value: number): MxArray;
+  subScalar(value: number): MxArray;
+  divScalar(value: number): MxArray;
+  matmul(other: MxArray): MxArray;
   /**
    * Fused matrix multiply-add: D = beta * C + alpha * (self @ B)
    * where self is A. More efficient than separate matmul and add operations.
    * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
    */
-  addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray
-  abs(): MxArray
-  negative(): MxArray
-  sign(): MxArray
-  sqrt(): MxArray
-  square(): MxArray
-  power(other: MxArray): MxArray
-  sin(): MxArray
-  cos(): MxArray
-  tan(): MxArray
-  sinh(): MxArray
-  cosh(): MxArray
-  tanh(): MxArray
-  floor(): MxArray
-  ceil(): MxArray
-  round(): MxArray
-  floorDivide(other: MxArray): MxArray
-  remainder(other: MxArray): MxArray
-  reciprocal(): MxArray
-  arcsin(): MxArray
-  arccos(): MxArray
-  arctan(): MxArray
-  log10(): MxArray
-  log2(): MxArray
-  log1p(): MxArray
+  addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray;
+  abs(): MxArray;
+  negative(): MxArray;
+  sign(): MxArray;
+  sqrt(): MxArray;
+  square(): MxArray;
+  power(other: MxArray): MxArray;
+  sin(): MxArray;
+  cos(): MxArray;
+  tan(): MxArray;
+  sinh(): MxArray;
+  cosh(): MxArray;
+  tanh(): MxArray;
+  floor(): MxArray;
+  ceil(): MxArray;
+  round(): MxArray;
+  floorDivide(other: MxArray): MxArray;
+  remainder(other: MxArray): MxArray;
+  reciprocal(): MxArray;
+  arcsin(): MxArray;
+  arccos(): MxArray;
+  arctan(): MxArray;
+  log10(): MxArray;
+  log2(): MxArray;
+  log1p(): MxArray;
   /**
    * Element-wise check for NaN values
    *
    * Returns a boolean array where True indicates the element is NaN.
    * This is a GPU-native operation that avoids CPU data transfer.
    */
-  isnan(): MxArray
+  isnan(): MxArray;
   /**
    * Element-wise check for Inf values
    *
    * Returns a boolean array where True indicates the element is +Inf or -Inf.
    * This is a GPU-native operation that avoids CPU data transfer.
    */
-  isinf(): MxArray
+  isinf(): MxArray;
   /**
    * Element-wise check for finite values
    *
    * Returns a boolean array where True indicates the element is finite (not NaN and not Inf).
    * This is a GPU-native operation that avoids CPU data transfer.
    */
-  isfinite(): MxArray
-  static randomUniform(shape: BigInt64Array, low: number, high: number, dtype?: DType | undefined | null): MxArray
-  static randomNormal(shape: BigInt64Array, mean: number, std: number, dtype?: DType | undefined | null): MxArray
-  static randomBernoulli(shape: BigInt64Array, prob: number): MxArray
-  static randint(shape: BigInt64Array, low: number, high: number): MxArray
+  isfinite(): MxArray;
+  static randomUniform(shape: BigInt64Array, low: number, high: number, dtype?: DType | undefined | null): MxArray;
+  static randomNormal(shape: BigInt64Array, mean: number, std: number, dtype?: DType | undefined | null): MxArray;
+  static randomBernoulli(shape: BigInt64Array, prob: number): MxArray;
+  static randint(shape: BigInt64Array, low: number, high: number): MxArray;
   /**
    * Sample from categorical distribution
    * Takes logits and returns sampled indices
    */
-  categorical(axis?: number | undefined | null): MxArray
-  sum(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray
-  mean(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray
-  argmax(axis: number, keepdims?: boolean | undefined | null): MxArray
-  argmin(axis: number, keepdims?: boolean | undefined | null): MxArray
-  max(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray
-  min(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray
-  prod(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray
-  var(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null, ddof?: number | undefined | null): MxArray
-  std(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null, ddof?: number | undefined | null): MxArray
-  logsumexp(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray
-  cumsum(axis: number): MxArray
-  cumprod(axis: number): MxArray
-  reshape(shape: BigInt64Array): MxArray
-  transpose(axes?: Int32Array | undefined | null): MxArray
-  take(indices: MxArray, axis: number): MxArray
-  takeAlongAxis(indices: MxArray, axis: number): MxArray
+  categorical(axis?: number | undefined | null): MxArray;
+  sum(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  mean(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  argmax(axis: number, keepdims?: boolean | undefined | null): MxArray;
+  argmin(axis: number, keepdims?: boolean | undefined | null): MxArray;
+  max(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  min(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  prod(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  var(
+    axes?: Int32Array | undefined | null,
+    keepdims?: boolean | undefined | null,
+    ddof?: number | undefined | null,
+  ): MxArray;
+  std(
+    axes?: Int32Array | undefined | null,
+    keepdims?: boolean | undefined | null,
+    ddof?: number | undefined | null,
+  ): MxArray;
+  logsumexp(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  cumsum(axis: number): MxArray;
+  cumprod(axis: number): MxArray;
+  reshape(shape: BigInt64Array): MxArray;
+  transpose(axes?: Int32Array | undefined | null): MxArray;
+  take(indices: MxArray, axis: number): MxArray;
+  takeAlongAxis(indices: MxArray, axis: number): MxArray;
   /**
    * Put values into array at specified indices along an axis
    * Equivalent to: result = array.copy(); result[..., indices] = values
    * This matches MLX's put_along_axis for efficient in-place-style updates
    */
-  putAlongAxis(indices: MxArray, values: MxArray, axis: number): MxArray
-  slice(starts: BigInt64Array, stops: BigInt64Array): MxArray
+  putAlongAxis(indices: MxArray, values: MxArray, axis: number): MxArray;
+  slice(starts: BigInt64Array, stops: BigInt64Array): MxArray;
   /**
    * Concatenate two arrays along an axis
    * Optimized for the common binary concatenation case
    */
-  static concatenate(a: MxArray, b: MxArray, axis: number): MxArray
+  static concatenate(a: MxArray, b: MxArray, axis: number): MxArray;
   /**
    * Concatenate multiple arrays along an axis
    * For concatenating 3 or more arrays
    */
-  static concatenateMany(arrays: Array<MxArray>, axis?: number | undefined | null): MxArray
-  sort(axis?: number | undefined | null): MxArray
-  argsort(axis?: number | undefined | null): MxArray
-  partition(kth: number, axis?: number | undefined | null): MxArray
-  argpartition(kth: number, axis?: number | undefined | null): MxArray
-  static stack(arrays: Array<MxArray>, axis?: number | undefined | null): MxArray
-  pad(padWidth: Int32Array, constantValue: number): MxArray
-  roll(shift: number, axis: number): MxArray
-  split(indicesOrSections: number, axis?: number | undefined | null): Array<MxArray>
-  tile(reps: Int32Array): MxArray
-  repeat(repeats: number, axis: number): MxArray
-  squeeze(axes?: Int32Array | undefined | null): MxArray
-  expandDims(axis: number): MxArray
-  broadcastTo(shape: BigInt64Array): MxArray
+  static concatenateMany(arrays: Array<MxArray>, axis?: number | undefined | null): MxArray;
+  sort(axis?: number | undefined | null): MxArray;
+  argsort(axis?: number | undefined | null): MxArray;
+  partition(kth: number, axis?: number | undefined | null): MxArray;
+  argpartition(kth: number, axis?: number | undefined | null): MxArray;
+  static stack(arrays: Array<MxArray>, axis?: number | undefined | null): MxArray;
+  pad(padWidth: Int32Array, constantValue: number): MxArray;
+  roll(shift: number, axis: number): MxArray;
+  split(indicesOrSections: number, axis?: number | undefined | null): Array<MxArray>;
+  tile(reps: Int32Array): MxArray;
+  repeat(repeats: number, axis: number): MxArray;
+  squeeze(axes?: Int32Array | undefined | null): MxArray;
+  expandDims(axis: number): MxArray;
+  broadcastTo(shape: BigInt64Array): MxArray;
 }
 
 /** NAPI-exported reward registry wrapper */
 export declare class NativeRewardRegistry {
   /** Create a new reward registry */
-  constructor()
+  constructor();
   /** Register a built-in reward function */
-  register(config: BuiltinRewardConfig): void
+  register(config: BuiltinRewardConfig): void;
   /** Score a single completion */
-  score(prompt: string, completion: string): number
+  score(prompt: string, completion: string): number;
   /** Score a batch of completions */
-  scoreBatch(prompts: Array<string>, completions: Array<string>): Array<number>
+  scoreBatch(prompts: Array<string>, completions: Array<string>): Array<number>;
   /** Check if registry is empty */
-  get isEmpty(): boolean
+  get isEmpty(): boolean;
   /** Get registered reward names */
-  get names(): Array<string>
+  get names(): Array<string>;
   /** Set whether to normalize scores */
-  setNormalize(normalize: boolean): void
+  setNormalize(normalize: boolean): void;
 }
 
 /**
@@ -473,96 +540,136 @@ export declare class NativeRewardRegistry {
  */
 export declare class OutputStore {
   /** Create a new output store with local SQLite file */
-  static local(path: string): Promise<OutputStore>
+  static local(path: string): Promise<OutputStore>;
   /** Create from config object */
-  static fromConfig(config: OutputStoreConfig): Promise<OutputStore>
+  static fromConfig(config: OutputStoreConfig): Promise<OutputStore>;
   /** Start a new training run */
-  startRun(modelName: string, modelPath: string | undefined | null, config: string): Promise<string>
+  startRun(modelName: string, modelPath: string | undefined | null, config: string): Promise<string>;
   /** Start a new training run with a name */
-  startRunWithName(name: string | undefined | null, modelName: string, modelPath: string | undefined | null, config: string): Promise<string>
+  startRunWithName(
+    name: string | undefined | null,
+    modelName: string,
+    modelPath: string | undefined | null,
+    config: string,
+  ): Promise<string>;
   /** End the current training run */
-  endRun(status: string): Promise<void>
+  endRun(status: string): Promise<void>;
   /** Get current run ID */
-  currentRunId(): Promise<string | null>
+  currentRunId(): Promise<string | null>;
   /** Find a run by name */
-  findRunByName(name: string): Promise<TrainingRunRecord | null>
+  findRunByName(name: string): Promise<TrainingRunRecord | null>;
   /** Resume an existing run (sets status to running and makes it current) */
-  resumeRun(runId: string): Promise<void>
+  resumeRun(runId: string): Promise<void>;
   /** Delete all steps after a given step number (for resume cleanup) */
-  deleteStepsAfter(runId: string, afterStep: number): Promise<number>
+  deleteStepsAfter(runId: string, afterStep: number): Promise<number>;
   /**
    * Delete all records after a given step (for checkpoint resume)
    *
    * Cascades through: training_steps → generations → tool_calls, and logs.
    * Use this when resuming from checkpoint to ensure clean database state.
    */
-  deleteAllAfterStep(runId: string, afterStep: number): Promise<CleanupStats>
+  deleteAllAfterStep(runId: string, afterStep: number): Promise<CleanupStats>;
   /**
    * Get recent step metrics for TUI sparkline restoration
    *
    * Returns metrics ordered by step (oldest first) for easy insertion into VecDeque.
    */
-  getRecentStepMetrics(runId: string, limit: number): Promise<Array<StepMetricSummary>>
+  getRecentStepMetrics(runId: string, limit: number): Promise<Array<StepMetricSummary>>;
   /**
    * Get aggregate statistics for a training run
    *
    * Returns pre-computed aggregates for restoring TUI state on resume.
    */
-  getRunAggregates(runId: string): Promise<RunAggregates>
+  getRunAggregates(runId: string): Promise<RunAggregates>;
   /**
    * Get recent generations for sample panel restoration
    *
    * Returns generations ordered by step DESC, reward DESC (most recent high-reward first).
    */
-  getRecentGenerations(runId: string, limit: number): Promise<Array<GenerationRecord>>
+  getRecentGenerations(runId: string, limit: number): Promise<Array<GenerationRecord>>;
   /** Get store configuration */
-  get config(): OutputStoreConfig
+  get config(): OutputStoreConfig;
   /** Record from RewardOutput JSON (direct integration with training engine) */
-  recordStepFromOutputs(step: number, metrics: EngineStepMetrics, outputsJson: string, rewards: Array<number>, groupSize: number): Promise<number>
+  recordStepFromOutputs(
+    step: number,
+    metrics: EngineStepMetrics,
+    outputsJson: string,
+    rewards: Array<number>,
+    groupSize: number,
+  ): Promise<number>;
   /**
    * Record a complete training step with all generations and tool calls
    *
    * Lower-level API for direct control over step recording.
    */
-  recordStep(step: StepRecord, generations: Array<GenerationRecord>, toolCalls: Array<Array<ToolCallRecord>>): Promise<number>
+  recordStep(
+    step: StepRecord,
+    generations: Array<GenerationRecord>,
+    toolCalls: Array<Array<ToolCallRecord>>,
+  ): Promise<number>;
   /** Flush any pending writes */
-  flush(): Promise<void>
+  flush(): Promise<void>;
   /** List all training runs */
-  listRuns(limit?: number | undefined | null, status?: string | undefined | null): Promise<Array<TrainingRunRecord>>
+  listRuns(limit?: number | undefined | null, status?: string | undefined | null): Promise<Array<TrainingRunRecord>>;
   /** Get a specific run */
-  getRun(runId: string): Promise<TrainingRunRecord | null>
+  getRun(runId: string): Promise<TrainingRunRecord | null>;
   /** Get step summaries for a run */
-  getStepSummaries(runId: string, startStep?: number | undefined | null, endStep?: number | undefined | null): Promise<Array<StepSummary>>
+  getStepSummaries(
+    runId: string,
+    startStep?: number | undefined | null,
+    endStep?: number | undefined | null,
+  ): Promise<Array<StepSummary>>;
   /** Get all generations for a step */
-  getGenerations(runId: string, step: number): Promise<Array<GenerationWithToolCalls>>
+  getGenerations(runId: string, step: number): Promise<Array<GenerationWithToolCalls>>;
   /** Get top/bottom generations by reward */
-  getGenerationsByReward(runId: string, topN?: number | undefined | null, bottomN?: number | undefined | null, stepRange?: Array<number> | undefined | null): Promise<Array<GenerationWithToolCalls>>
+  getGenerationsByReward(
+    runId: string,
+    topN?: number | undefined | null,
+    bottomN?: number | undefined | null,
+    stepRange?: Array<number> | undefined | null,
+  ): Promise<Array<GenerationWithToolCalls>>;
   /** Get generations with specific finish reason */
-  getGenerationsByFinishReason(runId: string, finishReason: string, limit?: number | undefined | null): Promise<Array<GenerationWithToolCalls>>
+  getGenerationsByFinishReason(
+    runId: string,
+    finishReason: string,
+    limit?: number | undefined | null,
+  ): Promise<Array<GenerationWithToolCalls>>;
   /** Get generations containing tool calls */
-  getGenerationsWithToolCalls(runId: string, toolName?: string | undefined | null, status?: string | undefined | null, limit?: number | undefined | null): Promise<Array<GenerationWithToolCalls>>
+  getGenerationsWithToolCalls(
+    runId: string,
+    toolName?: string | undefined | null,
+    status?: string | undefined | null,
+    limit?: number | undefined | null,
+  ): Promise<Array<GenerationWithToolCalls>>;
   /** Search generations by text content */
-  searchGenerations(runId: string, query: string, searchIn?: string | undefined | null, limit?: number | undefined | null): Promise<Array<GenerationWithToolCalls>>
+  searchGenerations(
+    runId: string,
+    query: string,
+    searchIn?: string | undefined | null,
+    limit?: number | undefined | null,
+  ): Promise<Array<GenerationWithToolCalls>>;
   /** Get reward distribution statistics */
-  getRewardStats(runId: string, stepRange?: Array<number> | undefined | null): Promise<RewardStats>
+  getRewardStats(runId: string, stepRange?: Array<number> | undefined | null): Promise<RewardStats>;
   /** Export to JSONL file */
-  exportJsonl(runId: string, outputPath: string, includeToolCalls?: boolean | undefined | null): Promise<number>
+  exportJsonl(runId: string, outputPath: string, includeToolCalls?: boolean | undefined | null): Promise<number>;
   /** Execute raw SQL query (for advanced users) */
-  queryRaw(sql: string): Promise<string>
+  queryRaw(sql: string): Promise<string>;
 }
 
 /**
- * Qwen3.5 Model — hybrid linear/full attention with optional MoE.
+ * Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
  *
- * Inference-only implementation. Supports both dense and MoE variants.
+ * Uses interior mutability (RwLock) for layers, final_norm, lm_head, and caches
+ * to allow async generation via spawn_blocking without blocking the Node.js event loop.
+ * This matches the pattern used by Qwen3Model.
  */
 export declare class Qwen35Model {
   /** Create a new Qwen3.5 model with the given configuration. */
-  constructor(config: Qwen35Config)
+  constructor(config: Qwen35Config);
   /** Initialize caches for incremental generation. */
-  initCaches(): void
+  initCaches(): void;
   /** Reset all caches. */
-  resetCaches(): void
+  resetCaches(): void;
   /**
    * Forward pass through the model.
    *
@@ -572,9 +679,9 @@ export declare class Qwen35Model {
    * # Returns
    * Logits [B, T, vocab_size]
    */
-  forward(inputIds: MxArray): MxArray
+  forward(inputIds: MxArray): MxArray;
   /** Forward pass with cache for incremental generation. */
-  forwardWithCache(inputIds: MxArray): MxArray
+  forwardWithCache(inputIds: MxArray): MxArray;
   /**
    * Load a pretrained model from a directory.
    *
@@ -583,15 +690,25 @@ export declare class Qwen35Model {
    * - model.safetensors (or model-*.safetensors)
    * - tokenizer.json + tokenizer_config.json
    */
-  static loadPretrained(path: string): Promise<Qwen35Model>
-  /** Generate text from a prompt token sequence. */
-  generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Qwen35GenerationResult
-  /** Chat API with tool calling support. */
-  chat(messages: Array<ChatMessage>, config?: Qwen35ChatConfig | undefined | null): Qwen35ChatResult
+  static loadPretrained(path: string): Promise<Qwen35Model>;
+  /**
+   * Generate text from a prompt token sequence.
+   *
+   * Runs generation on a worker thread via spawn_blocking to avoid
+   * blocking the Node.js event loop.
+   */
+  generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
+  /**
+   * Chat API with tool calling support.
+   *
+   * Runs tokenization + generation on a worker thread via spawn_blocking
+   * to avoid blocking the Node.js event loop.
+   */
+  chat(messages: Array<ChatMessage>, config?: Qwen35ChatConfig | undefined | null): Promise<Qwen35ChatResult>;
   /** Get the number of parameters in the model. */
-  numParameters(): number
+  numParameters(): number;
 }
-export type Qwen3_5Model = Qwen35Model
+export type Qwen3_5Model = Qwen35Model;
 
 /**
  * Qwen3 Model with automatic differentiation support
@@ -602,7 +719,7 @@ export type Qwen3_5Model = Qwen35Model
  */
 export declare class Qwen3Model {
   /** Create a new Qwen3 model with the given configuration */
-  constructor(config: Qwen3Config)
+  constructor(config: Qwen3Config);
   /**
    * Forward pass through the model
    *
@@ -612,33 +729,33 @@ export declare class Qwen3Model {
    * # Returns
    * * Logits, shape: [batch_size, seq_len, vocab_size]
    */
-  forward(inputIds: MxArray): MxArray
+  forward(inputIds: MxArray): MxArray;
   /**
    * Initialize KV caches for incremental generation
    *
    * Creates one KV cache per transformer layer. Call this before starting generation.
    */
-  initKvCaches(): void
+  initKvCaches(): void;
   /**
    * Reset all KV caches
    *
    * Clears cached key-value states. Call this between different generation sequences.
    */
-  resetKvCaches(): void
+  resetKvCaches(): void;
   /** Check if paged attention is enabled for this model */
-  hasPagedAttention(): boolean
+  hasPagedAttention(): boolean;
   /**
    * Get paged attention memory statistics (if enabled)
    *
    * Returns memory usage statistics for the paged KV cache.
    */
-  pagedCacheStats(): PagedCacheStats | null
+  pagedCacheStats(): PagedCacheStats | null;
   /**
    * Get scheduler statistics (if paged attention is enabled)
    *
    * Returns the number of waiting, running, and completed sequences.
    */
-  schedulerStats(): SchedulerStatsNapi | null
+  schedulerStats(): SchedulerStatsNapi | null;
   /**
    * Forward pass with KV caching for incremental generation
    *
@@ -649,7 +766,7 @@ export declare class Qwen3Model {
    * # Returns
    * * Logits, shape: [batch_size, seq_len, vocab_size]
    */
-  forwardWithCache(inputIds: MxArray, useCache: boolean): MxArray
+  forwardWithCache(inputIds: MxArray, useCache: boolean): MxArray;
   /**
    * Forward pass with paged attention for memory-efficient inference.
    *
@@ -667,7 +784,7 @@ export declare class Qwen3Model {
    * # Returns
    * * Logits, shape: [num_seqs, 1, vocab_size] for decode
    */
-  forwardPaged(inputIds: MxArray, slotMapping: MxArray, seqIds: Array<number>, positions: MxArray): MxArray
+  forwardPaged(inputIds: MxArray, slotMapping: MxArray, seqIds: Array<number>, positions: MxArray): MxArray;
   /**
    * Prefill a sequence using standard attention and write K/V to paged cache.
    *
@@ -683,7 +800,7 @@ export declare class Qwen3Model {
    * # Returns
    * * Logits for the last token, shape: [1, vocab_size]
    */
-  prefillPaged(promptTokens: Array<number>, seqId: number): MxArray
+  prefillPaged(promptTokens: Array<number>, seqId: number): MxArray;
   /**
    * Add a request to the paged attention scheduler.
    *
@@ -703,7 +820,12 @@ export declare class Qwen3Model {
    * # Returns
    * * Number of pending requests in the queue
    */
-  addPagedRequest(requestId: string, promptTokens: Array<number>, maxNewTokens: number, priority?: number | undefined | null): number
+  addPagedRequest(
+    requestId: string,
+    promptTokens: Array<number>,
+    maxNewTokens: number,
+    priority?: number | undefined | null,
+  ): number;
   /**
    * Schedule and execute one step of paged generation.
    *
@@ -719,17 +841,17 @@ export declare class Qwen3Model {
    * # Returns
    * * `PagedGenerationStep` with token outputs for each sequence
    */
-  stepPagedGeneration(config?: GenerationConfig | undefined | null): PagedGenerationStep | null
+  stepPagedGeneration(config?: GenerationConfig | undefined | null): PagedGenerationStep | null;
   /**
    * Get completed sequences from the scheduler.
    *
    * Call this after `step_paged_generation()` returns outputs with `is_finished: true`.
    */
-  getCompletedSequences(): Array<PagedCompletedSequence>
+  getCompletedSequences(): Array<PagedCompletedSequence>;
   /** Check if the scheduler has pending work. */
-  hasPagedWork(): boolean
+  hasPagedWork(): boolean;
   /** Get model configuration */
-  getConfig(): Qwen3Config
+  getConfig(): Qwen3Config;
   /**
    * Generate tokens using speculative decoding with a draft model.
    *
@@ -764,17 +886,21 @@ export declare class Qwen3Model {
    * });
    * ```
    */
-  generateSpeculativeSync(draftModel: Qwen3Model, inputIds: MxArray, config?: GenerationConfig | undefined | null): GenerationResult
+  generateSpeculativeSync(
+    draftModel: Qwen3Model,
+    inputIds: MxArray,
+    config?: GenerationConfig | undefined | null,
+  ): GenerationResult;
   /** Count total number of parameters in the model */
-  numParameters(): number
+  numParameters(): number;
   /**
    * Get all model parameters as a dictionary mapping names to arrays
    *
    * This matches the TypeScript API for compatibility
    */
-  getParameters(): Record<string, MxArray>
+  getParameters(): Record<string, MxArray>;
   /** Load parameters from a dictionary */
-  loadParameters(params: Record<string, MxArray>): void
+  loadParameters(params: Record<string, MxArray>): void;
   /**
    * Compute forward pass and loss (for evaluation)
    *
@@ -785,7 +911,7 @@ export declare class Qwen3Model {
    * # Returns
    * * Scalar loss value
    */
-  computeLoss(inputIds: MxArray, labels: MxArray): MxArray
+  computeLoss(inputIds: MxArray, labels: MxArray): MxArray;
   /**
    * Compute loss and gradients using a hybrid approach
    *
@@ -807,7 +933,7 @@ export declare class Qwen3Model {
    *
    * Future: Full MLX autograd will compute exact gradients for all 250+ parameters
    */
-  computeLossAndGradients(inputIds: MxArray, labels: MxArray): [MxArray, Record<string, MxArray>]
+  computeLossAndGradients(inputIds: MxArray, labels: MxArray): [MxArray, Record<string, MxArray>];
   /**
    * Complete GRPO training step using MLX Autograd (RECOMMENDED)
    *
@@ -826,7 +952,15 @@ export declare class Qwen3Model {
    * # Returns
    * * Tuple of (loss_value, metrics_dict)
    */
-  trainStepGrpoAutograd(promptTokens: Array<MxArray>, completionTokens: Array<MxArray>, completionLogprobs: Array<MxArray>, rewards: Float64Array, groupSize: number, config: GrpoLossConfig, learningRate: number): [number, Record<string, number>]
+  trainStepGrpoAutograd(
+    promptTokens: Array<MxArray>,
+    completionTokens: Array<MxArray>,
+    completionLogprobs: Array<MxArray>,
+    rewards: Float64Array,
+    groupSize: number,
+    config: GrpoLossConfig,
+    learningRate: number,
+  ): [number, Record<string, number>];
   /**
    * Compute gradients only without applying them (for gradient accumulation)
    *
@@ -845,7 +979,14 @@ export declare class Qwen3Model {
    * # Returns
    * * Tuple of (loss_value, gradients_dict, metrics_dict)
    */
-  computeGradientsOnlyGrpoAutograd(promptTokens: Array<MxArray>, completionTokens: Array<MxArray>, completionLogprobs: Array<MxArray>, rewards: Float64Array, groupSize: number, config: GrpoLossConfig): [number, Record<string, MxArray>, Record<string, number>]
+  computeGradientsOnlyGrpoAutograd(
+    promptTokens: Array<MxArray>,
+    completionTokens: Array<MxArray>,
+    completionLogprobs: Array<MxArray>,
+    rewards: Float64Array,
+    groupSize: number,
+    config: GrpoLossConfig,
+  ): [number, Record<string, MxArray>, Record<string, number>];
   /**
    * Accumulate gradients into existing gradient dictionary
    *
@@ -859,7 +1000,10 @@ export declare class Qwen3Model {
    * # Returns
    * * Updated gradient dictionary with accumulated values
    */
-  static accumulateGradients(accumulatedGradients: Record<string, MxArray>, newGradients: Record<string, MxArray>): Record<string, MxArray>
+  static accumulateGradients(
+    accumulatedGradients: Record<string, MxArray>,
+    newGradients: Record<string, MxArray>,
+  ): Record<string, MxArray>;
   /**
    * Complete GRPO training step using manual gradients (Legacy)
    *
@@ -883,7 +1027,15 @@ export declare class Qwen3Model {
    * # Returns
    * * Tuple of (loss_value, metrics_dict)
    */
-  trainStepGrpo(promptTokens: Array<MxArray>, completionTokens: Array<MxArray>, completionLogprobs: Array<MxArray>, rewards: Float64Array, groupSize: number, config: GrpoLossConfig, learningRate: number): [number, Record<string, number>]
+  trainStepGrpo(
+    promptTokens: Array<MxArray>,
+    completionTokens: Array<MxArray>,
+    completionLogprobs: Array<MxArray>,
+    rewards: Float64Array,
+    groupSize: number,
+    config: GrpoLossConfig,
+    learningRate: number,
+  ): [number, Record<string, number>];
   /**
    * Apply gradients to model parameters
    *
@@ -898,7 +1050,7 @@ export declare class Qwen3Model {
    * The learning rate scalar is cast to match param dtype to prevent
    * promotion to float32 during arithmetic operations.
    */
-  applyGradients(gradients: Record<string, MxArray>, learningRate: number): void
+  applyGradients(gradients: Record<string, MxArray>, learningRate: number): void;
   /**
    * Text-to-text generation with integrated tokenization
    *
@@ -929,7 +1081,7 @@ export declare class Qwen3Model {
    * console.log(result.logprobs); // Log probabilities (for GRPO)
    * ```
    */
-  generate(messages: Array<ChatMessage>, config?: GenerationConfig | undefined | null): Promise<GenerationResult>
+  generate(messages: Array<ChatMessage>, config?: GenerationConfig | undefined | null): Promise<GenerationResult>;
   /**
    * High-level chat API with structured response parsing
    *
@@ -1000,7 +1152,7 @@ export declare class Qwen3Model {
    * }
    * ```
    */
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Generate multiple completions for multiple prompts in batch
    *
@@ -1035,7 +1187,11 @@ export declare class Qwen3Model {
    * );
    * ```
    */
-  generateBatch(prompts: Array<Array<ChatMessage>>, groupSize: number, config?: GenerationConfig | undefined | null): Promise<BatchGenerationResult>
+  generateBatch(
+    prompts: Array<Array<ChatMessage>>,
+    groupSize: number,
+    config?: GenerationConfig | undefined | null,
+  ): Promise<BatchGenerationResult>;
   /**
    * Decode token IDs to text using the internal tokenizer
    *
@@ -1049,7 +1205,7 @@ export declare class Qwen3Model {
    * # Returns
    * * Decoded text string
    */
-  decode(tokenIds: Uint32Array, skipSpecialTokens?: boolean | undefined | null): Promise<string>
+  decode(tokenIds: Uint32Array, skipSpecialTokens?: boolean | undefined | null): Promise<string>;
   /**
    * Apply chat template and encode to token IDs
    *
@@ -1065,7 +1221,12 @@ export declare class Qwen3Model {
    * # Returns
    * * Encoded token IDs as Uint32Array
    */
-  applyChatTemplate(messages: Array<ChatMessage>, addGenerationPrompt?: boolean | undefined | null, tools?: Array<ToolDefinition> | undefined | null, enableThinking?: boolean | undefined | null): Promise<Uint32Array>
+  applyChatTemplate(
+    messages: Array<ChatMessage>,
+    addGenerationPrompt?: boolean | undefined | null,
+    tools?: Array<ToolDefinition> | undefined | null,
+    enableThinking?: boolean | undefined | null,
+  ): Promise<Uint32Array>;
   /**
    * Load a pretrained model from disk
    *
@@ -1080,7 +1241,7 @@ export declare class Qwen3Model {
    * # Returns
    * * A fully initialized Qwen3Model with loaded weights
    */
-  static loadPretrained(modelPath: string): Promise<Qwen3Model>
+  static loadPretrained(modelPath: string): Promise<Qwen3Model>;
   /**
    * Save model configuration and weights to disk
    *
@@ -1092,7 +1253,7 @@ export declare class Qwen3Model {
    * # Arguments
    * * `save_path` - Directory to save the model
    */
-  saveModel(savePath: string): Promise<undefined>
+  saveModel(savePath: string): Promise<undefined>;
   /**
    * Validate that a set of parameters has all required weights with correct shapes
    *
@@ -1106,7 +1267,7 @@ export declare class Qwen3Model {
    * * Ok(()) if all validations pass
    * * Err with descriptive message if validation fails
    */
-  validateParameters(params: Record<string, MxArray>): void
+  validateParameters(params: Record<string, MxArray>): void;
 }
 
 /** Qwen3 Tokenizer class with NAPI bindings */
@@ -1123,7 +1284,7 @@ export declare class Qwen3Tokenizer {
    * const tokens = tokenizer.encode("Hello, world!");
    * ```
    */
-  static fromPretrained(tokenizerPath: string): Promise<Qwen3Tokenizer>
+  static fromPretrained(tokenizerPath: string): Promise<Qwen3Tokenizer>;
   /**
    * Encode text to token IDs
    *
@@ -1140,7 +1301,7 @@ export declare class Qwen3Tokenizer {
    * console.log(tokens); // Int32Array [9906, 11, 1879, 0]
    * ```
    */
-  encode(text: string, addSpecialTokens?: boolean | undefined | null): Promise<Uint32Array>
+  encode(text: string, addSpecialTokens?: boolean | undefined | null): Promise<Uint32Array>;
   /**
    * Encode multiple texts in batch
    *
@@ -1151,7 +1312,7 @@ export declare class Qwen3Tokenizer {
    * # Returns
    * Array of Int32Arrays, one for each text
    */
-  encodeBatch(texts: Array<string>, addSpecialTokens?: boolean | undefined | null): Promise<Array<Uint32Array>>
+  encodeBatch(texts: Array<string>, addSpecialTokens?: boolean | undefined | null): Promise<Array<Uint32Array>>;
   /**
    * Decode token IDs to text
    *
@@ -1168,7 +1329,7 @@ export declare class Qwen3Tokenizer {
    * console.log(text); // "Hello, world!"
    * ```
    */
-  decode(tokenIds: Uint32Array, skipSpecialTokens?: boolean | undefined | null): Promise<string>
+  decode(tokenIds: Uint32Array, skipSpecialTokens?: boolean | undefined | null): Promise<string>;
   /**
    * Decode multiple token sequences in batch
    *
@@ -1179,7 +1340,10 @@ export declare class Qwen3Tokenizer {
    * # Returns
    * Array of decoded text strings
    */
-  decodeBatch(tokenIdsBatch: Array<Uint32Array>, skipSpecialTokens?: boolean | undefined | null): Promise<Array<string>>
+  decodeBatch(
+    tokenIdsBatch: Array<Uint32Array>,
+    skipSpecialTokens?: boolean | undefined | null,
+  ): Promise<Array<string>>;
   /**
    * Apply chat template to messages and encode
    *
@@ -1212,37 +1376,42 @@ export declare class Qwen3Tokenizer {
    * const tokens = tokenizer.applyChatTemplate(messages, true, tools);
    * ```
    */
-  applyChatTemplate(messages: Array<ChatMessage>, addGenerationPrompt?: boolean | undefined | null, tools?: Array<ToolDefinition> | undefined | null, enableThinking?: boolean | undefined | null): Promise<Uint32Array>
+  applyChatTemplate(
+    messages: Array<ChatMessage>,
+    addGenerationPrompt?: boolean | undefined | null,
+    tools?: Array<ToolDefinition> | undefined | null,
+    enableThinking?: boolean | undefined | null,
+  ): Promise<Uint32Array>;
   /** Get vocabulary size */
-  vocabSize(): number
+  vocabSize(): number;
   /** Get PAD token ID */
-  getPadTokenId(): number
+  getPadTokenId(): number;
   /** Get EOS token ID */
-  getEosTokenId(): number
+  getEosTokenId(): number;
   /** Get BOS token ID (if exists) */
-  getBosTokenId(): number | null
+  getBosTokenId(): number | null;
   /** Convert token ID to string */
-  idToToken(id: number): string | null
+  idToToken(id: number): string | null;
   /** Convert token string to ID */
-  tokenToId(token: string): number | null
+  tokenToId(token: string): number | null;
   /** Get the special token for IM_START */
-  getImStartToken(): string
+  getImStartToken(): string;
   /** Get the special token for IM_END */
-  getImEndToken(): string
+  getImEndToken(): string;
   /** Get the special token for ENDOFTEXT (used as PAD) */
-  getEndoftextToken(): string
+  getEndoftextToken(): string;
 }
 
 /** SFT Training Engine */
 export declare class SftTrainingEngine {
   /** Create a new SFT training engine */
-  constructor(model: Qwen3Model, config: SftEngineConfig)
+  constructor(model: Qwen3Model, config: SftEngineConfig);
   /** Run a single training step */
-  trainStep(inputIds: MxArray, labels: MxArray): Promise<SftStepMetrics>
+  trainStep(inputIds: MxArray, labels: MxArray): Promise<SftStepMetrics>;
   /** Get current step number */
-  getStep(): number
+  getStep(): number;
   /** Get current epoch */
-  getEpoch(): number
+  getEpoch(): number;
   /**
    * Flush any accumulated gradients at epoch end
    *
@@ -1250,33 +1419,33 @@ export declare class SftTrainingEngine {
    * leftover gradients from the final micro-batches. This method applies
    * them with proper averaging, matching TRL behavior.
    */
-  flushGradients(): boolean
+  flushGradients(): boolean;
   /**
    * Compute the resume position given current state and dataset info
    *
    * This centralizes all resume logic in Rust for correctness.
    * Uses i64 math internally to avoid overflow on long runs.
    */
-  computeResumePosition(stepsPerEpoch: number): ResumePosition
+  computeResumePosition(stepsPerEpoch: number): ResumePosition;
   /** Check if emergency save is needed */
-  needsEmergencySave(): boolean
+  needsEmergencySave(): boolean;
   /** Clear emergency save flag */
-  clearEmergencySave(): void
+  clearEmergencySave(): void;
   /**
    * Signal start of a new epoch
    *
    * Takes the epoch number directly from TypeScript to ensure synchronization.
    * The epoch is 0-indexed to match the TypeScript training loop.
    */
-  startEpoch(epoch: number): void
+  startEpoch(epoch: number): void;
   /** End current epoch and return metrics */
-  endEpoch(epochTimeSecs: number): SftEpochMetrics
+  endEpoch(epochTimeSecs: number): SftEpochMetrics;
   /** Reset training state (for new training run) */
-  reset(): void
+  reset(): void;
   /** Restore training state (for resuming from checkpoint) */
-  restoreState(step: number, epoch: number): void
+  restoreState(step: number, epoch: number): void;
   /** Get the underlying model for checkpointing */
-  getModel(): Qwen3Model
+  getModel(): Qwen3Model;
 }
 
 /**
@@ -1289,48 +1458,56 @@ export declare class SftTrainingEngine {
  */
 export declare class Tensor {
   /** Create a tensor from float32 data */
-  static fromFloat32(data: Float32Array, shape: BigInt64Array, requiresGrad?: boolean | undefined | null): Tensor
+  static fromFloat32(data: Float32Array, shape: BigInt64Array, requiresGrad?: boolean | undefined | null): Tensor;
   /** Create a tensor from int32 data */
-  static fromInt32(data: Int32Array, shape: BigInt64Array, requiresGrad?: boolean | undefined | null): Tensor
+  static fromInt32(data: Int32Array, shape: BigInt64Array, requiresGrad?: boolean | undefined | null): Tensor;
   /** Get the shape of the underlying data */
-  dataShape(): BigInt64Array
+  dataShape(): BigInt64Array;
   /** Get the shape of the gradient (if it exists) */
-  gradShape(): BigInt64Array | null
+  gradShape(): BigInt64Array | null;
   /** Check if gradient exists */
-  hasGrad(): boolean
+  hasGrad(): boolean;
   /** Check if this tensor requires gradients */
-  get requiresGrad(): boolean
+  get requiresGrad(): boolean;
   /** Set whether this tensor requires gradients */
-  set requiresGrad(requiresGrad: boolean)
+  set requiresGrad(requiresGrad: boolean);
   /** Zero out the gradient */
-  zeroGrad(): void
+  zeroGrad(): void;
   /**
    * Accumulate gradient
    *
    * If gradient already exists, add to it. Otherwise, set it.
    * Note: This takes ownership of the gradient array.
    */
-  accumulateGrad(grad: MxArray): void
+  accumulateGrad(grad: MxArray): void;
   /** Get the shape of the tensor */
-  shape(): BigInt64Array
+  shape(): BigInt64Array;
   /** Convert data to Float32 array */
-  toFloat32(): Float32Array
+  toFloat32(): Float32Array;
   /** Convert gradient to Float32 array (if it exists) */
-  gradToFloat32(): Float32Array | null
+  gradToFloat32(): Float32Array | null;
   /** Convert to Int32 array */
-  toInt32(): Int32Array
+  toInt32(): Int32Array;
   /**
    * Detach this tensor from the computation graph
    *
    * Returns a new tensor with the same data but no gradient tracking
    */
-  detach(): Tensor
+  detach(): Tensor;
   /** Create a tensor of zeros */
-  static zeros(shape: BigInt64Array, dtype?: DType | undefined | null, requiresGrad?: boolean | undefined | null): Tensor
+  static zeros(
+    shape: BigInt64Array,
+    dtype?: DType | undefined | null,
+    requiresGrad?: boolean | undefined | null,
+  ): Tensor;
   /** Create a tensor of ones */
-  static ones(shape: BigInt64Array, dtype?: DType | undefined | null, requiresGrad?: boolean | undefined | null): Tensor
+  static ones(
+    shape: BigInt64Array,
+    dtype?: DType | undefined | null,
+    requiresGrad?: boolean | undefined | null,
+  ): Tensor;
   /** Evaluate the underlying array */
-  eval(): void
+  eval(): void;
 }
 
 /**
@@ -1345,18 +1522,31 @@ export declare class TextDetModel {
    * # Arguments
    * * `model_path` - Path to model directory
    */
-  static load(modelPath: string): TextDetModel
+  static load(modelPath: string): TextDetModel;
   /**
    * Detect text lines in an image.
    *
    * # Arguments
-   * * `image_path` - Path to the input image
+   * * `image_data` - Encoded image bytes (PNG/JPEG)
    * * `threshold` - Optional detection threshold (default from config, typically 0.3)
    *
    * # Returns
    * * Vec of TextBox with bounding boxes and confidence scores
    */
-  detect(imagePath: string, threshold?: number | undefined | null): Array<TextBox>
+  detect(imageData: Buffer, threshold?: number | undefined | null): Array<TextBox>;
+  /**
+   * Detect text lines from raw RGB pixel data.
+   *
+   * # Arguments
+   * * `rgb_data` - Raw RGB pixel data
+   * * `width` - Image width
+   * * `height` - Image height
+   * * `threshold` - Optional detection threshold (default from config)
+   *
+   * # Returns
+   * * Vec of TextBox with bounding boxes and confidence scores
+   */
+  detectCrop(rgbData: Uint8Array, width: number, height: number, threshold?: number | undefined | null): Array<TextBox>;
 }
 
 /**
@@ -1372,27 +1562,27 @@ export declare class TextRecModel {
    * * `model_path` - Path to model directory
    * * `dict_path` - Path to character dictionary text file
    */
-  static load(modelPath: string, dictPath: string): TextRecModel
+  static load(modelPath: string, dictPath: string): TextRecModel;
   /**
-   * Recognize text from a single image file.
+   * Recognize text from encoded image bytes.
    *
    * # Arguments
-   * * `image_path` - Path to a cropped text line image
+   * * `image_data` - Encoded image bytes (PNG/JPEG)
    *
    * # Returns
    * * RecResult with recognized text and confidence score
    */
-  recognize(imagePath: string): RecResult
+  recognize(imageData: Buffer): RecResult;
   /**
-   * Recognize text from multiple image files (batch).
+   * Recognize text from multiple encoded images.
    *
    * # Arguments
-   * * `image_paths` - Paths to cropped text line images
+   * * `images` - Vec of encoded image bytes (PNG/JPEG)
    *
    * # Returns
    * * Vec of RecResult with recognized text and confidence scores
    */
-  recognizeBatch(imagePaths: Array<string>): Array<RecResult>
+  recognizeBatch(images: Array<Buffer>): Array<RecResult>;
   /**
    * Recognize text from raw RGB crop data.
    *
@@ -1404,23 +1594,23 @@ export declare class TextRecModel {
    * # Returns
    * * RecResult with recognized text and confidence score
    */
-  recognizeCrop(rgbData: Uint8Array, width: number, height: number): RecResult
+  recognizeCrop(rgbData: Uint8Array, width: number, height: number): RecResult;
 }
 
 /** Result from VLM chat */
 export declare class VlmChatResult {
   /** Get the response text */
-  get text(): string
+  get text(): string;
   /** Get the generated tokens */
-  get tokens(): MxArray
+  get tokens(): MxArray;
   /** Get the log probabilities */
-  get logprobs(): MxArray
+  get logprobs(): MxArray;
   /** Get the finish reason */
-  get finishReason(): 'stop' | 'length' | 'repetition'
+  get finishReason(): 'stop' | 'length' | 'repetition';
   /** Get the number of tokens generated */
-  get numTokens(): number
+  get numTokens(): number;
 }
-export type VLMChatResult = VlmChatResult
+export type VLMChatResult = VlmChatResult;
 
 /**
  * Vision-Language Model
@@ -1430,11 +1620,11 @@ export type VLMChatResult = VlmChatResult
  */
 export declare class VLModel {
   /** Create a new PaddleOCR-VL model */
-  constructor(config: ModelConfig)
+  constructor(config: ModelConfig);
   /** Set the tokenizer */
-  setTokenizer(tokenizer: Qwen3Tokenizer): void
+  setTokenizer(tokenizer: Qwen3Tokenizer): void;
   /** Check if tokenizer is available */
-  get hasTokenizer(): boolean
+  get hasTokenizer(): boolean;
   /**
    * Chat with the VLM model
    *
@@ -1442,7 +1632,7 @@ export declare class VLModel {
    *
    * # Arguments
    * * `messages` - Chat messages (role + content)
-   * * `config` - Chat configuration (including image_paths for automatic processing)
+   * * `config` - Chat configuration (including images for automatic processing)
    *
    * # Returns
    * * VLMChatResult with generated text
@@ -1451,18 +1641,18 @@ export declare class VLModel {
    * ```typescript
    * const result = model.chat(
    *   [{ role: 'user', content: 'Describe this image.' }],
-   *   { imagePaths: ['./photo.jpg'], maxNewTokens: 256 }
+   *   { images: [readFileSync('./photo.jpg')], maxNewTokens: 256 }
    * );
    * ```
    */
-  chat(messages: Array<VlmChatMessage>, config?: VlmChatConfig | undefined | null): VlmChatResult
+  chat(messages: Array<VlmChatMessage>, config?: VlmChatConfig | undefined | null): VlmChatResult;
   /**
-   * Simple OCR: extract text from an image file
+   * Simple OCR: extract text from encoded image bytes
    *
    * Convenience method that processes an image and extracts all text.
    *
    * # Arguments
-   * * `image_path` - Path to the image file
+   * * `image_data` - Encoded image bytes (PNG/JPEG)
    * * `prompt` - Optional custom prompt (default: "Extract all text from this image.")
    *
    * # Returns
@@ -1470,11 +1660,11 @@ export declare class VLModel {
    *
    * # Example
    * ```typescript
-   * const text = await model.ocr('./receipt.jpg');
+   * const text = model.ocr(imageBuffer);
    * console.log(text);
    * ```
    */
-  ocr(imagePath: string, prompt?: string | undefined | null): string
+  ocr(imageData: Buffer, prompt?: string | undefined | null): string;
   /**
    * Get input embeddings with vision features merged
    *
@@ -1486,7 +1676,11 @@ export declare class VLModel {
    * # Returns
    * * Input embeddings with vision features inserted at image token positions
    */
-  getInputEmbeddings(inputIds: MxArray, pixelValues?: MxArray | undefined | null, imageGridThw?: MxArray | undefined | null): MxArray
+  getInputEmbeddings(
+    inputIds: MxArray,
+    pixelValues?: MxArray | undefined | null,
+    imageGridThw?: MxArray | undefined | null,
+  ): MxArray;
   /**
    * Forward pass
    *
@@ -1499,7 +1693,12 @@ export declare class VLModel {
    * # Returns
    * * Logits [batch, seq_len, vocab_size]
    */
-  forward(inputIds: MxArray, pixelValues?: MxArray | undefined | null, imageGridThw?: MxArray | undefined | null, mask?: MxArray | undefined | null): MxArray
+  forward(
+    inputIds: MxArray,
+    pixelValues?: MxArray | undefined | null,
+    imageGridThw?: MxArray | undefined | null,
+    mask?: MxArray | undefined | null,
+  ): MxArray;
   /**
    * Generate text tokens given input tokens and optional image
    *
@@ -1516,14 +1715,19 @@ export declare class VLModel {
    * # Returns
    * * GenerationResult with tokens, logprobs, and finish reason
    */
-  generate(inputIds: MxArray, pixelValues?: MxArray | undefined | null, imageGridThw?: MxArray | undefined | null, config?: GenerationConfig | undefined | null): GenerationResult
+  generate(
+    inputIds: MxArray,
+    pixelValues?: MxArray | undefined | null,
+    imageGridThw?: MxArray | undefined | null,
+    config?: GenerationConfig | undefined | null,
+  ): GenerationResult;
   /**
    * Batch OCR: extract text from multiple images simultaneously
    *
    * Processes N images with sequential prefill + batched decode for ~N× decode throughput.
    *
    * # Arguments
-   * * `image_paths` - Paths to image files
+   * * `images` - Encoded image buffers
    * * `config` - Optional chat configuration (shared across all items)
    *
    * # Returns
@@ -1531,27 +1735,29 @@ export declare class VLModel {
    *
    * # Example
    * ```typescript
-   * const texts = model.ocrBatch(['page1.jpg', 'page2.jpg', 'page3.jpg']);
+   * import { readFileSync } from 'fs';
+   * const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
+   * const texts = model.ocrBatch(images);
    * ```
    */
-  ocrBatch(imagePaths: Array<string>, config?: VlmChatConfig | undefined | null): Array<string>
+  ocrBatch(images: Array<Buffer>, config?: VlmChatConfig | undefined | null): Array<string>;
   /**
    * Batch chat: process multiple items simultaneously
    *
    * Sequential prefill + batched decode. Each item can have different images/prompts.
    *
    * # Arguments
-   * * `batch` - Batch items, each with messages and optional image_paths
+   * * `batch` - Batch items, each with messages and optional images
    * * `config` - Optional shared chat configuration
    *
    * # Returns
    * * Vec of VLMChatResult, one per batch item
    */
-  batch(batch: Array<VlmBatchItem>, config?: VlmChatConfig | undefined | null): Array<VlmChatResult>
+  batch(batch: Array<VlmBatchItem>, config?: VlmChatConfig | undefined | null): Array<VlmChatResult>;
   /** Get model configuration */
-  get config(): ModelConfig
+  get config(): ModelConfig;
   /** Check if model is fully initialized */
-  get isInitialized(): boolean
+  get isInitialized(): boolean;
   /**
    * Load a VLM from disk
    *
@@ -1569,10 +1775,10 @@ export declare class VLModel {
    * ```typescript
    * import { VLModel } from '@mlx-node/vlm';
    * const model = await VLModel.load('./models/paddleocr-vl');
-   * const result = model.chat(messages, { imagePaths: ['./image.jpg'] });
+   * const result = model.chat(messages, { images: [readFileSync('./image.jpg')] });
    * ```
    */
-  static load(modelPath: string): Promise<VLModel>
+  static load(modelPath: string): Promise<VLModel>;
   /**
    * Load model configuration from disk without loading weights
    *
@@ -1591,7 +1797,7 @@ export declare class VLModel {
    * console.log(config.visionConfig.hiddenSize);
    * ```
    */
-  static loadConfig(modelPath: string): Promise<ModelConfig>
+  static loadConfig(modelPath: string): Promise<ModelConfig>;
 }
 
 /**
@@ -1629,28 +1835,34 @@ export declare class VLModel {
  * outputs[0].completion.finishReason; // "eos"
  * ```
  */
-export declare function buildRewardOutputs(prompts: Array<string>, completions: Array<string>, tokenCounts: Array<number>, finishReasons: Array<string>, groupSize: number): Array<RewardOutput>
+export declare function buildRewardOutputs(
+  prompts: Array<string>,
+  completions: Array<string>,
+  tokenCounts: Array<number>,
+  finishReasons: Array<string>,
+  groupSize: number,
+): Array<RewardOutput>;
 
 /** Configuration for built-in rewards */
 export interface BuiltinRewardConfig {
   /** Type of reward function */
-  rewardType: BuiltinRewardType
+  rewardType: BuiltinRewardType;
   /** Weight for this reward (default 1.0) */
-  weight?: number
+  weight?: number;
   /** Allowed tool names (for ToolUse) */
-  allowedTools?: Array<string>
+  allowedTools?: Array<string>;
   /** Required tags (for XmlFormat) */
-  requiredTags?: Array<string>
+  requiredTags?: Array<string>;
   /** Minimum length (for Length) */
-  minLength?: number
+  minLength?: number;
   /** Maximum length (for Length) */
-  maxLength?: number
+  maxLength?: number;
   /** Use character count vs word count (for Length) */
-  useChars?: boolean
+  useChars?: boolean;
   /** Required JSON fields (for JsonSchema) */
-  requiredFields?: Array<string>
+  requiredFields?: Array<string>;
   /** Whether tool call is required (for ToolUse) */
-  required?: boolean
+  required?: boolean;
 }
 
 /** Built-in reward function types */
@@ -1662,7 +1874,7 @@ export declare const enum BuiltinRewardType {
   /** Length-based scoring */
   Length = 'Length',
   /** JSON schema validation */
-  JsonSchema = 'JsonSchema'
+  JsonSchema = 'JsonSchema',
 }
 
 /**
@@ -1691,45 +1903,45 @@ export interface ChatConfig {
    * When provided, the model can invoke these tools during generation.
    * Tool calls are parsed and returned in `ChatResult.toolCalls`.
    */
-  tools?: Array<ToolDefinition>
+  tools?: Array<ToolDefinition>;
   /** Maximum number of new tokens to generate (default: 2048 for chat) */
-  maxNewTokens?: number
+  maxNewTokens?: number;
   /** Sampling temperature (0 = greedy, higher = more random) (default: 0.7) */
-  temperature?: number
+  temperature?: number;
   /** Top-k sampling: keep only top k tokens (0 = disabled) (default: 0) */
-  topK?: number
+  topK?: number;
   /** Top-p (nucleus) sampling: keep tokens with cumulative prob < p (default: 0.9) */
-  topP?: number
+  topP?: number;
   /** Min-p sampling: keep tokens with prob > min_p * max_prob (default: 0.0) */
-  minP?: number
+  minP?: number;
   /** Repetition penalty factor (1.0 = no penalty) (default: 1.0) */
-  repetitionPenalty?: number
+  repetitionPenalty?: number;
   /** Number of recent tokens to consider for repetition penalty (default: 20) */
-  repetitionContextSize?: number
+  repetitionContextSize?: number;
   /** Stop if same token repeats this many times consecutively (default: 16) */
-  maxConsecutiveTokens?: number
+  maxConsecutiveTokens?: number;
   /** Stop if an n-gram pattern repeats this many times (default: 8) */
-  maxNgramRepeats?: number
+  maxNgramRepeats?: number;
   /** N-gram size for repetition detection (default: 3) */
-  ngramSize?: number
+  ngramSize?: number;
   /** EOS token ID (generation stops when this is generated) */
-  eosTokenId?: number
+  eosTokenId?: number;
   /** Whether to return log probabilities (default: true) */
-  returnLogprobs?: boolean
+  returnLogprobs?: boolean;
 }
 
 /** Chat message with tool calling support */
 export interface ChatMessage {
   /** Role: "system", "user", "assistant", or "tool" */
-  role: string
+  role: string;
   /** Message content */
-  content: string
+  content: string;
   /** Tool calls made by the assistant (for assistant messages) */
-  toolCalls?: Array<ToolCall>
+  toolCalls?: Array<ToolCall>;
   /** Tool call ID this message is responding to (for tool messages) */
-  toolCallId?: string
+  toolCallId?: string;
   /** Reasoning content for thinking mode (used with <think> tags) */
-  reasoningContent?: string
+  reasoningContent?: string;
 }
 
 /** Chat message role */
@@ -1739,19 +1951,31 @@ export declare const enum ChatRole {
   /** Assistant response */
   Assistant = 'Assistant',
   /** System prompt */
-  System = 'System'
+  System = 'System',
+}
+
+/** Result from classify_and_rotate: orientation info + corrected image bytes. */
+export interface ClassifyRotateResult {
+  /** Detected rotation angle (0, 90, 180, or 270 degrees) */
+  angle: number;
+  /** Confidence score */
+  score: number;
+  /** Angle label as string */
+  label: string;
+  /** Corrected image as PNG bytes (or original bytes if angle=0) */
+  image: Buffer;
 }
 
 /** Statistics about cleanup operations (NAPI wrapper) */
 export interface CleanupStats {
   /** Number of training steps deleted */
-  stepsDeleted: number
+  stepsDeleted: number;
   /** Number of generations deleted */
-  generationsDeleted: number
+  generationsDeleted: number;
   /** Number of tool calls deleted */
-  toolCallsDeleted: number
+  toolCallsDeleted: number;
   /** Number of logs deleted */
-  logsDeleted: number
+  logsDeleted: number;
 }
 
 /**
@@ -1760,42 +1984,44 @@ export interface CleanupStats {
  */
 export interface CompletionInfo {
   /** Clean text with <tool_call> and <think> tags removed */
-  text: string
+  text: string;
   /** Raw output before tag stripping (for debugging/XML parsing) */
-  rawText: string
+  rawText: string;
   /** Parsed tool calls (arguments are already JS objects) */
-  toolCalls: Array<ToolCallResult>
+  toolCalls: Array<ToolCallResult>;
   /** Extracted thinking/reasoning from <think> tags (null if none) */
-  thinking?: string
+  thinking?: string;
   /** Number of tokens generated */
-  numTokens: number
+  numTokens: number;
   /** Finish reason: "stop" | "length" | "tool_calls" */
-  finishReason: string
+  finishReason: string;
 }
 
 export interface ConversionOptions {
   /** Input directory containing model files (config.json, model.safetensors) */
-  inputDir: string
+  inputDir: string;
   /** Output directory for converted model */
-  outputDir: string
+  outputDir: string;
   /** Target dtype for conversion (default: "float32") */
-  dtype?: string
+  dtype?: string;
   /** Whether to verbose logging (default: false) */
-  verbose?: boolean
+  verbose?: boolean;
   /** Model type for model-specific weight sanitization (e.g., "paddleocr-vl") */
-  modelType?: string
+  modelType?: string;
 }
 
 export interface ConversionResult {
   /** Number of tensors converted */
-  numTensors: number
+  numTensors: number;
   /** Total number of parameters */
-  numParameters: number
+  numParameters: number;
   /** Output model path */
-  outputPath: string
+  outputPath: string;
   /** List of converted tensor names */
-  tensorNames: Array<string>
+  tensorNames: Array<string>;
 }
+
+export declare function convertForeignWeights(options: ForeignConversionOptions): ForeignConversionResult;
 
 /**
  * Convert a HuggingFace SafeTensors model to MLX format
@@ -1826,20 +2052,20 @@ export interface ConversionResult {
  * console.log(`Converted ${result.numTensors} tensors (${result.numParameters} parameters)`);
  * ```
  */
-export declare function convertModel(options: ConversionOptions): Promise<ConversionResult>
+export declare function convertModel(options: ConversionOptions): Promise<ConversionResult>;
 
-export declare function convertParquetToJsonl(inputPath: string, outputPath: string): void
+export declare function convertParquetToJsonl(inputPath: string, outputPath: string): void;
 
 /** Create a default PaddleOCR-VL 1.5 configuration (JS factory function) */
-export declare function createPaddleocrVlConfig(): ModelConfig
+export declare function createPaddleocrVlConfig(): ModelConfig;
 
 /** Document element - either a table or paragraph */
 export interface DocumentElement {
-  elementType: ElementType
+  elementType: ElementType;
   /** Table data (only present if element_type is Table) */
-  table?: Table
+  table?: Table;
   /** Paragraph data (only present if element_type is Paragraph) */
-  paragraph?: Paragraph
+  paragraph?: Paragraph;
 }
 
 /**
@@ -1858,148 +2084,165 @@ export interface DocumentElement {
  * writeFileSync('output.xlsx', buffer);
  * ```
  */
-export declare function documentToXlsx(doc: ParsedDocument): Buffer
+export declare function documentToXlsx(doc: ParsedDocument): Buffer;
 
 export declare const enum DType {
   Float32 = 0,
   Int32 = 1,
   Float16 = 2,
   BFloat16 = 3,
-  Uint32 = 4
+  Uint32 = 4,
 }
 
 /** Document element type */
 export declare const enum ElementType {
   Table = 'Table',
-  Paragraph = 'Paragraph'
+  Paragraph = 'Paragraph',
 }
 
 /** Metrics from a training epoch */
 export interface EngineEpochMetrics {
   /** Epoch number */
-  epoch: number
+  epoch: number;
   /** Average loss for the epoch */
-  avgLoss: number
+  avgLoss: number;
   /** Average reward for the epoch */
-  avgReward: number
+  avgReward: number;
   /** Total steps in the epoch */
-  totalSteps: number
+  totalSteps: number;
   /** Total tokens processed */
-  totalTokens: number
+  totalTokens: number;
   /** Time for the epoch (seconds) */
-  epochTimeSecs: number
+  epochTimeSecs: number;
 }
 
 /** Metrics from a single training step */
 export interface EngineStepMetrics {
   /** Current step number */
-  step: number
+  step: number;
   /** GRPO loss value */
-  loss: number
+  loss: number;
   /** Mean reward across completions */
-  meanReward: number
+  meanReward: number;
   /** Standard deviation of rewards */
-  stdReward: number
+  stdReward: number;
   /** Mean advantage value */
-  meanAdvantage: number
+  meanAdvantage: number;
   /** Standard deviation of advantages */
-  stdAdvantage: number
+  stdAdvantage: number;
   /** Total tokens generated this step */
-  totalTokens: number
+  totalTokens: number;
   /** Whether gradients were applied */
-  gradientsApplied: boolean
+  gradientsApplied: boolean;
   /** Time for generation (ms) */
-  generationTimeMs: number
+  generationTimeMs: number;
   /** Time for training (ms) */
-  trainingTimeMs: number
+  trainingTimeMs: number;
   /** Peak memory usage this step (MB) */
-  peakMemoryMb: number
+  peakMemoryMb: number;
   /** Active memory at end of step (MB) */
-  activeMemoryMb: number
+  activeMemoryMb: number;
+}
+
+export interface ForeignConversionOptions {
+  /** Path to the input weights file (.pdparams, .pkl, .pt, .pth) */
+  inputPath: string;
+  /** Output directory for model.safetensors + config.json */
+  outputDir: string;
+  /** Model type: "pp-lcnet-ori" or "uvdoc" */
+  modelType: string;
+  /** Enable verbose logging */
+  verbose?: boolean;
+}
+
+export interface ForeignConversionResult {
+  numTensors: number;
+  outputPath: string;
+  tensorNames: Array<string>;
 }
 
 /** Format parsed document according to config */
-export declare function formatDocument(doc: ParsedDocument, config?: ParserConfig | undefined | null): string
+export declare function formatDocument(doc: ParsedDocument, config?: ParserConfig | undefined | null): string;
 
 /** Function definition for tool calling */
 export interface FunctionDefinition {
   /** Name of the function */
-  name: string
+  name: string;
   /** Description of what the function does */
-  description?: string
+  description?: string;
   /** Parameter schema */
-  parameters?: FunctionParameters
+  parameters?: FunctionParameters;
 }
 
 /** Function parameters schema (JSON Schema subset) */
 export interface FunctionParameters {
   /** Type (usually "object") */
-  type: string
+  type: string;
   /** JSON string of property definitions */
-  properties?: string
+  properties?: string;
   /** List of required parameter names */
-  required?: Array<string>
+  required?: Array<string>;
 }
 
 /** Result from generate_batch_for_training with all data needed for training */
 export interface GenerateBatchResult {
   /** Generated completion texts */
-  completionTexts: Array<string>
+  completionTexts: Array<string>;
   /** Completion token IDs (flattened, concatenated) */
-  completionTokens: Array<number>
+  completionTokens: Array<number>;
   /** Completion log probabilities (flattened, concatenated) */
-  completionLogprobs: Array<number>
+  completionLogprobs: Array<number>;
   /** Lengths of each completion (for reconstruction) */
-  completionLengths: Array<number>
+  completionLengths: Array<number>;
   /** Finish reasons for each completion ("eos", "length", or "repetition") */
-  finishReasons: Array<string>
+  finishReasons: Array<string>;
 }
 
 /** Configuration for text generation */
 export interface GenerationConfig {
   /** Maximum number of new tokens to generate (default: 100) */
-  maxNewTokens?: number
+  maxNewTokens?: number;
   /** Sampling temperature (0 = greedy, higher = more random) (default: 1.0) */
-  temperature?: number
+  temperature?: number;
   /** Top-k sampling: keep only top k tokens (0 = disabled) (default: 0) */
-  topK?: number
+  topK?: number;
   /** Top-p (nucleus) sampling: keep tokens with cumulative prob < p (default: 1.0) */
-  topP?: number
+  topP?: number;
   /** Min-p sampling: keep tokens with prob > min_p * max_prob (default: 0.0) */
-  minP?: number
+  minP?: number;
   /** Repetition penalty factor (1.0 = no penalty, 1.1-1.5 typical) (default: 1.0) */
-  repetitionPenalty?: number
+  repetitionPenalty?: number;
   /**
    * Number of recent tokens to consider for repetition penalty (default: 20)
    * Matches mlx-lm default. Larger values catch longer patterns but use more memory
    */
-  repetitionContextSize?: number
+  repetitionContextSize?: number;
   /**
    * Stop if same token repeats this many times consecutively (default: 16)
    * Set to 0 to disable. Prevents OOM from degenerate repetitive generation.
    */
-  maxConsecutiveTokens?: number
+  maxConsecutiveTokens?: number;
   /**
    * Stop if an n-gram pattern repeats this many times (default: 8)
    * Set to 0 to disable. Detects patterns like "A B A B A B A B".
    */
-  maxNgramRepeats?: number
+  maxNgramRepeats?: number;
   /**
    * N-gram size for repetition detection (default: 3)
    * Used with max_ngram_repeats to detect repeating patterns.
    */
-  ngramSize?: number
+  ngramSize?: number;
   /** EOS token ID (generation stops when this is generated) */
-  eosTokenId?: number
+  eosTokenId?: number;
   /** Whether to return log probabilities (always true for GRPO) */
-  returnLogprobs?: boolean
+  returnLogprobs?: boolean;
   /**
    * Prefill step size for chunked processing of long prompts (default: 2048)
    * When the prompt length exceeds this value, it will be processed in chunks
    * to improve memory efficiency and enable async pipelining.
    * Set to 0 to disable chunking and process the entire prompt at once.
    */
-  prefillStepSize?: number
+  prefillStepSize?: number;
   /**
    * KV cache quantization bits (default: 16 = no quantization)
    * - 16: Full precision (bfloat16/float16), no quantization
@@ -2009,89 +2252,89 @@ export interface GenerationConfig {
    * Quantized KV cache is useful for long sequences where memory becomes a bottleneck.
    * Note: Adds dequantization overhead per forward pass.
    */
-  kvCacheBits?: number
+  kvCacheBits?: number;
   /**
    * KV cache quantization group size (default: 64)
    * Number of elements per quantization group. Smaller groups = better accuracy
    * but more overhead from storing scales/biases.
    * Only used when kv_cache_bits is 4 or 8.
    */
-  kvCacheGroupSize?: number
+  kvCacheGroupSize?: number;
   /**
    * Number of draft tokens to generate speculatively (default: 5)
    * Only used when a draft model is provided for speculative decoding.
    * Higher values can increase throughput but may reduce acceptance rate.
    */
-  numDraftTokens?: number
+  numDraftTokens?: number;
 }
 
 /** A generation record (NAPI wrapper) */
 export interface GenerationRecord {
-  batchIndex: number
-  groupIndex: number
-  prompt: string
-  expectedAnswer?: string
-  completionText: string
-  completionRaw: string
-  thinking?: string
-  numTokens: number
-  finishReason: string
-  reward: number
+  batchIndex: number;
+  groupIndex: number;
+  prompt: string;
+  expectedAnswer?: string;
+  completionText: string;
+  completionRaw: string;
+  thinking?: string;
+  numTokens: number;
+  finishReason: string;
+  reward: number;
 }
 
 /** A generation with its associated tool calls (NAPI wrapper) */
 export interface GenerationWithToolCalls {
-  generation: GenerationRecord
-  toolCalls: Array<ToolCallRecord>
+  generation: GenerationRecord;
+  toolCalls: Array<ToolCallRecord>;
 }
 
 /** Get expected weight keys for PaddleOCR-VL model */
-export declare function getExpectedWeightKeys(): Array<string>
+export declare function getExpectedWeightKeys(): Array<string>;
 
 /** Configuration for the GRPO training engine */
 export interface GrpoEngineConfig {
   /** Learning rate (default: 1e-6) */
-  learningRate?: number
+  learningRate?: number;
   /** Gradient accumulation steps (default: 1) */
-  gradientAccumulationSteps?: number
+  gradientAccumulationSteps?: number;
   /** Maximum gradient norm for clipping (default: 1.0) */
-  gradientClipNorm?: number
+  gradientClipNorm?: number;
   /**
    * Maximum gradient value for element-wise clipping (default: 1.0)
    * This clamps individual gradient elements to [-value, value]
    */
-  gradientClipValue?: number
+  gradientClipValue?: number;
   /** Number of completions per prompt (default: 4) */
-  groupSize?: number
+  groupSize?: number;
   /** PPO clipping epsilon (default: 0.2) */
-  clipEpsilon?: number
+  clipEpsilon?: number;
   /** KL divergence coefficient (default: 0.0) */
-  klCoef?: number
+  klCoef?: number;
   /** Loss type: "grpo", "dapo", "dr_grpo", "bnpo" (default: "grpo") */
-  lossType?: string
+  lossType?: string;
   /**
    * Maximum completion length for both generation and training (default: 256)
    * Matches Python TRL's max_completion_length config.
    */
-  maxCompletionLength?: number
+  maxCompletionLength?: number;
   /** Sampling temperature (default: 0.8) */
-  temperature?: number
+  temperature?: number;
   /** Top-p (nucleus) sampling (default: 0.95) */
-  topP?: number
+  topP?: number;
   /** Top-k sampling (optional) */
-  topK?: number
+  topK?: number;
   /** Repetition penalty (default: 1.1) */
-  repetitionPenalty?: number
+  repetitionPenalty?: number;
   /**
    * Maximum allowed NaN gradient occurrences before stopping training (default: 100)
    * When exceeded, training will stop with an error to prevent model corruption.
    */
-  maxNanGradients?: number
+  maxNanGradients?: number;
   /**
    * Consecutive NaN gradients that trigger emergency checkpoint (default: 5)
    * When reached, the needs_emergency_save flag is set for the TypeScript layer.
    */
-  emergencySaveThreshold?: number
+  emergencySaveThreshold?: number;
   /**
    * Enable detailed NaN/Inf detection with per-element counts (default: false)
    * When false (default), uses GPU-native has_nan_or_inf() which only transfers a single
@@ -2099,19 +2342,19 @@ export interface GrpoEngineConfig {
    * per-element analysis - useful for debugging but has significant performance overhead
    * for large models (e.g., 2.4GB for Qwen3-0.6B).
    */
-  verboseNanDetection?: boolean
+  verboseNanDetection?: boolean;
   /**
    * Enable thinking mode for Qwen3 models (default: true)
    * When false, adds empty <think></think> tags to disable model thinking.
    * This is useful for tool-use training where you want direct outputs.
    */
-  enableThinking?: boolean
+  enableThinking?: boolean;
   /**
    * Tool definitions for function calling
    * When provided, tools are included in the chat template so the model
    * can generate tool calls. This is essential for tool-use training.
    */
-  tools?: Array<ToolDefinition>
+  tools?: Array<ToolDefinition>;
   /**
    * Batch chunk size for LM head computation (memory optimization).
    * When set, the LM head (hidden_states -> logits) is computed in chunks
@@ -2120,7 +2363,7 @@ export interface GrpoEngineConfig {
    * Recommended: 2 for batch_size >= 4 with large vocabularies (e.g., 151936)
    * This reduces peak memory from ~1.2GB to ~300MB for Qwen3 (vocab=151936).
    */
-  lmHeadChunkSize?: number
+  lmHeadChunkSize?: number;
   /**
    * Batch chunk size for transformer forward pass (memory optimization).
    * When set, the transformer layers process the batch in chunks of this size,
@@ -2129,7 +2372,7 @@ export interface GrpoEngineConfig {
    * Recommended: 4 for batch_size >= 4 with groupSize >= 4
    * Memory savings: ~70-80% for batch=4, groupSize=4 (16 sequences → 4 at a time)
    */
-  forwardChunkSize?: number
+  forwardChunkSize?: number;
   /**
    * Chunk size for vocabulary dimension in cross-entropy computation.
    * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
@@ -2138,7 +2381,7 @@ export interface GrpoEngineConfig {
    * Recommended: 65536 for Qwen3 (vocab=151936) splits into 3 chunks
    * Set to a larger value to reduce chunking overhead or smaller for tighter memory constraints.
    */
-  vocabChunkSize?: number
+  vocabChunkSize?: number;
   /**
    * Enable true parallel batch generation (default: false).
    * When true, all N*G sequences are processed in parallel using batched FFI
@@ -2146,30 +2389,30 @@ export interface GrpoEngineConfig {
    * When false, uses the sequential generation (process one prompt at a time,
    * then expand KV cache for G completions).
    */
-  useParallelBatchGeneration?: boolean
+  useParallelBatchGeneration?: boolean;
 }
 
 /** Configuration for GRPO loss computation */
 export interface GrpoLossConfig {
   /** Lower clipping bound (default: 0.2, means clip to [1-0.2, 1+epsilon_high]) */
-  epsilonLow: number
+  epsilonLow: number;
   /** Upper clipping bound (default: same as epsilon_low) */
-  epsilonHigh?: number
+  epsilonHigh?: number;
   /** KL divergence penalty coefficient (default: 0.0, no penalty) */
-  beta: number
+  beta: number;
   /** Loss aggregation type: "grpo", "bnpo", "dr_grpo", or "dapo" */
-  lossType: string
+  lossType: string;
   /** Importance sampling level: "token" or "sequence" */
-  importanceSamplingLevel: string
+  importanceSamplingLevel: string;
   /**
    * Maximum completion length (legacy, no longer used by dr_grpo)
    * Kept for backwards compatibility but ignored in current implementation.
    */
-  maxCompletionLength?: number
+  maxCompletionLength?: number;
   /** Total number of items in batch across all processes (needed for dapo) */
-  numItemsInBatch?: number
+  numItemsInBatch?: number;
   /** Current gradient accumulation step (for loss scaling) */
-  gradientAccumulationSteps: number
+  gradientAccumulationSteps: number;
   /**
    * Batch chunk size for LM head computation (memory optimization).
    * When set, the LM head (hidden_states -> logits) is computed in chunks
@@ -2177,7 +2420,7 @@ export interface GrpoLossConfig {
    * Default: None (no chunking, full batch at once)
    * Recommended: 2 for batch_size >= 4 with large vocabularies (e.g., 151936)
    */
-  lmHeadChunkSize?: number
+  lmHeadChunkSize?: number;
   /**
    * Batch chunk size for transformer forward pass (memory optimization).
    * When set, the transformer layers process the batch in chunks of this size,
@@ -2186,7 +2429,7 @@ export interface GrpoLossConfig {
    * Recommended: 4 for batch_size >= 4 with groupSize >= 4
    * Memory savings: ~70-80% for batch=4, groupSize=4 (16 sequences → 4 at a time)
    */
-  forwardChunkSize?: number
+  forwardChunkSize?: number;
   /**
    * Chunk size for vocabulary dimension in cross-entropy computation.
    * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
@@ -2194,38 +2437,48 @@ export interface GrpoLossConfig {
    * Default: 65536 (2^16)
    * Recommended: 65536 for Qwen3 (vocab=151936) splits into 3 chunks
    */
-  vocabChunkSize?: number
+  vocabChunkSize?: number;
 }
 
 /** A single detected layout element. */
 export interface LayoutElement {
   /** Detection confidence score */
-  score: number
+  score: number;
   /** Class label ID (0-24) */
-  label: number
+  label: number;
   /** Human-readable label name (e.g., "title", "text", "table") */
-  labelName: string
+  labelName: string;
   /** Bounding box in original image coordinates [x1, y1, x2, y2] */
-  bbox: Array<number>
+  bbox: Array<number>;
   /** Reading order index (0 = first element to read) */
-  order: number
+  order: number;
 }
 
 /** Full model configuration */
 export interface ModelConfig {
-  visionConfig: VisionConfig
-  textConfig: TextConfig
-  modelType: string
-  ignoreIndex: number
-  imageTokenId: number
-  videoTokenId: number
-  visionStartTokenId: number
-  visionEndTokenId: number
-  eosTokenId: number
+  visionConfig: VisionConfig;
+  textConfig: TextConfig;
+  modelType: string;
+  ignoreIndex: number;
+  imageTokenId: number;
+  videoTokenId: number;
+  visionStartTokenId: number;
+  visionEndTokenId: number;
+  eosTokenId: number;
+}
+
+/** Result from document orientation classification. */
+export interface OrientationResult {
+  /** Detected rotation angle (0, 90, 180, or 270 degrees) */
+  angle: number;
+  /** Confidence score */
+  score: number;
+  /** Angle label as string */
+  label: string;
 }
 
 /** Output format options */
-export declare const enum OutputFormat {
+export enum OutputFormat {
   /** Raw output with minimal processing */
   Raw = 'Raw',
   /** Plain text with aligned columns */
@@ -2235,73 +2488,73 @@ export declare const enum OutputFormat {
   /** HTML tables */
   Html = 'Html',
   /** JSON structured output */
-  Json = 'Json'
+  Json = 'Json',
 }
 
 /** Configuration for creating an OutputStore connection */
 export interface OutputStoreConfig {
   /** Local SQLite file path (e.g., "training_outputs.db") */
-  localPath: string
+  localPath: string;
 }
 
 /** Paged attention memory statistics (NAPI-compatible) */
 export interface PagedCacheStats {
   /** Total number of blocks in the pool */
-  totalBlocks: number
+  totalBlocks: number;
   /** Number of free blocks */
-  freeBlocks: number
+  freeBlocks: number;
   /** Number of allocated blocks */
-  allocatedBlocks: number
+  allocatedBlocks: number;
   /** Total memory in MB */
-  totalMemoryMb: number
+  totalMemoryMb: number;
   /** Used memory in MB */
-  usedMemoryMb: number
+  usedMemoryMb: number;
   /** Utilization percentage */
-  utilizationPercent: number
+  utilizationPercent: number;
 }
 
 /** A completed sequence from paged generation */
 export interface PagedCompletedSequence {
   /** Original request ID */
-  requestId: string
+  requestId: string;
   /** All generated tokens (excluding prompt) */
-  tokens: Array<number>
+  tokens: Array<number>;
   /** Reason for completion ("eos", "max_tokens", etc.) */
-  finishReason: string
+  finishReason: string;
 }
 
 /** Result of a paged generation step */
 export interface PagedGenerationStep {
   /** Token outputs for each sequence in the batch */
-  outputs: Array<PagedTokenOutput>
+  outputs: Array<PagedTokenOutput>;
   /** Number of sequences that were in prefill phase */
-  numPrefill: number
+  numPrefill: number;
   /** Number of sequences that were in decode phase */
-  numDecode: number
+  numDecode: number;
 }
 
 /** Output from a single token generation step in paged attention */
 export interface PagedTokenOutput {
   /** Sequence ID in the scheduler */
-  seqId: number
+  seqId: number;
   /** Request ID for this sequence */
-  requestId: string
+  requestId: string;
   /** Generated token ID */
-  token: number
+  token: number;
   /** Log probability of the token (f64 for NAPI compatibility) */
-  logprob: number
+  logprob: number;
   /** Whether this sequence has finished */
-  isFinished: boolean
+  isFinished: boolean;
 }
 
 /** A text paragraph */
 export interface Paragraph {
-  content: string
+  content: string;
 }
 
 /** Parsed document structure */
 export interface ParsedDocument {
-  elements: Array<DocumentElement>
+  elements: Array<DocumentElement>;
 }
 
 /**
@@ -2331,16 +2584,16 @@ export interface ParsedDocument {
  * const plain = parsePaddleResponse(vlmResult.text, { format: 'plain' });
  * ```
  */
-export declare function parsePaddleResponse(text: string, config?: ParserConfig | undefined | null): string
+export declare function parsePaddleResponse(text: string, config?: ParserConfig | undefined | null): string;
 
 /** Parser configuration */
 export interface ParserConfig {
   /** Output format (default: 'markdown') */
-  format?: OutputFormat
+  format?: OutputFormat;
   /** Whether to trim whitespace from cells (default: true) */
-  trimCells?: boolean
+  trimCells?: boolean;
   /** Whether to collapse empty rows (default: true) */
-  collapseEmptyRows?: boolean
+  collapseEmptyRows?: boolean;
 }
 
 /**
@@ -2359,35 +2612,35 @@ export interface ParserConfig {
  * console.log(result.toolCalls[0].arguments.q); // "test"
  * ```
  */
-export declare function parseToolCallsFromText(text: string): ParseToolCallsResult
+export declare function parseToolCallsFromText(text: string): ParseToolCallsResult;
 
 /** Result of parsing tool calls from text */
 export interface ParseToolCallsResult {
   /** Cleaned text with tool_call tags removed */
-  text: string
+  text: string;
   /** Parsed tool calls */
-  toolCalls: Array<ToolCallResult>
+  toolCalls: Array<ToolCallResult>;
 }
 
 /** Parse VLM output into structured document */
-export declare function parseVlmOutput(text: string): ParsedDocument
+export declare function parseVlmOutput(text: string): ParsedDocument;
 
 /** Chat configuration for Qwen3.5 */
 export interface Qwen35ChatConfig {
-  maxNewTokens?: number | undefined
-  temperature?: number | undefined
-  topK?: number | undefined
-  topP?: number | undefined
-  minP?: number | undefined
-  tools?: object[] | undefined
+  maxNewTokens?: number | undefined;
+  temperature?: number | undefined;
+  topK?: number | undefined;
+  topP?: number | undefined;
+  minP?: number | undefined;
+  tools?: Array<ToolDefinition>;
 }
 
 /** Chat result */
 export interface Qwen35ChatResult {
-  text: string
-  thinking?: string
-  numTokens: number
-  finishReason: string
+  text: string;
+  thinking?: string;
+  numTokens: number;
+  finishReason: string;
 }
 
 /**
@@ -2397,112 +2650,112 @@ export interface Qwen35ChatResult {
  * when `num_experts` is 0 or None, the model uses dense MLP layers.
  */
 export interface Qwen35Config {
-  vocabSize: number
-  hiddenSize: number
-  numLayers: number
-  numHeads: number
-  numKvHeads: number
-  intermediateSize: number
-  rmsNormEps: number
-  headDim: number
-  tieWordEmbeddings: boolean
-  attentionBias: boolean
-  maxPositionEmbeddings: number
-  padTokenId: number
-  eosTokenId: number
-  bosTokenId: number
-  linearNumValueHeads: number
-  linearNumKeyHeads: number
-  linearKeyHeadDim: number
-  linearValueHeadDim: number
-  linearConvKernelDim: number
-  fullAttentionInterval: number
-  partialRotaryFactor: number
-  ropeTheta: number
-  numExperts?: number | undefined
-  numExpertsPerTok?: number | undefined
-  decoderSparseStep?: number | undefined
-  sharedExpertIntermediateSize?: number | undefined
-  moeIntermediateSize?: number | undefined
-  normTopkProb?: boolean | undefined
-  mlpOnlyLayers?: number[] | undefined
+  vocabSize: number;
+  hiddenSize: number;
+  numLayers: number;
+  numHeads: number;
+  numKvHeads: number;
+  intermediateSize: number;
+  rmsNormEps: number;
+  headDim: number;
+  tieWordEmbeddings: boolean;
+  attentionBias: boolean;
+  maxPositionEmbeddings: number;
+  padTokenId: number;
+  eosTokenId: number;
+  bosTokenId: number;
+  linearNumValueHeads: number;
+  linearNumKeyHeads: number;
+  linearKeyHeadDim: number;
+  linearValueHeadDim: number;
+  linearConvKernelDim: number;
+  fullAttentionInterval: number;
+  partialRotaryFactor: number;
+  ropeTheta: number;
+  numExperts?: number | undefined;
+  numExpertsPerTok?: number | undefined;
+  decoderSparseStep?: number | undefined;
+  sharedExpertIntermediateSize?: number | undefined;
+  moeIntermediateSize?: number | undefined;
+  normTopkProb?: boolean | undefined;
+  mlpOnlyLayers?: number[] | undefined;
 }
 
 /** Generation configuration for Qwen3.5 */
 export interface Qwen35GenerationConfig {
-  maxNewTokens: number
-  temperature?: number | undefined
-  topK?: number | undefined
-  topP?: number | undefined
-  minP?: number | undefined
+  maxNewTokens: number;
+  temperature?: number | undefined;
+  topK?: number | undefined;
+  topP?: number | undefined;
+  minP?: number | undefined;
 }
 
 /** Generation result */
 export interface Qwen35GenerationResult {
-  tokens: Array<number>
-  text: string
-  numTokens: number
-  finishReason: string
+  tokens: Array<number>;
+  text: string;
+  numTokens: number;
+  finishReason: string;
 }
 
 /** Qwen3 model configuration */
 export interface Qwen3Config {
-  vocabSize: number
-  hiddenSize: number
-  numLayers: number
-  numHeads: number
-  numKvHeads: number
-  intermediateSize: number
-  rmsNormEps: number
-  ropeTheta: number
-  maxPositionEmbeddings: number
-  headDim: number
-  useQkNorm: boolean
-  tieWordEmbeddings: boolean
-  padTokenId: number
-  eosTokenId: number
-  bosTokenId: number
+  vocabSize: number;
+  hiddenSize: number;
+  numLayers: number;
+  numHeads: number;
+  numKvHeads: number;
+  intermediateSize: number;
+  rmsNormEps: number;
+  ropeTheta: number;
+  maxPositionEmbeddings: number;
+  headDim: number;
+  useQkNorm: boolean;
+  tieWordEmbeddings: boolean;
+  padTokenId: number;
+  eosTokenId: number;
+  bosTokenId: number;
   /**
    * Enable paged attention for memory-efficient inference.
    * Default: false (use standard KVCache)
    */
-  usePagedAttention?: boolean | undefined
+  usePagedAttention?: boolean | undefined;
   /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when use_paged_attention is true.
    * Default: 2048 (2GB)
    */
-  pagedCacheMemoryMb?: number | undefined
+  pagedCacheMemoryMb?: number | undefined;
   /**
    * Block size for paged attention (tokens per block).
    * Only used when use_paged_attention is true.
    * Default: 16
    */
-  pagedBlockSize?: number | undefined
+  pagedBlockSize?: number | undefined;
   /**
    * Use FP8 cache for 2x memory reduction (experimental).
    * Only used when use_paged_attention is true.
    * Default: false
    */
-  useFp8Cache?: boolean | undefined
+  useFp8Cache?: boolean | undefined;
 }
 
 /** Result of text recognition. */
 export interface RecResult {
   /** Recognized text */
-  text: string
+  text: string;
   /** Confidence score (mean character probability) */
-  score: number
+  score: number;
 }
 
 /** Result of resume position computation */
 export interface ResumePosition {
   /** Epoch to start from (0-indexed) */
-  startEpoch: number
+  startEpoch: number;
   /** Batch index within epoch to start from */
-  startBatchIdx: number
+  startBatchIdx: number;
   /** Whether we're at an epoch boundary */
-  isEpochBoundary: boolean
+  isEpochBoundary: boolean;
 }
 
 /**
@@ -2511,45 +2764,45 @@ export interface ResumePosition {
  */
 export interface RewardOutput {
   /** The input prompt text */
-  prompt: string
+  prompt: string;
   /** Structured completion data aligned with ChatResult */
-  completion: CompletionInfo
+  completion: CompletionInfo;
 }
 
 /** Reward distribution statistics (NAPI wrapper) */
 export interface RewardStats {
-  count: number
-  mean: number
-  std: number
-  min: number
-  max: number
-  median: number
-  p25: number
-  p75: number
+  count: number;
+  mean: number;
+  std: number;
+  min: number;
+  max: number;
+  median: number;
+  p25: number;
+  p75: number;
 }
 
 /** Aggregate statistics for a training run for resume state (NAPI wrapper) */
 export interface RunAggregates {
   /** Best (highest) reward seen */
-  bestReward: number
+  bestReward: number;
   /** Average reward */
-  avgReward: number
+  avgReward: number;
   /** Total reward count */
-  rewardCount: number
+  rewardCount: number;
   /** Best (lowest) loss seen */
-  bestLoss: number
+  bestLoss: number;
   /** Average loss */
-  avgLoss: number
+  avgLoss: number;
   /** Total loss count */
-  lossCount: number
+  lossCount: number;
   /** Total tokens generated */
-  totalTokens: number
+  totalTokens: number;
   /** Current step number */
-  currentStep: number
+  currentStep: number;
   /** Average generation time (milliseconds) */
-  avgGenerationTimeMs: number
+  avgGenerationTimeMs: number;
   /** Average training time (milliseconds) */
-  avgTrainingTimeMs: number
+  avgTrainingTimeMs: number;
 }
 
 /**
@@ -2558,13 +2811,13 @@ export interface RunAggregates {
  */
 export interface SamplingConfig {
   /** Temperature for softmax (default: 1.0). Lower = more deterministic */
-  temperature?: number
+  temperature?: number;
   /** Number of top tokens to keep (top-k sampling). 0 = disabled */
-  topK?: number
+  topK?: number;
   /** Cumulative probability threshold (top-p/nucleus sampling). 1.0 = disabled */
-  topP?: number
+  topP?: number;
   /** Minimum probability threshold relative to max (min-p sampling). 0 = disabled */
-  minP?: number
+  minP?: number;
 }
 
 /**
@@ -2579,208 +2832,208 @@ export interface SamplingConfig {
  * saveToXlsx(vlmResult.text, 'output.xlsx');
  * ```
  */
-export declare function saveToXlsx(text: string, filePath: string): void
+export declare function saveToXlsx(text: string, filePath: string): void;
 
 /** Scheduler statistics (NAPI-compatible) */
 export interface SchedulerStatsNapi {
   /** Number of requests waiting to be scheduled */
-  numWaiting: number
+  numWaiting: number;
   /** Number of sequences currently running */
-  numRunning: number
+  numRunning: number;
   /** Number of completed sequences */
-  numCompleted: number
+  numCompleted: number;
   /** Number of sequences in prefill phase */
-  numPrefill: number
+  numPrefill: number;
   /** Number of sequences in decode phase */
-  numDecode: number
+  numDecode: number;
   /** Total tokens across all running sequences */
-  totalRunningTokens: number
+  totalRunningTokens: number;
 }
 
 /** Configuration for the SFT training engine */
 export interface SftEngineConfig {
   /** Learning rate (default: 2e-5) */
-  learningRate?: number
+  learningRate?: number;
   /** Gradient accumulation steps (default: 1) */
-  gradientAccumulationSteps?: number
+  gradientAccumulationSteps?: number;
   /** Maximum gradient norm for clipping (default: 1.0) */
-  gradientClipNorm?: number
+  gradientClipNorm?: number;
   /** Maximum gradient value for element-wise clipping (optional) */
-  gradientClipValue?: number
+  gradientClipValue?: number;
   /** Weight decay (L2 regularization) (default: 0.01) */
-  weightDecay?: number
+  weightDecay?: number;
   /** Label smoothing factor (default: 0.0) */
-  labelSmoothing?: number
+  labelSmoothing?: number;
   /** Steps between heavy cleanup (default: 25) */
-  heavyCleanupInterval?: number
+  heavyCleanupInterval?: number;
   /** Maximum allowed NaN gradient occurrences (default: 100) */
-  maxNanGradients?: number
+  maxNanGradients?: number;
   /** Consecutive NaN gradients that trigger emergency checkpoint (default: 5) */
-  emergencySaveThreshold?: number
+  emergencySaveThreshold?: number;
   /** Compute token accuracy (requires extra forward pass) (default: false) */
-  computeAccuracy?: boolean
+  computeAccuracy?: boolean;
   /**
    * Enable detailed NaN/Inf detection with per-element counts (default: false)
    * When false (default), uses GPU-native has_nan_or_inf() which only transfers a single
    * boolean to CPU. When true, transfers the entire gradient tensor to CPU for detailed
    * per-element analysis - useful for debugging but has significant performance overhead.
    */
-  verboseNanDetection?: boolean
+  verboseNanDetection?: boolean;
 }
 
 /** Metrics from a training epoch */
 export interface SftEpochMetrics {
   /** Epoch number */
-  epoch: number
+  epoch: number;
   /** Average loss for the epoch */
-  avgLoss: number
+  avgLoss: number;
   /** Total steps in the epoch */
-  totalSteps: number
+  totalSteps: number;
   /** Total tokens processed */
-  totalTokens: number
+  totalTokens: number;
   /** Time for the epoch (seconds) */
-  epochTimeSecs: number
+  epochTimeSecs: number;
 }
 
 /** Metrics from a single training step */
 export interface SftStepMetrics {
   /** Current step number */
-  step: number
+  step: number;
   /** Cross-entropy loss value */
-  loss: number
+  loss: number;
   /** Total tokens processed this step (non-ignored) */
-  totalTokens: number
+  totalTokens: number;
   /** Token-level accuracy (if compute_accuracy enabled) */
-  tokenAccuracy?: number
+  tokenAccuracy?: number;
   /** Whether gradients were applied (vs accumulated) */
-  gradientsApplied: boolean
+  gradientsApplied: boolean;
   /** Time for training step (ms) */
-  trainingTimeMs: number
+  trainingTimeMs: number;
 }
 
 /** Metrics from a single training step for sparkline restoration (NAPI wrapper) */
 export interface StepMetricSummary {
   /** Step number */
-  step: number
+  step: number;
   /** Loss value */
-  loss: number
+  loss: number;
   /** Mean reward (GRPO) */
-  meanReward: number
+  meanReward: number;
   /** Mean advantage (GRPO) */
-  meanAdvantage: number
+  meanAdvantage: number;
   /** Std advantage (GRPO) - indicates reward variance within groups */
-  stdAdvantage: number
+  stdAdvantage: number;
   /** Perplexity (SFT, optional) */
-  perplexity?: number
+  perplexity?: number;
   /** Token accuracy (SFT, optional) */
-  tokenAccuracy?: number
+  tokenAccuracy?: number;
   /** Total tokens this step */
-  totalTokens: number
+  totalTokens: number;
   /** Time for generation phase (milliseconds) */
-  generationTimeMs?: number
+  generationTimeMs?: number;
   /** Time for training phase (milliseconds) */
-  trainingTimeMs?: number
+  trainingTimeMs?: number;
 }
 
 /** A training step record (NAPI wrapper) */
 export interface StepRecord {
-  runId: string
-  step: number
-  epoch?: number
-  loss: number
-  meanReward: number
-  stdReward: number
-  meanAdvantage?: number
-  stdAdvantage: number
-  totalTokens?: number
-  generationTimeMs?: number
-  trainingTimeMs?: number
-  gradientsApplied: boolean
+  runId: string;
+  step: number;
+  epoch?: number;
+  loss: number;
+  meanReward: number;
+  stdReward: number;
+  meanAdvantage?: number;
+  stdAdvantage: number;
+  totalTokens?: number;
+  generationTimeMs?: number;
+  trainingTimeMs?: number;
+  gradientsApplied: boolean;
 }
 
 /** Summary of a training step (NAPI wrapper) */
 export interface StepSummary {
-  step: number
-  loss: number
-  meanReward: number
-  numGenerations: number
-  numToolCalls: number
-  eosCount: number
-  lengthCount: number
+  step: number;
+  loss: number;
+  meanReward: number;
+  numGenerations: number;
+  numToolCalls: number;
+  eosCount: number;
+  lengthCount: number;
 }
 
 /** A table structure */
 export interface Table {
-  rows: Array<TableRow>
+  rows: Array<TableRow>;
 }
 
 /** A single cell in a table */
 export interface TableCell {
-  content: string
-  isEmpty: boolean
+  content: string;
+  isEmpty: boolean;
 }
 
 /** A row in a table */
 export interface TableRow {
-  cells: Array<TableCell>
+  cells: Array<TableCell>;
 }
 
 /** A detected text bounding box. */
 export interface TextBox {
   /** Bounding box in original image coordinates [x1, y1, x2, y2] */
-  bbox: Array<number>
+  bbox: Array<number>;
   /** Detection confidence score (mean probability inside box) */
-  score: number
+  score: number;
 }
 
 /** Language model (text decoder) configuration */
 export interface TextConfig {
-  modelType: string
-  hiddenSize: number
-  numHiddenLayers: number
-  intermediateSize: number
-  numAttentionHeads: number
-  rmsNormEps: number
-  vocabSize: number
-  numKeyValueHeads: number
-  maxPositionEmbeddings: number
-  ropeTheta: number
-  ropeTraditional: boolean
-  useBias: boolean
-  headDim: number
+  modelType: string;
+  hiddenSize: number;
+  numHiddenLayers: number;
+  intermediateSize: number;
+  numAttentionHeads: number;
+  rmsNormEps: number;
+  vocabSize: number;
+  numKeyValueHeads: number;
+  maxPositionEmbeddings: number;
+  ropeTheta: number;
+  ropeTraditional: boolean;
+  useBias: boolean;
+  headDim: number;
   /**
    * Multimodal RoPE sections: [temporal, height, width]
    * These define how the head_dim is split for 3D position encoding
    */
-  mropeSection: Array<number>
+  mropeSection: Array<number>;
 }
 
 /** Tool call made by an assistant */
 export interface ToolCall {
   /** Optional unique identifier for the tool call */
-  id?: string
+  id?: string;
   /** Name of the tool/function to call */
-  name: string
+  name: string;
   /** JSON string of arguments to pass to the tool */
-  arguments: string
+  arguments: string;
 }
 
 /** A tool call record (NAPI wrapper) */
 export interface ToolCallRecord {
-  callIndex: number
-  status: string
-  toolName?: string
-  arguments?: string
-  rawContent: string
-  errorMessage?: string
+  callIndex: number;
+  status: string;
+  toolName?: string;
+  arguments?: string;
+  rawContent: string;
+  errorMessage?: string;
 }
 
 /** Structured tool call with parsed arguments */
 export interface ToolCallResult {
   /** Unique identifier for this tool call (format: call_<uuid>) */
-  id: string
+  id: string;
   /** Name of the tool/function to call */
-  name: string
+  name: string;
   /**
    * Parsed arguments as native object (serde_json::Value -> JS object)
    *
@@ -2788,7 +3041,7 @@ export interface ToolCallResult {
    * When status is "parse_error", this contains the original unparsed string.
    * Otherwise, this is an empty object {}.
    */
-  arguments: Record<string, unknown> | string
+  arguments: Record<string, unknown> | string;
   /**
    * Parsing status: "ok" | "invalid_json" | "missing_name" | "parse_error"
    *
@@ -2797,113 +3050,116 @@ export interface ToolCallResult {
    * - "missing_name": Valid JSON but no "name" field
    * - "parse_error": Valid JSON but the "arguments" string field couldn't be parsed as JSON
    */
-  status: string
+  status: string;
   /** Error message if status != "ok" */
-  error?: string
+  error?: string;
   /**
    * Raw content from <tool_call> tag (preserved for debugging/persistence)
    * Defaults to empty string for backward compatibility with older JSON
    */
-  rawContent: string
+  rawContent: string;
 }
 
 /** OpenAI-compatible tool definition */
 export interface ToolDefinition {
   /** Tool type (currently only "function" is supported) */
-  type: string
+  type: string;
   /** Function definition */
-  function: FunctionDefinition
+  function: FunctionDefinition;
 }
 
 /** A training run record (NAPI wrapper) */
 export interface TrainingRunRecord {
-  id: string
-  name?: string
-  modelName: string
-  modelPath?: string
-  config: string
-  startedAt: number
-  endedAt?: number
-  totalSteps: number
-  status: string
+  id: string;
+  name?: string;
+  modelName: string;
+  modelPath?: string;
+  config: string;
+  startedAt: number;
+  endedAt?: number;
+  totalSteps: number;
+  status: string;
 }
 
 /** Result from train_step_auto including metrics, completions, and rewards */
 export interface TrainStepResult {
   /** Training metrics */
-  metrics: EngineStepMetrics
+  metrics: EngineStepMetrics;
   /** Generated completion texts (for TUI logging) */
-  completions: Array<string>
+  completions: Array<string>;
   /** Computed reward values (for TUI logging) */
-  rewards: Array<number>
+  rewards: Array<number>;
 }
 
 /** Result from train_step_auto_with_recording including optional full RewardOutput data */
 export interface TrainStepResultWithOutputs {
   /** Training metrics */
-  metrics: EngineStepMetrics
+  metrics: EngineStepMetrics;
   /** Generated completion texts (for TUI logging) */
-  completions: Array<string>
+  completions: Array<string>;
   /** Computed reward values (for TUI logging) */
-  rewards: Array<number>
+  rewards: Array<number>;
   /**
    * Full RewardOutput data as JSON (only populated when record_outputs is true)
    * This enables zero-copy persistence of training outputs
    */
-  outputsJson?: string
+  outputsJson?: string;
   /** Actual token counts for each completion (for accurate TUI display) */
-  completionLengths: Array<number>
+  completionLengths: Array<number>;
+}
+
+/** Result from document unwarping. */
+export interface UnwarpResult {
+  /** Unwarped image as PNG bytes */
+  image: Buffer;
 }
 
 /** Vision encoder configuration */
 export interface VisionConfig {
-  modelType: string
-  hiddenSize: number
-  intermediateSize: number
-  numHiddenLayers: number
-  numAttentionHeads: number
-  numChannels: number
-  imageSize: number
-  patchSize: number
-  hiddenAct: string
-  layerNormEps: number
-  attentionDropout: number
-  spatialMergeSize: number
+  modelType: string;
+  hiddenSize: number;
+  intermediateSize: number;
+  numHiddenLayers: number;
+  numAttentionHeads: number;
+  numChannels: number;
+  imageSize: number;
+  patchSize: number;
+  hiddenAct: string;
+  layerNormEps: number;
+  attentionDropout: number;
+  spatialMergeSize: number;
 }
 
 /** A batch item for VLM batch inference */
 export interface VlmBatchItem {
   /** Chat messages for this item */
-  messages: Array<VlmChatMessage>
-  /** Image paths for this item (one image per item for OCR) */
-  imagePaths?: Array<string>
+  messages: Array<VlmChatMessage>;
+  /** Encoded image buffers for this item (one image per item for OCR) */
+  images?: Array<Buffer>;
 }
 
 /** Configuration for VLM chat */
 export interface VlmChatConfig {
-  /**
-   * Image paths to process (alternative to passing pre-processed images)
-   * These will be automatically processed using the ImageProcessor
-   */
-  imagePaths?: Array<string>
+  /** Encoded image buffers to process (PNG/JPEG bytes) */
+  images?: Array<Buffer>;
   /** Maximum number of new tokens to generate (default: 512) */
-  maxNewTokens?: number
+  maxNewTokens?: number;
   /** Sampling temperature (0 = greedy, higher = more random) (default: 0.0 for OCR) */
-  temperature?: number
+  temperature?: number;
   /** Top-k sampling (default: 0) */
-  topK?: number
+  topK?: number;
   /** Top-p (nucleus) sampling (default: 1.0) */
-  topP?: number
+  topP?: number;
   /** Repetition penalty (default: 1.5) */
-  repetitionPenalty?: number
+  repetitionPenalty?: number;
   /** Whether to return log probabilities (default: false) */
-  returnLogprobs?: boolean
+  returnLogprobs?: boolean;
 }
 
 /** A chat message with optional image */
 export interface VlmChatMessage {
   /** Role of the message sender */
-  role: ChatRole
+  role: ChatRole;
   /** Text content of the message */
-  content: string
+  content: string;
 }

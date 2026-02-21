@@ -23,6 +23,8 @@ pub fn apply_activation(input: &MxArray, activation: &str) -> Result<MxArray> {
         "relu" => Activations::relu(input),
         "silu" | "swish" => Activations::silu(input),
         "gelu" => Activations::gelu(input),
+        "hardswish" | "hard_swish" => Activations::hard_swish(input),
+        "hardsigmoid" | "hard_sigmoid" => Activations::hard_sigmoid(input),
         "none" | "identity" => Ok(input.clone()),
         _ => Err(Error::new(
             Status::InvalidArg,

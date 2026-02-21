@@ -27,11 +27,14 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { DocLayoutModel, TextDetModel, TextRecModel, type LayoutElement } from '@mlx-node/core';
+import {
+  DocLayoutModel,
+  TextDetModel,
+  TextRecModel,
+  DocOrientationModel,
+  DocUnwarpModel,
+  type LayoutElement,
+} from '@mlx-node/core';
 
 // ============================================================================
 // Types
@@ -47,6 +50,10 @@ export interface StructureV3Config {
   textRecModelPath: string;
   /** Path to character dictionary file (e.g., ppocr_keys_v1.txt) */
   dictPath: string;
+  /** Path to doc orientation classification model directory (optional) */
+  docOrientationModelPath?: string;
+  /** Path to doc unwarping model directory (optional) */
+  docUnwarpModelPath?: string;
 }
 
 /** Options for document analysis. */
@@ -57,6 +64,10 @@ export interface AnalyzeOptions {
   textDetThreshold?: number;
   /** Whether to include element-level details in output (default: false) */
   includeDetails?: boolean;
+  /** Whether to run document orientation classification (default: true if model loaded) */
+  useDocOrientationClassify?: boolean;
+  /** Whether to run document unwarping (default: true if model loaded) */
+  useDocUnwarping?: boolean;
 }
 
 /** A recognized text line within a layout element. */
@@ -138,11 +149,21 @@ export class StructureV3Pipeline {
   private layout: DocLayoutModel;
   private textDet: TextDetModel;
   private textRec: TextRecModel;
+  private docOrientation: DocOrientationModel | null;
+  private docUnwarp: DocUnwarpModel | null;
 
-  private constructor(layout: DocLayoutModel, textDet: TextDetModel, textRec: TextRecModel) {
+  private constructor(
+    layout: DocLayoutModel,
+    textDet: TextDetModel,
+    textRec: TextRecModel,
+    docOrientation: DocOrientationModel | null,
+    docUnwarp: DocUnwarpModel | null,
+  ) {
     this.layout = layout;
     this.textDet = textDet;
     this.textRec = textRec;
+    this.docOrientation = docOrientation;
+    this.docUnwarp = docUnwarp;
   }
 
   /**
@@ -152,101 +173,116 @@ export class StructureV3Pipeline {
     const layout = DocLayoutModel.load(config.layoutModelPath);
     const textDet = TextDetModel.load(config.textDetModelPath);
     const textRec = TextRecModel.load(config.textRecModelPath, config.dictPath);
-    return new StructureV3Pipeline(layout, textDet, textRec);
+
+    const docOrientation = config.docOrientationModelPath
+      ? DocOrientationModel.load(config.docOrientationModelPath)
+      : null;
+    const docUnwarp = config.docUnwarpModelPath ? DocUnwarpModel.load(config.docUnwarpModelPath) : null;
+
+    return new StructureV3Pipeline(layout, textDet, textRec, docOrientation, docUnwarp);
   }
 
   /**
    * Analyze a document image and extract structured content.
    *
-   * @param imagePath - Path to the document image
+   * @param imageData - Buffer with encoded image bytes, or a file path string
    * @param options - Analysis options
    * @returns Structured document with elements and markdown
    */
-  async analyze(imagePath: string, options: AnalyzeOptions = {}): Promise<StructuredDocument> {
+  async analyze(imageData: Buffer | string, options: AnalyzeOptions = {}): Promise<StructuredDocument> {
     const { layoutThreshold = 0.5, textDetThreshold, includeDetails = false } = options;
 
-    // Step 1: Layout detection
-    const layoutElements = this.layout.detect(imagePath, layoutThreshold);
+    let imageBuffer: Buffer = typeof imageData === 'string' ? readFileSync(imageData) : imageData;
+
+    // Step 0a: Document orientation correction
+    if (this.docOrientation && (options.useDocOrientationClassify ?? true)) {
+      const rotateResult = this.docOrientation.classifyAndRotate(imageBuffer);
+      if (rotateResult.angle !== 0) {
+        imageBuffer = Buffer.from(rotateResult.image);
+      }
+    }
+
+    // Step 0b: Document unwarping
+    if (this.docUnwarp && (options.useDocUnwarping ?? true)) {
+      const unwarpResult = this.docUnwarp.unwarp(imageBuffer);
+      imageBuffer = Buffer.from(unwarpResult.image);
+    }
+
+    // Step 1: Layout detection (on preprocessed image)
+    const layoutElements = this.layout.detect(imageBuffer, layoutThreshold);
 
     if (layoutElements.length === 0) {
       return { elements: [], markdown: '' };
     }
 
     // Step 2: Process each element
-    const imageBuffer = readFileSync(imagePath);
-    const tmpDir = mkdtempSync(join(tmpdir(), 'structv3-'));
+    const elements: StructuredElement[] = [];
 
-    try {
-      const elements: StructuredElement[] = [];
+    for (const el of layoutElements) {
+      const label = el.labelName;
 
-      for (const el of layoutElements) {
-        const label = el.labelName;
-
-        if (SKIP_LABELS.has(label)) {
-          continue;
-        }
-
-        if (TEXT_LABELS.has(label)) {
-          // OCR path: detect text lines then recognize
-          const cropPath = await this.cropElement(imageBuffer, el, tmpDir);
-          const textLines = await this.ocrRegion(cropPath, tmpDir, textDetThreshold);
-
-          const fullText = textLines.map((l) => l.text).join('\n');
-
-          elements.push({
-            label,
-            score: el.score,
-            bbox: el.bbox,
-            order: el.order,
-            text: fullText,
-            lines: includeDetails ? textLines : undefined,
-          });
-        } else if (label === 'table') {
-          // Table: detect text lines in each cell (simplified - full table parsing in Phase 4)
-          const cropPath = await this.cropElement(imageBuffer, el, tmpDir);
-          const textLines = await this.ocrRegion(cropPath, tmpDir, textDetThreshold);
-          const fullText = textLines.map((l) => l.text).join('\n');
-
-          elements.push({
-            label,
-            score: el.score,
-            bbox: el.bbox,
-            order: el.order,
-            text: fullText,
-            lines: includeDetails ? textLines : undefined,
-          });
-        } else if (label === 'isolate_formula') {
-          // Formula: basic OCR for now (Phase 5 adds LaTeX recognition)
-          const cropPath = await this.cropElement(imageBuffer, el, tmpDir);
-          const textLines = await this.ocrRegion(cropPath, tmpDir, textDetThreshold);
-          const fullText = textLines.map((l) => l.text).join(' ');
-
-          elements.push({
-            label,
-            score: el.score,
-            bbox: el.bbox,
-            order: el.order,
-            text: fullText,
-          });
-        } else {
-          // figure, chart, seal, etc. - placeholder
-          elements.push({
-            label,
-            score: el.score,
-            bbox: el.bbox,
-            order: el.order,
-            text: '',
-          });
-        }
+      if (SKIP_LABELS.has(label)) {
+        continue;
       }
 
-      // Step 3: Assemble markdown
-      const markdown = assembleMarkdown(elements);
+      if (TEXT_LABELS.has(label)) {
+        // OCR path: detect text lines then recognize
+        const cropBuffer = await this.cropElement(imageBuffer, el);
+        const textLines = await this.ocrRegion(cropBuffer, textDetThreshold);
 
-      return { elements, markdown };
-    } finally {
-      rmSync(tmpDir, { recursive: true, force: true });
+        const fullText = textLines.map((l) => l.text).join('\n');
+
+        elements.push({
+          label,
+          score: el.score,
+          bbox: el.bbox,
+          order: el.order,
+          text: fullText,
+          lines: includeDetails ? textLines : undefined,
+        });
+      } else if (label === 'table') {
+        // Table: detect text lines in each cell (simplified - full table parsing in Phase 4)
+        const cropBuffer = await this.cropElement(imageBuffer, el);
+        const textLines = await this.ocrRegion(cropBuffer, textDetThreshold);
+        const fullText = textLines.map((l) => l.text).join('\n');
+
+        elements.push({
+          label,
+          score: el.score,
+          bbox: el.bbox,
+          order: el.order,
+          text: fullText,
+          lines: includeDetails ? textLines : undefined,
+        });
+      } else if (label === 'isolate_formula') {
+        // Formula: basic OCR for now (Phase 5 adds LaTeX recognition)
+        const cropBuffer = await this.cropElement(imageBuffer, el);
+        const textLines = await this.ocrRegion(cropBuffer, textDetThreshold);
+        const fullText = textLines.map((l) => l.text).join(' ');
+
+        elements.push({
+          label,
+          score: el.score,
+          bbox: el.bbox,
+          order: el.order,
+          text: fullText,
+        });
+      } else {
+        // figure, chart, seal, etc. - placeholder
+        elements.push({
+          label,
+          score: el.score,
+          bbox: el.bbox,
+          order: el.order,
+          text: '',
+        });
+      }
     }
+
+    // Step 3: Assemble markdown
+    const markdown = assembleMarkdown(elements);
+
+    return { elements, markdown };
   }
 
   /**
@@ -254,13 +290,8 @@ export class StructureV3Pipeline {
    *
    * Useful for processing pre-cropped text regions.
    */
-  async ocrImage(imagePath: string, textDetThreshold?: number): Promise<TextLine[]> {
-    const tempDir = mkdtempSync(join(tmpdir(), 'ocr-'));
-    try {
-      return await this.ocrRegion(imagePath, tempDir, textDetThreshold);
-    } finally {
-      rmSync(tempDir, { recursive: true, force: true });
-    }
+  async ocrImage(imageData: Buffer, textDetThreshold?: number): Promise<TextLine[]> {
+    return this.ocrRegion(imageData, textDetThreshold);
   }
 
   /**
@@ -269,13 +300,13 @@ export class StructureV3Pipeline {
    * For each detected text line bounding box, sub-crops that line from the
    * crop image and passes the individual line image to text recognition.
    */
-  private async ocrRegion(imagePath: string, tmpDir: string, textDetThreshold?: number): Promise<TextLine[]> {
+  private async ocrRegion(imageData: Buffer, textDetThreshold?: number): Promise<TextLine[]> {
     // Detect text lines within the crop
-    const textBoxes = this.textDet.detect(imagePath, textDetThreshold);
+    const textBoxes = this.textDet.detect(imageData, textDetThreshold);
 
     if (textBoxes.length === 0) {
       // Fall back to recognizing the entire crop as one text line
-      const result = this.textRec.recognize(imagePath);
+      const result = this.textRec.recognize(imageData);
       if (result.text.trim()) {
         return [{ bbox: [0, 0, 0, 0], text: result.text, score: result.score }];
       }
@@ -291,7 +322,7 @@ export class StructureV3Pipeline {
 
     // Single detected line: recognize the full crop directly (no sub-crop needed)
     if (sorted.length === 1) {
-      const result = this.textRec.recognize(imagePath);
+      const result = this.textRec.recognize(imageData);
       return [
         {
           bbox: sorted[0].bbox,
@@ -302,10 +333,9 @@ export class StructureV3Pipeline {
     }
 
     // Multiple detected lines: sub-crop each line from the crop image
-    const cropBuffer = readFileSync(imagePath);
     const { Transformer } = await import('@napi-rs/image');
 
-    const linePaths: string[] = [];
+    const lineBuffers: Buffer[] = [];
     for (let i = 0; i < sorted.length; i++) {
       const [x1, y1, x2, y2] = sorted[i].bbox;
       const x = Math.max(0, Math.round(x1));
@@ -313,13 +343,11 @@ export class StructureV3Pipeline {
       const w = Math.max(1, Math.round(x2 - x1));
       const h = Math.max(1, Math.round(y2 - y1));
 
-      const linePng = await new Transformer(cropBuffer).crop(x, y, w, h).png();
-      const linePath = join(tmpDir, `line_${i}.png`);
-      await writeFile(linePath, linePng);
-      linePaths.push(linePath);
+      const linePng = await new Transformer(imageData).crop(x, y, w, h).png();
+      lineBuffers.push(Buffer.from(linePng));
     }
 
-    const results = this.textRec.recognizeBatch(linePaths);
+    const results = this.textRec.recognizeBatch(lineBuffers);
 
     return sorted.map((box, i) => ({
       bbox: box.bbox,
@@ -329,21 +357,18 @@ export class StructureV3Pipeline {
   }
 
   /**
-   * Crop a layout element from the source image and save to a temporary file.
+   * Crop a layout element from the source image and return PNG bytes.
    */
-  private async cropElement(imageBuffer: Buffer, el: LayoutElement, tmpDir: string): Promise<string> {
+  private async cropElement(imageBuffer: Buffer, el: LayoutElement): Promise<Buffer> {
     const [x1, y1, x2, y2] = el.bbox;
     const x = Math.max(0, Math.round(x1));
     const y = Math.max(0, Math.round(y1));
     const w = Math.max(1, Math.round(x2 - x1));
     const h = Math.max(1, Math.round(y2 - y1));
 
-    // Use @napi-rs/image for cropping
     const { Transformer } = await import('@napi-rs/image');
     const cropped = await new Transformer(imageBuffer).crop(x, y, w, h).png();
-    const cropPath = join(tmpDir, `crop_${el.order}.png`);
-    await writeFile(cropPath, cropped);
-    return cropPath;
+    return Buffer.from(cropped);
   }
 }
 

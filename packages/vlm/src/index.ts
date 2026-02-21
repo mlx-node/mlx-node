@@ -12,17 +12,18 @@
  * const model = await VLModel.load('./models/paddleocr-vl');
  *
  * // Chat with images
+ * const imageBuffer = readFileSync('./photo.jpg');
  * const result = model.chat(
- *   [{ role: 'user', content: 'What is in these images?' }],
- *   { imagePaths: ['./photo1.jpg', './photo2.jpg'] }
+ *   [{ role: 'user', content: 'What is in this image?' }],
+ *   { images: [imageBuffer] }
  * );
  * console.log(result.text);
  *
  * // Simple OCR
- * const text = model.ocr('./document.jpg');
+ * const text = model.ocr(readFileSync('./document.jpg'));
  *
- * // Batch OCR (multiple images in parallel)
- * const texts = model.ocrBatch(['page1.jpg', 'page2.jpg', 'page3.jpg']);
+ * // Batch OCR (multiple images)
+ * const texts = model.ocrBatch([readFileSync('page1.jpg'), readFileSync('page2.jpg')]);
  * ```
  */
 
@@ -36,6 +37,15 @@ export { DocLayoutModel, type LayoutElement } from '@mlx-node/core';
 
 // Text detection and recognition models (PP-OCRv5)
 export { TextDetModel, type TextBox, TextRecModel, type RecResult } from '@mlx-node/core';
+
+// Document preprocessing models
+export {
+  DocOrientationModel,
+  type OrientationResult,
+  type ClassifyRotateResult,
+  DocUnwarpModel,
+  type UnwarpResult,
+} from '@mlx-node/core';
 
 // Document understanding pipeline (PP-StructureV3)
 export {

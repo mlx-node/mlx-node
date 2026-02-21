@@ -30,6 +30,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 unicode-width = "0.2.2"
 rust_xlsxwriter = "0.93.0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # NAPI-RS
 napi = { version = "3", features = ["napi10", "async", "tokio_fs", "serde-json"] }

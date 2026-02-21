@@ -7,11 +7,9 @@
  * This module is internal - users interact via VLModel::chat() with imagePaths config.
  */
 use crate::array::MxArray;
-use image::ImageReader;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, RgbImage};
 use napi::bindgen_prelude::*;
-use std::path::Path;
 
 /// Smart resize that maintains aspect ratio within pixel bounds (internal)
 pub fn smart_resize(
@@ -192,25 +190,30 @@ impl ImageProcessor {
         self.config.patch_size * self.config.merge_size
     }
 
-    /// Process an image from file path
-    pub fn process_file(&self, path: String) -> Result<ProcessedImage> {
-        let img = load_image_from_path(&path)?;
+    /// Process an image from encoded bytes
+    pub fn process_bytes(&self, data: &[u8]) -> Result<ProcessedImage> {
+        let img = image::load_from_memory(data).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to decode image: {e}"),
+            )
+        })?;
         self.process_image(img)
     }
 
-    /// Process multiple images from file paths
+    /// Process multiple images from encoded bytes
     ///
-    /// Used internally by VLModel::chat() - users pass imagePaths to chat() directly.
-    pub fn process_files(&self, paths: Vec<String>) -> Result<ProcessedImages> {
-        if paths.is_empty() {
-            return Err(Error::new(Status::InvalidArg, "paths cannot be empty"));
+    /// Used internally by VLModel::chat() - users pass images to chat() directly.
+    pub fn process_many(&self, images: &[&[u8]]) -> Result<ProcessedImages> {
+        if images.is_empty() {
+            return Err(Error::new(Status::InvalidArg, "images cannot be empty"));
         }
 
         let mut all_pixel_values: Vec<MxArray> = Vec::new();
         let mut all_grid_thw: Vec<i32> = Vec::new();
 
-        for path in &paths {
-            let processed = self.process_file(path.clone())?;
+        for data in images {
+            let processed = self.process_bytes(data)?;
             all_pixel_values.push(processed.pixel_values());
             all_grid_thw.extend_from_slice(&processed.image_grid_thw());
         }
@@ -224,7 +227,7 @@ impl ImageProcessor {
         };
 
         // Create grid_thw with shape [num_images, 3]
-        let num_images = paths.len() as i64;
+        let num_images = images.len() as i64;
         let grid_thw = MxArray::from_int32(&all_grid_thw, &[num_images, 3])?;
 
         Ok(ProcessedImages {
@@ -330,32 +333,6 @@ impl ImageProcessor {
             image_grid_thw: vec![grid_t as i32, grid_h as i32, grid_w as i32],
         })
     }
-}
-
-/// Load image from file path
-fn load_image_from_path(path: &str) -> Result<DynamicImage> {
-    let path = Path::new(path);
-    if !path.exists() {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!("Image file not found: {}", path.display()),
-        ));
-    }
-
-    ImageReader::open(path)
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Failed to open image: {}", e),
-            )
-        })?
-        .decode()
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Failed to decode image: {}", e),
-            )
-        })
 }
 
 #[cfg(test)]

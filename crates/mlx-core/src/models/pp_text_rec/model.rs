@@ -49,16 +49,16 @@ impl TextRecModel {
         super::persistence::load_model(&model_path, &dict_path)
     }
 
-    /// Recognize text from a single image file.
+    /// Recognize text from encoded image bytes.
     ///
     /// # Arguments
-    /// * `image_path` - Path to a cropped text line image
+    /// * `image_data` - Encoded image bytes (PNG/JPEG)
     ///
     /// # Returns
     /// * RecResult with recognized text and confidence score
     #[napi]
-    pub fn recognize(&self, image_path: String) -> Result<RecResult> {
-        let pixel_values = self.image_processor.process_file(&image_path)?;
+    pub fn recognize(&self, image_data: Buffer) -> Result<RecResult> {
+        let pixel_values = self.image_processor.process(&image_data)?;
         let logits = self.forward(&pixel_values)?;
         let decoded = ctc_greedy_decode(&logits)?;
 
@@ -78,21 +78,21 @@ impl TextRecModel {
         })
     }
 
-    /// Recognize text from multiple image files (batch).
+    /// Recognize text from multiple encoded images.
     ///
     /// # Arguments
-    /// * `image_paths` - Paths to cropped text line images
+    /// * `images` - Vec of encoded image bytes (PNG/JPEG)
     ///
     /// # Returns
     /// * Vec of RecResult with recognized text and confidence scores
     #[napi]
-    pub fn recognize_batch(&self, image_paths: Vec<String>) -> Result<Vec<RecResult>> {
-        let mut results = Vec::with_capacity(image_paths.len());
+    pub fn recognize_batch(&self, images: Vec<Buffer>) -> Result<Vec<RecResult>> {
+        let mut results = Vec::with_capacity(images.len());
 
         // Process images one at a time through the model
         // (batching requires all images to have same dimensions after processing)
-        for path in &image_paths {
-            let pixel_values = self.image_processor.process_file(path)?;
+        for image_data in &images {
+            let pixel_values = self.image_processor.process(image_data)?;
             let logits = self.forward(&pixel_values)?;
             let decoded = ctc_greedy_decode(&logits)?;
 

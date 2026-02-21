@@ -41,18 +41,18 @@ impl TextDetModel {
     /// Detect text lines in an image.
     ///
     /// # Arguments
-    /// * `image_path` - Path to the input image
+    /// * `image_data` - Encoded image bytes (PNG/JPEG)
     /// * `threshold` - Optional detection threshold (default from config, typically 0.3)
     ///
     /// # Returns
     /// * Vec of TextBox with bounding boxes and confidence scores
     #[napi]
-    pub fn detect(&self, image_path: String, threshold: Option<f64>) -> Result<Vec<TextBox>> {
+    pub fn detect(&self, image_data: Buffer, threshold: Option<f64>) -> Result<Vec<TextBox>> {
         let det_threshold = threshold.unwrap_or(self.config.det_threshold);
 
         // 1. Preprocess
         let (pixel_values, orig_h, orig_w, resized_h, resized_w) =
-            self.image_processor.process_file(&image_path)?;
+            self.image_processor.process(&image_data)?;
 
         // 2. Run model
         let prob_map = self.forward(&pixel_values)?;
@@ -72,6 +72,55 @@ impl TextDetModel {
             map_w,
             orig_h,
             orig_w,
+            resized_h,
+            resized_w,
+            det_threshold,
+            self.config.box_threshold,
+            self.config.unclip_ratio,
+            self.config.max_candidates,
+            self.config.min_size,
+        ))
+    }
+
+    /// Detect text lines from raw RGB pixel data.
+    ///
+    /// # Arguments
+    /// * `rgb_data` - Raw RGB pixel data
+    /// * `width` - Image width
+    /// * `height` - Image height
+    /// * `threshold` - Optional detection threshold (default from config)
+    ///
+    /// # Returns
+    /// * Vec of TextBox with bounding boxes and confidence scores
+    #[napi]
+    pub fn detect_crop(
+        &self,
+        rgb_data: &[u8],
+        width: u32,
+        height: u32,
+        threshold: Option<f64>,
+    ) -> Result<Vec<TextBox>> {
+        let det_threshold = threshold.unwrap_or(self.config.det_threshold);
+
+        let (pixel_values, resized_h, resized_w) =
+            self.image_processor.process_crop(rgb_data, width, height)?;
+
+        let prob_map = self.forward(&pixel_values)?;
+
+        let map_shape = prob_map.shape()?;
+        let map_h = map_shape[1] as usize;
+        let map_w = map_shape[2] as usize;
+
+        prob_map.eval();
+        let prob_data = prob_map.to_float32()?;
+        let prob_vec: Vec<f32> = prob_data.to_vec();
+
+        Ok(postprocess_db(
+            &prob_vec,
+            map_h,
+            map_w,
+            height,
+            width,
             resized_h,
             resized_w,
             det_threshold,

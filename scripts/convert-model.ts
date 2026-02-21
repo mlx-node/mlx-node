@@ -1,30 +1,25 @@
 /**
- * Convert HuggingFace SafeTensors Model to MLX Format
+ * Convert Model Weights to MLX Format
  *
- * This script converts a HuggingFace model from any dtype (F16, BF16, etc.)
- * to MLX float32 format for GRPO training.
+ * Supports multiple conversion paths:
+ * 1. HuggingFace SafeTensors (dtype conversion: F16/BF16 -> F32)
+ * 2. PP-LCNet orientation classifier (Paddle .pdparams -> SafeTensors)
+ * 3. UVDoc unwarping model (Paddle .pdiparams or PyTorch .pkl -> SafeTensors)
  *
  * Usage:
- *   node scripts/convert-model.ts --input <input-dir> --output <output-dir> [--dtype float32] [--verbose]
- *   yarn convert:model --input .cache/models/qwen3-0.6b --output .cache/models/qwen3-0.6b-mlx
+ *   # SafeTensors dtype conversion
+ *   oxnode scripts/convert-model.ts --input <dir> --output <dir> [--dtype float32]
  *
- * Arguments:
- *   --input, -i     Input directory containing HuggingFace model (required)
- *   --output, -o    Output directory for converted MLX model (required)
- *   --dtype, -d     Target dtype (default: float32, options: float32, float16, bfloat16)
- *   --verbose, -v   Enable verbose logging
+ *   # Paddle orientation model conversion
+ *   oxnode scripts/convert-model.ts -m pp-lcnet-ori --input model.pdparams --output ./models/PP-LCNet_x1_0_doc_ori/
  *
- * Example:
- *   # Convert Qwen3-0.6B from BF16 to Float32
- *   yarn convert:model -i .cache/models/qwen3-0.6b -o .cache/models/qwen3-0.6b-mlx
- *
- *   # Convert to Float16
- *   yarn convert:model -i .cache/models/qwen3-0.6b -o .cache/models/qwen3-0.6b-f16 -d float16
+ *   # PyTorch UVDoc conversion
+ *   oxnode scripts/convert-model.ts -m uvdoc --input best_model.pkl --output ./models/UVDoc/
  */
 
 import { resolve } from 'node:path';
-import { readFileSync } from 'node:fs';
-import { convertModel } from '@mlx-node/core';
+import { readFileSync, existsSync } from 'node:fs';
+import { convertModel, convertForeignWeights } from '@mlx-node/core';
 
 interface Args {
   input?: string;
@@ -86,47 +81,53 @@ function parseArgs(): Args {
 function printHelp() {
   console.log(`
 ╔════════════════════════════════════════════════════════╗
-║   Convert HuggingFace Model to MLX Format              ║
+║   Convert Model Weights to MLX Format                  ║
 ╚════════════════════════════════════════════════════════╝
 
 Usage:
-  node scripts/convert-model.ts --input <dir> --output <dir> [options]
+  oxnode scripts/convert-model.ts --input <path> --output <dir> [options]
 
 Required Arguments:
-  --input, -i <dir>     Input directory with HuggingFace model
-  --output, -o <dir>    Output directory for MLX model
+  --input, -i <path>    Input model directory or weights file
+  --output, -o <dir>    Output directory for converted model
 
 Optional Arguments:
   --dtype, -d <type>    Target dtype (default: bfloat16)
                         Options: float32, float16, bfloat16
-  --model-type, -m      Model type for weight sanitization (e.g., paddleocr-vl)
-                        Auto-detected from config.json if not specified
+  --model-type, -m      Model type (auto-detected if not specified)
+                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc
   --verbose, -v         Enable verbose logging
   --help, -h            Show this help message
 
+Model Types:
+  (default)             SafeTensors dtype conversion (HuggingFace models)
+  paddleocr-vl          PaddleOCR-VL weight sanitization
+  pp-lcnet-ori          PP-LCNet orientation classifier (Paddle .pdparams/.pdiparams -> SafeTensors)
+  uvdoc                 UVDoc unwarping model (Paddle .pdiparams or PyTorch .pkl -> SafeTensors)
+
 Examples:
   # Convert Qwen3-0.6B from BF16 to Float32 for GRPO training
-  node scripts/convert-model.ts \\
-    --input .cache/models/qwen3-0.6b \\
-    --output .cache/models/qwen3-0.6b-mlx \\
-    --verbose
-
-  # Convert to Float16
-  node scripts/convert-model.ts \\
+  oxnode scripts/convert-model.ts \\
     -i .cache/models/qwen3-0.6b \\
-    -o .cache/models/qwen3-0.6b-f16 \\
-    -d float16
+    -o .cache/models/qwen3-0.6b-mlx
 
-Why Convert?
-  - Float32 provides better gradient stability for GRPO training
-  - BFloat16/Float16 models have reduced precision unsuitable for RL
-  - Conversion ensures numerical accuracy during training
+  # Convert PP-LCNet orientation model from Paddle format (directory or file)
+  oxnode scripts/convert-model.ts \\
+    -m pp-lcnet-ori \\
+    -i .cache/models/PP-LCNet_x1_0_doc_ori \\
+    -o ./models/PP-LCNet_x1_0_doc_ori/
 
-Note:
-  The script will copy all necessary files (config, tokenizer, etc.)
-  to the output directory.
+  # Convert UVDoc unwarping model from HuggingFace download
+  oxnode scripts/convert-model.ts \\
+    -m uvdoc \\
+    -i .cache/models/UVDoc \\
+    -o .cache/models/UVDoc-mlx
 `);
 }
+
+// ============================================================================
+// Main
+// ============================================================================
 
 async function main() {
   const args = parseArgs();
@@ -136,39 +137,67 @@ async function main() {
     process.exit(0);
   }
 
-  // Validate required arguments
   if (!args.input || !args.output) {
     console.error('Error: Both --input and --output are required\n');
     console.error('Use --help for usage information');
     process.exit(1);
   }
 
-  // Resolve paths
-  const inputDir = resolve(args.input);
+  const inputPath = resolve(args.input);
   const outputDir = resolve(args.output);
-  const dtype = args.dtype || 'bfloat16';
   const verbose = args.verbose || false;
 
   // Auto-detect model type from config.json if not specified
   let modelType = args.modelType;
   if (!modelType) {
     try {
-      const configPath = resolve(inputDir, 'config.json');
+      const configPath = resolve(inputPath, 'config.json');
       const config = JSON.parse(readFileSync(configPath, 'utf-8'));
       if (config.model_type === 'paddleocr_vl') {
         modelType = 'paddleocr-vl';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       }
     } catch {
-      // config.json not found or invalid - will be caught later by convertModel
+      // config.json not found or invalid
     }
   }
 
-  console.log('╔════════════════════════════════════════════════════════╗');
-  console.log('║   Converting HuggingFace Model to MLX Format           ║');
-  console.log('╚════════════════════════════════════════════════════════╝\n');
+  const startTime = Date.now();
 
-  console.log(`Input:      ${inputDir}`);
+  // Foreign weight formats (Paddle .pdparams/.pdiparams, PyTorch .pkl)
+  if (modelType === 'pp-lcnet-ori' || modelType === 'uvdoc') {
+    if (!existsSync(inputPath)) {
+      console.error(`Error: Input path not found: ${inputPath}`);
+      process.exit(1);
+    }
+
+    const label =
+      modelType === 'pp-lcnet-ori'
+        ? 'PP-LCNet Orientation Classifier (Paddle -> SafeTensors)'
+        : 'UVDoc Unwarping Model (-> SafeTensors)';
+
+    console.log(`Converting: ${label}`);
+    console.log(`Input:  ${inputPath}`);
+    console.log(`Output: ${outputDir}\n`);
+
+    const result = convertForeignWeights({
+      inputPath,
+      outputDir,
+      modelType,
+      verbose,
+    });
+
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+    console.log(`\n✓ Converted ${result.numTensors} tensors`);
+    console.log(`✓ Output directory: ${result.outputPath}`);
+    console.log(`✓ Duration: ${duration}s`);
+    return;
+  }
+
+  // Default: SafeTensors dtype conversion
+  const dtype = args.dtype || 'bfloat16';
+
+  console.log(`Input:      ${inputPath}`);
   console.log(`Output:     ${outputDir}`);
   console.log(`Dtype:      ${dtype}`);
   if (modelType) {
@@ -177,10 +206,8 @@ async function main() {
   console.log('');
 
   try {
-    const startTime = Date.now();
-
     const result = await convertModel({
-      inputDir,
+      inputDir: inputPath,
       outputDir,
       dtype,
       verbose,
@@ -188,35 +215,22 @@ async function main() {
     });
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-
-    console.log('\n╔════════════════════════════════════════════════════════╗');
-    console.log('║   Conversion Complete!                                 ║');
-    console.log('╚════════════════════════════════════════════════════════╝\n');
-
-    console.log(`✓ Converted ${result.numTensors} tensors`);
+    console.log(`\n✓ Converted ${result.numTensors} tensors`);
     console.log(`✓ Total parameters: ${result.numParameters.toLocaleString()}`);
     console.log(`✓ Output directory: ${result.outputPath}`);
-    console.log(`✓ Duration: ${duration}s\n`);
+    console.log(`✓ Duration: ${duration}s`);
 
     if (verbose) {
-      console.log('Converted tensors:');
+      console.log('\nConverted tensors:');
       for (const name of result.tensorNames) {
         console.log(`  - ${name}`);
       }
-      console.log('');
     }
-
-    console.log('You can now use this model for GRPO training:');
-    console.log(`  yarn oxnode examples/grpo/train-simple.ts --model ${outputDir}\n`);
   } catch (error: any) {
-    console.error('\n❌ Conversion failed!\n');
-    console.error('Error:', error.message);
-
+    console.error('\nConversion failed:', error.message);
     if (error.stack && verbose) {
-      console.error('\nStack trace:');
-      console.error(error.stack);
+      console.error('\nStack trace:', error.stack);
     }
-
     process.exit(1);
   }
 }

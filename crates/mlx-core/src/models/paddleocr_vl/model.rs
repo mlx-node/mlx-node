@@ -83,7 +83,7 @@ impl VLModel {
     ///
     /// # Arguments
     /// * `messages` - Chat messages (role + content)
-    /// * `config` - Chat configuration (including image_paths for automatic processing)
+    /// * `config` - Chat configuration (including images for automatic processing)
     ///
     /// # Returns
     /// * VLMChatResult with generated text
@@ -92,7 +92,7 @@ impl VLModel {
     /// ```typescript
     /// const result = model.chat(
     ///   [{ role: 'user', content: 'Describe this image.' }],
-    ///   { imagePaths: ['./photo.jpg'], maxNewTokens: 256 }
+    ///   { images: [readFileSync('./photo.jpg')], maxNewTokens: 256 }
     /// );
     /// ```
     #[napi]
@@ -112,7 +112,7 @@ impl VLModel {
         let default_config = VLMChatConfig::default();
         let config = match config {
             Some(c) => VLMChatConfig {
-                image_paths: c.image_paths,
+                images: c.images,
                 max_new_tokens: c.max_new_tokens.or(default_config.max_new_tokens),
                 temperature: c.temperature.or(default_config.temperature),
                 top_k: c.top_k.or(default_config.top_k),
@@ -123,9 +123,9 @@ impl VLModel {
             None => default_config,
         };
 
-        // Process images if image_paths provided
-        let (pixel_values, grid_thw) = if let Some(paths) = &config.image_paths {
-            if paths.is_empty() {
+        // Process images if image buffers provided
+        let (pixel_values, grid_thw) = if let Some(ref images) = config.images {
+            if images.is_empty() {
                 (None, None)
             } else {
                 // Process ALL images using batch processing
@@ -135,7 +135,8 @@ impl VLModel {
                     ..ImageProcessorConfig::default()
                 };
                 let processor = ImageProcessor::new(Some(processor_config));
-                let processed = processor.process_files(paths.clone())?;
+                let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
+                let processed = processor.process_many(&image_refs)?;
 
                 // Add batch dimension: [total_patches, C, H, W] -> [1, total_patches, C, H, W]
                 let pv = processed.pixel_values();
@@ -149,7 +150,7 @@ impl VLModel {
                 ]);
                 let pixel_values = pv.reshape(&new_shape)?;
 
-                // grid_thw already [num_images, 3] from process_files
+                // grid_thw already [num_images, 3] from process_many
                 let grid_thw = processed.grid_thw();
 
                 (Some(pixel_values), Some(grid_thw))
@@ -233,12 +234,12 @@ impl VLModel {
         })
     }
 
-    /// Simple OCR: extract text from an image file
+    /// Simple OCR: extract text from encoded image bytes
     ///
     /// Convenience method that processes an image and extracts all text.
     ///
     /// # Arguments
-    /// * `image_path` - Path to the image file
+    /// * `image_data` - Encoded image bytes (PNG/JPEG)
     /// * `prompt` - Optional custom prompt (default: "Extract all text from this image.")
     ///
     /// # Returns
@@ -246,11 +247,11 @@ impl VLModel {
     ///
     /// # Example
     /// ```typescript
-    /// const text = await model.ocr('./receipt.jpg');
+    /// const text = model.ocr(imageBuffer);
     /// console.log(text);
     /// ```
     #[napi]
-    pub fn ocr(&self, image_path: String, prompt: Option<String>) -> Result<String> {
+    pub fn ocr(&self, image_data: Buffer, prompt: Option<String>) -> Result<String> {
         let prompt = prompt.unwrap_or_else(|| "Extract all text from this image.".to_string());
 
         let messages = vec![VLMChatMessage {
@@ -259,7 +260,7 @@ impl VLModel {
         }];
 
         let config = VLMChatConfig {
-            image_paths: Some(vec![image_path]),
+            images: Some(vec![image_data]),
             ..Default::default()
         };
 
@@ -1026,7 +1027,7 @@ impl VLModel {
     /// Processes N images with sequential prefill + batched decode for ~N× decode throughput.
     ///
     /// # Arguments
-    /// * `image_paths` - Paths to image files
+    /// * `images` - Encoded image buffers
     /// * `config` - Optional chat configuration (shared across all items)
     ///
     /// # Returns
@@ -1034,24 +1035,26 @@ impl VLModel {
     ///
     /// # Example
     /// ```typescript
-    /// const texts = model.ocrBatch(['page1.jpg', 'page2.jpg', 'page3.jpg']);
+    /// import { readFileSync } from 'fs';
+    /// const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
+    /// const texts = model.ocrBatch(images);
     /// ```
     #[napi]
     pub fn ocr_batch(
         &self,
-        image_paths: Vec<String>,
+        images: Vec<Buffer>,
         config: Option<VLMChatConfig>,
     ) -> Result<Vec<String>> {
         let prompt = "Extract all text from this image.".to_string();
 
-        let batch: Vec<VLMBatchItem> = image_paths
+        let batch: Vec<VLMBatchItem> = images
             .into_iter()
-            .map(|path| VLMBatchItem {
+            .map(|image_data| VLMBatchItem {
                 messages: vec![VLMChatMessage {
                     role: ChatRole::User,
                     content: prompt.clone(),
                 }],
-                image_paths: Some(vec![path]),
+                images: Some(vec![image_data]),
             })
             .collect();
 
@@ -1074,7 +1077,7 @@ impl VLModel {
     /// Sequential prefill + batched decode. Each item can have different images/prompts.
     ///
     /// # Arguments
-    /// * `batch` - Batch items, each with messages and optional image_paths
+    /// * `batch` - Batch items, each with messages and optional images
     /// * `config` - Optional shared chat configuration
     ///
     /// # Returns
@@ -1099,16 +1102,20 @@ impl VLModel {
         // Fall back to sequential for batch_size == 1
         if batch.len() == 1 {
             let item = &batch[0];
-            let c = match &config {
-                Some(c) => Some(VLMChatConfig {
-                    image_paths: item.image_paths.clone(),
-                    ..c.clone()
-                }),
-                None => Some(VLMChatConfig {
-                    image_paths: item.image_paths.clone(),
-                    ..Default::default()
-                }),
-            };
+            let default_cfg = VLMChatConfig::default();
+            let base = config.as_ref().unwrap_or(&default_cfg);
+            let c = Some(VLMChatConfig {
+                images: item
+                    .images
+                    .as_ref()
+                    .map(|imgs| imgs.iter().map(|b| Buffer::from(b.to_vec())).collect()),
+                max_new_tokens: base.max_new_tokens,
+                temperature: base.temperature,
+                top_k: base.top_k,
+                top_p: base.top_p,
+                repetition_penalty: base.repetition_penalty,
+                return_logprobs: base.return_logprobs,
+            });
             let result = self.chat(item.messages.clone(), c)?;
             return Ok(vec![result]);
         }
@@ -1116,7 +1123,7 @@ impl VLModel {
         let default_config = VLMChatConfig::default();
         let config = match config {
             Some(c) => VLMChatConfig {
-                image_paths: None, // Per-item
+                images: None, // Per-item
                 max_new_tokens: c.max_new_tokens.or(default_config.max_new_tokens),
                 temperature: c.temperature.or(default_config.temperature),
                 top_k: c.top_k.or(default_config.top_k),
@@ -1154,8 +1161,8 @@ impl VLModel {
 
         for item in &batch {
             // Process images
-            let (pixel_values, grid_thw) = if let Some(paths) = &item.image_paths {
-                if paths.is_empty() {
+            let (pixel_values, grid_thw) = if let Some(ref images) = item.images {
+                if images.is_empty() {
                     (None, None)
                 } else {
                     let processor_config = ImageProcessorConfig {
@@ -1164,7 +1171,8 @@ impl VLModel {
                         ..ImageProcessorConfig::default()
                     };
                     let processor = ImageProcessor::new(Some(processor_config));
-                    let processed = processor.process_files(paths.clone())?;
+                    let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
+                    let processed = processor.process_many(&image_refs)?;
                     let pv = processed.pixel_values();
                     let pv_shape = pv.shape()?;
                     let new_shape = BigInt64Array::from(vec![
@@ -1724,7 +1732,7 @@ impl VLModel {
     /// ```typescript
     /// import { VLModel } from '@mlx-node/vlm';
     /// const model = await VLModel.load('./models/paddleocr-vl');
-    /// const result = model.chat(messages, { imagePaths: ['./image.jpg'] });
+    /// const result = model.chat(messages, { images: [readFileSync('./image.jpg')] });
     /// ```
     #[napi]
     pub fn load<'env>(env: &'env Env, model_path: String) -> Result<PromiseRaw<'env, VLModel>> {

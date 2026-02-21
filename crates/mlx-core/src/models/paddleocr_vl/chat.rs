@@ -3,6 +3,7 @@
  *
  * High-level chat interface for vision-language tasks like OCR.
  */
+use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 
 use crate::array::MxArray;
@@ -31,11 +32,9 @@ pub struct VLMChatMessage {
 
 /// Configuration for VLM chat
 #[napi(object)]
-#[derive(Debug, Clone)]
 pub struct VLMChatConfig {
-    /// Image paths to process (alternative to passing pre-processed images)
-    /// These will be automatically processed using the ImageProcessor
-    pub image_paths: Option<Vec<String>>,
+    /// Encoded image buffers to process (PNG/JPEG bytes)
+    pub images: Option<Vec<Buffer>>,
 
     /// Maximum number of new tokens to generate (default: 512)
     pub max_new_tokens: Option<i32>,
@@ -59,7 +58,7 @@ pub struct VLMChatConfig {
 impl Default for VLMChatConfig {
     fn default() -> Self {
         Self {
-            image_paths: None,
+            images: None,
             max_new_tokens: Some(512),
             temperature: Some(0.0), // Greedy by default for OCR
             top_k: Some(0),
@@ -124,12 +123,11 @@ impl VLMChatResult {
 
 /// A batch item for VLM batch inference
 #[napi(object)]
-#[derive(Debug, Clone)]
 pub struct VLMBatchItem {
     /// Chat messages for this item
     pub messages: Vec<VLMChatMessage>,
-    /// Image paths for this item (one image per item for OCR)
-    pub image_paths: Option<Vec<String>>,
+    /// Encoded image buffers for this item (one image per item for OCR)
+    pub images: Option<Vec<Buffer>>,
 }
 
 /// Default PaddleOCR-VL chat template

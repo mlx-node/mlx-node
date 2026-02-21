@@ -5,10 +5,8 @@
 //! beyond rescaling is needed.
 
 use crate::array::MxArray;
-use image::ImageReader;
 use image::imageops::FilterType;
 use napi::bindgen_prelude::*;
-use std::path::Path;
 
 /// Image processor for PP-DocLayoutV3 document layout analysis.
 ///
@@ -34,40 +32,23 @@ impl PPDocLayoutV3ImageProcessor {
         }
     }
 
-    /// Process an image file for model input.
+    /// Process encoded image bytes for model input.
     ///
     /// # Arguments
-    /// * `path` - Path to the image file
+    /// * `data` - Encoded image bytes (PNG/JPEG)
     ///
     /// # Returns
     /// * `(pixel_values, original_height, original_width)` where:
     ///   - pixel_values: MxArray [1, 800, 800, 3] in NHWC format, float32, rescaled to [0,1]
     ///   - original_height: Original image height before resize
     ///   - original_width: Original image width before resize
-    pub fn process_file(&self, path: &str) -> Result<(MxArray, u32, u32)> {
-        let img_path = Path::new(path);
-        if !img_path.exists() {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!("Image file not found: {}", img_path.display()),
-            ));
-        }
-
-        // Load image
-        let img = ImageReader::open(img_path)
-            .map_err(|e| {
-                Error::new(
-                    Status::GenericFailure,
-                    format!("Failed to open image: {}", e),
-                )
-            })?
-            .decode()
-            .map_err(|e| {
-                Error::new(
-                    Status::GenericFailure,
-                    format!("Failed to decode image: {}", e),
-                )
-            })?;
+    pub fn process(&self, data: &[u8]) -> Result<(MxArray, u32, u32)> {
+        let img = image::load_from_memory(data).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to decode image: {}", e),
+            )
+        })?;
 
         // Get original dimensions
         let original_width = img.width();
@@ -87,17 +68,7 @@ impl PPDocLayoutV3ImageProcessor {
         let h = self.target_height as usize;
         let w = self.target_width as usize;
         let channels = 3usize;
-        let mut pixel_data: Vec<f32> = Vec::with_capacity(h * w * channels);
-
-        for y in 0..h {
-            for x in 0..w {
-                let pixel = rgb_img.get_pixel(x as u32, y as u32);
-                for c in 0..channels {
-                    let val = pixel[c] as f32 / 255.0;
-                    pixel_data.push(val);
-                }
-            }
-        }
+        let pixel_data: Vec<f32> = rgb_img.as_raw().iter().map(|&b| b as f32 / 255.0).collect();
 
         // Create MxArray [1, H, W, 3] in NHWC format
         let pixel_values =

@@ -209,6 +209,48 @@ impl Activations {
         silu_gate.mul(up)
     }
 
+    /// Hard Swish: x * clamp(x + 3, 0, 6) / 6
+    /// Used in PP-LCNet (MobileNet-style architectures).
+    pub fn hard_swish(input: &MxArray) -> Result<MxArray> {
+        let handle = unsafe {
+            let three = sys::mlx_array_scalar_float(3.0);
+            let six = sys::mlx_array_scalar_float(6.0);
+            let x_plus_3 = sys::mlx_array_add(input.handle.0, three);
+            let clamped = sys::mlx_array_clip(x_plus_3, 0.0, 6.0);
+            let x_times_clamped = sys::mlx_array_mul(input.handle.0, clamped);
+            let result = sys::mlx_array_div(x_times_clamped, six);
+
+            sys::mlx_array_delete(three);
+            sys::mlx_array_delete(six);
+            sys::mlx_array_delete(x_plus_3);
+            sys::mlx_array_delete(clamped);
+            sys::mlx_array_delete(x_times_clamped);
+
+            result
+        };
+        MxArray::from_handle(handle, "hard_swish")
+    }
+
+    /// Hard Sigmoid: clamp(x / 6 + 0.5, 0, 1)
+    /// Used in SE modules of PP-LCNet.
+    pub fn hard_sigmoid(input: &MxArray) -> Result<MxArray> {
+        let handle = unsafe {
+            let six = sys::mlx_array_scalar_float(6.0);
+            let half = sys::mlx_array_scalar_float(0.5);
+            let x_div_6 = sys::mlx_array_div(input.handle.0, six);
+            let x_div_6_plus_half = sys::mlx_array_add(x_div_6, half);
+            let result = sys::mlx_array_clip(x_div_6_plus_half, 0.0, 1.0);
+
+            sys::mlx_array_delete(six);
+            sys::mlx_array_delete(half);
+            sys::mlx_array_delete(x_div_6);
+            sys::mlx_array_delete(x_div_6_plus_half);
+
+            result
+        };
+        MxArray::from_handle(handle, "hard_sigmoid")
+    }
+
     /// Softplus: log(1 + exp(x))
     /// Used in GatedDeltaNet for computing decay rates.
     ///
@@ -238,5 +280,58 @@ impl Activations {
             result
         };
         MxArray::from_handle(handle, "softplus")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::array::MxArray;
+
+    #[test]
+    fn test_hard_swish() {
+        // hardswish(x) = x * clamp(x + 3, 0, 6) / 6
+        let input =
+            MxArray::from_float32(&[-4.0, -3.0, -1.0, 0.0, 1.0, 1.5, 3.0, 4.0], &[8]).unwrap();
+        let result = Activations::hard_swish(&input).unwrap();
+        result.eval();
+        let data: Vec<f32> = result.to_float32().unwrap().to_vec();
+
+        // x=-4: -4 * clamp(-1, 0, 6) / 6 = 0
+        assert!((data[0] - 0.0).abs() < 1e-6);
+        // x=-3: -3 * clamp(0, 0, 6) / 6 = 0
+        assert!((data[1] - 0.0).abs() < 1e-6);
+        // x=-1: -1 * clamp(2, 0, 6) / 6 = -1 * 2/6 = -0.3333
+        assert!((data[2] - (-1.0 / 3.0)).abs() < 1e-5);
+        // x=0: 0 * clamp(3, 0, 6) / 6 = 0
+        assert!((data[3] - 0.0).abs() < 1e-6);
+        // x=1: 1 * clamp(4, 0, 6) / 6 = 4/6 = 0.6667
+        assert!((data[4] - (4.0 / 6.0)).abs() < 1e-5);
+        // x=1.5: 1.5 * clamp(4.5, 0, 6) / 6 = 1.5 * 4.5/6 = 1.125
+        assert!((data[5] - 1.125).abs() < 1e-5);
+        // x=3: 3 * clamp(6, 0, 6) / 6 = 3
+        assert!((data[6] - 3.0).abs() < 1e-6);
+        // x=4: 4 * clamp(7, 0, 6) / 6 = 4
+        assert!((data[7] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_hard_sigmoid() {
+        // hardsigmoid(x) = clamp(x / 6 + 0.5, 0, 1)
+        let input = MxArray::from_float32(&[-6.0, -3.0, 0.0, 3.0, 6.0], &[5]).unwrap();
+        let result = Activations::hard_sigmoid(&input).unwrap();
+        result.eval();
+        let data: Vec<f32> = result.to_float32().unwrap().to_vec();
+
+        // x=-6: clamp(-1 + 0.5, 0, 1) = clamp(-0.5, 0, 1) = 0
+        assert!((data[0] - 0.0).abs() < 1e-6);
+        // x=-3: clamp(-0.5 + 0.5, 0, 1) = clamp(0, 0, 1) = 0
+        assert!((data[1] - 0.0).abs() < 1e-6);
+        // x=0: clamp(0 + 0.5, 0, 1) = 0.5
+        assert!((data[2] - 0.5).abs() < 1e-6);
+        // x=3: clamp(0.5 + 0.5, 0, 1) = 1.0
+        assert!((data[3] - 1.0).abs() < 1e-6);
+        // x=6: clamp(1 + 0.5, 0, 1) = 1.0
+        assert!((data[4] - 1.0).abs() < 1e-6);
     }
 }

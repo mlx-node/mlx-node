@@ -148,7 +148,76 @@ pub fn postprocess_detection(
         });
     }
 
+    // Fixup: promote doc_title elements near the top of the page to the front.
+    // The reading order model sometimes misranks page-spanning titles in
+    // multi-column layouts.
+    fixup_doc_title_order(&mut elements, oh);
+
     Ok(elements)
+}
+
+/// Promote doc_title elements near the top of the page to the front of reading order.
+///
+/// The pairwise reading order model can misrank page-spanning titles in
+/// multi-column newspaper layouts. This heuristic detects doc_title elements
+/// whose top edge is in the upper 15% of the image and moves them to order 0,
+/// shifting other elements down.
+fn fixup_doc_title_order(elements: &mut [LayoutElement], image_height: f64) {
+    if elements.is_empty() {
+        return;
+    }
+
+    let top_threshold = image_height * 0.15;
+
+    // Find doc_title elements near the top, sorted by y1 (topmost first)
+    let mut top_titles: Vec<usize> = elements
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.label_name == "doc_title" && e.bbox[1] < top_threshold)
+        .map(|(i, _)| i)
+        .collect();
+
+    if top_titles.is_empty() {
+        return;
+    }
+
+    // Sort by y position (topmost first)
+    top_titles.sort_by(|&a, &b| {
+        elements[a].bbox[1]
+            .partial_cmp(&elements[b].bbox[1])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Check if they're already at the front
+    let already_first = top_titles
+        .iter()
+        .enumerate()
+        .all(|(rank, &idx)| elements[idx].order == rank as u32);
+    if already_first {
+        return;
+    }
+
+    // Collect the title indices as a set for quick lookup
+    let title_set: std::collections::HashSet<usize> = top_titles.iter().copied().collect();
+    let num_promoted = top_titles.len() as u32;
+
+    // Assign order 0, 1, ... to the promoted titles
+    for (rank, &idx) in top_titles.iter().enumerate() {
+        elements[idx].order = rank as u32;
+    }
+
+    // Shift all other elements' order by num_promoted
+    for (i, el) in elements.iter_mut().enumerate() {
+        if !title_set.contains(&i) {
+            el.order += num_promoted;
+        }
+    }
+
+    // Re-sort the slice by the new order and renormalize to contiguous indices
+    elements.sort_by_key(|e| e.order);
+    for (i, el) in elements.iter_mut().enumerate() {
+        el.order = i as u32;
+    }
 }
 
 /// Compute reading order from pairwise order logits.

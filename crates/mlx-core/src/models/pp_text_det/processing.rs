@@ -7,14 +7,12 @@
 //! We swap R and B channels before normalization to match PaddleOCR's convention.
 
 use crate::array::MxArray;
-use image::ImageReader;
 use image::imageops::FilterType;
 
 /// PaddleOCR uses cv2.INTER_LINEAR (bilinear). The closest equivalent
 /// in the `image` crate is `FilterType::Triangle` (bilinear interpolation).
 const RESIZE_FILTER: FilterType = FilterType::Triangle;
 use napi::bindgen_prelude::*;
-use std::path::Path;
 
 /// Limit type for resize behavior, matching PaddleOCR's DetResizeForTest.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -101,28 +99,17 @@ impl TextDetImageProcessor {
         }
     }
 
-    /// Process an image file.
+    /// Process encoded image bytes.
     ///
     /// Returns (pixel_values, original_h, original_w, resized_h, resized_w)
     /// pixel_values: [1, padded_h, padded_w, 3] normalized float32
-    pub fn process_file(&self, path: &str) -> Result<(MxArray, u32, u32, u32, u32)> {
-        let img_path = Path::new(path);
-        if !img_path.exists() {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!("Image file not found: {}", img_path.display()),
-            ));
-        }
-
-        let img = ImageReader::open(img_path)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to open image: {e}")))?
-            .decode()
-            .map_err(|e| {
-                Error::new(
-                    Status::GenericFailure,
-                    format!("Failed to decode image: {e}"),
-                )
-            })?;
+    pub fn process(&self, data: &[u8]) -> Result<(MxArray, u32, u32, u32, u32)> {
+        let img = image::load_from_memory(data).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to decode image: {e}"),
+            )
+        })?;
 
         let orig_w = img.width();
         let orig_h = img.height();
@@ -208,7 +195,7 @@ impl TextDetImageProcessor {
         let w = round_w as usize;
         let mut pixel_data: Vec<f32> = vec![0.0; h * w * 3];
 
-        // Channel mapping: RGB->BGR (same as process_file)
+        // Channel mapping: RGB->BGR (same as process)
         let channel_map = [2usize, 1, 0];
 
         for y in 0..h {

@@ -97,15 +97,51 @@ export declare class DocLayoutModel {
    * Detect document layout elements in an image.
    *
    * # Arguments
-   * * `image_path` - Path to the input image
+   * * `image_data` - Encoded image bytes (PNG/JPEG)
    * * `threshold` - Optional confidence threshold (default 0.5)
    *
    * # Returns
    * * Vec of LayoutElements sorted by reading order
    */
-  detect(imagePath: string, threshold?: number | undefined | null): Array<LayoutElement>;
+  detect(imageData: Buffer, threshold?: number | undefined | null): Array<LayoutElement>;
 }
 export type PPDocLayoutV3Model = DocLayoutModel;
+
+/**
+ * PP-LCNet_x1_0 Document Orientation Classification model.
+ *
+ * Classifies document images into 4 orientation classes (0/90/180/270 degrees).
+ * Uses depthwise separable convolutions with HardSwish activation.
+ */
+export declare class DocOrientationModel {
+  /** Load a DocOrientationModel from a directory containing model.safetensors and config.json. */
+  static load(modelPath: string): DocOrientationModel;
+  /**
+   * Classify the orientation of a document image.
+   *
+   * Returns the detected orientation angle (0, 90, 180, 270) and confidence.
+   */
+  classify(imageData: Buffer): OrientationResult;
+  /**
+   * Classify orientation and return the corrected (upright) image bytes.
+   *
+   * Returns classification result plus corrected PNG image bytes.
+   */
+  classifyAndRotate(imageData: Buffer): ClassifyRotateResult;
+}
+
+/**
+ * UVDoc Document Unwarping model.
+ *
+ * Predicts a 2D displacement field and applies it to correct perspective
+ * distortion in camera-captured documents.
+ */
+export declare class DocUnwarpModel {
+  /** Load a DocUnwarpModel from a directory containing model.safetensors. */
+  static load(modelPath: string): DocUnwarpModel;
+  /** Unwarp a document image and return the corrected image bytes. */
+  unwarp(imageData: Buffer): UnwarpResult;
+}
 
 /** Result from text generation with detailed metadata */
 export declare class GenerationResult {
@@ -1491,13 +1527,26 @@ export declare class TextDetModel {
    * Detect text lines in an image.
    *
    * # Arguments
-   * * `image_path` - Path to the input image
+   * * `image_data` - Encoded image bytes (PNG/JPEG)
    * * `threshold` - Optional detection threshold (default from config, typically 0.3)
    *
    * # Returns
    * * Vec of TextBox with bounding boxes and confidence scores
    */
-  detect(imagePath: string, threshold?: number | undefined | null): Array<TextBox>;
+  detect(imageData: Buffer, threshold?: number | undefined | null): Array<TextBox>;
+  /**
+   * Detect text lines from raw RGB pixel data.
+   *
+   * # Arguments
+   * * `rgb_data` - Raw RGB pixel data
+   * * `width` - Image width
+   * * `height` - Image height
+   * * `threshold` - Optional detection threshold (default from config)
+   *
+   * # Returns
+   * * Vec of TextBox with bounding boxes and confidence scores
+   */
+  detectCrop(rgbData: Uint8Array, width: number, height: number, threshold?: number | undefined | null): Array<TextBox>;
 }
 
 /**
@@ -1515,25 +1564,25 @@ export declare class TextRecModel {
    */
   static load(modelPath: string, dictPath: string): TextRecModel;
   /**
-   * Recognize text from a single image file.
+   * Recognize text from encoded image bytes.
    *
    * # Arguments
-   * * `image_path` - Path to a cropped text line image
+   * * `image_data` - Encoded image bytes (PNG/JPEG)
    *
    * # Returns
    * * RecResult with recognized text and confidence score
    */
-  recognize(imagePath: string): RecResult;
+  recognize(imageData: Buffer): RecResult;
   /**
-   * Recognize text from multiple image files (batch).
+   * Recognize text from multiple encoded images.
    *
    * # Arguments
-   * * `image_paths` - Paths to cropped text line images
+   * * `images` - Vec of encoded image bytes (PNG/JPEG)
    *
    * # Returns
    * * Vec of RecResult with recognized text and confidence scores
    */
-  recognizeBatch(imagePaths: Array<string>): Array<RecResult>;
+  recognizeBatch(images: Array<Buffer>): Array<RecResult>;
   /**
    * Recognize text from raw RGB crop data.
    *
@@ -1583,7 +1632,7 @@ export declare class VLModel {
    *
    * # Arguments
    * * `messages` - Chat messages (role + content)
-   * * `config` - Chat configuration (including image_paths for automatic processing)
+   * * `config` - Chat configuration (including images for automatic processing)
    *
    * # Returns
    * * VLMChatResult with generated text
@@ -1592,18 +1641,18 @@ export declare class VLModel {
    * ```typescript
    * const result = model.chat(
    *   [{ role: 'user', content: 'Describe this image.' }],
-   *   { imagePaths: ['./photo.jpg'], maxNewTokens: 256 }
+   *   { images: [readFileSync('./photo.jpg')], maxNewTokens: 256 }
    * );
    * ```
    */
   chat(messages: Array<VlmChatMessage>, config?: VlmChatConfig | undefined | null): VlmChatResult;
   /**
-   * Simple OCR: extract text from an image file
+   * Simple OCR: extract text from encoded image bytes
    *
    * Convenience method that processes an image and extracts all text.
    *
    * # Arguments
-   * * `image_path` - Path to the image file
+   * * `image_data` - Encoded image bytes (PNG/JPEG)
    * * `prompt` - Optional custom prompt (default: "Extract all text from this image.")
    *
    * # Returns
@@ -1611,11 +1660,11 @@ export declare class VLModel {
    *
    * # Example
    * ```typescript
-   * const text = await model.ocr('./receipt.jpg');
+   * const text = model.ocr(imageBuffer);
    * console.log(text);
    * ```
    */
-  ocr(imagePath: string, prompt?: string | undefined | null): string;
+  ocr(imageData: Buffer, prompt?: string | undefined | null): string;
   /**
    * Get input embeddings with vision features merged
    *
@@ -1678,7 +1727,7 @@ export declare class VLModel {
    * Processes N images with sequential prefill + batched decode for ~N× decode throughput.
    *
    * # Arguments
-   * * `image_paths` - Paths to image files
+   * * `images` - Encoded image buffers
    * * `config` - Optional chat configuration (shared across all items)
    *
    * # Returns
@@ -1686,17 +1735,19 @@ export declare class VLModel {
    *
    * # Example
    * ```typescript
-   * const texts = model.ocrBatch(['page1.jpg', 'page2.jpg', 'page3.jpg']);
+   * import { readFileSync } from 'fs';
+   * const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
+   * const texts = model.ocrBatch(images);
    * ```
    */
-  ocrBatch(imagePaths: Array<string>, config?: VlmChatConfig | undefined | null): Array<string>;
+  ocrBatch(images: Array<Buffer>, config?: VlmChatConfig | undefined | null): Array<string>;
   /**
    * Batch chat: process multiple items simultaneously
    *
    * Sequential prefill + batched decode. Each item can have different images/prompts.
    *
    * # Arguments
-   * * `batch` - Batch items, each with messages and optional image_paths
+   * * `batch` - Batch items, each with messages and optional images
    * * `config` - Optional shared chat configuration
    *
    * # Returns
@@ -1724,7 +1775,7 @@ export declare class VLModel {
    * ```typescript
    * import { VLModel } from '@mlx-node/vlm';
    * const model = await VLModel.load('./models/paddleocr-vl');
-   * const result = model.chat(messages, { imagePaths: ['./image.jpg'] });
+   * const result = model.chat(messages, { images: [readFileSync('./image.jpg')] });
    * ```
    */
   static load(modelPath: string): Promise<VLModel>;
@@ -1903,6 +1954,18 @@ export declare const enum ChatRole {
   System = 'System',
 }
 
+/** Result from classify_and_rotate: orientation info + corrected image bytes. */
+export interface ClassifyRotateResult {
+  /** Detected rotation angle (0, 90, 180, or 270 degrees) */
+  angle: number;
+  /** Confidence score */
+  score: number;
+  /** Angle label as string */
+  label: string;
+  /** Corrected image as PNG bytes (or original bytes if angle=0) */
+  image: Buffer;
+}
+
 /** Statistics about cleanup operations (NAPI wrapper) */
 export interface CleanupStats {
   /** Number of training steps deleted */
@@ -1957,6 +2020,8 @@ export interface ConversionResult {
   /** List of converted tensor names */
   tensorNames: Array<string>;
 }
+
+export declare function convertForeignWeights(options: ForeignConversionOptions): ForeignConversionResult;
 
 /**
  * Convert a HuggingFace SafeTensors model to MLX format
@@ -2077,6 +2142,23 @@ export interface EngineStepMetrics {
   peakMemoryMb: number;
   /** Active memory at end of step (MB) */
   activeMemoryMb: number;
+}
+
+export interface ForeignConversionOptions {
+  /** Path to the input weights file (.pdparams, .pkl, .pt, .pth) */
+  inputPath: string;
+  /** Output directory for model.safetensors + config.json */
+  outputDir: string;
+  /** Model type: "pp-lcnet-ori" or "uvdoc" */
+  modelType: string;
+  /** Enable verbose logging */
+  verbose?: boolean;
+}
+
+export interface ForeignConversionResult {
+  numTensors: number;
+  outputPath: string;
+  tensorNames: Array<string>;
 }
 
 /** Format parsed document according to config */
@@ -2383,6 +2465,16 @@ export interface ModelConfig {
   visionStartTokenId: number;
   visionEndTokenId: number;
   eosTokenId: number;
+}
+
+/** Result from document orientation classification. */
+export interface OrientationResult {
+  /** Detected rotation angle (0, 90, 180, or 270 degrees) */
+  angle: number;
+  /** Confidence score */
+  score: number;
+  /** Angle label as string */
+  label: string;
 }
 
 /** Output format options */
@@ -3016,6 +3108,12 @@ export interface TrainStepResultWithOutputs {
   completionLengths: Array<number>;
 }
 
+/** Result from document unwarping. */
+export interface UnwarpResult {
+  /** Unwarped image as PNG bytes */
+  image: Buffer;
+}
+
 /** Vision encoder configuration */
 export interface VisionConfig {
   modelType: string;
@@ -3036,17 +3134,14 @@ export interface VisionConfig {
 export interface VlmBatchItem {
   /** Chat messages for this item */
   messages: Array<VlmChatMessage>;
-  /** Image paths for this item (one image per item for OCR) */
-  imagePaths?: Array<string>;
+  /** Encoded image buffers for this item (one image per item for OCR) */
+  images?: Array<Buffer>;
 }
 
 /** Configuration for VLM chat */
 export interface VlmChatConfig {
-  /**
-   * Image paths to process (alternative to passing pre-processed images)
-   * These will be automatically processed using the ImageProcessor
-   */
-  imagePaths?: Array<string>;
+  /** Encoded image buffers to process (PNG/JPEG bytes) */
+  images?: Array<Buffer>;
   /** Maximum number of new tokens to generate (default: 512) */
   maxNewTokens?: number;
   /** Sampling temperature (0 = greedy, higher = more random) (default: 0.0 for OCR) */
