@@ -30,18 +30,8 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
 
       - name: Install dependencies
         run: yarn install --immutable
@@ -83,18 +73,8 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
 
       - name: Install dependencies
         run: yarn install --immutable
@@ -136,18 +116,8 @@ jobs:
           components: clippy, rustfmt
           targets: aarch64-apple-darwin
 
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-lint-
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
 
       - name: Install dependencies
         run: yarn install --immutable
