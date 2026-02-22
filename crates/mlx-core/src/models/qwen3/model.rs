@@ -3559,16 +3559,21 @@ impl Qwen3Model {
                 )
             })?
             .len();
-        for _ in 0..num_layers {
-            // Each layer has:
-            // Q, K, V, O projections: 4 * (hidden_size * hidden_size)
-            // MLP: gate, up, down projections
-            // Norms: 2 * hidden_size
-            let hidden_size = self.config.hidden_size as i64;
-            let intermediate_size = self.config.intermediate_size as i64;
+        let hidden_size = self.config.hidden_size as i64;
+        let intermediate_size = self.config.intermediate_size as i64;
+        let head_dim = self.config.head_dim as i64;
+        let kv_dim = self.config.num_kv_heads as i64 * head_dim;
 
-            // Attention: Q, K, V, O
-            total += hidden_size * hidden_size * 4;
+        for _ in 0..num_layers {
+            // Attention: Q, K, V, O projections (GQA: K/V use num_kv_heads * head_dim)
+            total += hidden_size * hidden_size // q_proj
+                + hidden_size * kv_dim         // k_proj
+                + hidden_size * kv_dim         // v_proj
+                + hidden_size * hidden_size; // o_proj
+            // QK norms (when enabled)
+            if self.config.use_qk_norm {
+                total += head_dim * 2; // q_norm + k_norm (each [head_dim])
+            }
             // MLP: gate, up, down
             total += hidden_size * intermediate_size * 2; // gate + up
             total += intermediate_size * hidden_size; // down
@@ -3577,10 +3582,12 @@ impl Qwen3Model {
         }
 
         // Final norm
-        total += self.config.hidden_size as i64;
+        total += hidden_size;
 
-        // LM head
-        total += (self.config.hidden_size * self.config.vocab_size) as i64;
+        // LM head (only when not tied to embeddings)
+        if !self.config.tie_word_embeddings {
+            total += hidden_size * self.config.vocab_size as i64;
+        }
 
         Ok(total)
     }

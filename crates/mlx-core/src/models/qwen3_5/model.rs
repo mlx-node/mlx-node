@@ -574,9 +574,11 @@ impl Qwen3_5Model {
             } else {
                 // Full attention layer parameters
                 // Note: assumes num_heads * head_dim == hidden_size (true for standard configs)
+                let d = self.config.head_dim as i64;
                 total += h * h * 2 // q_proj (2x for gate)
-                    + h * (self.config.num_kv_heads as i64 * self.config.head_dim as i64) * 2 // k, v
-                    + h * h; // o_proj
+                    + h * (self.config.num_kv_heads as i64 * d) * 2 // k, v
+                    + h * h // o_proj
+                    + d * 2; // q_norm + k_norm (each [head_dim])
             }
 
             // MLP params
@@ -592,6 +594,9 @@ impl Qwen3_5Model {
             // Norms (2 per layer)
             total += h * 2;
         }
+
+        // Final norm
+        total += h;
 
         total
     }
