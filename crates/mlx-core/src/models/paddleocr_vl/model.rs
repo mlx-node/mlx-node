@@ -90,18 +90,18 @@ impl VLModel {
     ///
     /// # Example
     /// ```typescript
-    /// const result = model.chat(
+    /// const result = await model.chat(
     ///   [{ role: 'user', content: 'Describe this image.' }],
     ///   { images: [readFileSync('./photo.jpg')], maxNewTokens: 256 }
     /// );
     /// ```
     #[napi]
-    pub fn chat(
+    pub async fn chat(
         &self,
         messages: Vec<VLMChatMessage>,
         config: Option<VLMChatConfig>,
     ) -> Result<VLMChatResult> {
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::GenericFailure,
                 "Tokenizer not set. Use set_tokenizer() first.",
@@ -123,107 +123,125 @@ impl VLModel {
             None => default_config,
         };
 
-        // Process images if image buffers provided
-        let (pixel_values, grid_thw) = if let Some(ref images) = config.images {
-            if images.is_empty() {
-                (None, None)
-            } else {
-                // Process ALL images using batch processing
-                let processor_config = ImageProcessorConfig {
-                    patch_size: self.config.vision_config.patch_size,
-                    merge_size: self.config.vision_config.spatial_merge_size,
-                    ..ImageProcessorConfig::default()
+        // spawn_blocking: image processing + tokenization (CPU-bound)
+        let vision_config = self.config.vision_config.clone();
+        let eos_token_id = self.config.eos_token_id;
+        let tokenizer_clone = tokenizer.clone();
+        let (input_ids, pixel_values, grid_thw, gen_config) =
+            napi::bindgen_prelude::spawn_blocking(move || {
+                // Process images if image buffers provided
+                let (pixel_values, grid_thw) = if let Some(ref images) = config.images {
+                    if images.is_empty() {
+                        (None, None)
+                    } else {
+                        let processor_config = ImageProcessorConfig {
+                            patch_size: vision_config.patch_size,
+                            merge_size: vision_config.spatial_merge_size,
+                            ..ImageProcessorConfig::default()
+                        };
+                        let processor = ImageProcessor::new(Some(processor_config));
+                        let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
+                        let processed = processor.process_many(&image_refs)?;
+
+                        let pv = processed.pixel_values();
+                        let pv_shape = pv.shape()?;
+                        let new_shape = BigInt64Array::from(vec![
+                            1i64,
+                            pv_shape[0],
+                            pv_shape[1],
+                            pv_shape[2],
+                            pv_shape[3],
+                        ]);
+                        let pixel_values = pv.reshape(&new_shape)?;
+                        let grid_thw = processed.grid_thw();
+                        (Some(pixel_values), Some(grid_thw))
+                    }
+                } else {
+                    (None, None)
                 };
-                let processor = ImageProcessor::new(Some(processor_config));
-                let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
-                let processed = processor.process_many(&image_refs)?;
 
-                // Add batch dimension: [total_patches, C, H, W] -> [1, total_patches, C, H, W]
-                let pv = processed.pixel_values();
-                let pv_shape = pv.shape()?;
-                let new_shape = BigInt64Array::from(vec![
-                    1i64,
-                    pv_shape[0],
-                    pv_shape[1],
-                    pv_shape[2],
-                    pv_shape[3],
-                ]);
-                let pixel_values = pv.reshape(&new_shape)?;
+                // Count image tokens
+                let num_image_tokens = if let Some(ref grid) = grid_thw {
+                    grid.eval();
+                    let grid_data = grid.to_int32()?;
+                    let spatial_merge_size = vision_config.spatial_merge_size;
+                    let merge_factor = spatial_merge_size * spatial_merge_size;
+                    let mut total = 0i32;
+                    for i in 0..(grid_data.len() / 3) {
+                        let t = grid_data[i * 3];
+                        let h = grid_data[i * 3 + 1];
+                        let w = grid_data[i * 3 + 2];
+                        total += (t * h * w) / merge_factor;
+                    }
+                    Some(total as usize)
+                } else {
+                    None
+                };
 
-                // grid_thw already [num_images, 3] from process_many
-                let grid_thw = processed.grid_thw();
+                // Format messages with image placeholders
+                let formatted =
+                    crate::models::paddleocr_vl::chat::format_vlm_chat(&messages, num_image_tokens);
 
-                (Some(pixel_values), Some(grid_thw))
-            }
-        } else {
-            (None, None)
-        };
+                // Encode the text
+                let token_ids = tokenizer_clone.encode_sync(&formatted, None)?;
+                let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
-        // Count image tokens if image is provided
-        let num_image_tokens = if let Some(ref grid) = grid_thw {
-            grid.eval();
-            let grid_data = grid.to_int32()?;
-            // grid_thw has shape [num_images, 3] with [t, h, w] per image
-            // Total tokens = sum of (t * h * w / spatial_merge_size^2) for each image
-            let spatial_merge_size = self.config.vision_config.spatial_merge_size;
-            let merge_factor = spatial_merge_size * spatial_merge_size;
-            let mut total = 0i32;
-            for i in 0..(grid_data.len() / 3) {
-                let t = grid_data[i * 3];
-                let h = grid_data[i * 3 + 1];
-                let w = grid_data[i * 3 + 2];
-                total += (t * h * w) / merge_factor;
-            }
-            Some(total as usize)
-        } else {
-            None
-        };
+                // Build generation config
+                let gen_config = GenerationConfig {
+                    max_new_tokens: config.max_new_tokens,
+                    temperature: config.temperature,
+                    top_k: config.top_k,
+                    top_p: config.top_p,
+                    min_p: None,
+                    repetition_penalty: config.repetition_penalty,
+                    repetition_context_size: None,
+                    max_consecutive_tokens: None,
+                    max_ngram_repeats: None,
+                    ngram_size: None,
+                    eos_token_id: Some(eos_token_id),
+                    return_logprobs: config.return_logprobs,
+                    prefill_step_size: None,
+                    kv_cache_bits: None,
+                    kv_cache_group_size: None,
+                    num_draft_tokens: None,
+                };
 
-        // Format messages with image placeholders
-        let formatted =
-            crate::models::paddleocr_vl::chat::format_vlm_chat(&messages, num_image_tokens);
+                Ok::<_, Error>((input_ids, pixel_values, grid_thw, gen_config))
+            })
+            .await
+            .map_err(|e| {
+                Error::new(
+                    Status::GenericFailure,
+                    format!("VLM chat preprocessing failed: {}", e),
+                )
+            })??;
 
-        // Encode the text (use sync method for internal API)
-        let token_ids = tokenizer.encode_sync(&formatted, None)?;
-        let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
+        // Generate (already async)
+        let result = self
+            .generate(
+                &input_ids,
+                pixel_values.as_ref(),
+                grid_thw.as_ref(),
+                Some(gen_config),
+            )
+            .await?;
 
-        // Build generation config
-        let gen_config = GenerationConfig {
-            max_new_tokens: config.max_new_tokens,
-            temperature: config.temperature,
-            top_k: config.top_k,
-            top_p: config.top_p,
-            min_p: None,
-            repetition_penalty: config.repetition_penalty,
-            repetition_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            eos_token_id: Some(self.config.eos_token_id),
-            return_logprobs: config.return_logprobs,
-            prefill_step_size: None,
-            kv_cache_bits: None,
-            kv_cache_group_size: None,
-            num_draft_tokens: None,
-        };
-
-        // Generate
-        let result = self.generate(
-            &input_ids,
-            pixel_values.as_ref(),
-            grid_thw.as_ref(),
-            Some(gen_config),
-        )?;
-
-        // Decode the generated tokens (use sync method for internal API)
-        result.tokens.eval();
-        let tokens_vec = result.tokens.to_uint32()?;
-        let text = tokenizer.decode_sync(&tokens_vec, true)?;
-
-        // Clean up the text (remove special tokens)
-        // Note: Table tokens (<nl>, <lcel>, <ecel>, <fcel>, etc.) are preserved
-        // for structured parsing. Use VlmOutputParser to convert to markdown/etc.
-        let text = text.replace("<|im_end|>", "").trim().to_string();
+        // spawn_blocking: decode tokens → text (CPU-bound)
+        let result_tokens = result.tokens.clone();
+        let text = napi::bindgen_prelude::spawn_blocking(move || {
+            result_tokens.eval();
+            let tokens_vec = result_tokens.to_uint32()?;
+            let text = tokenizer.decode_sync(&tokens_vec, true)?;
+            let text = text.replace("<|im_end|>", "").trim().to_string();
+            Ok::<String, Error>(text)
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("VLM chat decoding failed: {}", e),
+            )
+        })??;
 
         Ok(VLMChatResult {
             text,
@@ -247,11 +265,11 @@ impl VLModel {
     ///
     /// # Example
     /// ```typescript
-    /// const text = model.ocr(imageBuffer);
+    /// const text = await model.ocr(imageBuffer);
     /// console.log(text);
     /// ```
     #[napi]
-    pub fn ocr(&self, image_data: Buffer, prompt: Option<String>) -> Result<String> {
+    pub async fn ocr(&self, image_data: Buffer, prompt: Option<String>) -> Result<String> {
         let prompt = prompt.unwrap_or_else(|| "Extract all text from this image.".to_string());
 
         let messages = vec![VLMChatMessage {
@@ -264,7 +282,7 @@ impl VLModel {
             ..Default::default()
         };
 
-        let result = self.chat(messages, Some(config))?;
+        let result = self.chat(messages, Some(config)).await?;
 
         // Clean up common LaTeX wrappers from OCR output
         let text = result.text;
@@ -337,7 +355,7 @@ impl VLModel {
         };
 
         // Merge vision features into text embeddings at image token positions
-        self.merge_input_ids_with_image_features(
+        Self::merge_input_ids_with_image_features(
             self.config.image_token_id,
             &hidden_states,
             &inputs_embeds,
@@ -355,9 +373,10 @@ impl VLModel {
     /// - position_ids: [3, batch, seq_len] position indices for t, h, w
     /// - rope_deltas: offset to add during decode phase
     fn get_rope_index(
-        &self,
         input_ids: &MxArray,
         image_grid_thw: Option<&MxArray>,
+        spatial_merge_size: i32,
+        image_token_id: i32,
     ) -> Result<(MxArray, i64)> {
         let shape = input_ids.shape()?;
         let batch_size = shape[0];
@@ -372,8 +391,6 @@ impl VLModel {
         }
 
         let grid_thw = image_grid_thw.unwrap();
-        let spatial_merge_size = self.config.vision_config.spatial_merge_size;
-        let image_token_id = self.config.image_token_id;
 
         // Get input IDs and grid data
         let input_ids_data = input_ids.to_int32()?;
@@ -534,7 +551,6 @@ impl VLModel {
 
     /// Merge image features into input embeddings at image token positions
     fn merge_input_ids_with_image_features(
-        &self,
         image_token_id: i32,
         image_features: &MxArray,
         inputs_embeds: &MxArray,
@@ -662,7 +678,7 @@ impl VLModel {
     /// # Returns
     /// * GenerationResult with tokens, logprobs, and finish reason
     #[napi]
-    pub fn generate(
+    pub async fn generate(
         &self,
         input_ids: &MxArray,
         pixel_values: Option<&MxArray>,
@@ -671,355 +687,322 @@ impl VLModel {
     ) -> Result<GenerationResult> {
         let config = config.unwrap_or_default();
 
-        // Extract config with defaults - aligned with mlx-vlm generate_step defaults
-        let max_new_tokens = config.max_new_tokens.unwrap_or(256); // mlx-vlm DEFAULT_MAX_TOKENS
-        let temperature = config.temperature.unwrap_or(0.0); // mlx-vlm: greedy by default
-        let top_k = config.top_k.unwrap_or(0);
-        let top_p = config.top_p.unwrap_or(1.0);
-        let min_p = config.min_p.unwrap_or(0.0);
-        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-        let repetition_context_size = config.repetition_context_size.unwrap_or(20); // Match Python default
-        let eos_token_id = config.eos_token_id.unwrap_or(self.config.eos_token_id);
-        let return_logprobs = config.return_logprobs.unwrap_or(false); // Default false for VLM (OCR use case)
-
-        debug!(
-            "Starting VLM generation with KV cache: max_tokens={}, temp={}, top_k={}, top_p={}, rep_penalty={}",
-            max_new_tokens, temperature, top_k, top_p, repetition_penalty
-        );
-
-        // Create dedicated generation stream for GPU-CPU pipelining.
-        // Forward pass runs on this stream, async_eval queues work, while CPU
-        // extracts the previous token. Gives ~25% decode speedup.
-        let generation_stream = Stream::new(DeviceType::Gpu);
-
-        // Prepare sampling config
-        let sampling_config = SamplingConfig {
-            temperature: Some(temperature),
-            top_k: Some(top_k),
-            top_p: Some(top_p),
-            min_p: Some(min_p),
-        };
-
-        // Get language model with write access for KV cache
-        let lm = self
+        // Clone Arc fields and input arrays before the closure
+        let visual_arc = self.visual.clone();
+        let lm_arc = self
             .language_model
-            .as_ref()
+            .clone()
             .ok_or_else(|| Error::new(Status::GenericFailure, "Language model not set"))?;
-        let mut lm_guard = lm.write().map_err(|_| {
-            Error::new(
-                Status::GenericFailure,
-                "Failed to acquire language model write lock",
-            )
-        })?;
+        let model_config = self.config.clone();
+        let input_ids = input_ids.clone();
+        let pixel_values = pixel_values.cloned();
+        let image_grid_thw = image_grid_thw.cloned();
 
-        // Initialize fused KV caches for this generation (C++ forward pass)
-        lm_guard.init_fused_kv_caches();
+        napi::bindgen_prelude::spawn_blocking(move || {
+            // Extract config with defaults - aligned with mlx-vlm generate_step defaults
+            let max_new_tokens = config.max_new_tokens.unwrap_or(256); // mlx-vlm DEFAULT_MAX_TOKENS
+            let temperature = config.temperature.unwrap_or(0.0); // mlx-vlm: greedy by default
+            let top_k = config.top_k.unwrap_or(0);
+            let top_p = config.top_p.unwrap_or(1.0);
+            let min_p = config.min_p.unwrap_or(0.0);
+            let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+            let repetition_context_size = config.repetition_context_size.unwrap_or(20);
+            let eos_token_id = config.eos_token_id.unwrap_or(model_config.eos_token_id);
+            let return_logprobs = config.return_logprobs.unwrap_or(false);
 
-        // Reset position state for new generation (critical for multimodal)
-        lm_guard.reset_position_state();
+            debug!(
+                "Starting VLM generation with KV cache: max_tokens={}, temp={}, top_k={}, top_p={}, rep_penalty={}",
+                max_new_tokens, temperature, top_k, top_p, repetition_penalty
+            );
 
-        // === STEP 1: Compute vision features ONCE ===
-        // Run vision encoding inside stream context for GPU-CPU overlap
-        let vision_features = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            if let (Some(pv), Some(grid)) = (pixel_values, image_grid_thw) {
-                let visual = self
-                    .visual
-                    .as_ref()
-                    .ok_or_else(|| Error::new(Status::GenericFailure, "Vision model not set"))?;
-                Some(visual.forward(pv, grid)?)
-            } else {
-                None
-            }
-        };
+            // Create dedicated generation stream for GPU-CPU pipelining.
+            let generation_stream = Stream::new(DeviceType::Gpu);
 
-        // === STEP 2: Compute proper position IDs for mRoPE ===
-        // This is critical - image tokens need 2D spatial positions, not sequential
-        let (position_ids, rope_deltas) = self.get_rope_index(input_ids, image_grid_thw)?;
-        debug!("Computed position_ids with rope_deltas: {}", rope_deltas);
+            // Prepare sampling config
+            let sampling_config = SamplingConfig {
+                temperature: Some(temperature),
+                top_k: Some(top_k),
+                top_p: Some(top_p),
+                min_p: Some(min_p),
+            };
 
-        // Store position state for decode phase (critical for proper multimodal attention)
-        lm_guard.set_position_state(position_ids.clone(), rope_deltas);
+            // Get language model with write access for KV cache
+            let mut lm_guard = lm_arc.write().map_err(|_| {
+                Error::new(
+                    Status::GenericFailure,
+                    "Failed to acquire language model write lock",
+                )
+            })?;
 
-        // === STEP 3: Prefill - process prompt with vision features ===
-        // Get text embeddings and merge with vision features (in stream context)
-        let inputs_embeds = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            let embeds = lm_guard.get_embeddings(input_ids)?;
-            if let Some(ref vf) = vision_features {
-                // Cast vision features to match language model dtype (e.g. bfloat16).
-                // Vision encoder outputs float32 (from float32 pixel inputs), but the
-                // language model operates in bfloat16. Without this cast, the merged
-                // embeddings become float32, causing the KV cache and all decode steps
-                // to run in float32 (2x memory bandwidth → ~3-4x slower decode).
-                let embed_dtype = embeds.dtype()?;
-                let vf_cast = if vf.dtype()? != embed_dtype {
-                    vf.astype(embed_dtype)?
+            // Initialize fused KV caches for this generation (C++ forward pass)
+            lm_guard.init_fused_kv_caches();
+
+            // Reset position state for new generation (critical for multimodal)
+            lm_guard.reset_position_state();
+
+            // === STEP 1: Compute vision features ONCE ===
+            let vision_features = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                if let (Some(pv), Some(grid)) = (&pixel_values, &image_grid_thw) {
+                    let visual = visual_arc
+                        .as_ref()
+                        .ok_or_else(|| Error::new(Status::GenericFailure, "Vision model not set"))?;
+                    Some(visual.forward(pv, grid)?)
                 } else {
-                    vf.clone()
-                };
-                self.merge_input_ids_with_image_features(
-                    self.config.image_token_id,
-                    &vf_cast,
-                    &embeds,
-                    input_ids,
-                )?
-            } else {
-                embeds
-            }
-        };
+                    None
+                }
+            };
 
-        // Chunked prefill: process long sequences in chunks to bound memory usage
-        // and keep computation graphs manageable. Matching Python mlx-vlm's approach.
-        let prefill_step_size: i64 = 2048;
-        let seq_len = inputs_embeds.shape_at(1)?;
+            // === STEP 2: Compute proper position IDs for mRoPE ===
+            let (position_ids, rope_deltas) = VLModel::get_rope_index(
+                &input_ids,
+                image_grid_thw.as_ref(),
+                model_config.vision_config.spatial_merge_size,
+                model_config.image_token_id,
+            )?;
+            debug!("Computed position_ids with rope_deltas: {}", rope_deltas);
 
-        let mut last_logits = if seq_len > prefill_step_size {
-            // Chunked prefill for long sequences (common with images)
-            let mut offset: i64 = 0;
-            let mut chunk_logits = None;
+            // Store position state for decode phase
+            lm_guard.set_position_state(position_ids.clone(), rope_deltas);
 
-            while offset < seq_len {
-                let chunk_end = std::cmp::min(offset + prefill_step_size, seq_len);
-                // For all chunks except the last, process up to chunk_end
-                // For the last chunk, process the rest
-                let n_to_process = if chunk_end < seq_len {
-                    // Not the last chunk: process prefill_step_size tokens
-                    chunk_end - offset
+            // === STEP 3: Prefill - process prompt with vision features ===
+            let inputs_embeds = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                let embeds = lm_guard.get_embeddings(&input_ids)?;
+                if let Some(ref vf) = vision_features {
+                    let embed_dtype = embeds.dtype()?;
+                    let vf_cast = if vf.dtype()? != embed_dtype {
+                        vf.astype(embed_dtype)?
+                    } else {
+                        vf.clone()
+                    };
+                    VLModel::merge_input_ids_with_image_features(
+                        model_config.image_token_id,
+                        &vf_cast,
+                        &embeds,
+                        &input_ids,
+                    )?
                 } else {
-                    // Last chunk: process remaining
-                    seq_len - offset
-                };
+                    embeds
+                }
+            };
 
-                let chunk_embeds = inputs_embeds.slice_axis(1, offset, offset + n_to_process)?;
-                let chunk_pos = position_ids.slice_axis(2, offset, offset + n_to_process)?;
+            // Chunked prefill
+            let prefill_step_size: i64 = 2048;
+            let seq_len = inputs_embeds.shape_at(1)?;
 
-                {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    chunk_logits = Some(lm_guard.forward_fused(&chunk_embeds, &chunk_pos)?);
+            let mut last_logits = if seq_len > prefill_step_size {
+                let mut offset: i64 = 0;
+                let mut chunk_logits = None;
+
+                while offset < seq_len {
+                    let chunk_end = std::cmp::min(offset + prefill_step_size, seq_len);
+                    let n_to_process = if chunk_end < seq_len {
+                        chunk_end - offset
+                    } else {
+                        seq_len - offset
+                    };
+
+                    let chunk_embeds = inputs_embeds.slice_axis(1, offset, offset + n_to_process)?;
+                    let chunk_pos = position_ids.slice_axis(2, offset, offset + n_to_process)?;
+
+                    {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        chunk_logits = Some(lm_guard.forward_fused(&chunk_embeds, &chunk_pos)?);
+                    }
+
+                    lm_guard.eval_fused_kv_caches();
+                    clear_cache();
+
+                    offset += n_to_process;
                 }
 
-                // Eval KV caches between chunks to materialize results and bound graph size
+                let logits = chunk_logits.unwrap();
+                let last_seq = logits.shape_at(1)?;
+                logits
+                    .slice_axis(1, last_seq - 1, last_seq)?
+                    .squeeze(Some(&[0, 1]))?
+            } else {
+                let logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    lm_guard.forward_fused(&inputs_embeds, &position_ids)?
+                };
                 lm_guard.eval_fused_kv_caches();
                 clear_cache();
+                logits
+                    .slice_axis(1, seq_len - 1, seq_len)?
+                    .squeeze(Some(&[0, 1]))?
+            };
 
-                offset += n_to_process;
+            // Get input tokens for repetition penalty context
+            let input_tokens = input_ids.to_uint32()?;
+            let mut all_tokens: Vec<u32> = input_tokens.to_vec();
+
+            // Apply repetition penalty to first token if enabled
+            if repetition_penalty != 1.0 {
+                last_logits = apply_repetition_penalty(
+                    &last_logits,
+                    &all_tokens,
+                    repetition_penalty,
+                    Some(repetition_context_size),
+                )?;
             }
 
-            // Extract last position logits from the final chunk
-            let logits = chunk_logits.unwrap();
-            let last_seq = logits.shape_at(1)?;
-            logits
-                .slice_axis(1, last_seq - 1, last_seq)?
-                .squeeze(Some(&[0, 1]))?
-        } else {
-            // Short sequence: single forward pass (text-only or short prompts)
-            let logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                lm_guard.forward_fused(&inputs_embeds, &position_ids)?
+            // Sample first token
+            let (mut token, mut logprobs_arr): (MxArray, Option<MxArray>) = if return_logprobs {
+                let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
+                (tok, Some(lp))
+            } else {
+                let tok = sample(&last_logits, Some(sampling_config))?;
+                (tok, None)
             };
-            // Evaluate KV caches to materialize them and break dependency chain
-            // from prefill (especially vision encoder graph). Without this, every
-            // decode step drags the full prefill graph as a dependency.
-            lm_guard.eval_fused_kv_caches();
-            clear_cache();
-            logits
-                .slice_axis(1, seq_len - 1, seq_len)?
-                .squeeze(Some(&[0, 1]))?
-        };
 
-        // Get input tokens for repetition penalty context
-        let input_tokens = input_ids.to_uint32()?;
-        let mut all_tokens: Vec<u32> = input_tokens.to_vec();
-
-        // Apply repetition penalty to first token if enabled
-        if repetition_penalty != 1.0 {
-            last_logits = apply_repetition_penalty(
-                &last_logits,
-                &all_tokens,
-                repetition_penalty,
-                Some(repetition_context_size),
-            )?;
-        }
-
-        // Sample first token
-        let (mut token, mut logprobs_arr): (MxArray, Option<MxArray>) = if return_logprobs {
-            let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
-            (tok, Some(lp))
-        } else {
-            let tok = sample(&last_logits, Some(sampling_config))?;
-            (tok, None)
-        };
-
-        // Synchronously evaluate the first token so that prefill cost is fully paid
-        // before entering the decode loop. Without this, step 0's async_eval blocks
-        // for 30-40ms waiting for the deferred prefill graph to complete.
-        // This matches Python mlx-vlm's pattern: mx.eval(y) after first generate_step.
-        if return_logprobs {
-            if let Some(ref lp) = logprobs_arr {
-                MxArray::async_eval_arrays(&[&token, lp]);
+            // Synchronously evaluate the first token
+            if return_logprobs {
+                if let Some(ref lp) = logprobs_arr {
+                    MxArray::async_eval_arrays(&[&token, lp]);
+                } else {
+                    MxArray::async_eval_arrays(&[&token]);
+                }
             } else {
                 MxArray::async_eval_arrays(&[&token]);
             }
-        } else {
-            MxArray::async_eval_arrays(&[&token]);
-        }
-        token.eval();
+            token.eval();
 
-        // Track generated tokens
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
-        let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(max_new_tokens as usize)
-        } else {
-            Vec::new()
-        };
-        let mut finish_reason = "length";
+            // Track generated tokens
+            let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+            let mut generated_logprobs: Vec<f32> = if return_logprobs {
+                Vec::with_capacity(max_new_tokens as usize)
+            } else {
+                Vec::new()
+            };
+            let mut finish_reason = "length";
 
-        // N-gram repetition detection: max pattern length to check (stop on first repeat)
-        // Default to 0 (disabled) for VLM - mlx-vlm does NOT have this aggressive check.
-        // VLM outputs structured data that can trigger false positives.
-        let ngram_size = config.ngram_size.unwrap_or(0);
+            let ngram_size = config.ngram_size.unwrap_or(0);
 
-        // === STEP 4: Pipelined decode loop ===
-        // Structure: Build next graph → async_eval → extract current token
-        // This overlaps GPU evaluation of the next step with CPU extraction of the current step,
-        // matching the pipelining pattern used by Python mlx-vlm's generate_step.
-        #[allow(clippy::needless_range_loop)]
-        for step in 0..max_new_tokens {
-            // --- Phase 1: Build next step's graph while GPU evaluates current token ---
-            let (next_tok, next_lp) = {
-                let _stream_ctx = StreamContext::new(generation_stream);
+            // === STEP 4: Pipelined decode loop ===
+            #[allow(clippy::needless_range_loop)]
+            for step in 0..max_new_tokens {
+                let (next_tok, next_lp) = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
 
-                // Zero-copy reshape: keep token on GPU instead of CPU round-trip
-                let token_2d = token.reshape(&[1, 1])?;
-                let input_embeds = lm_guard.get_embeddings(&token_2d)?;
+                    let token_2d = token.reshape(&[1, 1])?;
+                    let input_embeds = lm_guard.get_embeddings(&token_2d)?;
 
-                // Position from Rust-side state (no GPU dependency)
-                let rope_deltas = lm_guard.get_rope_deltas().unwrap_or(0);
-                let cache_offset = lm_guard.get_fused_cache_offset() as i64;
-                let pos_value = (cache_offset + rope_deltas) as f32;
-                let decode_pos =
-                    MxArray::from_float32(&[pos_value], &[1, 1, 1])?.broadcast_to(&[3, 1, 1])?;
+                    let rope_deltas = lm_guard.get_rope_deltas().unwrap_or(0);
+                    let cache_offset = lm_guard.get_fused_cache_offset() as i64;
+                    let pos_value = (cache_offset + rope_deltas) as f32;
+                    let decode_pos =
+                        MxArray::from_float32(&[pos_value], &[1, 1, 1])?.broadcast_to(&[3, 1, 1])?;
 
-                let logits = lm_guard.forward_fused(&input_embeds, &decode_pos)?;
-                let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
+                    let logits = lm_guard.forward_fused(&input_embeds, &decode_pos)?;
+                    let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
 
-                // Apply repetition penalty if enabled
-                if repetition_penalty != 1.0 {
-                    next_logits = apply_repetition_penalty(
-                        &next_logits,
-                        &all_tokens,
-                        repetition_penalty,
-                        Some(repetition_context_size),
-                    )?;
-                }
+                    if repetition_penalty != 1.0 {
+                        next_logits = apply_repetition_penalty(
+                            &next_logits,
+                            &all_tokens,
+                            repetition_penalty,
+                            Some(repetition_context_size),
+                        )?;
+                    }
 
-                // Sample next token
-                let (tok, lp): (MxArray, Option<MxArray>) = if return_logprobs {
-                    let (t, l) = sample_and_logprobs(&next_logits, Some(sampling_config))?;
-                    (t, Some(l))
-                } else {
-                    (sample(&next_logits, Some(sampling_config))?, None)
+                    let (tok, lp): (MxArray, Option<MxArray>) = if return_logprobs {
+                        let (t, l) = sample_and_logprobs(&next_logits, Some(sampling_config))?;
+                        (t, Some(l))
+                    } else {
+                        (sample(&next_logits, Some(sampling_config))?, None)
+                    };
+
+                    (tok, lp)
                 };
 
-                (tok, lp)
-            };
-
-            // Submit next step's graph to GPU (starts processing while we do CPU work below)
-            if return_logprobs {
-                if let Some(ref lp) = next_lp {
-                    MxArray::async_eval_arrays(&[&next_tok, lp]);
+                if return_logprobs {
+                    if let Some(ref lp) = next_lp {
+                        MxArray::async_eval_arrays(&[&next_tok, lp]);
+                    } else {
+                        MxArray::async_eval_arrays(&[&next_tok]);
+                    }
                 } else {
                     MxArray::async_eval_arrays(&[&next_tok]);
                 }
-            } else {
-                MxArray::async_eval_arrays(&[&next_tok]);
-            }
 
-            // --- Phase 2: Extract current token (GPU already working on next step) ---
-            token.eval();
-            let token_value = token.item_at_int32(0)? as u32;
+                token.eval();
+                let token_value = token.item_at_int32(0)? as u32;
 
-            generated_tokens.push(token_value);
-            all_tokens.push(token_value);
+                generated_tokens.push(token_value);
+                all_tokens.push(token_value);
 
-            // Extract logprob if needed
-            if return_logprobs && let Some(ref lp) = logprobs_arr {
-                lp.eval();
-                let token_logprob = lp.item_at_float32(token_value as usize)?;
-                generated_logprobs.push(token_logprob);
-            }
+                if return_logprobs && let Some(ref lp) = logprobs_arr {
+                    lp.eval();
+                    let token_logprob = lp.item_at_float32(token_value as usize)?;
+                    generated_logprobs.push(token_logprob);
+                }
 
-            // Check for EOS
-            if token_value == eos_token_id as u32 {
-                finish_reason = "stop";
-                break;
-            }
+                if token_value == eos_token_id as u32 {
+                    finish_reason = "stop";
+                    break;
+                }
 
-            // Check for repetition (loop detection) - find any repeating pattern
-            let min_pattern_len = 8; // Minimum pattern length to consider
-            let max_pattern_len = ngram_size as usize;
-            // Skip repetition check entirely if ngram_size is 0 (disabled)
-            if ngram_size > 0 && generated_tokens.len() >= (min_pattern_len * 2) {
-                let len = generated_tokens.len();
+                let min_pattern_len = 8;
+                let max_pattern_len = ngram_size as usize;
+                if ngram_size > 0 && generated_tokens.len() >= (min_pattern_len * 2) {
+                    let len = generated_tokens.len();
 
-                // Check for patterns of various lengths
-                for pattern_len in min_pattern_len..=max_pattern_len.min(len / 2) {
-                    let pattern1_start = len - pattern_len * 2;
-                    let pattern2_start = len - pattern_len;
+                    for pattern_len in min_pattern_len..=max_pattern_len.min(len / 2) {
+                        let pattern1_start = len - pattern_len * 2;
+                        let pattern2_start = len - pattern_len;
 
-                    let pattern1 = &generated_tokens[pattern1_start..pattern1_start + pattern_len];
-                    let pattern2 = &generated_tokens[pattern2_start..];
+                        let pattern1 = &generated_tokens[pattern1_start..pattern1_start + pattern_len];
+                        let pattern2 = &generated_tokens[pattern2_start..];
 
-                    if pattern1 == pattern2 {
-                        debug!(
-                            "Detected {}-token pattern repetition, stopping",
-                            pattern_len
-                        );
-                        finish_reason = "repetition";
-                        // Keep only up to the first occurrence of the repeated pattern
-                        generated_tokens.truncate(pattern2_start);
-                        generated_logprobs.truncate(pattern2_start);
+                        if pattern1 == pattern2 {
+                            debug!(
+                                "Detected {}-token pattern repetition, stopping",
+                                pattern_len
+                            );
+                            finish_reason = "repetition";
+                            generated_tokens.truncate(pattern2_start);
+                            generated_logprobs.truncate(pattern2_start);
+                            break;
+                        }
+                    }
+
+                    if finish_reason == "repetition" {
                         break;
                     }
                 }
 
-                // If we broke from the inner loop due to repetition, break from outer loop too
-                if finish_reason == "repetition" {
-                    break;
+                if step > 0 && step % 256 == 0 {
+                    clear_cache();
                 }
+
+                token = next_tok;
+                logprobs_arr = next_lp;
             }
 
-            // Periodic cleanup to release intermediate tensors and prevent memory accumulation
-            // Every 256 tokens is a good balance (aligned with mlx-vlm)
-            // Only clear cache - do NOT synchronize, as that kills GPU-CPU pipelining
-            if step > 0 && step % 256 == 0 {
-                clear_cache();
-            }
+            // Reset fused caches after generation
+            lm_guard.reset_fused_kv_caches();
 
-            token = next_tok;
-            logprobs_arr = next_lp;
-        }
+            // Build result
+            let tokens_array =
+                MxArray::from_uint32(&generated_tokens, &[generated_tokens.len() as i64])?;
+            let logprobs_array = if return_logprobs {
+                MxArray::from_float32(&generated_logprobs, &[generated_logprobs.len() as i64])?
+            } else {
+                MxArray::from_float32(&[], &[0])?
+            };
 
-        // Reset fused caches after generation
-        lm_guard.reset_fused_kv_caches();
-
-        // Build result
-        let tokens_array =
-            MxArray::from_uint32(&generated_tokens, &[generated_tokens.len() as i64])?;
-        let logprobs_array = if return_logprobs {
-            MxArray::from_float32(&generated_logprobs, &[generated_logprobs.len() as i64])?
-        } else {
-            MxArray::from_float32(&[], &[0])?
-        };
-
-        Ok(GenerationResult {
-            text: String::new(), // Caller should decode with tokenizer
-            tokens: tokens_array,
-            logprobs: logprobs_array,
-            finish_reason: finish_reason.to_string(),
-            num_tokens: generated_tokens.len(),
+            Ok(GenerationResult {
+                text: String::new(),
+                tokens: tokens_array,
+                logprobs: logprobs_array,
+                finish_reason: finish_reason.to_string(),
+                num_tokens: generated_tokens.len(),
+            })
         })
+        .await
+        .map_err(|e| Error::new(Status::GenericFailure, format!("VLM generation failed: {}", e)))?
     }
 
     /// Batch OCR: extract text from multiple images simultaneously
@@ -1037,10 +1020,10 @@ impl VLModel {
     /// ```typescript
     /// import { readFileSync } from 'fs';
     /// const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
-    /// const texts = model.ocrBatch(images);
+    /// const texts = await model.ocrBatch(images);
     /// ```
     #[napi]
-    pub fn ocr_batch(
+    pub async fn ocr_batch(
         &self,
         images: Vec<Buffer>,
         config: Option<VLMChatConfig>,
@@ -1058,7 +1041,7 @@ impl VLModel {
             })
             .collect();
 
-        let results = self.batch(batch, config)?;
+        let results = self.batch(batch, config).await?;
 
         Ok(results
             .into_iter()
@@ -1083,12 +1066,12 @@ impl VLModel {
     /// # Returns
     /// * Vec of VLMChatResult, one per batch item
     #[napi]
-    pub fn batch(
+    pub async fn batch(
         &self,
         batch: Vec<VLMBatchItem>,
         config: Option<VLMChatConfig>,
     ) -> Result<Vec<VLMChatResult>> {
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::GenericFailure,
                 "Tokenizer not set. Use set_tokenizer() first.",
@@ -1116,7 +1099,7 @@ impl VLModel {
                 repetition_penalty: base.repetition_penalty,
                 return_logprobs: base.return_logprobs,
             });
-            let result = self.chat(item.messages.clone(), c)?;
+            let result = self.chat(item.messages.clone(), c).await?;
             return Ok(vec![result]);
         }
 
@@ -1134,127 +1117,148 @@ impl VLModel {
             None => default_config,
         };
 
-        let gen_config = GenerationConfig {
-            max_new_tokens: config.max_new_tokens,
-            temperature: config.temperature,
-            top_k: config.top_k,
-            top_p: config.top_p,
-            min_p: None,
-            repetition_penalty: config.repetition_penalty,
-            repetition_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            eos_token_id: Some(self.config.eos_token_id),
-            return_logprobs: config.return_logprobs,
-            prefill_step_size: None,
-            kv_cache_bits: None,
-            kv_cache_group_size: None,
-            num_draft_tokens: None,
-        };
+        // Clone Arc fields for use inside spawn_blocking
+        let visual_arc = self.visual.clone();
+        let lm_arc = self
+            .language_model
+            .clone()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Language model not set"))?;
+        let model_config = self.config.clone();
+        let tokenizer_clone = tokenizer.clone();
 
-        // Prepare per-item inputs
-        let batch_size = batch.len();
-        let mut all_input_ids = Vec::with_capacity(batch_size);
-        let mut all_pixel_values = Vec::with_capacity(batch_size);
-        let mut all_grid_thws = Vec::with_capacity(batch_size);
+        // spawn_blocking: image processing + tokenization + generate_batch + decoding
+        napi::bindgen_prelude::spawn_blocking(move || {
+            let gen_config = GenerationConfig {
+                max_new_tokens: config.max_new_tokens,
+                temperature: config.temperature,
+                top_k: config.top_k,
+                top_p: config.top_p,
+                min_p: None,
+                repetition_penalty: config.repetition_penalty,
+                repetition_context_size: None,
+                max_consecutive_tokens: None,
+                max_ngram_repeats: None,
+                ngram_size: None,
+                eos_token_id: Some(model_config.eos_token_id),
+                return_logprobs: config.return_logprobs,
+                prefill_step_size: None,
+                kv_cache_bits: None,
+                kv_cache_group_size: None,
+                num_draft_tokens: None,
+            };
 
-        for item in &batch {
-            // Process images
-            let (pixel_values, grid_thw) = if let Some(ref images) = item.images {
-                if images.is_empty() {
-                    (None, None)
+            // Prepare per-item inputs
+            let batch_size = batch.len();
+            let mut all_input_ids = Vec::with_capacity(batch_size);
+            let mut all_pixel_values = Vec::with_capacity(batch_size);
+            let mut all_grid_thws = Vec::with_capacity(batch_size);
+
+            for item in &batch {
+                let (pixel_values, grid_thw) = if let Some(ref images) = item.images {
+                    if images.is_empty() {
+                        (None, None)
+                    } else {
+                        let processor_config = ImageProcessorConfig {
+                            patch_size: model_config.vision_config.patch_size,
+                            merge_size: model_config.vision_config.spatial_merge_size,
+                            ..ImageProcessorConfig::default()
+                        };
+                        let processor = ImageProcessor::new(Some(processor_config));
+                        let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
+                        let processed = processor.process_many(&image_refs)?;
+                        let pv = processed.pixel_values();
+                        let pv_shape = pv.shape()?;
+                        let new_shape = BigInt64Array::from(vec![
+                            1i64,
+                            pv_shape[0],
+                            pv_shape[1],
+                            pv_shape[2],
+                            pv_shape[3],
+                        ]);
+                        let pixel_values = pv.reshape(&new_shape)?;
+                        let grid_thw = processed.grid_thw();
+                        (Some(pixel_values), Some(grid_thw))
+                    }
                 } else {
-                    let processor_config = ImageProcessorConfig {
-                        patch_size: self.config.vision_config.patch_size,
-                        merge_size: self.config.vision_config.spatial_merge_size,
-                        ..ImageProcessorConfig::default()
-                    };
-                    let processor = ImageProcessor::new(Some(processor_config));
-                    let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
-                    let processed = processor.process_many(&image_refs)?;
-                    let pv = processed.pixel_values();
-                    let pv_shape = pv.shape()?;
-                    let new_shape = BigInt64Array::from(vec![
-                        1i64,
-                        pv_shape[0],
-                        pv_shape[1],
-                        pv_shape[2],
-                        pv_shape[3],
-                    ]);
-                    let pixel_values = pv.reshape(&new_shape)?;
-                    let grid_thw = processed.grid_thw();
-                    (Some(pixel_values), Some(grid_thw))
-                }
-            } else {
-                (None, None)
-            };
+                    (None, None)
+                };
 
-            // Count image tokens
-            let num_image_tokens = if let Some(ref grid) = grid_thw {
-                grid.eval();
-                let grid_data = grid.to_int32()?;
-                let spatial_merge_size = self.config.vision_config.spatial_merge_size;
-                let merge_factor = spatial_merge_size * spatial_merge_size;
-                let mut total = 0i32;
-                for i in 0..(grid_data.len() / 3) {
-                    let t = grid_data[i * 3];
-                    let h = grid_data[i * 3 + 1];
-                    let w = grid_data[i * 3 + 2];
-                    total += (t * h * w) / merge_factor;
-                }
-                Some(total as usize)
-            } else {
-                None
-            };
+                let num_image_tokens = if let Some(ref grid) = grid_thw {
+                    grid.eval();
+                    let grid_data = grid.to_int32()?;
+                    let spatial_merge_size = model_config.vision_config.spatial_merge_size;
+                    let merge_factor = spatial_merge_size * spatial_merge_size;
+                    let mut total = 0i32;
+                    for i in 0..(grid_data.len() / 3) {
+                        let t = grid_data[i * 3];
+                        let h = grid_data[i * 3 + 1];
+                        let w = grid_data[i * 3 + 2];
+                        total += (t * h * w) / merge_factor;
+                    }
+                    Some(total as usize)
+                } else {
+                    None
+                };
 
-            // Format and tokenize
-            let formatted = crate::models::paddleocr_vl::chat::format_vlm_chat(
-                &item.messages,
-                num_image_tokens,
-            );
-            let token_ids = tokenizer.encode_sync(&formatted, None)?;
-            let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
+                let formatted = crate::models::paddleocr_vl::chat::format_vlm_chat(
+                    &item.messages,
+                    num_image_tokens,
+                );
+                let token_ids = tokenizer_clone.encode_sync(&formatted, None)?;
+                let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
-            all_input_ids.push(input_ids);
-            all_pixel_values.push(pixel_values);
-            all_grid_thws.push(grid_thw);
-        }
+                all_input_ids.push(input_ids);
+                all_pixel_values.push(pixel_values);
+                all_grid_thws.push(grid_thw);
+            }
 
-        // Run batch generation
-        let results = self.generate_batch(
-            &all_input_ids,
-            &all_pixel_values,
-            &all_grid_thws,
-            Some(gen_config),
-        )?;
+            // Run batch generation (generate_batch is private, stays sync)
+            let results = VLModel::generate_batch_impl(
+                &visual_arc,
+                &lm_arc,
+                &model_config,
+                &all_input_ids,
+                &all_pixel_values,
+                &all_grid_thws,
+                Some(gen_config),
+            )?;
 
-        // Decode results
-        let mut chat_results = Vec::with_capacity(batch_size);
-        for result in results {
-            result.tokens.eval();
-            let tokens_vec = result.tokens.to_uint32()?;
-            let text = tokenizer.decode_sync(&tokens_vec, true)?;
-            let text = text.replace("<|im_end|>", "").trim().to_string();
+            // Decode results
+            let mut chat_results = Vec::with_capacity(batch_size);
+            for result in results {
+                result.tokens.eval();
+                let tokens_vec = result.tokens.to_uint32()?;
+                let text = tokenizer_clone.decode_sync(&tokens_vec, true)?;
+                let text = text.replace("<|im_end|>", "").trim().to_string();
 
-            chat_results.push(VLMChatResult {
-                text,
-                tokens: result.tokens,
-                logprobs: result.logprobs,
-                finish_reason: result.finish_reason,
-                num_tokens: result.num_tokens,
-            });
-        }
+                chat_results.push(VLMChatResult {
+                    text,
+                    tokens: result.tokens,
+                    logprobs: result.logprobs,
+                    finish_reason: result.finish_reason,
+                    num_tokens: result.num_tokens,
+                });
+            }
 
-        Ok(chat_results)
+            Ok(chat_results)
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("VLM batch processing failed: {}", e),
+            )
+        })?
     }
 
     /// Batch generate: sequential prefill + batched decode
     ///
     /// Each item is prefilled independently (different image sizes → different vision tokens),
     /// then KV caches are merged and decode runs in batch for ~N× throughput.
-    fn generate_batch(
-        &self,
+    fn generate_batch_impl(
+        visual_arc: &Option<Arc<PaddleOCRVisionModel>>,
+        lm_arc: &Arc<RwLock<ERNIELanguageModel>>,
+        model_config: &ModelConfig,
         all_input_ids: &[MxArray],
         all_pixel_values: &[Option<MxArray>],
         all_grid_thws: &[Option<MxArray>],
@@ -1274,7 +1278,7 @@ impl VLModel {
         let min_p = config.min_p.unwrap_or(0.0);
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(20);
-        let eos_token_id = config.eos_token_id.unwrap_or(self.config.eos_token_id);
+        let eos_token_id = config.eos_token_id.unwrap_or(model_config.eos_token_id);
         let return_logprobs = config.return_logprobs.unwrap_or(false);
 
         let sampling_config = SamplingConfig {
@@ -1286,11 +1290,8 @@ impl VLModel {
 
         let generation_stream = Stream::new(DeviceType::Gpu);
 
-        let lm = self
-            .language_model
-            .as_ref()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Language model not set"))?;
-        let visual = self.visual.as_ref();
+        let lm = lm_arc;
+        let visual = visual_arc.as_ref();
 
         let num_layers = {
             let lm_guard = lm.read().map_err(|_| {
@@ -1334,7 +1335,12 @@ impl VLModel {
             };
 
             // Position IDs with mRoPE
-            let (position_ids, rope_deltas) = self.get_rope_index(input_ids, grid_thw)?;
+            let (position_ids, rope_deltas) = VLModel::get_rope_index(
+                input_ids,
+                grid_thw,
+                model_config.vision_config.spatial_merge_size,
+                model_config.image_token_id,
+            )?;
 
             // Merge embeddings
             let inputs_embeds = {
@@ -1347,8 +1353,8 @@ impl VLModel {
                     } else {
                         vf.clone()
                     };
-                    self.merge_input_ids_with_image_features(
-                        self.config.image_token_id,
+                    VLModel::merge_input_ids_with_image_features(
+                        model_config.image_token_id,
                         &vf_cast,
                         &embeds,
                         input_ids,
@@ -1732,7 +1738,7 @@ impl VLModel {
     /// ```typescript
     /// import { VLModel } from '@mlx-node/vlm';
     /// const model = await VLModel.load('./models/paddleocr-vl');
-    /// const result = model.chat(messages, { images: [readFileSync('./image.jpg')] });
+    /// const result = await model.chat(messages, { images: [readFileSync('./image.jpg')] });
     /// ```
     #[napi]
     pub fn load<'env>(env: &'env Env, model_path: String) -> Result<PromiseRaw<'env, VLModel>> {

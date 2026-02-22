@@ -1639,13 +1639,13 @@ export declare class VLModel {
    *
    * # Example
    * ```typescript
-   * const result = model.chat(
+   * const result = await model.chat(
    *   [{ role: 'user', content: 'Describe this image.' }],
    *   { images: [readFileSync('./photo.jpg')], maxNewTokens: 256 }
    * );
    * ```
    */
-  chat(messages: Array<VlmChatMessage>, config?: VlmChatConfig | undefined | null): VlmChatResult;
+  chat(messages: Array<VlmChatMessage>, config?: VlmChatConfig | undefined | null): Promise<VlmChatResult>;
   /**
    * Simple OCR: extract text from encoded image bytes
    *
@@ -1660,11 +1660,11 @@ export declare class VLModel {
    *
    * # Example
    * ```typescript
-   * const text = model.ocr(imageBuffer);
+   * const text = await model.ocr(imageBuffer);
    * console.log(text);
    * ```
    */
-  ocr(imageData: Buffer, prompt?: string | undefined | null): string;
+  ocr(imageData: Buffer, prompt?: string | undefined | null): Promise<string>;
   /**
    * Get input embeddings with vision features merged
    *
@@ -1720,7 +1720,7 @@ export declare class VLModel {
     pixelValues?: MxArray | undefined | null,
     imageGridThw?: MxArray | undefined | null,
     config?: GenerationConfig | undefined | null,
-  ): GenerationResult;
+  ): Promise<GenerationResult>;
   /**
    * Batch OCR: extract text from multiple images simultaneously
    *
@@ -1737,10 +1737,10 @@ export declare class VLModel {
    * ```typescript
    * import { readFileSync } from 'fs';
    * const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
-   * const texts = model.ocrBatch(images);
+   * const texts = await model.ocrBatch(images);
    * ```
    */
-  ocrBatch(images: Array<Buffer>, config?: VlmChatConfig | undefined | null): Array<string>;
+  ocrBatch(images: Array<Buffer>, config?: VlmChatConfig | undefined | null): Promise<Array<string>>;
   /**
    * Batch chat: process multiple items simultaneously
    *
@@ -1753,7 +1753,7 @@ export declare class VLModel {
    * # Returns
    * * Vec of VLMChatResult, one per batch item
    */
-  batch(batch: Array<VlmBatchItem>, config?: VlmChatConfig | undefined | null): Array<VlmChatResult>;
+  batch(batch: Array<VlmBatchItem>, config?: VlmChatConfig | undefined | null): Promise<Array<VlmChatResult>>;
   /** Get model configuration */
   get config(): ModelConfig;
   /** Check if model is fully initialized */
@@ -1775,7 +1775,7 @@ export declare class VLModel {
    * ```typescript
    * import { VLModel } from '@mlx-node/vlm';
    * const model = await VLModel.load('./models/paddleocr-vl');
-   * const result = model.chat(messages, { images: [readFileSync('./image.jpg')] });
+   * const result = await model.chat(messages, { images: [readFileSync('./image.jpg')] });
    * ```
    */
   static load(modelPath: string): Promise<VLModel>;

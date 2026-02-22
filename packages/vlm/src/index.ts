@@ -13,17 +13,17 @@
  *
  * // Chat with images
  * const imageBuffer = readFileSync('./photo.jpg');
- * const result = model.chat(
+ * const result = await model.chat(
  *   [{ role: 'user', content: 'What is in this image?' }],
  *   { images: [imageBuffer] }
  * );
  * console.log(result.text);
  *
  * // Simple OCR
- * const text = model.ocr(readFileSync('./document.jpg'));
+ * const text = await model.ocr(readFileSync('./document.jpg'));
  *
  * // Batch OCR (multiple images)
- * const texts = model.ocrBatch([readFileSync('page1.jpg'), readFileSync('page2.jpg')]);
+ * const texts = await model.ocrBatch([readFileSync('page1.jpg'), readFileSync('page2.jpg')]);
  * ```
  */
 

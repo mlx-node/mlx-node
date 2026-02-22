@@ -11,11 +11,11 @@ import { VLModel } from '@mlx-node/vlm';
 const model = await VLModel.load('./models/paddleocr-vl-1.5');
 
 // Simple OCR - just pass the image path
-const text = model.ocr('./receipt.jpg');
+const text = await model.ocr('./receipt.jpg');
 console.log(text);
 
 // Chat with image - also just pass the path
-const result = model.chat([{ role: 'user', content: 'What text is in this image?' }], {
+const result = await model.chat([{ role: 'user', content: 'What text is in this image?' }], {
   imagePaths: ['./document.jpg'],
 });
 console.log(result.text);
@@ -53,7 +53,7 @@ console.log(config.visionConfig.hiddenSize);
 High-level conversational interface for image understanding. Just pass image paths directly.
 
 ```typescript
-const result = model.chat(
+const result = await model.chat(
   [
     { role: 'system', content: 'You are a helpful OCR assistant.' },
     { role: 'user', content: 'Extract all text from this image.' },
@@ -75,10 +75,10 @@ Convenience method for simple text extraction. Just pass an image path - no prep
 
 ```typescript
 // Basic OCR
-const text = model.ocr('./receipt.jpg');
+const text = await model.ocr('./receipt.jpg');
 
 // With custom prompt
-const text = model.ocr('./document.png', 'Extract all dates from this image.');
+const text = await model.ocr('./document.png', 'Extract all dates from this image.');
 ```
 
 **`generate(inputIds, pixelValues?, gridThw?, options?)`**
@@ -192,7 +192,7 @@ KV caching is automatically enabled during generation, providing 10-100x speedup
 
 ```typescript
 // KV caches are managed internally
-model.chat(messages, { imagePaths: ['./image.jpg'] });
+await model.chat(messages, { imagePaths: ['./image.jpg'] });
 
 // Reset for new conversation
 model.resetKvCaches();
@@ -205,7 +205,7 @@ Process multiple images sequentially:
 ```typescript
 // Each call manages its own KV cache state
 const files = ['./doc1.jpg', './doc2.jpg', './doc3.jpg'];
-const results = files.map((f) => model.ocr(f));
+const results = await Promise.all(files.map((f) => model.ocr(f)));
 ```
 
 ### 3. Image Size Optimization
@@ -249,7 +249,7 @@ async function processDocuments(inputDir: string, outputDir: string) {
     const imagePath = path.join(inputDir, file);
 
     // Extract text - just pass the path
-    const text = model.ocr(imagePath);
+    const text = await model.ocr(imagePath);
 
     // Save result
     const outputPath = path.join(outputDir, `${path.basename(file, path.extname(file))}.txt`);
@@ -295,7 +295,7 @@ async function interactiveChat(imagePath: string) {
 
       messages.push({ role: 'user', content: input });
 
-      const result = model.chat(messages, { imagePaths: [imagePath] });
+      const result = await model.chat(messages, { imagePaths: [imagePath] });
 
       messages.push({ role: 'assistant', content: result.text });
 

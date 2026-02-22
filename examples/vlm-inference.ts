@@ -93,7 +93,7 @@ if (vlmOnly) {
   console.log(`\n--- OCR: ${imagePath} ---`);
   console.time('OCR');
   const imageBuffer = readFileSync(imagePath);
-  const result = vlm.chat([{ role: ChatRole.User, content: 'Extract the text in this image' }], {
+  const result = await vlm.chat([{ role: ChatRole.User, content: 'Extract the text in this image' }], {
     images: [imageBuffer],
   });
   console.timeEnd('OCR');
@@ -329,7 +329,7 @@ const batchItems = ocrItems.map((item) => ({
   messages: [{ role: ChatRole.User as const, content: item.prompt }],
   images: [item.cropBuffer],
 }));
-const batchResults = vlm.batch(batchItems);
+const batchResults = await vlm.batch(batchItems);
 
 console.timeEnd('Batch OCR');
 
