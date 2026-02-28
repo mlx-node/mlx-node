@@ -140,6 +140,31 @@ impl KVCache {
         self.offset
     }
 
+    /// Get a reference to the cached keys.
+    pub fn keys_ref(&self) -> Option<&MxArray> {
+        self.keys.as_ref()
+    }
+
+    /// Get a reference to the cached values.
+    pub fn values_ref(&self) -> Option<&MxArray> {
+        self.values.as_ref()
+    }
+
+    /// Set the cached keys directly (used by fused forward pass).
+    pub fn set_keys(&mut self, keys: MxArray) {
+        self.keys = Some(keys);
+    }
+
+    /// Set the cached values directly (used by fused forward pass).
+    pub fn set_values(&mut self, values: MxArray) {
+        self.values = Some(values);
+    }
+
+    /// Set the cache offset directly (used by fused forward pass).
+    pub fn set_offset(&mut self, offset: i32) {
+        self.offset = offset;
+    }
+
     /// Trim the cache to keep only the first `new_len` tokens.
     ///
     /// This is used in speculative decoding to rewind the cache when draft tokens

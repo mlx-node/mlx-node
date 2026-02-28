@@ -48,6 +48,15 @@ impl DType {
     fn code(self) -> i32 {
         self as i32
     }
+
+    /// Byte size per element for this dtype.
+    /// Used to pre-compute SafeTensors data offsets without materializing tensors.
+    pub(crate) fn byte_size(self) -> usize {
+        match self {
+            DType::Float32 | DType::Int32 | DType::Uint32 => 4,
+            DType::Float16 | DType::BFloat16 => 2,
+        }
+    }
 }
 
 impl TryFrom<i32> for DType {

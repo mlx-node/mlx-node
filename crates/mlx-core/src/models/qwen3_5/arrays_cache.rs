@@ -32,11 +32,6 @@ impl ArraysCache {
         self.cache[idx] = Some(value);
     }
 
-    /// Check if a specific slot is populated.
-    pub fn has(&self, idx: usize) -> bool {
-        self.cache.get(idx).is_some_and(|v| v.is_some())
-    }
-
     /// Reset all cache entries.
     pub fn reset(&mut self) {
         for slot in &mut self.cache {

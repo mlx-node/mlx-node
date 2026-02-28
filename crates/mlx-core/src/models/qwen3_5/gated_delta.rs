@@ -1,8 +1,12 @@
 use crate::array::MxArray;
 use crate::nn::Activations;
+use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
 /// Compute decay gate: g = exp(-exp(A_log) * softplus(a + dt_bias))
+///
+/// Uses a fused C++ implementation that builds the full expression in a single
+/// FFI call, allowing MLX's graph optimizer to see the complete expression.
 ///
 /// Shapes:
 ///   A_log: [Hv]
@@ -11,31 +15,71 @@ use napi::bindgen_prelude::*;
 ///
 /// Returns: [B, T, Hv]
 fn compute_g(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxArray> {
-    // a + dt_bias (broadcasts [Hv] to [B, T, Hv])
-    let a_biased = a.add(dt_bias)?;
-
-    // softplus(a + dt_bias) = log(1 + exp(a + dt_bias))
-    let sp = Activations::softplus(&a_biased)?;
-
-    // exp(A_log)
-    let a_exp = a_log.exp()?;
-
-    // -exp(A_log) * softplus(a + dt_bias)
-    let neg_a_exp = a_exp.negative()?;
-    let exponent = neg_a_exp.mul(&sp)?;
-
-    // g = exp(exponent)
-    exponent.exp()
+    let handle = unsafe {
+        sys::mlx_fused_compute_g(a_log.as_raw_ptr(), a.as_raw_ptr(), dt_bias.as_raw_ptr())
+    };
+    MxArray::from_handle(handle, "fused_compute_g")
 }
 
-/// Single timestep of the gated delta recurrence (delta rule).
+/// Run the gated delta recurrence using a custom Metal kernel.
 ///
-/// Implements the correct delta rule:
-///   1. Decay state: state *= g
-///   2. Compute kv_mem = (state * k).sum(-1)  → retrieval from memory
-///   3. Compute delta = (v - kv_mem) * beta   → error signal
-///   4. Update state: state += k * delta      → write correction to memory
-///   5. Output: y = (state * q).sum(-1)       → read from memory
+/// This dispatches to a fused GPU kernel that keeps recurrent state in
+/// thread-local registers and uses SIMD reductions, avoiding per-timestep
+/// kernel launches. ~10x faster than the ops-based sequential loop.
+///
+/// Shapes:
+///   q: [B, T, Hk, Dk]  (already GQA-expanded to Hv heads by caller)
+///   k: [B, T, Hk, Dk]  (already GQA-expanded)
+///   v: [B, T, Hv, Dv]
+///   g: [B, T, Hv]       - decay gate
+///   beta: [B, T, Hv]    - beta (sigmoid already applied)
+///   state: [B, Hv, Dv, Dk] - recurrent state
+///   mask: Option<[B, T]>
+///
+/// Returns: (output [B, T, Hv, Dv], final_state [B, Hv, Dv, Dk])
+fn gated_delta_kernel(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+    mask: Option<&MxArray>,
+) -> Result<(MxArray, MxArray)> {
+    let mut out_y: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_state: *mut sys::mlx_array = std::ptr::null_mut();
+
+    let mask_ptr = match mask {
+        Some(m) => m.as_raw_ptr(),
+        None => std::ptr::null_mut(),
+    };
+
+    let ok = unsafe {
+        sys::mlx_gated_delta_kernel(
+            q.as_raw_ptr(),
+            k.as_raw_ptr(),
+            v.as_raw_ptr(),
+            g.as_raw_ptr(),
+            beta.as_raw_ptr(),
+            state.as_raw_ptr(),
+            mask_ptr,
+            &mut out_y,
+            &mut out_state,
+        )
+    };
+
+    if !ok {
+        return Err(Error::from_reason(
+            "Metal gated delta kernel failed (check stderr for details)",
+        ));
+    }
+
+    let y = MxArray::from_handle(out_y, "gated_delta_kernel:y")?;
+    let new_state = MxArray::from_handle(out_state, "gated_delta_kernel:state")?;
+    Ok((y, new_state))
+}
+
+/// Single timestep of the gated delta recurrence (delta rule) — ops-based fallback.
 ///
 /// Shapes:
 ///   q_t: [B, 1, Hv, Dk]  (already GQA-expanded)
@@ -113,10 +157,56 @@ fn gated_delta_step(
     Ok((y_out, new_state))
 }
 
-/// Gated delta recurrence update (ops-based sequential loop).
+/// Ops-based sequential loop fallback for the gated delta recurrence.
+fn gated_delta_ops(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+    mask: Option<&MxArray>,
+) -> Result<(MxArray, MxArray)> {
+    let seq_len = q.shape_at(1)?;
+
+    let mut current_state = state.clone();
+    let mut outputs: Vec<MxArray> = Vec::with_capacity(seq_len as usize);
+
+    for t in 0..seq_len {
+        // Slice timestep t: [B, 1, ...]
+        let q_t = q.slice_axis(1, t, t + 1)?;
+        let k_t = k.slice_axis(1, t, t + 1)?;
+        let v_t = v.slice_axis(1, t, t + 1)?;
+        let g_t = g.slice_axis(1, t, t + 1)?;
+        let beta_t = beta.slice_axis(1, t, t + 1)?;
+
+        let mask_t = mask.map(|m| m.slice_axis(1, t, t + 1)).transpose()?;
+
+        let (y_t, new_state) = gated_delta_step(
+            &q_t,
+            &k_t,
+            &v_t,
+            &g_t,
+            &beta_t,
+            &current_state,
+            mask_t.as_ref(),
+        )?;
+
+        outputs.push(y_t);
+        current_state = new_state;
+    }
+
+    // Concatenate along time dimension: [B, T, Hv, Dv]
+    let output_refs: Vec<&MxArray> = outputs.iter().collect();
+    let output = MxArray::concatenate_many(output_refs, Some(1))?;
+
+    Ok((output, current_state))
+}
+
+/// Gated delta recurrence update.
 ///
-/// This is the main entry point for linear attention recurrence.
-/// Handles GQA head expansion when num_v_heads != num_k_heads.
+/// Uses a custom Metal kernel when available (GPU, Metal, Dk divisible by 32),
+/// falling back to an ops-based sequential loop otherwise.
 ///
 /// Shapes:
 ///   q: [B, T, Hk, Dk]   - queries
@@ -142,7 +232,6 @@ pub fn gated_delta_update(
     mask: Option<&MxArray>,
 ) -> Result<(MxArray, MxArray)> {
     let batch = q.shape_at(0)?;
-    let seq_len = q.shape_at(1)?;
     let num_k_heads = q.shape_at(2)?;
     let num_v_heads = v.shape_at(2)?;
     let v_dim = v.shape_at(3)?;
@@ -177,41 +266,21 @@ pub fn gated_delta_update(
 
     // Initialize state if not provided: [B, Hv, Dv, Dk]
     // Use v's dtype to avoid f32 promotion for bf16/f16 models
-    let mut current_state = match state {
+    let initial_state = match state {
         Some(s) => s.clone(),
         None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
     };
 
-    // Sequential loop over timesteps
-    let mut outputs: Vec<MxArray> = Vec::with_capacity(seq_len as usize);
-
-    for t in 0..seq_len {
-        // Slice timestep t: [B, 1, ...]
-        let q_t = q.slice_axis(1, t, t + 1)?;
-        let k_t = k.slice_axis(1, t, t + 1)?;
-        let v_t = v.slice_axis(1, t, t + 1)?;
-        let g_t = g.slice_axis(1, t, t + 1)?;
-        let beta_t = beta.slice_axis(1, t, t + 1)?;
-
-        let mask_t = mask.map(|m| m.slice_axis(1, t, t + 1)).transpose()?;
-
-        let (y_t, new_state) = gated_delta_step(
-            &q_t,
-            &k_t,
-            &v_t,
-            &g_t,
-            &beta_t,
-            &current_state,
-            mask_t.as_ref(),
-        )?;
-
-        outputs.push(y_t);
-        current_state = new_state;
+    // Use Metal kernel for recurrence (requires Dk divisible by 32 for SIMD register blocking)
+    if k_dim % 32 == 0 {
+        match gated_delta_kernel(&q, &k, v, &g, &beta, &initial_state, mask) {
+            Ok(result) => return Ok(result),
+            Err(_) => {
+                // Fall back to ops-based loop (e.g., CPU device or Metal not available)
+            }
+        }
     }
 
-    // Concatenate along time dimension: [B, T, Hv, Dv]
-    let output_refs: Vec<&MxArray> = outputs.iter().collect();
-    let output = MxArray::concatenate_many(output_refs, Some(1))?;
-
-    Ok((output, current_state))
+    // Ops-based sequential loop fallback
+    gated_delta_ops(&q, &k, v, &g, &beta, &initial_state, mask)
 }

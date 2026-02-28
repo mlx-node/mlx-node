@@ -1,6 +1,5 @@
 use crate::array::MxArray;
 use crate::nn::{Activations, Conv1d, Linear};
-use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
 use super::arrays_cache::ArraysCache;
@@ -293,29 +292,11 @@ impl GatedDeltaNet {
         self.a_log = w.clone();
     }
 
-    pub fn get_parameters(&self) -> Vec<(&str, MxArray)> {
-        vec![
-            ("in_proj_qkvz.weight", self.in_proj_qkvz.get_weight()),
-            ("in_proj_ba.weight", self.in_proj_ba.get_weight()),
-            ("conv1d.weight", self.conv1d.get_weight()),
-            ("norm.weight", self.norm.get_weight()),
-            ("out_proj.weight", self.out_proj.get_weight()),
-            ("dt_bias", self.dt_bias.clone()),
-            ("A_log", self.a_log.clone()),
-        ]
-    }
 }
 
 /// RMS normalization without learnable weight (weight=None in Python).
-/// Uses mlx_fast_rms_norm with a ones weight vector.
+/// Uses mlx_fast_rms_norm with nullptr weight (C++ handles nullptr → std::nullopt).
 fn rms_norm_no_weight(x: &MxArray, eps: f32) -> Result<MxArray> {
-    // Get the last dimension size for the ones weight
-    let shape = x.shape()?;
-    let last_dim = *shape
-        .last()
-        .ok_or_else(|| Error::from_reason("empty shape"))?;
-    // Use input's dtype to avoid f32 promotion for bf16/f16 models
-    let ones = MxArray::ones(&[last_dim], Some(x.dtype()?))?;
-    let handle = unsafe { sys::mlx_fast_rms_norm(x.handle.0, ones.handle.0, eps) };
+    let handle = unsafe { mlx_sys::mlx_fast_rms_norm(x.handle.0, std::ptr::null_mut(), eps) };
     MxArray::from_handle(handle, "rms_norm_no_weight")
 }

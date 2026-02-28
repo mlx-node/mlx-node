@@ -366,6 +366,7 @@ unsafe extern "C" {
     pub fn mlx_array_to_int32(handle: *mut mlx_array, out: *mut i32, len: usize) -> bool;
     pub fn mlx_array_to_int32_noeval(handle: *mut mlx_array, out: *mut i32, len: usize) -> bool;
     pub fn mlx_array_to_uint32(handle: *mut mlx_array, out: *mut u32, len: usize) -> bool;
+    pub fn mlx_array_to_uint16(handle: *mut mlx_array, out: *mut u16, len: usize) -> bool;
     pub fn mlx_array_delete(arr: *mut mlx_array);
     pub fn mlx_synchronize();
     pub fn mlx_clear_cache();
@@ -770,6 +771,7 @@ unsafe extern "C" {
     /// Synchronize - ensure all MLX operations are complete
     /// Call this before dispatching external Metal kernels
     pub fn mlx_metal_synchronize();
+
 }
 
 // ================================================================================
@@ -899,6 +901,80 @@ unsafe extern "C" {
         rhs_indices: *mut mlx_array, // nullable
         sorted_indices: bool,
     ) -> *mut mlx_array;
+
+    // Gated Delta Recurrence Metal Kernel
+    pub fn mlx_gated_delta_kernel(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        mask: *mut mlx_array, // nullptr if no mask
+        out_y: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+
+    // Fused compute_g: g = exp(-exp(A_log) * softplus(a + dt_bias))
+    pub fn mlx_fused_compute_g(
+        a_log: *mut mlx_array,
+        a: *mut mlx_array,
+        dt_bias: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    // ============================================
+    // Qwen3.5 Fused Forward Pass
+    // ============================================
+
+    /// Store a model weight by name (called once per weight during model load)
+    pub fn mlx_qwen35_store_weight(name: *const std::os::raw::c_char, weight: *mut mlx_array);
+
+    /// Clear all stored weights (called on model destruction)
+    pub fn mlx_qwen35_clear_weights();
+
+    /// Get the number of stored weights (for debugging)
+    pub fn mlx_qwen35_weight_count() -> usize;
+
+    /// Initialize compiled forward pass from post-prefill caches.
+    /// Call once after prefill, before decode loop.
+    /// cache_arrays: [num_layers * 2] non-null pointers to prefill cache arrays.
+    pub fn mlx_qwen35_compiled_init_from_prefill(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        rope_dims: i32,
+        rms_norm_eps: f32,
+        full_attention_interval: i32,
+        linear_num_k_heads: i32,
+        linear_num_v_heads: i32,
+        linear_key_head_dim: i32,
+        linear_value_head_dim: i32,
+        linear_conv_kernel_dim: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        cache_arrays: *mut *mut mlx_array,
+        prefill_offset: i32,
+    );
+
+    /// Compiled single-token decode step.
+    /// Runs the full 64-layer forward pass with graph caching (mlx::core::compile).
+    /// output_logits receives heap-allocated array; cache_offset_out receives new offset.
+    pub fn mlx_qwen35_forward_compiled(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        output_logits: *mut *mut mlx_array,
+        cache_offset_out: *mut i32,
+    );
+
+    /// Eval next_token and all compiled cache arrays to prevent graph accumulation.
+    pub fn mlx_qwen35_eval_token_and_compiled_caches(next_token: *mut mlx_array);
+
+    /// Reset compiled state (call on model reset / new conversation).
+    pub fn mlx_qwen35_compiled_reset();
 }
 
 // Gradient computation types

@@ -290,36 +290,38 @@ fn bytes_to_u16(bytes: &[u8]) -> Vec<u16> {
 // SafeTensors Writer
 // ============================================================================
 
-/// Save tensors to SafeTensors format
+/// Save tensors to SafeTensors format.
+///
+/// Uses a two-pass streaming approach to avoid materializing all tensor bytes
+/// in memory at once — critical for large models (e.g. 27B params / 52 GB).
+///
+/// Pass 1: Compute byte sizes from array metadata (no evaluation), build header.
+/// Pass 2: Write header, then stream each tensor's bytes to disk one at a time.
 pub fn save_safetensors<P: AsRef<Path>>(
     path: P,
     tensors: &HashMap<String, MxArray>,
     metadata: Option<serde_json::Value>,
 ) -> Result<()> {
-    use std::io::Write;
-
-    // Build header with tensor metadata
-    let mut header = serde_json::Map::new();
-    let mut current_offset = 0usize;
-    let mut tensor_data_vec: Vec<(String, Vec<u8>)> = Vec::new();
+    use std::io::{BufWriter, Write};
 
     // Sort tensor names for deterministic output
     let mut tensor_names: Vec<String> = tensors.keys().cloned().collect();
     tensor_names.sort();
 
-    for name in tensor_names {
-        let array = tensors.get(&name).unwrap();
+    // --- Pass 1: Build header from metadata only (no tensor evaluation) ---
+    let mut header = serde_json::Map::new();
+    let mut current_offset = 0usize;
 
-        // Get array metadata
+    for name in &tensor_names {
+        let array = tensors.get(name).unwrap();
         let shape = array.shape()?;
         let shape_vec: Vec<usize> = shape.as_ref().iter().map(|&x| x as usize).collect();
         let dtype = array.dtype()?;
 
-        // Convert array to bytes
-        let bytes = array_to_bytes(array)?;
-        let byte_size = bytes.len();
+        // Compute byte size without evaluating the array
+        let size = array.size()? as usize;
+        let byte_size = size * dtype.byte_size();
 
-        // Create tensor info
         let tensor_info = serde_json::json!({
             "dtype": dtype_to_safetensor_str(dtype),
             "shape": shape_vec,
@@ -327,46 +329,52 @@ pub fn save_safetensors<P: AsRef<Path>>(
         });
 
         header.insert(name.clone(), tensor_info);
-        tensor_data_vec.push((name, bytes));
         current_offset += byte_size;
     }
 
-    // Add metadata if provided
     if let Some(meta) = metadata {
         header.insert("__metadata__".to_string(), meta);
     }
 
-    // Serialize header to JSON
     let header_json = serde_json::to_string(&header)
         .map_err(|e| Error::from_reason(format!("Failed to serialize header: {}", e)))?;
     let header_bytes = header_json.as_bytes();
     let header_len = header_bytes.len() as u64;
 
-    // Write to file
-    let mut file = File::create(path.as_ref())
+    // --- Pass 2: Stream header + tensor data to file ---
+    let file = File::create(path.as_ref())
         .map_err(|e| Error::from_reason(format!("Failed to create file: {}", e)))?;
+    let mut writer = BufWriter::new(file);
 
-    // Write header length (8 bytes, little-endian)
-    file.write_all(&header_len.to_le_bytes())
+    writer
+        .write_all(&header_len.to_le_bytes())
         .map_err(|e| Error::from_reason(format!("Failed to write header length: {}", e)))?;
 
-    // Write header JSON
-    file.write_all(header_bytes)
+    writer
+        .write_all(header_bytes)
         .map_err(|e| Error::from_reason(format!("Failed to write header: {}", e)))?;
 
-    // Write tensor data
-    for (_name, bytes) in tensor_data_vec {
-        file.write_all(&bytes)
-            .map_err(|e| Error::from_reason(format!("Failed to write tensor data: {}", e)))?;
+    // Stream each tensor: materialize → write → drop
+    for name in &tensor_names {
+        let array = tensors.get(name).unwrap();
+        let bytes = array_to_bytes(array)?;
+        writer
+            .write_all(&bytes)
+            .map_err(|e| Error::from_reason(format!("Failed to write tensor {}: {}", name, e)))?;
+        // `bytes` is dropped here, freeing memory before the next tensor
     }
 
-    file.flush()
+    writer
+        .flush()
         .map_err(|e| Error::from_reason(format!("Failed to flush file: {}", e)))?;
 
     Ok(())
 }
 
-/// Convert MxArray to bytes for SafeTensors format
+/// Convert MxArray to bytes for SafeTensors format.
+///
+/// For bf16/f16 arrays, extracts raw 16-bit values directly via FFI instead of
+/// round-tripping through f32, which would triple per-tensor memory usage.
 fn array_to_bytes(array: &MxArray) -> Result<Vec<u8>> {
     let dtype = array.dtype()?;
 
@@ -375,15 +383,9 @@ fn array_to_bytes(array: &MxArray) -> Result<Vec<u8>> {
             let data = array.to_float32()?;
             Ok(f32_to_bytes(&data))
         }
-        DType::Float16 => {
-            // Convert to f16 bytes
-            let data = array.to_float32()?; // Get as f32 first
-            Ok(f32_to_f16_bytes(&data))
-        }
-        DType::BFloat16 => {
-            // Convert to bf16 bytes
-            let data = array.to_float32()?;
-            Ok(f32_to_bf16_bytes(&data))
+        DType::Float16 | DType::BFloat16 => {
+            let u16_data = array.to_uint16_native()?;
+            Ok(u16_to_bytes(&u16_data))
         }
         DType::Int32 => {
             let data = array.to_int32()?;
@@ -417,26 +419,10 @@ fn i32_to_bytes(data: &[i32]) -> Vec<u8> {
     data.iter().flat_map(|&x| x.to_le_bytes()).collect()
 }
 
-/// Convert f32 array to f16 bytes
-fn f32_to_f16_bytes(data: &[f32]) -> Vec<u8> {
-    data.iter()
-        .flat_map(|&x| {
-            let f16_val = half::f16::from_f32(x);
-            f16_val.to_le_bytes()
-        })
-        .collect()
-}
-
-/// Convert f32 array to bf16 bytes
-fn f32_to_bf16_bytes(data: &[f32]) -> Vec<u8> {
-    data.iter()
-        .flat_map(|&x| {
-            // BF16 is just the upper 16 bits of f32
-            let f32_bits = x.to_bits();
-            let bf16_bits = (f32_bits >> 16) as u16;
-            bf16_bits.to_le_bytes()
-        })
-        .collect()
+/// Convert u16 array to bytes (little-endian)
+/// Used for writing bf16/f16 tensors extracted via direct FFI
+fn u16_to_bytes(data: &[u16]) -> Vec<u8> {
+    data.iter().flat_map(|&x| x.to_le_bytes()).collect()
 }
 
 #[cfg(test)]

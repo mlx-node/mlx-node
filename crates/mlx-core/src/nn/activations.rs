@@ -12,29 +12,14 @@ impl Activations {
     /// Sigmoid Linear Unit (SiLU): x * sigmoid(x)
     /// This is the most common activation in modern LLMs (Llama, Qwen, Phi)
     ///
-    /// This version cleans up intermediate handles after use.
-    /// It works well for generation but doesn't preserve the computation graph for autograd.
-    /// Use `silu_for_autograd` in training contexts that need gradient computation.
+    /// Uses MLX's native sigmoid primitive which preserves dtype (no f32 promotion).
     pub fn silu(input: &MxArray) -> Result<MxArray> {
-        // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+        // SiLU(x) = x * sigmoid(x)
+        // Uses native MLX sigmoid which preserves input dtype (bf16/f16/f32)
         let handle = unsafe {
-            // First compute sigmoid: 1 / (1 + exp(-x))
-            let neg_x = sys::mlx_array_negative(input.handle.0);
-            let exp_neg_x = sys::mlx_array_exp(neg_x);
-            let one = sys::mlx_array_scalar_float(1.0);
-            let one_plus_exp = sys::mlx_array_add(one, exp_neg_x);
-            let sigmoid = sys::mlx_array_div(one, one_plus_exp);
-
-            // Then multiply by x
-            let result = sys::mlx_array_mul(input.handle.0, sigmoid);
-
-            // Clean up intermediates - this breaks autograd but is fine for generation
-            sys::mlx_array_delete(neg_x);
-            sys::mlx_array_delete(exp_neg_x);
-            sys::mlx_array_delete(one);
-            sys::mlx_array_delete(one_plus_exp);
-            sys::mlx_array_delete(sigmoid);
-
+            let sig = sys::mlx_array_sigmoid(input.handle.0);
+            let result = sys::mlx_array_mul(input.handle.0, sig);
+            sys::mlx_array_delete(sig);
             result
         };
         MxArray::from_handle(handle, "silu")
@@ -137,32 +122,16 @@ impl Activations {
     }
 
     /// ReLU: max(0, x)
+    /// Uses dtype-aware zero to avoid f32 promotion with bf16 inputs.
     pub fn relu(input: &MxArray) -> Result<MxArray> {
-        let handle = unsafe {
-            let zero = sys::mlx_array_scalar_float(0.0);
-            let result = sys::mlx_array_maximum(input.handle.0, zero);
-            sys::mlx_array_delete(zero);
-            result
-        };
-        MxArray::from_handle(handle, "relu")
+        let zero = MxArray::zeros(&[], Some(input.dtype()?))?;
+        input.maximum(&zero)
     }
 
     /// Sigmoid: 1 / (1 + exp(-x))
+    /// Uses MLX's native sigmoid primitive which preserves dtype (no f32 promotion).
     pub fn sigmoid(input: &MxArray) -> Result<MxArray> {
-        let handle = unsafe {
-            let neg_x = sys::mlx_array_negative(input.handle.0);
-            let exp_neg_x = sys::mlx_array_exp(neg_x);
-            let one = sys::mlx_array_scalar_float(1.0);
-            let one_plus_exp = sys::mlx_array_add(one, exp_neg_x);
-            let result = sys::mlx_array_div(one, one_plus_exp);
-
-            sys::mlx_array_delete(neg_x);
-            sys::mlx_array_delete(exp_neg_x);
-            sys::mlx_array_delete(one);
-            sys::mlx_array_delete(one_plus_exp);
-
-            result
-        };
+        let handle = unsafe { sys::mlx_array_sigmoid(input.handle.0) };
         MxArray::from_handle(handle, "sigmoid")
     }
 
@@ -261,25 +230,15 @@ impl Activations {
     /// because exp(x) → inf. The stable form avoids this because -|x| <= 0,
     /// so exp(-|x|) is always in (0, 1] and never overflows.
     pub fn softplus(input: &MxArray) -> Result<MxArray> {
-        let handle = unsafe {
-            let zero = sys::mlx_array_scalar_float(0.0);
-            let max_x_0 = sys::mlx_array_maximum(input.handle.0, zero);
-            let abs_x = sys::mlx_array_abs(input.handle.0);
-            let neg_abs_x = sys::mlx_array_negative(abs_x);
-            let exp_neg_abs_x = sys::mlx_array_exp(neg_abs_x);
-            let log1p_term = sys::mlx_array_log1p(exp_neg_abs_x);
-            let result = sys::mlx_array_add(max_x_0, log1p_term);
-
-            sys::mlx_array_delete(zero);
-            sys::mlx_array_delete(max_x_0);
-            sys::mlx_array_delete(abs_x);
-            sys::mlx_array_delete(neg_abs_x);
-            sys::mlx_array_delete(exp_neg_abs_x);
-            sys::mlx_array_delete(log1p_term);
-
-            result
-        };
-        MxArray::from_handle(handle, "softplus")
+        // softplus(x) = max(x, 0) + log1p(exp(-|x|))  (numerically stable)
+        // Use dtype-aware zero to avoid f32 promotion with bf16 inputs
+        let zero = MxArray::zeros(&[], Some(input.dtype()?))?;
+        let max_x_0 = input.maximum(&zero)?;
+        let abs_x = input.abs()?;
+        let neg_abs_x = abs_x.negative()?;
+        let exp_neg = neg_abs_x.exp()?;
+        let log1p_term = exp_neg.log1p()?;
+        max_x_0.add(&log1p_term)
     }
 }
 

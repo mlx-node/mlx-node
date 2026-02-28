@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -136,9 +137,10 @@ fn sanitize_weights(
             continue;
         }
 
-        // Strip prefixes: language_model.model. > language_model. > model.
+        // Strip prefixes (VL models use model.language_model.*, text-only use model.*)
         let name = name
-            .strip_prefix("language_model.model.")
+            .strip_prefix("model.language_model.")
+            .or_else(|| name.strip_prefix("language_model.model."))
             .or_else(|| name.strip_prefix("language_model."))
             .or_else(|| name.strip_prefix("model."))
             .unwrap_or(&name)
@@ -657,6 +659,9 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
         // Apply weights
         apply_weights(&mut model, &params, &config)?;
 
+        // Register weights with C++ fused forward pass
+        register_weights_with_cpp(&params);
+
         // Set tokenizer
         if let Some(tok) = tokenizer {
             model.tokenizer = Some(Arc::new(tok));
@@ -669,10 +674,103 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
     .map_err(|e| Error::from_reason(format!("Failed to load model: {}", e)))?
 }
 
+/// Register all sanitized weights with the C++ fused forward pass.
+///
+/// This copies weight references into a C++ global map so the fused forward step
+/// can look them up by name without crossing the FFI boundary per-weight.
+///
+/// Handles split projections: the checkpoint may use split `in_proj_qkv` + `in_proj_z`
+/// (instead of combined `in_proj_qkvz`) and split `in_proj_b` + `in_proj_a` (instead of
+/// combined `in_proj_ba`). The C++ forward step expects the combined names, so we
+/// concatenate them here before registering.
+fn register_weights_with_cpp(params: &HashMap<String, MxArray>) {
+    use mlx_sys as sys;
+
+    // Clear any previously stored weights
+    unsafe { sys::mlx_qwen35_clear_weights() };
+
+    let store = |name: &str, array: &MxArray| {
+        let c_name = CString::new(name).expect("Weight name contains null byte");
+        unsafe {
+            sys::mlx_qwen35_store_weight(c_name.as_ptr(), array.as_raw_ptr());
+        }
+    };
+
+    // Track which split keys we've already handled
+    let mut handled_splits: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (name, array) in params {
+        // Check if this is a split qkv/z pair that needs combining
+        if name.ends_with(".linear_attn.in_proj_qkv.weight") {
+            let prefix = name.strip_suffix(".in_proj_qkv.weight").unwrap();
+            let z_key = format!("{}.in_proj_z.weight", prefix);
+            if let Some(z_array) = params.get(&z_key) {
+                // Concatenate qkv + z → qkvz
+                if let Ok(combined) = MxArray::concatenate(array, z_array, 0) {
+                    let combined_key = format!("{}.in_proj_qkvz.weight", prefix);
+                    store(&combined_key, &combined);
+                    handled_splits.insert(z_key);
+                    handled_splits.insert(name.clone());
+                    continue;
+                }
+            }
+        }
+        if name.ends_with(".linear_attn.in_proj_z.weight") && handled_splits.contains(name) {
+            continue;
+        }
+
+        // Check if this is a split b/a pair that needs combining
+        if name.ends_with(".linear_attn.in_proj_b.weight") {
+            let prefix = name.strip_suffix(".in_proj_b.weight").unwrap();
+            let a_key = format!("{}.in_proj_a.weight", prefix);
+            if let Some(a_array) = params.get(&a_key) {
+                // Concatenate b + a → ba
+                if let Ok(combined) = MxArray::concatenate(array, a_array, 0) {
+                    let combined_key = format!("{}.in_proj_ba.weight", prefix);
+                    store(&combined_key, &combined);
+                    handled_splits.insert(a_key);
+                    handled_splits.insert(name.clone());
+                    continue;
+                }
+            }
+        }
+        if name.ends_with(".linear_attn.in_proj_a.weight") && handled_splits.contains(name) {
+            continue;
+        }
+
+        // Register as-is (already in combined format or non-split weight)
+        if !handled_splits.contains(name) {
+            store(name, array);
+        }
+    }
+
+    let count = unsafe { sys::mlx_qwen35_weight_count() };
+    info!(
+        "Registered {} weights with C++ fused forward pass",
+        count
+    );
+}
+
 /// Parse Qwen3.5 config from JSON.
+///
+/// Supports two config layouts:
+/// 1. Flat: all fields at top level (text-only models)
+/// 2. Nested: critical fields under `text_config` (VL / multimodal models)
+///
+/// The helpers check `text_config` first, then fall back to the top level.
 fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
+    // VL models nest language params under text_config
+    let text_cfg = raw.get("text_config");
+
     let get_i32 = |keys: &[&str], default: i32| -> i32 {
         for key in keys {
+            // Check text_config first
+            if let Some(tc) = text_cfg {
+                if let Some(v) = tc[key].as_i64() {
+                    return v as i32;
+                }
+            }
+            // Then top level
             if let Some(v) = raw[key].as_i64() {
                 return v as i32;
             }
@@ -682,6 +780,11 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
 
     let get_f64 = |keys: &[&str], default: f64| -> f64 {
         for key in keys {
+            if let Some(tc) = text_cfg {
+                if let Some(v) = tc[key].as_f64() {
+                    return v;
+                }
+            }
             if let Some(v) = raw[key].as_f64() {
                 return v;
             }
@@ -691,6 +794,11 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
 
     let get_bool = |keys: &[&str], default: bool| -> bool {
         for key in keys {
+            if let Some(tc) = text_cfg {
+                if let Some(v) = tc[key].as_bool() {
+                    return v;
+                }
+            }
             if let Some(v) = raw[key].as_bool() {
                 return v;
             }
@@ -700,28 +808,26 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
 
     let hidden_size = get_i32(&["hidden_size"], 0);
     let num_heads = get_i32(&["num_attention_heads", "num_heads"], 0);
-    let head_dim = if let Some(v) = raw["head_dim"].as_i64() {
-        v as i32
-    } else if num_heads > 0 {
-        hidden_size / num_heads
-    } else {
-        128
-    };
 
-    // Extract rope parameters from nested config if present
-    let partial_rotary_factor = if let Some(rope_params) = raw.get("rope_parameters") {
-        rope_params["partial_rotary_factor"]
-            .as_f64()
-            .unwrap_or(0.25)
-    } else {
-        raw["partial_rotary_factor"].as_f64().unwrap_or(0.25)
-    };
+    // head_dim: check text_config first, then top level
+    let head_dim = text_cfg
+        .and_then(|tc| tc["head_dim"].as_i64())
+        .or_else(|| raw["head_dim"].as_i64())
+        .map(|v| v as i32)
+        .unwrap_or_else(|| if num_heads > 0 { hidden_size / num_heads } else { 128 });
 
-    let rope_theta = if let Some(rope_params) = raw.get("rope_parameters") {
-        rope_params["rope_theta"].as_f64().unwrap_or(100_000.0)
-    } else {
-        raw["rope_theta"].as_f64().unwrap_or(100_000.0)
-    };
+    // Extract rope parameters — may be nested inside text_config.rope_parameters
+    let rope_obj = text_cfg
+        .and_then(|tc| tc.get("rope_parameters"))
+        .or_else(|| raw.get("rope_parameters"));
+
+    let partial_rotary_factor = rope_obj
+        .and_then(|rp| rp["partial_rotary_factor"].as_f64())
+        .unwrap_or_else(|| get_f64(&["partial_rotary_factor"], 0.25));
+
+    let rope_theta = rope_obj
+        .and_then(|rp| rp["rope_theta"].as_f64())
+        .unwrap_or_else(|| get_f64(&["rope_theta"], 100_000.0));
 
     let bos_token_id = get_i32(&["bos_token_id"], 151643);
     let num_layers = get_i32(&["num_hidden_layers", "num_layers"], 0);
@@ -815,10 +921,13 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
             if v > 0 { Some(v) } else { None }
         },
         norm_topk_prob: Some(get_bool(&["norm_topk_prob"], true)),
-        mlp_only_layers: raw["mlp_only_layers"].as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_i64().map(|i| i as i32))
-                .collect()
-        }),
+        mlp_only_layers: text_cfg
+            .and_then(|tc| tc["mlp_only_layers"].as_array())
+            .or_else(|| raw["mlp_only_layers"].as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_i64().map(|i| i as i32))
+                    .collect()
+            }),
     })
 }

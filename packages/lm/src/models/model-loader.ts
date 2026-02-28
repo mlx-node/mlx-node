@@ -4,24 +4,36 @@
  * Handles loading pretrained weights from MLX format or converting from HuggingFace.
  */
 
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Qwen3Model, Qwen35Model } from '@mlx-node/core';
 import type { Qwen3_5Model } from '@mlx-node/core';
 
 /**
- * Model loader for Qwen3 models
+ * Model loader for Qwen3 and Qwen3.5 models
  */
 export class ModelLoader {
   /**
-   * Load a pretrained Qwen3 model from disk
+   * Load a pretrained Qwen3 model from disk.
    *
-   * Delegates to Rust implementation for efficient loading without JavaScript memory limits.
+   * For Qwen3.5 models, use {@link loadQwen35} instead.
+   * If the config.json indicates a qwen3_5 model, this method will
+   * automatically delegate to loadQwen35.
    *
    * @param modelPath - Path to the model directory or file
    * @param _deviceMap - Device placement (not used in MLX, kept for compatibility)
    * @returns Loaded model
    */
-  static async loadPretrained(modelPath: string, _deviceMap: string = 'auto'): Promise<Qwen3Model> {
-    // Delegate to Rust implementation for efficient loading
+  static async loadPretrained(
+    modelPath: string,
+    _deviceMap: string = 'auto',
+  ): Promise<Qwen3Model | Qwen3_5Model> {
+    const modelType = detectModelType(modelPath);
+
+    if (modelType === 'qwen3_5') {
+      return await Qwen35Model.loadPretrained(modelPath);
+    }
+
     return await Qwen3Model.loadPretrained(modelPath);
   }
 
@@ -49,5 +61,15 @@ export class ModelLoader {
   static saveModel(model: Qwen3Model, savePath: string): Promise<void> {
     // Delegate to Rust implementation for efficient saving
     return model.saveModel(savePath);
+  }
+}
+
+function detectModelType(modelPath: string): string {
+  try {
+    const raw = readFileSync(join(modelPath, 'config.json'), 'utf-8');
+    const config = JSON.parse(raw);
+    return config.model_type ?? 'qwen3';
+  } catch {
+    return 'qwen3';
   }
 }
