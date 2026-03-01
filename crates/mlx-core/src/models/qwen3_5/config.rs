@@ -1,9 +1,8 @@
 use napi_derive::napi;
 
-/// Qwen3.5 model configuration.
+/// Qwen3.5 model configuration (dense variant).
 ///
-/// Supports both dense and MoE variants. MoE fields are optional -
-/// when `num_experts` is 0 or None, the model uses dense MLP layers.
+/// For MoE models, use `Qwen3_5MoeConfig` from `qwen3_5_moe`.
 #[napi(object)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Qwen3_5Config {
@@ -41,29 +40,6 @@ pub struct Qwen3_5Config {
     pub partial_rotary_factor: f64,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
-
-    // MoE fields (Optional — zero/None = dense)
-    #[serde(default)]
-    #[napi(ts_type = "number | undefined")]
-    pub num_experts: Option<i32>,
-    #[serde(default)]
-    #[napi(ts_type = "number | undefined")]
-    pub num_experts_per_tok: Option<i32>,
-    #[serde(default = "default_decoder_sparse_step")]
-    #[napi(ts_type = "number | undefined")]
-    pub decoder_sparse_step: Option<i32>,
-    #[serde(default)]
-    #[napi(ts_type = "number | undefined")]
-    pub shared_expert_intermediate_size: Option<i32>,
-    #[serde(default)]
-    #[napi(ts_type = "number | undefined")]
-    pub moe_intermediate_size: Option<i32>,
-    #[serde(default)]
-    #[napi(ts_type = "boolean | undefined")]
-    pub norm_topk_prob: Option<bool>,
-    #[serde(default)]
-    #[napi(ts_type = "number[] | undefined")]
-    pub mlp_only_layers: Option<Vec<i32>>,
 }
 
 fn default_linear_num_value_heads() -> i32 {
@@ -90,16 +66,8 @@ fn default_partial_rotary_factor() -> f64 {
 fn default_rope_theta() -> f64 {
     100_000.0
 }
-fn default_decoder_sparse_step() -> Option<i32> {
-    Some(1)
-}
 
 impl Qwen3_5Config {
-    /// Returns true if this is a MoE model.
-    pub fn is_moe(&self) -> bool {
-        self.num_experts.unwrap_or(0) > 0
-    }
-
     /// Returns whether a given layer index uses linear attention (GatedDeltaNet)
     /// vs full attention (Qwen3NextAttention).
     ///
@@ -110,24 +78,6 @@ impl Qwen3_5Config {
             return true;
         }
         !(layer_idx + 1).is_multiple_of(self.full_attention_interval as usize)
-    }
-
-    /// Returns whether a given layer should use MoE MLP.
-    pub fn is_moe_layer(&self, layer_idx: usize) -> bool {
-        if !self.is_moe() {
-            return false;
-        }
-        let step = self.decoder_sparse_step.unwrap_or(1);
-        if step <= 0 {
-            return false;
-        }
-        // Check if this layer is in the mlp_only_layers list (dense override)
-        if let Some(ref mlp_only) = self.mlp_only_layers
-            && mlp_only.contains(&(layer_idx as i32))
-        {
-            return false;
-        }
-        (layer_idx + 1).is_multiple_of(step as usize)
     }
 
     /// Compute the RoPE dimensions for partial rotary embedding.
@@ -158,9 +108,9 @@ impl Qwen3_5Config {
         let n = self.num_layers as u64;
         let i = self.intermediate_size as u64;
 
-        // Rough estimate: embedding + per-layer weights + final norm
         let embed = v * h;
-        let per_layer = 3 * h * i  // MLP gate/up/down
+        let mlp_params = 3 * h * i; // MLP gate/up/down
+        let per_layer = mlp_params
             + h * h * 2  // attention projections (rough)
             + h * 4;     // norms, biases, etc.
         let total_params = embed * 2 + n * per_layer + h;

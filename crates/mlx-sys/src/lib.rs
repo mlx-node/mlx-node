@@ -902,6 +902,37 @@ unsafe extern "C" {
         sorted_indices: bool,
     ) -> *mut mlx_array;
 
+    // ============================================
+    // Quantized Matmul (for QuantizedLinear)
+    // ============================================
+    pub fn mlx_quantized_matmul(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array, // nullable
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+    ) -> *mut mlx_array;
+
+    // ============================================
+    // Gather QMM (for QuantizedSwitchLinear / MoE)
+    // ============================================
+    pub fn mlx_gather_qmm(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,      // nullable
+        lhs_indices: *mut mlx_array, // nullable
+        rhs_indices: *mut mlx_array, // nullable
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+        sorted_indices: bool,
+    ) -> *mut mlx_array;
+
     // Gated Delta Recurrence Metal Kernel
     pub fn mlx_gated_delta_kernel(
         q: *mut mlx_array,

@@ -1828,4 +1828,98 @@ mlx_array* mlx_gather_mm(
     }
 }
 
+// ============================================
+// Quantized Matmul (for QuantizedLinear)
+// ============================================
+
+mlx_array* mlx_quantized_matmul(
+    mlx_array* x,
+    mlx_array* w,
+    mlx_array* scales,
+    mlx_array* biases,        // nullable
+    bool transpose,
+    int group_size,
+    int bits,
+    const char* mode          // "affine" or "none"
+) {
+    try {
+        auto x_arr = reinterpret_cast<mlx::core::array*>(x);
+        auto w_arr = reinterpret_cast<mlx::core::array*>(w);
+        auto scales_arr = reinterpret_cast<mlx::core::array*>(scales);
+
+        std::optional<mlx::core::array> biases_opt = std::nullopt;
+        if (biases != nullptr) {
+            biases_opt = *reinterpret_cast<mlx::core::array*>(biases);
+        }
+
+        std::string mode_str(mode ? mode : "affine");
+
+        mlx::core::array result = mlx::core::quantized_matmul(
+            *x_arr, *w_arr, *scales_arr, biases_opt,
+            transpose,
+            std::optional<int>(group_size),
+            std::optional<int>(bits),
+            mode_str
+        );
+        return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_quantized_matmul error: " << e.what() << std::endl;
+        return nullptr;
+    }
+}
+
+// ============================================
+// Gather QMM (for QuantizedSwitchLinear / MoE)
+// ============================================
+
+mlx_array* mlx_gather_qmm(
+    mlx_array* x,
+    mlx_array* w,
+    mlx_array* scales,
+    mlx_array* biases,        // nullable
+    mlx_array* lhs_indices,   // nullable
+    mlx_array* rhs_indices,   // nullable
+    bool transpose,
+    int group_size,
+    int bits,
+    const char* mode,         // "affine" or "none"
+    bool sorted_indices
+) {
+    try {
+        auto x_arr = reinterpret_cast<mlx::core::array*>(x);
+        auto w_arr = reinterpret_cast<mlx::core::array*>(w);
+        auto scales_arr = reinterpret_cast<mlx::core::array*>(scales);
+
+        std::optional<mlx::core::array> biases_opt = std::nullopt;
+        if (biases != nullptr) {
+            biases_opt = *reinterpret_cast<mlx::core::array*>(biases);
+        }
+
+        std::optional<mlx::core::array> lhs_opt = std::nullopt;
+        std::optional<mlx::core::array> rhs_opt = std::nullopt;
+        if (lhs_indices != nullptr) {
+            lhs_opt = *reinterpret_cast<mlx::core::array*>(lhs_indices);
+        }
+        if (rhs_indices != nullptr) {
+            rhs_opt = *reinterpret_cast<mlx::core::array*>(rhs_indices);
+        }
+
+        std::string mode_str(mode ? mode : "affine");
+
+        mlx::core::array result = mlx::core::gather_qmm(
+            *x_arr, *w_arr, *scales_arr, biases_opt,
+            lhs_opt, rhs_opt,
+            transpose,
+            std::optional<int>(group_size),
+            std::optional<int>(bits),
+            mode_str,
+            sorted_indices
+        );
+        return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_gather_qmm error: " << e.what() << std::endl;
+        return nullptr;
+    }
+}
+
 }  // extern "C"

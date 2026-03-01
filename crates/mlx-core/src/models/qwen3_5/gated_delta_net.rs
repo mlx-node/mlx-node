@@ -5,7 +5,23 @@ use napi::bindgen_prelude::*;
 use super::arrays_cache::ArraysCache;
 use super::config::Qwen3_5Config;
 use super::gated_delta::gated_delta_update;
+use super::quantized_linear::QuantizedLinear;
 use super::rms_norm_gated::RMSNormGated;
+
+/// A linear projection that can be either standard or quantized.
+enum LinearProj {
+    Standard(Linear),
+    Quantized(QuantizedLinear),
+}
+
+impl LinearProj {
+    fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        match self {
+            LinearProj::Standard(l) => l.forward(x),
+            LinearProj::Quantized(l) => l.forward(x),
+        }
+    }
+}
 
 /// GatedDeltaNet: Linear attention module using gated delta recurrence.
 ///
@@ -13,11 +29,11 @@ use super::rms_norm_gated::RMSNormGated;
 /// Uses depthwise convolution + state-space recurrence instead of softmax attention.
 pub struct GatedDeltaNet {
     // Projections
-    in_proj_qkvz: Linear, // hidden → key_dim*2 + value_dim*2 (q,k,v,z combined)
-    in_proj_ba: Linear,   // hidden → num_v_heads * 2 (b and a combined)
-    conv1d: Conv1d,       // depthwise conv, groups = conv_dim
-    norm: RMSNormGated,   // per-head norm: weight dim = value_head_dim
-    out_proj: Linear,     // value_dim → hidden
+    in_proj_qkvz: LinearProj, // hidden → key_dim*2 + value_dim*2 (q,k,v,z combined)
+    in_proj_ba: LinearProj,   // hidden → num_v_heads * 2 (b and a combined)
+    conv1d: Conv1d,            // depthwise conv, groups = conv_dim
+    norm: RMSNormGated,        // per-head norm: weight dim = value_head_dim
+    out_proj: LinearProj,      // value_dim → hidden
 
     // Learnable parameters
     dt_bias: MxArray, // [num_v_heads]
@@ -80,11 +96,11 @@ impl GatedDeltaNet {
         let a_log = MxArray::zeros(&[num_v_heads as i64], None)?; // Will be loaded from weights
 
         Ok(Self {
-            in_proj_qkvz,
-            in_proj_ba,
+            in_proj_qkvz: LinearProj::Standard(in_proj_qkvz),
+            in_proj_ba: LinearProj::Standard(in_proj_ba),
             conv1d,
             norm,
-            out_proj,
+            out_proj: LinearProj::Standard(out_proj),
             dt_bias,
             a_log,
             num_k_heads,
@@ -268,30 +284,69 @@ impl GatedDeltaNet {
         self.out_proj.forward(&y_flat)
     }
 
-    // ========== Weight accessors ==========
+    // ========== Weight accessors (standard mode) ==========
 
     pub fn set_in_proj_qkvz_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.in_proj_qkvz.set_weight(w)
+        match &mut self.in_proj_qkvz {
+            LinearProj::Standard(l) => l.set_weight(w),
+            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set weight on quantized in_proj_qkvz")),
+        }
     }
     pub fn set_in_proj_ba_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.in_proj_ba.set_weight(w)
+        match &mut self.in_proj_ba {
+            LinearProj::Standard(l) => l.set_weight(w),
+            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set weight on quantized in_proj_ba")),
+        }
     }
     pub fn set_conv1d_weight(&mut self, w: &MxArray) -> Result<()> {
         self.conv1d.set_weight(w)
     }
     pub fn set_norm_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.norm.set_weight(w)
+        // norm.weight may be stored as f32 in checkpoints for precision,
+        // but must match model dtype to avoid cascading f32 promotion.
+        let target_dtype = self.dt_bias.dtype()?;
+        let w_dtype = w.dtype()?;
+        if w_dtype != target_dtype {
+            let casted = w.astype(target_dtype)?;
+            self.norm.set_weight(&casted)
+        } else {
+            self.norm.set_weight(w)
+        }
     }
     pub fn set_out_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.out_proj.set_weight(w)
+        match &mut self.out_proj {
+            LinearProj::Standard(l) => l.set_weight(w),
+            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set weight on quantized out_proj")),
+        }
     }
     pub fn set_dt_bias(&mut self, w: &MxArray) {
         self.dt_bias = w.clone();
     }
-    pub fn set_a_log(&mut self, w: &MxArray) {
-        self.a_log = w.clone();
+    pub fn set_a_log(&mut self, w: &MxArray) -> Result<()> {
+        // A_log is stored as float32 in checkpoints for training precision,
+        // but must be cast to bf16 for inference to avoid cascading f32 promotion.
+        // Check if model weights are bf16 by looking at dt_bias dtype.
+        let target_dtype = self.dt_bias.dtype()?;
+        let w_dtype = w.dtype()?;
+        if w_dtype != target_dtype {
+            self.a_log = w.astype(target_dtype)?;
+        } else {
+            self.a_log = w.clone();
+        }
+        Ok(())
     }
 
+    // ========== Quantized setters ==========
+
+    pub fn set_quantized_in_proj_qkvz(&mut self, ql: QuantizedLinear) {
+        self.in_proj_qkvz = LinearProj::Quantized(ql);
+    }
+    pub fn set_quantized_in_proj_ba(&mut self, ql: QuantizedLinear) {
+        self.in_proj_ba = LinearProj::Quantized(ql);
+    }
+    pub fn set_quantized_out_proj(&mut self, ql: QuantizedLinear) {
+        self.out_proj = LinearProj::Quantized(ql);
+    }
 }
 
 /// RMS normalization without learnable weight (weight=None in Python).

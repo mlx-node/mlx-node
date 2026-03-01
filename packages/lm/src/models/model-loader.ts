@@ -6,8 +6,8 @@
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { Qwen3Model, Qwen35Model } from '@mlx-node/core';
-import type { Qwen3_5Model } from '@mlx-node/core';
+import { Qwen3Model, Qwen35Model, Qwen35MoeModel } from '@mlx-node/core';
+import type { Qwen3_5Model, Qwen3_5MoeModel } from '@mlx-node/core';
 
 /**
  * Model loader for Qwen3 and Qwen3.5 models
@@ -27,8 +27,12 @@ export class ModelLoader {
   static async loadPretrained(
     modelPath: string,
     _deviceMap: string = 'auto',
-  ): Promise<Qwen3Model | Qwen3_5Model> {
+  ): Promise<Qwen3Model | Qwen3_5Model | Qwen3_5MoeModel> {
     const modelType = detectModelType(modelPath);
+
+    if (modelType === 'qwen3_5_moe') {
+      return await Qwen35MoeModel.loadPretrained(modelPath);
+    }
 
     if (modelType === 'qwen3_5') {
       return await Qwen35Model.loadPretrained(modelPath);
@@ -38,15 +42,23 @@ export class ModelLoader {
   }
 
   /**
-   * Load a pretrained Qwen3.5 model from disk
-   *
-   * Supports both dense and MoE variants.
+   * Load a pretrained Qwen3.5 dense model from disk
    *
    * @param modelPath - Path to the model directory
    * @returns Loaded Qwen3.5 model
    */
   static async loadQwen35(modelPath: string): Promise<Qwen3_5Model> {
     return await Qwen35Model.loadPretrained(modelPath);
+  }
+
+  /**
+   * Load a pretrained Qwen3.5 MoE model from disk
+   *
+   * @param modelPath - Path to the model directory
+   * @returns Loaded Qwen3.5 MoE model
+   */
+  static async loadQwen35Moe(modelPath: string): Promise<Qwen3_5MoeModel> {
+    return await Qwen35MoeModel.loadPretrained(modelPath);
   }
 
   /**

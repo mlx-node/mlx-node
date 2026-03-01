@@ -4,10 +4,11 @@ use crate::transformer::MLP;
 use napi::bindgen_prelude::*;
 
 use super::attention::Qwen3_5Attention;
-use super::config::Qwen3_5Config;
+use super::config::Qwen3_5MoeConfig;
 use super::gated_delta_net::GatedDeltaNet;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::quantized_linear::QuantizedLinear;
+use super::sparse_moe::SparseMoeBlock;
 
 /// Attention type for a decoder layer.
 pub enum AttentionType {
@@ -15,7 +16,7 @@ pub enum AttentionType {
     Full(Qwen3_5Attention),
 }
 
-/// MLP type for a decoder layer (dense variant — no MoE).
+/// MLP type for a decoder layer.
 pub enum MLPType {
     Dense(MLP),
     QuantizedDense {
@@ -23,14 +24,10 @@ pub enum MLPType {
         up_proj: QuantizedLinear,
         down_proj: QuantizedLinear,
     },
+    MoE(SparseMoeBlock),
 }
 
-/// A single decoder layer in the Qwen3.5 dense model.
-///
-/// Each layer has:
-/// - Either linear attention (GatedDeltaNet) or full attention (Qwen3NextAttention)
-/// - Dense MLP (standard or quantized)
-/// - Pre-norm architecture with residual connections
+/// A single decoder layer in the Qwen3.5 MoE model.
 pub struct DecoderLayer {
     pub attn: AttentionType,
     pub mlp: MLPType,
@@ -39,24 +36,36 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    /// Whether this layer uses linear attention (derived from attention type).
     pub fn is_linear(&self) -> bool {
         matches!(self.attn, AttentionType::Linear(_))
     }
 
-    pub fn new(config: &Qwen3_5Config, layer_idx: usize) -> Result<Self> {
+    pub fn is_moe(&self) -> bool {
+        matches!(self.mlp, MLPType::MoE(_))
+    }
+
+    pub fn new(config: &Qwen3_5MoeConfig, layer_idx: usize) -> Result<Self> {
         let is_linear = config.is_linear_layer(layer_idx);
 
+        // Attention and GatedDeltaNet need a Qwen3_5Config-compatible interface.
+        // We create a temporary Qwen3_5Config from the MoE config for shared types.
+        let dense_config = config.to_dense_config();
+
         let attn = if is_linear {
-            AttentionType::Linear(GatedDeltaNet::new(config)?)
+            AttentionType::Linear(GatedDeltaNet::new(&dense_config)?)
         } else {
-            AttentionType::Full(Qwen3_5Attention::new(config)?)
+            AttentionType::Full(Qwen3_5Attention::new(&dense_config)?)
         };
 
-        let mlp = MLPType::Dense(MLP::new(
-            config.hidden_size as u32,
-            config.intermediate_size as u32,
-        )?);
+        let is_moe = config.is_moe_layer(layer_idx);
+        let mlp = if is_moe {
+            MLPType::MoE(SparseMoeBlock::new(config)?)
+        } else {
+            MLPType::Dense(MLP::new(
+                config.hidden_size as u32,
+                config.intermediate_size as u32,
+            )?)
+        };
 
         let input_layernorm = RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps))?;
         let post_attention_layernorm =
@@ -70,14 +79,12 @@ impl DecoderLayer {
         })
     }
 
-    /// Forward pass.
     pub fn forward(
         &mut self,
         x: &MxArray,
         mask: Option<&MxArray>,
         cache: Option<&mut Qwen3_5LayerCache>,
     ) -> Result<MxArray> {
-        // Pre-norm + attention
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = match &mut self.attn {
             AttentionType::Linear(gdn) => {
@@ -90,10 +97,8 @@ impl DecoderLayer {
             }
         };
 
-        // Residual connection
         let h = x.add(&attn_out)?;
 
-        // Pre-norm + MLP
         let normed = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = match &self.mlp {
             MLPType::Dense(mlp) => mlp.forward(&normed)?,
@@ -103,13 +108,11 @@ impl DecoderLayer {
                 let activated = Activations::swiglu(&gate, &up)?;
                 down_proj.forward(&activated)?
             }
+            MLPType::MoE(moe) => moe.forward(&normed)?,
         };
 
-        // Residual connection
         h.add(&mlp_out)
     }
-
-    // ========== Weight accessors ==========
 
     pub fn set_input_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {
         self.input_layernorm.set_weight(w)
@@ -119,7 +122,6 @@ impl DecoderLayer {
         self.post_attention_layernorm.set_weight(w)
     }
 
-    /// Replace the dense MLP with a quantized version.
     pub fn set_quantized_dense_mlp(
         &mut self,
         gate_proj: QuantizedLinear,

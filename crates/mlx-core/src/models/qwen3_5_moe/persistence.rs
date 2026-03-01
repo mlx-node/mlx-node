@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -12,12 +11,13 @@ use crate::array::MxArray;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::SafeTensorsFile;
 
-use super::config::Qwen3_5Config;
+use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
-use super::model::Qwen3_5Model;
-use super::quantized_linear::QuantizedLinear;
+use super::model::Qwen3_5MoeModel;
+use super::quantized_linear::{QuantizedLinear, QuantizedSwitchLinear};
+use super::switch_glu::SwitchGLU;
 
-/// Load all safetensors files from a directory (supports sharded checkpoints).
+/// Load all safetensors files from a directory.
 fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     let single_path = if dir.join("weights.safetensors").exists() {
         Some(dir.join("weights.safetensors"))
@@ -70,18 +70,10 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     Ok(all_params)
 }
 
-/// Sanitize weights from HuggingFace format (dense variant).
-///
-/// Handles:
-/// 1. Strip "model." and "language_model." prefixes
-/// 2. Rename embed_tokens → embedding, model.norm → final_norm
-/// 3. Remove lm_head.weight when tie_word_embeddings
-/// 4. Conv1d weight axis: transpose([0, 2, 1]) when shape[-1] != 1
-/// 5. Norm weight +1.0 adjustment (when unsanitized weights detected)
-/// 6. Remove MTP (multi-token prediction) weights
+/// Sanitize weights from HuggingFace format.
 fn sanitize_weights(
     mut params: HashMap<String, MxArray>,
-    config: &Qwen3_5Config,
+    config: &Qwen3_5MoeConfig,
 ) -> Result<HashMap<String, MxArray>> {
     let mut result: HashMap<String, MxArray> = HashMap::new();
 
@@ -100,6 +92,13 @@ fn sanitize_weights(
     });
     let needs_norm_fix = has_mtp_weights || has_unsanitized_conv1d;
 
+    let has_individual_experts = params.keys().any(|k| {
+        k.contains(".mlp.experts.0.up_proj.weight")
+            || k.contains("model.layers.0.mlp.experts.0.up_proj.weight")
+    });
+
+    let mut expert_weights: HashMap<String, Vec<(usize, MxArray)>> = HashMap::new();
+
     let norm_suffixes = [
         ".input_layernorm.weight",
         ".post_attention_layernorm.weight",
@@ -110,17 +109,13 @@ fn sanitize_weights(
     ];
 
     for (name, array) in params.drain() {
-        // Skip MTP weights
         if name.contains("mtp.") {
             continue;
         }
-
-        // Skip visual encoder weights (for VL models)
         if name.contains("model.visual") || name.contains("visual_encoder") {
             continue;
         }
 
-        // Strip prefixes (VL models use model.language_model.*, text-only use model.*)
         let name = name
             .strip_prefix("model.language_model.")
             .or_else(|| name.strip_prefix("language_model.model."))
@@ -129,7 +124,6 @@ fn sanitize_weights(
             .unwrap_or(&name)
             .to_string();
 
-        // Rename special keys
         let name = if name == "embed_tokens.weight" {
             "embedding.weight".to_string()
         } else if name == "norm.weight" {
@@ -138,13 +132,88 @@ fn sanitize_weights(
             name
         };
 
-        // Remove lm_head when tie_word_embeddings is set
         if config.tie_word_embeddings && name == "lm_head.weight" {
             continue;
         }
 
-        // Fix conv1d weight axis: HF stores [channels, 1, kernel_size],
-        // we need [channels, kernel_size, 1] for depthwise conv
+        // Handle individually-listed expert weights
+        if has_individual_experts && name.contains(".mlp.experts.") {
+            let parts: Vec<&str> = name.split('.').collect();
+            if parts.len() >= 7 {
+                let layer = parts[1];
+                let expert_idx: usize = parts[4].parse().map_err(|e| {
+                    Error::from_reason(format!(
+                        "Failed to parse expert index from weight '{}': {}",
+                        name, e
+                    ))
+                })?;
+                let proj_name = parts[5];
+                let key = format!("layers.{}.mlp.switch_mlp.{}.weight", layer, proj_name);
+                expert_weights
+                    .entry(key)
+                    .or_default()
+                    .push((expert_idx, array));
+                continue;
+            }
+        }
+
+        // Handle fused gate_up_proj split
+        if name.contains(".mlp.experts.gate_up_proj")
+            || name.contains(".mlp.switch_mlp.gate_up_proj")
+        {
+            let suffix = if name.ends_with(".weight") {
+                ".weight"
+            } else if name.ends_with(".scales") {
+                ".scales"
+            } else if name.ends_with(".biases") {
+                ".biases"
+            } else {
+                ".weight"
+            };
+
+            let shape = array.shape()?;
+            if shape.len() >= 2 {
+                let split_axis = shape.len() - 2;
+                let mid = shape[split_axis] / 2;
+                let gate = array.slice_axis(split_axis, 0, mid)?;
+                let up = array.slice_axis(split_axis, mid, shape[split_axis])?;
+
+                let name_stripped = name.strip_suffix(suffix).unwrap_or(&name);
+                let base = if name_stripped.contains("switch_mlp") {
+                    format!("{}{}", name_stripped.replace("gate_up_proj", "gate_proj"), suffix)
+                } else {
+                    format!("{}{}", name_stripped.replace("experts.gate_up_proj", "switch_mlp.gate_proj"), suffix)
+                };
+                let up_name = base.replace("gate_proj", "up_proj");
+
+                result.insert(base, gate);
+                result.insert(up_name, up);
+                continue;
+            } else {
+                let shape_vec: Vec<i64> = shape.to_vec();
+                warn!(
+                    "gate_up_proj tensor '{}' has unexpected shape {:?}, skipping split",
+                    name, shape_vec
+                );
+            }
+        }
+
+        // Handle experts.down_proj rename
+        let name = if name.contains(".mlp.experts.down_proj") {
+            let suffix = if name.ends_with(".scales") {
+                ".scales"
+            } else if name.ends_with(".biases") {
+                ".biases"
+            } else {
+                ".weight"
+            };
+            let stripped = name.strip_suffix(suffix).unwrap_or(&name);
+            format!("{}{}", stripped.replace(".mlp.experts.down_proj", ".mlp.switch_mlp.down_proj"), suffix)
+        } else {
+            name
+        };
+
+        // Fix conv1d weight axis
         let array = if name.contains("conv1d.weight") {
             let shape = array.shape()?;
             if shape.len() == 3 && shape[2] != 1 {
@@ -156,7 +225,7 @@ fn sanitize_weights(
             array
         };
 
-        // Apply norm +1.0 fix for unsanitized weights
+        // Apply norm +1.0 fix
         let array = if needs_norm_fix && norm_suffixes.iter().any(|sfx| name.ends_with(sfx)) {
             let ndim = array.ndim()?;
             if ndim == 1 {
@@ -172,15 +241,32 @@ fn sanitize_weights(
         result.insert(name, array);
     }
 
+    // Stack individual expert weights
+    if !expert_weights.is_empty() {
+        let num_experts = config.num_experts as usize;
+        for (key, mut experts) in expert_weights {
+            experts.sort_by_key(|(idx, _)| *idx);
+
+            if num_experts > 0 && experts.len() != num_experts {
+                return Err(Error::from_reason(format!(
+                    "Expected {} experts for {}, got {}",
+                    num_experts, key, experts.len()
+                )));
+            }
+
+            let arrays: Vec<&MxArray> = experts.iter().map(|(_, a)| a).collect();
+            let stacked = MxArray::stack(arrays, Some(0))?;
+            result.insert(key, stacked);
+        }
+    }
+
     Ok(result)
 }
 
-/// Check if a model checkpoint is quantized by looking for `.scales` keys.
 fn is_quantized_checkpoint(params: &HashMap<String, MxArray>) -> bool {
     params.keys().any(|k| k.ends_with(".scales"))
 }
 
-/// Helper: try to build a QuantizedLinear from weight/scales/biases keys.
 fn try_build_quantized_linear(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
@@ -201,19 +287,37 @@ fn try_build_quantized_linear(
     ))
 }
 
-/// Apply weights to a Qwen3.5 dense model.
-fn apply_weights(
-    model: &mut Qwen3_5Model,
+fn try_build_quantized_switch_linear(
     params: &HashMap<String, MxArray>,
-    config: &Qwen3_5Config,
+    key_prefix: &str,
+    group_size: i32,
+    bits: i32,
+) -> Option<QuantizedSwitchLinear> {
+    let weight = params.get(&format!("{}.weight", key_prefix))?;
+    let scales = params.get(&format!("{}.scales", key_prefix))?;
+    let biases = params.get(&format!("{}.biases", key_prefix)).cloned();
+    Some(QuantizedSwitchLinear::new(
+        weight.clone(),
+        scales.clone(),
+        biases,
+        group_size,
+        bits,
+        "affine".to_string(),
+    ))
+}
+
+/// Apply weights to a Qwen3.5 MoE model.
+fn apply_weights(
+    model: &mut Qwen3_5MoeModel,
+    params: &HashMap<String, MxArray>,
+    config: &Qwen3_5MoeConfig,
 ) -> Result<()> {
     let is_quantized = is_quantized_checkpoint(params);
-    // Embedding
+
     if let Some(w) = params.get("embedding.weight") {
         model.embedding.set_weight(w)?;
     }
 
-    // Final norm
     {
         let mut final_norm = model
             .final_norm
@@ -224,7 +328,6 @@ fn apply_weights(
         }
     }
 
-    // LM head
     {
         let mut lm_head = model
             .lm_head
@@ -237,7 +340,6 @@ fn apply_weights(
         }
     }
 
-    // Per-layer weights
     let mut layers = model
         .layers
         .write()
@@ -386,7 +488,7 @@ fn apply_weights(
             }
         }
 
-        // Dense MLP weights
+        // MLP weights
         match &mut layer.mlp {
             MLPType::Dense(mlp) => {
                 if is_quantized {
@@ -425,8 +527,100 @@ fn apply_weights(
                     }
                 }
             }
-            MLPType::QuantizedDense { .. } => {
-                // Already quantized, skip
+            MLPType::QuantizedDense { .. } => {}
+            MLPType::MoE(moe) => {
+                if is_quantized {
+                    let gate_bits = 8;
+                    let gate_gs = 64;
+                    let default_bits = 4;
+                    let default_gs = 64;
+
+                    if let Some(ql) = try_build_quantized_linear(
+                        params, &format!("{}.mlp.gate", prefix), gate_gs, gate_bits,
+                    ) {
+                        moe.set_quantized_gate(ql);
+                    } else if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
+                        moe.set_gate_weight(w)?;
+                    }
+
+                    let gate_proj_key = format!("{}.mlp.switch_mlp.gate_proj", prefix);
+                    let up_proj_key = format!("{}.mlp.switch_mlp.up_proj", prefix);
+                    let down_proj_key = format!("{}.mlp.switch_mlp.down_proj", prefix);
+
+                    let q_gate = try_build_quantized_switch_linear(params, &gate_proj_key, default_gs, default_bits);
+                    let q_up = try_build_quantized_switch_linear(params, &up_proj_key, default_gs, default_bits);
+                    let q_down = try_build_quantized_switch_linear(params, &down_proj_key, default_gs, default_bits);
+
+                    if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
+                        let quantized_switch = SwitchGLU::new_quantized(qg, qu, qd);
+                        moe.set_switch_mlp(quantized_switch);
+                    } else {
+                        if let Some(w) = params.get(&format!("{}.weight", gate_proj_key)) {
+                            moe.set_switch_mlp_gate_proj_weight(w);
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", up_proj_key)) {
+                            moe.set_switch_mlp_up_proj_weight(w);
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", down_proj_key)) {
+                            moe.set_switch_mlp_down_proj_weight(w);
+                        }
+                    }
+
+                    let se_gate_key = format!("{}.mlp.shared_expert.gate_proj", prefix);
+                    let se_up_key = format!("{}.mlp.shared_expert.up_proj", prefix);
+                    let se_down_key = format!("{}.mlp.shared_expert.down_proj", prefix);
+
+                    let q_se_gate = try_build_quantized_linear(params, &se_gate_key, default_gs, default_bits);
+                    let q_se_up = try_build_quantized_linear(params, &se_up_key, default_gs, default_bits);
+                    let q_se_down = try_build_quantized_linear(params, &se_down_key, default_gs, default_bits);
+
+                    if let (Some(qg), Some(qu), Some(qd)) = (q_se_gate, q_se_up, q_se_down) {
+                        moe.set_quantized_shared_expert(qg, qu, qd);
+                    } else {
+                        if let Some(w) = params.get(&format!("{}.weight", se_gate_key)) {
+                            moe.set_shared_expert_gate_proj_weight(w)?;
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", se_up_key)) {
+                            moe.set_shared_expert_up_proj_weight(w)?;
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", se_down_key)) {
+                            moe.set_shared_expert_down_proj_weight(w)?;
+                        }
+                    }
+
+                    if let Some(ql) = try_build_quantized_linear(
+                        params, &format!("{}.mlp.shared_expert_gate", prefix), gate_gs, gate_bits,
+                    ) {
+                        moe.set_quantized_shared_expert_gate(ql);
+                    } else if let Some(w) = params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix)) {
+                        moe.set_shared_expert_gate_weight(w)?;
+                    }
+                } else {
+                    if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
+                        moe.set_gate_weight(w)?;
+                    }
+                    if let Some(w) = params.get(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix)) {
+                        moe.set_switch_mlp_gate_proj_weight(w);
+                    }
+                    if let Some(w) = params.get(&format!("{}.mlp.switch_mlp.up_proj.weight", prefix)) {
+                        moe.set_switch_mlp_up_proj_weight(w);
+                    }
+                    if let Some(w) = params.get(&format!("{}.mlp.switch_mlp.down_proj.weight", prefix)) {
+                        moe.set_switch_mlp_down_proj_weight(w);
+                    }
+                    if let Some(w) = params.get(&format!("{}.mlp.shared_expert.gate_proj.weight", prefix)) {
+                        moe.set_shared_expert_gate_proj_weight(w)?;
+                    }
+                    if let Some(w) = params.get(&format!("{}.mlp.shared_expert.up_proj.weight", prefix)) {
+                        moe.set_shared_expert_up_proj_weight(w)?;
+                    }
+                    if let Some(w) = params.get(&format!("{}.mlp.shared_expert.down_proj.weight", prefix)) {
+                        moe.set_shared_expert_down_proj_weight(w)?;
+                    }
+                    if let Some(w) = params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix)) {
+                        moe.set_shared_expert_gate_weight(w)?;
+                    }
+                }
             }
         }
 
@@ -439,7 +633,7 @@ fn apply_weights(
         }
     }
 
-    // Verify mandatory weights were present
+    // Verify mandatory weights
     let mut missing_mandatory = Vec::new();
     if !params.contains_key("embedding.weight") {
         missing_mandatory.push("embedding.weight".to_string());
@@ -457,21 +651,20 @@ fn apply_weights(
 
     for i in 0..num_layers {
         let prefix = format!("layers.{}", i);
-
         let has_attn = params.contains_key(&format!("{}.self_attn.q_proj.weight", prefix))
             || params.contains_key(&format!("{}.self_attn.q_proj.scales", prefix))
             || params.contains_key(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
             || params.contains_key(&format!("{}.linear_attn.in_proj_qkvz.scales", prefix))
             || params.contains_key(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))
             || params.contains_key(&format!("{}.linear_attn.in_proj_qkv.scales", prefix));
-
         if !has_attn {
             layers_missing_attn.push(i);
         }
-
         let has_mlp = params.contains_key(&format!("{}.mlp.gate_proj.weight", prefix))
-            || params.contains_key(&format!("{}.mlp.gate_proj.scales", prefix));
-
+            || params.contains_key(&format!("{}.mlp.gate.weight", prefix))
+            || params.contains_key(&format!("{}.mlp.gate.scales", prefix))
+            || params.contains_key(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix))
+            || params.contains_key(&format!("{}.mlp.switch_mlp.gate_proj.scales", prefix));
         if !has_mlp {
             layers_missing_mlp.push(i);
         }
@@ -489,7 +682,6 @@ fn apply_weights(
             ));
         }
     }
-
     if !layers_missing_mlp.is_empty() {
         if layers_missing_mlp.len() == num_layers {
             missing_mandatory.push("layers.*.mlp weights".to_string());
@@ -511,33 +703,15 @@ fn apply_weights(
     }
 
     let total_weights = params.len();
-    let expected_prefixes = ["embedding.", "final_norm.", "lm_head.", "layers."];
-    let recognized = params
-        .keys()
-        .filter(|k| expected_prefixes.iter().any(|p| k.starts_with(p)))
-        .count();
-    let unrecognized: Vec<_> = params
-        .keys()
-        .filter(|k| !expected_prefixes.iter().any(|p| k.starts_with(p)))
-        .collect();
-    if !unrecognized.is_empty() {
-        warn!(
-            "{} weights in checkpoint were not recognized: {:?}",
-            unrecognized.len(),
-            &unrecognized[..unrecognized.len().min(10)]
-        );
-    }
     info!(
-        "Applied weights from checkpoint: {}/{} recognized, {} total in checkpoint",
-        recognized,
-        params.len(),
+        "Applied weights from checkpoint: {} total in checkpoint",
         total_weights
     );
     Ok(())
 }
 
-/// Load a pretrained Qwen3.5 dense model from a directory.
-pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
+/// Load a pretrained Qwen3.5 MoE model from a directory.
+pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5MoeModel> {
     let model_path = model_path.to_string();
 
     napi::tokio::task::spawn_blocking(move || {
@@ -550,7 +724,6 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
             )));
         }
 
-        // Load config
         let config_path = path.join("config.json");
         let config_data = fs::read_to_string(&config_path)
             .map_err(|e| Error::from_reason(format!("Failed to read config: {}", e)))?;
@@ -560,18 +733,16 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
         let config = parse_config(&raw)?;
 
         info!(
-            "Qwen3.5 config: {} layers, hidden={}, heads={}, kv_heads={}",
+            "Qwen3.5 MoE config: {} layers, hidden={}, experts={}x{}",
             config.num_layers,
             config.hidden_size,
-            config.num_heads,
-            config.num_kv_heads,
+            config.num_experts,
+            config.num_experts_per_tok
         );
 
-        // Load all weights
         let raw_params = load_all_safetensors(path)?;
         info!("Loaded {} raw tensors", raw_params.len());
 
-        // Sanitize weights
         let params = sanitize_weights(raw_params, &config)?;
         let quantized = is_quantized_checkpoint(&params);
         info!(
@@ -580,7 +751,6 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
             quantized
         );
 
-        // Load tokenizer
         let tokenizer_path = path.join("tokenizer.json");
         let tokenizer = if tokenizer_path.exists() {
             info!("Loading tokenizer from: {}", tokenizer_path.display());
@@ -593,91 +763,24 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
             None
         };
 
-        // Create model
-        let mut model = Qwen3_5Model::new(config.clone())?;
-
-        // Apply weights
+        let mut model = Qwen3_5MoeModel::new(config.clone())?;
         apply_weights(&mut model, &params, &config)?;
 
-        // Register weights with C++ compiled forward pass (dense-only).
-        register_weights_with_cpp(&params);
+        // No C++ compiled path for MoE — expert routing not supported in C++
 
-        // Set tokenizer
         if let Some(tok) = tokenizer {
             model.tokenizer = Some(Arc::new(tok));
         }
 
-        info!("Qwen3.5 model loaded successfully");
+        info!("Qwen3.5 MoE model loaded successfully");
         Ok(model)
     })
     .await
     .map_err(|e| Error::from_reason(format!("Failed to load model: {}", e)))?
 }
 
-/// Register all sanitized weights with the C++ fused forward pass.
-fn register_weights_with_cpp(params: &HashMap<String, MxArray>) {
-    use mlx_sys as sys;
-
-    unsafe { sys::mlx_qwen35_clear_weights() };
-
-    let store = |name: &str, array: &MxArray| {
-        let c_name = CString::new(name).expect("Weight name contains null byte");
-        unsafe {
-            sys::mlx_qwen35_store_weight(c_name.as_ptr(), array.as_raw_ptr());
-        }
-    };
-
-    let mut handled_splits: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for (name, array) in params {
-        if name.ends_with(".linear_attn.in_proj_qkv.weight") {
-            let prefix = name.strip_suffix(".in_proj_qkv.weight").unwrap();
-            let z_key = format!("{}.in_proj_z.weight", prefix);
-            if let Some(z_array) = params.get(&z_key) {
-                if let Ok(combined) = MxArray::concatenate(array, z_array, 0) {
-                    let combined_key = format!("{}.in_proj_qkvz.weight", prefix);
-                    store(&combined_key, &combined);
-                    handled_splits.insert(z_key);
-                    handled_splits.insert(name.clone());
-                    continue;
-                }
-            }
-        }
-        if name.ends_with(".linear_attn.in_proj_z.weight") && handled_splits.contains(name) {
-            continue;
-        }
-
-        if name.ends_with(".linear_attn.in_proj_b.weight") {
-            let prefix = name.strip_suffix(".in_proj_b.weight").unwrap();
-            let a_key = format!("{}.in_proj_a.weight", prefix);
-            if let Some(a_array) = params.get(&a_key) {
-                if let Ok(combined) = MxArray::concatenate(array, a_array, 0) {
-                    let combined_key = format!("{}.in_proj_ba.weight", prefix);
-                    store(&combined_key, &combined);
-                    handled_splits.insert(a_key);
-                    handled_splits.insert(name.clone());
-                    continue;
-                }
-            }
-        }
-        if name.ends_with(".linear_attn.in_proj_a.weight") && handled_splits.contains(name) {
-            continue;
-        }
-
-        if !handled_splits.contains(name) {
-            store(name, array);
-        }
-    }
-
-    let count = unsafe { sys::mlx_qwen35_weight_count() };
-    info!(
-        "Registered {} weights with C++ fused forward pass",
-        count
-    );
-}
-
-/// Parse Qwen3.5 dense config from JSON.
-fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
+/// Parse Qwen3.5 MoE config from JSON.
+fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
     let text_cfg = raw.get("text_config");
 
     let get_i32 = |keys: &[&str], default: i32| -> i32 {
@@ -749,44 +852,33 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
     let num_kv_heads = get_i32(&["num_key_value_heads", "num_kv_heads"], 8);
     let vocab_size = get_i32(&["vocab_size"], 151936);
 
+    let num_experts = get_i32(&["num_experts"], 0);
+    let num_experts_per_tok = get_i32(&["num_experts_per_tok"], 1);
+    let moe_i = get_i32(&["moe_intermediate_size"], 0);
+
     if hidden_size <= 0 {
         return Err(Error::from_reason(format!(
-            "Invalid Qwen3.5 config: hidden_size must be > 0, got {}",
-            hidden_size
+            "Invalid config: hidden_size must be > 0, got {}", hidden_size
         )));
     }
     if num_layers <= 0 {
         return Err(Error::from_reason(format!(
-            "Invalid Qwen3.5 config: num_hidden_layers must be > 0, got {}",
-            num_layers
+            "Invalid config: num_hidden_layers must be > 0, got {}", num_layers
         )));
     }
-    if num_heads <= 0 {
+    if num_experts <= 0 {
         return Err(Error::from_reason(format!(
-            "Invalid Qwen3.5 config: num_attention_heads must be > 0, got {}",
-            num_heads
+            "MoE config requires num_experts > 0, got {}", num_experts
         )));
     }
-    if intermediate_size <= 0 {
+    if intermediate_size <= 0 && moe_i <= 0 {
         return Err(Error::from_reason(format!(
-            "Invalid Qwen3.5 config: intermediate_size must be > 0, got {}",
-            intermediate_size
-        )));
-    }
-    if num_kv_heads <= 0 {
-        return Err(Error::from_reason(format!(
-            "Invalid Qwen3.5 config: num_kv_heads must be > 0, got {}",
-            num_kv_heads
-        )));
-    }
-    if vocab_size <= 0 {
-        return Err(Error::from_reason(format!(
-            "Invalid Qwen3.5 config: vocab_size must be > 0, got {}",
-            vocab_size
+            "Invalid config: intermediate_size ({}) or moe_intermediate_size ({}) must be > 0",
+            intermediate_size, moe_i
         )));
     }
 
-    Ok(Qwen3_5Config {
+    Ok(Qwen3_5MoeConfig {
         vocab_size,
         hidden_size,
         num_layers,
@@ -810,5 +902,25 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         full_attention_interval: get_i32(&["full_attention_interval"], 4),
         partial_rotary_factor,
         rope_theta,
+
+        num_experts,
+        num_experts_per_tok,
+        decoder_sparse_step: get_i32(&["decoder_sparse_step"], 1),
+        shared_expert_intermediate_size: {
+            let v = get_i32(&["shared_expert_intermediate_size"], 0);
+            if v > 0 { Some(v) } else { None }
+        },
+        moe_intermediate_size: {
+            if moe_i > 0 { Some(moe_i) } else { None }
+        },
+        norm_topk_prob: get_bool(&["norm_topk_prob"], true),
+        mlp_only_layers: text_cfg
+            .and_then(|tc| tc["mlp_only_layers"].as_array())
+            .or_else(|| raw["mlp_only_layers"].as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_i64().map(|i| i as i32))
+                    .collect()
+            }),
     })
 }

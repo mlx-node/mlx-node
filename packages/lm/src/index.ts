@@ -24,6 +24,16 @@ export type {
   Qwen35GenerationResult,
 } from '@mlx-node/core';
 
+// MoE variant
+export { Qwen35MoeModel, Qwen35MoeModel as Qwen3_5MoeModel } from '@mlx-node/core';
+export type {
+  Qwen35MoeConfig,
+  Qwen35MoeChatConfig,
+  Qwen35MoeChatResult,
+  Qwen35MoeGenerationConfig,
+  Qwen35MoeGenerationResult,
+} from '@mlx-node/core';
+
 // Note: Memory management is handled internally by Rust - not exposed to JS
 
 // Types

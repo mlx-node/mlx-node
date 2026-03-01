@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vite-plus/test';
-import { Qwen35Model, MxArray } from '@mlx-node/core';
-import type { Qwen35Config } from '@mlx-node/core';
+import { Qwen35Model, Qwen35MoeModel, MxArray } from '@mlx-node/core';
+import type { Qwen35Config, Qwen35MoeConfig } from '@mlx-node/core';
 import { shape } from '../test-utils';
 
 describe.sequential('Qwen3.5 MoE', () => {
@@ -29,7 +29,7 @@ describe.sequential('Qwen3.5 MoE', () => {
     ropeTheta: 10000.0,
   };
 
-  it('should create dense model when numExperts is undefined', () => {
+  it('should create dense model', () => {
     const model = new Qwen35Model(denseConfig);
     expect(model).toBeDefined();
 
@@ -39,7 +39,7 @@ describe.sequential('Qwen3.5 MoE', () => {
   });
 
   it('should create MoE model with experts', () => {
-    const moeConfig: Qwen35Config = {
+    const moeConfig: Qwen35MoeConfig = {
       ...denseConfig,
       numExperts: 4,
       numExpertsPerTok: 2,
@@ -49,7 +49,7 @@ describe.sequential('Qwen3.5 MoE', () => {
       normTopkProb: true,
     };
 
-    const model = new Qwen35Model(moeConfig);
+    const model = new Qwen35MoeModel(moeConfig);
     expect(model).toBeDefined();
 
     const input = MxArray.fromInt32(new Int32Array([1, 2]), shape(1, 2));
@@ -59,7 +59,7 @@ describe.sequential('Qwen3.5 MoE', () => {
 
   it('should have more parameters with MoE than dense', () => {
     const dense = new Qwen35Model(denseConfig);
-    const moe = new Qwen35Model({
+    const moe = new Qwen35MoeModel({
       ...denseConfig,
       numExperts: 4,
       numExpertsPerTok: 2,

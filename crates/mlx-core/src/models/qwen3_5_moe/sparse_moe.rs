@@ -3,7 +3,7 @@ use crate::nn::{Activations, Linear};
 use crate::transformer::MLP;
 use napi::bindgen_prelude::*;
 
-use super::config::Qwen3_5Config;
+use super::config::Qwen3_5MoeConfig;
 use super::quantized_linear::QuantizedLinear;
 use super::switch_glu::SwitchGLU;
 
@@ -23,7 +23,6 @@ impl LinearProj {
 }
 
 /// An MLP that can be either standard or quantized.
-/// For quantized mode, we use 3 QuantizedLinear layers (gate, up, down).
 pub enum MLPVariant {
     Standard(MLP),
     Quantized {
@@ -52,25 +51,20 @@ impl MLPVariant {
 }
 
 /// SparseMoeBlock: Mixture-of-Experts block with shared expert.
-///
-/// Routes tokens to top-k experts via learned gating, then adds
-/// a dedicated shared expert (gated by sigmoid) to all tokens.
-///
-/// Supports both standard (bf16) and quantized (4-bit/8-bit) modes.
 pub struct SparseMoeBlock {
-    gate: LinearProj,           // hidden -> num_experts (routing logits)
-    switch_mlp: SwitchGLU,      // expert MLP with gather_mm/gather_qmm
-    shared_expert: MLPVariant,  // dedicated shared expert
-    shared_expert_gate: LinearProj, // hidden -> 1 (sigmoid gating for shared expert)
+    gate: LinearProj,
+    switch_mlp: SwitchGLU,
+    shared_expert: MLPVariant,
+    shared_expert_gate: LinearProj,
     num_experts: i32,
     num_experts_per_tok: i32,
     norm_topk_prob: bool,
 }
 
 impl SparseMoeBlock {
-    pub fn new(config: &Qwen3_5Config) -> Result<Self> {
-        let num_experts = config.num_experts.unwrap_or(0);
-        let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
+    pub fn new(config: &Qwen3_5MoeConfig) -> Result<Self> {
+        let num_experts = config.num_experts;
+        let num_experts_per_tok = config.num_experts_per_tok;
 
         if num_experts <= 0 {
             return Err(Error::from_reason(format!(
@@ -92,7 +86,7 @@ impl SparseMoeBlock {
         let shared_expert_intermediate = config
             .shared_expert_intermediate_size
             .unwrap_or(config.intermediate_size);
-        let norm_topk_prob = config.norm_topk_prob.unwrap_or(true);
+        let norm_topk_prob = config.norm_topk_prob;
 
         let gate = Linear::new(hidden_size as u32, num_experts as u32, Some(false))?;
         let switch_mlp = SwitchGLU::new(
@@ -114,17 +108,16 @@ impl SparseMoeBlock {
         })
     }
 
-    /// Create a quantized SparseMoeBlock.
     pub fn new_quantized(
-        config: &Qwen3_5Config,
+        config: &Qwen3_5MoeConfig,
         gate: QuantizedLinear,
         switch_mlp: SwitchGLU,
         shared_expert: MLPVariant,
         shared_expert_gate: QuantizedLinear,
     ) -> Result<Self> {
-        let num_experts = config.num_experts.unwrap_or(0);
-        let num_experts_per_tok = config.num_experts_per_tok.unwrap_or(1);
-        let norm_topk_prob = config.norm_topk_prob.unwrap_or(true);
+        let num_experts = config.num_experts;
+        let num_experts_per_tok = config.num_experts_per_tok;
+        let norm_topk_prob = config.norm_topk_prob;
 
         Ok(Self {
             gate: LinearProj::Quantized(gate),
@@ -137,13 +130,6 @@ impl SparseMoeBlock {
         })
     }
 
-    /// Forward pass.
-    ///
-    /// # Arguments
-    /// * `x` - Input [B, T, hidden_size]
-    ///
-    /// # Returns
-    /// Output [B, T, hidden_size]
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
         let shape = x.shape()?;
         if shape.len() != 3 {
@@ -159,27 +145,16 @@ impl SparseMoeBlock {
         let k = self.num_experts_per_tok as i64;
         let num_exp = self.num_experts as i64;
 
-        // Flatten: [B, T, D] -> [B*T, D]
         let x_flat = x.reshape(&[ne, hidden_size])?;
-
-        // Routing logits: [B*T, num_experts]
         let router_logits = self.gate.forward(&x_flat)?;
-
-        // Softmax over experts: [B*T, num_experts]
         let routing_weights = Activations::softmax(&router_logits, Some(-1))?;
 
-        // Top-k: argpartition to find k largest routing weights.
-        // argpartition at kth=-k puts the k largest values in the last k positions.
         let top_indices_full = routing_weights.argpartition(-(k as i32), Some(-1))?;
         let top_indices = top_indices_full.slice_axis(1, num_exp - k, num_exp)?;
-
-        // Gather top-k weights: [B*T, k]
         let top_weights = routing_weights.take_along_axis(&top_indices, -1)?;
 
-        // Normalize weights if configured
         let top_weights = if self.norm_topk_prob {
             let sum = top_weights.sum(Some(&[-1]), Some(true))?;
-            // Cast epsilon to match input dtype to avoid f32 promotion for bf16/f16 models
             let eps = MxArray::scalar_float(1e-8)?.astype(x.dtype()?)?;
             let safe_sum = sum.add(&eps)?;
             top_weights.div(&safe_sum)?
@@ -187,28 +162,21 @@ impl SparseMoeBlock {
             top_weights
         };
 
-        // Expert forward: x_flat (ne, D), top_indices (ne, k) -> (ne, k, D)
         let expert_out = self.switch_mlp.forward(&x_flat, &top_indices)?;
-
-        // Weight by routing scores: (ne, k, 1) * (ne, k, D) -> sum over k -> (ne, D)
         let weights_expanded = top_weights.reshape(&[ne, k, 1])?;
         let weighted = expert_out.mul(&weights_expanded)?;
         let expert_output = weighted.sum(Some(&[1]), None)?;
 
-        // Shared expert contribution
         let shared_out = self.shared_expert.forward(&x_flat)?;
         let shared_gate = self.shared_expert_gate.forward(&x_flat)?;
         let shared_gate = Activations::sigmoid(&shared_gate)?;
         let shared_contribution = shared_out.mul(&shared_gate)?;
 
-        // Combine: expert_output + shared_expert_output
         let output = expert_output.add(&shared_contribution)?;
-
-        // Reshape back: [B*T, D] -> [B, T, D]
         output.reshape(&[batch, seq_len, hidden_size])
     }
 
-    // ========== Weight accessors (standard mode) ==========
+    // ========== Weight accessors ==========
 
     pub fn set_gate_weight(&mut self, w: &MxArray) -> Result<()> {
         match &mut self.gate {
@@ -262,27 +230,22 @@ impl SparseMoeBlock {
         }
     }
 
-    /// Get a mutable reference to the switch_mlp for setting quantized projections.
     pub fn switch_mlp_mut(&mut self) -> &mut SwitchGLU {
         &mut self.switch_mlp
     }
 
-    /// Replace the switch_mlp entirely (used during quantized weight loading).
     pub fn set_switch_mlp(&mut self, mlp: SwitchGLU) {
         self.switch_mlp = mlp;
     }
 
-    /// Replace the gate with a quantized version.
     pub fn set_quantized_gate(&mut self, gate: QuantizedLinear) {
         self.gate = LinearProj::Quantized(gate);
     }
 
-    /// Replace the shared_expert_gate with a quantized version.
     pub fn set_quantized_shared_expert_gate(&mut self, gate: QuantizedLinear) {
         self.shared_expert_gate = LinearProj::Quantized(gate);
     }
 
-    /// Replace the shared expert with a quantized version.
     pub fn set_quantized_shared_expert(
         &mut self,
         gate_proj: QuantizedLinear,

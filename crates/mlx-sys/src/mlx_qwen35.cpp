@@ -644,12 +644,13 @@ void mlx_qwen35_compiled_init_from_prefill(
   g_offset_int = prefill_offset;
   g_compile_inited = true;
 
-  // CRITICAL: Evaluate the global RNG key state to break the lazy split chain.
-  // During model loading, KeySequence::next() is called 400+ times, each creating
-  // a lazy split(key). Without evaluation, the decode step's categorical() call
-  // pulls the entire 400+ node chain into the eval tape (~452 RandomBits + 452 Split).
-  // Evaluating the key here materializes it, so decode steps see a concrete key.
-  mlx::core::random::KeySequence::default_().eval_key();
+  // Break the lazy RNG split chain from model initialization.
+  // During model loading, KeySequence::next() is called 400+ times (Linear/Conv1d
+  // constructors), each creating a lazy split(key). Without evaluation, subsequent
+  // categorical() calls during generation would trace through all previous splits.
+  // Calling next() and evaluating it materializes the current key state.
+  auto rng_key = mlx::core::random::KeySequence::default_().next();
+  mlx::core::eval({rng_key});
 }
 
 // =============================================================================

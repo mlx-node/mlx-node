@@ -711,6 +711,25 @@ export declare class Qwen35Model {
 export type Qwen3_5Model = Qwen35Model;
 
 /**
+ * Qwen3.5 MoE Model -- hybrid linear/full attention with Mixture-of-Experts.
+ *
+ * No compiled C++ forward path — MoE models use the Rust forward_with_locks path
+ * since the C++ compiled forward doesn't support sparse expert routing.
+ */
+export declare class Qwen35MoeModel {
+  constructor(config: Qwen35MoeConfig);
+  initCaches(): void;
+  resetCaches(): void;
+  forward(inputIds: MxArray): MxArray;
+  forwardWithCache(inputIds: MxArray): MxArray;
+  static loadPretrained(path: string): Promise<Qwen35MoeModel>;
+  generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
+  chat(messages: Array<ChatMessage>, config?: Qwen35MoeChatConfig | undefined | null): Promise<Qwen35MoeChatResult>;
+  numParameters(): number;
+}
+export type Qwen3_5MoeModel = Qwen35MoeModel;
+
+/**
  * Qwen3 Model with automatic differentiation support
  *
  * Uses interior mutability (RwLock) for layers, final_norm, and lm_head
@@ -2644,10 +2663,9 @@ export interface Qwen35ChatResult {
 }
 
 /**
- * Qwen3.5 model configuration.
+ * Qwen3.5 model configuration (dense variant).
  *
- * Supports both dense and MoE variants. MoE fields are optional -
- * when `num_experts` is 0 or None, the model uses dense MLP layers.
+ * For MoE models, use `Qwen3_5MoeConfig` from `qwen3_5_moe`.
  */
 export interface Qwen35Config {
   vocabSize: number;
@@ -2672,13 +2690,6 @@ export interface Qwen35Config {
   fullAttentionInterval: number;
   partialRotaryFactor: number;
   ropeTheta: number;
-  numExperts?: number | undefined;
-  numExpertsPerTok?: number | undefined;
-  decoderSparseStep?: number | undefined;
-  sharedExpertIntermediateSize?: number | undefined;
-  moeIntermediateSize?: number | undefined;
-  normTopkProb?: boolean | undefined;
-  mlpOnlyLayers?: number[] | undefined;
 }
 
 /** Generation configuration for Qwen3.5 */
@@ -2692,6 +2703,78 @@ export interface Qwen35GenerationConfig {
 
 /** Generation result */
 export interface Qwen35GenerationResult {
+  tokens: Array<number>;
+  text: string;
+  numTokens: number;
+  finishReason: string;
+}
+
+/** Chat configuration for Qwen3.5 MoE */
+export interface Qwen35MoeChatConfig {
+  maxNewTokens?: number | undefined;
+  temperature?: number | undefined;
+  topK?: number | undefined;
+  topP?: number | undefined;
+  minP?: number | undefined;
+  tools?: Array<ToolDefinition>;
+}
+
+/** Chat result */
+export interface Qwen35MoeChatResult {
+  text: string;
+  thinking?: string;
+  numTokens: number;
+  finishReason: string;
+}
+
+/**
+ * Qwen3.5 MoE model configuration.
+ *
+ * Contains all fields including MoE-specific ones (num_experts, etc.).
+ */
+export interface Qwen35MoeConfig {
+  vocabSize: number;
+  hiddenSize: number;
+  numLayers: number;
+  numHeads: number;
+  numKvHeads: number;
+  intermediateSize: number;
+  rmsNormEps: number;
+  headDim: number;
+  tieWordEmbeddings: boolean;
+  attentionBias: boolean;
+  maxPositionEmbeddings: number;
+  padTokenId: number;
+  eosTokenId: number;
+  bosTokenId: number;
+  linearNumValueHeads: number;
+  linearNumKeyHeads: number;
+  linearKeyHeadDim: number;
+  linearValueHeadDim: number;
+  linearConvKernelDim: number;
+  fullAttentionInterval: number;
+  partialRotaryFactor: number;
+  ropeTheta: number;
+  numExperts: number;
+  numExpertsPerTok: number;
+  decoderSparseStep: number;
+  sharedExpertIntermediateSize?: number | undefined;
+  moeIntermediateSize?: number | undefined;
+  normTopkProb: boolean;
+  mlpOnlyLayers?: number[] | undefined;
+}
+
+/** Generation configuration for Qwen3.5 MoE */
+export interface Qwen35MoeGenerationConfig {
+  maxNewTokens: number;
+  temperature?: number | undefined;
+  topK?: number | undefined;
+  topP?: number | undefined;
+  minP?: number | undefined;
+}
+
+/** Generation result */
+export interface Qwen35MoeGenerationResult {
   tokens: Array<number>;
   text: string;
   numTokens: number;
