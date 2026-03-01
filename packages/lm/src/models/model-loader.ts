@@ -4,7 +4,7 @@
  * Handles loading pretrained weights from MLX format or converting from HuggingFace.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Qwen3Model, Qwen35Model, Qwen35MoeModel } from '@mlx-node/core';
 import type { Qwen3_5Model, Qwen3_5MoeModel } from '@mlx-node/core';
@@ -28,7 +28,7 @@ export class ModelLoader {
     modelPath: string,
     _deviceMap: string = 'auto',
   ): Promise<Qwen3Model | Qwen3_5Model | Qwen3_5MoeModel> {
-    const modelType = detectModelType(modelPath);
+    const modelType = await detectModelType(modelPath);
 
     if (modelType === 'qwen3_5_moe') {
       return await Qwen35MoeModel.loadPretrained(modelPath);
@@ -76,9 +76,9 @@ export class ModelLoader {
   }
 }
 
-function detectModelType(modelPath: string): string {
+async function detectModelType(modelPath: string): Promise<string> {
   try {
-    const raw = readFileSync(join(modelPath, 'config.json'), 'utf-8');
+    const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
     const config = JSON.parse(raw);
     return config.model_type ?? 'qwen3';
   } catch {

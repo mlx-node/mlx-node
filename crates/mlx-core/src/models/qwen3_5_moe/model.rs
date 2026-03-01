@@ -667,8 +667,8 @@ fn eval_token_and_caches(
 ) {
     let mut handles: Vec<*mut mlx_sys::mlx_array> = vec![next_token.as_raw_ptr()];
 
-    if let Ok(caches_guard) = caches_arc.read() {
-        if let Some(ref caches) = *caches_guard {
+    if let Ok(caches_guard) = caches_arc.read()
+        && let Some(ref caches) = *caches_guard {
             let mut arr_refs: Vec<&MxArray> = Vec::with_capacity(caches.len() * 2);
             for cache in caches.iter() {
                 cache.collect_arrays(&mut arr_refs);
@@ -677,7 +677,6 @@ fn eval_token_and_caches(
                 handles.push(arr.as_raw_ptr());
             }
         }
-    }
 
     unsafe {
         mlx_sys::mlx_async_eval(handles.as_mut_ptr(), handles.len());
@@ -755,8 +754,11 @@ impl Qwen3_5MoeModel {
     }
 
     fn create_ssm_mask(&self, hidden_states: &MxArray) -> Result<Option<MxArray>> {
-        let batch = hidden_states.shape_at(0)?;
         let seq_len = hidden_states.shape_at(1)?;
+        if seq_len <= 1 {
+            return Ok(None);
+        }
+        let batch = hidden_states.shape_at(0)?;
         let mask = MxArray::ones(&[batch, seq_len], Some(hidden_states.dtype()?))?;
         Ok(Some(mask))
     }

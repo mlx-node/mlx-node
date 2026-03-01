@@ -1,8 +1,115 @@
+use std::collections::HashMap;
 use std::ffi::CString;
 
 use crate::array::MxArray;
+use crate::nn::{Activations, Linear};
+use crate::transformer::MLP;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
+
+/// Default quantization parameters for 4-bit models.
+pub const DEFAULT_QUANT_BITS: i32 = 4;
+pub const DEFAULT_QUANT_GROUP_SIZE: i32 = 64;
+/// Router gates use higher precision (8-bit).
+pub const GATE_QUANT_BITS: i32 = 8;
+pub const DEFAULT_QUANT_MODE: &str = "affine";
+
+/// A linear projection that can be either standard or quantized.
+///
+/// Shared between attention, GatedDeltaNet, and SparseMoeBlock.
+pub enum LinearProj {
+    Standard(Linear),
+    Quantized(QuantizedLinear),
+}
+
+impl LinearProj {
+    pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        match self {
+            LinearProj::Standard(l) => l.forward(x),
+            LinearProj::Quantized(l) => l.forward(x),
+        }
+    }
+
+    pub fn set_weight(&mut self, w: &MxArray, name: &str) -> Result<()> {
+        match self {
+            LinearProj::Standard(l) => l.set_weight(w),
+            LinearProj::Quantized(_) => Err(Error::from_reason(format!(
+                "Cannot set weight on quantized {}",
+                name
+            ))),
+        }
+    }
+
+    pub fn set_bias(&mut self, b: Option<&MxArray>, name: &str) -> Result<()> {
+        match self {
+            LinearProj::Standard(l) => l.set_bias(b),
+            LinearProj::Quantized(_) => Err(Error::from_reason(format!(
+                "Cannot set bias on quantized {}",
+                name
+            ))),
+        }
+    }
+
+    pub fn set_quantized(&mut self, ql: QuantizedLinear) {
+        *self = LinearProj::Quantized(ql);
+    }
+}
+
+/// An MLP that can be either standard or quantized.
+///
+/// Shared between decoder_layer and sparse_moe.
+pub enum MLPVariant {
+    Standard(MLP),
+    Quantized {
+        gate_proj: QuantizedLinear,
+        up_proj: QuantizedLinear,
+        down_proj: QuantizedLinear,
+    },
+}
+
+impl MLPVariant {
+    pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        match self {
+            MLPVariant::Standard(mlp) => mlp.forward(x),
+            MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                let gate = gate_proj.forward(x)?;
+                let up = up_proj.forward(x)?;
+                let activated = Activations::swiglu(&gate, &up)?;
+                down_proj.forward(&activated)
+            }
+        }
+    }
+}
+
+/// Check if a model checkpoint is quantized by looking for `.scales` keys.
+pub fn is_quantized_checkpoint(params: &HashMap<String, MxArray>) -> bool {
+    params.keys().any(|k| k.ends_with(".scales"))
+}
+
+/// Try to build a QuantizedLinear from weight/scales/biases keys in a params map.
+pub fn try_build_quantized_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+    group_size: i32,
+    bits: i32,
+) -> Option<QuantizedLinear> {
+    let weight = params.get(&format!("{}.weight", key_prefix))?;
+    let scales = params.get(&format!("{}.scales", key_prefix))?;
+    let biases = params.get(&format!("{}.biases", key_prefix)).cloned();
+    Some(QuantizedLinear::new(
+        weight.clone(),
+        scales.clone(),
+        biases,
+        None,
+        group_size,
+        bits,
+        DEFAULT_QUANT_MODE.to_string(),
+    ))
+}
 
 /// QuantizedLinear: Linear layer using quantized_matmul for efficient inference.
 ///

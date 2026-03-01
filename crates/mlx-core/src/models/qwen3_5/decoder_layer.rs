@@ -1,5 +1,5 @@
 use crate::array::MxArray;
-use crate::nn::{Activations, RMSNorm};
+use crate::nn::RMSNorm;
 use crate::transformer::MLP;
 use napi::bindgen_prelude::*;
 
@@ -7,22 +7,12 @@ use super::attention::Qwen3_5Attention;
 use super::config::Qwen3_5Config;
 use super::gated_delta_net::GatedDeltaNet;
 use super::layer_cache::Qwen3_5LayerCache;
-use super::quantized_linear::QuantizedLinear;
+use super::quantized_linear::{MLPVariant, QuantizedLinear};
 
 /// Attention type for a decoder layer.
 pub enum AttentionType {
     Linear(GatedDeltaNet),
     Full(Qwen3_5Attention),
-}
-
-/// MLP type for a decoder layer (dense variant — no MoE).
-pub enum MLPType {
-    Dense(MLP),
-    QuantizedDense {
-        gate_proj: QuantizedLinear,
-        up_proj: QuantizedLinear,
-        down_proj: QuantizedLinear,
-    },
 }
 
 /// A single decoder layer in the Qwen3.5 dense model.
@@ -33,7 +23,7 @@ pub enum MLPType {
 /// - Pre-norm architecture with residual connections
 pub struct DecoderLayer {
     pub attn: AttentionType,
-    pub mlp: MLPType,
+    pub mlp: MLPVariant,
     input_layernorm: RMSNorm,
     post_attention_layernorm: RMSNorm,
 }
@@ -53,7 +43,7 @@ impl DecoderLayer {
             AttentionType::Full(Qwen3_5Attention::new(config)?)
         };
 
-        let mlp = MLPType::Dense(MLP::new(
+        let mlp = MLPVariant::Standard(MLP::new(
             config.hidden_size as u32,
             config.intermediate_size as u32,
         )?);
@@ -95,15 +85,7 @@ impl DecoderLayer {
 
         // Pre-norm + MLP
         let normed = self.post_attention_layernorm.forward(&h)?;
-        let mlp_out = match &self.mlp {
-            MLPType::Dense(mlp) => mlp.forward(&normed)?,
-            MLPType::QuantizedDense { gate_proj, up_proj, down_proj } => {
-                let gate = gate_proj.forward(&normed)?;
-                let up = up_proj.forward(&normed)?;
-                let activated = Activations::swiglu(&gate, &up)?;
-                down_proj.forward(&activated)?
-            }
-        };
+        let mlp_out = self.mlp.forward(&normed)?;
 
         // Residual connection
         h.add(&mlp_out)
@@ -126,6 +108,6 @@ impl DecoderLayer {
         up_proj: QuantizedLinear,
         down_proj: QuantizedLinear,
     ) {
-        self.mlp = MLPType::QuantizedDense { gate_proj, up_proj, down_proj };
+        self.mlp = MLPVariant::Quantized { gate_proj, up_proj, down_proj };
     }
 }

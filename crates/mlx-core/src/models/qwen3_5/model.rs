@@ -327,7 +327,7 @@ impl Qwen3_5Model {
                 // max_kv_len is rounded up to handle prompt + max_tokens.
                 use mlx_sys as sys;
                 let prefill_len = seq_len as i32;
-                let max_kv_len = ((prefill_len + max_tokens as i32 + 255) / 256) * 256;
+                let max_kv_len = ((prefill_len + max_tokens + 255) / 256) * 256;
                 let num_layers = model_config.num_layers as usize;
                 let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                     vec![std::ptr::null_mut(); num_layers * 2];
@@ -581,7 +581,7 @@ impl Qwen3_5Model {
             if use_compiled {
                 use mlx_sys as sys;
                 let prefill_len = seq_len as i32;
-                let max_kv_len = ((prefill_len + max_new_tokens as i32 + 255) / 256) * 256;
+                let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
                 let num_layers = model_config.num_layers as usize;
                 let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                     vec![std::ptr::null_mut(); num_layers * 2];
@@ -925,8 +925,8 @@ fn eval_token_and_caches(
     // We build a Vec<*mut mlx_array> directly to avoid lifetime issues.
     let mut handles: Vec<*mut mlx_sys::mlx_array> = vec![next_token.as_raw_ptr()];
 
-    if let Ok(caches_guard) = caches_arc.read() {
-        if let Some(ref caches) = *caches_guard {
+    if let Ok(caches_guard) = caches_arc.read()
+        && let Some(ref caches) = *caches_guard {
             let mut arr_refs: Vec<&MxArray> = Vec::with_capacity(caches.len() * 2);
             for cache in caches.iter() {
                 cache.collect_arrays(&mut arr_refs);
@@ -935,7 +935,6 @@ fn eval_token_and_caches(
                 handles.push(arr.as_raw_ptr());
             }
         }
-    }
 
     // Single async_eval call for token + all cache arrays.
     // MLX will evaluate and detach all of them, preventing graph accumulation.

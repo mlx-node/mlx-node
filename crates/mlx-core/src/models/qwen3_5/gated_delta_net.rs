@@ -5,23 +5,8 @@ use napi::bindgen_prelude::*;
 use super::arrays_cache::ArraysCache;
 use super::config::Qwen3_5Config;
 use super::gated_delta::gated_delta_update;
-use super::quantized_linear::QuantizedLinear;
+use super::quantized_linear::{LinearProj, QuantizedLinear};
 use super::rms_norm_gated::RMSNormGated;
-
-/// A linear projection that can be either standard or quantized.
-enum LinearProj {
-    Standard(Linear),
-    Quantized(QuantizedLinear),
-}
-
-impl LinearProj {
-    fn forward(&self, x: &MxArray) -> Result<MxArray> {
-        match self {
-            LinearProj::Standard(l) => l.forward(x),
-            LinearProj::Quantized(l) => l.forward(x),
-        }
-    }
-}
 
 /// GatedDeltaNet: Linear attention module using gated delta recurrence.
 ///
@@ -287,16 +272,10 @@ impl GatedDeltaNet {
     // ========== Weight accessors (standard mode) ==========
 
     pub fn set_in_proj_qkvz_weight(&mut self, w: &MxArray) -> Result<()> {
-        match &mut self.in_proj_qkvz {
-            LinearProj::Standard(l) => l.set_weight(w),
-            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set weight on quantized in_proj_qkvz")),
-        }
+        self.in_proj_qkvz.set_weight(w, "in_proj_qkvz")
     }
     pub fn set_in_proj_ba_weight(&mut self, w: &MxArray) -> Result<()> {
-        match &mut self.in_proj_ba {
-            LinearProj::Standard(l) => l.set_weight(w),
-            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set weight on quantized in_proj_ba")),
-        }
+        self.in_proj_ba.set_weight(w, "in_proj_ba")
     }
     pub fn set_conv1d_weight(&mut self, w: &MxArray) -> Result<()> {
         self.conv1d.set_weight(w)
@@ -314,10 +293,7 @@ impl GatedDeltaNet {
         }
     }
     pub fn set_out_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        match &mut self.out_proj {
-            LinearProj::Standard(l) => l.set_weight(w),
-            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set weight on quantized out_proj")),
-        }
+        self.out_proj.set_weight(w, "out_proj")
     }
     pub fn set_dt_bias(&mut self, w: &MxArray) {
         self.dt_bias = w.clone();
@@ -339,13 +315,13 @@ impl GatedDeltaNet {
     // ========== Quantized setters ==========
 
     pub fn set_quantized_in_proj_qkvz(&mut self, ql: QuantizedLinear) {
-        self.in_proj_qkvz = LinearProj::Quantized(ql);
+        self.in_proj_qkvz.set_quantized(ql);
     }
     pub fn set_quantized_in_proj_ba(&mut self, ql: QuantizedLinear) {
-        self.in_proj_ba = LinearProj::Quantized(ql);
+        self.in_proj_ba.set_quantized(ql);
     }
     pub fn set_quantized_out_proj(&mut self, ql: QuantizedLinear) {
-        self.out_proj = LinearProj::Quantized(ql);
+        self.out_proj.set_quantized(ql);
     }
 }
 

@@ -1,5 +1,5 @@
 use crate::array::MxArray;
-use crate::nn::{Activations, RMSNorm};
+use crate::nn::RMSNorm;
 use crate::transformer::MLP;
 use napi::bindgen_prelude::*;
 
@@ -7,7 +7,7 @@ use super::attention::Qwen3_5Attention;
 use super::config::Qwen3_5MoeConfig;
 use super::gated_delta_net::GatedDeltaNet;
 use super::layer_cache::Qwen3_5LayerCache;
-use super::quantized_linear::QuantizedLinear;
+use super::quantized_linear::{MLPVariant, QuantizedLinear};
 use super::sparse_moe::SparseMoeBlock;
 
 /// Attention type for a decoder layer.
@@ -18,13 +18,8 @@ pub enum AttentionType {
 
 /// MLP type for a decoder layer.
 pub enum MLPType {
-    Dense(MLP),
-    QuantizedDense {
-        gate_proj: QuantizedLinear,
-        up_proj: QuantizedLinear,
-        down_proj: QuantizedLinear,
-    },
-    MoE(SparseMoeBlock),
+    Dense(MLPVariant),
+    MoE(Box<SparseMoeBlock>),
 }
 
 /// A single decoder layer in the Qwen3.5 MoE model.
@@ -59,12 +54,12 @@ impl DecoderLayer {
 
         let is_moe = config.is_moe_layer(layer_idx);
         let mlp = if is_moe {
-            MLPType::MoE(SparseMoeBlock::new(config)?)
+            MLPType::MoE(Box::new(SparseMoeBlock::new(config)?))
         } else {
-            MLPType::Dense(MLP::new(
+            MLPType::Dense(MLPVariant::Standard(MLP::new(
                 config.hidden_size as u32,
                 config.intermediate_size as u32,
-            )?)
+            )?))
         };
 
         let input_layernorm = RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps))?;
@@ -102,12 +97,6 @@ impl DecoderLayer {
         let normed = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = match &self.mlp {
             MLPType::Dense(mlp) => mlp.forward(&normed)?,
-            MLPType::QuantizedDense { gate_proj, up_proj, down_proj } => {
-                let gate = gate_proj.forward(&normed)?;
-                let up = up_proj.forward(&normed)?;
-                let activated = Activations::swiglu(&gate, &up)?;
-                down_proj.forward(&activated)?
-            }
             MLPType::MoE(moe) => moe.forward(&normed)?,
         };
 
@@ -128,6 +117,6 @@ impl DecoderLayer {
         up_proj: QuantizedLinear,
         down_proj: QuantizedLinear,
     ) {
-        self.mlp = MLPType::QuantizedDense { gate_proj, up_proj, down_proj };
+        self.mlp = MLPType::Dense(MLPVariant::Quantized { gate_proj, up_proj, down_proj });
     }
 }

@@ -14,7 +14,10 @@ use crate::utils::safetensors::SafeTensorsFile;
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
 use super::model::Qwen3_5MoeModel;
-use super::quantized_linear::{QuantizedLinear, QuantizedSwitchLinear};
+use super::quantized_linear::{
+    is_quantized_checkpoint, try_build_quantized_linear, MLPVariant, QuantizedSwitchLinear,
+    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS,
+};
 use super::switch_glu::SwitchGLU;
 
 /// Load all safetensors files from a directory.
@@ -263,30 +266,6 @@ fn sanitize_weights(
     Ok(result)
 }
 
-fn is_quantized_checkpoint(params: &HashMap<String, MxArray>) -> bool {
-    params.keys().any(|k| k.ends_with(".scales"))
-}
-
-fn try_build_quantized_linear(
-    params: &HashMap<String, MxArray>,
-    key_prefix: &str,
-    group_size: i32,
-    bits: i32,
-) -> Option<QuantizedLinear> {
-    let weight = params.get(&format!("{}.weight", key_prefix))?;
-    let scales = params.get(&format!("{}.scales", key_prefix))?;
-    let biases = params.get(&format!("{}.biases", key_prefix)).cloned();
-    Some(QuantizedLinear::new(
-        weight.clone(),
-        scales.clone(),
-        biases,
-        None,
-        group_size,
-        bits,
-        "affine".to_string(),
-    ))
-}
-
 fn try_build_quantized_switch_linear(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
@@ -351,8 +330,8 @@ fn apply_weights(
         match &mut layer.attn {
             AttentionType::Linear(gdn) => {
                 if is_quantized {
-                    let default_bits = 4;
-                    let default_gs = 64;
+                    let default_bits = DEFAULT_QUANT_BITS;
+                    let default_gs = DEFAULT_QUANT_GROUP_SIZE;
 
                     if let Some(ql) = try_build_quantized_linear(
                         params, &format!("{}.linear_attn.in_proj_qkvz", prefix), default_gs, default_bits,
@@ -422,8 +401,8 @@ fn apply_weights(
             }
             AttentionType::Full(attn) => {
                 if is_quantized {
-                    let default_bits = 4;
-                    let default_gs = 64;
+                    let default_bits = DEFAULT_QUANT_BITS;
+                    let default_gs = DEFAULT_QUANT_GROUP_SIZE;
 
                     if let Some(ql) = try_build_quantized_linear(
                         params, &format!("{}.self_attn.q_proj", prefix), default_gs, default_bits,
@@ -490,10 +469,10 @@ fn apply_weights(
 
         // MLP weights
         match &mut layer.mlp {
-            MLPType::Dense(mlp) => {
+            MLPType::Dense(MLPVariant::Standard(mlp)) => {
                 if is_quantized {
-                    let default_bits = 4;
-                    let default_gs = 64;
+                    let default_bits = DEFAULT_QUANT_BITS;
+                    let default_gs = DEFAULT_QUANT_GROUP_SIZE;
                     let gate_key = format!("{}.mlp.gate_proj", prefix);
                     let up_key = format!("{}.mlp.up_proj", prefix);
                     let down_key = format!("{}.mlp.down_proj", prefix);
@@ -527,13 +506,13 @@ fn apply_weights(
                     }
                 }
             }
-            MLPType::QuantizedDense { .. } => {}
+            MLPType::Dense(MLPVariant::Quantized { .. }) => {}
             MLPType::MoE(moe) => {
                 if is_quantized {
-                    let gate_bits = 8;
-                    let gate_gs = 64;
-                    let default_bits = 4;
-                    let default_gs = 64;
+                    let gate_bits = GATE_QUANT_BITS;
+                    let gate_gs = DEFAULT_QUANT_GROUP_SIZE;
+                    let default_bits = DEFAULT_QUANT_BITS;
+                    let default_gs = DEFAULT_QUANT_GROUP_SIZE;
 
                     if let Some(ql) = try_build_quantized_linear(
                         params, &format!("{}.mlp.gate", prefix), gate_gs, gate_bits,
@@ -785,11 +764,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
 
     let get_i32 = |keys: &[&str], default: i32| -> i32 {
         for key in keys {
-            if let Some(tc) = text_cfg {
-                if let Some(v) = tc[key].as_i64() {
+            if let Some(tc) = text_cfg
+                && let Some(v) = tc[key].as_i64() {
                     return v as i32;
                 }
-            }
             if let Some(v) = raw[key].as_i64() {
                 return v as i32;
             }
@@ -799,11 +777,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
 
     let get_f64 = |keys: &[&str], default: f64| -> f64 {
         for key in keys {
-            if let Some(tc) = text_cfg {
-                if let Some(v) = tc[key].as_f64() {
+            if let Some(tc) = text_cfg
+                && let Some(v) = tc[key].as_f64() {
                     return v;
                 }
-            }
             if let Some(v) = raw[key].as_f64() {
                 return v;
             }
@@ -813,11 +790,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
 
     let get_bool = |keys: &[&str], default: bool| -> bool {
         for key in keys {
-            if let Some(tc) = text_cfg {
-                if let Some(v) = tc[key].as_bool() {
+            if let Some(tc) = text_cfg
+                && let Some(v) = tc[key].as_bool() {
                     return v;
                 }
-            }
             if let Some(v) = raw[key].as_bool() {
                 return v;
             }

@@ -4,52 +4,8 @@ use crate::transformer::MLP;
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
-use super::quantized_linear::QuantizedLinear;
+use super::quantized_linear::{LinearProj, MLPVariant, QuantizedLinear};
 use super::switch_glu::SwitchGLU;
-
-/// A linear layer that can be either standard or quantized.
-pub enum LinearProj {
-    Standard(Linear),
-    Quantized(QuantizedLinear),
-}
-
-impl LinearProj {
-    fn forward(&self, x: &MxArray) -> Result<MxArray> {
-        match self {
-            LinearProj::Standard(l) => l.forward(x),
-            LinearProj::Quantized(l) => l.forward(x),
-        }
-    }
-}
-
-/// An MLP that can be either standard or quantized.
-/// For quantized mode, we use 3 QuantizedLinear layers (gate, up, down).
-pub enum MLPVariant {
-    Standard(MLP),
-    Quantized {
-        gate_proj: QuantizedLinear,
-        up_proj: QuantizedLinear,
-        down_proj: QuantizedLinear,
-    },
-}
-
-impl MLPVariant {
-    fn forward(&self, x: &MxArray) -> Result<MxArray> {
-        match self {
-            MLPVariant::Standard(mlp) => mlp.forward(x),
-            MLPVariant::Quantized {
-                gate_proj,
-                up_proj,
-                down_proj,
-            } => {
-                let gate = gate_proj.forward(x)?;
-                let up = up_proj.forward(x)?;
-                let activated = Activations::swiglu(&gate, &up)?;
-                down_proj.forward(&activated)
-            }
-        }
-    }
-}
 
 /// SparseMoeBlock: Mixture-of-Experts block with shared expert.
 ///
@@ -211,12 +167,7 @@ impl SparseMoeBlock {
     // ========== Weight accessors (standard mode) ==========
 
     pub fn set_gate_weight(&mut self, w: &MxArray) -> Result<()> {
-        match &mut self.gate {
-            LinearProj::Standard(l) => l.set_weight(w),
-            LinearProj::Quantized(_) => Err(Error::from_reason(
-                "Cannot set weight on quantized gate",
-            )),
-        }
+        self.gate.set_weight(w, "gate")
     }
 
     pub fn set_switch_mlp_gate_proj_weight(&mut self, w: &MxArray) {
@@ -254,12 +205,7 @@ impl SparseMoeBlock {
         }
     }
     pub fn set_shared_expert_gate_weight(&mut self, w: &MxArray) -> Result<()> {
-        match &mut self.shared_expert_gate {
-            LinearProj::Standard(l) => l.set_weight(w),
-            LinearProj::Quantized(_) => Err(Error::from_reason(
-                "Cannot set weight on quantized shared_expert_gate",
-            )),
-        }
+        self.shared_expert_gate.set_weight(w, "shared_expert_gate")
     }
 
     /// Get a mutable reference to the switch_mlp for setting quantized projections.
@@ -274,12 +220,12 @@ impl SparseMoeBlock {
 
     /// Replace the gate with a quantized version.
     pub fn set_quantized_gate(&mut self, gate: QuantizedLinear) {
-        self.gate = LinearProj::Quantized(gate);
+        self.gate.set_quantized(gate);
     }
 
     /// Replace the shared_expert_gate with a quantized version.
     pub fn set_quantized_shared_expert_gate(&mut self, gate: QuantizedLinear) {
-        self.shared_expert_gate = LinearProj::Quantized(gate);
+        self.shared_expert_gate.set_quantized(gate);
     }
 
     /// Replace the shared expert with a quantized version.

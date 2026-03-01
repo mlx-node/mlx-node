@@ -5,22 +5,7 @@ use crate::transformer::KVCache;
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
-use super::quantized_linear::QuantizedLinear;
-
-/// A linear projection that can be either standard or quantized.
-enum LinearProj {
-    Standard(Linear),
-    Quantized(QuantizedLinear),
-}
-
-impl LinearProj {
-    fn forward(&self, x: &MxArray) -> Result<MxArray> {
-        match self {
-            LinearProj::Standard(l) => l.forward(x),
-            LinearProj::Quantized(l) => l.forward(x),
-        }
-    }
-}
+use super::quantized_linear::{LinearProj, QuantizedLinear};
 
 /// Qwen3.5 full attention with gating and partial RoPE.
 ///
@@ -194,52 +179,28 @@ impl Qwen3_5Attention {
     // ========== Weight accessors (standard mode) ==========
 
     pub fn set_q_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        match &mut self.q_proj {
-            LinearProj::Standard(l) => l.set_weight(w),
-            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set weight on quantized q_proj")),
-        }
+        self.q_proj.set_weight(w, "q_proj")
     }
     pub fn set_k_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        match &mut self.k_proj {
-            LinearProj::Standard(l) => l.set_weight(w),
-            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set weight on quantized k_proj")),
-        }
+        self.k_proj.set_weight(w, "k_proj")
     }
     pub fn set_v_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        match &mut self.v_proj {
-            LinearProj::Standard(l) => l.set_weight(w),
-            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set weight on quantized v_proj")),
-        }
+        self.v_proj.set_weight(w, "v_proj")
     }
     pub fn set_o_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        match &mut self.o_proj {
-            LinearProj::Standard(l) => l.set_weight(w),
-            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set weight on quantized o_proj")),
-        }
+        self.o_proj.set_weight(w, "o_proj")
     }
     pub fn set_q_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
-        match &mut self.q_proj {
-            LinearProj::Standard(l) => l.set_bias(b),
-            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set bias on quantized q_proj")),
-        }
+        self.q_proj.set_bias(b, "q_proj")
     }
     pub fn set_k_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
-        match &mut self.k_proj {
-            LinearProj::Standard(l) => l.set_bias(b),
-            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set bias on quantized k_proj")),
-        }
+        self.k_proj.set_bias(b, "k_proj")
     }
     pub fn set_v_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
-        match &mut self.v_proj {
-            LinearProj::Standard(l) => l.set_bias(b),
-            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set bias on quantized v_proj")),
-        }
+        self.v_proj.set_bias(b, "v_proj")
     }
     pub fn set_o_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
-        match &mut self.o_proj {
-            LinearProj::Standard(l) => l.set_bias(b),
-            LinearProj::Quantized(_) => Err(Error::from_reason("Cannot set bias on quantized o_proj")),
-        }
+        self.o_proj.set_bias(b, "o_proj")
     }
     pub fn set_q_norm_weight(&mut self, w: &MxArray) -> Result<()> {
         self.q_norm.set_weight(w)
@@ -251,15 +212,15 @@ impl Qwen3_5Attention {
     // ========== Quantized setters ==========
 
     pub fn set_quantized_q_proj(&mut self, ql: QuantizedLinear) {
-        self.q_proj = LinearProj::Quantized(ql);
+        self.q_proj.set_quantized(ql);
     }
     pub fn set_quantized_k_proj(&mut self, ql: QuantizedLinear) {
-        self.k_proj = LinearProj::Quantized(ql);
+        self.k_proj.set_quantized(ql);
     }
     pub fn set_quantized_v_proj(&mut self, ql: QuantizedLinear) {
-        self.v_proj = LinearProj::Quantized(ql);
+        self.v_proj.set_quantized(ql);
     }
     pub fn set_quantized_o_proj(&mut self, ql: QuantizedLinear) {
-        self.o_proj = LinearProj::Quantized(ql);
+        self.o_proj.set_quantized(ql);
     }
 }

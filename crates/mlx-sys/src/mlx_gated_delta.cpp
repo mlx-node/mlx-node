@@ -3,105 +3,20 @@
 // Opaque handle for a compiled Metal kernel function
 struct mlx_metal_kernel;
 
-// Build the Metal shader source for the gated delta recurrence.
-// has_mask: whether to include mask-checking logic
-// vectorized: whether g has per-element (4D) or per-head (3D) shape
-static std::string build_gated_delta_source(bool has_mask, bool vectorized) {
-    const char* mask_source = has_mask ? "mask[b_idx * T + t]" : "true";
-    const char* g_comment;
-    const char* g_setup;
-    const char* g_access;
-    const char* g_advance;
-
-    if (vectorized) {
-        g_comment = "// g: [B, T, Hv, Dk]";
-        g_setup   = "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;";
-        g_access  = "g_[s_idx]";
-        g_advance = "g_ += Hv * Dk;";
-    } else {
-        g_comment = "// g: [B, T, Hv]";
-        g_setup   = "auto g_ = g + b_idx * T * Hv;";
-        g_access  = "g_[hv_idx]";
-        g_advance = "g_ += Hv;";
-    }
-
-    std::string src;
-    src += R"(
-        auto n = thread_position_in_grid.z;
-        auto b_idx = n / Hv;
-        auto hv_idx = n % Hv;
-        auto hk_idx = hv_idx / (Hv / Hk);
-        constexpr int n_per_t = Dk / 32;
-
-        // q, k: [B, T, Hk, Dk]
-        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
-        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
-
-        // v, y: [B, T, Hv, Dv]
-        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
-        y += b_idx * T * Hv * Dv + hv_idx * Dv;
-
-        auto dk_idx = thread_position_in_threadgroup.x;
-        auto dv_idx = thread_position_in_grid.y;
-
-        // state_in, state_out: [B, Hv, Dv, Dk]
-        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
-        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
-
-        float state[n_per_t];
-        for (int i = 0; i < n_per_t; ++i) {
-          auto s_idx = n_per_t * dk_idx + i;
-          state[i] = static_cast<float>(i_state[s_idx]);
-        }
-)";
-    src += "        "; src += g_comment; src += "\n";
-    src += "        "; src += g_setup; src += "\n";
-    src += R"(        auto beta_ = beta + b_idx * T * Hv;
-
-        for (int t = 0; t < T; ++t) {
-          if ()";
-    src += mask_source;
-    src += R"() {
-            float kv_mem = 0.0f;
-            for (int i = 0; i < n_per_t; ++i) {
-              auto s_idx = n_per_t * dk_idx + i;
-              state[i] = state[i] * )";
-    src += g_access;
-    src += R"(;
-              kv_mem += state[i] * k_[s_idx];
-            }
-            kv_mem = simd_sum(kv_mem);
-
-            auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
-
-            float out = 0.0f;
-            for (int i = 0; i < n_per_t; ++i) {
-              auto s_idx = n_per_t * dk_idx + i;
-              state[i] = state[i] + k_[s_idx] * delta;
-              out += state[i] * q_[s_idx];
-            }
-            out = simd_sum(out);
-            if (thread_index_in_simdgroup == 0) {
-              y[dv_idx] = static_cast<InT>(out);
-            }
-          }
-          // Increment data pointers to next time step
-          q_ += Hk * Dk;
-          k_ += Hk * Dk;
-          v_ += Hv * Dv;
-          y += Hv * Dv;
-          )";
-    src += g_advance;
-    src += R"(
-          beta_ += Hv;
-        }
-        for (int i = 0; i < n_per_t; ++i) {
-          auto s_idx = n_per_t * dk_idx + i;
-          o_state[s_idx] = static_cast<InT>(state[i]);
-        }
-    )";
-    return src;
-}
+// Metal shader sources for the gated delta recurrence, indexed by variant:
+//   [0] = non-vectorized, non-masked
+//   [1] = non-vectorized, masked
+//   [2] = vectorized, non-masked
+//   [3] = vectorized, masked
+static const char* gated_delta_sources[] = {
+    #include "metal/gated_delta_step.metal.inc"
+    ,
+    #include "metal/gated_delta_step_mask.metal.inc"
+    ,
+    #include "metal/gated_delta_step_vec.metal.inc"
+    ,
+    #include "metal/gated_delta_step_vec_mask.metal.inc"
+};
 
 // Cache compiled kernels to avoid recompilation
 static std::mutex kernel_cache_mutex;
@@ -128,7 +43,7 @@ static mlx::core::fast::CustomKernelFunction& get_or_create_kernel(bool has_mask
         "gated_delta_step" + suffix,
         inputs,
         {"y", "state_out"},
-        build_gated_delta_source(has_mask, vectorized)
+        gated_delta_sources[key]
     );
 
     auto [inserted, success] = kernel_cache.emplace(key, std::move(kernel));

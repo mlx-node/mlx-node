@@ -7,6 +7,10 @@ use napi::bindgen_prelude::*;
 // Re-export QuantizedLinear from the dense module so shared types (attention, GatedDeltaNet)
 // get the same concrete type.
 pub use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
+pub use crate::models::qwen3_5::quantized_linear::{
+    is_quantized_checkpoint, try_build_quantized_linear, DEFAULT_QUANT_BITS,
+    DEFAULT_QUANT_GROUP_SIZE, DEFAULT_QUANT_MODE, GATE_QUANT_BITS, LinearProj, MLPVariant,
+};
 
 /// QuantizedSwitchLinear: Expert-indexed quantized linear layer using gather_qmm.
 ///
