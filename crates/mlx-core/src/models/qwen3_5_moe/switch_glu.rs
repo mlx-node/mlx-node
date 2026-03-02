@@ -36,7 +36,9 @@ struct GatherSortResult {
 
 fn gather_sort(x: &MxArray, indices: &MxArray) -> Result<GatherSortResult> {
     let idx_shape = indices.shape()?;
-    let m = *idx_shape.last().ok_or_else(|| Error::from_reason("empty indices"))?;
+    let m = *idx_shape
+        .last()
+        .ok_or_else(|| Error::from_reason("empty indices"))?;
 
     let flat_indices = indices.reshape(&[-1])?;
     let order = flat_indices.argsort(Some(-1))?;

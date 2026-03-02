@@ -67,6 +67,40 @@ mlx_array* mlx_array_from_float16(const uint16_t* data,
   return reinterpret_cast<mlx_array*>(arr);
 }
 
+// Create array from uint8 raw bytes
+// Used for loading FP8 E4M3 weights (1 byte per element)
+mlx_array* mlx_array_from_uint8(const uint8_t* data,
+                                const int64_t* shape,
+                                size_t ndim) {
+  try {
+    Shape target_shape = make_shape(shape, ndim);
+    auto arr = new array(data, target_shape, mlx::core::uint8);
+    return reinterpret_cast<mlx_array*>(arr);
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] mlx_array_from_uint8: " << e.what() << std::endl;
+    return nullptr;
+  }
+}
+
+// Convert FP8 E4M3 array to target dtype using MLX's from_fp8
+// Input must be a uint8 array containing FP8 E4M3 encoded values
+// target_dtype: 0=float32, 2=float16, 3=bfloat16
+mlx_array* mlx_from_fp8(mlx_array* handle, int32_t target_dtype) {
+  if (!handle) {
+    std::cerr << "[MLX] mlx_from_fp8: null handle" << std::endl;
+    return nullptr;
+  }
+  try {
+    auto& arr = *reinterpret_cast<array*>(handle);
+    auto dtype = to_mlx_dtype(target_dtype);
+    auto result = mlx::core::from_fp8(arr, dtype);
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] mlx_from_fp8: " << e.what() << std::endl;
+    return nullptr;
+  }
+}
+
 mlx_array* mlx_array_scalar_float(double value) {
   auto arr = new array(static_cast<float>(value));
   return reinterpret_cast<mlx_array*>(arr);
@@ -536,6 +570,36 @@ mlx_array* mlx_array_matmul(mlx_array* lhs, mlx_array* rhs) {
   auto b = reinterpret_cast<array*>(rhs);
   array result = matmul(*a, *b);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+// Extract uint8 data from a uint8 array (used for MXFP8 scales in SafeTensors writer)
+bool mlx_array_to_uint8(mlx_array* handle, uint8_t* out, size_t len) {
+  if (!out) {
+    return false;
+  }
+  auto arr = reinterpret_cast<array*>(handle);
+  if (!arr) {
+    return false;
+  }
+  try {
+    auto flat = flatten(*arr);
+    flat.eval();
+
+    if (flat.size() != len) {
+      return false;
+    }
+
+    if (flat.dtype() != mlx::core::uint8) {
+      return false;
+    }
+
+    const auto* data = flat.data<uint8_t>();
+    std::memcpy(out, data, len * sizeof(uint8_t));
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] mlx_array_to_uint8: " << e.what() << std::endl;
+    return false;
+  }
 }
 
 // Compute D = beta * C + alpha * (A @ B)

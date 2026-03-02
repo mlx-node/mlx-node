@@ -276,6 +276,7 @@ impl QuantizedKVCache {
                 tensor.as_raw_ptr(),
                 self.group_size,
                 self.bits,
+                c"affine".as_ptr(),
                 &mut out_quantized,
                 &mut out_scales,
                 &mut out_biases,
@@ -342,6 +343,7 @@ impl QuantizedKVCache {
                 self.group_size,
                 self.bits,
                 -1, // Use input dtype
+                c"affine".as_ptr(),
             )
         };
 

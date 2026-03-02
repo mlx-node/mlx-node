@@ -48,6 +48,22 @@ impl MxArray {
         MxArray::from_handle(handle, "array_from_float32")
     }
 
+    /// Create an MxArray from raw uint8 bytes.
+    /// Used for loading FP8 E4M3 weights (1 byte per element).
+    pub fn from_uint8(data: &[u8], shape: &[i64]) -> Result<Self> {
+        validate_data_shape(data.len(), shape, "from_uint8")?;
+        let handle =
+            unsafe { sys::mlx_array_from_uint8(data.as_ptr(), shape.as_ptr(), shape.len()) };
+        MxArray::from_handle(handle, "array_from_uint8")
+    }
+
+    /// Convert FP8 E4M3 array to target dtype using MLX's from_fp8.
+    /// Input must be a uint8 array containing FP8 E4M3 encoded values.
+    pub fn from_fp8(&self, target_dtype: DType) -> Result<Self> {
+        let handle = unsafe { sys::mlx_from_fp8(self.as_raw_ptr(), target_dtype.code()) };
+        MxArray::from_handle(handle, "from_fp8")
+    }
+
     /// Create an MxArray from raw bfloat16 bytes (as u16 values).
     /// This enables zero-copy loading of bf16 weights from safetensors.
     /// The input is the raw bytes reinterpreted as u16 (2 bytes per element).

@@ -273,6 +273,21 @@ impl MxArray {
             Err(Error::from_reason("Failed to copy array to uint32 buffer"))
         }
     }
+    /// Extract raw uint8 values from uint8 arrays.
+    /// Used by SafeTensors writer for MXFP8 scales (E8M0 format).
+    pub(crate) fn to_uint8(&self) -> Result<Vec<u8>> {
+        let len = unsafe { sys::mlx_array_size(self.handle.0) };
+        let mut buffer = vec![0u8; len];
+        let ok = unsafe { sys::mlx_array_to_uint8(self.handle.0, buffer.as_mut_ptr(), len) };
+        if ok {
+            Ok(buffer)
+        } else {
+            Err(Error::from_reason(
+                "Failed to extract uint8 from array (must be uint8 dtype)",
+            ))
+        }
+    }
+
     /// Extract raw uint16 values from bf16/f16 arrays without f32 round-trip.
     /// Used by SafeTensors writer to avoid tripling memory for 16-bit tensors.
     pub(crate) fn to_uint16_native(&self) -> Result<Vec<u16>> {

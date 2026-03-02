@@ -25,9 +25,10 @@ fn main() {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(ext) = path.extension()
-                && (ext == "cpp" || ext == "h") {
-                    println!("cargo:rerun-if-changed={}", path.display());
-                }
+                && (ext == "cpp" || ext == "h")
+            {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
         }
     }
     let metal_dir = src_dir.join("metal");
@@ -35,9 +36,10 @@ fn main() {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(ext) = path.extension()
-                && ext == "inc" {
-                    println!("cargo:rerun-if-changed={}", path.display());
-                }
+                && ext == "inc"
+            {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
         }
     }
 

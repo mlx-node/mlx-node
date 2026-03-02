@@ -25,6 +25,7 @@ unsafe extern "C" {
         shape: *const i64,
         ndim: usize,
     ) -> *mut mlx_array;
+    pub fn mlx_array_from_uint8(data: *const u8, shape: *const i64, ndim: usize) -> *mut mlx_array;
     pub fn mlx_array_from_float32(
         data: *const f32,
         shape: *const i64,
@@ -40,6 +41,7 @@ unsafe extern "C" {
         shape: *const i64,
         ndim: usize,
     ) -> *mut mlx_array;
+    pub fn mlx_from_fp8(handle: *mut mlx_array, target_dtype: i32) -> *mut mlx_array;
     pub fn mlx_array_scalar_float(value: f64) -> *mut mlx_array;
     pub fn mlx_array_scalar_int(value: i32) -> *mut mlx_array;
     pub fn mlx_array_zeros(shape: *const i64, ndim: usize, dtype: i32) -> *mut mlx_array;
@@ -366,6 +368,7 @@ unsafe extern "C" {
     pub fn mlx_array_to_int32(handle: *mut mlx_array, out: *mut i32, len: usize) -> bool;
     pub fn mlx_array_to_int32_noeval(handle: *mut mlx_array, out: *mut i32, len: usize) -> bool;
     pub fn mlx_array_to_uint32(handle: *mut mlx_array, out: *mut u32, len: usize) -> bool;
+    pub fn mlx_array_to_uint8(handle: *mut mlx_array, out: *mut u8, len: usize) -> bool;
     pub fn mlx_array_to_uint16(handle: *mut mlx_array, out: *mut u16, len: usize) -> bool;
     pub fn mlx_array_delete(arr: *mut mlx_array);
     pub fn mlx_synchronize();
@@ -779,19 +782,20 @@ unsafe extern "C" {
 // ================================================================================
 
 unsafe extern "C" {
-    /// Quantize a matrix along its last axis using affine quantization.
-    /// Returns quantized weights, scales, and biases via output pointers.
+    /// Quantize a matrix along its last axis.
+    /// Mode: "affine" (returns 3 arrays), "mxfp4"/"mxfp8" (returns 2 arrays, biases=nullptr).
     pub fn mlx_quantize(
         w: *mut mlx_array,
         group_size: i32,
         bits: i32,
+        mode: *const std::os::raw::c_char,
         out_quantized: *mut *mut mlx_array,
         out_scales: *mut *mut mlx_array,
         out_biases: *mut *mut mlx_array,
     ) -> bool;
 
     /// Dequantize a matrix that was quantized with mlx_quantize.
-    /// Reconstructs the original values using: value = quantized * scale + bias
+    /// Mode must match the mode used during quantization.
     pub fn mlx_dequantize(
         quantized: *mut mlx_array,
         scales: *mut mlx_array,
@@ -799,6 +803,7 @@ unsafe extern "C" {
         group_size: i32,
         bits: i32,
         out_dtype: i32, // -1 for input dtype
+        mode: *const std::os::raw::c_char,
     ) -> *mut mlx_array;
 
     // 2D Convolution using MLX native conv2d

@@ -120,23 +120,27 @@ impl Qwen3_5LayerCache {
         match self {
             Self::Linear(c) => {
                 if !p0.is_null()
-                    && let Ok(arr) = MxArray::from_handle(p0, "fused_conv_state") {
-                        c.set(0, arr);
-                    }
+                    && let Ok(arr) = MxArray::from_handle(p0, "fused_conv_state")
+                {
+                    c.set(0, arr);
+                }
                 if !p1.is_null()
-                    && let Ok(arr) = MxArray::from_handle(p1, "fused_recurrent_state") {
-                        c.set(1, arr);
-                    }
+                    && let Ok(arr) = MxArray::from_handle(p1, "fused_recurrent_state")
+                {
+                    c.set(1, arr);
+                }
             }
             Self::FullAttention(c) => {
                 if !p0.is_null()
-                    && let Ok(keys) = MxArray::from_handle(p0, "fused_kv_keys") {
-                        c.set_keys(keys);
-                    }
+                    && let Ok(keys) = MxArray::from_handle(p0, "fused_kv_keys")
+                {
+                    c.set_keys(keys);
+                }
                 if !p1.is_null()
-                    && let Ok(values) = MxArray::from_handle(p1, "fused_kv_values") {
-                        c.set_values(values);
-                    }
+                    && let Ok(values) = MxArray::from_handle(p1, "fused_kv_values")
+                {
+                    c.set_values(values);
+                }
                 c.set_offset(new_offset);
             }
         }

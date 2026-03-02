@@ -22,7 +22,8 @@
  */
 
 import { resolve } from 'node:path';
-import { ModelLoader, formatToolResponse, createToolDefinition } from '@mlx-node/lm';
+import { Qwen3Model } from '@mlx-node/core';
+import { formatToolResponse, createToolDefinition } from '@mlx-node/lm';
 
 // Get model path from CLI args, environment, or default
 const DEFAULT_MODEL_PATH = resolve(process.cwd(), '.cache', 'models', 'qwen3-0.6b-mlx-bf16');
@@ -90,7 +91,7 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
   }
 }
 
-async function runToolConversation(model: Awaited<ReturnType<typeof ModelLoader.loadPretrained>>, userPrompt: string) {
+async function runToolConversation(model: Qwen3Model, userPrompt: string) {
   console.log('='.repeat(75));
   console.log(`User: ${userPrompt}`);
   console.log('='.repeat(75));
@@ -166,7 +167,7 @@ async function main() {
   console.log('+' + '-'.repeat(58) + '+\n');
 
   console.log(`Loading model from: ${MODEL_PATH}\n`);
-  const model = await ModelLoader.loadPretrained(MODEL_PATH);
+  const model = await Qwen3Model.loadPretrained(MODEL_PATH);
   console.log('[OK] Model loaded\n');
 
   // Example prompts that should trigger tool use

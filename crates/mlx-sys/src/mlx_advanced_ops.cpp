@@ -1427,6 +1427,7 @@ bool mlx_quantize(
     mlx_array* w,
     int32_t group_size,
     int32_t bits,
+    const char* mode,
     mlx_array** out_quantized,
     mlx_array** out_scales,
     mlx_array** out_biases
@@ -1438,21 +1439,25 @@ bool mlx_quantize(
     try {
         auto& w_arr = *reinterpret_cast<array*>(w);
 
-        // Call MLX quantize with affine mode
         std::optional<int> gs = group_size > 0 ? std::optional<int>(group_size) : std::nullopt;
         std::optional<int> b = bits > 0 ? std::optional<int>(bits) : std::nullopt;
+        std::string mode_str = (mode && mode[0]) ? std::string(mode) : "affine";
 
-        auto result = mlx::core::quantize(w_arr, gs, b, "affine");
+        auto result = mlx::core::quantize(w_arr, gs, b, mode_str);
 
-        // Result is [quantized, scales, biases]
-        if (result.size() != 3) {
+        // FP modes (mxfp4, mxfp8) return 2 arrays [quantized, scales], affine returns 3 [quantized, scales, biases]
+        if (result.size() == 2) {
+            *out_quantized = reinterpret_cast<mlx_array*>(new array(std::move(result[0])));
+            *out_scales = reinterpret_cast<mlx_array*>(new array(std::move(result[1])));
+            *out_biases = nullptr;
+        } else if (result.size() == 3) {
+            *out_quantized = reinterpret_cast<mlx_array*>(new array(std::move(result[0])));
+            *out_scales = reinterpret_cast<mlx_array*>(new array(std::move(result[1])));
+            *out_biases = reinterpret_cast<mlx_array*>(new array(std::move(result[2])));
+        } else {
             std::cerr << "[MLX] quantize returned unexpected number of arrays: " << result.size() << std::endl;
             return false;
         }
-
-        *out_quantized = reinterpret_cast<mlx_array*>(new array(std::move(result[0])));
-        *out_scales = reinterpret_cast<mlx_array*>(new array(std::move(result[1])));
-        *out_biases = reinterpret_cast<mlx_array*>(new array(std::move(result[2])));
 
         return true;
     } catch (const std::exception& e) {
@@ -1480,7 +1485,8 @@ mlx_array* mlx_dequantize(
     mlx_array* biases,
     int32_t group_size,
     int32_t bits,
-    int32_t out_dtype
+    int32_t out_dtype,
+    const char* mode
 ) {
     if (!quantized || !scales) {
         return nullptr;
@@ -1498,12 +1504,13 @@ mlx_array* mlx_dequantize(
         std::optional<int> gs = group_size > 0 ? std::optional<int>(group_size) : std::nullopt;
         std::optional<int> b = bits > 0 ? std::optional<int>(bits) : std::nullopt;
         std::optional<mlx::core::Dtype> dtype = std::nullopt;
+        std::string mode_str = (mode && mode[0]) ? std::string(mode) : "affine";
 
         if (out_dtype >= 0) {
             dtype = to_mlx_dtype(out_dtype);
         }
 
-        auto result = mlx::core::dequantize(q_arr, s_arr, b_opt, gs, b, "affine", dtype);
+        auto result = mlx::core::dequantize(q_arr, s_arr, b_opt, gs, b, mode_str, dtype);
 
         return reinterpret_cast<mlx_array*>(new array(std::move(result)));
     } catch (const std::exception& e) {

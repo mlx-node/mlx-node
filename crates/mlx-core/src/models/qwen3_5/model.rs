@@ -121,8 +121,7 @@ impl Qwen3_5Model {
 
         info!(
             "Qwen3.5 model created: {} layers, fa_idx={}",
-            config.num_layers,
-            fa_idx,
+            config.num_layers, fa_idx,
         );
 
         Ok(Self {
@@ -317,8 +316,7 @@ impl Qwen3_5Model {
             // The compiled path requires C++ weights to be loaded (only true for
             // safetensors-loaded models). Test models have no stored weights and
             // must fall back to the pure Rust forward_with_locks path.
-            let use_compiled =
-                unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+            let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
 
             if use_compiled {
                 // Initialize compiled forward pass from prefill caches.
@@ -358,7 +356,11 @@ impl Qwen3_5Model {
                         model_config.linear_key_head_dim,
                         model_config.linear_value_head_dim,
                         model_config.linear_conv_kernel_dim,
-                        if model_config.tie_word_embeddings { 1 } else { 0 },
+                        if model_config.tie_word_embeddings {
+                            1
+                        } else {
+                            0
+                        },
                         max_kv_len,
                         1, // batch_size
                         cache_ptrs.as_mut_ptr(),
@@ -435,7 +437,9 @@ impl Qwen3_5Model {
 
             // Clean up compiled state for next generation call.
             if use_compiled {
-                unsafe { mlx_sys::mlx_qwen35_compiled_reset(); }
+                unsafe {
+                    mlx_sys::mlx_qwen35_compiled_reset();
+                }
             }
 
             // Decode text if tokenizer available
@@ -575,8 +579,7 @@ impl Qwen3_5Model {
             MxArray::async_eval_arrays(&[&y]);
 
             // Initialize compiled forward pass (same as generate() path).
-            let use_compiled =
-                unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+            let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
 
             if use_compiled {
                 use mlx_sys as sys;
@@ -612,7 +615,11 @@ impl Qwen3_5Model {
                         model_config.linear_key_head_dim,
                         model_config.linear_value_head_dim,
                         model_config.linear_conv_kernel_dim,
-                        if model_config.tie_word_embeddings { 1 } else { 0 },
+                        if model_config.tie_word_embeddings {
+                            1
+                        } else {
+                            0
+                        },
                         max_kv_len,
                         1,
                         cache_ptrs.as_mut_ptr(),
@@ -683,7 +690,9 @@ impl Qwen3_5Model {
 
             // Clean up compiled state for next generation call.
             if use_compiled {
-                unsafe { mlx_sys::mlx_qwen35_compiled_reset(); }
+                unsafe {
+                    mlx_sys::mlx_qwen35_compiled_reset();
+                }
             }
 
             // Decode text
@@ -868,10 +877,7 @@ fn forward_with_locks(
 ///
 /// State is held in C++ globals (g_compiled_caches, g_compiled_offset).
 /// Must call `mlx_qwen35_compiled_init_from_prefill` before the decode loop.
-fn forward_compiled(
-    input_ids: &MxArray,
-    embedding_weight: &MxArray,
-) -> Result<MxArray> {
+fn forward_compiled(input_ids: &MxArray, embedding_weight: &MxArray) -> Result<MxArray> {
     use mlx_sys as sys;
 
     let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
@@ -926,15 +932,16 @@ fn eval_token_and_caches(
     let mut handles: Vec<*mut mlx_sys::mlx_array> = vec![next_token.as_raw_ptr()];
 
     if let Ok(caches_guard) = caches_arc.read()
-        && let Some(ref caches) = *caches_guard {
-            let mut arr_refs: Vec<&MxArray> = Vec::with_capacity(caches.len() * 2);
-            for cache in caches.iter() {
-                cache.collect_arrays(&mut arr_refs);
-            }
-            for arr in &arr_refs {
-                handles.push(arr.as_raw_ptr());
-            }
+        && let Some(ref caches) = *caches_guard
+    {
+        let mut arr_refs: Vec<&MxArray> = Vec::with_capacity(caches.len() * 2);
+        for cache in caches.iter() {
+            cache.collect_arrays(&mut arr_refs);
         }
+        for arr in &arr_refs {
+            handles.push(arr.as_raw_ptr());
+        }
+    }
 
     // Single async_eval call for token + all cache arrays.
     // MLX will evaluate and detach all of them, preventing graph accumulation.

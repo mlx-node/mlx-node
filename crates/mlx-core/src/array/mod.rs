@@ -42,6 +42,7 @@ pub enum DType {
     Float16 = 2,
     BFloat16 = 3,
     Uint32 = 4,
+    Uint8 = 5,
 }
 
 impl DType {
@@ -55,6 +56,7 @@ impl DType {
         match self {
             DType::Float32 | DType::Int32 | DType::Uint32 => 4,
             DType::Float16 | DType::BFloat16 => 2,
+            DType::Uint8 => 1,
         }
     }
 }
@@ -69,6 +71,7 @@ impl TryFrom<i32> for DType {
             2 => Ok(DType::Float16),
             3 => Ok(DType::BFloat16),
             4 => Ok(DType::Uint32),
+            5 => Ok(DType::Uint8),
             other => Err(Error::from_reason(format!(
                 "Unsupported dtype code {other}"
             ))),

@@ -155,6 +155,8 @@ enum BridgeDType : int32_t {
   INT32 = 1,
   FLOAT16 = 2,
   BFLOAT16 = 3,
+  UINT32 = 4,
+  UINT8 = 5,
 };
 
 mlx::core::Dtype to_mlx_dtype(int32_t code) {
@@ -167,6 +169,10 @@ mlx::core::Dtype to_mlx_dtype(int32_t code) {
       return mlx::core::float16;
     case BFLOAT16:
       return mlx::core::bfloat16;
+    case UINT32:
+      return mlx::core::uint32;
+    case UINT8:
+      return mlx::core::uint8;
     default:
       return mlx::core::float32;
   }
@@ -182,6 +188,10 @@ int32_t from_mlx_dtype(mlx::core::Dtype dtype) {
       return FLOAT16;
     case mlx::core::bfloat16:
       return BFLOAT16;
+    case mlx::core::uint32:
+      return UINT32;
+    case mlx::core::uint8:
+      return UINT8;
     default:
       return -1;
   }

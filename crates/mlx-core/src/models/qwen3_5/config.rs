@@ -112,7 +112,7 @@ impl Qwen3_5Config {
         let mlp_params = 3 * h * i; // MLP gate/up/down
         let per_layer = mlp_params
             + h * h * 2  // attention projections (rough)
-            + h * 4;     // norms, biases, etc.
+            + h * 4; // norms, biases, etc.
         let total_params = embed * 2 + n * per_layer + h;
 
         // 2 bytes per param (bf16)

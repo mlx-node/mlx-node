@@ -8,7 +8,7 @@ use napi::bindgen_prelude::*;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::SafeTensorsFile;
 
@@ -16,8 +16,8 @@ use super::config::Qwen3_5Config;
 use super::decoder_layer::AttentionType;
 use super::model::Qwen3_5Model;
 use super::quantized_linear::{
-    is_quantized_checkpoint, try_build_quantized_linear, MLPVariant, DEFAULT_QUANT_BITS,
-    DEFAULT_QUANT_GROUP_SIZE,
+    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MLPVariant, is_mxfp8_checkpoint,
+    is_quantized_checkpoint, try_build_mxfp8_quantized_linear, try_build_quantized_linear,
 };
 
 /// Load all safetensors files from a directory (supports sharded checkpoints).
@@ -73,6 +73,86 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     Ok(all_params)
 }
 
+/// FP8 E4M3 block-wise dequantization: weight * scale_inv with block_size=128
+fn dequant_fp8(weight: &MxArray, scale_inv: &MxArray, target_dtype: DType) -> Result<MxArray> {
+    let weight = weight.from_fp8(target_dtype)?;
+
+    let shape = weight.shape()?;
+    let shape_ref = shape.as_ref();
+
+    if shape_ref.len() < 2 {
+        return weight.mul(scale_inv)?.astype(target_dtype);
+    }
+
+    let m = shape_ref[0] as usize;
+    let n = shape_ref[1] as usize;
+    let bs: usize = 128;
+
+    let pad_bottom = (bs - (m % bs)) % bs;
+    let pad_side = (bs - (n % bs)) % bs;
+
+    let weight = if pad_bottom > 0 || pad_side > 0 {
+        weight.pad(&[0, pad_bottom as i32, 0, pad_side as i32], 0.0)?
+    } else {
+        weight
+    };
+
+    let m_padded = m + pad_bottom;
+    let n_padded = n + pad_side;
+    let weight = weight.reshape(&[
+        (m_padded / bs) as i64,
+        bs as i64,
+        (n_padded / bs) as i64,
+        bs as i64,
+    ])?;
+
+    let scale = scale_inv.expand_dims(1)?.expand_dims(3)?;
+    let weight = weight.mul(&scale)?;
+
+    let weight = weight.reshape(&[m_padded as i64, n_padded as i64])?;
+    let weight = if pad_bottom > 0 || pad_side > 0 {
+        weight.slice(&[0, 0], &[m as i64, n as i64])?
+    } else {
+        weight
+    };
+
+    weight.astype(target_dtype)
+}
+
+/// Dequantize all FP8 weight pairs in-place.
+fn dequant_fp8_weights(params: &mut HashMap<String, MxArray>, target_dtype: DType) -> Result<()> {
+    let scale_keys: Vec<String> = params
+        .keys()
+        .filter(|k| k.ends_with("weight_scale_inv"))
+        .cloned()
+        .collect();
+
+    if scale_keys.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        "Dequantizing {} FP8 weight pairs to {:?}",
+        scale_keys.len(),
+        target_dtype
+    );
+
+    for scale_key in scale_keys {
+        let weight_key = scale_key.replace("_scale_inv", "");
+        let scale_inv = params
+            .remove(&scale_key)
+            .expect("scale_key must exist in params");
+        if let Some(weight) = params.remove(&weight_key) {
+            let dequantized = dequant_fp8(&weight, &scale_inv, target_dtype)?;
+            // Eval immediately to prevent lazy chain accumulation (OOM with many FP8 pairs)
+            dequantized.eval();
+            params.insert(weight_key, dequantized);
+        }
+    }
+
+    Ok(())
+}
+
 /// Sanitize weights from HuggingFace format (dense variant).
 ///
 /// Handles:
@@ -82,6 +162,8 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
 /// 4. Conv1d weight axis: transpose([0, 2, 1]) when shape[-1] != 1
 /// 5. Norm weight +1.0 adjustment (when unsanitized weights detected)
 /// 6. Remove MTP (multi-token prediction) weights
+/// 7. FP8 E4M3 dequantization (weight + weight_scale_inv → bf16)
+/// 8. 4-bit affine re-quantization (for FP8 source checkpoints)
 fn sanitize_weights(
     mut params: HashMap<String, MxArray>,
     config: &Qwen3_5Config,
@@ -102,6 +184,14 @@ fn sanitize_weights(
         }
     });
     let needs_norm_fix = has_mtp_weights || has_unsanitized_conv1d;
+
+    // FP8 dequantization pass — convert FP8 weights to bf16 before further processing.
+    // After all sanitization, FP8 weights are re-quantized to 4-bit affine for memory savings.
+    let had_fp8 = params.keys().any(|k| k.ends_with("weight_scale_inv"));
+    dequant_fp8_weights(&mut params, DType::BFloat16)?;
+    if had_fp8 {
+        crate::array::memory::synchronize_and_clear_cache();
+    }
 
     let norm_suffixes = [
         ".input_layernorm.weight",
@@ -175,6 +265,10 @@ fn sanitize_weights(
         result.insert(name, array);
     }
 
+    // For FP8 source checkpoints, keep dequantized bf16 weights as-is.
+    // Re-quantizing (FP8→bf16→4bit or →MXFP8) compounds quantization error
+    // and produces gibberish. mlx-lm also keeps FP8-dequanted weights as bf16.
+
     Ok(result)
 }
 
@@ -183,8 +277,20 @@ fn apply_weights(
     model: &mut Qwen3_5Model,
     params: &HashMap<String, MxArray>,
     config: &Qwen3_5Config,
+    quant_bits: i32,
+    quant_group_size: i32,
 ) -> Result<()> {
     let is_quantized = is_quantized_checkpoint(params);
+    let is_mxfp8 = is_mxfp8_checkpoint(params);
+
+    // Helper: try MXFP8 builder first (if applicable), then affine builder
+    let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
+        if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_linear(params, prefix) {
+            return Some(ql);
+        }
+        try_build_quantized_linear(params, prefix, quant_group_size, quant_bits)
+    };
+
     // Embedding
     if let Some(w) = params.get("embedding.weight") {
         model.embedding.set_weight(w)?;
@@ -226,38 +332,47 @@ fn apply_weights(
         match &mut layer.attn {
             AttentionType::Linear(gdn) => {
                 if is_quantized {
-                    let default_bits = DEFAULT_QUANT_BITS;
-                    let default_gs = DEFAULT_QUANT_GROUP_SIZE;
-
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.linear_attn.in_proj_qkvz", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) =
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))
+                    {
                         gdn.set_quantized_in_proj_qkvz(ql);
-                    } else if let Some(w) = params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
+                    {
                         gdn.set_in_proj_qkvz_weight(w)?;
                     }
 
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.linear_attn.in_proj_ba", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) =
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_ba", prefix))
+                    {
                         gdn.set_quantized_in_proj_ba(ql);
-                    } else if let Some(w) = params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix))
+                    {
                         gdn.set_in_proj_ba_weight(w)?;
                     }
 
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.linear_attn.out_proj", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) =
+                        try_build_ql(params, &format!("{}.linear_attn.out_proj", prefix))
+                    {
                         gdn.set_quantized_out_proj(ql);
-                    } else if let Some(w) = params.get(&format!("{}.linear_attn.out_proj.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.linear_attn.out_proj.weight", prefix))
+                    {
                         gdn.set_out_proj_weight(w)?;
                     }
                 } else {
-                    if let Some(w) = params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
+                    {
                         gdn.set_in_proj_qkvz_weight(w)?;
                     }
-                    if let Some(w) = params.get(&format!("{}.linear_attn.in_proj_qkv.weight", prefix)) {
-                        if let Some(z) = params.get(&format!("{}.linear_attn.in_proj_z.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))
+                    {
+                        if let Some(z) =
+                            params.get(&format!("{}.linear_attn.in_proj_z.weight", prefix))
+                        {
                             let combined = MxArray::concatenate(w, z, 0)?;
                             gdn.set_in_proj_qkvz_weight(&combined)?;
                         } else {
@@ -267,16 +382,20 @@ fn apply_weights(
                             )));
                         }
                     }
-                    if let Some(w) = params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix))
+                    {
                         gdn.set_in_proj_ba_weight(w)?;
                     }
                     if let Some(b) = params.get(&format!("{}.linear_attn.in_proj_b.weight", prefix))
-                        && let Some(a) = params.get(&format!("{}.linear_attn.in_proj_a.weight", prefix))
+                        && let Some(a) =
+                            params.get(&format!("{}.linear_attn.in_proj_a.weight", prefix))
                     {
                         let combined = MxArray::concatenate(b, a, 0)?;
                         gdn.set_in_proj_ba_weight(&combined)?;
                     }
-                    if let Some(w) = params.get(&format!("{}.linear_attn.out_proj.weight", prefix)) {
+                    if let Some(w) = params.get(&format!("{}.linear_attn.out_proj.weight", prefix))
+                    {
                         gdn.set_out_proj_weight(w)?;
                     }
                 }
@@ -297,35 +416,36 @@ fn apply_weights(
             }
             AttentionType::Full(attn) => {
                 if is_quantized {
-                    let default_bits = DEFAULT_QUANT_BITS;
-                    let default_gs = DEFAULT_QUANT_GROUP_SIZE;
-
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.self_attn.q_proj", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix))
+                    {
                         attn.set_quantized_q_proj(ql);
-                    } else if let Some(w) = params.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.self_attn.q_proj.weight", prefix))
+                    {
                         attn.set_q_proj_weight(w)?;
                     }
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.self_attn.k_proj", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix))
+                    {
                         attn.set_quantized_k_proj(ql);
-                    } else if let Some(w) = params.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.self_attn.k_proj.weight", prefix))
+                    {
                         attn.set_k_proj_weight(w)?;
                     }
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.self_attn.v_proj", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix))
+                    {
                         attn.set_quantized_v_proj(ql);
-                    } else if let Some(w) = params.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.self_attn.v_proj.weight", prefix))
+                    {
                         attn.set_v_proj_weight(w)?;
                     }
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.self_attn.o_proj", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix))
+                    {
                         attn.set_quantized_o_proj(ql);
-                    } else if let Some(w) = params.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.self_attn.o_proj.weight", prefix))
+                    {
                         attn.set_o_proj_weight(w)?;
                     }
                 } else {
@@ -367,15 +487,13 @@ fn apply_weights(
         match &mut layer.mlp {
             MLPVariant::Standard(mlp) => {
                 if is_quantized {
-                    let default_bits = DEFAULT_QUANT_BITS;
-                    let default_gs = DEFAULT_QUANT_GROUP_SIZE;
                     let gate_key = format!("{}.mlp.gate_proj", prefix);
                     let up_key = format!("{}.mlp.up_proj", prefix);
                     let down_key = format!("{}.mlp.down_proj", prefix);
 
-                    let q_gate = try_build_quantized_linear(params, &gate_key, default_gs, default_bits);
-                    let q_up = try_build_quantized_linear(params, &up_key, default_gs, default_bits);
-                    let q_down = try_build_quantized_linear(params, &down_key, default_gs, default_bits);
+                    let q_gate = try_build_ql(params, &gate_key);
+                    let q_up = try_build_ql(params, &up_key);
+                    let q_down = try_build_ql(params, &down_key);
 
                     if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
                         layer.set_quantized_dense_mlp(qg, qu, qd);
@@ -538,10 +656,7 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
 
         info!(
             "Qwen3.5 config: {} layers, hidden={}, heads={}, kv_heads={}",
-            config.num_layers,
-            config.hidden_size,
-            config.num_heads,
-            config.num_kv_heads,
+            config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
         );
 
         // Load all weights
@@ -556,6 +671,23 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
             params.len(),
             quantized
         );
+
+        // Parse quantization config from config.json (our format or mlx-lm compat)
+        let quant_cfg = raw
+            .get("quantization")
+            .or_else(|| raw.get("quantization_config"));
+        let quant_bits = quant_cfg
+            .and_then(|q| q["bits"].as_i64())
+            .unwrap_or(DEFAULT_QUANT_BITS as i64) as i32;
+        let quant_group_size = quant_cfg
+            .and_then(|q| q["group_size"].as_i64())
+            .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64) as i32;
+        if quant_cfg.is_some() {
+            info!(
+                "Using quantization config from config.json: bits={}, group_size={}",
+                quant_bits, quant_group_size
+            );
+        }
 
         // Load tokenizer
         let tokenizer_path = path.join("tokenizer.json");
@@ -574,10 +706,15 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
         let mut model = Qwen3_5Model::new(config.clone())?;
 
         // Apply weights
-        apply_weights(&mut model, &params, &config)?;
+        apply_weights(&mut model, &params, &config, quant_bits, quant_group_size)?;
 
         // Register weights with C++ compiled forward pass (dense-only).
-        register_weights_with_cpp(&params);
+        // Skip for quantized models — C++ path uses dense matmul, not quantized_matmul.
+        if !is_quantized_checkpoint(&params) && !is_mxfp8_checkpoint(&params) {
+            register_weights_with_cpp(&params);
+        } else {
+            info!("Skipping C++ compiled path for quantized model (using Rust quantized_matmul)");
+        }
 
         // Set tokenizer
         if let Some(tok) = tokenizer {
@@ -611,13 +748,14 @@ fn register_weights_with_cpp(params: &HashMap<String, MxArray>) {
             let prefix = name.strip_suffix(".in_proj_qkv.weight").unwrap();
             let z_key = format!("{}.in_proj_z.weight", prefix);
             if let Some(z_array) = params.get(&z_key)
-                && let Ok(combined) = MxArray::concatenate(array, z_array, 0) {
-                    let combined_key = format!("{}.in_proj_qkvz.weight", prefix);
-                    store(&combined_key, &combined);
-                    handled_splits.insert(z_key);
-                    handled_splits.insert(name.clone());
-                    continue;
-                }
+                && let Ok(combined) = MxArray::concatenate(array, z_array, 0)
+            {
+                let combined_key = format!("{}.in_proj_qkvz.weight", prefix);
+                store(&combined_key, &combined);
+                handled_splits.insert(z_key);
+                handled_splits.insert(name.clone());
+                continue;
+            }
         }
         if name.ends_with(".linear_attn.in_proj_z.weight") && handled_splits.contains(name) {
             continue;
@@ -627,13 +765,14 @@ fn register_weights_with_cpp(params: &HashMap<String, MxArray>) {
             let prefix = name.strip_suffix(".in_proj_b.weight").unwrap();
             let a_key = format!("{}.in_proj_a.weight", prefix);
             if let Some(a_array) = params.get(&a_key)
-                && let Ok(combined) = MxArray::concatenate(array, a_array, 0) {
-                    let combined_key = format!("{}.in_proj_ba.weight", prefix);
-                    store(&combined_key, &combined);
-                    handled_splits.insert(a_key);
-                    handled_splits.insert(name.clone());
-                    continue;
-                }
+                && let Ok(combined) = MxArray::concatenate(array, a_array, 0)
+            {
+                let combined_key = format!("{}.in_proj_ba.weight", prefix);
+                store(&combined_key, &combined);
+                handled_splits.insert(a_key);
+                handled_splits.insert(name.clone());
+                continue;
+            }
         }
         if name.ends_with(".linear_attn.in_proj_a.weight") && handled_splits.contains(name) {
             continue;
@@ -645,10 +784,7 @@ fn register_weights_with_cpp(params: &HashMap<String, MxArray>) {
     }
 
     let count = unsafe { sys::mlx_qwen35_weight_count() };
-    info!(
-        "Registered {} weights with C++ fused forward pass",
-        count
-    );
+    info!("Registered {} weights with C++ fused forward pass", count);
 }
 
 /// Parse Qwen3.5 dense config from JSON.
@@ -658,9 +794,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
     let get_i32 = |keys: &[&str], default: i32| -> i32 {
         for key in keys {
             if let Some(tc) = text_cfg
-                && let Some(v) = tc[key].as_i64() {
-                    return v as i32;
-                }
+                && let Some(v) = tc[key].as_i64()
+            {
+                return v as i32;
+            }
             if let Some(v) = raw[key].as_i64() {
                 return v as i32;
             }
@@ -671,9 +808,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
     let get_f64 = |keys: &[&str], default: f64| -> f64 {
         for key in keys {
             if let Some(tc) = text_cfg
-                && let Some(v) = tc[key].as_f64() {
-                    return v;
-                }
+                && let Some(v) = tc[key].as_f64()
+            {
+                return v;
+            }
             if let Some(v) = raw[key].as_f64() {
                 return v;
             }
@@ -684,9 +822,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
     let get_bool = |keys: &[&str], default: bool| -> bool {
         for key in keys {
             if let Some(tc) = text_cfg
-                && let Some(v) = tc[key].as_bool() {
-                    return v;
-                }
+                && let Some(v) = tc[key].as_bool()
+            {
+                return v;
+            }
             if let Some(v) = raw[key].as_bool() {
                 return v;
             }
@@ -701,7 +840,13 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         .and_then(|tc| tc["head_dim"].as_i64())
         .or_else(|| raw["head_dim"].as_i64())
         .map(|v| v as i32)
-        .unwrap_or_else(|| if num_heads > 0 { hidden_size / num_heads } else { 128 });
+        .unwrap_or_else(|| {
+            if num_heads > 0 {
+                hidden_size / num_heads
+            } else {
+                128
+            }
+        });
 
     let rope_obj = text_cfg
         .and_then(|tc| tc.get("rope_parameters"))

@@ -2027,6 +2027,14 @@ export interface ConversionOptions {
   verbose?: boolean;
   /** Model type for model-specific weight sanitization (e.g., "paddleocr-vl") */
   modelType?: string;
+  /** Enable quantization of converted weights */
+  quantize?: boolean;
+  /** Quantization bits: 4 (default) or 8 */
+  quantBits?: number;
+  /** Quantization group size (default: 64 for affine, 32 for mxfp8) */
+  quantGroupSize?: number;
+  /** Quantization mode: "affine" (default) or "mxfp8" */
+  quantMode?: string;
 }
 
 export interface ConversionResult {
@@ -2111,6 +2119,7 @@ export declare const enum DType {
   Float16 = 2,
   BFloat16 = 3,
   Uint32 = 4,
+  Uint8 = 5,
 }
 
 /** Document element type */

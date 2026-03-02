@@ -32,16 +32,19 @@ use crate::array::{DType, MxArray};
 /// Supported tensor data types in SafeTensors format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
+#[allow(non_camel_case_types)]
 pub enum SafeTensorDType {
-    F32,  // float32
-    F16,  // float16
-    BF16, // bfloat16
-    I32,  // int32
-    I64,  // int64
-    U8,   // uint8
-    I8,   // int8
-    F64,  // float64
-    BOOL, // boolean
+    F32,     // float32
+    F16,     // float16
+    BF16,    // bfloat16
+    I32,     // int32
+    I64,     // int64
+    U8,      // uint8
+    U32,     // uint32 (packed quantized weights)
+    I8,      // int8
+    F64,     // float64
+    BOOL,    // boolean
+    F8_E4M3, // FP8 E4M3 (8-bit float, used by DeepSeek/Qwen FP8 models)
 }
 
 impl SafeTensorDType {
@@ -54,9 +57,11 @@ impl SafeTensorDType {
             SafeTensorDType::I32 => 4,
             SafeTensorDType::I64 => 8,
             SafeTensorDType::U8 => 1,
+            SafeTensorDType::U32 => 4,
             SafeTensorDType::I8 => 1,
             SafeTensorDType::F64 => 8,
             SafeTensorDType::BOOL => 1,
+            SafeTensorDType::F8_E4M3 => 1,
         }
     }
 
@@ -67,6 +72,8 @@ impl SafeTensorDType {
             SafeTensorDType::F16 => Some(DType::Float16),
             SafeTensorDType::BF16 => Some(DType::BFloat16),
             SafeTensorDType::I32 => Some(DType::Int32),
+            SafeTensorDType::U8 => Some(DType::Uint8),
+            SafeTensorDType::U32 => Some(DType::Uint32),
             _ => None, // Unsupported dtypes
         }
     }
@@ -241,8 +248,17 @@ impl SafeTensorsFile {
                 let int_data = bytes_to_i32(&buffer);
                 MxArray::from_int32(&int_data, &shape)
             }
+            SafeTensorDType::F8_E4M3 | SafeTensorDType::U8 => {
+                // Load as raw uint8 - FP8 dequantization or MXFP8 scales
+                MxArray::from_uint8(&buffer, &shape)
+            }
+            SafeTensorDType::U32 => {
+                // Load as uint32 - packed quantized weights
+                let u32_data = bytes_to_u32(&buffer);
+                MxArray::from_uint32(&u32_data, &shape)
+            }
             _ => Err(Error::from_reason(format!(
-                "Unsupported dtype for tensor {}: {:?}. Supported: F32, F16, BF16, I32",
+                "Unsupported dtype for tensor {}: {:?}. Supported: F32, F16, BF16, I32, U8, U32, F8_E4M3",
                 name, info.dtype
             ))),
         }
@@ -274,6 +290,15 @@ fn bytes_to_i32(bytes: &[u8]) -> Vec<i32> {
     bytes
         .chunks_exact(4)
         .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+/// Convert bytes to u32 array (little-endian)
+/// Used for packed quantized weight loading
+fn bytes_to_u32(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
 }
 
@@ -395,6 +420,10 @@ fn array_to_bytes(array: &MxArray) -> Result<Vec<u8>> {
             let data = array.to_uint32()?;
             Ok(data.iter().flat_map(|&x| x.to_le_bytes()).collect())
         }
+        DType::Uint8 => {
+            let data = array.to_uint8()?;
+            Ok(data)
+        }
     }
 }
 
@@ -406,6 +435,7 @@ fn dtype_to_safetensor_str(dtype: DType) -> String {
         DType::BFloat16 => "BF16".to_string(),
         DType::Int32 => "I32".to_string(),
         DType::Uint32 => "U32".to_string(),
+        DType::Uint8 => "U8".to_string(),
     }
 }
 

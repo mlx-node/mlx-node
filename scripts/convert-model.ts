@@ -28,6 +28,10 @@ interface Args {
   modelType?: string;
   verbose?: boolean;
   help?: boolean;
+  quantize?: boolean;
+  quantBits?: number;
+  quantGroupSize?: number;
+  quantMode?: string;
 }
 
 function parseArgs(): Args {
@@ -63,6 +67,35 @@ function parseArgs(): Args {
         args.verbose = true;
         break;
 
+      case '--quantize':
+      case '-q':
+        args.quantize = true;
+        break;
+
+      case '--q-bits': {
+        const bits = parseInt(argv[++i], 10);
+        if (isNaN(bits)) {
+          console.error('Error: --q-bits requires a numeric value');
+          process.exit(1);
+        }
+        args.quantBits = bits;
+        break;
+      }
+
+      case '--q-group-size': {
+        const gs = parseInt(argv[++i], 10);
+        if (isNaN(gs)) {
+          console.error('Error: --q-group-size requires a numeric value');
+          process.exit(1);
+        }
+        args.quantGroupSize = gs;
+        break;
+      }
+
+      case '--q-mode':
+        args.quantMode = argv[++i];
+        break;
+
       case '--help':
       case '-h':
         args.help = true;
@@ -95,13 +128,21 @@ Optional Arguments:
   --dtype, -d <type>    Target dtype (default: bfloat16)
                         Options: float32, float16, bfloat16
   --model-type, -m      Model type (auto-detected if not specified)
-                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc
+                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_5, qwen3_5_moe
   --verbose, -v         Enable verbose logging
   --help, -h            Show this help message
+
+Quantization Arguments:
+  --quantize, -q        Enable quantization of converted weights
+  --q-bits <int>        Quantization bits (default: 4 for affine, 8 for mxfp8)
+  --q-group-size <int>  Group size (default: 64 for affine, 32 for mxfp8)
+  --q-mode <string>     Mode: "affine" (default) or "mxfp8"
 
 Model Types:
   (default)             SafeTensors dtype conversion (HuggingFace models)
   paddleocr-vl          PaddleOCR-VL weight sanitization
+  qwen3_5               Qwen3.5 dense model (FP8 dequant, key remapping)
+  qwen3_5_moe           Qwen3.5 MoE model (FP8 dequant, expert stacking)
   pp-lcnet-ori          PP-LCNet orientation classifier (Paddle .pdparams/.pdiparams -> SafeTensors)
   uvdoc                 UVDoc unwarping model (Paddle .pdiparams or PyTorch .pkl -> SafeTensors)
 
@@ -110,6 +151,18 @@ Examples:
   oxnode scripts/convert-model.ts \\
     -i .cache/models/qwen3-0.6b \\
     -o .cache/models/qwen3-0.6b-mlx
+
+  # Convert FP8 MoE model to 4-bit quantized
+  oxnode scripts/convert-model.ts \\
+    -i .cache/models/Qwen3.5-35B-A3B-FP8 \\
+    -o .cache/models/Qwen3.5-35B-A3B-4bit \\
+    -m qwen3_5_moe --quantize --q-bits 4
+
+  # Convert FP8 MoE model to MXFP8 quantized
+  oxnode scripts/convert-model.ts \\
+    -i .cache/models/Qwen3.5-35B-A3B-FP8 \\
+    -o .cache/models/Qwen3.5-35B-A3B-mxfp8 \\
+    -m qwen3_5_moe --quantize --q-mode mxfp8
 
   # Convert PP-LCNet orientation model from Paddle format (directory or file)
   oxnode scripts/convert-model.ts \\
@@ -155,6 +208,9 @@ async function main() {
       const config = JSON.parse(readFileSync(configPath, 'utf-8'));
       if (config.model_type === 'paddleocr_vl') {
         modelType = 'paddleocr-vl';
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'qwen3_5_moe' || config.model_type === 'qwen3_5') {
+        modelType = config.model_type;
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       }
     } catch {
@@ -203,6 +259,12 @@ async function main() {
   if (modelType) {
     console.log(`Model Type: ${modelType}`);
   }
+  if (args.quantize) {
+    const qMode = args.quantMode || 'affine';
+    const qBits = args.quantBits || (qMode === 'mxfp8' ? 8 : 4);
+    const qGs = args.quantGroupSize || (qMode === 'mxfp8' ? 32 : 64);
+    console.log(`Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})`);
+  }
   console.log('');
 
   try {
@@ -212,6 +274,10 @@ async function main() {
       dtype,
       verbose,
       modelType,
+      quantize: args.quantize,
+      quantBits: args.quantBits,
+      quantGroupSize: args.quantGroupSize,
+      quantMode: args.quantMode,
     });
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);

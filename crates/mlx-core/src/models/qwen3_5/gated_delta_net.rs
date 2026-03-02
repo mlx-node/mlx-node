@@ -16,9 +16,9 @@ pub struct GatedDeltaNet {
     // Projections
     in_proj_qkvz: LinearProj, // hidden → key_dim*2 + value_dim*2 (q,k,v,z combined)
     in_proj_ba: LinearProj,   // hidden → num_v_heads * 2 (b and a combined)
-    conv1d: Conv1d,            // depthwise conv, groups = conv_dim
-    norm: RMSNormGated,        // per-head norm: weight dim = value_head_dim
-    out_proj: LinearProj,      // value_dim → hidden
+    conv1d: Conv1d,           // depthwise conv, groups = conv_dim
+    norm: RMSNormGated,       // per-head norm: weight dim = value_head_dim
+    out_proj: LinearProj,     // value_dim → hidden
 
     // Learnable parameters
     dt_bias: MxArray, // [num_v_heads]

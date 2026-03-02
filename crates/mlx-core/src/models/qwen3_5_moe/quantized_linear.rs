@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::CString;
 
 use crate::array::MxArray;
@@ -8,8 +9,10 @@ use napi::bindgen_prelude::*;
 // get the same concrete type.
 pub use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
 pub use crate::models::qwen3_5::quantized_linear::{
-    is_quantized_checkpoint, try_build_quantized_linear, DEFAULT_QUANT_BITS,
-    DEFAULT_QUANT_GROUP_SIZE, DEFAULT_QUANT_MODE, GATE_QUANT_BITS, LinearProj, MLPVariant,
+    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DEFAULT_QUANT_MODE, GATE_QUANT_BITS,
+    GATE_QUANT_GROUP_SIZE, LinearProj, MLPVariant, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
+    is_mxfp8_checkpoint, is_quantized_checkpoint, try_build_mxfp8_quantized_linear,
+    try_build_quantized_linear,
 };
 
 /// QuantizedSwitchLinear: Expert-indexed quantized linear layer using gather_qmm.
@@ -108,4 +111,21 @@ impl Clone for QuantizedSwitchLinear {
             mode: self.mode.clone(),
         }
     }
+}
+
+/// Try to build an MXFP8 QuantizedSwitchLinear from weight/scales keys.
+pub fn try_build_mxfp8_quantized_switch_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+) -> Option<QuantizedSwitchLinear> {
+    let weight = params.get(&format!("{}.weight", key_prefix))?;
+    let scales = params.get(&format!("{}.scales", key_prefix))?;
+    Some(QuantizedSwitchLinear::new(
+        weight.clone(),
+        scales.clone(),
+        None,
+        MXFP8_GROUP_SIZE,
+        MXFP8_BITS,
+        MXFP8_MODE.to_string(),
+    ))
 }

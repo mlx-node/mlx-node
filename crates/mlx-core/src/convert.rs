@@ -1,9 +1,10 @@
 /**
  * Model Format Conversion
  *
- * Converts HuggingFace SafeTensors models to MLX float32 format.
- * This is essential for GRPO training which requires full float32 precision.
- * Supports both single-file and sharded models.
+ * Converts HuggingFace SafeTensors models to MLX format with optional quantization.
+ * Supports dtype conversion, FP8 dequantization, model-specific weight sanitization,
+ * and offline quantization (4-bit affine or MXFP8).
+ * Handles both single-file and sharded models.
  */
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -41,6 +42,18 @@ pub struct ConversionOptions {
 
     /// Model type for model-specific weight sanitization (e.g., "paddleocr-vl")
     pub model_type: Option<String>,
+
+    /// Enable quantization of converted weights
+    pub quantize: Option<bool>,
+
+    /// Quantization bits: 4 (default) or 8
+    pub quant_bits: Option<i32>,
+
+    /// Quantization group size (default: 64 for affine, 32 for mxfp8)
+    pub quant_group_size: Option<i32>,
+
+    /// Quantization mode: "affine" (default) or "mxfp8"
+    pub quant_mode: Option<String>,
 }
 
 #[napi(object)]
@@ -92,6 +105,23 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
     let target_dtype = options.dtype.unwrap_or_else(|| "float32".to_string());
     let verbose = options.verbose.unwrap_or(false);
     let model_type = options.model_type;
+    let do_quantize = options.quantize.unwrap_or(false);
+    let quant_mode = options.quant_mode.unwrap_or_else(|| "affine".to_string());
+
+    // Validate quant_mode before it reaches FFI
+    if do_quantize && quant_mode != "affine" && quant_mode != "mxfp8" {
+        return Err(Error::from_reason(format!(
+            "Invalid quant_mode '{}': must be 'affine' or 'mxfp8'",
+            quant_mode
+        )));
+    }
+
+    let quant_bits = options
+        .quant_bits
+        .unwrap_or(if quant_mode == "mxfp8" { 8 } else { 4 });
+    let quant_group_size = options
+        .quant_group_size
+        .unwrap_or(if quant_mode == "mxfp8" { 32 } else { 64 });
 
     // Validate input directory
     if !input_dir.exists() {
@@ -219,13 +249,17 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         )));
     }
 
+    // For models with a sanitizer that handles FP8 dequant + dtype conversion
+    // (e.g. qwen3_5_moe), skip the generic dtype conversion and let the sanitizer do it.
+    let has_custom_sanitizer = matches!(model_type.as_deref(), Some("qwen3_5_moe" | "qwen3_5"));
+
     // Convert tensors to target dtype
     info!("Converting tensors to {}...", target_dtype);
 
     let mut converted_tensors: HashMap<String, MxArray> = HashMap::new();
     let mut tensor_names = Vec::new();
 
-    for (name, array) in tensors.iter() {
+    for (name, array) in tensors.into_iter() {
         // Skip lm_head.weight if embeddings are tied
         // When tied, the model should use embed_tokens.weight via as_linear()
         if tie_word_embeddings && name == "lm_head.weight" {
@@ -234,6 +268,14 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
             }
             continue;
         }
+
+        // If a custom sanitizer handles dtype conversion, pass tensors through as-is
+        if has_custom_sanitizer {
+            converted_tensors.insert(name.clone(), array);
+            tensor_names.push(name);
+            continue;
+        }
+
         let current_dtype = array.dtype()?;
 
         if verbose {
@@ -241,17 +283,16 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
             info!("  {} {:?} {:?}", name, shape.as_ref(), current_dtype);
         }
 
-        // Convert to float32 if needed
+        // Convert to target dtype if needed
         let converted = match target_dtype.as_str() {
             "float32" | "f32" => {
                 if current_dtype != DType::Float32 {
                     if verbose {
                         info!("    Converting {:?} -> Float32", current_dtype);
                     }
-                    // astype converts to f32
                     array.astype(DType::Float32)?
                 } else {
-                    array.clone()
+                    array
                 }
             }
             "float16" | "f16" => {
@@ -261,7 +302,7 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
                     }
                     array.astype(DType::Float16)?
                 } else {
-                    array.clone()
+                    array
                 }
             }
             "bfloat16" | "bf16" => {
@@ -271,7 +312,7 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
                     }
                     array.astype(DType::BFloat16)?
                 } else {
-                    array.clone()
+                    array
                 }
             }
             _ => {
@@ -283,7 +324,7 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         };
 
         converted_tensors.insert(name.clone(), converted);
-        tensor_names.push(name.clone());
+        tensor_names.push(name);
     }
 
     // Apply model-specific weight sanitization
@@ -294,16 +335,37 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
             );
             load_paddleocr_vl_weights(converted_tensors)?
         }
+        Some("qwen3_5_moe" | "qwen3_5") => {
+            info!(
+                "Applying Qwen3.5 weight sanitization (FP8 dequant, key remapping, expert stacking)..."
+            );
+            sanitize_qwen35_moe(converted_tensors, &config, &target_dtype)?
+        }
         Some(other) => {
             return Err(Error::from_reason(format!(
-                "Unknown model type: '{}'. Supported: paddleocr-vl",
+                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5",
                 other
             )));
         }
         None => converted_tensors,
     };
 
-    // Update tensor names after sanitization
+    // Apply quantization if requested
+    let mut converted_tensors = converted_tensors;
+    if do_quantize {
+        info!(
+            "Quantizing weights: bits={}, group_size={}, mode={}",
+            quant_bits, quant_group_size, quant_mode
+        );
+        quantize_weights(
+            &mut converted_tensors,
+            quant_bits,
+            quant_group_size,
+            &quant_mode,
+        )?;
+    }
+
+    // Update tensor names after sanitization/quantization
     let mut tensor_names: Vec<String> = converted_tensors.keys().cloned().collect();
     tensor_names.sort();
 
@@ -324,11 +386,25 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
 
     save_safetensors(&output_weights_path, &converted_tensors, Some(metadata))?;
 
-    // Copy config.json
+    // Write config.json — inject quantization metadata if quantized
     let output_config_path = output_dir.join("config.json");
-    info!("Copying config.json to: {}", output_config_path.display());
-    fs::copy(&config_path, &output_config_path)
-        .map_err(|e| Error::from_reason(format!("Failed to copy config.json: {}", e)))?;
+    if do_quantize {
+        let mut output_config = config.clone();
+        output_config["quantization"] = serde_json::json!({
+            "group_size": quant_group_size,
+            "bits": quant_bits,
+            "mode": quant_mode,
+        });
+        let config_str = serde_json::to_string_pretty(&output_config)
+            .map_err(|e| Error::from_reason(format!("Failed to serialize config: {}", e)))?;
+        fs::write(&output_config_path, config_str)
+            .map_err(|e| Error::from_reason(format!("Failed to write config.json: {}", e)))?;
+        info!("Wrote config.json with quantization metadata");
+    } else {
+        info!("Copying config.json to: {}", output_config_path.display());
+        fs::copy(&config_path, &output_config_path)
+            .map_err(|e| Error::from_reason(format!("Failed to copy config.json: {}", e)))?;
+    }
 
     // Copy tokenizer and model config files if they exist
     let config_files = [
@@ -374,4 +450,417 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         output_path: output_dir.to_string_lossy().to_string(),
         tensor_names,
     })
+}
+
+/// Determine whether a weight key should be quantized.
+fn should_quantize(key: &str) -> bool {
+    // Only .weight keys (not .scales, .biases, etc.)
+    if !key.ends_with(".weight") {
+        return false;
+    }
+
+    // Exclude embeddings
+    if key.contains("embed_tokens") || key.contains("embedding.") {
+        return false;
+    }
+
+    // Exclude norms (layernorm covers input_layernorm/post_attention_layernorm)
+    if key.contains("layernorm") || key.contains("rms_norm") || key.contains("_norm.") {
+        return false;
+    }
+
+    // Exclude conv1d (not a standard matmul shape)
+    if key.contains("conv1d") {
+        return false;
+    }
+
+    // Exclude A_log and dt_bias (GatedDeltaNet parameters)
+    if key.contains("A_log") || key.contains("dt_bias") {
+        return false;
+    }
+
+    // Exclude in_proj_a, in_proj_b, and in_proj_ba (low-rank projections in GatedDeltaNet)
+    if key.contains("in_proj_a.") || key.contains("in_proj_b.") || key.contains("in_proj_ba.") {
+        return false;
+    }
+
+    true
+}
+
+/// Check if a key is a router gate (should be quantized at 8-bit for accuracy).
+fn is_router_gate(key: &str) -> bool {
+    // Router gates: mlp.gate.weight, shared_expert_gate.weight
+    let stripped = key.strip_suffix(".weight").unwrap_or(key);
+    stripped.ends_with(".mlp.gate") || stripped.ends_with(".shared_expert_gate")
+}
+
+/// Quantize weights in-place using MLX's quantize operation.
+///
+/// Replaces qualifying `.weight` tensors with quantized (uint32 packed) versions
+/// and inserts `.scales` (and `.biases` for affine mode) tensors.
+fn quantize_weights(
+    weights: &mut HashMap<String, MxArray>,
+    bits: i32,
+    group_size: i32,
+    mode: &str,
+) -> Result<()> {
+    use std::ffi::CString;
+
+    let mode_c =
+        CString::new(mode).map_err(|_| Error::from_reason("Invalid quantize mode string"))?;
+
+    // Gate quantization: always 8-bit affine
+    let gate_mode_c = CString::new("affine").unwrap();
+    let gate_bits: i32 = 8;
+    let gate_group_size: i32 = 64;
+
+    // Collect keys to quantize
+    let keys_to_quantize: Vec<(String, bool)> = weights
+        .keys()
+        .filter(|k| should_quantize(k))
+        .map(|k| {
+            let is_gate = is_router_gate(k);
+            (k.clone(), is_gate)
+        })
+        .collect();
+
+    info!(
+        "Quantizing {} weights ({}-bit {}, group_size={})",
+        keys_to_quantize.len(),
+        bits,
+        mode,
+        group_size
+    );
+
+    let mut count = 0;
+    for (key, is_gate) in &keys_to_quantize {
+        let array = match weights.remove(key) {
+            Some(a) => a,
+            None => continue,
+        };
+
+        // Check dimensionality — must be 2D+
+        let ndim = array.ndim()? as usize;
+        if ndim < 2 {
+            weights.insert(key.clone(), array);
+            continue;
+        }
+
+        // Check last dim divisibility
+        let last_dim = array.shape_at((ndim - 1) as u32)? as i32;
+        let (q_bits, q_gs, q_mode) = if *is_gate {
+            (gate_bits, gate_group_size, &gate_mode_c)
+        } else {
+            (bits, group_size, &mode_c)
+        };
+
+        if last_dim % q_gs != 0 {
+            weights.insert(key.clone(), array);
+            continue;
+        }
+
+        // Eval to materialize (prevents lazy graph OOM)
+        array.eval();
+
+        // Quantize
+        let mut out_quantized: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_scales: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_biases: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+
+        let ok = unsafe {
+            mlx_sys::mlx_quantize(
+                array.as_raw_ptr(),
+                q_gs,
+                q_bits,
+                q_mode.as_ptr(),
+                &mut out_quantized,
+                &mut out_scales,
+                &mut out_biases,
+            )
+        };
+
+        if !ok {
+            return Err(Error::from_reason(format!(
+                "mlx_quantize failed for tensor '{}'",
+                key
+            )));
+        }
+
+        let q_weight = MxArray::from_handle(out_quantized, "quantize_weight")?;
+        let q_scales = MxArray::from_handle(out_scales, "quantize_scales")?;
+
+        let prefix = key.strip_suffix(".weight").unwrap_or(key);
+        weights.insert(format!("{}.weight", prefix), q_weight);
+        weights.insert(format!("{}.scales", prefix), q_scales);
+
+        if !out_biases.is_null() {
+            let q_biases = MxArray::from_handle(out_biases, "quantize_biases")?;
+            weights.insert(format!("{}.biases", prefix), q_biases);
+        }
+
+        count += 1;
+
+        if count % 50 == 0 {
+            crate::array::memory::synchronize_and_clear_cache();
+            info!(
+                "  Quantized {}/{} tensors...",
+                count,
+                keys_to_quantize.len()
+            );
+        }
+    }
+
+    crate::array::memory::synchronize_and_clear_cache();
+    info!(
+        "Quantization complete: {} tensors quantized, {} total keys",
+        count,
+        weights.len()
+    );
+
+    Ok(())
+}
+
+/// FP8 E4M3 block-wise dequantization: weight * scale_inv with block_size=128
+///
+/// 1. from_fp8(weight) → target_dtype
+/// 2. Pad to 128-block alignment
+/// 3. Reshape into blocks, multiply by scale_inv
+/// 4. Unpad and return
+fn dequant_fp8(weight: &MxArray, scale_inv: &MxArray, target_dtype: DType) -> Result<MxArray> {
+    // Step 1: Convert FP8 uint8 → target float type
+    let weight = weight.from_fp8(target_dtype)?;
+
+    let shape = weight.shape()?;
+    let shape_ref = shape.as_ref();
+
+    if shape_ref.len() < 2 {
+        // 1D weight (e.g. bias): just scale directly
+        return weight.mul(scale_inv)?.astype(target_dtype);
+    }
+
+    let m = shape_ref[0] as usize;
+    let n = shape_ref[1] as usize;
+    let bs: usize = 128;
+
+    // Step 2: Pad to block alignment
+    let pad_bottom = (bs - (m % bs)) % bs;
+    let pad_side = (bs - (n % bs)) % bs;
+
+    let weight = if pad_bottom > 0 || pad_side > 0 {
+        weight.pad(&[0, pad_bottom as i32, 0, pad_side as i32], 0.0)?
+    } else {
+        weight
+    };
+
+    // Step 3: Reshape into [m_blocks, bs, n_blocks, bs]
+    let m_padded = m + pad_bottom;
+    let n_padded = n + pad_side;
+    let weight = weight.reshape(&[
+        (m_padded / bs) as i64,
+        bs as i64,
+        (n_padded / bs) as i64,
+        bs as i64,
+    ])?;
+
+    // Step 4: Multiply by scale_inv [m_blocks, 1, n_blocks, 1] (broadcast)
+    let scale = scale_inv.expand_dims(1)?.expand_dims(3)?;
+    let weight = weight.mul(&scale)?;
+
+    // Step 5: Reshape back and unpad
+    let weight = weight.reshape(&[m_padded as i64, n_padded as i64])?;
+    let weight = if pad_bottom > 0 || pad_side > 0 {
+        weight.slice(&[0, 0], &[m as i64, n as i64])?
+    } else {
+        weight
+    };
+
+    weight.astype(target_dtype)
+}
+
+/// Sanitize Qwen3.5 / Qwen3.5-MoE model weights.
+///
+/// Handles:
+/// 1. VL key prefix remapping (model.language_model.* → language_model.*)
+/// 2. Skipping vision tower and MTP weights
+/// 3. FP8 E4M3 dequantization (weight + weight_scale_inv → target dtype)
+/// 4. Individual expert stacking (experts.{i}.{proj} → switch_mlp.{proj})
+/// 5. Projection merging (in_proj_qkv + in_proj_z → in_proj_qkvz, in_proj_b + in_proj_a → in_proj_ba)
+fn sanitize_qwen35_moe(
+    weights: HashMap<String, MxArray>,
+    config: &serde_json::Value,
+    target_dtype_str: &str,
+) -> Result<HashMap<String, MxArray>> {
+    let target_dtype = match target_dtype_str {
+        "float32" | "f32" => DType::Float32,
+        "float16" | "f16" => DType::Float16,
+        "bfloat16" | "bf16" => DType::BFloat16,
+        other => {
+            warn!("Unknown target dtype '{}', defaulting to bfloat16", other);
+            DType::BFloat16
+        }
+    };
+
+    // Get num_experts from config (check text_config first, then top-level)
+    let num_experts_val = config
+        .get("text_config")
+        .and_then(|tc| tc.get("num_experts"))
+        .or_else(|| config.get("num_experts"))
+        .and_then(|v| v.as_u64());
+    if num_experts_val.is_none() {
+        warn!("num_experts not found in config.json, defaulting to 256");
+    }
+    let num_experts = num_experts_val.unwrap_or(256) as usize;
+
+    let num_hidden_layers_val = config
+        .get("text_config")
+        .and_then(|tc| tc.get("num_hidden_layers"))
+        .or_else(|| config.get("num_hidden_layers"))
+        .and_then(|v| v.as_u64());
+    if num_hidden_layers_val.is_none() {
+        warn!("num_hidden_layers not found in config.json, defaulting to 40");
+    }
+    let num_hidden_layers = num_hidden_layers_val.unwrap_or(40) as usize;
+
+    info!(
+        "  num_experts={}, num_hidden_layers={}, target_dtype={:?}",
+        num_experts, num_hidden_layers, target_dtype
+    );
+
+    let has_fp8 = weights.keys().any(|k| k.contains("weight_scale_inv"));
+    if has_fp8 {
+        info!("  Detected FP8 weights — will dequantize");
+    }
+
+    // Step 1: Remap key prefixes, skip vision/MTP
+    let mut new_weights: HashMap<String, MxArray> = HashMap::new();
+    for (key, value) in weights.into_iter() {
+        // Skip vision tower
+        if key.starts_with("vision_tower") || key.starts_with("model.visual") {
+            continue;
+        }
+        // Skip MTP (multi-token prediction)
+        if key.starts_with("mtp.") || key.starts_with("mtp_") {
+            continue;
+        }
+
+        // Remap VL key prefixes
+        let new_key = if key.starts_with("model.language_model.") {
+            key.replacen("model.language_model.", "language_model.", 1)
+        } else if key.starts_with("language_model.") {
+            key
+        } else {
+            format!("language_model.{}", key)
+        };
+
+        new_weights.insert(new_key, value);
+    }
+
+    info!("  After key remapping: {} tensors", new_weights.len());
+
+    // Step 2: FP8 dequantization (in-place to avoid extra HashMap allocation)
+    if has_fp8 {
+        let scale_keys: Vec<String> = new_weights
+            .keys()
+            .filter(|k| k.contains("weight_scale_inv"))
+            .cloned()
+            .collect();
+
+        info!("  Dequantizing {} FP8 weight pairs...", scale_keys.len());
+
+        for scale_key in &scale_keys {
+            let weight_key = scale_key.replace("_scale_inv", "");
+            let scale_inv = new_weights.remove(scale_key).unwrap();
+            if let Some(weight) = new_weights.remove(&weight_key) {
+                let dequant = dequant_fp8(&weight, &scale_inv, target_dtype)?;
+                // Eval immediately to prevent lazy chain accumulation (OOM with many FP8 pairs)
+                dequant.eval();
+                new_weights.insert(weight_key, dequant);
+            } else {
+                warn!(
+                    "Orphaned FP8 scale_inv key (no matching weight): {}",
+                    scale_key
+                );
+            }
+        }
+
+        // Convert remaining non-FP8 weights to target dtype
+        let keys: Vec<String> = new_weights.keys().cloned().collect();
+        for k in keys {
+            let v = new_weights.get(&k).unwrap();
+            let current_dtype = v.dtype()?;
+            if current_dtype != target_dtype {
+                let converted = v.astype(target_dtype)?;
+                new_weights.insert(k, converted);
+            }
+        }
+
+        info!("  After FP8 dequantization: {} tensors", new_weights.len());
+    }
+
+    // Step 3: Stack individual expert weights
+    for l in 0..num_hidden_layers {
+        let prefix = format!("language_model.layers.{}.mlp", l);
+        let first_expert_key = format!("{}.experts.0.gate_proj.weight", prefix);
+
+        if !new_weights.contains_key(&first_expert_key) {
+            continue;
+        }
+
+        info!("  Layer {}: stacking {} experts...", l, num_experts);
+
+        for proj in &["gate_proj", "up_proj", "down_proj"] {
+            let mut to_stack: Vec<MxArray> = Vec::with_capacity(num_experts);
+            for e in 0..num_experts {
+                let k = format!("{}.experts.{}.{}.weight", prefix, e, proj);
+                match new_weights.remove(&k) {
+                    Some(w) => to_stack.push(w),
+                    None => {
+                        return Err(Error::from_reason(format!("Missing expert weight: {}", k)));
+                    }
+                }
+            }
+            let refs: Vec<&MxArray> = to_stack.iter().collect();
+            let stacked = MxArray::stack(refs, Some(0))?;
+            new_weights.insert(format!("{}.switch_mlp.{}.weight", prefix, proj), stacked);
+        }
+    }
+
+    // Clean up any remaining individual expert keys (shouldn't be any after stacking)
+    let expert_keys: Vec<String> = new_weights
+        .keys()
+        .filter(|k| k.contains(".mlp.experts.") && k.ends_with(".weight"))
+        .cloned()
+        .collect();
+    for k in expert_keys {
+        new_weights.remove(&k);
+    }
+
+    info!("  After expert stacking: {} tensors", new_weights.len());
+
+    // Step 4: Merge split projections for quantization compatibility.
+    // The loading code expects combined in_proj_qkvz and in_proj_ba, so we
+    // concatenate them here so they get quantized as single tensors.
+    for l in 0..num_hidden_layers {
+        let prefix = format!("language_model.layers.{}.linear_attn", l);
+
+        // Merge in_proj_qkv + in_proj_z → in_proj_qkvz
+        let qkv_key = format!("{}.in_proj_qkv.weight", prefix);
+        let z_key = format!("{}.in_proj_z.weight", prefix);
+        if let (Some(qkv), Some(z)) = (new_weights.remove(&qkv_key), new_weights.remove(&z_key)) {
+            let combined = MxArray::concatenate(&qkv, &z, 0)?;
+            new_weights.insert(format!("{}.in_proj_qkvz.weight", prefix), combined);
+        }
+
+        // Merge in_proj_b + in_proj_a → in_proj_ba
+        let b_key = format!("{}.in_proj_b.weight", prefix);
+        let a_key = format!("{}.in_proj_a.weight", prefix);
+        if let (Some(b), Some(a)) = (new_weights.remove(&b_key), new_weights.remove(&a_key)) {
+            let combined = MxArray::concatenate(&b, &a, 0)?;
+            new_weights.insert(format!("{}.in_proj_ba.weight", prefix), combined);
+        }
+    }
+
+    info!("  After projection merging: {} tensors", new_weights.len());
+
+    Ok(new_weights)
 }

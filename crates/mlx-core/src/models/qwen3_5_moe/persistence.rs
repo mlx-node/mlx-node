@@ -7,7 +7,7 @@ use napi::bindgen_prelude::*;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::SafeTensorsFile;
 
@@ -15,8 +15,10 @@ use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
 use super::model::Qwen3_5MoeModel;
 use super::quantized_linear::{
-    is_quantized_checkpoint, try_build_quantized_linear, MLPVariant, QuantizedSwitchLinear,
-    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS,
+    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
+    MLPVariant, QuantizedSwitchLinear, is_mxfp8_checkpoint, is_quantized_checkpoint,
+    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
+    try_build_quantized_linear,
 };
 use super::switch_glu::SwitchGLU;
 
@@ -73,6 +75,95 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     Ok(all_params)
 }
 
+/// FP8 E4M3 block-wise dequantization: weight * scale_inv with block_size=128
+///
+/// Handles both 2D [out, in] and 1D [n] weights.
+/// 1. from_fp8(weight) → target dtype
+/// 2. Pad to 128-block alignment
+/// 3. Reshape into blocks, multiply by scale_inv
+/// 4. Unpad and return as target dtype
+fn dequant_fp8(weight: &MxArray, scale_inv: &MxArray, target_dtype: DType) -> Result<MxArray> {
+    let weight = weight.from_fp8(target_dtype)?;
+
+    let shape = weight.shape()?;
+    let shape_ref = shape.as_ref();
+
+    if shape_ref.len() < 2 {
+        // 1D weight (e.g. bias): just scale directly
+        return weight.mul(scale_inv)?.astype(target_dtype);
+    }
+
+    let m = shape_ref[0] as usize;
+    let n = shape_ref[1] as usize;
+    let bs: usize = 128;
+
+    let pad_bottom = (bs - (m % bs)) % bs;
+    let pad_side = (bs - (n % bs)) % bs;
+
+    let weight = if pad_bottom > 0 || pad_side > 0 {
+        weight.pad(&[0, pad_bottom as i32, 0, pad_side as i32], 0.0)?
+    } else {
+        weight
+    };
+
+    let m_padded = m + pad_bottom;
+    let n_padded = n + pad_side;
+    let weight = weight.reshape(&[
+        (m_padded / bs) as i64,
+        bs as i64,
+        (n_padded / bs) as i64,
+        bs as i64,
+    ])?;
+
+    let scale = scale_inv.expand_dims(1)?.expand_dims(3)?;
+    let weight = weight.mul(&scale)?;
+
+    let weight = weight.reshape(&[m_padded as i64, n_padded as i64])?;
+    let weight = if pad_bottom > 0 || pad_side > 0 {
+        weight.slice(&[0, 0], &[m as i64, n as i64])?
+    } else {
+        weight
+    };
+
+    weight.astype(target_dtype)
+}
+
+/// Dequantize all FP8 weight pairs in-place.
+/// Finds all `*weight_scale_inv` keys, dequantizes the corresponding weight,
+/// removes scale_inv keys, and replaces weights with dequantized versions.
+fn dequant_fp8_weights(params: &mut HashMap<String, MxArray>, target_dtype: DType) -> Result<()> {
+    let scale_keys: Vec<String> = params
+        .keys()
+        .filter(|k| k.ends_with("weight_scale_inv"))
+        .cloned()
+        .collect();
+
+    if scale_keys.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        "Dequantizing {} FP8 weight pairs to {:?}",
+        scale_keys.len(),
+        target_dtype
+    );
+
+    for scale_key in scale_keys {
+        let weight_key = scale_key.replace("_scale_inv", "");
+        let scale_inv = params
+            .remove(&scale_key)
+            .expect("scale_key must exist in params");
+        if let Some(weight) = params.remove(&weight_key) {
+            let dequantized = dequant_fp8(&weight, &scale_inv, target_dtype)?;
+            // Eval immediately to prevent lazy chain accumulation (OOM with ~31K FP8 pairs)
+            dequantized.eval();
+            params.insert(weight_key, dequantized);
+        }
+    }
+
+    Ok(())
+}
+
 /// Sanitize weights from HuggingFace format.
 fn sanitize_weights(
     mut params: HashMap<String, MxArray>,
@@ -95,6 +186,16 @@ fn sanitize_weights(
     });
     let needs_norm_fix = has_mtp_weights || has_unsanitized_conv1d;
 
+    // Detect FP8 source checkpoint before dequantization removes scale_inv keys
+    let had_fp8 = params.keys().any(|k| k.ends_with("weight_scale_inv"));
+
+    // FP8 dequantization pass — must run before expert stacking and gate_up_proj splitting
+    // because FP8 weights are 2D individual expert weights with paired scale_inv tensors
+    dequant_fp8_weights(&mut params, DType::BFloat16)?;
+    if had_fp8 {
+        crate::array::memory::synchronize_and_clear_cache();
+    }
+
     let has_individual_experts = params.keys().any(|k| {
         k.contains(".mlp.experts.0.up_proj.weight")
             || k.contains("model.layers.0.mlp.experts.0.up_proj.weight")
@@ -108,7 +209,9 @@ fn sanitize_weights(
         "final_norm.weight",
         ".q_norm.weight",
         ".k_norm.weight",
-        ".linear_attn.norm.weight",
+        // NOTE: .linear_attn.norm.weight is intentionally NOT included here.
+        // It's stored as f32 with final values (e.g. ~0.87), not as shifted weights.
+        // Only standard layer/attention norms need the +1.0 shift for MTP checkpoints.
     ];
 
     for (name, array) in params.drain() {
@@ -183,9 +286,17 @@ fn sanitize_weights(
 
                 let name_stripped = name.strip_suffix(suffix).unwrap_or(&name);
                 let base = if name_stripped.contains("switch_mlp") {
-                    format!("{}{}", name_stripped.replace("gate_up_proj", "gate_proj"), suffix)
+                    format!(
+                        "{}{}",
+                        name_stripped.replace("gate_up_proj", "gate_proj"),
+                        suffix
+                    )
                 } else {
-                    format!("{}{}", name_stripped.replace("experts.gate_up_proj", "switch_mlp.gate_proj"), suffix)
+                    format!(
+                        "{}{}",
+                        name_stripped.replace("experts.gate_up_proj", "switch_mlp.gate_proj"),
+                        suffix
+                    )
                 };
                 let up_name = base.replace("gate_proj", "up_proj");
 
@@ -211,7 +322,11 @@ fn sanitize_weights(
                 ".weight"
             };
             let stripped = name.strip_suffix(suffix).unwrap_or(&name);
-            format!("{}{}", stripped.replace(".mlp.experts.down_proj", ".mlp.switch_mlp.down_proj"), suffix)
+            format!(
+                "{}{}",
+                stripped.replace(".mlp.experts.down_proj", ".mlp.switch_mlp.down_proj"),
+                suffix
+            )
         } else {
             name
         };
@@ -253,7 +368,9 @@ fn sanitize_weights(
             if num_experts > 0 && experts.len() != num_experts {
                 return Err(Error::from_reason(format!(
                     "Expected {} experts for {}, got {}",
-                    num_experts, key, experts.len()
+                    num_experts,
+                    key,
+                    experts.len()
                 )));
             }
 
@@ -262,6 +379,10 @@ fn sanitize_weights(
             result.insert(key, stacked);
         }
     }
+
+    // For FP8 source checkpoints, keep dequantized bf16 weights as-is.
+    // Re-quantizing (FP8→bf16→4bit or →MXFP8) compounds quantization error
+    // and produces gibberish. mlx-lm also keeps FP8-dequanted weights as bf16.
 
     Ok(result)
 }
@@ -290,8 +411,31 @@ fn apply_weights(
     model: &mut Qwen3_5MoeModel,
     params: &HashMap<String, MxArray>,
     config: &Qwen3_5MoeConfig,
+    quant_bits: i32,
+    quant_group_size: i32,
 ) -> Result<()> {
     let is_quantized = is_quantized_checkpoint(params);
+    let is_mxfp8 = is_mxfp8_checkpoint(params);
+
+    // Helper: try MXFP8 builder first (if applicable), then affine builder
+    let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
+        if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_linear(params, prefix) {
+            return Some(ql);
+        }
+        try_build_quantized_linear(params, prefix, quant_group_size, quant_bits)
+    };
+
+    // Router gates always use 8-bit affine with group_size=64 regardless of main quant config
+    let try_build_ql_gate = |params: &HashMap<String, MxArray>, prefix: &str| {
+        try_build_quantized_linear(params, prefix, GATE_QUANT_GROUP_SIZE, GATE_QUANT_BITS)
+    };
+
+    let try_build_qsl = |params: &HashMap<String, MxArray>, prefix: &str| {
+        if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_switch_linear(params, prefix) {
+            return Some(ql);
+        }
+        try_build_quantized_switch_linear(params, prefix, quant_group_size, quant_bits)
+    };
 
     if let Some(w) = params.get("embedding.weight") {
         model.embedding.set_weight(w)?;
@@ -312,10 +456,18 @@ fn apply_weights(
             .lm_head
             .write()
             .map_err(|_| Error::from_reason("Failed to acquire lm_head write lock"))?;
-        if let Some(ref mut head) = *lm_head
+        if is_quantized {
+            if let Some(ql) = try_build_ql(params, "lm_head") {
+                *lm_head = Some(super::quantized_linear::LinearProj::Quantized(ql));
+            } else if let Some(ref mut head) = *lm_head
+                && let Some(w) = params.get("lm_head.weight")
+            {
+                head.set_weight(w, "lm_head")?;
+            }
+        } else if let Some(ref mut head) = *lm_head
             && let Some(w) = params.get("lm_head.weight")
         {
-            head.set_weight(w)?;
+            head.set_weight(w, "lm_head")?;
         }
     }
 
@@ -330,38 +482,47 @@ fn apply_weights(
         match &mut layer.attn {
             AttentionType::Linear(gdn) => {
                 if is_quantized {
-                    let default_bits = DEFAULT_QUANT_BITS;
-                    let default_gs = DEFAULT_QUANT_GROUP_SIZE;
-
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.linear_attn.in_proj_qkvz", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) =
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))
+                    {
                         gdn.set_quantized_in_proj_qkvz(ql);
-                    } else if let Some(w) = params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
+                    {
                         gdn.set_in_proj_qkvz_weight(w)?;
                     }
 
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.linear_attn.in_proj_ba", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) =
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_ba", prefix))
+                    {
                         gdn.set_quantized_in_proj_ba(ql);
-                    } else if let Some(w) = params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix))
+                    {
                         gdn.set_in_proj_ba_weight(w)?;
                     }
 
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.linear_attn.out_proj", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) =
+                        try_build_ql(params, &format!("{}.linear_attn.out_proj", prefix))
+                    {
                         gdn.set_quantized_out_proj(ql);
-                    } else if let Some(w) = params.get(&format!("{}.linear_attn.out_proj.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.linear_attn.out_proj.weight", prefix))
+                    {
                         gdn.set_out_proj_weight(w)?;
                     }
                 } else {
-                    if let Some(w) = params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
+                    {
                         gdn.set_in_proj_qkvz_weight(w)?;
                     }
-                    if let Some(w) = params.get(&format!("{}.linear_attn.in_proj_qkv.weight", prefix)) {
-                        if let Some(z) = params.get(&format!("{}.linear_attn.in_proj_z.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))
+                    {
+                        if let Some(z) =
+                            params.get(&format!("{}.linear_attn.in_proj_z.weight", prefix))
+                        {
                             let combined = MxArray::concatenate(w, z, 0)?;
                             gdn.set_in_proj_qkvz_weight(&combined)?;
                         } else {
@@ -371,16 +532,20 @@ fn apply_weights(
                             )));
                         }
                     }
-                    if let Some(w) = params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix))
+                    {
                         gdn.set_in_proj_ba_weight(w)?;
                     }
                     if let Some(b) = params.get(&format!("{}.linear_attn.in_proj_b.weight", prefix))
-                        && let Some(a) = params.get(&format!("{}.linear_attn.in_proj_a.weight", prefix))
+                        && let Some(a) =
+                            params.get(&format!("{}.linear_attn.in_proj_a.weight", prefix))
                     {
                         let combined = MxArray::concatenate(b, a, 0)?;
                         gdn.set_in_proj_ba_weight(&combined)?;
                     }
-                    if let Some(w) = params.get(&format!("{}.linear_attn.out_proj.weight", prefix)) {
+                    if let Some(w) = params.get(&format!("{}.linear_attn.out_proj.weight", prefix))
+                    {
                         gdn.set_out_proj_weight(w)?;
                     }
                 }
@@ -401,35 +566,36 @@ fn apply_weights(
             }
             AttentionType::Full(attn) => {
                 if is_quantized {
-                    let default_bits = DEFAULT_QUANT_BITS;
-                    let default_gs = DEFAULT_QUANT_GROUP_SIZE;
-
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.self_attn.q_proj", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix))
+                    {
                         attn.set_quantized_q_proj(ql);
-                    } else if let Some(w) = params.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.self_attn.q_proj.weight", prefix))
+                    {
                         attn.set_q_proj_weight(w)?;
                     }
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.self_attn.k_proj", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix))
+                    {
                         attn.set_quantized_k_proj(ql);
-                    } else if let Some(w) = params.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.self_attn.k_proj.weight", prefix))
+                    {
                         attn.set_k_proj_weight(w)?;
                     }
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.self_attn.v_proj", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix))
+                    {
                         attn.set_quantized_v_proj(ql);
-                    } else if let Some(w) = params.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.self_attn.v_proj.weight", prefix))
+                    {
                         attn.set_v_proj_weight(w)?;
                     }
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.self_attn.o_proj", prefix), default_gs, default_bits,
-                    ) {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix))
+                    {
                         attn.set_quantized_o_proj(ql);
-                    } else if let Some(w) = params.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.self_attn.o_proj.weight", prefix))
+                    {
                         attn.set_o_proj_weight(w)?;
                     }
                 } else {
@@ -471,15 +637,13 @@ fn apply_weights(
         match &mut layer.mlp {
             MLPType::Dense(MLPVariant::Standard(mlp)) => {
                 if is_quantized {
-                    let default_bits = DEFAULT_QUANT_BITS;
-                    let default_gs = DEFAULT_QUANT_GROUP_SIZE;
                     let gate_key = format!("{}.mlp.gate_proj", prefix);
                     let up_key = format!("{}.mlp.up_proj", prefix);
                     let down_key = format!("{}.mlp.down_proj", prefix);
 
-                    let q_gate = try_build_quantized_linear(params, &gate_key, default_gs, default_bits);
-                    let q_up = try_build_quantized_linear(params, &up_key, default_gs, default_bits);
-                    let q_down = try_build_quantized_linear(params, &down_key, default_gs, default_bits);
+                    let q_gate = try_build_ql(params, &gate_key);
+                    let q_up = try_build_ql(params, &up_key);
+                    let q_down = try_build_ql(params, &down_key);
 
                     if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
                         layer.set_quantized_dense_mlp(qg, qu, qd);
@@ -509,14 +673,8 @@ fn apply_weights(
             MLPType::Dense(MLPVariant::Quantized { .. }) => {}
             MLPType::MoE(moe) => {
                 if is_quantized {
-                    let gate_bits = GATE_QUANT_BITS;
-                    let gate_gs = DEFAULT_QUANT_GROUP_SIZE;
-                    let default_bits = DEFAULT_QUANT_BITS;
-                    let default_gs = DEFAULT_QUANT_GROUP_SIZE;
-
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.mlp.gate", prefix), gate_gs, gate_bits,
-                    ) {
+                    // Router gate: 8-bit for routing accuracy
+                    if let Some(ql) = try_build_ql_gate(params, &format!("{}.mlp.gate", prefix)) {
                         moe.set_quantized_gate(ql);
                     } else if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
                         moe.set_gate_weight(w)?;
@@ -526,9 +684,9 @@ fn apply_weights(
                     let up_proj_key = format!("{}.mlp.switch_mlp.up_proj", prefix);
                     let down_proj_key = format!("{}.mlp.switch_mlp.down_proj", prefix);
 
-                    let q_gate = try_build_quantized_switch_linear(params, &gate_proj_key, default_gs, default_bits);
-                    let q_up = try_build_quantized_switch_linear(params, &up_proj_key, default_gs, default_bits);
-                    let q_down = try_build_quantized_switch_linear(params, &down_proj_key, default_gs, default_bits);
+                    let q_gate = try_build_qsl(params, &gate_proj_key);
+                    let q_up = try_build_qsl(params, &up_proj_key);
+                    let q_down = try_build_qsl(params, &down_proj_key);
 
                     if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
                         let quantized_switch = SwitchGLU::new_quantized(qg, qu, qd);
@@ -549,9 +707,9 @@ fn apply_weights(
                     let se_up_key = format!("{}.mlp.shared_expert.up_proj", prefix);
                     let se_down_key = format!("{}.mlp.shared_expert.down_proj", prefix);
 
-                    let q_se_gate = try_build_quantized_linear(params, &se_gate_key, default_gs, default_bits);
-                    let q_se_up = try_build_quantized_linear(params, &se_up_key, default_gs, default_bits);
-                    let q_se_down = try_build_quantized_linear(params, &se_down_key, default_gs, default_bits);
+                    let q_se_gate = try_build_ql(params, &se_gate_key);
+                    let q_se_up = try_build_ql(params, &se_up_key);
+                    let q_se_down = try_build_ql(params, &se_down_key);
 
                     if let (Some(qg), Some(qu), Some(qd)) = (q_se_gate, q_se_up, q_se_down) {
                         moe.set_quantized_shared_expert(qg, qu, qd);
@@ -567,36 +725,53 @@ fn apply_weights(
                         }
                     }
 
-                    if let Some(ql) = try_build_quantized_linear(
-                        params, &format!("{}.mlp.shared_expert_gate", prefix), gate_gs, gate_bits,
-                    ) {
+                    // Shared expert gate: 8-bit for routing accuracy
+                    if let Some(ql) =
+                        try_build_ql_gate(params, &format!("{}.mlp.shared_expert_gate", prefix))
+                    {
                         moe.set_quantized_shared_expert_gate(ql);
-                    } else if let Some(w) = params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix)) {
+                    } else if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix))
+                    {
                         moe.set_shared_expert_gate_weight(w)?;
                     }
                 } else {
                     if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
                         moe.set_gate_weight(w)?;
                     }
-                    if let Some(w) = params.get(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix))
+                    {
                         moe.set_switch_mlp_gate_proj_weight(w);
                     }
-                    if let Some(w) = params.get(&format!("{}.mlp.switch_mlp.up_proj.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.switch_mlp.up_proj.weight", prefix))
+                    {
                         moe.set_switch_mlp_up_proj_weight(w);
                     }
-                    if let Some(w) = params.get(&format!("{}.mlp.switch_mlp.down_proj.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.switch_mlp.down_proj.weight", prefix))
+                    {
                         moe.set_switch_mlp_down_proj_weight(w);
                     }
-                    if let Some(w) = params.get(&format!("{}.mlp.shared_expert.gate_proj.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert.gate_proj.weight", prefix))
+                    {
                         moe.set_shared_expert_gate_proj_weight(w)?;
                     }
-                    if let Some(w) = params.get(&format!("{}.mlp.shared_expert.up_proj.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert.up_proj.weight", prefix))
+                    {
                         moe.set_shared_expert_up_proj_weight(w)?;
                     }
-                    if let Some(w) = params.get(&format!("{}.mlp.shared_expert.down_proj.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert.down_proj.weight", prefix))
+                    {
                         moe.set_shared_expert_down_proj_weight(w)?;
                     }
-                    if let Some(w) = params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix)) {
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix))
+                    {
                         moe.set_shared_expert_gate_weight(w)?;
                     }
                 }
@@ -620,7 +795,10 @@ fn apply_weights(
     if !params.contains_key("final_norm.weight") {
         missing_mandatory.push("final_norm.weight".to_string());
     }
-    if !config.tie_word_embeddings && !params.contains_key("lm_head.weight") {
+    if !config.tie_word_embeddings
+        && !params.contains_key("lm_head.weight")
+        && !params.contains_key("lm_head.scales")
+    {
         missing_mandatory.push("lm_head.weight".to_string());
     }
 
@@ -713,10 +891,7 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
         info!(
             "Qwen3.5 MoE config: {} layers, hidden={}, experts={}x{}",
-            config.num_layers,
-            config.hidden_size,
-            config.num_experts,
-            config.num_experts_per_tok
+            config.num_layers, config.hidden_size, config.num_experts, config.num_experts_per_tok
         );
 
         let raw_params = load_all_safetensors(path)?;
@@ -729,6 +904,23 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5MoeModel> {
             params.len(),
             quantized
         );
+
+        // Parse quantization config from config.json (our format or mlx-lm compat)
+        let quant_cfg = raw
+            .get("quantization")
+            .or_else(|| raw.get("quantization_config"));
+        let quant_bits = quant_cfg
+            .and_then(|q| q["bits"].as_i64())
+            .unwrap_or(DEFAULT_QUANT_BITS as i64) as i32;
+        let quant_group_size = quant_cfg
+            .and_then(|q| q["group_size"].as_i64())
+            .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64) as i32;
+        if quant_cfg.is_some() {
+            info!(
+                "Using quantization config from config.json: bits={}, group_size={}",
+                quant_bits, quant_group_size
+            );
+        }
 
         let tokenizer_path = path.join("tokenizer.json");
         let tokenizer = if tokenizer_path.exists() {
@@ -743,7 +935,7 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5MoeModel> {
         };
 
         let mut model = Qwen3_5MoeModel::new(config.clone())?;
-        apply_weights(&mut model, &params, &config)?;
+        apply_weights(&mut model, &params, &config, quant_bits, quant_group_size)?;
 
         // No C++ compiled path for MoE — expert routing not supported in C++
 
@@ -765,9 +957,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
     let get_i32 = |keys: &[&str], default: i32| -> i32 {
         for key in keys {
             if let Some(tc) = text_cfg
-                && let Some(v) = tc[key].as_i64() {
-                    return v as i32;
-                }
+                && let Some(v) = tc[key].as_i64()
+            {
+                return v as i32;
+            }
             if let Some(v) = raw[key].as_i64() {
                 return v as i32;
             }
@@ -778,9 +971,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
     let get_f64 = |keys: &[&str], default: f64| -> f64 {
         for key in keys {
             if let Some(tc) = text_cfg
-                && let Some(v) = tc[key].as_f64() {
-                    return v;
-                }
+                && let Some(v) = tc[key].as_f64()
+            {
+                return v;
+            }
             if let Some(v) = raw[key].as_f64() {
                 return v;
             }
@@ -791,9 +985,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
     let get_bool = |keys: &[&str], default: bool| -> bool {
         for key in keys {
             if let Some(tc) = text_cfg
-                && let Some(v) = tc[key].as_bool() {
-                    return v;
-                }
+                && let Some(v) = tc[key].as_bool()
+            {
+                return v;
+            }
             if let Some(v) = raw[key].as_bool() {
                 return v;
             }
@@ -808,7 +1003,13 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
         .and_then(|tc| tc["head_dim"].as_i64())
         .or_else(|| raw["head_dim"].as_i64())
         .map(|v| v as i32)
-        .unwrap_or_else(|| if num_heads > 0 { hidden_size / num_heads } else { 128 });
+        .unwrap_or_else(|| {
+            if num_heads > 0 {
+                hidden_size / num_heads
+            } else {
+                128
+            }
+        });
 
     let rope_obj = text_cfg
         .and_then(|tc| tc.get("rope_parameters"))
@@ -834,17 +1035,20 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
 
     if hidden_size <= 0 {
         return Err(Error::from_reason(format!(
-            "Invalid config: hidden_size must be > 0, got {}", hidden_size
+            "Invalid config: hidden_size must be > 0, got {}",
+            hidden_size
         )));
     }
     if num_layers <= 0 {
         return Err(Error::from_reason(format!(
-            "Invalid config: num_hidden_layers must be > 0, got {}", num_layers
+            "Invalid config: num_hidden_layers must be > 0, got {}",
+            num_layers
         )));
     }
     if num_experts <= 0 {
         return Err(Error::from_reason(format!(
-            "MoE config requires num_experts > 0, got {}", num_experts
+            "MoE config requires num_experts > 0, got {}",
+            num_experts
         )));
     }
     if intermediate_size <= 0 && moe_i <= 0 {
@@ -886,9 +1090,7 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
             let v = get_i32(&["shared_expert_intermediate_size"], 0);
             if v > 0 { Some(v) } else { None }
         },
-        moe_intermediate_size: {
-            if moe_i > 0 { Some(moe_i) } else { None }
-        },
+        moe_intermediate_size: { if moe_i > 0 { Some(moe_i) } else { None } },
         norm_topk_prob: get_bool(&["norm_topk_prob"], true),
         mlp_only_layers: text_cfg
             .and_then(|tc| tc["mlp_only_layers"].as_array())

@@ -108,6 +108,10 @@ impl DecoderLayer {
         up_proj: QuantizedLinear,
         down_proj: QuantizedLinear,
     ) {
-        self.mlp = MLPVariant::Quantized { gate_proj, up_proj, down_proj };
+        self.mlp = MLPVariant::Quantized {
+            gate_proj,
+            up_proj,
+            down_proj,
+        };
     }
 }

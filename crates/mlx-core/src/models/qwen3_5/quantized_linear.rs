@@ -10,9 +10,15 @@ use napi::bindgen_prelude::*;
 /// Default quantization parameters for 4-bit models.
 pub const DEFAULT_QUANT_BITS: i32 = 4;
 pub const DEFAULT_QUANT_GROUP_SIZE: i32 = 64;
-/// Router gates use higher precision (8-bit).
+/// Router gates use higher precision (8-bit affine, group_size=64).
 pub const GATE_QUANT_BITS: i32 = 8;
+pub const GATE_QUANT_GROUP_SIZE: i32 = 64;
 pub const DEFAULT_QUANT_MODE: &str = "affine";
+
+/// MXFP8 quantization parameters (for FP8 source checkpoints).
+pub const MXFP8_BITS: i32 = 8;
+pub const MXFP8_GROUP_SIZE: i32 = 32;
+pub const MXFP8_MODE: &str = "mxfp8";
 
 /// A linear projection that can be either standard or quantized.
 ///
@@ -90,6 +96,32 @@ pub fn is_quantized_checkpoint(params: &HashMap<String, MxArray>) -> bool {
     params.keys().any(|k| k.ends_with(".scales"))
 }
 
+/// Check if a checkpoint uses MXFP8 quantization (Uint8 scales = E8M0 format).
+pub fn is_mxfp8_checkpoint(params: &HashMap<String, MxArray>) -> bool {
+    params
+        .iter()
+        .any(|(k, v)| k.ends_with(".scales") && matches!(v.dtype(), Ok(crate::array::DType::Uint8)))
+}
+
+/// Try to build an MXFP8 QuantizedLinear from weight/scales keys in a params map.
+/// MXFP8 has no biases (only weight + scales).
+pub fn try_build_mxfp8_quantized_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+) -> Option<QuantizedLinear> {
+    let weight = params.get(&format!("{}.weight", key_prefix))?;
+    let scales = params.get(&format!("{}.scales", key_prefix))?;
+    Some(QuantizedLinear::new(
+        weight.clone(),
+        scales.clone(),
+        None,
+        None,
+        MXFP8_GROUP_SIZE,
+        MXFP8_BITS,
+        MXFP8_MODE.to_string(),
+    ))
+}
+
 /// Try to build a QuantizedLinear from weight/scales/biases keys in a params map.
 pub fn try_build_quantized_linear(
     params: &HashMap<String, MxArray>,
@@ -122,7 +154,7 @@ pub struct QuantizedLinear {
     bias: Option<MxArray>,   // Linear bias (additive)
     group_size: i32,
     bits: i32,
-    mode: String,            // "affine" or "none"
+    mode: String, // "affine" or "none"
 }
 
 impl QuantizedLinear {

@@ -4,6 +4,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tracing::{info, warn};
 
+use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
 use crate::nn::{Embedding, Linear, RMSNorm};
@@ -80,7 +81,7 @@ pub struct Qwen3_5MoeModel {
     pub(crate) embedding: Embedding,
     pub(crate) layers: Arc<RwLock<Vec<DecoderLayer>>>,
     pub(crate) final_norm: Arc<RwLock<RMSNorm>>,
-    pub(crate) lm_head: Arc<RwLock<Option<Linear>>>,
+    pub(crate) lm_head: Arc<RwLock<Option<LinearProj>>>,
     caches: Arc<RwLock<Option<Vec<Qwen3_5LayerCache>>>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     fa_idx: usize,
@@ -101,11 +102,11 @@ impl Qwen3_5MoeModel {
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(Linear::new(
+            Some(LinearProj::Standard(Linear::new(
                 config.hidden_size as u32,
                 config.vocab_size as u32,
                 Some(false),
-            )?)
+            )?))
         };
 
         let fa_idx = (0..config.num_layers as usize)
@@ -114,9 +115,7 @@ impl Qwen3_5MoeModel {
 
         info!(
             "Qwen3.5 MoE model created: {} layers, fa_idx={}, experts={}",
-            config.num_layers,
-            fa_idx,
-            config.num_experts
+            config.num_layers, fa_idx, config.num_experts
         );
 
         Ok(Self {
@@ -555,17 +554,11 @@ impl Qwen3_5MoeModel {
                     + vhd;
             } else {
                 let d = self.config.head_dim as i64;
-                total += h * h * 2
-                    + h * (self.config.num_kv_heads as i64 * d) * 2
-                    + h * h
-                    + d * 2;
+                total += h * h * 2 + h * (self.config.num_kv_heads as i64 * d) * 2 + h * h + d * 2;
             }
 
             if is_moe {
-                total += h * num_experts
-                    + num_experts * 3 * h * moe_i
-                    + 3 * h * shared_i
-                    + h;
+                total += h * num_experts + num_experts * 3 * h * moe_i + 3 * h * shared_i + h;
             } else {
                 total += 3 * h * dense_i;
             }
@@ -584,7 +577,7 @@ fn forward_with_locks(
     embedding_weight: &MxArray,
     layers_arc: &Arc<RwLock<Vec<DecoderLayer>>>,
     final_norm_arc: &Arc<RwLock<RMSNorm>>,
-    lm_head_arc: &Arc<RwLock<Option<Linear>>>,
+    lm_head_arc: &Arc<RwLock<Option<LinearProj>>>,
     caches_arc: &Arc<RwLock<Option<Vec<Qwen3_5LayerCache>>>>,
     fa_idx: usize,
     embedding_weight_t: Option<&MxArray>,
@@ -648,15 +641,13 @@ fn forward_with_locks(
         .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
     match &*lm_head_guard {
         Some(head) => head.forward(&h),
-        None => {
-            match embedding_weight_t {
-                Some(wt) => h.matmul(wt),
-                None => {
-                    let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-                    h.matmul(&wt)
-                }
+        None => match embedding_weight_t {
+            Some(wt) => h.matmul(wt),
+            None => {
+                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
+                h.matmul(&wt)
             }
-        }
+        },
     }
 }
 
@@ -668,15 +659,16 @@ fn eval_token_and_caches(
     let mut handles: Vec<*mut mlx_sys::mlx_array> = vec![next_token.as_raw_ptr()];
 
     if let Ok(caches_guard) = caches_arc.read()
-        && let Some(ref caches) = *caches_guard {
-            let mut arr_refs: Vec<&MxArray> = Vec::with_capacity(caches.len() * 2);
-            for cache in caches.iter() {
-                cache.collect_arrays(&mut arr_refs);
-            }
-            for arr in &arr_refs {
-                handles.push(arr.as_raw_ptr());
-            }
+        && let Some(ref caches) = *caches_guard
+    {
+        let mut arr_refs: Vec<&MxArray> = Vec::with_capacity(caches.len() * 2);
+        for cache in caches.iter() {
+            cache.collect_arrays(&mut arr_refs);
         }
+        for arr in &arr_refs {
+            handles.push(arr.as_raw_ptr());
+        }
+    }
 
     unsafe {
         mlx_sys::mlx_async_eval(handles.as_mut_ptr(), handles.len());
