@@ -544,54 +544,59 @@ void mlx_qwen35_compiled_init_from_prefill(
     mlx_array** cache_arrays,
     int prefill_offset
 ) {
-  g_compile_config = CompileConfig{
-    num_layers, hidden_size, num_heads, num_kv_heads, head_dim,
-    rope_theta, rope_dims, rms_norm_eps, full_attention_interval,
-    linear_num_k_heads, linear_num_v_heads, linear_key_head_dim,
-    linear_value_head_dim, linear_conv_kernel_dim,
-    tie_word_embeddings != 0,
-    max_kv_len, batch_size
-  };
+  try {
+    g_compile_config = CompileConfig{
+      num_layers, hidden_size, num_heads, num_kv_heads, head_dim,
+      rope_theta, rope_dims, rms_norm_eps, full_attention_interval,
+      linear_num_k_heads, linear_num_v_heads, linear_key_head_dim,
+      linear_value_head_dim, linear_conv_kernel_dim,
+      tie_word_embeddings != 0,
+      max_kv_len, batch_size
+    };
 
-  // Build g_compiled_caches via push_back (array has no default constructor,
-  // so resize/vector(N) won't work — we must construct each element explicitly).
-  g_compiled_caches.clear();
-  g_compiled_caches.reserve(num_layers * 2);
+    // Build g_compiled_caches via push_back (array has no default constructor,
+    // so resize/vector(N) won't work — we must construct each element explicitly).
+    g_compiled_caches.clear();
+    g_compiled_caches.reserve(num_layers * 2);
 
-  for (int i = 0; i < num_layers; i++) {
-    bool is_linear = !((i + 1) % full_attention_interval == 0);
+    for (int i = 0; i < num_layers; i++) {
+      bool is_linear = !((i + 1) % full_attention_interval == 0);
 
-    if (is_linear) {
-      g_compiled_caches.push_back(*reinterpret_cast<array*>(cache_arrays[i * 2]));
-      g_compiled_caches.push_back(*reinterpret_cast<array*>(cache_arrays[i * 2 + 1]));
-    } else {
-      auto& kk = *reinterpret_cast<array*>(cache_arrays[i * 2]);
-      auto& kv = *reinterpret_cast<array*>(cache_arrays[i * 2 + 1]);
-      int current_cap = kk.shape(2);
-      if (current_cap < max_kv_len) {
-        int pad_len = max_kv_len - current_cap;
-        auto kpad = zeros({batch_size, num_kv_heads, pad_len, head_dim}, kk.dtype());
-        auto vpad = zeros({batch_size, num_kv_heads, pad_len, head_dim}, kv.dtype());
-        g_compiled_caches.push_back(concatenate({kk, kpad}, 2));
-        g_compiled_caches.push_back(concatenate({kv, vpad}, 2));
+      if (is_linear) {
+        g_compiled_caches.push_back(*reinterpret_cast<array*>(cache_arrays[i * 2]));
+        g_compiled_caches.push_back(*reinterpret_cast<array*>(cache_arrays[i * 2 + 1]));
       } else {
-        g_compiled_caches.push_back(kk);
-        g_compiled_caches.push_back(kv);
+        auto& kk = *reinterpret_cast<array*>(cache_arrays[i * 2]);
+        auto& kv = *reinterpret_cast<array*>(cache_arrays[i * 2 + 1]);
+        int current_cap = kk.shape(2);
+        if (current_cap < max_kv_len) {
+          int pad_len = max_kv_len - current_cap;
+          auto kpad = zeros({batch_size, num_kv_heads, pad_len, head_dim}, kk.dtype());
+          auto vpad = zeros({batch_size, num_kv_heads, pad_len, head_dim}, kv.dtype());
+          g_compiled_caches.push_back(concatenate({kk, kpad}, 2));
+          g_compiled_caches.push_back(concatenate({kv, vpad}, 2));
+        } else {
+          g_compiled_caches.push_back(kk);
+          g_compiled_caches.push_back(kv);
+        }
       }
     }
+
+    g_compiled_offset = array(prefill_offset, mlx::core::int32);
+    g_offset_int = prefill_offset;
+    g_compile_inited = true;
+
+    // Break the lazy RNG split chain from model initialization.
+    // During model loading, KeySequence::next() is called 400+ times (Linear/Conv1d
+    // constructors), each creating a lazy split(key). Without evaluation, subsequent
+    // categorical() calls during generation would trace through all previous splits.
+    // Calling next() and evaluating it materializes the current key state.
+    auto rng_key = mlx::core::random::KeySequence::default_().next();
+    mlx::core::eval({rng_key});
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] mlx_qwen35_compiled_init_from_prefill: " << e.what() << std::endl;
+    g_compile_inited = false;
   }
-
-  g_compiled_offset = array(prefill_offset, mlx::core::int32);
-  g_offset_int = prefill_offset;
-  g_compile_inited = true;
-
-  // Break the lazy RNG split chain from model initialization.
-  // During model loading, KeySequence::next() is called 400+ times (Linear/Conv1d
-  // constructors), each creating a lazy split(key). Without evaluation, subsequent
-  // categorical() calls during generation would trace through all previous splits.
-  // Calling next() and evaluating it materializes the current key state.
-  auto rng_key = mlx::core::random::KeySequence::default_().next();
-  mlx::core::eval({rng_key});
 }
 
 // =============================================================================

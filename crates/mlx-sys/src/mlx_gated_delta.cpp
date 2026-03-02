@@ -149,27 +149,36 @@ bool mlx_gated_delta_kernel(
 ///
 /// Shapes: A_log [Hv], a [B, T, Hv], dt_bias [Hv] → g [B, T, Hv]
 mlx_array* mlx_fused_compute_g(mlx_array* a_log_ptr, mlx_array* a_ptr, mlx_array* dt_bias_ptr) {
-    using namespace mlx::core;
-    auto& a_log = *reinterpret_cast<array*>(a_log_ptr);
-    auto& a = *reinterpret_cast<array*>(a_ptr);
-    auto& dt_bias = *reinterpret_cast<array*>(dt_bias_ptr);
+    if (!a_log_ptr || !a_ptr || !dt_bias_ptr) {
+        std::cerr << "[MLX] mlx_fused_compute_g: null handle" << std::endl;
+        return nullptr;
+    }
+    try {
+        using namespace mlx::core;
+        auto& a_log = *reinterpret_cast<array*>(a_log_ptr);
+        auto& a = *reinterpret_cast<array*>(a_ptr);
+        auto& dt_bias = *reinterpret_cast<array*>(dt_bias_ptr);
 
-    // softplus(a + dt_bias) = max(x,0) + log1p(exp(-|x|))  (numerically stable)
-    auto x = add(a, dt_bias, {});
-    // Use input dtype for zero to avoid f32 promotion with bf16 inputs
-    auto zero = zeros({}, x.dtype());
-    auto max_x_0 = maximum(x, zero, {});
-    auto abs_x = abs(x, {});
-    auto neg_abs = negative(abs_x, {});
-    auto sp = add(max_x_0, log1p(exp(neg_abs, {}), {}), {});
+        // softplus(a + dt_bias) = max(x,0) + log1p(exp(-|x|))  (numerically stable)
+        auto x = add(a, dt_bias, {});
+        // Use input dtype for zero to avoid f32 promotion with bf16 inputs
+        auto zero = zeros({}, x.dtype());
+        auto max_x_0 = maximum(x, zero, {});
+        auto abs_x = abs(x, {});
+        auto neg_abs = negative(abs_x, {});
+        auto sp = add(max_x_0, log1p(exp(neg_abs, {}), {}), {});
 
-    // g = exp(-exp(A_log) * sp)
-    auto a_exp = exp(a_log, {});
-    auto neg_a_exp = negative(a_exp, {});
-    auto exponent = multiply(neg_a_exp, sp, {});
-    auto g = exp(exponent, {});
+        // g = exp(-exp(A_log) * sp)
+        auto a_exp = exp(a_log, {});
+        auto neg_a_exp = negative(a_exp, {});
+        auto exponent = multiply(neg_a_exp, sp, {});
+        auto g = exp(exponent, {});
 
-    return reinterpret_cast<mlx_array*>(new array(std::move(g)));
+        return reinterpret_cast<mlx_array*>(new array(std::move(g)));
+    } catch (const std::exception& e) {
+        std::cerr << "[MLX] mlx_fused_compute_g: " << e.what() << std::endl;
+        return nullptr;
+    }
 }
 
 }  // extern "C"

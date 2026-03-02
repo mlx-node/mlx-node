@@ -32,6 +32,7 @@ struct mlx_stream {
 };
 
 namespace {
+using mlx::core::add;
 using mlx::core::arange;
 using mlx::core::array;
 using mlx::core::astype;

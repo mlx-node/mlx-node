@@ -123,6 +123,19 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         .quant_group_size
         .unwrap_or(if quant_mode == "mxfp8" { 32 } else { 64 });
 
+    if do_quantize && quant_group_size <= 0 {
+        return Err(Error::from_reason(format!(
+            "Invalid quant_group_size '{}': must be > 0",
+            quant_group_size
+        )));
+    }
+    if do_quantize && quant_bits <= 0 {
+        return Err(Error::from_reason(format!(
+            "Invalid quant_bits '{}': must be > 0",
+            quant_bits
+        )));
+    }
+
     // Validate input directory
     if !input_dir.exists() {
         return Err(Error::from_reason(format!(
