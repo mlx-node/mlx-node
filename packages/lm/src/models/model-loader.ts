@@ -21,12 +21,10 @@ export class ModelLoader {
    * automatically delegate to loadQwen35.
    *
    * @param modelPath - Path to the model directory or file
-   * @param _deviceMap - Device placement (not used in MLX, kept for compatibility)
    * @returns Loaded model
    */
   static async loadPretrained(
     modelPath: string,
-    _deviceMap: string = 'auto',
   ): Promise<Qwen3Model | Qwen3_5Model | Qwen3_5MoeModel> {
     const modelType = await detectModelType(modelPath);
 
