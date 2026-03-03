@@ -121,7 +121,7 @@ impl SparseMoeBlock {
         // Routing logits: [B*T, num_experts]
         let router_logits = self.gate.forward(&x_flat)?;
 
-        // Softmax over experts: [B*T, num_experts]
+        // Softmax over experts (bf16 — precision is sufficient for top-k selection)
         let routing_weights = Activations::softmax(&router_logits, Some(-1))?;
 
         // Top-k: argpartition to find k largest routing weights.
@@ -132,13 +132,11 @@ impl SparseMoeBlock {
         // Gather top-k weights: [B*T, k]
         let top_weights = routing_weights.take_along_axis(&top_indices, -1)?;
 
-        // Normalize weights if configured
+        // Normalize weights if configured (matches mlx-vlm: simple division, no epsilon).
+        // Top-k weights from softmax are always positive, so sum is never zero.
         let top_weights = if self.norm_topk_prob {
             let sum = top_weights.sum(Some(&[-1]), Some(true))?;
-            // Cast epsilon to match input dtype to avoid f32 promotion for bf16/f16 models
-            let eps = MxArray::scalar_float(1e-8)?.astype(x.dtype()?)?;
-            let safe_sum = sum.add(&eps)?;
-            top_weights.div(&safe_sum)?
+            top_weights.div(&sum)?
         } else {
             top_weights
         };

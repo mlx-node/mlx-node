@@ -1510,7 +1510,7 @@ mlx_array* mlx_dequantize(
             dtype = to_mlx_dtype(out_dtype);
         }
 
-        auto result = mlx::core::dequantize(q_arr, s_arr, b_opt, gs, b, mode_str, dtype);
+        auto result = mlx::core::dequantize(q_arr, s_arr, b_opt, gs, b, mode_str, std::nullopt, dtype);
 
         return reinterpret_cast<mlx_array*>(new array(std::move(result)));
     } catch (const std::exception& e) {

@@ -408,6 +408,7 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
             "bits": quant_bits,
             "mode": quant_mode,
         });
+        output_config["quantization_config"] = output_config["quantization"].clone();
         let config_str = serde_json::to_string_pretty(&output_config)
             .map_err(|e| Error::from_reason(format!("Failed to serialize config: {}", e)))?;
         fs::write(&output_config_path, config_str)
@@ -472,8 +473,8 @@ fn should_quantize(key: &str) -> bool {
         return false;
     }
 
-    // Exclude embeddings
-    if key.contains("embed_tokens") || key.contains("embedding.") {
+    // Exclude embeddings and lm_head (output projection shares vocab dimension)
+    if key.contains("embed_tokens") || key.contains("embedding.") || key.contains("lm_head") {
         return false;
     }
 
@@ -522,15 +523,19 @@ fn quantize_weights(
     let mode_c =
         CString::new(mode).map_err(|_| Error::from_reason("Invalid quantize mode string"))?;
 
-    // Gate quantization: always 8-bit affine
+    // Gate quantization: 8-bit affine with group_size=64.
+    // For MXFP8 mode, router gates are EXCLUDED entirely — MXFP8 quantization
+    // of small routing weights destroys expert selection and produces garbage output.
     let gate_mode_c = CString::new("affine").unwrap();
     let gate_bits: i32 = 8;
     let gate_group_size: i32 = 64;
+    let is_mxfp8 = mode == "mxfp8";
 
     // Collect keys to quantize
     let keys_to_quantize: Vec<(String, bool)> = weights
         .keys()
         .filter(|k| should_quantize(k))
+        .filter(|k| !(is_mxfp8 && is_router_gate(k))) // Skip gates in MXFP8 mode
         .map(|k| {
             let is_gate = is_router_gate(k);
             (k.clone(), is_gate)
@@ -692,12 +697,14 @@ fn dequant_fp8(weight: &MxArray, scale_inv: &MxArray, target_dtype: DType) -> Re
 
 /// Sanitize Qwen3.5 / Qwen3.5-MoE model weights.
 ///
+/// Output matches mlx-vlm `format: "mlx"` convention (sanitize is skipped on load).
+///
 /// Handles:
-/// 1. VL key prefix remapping (model.language_model.* → language_model.*)
-/// 2. Skipping vision tower and MTP weights
+/// 1. VL key prefix remapping to mlx-vlm convention (language_model.model.*, vision_tower.*)
+/// 2. Skipping MTP weights
 /// 3. FP8 E4M3 dequantization (weight + weight_scale_inv → target dtype)
 /// 4. Individual expert stacking (experts.{i}.{proj} → switch_mlp.{proj})
-/// 5. Projection merging (in_proj_qkv + in_proj_z → in_proj_qkvz, in_proj_b + in_proj_a → in_proj_ba)
+/// 5. mlx-vlm sanitization: norm weight +1.0 shift, conv1d weight transpose
 fn sanitize_qwen35_moe(
     weights: HashMap<String, MxArray>,
     config: &serde_json::Value,
@@ -744,25 +751,42 @@ fn sanitize_qwen35_moe(
         info!("  Detected FP8 weights — will dequantize");
     }
 
-    // Step 1: Remap key prefixes, skip vision/MTP
+    // Step 1: Remap key prefixes, skip MTP
     let mut new_weights: HashMap<String, MxArray> = HashMap::new();
     for (key, value) in weights.into_iter() {
-        // Skip vision tower
-        if key.starts_with("vision_tower") || key.starts_with("model.visual") {
-            continue;
-        }
         // Skip MTP (multi-token prediction)
         if key.starts_with("mtp.") || key.starts_with("mtp_") {
             continue;
         }
 
-        // Remap VL key prefixes
-        let new_key = if key.starts_with("model.language_model.") {
-            key.replacen("model.language_model.", "language_model.", 1)
-        } else if key.starts_with("language_model.") {
-            key
+        // Vision tower: model.visual.* → vision_tower.*, already vision_tower.* stays as-is
+        // Skip position_ids (unused in MLX)
+        if key.contains("position_ids") {
+            continue;
+        }
+        if key.starts_with("model.visual") {
+            let new_key = key.replacen("model.visual", "vision_tower", 1);
+            new_weights.insert(new_key, value);
+            continue;
+        }
+        if key.starts_with("vision_tower") {
+            new_weights.insert(key, value);
+            continue;
+        }
+
+        // Language model: strip all known prefixes to bare key
+        let bare = key
+            .strip_prefix("model.language_model.")
+            .or_else(|| key.strip_prefix("language_model.model."))
+            .or_else(|| key.strip_prefix("language_model."))
+            .or_else(|| key.strip_prefix("model."))
+            .unwrap_or(&key);
+
+        // Re-prefix: lm_head directly under language_model., everything else under language_model.model.
+        let new_key = if bare.starts_with("lm_head") {
+            format!("language_model.{}", bare)
         } else {
-            format!("language_model.{}", key)
+            format!("language_model.model.{}", bare)
         };
 
         new_weights.insert(new_key, value);
@@ -808,11 +832,22 @@ fn sanitize_qwen35_moe(
         }
 
         info!("  After FP8 dequantization: {} tensors", new_weights.len());
+    } else {
+        // Non-FP8: convert all weights to target dtype
+        let keys: Vec<String> = new_weights.keys().cloned().collect();
+        for k in keys {
+            let v = new_weights.get(&k).unwrap();
+            let current_dtype = v.dtype()?;
+            if current_dtype != target_dtype {
+                let converted = v.astype(target_dtype)?;
+                new_weights.insert(k, converted);
+            }
+        }
     }
 
     // Step 3: Stack individual expert weights
     for l in 0..num_hidden_layers {
-        let prefix = format!("language_model.layers.{}.mlp", l);
+        let prefix = format!("language_model.model.layers.{}.mlp", l);
         let first_expert_key = format!("{}.experts.0.gate_proj.weight", prefix);
 
         if !new_weights.contains_key(&first_expert_key) {
@@ -850,30 +885,47 @@ fn sanitize_qwen35_moe(
 
     info!("  After expert stacking: {} tensors", new_weights.len());
 
-    // Step 4: Merge split projections for quantization compatibility.
-    // The loading code expects combined in_proj_qkvz and in_proj_ba, so we
-    // concatenate them here so they get quantized as single tensors.
-    for l in 0..num_hidden_layers {
-        let prefix = format!("language_model.layers.{}.linear_attn", l);
-
-        // Merge in_proj_qkv + in_proj_z → in_proj_qkvz
-        let qkv_key = format!("{}.in_proj_qkv.weight", prefix);
-        let z_key = format!("{}.in_proj_z.weight", prefix);
-        if let (Some(qkv), Some(z)) = (new_weights.remove(&qkv_key), new_weights.remove(&z_key)) {
-            let combined = MxArray::concatenate(&qkv, &z, 0)?;
-            new_weights.insert(format!("{}.in_proj_qkvz.weight", prefix), combined);
-        }
-
-        // Merge in_proj_b + in_proj_a → in_proj_ba
-        let b_key = format!("{}.in_proj_b.weight", prefix);
-        let a_key = format!("{}.in_proj_a.weight", prefix);
-        if let (Some(b), Some(a)) = (new_weights.remove(&b_key), new_weights.remove(&a_key)) {
-            let combined = MxArray::concatenate(&b, &a, 0)?;
-            new_weights.insert(format!("{}.in_proj_ba.weight", prefix), combined);
+    // Step 4: mlx-vlm sanitization (since format:"mlx" skips sanitize on load)
+    // - Norm weights: +1.0 shift (HF stores raw values, MLX RMSNorm expects weight+1)
+    // - Conv1d weights: transpose last two dims (HF [out, in/g, k] → MLX [out, k, in/g])
+    let norm_suffixes = [
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+        "model.norm.weight",
+        ".q_norm.weight",
+        ".k_norm.weight",
+    ];
+    let keys: Vec<String> = new_weights.keys().cloned().collect();
+    for k in keys {
+        if k.contains("patch_embed.proj.weight") {
+            // Conv3d/Conv2d: PyTorch [out, in, t, h, w] → MLX [out, t, h, w, in]
+            let v = new_weights.get(&k).unwrap();
+            let ndim = v.ndim()? as usize;
+            if ndim == 5 {
+                let transposed = v.transpose(Some(&[0, 2, 3, 4, 1]))?;
+                new_weights.insert(k, transposed);
+            }
+        } else if k.contains("conv1d.weight") {
+            let v = new_weights.get(&k).unwrap();
+            let ndim = v.ndim()? as usize;
+            if ndim >= 2 {
+                let last_dim = v.shape_at((ndim - 1) as u32)?;
+                if last_dim != 1 {
+                    // moveaxis(2, 1) for 3D: [out, in/g, k] → [out, k, in/g]
+                    let transposed = v.transpose(Some(&[0, 2, 1]))?;
+                    new_weights.insert(k, transposed);
+                }
+            }
+        } else if norm_suffixes.iter().any(|sfx| k.ends_with(sfx)) {
+            let v = new_weights.get(&k).unwrap();
+            if v.ndim()? == 1 {
+                let shifted = v.add_scalar(1.0)?;
+                new_weights.insert(k, shifted);
+            }
         }
     }
 
-    info!("  After projection merging: {} tensors", new_weights.len());
+    info!("  After sanitization: {} tensors", new_weights.len());
 
     Ok(new_weights)
 }

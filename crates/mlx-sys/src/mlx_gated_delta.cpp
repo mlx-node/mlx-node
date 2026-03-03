@@ -142,12 +142,35 @@ bool mlx_gated_delta_kernel(
     }
 }
 
-/// Fused compute_g: g = exp(-exp(A_log) * softplus(a + dt_bias))
+/// Compiled compute_g: g = exp(-exp(A_log.f32) * softplus(a + dt_bias)).astype(a.dtype)
 ///
-/// Combines 6 separate ops into a single C++ call so MLX's graph optimizer
-/// can see the full expression. Avoids 6 separate FFI round-trips.
+/// Uses mlx::core::compile(shapeless=true) to cache the fused kernel graph,
+/// matching mlx-lm's @partial(mx.compile, shapeless=True) decorator.
+/// Called 30x per decode step (once per linear attention layer).
 ///
-/// Shapes: A_log [Hv], a [B, T, Hv], dt_bias [Hv] → g [B, T, Hv]
+/// Shapes: A_log [Hv] (f32), a [B, T, Hv] (bf16), dt_bias [Hv] (bf16) → g [B, T, Hv] (bf16)
+
+namespace {
+using namespace mlx::core;
+
+static std::vector<array> compute_g_compiled_impl(const std::vector<array>& inputs) {
+    const auto& a_log = inputs[0];   // bf16 (pre-cast by Rust loader)
+    const auto& a = inputs[1];       // bf16
+    const auto& dt_bias = inputs[2]; // bf16
+    // All ops in bf16 — no dtype promotion, single fused kernel
+    auto A = exp(a_log);
+    auto x = a + dt_bias;
+    auto sp = log(exp(x) + array(1.0f, a.dtype()));
+    return {exp(negative(A * sp))};
+}
+
+static auto& get_compiled_compute_g() {
+    static auto fn = mlx::core::compile(compute_g_compiled_impl, /* shapeless= */ true);
+    return fn;
+}
+
+}  // anonymous namespace
+
 mlx_array* mlx_fused_compute_g(mlx_array* a_log_ptr, mlx_array* a_ptr, mlx_array* dt_bias_ptr) {
     if (!a_log_ptr || !a_ptr || !dt_bias_ptr) {
         std::cerr << "[MLX] mlx_fused_compute_g: null handle" << std::endl;
@@ -159,22 +182,8 @@ mlx_array* mlx_fused_compute_g(mlx_array* a_log_ptr, mlx_array* a_ptr, mlx_array
         auto& a = *reinterpret_cast<array*>(a_ptr);
         auto& dt_bias = *reinterpret_cast<array*>(dt_bias_ptr);
 
-        // softplus(a + dt_bias) = max(x,0) + log1p(exp(-|x|))  (numerically stable)
-        auto x = add(a, dt_bias, {});
-        // Use input dtype for zero to avoid f32 promotion with bf16 inputs
-        auto zero = zeros({}, x.dtype());
-        auto max_x_0 = maximum(x, zero, {});
-        auto abs_x = abs(x, {});
-        auto neg_abs = negative(abs_x, {});
-        auto sp = add(max_x_0, log1p(exp(neg_abs, {}), {}), {});
-
-        // g = exp(-exp(A_log) * sp)
-        auto a_exp = exp(a_log, {});
-        auto neg_a_exp = negative(a_exp, {});
-        auto exponent = multiply(neg_a_exp, sp, {});
-        auto g = exp(exponent, {});
-
-        return reinterpret_cast<mlx_array*>(new array(std::move(g)));
+        auto result = get_compiled_compute_g()({a_log, a, dt_bias});
+        return reinterpret_cast<mlx_array*>(new array(std::move(result[0])));
     } catch (const std::exception& e) {
         std::cerr << "[MLX] mlx_fused_compute_g: " << e.what() << std::endl;
         return nullptr;

@@ -160,6 +160,73 @@ fn dequant_fp8_weights(params: &mut HashMap<String, MxArray>, target_dtype: DTyp
 /// 2. Rename embed_tokens → embedding, model.norm → final_norm
 /// 3. Remove lm_head.weight when tie_word_embeddings
 /// 4. Conv1d weight axis: transpose([0, 2, 1]) when shape[-1] != 1
+/// 5. Merge split linear attention projections into combined tensors.
+///
+/// mlx-vlm/mlx-lm store separate in_proj_qkv, in_proj_z, in_proj_a, in_proj_b,
+/// but our model expects merged in_proj_qkvz and in_proj_ba.
+/// Concatenates .weight, .scales, and .biases along axis 0.
+pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> Result<()> {
+    // Merge in_proj_qkv + in_proj_z → in_proj_qkvz
+    let split_qkv_keys: Vec<String> = result
+        .keys()
+        .filter(|k| k.ends_with(".linear_attn.in_proj_qkv.weight"))
+        .cloned()
+        .collect();
+
+    for qkv_key in &split_qkv_keys {
+        let prefix = qkv_key.strip_suffix(".in_proj_qkv.weight").unwrap();
+        let z_weight_key = format!("{}.in_proj_z.weight", prefix);
+        if !result.contains_key(&z_weight_key) {
+            continue;
+        }
+
+        let qkv_w = result.remove(qkv_key).unwrap();
+        let z_w = result.remove(&z_weight_key).unwrap();
+        let combined_w = MxArray::concatenate(&qkv_w, &z_w, 0)?;
+        result.insert(format!("{}.in_proj_qkvz.weight", prefix), combined_w);
+
+        for suffix in &["scales", "biases"] {
+            let qkv_k = format!("{}.in_proj_qkv.{}", prefix, suffix);
+            let z_k = format!("{}.in_proj_z.{}", prefix, suffix);
+            if let (Some(a), Some(b)) = (result.remove(&qkv_k), result.remove(&z_k)) {
+                let combined = MxArray::concatenate(&a, &b, 0)?;
+                result.insert(format!("{}.in_proj_qkvz.{}", prefix, suffix), combined);
+            }
+        }
+    }
+
+    // Merge in_proj_b + in_proj_a → in_proj_ba
+    let split_b_keys: Vec<String> = result
+        .keys()
+        .filter(|k| k.ends_with(".linear_attn.in_proj_b.weight"))
+        .cloned()
+        .collect();
+
+    for b_key in &split_b_keys {
+        let prefix = b_key.strip_suffix(".in_proj_b.weight").unwrap();
+        let a_weight_key = format!("{}.in_proj_a.weight", prefix);
+        if !result.contains_key(&a_weight_key) {
+            continue;
+        }
+
+        let b_w = result.remove(b_key).unwrap();
+        let a_w = result.remove(&a_weight_key).unwrap();
+        let combined_w = MxArray::concatenate(&b_w, &a_w, 0)?;
+        result.insert(format!("{}.in_proj_ba.weight", prefix), combined_w);
+
+        for suffix in &["scales", "biases"] {
+            let b_k = format!("{}.in_proj_b.{}", prefix, suffix);
+            let a_k = format!("{}.in_proj_a.{}", prefix, suffix);
+            if let (Some(a), Some(b)) = (result.remove(&b_k), result.remove(&a_k)) {
+                let combined = MxArray::concatenate(&a, &b, 0)?;
+                result.insert(format!("{}.in_proj_ba.{}", prefix, suffix), combined);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// 5. Norm weight +1.0 adjustment (when unsanitized weights detected)
 /// 6. Remove MTP (multi-token prediction) weights
 /// 7. FP8 E4M3 dequantization (weight + weight_scale_inv → bf16)
@@ -264,6 +331,8 @@ fn sanitize_weights(
 
         result.insert(name, array);
     }
+
+    merge_split_projections(&mut result)?;
 
     // For FP8 source checkpoints, keep dequantized bf16 weights as-is.
     // Re-quantizing (FP8→bf16→4bit or →MXFP8) compounds quantization error

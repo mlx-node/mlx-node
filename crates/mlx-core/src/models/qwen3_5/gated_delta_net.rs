@@ -299,16 +299,9 @@ impl GatedDeltaNet {
         self.dt_bias = w.clone();
     }
     pub fn set_a_log(&mut self, w: &MxArray) -> Result<()> {
-        // A_log is stored as float32 in checkpoints for training precision,
-        // but must be cast to bf16 for inference to avoid cascading f32 promotion.
-        // Check if model weights are bf16 by looking at dt_bias dtype.
-        let target_dtype = self.dt_bias.dtype()?;
-        let w_dtype = w.dtype()?;
-        if w_dtype != target_dtype {
-            self.a_log = w.astype(target_dtype)?;
-        } else {
-            self.a_log = w.clone();
-        }
+        // Cast A_log to model dtype (bf16) to avoid f32→bf16 promotion overhead.
+        // The precision difference is negligible for inference.
+        self.a_log = w.astype(self.dt_bias.dtype()?)?;
         Ok(())
     }
 

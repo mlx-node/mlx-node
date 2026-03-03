@@ -9,6 +9,13 @@ pub fn clear_cache() {
     }
 }
 
+/// Synchronize GPU — block until all pending GPU work completes
+pub fn synchronize() {
+    unsafe {
+        sys::mlx_synchronize();
+    }
+}
+
 /// Synchronize and clear cache - prevents GPU timeout and memory pressure
 /// This is the recommended function for long-running training loops
 /// Internal Rust-only function - memory management is handled automatically by the trainer

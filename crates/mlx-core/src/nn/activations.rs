@@ -135,31 +135,19 @@ impl Activations {
         MxArray::from_handle(handle, "sigmoid")
     }
 
-    /// Softmax along the last axis
+    /// Softmax along the specified axis (uses MLX's native fused softmax primitive)
     pub fn softmax(input: &MxArray, axis: Option<i32>) -> Result<MxArray> {
         let axis_val = axis.unwrap_or(-1);
-
-        let handle = unsafe {
-            // Compute exp(x - max(x)) for numerical stability
-            let max_vals = sys::mlx_array_max(input.handle.0, &axis_val, 1, true);
-            let shifted = sys::mlx_array_sub(input.handle.0, max_vals);
-            let exp_vals = sys::mlx_array_exp(shifted);
-
-            // Sum along axis
-            let sum_exp = sys::mlx_array_sum(exp_vals, &axis_val, 1, true);
-
-            // Divide to get softmax
-            let result = sys::mlx_array_div(exp_vals, sum_exp);
-
-            // Clean up
-            sys::mlx_array_delete(max_vals);
-            sys::mlx_array_delete(shifted);
-            sys::mlx_array_delete(exp_vals);
-            sys::mlx_array_delete(sum_exp);
-
-            result
-        };
+        let handle = unsafe { sys::mlx_array_softmax(input.handle.0, axis_val) };
         MxArray::from_handle(handle, "softmax")
+    }
+
+    /// Softmax with precise=true (computes in f32 internally, casts back to input dtype).
+    /// Use for numerically sensitive operations like MoE routing with many experts.
+    pub fn softmax_precise(input: &MxArray, axis: Option<i32>) -> Result<MxArray> {
+        let axis_val = axis.unwrap_or(-1);
+        let handle = unsafe { sys::mlx_array_softmax_precise(input.handle.0, axis_val) };
+        MxArray::from_handle(handle, "softmax_precise")
     }
 
     /// Log-Softmax along the specified axis

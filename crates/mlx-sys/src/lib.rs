@@ -68,6 +68,7 @@ unsafe extern "C" {
         keepdims: bool,
     ) -> *mut mlx_array;
     pub fn mlx_array_softmax(handle: *mut mlx_array, axis: i32) -> *mut mlx_array;
+    pub fn mlx_array_softmax_precise(handle: *mut mlx_array, axis: i32) -> *mut mlx_array;
     pub fn mlx_array_sigmoid(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_exp(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log(handle: *mut mlx_array) -> *mut mlx_array;
@@ -1011,6 +1012,53 @@ unsafe extern "C" {
 
     /// Reset compiled state (call on model reset / new conversation).
     pub fn mlx_qwen35_compiled_reset();
+
+    // ============================================
+    // Qwen3.5 MoE Forward Pass (non-compiled)
+    // ============================================
+
+    /// Initialize MoE forward pass from post-prefill caches.
+    pub fn mlx_qwen35_moe_init_from_prefill(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        rope_dims: i32,
+        rms_norm_eps: f32,
+        full_attention_interval: i32,
+        linear_num_k_heads: i32,
+        linear_num_v_heads: i32,
+        linear_key_head_dim: i32,
+        linear_value_head_dim: i32,
+        linear_conv_kernel_dim: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        num_experts: i32,
+        num_experts_per_tok: i32,
+        norm_topk_prob: i32,
+        decoder_sparse_step: i32,
+        mlp_only_layers: *const i32,
+        mlp_only_layers_len: i32,
+        cache_arrays: *mut *mut mlx_array,
+        prefill_offset: i32,
+    );
+
+    /// MoE single-token decode step.
+    pub fn mlx_qwen35_moe_forward(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        output_logits: *mut *mut mlx_array,
+        cache_offset_out: *mut i32,
+    );
+
+    /// Eval next_token and all MoE cache arrays to prevent graph accumulation.
+    pub fn mlx_qwen35_moe_eval_token_and_caches(next_token: *mut mlx_array);
+
+    /// Reset MoE state.
+    pub fn mlx_qwen35_moe_reset();
 }
 
 // Gradient computation types

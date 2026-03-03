@@ -16,7 +16,9 @@ use crate::array::{
 };
 use crate::grpo::{advantages::compute_advantages, autograd::compute_loss_and_gradients_autograd};
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::sampling::{SamplingConfig, apply_repetition_penalty, sample, sample_and_logprobs};
+use crate::sampling::{
+    SamplingConfig, apply_repetition_penalty, check_repetition_cutoff, sample, sample_and_logprobs,
+};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools;
@@ -103,73 +105,6 @@ pub struct PagedCompletedSequence {
     pub tokens: Vec<u32>,
     /// Reason for completion ("eos", "max_tokens", etc.)
     pub finish_reason: String,
-}
-
-/// Check if generation has fallen into a repetitive loop.
-///
-/// Returns Some("repetition") if should stop, None otherwise.
-/// Checks for two types of repetition:
-/// 1. Consecutive identical tokens (e.g., "A A A A A")
-/// 2. N-gram repetition (e.g., "A B C A B C A B C")
-fn check_repetition_cutoff(
-    tokens: &[u32],
-    max_consecutive: i32,
-    max_ngram_repeats: i32,
-    ngram_size: i32,
-) -> Option<&'static str> {
-    let len = tokens.len();
-    if len < 2 {
-        return None;
-    }
-
-    // Skip check if disabled (values <= 0)
-    let check_consecutive = max_consecutive > 0;
-    let check_ngram = max_ngram_repeats > 0 && ngram_size > 0;
-
-    // 1. Check consecutive identical tokens (fast path)
-    if check_consecutive {
-        let last = tokens[len - 1];
-        let mut consecutive = 1usize;
-        for i in (0..len - 1).rev() {
-            if tokens[i] == last {
-                consecutive += 1;
-                if consecutive >= max_consecutive as usize {
-                    return Some("repetition");
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    // 2. Check n-gram repetition (e.g., "A B C A B C A B C")
-    if check_ngram {
-        let ngram_size = ngram_size as usize;
-        let max_ngram_repeats = max_ngram_repeats as usize;
-
-        if len >= ngram_size * 2 {
-            let ngram = &tokens[len - ngram_size..];
-            let mut repeats = 1usize;
-            let mut pos = len - ngram_size * 2;
-
-            loop {
-                if &tokens[pos..pos + ngram_size] == ngram {
-                    repeats += 1;
-                    if repeats >= max_ngram_repeats {
-                        return Some("repetition");
-                    }
-                } else {
-                    break; // Must be consecutive repetitions
-                }
-                if pos < ngram_size {
-                    break;
-                }
-                pos -= ngram_size;
-            }
-        }
-    }
-
-    None
 }
 
 /// Qwen3 Model with automatic differentiation support

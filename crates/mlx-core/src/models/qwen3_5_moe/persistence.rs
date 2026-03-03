@@ -380,6 +380,8 @@ fn sanitize_weights(
         }
     }
 
+    crate::models::qwen3_5::persistence::merge_split_projections(&mut result)?;
+
     // For FP8 source checkpoints, keep dequantized bf16 weights as-is.
     // Re-quantizing (FP8→bf16→4bit or →MXFP8) compounds quantization error
     // and produces gibberish. mlx-lm also keeps FP8-dequanted weights as bf16.
@@ -937,7 +939,9 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5MoeModel> {
         let mut model = Qwen3_5MoeModel::new(config.clone())?;
         apply_weights(&mut model, &params, &config, quant_bits, quant_group_size)?;
 
-        // No C++ compiled path for MoE — expert routing not supported in C++
+        // Register weights with C++ MoE forward pass.
+        // Works for both quantized and unquantized models (C++ detects quantization at init).
+        register_moe_weights_with_cpp(&params);
 
         if let Some(tok) = tokenizer {
             model.tokenizer = Some(Arc::new(tok));
@@ -1101,4 +1105,31 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
                     .collect()
             }),
     })
+}
+
+/// Register all sanitized weights with the C++ MoE forward pass.
+/// Uses the same shared g_weights map as the dense path (mlx_qwen35_store_weight).
+fn register_moe_weights_with_cpp(params: &HashMap<String, MxArray>) {
+    use mlx_sys as sys;
+    use std::ffi::CString;
+
+    // Clear weights (shared map)
+    unsafe { sys::mlx_qwen35_clear_weights() };
+
+    let store = |name: &str, array: &MxArray| {
+        let c_name = CString::new(name).expect("Weight name contains null byte");
+        unsafe {
+            sys::mlx_qwen35_store_weight(c_name.as_ptr(), array.as_raw_ptr());
+        }
+    };
+
+    // Projections are already merged by sanitize_weights → merge_split_projections
+    // (handles both bf16 concat and quantized scales/biases concat correctly).
+    // Just store all params directly.
+    for (name, array) in params {
+        store(name, array);
+    }
+
+    let count = unsafe { sys::mlx_qwen35_weight_count() };
+    info!("Registered {} weights with C++ MoE forward pass", count);
 }

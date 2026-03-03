@@ -112,9 +112,7 @@ impl SparseMoeBlock {
 
         let top_weights = if self.norm_topk_prob {
             let sum = top_weights.sum(Some(&[-1]), Some(true))?;
-            let eps = MxArray::scalar_float(1e-8)?.astype(x.dtype()?)?;
-            let safe_sum = sum.add(&eps)?;
-            top_weights.div(&safe_sum)?
+            top_weights.div(&sum)?
         } else {
             top_weights
         };

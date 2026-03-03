@@ -1,12 +1,12 @@
 //! Tool call parsing utilities
 //!
 //! Extracts structured tool calls from model-generated text.
-//! Supports both JSON format (Qwen3 native) and XML format (training/legacy).
+//! Supports JSON format (Qwen3), function/parameter format (Qwen3.5), and XML format (legacy).
+//!
+//! Uses simple string-based parsers instead of regex for clarity and debuggability.
 
 use napi_derive::napi;
-use regex::Regex;
 use serde_json::Value;
-use std::sync::LazyLock;
 use uuid::Uuid;
 
 /// Structured tool call with parsed arguments
@@ -103,41 +103,69 @@ fn generate_tool_call_id() -> String {
     format!("call_{}", Uuid::new_v4().simple())
 }
 
-// Compiled regex patterns (created once, reused)
-static JSON_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>").expect("Invalid JSON pattern regex")
-});
+// ---------------------------------------------------------------------------
+// Tag extraction helpers — replace all regex with simple string scanning
+// ---------------------------------------------------------------------------
 
-static XML_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<tool_call>\s*<name>([\s\S]*?)</name>\s*(?:<arguments>([\s\S]*?)</arguments>)?\s*</tool_call>")
-        .expect("Invalid XML pattern regex")
-});
+/// Extract all blocks between `<open_tag>` and `</close_tag>`.
+/// Returns Vec of (start_of_open_tag, end_of_close_tag, inner_content).
+fn extract_tag_blocks<'a>(
+    text: &'a str,
+    open_tag: &str,
+    close_tag: &str,
+) -> Vec<(usize, usize, &'a str)> {
+    let mut results = Vec::new();
+    let mut search_from = 0;
 
-static TOOL_CALL_TAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<tool_call>[\s\S]*?</tool_call>").expect("Invalid tool_call tag regex")
-});
+    while search_from < text.len() {
+        let Some(open_start) = text[search_from..].find(open_tag) else {
+            break;
+        };
+        let open_start = search_from + open_start;
+        let content_start = open_start + open_tag.len();
 
-// Pattern for extracting thinking content: <think>...</think>
-static THINK_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<think>\s*([\s\S]*?)\s*</think>").expect("Invalid think pattern regex")
-});
+        let Some(close_start) = text[content_start..].find(close_tag) else {
+            break;
+        };
+        let close_start = content_start + close_start;
+        let close_end = close_start + close_tag.len();
 
-static THINK_TAG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<think>[\s\S]*?</think>").expect("Invalid think tag regex"));
+        let inner = &text[content_start..close_start];
+        results.push((open_start, close_end, inner));
+
+        search_from = close_end;
+    }
+
+    results
+}
+
+/// Remove all occurrences of `<open_tag>...</close_tag>` from text.
+fn strip_tag_blocks(text: &str, open_tag: &str, close_tag: &str) -> String {
+    let blocks = extract_tag_blocks(text, open_tag, close_tag);
+    if blocks.is_empty() {
+        return text.to_string();
+    }
+
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    for (start, end, _) in &blocks {
+        result.push_str(&text[last_end..*start]);
+        last_end = *end;
+    }
+    result.push_str(&text[last_end..]);
+    result.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// JSON sanitizer (for LLM-generated JSON with raw control characters)
+// ---------------------------------------------------------------------------
 
 /// Sanitize JSON string by escaping raw control characters inside string values.
 ///
 /// LLMs often generate JSON with raw newlines inside strings for readability.
 /// This function escapes control characters (`\u0000-\u001F`) found inside
 /// quoted string values so that standard JSON parsers can handle them.
-///
-/// # Example
-/// ```ignore
-/// let input = r#"{"code": "line1
-/// line2"}"#;
-/// let sanitized = sanitize_json_string(input);
-/// // sanitized: {"code": "line1\nline2"}
-/// ```
 fn sanitize_json_string(input: &str) -> String {
     let mut result = String::with_capacity(input.len() + 64);
     let mut in_string = false;
@@ -183,14 +211,14 @@ fn sanitize_json_string(input: &str) -> String {
     result
 }
 
-/// Parse a JSON format tool call
+// ---------------------------------------------------------------------------
+// Individual format parsers
+// ---------------------------------------------------------------------------
+
+/// Parse a JSON format tool call (Qwen3)
 ///
-/// Format: `<tool_call>{"name": "func", "arguments": {...}}</tool_call>`
-///
-/// This function is tolerant of raw control characters (newlines, tabs, etc.)
-/// inside JSON string values, which LLMs commonly generate for readability.
+/// Format: `{"name": "func", "arguments": {...}}`
 fn parse_json_tool_call(json_str: &str, raw_content: &str) -> ToolCallResult {
-    // Sanitize the JSON to escape raw control characters inside strings
     let sanitized = sanitize_json_string(json_str);
     match serde_json::from_str::<Value>(&sanitized) {
         Ok(parsed) => {
@@ -212,15 +240,12 @@ fn parse_json_tool_call(json_str: &str, raw_content: &str) -> ToolCallResult {
                             Ok(parsed_args) => {
                                 ToolCallResult::ok(name, parsed_args, raw_content.to_string())
                             }
-                            Err(e) => {
-                                // Return parse_error status with original string preserved
-                                ToolCallResult::parse_error(
-                                    name,
-                                    s.clone(),
-                                    format!("Failed to parse arguments string as JSON: {}", e),
-                                    raw_content.to_string(),
-                                )
-                            }
+                            Err(e) => ToolCallResult::parse_error(
+                                name,
+                                s.clone(),
+                                format!("Failed to parse arguments string as JSON: {}", e),
+                                raw_content.to_string(),
+                            ),
                         },
                         _ => ToolCallResult::ok(name, arguments, raw_content.to_string()),
                     }
@@ -236,19 +261,86 @@ fn parse_json_tool_call(json_str: &str, raw_content: &str) -> ToolCallResult {
     }
 }
 
-/// Parse an XML format tool call
+/// Parse a Qwen3.5/Qwen3-Coder function-parameter format tool call
 ///
-/// Format: `<tool_call><name>func</name><arguments>{...}</arguments></tool_call>`
-fn parse_xml_tool_call(name: &str, arguments: Option<&str>, raw_content: &str) -> ToolCallResult {
-    let name = name.trim().to_string();
+/// Format: `<function=func_name>\n<parameter=key>\nvalue\n</parameter>\n</function>`
+fn parse_function_tool_call(inner: &str, raw_content: &str) -> ToolCallResult {
+    // inner is everything between <tool_call> and </tool_call>, e.g.:
+    // "\n<function=fetch_url>\n<parameter=url>\nhttps://...\n</parameter>\n</function>\n"
+    let inner = inner.trim();
 
+    // Extract <function=NAME>...</function>
+    let Some(func_start) = inner.find("<function=") else {
+        return ToolCallResult::missing_name(raw_content.to_string());
+    };
+    let after_prefix = &inner[func_start + "<function=".len()..];
+
+    let Some(name_end) = after_prefix.find('>') else {
+        return ToolCallResult::missing_name(raw_content.to_string());
+    };
+    let function_name = after_prefix[..name_end].trim().to_string();
+    if function_name.is_empty() {
+        return ToolCallResult::missing_name(raw_content.to_string());
+    }
+
+    // Find </function> to get parameter section
+    let params_start = name_end + 1;
+    let params_section = if let Some(func_end) = after_prefix[params_start..].find("</function>") {
+        &after_prefix[params_start..params_start + func_end]
+    } else {
+        &after_prefix[params_start..]
+    };
+
+    // Extract all <parameter=key>value</parameter> pairs
+    let mut param_map = serde_json::Map::new();
+    for (_, _, param_inner) in extract_tag_blocks(params_section, "<parameter=", "</parameter>") {
+        // param_inner is "key>\nvalue"
+        if let Some(idx) = param_inner.find('>') {
+            let param_name = param_inner[..idx].trim();
+            let mut param_value = &param_inner[idx + 1..];
+
+            // Strip leading/trailing newlines (matches Python mlx-lm behavior)
+            if param_value.starts_with('\n') {
+                param_value = &param_value[1..];
+            }
+            if param_value.ends_with('\n') {
+                param_value = &param_value[..param_value.len() - 1];
+            }
+
+            param_map.insert(
+                param_name.to_string(),
+                Value::String(param_value.to_string()),
+            );
+        }
+    }
+
+    ToolCallResult::ok(
+        function_name,
+        Value::Object(param_map),
+        raw_content.to_string(),
+    )
+}
+
+/// Parse an XML format tool call (legacy/training)
+///
+/// Format: `<name>func</name><arguments>{...}</arguments>`
+fn parse_xml_tool_call(inner: &str, raw_content: &str) -> ToolCallResult {
+    // Extract <name>...</name>
+    let name_blocks = extract_tag_blocks(inner, "<name>", "</name>");
+    let Some((_, _, name_content)) = name_blocks.first() else {
+        return ToolCallResult::missing_name(raw_content.to_string());
+    };
+
+    let name = name_content.trim().to_string();
     if name.is_empty() {
         return ToolCallResult::missing_name(raw_content.to_string());
     }
 
-    match arguments {
-        Some(args_str) => {
-            let args_str = args_str.trim();
+    // Extract <arguments>...</arguments> (optional)
+    let args_blocks = extract_tag_blocks(inner, "<arguments>", "</arguments>");
+    match args_blocks.first() {
+        Some((_, _, args_content)) => {
+            let args_str = args_content.trim();
             if args_str.is_empty() {
                 ToolCallResult::ok(
                     name,
@@ -274,46 +366,59 @@ fn parse_xml_tool_call(name: &str, arguments: Option<&str>, raw_content: &str) -
     }
 }
 
+// ---------------------------------------------------------------------------
+// Detect which format a <tool_call> block uses
+// ---------------------------------------------------------------------------
+
+/// Determine the format of tool call content and parse accordingly.
+fn classify_and_parse_tool_call(inner: &str, raw_content: &str) -> Option<ToolCallResult> {
+    let trimmed = inner.trim();
+
+    // JSON format (Qwen3): starts with `{`
+    if trimmed.starts_with('{') {
+        return Some(parse_json_tool_call(trimmed, raw_content));
+    }
+
+    // Function format (Qwen3.5): contains `<function=`
+    if trimmed.contains("<function=") {
+        return Some(parse_function_tool_call(inner, raw_content));
+    }
+
+    // XML format (legacy): contains `<name>`
+    if trimmed.contains("<name>") {
+        return Some(parse_xml_tool_call(inner, raw_content));
+    }
+
+    // Unrecognized content — not a tool call
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 /// Parse tool calls from generated text
 ///
 /// Returns (cleaned_text, tool_calls) where:
 /// - `cleaned_text` has all `<tool_call>...</tool_call>` tags removed
 /// - `tool_calls` contains all parsed tool calls with status info
 ///
-/// Supports both formats:
-/// - JSON: `<tool_call>{"name": "func", "arguments": {...}}</tool_call>`
-/// - XML: `<tool_call><name>func</name><arguments>{...}</arguments></tool_call>`
+/// Supports three formats:
+/// - JSON (Qwen3): `<tool_call>{"name": "func", "arguments": {...}}</tool_call>`
+/// - Function (Qwen3.5): `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`
+/// - XML (legacy): `<tool_call><name>func</name><arguments>{...}</arguments></tool_call>`
 pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCallResult>) {
+    let blocks = extract_tag_blocks(text, "<tool_call>", "</tool_call>");
+
     let mut tool_calls = Vec::new();
-
-    // Try JSON format first (Qwen3 native)
-    for cap in JSON_PATTERN.captures_iter(text) {
-        // cap.get(0) is the full match including <tool_call> tags
-        let raw_content = cap.get(0).map(|m| m.as_str()).unwrap_or("");
-        if let Some(json_match) = cap.get(1) {
-            tool_calls.push(parse_json_tool_call(json_match.as_str(), raw_content));
+    for (start, end, inner) in &blocks {
+        let raw_content = &text[*start..*end];
+        if let Some(result) = classify_and_parse_tool_call(inner, raw_content) {
+            tool_calls.push(result);
         }
     }
 
-    // If no JSON matches, try XML format (training/legacy)
-    if tool_calls.is_empty() {
-        for cap in XML_PATTERN.captures_iter(text) {
-            // cap.get(0) is the full match including <tool_call> tags
-            let raw_content = cap.get(0).map(|m| m.as_str()).unwrap_or("");
-            if let Some(name_match) = cap.get(1) {
-                let arguments = cap.get(2).map(|m| m.as_str());
-                tool_calls.push(parse_xml_tool_call(
-                    name_match.as_str(),
-                    arguments,
-                    raw_content,
-                ));
-            }
-        }
-    }
-
-    // Strip all tool_call tags from text
-    let cleaned_text = TOOL_CALL_TAG.replace_all(text, "").trim().to_string();
-
+    let cleaned_text = strip_tag_blocks(text, "<tool_call>", "</tool_call>");
     (cleaned_text, tool_calls)
 }
 
@@ -329,18 +434,12 @@ pub fn has_tool_calls(text: &str) -> bool {
 /// - `thinking_content` is the extracted content from within the tags (None if no tags found)
 ///
 /// If multiple `<think>` blocks exist, they are concatenated with newlines.
-///
-/// # Example
-/// ```ignore
-/// let (text, thinking) = parse_thinking("<think>Let me analyze...</think>\n\nThe answer is 42.");
-/// assert_eq!(text, "The answer is 42.");
-/// assert_eq!(thinking, Some("Let me analyze...".to_string()));
-/// ```
 pub fn parse_thinking(text: &str) -> (String, Option<String>) {
-    // Extract all thinking content
-    let thinking_parts: Vec<&str> = THINK_PATTERN
-        .captures_iter(text)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().trim()))
+    let blocks = extract_tag_blocks(text, "<think>", "</think>");
+
+    let thinking_parts: Vec<&str> = blocks
+        .iter()
+        .map(|(_, _, inner)| inner.trim())
         .filter(|s| !s.is_empty())
         .collect();
 
@@ -350,9 +449,7 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
         Some(thinking_parts.join("\n\n"))
     };
 
-    // Strip all think tags from text
-    let cleaned_text = THINK_TAG.replace_all(text, "").trim().to_string();
-
+    let cleaned_text = strip_tag_blocks(text, "<think>", "</think>");
     (cleaned_text, thinking)
 }
 
@@ -401,19 +498,6 @@ pub struct RewardOutput {
 }
 
 /// Parse tool calls from text (NAPI export)
-///
-/// Extracts tool calls from model-generated text and returns both the cleaned text
-/// and the parsed tool calls.
-///
-/// # Example
-/// ```typescript
-/// import { parseToolCallsFromText } from '@mlx-node/core';
-///
-/// const result = parseToolCallsFromText('<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>');
-/// console.log(result.text); // ""
-/// console.log(result.toolCalls[0].name); // "search"
-/// console.log(result.toolCalls[0].arguments.q); // "test"
-/// ```
 #[napi]
 pub fn parse_tool_calls_from_text(text: String) -> ParseToolCallsResult {
     let (cleaned_text, tool_calls) = parse_tool_calls(&text);
@@ -429,12 +513,8 @@ pub fn parse_tool_calls_from_text(text: String) -> ParseToolCallsResult {
 /// Returns (cleaned_text, tool_calls, thinking) where cleaned_text has
 /// both `<tool_call>` and `<think>` tags removed.
 pub fn parse_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Option<String>) {
-    // Parse tool calls first (this also strips tool_call tags)
     let (text_without_tools, tool_calls) = parse_tool_calls(text);
-
-    // Then parse thinking from the remaining text
     let (cleaned_text, thinking) = parse_thinking(&text_without_tools);
-
     (cleaned_text, tool_calls, thinking)
 }
 
@@ -442,33 +522,6 @@ pub fn parse_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Opti
 ///
 /// Parses tool calls and thinking from completions, creating structured outputs
 /// aligned with the ChatResult structure.
-///
-/// # Arguments
-/// * `prompts` - Array of prompt texts (one per unique prompt, will be expanded by group_size)
-/// * `completions` - Array of completion texts (prompts.len() * group_size total)
-/// * `token_counts` - Array of token counts for each completion
-/// * `finish_reasons` - Array of finish reasons from generation ("eos", "length", "stop", "repetition")
-/// * `group_size` - Number of completions per prompt
-///
-/// # Returns
-/// Array of RewardOutput objects with structured completion data
-///
-/// # Example
-/// ```typescript
-/// import { buildRewardOutputs } from '@mlx-node/core';
-///
-/// const outputs = buildRewardOutputs(
-///   ['What is 2+2?'],           // prompts
-///   ['<think>Let me calculate</think>\n\n4', '4'],  // completions (group_size=2)
-///   [10, 5],                     // token counts
-///   ['eos', 'length'],          // finish reasons
-///   2                            // group_size
-/// );
-///
-/// outputs[0].completion.thinking; // "Let me calculate"
-/// outputs[0].completion.text;     // "4"
-/// outputs[0].completion.finishReason; // "eos"
-/// ```
 #[napi]
 pub fn build_reward_outputs(
     prompts: Vec<String>,
@@ -483,10 +536,8 @@ pub fn build_reward_outputs(
     for (i, completion_text) in completions.iter().enumerate() {
         let prompt_idx = i / group_size;
 
-        // Parse tool calls and thinking
         let (clean_text, tool_calls, thinking) = parse_generation_output(completion_text);
 
-        // Use provided finish reason, or infer from tool calls if not provided
         let finish_reason = finish_reasons.get(i).cloned().unwrap_or_else(|| {
             if !tool_calls.is_empty() {
                 "tool_calls".to_string()
@@ -495,10 +546,7 @@ pub fn build_reward_outputs(
             }
         });
 
-        // Get token count (default to 0 if not available)
         let num_tokens = token_counts.get(i).copied().unwrap_or(0);
-
-        // Get prompt text
         let prompt = prompts.get(prompt_idx).cloned().unwrap_or_default();
 
         outputs.push(RewardOutput {
@@ -521,6 +569,30 @@ pub fn build_reward_outputs(
 mod tests {
     use super::*;
 
+    // ---- Tag extraction helpers ----
+
+    #[test]
+    fn test_extract_tag_blocks_basic() {
+        let blocks = extract_tag_blocks("<a>hello</a> world <a>bye</a>", "<a>", "</a>");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].2, "hello");
+        assert_eq!(blocks[1].2, "bye");
+    }
+
+    #[test]
+    fn test_extract_tag_blocks_no_match() {
+        let blocks = extract_tag_blocks("no tags here", "<a>", "</a>");
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_strip_tag_blocks() {
+        let result = strip_tag_blocks("before <a>inner</a> after", "<a>", "</a>");
+        assert_eq!(result, "before  after");
+    }
+
+    // ---- JSON format (Qwen3) ----
+
     #[test]
     fn test_parse_json_tool_call() {
         let (text, calls) = parse_tool_calls(
@@ -533,19 +605,6 @@ mod tests {
         assert_eq!(calls[0].status, "ok");
         assert_eq!(calls[0].arguments["location"], "Paris");
         assert!(calls[0].id.starts_with("call_"));
-    }
-
-    #[test]
-    fn test_parse_xml_tool_call() {
-        let (text, calls) = parse_tool_calls(
-            r#"<tool_call><name>search</name><arguments>{"query": "test"}</arguments></tool_call>"#,
-        );
-
-        assert_eq!(text, "");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "search");
-        assert_eq!(calls[0].status, "ok");
-        assert_eq!(calls[0].arguments["query"], "test");
     }
 
     #[test]
@@ -574,7 +633,6 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_json() {
-        // Content must have {...} to be matched by JSON_PATTERN regex
         let (_, calls) = parse_tool_calls(r#"<tool_call>{not valid json}</tool_call>"#);
 
         assert_eq!(calls.len(), 1);
@@ -584,12 +642,11 @@ mod tests {
 
     #[test]
     fn test_parse_no_braces_ignored() {
-        // Content without {...} is not matched by JSON_PATTERN
         let (text, calls) = parse_tool_calls(r#"<tool_call>not valid json</tool_call>"#);
 
         // The tag is still stripped from text
         assert_eq!(text, "");
-        // But no tool call is detected (requires {...} or <name>...</name>)
+        // No recognized format — no tool call detected
         assert_eq!(calls.len(), 0);
     }
 
@@ -634,7 +691,6 @@ mod tests {
 
     #[test]
     fn test_string_arguments_invalid_json() {
-        // Test that invalid JSON string arguments result in parse_error status
         let (_, calls) = parse_tool_calls(
             r#"<tool_call>{"name": "test", "arguments": "not valid json"}</tool_call>"#,
         );
@@ -650,13 +706,11 @@ mod tests {
                 .unwrap()
                 .contains("Failed to parse arguments string as JSON")
         );
-        // Original string is preserved in arguments field
         assert_eq!(calls[0].arguments, "not valid json");
     }
 
     #[test]
     fn test_string_arguments_truncated_json() {
-        // Test with truncated/malformed JSON that looks like it should be valid
         let (_, calls) = parse_tool_calls(
             r#"<tool_call>{"name": "search", "arguments": "{\"query\": \"test"}</tool_call>"#,
         );
@@ -665,7 +719,6 @@ mod tests {
         assert_eq!(calls[0].name, "search");
         assert_eq!(calls[0].status, "parse_error");
         assert!(calls[0].error.is_some());
-        // Original malformed string is preserved
         assert_eq!(calls[0].arguments, r#"{"query": "test"#);
     }
 
@@ -675,7 +728,84 @@ mod tests {
         assert!(!has_tool_calls("no tools here"));
     }
 
-    // Tests for thinking parsing
+    // ---- Function format (Qwen3.5/Qwen3-Coder) ----
+
+    #[test]
+    fn test_parse_function_tool_call_basic() {
+        let input = "<tool_call>\n<function=get_current_time>\n</function>\n</tool_call>";
+        let (text, calls) = parse_tool_calls(input);
+
+        assert_eq!(text, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_current_time");
+        assert_eq!(calls[0].status, "ok");
+        assert!(calls[0].arguments.is_object());
+        assert_eq!(calls[0].arguments.as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_with_params() {
+        let input = "<tool_call>\n<function=fetch_url>\n<parameter=url>\nhttps://httpbin.org/json\n</parameter>\n<parameter=method>\nGET\n</parameter>\n</function>\n</tool_call>";
+        let (text, calls) = parse_tool_calls(input);
+
+        assert_eq!(text, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fetch_url");
+        assert_eq!(calls[0].status, "ok");
+        assert_eq!(calls[0].arguments["url"], "https://httpbin.org/json");
+        assert_eq!(calls[0].arguments["method"], "GET");
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_multiline_value() {
+        let input = "<tool_call>\n<function=multiply>\n<parameter=a>\n12234585\n</parameter>\n<parameter=b>\n48838483920\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "multiply");
+        assert_eq!(calls[0].arguments["a"], "12234585");
+        assert_eq!(calls[0].arguments["b"], "48838483920");
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_with_reasoning() {
+        let input = "I'll look that up for you.\n\n<tool_call>\n<function=fetch_url>\n<parameter=url>\nhttps://example.com\n</parameter>\n</function>\n</tool_call>";
+        let (text, calls) = parse_tool_calls(input);
+
+        assert_eq!(text, "I'll look that up for you.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fetch_url");
+        assert_eq!(calls[0].arguments["url"], "https://example.com");
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_multiple() {
+        let input = "<tool_call>\n<function=func1>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=func2>\n<parameter=y>\n2\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "func1");
+        assert_eq!(calls[0].arguments["x"], "1");
+        assert_eq!(calls[1].name, "func2");
+        assert_eq!(calls[1].arguments["y"], "2");
+    }
+
+    // ---- XML format (legacy) ----
+
+    #[test]
+    fn test_parse_xml_tool_call() {
+        let (text, calls) = parse_tool_calls(
+            r#"<tool_call><name>search</name><arguments>{"query": "test"}</arguments></tool_call>"#,
+        );
+
+        assert_eq!(text, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].status, "ok");
+        assert_eq!(calls[0].arguments["query"], "test");
+    }
+
+    // ---- Thinking parsing ----
 
     #[test]
     fn test_parse_thinking_basic() {
@@ -699,7 +829,7 @@ mod tests {
         let (text, thinking) = parse_thinking("<think>\n\n</think>\n\nThe response.");
 
         assert_eq!(text, "The response.");
-        assert!(thinking.is_none()); // Empty thinking should be None
+        assert!(thinking.is_none());
     }
 
     #[test]
@@ -721,6 +851,8 @@ mod tests {
         assert!(!has_thinking("no thinking here"));
     }
 
+    // ---- Combined parsing ----
+
     #[test]
     fn test_parse_generation_output_with_both() {
         let input = r#"<think>Let me think about this...</think>
@@ -732,7 +864,6 @@ Here's the result."#;
 
         let (text, tool_calls, thinking) = parse_generation_output(input);
 
-        // Text has both tool_call and think tags stripped (whitespace may vary)
         assert!(text.contains("I'll use a tool."));
         assert!(text.contains("Here's the result."));
         assert!(!text.contains("<tool_call>"));
@@ -753,18 +884,27 @@ Here's the result."#;
         assert!(thinking.is_none());
     }
 
-    // Tests for sanitize_json_string
+    #[test]
+    fn test_parse_generation_output_qwen35_with_thinking() {
+        let input = "<think>\nI need to check the time.\n</think>\n\n<tool_call>\n<function=get_current_time>\n</function>\n</tool_call>";
+
+        let (text, tool_calls, thinking) = parse_generation_output(input);
+
+        assert_eq!(text, "");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "get_current_time");
+        assert_eq!(thinking, Some("I need to check the time.".to_string()));
+    }
+
+    // ---- JSON sanitizer ----
 
     #[test]
     fn test_sanitize_json_string_with_raw_newlines() {
-        // Simulates model output with raw newlines inside a string value
         let input = "{\n  \"code\": \"line1\nline2\nline3\"\n}";
         let sanitized = sanitize_json_string(input);
 
-        // The newlines inside the string should be escaped
         assert_eq!(sanitized, "{\n  \"code\": \"line1\\nline2\\nline3\"\n}");
 
-        // Should now be valid JSON
         let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
         assert_eq!(parsed["code"], "line1\nline2\nline3");
     }
@@ -774,43 +914,35 @@ Here's the result."#;
         let input = "{\n  \"text\": \"has\ttab\rand\r\ncrlf\"\n}";
         let sanitized = sanitize_json_string(input);
 
-        // Tabs and CRs inside string should be escaped
         assert!(sanitized.contains("\\t"));
         assert!(sanitized.contains("\\r"));
 
-        // Should now be valid JSON
         let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
         assert_eq!(parsed["text"], "has\ttab\rand\r\ncrlf");
     }
 
     #[test]
     fn test_sanitize_json_string_with_escaped_quotes() {
-        // String containing escaped quotes should not confuse the parser
         let input = r#"{"text": "he said \"hello\"\nand left"}"#;
         let sanitized = sanitize_json_string(input);
 
-        // The escaped quote should remain, newline should be escaped
         assert!(sanitized.contains(r#"\"hello\""#));
 
-        // Should be valid JSON
         let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
         assert_eq!(parsed["text"], "he said \"hello\"\nand left");
     }
 
     #[test]
     fn test_sanitize_json_string_with_escaped_backslash() {
-        // A backslash-backslash before a quote: \\" means end of string
         let input = "{\n  \"path\": \"C:\\\\\nD:\\\\\"\n}";
         let sanitized = sanitize_json_string(input);
 
-        // Should be valid JSON - the \n between paths should be escaped
         let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
         assert_eq!(parsed["path"], "C:\\\nD:\\");
     }
 
     #[test]
     fn test_sanitize_json_string_multiline_code() {
-        // Real-world case: model generates code with newlines
         let input = r#"{
   "name": "run_js",
   "arguments": {
@@ -822,7 +954,6 @@ export function main() {
 }"#;
         let sanitized = sanitize_json_string(input);
 
-        // Should be valid JSON now
         let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
         assert_eq!(parsed["name"], "run_js");
         let code = parsed["arguments"]["code"].as_str().unwrap();
@@ -833,7 +964,6 @@ export function main() {
 
     #[test]
     fn test_sanitize_json_string_preserves_valid_json() {
-        // Already valid JSON should pass through unchanged (except the escapes are equivalent)
         let input = r#"{"name": "test", "args": {"key": "value"}}"#;
         let sanitized = sanitize_json_string(input);
         assert_eq!(sanitized, input);
@@ -850,7 +980,6 @@ export function main() {
 
     #[test]
     fn test_sanitize_json_tool_call_integration() {
-        // Full integration test: tool call with raw newlines in code
         let input = r#"<tool_call>
 {
   "name": "run_js",

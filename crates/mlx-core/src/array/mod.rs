@@ -25,7 +25,7 @@ pub use padding::{
 pub use memory::{
     check_memory_safety, clear_cache, compile_clear_cache, get_active_memory, get_cache_memory,
     get_memory_limit, get_peak_memory, heavy_cleanup, reset_peak_memory, set_cache_limit,
-    set_memory_limit, synchronize_and_clear_cache,
+    set_memory_limit, synchronize, synchronize_and_clear_cache,
 };
 
 use mlx_sys as sys;

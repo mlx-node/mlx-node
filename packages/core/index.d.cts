@@ -713,8 +713,9 @@ export type Qwen3_5Model = Qwen35Model;
 /**
  * Qwen3.5 MoE Model -- hybrid linear/full attention with Mixture-of-Experts.
  *
- * No compiled C++ forward path — MoE models use the Rust forward_with_locks path
- * since the C++ compiled forward doesn't support sparse expert routing.
+ * Supports C++ MoE forward path (non-compiled, builds fresh graph per step)
+ * when weights are registered via `register_moe_weights_with_cpp`.
+ * Falls back to Rust forward_inner path for test models without stored weights.
  */
 export declare class Qwen35MoeModel {
   constructor(config: Qwen35MoeConfig);
@@ -1824,35 +1825,6 @@ export declare class VLModel {
  *
  * Parses tool calls and thinking from completions, creating structured outputs
  * aligned with the ChatResult structure.
- *
- * # Arguments
- * * `prompts` - Array of prompt texts (one per unique prompt, will be expanded by group_size)
- * * `completions` - Array of completion texts (prompts.len() * group_size total)
- * * `token_counts` - Array of token counts for each completion
- * * `finish_reasons` - Array of finish reasons from generation ("eos", "length", "stop", "repetition")
- * * `group_size` - Number of completions per prompt
- *
- * # Returns
- * Array of RewardOutput objects with structured completion data
- *
- * # Example
- * ```typescript
- * import { buildRewardOutputs } from '@mlx-node/core';
- *
- * const outputs = buildRewardOutputs(
- *   ['What is 2+2?'],           // prompts
- *   ['<think>Let me calculate</think>
-
-4', '4'],  // completions (group_size=2)
- *   [10, 5],                     // token counts
- *   ['eos', 'length'],          // finish reasons
- *   2                            // group_size
- * );
- *
- * outputs[0].completion.thinking; // "Let me calculate"
- * outputs[0].completion.text;     // "4"
- * outputs[0].completion.finishReason; // "eos"
- * ```
  */
 export declare function buildRewardOutputs(
   prompts: Array<string>,
@@ -2624,22 +2596,7 @@ export interface ParserConfig {
   collapseEmptyRows?: boolean;
 }
 
-/**
- * Parse tool calls from text (NAPI export)
- *
- * Extracts tool calls from model-generated text and returns both the cleaned text
- * and the parsed tool calls.
- *
- * # Example
- * ```typescript
- * import { parseToolCallsFromText } from '@mlx-node/core';
- *
- * const result = parseToolCallsFromText('<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>');
- * console.log(result.text); // ""
- * console.log(result.toolCalls[0].name); // "search"
- * console.log(result.toolCalls[0].arguments.q); // "test"
- * ```
- */
+/** Parse tool calls from text (NAPI export) */
 export declare function parseToolCallsFromText(text: string): ParseToolCallsResult;
 
 /** Result of parsing tool calls from text */
@@ -2660,15 +2617,27 @@ export interface Qwen35ChatConfig {
   topK?: number | undefined;
   topP?: number | undefined;
   minP?: number | undefined;
+  /** Repetition penalty (1.0 = disabled). Penalizes tokens already in context. */
+  repetitionPenalty?: number | undefined;
+  /** Size of the context window for repetition penalty (default: 256) */
+  repetitionContextSize?: number | undefined;
+  /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
+  maxConsecutiveTokens?: number | undefined;
+  /** Max n-gram repetitions before stopping (default: 8, 0 = disabled) */
+  maxNgramRepeats?: number | undefined;
+  /** N-gram size for repetition detection (default: 3) */
+  ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
 }
 
 /** Chat result */
 export interface Qwen35ChatResult {
   text: string;
+  toolCalls: Array<ToolCallResult>;
   thinking?: string;
   numTokens: number;
   finishReason: string;
+  rawText: string;
 }
 
 /**
@@ -2725,15 +2694,27 @@ export interface Qwen35MoeChatConfig {
   topK?: number | undefined;
   topP?: number | undefined;
   minP?: number | undefined;
+  /** Repetition penalty (1.0 = disabled). Penalizes tokens already in context. */
+  repetitionPenalty?: number | undefined;
+  /** Size of the context window for repetition penalty (default: 256) */
+  repetitionContextSize?: number | undefined;
+  /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
+  maxConsecutiveTokens?: number | undefined;
+  /** Max n-gram repetitions before stopping (default: 8, 0 = disabled) */
+  maxNgramRepeats?: number | undefined;
+  /** N-gram size for repetition detection (default: 3) */
+  ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
 }
 
 /** Chat result */
 export interface Qwen35MoeChatResult {
   text: string;
+  toolCalls: Array<ToolCallResult>;
   thinking?: string;
   numTokens: number;
   finishReason: string;
+  rawText: string;
 }
 
 /**

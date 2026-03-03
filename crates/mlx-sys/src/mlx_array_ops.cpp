@@ -183,6 +183,12 @@ mlx_array* mlx_array_softmax(mlx_array* handle, int32_t axis) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
+mlx_array* mlx_array_softmax_precise(mlx_array* handle, int32_t axis) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = softmax(*arr, axis, /*precise=*/true);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
 mlx_array* mlx_array_sigmoid(mlx_array* handle) {
   auto arr = reinterpret_cast<array*>(handle);
   array result = sigmoid(*arr);

@@ -10,7 +10,7 @@ import { resolve } from 'node:path';
 import { ModelLoader } from '@mlx-node/lm';
 import { Qwen3Model } from '@mlx-node/core';
 
-const MODEL_PATH = resolve(process.cwd(), '.cache', 'models', 'qwen3.5-27b-mlx-bf16');
+const MODEL_PATH = resolve(process.cwd(), '.cache', 'models', process.argv[2] || 'qwen3.5-27b-mxfp8');
 
 async function main() {
   console.log('╔════════════════════════════════════════════════════════╗');

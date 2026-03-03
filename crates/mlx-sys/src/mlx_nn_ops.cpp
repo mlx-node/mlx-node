@@ -113,67 +113,55 @@ bool mlx_array_get_batch_seq_hidden(mlx_array* handle, int64_t* batch, int64_t* 
   return true;
 }
 
+} // extern "C" — temporarily close for C++ template
+
+// Read a scalar element from an evaluated array at the given index, casting to
+// the requested output type entirely on CPU.  Never creates a GPU astype+eval
+// -- that was the root cause of a 4.4 ms per-step stall in decode loops.
+namespace {
+template <typename Out>
+Out read_scalar(const array& arr, size_t index) {
+  switch (arr.dtype()) {
+    case mlx::core::bool_:    return static_cast<Out>(arr.data<bool>()[index]);
+    case mlx::core::uint8:    return static_cast<Out>(arr.data<uint8_t>()[index]);
+    case mlx::core::uint16:   return static_cast<Out>(arr.data<uint16_t>()[index]);
+    case mlx::core::uint32:   return static_cast<Out>(arr.data<uint32_t>()[index]);
+    case mlx::core::int8:     return static_cast<Out>(arr.data<int8_t>()[index]);
+    case mlx::core::int16:    return static_cast<Out>(arr.data<int16_t>()[index]);
+    case mlx::core::int32:    return static_cast<Out>(arr.data<int32_t>()[index]);
+    case mlx::core::float16:
+      return static_cast<Out>(static_cast<float>(arr.data<mlx::core::float16_t>()[index]));
+    case mlx::core::bfloat16:
+      return static_cast<Out>(static_cast<float>(arr.data<mlx::core::bfloat16_t>()[index]));
+    case mlx::core::float32:  return static_cast<Out>(arr.data<float>()[index]);
+    default:                  return Out{};
+  }
+}
+} // namespace
+
+extern "C" {
+
 bool mlx_array_item_at_float32(mlx_array* handle, size_t index, float* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
-  if (index >= arr->size()) {
-    return false;  // Index out of bounds
-  }
-
-  // Array is already evaluated by async_eval in the caller
-  // Extract single element at index and cast to float in C++ (no GPU array conversion)
-  switch (arr->dtype()) {
-    case mlx::core::float32:
-      *out = arr->data<float>()[index];
-      break;
-    default:
-      auto converted = astype(*arr, mlx::core::float32);
-      converted.eval();
-      *out = converted.data<float>()[index];
-      break;
-  }
+  if (index >= arr->size()) return false;
+  *out = read_scalar<float>(*arr, index);
   return true;
 }
 
 bool mlx_array_item_at_int32(mlx_array* handle, size_t index, int32_t* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
-  if (index >= arr->size()) {
-    return false;  // Index out of bounds
-  }
-  // Array is already evaluated by async_eval in the caller
-  // Extract single element at index and cast to int32 in C++ (no GPU array conversion)
-  switch (arr->dtype()) {
-    case mlx::core::int32:
-      *out = arr->data<int32_t>()[index];
-      break;
-    default:
-      auto converted = astype(*arr, mlx::core::int32);
-      converted.eval();
-      *out = converted.data<int32_t>()[index];
-      break;
-  }
+  if (index >= arr->size()) return false;
+  *out = read_scalar<int32_t>(*arr, index);
   return true;
 }
 
 bool mlx_array_item_at_uint32(mlx_array* handle, size_t index, uint32_t* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
-  if (index >= arr->size()) {
-    return false;  // Index out of bounds
-  }
-  // Array is already evaluated by async_eval in the caller
-  // Extract single element at index and cast to uint32 in C++ (no GPU array conversion)
-  switch (arr->dtype()) {
-    case mlx::core::uint32:
-      *out = arr->data<uint32_t>()[index];
-      break;
-    default:
-      auto converted = astype(*arr, mlx::core::uint32);
-      converted.eval();
-      *out = converted.data<uint32_t>()[index];
-      break;
-  }
+  if (index >= arr->size()) return false;
+  *out = read_scalar<uint32_t>(*arr, index);
   return true;
 }
 

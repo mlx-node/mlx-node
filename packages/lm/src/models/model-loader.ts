@@ -23,9 +23,7 @@ export class ModelLoader {
    * @param modelPath - Path to the model directory or file
    * @returns Loaded model
    */
-  static async loadPretrained(
-    modelPath: string,
-  ): Promise<Qwen3Model | Qwen3_5Model | Qwen3_5MoeModel> {
+  static async loadPretrained(modelPath: string): Promise<Qwen3Model | Qwen3_5Model | Qwen3_5MoeModel> {
     const modelType = await detectModelType(modelPath);
 
     if (modelType === 'qwen3_5_moe') {

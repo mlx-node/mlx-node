@@ -7,10 +7,11 @@ use tracing::{info, warn};
 use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::sampling::{SamplingConfig, sample};
+use crate::sampling::{SamplingConfig, apply_repetition_penalty, check_repetition_cutoff, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools;
+use crate::tools::ToolCallResult;
 
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
@@ -56,6 +57,21 @@ pub struct Qwen3_5ChatConfig {
     pub top_p: Option<f64>,
     #[napi(ts_type = "number | undefined")]
     pub min_p: Option<f64>,
+    /// Repetition penalty (1.0 = disabled). Penalizes tokens already in context.
+    #[napi(ts_type = "number | undefined")]
+    pub repetition_penalty: Option<f64>,
+    /// Size of the context window for repetition penalty (default: 256)
+    #[napi(ts_type = "number | undefined")]
+    pub repetition_context_size: Option<i32>,
+    /// Max consecutive identical tokens before stopping (default: 16, 0 = disabled)
+    #[napi(ts_type = "number | undefined")]
+    pub max_consecutive_tokens: Option<i32>,
+    /// Max n-gram repetitions before stopping (default: 8, 0 = disabled)
+    #[napi(ts_type = "number | undefined")]
+    pub max_ngram_repeats: Option<i32>,
+    /// N-gram size for repetition detection (default: 3)
+    #[napi(ts_type = "number | undefined")]
+    pub ngram_size: Option<i32>,
     #[napi(ts_type = "Array<ToolDefinition>")]
     pub tools: Option<Vec<ToolDefinition>>,
 }
@@ -65,9 +81,11 @@ pub struct Qwen3_5ChatConfig {
 #[derive(Debug, Clone)]
 pub struct Qwen3_5ChatResult {
     pub text: String,
+    pub tool_calls: Vec<ToolCallResult>,
     pub thinking: Option<String>,
     pub num_tokens: u32,
     pub finish_reason: String,
+    pub raw_text: String,
 }
 
 /// Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
@@ -483,6 +501,11 @@ impl Qwen3_5Model {
             top_k: None,
             top_p: None,
             min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
             tools: None,
         });
 
@@ -511,9 +534,14 @@ impl Qwen3_5Model {
             let prompt = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64])?;
 
             let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
+            let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+            let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+            let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+            let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(8);
+            let ngram_size = config.ngram_size.unwrap_or(3);
             let sampling_config = Some(SamplingConfig {
                 temperature: config.temperature,
-                top_k: config.top_k,
+                top_k: config.top_k.or(Some(20)), // Qwen3.5 recommends top_k=20
                 top_p: config.top_p,
                 min_p: config.min_p,
             });
@@ -544,6 +572,9 @@ impl Qwen3_5Model {
             let mut generated_tokens: Vec<u32> = Vec::new();
             let mut finish_reason = String::from("length");
 
+            // Track token history for repetition penalty
+            let mut token_history: Vec<u32> = tokens.clone();
+
             // Pre-compute embedding weight transpose once (avoids recomputing per step)
             let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
 
@@ -572,7 +603,17 @@ impl Qwen3_5Model {
 
             let seq_len = logits.shape_at(1)?;
             let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-            let last_logits = last_logits.squeeze(Some(&[1]))?;
+            let mut last_logits = last_logits.squeeze(Some(&[1]))?;
+
+            // Apply repetition penalty to prefill logits
+            if repetition_penalty != 1.0 && !token_history.is_empty() {
+                last_logits = apply_repetition_penalty(
+                    &last_logits,
+                    &token_history,
+                    repetition_penalty,
+                    Some(repetition_context_size),
+                )?;
+            }
 
             // Sample first token (lazy — not evaluated yet)
             let mut y = sample(&last_logits, sampling_config)?;
@@ -631,14 +672,20 @@ impl Qwen3_5Model {
             // Decode loop: compiled C++ path for real models, Rust fallback for tests.
             for step in 0..max_new_tokens {
                 // 1. Compute NEXT token (GPU work starts immediately)
-                // Wrap entire step in generation stream (matches Python mlx-lm)
                 let next_y = {
                     let _stream_ctx = StreamContext::new(generation_stream);
                     if step + 1 < max_new_tokens {
                         let next_ids = y.reshape(&[1, 1])?;
                         let next_token = if use_compiled {
-                            let logits = forward_compiled(&next_ids, &embedding_weight)?;
-                            // Compiled path returns 2D [B, vocab] — no squeeze needed.
+                            let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
+                            if repetition_penalty != 1.0 {
+                                logits = apply_repetition_penalty(
+                                    &logits,
+                                    &token_history,
+                                    repetition_penalty,
+                                    Some(repetition_context_size),
+                                )?;
+                            }
                             let next_token = sample(&logits, sampling_config)?;
                             eval_token_and_compiled_caches(&next_token);
                             next_token
@@ -653,7 +700,15 @@ impl Qwen3_5Model {
                                 fa_idx,
                                 Some(&embedding_weight_t),
                             )?;
-                            let logits = logits.squeeze(Some(&[1]))?;
+                            let mut logits = logits.squeeze(Some(&[1]))?;
+                            if repetition_penalty != 1.0 {
+                                logits = apply_repetition_penalty(
+                                    &logits,
+                                    &token_history,
+                                    repetition_penalty,
+                                    Some(repetition_context_size),
+                                )?;
+                            }
                             let next_token = sample(&logits, sampling_config)?;
                             eval_token_and_caches(&next_token, &caches_arc);
                             next_token
@@ -666,13 +721,25 @@ impl Qwen3_5Model {
 
                 // 2. Extract CURRENT token (GPU is already working on next)
                 if step == 0 {
-                    y.eval(); // Ensure first token is materialized
+                    y.eval();
                 }
                 let token_id = y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
+                token_history.push(token_id);
 
                 if token_id == eos_id {
                     finish_reason = String::from("eos");
+                    break;
+                }
+
+                // Check repetition cutoff
+                if let Some(reason) = check_repetition_cutoff(
+                    &generated_tokens,
+                    max_consecutive_tokens,
+                    max_ngram_repeats,
+                    ngram_size,
+                ) {
+                    finish_reason = reason.to_string();
                     break;
                 }
 
@@ -705,14 +772,23 @@ impl Qwen3_5Model {
 
             let num_tokens = generated_tokens.len() as u32;
 
-            // Extract thinking and clean text
-            let (clean_text, thinking) = tools::parse_thinking(&text);
+            // Parse tool calls and thinking from the generated text
+            let (clean_text, tool_calls, thinking) = tools::parse_generation_output(&text);
+
+            // If we have valid tool calls, override finish reason
+            let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
+                "tool_calls".to_string()
+            } else {
+                finish_reason
+            };
 
             Ok(Qwen3_5ChatResult {
                 text: clean_text,
+                tool_calls,
                 thinking,
                 num_tokens,
                 finish_reason,
+                raw_text: text,
             })
         })
         .await
@@ -818,20 +894,14 @@ fn forward_with_locks(
         }
     };
 
-    // For single-token decode (T=1), skip the SSM mask — it's all ones and adds overhead
-    let ssm_mask = if seq_len > 1 {
-        let batch = hidden_states.shape_at(0)?;
-        let mask = MxArray::ones(&[batch, seq_len], Some(hidden_states.dtype()?))?;
-        Some(mask)
-    } else {
-        None
-    };
+    // SSM mask is always None — mlx-vlm never creates one for ArraysCache.
+    // An all-ones mask is a no-op that adds unnecessary graph nodes and Metal overhead.
 
     // Forward through layers
     let num_layers = layers_guard.len();
     for i in 0..num_layers {
         let mask = if layers_guard[i].is_linear() {
-            ssm_mask.as_ref()
+            None
         } else {
             fa_mask.as_ref()
         };
@@ -1039,16 +1109,9 @@ impl Qwen3_5Model {
     }
 
     /// Create mask for linear attention (SSM) layers.
-    /// Currently returns an all-ones mask (no masking applied).
-    /// TODO: Implement left-padding support for batched generation.
-    fn create_ssm_mask(&self, hidden_states: &MxArray) -> Result<Option<MxArray>> {
-        let batch = hidden_states.shape_at(0)?;
-        let seq_len = hidden_states.shape_at(1)?;
-
-        // For now, return all-ones mask (no masking)
-        // Use hidden_states' dtype to avoid f32 promotion for bf16/f16 models
-        // TODO: Support left-padding mask for batched generation
-        let mask = MxArray::ones(&[batch, seq_len], Some(hidden_states.dtype()?))?;
-        Ok(Some(mask))
+    /// Always returns None — mlx-vlm never creates an SSM mask for ArraysCache.
+    /// An all-ones mask is a no-op that adds unnecessary graph nodes and Metal overhead.
+    fn create_ssm_mask(&self, _hidden_states: &MxArray) -> Result<Option<MxArray>> {
+        Ok(None)
     }
 }

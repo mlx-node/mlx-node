@@ -89,6 +89,7 @@ fn gated_delta_kernel(
 ///   beta_t: [B, 1, Hv]
 ///   state: [B, Hv, Dv, Dk]
 ///   mask_t: [B, 1] or None
+///   batch, num_v_heads, k_dim, v_dim: pre-extracted dimensions (avoids per-step FFI calls)
 ///
 /// Returns: (output [B, 1, Hv, Dv], new_state [B, Hv, Dv, Dk])
 fn gated_delta_step(
@@ -99,12 +100,11 @@ fn gated_delta_step(
     beta_t: &MxArray,
     state: &MxArray,
     mask_t: Option<&MxArray>,
+    batch: i64,
+    num_v_heads: i64,
+    k_dim: i64,
+    v_dim: i64,
 ) -> Result<(MxArray, MxArray)> {
-    let batch = q_t.shape_at(0)?;
-    let num_v_heads = v_t.shape_at(2)?;
-    let k_dim = q_t.shape_at(3)?;
-    let v_dim = v_t.shape_at(3)?;
-
     // Squeeze time dimension: [B, 1, H, D] → [B, H, D]
     let q = q_t.squeeze(Some(&[1]))?; // [B, Hv, Dk]
     let k = k_t.squeeze(Some(&[1]))?; // [B, Hv, Dk]
@@ -169,6 +169,12 @@ fn gated_delta_ops(
 ) -> Result<(MxArray, MxArray)> {
     let seq_len = q.shape_at(1)?;
 
+    // Extract dimensions once to avoid per-step FFI calls in gated_delta_step
+    let batch = q.shape_at(0)?;
+    let num_v_heads = v.shape_at(2)?;
+    let k_dim = q.shape_at(3)?;
+    let v_dim = v.shape_at(3)?;
+
     let mut current_state = state.clone();
     let mut outputs: Vec<MxArray> = Vec::with_capacity(seq_len as usize);
 
@@ -190,6 +196,10 @@ fn gated_delta_ops(
             &beta_t,
             &current_state,
             mask_t.as_ref(),
+            batch,
+            num_v_heads,
+            k_dim,
+            v_dim,
         )?;
 
         outputs.push(y_t);
