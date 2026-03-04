@@ -1,7 +1,7 @@
 import { readdir, stat, copyFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 import { existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
 import { listFiles, whoAmI, downloadFileToCacheDir, type ListFileEntry } from '@huggingface/hub';
 import { AsyncEntry } from '@napi-rs/keyring';
 import { input } from '@inquirer/prompts';
@@ -211,7 +211,9 @@ export async function run(argv: string[]) {
     });
     const stats = await stat(snapshotPath);
     const fileSizeStr = formatBytes(stats.size);
-    await copyFile(snapshotPath, join(outputDir, file.path));
+    const destPath = join(outputDir, file.path);
+    await ensureDir(dirname(destPath));
+    await copyFile(snapshotPath, destPath);
     if (file.path.endsWith('.safetensors') || file.path.endsWith('.pdiparams')) {
       weightFiles.push(file.path);
     }

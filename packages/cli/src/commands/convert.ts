@@ -75,16 +75,21 @@ export async function run(argv: string[]) {
   const outputDir = resolve(args.output);
   const verbose = args.verbose!;
 
-  const quantBits = args['q-bits'] ? parseInt(args['q-bits'], 10) : undefined;
-  const quantGroupSize = args['q-group-size'] ? parseInt(args['q-group-size'], 10) : undefined;
+  const parsePositiveInt = (flag: string, raw?: string): number | undefined => {
+    if (raw === undefined) return undefined;
+    if (!/^\d+$/.test(raw)) {
+      console.error(`Error: ${flag} requires a positive integer value`);
+      process.exit(1);
+    }
+    return Number(raw);
+  };
+
+  const quantBits = parsePositiveInt('--q-bits', args['q-bits']);
+  const quantGroupSize = parsePositiveInt('--q-group-size', args['q-group-size']);
   const quantMode = args['q-mode'];
 
-  if (quantBits !== undefined && isNaN(quantBits)) {
-    console.error('Error: --q-bits requires a numeric value');
-    process.exit(1);
-  }
-  if (quantGroupSize !== undefined && isNaN(quantGroupSize)) {
-    console.error('Error: --q-group-size requires a numeric value');
+  if (quantMode !== undefined && quantMode !== 'affine' && quantMode !== 'mxfp8') {
+    console.error('Error: --q-mode must be "affine" or "mxfp8"');
     process.exit(1);
   }
 
