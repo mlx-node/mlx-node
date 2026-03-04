@@ -157,7 +157,7 @@ export async function run(argv: string[]) {
   }
 
   const modelName = args.model!;
-  const modelSlug = modelName.split('/').pop()!.toLowerCase();
+  const modelSlug = modelName.replace(/\//g, '--').toLowerCase();
   const outputDir = resolve(args.output ?? join('.cache', 'models', modelSlug));
 
   const HUGGINGFACE_TOKEN = (await keyringEntry.getPassword()) ?? undefined;
