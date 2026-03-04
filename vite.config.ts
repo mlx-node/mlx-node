@@ -22,6 +22,7 @@ export default defineConfig({
       '/mlx-lm',
       '/mlx-rs',
       '/crates/mlx-sys/mlx',
+      '**/*.metal.inc',
     ],
   },
   test: {
