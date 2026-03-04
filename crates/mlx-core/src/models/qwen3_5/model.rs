@@ -18,6 +18,21 @@ use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::persistence;
 
+/// RAII guard that calls `mlx_qwen35_compiled_reset()` on drop.
+///
+/// Ensures C++ compiled state is always cleaned up, even if the decode
+/// loop returns early via `?` operator. Without this, an error during decode
+/// would leave stale compiled state that corrupts the next generation call.
+struct CompiledResetGuard;
+
+impl Drop for CompiledResetGuard {
+    fn drop(&mut self) {
+        unsafe {
+            mlx_sys::mlx_qwen35_compiled_reset();
+        }
+    }
+}
+
 /// Generation configuration for Qwen3.5
 #[napi(object)]
 #[derive(Debug, Clone)]
@@ -249,6 +264,16 @@ impl Qwen3_5Model {
             )));
         }
 
+        // generate() assumes batch_size=1 (reshape to [1,1], item_at_int32(0)).
+        // Reject multi-batch prompts early to avoid silently wrong results.
+        let batch_size = prompt_tokens.shape_at(0)?;
+        if batch_size != 1 {
+            return Err(Error::from_reason(format!(
+                "generate() only supports batch_size=1, got batch_size={}",
+                batch_size
+            )));
+        }
+
         // Clone Arcs and data needed for the closure
         let embedding_weight = self.embedding.get_weight();
         let layers_arc = self.layers.clone();
@@ -335,6 +360,14 @@ impl Qwen3_5Model {
             // safetensors-loaded models). Test models have no stored weights and
             // must fall back to the pure Rust forward_with_locks path.
             let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+
+            // Guard ensures mlx_qwen35_compiled_reset() is called even if `?` returns early.
+            // Created before the decode loop so it outlives the entire loop + init block.
+            let _compiled_guard = if use_compiled {
+                Some(CompiledResetGuard)
+            } else {
+                None
+            };
 
             if use_compiled {
                 // Initialize compiled forward pass from prefill caches.
@@ -453,12 +486,7 @@ impl Qwen3_5Model {
                 }
             }
 
-            // Clean up compiled state for next generation call.
-            if use_compiled {
-                unsafe {
-                    mlx_sys::mlx_qwen35_compiled_reset();
-                }
-            }
+            // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
 
             // Decode text if tokenizer available
             let text = if let Some(ref tok) = tokenizer {
@@ -622,6 +650,13 @@ impl Qwen3_5Model {
             // Initialize compiled forward pass (same as generate() path).
             let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
 
+            // Guard ensures mlx_qwen35_compiled_reset() is called even if `?` returns early.
+            let _compiled_guard = if use_compiled {
+                Some(CompiledResetGuard)
+            } else {
+                None
+            };
+
             if use_compiled {
                 use mlx_sys as sys;
                 let prefill_len = seq_len as i32;
@@ -755,12 +790,7 @@ impl Qwen3_5Model {
                 }
             }
 
-            // Clean up compiled state for next generation call.
-            if use_compiled {
-                unsafe {
-                    mlx_sys::mlx_qwen35_compiled_reset();
-                }
-            }
+            // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
 
             // Decode text
             let text = tokenizer_for_decode

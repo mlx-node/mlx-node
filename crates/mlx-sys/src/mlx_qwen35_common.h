@@ -63,6 +63,14 @@ inline bool has_weight(const std::string& name) {
 // Auto-detecting linear projection: uses quantized_matmul if .scales exists,
 // otherwise plain matmul with transposed weight. Safe for both dense (bf16)
 // and quantized (MXFP8/affine) weights.
+//
+// Quant param heuristic: the presence of .biases distinguishes the format:
+//   - No .biases → MXFP8 quantization (group_size=32, bits=8, mode="mxfp8")
+//   - Has .biases → Affine quantization (group_size=64, bits=4, mode="affine")
+// This is correct for all currently supported Qwen3.5 model formats because:
+//   - MXFP8 (mlx-community fp8 models) never stores biases
+//   - Affine 4-bit (mlx-community 4bit models) always stores biases
+// The MoE path uses explicit quant param detection (detect_quant) instead.
 inline array linear_proj(const array& x, const std::string& prefix) {
   std::string scales_key = prefix + ".scales";
   if (has_weight(scales_key)) {
@@ -135,9 +143,14 @@ inline array swiglu(const array& gate, const array& up) {
   return compiled_swiglu()({gate, up})[0];
 }
 
-// Softplus: log(1 + exp(x)) — preserves input dtype
+// Numerically stable softplus: where(x > 20, x, log1p(exp(x)))
+// Naive log(exp(x)+1) overflows for large x in bf16/f16 (max ~65504).
+// Threshold of 20 is well above typical values but well below bf16 overflow.
 inline array softplus(const array& x) {
-  return log(mlx::core::add(exp(x), array(1.0f, x.dtype())));
+  return mlx::core::where(
+      mlx::core::greater(x, array(20.0f, x.dtype())),
+      x,
+      mlx::core::log1p(exp(x)));
 }
 
 // Fused compute_g: g = exp(-exp(A_log) * softplus(a + dt_bias))

@@ -98,10 +98,11 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
   return result;
 }
 
-static auto& compiled_qwen35_decode() {
-  static auto fn = mlx::core::compile(qwen35_decode_fn);
-  return fn;
-}
+// Note: mlx::core::compile(qwen35_decode_fn) is NOT used here because the
+// compile cache is invalidated every step due to the changing g_offset_int
+// captured in qwen35_decode_fn. Instead, we call qwen35_decode_fn directly
+// and rely on the inner compiled helpers (compiled_swiglu, compiled_compute_g,
+// etc.) for kernel fusion.
 
 } // namespace
 
@@ -204,6 +205,10 @@ void mlx_qwen35_forward_compiled(
     mlx_array** output_logits,
     int* cache_offset_out
 ) {
+  if (!input_ids_ptr || !embedding_weight_ptr || !output_logits) {
+    if (output_logits) *output_logits = nullptr;
+    return;
+  }
   if (!g_compile_inited) {
     *output_logits = nullptr;
     return;

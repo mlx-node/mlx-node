@@ -160,7 +160,9 @@ static std::vector<array> compute_g_compiled_impl(const std::vector<array>& inpu
     // All ops in bf16 — no dtype promotion, single fused kernel
     auto A = exp(a_log);
     auto x = a + dt_bias;
-    auto sp = log(exp(x) + array(1.0f, a.dtype()));
+    // Numerically stable softplus: where(x > 20, x, log1p(exp(x)))
+    // Naive log(exp(x)+1) overflows for large x in bf16/f16 (max ~65504).
+    auto sp = where(greater(x, array(20.0f, a.dtype())), x, mlx::core::log1p(exp(x)));
     return {exp(negative(A * sp))};
 }
 

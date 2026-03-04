@@ -19,6 +19,21 @@ use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::persistence;
 
+/// RAII guard that calls `mlx_qwen35_moe_reset()` on drop.
+///
+/// Ensures C++ compiled MoE state is always cleaned up, even if the decode
+/// loop returns early via `?` operator. Without this, an error during decode
+/// would leave stale compiled state that corrupts the next generation call.
+struct MoeResetGuard;
+
+impl Drop for MoeResetGuard {
+    fn drop(&mut self) {
+        unsafe {
+            mlx_sys::mlx_qwen35_moe_reset();
+        }
+    }
+}
+
 /// Generation configuration for Qwen3.5 MoE
 #[napi(object)]
 #[derive(Debug, Clone)]
@@ -224,6 +239,16 @@ impl Qwen3_5MoeModel {
             )));
         }
 
+        // generate() assumes batch_size=1 (reshape to [1,1], item_at_int32(0)).
+        // Reject multi-batch prompts early to avoid silently wrong results.
+        let batch_size = prompt_tokens.shape_at(0)?;
+        if batch_size != 1 {
+            return Err(Error::from_reason(format!(
+                "generate() only supports batch_size=1, got batch_size={}",
+                batch_size
+            )));
+        }
+
         let embedding_weight = self.embedding.get_weight();
         let layers_arc = self.layers.clone();
         let final_norm_arc = self.final_norm.clone();
@@ -312,6 +337,8 @@ impl Qwen3_5MoeModel {
             let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
 
             if use_cpp {
+                // Guard ensures mlx_qwen35_moe_reset() is called even if `?` returns early.
+                let _moe_guard = MoeResetGuard;
                 // Initialize C++ MoE forward pass from prefill caches
                 use mlx_sys as sys;
                 let prefill_len = seq_len as i32;
@@ -431,10 +458,7 @@ impl Qwen3_5MoeModel {
                         avg_fwd, avg_samp, avg_eval, avg_ext, total, timing_steps
                     );
                 }
-
-                unsafe {
-                    mlx_sys::mlx_qwen35_moe_reset();
-                }
+                // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
             } else {
                 // Rust fallback decode loop (outer StreamContext already active)
                 for step in 0..max_tokens {
@@ -643,6 +667,8 @@ impl Qwen3_5MoeModel {
             let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
 
             if use_cpp {
+                // Guard ensures mlx_qwen35_moe_reset() is called even if `?` returns early.
+                let _moe_guard = MoeResetGuard;
                 // Initialize C++ MoE forward pass from prefill caches
                 use mlx_sys as sys;
                 let prefill_len = seq_len as i32;
@@ -798,10 +824,7 @@ impl Qwen3_5MoeModel {
                         );
                     }
                 }
-
-                unsafe {
-                    mlx_sys::mlx_qwen35_moe_reset();
-                }
+                // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
             } else {
                 // Rust fallback decode loop
                 for step in 0..max_new_tokens {

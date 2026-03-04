@@ -129,6 +129,8 @@ Out read_scalar(const array& arr, size_t index) {
     case mlx::core::int8:     return static_cast<Out>(arr.data<int8_t>()[index]);
     case mlx::core::int16:    return static_cast<Out>(arr.data<int16_t>()[index]);
     case mlx::core::int32:    return static_cast<Out>(arr.data<int32_t>()[index]);
+    case mlx::core::int64:    return static_cast<Out>(arr.data<int64_t>()[index]);
+    case mlx::core::uint64:   return static_cast<Out>(arr.data<uint64_t>()[index]);
     case mlx::core::float16:
       return static_cast<Out>(static_cast<float>(arr.data<mlx::core::float16_t>()[index]));
     case mlx::core::bfloat16:
@@ -535,6 +537,7 @@ size_t mlx_array_split_multi(mlx_array* handle,
                              int32_t axis,
                              uint64_t* out_handles,
                              size_t max_outputs) {
+  if (!handle || !out_handles) return 0;
   auto arr = reinterpret_cast<array*>(handle);
   auto splits = mlx::core::split(*arr, indices_or_sections, axis);
   size_t count = std::min(splits.size(), max_outputs);

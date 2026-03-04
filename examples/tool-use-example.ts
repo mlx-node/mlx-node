@@ -15,7 +15,7 @@
  *   yarn oxnode examples/tool-use-example.ts [model-path]
  *
  * Arguments:
- *   model-path  Path to the model directory (default: .cache/models/qwen3-0.6b-mlx-bf16)
+ *   model-path  Path to the model directory (default: .cache/models/qwen3.5-4B-mlx-bf16)
  *
  * Environment:
  *   MODEL_PATH  Alternative way to specify model path
