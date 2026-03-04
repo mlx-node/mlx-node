@@ -565,8 +565,8 @@ impl Qwen3_5Model {
             let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
             let repetition_context_size = config.repetition_context_size.unwrap_or(256);
             let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-            let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(8);
-            let ngram_size = config.ngram_size.unwrap_or(3);
+            let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+            let ngram_size = config.ngram_size.unwrap_or(64);
             let sampling_config = Some(SamplingConfig {
                 temperature: config.temperature,
                 top_k: config.top_k.or(Some(20)), // Qwen3.5 recommends top_k=20

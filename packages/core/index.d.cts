@@ -1911,9 +1911,9 @@ export interface ChatConfig {
   repetitionContextSize?: number;
   /** Stop if same token repeats this many times consecutively (default: 16) */
   maxConsecutiveTokens?: number;
-  /** Stop if an n-gram pattern repeats this many times (default: 8) */
+  /** Stop if a pattern repeats this many times consecutively (default: 3) */
   maxNgramRepeats?: number;
-  /** N-gram size for repetition detection (default: 3) */
+  /** Maximum pattern size for repetition detection (default: 64) */
   ngramSize?: number;
   /** EOS token ID (generation stops when this is generated) */
   eosTokenId?: number;
@@ -2223,13 +2223,15 @@ export interface GenerationConfig {
    */
   maxConsecutiveTokens?: number;
   /**
-   * Stop if an n-gram pattern repeats this many times (default: 8)
-   * Set to 0 to disable. Detects patterns like "A B A B A B A B".
+   * Stop if a pattern repeats this many times consecutively (default: 3)
+   * Set to 0 to disable. Detects patterns like "A B A B A B".
+   * Uses range-based detection: checks all pattern sizes from 2 to ngram_size.
    */
   maxNgramRepeats?: number;
   /**
-   * N-gram size for repetition detection (default: 3)
-   * Used with max_ngram_repeats to detect repeating patterns.
+   * Maximum pattern size for repetition detection (default: 64)
+   * All pattern sizes from 2 up to this value are checked each decode step.
+   * Larger values catch long phrase-level repetition common in small models.
    */
   ngramSize?: number;
   /** EOS token ID (generation stops when this is generated) */

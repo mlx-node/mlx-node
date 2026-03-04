@@ -38,12 +38,14 @@ pub struct GenerationConfig {
     /// Set to 0 to disable. Prevents OOM from degenerate repetitive generation.
     pub max_consecutive_tokens: Option<i32>,
 
-    /// Stop if an n-gram pattern repeats this many times (default: 8)
-    /// Set to 0 to disable. Detects patterns like "A B A B A B A B".
+    /// Stop if a pattern repeats this many times consecutively (default: 3)
+    /// Set to 0 to disable. Detects patterns like "A B A B A B".
+    /// Uses range-based detection: checks all pattern sizes from 2 to ngram_size.
     pub max_ngram_repeats: Option<i32>,
 
-    /// N-gram size for repetition detection (default: 3)
-    /// Used with max_ngram_repeats to detect repeating patterns.
+    /// Maximum pattern size for repetition detection (default: 64)
+    /// All pattern sizes from 2 up to this value are checked each decode step.
+    /// Larger values catch long phrase-level repetition common in small models.
     pub ngram_size: Option<i32>,
 
     /// EOS token ID (generation stops when this is generated)
@@ -90,8 +92,8 @@ impl Default for GenerationConfig {
             repetition_penalty: Some(1.0),
             repetition_context_size: Some(20),
             max_consecutive_tokens: Some(16),
-            max_ngram_repeats: Some(8),
-            ngram_size: Some(3),
+            max_ngram_repeats: Some(3),
+            ngram_size: Some(64),
             eos_token_id: None,
             return_logprobs: Some(true),
             prefill_step_size: Some(2048),
@@ -153,10 +155,10 @@ pub struct ChatConfig {
     /// Stop if same token repeats this many times consecutively (default: 16)
     pub max_consecutive_tokens: Option<i32>,
 
-    /// Stop if an n-gram pattern repeats this many times (default: 8)
+    /// Stop if a pattern repeats this many times consecutively (default: 3)
     pub max_ngram_repeats: Option<i32>,
 
-    /// N-gram size for repetition detection (default: 3)
+    /// Maximum pattern size for repetition detection (default: 64)
     pub ngram_size: Option<i32>,
 
     /// EOS token ID (generation stops when this is generated)

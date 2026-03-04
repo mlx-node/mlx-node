@@ -894,6 +894,7 @@ impl Qwen3Model {
                 crate::sampling::sample_and_logprobs(&logit_arr, Some(sampling_config))?;
 
             next_token_arr.eval();
+            logprobs_arr.eval();
             let next_token = next_token_arr.item_at_int32(0)? as u32;
             let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
             let is_finished = next_token == eos_token_id as u32;
@@ -997,6 +998,7 @@ impl Qwen3Model {
                     crate::sampling::sample_and_logprobs(&logit_arr, Some(sampling_config))?;
 
                 next_token_arr.eval();
+                logprobs_arr.eval();
                 let next_token = next_token_arr.item_at_int32(0)? as u32;
                 let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
                 let is_finished = next_token == eos_token_id as u32;
@@ -1439,8 +1441,8 @@ impl Qwen3Model {
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(8);
-        let ngram_size = config.ngram_size.unwrap_or(3);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
         let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
@@ -1677,8 +1679,9 @@ impl Qwen3Model {
             // Add to generated tokens
             generated_tokens.push(token_value);
 
-            // Extract logprob if needed
+            // Extract logprob if needed (eval first — read_scalar requires materialized data)
             if return_logprobs && let Some(ref lp) = logprobs_arr {
+                lp.eval();
                 let token_logprob = lp.item_at_float32(token_value as usize)?;
                 generated_logprobs.push(token_logprob);
             }
@@ -1843,8 +1846,8 @@ impl Qwen3Model {
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(8);
-        let ngram_size = config.ngram_size.unwrap_or(3);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
         let num_draft_tokens = config.num_draft_tokens.unwrap_or(5) as usize;
@@ -2023,6 +2026,7 @@ impl Qwen3Model {
         // Add first token
         generated_tokens.push(current_token);
         if return_logprobs {
+            first_token_result.1.eval();
             let lp = first_token_result
                 .1
                 .item_at_float32(current_token as usize)?;
@@ -2298,8 +2302,8 @@ impl Qwen3Model {
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(8);
-        let ngram_size = config.ngram_size.unwrap_or(3);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
         let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
@@ -2913,8 +2917,8 @@ impl Qwen3Model {
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(8);
-        let ngram_size = config.ngram_size.unwrap_or(3);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
 
@@ -3207,6 +3211,7 @@ impl Qwen3Model {
                 token_histories[global_idx].push(token_value);
 
                 if return_logprobs && let Some(ref lp) = current_logprobs_arr {
+                    lp.eval();
                     let token_logprob = lp.item_at_float32_2d(local_idx, token_value as usize)?;
                     generated_logprobs[global_idx].push(token_logprob);
                 }
@@ -4541,8 +4546,8 @@ impl Qwen3Model {
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(8);
-        let ngram_size = config.ngram_size.unwrap_or(3);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
         let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
@@ -4797,10 +4802,9 @@ impl Qwen3Model {
                 // repetition of the most recent token which causes infinite loops.
                 //
                 // The async pipelining is slightly reduced but correctness is essential.
-                // Sync on first token to ensure it's materialized
-                if step == 0 {
-                    token.eval();
-                }
+                // Sync token to ensure async_eval has completed before reading data.
+                // read_scalar (used by item_at_int32) requires the array to be evaluated.
+                token.eval();
 
                 // Extract current token value
                 let token_value = token.item_at_int32(0)? as u32;
@@ -4808,8 +4812,9 @@ impl Qwen3Model {
                 // Add to generated tokens BEFORE computing next token's penalty
                 generated_tokens.push(token_value);
 
-                // Extract logprob if needed
+                // Extract logprob if needed (eval first — read_scalar requires materialized data)
                 if return_logprobs && let Some(ref lp) = logprobs {
+                    lp.eval();
                     let token_logprob = lp.item_at_float32(token_value as usize)?;
                     generated_logprobs.push(token_logprob);
                 }
@@ -5445,13 +5450,13 @@ mod tests {
     fn test_repetition_cutoff_consecutive_triggers() {
         // 5 consecutive tokens with max=5 → triggers
         assert_eq!(
-            check_repetition_cutoff(&[1, 1, 1, 1, 1], 5, 8, 3),
+            check_repetition_cutoff(&[1, 1, 1, 1, 1], 5, 3, 64),
             Some("repetition")
         );
 
         // 6 consecutive tokens with max=5 → triggers
         assert_eq!(
-            check_repetition_cutoff(&[1, 1, 1, 1, 1, 1], 5, 8, 3),
+            check_repetition_cutoff(&[1, 1, 1, 1, 1, 1], 5, 3, 64),
             Some("repetition")
         );
     }
@@ -5459,38 +5464,41 @@ mod tests {
     #[test]
     fn test_repetition_cutoff_consecutive_no_trigger() {
         // 4 consecutive tokens with max=5 → no trigger
-        assert_eq!(check_repetition_cutoff(&[1, 1, 1, 1], 5, 8, 3), None);
+        assert_eq!(check_repetition_cutoff(&[1, 1, 1, 1], 5, 3, 64), None);
 
         // Varied tokens → no trigger
-        assert_eq!(check_repetition_cutoff(&[1, 2, 3, 4, 5], 5, 8, 3), None);
+        assert_eq!(check_repetition_cutoff(&[1, 2, 3, 4, 5], 5, 3, 64), None);
 
         // Pattern broken at end → no trigger
-        assert_eq!(check_repetition_cutoff(&[1, 1, 1, 1, 2], 5, 8, 3), None);
+        assert_eq!(check_repetition_cutoff(&[1, 1, 1, 1, 2], 5, 3, 64), None);
     }
 
     #[test]
     fn test_repetition_cutoff_ngram_triggers() {
         // 4 repetitions of 2-gram [1, 2] with max=4 → triggers
         assert_eq!(
-            check_repetition_cutoff(&[1, 2, 1, 2, 1, 2, 1, 2], 16, 4, 2),
+            check_repetition_cutoff(&[1, 2, 1, 2, 1, 2, 1, 2], 16, 4, 64),
             Some("repetition")
         );
 
         // 3 repetitions of 3-gram [1, 2, 3] with max=3 → triggers
         assert_eq!(
-            check_repetition_cutoff(&[1, 2, 3, 1, 2, 3, 1, 2, 3], 16, 3, 3),
+            check_repetition_cutoff(&[1, 2, 3, 1, 2, 3, 1, 2, 3], 16, 3, 64),
             Some("repetition")
         );
     }
 
     #[test]
     fn test_repetition_cutoff_ngram_no_trigger() {
-        // Only 3 repetitions with max=4 → no trigger
-        assert_eq!(check_repetition_cutoff(&[1, 2, 1, 2, 1, 2], 16, 4, 2), None);
+        // Only 3 repetitions of 2-gram with max=4 → no trigger
+        assert_eq!(
+            check_repetition_cutoff(&[1, 2, 1, 2, 1, 2], 16, 4, 64),
+            None
+        );
 
         // Pattern broken → no trigger
         assert_eq!(
-            check_repetition_cutoff(&[1, 2, 1, 2, 3, 2, 1, 2], 16, 4, 2),
+            check_repetition_cutoff(&[1, 2, 1, 2, 3, 2, 1, 2], 16, 4, 64),
             None
         );
     }
@@ -5498,31 +5506,74 @@ mod tests {
     #[test]
     fn test_repetition_cutoff_short_sequences() {
         // Very short sequences should not trigger
-        assert_eq!(check_repetition_cutoff(&[], 5, 4, 2), None);
-        assert_eq!(check_repetition_cutoff(&[1], 5, 4, 2), None);
-        assert_eq!(check_repetition_cutoff(&[1, 1], 5, 4, 2), None);
+        assert_eq!(check_repetition_cutoff(&[], 5, 4, 64), None);
+        assert_eq!(check_repetition_cutoff(&[1], 5, 4, 64), None);
+        assert_eq!(check_repetition_cutoff(&[1, 1], 5, 4, 64), None);
     }
 
     #[test]
     fn test_repetition_cutoff_default_thresholds() {
-        // Test with default thresholds (16 consecutive, 8 n-gram repeats, 3-gram size)
+        // Test with new defaults (16 consecutive, 3 n-gram repeats, 64 max pattern size)
 
         // 16 consecutive → triggers
         let tokens: Vec<u32> = vec![1; 16];
         assert_eq!(
-            check_repetition_cutoff(&tokens, 16, 8, 3),
+            check_repetition_cutoff(&tokens, 16, 3, 64),
             Some("repetition")
         );
 
-        // 15 consecutive → no trigger
+        // 15 consecutive → now triggers via range detection (2-gram [1,1] repeats 7x >= 3)
         let tokens: Vec<u32> = vec![1; 15];
-        assert_eq!(check_repetition_cutoff(&tokens, 16, 8, 3), None);
-
-        // 8 repetitions of 3-gram → triggers
-        let tokens: Vec<u32> = (0..24).map(|i| (i % 3) as u32 + 1).collect(); // [1,2,3,1,2,3,...]
         assert_eq!(
-            check_repetition_cutoff(&tokens, 16, 8, 3),
+            check_repetition_cutoff(&tokens, 16, 3, 64),
             Some("repetition")
         );
+
+        // 5 non-repeating tokens → no trigger
+        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
+        assert_eq!(check_repetition_cutoff(&tokens, 16, 3, 64), None);
+
+        // 3 repetitions of 3-gram → triggers (with max_pattern_size=64)
+        let tokens: Vec<u32> = (0..9).map(|i| (i % 3) as u32 + 1).collect(); // [1,2,3,1,2,3,1,2,3]
+        assert_eq!(
+            check_repetition_cutoff(&tokens, 16, 3, 64),
+            Some("repetition")
+        );
+    }
+
+    #[test]
+    fn test_repetition_cutoff_long_pattern() {
+        // Simulate a long phrase-level repetition (50-token pattern repeated 3 times)
+        let pattern: Vec<u32> = (0..50).map(|i| i as u32 + 100).collect();
+        let mut tokens = Vec::new();
+        for _ in 0..3 {
+            tokens.extend_from_slice(&pattern);
+        }
+        assert_eq!(
+            check_repetition_cutoff(&tokens, 16, 3, 64),
+            Some("repetition")
+        );
+
+        // Only 2 repetitions with min_count=3 → no trigger
+        let mut tokens2 = Vec::new();
+        for _ in 0..2 {
+            tokens2.extend_from_slice(&pattern);
+        }
+        assert_eq!(check_repetition_cutoff(&tokens2, 16, 3, 64), None);
+    }
+
+    #[test]
+    fn test_repetition_cutoff_range_detection() {
+        // Range detection: a 5-token pattern repeated 3 times should be caught
+        // even when max_pattern_size is much larger
+        let tokens = vec![10, 20, 30, 40, 50, 10, 20, 30, 40, 50, 10, 20, 30, 40, 50];
+        assert_eq!(
+            check_repetition_cutoff(&tokens, 16, 3, 64),
+            Some("repetition")
+        );
+
+        // Same pattern but only 2 repeats → no trigger
+        let tokens2 = vec![10, 20, 30, 40, 50, 10, 20, 30, 40, 50];
+        assert_eq!(check_repetition_cutoff(&tokens2, 16, 3, 64), None);
     }
 }

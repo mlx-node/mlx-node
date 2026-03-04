@@ -532,15 +532,25 @@ pub(crate) fn apply_repetition_penalty(
 
 /// Check if generation has fallen into a repetitive loop.
 ///
-/// Returns Some("repetition") if should stop, None otherwise.
-/// Checks for two types of repetition:
-/// 1. Consecutive identical tokens (e.g., "A A A A A")
-/// 2. N-gram repetition (e.g., "A B C A B C A B C")
+/// Detect degenerate repetitive generation and signal early termination.
+///
+/// Uses a two-tier approach inspired by vLLM's `RepetitionDetectionParams`:
+///
+/// 1. **Consecutive identical tokens** — fast O(n) scan from the tail.
+///    Triggers when the same token repeats `max_consecutive` times in a row.
+///
+/// 2. **Range-based n-gram pattern detection** — checks ALL pattern sizes from 2
+///    up to `max_pattern_size` (the `ngram_size` parameter). For each size, verifies
+///    whether the tail contains `max_ngram_repeats` consecutive identical blocks.
+///    This catches both short loops (2-token) and long phrase-level repetition
+///    (50-100 tokens) that small models are prone to.
+///
+/// Cost per decode step: O(max_pattern_size × max_ngram_repeats), typically ~200 comparisons.
 pub(crate) fn check_repetition_cutoff(
     tokens: &[u32],
     max_consecutive: i32,
     max_ngram_repeats: i32,
-    ngram_size: i32,
+    ngram_size: i32, // treated as max_pattern_size
 ) -> Option<&'static str> {
     let len = tokens.len();
     if len < 2 {
@@ -566,29 +576,34 @@ pub(crate) fn check_repetition_cutoff(
         }
     }
 
-    // 2. Check n-gram repetition (e.g., "A B C A B C A B C")
+    // 2. Range-based pattern detection (vLLM-style)
+    // Check all pattern sizes from 2 up to max_pattern_size. For each size,
+    // verify if the last `pattern_len * min_count` tokens form a repeating block.
     if check_ngram {
-        let ngram_size = ngram_size as usize;
-        let max_ngram_repeats = max_ngram_repeats as usize;
+        let max_pattern_size = ngram_size as usize;
+        let min_count = max_ngram_repeats as usize;
 
-        if len >= ngram_size * 2 {
-            let ngram = &tokens[len - ngram_size..];
+        for pattern_len in 2..=max_pattern_size {
+            let required = pattern_len * min_count;
+            if len < required {
+                continue;
+            }
+
+            let pattern = &tokens[len - pattern_len..];
             let mut repeats = 1usize;
-            let mut pos = len - ngram_size * 2;
+            let mut pos = len - pattern_len;
 
-            loop {
-                if &tokens[pos..pos + ngram_size] == ngram {
+            while repeats < min_count && pos >= pattern_len {
+                pos -= pattern_len;
+                if &tokens[pos..pos + pattern_len] == pattern {
                     repeats += 1;
-                    if repeats >= max_ngram_repeats {
-                        return Some("repetition");
-                    }
                 } else {
-                    break; // Must be consecutive repetitions
-                }
-                if pos < ngram_size {
                     break;
                 }
-                pos -= ngram_size;
+            }
+
+            if repeats >= min_count {
+                return Some("repetition");
             }
         }
     }

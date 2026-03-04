@@ -1,5 +1,5 @@
-// Gated delta recurrence kernel: vectorized, masked // g: [B, T, Hv, Dk] (per-element), mask: mask[b_idx * T + t]
-R"( auto n = thread_position_in_grid.z; auto b_idx = n / Hv; auto hv_idx = n % Hv; auto hk_idx = hv_idx / (Hv / Hk);
+// Gated delta recurrence kernel: vectorized, masked // g: [B, T, Hv, Dk] (per-element), mask: mask[b_idx * T + t] R"(
+auto n = thread_position_in_grid.z; auto b_idx = n / Hv; auto hv_idx = n % Hv; auto hk_idx = hv_idx / (Hv / Hk);
 constexpr int n_per_t = Dk / 32; // q, k: [B, T, Hk, Dk] auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk; auto k_ = k +
 b_idx * T * Hk * Dk + hk_idx * Dk; // v, y: [B, T, Hv, Dv] auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv; y += b_idx *
 T * Hv * Dv + hv_idx * Dv; auto dk_idx = thread_position_in_threadgroup.x; auto dv_idx = thread_position_in_grid.y; //
@@ -14,4 +14,6 @@ Dv + dv_idx) * Dk; float state[n_per_t]; for (int i = 0; i < n_per_t; ++i) { aut
   = simd_sum(out); if (thread_index_in_simdgroup == 0) { y[dv_idx] = static_cast<InT
     >(out); } } // Increment data pointers to next time step q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y += Hv * Dv;
     g_ += Hv * Dk; beta_ += Hv; } for (int i = 0; i < n_per_t; ++i) { auto s_idx = n_per_t * dk_idx + i; o_state[s_idx]
-    = static_cast<InT>(state[i]); } )"
+    = static_cast<InT>(state[i]); } )" </InT></InT
+  ></float
+>

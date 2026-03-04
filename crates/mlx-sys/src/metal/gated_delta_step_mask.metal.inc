@@ -14,4 +14,6 @@ Dv + dv_idx) * Dk; float state[n_per_t]; for (int i = 0; i < n_per_t; ++i) { aut
   (thread_index_in_simdgroup == 0) { y[dv_idx] = static_cast<InT
     >(out); } } // Increment data pointers to next time step q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y += Hv * Dv;
     g_ += Hv; beta_ += Hv; } for (int i = 0; i < n_per_t; ++i) { auto s_idx = n_per_t * dk_idx + i; o_state[s_idx] =
-    static_cast<InT>(state[i]); } )"
+    static_cast<InT>(state[i]); } )" </InT></InT
+  ></float
+>
