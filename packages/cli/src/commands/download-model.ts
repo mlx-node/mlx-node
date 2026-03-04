@@ -103,6 +103,11 @@ async function verifyDownload(outputDir: string, weightFiles: string[]): Promise
     console.log('  ✓ config.json');
   }
 
+  if (weightFiles.length === 0) {
+    console.error('  ✗ No weight files found');
+    allPresent = false;
+  }
+
   for (const file of weightFiles) {
     const path = join(outputDir, file);
     if (!existsSync(path)) {
