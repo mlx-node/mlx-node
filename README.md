@@ -133,8 +133,8 @@ yarn build
 ### Download and convert a Model
 
 ```bash
-yarn download:qwen3
-yarn oxnode ./scripts/convert-model.ts --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models/qwen3-0.6b-mlx-bf16
+yarn mlx download model
+yarn mlx convert --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models/qwen3-0.6b-mlx-bf16
 ```
 
 ### Test the converted model

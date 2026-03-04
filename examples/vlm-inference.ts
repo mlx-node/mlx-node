@@ -50,10 +50,10 @@ function tryLoadOrient(): DocOrientationModel | null {
     console.error(`Error: Orientation model not found at ${orientModelPath}`);
     console.error('  Download and convert it first:');
     console.error(
-      '    oxnode scripts/download-model.ts -m PaddlePaddle/PP-LCNet_x1_0_doc_ori -o .cache/models/PP-LCNet_x1_0_doc_ori',
+      '    mlx download model -m PaddlePaddle/PP-LCNet_x1_0_doc_ori -o .cache/models/PP-LCNet_x1_0_doc_ori',
     );
     console.error(
-      '    oxnode scripts/convert-model.ts -m pp-lcnet-ori -i .cache/models/PP-LCNet_x1_0_doc_ori -o .cache/models/PP-LCNet_x1_0_doc_ori-mlx',
+      '    mlx convert -m pp-lcnet-ori -i .cache/models/PP-LCNet_x1_0_doc_ori -o .cache/models/PP-LCNet_x1_0_doc_ori-mlx',
     );
     process.exit(1);
   }
@@ -65,8 +65,8 @@ function tryLoadUnwarp(): DocUnwarpModel | null {
   if (!existsSync(unwarpModelPath)) {
     console.error(`Error: Unwarp model not found at ${unwarpModelPath}`);
     console.error('  Download and convert it first:');
-    console.error('    oxnode scripts/download-model.ts -m PaddlePaddle/UVDoc -o .cache/models/UVDoc');
-    console.error('    oxnode scripts/convert-model.ts -m uvdoc -i .cache/models/UVDoc -o .cache/models/UVDoc-mlx');
+    console.error('    mlx download model -m PaddlePaddle/UVDoc -o .cache/models/UVDoc');
+    console.error('    mlx convert -m uvdoc -i .cache/models/UVDoc -o .cache/models/UVDoc-mlx');
     process.exit(1);
   }
   return DocUnwarpModel.load(unwarpModelPath);

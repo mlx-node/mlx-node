@@ -5,6 +5,7 @@
     { "path": "./packages/lm" },
     { "path": "./packages/trl" },
     { "path": "./packages/vlm" },
+    { "path": "./packages/cli" },
     { "path": "./__test__" }
   ],
   "compilerOptions": {

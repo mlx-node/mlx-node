@@ -89,9 +89,9 @@ jobs:
           path: packages/core/
       - name: Run tests
         run: |
-          yarn oxnode ./scripts/download-model.ts
-          yarn oxnode ./scripts/convert-model.ts --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models/qwen3-0.6b-mlx-bf16
-          yarn download:gsm8k
+          yarn mlx download model
+          yarn mlx convert --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models/qwen3-0.6b-mlx-bf16
+          yarn mlx download dataset
           ${{ matrix.test }}
         env:
           RUST_BACKTRACE: 1

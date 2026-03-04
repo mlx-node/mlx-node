@@ -16,17 +16,13 @@
     "format": "vite fmt",
     "test": "vite test",
     "typecheck": "tsc -b",
-    "download:gsm8k": "yarn oxnode scripts/download-gsm8k.ts",
-    "download:qwen3": "yarn oxnode scripts/download-model.ts"
+    "mlx": "oxnode packages/cli/src/cli.ts"
   },
   "devDependencies": {
     "@ast-grep/napi": "^0.40.5",
-    "@huggingface/hub": "^2.10.3",
-    "@inquirer/prompts": "^8.2.1",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/trl": "workspace:*",
     "@napi-rs/cli": "^3.5.1",
-    "@napi-rs/keyring": "^1.2.0",
     "@napi-rs/simple-git": "^0.1.22",
     "@oxc-node/cli": "^0.0.35",
     "@oxc-node/core": "^0.0.35",

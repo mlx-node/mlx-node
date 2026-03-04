@@ -446,6 +446,19 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@mlx-node/cli@workspace:packages/cli":
+  version: 0.0.0-use.local
+  resolution: "@mlx-node/cli@workspace:packages/cli"
+  dependencies:
+    "@huggingface/hub": "npm:^2.10.3"
+    "@inquirer/prompts": "npm:^8.2.1"
+    "@mlx-node/core": "workspace:*"
+    "@napi-rs/keyring": "npm:^1.2.0"
+  bin:
+    mlx: ./dist/cli.js
+  languageName: unknown
+  linkType: soft
+
 "@mlx-node/core@workspace:*, @mlx-node/core@workspace:packages/core":
   version: 0.0.0-use.local
   resolution: "@mlx-node/core@workspace:packages/core"
@@ -3449,12 +3462,9 @@ __metadata:
   resolution: "mlx-node@workspace:."
   dependencies:
     "@ast-grep/napi": "npm:^0.40.5"
-    "@huggingface/hub": "npm:^2.10.3"
-    "@inquirer/prompts": "npm:^8.2.1"
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/trl": "workspace:*"
     "@napi-rs/cli": "npm:^3.5.1"
-    "@napi-rs/keyring": "npm:^1.2.0"
     "@napi-rs/simple-git": "npm:^0.1.22"
     "@oxc-node/cli": "npm:^0.0.35"
     "@oxc-node/core": "npm:^0.0.35"

@@ -1,0 +1,20 @@
+{
+  "name": "@mlx-node/cli",
+  "version": "0.0.0",
+  "bin": {
+    "mlx": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@huggingface/hub": "^2.10.3",
+    "@inquirer/prompts": "^8.2.1",
+    "@mlx-node/core": "workspace:*",
+    "@napi-rs/keyring": "^1.2.0"
+  }
+}
