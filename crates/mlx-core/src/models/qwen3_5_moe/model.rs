@@ -379,7 +379,11 @@ impl Qwen3_5MoeModel {
                         model_config.linear_key_head_dim,
                         model_config.linear_value_head_dim,
                         model_config.linear_conv_kernel_dim,
-                        if model_config.tie_word_embeddings { 1 } else { 0 },
+                        if model_config.tie_word_embeddings {
+                            1
+                        } else {
+                            0
+                        },
                         max_kv_len,
                         1, // batch_size
                         model_config.num_experts,
@@ -675,7 +679,11 @@ impl Qwen3_5MoeModel {
                         model_config.linear_key_head_dim,
                         model_config.linear_value_head_dim,
                         model_config.linear_conv_kernel_dim,
-                        if model_config.tie_word_embeddings { 1 } else { 0 },
+                        if model_config.tie_word_embeddings {
+                            1
+                        } else {
+                            0
+                        },
                         max_kv_len,
                         1, // batch_size
                         model_config.num_experts,
