@@ -147,6 +147,7 @@ describe.sequential('Qwen3 Chat API', () => {
 
       const result = await model.chat(messages, {
         maxNewTokens: 5,
+        ngramSize: 0, // Disable repetition detection so length limit fires first
       });
 
       // With such a low limit, should hit length
