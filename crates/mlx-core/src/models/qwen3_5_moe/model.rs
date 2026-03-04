@@ -398,39 +398,19 @@ impl Qwen3_5MoeModel {
                 }
 
                 // C++ decode loop (outer StreamContext already active)
-                let mut t_forward_us: u64 = 0;
-                let mut t_sample_us: u64 = 0;
-                let mut t_eval_us: u64 = 0;
-                let mut t_extract_us: u64 = 0;
-                let mut timing_steps: u64 = 0;
                 for step in 0..max_tokens {
                     let next_y = if step + 1 < max_tokens {
                         let next_ids = y.reshape(&[1, 1])?;
-
-                        let t0 = std::time::Instant::now();
                         let logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
-                        t_forward_us += t0.elapsed().as_micros() as u64;
-
-                        let t1 = std::time::Instant::now();
                         let next_token = sample(&logits, sampling_config)?;
-                        t_sample_us += t1.elapsed().as_micros() as u64;
-
-                        let t2 = std::time::Instant::now();
                         eval_token_and_moe_caches(&next_token);
-                        t_eval_us += t2.elapsed().as_micros() as u64;
-
-                        timing_steps += 1;
                         Some(next_token)
                     } else {
                         None
                     };
 
-                    if step == 0 {
-                        y.eval();
-                    }
-                    let t3 = std::time::Instant::now();
+                    y.eval();
                     let token_id = y.item_at_int32(0)? as u32;
-                    t_extract_us += t3.elapsed().as_micros() as u64;
                     generated_tokens.push(token_id);
 
                     if token_id == eos_id {
@@ -446,17 +426,6 @@ impl Qwen3_5MoeModel {
                     if (step + 1) % 256 == 0 {
                         crate::array::clear_cache();
                     }
-                }
-                if timing_steps > 0 {
-                    let avg_fwd = t_forward_us / timing_steps;
-                    let avg_samp = t_sample_us / timing_steps;
-                    let avg_eval = t_eval_us / timing_steps;
-                    let avg_ext = t_extract_us / timing_steps;
-                    let total = avg_fwd + avg_samp + avg_eval + avg_ext;
-                    eprintln!(
-                        "[TIMING] fwd={}us sample={}us eval={}us extract={}us total={}us ({} steps)",
-                        avg_fwd, avg_samp, avg_eval, avg_ext, total, timing_steps
-                    );
                 }
                 // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
             } else {
@@ -482,9 +451,7 @@ impl Qwen3_5MoeModel {
                         None
                     };
 
-                    if step == 0 {
-                        y.eval();
-                    }
+                    y.eval();
                     let token_id = y.item_at_int32(0)? as u32;
                     generated_tokens.push(token_id);
 
@@ -727,25 +694,9 @@ impl Qwen3_5MoeModel {
                 }
 
                 // C++ decode loop (outer StreamContext already active)
-                let diag_sync = std::env::var("MLX_DIAG_SYNC").is_ok();
-                let mut t_sync_us: u64 = 0;
-                let mut t_forward_us: u64 = 0;
-                let mut t_sample_us: u64 = 0;
-                let mut t_eval_us: u64 = 0;
-                let mut t_extract_us: u64 = 0;
-                let mut timing_steps: u64 = 0;
                 for step in 0..max_new_tokens {
                     let next_y = if step + 1 < max_new_tokens {
-                        // Diagnostic: sync before forward to measure actual GPU time separately
-                        if diag_sync {
-                            let ts = std::time::Instant::now();
-                            crate::array::synchronize();
-                            t_sync_us += ts.elapsed().as_micros() as u64;
-                        }
-
                         let next_ids = y.reshape(&[1, 1])?;
-
-                        let t0 = std::time::Instant::now();
                         let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
                         if repetition_penalty != 1.0 {
                             logits = apply_repetition_penalty(
@@ -755,28 +706,15 @@ impl Qwen3_5MoeModel {
                                 Some(repetition_context_size),
                             )?;
                         }
-                        t_forward_us += t0.elapsed().as_micros() as u64;
-
-                        let t1 = std::time::Instant::now();
                         let next_token = sample(&logits, sampling_config)?;
-                        t_sample_us += t1.elapsed().as_micros() as u64;
-
-                        let t2 = std::time::Instant::now();
                         eval_token_and_moe_caches(&next_token);
-                        t_eval_us += t2.elapsed().as_micros() as u64;
-
-                        timing_steps += 1;
                         Some(next_token)
                     } else {
                         None
                     };
 
-                    if step == 0 {
-                        y.eval();
-                    }
-                    let t3 = std::time::Instant::now();
+                    y.eval();
                     let token_id = y.item_at_int32(0)? as u32;
-                    t_extract_us += t3.elapsed().as_micros() as u64;
                     generated_tokens.push(token_id);
                     token_history.push(token_id);
 
@@ -803,25 +741,6 @@ impl Qwen3_5MoeModel {
 
                     if (step + 1) % 256 == 0 {
                         crate::array::clear_cache();
-                    }
-                }
-                if timing_steps > 0 {
-                    let avg_sync = t_sync_us / timing_steps;
-                    let avg_fwd = t_forward_us / timing_steps;
-                    let avg_samp = t_sample_us / timing_steps;
-                    let avg_eval = t_eval_us / timing_steps;
-                    let avg_ext = t_extract_us / timing_steps;
-                    let total = avg_sync + avg_fwd + avg_samp + avg_eval + avg_ext;
-                    if diag_sync {
-                        eprintln!(
-                            "[CHAT-TIMING-DIAG] sync={}us fwd={}us sample={}us eval={}us extract={}us total={}us ({} steps)",
-                            avg_sync, avg_fwd, avg_samp, avg_eval, avg_ext, total, timing_steps
-                        );
-                    } else {
-                        eprintln!(
-                            "[CHAT-TIMING] fwd={}us sample={}us eval={}us extract={}us total={}us ({} steps)",
-                            avg_fwd, avg_samp, avg_eval, avg_ext, total, timing_steps
-                        );
                     }
                 }
                 // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
@@ -856,9 +775,7 @@ impl Qwen3_5MoeModel {
                         None
                     };
 
-                    if step == 0 {
-                        y.eval();
-                    }
+                    y.eval();
                     let token_id = y.item_at_int32(0)? as u32;
                     generated_tokens.push(token_id);
                     token_history.push(token_id);

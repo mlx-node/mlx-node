@@ -463,9 +463,9 @@ impl Qwen3_5Model {
                 };
 
                 // 2. Extract CURRENT token (GPU is already working on next)
-                if step == 0 {
-                    y.eval(); // Ensure first token is materialized
-                }
+                // eval() is required every step: read_scalar (used by item_at_int32)
+                // accesses data<T>() which does not block on async_eval completion.
+                y.eval();
                 let token_id = y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
@@ -755,9 +755,7 @@ impl Qwen3_5Model {
                 };
 
                 // 2. Extract CURRENT token (GPU is already working on next)
-                if step == 0 {
-                    y.eval();
-                }
+                y.eval();
                 let token_id = y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
                 token_history.push(token_id);
