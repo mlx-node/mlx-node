@@ -77,7 +77,7 @@ export async function run(argv: string[]) {
 
   const parsePositiveInt = (flag: string, raw?: string): number | undefined => {
     if (raw === undefined) return undefined;
-    if (!/^\d+$/.test(raw)) {
+    if (!/^[1-9]\d*$/.test(raw)) {
       console.error(`Error: ${flag} requires a positive integer value`);
       process.exit(1);
     }

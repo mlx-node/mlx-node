@@ -155,7 +155,7 @@ export async function run(argv: string[]) {
   const modelSlug = modelName.split('/').pop()!.toLowerCase();
   const outputDir = resolve(args.output ?? join('.cache', 'models', modelSlug));
 
-  const HUGGINGFACE_TOKEN = await keyringEntry.getPassword();
+  const HUGGINGFACE_TOKEN = (await keyringEntry.getPassword()) ?? undefined;
 
   if (!HUGGINGFACE_TOKEN) {
     console.warn('No HuggingFace token found, the model will download with anonymous access');
@@ -195,7 +195,7 @@ export async function run(argv: string[]) {
 
   console.log('Downloading base model from HuggingFace...\n');
 
-  const { totalSize, filesToDownload } = await getModelFiles(modelName, HUGGINGFACE_TOKEN ?? undefined);
+  const { totalSize, filesToDownload } = await getModelFiles(modelName, HUGGINGFACE_TOKEN);
   const sizeStr = formatBytes(totalSize);
   console.log(`This may take a while (model is ~${sizeStr})...\n`);
 
