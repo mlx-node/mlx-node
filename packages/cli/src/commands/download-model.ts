@@ -70,10 +70,10 @@ const CORE_FILES = [
   'merges.txt',
 ];
 
-async function getModelFiles(modelName: string) {
+async function getModelFiles(modelName: string, accessToken?: string) {
   let totalSize = 0;
   const filesToDownload: ListFileEntry[] = [];
-  for await (const file of listFiles({ repo: { type: 'model', name: modelName } })) {
+  for await (const file of listFiles({ repo: { type: 'model', name: modelName }, accessToken })) {
     if (
       CORE_FILES.includes(file.path) ||
       file.path.endsWith('.safetensors') ||
@@ -195,7 +195,7 @@ export async function run(argv: string[]) {
 
   console.log('Downloading base model from HuggingFace...\n');
 
-  const { totalSize, filesToDownload } = await getModelFiles(modelName);
+  const { totalSize, filesToDownload } = await getModelFiles(modelName, HUGGINGFACE_TOKEN ?? undefined);
   const sizeStr = formatBytes(totalSize);
   console.log(`This may take a while (model is ~${sizeStr})...\n`);
 
