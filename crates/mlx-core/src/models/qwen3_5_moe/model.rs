@@ -695,24 +695,7 @@ impl Qwen3_5MoeModel {
 
                 // C++ decode loop (outer StreamContext already active)
                 for step in 0..max_new_tokens {
-                    let next_y = if step + 1 < max_new_tokens {
-                        let next_ids = y.reshape(&[1, 1])?;
-                        let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
-                        if repetition_penalty != 1.0 {
-                            logits = apply_repetition_penalty(
-                                &logits,
-                                &token_history,
-                                repetition_penalty,
-                                Some(repetition_context_size),
-                            )?;
-                        }
-                        let next_token = sample(&logits, sampling_config)?;
-                        eval_token_and_moe_caches(&next_token);
-                        Some(next_token)
-                    } else {
-                        None
-                    };
-
+                    // Extract CURRENT token FIRST so repetition penalty includes it
                     y.eval();
                     let token_id = y.item_at_int32(0)? as u32;
                     generated_tokens.push(token_id);
@@ -734,9 +717,23 @@ impl Qwen3_5MoeModel {
                         break;
                     }
 
-                    match next_y {
-                        Some(next) => y = next,
-                        None => break,
+                    // Compute NEXT token (with complete token_history including current)
+                    if step + 1 < max_new_tokens {
+                        let next_ids = y.reshape(&[1, 1])?;
+                        let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
+                        if repetition_penalty != 1.0 {
+                            logits = apply_repetition_penalty(
+                                &logits,
+                                &token_history,
+                                repetition_penalty,
+                                Some(repetition_context_size),
+                            )?;
+                        }
+                        let next_token = sample(&logits, sampling_config)?;
+                        eval_token_and_moe_caches(&next_token);
+                        y = next_token;
+                    } else {
+                        break;
                     }
 
                     if (step + 1) % 256 == 0 {
@@ -747,7 +744,30 @@ impl Qwen3_5MoeModel {
             } else {
                 // Rust fallback decode loop
                 for step in 0..max_new_tokens {
-                    let next_y = if step + 1 < max_new_tokens {
+                    // Extract CURRENT token FIRST so repetition penalty includes it
+                    y.eval();
+                    let token_id = y.item_at_int32(0)? as u32;
+                    generated_tokens.push(token_id);
+                    token_history.push(token_id);
+
+                    if token_id == eos_id {
+                        finish_reason = String::from("eos");
+                        break;
+                    }
+
+                    // Check repetition cutoff
+                    if let Some(reason) = check_repetition_cutoff(
+                        &generated_tokens,
+                        max_consecutive_tokens,
+                        max_ngram_repeats,
+                        ngram_size,
+                    ) {
+                        finish_reason = reason.to_string();
+                        break;
+                    }
+
+                    // Compute NEXT token (with complete token_history including current)
+                    if step + 1 < max_new_tokens {
                         let next_ids = y.reshape(&[1, 1])?;
                         let logits = forward_inner(
                             &next_ids,
@@ -770,35 +790,9 @@ impl Qwen3_5MoeModel {
                         }
                         let next_token = sample(&logits, sampling_config)?;
                         eval_token_and_caches_inner(&next_token, &caches_guard);
-                        Some(next_token)
+                        y = next_token;
                     } else {
-                        None
-                    };
-
-                    y.eval();
-                    let token_id = y.item_at_int32(0)? as u32;
-                    generated_tokens.push(token_id);
-                    token_history.push(token_id);
-
-                    if token_id == eos_id {
-                        finish_reason = String::from("eos");
                         break;
-                    }
-
-                    // Check repetition cutoff
-                    if let Some(reason) = check_repetition_cutoff(
-                        &generated_tokens,
-                        max_consecutive_tokens,
-                        max_ngram_repeats,
-                        ngram_size,
-                    ) {
-                        finish_reason = reason.to_string();
-                        break;
-                    }
-
-                    match next_y {
-                        Some(next) => y = next,
-                        None => break,
                     }
 
                     if (step + 1) % 256 == 0 {

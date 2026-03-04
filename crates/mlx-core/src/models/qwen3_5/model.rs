@@ -706,55 +706,8 @@ impl Qwen3_5Model {
 
             // Decode loop: compiled C++ path for real models, Rust fallback for tests.
             for step in 0..max_new_tokens {
-                // 1. Compute NEXT token (GPU work starts immediately)
-                let next_y = {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    if step + 1 < max_new_tokens {
-                        let next_ids = y.reshape(&[1, 1])?;
-                        let next_token = if use_compiled {
-                            let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
-                            if repetition_penalty != 1.0 {
-                                logits = apply_repetition_penalty(
-                                    &logits,
-                                    &token_history,
-                                    repetition_penalty,
-                                    Some(repetition_context_size),
-                                )?;
-                            }
-                            let next_token = sample(&logits, sampling_config)?;
-                            eval_token_and_compiled_caches(&next_token);
-                            next_token
-                        } else {
-                            let logits = forward_with_locks(
-                                &next_ids,
-                                &embedding_weight,
-                                &layers_arc,
-                                &final_norm_arc,
-                                &lm_head_arc,
-                                &caches_arc,
-                                fa_idx,
-                                Some(&embedding_weight_t),
-                            )?;
-                            let mut logits = logits.squeeze(Some(&[1]))?;
-                            if repetition_penalty != 1.0 {
-                                logits = apply_repetition_penalty(
-                                    &logits,
-                                    &token_history,
-                                    repetition_penalty,
-                                    Some(repetition_context_size),
-                                )?;
-                            }
-                            let next_token = sample(&logits, sampling_config)?;
-                            eval_token_and_caches(&next_token, &caches_arc);
-                            next_token
-                        };
-                        Some(next_token)
-                    } else {
-                        None
-                    }
-                };
-
-                // 2. Extract CURRENT token (GPU is already working on next)
+                // 1. Extract CURRENT token FIRST so repetition penalty includes it.
+                // Without this, the penalty is one token behind (off-by-one).
                 y.eval();
                 let token_id = y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
@@ -776,10 +729,50 @@ impl Qwen3_5Model {
                     break;
                 }
 
-                // 3. Advance to next token
-                match next_y {
-                    Some(next) => y = next,
-                    None => break,
+                // 2. Compute NEXT token (with complete token_history including current)
+                if step + 1 >= max_new_tokens {
+                    break;
+                }
+                {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    let next_ids = y.reshape(&[1, 1])?;
+                    y = if use_compiled {
+                        let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
+                        if repetition_penalty != 1.0 {
+                            logits = apply_repetition_penalty(
+                                &logits,
+                                &token_history,
+                                repetition_penalty,
+                                Some(repetition_context_size),
+                            )?;
+                        }
+                        let next_token = sample(&logits, sampling_config)?;
+                        eval_token_and_compiled_caches(&next_token);
+                        next_token
+                    } else {
+                        let logits = forward_with_locks(
+                            &next_ids,
+                            &embedding_weight,
+                            &layers_arc,
+                            &final_norm_arc,
+                            &lm_head_arc,
+                            &caches_arc,
+                            fa_idx,
+                            Some(&embedding_weight_t),
+                        )?;
+                        let mut logits = logits.squeeze(Some(&[1]))?;
+                        if repetition_penalty != 1.0 {
+                            logits = apply_repetition_penalty(
+                                &logits,
+                                &token_history,
+                                repetition_penalty,
+                                Some(repetition_context_size),
+                            )?;
+                        }
+                        let next_token = sample(&logits, sampling_config)?;
+                        eval_token_and_caches(&next_token, &caches_arc);
+                        next_token
+                    };
                 }
 
                 // Periodic cleanup to prevent computation graph memory accumulation
