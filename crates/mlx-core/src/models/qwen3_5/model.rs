@@ -286,17 +286,23 @@ impl Qwen3_5Model {
         let prompt_tokens = prompt_tokens.clone();
 
         napi::bindgen_prelude::spawn_blocking(move || {
-            // Reset and init caches
-            {
-                let mut caches_guard = caches_arc
-                    .write()
-                    .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
-                if let Some(ref mut caches) = *caches_guard {
-                    for cache in caches.iter_mut() {
-                        cache.reset();
-                    }
-                }
-                let new_caches = (0..model_config.num_layers as usize)
+            // Acquire all locks ONCE for the entire prefill+decode sequence
+            let mut layers_guard = layers_arc
+                .write()
+                .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+            let mut caches_guard = caches_arc
+                .write()
+                .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+            let final_norm_guard = final_norm_arc
+                .read()
+                .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
+            let lm_head_guard = lm_head_arc
+                .read()
+                .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+
+            // Init fresh caches (old ones dropped on overwrite)
+            *caches_guard = Some(
+                (0..model_config.num_layers as usize)
                     .map(|i| {
                         if model_config.is_linear_layer(i) {
                             Qwen3_5LayerCache::new_linear()
@@ -304,9 +310,8 @@ impl Qwen3_5Model {
                             Qwen3_5LayerCache::new_full_attention()
                         }
                     })
-                    .collect();
-                *caches_guard = Some(new_caches);
-            }
+                    .collect(),
+            );
 
             let max_tokens = config.max_new_tokens;
             let sampling_config = Some(SamplingConfig {
@@ -334,13 +339,13 @@ impl Qwen3_5Model {
             // Prefill: forward pass on entire prompt
             let logits = {
                 let _stream_ctx = StreamContext::new(generation_stream);
-                forward_with_locks(
+                forward_inner(
                     &prompt_tokens,
                     &embedding_weight,
-                    &layers_arc,
-                    &final_norm_arc,
-                    &lm_head_arc,
-                    &caches_arc,
+                    &mut layers_guard,
+                    &mut caches_guard,
+                    &final_norm_guard,
+                    &lm_head_guard,
                     fa_idx,
                     Some(&embedding_weight_t),
                 )?
@@ -358,11 +363,10 @@ impl Qwen3_5Model {
             // Decide whether to use the compiled forward path.
             // The compiled path requires C++ weights to be loaded (only true for
             // safetensors-loaded models). Test models have no stored weights and
-            // must fall back to the pure Rust forward_with_locks path.
+            // must fall back to the pure Rust forward_inner path.
             let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
 
             // Guard ensures mlx_qwen35_compiled_reset() is called even if `?` returns early.
-            // Created before the decode loop so it outlives the entire loop + init block.
             let _compiled_guard = if use_compiled {
                 Some(CompiledResetGuard)
             } else {
@@ -371,18 +375,12 @@ impl Qwen3_5Model {
 
             if use_compiled {
                 // Initialize compiled forward pass from prefill caches.
-                // Imports post-prefill cache arrays into C++ global state and sets
-                // up mlx::core::compile() to cache the graph across decode steps.
-                // max_kv_len is rounded up to handle prompt + max_tokens.
                 use mlx_sys as sys;
                 let prefill_len = seq_len as i32;
                 let max_kv_len = ((prefill_len + max_tokens + 255) / 256) * 256;
                 let num_layers = model_config.num_layers as usize;
                 let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                     vec![std::ptr::null_mut(); num_layers * 2];
-                let caches_guard = caches_arc
-                    .read()
-                    .map_err(|_| Error::from_reason("Failed to acquire caches read lock"))?;
                 if let Some(ref caches) = *caches_guard {
                     for (i, cache) in caches.iter().enumerate() {
                         let (p0, p1) = cache.export_ptrs();
@@ -390,7 +388,11 @@ impl Qwen3_5Model {
                         cache_ptrs[i * 2 + 1] = p1;
                     }
                 }
+                // Drop locks before compiled init — compiled path uses C++ globals
                 drop(caches_guard);
+                drop(layers_guard);
+                drop(final_norm_guard);
+                drop(lm_head_guard);
                 unsafe {
                     sys::mlx_qwen35_compiled_init_from_prefill(
                         model_config.num_layers,
@@ -418,71 +420,83 @@ impl Qwen3_5Model {
                         prefill_len,
                     );
                 }
-            }
 
-            // Decode loop: matches Python mlx-lm's generate_step pattern.
-            // Key: compute NEXT token's forward pass BEFORE extracting current token.
-            // This overlaps GPU computation with CPU token extraction.
-            // Uses compiled C++ forward pass for real models (graph cached after step 1).
-            // Falls back to pure Rust forward_with_locks for test/unweighted models.
-            for step in 0..max_tokens {
-                // 1. Compute NEXT token (GPU work starts immediately)
-                // Wrap entire step in generation stream (matches Python mlx-lm)
-                let next_y = {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    if step + 1 < max_tokens {
-                        let next_ids = y.reshape(&[1, 1])?;
-                        let next_token = if use_compiled {
+                // Compiled C++ decode loop (locks dropped — C++ owns the state)
+                for step in 0..max_tokens {
+                    let next_y = {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        if step + 1 < max_tokens {
+                            let next_ids = y.reshape(&[1, 1])?;
                             let logits = forward_compiled(&next_ids, &embedding_weight)?;
-                            // Compiled path returns 2D [B, vocab] — no squeeze needed.
                             let next_token = sample(&logits, sampling_config)?;
-                            // Eval token + compiled caches to break lazy graph chains.
                             eval_token_and_compiled_caches(&next_token);
-                            next_token
+                            Some(next_token)
                         } else {
-                            // Fallback: pure Rust path (test models, no C++ weights)
-                            let logits = forward_with_locks(
+                            None
+                        }
+                    };
+
+                    y.eval();
+                    let token_id = y.item_at_int32(0)? as u32;
+                    generated_tokens.push(token_id);
+
+                    if token_id == eos_id {
+                        finish_reason = String::from("eos");
+                        break;
+                    }
+
+                    match next_y {
+                        Some(next) => y = next,
+                        None => break,
+                    }
+
+                    if (step + 1) % 256 == 0 {
+                        crate::array::synchronize_and_clear_cache();
+                    }
+                }
+            } else {
+                // Rust fallback decode loop (locks held for entire loop)
+                for step in 0..max_tokens {
+                    let next_y = {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        if step + 1 < max_tokens {
+                            let next_ids = y.reshape(&[1, 1])?;
+                            let logits = forward_inner(
                                 &next_ids,
                                 &embedding_weight,
-                                &layers_arc,
-                                &final_norm_arc,
-                                &lm_head_arc,
-                                &caches_arc,
+                                &mut layers_guard,
+                                &mut caches_guard,
+                                &final_norm_guard,
+                                &lm_head_guard,
                                 fa_idx,
                                 Some(&embedding_weight_t),
                             )?;
                             let logits = logits.squeeze(Some(&[1]))?;
                             let next_token = sample(&logits, sampling_config)?;
-                            eval_token_and_caches(&next_token, &caches_arc);
-                            next_token
-                        };
-                        Some(next_token)
-                    } else {
-                        None
+                            eval_token_and_caches_inner(&next_token, &caches_guard);
+                            Some(next_token)
+                        } else {
+                            None
+                        }
+                    };
+
+                    y.eval();
+                    let token_id = y.item_at_int32(0)? as u32;
+                    generated_tokens.push(token_id);
+
+                    if token_id == eos_id {
+                        finish_reason = String::from("eos");
+                        break;
                     }
-                };
 
-                // 2. Extract CURRENT token (GPU is already working on next)
-                // eval() is required every step: read_scalar (used by item_at_int32)
-                // accesses data<T>() which does not block on async_eval completion.
-                y.eval();
-                let token_id = y.item_at_int32(0)? as u32;
-                generated_tokens.push(token_id);
+                    match next_y {
+                        Some(next) => y = next,
+                        None => break,
+                    }
 
-                if token_id == eos_id {
-                    finish_reason = String::from("eos");
-                    break;
-                }
-
-                // 3. Advance to next token
-                match next_y {
-                    Some(next) => y = next,
-                    None => break,
-                }
-
-                // Periodic cleanup to prevent computation graph memory accumulation
-                if (step + 1) % 256 == 0 {
-                    crate::array::synchronize_and_clear_cache();
+                    if (step + 1) % 256 == 0 {
+                        crate::array::synchronize_and_clear_cache();
+                    }
                 }
             }
 
@@ -574,17 +588,23 @@ impl Qwen3_5Model {
                 min_p: config.min_p,
             });
 
-            // Reset and init caches
-            {
-                let mut caches_guard = caches_arc
-                    .write()
-                    .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
-                if let Some(ref mut caches) = *caches_guard {
-                    for cache in caches.iter_mut() {
-                        cache.reset();
-                    }
-                }
-                let new_caches = (0..model_config.num_layers as usize)
+            // Acquire all locks ONCE for the entire prefill+decode sequence
+            let mut layers_guard = layers_arc
+                .write()
+                .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+            let mut caches_guard = caches_arc
+                .write()
+                .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+            let final_norm_guard = final_norm_arc
+                .read()
+                .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
+            let lm_head_guard = lm_head_arc
+                .read()
+                .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+
+            // Init fresh caches (old ones dropped on overwrite)
+            *caches_guard = Some(
+                (0..model_config.num_layers as usize)
                     .map(|i| {
                         if model_config.is_linear_layer(i) {
                             Qwen3_5LayerCache::new_linear()
@@ -592,9 +612,8 @@ impl Qwen3_5Model {
                             Qwen3_5LayerCache::new_full_attention()
                         }
                     })
-                    .collect();
-                *caches_guard = Some(new_caches);
-            }
+                    .collect(),
+            );
 
             let eos_id = model_config.eos_token_id as u32;
             let mut generated_tokens: Vec<u32> = Vec::new();
@@ -603,13 +622,8 @@ impl Qwen3_5Model {
             // Track token history for repetition penalty
             let mut token_history: Vec<u32> = tokens.clone();
 
-            // Pre-compute embedding weight transpose once (avoids recomputing per step)
             let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-
-            // Create dedicated generation stream for GPU scheduling
             let generation_stream = Stream::new(DeviceType::Gpu);
-
-            // Pin model weights in Metal memory for the duration of generation
             let model_size_bytes = model_config.estimate_memory_bytes() as usize;
             let _wired_ctx =
                 crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
@@ -617,13 +631,13 @@ impl Qwen3_5Model {
             // Prefill
             let logits = {
                 let _stream_ctx = StreamContext::new(generation_stream);
-                forward_with_locks(
+                forward_inner(
                     &prompt,
                     &embedding_weight,
-                    &layers_arc,
-                    &final_norm_arc,
-                    &lm_head_arc,
-                    &caches_arc,
+                    &mut layers_guard,
+                    &mut caches_guard,
+                    &final_norm_guard,
+                    &lm_head_guard,
                     fa_idx,
                     Some(&embedding_weight_t),
                 )?
@@ -643,14 +657,11 @@ impl Qwen3_5Model {
                 )?;
             }
 
-            // Sample first token (lazy — not evaluated yet)
             let mut y = sample(&last_logits, sampling_config)?;
             MxArray::async_eval_arrays(&[&y]);
 
-            // Initialize compiled forward pass (same as generate() path).
             let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
 
-            // Guard ensures mlx_qwen35_compiled_reset() is called even if `?` returns early.
             let _compiled_guard = if use_compiled {
                 Some(CompiledResetGuard)
             } else {
@@ -664,9 +675,6 @@ impl Qwen3_5Model {
                 let num_layers = model_config.num_layers as usize;
                 let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                     vec![std::ptr::null_mut(); num_layers * 2];
-                let caches_guard = caches_arc
-                    .read()
-                    .map_err(|_| Error::from_reason("Failed to acquire caches read lock"))?;
                 if let Some(ref caches) = *caches_guard {
                     for (i, cache) in caches.iter().enumerate() {
                         let (p0, p1) = cache.export_ptrs();
@@ -674,7 +682,11 @@ impl Qwen3_5Model {
                         cache_ptrs[i * 2 + 1] = p1;
                     }
                 }
+                // Drop locks before compiled init — compiled path uses C++ globals
                 drop(caches_guard);
+                drop(layers_guard);
+                drop(final_norm_guard);
+                drop(lm_head_guard);
                 unsafe {
                     sys::mlx_qwen35_compiled_init_from_prefill(
                         model_config.num_layers,
@@ -702,41 +714,35 @@ impl Qwen3_5Model {
                         prefill_len,
                     );
                 }
-            }
 
-            // Decode loop: compiled C++ path for real models, Rust fallback for tests.
-            for step in 0..max_new_tokens {
-                // 1. Extract CURRENT token FIRST so repetition penalty includes it.
-                // Without this, the penalty is one token behind (off-by-one).
-                y.eval();
-                let token_id = y.item_at_int32(0)? as u32;
-                generated_tokens.push(token_id);
-                token_history.push(token_id);
+                // Compiled C++ decode loop (locks dropped — C++ owns the state)
+                for step in 0..max_new_tokens {
+                    y.eval();
+                    let token_id = y.item_at_int32(0)? as u32;
+                    generated_tokens.push(token_id);
+                    token_history.push(token_id);
 
-                if token_id == eos_id {
-                    finish_reason = String::from("eos");
-                    break;
-                }
+                    if token_id == eos_id {
+                        finish_reason = String::from("eos");
+                        break;
+                    }
 
-                // Check repetition cutoff
-                if let Some(reason) = check_repetition_cutoff(
-                    &generated_tokens,
-                    max_consecutive_tokens,
-                    max_ngram_repeats,
-                    ngram_size,
-                ) {
-                    finish_reason = reason.to_string();
-                    break;
-                }
+                    if let Some(reason) = check_repetition_cutoff(
+                        &generated_tokens,
+                        max_consecutive_tokens,
+                        max_ngram_repeats,
+                        ngram_size,
+                    ) {
+                        finish_reason = reason.to_string();
+                        break;
+                    }
 
-                // 2. Compute NEXT token (with complete token_history including current)
-                if step + 1 >= max_new_tokens {
-                    break;
-                }
-                {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    let next_ids = y.reshape(&[1, 1])?;
-                    y = if use_compiled {
+                    if step + 1 >= max_new_tokens {
+                        break;
+                    }
+                    {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        let next_ids = y.reshape(&[1, 1])?;
                         let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
                         if repetition_penalty != 1.0 {
                             logits = apply_repetition_penalty(
@@ -748,15 +754,49 @@ impl Qwen3_5Model {
                         }
                         let next_token = sample(&logits, sampling_config)?;
                         eval_token_and_compiled_caches(&next_token);
-                        next_token
-                    } else {
-                        let logits = forward_with_locks(
+                        y = next_token;
+                    }
+
+                    if (step + 1) % 256 == 0 {
+                        crate::array::synchronize_and_clear_cache();
+                    }
+                }
+            } else {
+                // Rust fallback decode loop (locks held for entire loop)
+                for step in 0..max_new_tokens {
+                    y.eval();
+                    let token_id = y.item_at_int32(0)? as u32;
+                    generated_tokens.push(token_id);
+                    token_history.push(token_id);
+
+                    if token_id == eos_id {
+                        finish_reason = String::from("eos");
+                        break;
+                    }
+
+                    if let Some(reason) = check_repetition_cutoff(
+                        &generated_tokens,
+                        max_consecutive_tokens,
+                        max_ngram_repeats,
+                        ngram_size,
+                    ) {
+                        finish_reason = reason.to_string();
+                        break;
+                    }
+
+                    if step + 1 >= max_new_tokens {
+                        break;
+                    }
+                    {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        let next_ids = y.reshape(&[1, 1])?;
+                        let logits = forward_inner(
                             &next_ids,
                             &embedding_weight,
-                            &layers_arc,
-                            &final_norm_arc,
-                            &lm_head_arc,
-                            &caches_arc,
+                            &mut layers_guard,
+                            &mut caches_guard,
+                            &final_norm_guard,
+                            &lm_head_guard,
                             fa_idx,
                             Some(&embedding_weight_t),
                         )?;
@@ -770,14 +810,13 @@ impl Qwen3_5Model {
                             )?;
                         }
                         let next_token = sample(&logits, sampling_config)?;
-                        eval_token_and_caches(&next_token, &caches_arc);
-                        next_token
-                    };
-                }
+                        eval_token_and_caches_inner(&next_token, &caches_guard);
+                        y = next_token;
+                    }
 
-                // Periodic cleanup to prevent computation graph memory accumulation
-                if (step + 1) % 256 == 0 {
-                    crate::array::synchronize_and_clear_cache();
+                    if (step + 1) % 256 == 0 {
+                        crate::array::synchronize_and_clear_cache();
+                    }
                 }
             }
 
@@ -876,87 +915,54 @@ impl Qwen3_5Model {
 ///
 /// `embedding_weight_t` is an optional pre-transposed embedding weight for
 /// tied embeddings. When provided, avoids recomputing the transpose every step.
-fn forward_with_locks(
+/// Lock-free forward pass that takes direct mutable refs instead of Arcs.
+/// Caller must acquire locks once and hold them for the entire prefill+decode sequence.
+fn forward_inner(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
-    layers_arc: &Arc<RwLock<Vec<DecoderLayer>>>,
-    final_norm_arc: &Arc<RwLock<RMSNorm>>,
-    lm_head_arc: &Arc<RwLock<Option<Linear>>>,
-    caches_arc: &Arc<RwLock<Option<Vec<Qwen3_5LayerCache>>>>,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
     fa_idx: usize,
     embedding_weight_t: Option<&MxArray>,
 ) -> Result<MxArray> {
-    // Compute embeddings (embedding is immutable, no lock needed)
     let embedding = Embedding::from_weight(embedding_weight)?;
     let hidden_states = embedding.forward(input_ids)?;
-
     let mut h = hidden_states.clone();
 
-    // Acquire write locks for layers and caches (forward mutates caches)
-    let mut layers_guard = layers_arc
-        .write()
-        .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
-    let mut caches_guard = caches_arc
-        .write()
-        .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
-
-    // Create masks
     let seq_len = hidden_states.shape_at(1)?;
     let fa_mask = {
-        let has_cache = caches_guard.is_some();
+        let has_cache = caches.is_some();
         if seq_len <= 1 && has_cache {
             None
         } else {
-            let offset = caches_guard
-                .as_ref()
-                .map(|c| c[fa_idx].offset())
-                .unwrap_or(0);
+            let offset = caches.as_ref().map(|c| c[fa_idx].offset()).unwrap_or(0);
             Some(create_causal_mask(seq_len as i32, Some(offset), None)?)
         }
     };
 
-    // SSM mask is always None — mlx-vlm never creates one for ArraysCache.
-    // An all-ones mask is a no-op that adds unnecessary graph nodes and Metal overhead.
-
-    // Forward through layers
-    let num_layers = layers_guard.len();
+    let num_layers = layers.len();
     for i in 0..num_layers {
-        let mask = if layers_guard[i].is_linear() {
+        let mask = if layers[i].is_linear() {
             None
         } else {
             fa_mask.as_ref()
         };
-
-        let cache = caches_guard.as_mut().map(|c| &mut c[i]);
-        h = layers_guard[i].forward(&h, mask, cache)?;
+        let cache = caches.as_mut().map(|c| &mut c[i]);
+        h = layers[i].forward(&h, mask, cache)?;
     }
 
-    // Drop layers lock early -- no longer needed
-    drop(layers_guard);
-
-    // Final norm
-    let final_norm_guard = final_norm_arc
-        .read()
-        .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
-    let h = final_norm_guard.forward(&h)?;
-    drop(final_norm_guard);
-
-    // LM head
-    let lm_head_guard = lm_head_arc
-        .read()
-        .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
-    match &*lm_head_guard {
+    let h = final_norm.forward(&h)?;
+    match lm_head {
         Some(head) => head.forward(&h),
-        None => {
-            // tie_word_embeddings: use pre-transposed weight or compute on the fly
-            match embedding_weight_t {
-                Some(wt) => h.matmul(wt),
-                None => {
-                    let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-                    h.matmul(&wt)
-                }
+        None => match embedding_weight_t {
+            Some(wt) => h.matmul(wt),
+            None => {
+                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
+                h.matmul(&wt)
             }
-        }
+        },
     }
 }
 
@@ -1014,17 +1020,13 @@ fn eval_token_and_compiled_caches(next_token: &MxArray) {
 ///
 /// This matches Python mlx-lm's behavior: async_eval(y, logprobs) evaluates y (the token)
 /// whose graph transitively causes all cache state INPUTS to be detached/materialized.
-fn eval_token_and_caches(
-    next_token: &MxArray,
-    caches_arc: &Arc<RwLock<Option<Vec<Qwen3_5LayerCache>>>>,
-) {
-    // Collect all cache array handles while holding read lock.
-    // We build a Vec<*mut mlx_array> directly to avoid lifetime issues.
+/// Evaluate the sampled token AND all cache arrays together (lock-free version).
+///
+/// Takes caches directly instead of acquiring a read lock.
+fn eval_token_and_caches_inner(next_token: &MxArray, caches: &Option<Vec<Qwen3_5LayerCache>>) {
     let mut handles: Vec<*mut mlx_sys::mlx_array> = vec![next_token.as_raw_ptr()];
 
-    if let Ok(caches_guard) = caches_arc.read()
-        && let Some(ref caches) = *caches_guard
-    {
+    if let Some(ref caches) = *caches {
         let mut arr_refs: Vec<&MxArray> = Vec::with_capacity(caches.len() * 2);
         for cache in caches.iter() {
             cache.collect_arrays(&mut arr_refs);
@@ -1034,8 +1036,6 @@ fn eval_token_and_caches(
         }
     }
 
-    // Single async_eval call for token + all cache arrays.
-    // MLX will evaluate and detach all of them, preventing graph accumulation.
     unsafe {
         mlx_sys::mlx_async_eval(handles.as_mut_ptr(), handles.len());
     }
