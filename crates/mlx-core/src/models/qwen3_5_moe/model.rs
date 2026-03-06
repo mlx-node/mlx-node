@@ -371,11 +371,12 @@ impl Qwen3_5MoeModel {
                     .as_deref()
                     .unwrap_or(&[])
                     .to_vec();
-                // Drop Rust locks — C++ owns the state now
-                drop(caches_guard);
+                // Drop non-cache locks — not needed during C++ MoE decode
                 drop(layers_guard);
                 drop(final_norm_guard);
                 drop(lm_head_guard);
+                // Keep caches_guard alive through init_from_prefill so cache_ptrs
+                // (raw pointers into the cache MxArrays) remain valid.
                 unsafe {
                     sys::mlx_qwen35_moe_init_from_prefill(
                         model_config.num_layers,
@@ -413,8 +414,10 @@ impl Qwen3_5MoeModel {
                         prefill_len,
                     );
                 }
+                // C++ has copied arrays into its own globals — safe to release
+                drop(caches_guard);
 
-                // C++ decode loop (outer StreamContext already active)
+                // C++ decode loop (all locks dropped — C++ owns the state)
                 for step in 0..max_tokens {
                     let next_y = if step + 1 < max_tokens {
                         let next_ids = y.reshape(&[1, 1])?;
@@ -679,10 +682,12 @@ impl Qwen3_5MoeModel {
                     .as_deref()
                     .unwrap_or(&[])
                     .to_vec();
-                drop(caches_guard);
+                // Drop non-cache locks — not needed during C++ MoE decode
                 drop(layers_guard);
                 drop(final_norm_guard);
                 drop(lm_head_guard);
+                // Keep caches_guard alive through init_from_prefill so cache_ptrs
+                // (raw pointers into the cache MxArrays) remain valid.
                 unsafe {
                     sys::mlx_qwen35_moe_init_from_prefill(
                         model_config.num_layers,
@@ -720,8 +725,10 @@ impl Qwen3_5MoeModel {
                         prefill_len,
                     );
                 }
+                // C++ has copied arrays into its own globals — safe to release
+                drop(caches_guard);
 
-                // C++ decode loop (outer StreamContext already active)
+                // C++ decode loop (all locks dropped — C++ owns the state)
                 for step in 0..max_new_tokens {
                     // Extract CURRENT token FIRST so repetition penalty includes it
                     y.eval();

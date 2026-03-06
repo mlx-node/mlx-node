@@ -403,11 +403,12 @@ impl Qwen3_5Model {
                         cache_ptrs[i * 2 + 1] = p1;
                     }
                 }
-                // Drop locks before compiled init — compiled path uses C++ globals
-                drop(caches_guard);
+                // Drop non-cache locks — not needed during compiled decode
                 drop(layers_guard);
                 drop(final_norm_guard);
                 drop(lm_head_guard);
+                // Keep caches_guard alive through init_from_prefill so cache_ptrs
+                // (raw pointers into the cache MxArrays) remain valid.
                 unsafe {
                     sys::mlx_qwen35_compiled_init_from_prefill(
                         model_config.num_layers,
@@ -435,8 +436,10 @@ impl Qwen3_5Model {
                         prefill_len,
                     );
                 }
+                // C++ has copied arrays into g_compiled_caches — safe to release
+                drop(caches_guard);
 
-                // Compiled C++ decode loop (locks dropped — C++ owns the state)
+                // Compiled C++ decode loop (all locks dropped — C++ owns the state)
                 for step in 0..max_tokens {
                     let next_y = {
                         let _stream_ctx = StreamContext::new(generation_stream);
@@ -705,11 +708,12 @@ impl Qwen3_5Model {
                         cache_ptrs[i * 2 + 1] = p1;
                     }
                 }
-                // Drop locks before compiled init — compiled path uses C++ globals
-                drop(caches_guard);
+                // Drop non-cache locks — not needed during compiled decode
                 drop(layers_guard);
                 drop(final_norm_guard);
                 drop(lm_head_guard);
+                // Keep caches_guard alive through init_from_prefill so cache_ptrs
+                // (raw pointers into the cache MxArrays) remain valid.
                 unsafe {
                     sys::mlx_qwen35_compiled_init_from_prefill(
                         model_config.num_layers,
@@ -737,8 +741,10 @@ impl Qwen3_5Model {
                         prefill_len,
                     );
                 }
+                // C++ has copied arrays into g_compiled_caches — safe to release
+                drop(caches_guard);
 
-                // Compiled C++ decode loop (locks dropped — C++ owns the state)
+                // Compiled C++ decode loop (all locks dropped — C++ owns the state)
                 for step in 0..max_new_tokens {
                     y.eval();
                     let token_id = y.item_at_int32(0)? as u32;
