@@ -2,6 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use super::quantized_linear::LinearProj;
@@ -18,6 +19,13 @@ use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::persistence;
+
+/// Process-wide mutex serializing the MoE compiled forward lifecycle.
+///
+/// The C++ MoE forward path uses process-wide globals (separate from dense).
+/// This mutex prevents concurrent `generate()`/`chat()` calls from racing
+/// on those globals when dispatched via `spawn_blocking`.
+static MOE_COMPILED_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
 
 /// RAII guard that calls `mlx_qwen35_moe_reset()` on drop.
 ///
@@ -259,6 +267,16 @@ impl Qwen3_5MoeModel {
         let fa_idx = self.fa_idx;
         let prompt_tokens = prompt_tokens.clone();
 
+        // Check if C++ MoE path will be used (weights loaded from safetensors).
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+
+        // Serialize MoE compiled lifecycle — prevents concurrent C++ global corruption
+        let _moe_lock = if use_cpp {
+            Some(MOE_COMPILED_MUTEX.lock().await)
+        } else {
+            None
+        };
+
         napi::bindgen_prelude::spawn_blocking(move || {
             // Acquire all locks ONCE for the entire prefill+decode sequence
             let mut layers_guard = layers_arc
@@ -330,11 +348,6 @@ impl Qwen3_5MoeModel {
 
             let mut y = sample(&last_logits, sampling_config)?;
             MxArray::async_eval_arrays(&[&y]);
-
-            // Decide whether to use C++ MoE forward path.
-            // Split into fully separate branches so Rust doesn't see
-            // use-after-move on lock guards.
-            let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
 
             if use_cpp {
                 // Guard ensures mlx_qwen35_moe_reset() is called even if `?` returns early.
@@ -538,6 +551,16 @@ impl Qwen3_5MoeModel {
         let fa_idx = self.fa_idx;
         let tokenizer_for_decode = tokenizer.clone();
 
+        // Check if C++ MoE path will be used (weights loaded from safetensors).
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+
+        // Serialize MoE compiled lifecycle — prevents concurrent C++ global corruption
+        let _moe_lock = if use_cpp {
+            Some(MOE_COMPILED_MUTEX.lock().await)
+        } else {
+            None
+        };
+
         napi::bindgen_prelude::spawn_blocking(move || {
             let tool_defs = config.tools.as_deref();
             let tokens =
@@ -633,9 +656,6 @@ impl Qwen3_5MoeModel {
 
             let mut y = sample(&last_logits, sampling_config)?;
             MxArray::async_eval_arrays(&[&y]);
-
-            // Decide whether to use C++ MoE forward path
-            let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
 
             if use_cpp {
                 // Guard ensures mlx_qwen35_moe_reset() is called even if `?` returns early.

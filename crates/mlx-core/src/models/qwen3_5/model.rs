@@ -2,6 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use crate::array::MxArray;
@@ -17,6 +18,15 @@ use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::persistence;
+
+/// Process-wide mutex serializing the dense compiled forward lifecycle.
+///
+/// The C++ compiled decode path uses process-wide globals (`g_compiled_caches`,
+/// `g_offset_int`, etc.). Concurrent `generate()`/`chat()` calls via
+/// `Promise.all()` would race on these globals since `spawn_blocking` dispatches
+/// to separate threads. This mutex is acquired in the async context *before*
+/// `spawn_blocking`, ensuring only one compiled lifecycle runs at a time.
+static DENSE_COMPILED_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
 
 /// RAII guard that calls `mlx_qwen35_compiled_reset()` on drop.
 ///
@@ -285,6 +295,17 @@ impl Qwen3_5Model {
         let fa_idx = self.fa_idx;
         let prompt_tokens = prompt_tokens.clone();
 
+        // Check if compiled path will be used (C++ weights loaded from safetensors).
+        // Must be checked before spawn_blocking so we can acquire the mutex in async context.
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+
+        // Serialize compiled lifecycle — prevents concurrent C++ global corruption
+        let _compiled_lock = if use_compiled {
+            Some(DENSE_COMPILED_MUTEX.lock().await)
+        } else {
+            None
+        };
+
         napi::bindgen_prelude::spawn_blocking(move || {
             // Acquire all locks ONCE for the entire prefill+decode sequence
             let mut layers_guard = layers_arc
@@ -359,12 +380,6 @@ impl Qwen3_5Model {
             // Sample first token (lazy — not evaluated yet)
             let mut y = sample(&last_logits, sampling_config)?;
             MxArray::async_eval_arrays(&[&y]);
-
-            // Decide whether to use the compiled forward path.
-            // The compiled path requires C++ weights to be loaded (only true for
-            // safetensors-loaded models). Test models have no stored weights and
-            // must fall back to the pure Rust forward_inner path.
-            let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
 
             // Guard ensures mlx_qwen35_compiled_reset() is called even if `?` returns early.
             let _compiled_guard = if use_compiled {
@@ -567,6 +582,16 @@ impl Qwen3_5Model {
         let fa_idx = self.fa_idx;
         let tokenizer_for_decode = tokenizer.clone();
 
+        // Check if compiled path will be used (C++ weights loaded from safetensors).
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+
+        // Serialize compiled lifecycle — prevents concurrent C++ global corruption
+        let _compiled_lock = if use_compiled {
+            Some(DENSE_COMPILED_MUTEX.lock().await)
+        } else {
+            None
+        };
+
         napi::bindgen_prelude::spawn_blocking(move || {
             let tool_defs = config.tools.as_deref();
             let tokens =
@@ -659,8 +684,6 @@ impl Qwen3_5Model {
 
             let mut y = sample(&last_logits, sampling_config)?;
             MxArray::async_eval_arrays(&[&y]);
-
-            let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
 
             let _compiled_guard = if use_compiled {
                 Some(CompiledResetGuard)
