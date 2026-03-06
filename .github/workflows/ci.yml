@@ -33,6 +33,12 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
+      - name: Configure GitHub token for CMake downloads
+        run: |
+          echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          chmod 600 ~/.netrc
+
       - name: Install dependencies
         run: yarn install --immutable
 
@@ -76,6 +82,12 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
+      - name: Configure GitHub token for CMake downloads
+        run: |
+          echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          chmod 600 ~/.netrc
+
       - name: Install dependencies
         run: yarn install --immutable
 
@@ -118,6 +130,12 @@ jobs:
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+
+      - name: Configure GitHub token for CMake downloads
+        run: |
+          echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          chmod 600 ~/.netrc
 
       - name: Install dependencies
         run: yarn install --immutable
