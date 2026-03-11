@@ -12,14 +12,14 @@
     "build:native": "yarn workspace @mlx-node/core build",
     "build:ts": "tsc -b",
     "clean": "rm -rf packages/*/dist",
-    "lint": "vite lint --type-aware --type-check",
-    "format": "vite fmt",
-    "test": "vite test",
+    "lint": "vp lint --type-aware --type-check",
+    "format": "vp fmt",
+    "test": "vp test",
     "typecheck": "tsc -b",
     "mlx": "oxnode packages/cli/src/cli.ts"
   },
   "devDependencies": {
-    "@ast-grep/napi": "^0.40.5",
+    "@ast-grep/napi": "^0.41.1",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/trl": "workspace:*",
     "@napi-rs/cli": "^3.5.1",
@@ -27,9 +27,9 @@
     "@oxc-node/cli": "^0.0.35",
     "@oxc-node/core": "^0.0.35",
     "@std/toml": "npm:@jsr/std__toml@^1.0.11",
-    "@types/node": "^25.3.0",
+    "@types/node": "^25.4.0",
     "octokit": "^5.0.5",
-    "oxc-parser": "^0.114.0",
+    "oxc-parser": "^0.117.0",
     "prettier": "^3.8.1",
     "typescript": "^5.9.3",
     "vite-plus": "catalog:",
@@ -39,5 +39,5 @@
     "vite": "npm:@voidzero-dev/vite-plus-core@latest",
     "vitest": "npm:@voidzero-dev/vite-plus-test@latest"
   },
-  "packageManager": "yarn@4.12.0"
+  "packageManager": "yarn@4.13.0"
 }
