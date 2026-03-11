@@ -6,8 +6,9 @@
 
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { Qwen3Model, Qwen35Model, Qwen35MoeModel } from '@mlx-node/core';
-import type { Qwen3_5Model, Qwen3_5MoeModel } from '@mlx-node/core';
+import { Qwen3Model } from '@mlx-node/core';
+import { Qwen35Model, Qwen35MoeModel } from '../stream';
+import type { Qwen35Model as Qwen3_5Model, Qwen35MoeModel as Qwen3_5MoeModel } from '../stream';
 
 /**
  * Model loader for Qwen3 and Qwen3.5 models

@@ -15,7 +15,7 @@
 
 // Model classes (for inference)
 export { Qwen3Model, Qwen3Tokenizer } from '@mlx-node/core';
-export { Qwen35Model, Qwen35Model as Qwen3_5Model } from '@mlx-node/core';
+export { Qwen35Model, Qwen35Model as Qwen3_5Model } from './stream';
 export type {
   Qwen35Config,
   Qwen35ChatConfig,
@@ -25,7 +25,7 @@ export type {
 } from '@mlx-node/core';
 
 // MoE variant
-export { Qwen35MoeModel, Qwen35MoeModel as Qwen3_5MoeModel } from '@mlx-node/core';
+export { Qwen35MoeModel, Qwen35MoeModel as Qwen3_5MoeModel } from './stream';
 export type {
   Qwen35MoeConfig,
   Qwen35MoeChatConfig,
@@ -42,6 +42,10 @@ export type { SamplingConfig, BatchGenerationResult } from '@mlx-node/core';
 
 // Chat API types from core (for model.chat() API)
 export type { ToolCallResult, ChatResult, ChatConfig, ChatMessage } from '@mlx-node/core';
+
+// Streaming chat API
+export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent } from './stream';
+export type { ChatStreamChunk, ChatStreamHandle } from '@mlx-node/core';
 
 // Model utilities (TypeScript-only)
 export {

@@ -71,6 +71,11 @@ export declare class ChatResult {
   get rawText(): string;
 }
 
+/** Handle returned by `chat_stream()` to control an in-progress streaming generation. */
+export declare class ChatStreamHandle {
+  cancel(): void;
+}
+
 /**
  * PP-DocLayoutV3 full model for document layout analysis.
  *
@@ -705,6 +710,18 @@ export declare class Qwen35Model {
    * to avoid blocking the Node.js event loop.
    */
   chat(messages: Array<ChatMessage>, config?: Qwen35ChatConfig | undefined | null): Promise<Qwen35ChatResult>;
+  /**
+   * Streaming chat API with tool calling support.
+   *
+   * Same as `chat()` but streams tokens one-by-one via the callback.
+   * Returns a `ChatStreamHandle` immediately; generation runs in background.
+   * Call `handle.cancel()` to abort generation early.
+   */
+  chatStream(
+    messages: ChatMessage[],
+    config: Qwen35ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
   /** Get the number of parameters in the model. */
   numParameters(): number;
 }
@@ -726,6 +743,18 @@ export declare class Qwen35MoeModel {
   static loadPretrained(path: string): Promise<Qwen35MoeModel>;
   generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
   chat(messages: Array<ChatMessage>, config?: Qwen35MoeChatConfig | undefined | null): Promise<Qwen35MoeChatResult>;
+  /**
+   * Streaming chat API with tool calling support.
+   *
+   * Same as `chat()` but streams tokens one-by-one via the callback.
+   * Returns a `ChatStreamHandle` immediately; generation runs in background.
+   * Call `handle.cancel()` to abort generation early.
+   */
+  chatStream(
+    messages: ChatMessage[],
+    config: Qwen35MoeChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
   numParameters(): number;
 }
 export type Qwen3_5MoeModel = Qwen35MoeModel;
@@ -1943,6 +1972,17 @@ export declare const enum ChatRole {
   Assistant = 'Assistant',
   /** System prompt */
   System = 'System',
+}
+
+/** A single chunk emitted during streaming chat generation. */
+export interface ChatStreamChunk {
+  text: string;
+  done: boolean;
+  finishReason?: string;
+  toolCalls?: Array<ToolCallResult>;
+  thinking?: string;
+  numTokens?: number;
+  rawText?: string;
 }
 
 /** Result from classify_and_rotate: orientation info + corrected image bytes. */

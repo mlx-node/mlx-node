@@ -1,6 +1,8 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
@@ -111,6 +113,33 @@ pub struct Qwen3_5ChatResult {
     pub num_tokens: u32,
     pub finish_reason: String,
     pub raw_text: String,
+}
+
+/// A single chunk emitted during streaming chat generation.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ChatStreamChunk {
+    pub text: String,
+    pub done: bool,
+    pub finish_reason: Option<String>,
+    pub tool_calls: Option<Vec<ToolCallResult>>,
+    pub thinking: Option<String>,
+    pub num_tokens: Option<u32>,
+    pub raw_text: Option<String>,
+}
+
+/// Handle returned by `chat_stream()` to control an in-progress streaming generation.
+#[napi]
+pub struct ChatStreamHandle {
+    pub(crate) cancelled: Arc<AtomicBool>,
+}
+
+#[napi]
+impl ChatStreamHandle {
+    #[napi]
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
@@ -882,6 +911,459 @@ impl Qwen3_5Model {
         })
         .await
         .map_err(|e| Error::from_reason(format!("Chat task failed: {}", e)))?
+    }
+
+    /// Streaming chat API with tool calling support.
+    ///
+    /// Same as `chat()` but streams tokens one-by-one via the callback.
+    /// Returns a `ChatStreamHandle` immediately; generation runs in background.
+    /// Call `handle.cancel()` to abort generation early.
+    #[napi(
+        ts_args_type = "messages: ChatMessage[], config: Qwen35ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<Qwen3_5ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let config = config.unwrap_or(Qwen3_5ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+        });
+
+        // Tokenize messages using chat template
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+
+        // Clone Arcs and data needed for the closure
+        let embedding_weight = self.embedding.get_weight();
+        let layers_arc = self.layers.clone();
+        let final_norm_arc = self.final_norm.clone();
+        let lm_head_arc = self.lm_head.clone();
+        let caches_arc = self.caches.clone();
+        let model_config = self.config.clone();
+        let fa_idx = self.fa_idx;
+        let tokenizer_for_decode = tokenizer.clone();
+
+        // Check if compiled path will be used (C++ weights loaded from safetensors).
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+
+        // Serialize compiled lifecycle — prevents concurrent C++ global corruption.
+        // Acquire in async context, move into tokio::spawn so it stays held during generation.
+        let compiled_lock = if use_compiled {
+            Some(DENSE_COMPILED_MUTEX.lock().await)
+        } else {
+            None
+        };
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+
+        let callback = Arc::new(callback);
+
+        tokio::spawn(async move {
+            // Hold the compiled lock for the duration of generation
+            let _compiled_lock = compiled_lock;
+
+            let callback_err = callback.clone();
+            let result =
+                napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
+                    let tool_defs = config.tools.as_deref();
+                    let tokens = tokenizer
+                        .apply_chat_template_sync(&messages, Some(true), tool_defs, None)?;
+
+                    // Create prompt tensor
+                    let prompt = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64])?;
+
+                    let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
+                    let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+                    let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+                    let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+                    let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+                    let ngram_size = config.ngram_size.unwrap_or(64);
+                    let sampling_config = Some(SamplingConfig {
+                        temperature: config.temperature,
+                        top_k: config.top_k.or(Some(20)),
+                        top_p: config.top_p,
+                        min_p: config.min_p,
+                    });
+
+                    // Acquire all locks ONCE for the entire prefill+decode sequence
+                    let mut layers_guard = layers_arc.write().map_err(|_| {
+                        Error::from_reason("Failed to acquire layers write lock")
+                    })?;
+                    let mut caches_guard = caches_arc.write().map_err(|_| {
+                        Error::from_reason("Failed to acquire caches write lock")
+                    })?;
+                    let final_norm_guard = final_norm_arc.read().map_err(|_| {
+                        Error::from_reason("Failed to acquire final_norm read lock")
+                    })?;
+                    let lm_head_guard = lm_head_arc
+                        .read()
+                        .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+
+                    // Init fresh caches (old ones dropped on overwrite)
+                    *caches_guard = Some(
+                        (0..model_config.num_layers as usize)
+                            .map(|i| {
+                                if model_config.is_linear_layer(i) {
+                                    Qwen3_5LayerCache::new_linear()
+                                } else {
+                                    Qwen3_5LayerCache::new_full_attention()
+                                }
+                            })
+                            .collect(),
+                    );
+
+                    let eos_id = model_config.eos_token_id as u32;
+                    let mut generated_tokens: Vec<u32> = Vec::new();
+                    let mut finish_reason = String::from("length");
+
+                    // Track token history for repetition penalty
+                    let mut token_history: Vec<u32> = tokens.clone();
+
+                    let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+                    let generation_stream = Stream::new(DeviceType::Gpu);
+                    let model_size_bytes = model_config.estimate_memory_bytes() as usize;
+                    let _wired_ctx = crate::stream::WiredLimitContext::new(
+                        model_size_bytes,
+                        vec![generation_stream],
+                    );
+
+                    // Prefill
+                    let logits = {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        forward_inner(
+                            &prompt,
+                            &embedding_weight,
+                            &mut layers_guard,
+                            &mut caches_guard,
+                            &final_norm_guard,
+                            &lm_head_guard,
+                            fa_idx,
+                            Some(&embedding_weight_t),
+                        )?
+                    };
+
+                    let seq_len = logits.shape_at(1)?;
+                    let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+                    let mut last_logits = last_logits.squeeze(Some(&[1]))?;
+
+                    // Apply repetition penalty to prefill logits
+                    if repetition_penalty != 1.0 && !token_history.is_empty() {
+                        last_logits = apply_repetition_penalty(
+                            &last_logits,
+                            &token_history,
+                            repetition_penalty,
+                            Some(repetition_context_size),
+                        )?;
+                    }
+
+                    let mut y = sample(&last_logits, sampling_config)?;
+                    MxArray::async_eval_arrays(&[&y]);
+
+                    let _compiled_guard = if use_compiled {
+                        Some(CompiledResetGuard)
+                    } else {
+                        None
+                    };
+
+                    if use_compiled {
+                        use mlx_sys as sys;
+                        let prefill_len = seq_len as i32;
+                        let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+                        let num_layers = model_config.num_layers as usize;
+                        let mut cache_ptrs: Vec<*mut sys::mlx_array> =
+                            vec![std::ptr::null_mut(); num_layers * 2];
+                        if let Some(ref caches) = *caches_guard {
+                            for (i, cache) in caches.iter().enumerate() {
+                                let (p0, p1) = cache.export_ptrs();
+                                cache_ptrs[i * 2] = p0;
+                                cache_ptrs[i * 2 + 1] = p1;
+                            }
+                        }
+                        // Drop non-cache locks — not needed during compiled decode
+                        drop(layers_guard);
+                        drop(final_norm_guard);
+                        drop(lm_head_guard);
+                        unsafe {
+                            sys::mlx_qwen35_compiled_init_from_prefill(
+                                model_config.num_layers,
+                                model_config.hidden_size,
+                                model_config.num_heads,
+                                model_config.num_kv_heads,
+                                model_config.head_dim,
+                                model_config.rope_theta as f32,
+                                model_config.rope_dims(),
+                                model_config.rms_norm_eps as f32,
+                                model_config.full_attention_interval,
+                                model_config.linear_num_key_heads,
+                                model_config.linear_num_value_heads,
+                                model_config.linear_key_head_dim,
+                                model_config.linear_value_head_dim,
+                                model_config.linear_conv_kernel_dim,
+                                if model_config.tie_word_embeddings {
+                                    1
+                                } else {
+                                    0
+                                },
+                                max_kv_len,
+                                1,
+                                cache_ptrs.as_mut_ptr(),
+                                prefill_len,
+                            );
+                        }
+                        drop(caches_guard);
+
+                        // Compiled C++ decode loop
+                        for step in 0..max_new_tokens {
+                            y.eval();
+                            let token_id = y.item_at_int32(0)? as u32;
+                            generated_tokens.push(token_id);
+                            token_history.push(token_id);
+
+                            // Check cancellation
+                            if cancelled_inner.load(Ordering::Relaxed) {
+                                finish_reason = String::from("cancelled");
+                                // Stream the token before breaking
+                                let token_text = tokenizer_for_decode
+                                    .decode_sync(&[token_id], true)
+                                    .unwrap_or_default();
+                                callback.call(
+                                    Ok(ChatStreamChunk {
+                                        text: token_text,
+                                        done: false,
+                                        finish_reason: None,
+                                        tool_calls: None,
+                                        thinking: None,
+                                        num_tokens: None,
+                                        raw_text: None,
+                                    }),
+                                    ThreadsafeFunctionCallMode::NonBlocking,
+                                );
+                                break;
+                            }
+
+                            // Decode and stream this token
+                            let token_text = tokenizer_for_decode
+                                .decode_sync(&[token_id], true)
+                                .unwrap_or_default();
+                            callback.call(
+                                Ok(ChatStreamChunk {
+                                    text: token_text,
+                                    done: false,
+                                    finish_reason: None,
+                                    tool_calls: None,
+                                    thinking: None,
+                                    num_tokens: None,
+                                    raw_text: None,
+                                }),
+                                ThreadsafeFunctionCallMode::NonBlocking,
+                            );
+
+                            if token_id == eos_id {
+                                finish_reason = String::from("eos");
+                                break;
+                            }
+
+                            if let Some(reason) = check_repetition_cutoff(
+                                &generated_tokens,
+                                max_consecutive_tokens,
+                                max_ngram_repeats,
+                                ngram_size,
+                            ) {
+                                finish_reason = reason.to_string();
+                                break;
+                            }
+
+                            if step + 1 >= max_new_tokens {
+                                break;
+                            }
+                            {
+                                let _stream_ctx = StreamContext::new(generation_stream);
+                                let next_ids = y.reshape(&[1, 1])?;
+                                let mut logits =
+                                    forward_compiled(&next_ids, &embedding_weight)?;
+                                if repetition_penalty != 1.0 {
+                                    logits = apply_repetition_penalty(
+                                        &logits,
+                                        &token_history,
+                                        repetition_penalty,
+                                        Some(repetition_context_size),
+                                    )?;
+                                }
+                                let next_token = sample(&logits, sampling_config)?;
+                                eval_token_and_compiled_caches(&next_token);
+                                y = next_token;
+                            }
+
+                            if (step + 1) % 256 == 0 {
+                                crate::array::synchronize_and_clear_cache();
+                            }
+                        }
+                    } else {
+                        // Rust fallback decode loop (locks held for entire loop)
+                        for step in 0..max_new_tokens {
+                            y.eval();
+                            let token_id = y.item_at_int32(0)? as u32;
+                            generated_tokens.push(token_id);
+                            token_history.push(token_id);
+
+                            // Check cancellation
+                            if cancelled_inner.load(Ordering::Relaxed) {
+                                finish_reason = String::from("cancelled");
+                                let token_text = tokenizer_for_decode
+                                    .decode_sync(&[token_id], true)
+                                    .unwrap_or_default();
+                                callback.call(
+                                    Ok(ChatStreamChunk {
+                                        text: token_text,
+                                        done: false,
+                                        finish_reason: None,
+                                        tool_calls: None,
+                                        thinking: None,
+                                        num_tokens: None,
+                                        raw_text: None,
+                                    }),
+                                    ThreadsafeFunctionCallMode::NonBlocking,
+                                );
+                                break;
+                            }
+
+                            // Decode and stream this token
+                            let token_text = tokenizer_for_decode
+                                .decode_sync(&[token_id], true)
+                                .unwrap_or_default();
+                            callback.call(
+                                Ok(ChatStreamChunk {
+                                    text: token_text,
+                                    done: false,
+                                    finish_reason: None,
+                                    tool_calls: None,
+                                    thinking: None,
+                                    num_tokens: None,
+                                    raw_text: None,
+                                }),
+                                ThreadsafeFunctionCallMode::NonBlocking,
+                            );
+
+                            if token_id == eos_id {
+                                finish_reason = String::from("eos");
+                                break;
+                            }
+
+                            if let Some(reason) = check_repetition_cutoff(
+                                &generated_tokens,
+                                max_consecutive_tokens,
+                                max_ngram_repeats,
+                                ngram_size,
+                            ) {
+                                finish_reason = reason.to_string();
+                                break;
+                            }
+
+                            if step + 1 >= max_new_tokens {
+                                break;
+                            }
+                            {
+                                let _stream_ctx = StreamContext::new(generation_stream);
+                                let next_ids = y.reshape(&[1, 1])?;
+                                let logits = forward_inner(
+                                    &next_ids,
+                                    &embedding_weight,
+                                    &mut layers_guard,
+                                    &mut caches_guard,
+                                    &final_norm_guard,
+                                    &lm_head_guard,
+                                    fa_idx,
+                                    Some(&embedding_weight_t),
+                                )?;
+                                let mut logits = logits.squeeze(Some(&[1]))?;
+                                if repetition_penalty != 1.0 {
+                                    logits = apply_repetition_penalty(
+                                        &logits,
+                                        &token_history,
+                                        repetition_penalty,
+                                        Some(repetition_context_size),
+                                    )?;
+                                }
+                                let next_token = sample(&logits, sampling_config)?;
+                                eval_token_and_caches_inner(&next_token, &caches_guard);
+                                y = next_token;
+                            }
+
+                            if (step + 1) % 256 == 0 {
+                                crate::array::synchronize_and_clear_cache();
+                            }
+                        }
+                    }
+
+                    // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
+
+                    // Decode full text for final chunk
+                    let text = tokenizer_for_decode
+                        .decode_sync(&generated_tokens, true)
+                        .unwrap_or_else(|e| {
+                            warn!("Failed to decode generated tokens: {}", e);
+                            String::new()
+                        });
+
+                    let num_tokens = generated_tokens.len() as u32;
+
+                    // Parse tool calls and thinking from the generated text
+                    let (clean_text, tool_calls, thinking) =
+                        tools::parse_generation_output(&text);
+
+                    // If we have valid tool calls, override finish reason
+                    let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
+                        "tool_calls".to_string()
+                    } else {
+                        finish_reason
+                    };
+
+                    // Send final done chunk
+                    callback.call(
+                        Ok(ChatStreamChunk {
+                            text: clean_text,
+                            done: true,
+                            finish_reason: Some(finish_reason),
+                            tool_calls: Some(tool_calls),
+                            thinking,
+                            num_tokens: Some(num_tokens),
+                            raw_text: Some(text),
+                        }),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+
+                    Ok(())
+                })
+                .await;
+
+            // If spawn_blocking itself failed (e.g. panic), send error via callback
+            if let Err(e) = result {
+                callback_err.call(
+                    Err(Error::from_reason(format!(
+                        "Chat stream task failed: {}",
+                        e
+                    ))),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
     }
 
     /// Get the number of parameters in the model.
