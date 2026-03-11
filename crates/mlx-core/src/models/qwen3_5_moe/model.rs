@@ -943,8 +943,12 @@ impl Qwen3_5MoeModel {
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
                     let tool_defs = config.tools.as_deref();
-                    let tokens = tokenizer
-                        .apply_chat_template_sync(&messages, Some(true), tool_defs, None)?;
+                    let tokens = tokenizer.apply_chat_template_sync(
+                        &messages,
+                        Some(true),
+                        tool_defs,
+                        None,
+                    )?;
 
                     let prompt = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64])?;
 
@@ -962,12 +966,12 @@ impl Qwen3_5MoeModel {
                     });
 
                     // Acquire all locks ONCE for the entire prefill+decode sequence
-                    let mut layers_guard = layers_arc.write().map_err(|_| {
-                        Error::from_reason("Failed to acquire layers write lock")
-                    })?;
-                    let mut caches_guard = caches_arc.write().map_err(|_| {
-                        Error::from_reason("Failed to acquire caches write lock")
-                    })?;
+                    let mut layers_guard = layers_arc
+                        .write()
+                        .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+                    let mut caches_guard = caches_arc
+                        .write()
+                        .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
                     let final_norm_guard = final_norm_arc.read().map_err(|_| {
                         Error::from_reason("Failed to acquire final_norm read lock")
                     })?;
@@ -1269,8 +1273,7 @@ impl Qwen3_5MoeModel {
                     let num_tokens = generated_tokens.len() as u32;
 
                     // Parse tool calls and thinking from the generated text
-                    let (clean_text, tool_calls, thinking) =
-                        tools::parse_generation_output(&text);
+                    let (clean_text, tool_calls, thinking) = tools::parse_generation_output(&text);
 
                     // If we have valid tool calls, override finish reason
                     let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -1297,15 +1300,22 @@ impl Qwen3_5MoeModel {
                 })
                 .await;
 
-            // If spawn_blocking itself failed (e.g. panic), send error via callback
-            if let Err(e) = result {
-                callback_err.call(
-                    Err(Error::from_reason(format!(
-                        "Chat stream task failed: {}",
-                        e
-                    ))),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
+            match result {
+                Ok(Ok(())) => {} // Success — final chunk already sent via callback
+                Ok(Err(e)) => {
+                    // Inner closure error (tokenization, lock, array ops, etc.)
+                    callback_err.call(Err(e), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+                Err(e) => {
+                    // JoinError (panic in spawn_blocking)
+                    callback_err.call(
+                        Err(Error::from_reason(format!(
+                            "Chat stream task panicked: {}",
+                            e
+                        ))),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                }
             }
         });
 
