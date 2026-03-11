@@ -4,9 +4,7 @@ import type {
   ChatStreamChunk,
   ChatStreamHandle,
   Qwen35ChatConfig,
-  Qwen35Config,
   Qwen35MoeChatConfig,
-  Qwen35MoeConfig,
   ToolCallResult,
 } from '@mlx-node/core';
 
@@ -37,7 +35,8 @@ const _nativeMoeChatStream = Qwen35MoeModelNative.prototype.chatStream;
  *
  * Cancellation is automatic via the generator's `finally` block.
  */
-async function* _createChatStream(
+/** @internal Exported for testing only. */
+export async function* _createChatStream(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   nativeMethod: (
     messages: ChatMessage[],
@@ -112,10 +111,6 @@ async function* _createChatStream(
  * ```
  */
 export class Qwen35Model extends Qwen35ModelNative {
-  constructor(config: Qwen35Config) {
-    super(config);
-  }
-
   static override async loadPretrained(modelPath: string): Promise<Qwen35Model> {
     const instance = await Qwen35ModelNative.loadPretrained(modelPath);
     Object.setPrototypeOf(instance, Qwen35Model.prototype);
@@ -140,10 +135,6 @@ export class Qwen35Model extends Qwen35ModelNative {
  * ```
  */
 export class Qwen35MoeModel extends Qwen35MoeModelNative {
-  constructor(config: Qwen35MoeConfig) {
-    super(config);
-  }
-
   static override async loadPretrained(modelPath: string): Promise<Qwen35MoeModel> {
     const instance = await Qwen35MoeModelNative.loadPretrained(modelPath);
     Object.setPrototypeOf(instance, Qwen35MoeModel.prototype);

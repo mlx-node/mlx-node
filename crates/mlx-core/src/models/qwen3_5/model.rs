@@ -1134,25 +1134,8 @@ impl Qwen3_5Model {
                             generated_tokens.push(token_id);
                             token_history.push(token_id);
 
-                            // Check cancellation
                             if cancelled_inner.load(Ordering::Relaxed) {
                                 finish_reason = String::from("cancelled");
-                                // Stream the token before breaking
-                                let token_text = tokenizer_for_decode
-                                    .decode_sync(&[token_id], true)
-                                    .unwrap_or_default();
-                                callback.call(
-                                    Ok(ChatStreamChunk {
-                                        text: token_text,
-                                        done: false,
-                                        finish_reason: None,
-                                        tool_calls: None,
-                                        thinking: None,
-                                        num_tokens: None,
-                                        raw_text: None,
-                                    }),
-                                    ThreadsafeFunctionCallMode::NonBlocking,
-                                );
                                 break;
                             }
 
@@ -1221,24 +1204,8 @@ impl Qwen3_5Model {
                             generated_tokens.push(token_id);
                             token_history.push(token_id);
 
-                            // Check cancellation
                             if cancelled_inner.load(Ordering::Relaxed) {
                                 finish_reason = String::from("cancelled");
-                                let token_text = tokenizer_for_decode
-                                    .decode_sync(&[token_id], true)
-                                    .unwrap_or_default();
-                                callback.call(
-                                    Ok(ChatStreamChunk {
-                                        text: token_text,
-                                        done: false,
-                                        finish_reason: None,
-                                        tool_calls: None,
-                                        thinking: None,
-                                        num_tokens: None,
-                                        raw_text: None,
-                                    }),
-                                    ThreadsafeFunctionCallMode::NonBlocking,
-                                );
                                 break;
                             }
 
