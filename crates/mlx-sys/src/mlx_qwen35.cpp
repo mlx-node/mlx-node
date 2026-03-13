@@ -270,6 +270,11 @@ void mlx_qwen35_eval_token_and_compiled_caches(mlx_array* next_token_ptr) {
   }
 }
 
+void mlx_qwen35_compiled_adjust_offset(int delta) {
+  g_offset_int += delta;
+  g_compiled_offset = array(g_offset_int, mlx::core::int32);
+}
+
 void mlx_qwen35_compiled_reset() {
   g_compiled_caches.clear();
   g_compiled_offset = std::nullopt;

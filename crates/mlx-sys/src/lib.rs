@@ -959,6 +959,33 @@ unsafe extern "C" {
         dt_bias: *mut mlx_array,
     ) -> *mut mlx_array;
 
+    // Chunked gated delta recurrence for prefill (BT=32 tokens per chunk)
+    pub fn mlx_gated_delta_chunked(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        out_y: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+
+    // GPU architecture generation (M1=13, M2=14, M3=15, M4=16, M5=17)
+    pub fn mlx_gpu_architecture_gen() -> i32;
+
+    // Fused GDN gating: beta = sigmoid(b), g = -exp(a_log) * softplus(a + dt_bias)
+    pub fn mlx_fused_gdn_gating(
+        b: *mut mlx_array,
+        a: *mut mlx_array,
+        a_log: *mut mlx_array,
+        dt_bias: *mut mlx_array,
+        num_heads: i32,
+        total_elements: i32,
+        out_beta: *mut *mut mlx_array,
+        out_g: *mut *mut mlx_array,
+    ) -> bool;
+
     // ============================================
     // Qwen3.5 Fused Forward Pass
     // ============================================
@@ -1010,8 +1037,46 @@ unsafe extern "C" {
     /// Eval next_token and all compiled cache arrays to prevent graph accumulation.
     pub fn mlx_qwen35_eval_token_and_compiled_caches(next_token: *mut mlx_array);
 
+    /// Adjust the compiled offset by delta (for VLM rope_deltas).
+    pub fn mlx_qwen35_compiled_adjust_offset(delta: i32);
+
     /// Reset compiled state (call on model reset / new conversation).
     pub fn mlx_qwen35_compiled_reset();
+
+    // ============================================
+    // Qwen3.5 VLM Prefill
+    // ============================================
+
+    // VLM prefill
+    pub fn mlx_qwen35_vlm_prefill(
+        inputs_embeds: *mut mlx_array,
+        position_ids: *mut mlx_array,
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        rope_dims: i32,
+        rms_norm_eps: f32,
+        full_attention_interval: i32,
+        linear_num_k_heads: i32,
+        linear_num_v_heads: i32,
+        linear_key_head_dim: i32,
+        linear_value_head_dim: i32,
+        linear_conv_kernel_dim: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        mrope_section: *const i32,
+        rope_deltas: i32,
+        output_logits: *mut *mut mlx_array,
+    );
+
+    pub fn mlx_qwen35_vlm_cache_count() -> i32;
+    pub fn mlx_qwen35_vlm_get_cache(index: i32) -> *mut mlx_array;
+    pub fn mlx_qwen35_vlm_get_offset() -> i32;
+    pub fn mlx_qwen35_vlm_reset();
 
     // ============================================
     // Qwen3.5 MoE Forward Pass (non-compiled)
@@ -1059,6 +1124,20 @@ unsafe extern "C" {
 
     /// Reset MoE state.
     pub fn mlx_qwen35_moe_reset();
+
+    /// Load safetensors file using MLX's lazy loading (data read on eval, not upfront).
+    /// Calls `callback` for each tensor with (name, name_len, array_handle, ctx).
+    /// Returns number of tensors loaded, or -1 on error.
+    pub fn mlx_load_safetensors(
+        path: *const std::os::raw::c_char,
+        callback: unsafe extern "C" fn(
+            name: *const std::os::raw::c_char,
+            name_len: usize,
+            handle: *mut mlx_array,
+            ctx: *mut std::os::raw::c_void,
+        ),
+        ctx: *mut std::os::raw::c_void,
+    ) -> i32;
 }
 
 // Gradient computation types

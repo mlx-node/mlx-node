@@ -9,16 +9,21 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::SafeTensorsFile;
+use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
+use crate::vision::projector::SpatialProjector;
 
 use super::config::Qwen3_5Config;
 use super::decoder_layer::AttentionType;
 use super::model::Qwen3_5Model;
+use super::processing::Qwen35VLImageProcessor;
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MLPVariant, is_mxfp8_checkpoint,
     is_quantized_checkpoint, try_build_mxfp8_quantized_linear, try_build_quantized_linear,
 };
+use super::vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 
 /// Load all safetensors files from a directory (supports sharded checkpoints).
 fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
@@ -33,7 +38,19 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     if let Some(path) = single_path {
         info!("Loading weights from: {}", path.display());
         let st_file = SafeTensorsFile::load(&path)?;
-        return st_file.load_tensors(&path);
+        let mut params = st_file.load_tensors(&path)?;
+
+        // Also load vision.safetensors if present (VLM models)
+        let vision_path = dir.join("vision.safetensors");
+        if vision_path.exists() {
+            info!("Loading vision weights from: {}", vision_path.display());
+            let vision_st = SafeTensorsFile::load(&vision_path)?;
+            let vision_params = vision_st.load_tensors(&vision_path)?;
+            info!("Loaded {} vision tensors", vision_params.len());
+            params.extend(vision_params);
+        }
+
+        return Ok(params);
     }
 
     let mut shard_files: Vec<std::path::PathBuf> = Vec::new();
@@ -266,7 +283,9 @@ fn sanitize_weights(
         "final_norm.weight",
         ".q_norm.weight",
         ".k_norm.weight",
-        ".linear_attn.norm.weight",
+        // NOTE: .linear_attn.norm.weight is intentionally NOT included here.
+        // It's stored as f32 with final values (e.g. ~0.87), not as shifted weights.
+        // Matches mlx-lm, mlx-vlm, and MoE persistence behavior.
     ];
 
     for (name, array) in params.drain() {
@@ -348,16 +367,22 @@ fn apply_weights(
     config: &Qwen3_5Config,
     quant_bits: i32,
     quant_group_size: i32,
+    per_layer_quant: &HashMap<String, (i32, i32)>,
 ) -> Result<()> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
 
-    // Helper: try MXFP8 builder first (if applicable), then affine builder
+    // Helper: try MXFP8 builder first (if applicable), then affine builder.
+    // Checks per-layer overrides before falling back to global defaults.
     let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
         if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_linear(params, prefix) {
             return Some(ql);
         }
-        try_build_quantized_linear(params, prefix, quant_group_size, quant_bits)
+        let (bits, gs) = per_layer_quant
+            .get(prefix)
+            .copied()
+            .unwrap_or((quant_bits, quant_group_size));
+        try_build_quantized_linear(params, prefix, gs, bits)
     };
 
     // Embedding
@@ -732,8 +757,42 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
         let raw_params = load_all_safetensors(path)?;
         info!("Loaded {} raw tensors", raw_params.len());
 
-        // Sanitize weights
-        let params = sanitize_weights(raw_params, &config)?;
+        // Check for vision weights and split if present
+        let has_vision = raw_params
+            .keys()
+            .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."));
+
+        let (text_raw_params, vision_params) = if has_vision {
+            let mut vision_params: HashMap<String, MxArray> = HashMap::new();
+            let mut text_params: HashMap<String, MxArray> = HashMap::new();
+
+            for (name, array) in raw_params {
+                if name.starts_with("vision_tower.") || name.starts_with("visual.") {
+                    // Normalize vision key: strip prefix
+                    let vkey = name
+                        .strip_prefix("vision_tower.")
+                        .or_else(|| name.strip_prefix("visual."))
+                        .unwrap_or(&name)
+                        .to_string();
+                    vision_params.insert(vkey, array);
+                } else {
+                    text_params.insert(name, array);
+                }
+            }
+
+            info!(
+                "Split: {} vision tensors, {} text tensors",
+                vision_params.len(),
+                text_params.len()
+            );
+
+            (text_params, Some(vision_params))
+        } else {
+            (raw_params, None)
+        };
+
+        // Sanitize weights (text-only; sanitize doesn't know about vision keys)
+        let params = sanitize_weights(text_raw_params, &config)?;
         let quantized = is_quantized_checkpoint(&params);
         info!(
             "Sanitized to {} parameters (quantized={})",
@@ -751,10 +810,37 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
         let quant_group_size = quant_cfg
             .and_then(|q| q["group_size"].as_i64())
             .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64) as i32;
+        // Parse per-layer quantization overrides (module path → (bits, group_size)).
+        // Normalize keys by stripping model prefixes so they match the sanitized
+        // weight keys used in apply_weights (e.g. "layers.0.self_attn.q_proj").
+        let per_layer_quant: HashMap<String, (i32, i32)> = quant_cfg
+            .and_then(|q| q.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter(|(_, v)| v.is_object()) // per-layer entries are objects, globals are scalars
+                    .filter_map(|(k, v)| {
+                        let bits = v["bits"].as_i64()? as i32;
+                        let gs = v["group_size"]
+                            .as_i64()
+                            .unwrap_or(quant_group_size as i64)
+                            as i32;
+                        let normalized = k
+                            .strip_prefix("model.language_model.")
+                            .or_else(|| k.strip_prefix("language_model.model."))
+                            .or_else(|| k.strip_prefix("language_model."))
+                            .or_else(|| k.strip_prefix("model."))
+                            .unwrap_or(k)
+                            .to_string();
+                        Some((normalized, (bits, gs)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         if quant_cfg.is_some() {
             info!(
-                "Using quantization config from config.json: bits={}, group_size={}",
-                quant_bits, quant_group_size
+                "Using quantization config from config.json: bits={}, group_size={}, per_layer_overrides={}",
+                quant_bits, quant_group_size, per_layer_quant.len()
             );
         }
 
@@ -775,7 +861,14 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
         let mut model = Qwen3_5Model::new(config.clone())?;
 
         // Apply weights
-        apply_weights(&mut model, &params, &config, quant_bits, quant_group_size)?;
+        apply_weights(
+            &mut model,
+            &params,
+            &config,
+            quant_bits,
+            quant_group_size,
+            &per_layer_quant,
+        )?;
 
         // Register weights with C++ compiled forward pass (dense-only).
         // Skip for quantized models — C++ path uses dense matmul, not quantized_matmul.
@@ -790,7 +883,37 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
             model.tokenizer = Some(Arc::new(tok));
         }
 
-        info!("Qwen3.5 model loaded successfully");
+        // If vision weights were found, load vision encoder and configure VLM
+        if let Some(ref vparams) = vision_params {
+            let vision_config = parse_vision_config(&raw);
+            info!(
+                "Vision config: {} layers, hidden={}, heads={}, patch={}",
+                vision_config.num_layers,
+                vision_config.hidden_size,
+                vision_config.num_heads,
+                vision_config.patch_size,
+            );
+
+            let mut vision_encoder = Qwen3_5VisionEncoder::new(vision_config.clone())?;
+            load_vision_weights(&mut vision_encoder, vparams, &vision_config)?;
+
+            // Initialize M-RoPE on all full attention layers
+            // mrope_section = [11, 11, 10] for Qwen3.5-VL
+            model.init_mrope_layers(
+                vec![11, 11, 10],
+                config.rope_theta,
+                config.max_position_embeddings,
+            )?;
+
+            model.set_vision_encoder(vision_encoder);
+            model.set_image_processor(Qwen35VLImageProcessor::new(None));
+            model.set_spatial_merge_size(vision_config.spatial_merge_size);
+
+            info!("Qwen3.5-VL model loaded successfully (with vision encoder)");
+        } else {
+            info!("Qwen3.5 model loaded successfully");
+        }
+
         Ok(model)
     })
     .await
@@ -997,4 +1120,140 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         partial_rotary_factor,
         rope_theta,
     })
+}
+
+/// Check if weights contain vision encoder tensors.
+pub fn has_vision_weights(params: &HashMap<String, MxArray>) -> bool {
+    params
+        .keys()
+        .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."))
+}
+
+/// Parse vision config from JSON.
+pub(crate) fn parse_vision_config(raw: &Value) -> Qwen3_5VisionConfig {
+    let vision_cfg = raw.get("vision_config");
+
+    let get = |key: &str, default: i32| -> i32 {
+        vision_cfg
+            .and_then(|v| v[key].as_i64())
+            .unwrap_or(default as i64) as i32
+    };
+
+    Qwen3_5VisionConfig {
+        hidden_size: get("hidden_size", 1152),
+        intermediate_size: get("intermediate_size", 4304),
+        num_heads: get("num_heads", 16),
+        num_layers: vision_cfg
+            .and_then(|v| {
+                v["depth"]
+                    .as_i64()
+                    .or_else(|| v["num_hidden_layers"].as_i64())
+            })
+            .unwrap_or(27) as i32,
+        patch_size: get("patch_size", 16),
+        spatial_merge_size: get("spatial_merge_size", 2),
+        image_size: get("image_size", 768),
+        out_hidden_size: get("out_hidden_size", 4096),
+    }
+}
+
+/// Load vision encoder weights from params.
+pub(crate) fn load_vision_weights(
+    encoder: &mut Qwen3_5VisionEncoder,
+    params: &HashMap<String, MxArray>,
+    config: &Qwen3_5VisionConfig,
+) -> Result<()> {
+    let get = |key: &str| -> Result<&MxArray> {
+        params
+            .get(key)
+            .ok_or_else(|| Error::from_reason(format!("Missing vision weight: {}", key)))
+    };
+
+    let get_opt = |key: &str| -> Option<&MxArray> { params.get(key) };
+
+    // Patch embedding: handle both 4D Conv2d [out, kH, kW, in] and
+    // 5D Conv3d [out, kD, kH, kW, in] formats. For Conv3d, extract
+    // temporal slice 0 for our Conv2d PatchEmbedding.
+    if let Some(pe_weight) = get_opt("patch_embed.proj.weight") {
+        let ndim = pe_weight.ndim()?;
+        if ndim == 5 {
+            // Conv3d [out, kD, kH, kW, in] → take slice [:, 0, :, :, :]
+            let out_c = pe_weight.shape_at(0)?;
+            let kh = pe_weight.shape_at(2)?;
+            let kw = pe_weight.shape_at(3)?;
+            let in_c = pe_weight.shape_at(4)?;
+            let slice0 = pe_weight.slice(&[0, 0, 0, 0, 0], &[out_c, 1, kh, kw, in_c])?;
+            let conv2d_weight = slice0.squeeze(Some(&[1]))?;
+            encoder.set_patch_embed(&conv2d_weight)?;
+        } else {
+            encoder.set_patch_embed(pe_weight)?;
+        }
+    }
+
+    // Position embedding
+    if let Some(pos_embed) = get_opt("pos_embed.weight") {
+        encoder.set_pos_embed(pos_embed);
+    }
+
+    // Encoder layers (blocks.0..blocks.N)
+    for layer_idx in 0..config.num_layers {
+        let prefix = format!("blocks.{}", layer_idx);
+
+        let qkv_w = get(&format!("{}.attn.qkv.weight", prefix))?;
+        let qkv_b = get_opt(&format!("{}.attn.qkv.bias", prefix));
+        let proj_w = get(&format!("{}.attn.proj.weight", prefix))?;
+        let proj_b = get_opt(&format!("{}.attn.proj.bias", prefix));
+
+        let attn = VisionAttention::new(
+            config.hidden_size as u32,
+            config.num_heads as u32,
+            qkv_w,
+            qkv_b,
+            proj_w,
+            proj_b,
+        )?;
+
+        let fc1_w = get(&format!("{}.mlp.linear_fc1.weight", prefix))?;
+        let fc1_b = get_opt(&format!("{}.mlp.linear_fc1.bias", prefix));
+        let fc2_w = get(&format!("{}.mlp.linear_fc2.weight", prefix))?;
+        let fc2_b = get_opt(&format!("{}.mlp.linear_fc2.bias", prefix));
+
+        let mlp = VisionMLP::new(fc1_w, fc1_b, fc2_w, fc2_b)?;
+
+        let norm1_w = get(&format!("{}.norm1.weight", prefix))?;
+        let norm1_b = get_opt(&format!("{}.norm1.bias", prefix));
+        let norm2_w = get(&format!("{}.norm2.weight", prefix))?;
+        let norm2_b = get_opt(&format!("{}.norm2.bias", prefix));
+
+        let ln1 = LayerNorm::from_weights(norm1_w, norm1_b, Some(1e-6))?;
+        let ln2 = LayerNorm::from_weights(norm2_w, norm2_b, Some(1e-6))?;
+
+        let layer = VisionEncoderLayer::new(&ln1, &ln2, &attn, &mlp);
+        encoder.add_layer(&layer);
+    }
+
+    // Merger (spatial projector)
+    let ln_q_w = get("merger.norm.weight")?;
+    let ln_q_b = get("merger.norm.bias")?;
+    let fc1_w = get("merger.linear_fc1.weight")?;
+    let fc1_b = get("merger.linear_fc1.bias")?;
+    let fc2_w = get("merger.linear_fc2.weight")?;
+    let fc2_b = get("merger.linear_fc2.bias")?;
+
+    let merger = SpatialProjector::new(
+        config.spatial_merge_size as u32,
+        ln_q_w,
+        ln_q_b,
+        fc1_w,
+        fc1_b,
+        fc2_w,
+        fc2_b,
+    )?;
+    encoder.set_merger(merger);
+
+    info!(
+        "Loaded vision encoder: {} layers, merger ready",
+        config.num_layers
+    );
+    Ok(())
 }

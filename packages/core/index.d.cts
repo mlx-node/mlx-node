@@ -26,51 +26,6 @@ export declare class BatchGenerationResult {
   get groupSize(): number;
 }
 
-/**
- * Result from the high-level `chat()` API
- *
- * Contains structured responses with:
- * - Tool calls parsed as native JavaScript objects
- * - Thinking/reasoning extracted from `<think>` tags
- * - Clean text with all special tags stripped
- *
- * ## Example
- * ```typescript
- * const result = await model.chat(messages, { tools });
- * console.log(result.text);       // Clean response
- * console.log(result.thinking);   // Chain-of-thought (if any)
- * console.log(result.toolCalls);  // Parsed tool calls
- * ```
- */
-export declare class ChatResult {
-  /** Get the cleaned text (tool_call and think tags removed) */
-  get text(): string;
-  /** Get the extracted tool calls */
-  get toolCalls(): Array<ToolCallResult>;
-  /**
-   * Get the extracted thinking/reasoning content
-   *
-   * Returns the content from within `<think>...</think>` tags, or null if
-   * no thinking tags were present in the response.
-   *
-   * This is useful for:
-   * - Debugging model reasoning
-   * - Displaying chain-of-thought to users (optional)
-   * - Analyzing model decision-making
-   */
-  get thinking(): string | null;
-  /** Get the generated tokens */
-  get tokens(): MxArray;
-  /** Get the log probabilities */
-  get logprobs(): MxArray;
-  /** Get the finish reason ("stop", "length", "tool_calls", or "repetition") */
-  get finishReason(): 'stop' | 'length' | 'tool_calls' | 'repetition';
-  /** Get the number of tokens generated */
-  get numTokens(): number;
-  /** Get the raw text before tool call stripping (for debugging) */
-  get rawText(): string;
-}
-
 /** Handle returned by `chat_stream()` to control an in-progress streaming generation. */
 export declare class ChatStreamHandle {
   cancel(): void;
@@ -709,7 +664,7 @@ export declare class Qwen35Model {
    * Runs tokenization + generation on a worker thread via spawn_blocking
    * to avoid blocking the Node.js event loop.
    */
-  chat(messages: Array<ChatMessage>, config?: Qwen35ChatConfig | undefined | null): Promise<Qwen35ChatResult>;
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Streaming chat API with tool calling support.
    *
@@ -719,7 +674,7 @@ export declare class Qwen35Model {
    */
   chatStream(
     messages: ChatMessage[],
-    config: Qwen35ChatConfig | null,
+    config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
   /** Get the number of parameters in the model. */
@@ -742,7 +697,7 @@ export declare class Qwen35MoeModel {
   forwardWithCache(inputIds: MxArray): MxArray;
   static loadPretrained(path: string): Promise<Qwen35MoeModel>;
   generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
-  chat(messages: Array<ChatMessage>, config?: Qwen35MoeChatConfig | undefined | null): Promise<Qwen35MoeChatResult>;
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Streaming chat API with tool calling support.
    *
@@ -752,7 +707,7 @@ export declare class Qwen35MoeModel {
    */
   chatStream(
     messages: ChatMessage[],
-    config: Qwen35MoeChatConfig | null,
+    config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
   numParameters(): number;
@@ -1897,57 +1852,26 @@ export declare const enum BuiltinRewardType {
   JsonSchema = 'JsonSchema',
 }
 
-/**
- * Configuration for the high-level `chat()` API
- *
- * Combines tool definitions with generation parameters in a single config object.
- * Tools are optional - when not provided, `chat()` works as a simple conversational API.
- *
- * ## Example
- * ```typescript
- * // Simple chat (no tools)
- * const result = await model.chat(messages);
- *
- * // With tools
- * const result = await model.chat(messages, {
- *   tools: [weatherTool, searchTool],
- *   maxNewTokens: 2048,
- *   temperature: 0.7,
- * });
- * ```
- */
+/** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
-  /**
-   * Tool definitions for function calling (optional)
-   *
-   * When provided, the model can invoke these tools during generation.
-   * Tool calls are parsed and returned in `ChatResult.toolCalls`.
-   */
+  maxNewTokens?: number | undefined;
+  temperature?: number | undefined;
+  topK?: number | undefined;
+  topP?: number | undefined;
+  minP?: number | undefined;
+  /** Repetition penalty (1.0 = disabled). Penalizes tokens already in context. */
+  repetitionPenalty?: number | undefined;
+  /** Size of the context window for repetition penalty (default: 256) */
+  repetitionContextSize?: number | undefined;
+  /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
+  maxConsecutiveTokens?: number | undefined;
+  /** Max n-gram repetitions before stopping (default: 8, 0 = disabled) */
+  maxNgramRepeats?: number | undefined;
+  /** N-gram size for repetition detection (default: 3) */
+  ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
-  /** Maximum number of new tokens to generate (default: 2048 for chat) */
-  maxNewTokens?: number;
-  /** Sampling temperature (0 = greedy, higher = more random) (default: 0.7) */
-  temperature?: number;
-  /** Top-k sampling: keep only top k tokens (0 = disabled) (default: 0) */
-  topK?: number;
-  /** Top-p (nucleus) sampling: keep tokens with cumulative prob < p (default: 0.9) */
-  topP?: number;
-  /** Min-p sampling: keep tokens with prob > min_p * max_prob (default: 0.0) */
-  minP?: number;
-  /** Repetition penalty factor (1.0 = no penalty) (default: 1.0) */
-  repetitionPenalty?: number;
-  /** Number of recent tokens to consider for repetition penalty (default: 20) */
-  repetitionContextSize?: number;
-  /** Stop if same token repeats this many times consecutively (default: 16) */
-  maxConsecutiveTokens?: number;
-  /** Stop if a pattern repeats this many times consecutively (default: 3) */
-  maxNgramRepeats?: number;
-  /** Maximum pattern size for repetition detection (default: 64) */
-  ngramSize?: number;
-  /** EOS token ID (generation stops when this is generated) */
-  eosTokenId?: number;
-  /** Whether to return log probabilities (default: true) */
-  returnLogprobs?: boolean;
+  /** When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result */
+  reportPerformance?: boolean | undefined;
 }
 
 /** Chat message with tool calling support */
@@ -1962,6 +1886,20 @@ export interface ChatMessage {
   toolCallId?: string;
   /** Reasoning content for thinking mode (used with <think> tags) */
   reasoningContent?: string;
+  /** Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer) */
+  images?: Array<Uint8Array> | undefined;
+}
+
+/** Unified chat result shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
+export interface ChatResult {
+  text: string;
+  toolCalls: Array<ToolCallResult>;
+  thinking?: string;
+  numTokens: number;
+  finishReason: string;
+  rawText: string;
+  /** Performance metrics (present when `reportPerformance: true` in config) */
+  performance?: PerformanceMetrics;
 }
 
 /** Chat message role */
@@ -1983,6 +1921,8 @@ export interface ChatStreamChunk {
   thinking?: string;
   numTokens?: number;
   rawText?: string;
+  /** Performance metrics (only present in the final chunk when `reportPerformance: true`) */
+  performance?: PerformanceMetrics;
 }
 
 /** Result from classify_and_rotate: orientation info + corrected image bytes. */
@@ -2047,6 +1987,16 @@ export interface ConversionOptions {
   quantGroupSize?: number;
   /** Quantization mode: "affine" (default) or "mxfp8" */
   quantMode?: string;
+  /**
+   * Quantization recipe for per-layer mixed-bit quantization.
+   * Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5
+   */
+  quantRecipe?: string;
+  /**
+   * Path to an imatrix GGUF file for AWQ-style pre-scaling.
+   * Improves quantization quality by amplifying important weight channels.
+   */
+  imatrixPath?: string;
 }
 
 export interface ConversionResult {
@@ -2061,6 +2011,8 @@ export interface ConversionResult {
 }
 
 export declare function convertForeignWeights(options: ForeignConversionOptions): ForeignConversionResult;
+
+export declare function convertGgufToSafetensors(options: GgufConversionOptions): Promise<GgufConversionResult>;
 
 /**
  * Convert a HuggingFace SafeTensors model to MLX format
@@ -2310,6 +2262,33 @@ export interface GenerationConfig {
   numDraftTokens?: number;
 }
 
+export interface GenerationProfile {
+  /** Label identifying the decode loop variant. */
+  label: string;
+  /** Model type (e.g. "qwen3_5", "qwen3_5_moe", "qwen3"). */
+  modelType: string;
+  /** Number of tokens generated. */
+  numTokens: number;
+  /** Number of prompt tokens. */
+  promptTokens: number;
+  /** Prefill wall-clock time (ms). */
+  prefillMs: number;
+  /** Decode wall-clock time (ms). */
+  decodeMs: number;
+  /** Total wall-clock time (prefill + decode) (ms). */
+  totalMs: number;
+  /** Tokens per second (decode only). */
+  tokensPerSecond: number;
+  /** Time to first token (ms) — from decode loop start to first token extracted. */
+  timeToFirstTokenMs: number;
+  /** Per-phase breakdown. */
+  phases: Array<PhaseProfile>;
+  /** Memory snapshot before generation. */
+  memoryBefore?: MemorySnapshot;
+  /** Memory snapshot after generation. */
+  memoryAfter?: MemorySnapshot;
+}
+
 /** A generation record (NAPI wrapper) */
 export interface GenerationRecord {
   batchIndex: number;
@@ -2332,6 +2311,62 @@ export interface GenerationWithToolCalls {
 
 /** Get expected weight keys for PaddleOCR-VL model */
 export declare function getExpectedWeightKeys(): Array<string>;
+
+/** Retrieve all collected profiling data as a `ProfilingSession`. */
+export declare function getProfilingData(): ProfilingSession;
+
+export interface GgufConversionOptions {
+  /** Path to the GGUF file */
+  inputPath: string;
+  /** Output directory for converted SafeTensors model */
+  outputDir: string;
+  /** Target dtype: "float32", "float16", "bfloat16" (default: keep original) */
+  dtype?: string;
+  /** Enable verbose logging */
+  verbose?: boolean;
+  /** Enable quantization of converted weights */
+  quantize?: boolean;
+  /** Quantization bits (default: 4) */
+  quantBits?: number;
+  /** Quantization group size (default: 64) */
+  quantGroupSize?: number;
+  /** Quantization mode: "affine" or "mxfp8" */
+  quantMode?: string;
+  /**
+   * Quantization recipe for per-layer mixed-bit quantization.
+   * Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
+   */
+  quantRecipe?: string;
+  /**
+   * Path to an imatrix GGUF file for AWQ-style pre-scaling.
+   * Improves quantization quality by amplifying important weight channels.
+   */
+  imatrixPath?: string;
+  /**
+   * Output filename (default: "model.safetensors").
+   * Useful for saving vision weights separately (e.g., "vision.safetensors").
+   */
+  outputFilename?: string;
+  /**
+   * When true, remap LLM weight keys for VLM compatibility:
+   * "model.X" → "language_model.model.X", "lm_head.X" → "language_model.lm_head.X"
+   * This makes the safetensors compatible with mlx-vlm.
+   */
+  vlmKeyPrefix?: boolean;
+}
+
+export interface GgufConversionResult {
+  numTensors: number;
+  numParameters: number;
+  outputPath: string;
+  tensorNames: Array<string>;
+  sourceFormat: string;
+}
+
+export interface GpuInfo {
+  /** GPU architecture generation (M1=13, M2=14, M3=15, M4=16, M5=17). */
+  architectureGen: number;
+}
 
 /** Configuration for the GRPO training engine */
 export interface GrpoEngineConfig {
@@ -2482,6 +2517,9 @@ export interface GrpoLossConfig {
   vocabChunkSize?: number;
 }
 
+/** Check whether profiling is currently enabled. */
+export declare function isProfilingEnabled(): boolean;
+
 /** A single detected layout element. */
 export interface LayoutElement {
   /** Detection confidence score */
@@ -2494,6 +2532,15 @@ export interface LayoutElement {
   bbox: Array<number>;
   /** Reading order index (0 = first element to read) */
   order: number;
+}
+
+export interface MemorySnapshot {
+  /** Active (non-cached) memory in bytes. */
+  activeBytes: number;
+  /** Peak memory usage in bytes. */
+  peakBytes: number;
+  /** Cache memory in bytes. */
+  cacheBytes: number;
 }
 
 /** Full model configuration */
@@ -2652,34 +2699,59 @@ export interface ParseToolCallsResult {
 /** Parse VLM output into structured document */
 export declare function parseVlmOutput(text: string): ParsedDocument;
 
-/** Chat configuration for Qwen3.5 */
-export interface Qwen35ChatConfig {
-  maxNewTokens?: number | undefined;
-  temperature?: number | undefined;
-  topK?: number | undefined;
-  topP?: number | undefined;
-  minP?: number | undefined;
-  /** Repetition penalty (1.0 = disabled). Penalizes tokens already in context. */
-  repetitionPenalty?: number | undefined;
-  /** Size of the context window for repetition penalty (default: 256) */
-  repetitionContextSize?: number | undefined;
-  /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
-  maxConsecutiveTokens?: number | undefined;
-  /** Max n-gram repetitions before stopping (default: 8, 0 = disabled) */
-  maxNgramRepeats?: number | undefined;
-  /** N-gram size for repetition detection (default: 3) */
-  ngramSize?: number | undefined;
-  tools?: Array<ToolDefinition>;
+/**
+ * Lightweight performance metrics returned by chat/chatStream when
+ * `reportPerformance: true` is set in the config.
+ */
+export interface PerformanceMetrics {
+  /**
+   * Time to first token (ms) — wall-clock from generation start to
+   * first token extracted. Includes tokenization, prefill (lazy graph
+   * construction + first GPU eval), and first sample.
+   */
+  ttftMs: number;
+  /** Prefill throughput: prompt_tokens / (ttft_ms / 1000). */
+  prefillTokensPerSecond: number;
+  /**
+   * Decode throughput: (generated_tokens - 1) / decode_time.
+   * Excludes the first token (counted as prefill).
+   */
+  decodeTokensPerSecond: number;
 }
 
-/** Chat result */
-export interface Qwen35ChatResult {
-  text: string;
-  toolCalls: Array<ToolCallResult>;
-  thinking?: string;
-  numTokens: number;
-  finishReason: string;
-  rawText: string;
+export interface PhaseProfile {
+  /** Phase name (e.g. "forward", "sample", "eval_token"). */
+  name: string;
+  /** Total wall-clock time spent in this phase (ms). */
+  totalMs: number;
+  /** Average time per invocation (µs). */
+  avgUsPerToken: number;
+  /** Number of invocations. */
+  count: number;
+}
+
+export interface ProfilingSession {
+  /** GPU hardware info. */
+  gpuInfo: GpuInfo;
+  /** Total session duration (ms). */
+  totalDurationMs: number;
+  /** Individual generation profiles. */
+  generations: Array<GenerationProfile>;
+  /** Aggregate summary. */
+  summary: ProfilingSummary;
+}
+
+export interface ProfilingSummary {
+  /** Total tokens generated across all generations. */
+  totalTokens: number;
+  /** Total prompt tokens across all generations. */
+  totalPromptTokens: number;
+  /** Average tokens per second. */
+  avgTokensPerSecond: number;
+  /** Average time to first token (ms). */
+  avgTimeToFirstTokenMs: number;
+  /** Average prefill time (ms). */
+  avgPrefillMs: number;
 }
 
 /**
@@ -2727,36 +2799,6 @@ export interface Qwen35GenerationResult {
   text: string;
   numTokens: number;
   finishReason: string;
-}
-
-/** Chat configuration for Qwen3.5 MoE */
-export interface Qwen35MoeChatConfig {
-  maxNewTokens?: number | undefined;
-  temperature?: number | undefined;
-  topK?: number | undefined;
-  topP?: number | undefined;
-  minP?: number | undefined;
-  /** Repetition penalty (1.0 = disabled). Penalizes tokens already in context. */
-  repetitionPenalty?: number | undefined;
-  /** Size of the context window for repetition penalty (default: 256) */
-  repetitionContextSize?: number | undefined;
-  /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
-  maxConsecutiveTokens?: number | undefined;
-  /** Max n-gram repetitions before stopping (default: 8, 0 = disabled) */
-  maxNgramRepeats?: number | undefined;
-  /** N-gram size for repetition detection (default: 3) */
-  ngramSize?: number | undefined;
-  tools?: Array<ToolDefinition>;
-}
-
-/** Chat result */
-export interface Qwen35MoeChatResult {
-  text: string;
-  toolCalls: Array<ToolCallResult>;
-  thinking?: string;
-  numTokens: number;
-  finishReason: string;
-  rawText: string;
 }
 
 /**
@@ -2863,6 +2905,9 @@ export interface RecResult {
   score: number;
 }
 
+/** Clear all collected profiling data and reset session timer. */
+export declare function resetProfilingData(): void;
+
 /** Result of resume position computation */
 export interface ResumePosition {
   /** Epoch to start from (0-indexed) */
@@ -2964,6 +3009,9 @@ export interface SchedulerStatsNapi {
   /** Total tokens across all running sequences */
   totalRunningTokens: number;
 }
+
+/** Enable or disable profiling globally. */
+export declare function setProfilingEnabled(enabled: boolean): void;
 
 /** Configuration for the SFT training engine */
 export interface SftEngineConfig {

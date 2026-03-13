@@ -22,12 +22,30 @@ Usage:
 Options:
   -m, --model <name>    HuggingFace model name (default: ${DEFAULT_MODEL})
   -o, --output <dir>    Output directory (default: .cache/models/<model-slug>)
+  -g, --glob <pattern>  Filter files by glob pattern (can be repeated)
   -h, --help            Show this help message
   --set-token           Set HuggingFace token
+
+Glob Filtering:
+  Use --glob to download only specific files from a repo. This is especially
+  useful for GGUF repos that contain many quantization variants. Patterns use
+  simple wildcard matching (* matches any characters).
+
+  Multiple --glob flags can be combined; a file is included if it matches ANY
+  of the patterns.
 
 Examples:
   mlx download model
   mlx download model --model Qwen/Qwen3-1.7B --output .cache/models/qwen3-1.7b
+
+  # Download only the BF16 GGUF variant
+  mlx download model -m unsloth/Qwen3.5-9B-GGUF -g "*BF16*"
+
+  # Download only Q4_K_M and Q8_0 variants
+  mlx download model -m unsloth/Qwen3.5-9B-GGUF -g "*Q4_K_M*" -g "*Q8_0*"
+
+  # Download all .gguf files (skip everything else)
+  mlx download model -m unsloth/Qwen3.5-9B-GGUF -g "*.gguf"
 `);
 }
 
@@ -70,24 +88,58 @@ const CORE_FILES = [
   'merges.txt',
 ];
 
-async function getModelFiles(modelName: string, accessToken?: string) {
+/** Convert a simple glob pattern (with * wildcards) to a RegExp */
+function globToRegex(pattern: string): RegExp {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  return new RegExp(`^${escaped}$`, 'i');
+}
+
+/** Check if a filename matches any of the glob patterns */
+function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
+  return patterns.some((re) => re.test(filename));
+}
+
+async function getModelFiles(modelName: string, accessToken?: string, globPatterns?: string[]) {
   let totalSize = 0;
   const filesToDownload: ListFileEntry[] = [];
+  const allFiles: ListFileEntry[] = [];
+
+  // Compile glob patterns if provided
+  const globs = globPatterns?.map(globToRegex);
+
   for await (const file of listFiles({ repo: { type: 'model', name: modelName }, accessToken })) {
-    if (
-      CORE_FILES.includes(file.path) ||
-      file.path.endsWith('.safetensors') ||
-      file.path.endsWith('.json') ||
-      file.path.endsWith('.pdiparams') ||
-      file.path.endsWith('.yml')
-    ) {
-      filesToDownload.push(file);
-      if (file.size) {
-        totalSize += file.size;
+    allFiles.push(file);
+
+    if (globs) {
+      // When glob patterns are active, include files that match the pattern
+      // OR are essential metadata files (config, tokenizer)
+      const basename = file.path.split('/').pop() || file.path;
+      if (matchesAnyGlob(basename, globs) || matchesAnyGlob(file.path, globs)) {
+        filesToDownload.push(file);
+        if (file.size) totalSize += file.size;
+      } else if (CORE_FILES.includes(basename)) {
+        // Always include core config/tokenizer files
+        filesToDownload.push(file);
+        if (file.size) totalSize += file.size;
+      }
+    } else {
+      // Default behavior: download model files
+      if (
+        CORE_FILES.includes(file.path) ||
+        file.path.endsWith('.safetensors') ||
+        file.path.endsWith('.json') ||
+        file.path.endsWith('.pdiparams') ||
+        file.path.endsWith('.yml')
+      ) {
+        filesToDownload.push(file);
+        if (file.size) {
+          totalSize += file.size;
+        }
       }
     }
   }
-  return { totalSize, filesToDownload };
+
+  return { totalSize, filesToDownload, allFiles };
 }
 
 async function verifyDownload(outputDir: string, weightFiles: string[]): Promise<boolean> {
@@ -134,6 +186,11 @@ export async function run(argv: string[]) {
         type: 'string',
         short: 'o',
       },
+      glob: {
+        type: 'string',
+        short: 'g',
+        multiple: true,
+      },
       help: {
         type: 'boolean',
         short: 'h',
@@ -157,6 +214,7 @@ export async function run(argv: string[]) {
   }
 
   const modelName = args.model!;
+  const globPatterns = args.glob;
   const modelSlug = modelName.split('/').pop()!.toLowerCase();
   const outputDir = resolve(args.output ?? join('.cache', 'models', modelSlug));
 
@@ -166,7 +224,7 @@ export async function run(argv: string[]) {
     console.warn('No HuggingFace token found, the model will download with anonymous access');
   }
 
-  const title = `${modelName} Base Model Download from HuggingFace`;
+  const title = `${modelName} Model Download from HuggingFace`;
   const boxWidth = Math.max(title.length + 6, 58);
   const padding = Math.floor((boxWidth - title.length - 2) / 2);
   const rightPadding = boxWidth - title.length - padding;
@@ -175,11 +233,10 @@ export async function run(argv: string[]) {
   console.log('╚' + '═'.repeat(boxWidth) + '╝\n');
 
   console.log(`Model: ${modelName}`);
-  console.log(`Format: Base model (needs MLX conversion)`);
+  if (globPatterns?.length) {
+    console.log(`Filter: ${globPatterns.join(', ')}`);
+  }
   console.log(`Output: ${outputDir}\n`);
-
-  console.log('Note: After download, convert to MLX format:');
-  console.log(`    mlx convert --input ${outputDir} --output ${outputDir}-mlx-bf16\n`);
 
   // Check if already downloaded
   if (existsSync(outputDir)) {
@@ -188,21 +245,64 @@ export async function run(argv: string[]) {
     const hasSingleModel = files.includes('model.safetensors');
     const hasShardedModel = files.includes('model.safetensors.index.json');
     const hasPaddleModel = files.includes('inference.pdiparams');
+    const hasGguf = files.some((f) => f.endsWith('.gguf'));
     if (hasConfig && (hasSingleModel || hasShardedModel || hasPaddleModel)) {
       console.log('Model already downloaded!\n');
       console.log('To re-download, delete the output directory first:');
       console.log(`   rm -rf ${outputDir}\n`);
       return;
     }
+    if (hasGguf && !globPatterns?.length) {
+      console.log('GGUF file(s) already downloaded!\n');
+      console.log('To re-download, delete the output directory first:');
+      console.log(`   rm -rf ${outputDir}\n`);
+      return;
+    }
+    // For glob downloads, check if all glob-matched files are present
+    if (hasGguf && globPatterns?.length) {
+      const globs = globPatterns.map(globToRegex);
+      const matchedExisting = files.filter((f) => matchesAnyGlob(f, globs) || CORE_FILES.includes(f));
+      if (matchedExisting.length > 1) {
+        console.log('Matched files already downloaded!\n');
+        console.log('To re-download, delete the output directory first:');
+        console.log(`   rm -rf ${outputDir}\n`);
+        return;
+      }
+    }
   }
 
   await ensureDir(outputDir);
 
-  console.log('Downloading base model from HuggingFace...\n');
+  console.log('Fetching file list from HuggingFace...\n');
 
-  const { totalSize, filesToDownload } = await getModelFiles(modelName, HUGGINGFACE_TOKEN);
+  const { totalSize, filesToDownload, allFiles } = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
+
+  if (filesToDownload.length === 0) {
+    console.error('No files matched the given criteria.\n');
+    if (globPatterns?.length) {
+      const ggufFiles = allFiles.filter((f) => f.path.endsWith('.gguf'));
+      if (ggufFiles.length > 0) {
+        console.log('Available GGUF files in this repo:');
+        for (const f of ggufFiles) {
+          console.log(`  ${f.path} (${formatBytes(f.size)})`);
+        }
+        console.log(`\nTry: mlx download model -m ${modelName} -g "<pattern>"`);
+      }
+    }
+    process.exit(1);
+  }
+
+  // Show what will be downloaded
+  if (globPatterns?.length) {
+    console.log(`Matched ${filesToDownload.length} file(s):`);
+    for (const f of filesToDownload) {
+      console.log(`  ${f.path} (${formatBytes(f.size)})`);
+    }
+    console.log('');
+  }
+
   const sizeStr = formatBytes(totalSize);
-  console.log(`This may take a while (model is ~${sizeStr})...\n`);
+  console.log(`Downloading ${filesToDownload.length} file(s) (~${sizeStr})...\n`);
 
   const cacheDir = join(process.cwd(), '.cache', 'huggingface');
   const weightFiles: string[] = [];
@@ -219,18 +319,33 @@ export async function run(argv: string[]) {
     const destPath = join(outputDir, file.path);
     await ensureDir(dirname(destPath));
     await copyFile(snapshotPath, destPath);
-    if (file.path.endsWith('.safetensors') || file.path.endsWith('.pdiparams')) {
+    if (file.path.endsWith('.safetensors') || file.path.endsWith('.pdiparams') || file.path.endsWith('.gguf')) {
       weightFiles.push(file.path);
     }
     console.log(`  ✓ ${file.path} (${fileSizeStr})`);
   }
 
-  const success = await verifyDownload(outputDir, weightFiles);
-
-  if (success) {
-    console.log('\nModel downloaded successfully!\n');
+  // For GGUF downloads, skip strict verification (no config.json required in GGUF repos)
+  const hasGgufFiles = weightFiles.some((f) => f.endsWith('.gguf'));
+  if (hasGgufFiles) {
+    console.log(`\nDownload complete! ${weightFiles.length} file(s) saved to ${outputDir}\n`);
+    console.log('To convert GGUF to MLX SafeTensors format:');
+    for (const wf of weightFiles) {
+      const ggufPath = join(outputDir, wf);
+      console.log(`  mlx convert -i ${ggufPath} -o ${outputDir}-mlx`);
+    }
+    console.log('');
   } else {
-    console.error('\nDownload incomplete. Please try again.\n');
-    process.exit(1);
+    console.log(`Format: Base model (needs MLX conversion)`);
+    console.log('Note: After download, convert to MLX format:');
+    console.log(`    mlx convert --input ${outputDir} --output ${outputDir}-mlx-bf16\n`);
+
+    const success = await verifyDownload(outputDir, weightFiles);
+    if (success) {
+      console.log('\nModel downloaded successfully!\n');
+    } else {
+      console.error('\nDownload incomplete. Please try again.\n');
+      process.exit(1);
+    }
   }
 }

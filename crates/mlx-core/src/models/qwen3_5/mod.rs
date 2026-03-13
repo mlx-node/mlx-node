@@ -7,8 +7,9 @@ pub mod gated_delta_net;
 pub mod layer_cache;
 pub mod model;
 pub mod persistence;
+pub mod processing;
 pub mod quantized_linear;
 pub mod rms_norm_gated;
-
+pub mod vision;
 pub use config::Qwen3_5Config;
 pub use model::Qwen3_5Model;

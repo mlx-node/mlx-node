@@ -8,6 +8,9 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::models::qwen3_5::persistence::{load_vision_weights, parse_vision_config};
+use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
+use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::SafeTensorsFile;
 
@@ -415,28 +418,42 @@ fn apply_weights(
     config: &Qwen3_5MoeConfig,
     quant_bits: i32,
     quant_group_size: i32,
+    per_layer_quant: &HashMap<String, (i32, i32)>,
 ) -> Result<()> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
 
-    // Helper: try MXFP8 builder first (if applicable), then affine builder
+    // Helper: try MXFP8 builder first (if applicable), then affine builder.
+    // Checks per-layer overrides before falling back to global defaults.
     let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
         if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_linear(params, prefix) {
             return Some(ql);
         }
-        try_build_quantized_linear(params, prefix, quant_group_size, quant_bits)
+        let (bits, gs) = per_layer_quant
+            .get(prefix)
+            .copied()
+            .unwrap_or((quant_bits, quant_group_size));
+        try_build_quantized_linear(params, prefix, gs, bits)
     };
 
-    // Router gates always use 8-bit affine with group_size=64 regardless of main quant config
+    // Router gates: check per-layer overrides first, fallback to 8-bit affine
     let try_build_ql_gate = |params: &HashMap<String, MxArray>, prefix: &str| {
-        try_build_quantized_linear(params, prefix, GATE_QUANT_GROUP_SIZE, GATE_QUANT_BITS)
+        let (bits, gs) = per_layer_quant
+            .get(prefix)
+            .copied()
+            .unwrap_or((GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE));
+        try_build_quantized_linear(params, prefix, gs, bits)
     };
 
     let try_build_qsl = |params: &HashMap<String, MxArray>, prefix: &str| {
         if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_switch_linear(params, prefix) {
             return Some(ql);
         }
-        try_build_quantized_switch_linear(params, prefix, quant_group_size, quant_bits)
+        let (bits, gs) = per_layer_quant
+            .get(prefix)
+            .copied()
+            .unwrap_or((quant_bits, quant_group_size));
+        try_build_quantized_switch_linear(params, prefix, gs, bits)
     };
 
     if let Some(w) = params.get("embedding.weight") {
@@ -899,7 +916,41 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5MoeModel> {
         let raw_params = load_all_safetensors(path)?;
         info!("Loaded {} raw tensors", raw_params.len());
 
-        let params = sanitize_weights(raw_params, &config)?;
+        // Check for vision weights and split if present
+        let has_vision = raw_params
+            .keys()
+            .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."));
+
+        let (text_raw_params, vision_params) = if has_vision {
+            let mut vision_params: HashMap<String, MxArray> = HashMap::new();
+            let mut text_params: HashMap<String, MxArray> = HashMap::new();
+
+            for (name, array) in raw_params {
+                if name.starts_with("vision_tower.") || name.starts_with("visual.") {
+                    // Normalize vision key: strip prefix
+                    let vkey = name
+                        .strip_prefix("vision_tower.")
+                        .or_else(|| name.strip_prefix("visual."))
+                        .unwrap_or(&name)
+                        .to_string();
+                    vision_params.insert(vkey, array);
+                } else {
+                    text_params.insert(name, array);
+                }
+            }
+
+            info!(
+                "Split: {} vision tensors, {} text tensors",
+                vision_params.len(),
+                text_params.len()
+            );
+
+            (text_params, Some(vision_params))
+        } else {
+            (raw_params, None)
+        };
+
+        let params = sanitize_weights(text_raw_params, &config)?;
         let quantized = is_quantized_checkpoint(&params);
         info!(
             "Sanitized to {} parameters (quantized={})",
@@ -917,10 +968,37 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5MoeModel> {
         let quant_group_size = quant_cfg
             .and_then(|q| q["group_size"].as_i64())
             .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64) as i32;
+        // Parse per-layer quantization overrides (module path → (bits, group_size)).
+        // Normalize keys by stripping model prefixes so they match the sanitized
+        // weight keys used in apply_weights (e.g. "layers.0.mlp.gate").
+        let per_layer_quant: HashMap<String, (i32, i32)> = quant_cfg
+            .and_then(|q| q.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter(|(_, v)| v.is_object()) // per-layer entries are objects, globals are scalars
+                    .filter_map(|(k, v)| {
+                        let bits = v["bits"].as_i64()? as i32;
+                        let gs = v["group_size"]
+                            .as_i64()
+                            .unwrap_or(quant_group_size as i64)
+                            as i32;
+                        let normalized = k
+                            .strip_prefix("model.language_model.")
+                            .or_else(|| k.strip_prefix("language_model.model."))
+                            .or_else(|| k.strip_prefix("language_model."))
+                            .or_else(|| k.strip_prefix("model."))
+                            .unwrap_or(k)
+                            .to_string();
+                        Some((normalized, (bits, gs)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         if quant_cfg.is_some() {
             info!(
-                "Using quantization config from config.json: bits={}, group_size={}",
-                quant_bits, quant_group_size
+                "Using quantization config from config.json: bits={}, group_size={}, per_layer_overrides={}",
+                quant_bits, quant_group_size, per_layer_quant.len()
             );
         }
 
@@ -937,7 +1015,14 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5MoeModel> {
         };
 
         let mut model = Qwen3_5MoeModel::new(config.clone())?;
-        apply_weights(&mut model, &params, &config, quant_bits, quant_group_size)?;
+        apply_weights(
+            &mut model,
+            &params,
+            &config,
+            quant_bits,
+            quant_group_size,
+            &per_layer_quant,
+        )?;
 
         // Register weights with C++ MoE forward pass.
         // Works for both quantized and unquantized models (C++ detects quantization at init).
@@ -947,7 +1032,37 @@ pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5MoeModel> {
             model.tokenizer = Some(Arc::new(tok));
         }
 
-        info!("Qwen3.5 MoE model loaded successfully");
+        // If vision weights were found, load vision encoder and configure VLM
+        if let Some(ref vparams) = vision_params {
+            let vision_config = parse_vision_config(&raw);
+            info!(
+                "Vision config: {} layers, hidden={}, heads={}, patch={}",
+                vision_config.num_layers,
+                vision_config.hidden_size,
+                vision_config.num_heads,
+                vision_config.patch_size,
+            );
+
+            let mut vision_encoder = Qwen3_5VisionEncoder::new(vision_config.clone())?;
+            load_vision_weights(&mut vision_encoder, vparams, &vision_config)?;
+
+            // Initialize M-RoPE on all full attention layers
+            // mrope_section = [11, 11, 10] for Qwen3.5-VL
+            model.init_mrope_layers(
+                vec![11, 11, 10],
+                config.rope_theta,
+                config.max_position_embeddings,
+            )?;
+
+            model.set_vision_encoder(vision_encoder);
+            model.set_image_processor(Qwen35VLImageProcessor::new(None));
+            model.set_spatial_merge_size(vision_config.spatial_merge_size);
+
+            info!("Qwen3.5 MoE-VL model loaded successfully (with vision encoder)");
+        } else {
+            info!("Qwen3.5 MoE model loaded successfully");
+        }
+
         Ok(model)
     })
     .await

@@ -1,10 +1,10 @@
 import { Qwen35Model as Qwen35ModelNative, Qwen35MoeModel as Qwen35MoeModelNative } from '@mlx-node/core';
 import type {
+  ChatConfig,
   ChatMessage,
   ChatStreamChunk,
   ChatStreamHandle,
-  Qwen35ChatConfig,
-  Qwen35MoeChatConfig,
+  PerformanceMetrics,
   ToolCallResult,
 } from '@mlx-node/core';
 
@@ -21,12 +21,15 @@ export interface ChatStreamFinal {
   thinking: string | null;
   numTokens: number;
   rawText: string;
+  performance?: PerformanceMetrics;
 }
 
 export type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
 
 // Save references to the native callback-based methods before we override them
+// oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeDenseChatStream = Qwen35ModelNative.prototype.chatStream;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeMoeChatStream = Qwen35MoeModelNative.prototype.chatStream;
 
 /**
@@ -88,6 +91,7 @@ export async function* _createChatStream(
             thinking: chunk.thinking ?? null,
             numTokens: chunk.numTokens!,
             rawText: chunk.rawText!,
+            performance: chunk.performance ?? undefined,
           } as ChatStreamFinal;
           return;
         }
@@ -118,7 +122,7 @@ export class Qwen35Model extends Qwen35ModelNative {
   }
 
   // @ts-expect-error — override callback-based chatStream with AsyncGenerator
-  async *chatStream(messages: ChatMessage[], config?: Qwen35ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
+  async *chatStream(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
     yield* _createChatStream(_nativeDenseChatStream, this, messages, config);
   }
 }
@@ -142,7 +146,7 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
   }
 
   // @ts-expect-error — override callback-based chatStream with AsyncGenerator
-  async *chatStream(messages: ChatMessage[], config?: Qwen35MoeChatConfig | null): AsyncGenerator<ChatStreamEvent> {
+  async *chatStream(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
     yield* _createChatStream(_nativeMoeChatStream, this, messages, config);
   }
 }

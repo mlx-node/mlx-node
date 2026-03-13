@@ -5,12 +5,6 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
-  lint: {
-    options: {
-      typeAware: true,
-      typeCheck: true,
-    },
-  },
   fmt: {
     printWidth: 120,
     tabWidth: 2,
@@ -30,6 +24,12 @@ export default defineConfig({
       '/crates/mlx-sys/mlx',
       '**/*.metal.inc',
     ],
+  },
+  lint: {
+    options: {
+      typeAware: true,
+      typeCheck: true,
+    },
   },
   test: {
     globals: true,

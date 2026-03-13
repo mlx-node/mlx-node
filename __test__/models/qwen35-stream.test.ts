@@ -14,7 +14,11 @@ function fakeNativeMethod(numTokens: number) {
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle> => {
     let cancelledFlag = false;
-    const handle = { cancel: () => { cancelledFlag = true; } } as ChatStreamHandle;
+    const handle = {
+      cancel: () => {
+        cancelledFlag = true;
+      },
+    } as ChatStreamHandle;
 
     setTimeout(() => {
       for (let i = 0; i < numTokens; i++) {
@@ -81,7 +85,9 @@ describe.sequential('_createChatStream bridge', () => {
       callback: (err: Error | null, chunk: ChatStreamChunk) => void,
     ): Promise<ChatStreamHandle> => {
       const handle = {
-        cancel: () => { cancelCalled = true; },
+        cancel: () => {
+          cancelCalled = true;
+        },
       } as ChatStreamHandle;
 
       setTimeout(() => {

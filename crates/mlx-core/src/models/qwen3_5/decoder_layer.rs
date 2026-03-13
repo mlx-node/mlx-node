@@ -61,22 +61,30 @@ impl DecoderLayer {
     }
 
     /// Forward pass.
+    ///
+    /// # Arguments
+    /// * `x` - Input [B, T, hidden_size]
+    /// * `mask` - Attention mask (causal)
+    /// * `cache` - Optional layer cache
+    /// * `position_ids` - Optional [3, B, T] M-RoPE positions (VLM only, full attention layers)
     pub fn forward(
         &mut self,
         x: &MxArray,
         mask: Option<&MxArray>,
         cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
     ) -> Result<MxArray> {
         // Pre-norm + attention
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = match &mut self.attn {
             AttentionType::Linear(gdn) => {
                 let ac = cache.and_then(|c| c.as_arrays_cache_mut());
+                // Linear attention layers don't use explicit position IDs
                 gdn.forward(&normed, mask, ac)?
             }
             AttentionType::Full(attn) => {
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
-                attn.forward(&normed, mask, kvc)?
+                attn.forward(&normed, mask, kvc, position_ids)?
             }
         };
 

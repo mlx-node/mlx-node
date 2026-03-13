@@ -206,6 +206,86 @@ inline auto& compiled_attn_gate() {
 }
 
 // =====================================================================
+// M-RoPE (Multimodal Rotary Position Embeddings) for 3D position IDs
+// =====================================================================
+
+// Applies M-RoPE to queries and keys using 3-channel position IDs.
+// Each channel (temporal, height, width) controls a section of rotary dims.
+// Non-rotary dimensions (rope_dims..head_dim) are passed through unchanged.
+inline std::pair<array, array> apply_mrope(
+    const array& queries,      // [B, T, H, D]
+    const array& keys,         // [B, T, Hkv, D]
+    const array& position_ids, // [3, B, T]
+    int rope_dims,             // total rotary dims (e.g. 64)
+    float rope_theta,
+    const std::vector<int>& mrope_section) {  // e.g. [11, 11, 10], sum=32 half-dims
+
+  auto dt = queries.dtype();
+  int B = queries.shape(0);
+  int T = queries.shape(1);
+  int half_rotary = rope_dims / 2;  // = sum of mrope_section
+
+  // Extract 3 position channels: each [B, T]
+  auto pos_t = reshape(slice(position_ids, {0, 0, 0}, {1, B, T}), {B, T});
+  auto pos_h = reshape(slice(position_ids, {1, 0, 0}, {2, B, T}), {B, T});
+  auto pos_w = reshape(slice(position_ids, {2, 0, 0}, {3, B, T}), {B, T});
+  std::vector<array> pos_channels = {pos_t, pos_h, pos_w};
+
+  // Build concatenated frequency tensor [B, T, half_rotary]
+  std::vector<array> freq_sections;
+  int dim_offset = 0;
+  for (int s = 0; s < 3; s++) {
+    int section_dims = mrope_section[s];  // number of half-dim pairs in this section
+    // inv_freq: theta^(-2*(dim_offset+i)/rope_dims) for i in [0..section_dims)
+    // Shape: [section_dims]
+    std::vector<float> inv_freq_data(section_dims);
+    for (int i = 0; i < section_dims; i++) {
+      float exponent = -2.0f * (float)(dim_offset + i) / (float)rope_dims;
+      inv_freq_data[i] = std::pow(rope_theta, exponent);
+    }
+    auto inv_freq = array(inv_freq_data.data(), {1, 1, section_dims}, mlx::core::float32);
+
+    // positions: [B, T, 1] * inv_freq: [1, 1, section_dims] → freqs: [B, T, section_dims]
+    auto pos = astype(reshape(pos_channels[s], {B, T, 1}), mlx::core::float32);
+    auto freqs = pos * inv_freq;
+    freq_sections.push_back(freqs);
+    dim_offset += section_dims;
+  }
+
+  // Concatenate: [B, T, half_rotary]
+  auto freqs = concatenate(freq_sections, 2);
+
+  // cos/sin: [B, T, 1, half_rotary] for broadcasting over heads
+  auto cos_f = astype(reshape(cos(freqs), {B, T, 1, half_rotary}), dt);
+  auto sin_f = astype(reshape(sin(freqs), {B, T, 1, half_rotary}), dt);
+
+  // Helper: apply rotary embedding to the first rope_dims dims of x [B, T, H, D]
+  auto apply_rot = [&](const array& x) -> array {
+    int H = x.shape(2);
+    int D = x.shape(3);
+    // Rotary portion: [B, T, H, rope_dims]
+    auto x_rot = slice(x, {0, 0, 0, 0}, {B, T, H, rope_dims});
+    // Split into even/odd halves: [B, T, H, half_rotary]
+    auto x_even = slice(x_rot, {0, 0, 0, 0},          {B, T, H, rope_dims}, {1, 1, 1, 2});
+    auto x_odd  = slice(x_rot, {0, 0, 0, 1},          {B, T, H, rope_dims}, {1, 1, 1, 2});
+    // Rotation: [even*cos - odd*sin, even*sin + odd*cos]
+    auto r_even = x_even * cos_f - x_odd * sin_f;
+    auto r_odd  = x_even * sin_f + x_odd * cos_f;
+    // Interleave back: stack [B, T, H, half_rotary, 2] → reshape [B, T, H, rope_dims]
+    auto stacked = stack({r_even, r_odd}, 4);  // [B, T, H, half_rotary, 2]
+    auto rotated = reshape(stacked, {B, T, H, rope_dims});
+    if (rope_dims < D) {
+      // Pass-through portion
+      auto x_pass = slice(x, {0, 0, 0, rope_dims}, {B, T, H, D});
+      return concatenate({rotated, x_pass}, 3);
+    }
+    return rotated;
+  };
+
+  return {apply_rot(queries), apply_rot(keys)};
+}
+
+// =====================================================================
 // Metal kernel for gated delta recurrence
 // =====================================================================
 
@@ -444,6 +524,189 @@ inline AttnPureResult attn_pure_fn(
   if (has_weight(pfx + "o_proj.bias")) output = output + get_weight(pfx + "o_proj.bias");
 
   return {output, new_kv_keys, new_kv_values};
+}
+
+// =====================================================================
+// Attention prefill (3D input, M-RoPE, causal mask)
+// =====================================================================
+
+inline AttnPureResult attn_prefill_fn(
+    const array& x,              // [B, T, hidden] — 3D
+    int layer_idx,
+    const array& position_ids,   // [3, B, T]
+    const BaseConfig& cfg,
+    const std::vector<int>& mrope_section) {
+  int B = x.shape(0);
+  int T = x.shape(1);
+  int hidden = x.shape(2);
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".self_attn.";
+
+  // Flatten to [B*T, hidden] for projections
+  auto x_flat = reshape(x, {B * T, hidden});
+
+  // Q projection (2x width for per-head gating)
+  auto q_proj = linear_proj(x_flat, pfx + "q_proj");
+  if (has_weight(pfx + "q_proj.bias")) q_proj = q_proj + get_weight(pfx + "q_proj.bias");
+
+  auto qph    = reshape(q_proj, {B, T, cfg.num_heads, cfg.head_dim * 2});
+  auto queries = slice(qph, {0, 0, 0, 0},             {B, T, cfg.num_heads, cfg.head_dim});
+  auto gate    = slice(qph, {0, 0, 0, cfg.head_dim},  {B, T, cfg.num_heads, cfg.head_dim * 2});
+  gate = reshape(gate, {B, T, cfg.num_heads * cfg.head_dim});
+
+  // K, V projections
+  auto keys   = linear_proj(x_flat, pfx + "k_proj");
+  auto values = linear_proj(x_flat, pfx + "v_proj");
+  if (has_weight(pfx + "k_proj.bias")) keys   = keys   + get_weight(pfx + "k_proj.bias");
+  if (has_weight(pfx + "v_proj.bias")) values = values + get_weight(pfx + "v_proj.bias");
+
+  keys   = reshape(keys,   {B, T, cfg.num_kv_heads, cfg.head_dim});
+  values = reshape(values, {B, T, cfg.num_kv_heads, cfg.head_dim});
+
+  // QK norm
+  queries = fast::rms_norm(queries, get_weight(pfx + "q_norm.weight"), cfg.rms_norm_eps);
+  keys    = fast::rms_norm(keys,    get_weight(pfx + "k_norm.weight"), cfg.rms_norm_eps);
+
+  // M-RoPE (replaces scalar-offset fast::rope)
+  auto [q_rope, k_rope] = apply_mrope(queries, keys, position_ids, cfg.rope_dims, cfg.rope_theta, mrope_section);
+
+  // Transpose to [B, H, T, D] for SDPA
+  auto q_t = transpose(q_rope, {0, 2, 1, 3});
+  auto k_t = transpose(k_rope, {0, 2, 1, 3});
+  auto v_t = transpose(values, {0, 2, 1, 3});
+
+  // Causal mask: [1, 1, T, T] — upper-triangular -inf
+  auto dt = x.dtype();
+  auto mask_col = reshape(arange(0, T, mlx::core::int32), {1, 1, 1, T});
+  auto mask_row = reshape(arange(0, T, mlx::core::int32), {1, 1, T, 1});
+  auto causal_mask = where(
+      greater(mask_col, mask_row),
+      array(-std::numeric_limits<float>::infinity(), dt),
+      array(0.0f, dt));
+
+  // SDPA
+  float scale = std::pow((float)cfg.head_dim, -0.5f);
+  auto attn_out = fast::scaled_dot_product_attention(
+      q_t, k_t, v_t, scale, "", causal_mask, {});
+
+  // Transpose back to [B, T, H, D] → [B, T, H*D]
+  attn_out = transpose(attn_out, {0, 2, 1, 3});
+  attn_out = reshape(attn_out, {B, T, cfg.num_heads * cfg.head_dim});
+
+  // Gate
+  attn_out = compiled_attn_gate()({attn_out, gate})[0];
+
+  // Output projection: flatten to [B*T, H*D], project, reshape back
+  auto out_flat = linear_proj(reshape(attn_out, {B * T, cfg.num_heads * cfg.head_dim}), pfx + "o_proj");
+  if (has_weight(pfx + "o_proj.bias")) out_flat = out_flat + get_weight(pfx + "o_proj.bias");
+  auto output = reshape(out_flat, {B, T, hidden});
+
+  // Return keys/values in [B, Hkv, T, D] format (for cache initialization)
+  return {output, k_t, v_t};
+}
+
+// =====================================================================
+// GDN prefill (3D input, full sequence conv1d, initial recurrent state)
+// =====================================================================
+
+inline GDNPureResult gdn_prefill_fn(
+    const array& x,  // [B, T, hidden] — 3D
+    int layer_idx,
+    const BaseConfig& cfg) {
+  int B = x.shape(0);
+  int T = x.shape(1);
+  int hidden = x.shape(2);
+  int key_dim = cfg.linear_num_k_heads * cfg.linear_key_head_dim;
+  int value_dim = cfg.linear_num_v_heads * cfg.linear_value_head_dim;
+  int conv_dim = key_dim * 2 + value_dim;
+
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".linear_attn.";
+
+  // Flatten to [B*T, hidden] for projections
+  auto x_flat = reshape(x, {B * T, hidden});
+
+  // Projections — auto-detecting quantized vs dense weights
+  struct QkvzResult { array qkv, z; };
+  auto [qkv, z] = [&]() -> QkvzResult {
+    if (has_weight(pfx + "in_proj_qkvz.weight")) {
+      auto qkvz = linear_proj(x_flat, pfx + "in_proj_qkvz");
+      return {slice(qkvz, {0, 0}, {B * T, conv_dim}),
+              slice(qkvz, {0, conv_dim}, {B * T, key_dim * 2 + value_dim * 2})};
+    }
+    return {linear_proj(x_flat, pfx + "in_proj_qkv"),
+            linear_proj(x_flat, pfx + "in_proj_z")};
+  }();
+  struct BaResult { array b, a; };
+  auto [b, a] = [&]() -> BaResult {
+    if (has_weight(pfx + "in_proj_ba.weight")) {
+      auto ba = linear_proj(x_flat, pfx + "in_proj_ba");
+      return {slice(ba, {0, 0}, {B * T, cfg.linear_num_v_heads}),
+              slice(ba, {0, cfg.linear_num_v_heads}, {B * T, cfg.linear_num_v_heads * 2})};
+    }
+    return {linear_proj(x_flat, pfx + "in_proj_b"),
+            linear_proj(x_flat, pfx + "in_proj_a")};
+  }();
+
+  // Reshape qkv to 3D for conv1d: [B, T, conv_dim]
+  auto qkv_3d = reshape(qkv, {B, T, conv_dim});
+
+  // Conv1d: prepend (kernel_dim-1) zeros instead of using conv_state
+  int pad_len = cfg.linear_conv_kernel_dim - 1;
+  auto zero_pad = zeros({B, pad_len, conv_dim}, qkv_3d.dtype());
+  auto conv_input = concatenate({zero_pad, qkv_3d}, 1);  // [B, pad_len+T, conv_dim]
+
+  // Save conv_state: last (kernel_dim-1) tokens of pre-conv qkv for decode continuation
+  int total_len = pad_len + T;
+  auto new_conv_state = slice(conv_input, {0, total_len - pad_len, 0}, {B, total_len, conv_dim});
+
+  const auto& conv_w = get_weight(pfx + "conv1d.weight");
+  auto conv_out = mlx::core::conv1d(conv_input, conv_w, 1, 0, 1, conv_dim);  // [B, T, conv_dim]
+
+  // SiLU — compiled
+  conv_out = compiled_silu()({conv_out})[0];
+
+  // Split into q, k, v
+  auto q = slice(conv_out, {0, 0, 0},              {B, T, key_dim});
+  auto k = slice(conv_out, {0, 0, key_dim},        {B, T, key_dim * 2});
+  auto v = slice(conv_out, {0, 0, key_dim * 2},    {B, T, conv_dim});
+
+  // Reshape to heads: [B, T, H, D]
+  q = reshape(q, {B, T, cfg.linear_num_k_heads, cfg.linear_key_head_dim});
+  k = reshape(k, {B, T, cfg.linear_num_k_heads, cfg.linear_key_head_dim});
+  v = reshape(v, {B, T, cfg.linear_num_v_heads, cfg.linear_value_head_dim});
+
+  // RMS norm + scaling
+  float inv_s = std::pow((float)cfg.linear_key_head_dim, -0.5f);
+  auto q_dt = q.dtype();
+  q = rms_norm_no_weight(q, 1e-6f) * array(inv_s * inv_s, q_dt);
+  k = rms_norm_no_weight(k, 1e-6f) * array(inv_s, q_dt);
+
+  // Beta, g — reshape b/a from [B*T, Hv] to [B, T, Hv]
+  auto beta_3d = reshape(sigmoid(b), {B, T, cfg.linear_num_v_heads});
+  const auto& a_log = get_weight(pfx + "A_log");
+  const auto& dt_b  = get_weight(pfx + "dt_bias");
+  // fused_compute_g works on flat tensors [B*T, Hv]
+  auto g_flat = fused_compute_g(a_log, a, dt_b);
+  auto g_3d = reshape(g_flat, {B, T, cfg.linear_num_v_heads});
+
+  // Metal kernel: handles T>1, returns (y [B, T, Hv, Dv], new_state [B, Hv, Dv, Dk])
+  // Initial recurrent_state is zeros
+  auto init_state = zeros(
+      {B, cfg.linear_num_v_heads, cfg.linear_value_head_dim, cfg.linear_key_head_dim},
+      q_dt);
+  auto [y, new_recurrent_state] = gated_delta_kernel_call(q, k, v, g_3d, beta_3d, init_state);
+
+  // RMSNorm gating — z is [B*T, value_dim], reshape to [B, T, Hv, Dv]
+  auto z_h = reshape(z, {B, T, cfg.linear_num_v_heads, cfg.linear_value_head_dim});
+  const auto& nw = get_weight(pfx + "norm.weight");
+  auto y_normed = fast::rms_norm(y, nw, cfg.rms_norm_eps);
+  y_normed = compiled_silu_mul()({z_h, y_normed})[0];
+
+  // Output projection: flatten to [B*T, value_dim], project, reshape back
+  auto y_flat = reshape(y_normed, {B * T, value_dim});
+  auto out_flat = linear_proj(y_flat, pfx + "out_proj");
+  auto output = reshape(out_flat, {B, T, hidden});
+
+  return {output, new_conv_state, new_recurrent_state};
 }
 
 }  // namespace qwen35_common

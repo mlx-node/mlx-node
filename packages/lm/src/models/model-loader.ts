@@ -7,8 +7,8 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Qwen3Model } from '@mlx-node/core';
+import type { Qwen3_5Model, Qwen3_5MoeModel } from '@mlx-node/core';
 import { Qwen35Model, Qwen35MoeModel } from '../stream';
-import type { Qwen35Model as Qwen3_5Model, Qwen35MoeModel as Qwen3_5MoeModel } from '../stream';
 
 /**
  * Model loader for Qwen3 and Qwen3.5 models
@@ -28,11 +28,12 @@ export class ModelLoader {
     const modelType = await detectModelType(modelPath);
 
     if (modelType === 'qwen3_5_moe') {
-      return await Qwen35MoeModel.loadPretrained(modelPath);
+      return (await Qwen35MoeModel.loadPretrained(modelPath)) as unknown as Qwen3_5MoeModel;
     }
 
     if (modelType === 'qwen3_5') {
-      return await Qwen35Model.loadPretrained(modelPath);
+      // load_pretrained() auto-detects vision weights and loads encoder if present
+      return (await Qwen35Model.loadPretrained(modelPath)) as unknown as Qwen3_5Model;
     }
 
     return await Qwen3Model.loadPretrained(modelPath);
@@ -45,7 +46,7 @@ export class ModelLoader {
    * @returns Loaded Qwen3.5 model
    */
   static async loadQwen35(modelPath: string): Promise<Qwen3_5Model> {
-    return await Qwen35Model.loadPretrained(modelPath);
+    return (await Qwen35Model.loadPretrained(modelPath)) as unknown as Qwen3_5Model;
   }
 
   /**
@@ -55,7 +56,7 @@ export class ModelLoader {
    * @returns Loaded Qwen3.5 MoE model
    */
   static async loadQwen35Moe(modelPath: string): Promise<Qwen3_5MoeModel> {
-    return await Qwen35MoeModel.loadPretrained(modelPath);
+    return (await Qwen35MoeModel.loadPretrained(modelPath)) as unknown as Qwen3_5MoeModel;
   }
 
   /**

@@ -204,6 +204,7 @@ impl VLModel {
                     kv_cache_bits: None,
                     kv_cache_group_size: None,
                     num_draft_tokens: None,
+                    report_performance: None,
                 };
 
                 Ok::<_, Error>((input_ids, pixel_values, grid_thw, gen_config))
@@ -999,6 +1000,7 @@ impl VLModel {
                 logprobs: logprobs_array,
                 finish_reason: finish_reason.to_string(),
                 num_tokens: generated_tokens.len(),
+                first_token_elapsed_ms: None,
             })
         })
         .await
@@ -1145,6 +1147,7 @@ impl VLModel {
                 kv_cache_bits: None,
                 kv_cache_group_size: None,
                 num_draft_tokens: None,
+                report_performance: None,
             };
 
             // Prepare per-item inputs
@@ -1704,6 +1707,7 @@ impl VLModel {
                     .clone()
                     .unwrap_or_else(|| "length".to_string()),
                 num_tokens: tokens.len(),
+                first_token_elapsed_ms: None,
             });
         }
 

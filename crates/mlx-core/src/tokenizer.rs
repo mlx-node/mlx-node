@@ -108,7 +108,7 @@ pub struct ToolDefinition {
 
 /// Chat message with tool calling support
 #[napi(object)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ChatMessage {
     /// Role: "system", "user", "assistant", or "tool"
     pub role: String,
@@ -123,6 +123,29 @@ pub struct ChatMessage {
     /// Reasoning content for thinking mode (used with <think> tags)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer)
+    #[napi(ts_type = "Array<Uint8Array> | undefined")]
+    #[serde(skip)]
+    pub images: Option<Vec<Uint8Array>>,
+}
+
+impl std::fmt::Debug for ChatMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatMessage")
+            .field("role", &self.role)
+            .field("content", &self.content)
+            .field("tool_calls", &self.tool_calls)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("reasoning_content", &self.reasoning_content)
+            .field(
+                "images",
+                &self
+                    .images
+                    .as_ref()
+                    .map(|imgs| imgs.iter().map(|i| i.len()).collect::<Vec<_>>()),
+            )
+            .finish()
+    }
 }
 
 /// Qwen3 Tokenizer class with NAPI bindings
@@ -727,13 +750,21 @@ impl Qwen3Tokenizer {
                         }
                     }
                     "split" => {
-                        // Python's split() - split by whitespace or delimiter
-                        let parts: Vec<&str> =
-                            if let Some(delim) = args.first().and_then(|v| v.as_str()) {
-                                s.split(delim).collect()
-                            } else {
-                                s.split_whitespace().collect()
-                            };
+                        // Python's str.split(sep=None, maxsplit=-1)
+                        let delim = args.first().and_then(|v| v.as_str());
+                        let maxsplit = args
+                            .get(1)
+                            .and_then(|v| i64::try_from(v.clone()).ok())
+                            .filter(|&n| n >= 0);
+
+                        let parts: Vec<&str> = match (delim, maxsplit) {
+                            (Some(d), Some(n)) => s.splitn(n as usize + 1, d).collect(),
+                            (Some(d), None) => s.split(d).collect(),
+                            (None, Some(n)) => {
+                                s.splitn(n as usize + 1, char::is_whitespace).collect()
+                            }
+                            (None, None) => s.split_whitespace().collect(),
+                        };
                         Ok(minijinja::Value::from(
                             parts
                                 .into_iter()
@@ -753,6 +784,17 @@ impl Qwen3Tokenizer {
                 ))
             }
         });
+
+        // Register raise_exception (used by official Qwen3.5 VLM template for validation)
+        env.add_function(
+            "raise_exception",
+            |msg: String| -> std::result::Result<minijinja::Value, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    msg,
+                ))
+            },
+        );
 
         env.add_template("chat", template_str)
             .map_err(|e| format!("Template parse error: {}", e))?;

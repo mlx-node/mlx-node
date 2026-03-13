@@ -138,6 +138,14 @@ pub struct ProcessedImage {
 }
 
 impl ProcessedImage {
+    /// Create a new ProcessedImage
+    pub fn new(pixel_values: MxArray, image_grid_thw: Vec<i32>) -> Self {
+        Self {
+            pixel_values,
+            image_grid_thw,
+        }
+    }
+
     /// Get pixel values [num_patches, channels, patch_h, patch_w]
     pub fn pixel_values(&self) -> MxArray {
         self.pixel_values.clone()
@@ -160,6 +168,14 @@ pub struct ProcessedImages {
 }
 
 impl ProcessedImages {
+    /// Create a new ProcessedImages
+    pub fn new(pixel_values: MxArray, grid_thw: MxArray) -> Self {
+        Self {
+            pixel_values,
+            grid_thw,
+        }
+    }
+
     /// Get pixel values [total_patches, C, patch_h, patch_w]
     pub fn pixel_values(&self) -> MxArray {
         self.pixel_values.clone()

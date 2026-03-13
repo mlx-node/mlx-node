@@ -847,4 +847,29 @@ mlx_array* mlx_fast_layer_norm(mlx_array* x,
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
+// ── SafeTensors lazy loading ─────────────────────────────────────────────────
+
+/// Load safetensors file using MLX's lazy loading (data read on eval, not upfront).
+/// Calls `callback` for each tensor with (name, name_len, array_handle).
+/// Returns number of tensors loaded, or -1 on error.
+int32_t mlx_load_safetensors(
+    const char* path,
+    void (*callback)(const char* name, size_t name_len, mlx_array* handle, void* ctx),
+    void* ctx
+) {
+    try {
+        auto [tensors, metadata] = mlx::core::load_safetensors(std::string(path));
+        int32_t count = 0;
+        for (auto& [name, arr] : tensors) {
+            auto* handle = reinterpret_cast<mlx_array*>(new array(std::move(arr)));
+            callback(name.c_str(), name.size(), handle, ctx);
+            count++;
+        }
+        return count;
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_load_safetensors error: " << e.what() << std::endl;
+        return -1;
+    }
+}
+
 }  // extern "C"

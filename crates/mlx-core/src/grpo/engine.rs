@@ -516,6 +516,7 @@ impl GRPOTrainingEngine {
             kv_cache_bits: None,     // Default: no quantization
             kv_cache_group_size: None,
             num_draft_tokens: None, // Speculative decoding not used in GRPO
+            report_performance: None,
         };
 
         // Run the entire training step in spawn_blocking
@@ -958,6 +959,7 @@ impl GRPOTrainingEngine {
             kv_cache_bits: None,     // Default: no quantization
             kv_cache_group_size: None,
             num_draft_tokens: None, // Speculative decoding not used in GRPO
+            report_performance: None,
         };
 
         let result = napi::bindgen_prelude::spawn_blocking(move || {
@@ -1559,6 +1561,7 @@ impl GRPOTrainingEngine {
             kv_cache_bits: None,     // Default: no quantization
             kv_cache_group_size: None,
             num_draft_tokens: None, // Speculative decoding not used in GRPO
+            report_performance: None,
         };
 
         // === Phase 1: Generate completions ===

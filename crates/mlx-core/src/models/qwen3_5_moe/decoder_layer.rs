@@ -79,6 +79,7 @@ impl DecoderLayer {
         x: &MxArray,
         mask: Option<&MxArray>,
         cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
     ) -> Result<MxArray> {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = match &mut self.attn {
@@ -88,7 +89,7 @@ impl DecoderLayer {
             }
             AttentionType::Full(attn) => {
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
-                attn.forward(&normed, mask, kvc)?
+                attn.forward(&normed, mask, kvc, position_ids)?
             }
         };
 

@@ -16,23 +16,11 @@
 // Model classes (for inference)
 export { Qwen3Model, Qwen3Tokenizer } from '@mlx-node/core';
 export { Qwen35Model, Qwen35Model as Qwen3_5Model } from './stream';
-export type {
-  Qwen35Config,
-  Qwen35ChatConfig,
-  Qwen35ChatResult,
-  Qwen35GenerationConfig,
-  Qwen35GenerationResult,
-} from '@mlx-node/core';
+export type { Qwen35Config, Qwen35GenerationConfig, Qwen35GenerationResult } from '@mlx-node/core';
 
 // MoE variant
 export { Qwen35MoeModel, Qwen35MoeModel as Qwen3_5MoeModel } from './stream';
-export type {
-  Qwen35MoeConfig,
-  Qwen35MoeChatConfig,
-  Qwen35MoeChatResult,
-  Qwen35MoeGenerationConfig,
-  Qwen35MoeGenerationResult,
-} from '@mlx-node/core';
+export type { Qwen35MoeConfig, Qwen35MoeGenerationConfig, Qwen35MoeGenerationResult } from '@mlx-node/core';
 
 // Note: Memory management is handled internally by Rust - not exposed to JS
 
@@ -40,8 +28,8 @@ export type {
 export type { DType } from '@mlx-node/core';
 export type { SamplingConfig, BatchGenerationResult } from '@mlx-node/core';
 
-// Chat API types from core (for model.chat() API)
-export type { ToolCallResult, ChatResult, ChatConfig, ChatMessage } from '@mlx-node/core';
+// Unified Chat API types (shared by Qwen3, Qwen3.5, Qwen3.5 MoE)
+export type { ChatConfig, ChatResult, ChatMessage, ToolCallResult, PerformanceMetrics } from '@mlx-node/core';
 
 // Streaming chat API
 export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent } from './stream';
@@ -64,3 +52,6 @@ export { QWEN35_CONFIGS, getQwen35Config } from './models/qwen3_5-configs';
 
 // Tool calling utilities
 export * from './tools';
+
+// Profiling API
+export { enableProfiling, disableProfiling } from './profiling';

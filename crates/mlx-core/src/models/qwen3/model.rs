@@ -27,9 +27,8 @@ use crate::transformer::{
     SchedulerConfig, TransformerBlock,
 };
 
-use super::{
-    BatchGenerationResult, ChatConfig, ChatResult, GenerationConfig, GenerationResult, Qwen3Config,
-};
+use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
+use crate::models::qwen3_5::model::{ChatConfig, ChatResult};
 
 /// Paged attention memory statistics (NAPI-compatible)
 #[napi(object)]
@@ -1348,23 +1347,28 @@ impl Qwen3Model {
         })?;
 
         let add_prompt = add_generation_prompt.unwrap_or(true);
-        let messages_owned: Vec<ChatMessage> = messages.to_vec();
+
+        let suffix = if add_prompt {
+            "<|im_start|>assistant\n"
+        } else {
+            ""
+        };
+        let cap: usize = messages
+            .iter()
+            .map(|m| 15 + m.role.len() + 1 + m.content.len() + 12)
+            .sum::<usize>()
+            + suffix.len();
+        let mut formatted = String::with_capacity(cap);
+        for msg in messages {
+            formatted.push_str("<|im_start|>");
+            formatted.push_str(&msg.role);
+            formatted.push('\n');
+            formatted.push_str(&msg.content);
+            formatted.push_str("<|im_end|>\n");
+        }
+        formatted.push_str(suffix);
 
         napi::bindgen_prelude::spawn_blocking(move || {
-            // Format messages using ChatML template
-            let mut formatted = String::new();
-            for msg in &messages_owned {
-                formatted.push_str(&format!(
-                    "<|im_start|>{}\n{}<|im_end|>\n",
-                    msg.role, msg.content
-                ));
-            }
-
-            if add_prompt {
-                formatted.push_str("<|im_start|>assistant\n");
-            }
-
-            // Encode the formatted text
             tokenizer.encode_sync(&formatted, Some(false))
         })
         .await
@@ -1518,6 +1522,11 @@ impl Qwen3Model {
             min_p: Some(min_p),
         };
 
+        // Profiler for generate decode loop
+        let mut profiler = crate::decode_profiler::DecodeProfiler::new("generate", "qwen3");
+        profiler.set_prompt_tokens(current_ids.shape_at(1).unwrap_or(0) as u32);
+        profiler.snapshot_memory_before();
+
         // PREFILL: Process prompt (chunked for long sequences)
         // Get the sequence length from input shape [1, seq_len]
         let total_seq_len = current_ids.shape_at(1)? as usize;
@@ -1526,6 +1535,7 @@ impl Qwen3Model {
         // Use chunking if prefill_step_size > 0 and seq_len exceeds it
         let use_chunked_prefill = prefill_step_size > 0 && total_seq_len > prefill_step_size;
 
+        profiler.begin_prefill();
         let mut last_logits = if use_chunked_prefill {
             // === CHUNKED PREFILL ===
             // Process prompt in chunks to improve memory efficiency and enable async pipelining
@@ -1631,6 +1641,8 @@ impl Qwen3Model {
                 .squeeze(Some(&[0, 1]))?
         };
 
+        profiler.end_prefill();
+
         // Update rope_offsets after prefill (all tokens have been processed)
         rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
 
@@ -1658,6 +1670,17 @@ impl Qwen3Model {
         // Every 64 tokens is a good balance between memory savings and performance
         const DECODE_CLEANUP_INTERVAL: i32 = 256; // Aligned with mlx-lm
 
+        // Track time from decode start to first token extraction (for accurate TTFT).
+        // Only allocate Instant when chat() requested performance metrics — training
+        // callers never set report_performance so this is always None for them.
+        let report_performance = config.report_performance.unwrap_or(false);
+        let decode_start = if report_performance {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut first_token_elapsed_ms: Option<f64> = None;
+
         // Pre-allocate constant array for incrementing rope offsets (avoids allocation per iteration)
         let one_arr = MxArray::from_int32(&[1], &[1])?;
 
@@ -1675,6 +1698,12 @@ impl Qwen3Model {
 
             // Extract current token value
             let token_value = token.item_at_int32(0)? as u32;
+            profiler.mark_first_token();
+            if let Some(ds) = decode_start
+                && first_token_elapsed_ms.is_none()
+            {
+                first_token_elapsed_ms = Some(ds.elapsed().as_secs_f64() * 1000.0);
+            }
 
             // Add to generated tokens
             generated_tokens.push(token_value);
@@ -1754,7 +1783,12 @@ impl Qwen3Model {
 
             token = next_tok;
             logprobs_arr = next_lp;
+
+            profiler.step();
         }
+
+        profiler.snapshot_memory_after();
+        profiler.report();
 
         // Build result
         let tokens_array =
@@ -1771,6 +1805,7 @@ impl Qwen3Model {
             logprobs: logprobs_array,
             finish_reason: finish_reason.to_string(),
             num_tokens: generated_tokens.len(),
+            first_token_elapsed_ms,
         })
     }
 
@@ -2058,6 +2093,7 @@ impl Qwen3Model {
                 logprobs: logprobs_array,
                 finish_reason: finish_reason.to_string(),
                 num_tokens: generated_tokens.len(),
+                first_token_elapsed_ms: None,
             });
         }
 
@@ -2264,6 +2300,7 @@ impl Qwen3Model {
             logprobs: logprobs_array,
             finish_reason: detailed_finish_reason,
             num_tokens: generated_tokens.len(),
+            first_token_elapsed_ms: None,
         })
     }
 
@@ -4949,6 +4986,7 @@ impl Qwen3Model {
                 logprobs,
                 finish_reason: finish_reason.to_string(),
                 num_tokens: generated_tokens.len(),
+                first_token_elapsed_ms: None,
             })
         })
         .await
@@ -5132,8 +5170,12 @@ impl Qwen3Model {
             )
         })?;
 
-        // Extract tools from config (optional)
+        // Extract tools and report_performance from config
         let tools = config.as_ref().and_then(|c| c.tools.clone());
+        let report_perf = config
+            .as_ref()
+            .and_then(|c| c.report_performance)
+            .unwrap_or(false);
 
         // Convert ChatConfig to GenerationConfig for the internal generate call
         let gen_config = config.map(|c| GenerationConfig {
@@ -5147,13 +5189,22 @@ impl Qwen3Model {
             max_consecutive_tokens: c.max_consecutive_tokens,
             max_ngram_repeats: c.max_ngram_repeats,
             ngram_size: c.ngram_size,
-            eos_token_id: c.eos_token_id,
-            return_logprobs: c.return_logprobs,
+            eos_token_id: None,
+            return_logprobs: None,
             prefill_step_size: None, // Use default (2048)
             kv_cache_bits: None,     // Default: no quantization
             kv_cache_group_size: None,
             num_draft_tokens: None, // Speculative decoding not used in chat()
+            report_performance: c.report_performance,
         });
+
+        // Capture start time BEFORE tokenization + generation so TTFT
+        // reflects the full user-perceived latency.
+        let gen_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         // Apply chat template with tools and encode in a blocking task
         let tokenizer_clone = tokenizer.clone();
@@ -5178,7 +5229,9 @@ impl Qwen3Model {
         })??;
 
         // Generate tokens using the internal generate method
+        let prompt_token_count = input_ids.shape_at(1).unwrap_or(0) as f64;
         let result = self.generate_for_training(&input_ids, gen_config).await?;
+        let gen_elapsed = gen_start.map(|s| s.elapsed());
 
         // Decode the generated tokens in a blocking task
         let result_tokens = result.tokens.clone();
@@ -5204,15 +5257,40 @@ impl Qwen3Model {
             result.finish_reason.clone()
         };
 
+        // Compute performance metrics using actual first-token timing from the decode loop
+        let performance = if let (Some(gen_elapsed), Some(first_tok_ms)) =
+            (gen_elapsed, result.first_token_elapsed_ms)
+        {
+            let total_ms = gen_elapsed.as_secs_f64() * 1000.0;
+            let gen_toks = result.num_tokens as f64;
+            // TTFT = gen_start → first token extracted (includes tokenization + prefill + first eval)
+            let ttft_ms = first_tok_ms;
+            let decode_ms = total_ms - ttft_ms;
+            Some(crate::profiling::PerformanceMetrics {
+                ttft_ms,
+                prefill_tokens_per_second: if ttft_ms > 0.0 {
+                    prompt_token_count / (ttft_ms / 1000.0)
+                } else {
+                    0.0
+                },
+                decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                    (gen_toks - 1.0) / (decode_ms / 1000.0)
+                } else {
+                    0.0
+                },
+            })
+        } else {
+            None
+        };
+
         Ok(ChatResult {
             text: cleaned_text,
             tool_calls,
             thinking,
-            tokens: result.tokens,
-            logprobs: result.logprobs,
+            num_tokens: result.num_tokens as u32,
             finish_reason,
-            num_tokens: result.num_tokens,
             raw_text,
+            performance,
         })
     }
 

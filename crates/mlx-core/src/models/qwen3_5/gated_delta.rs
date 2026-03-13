@@ -3,6 +3,24 @@ use crate::nn::Activations;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
+/// Minimum sequence length to use the chunked prefill kernel.
+/// On M1–M4, the chunked kernel's O(BT^2) overhead outweighs memory bandwidth savings
+/// (no tensor cores to accelerate the quadratic matmuls). On M5+ (gen >= 17), the
+/// Neural Accelerators make simdgroup_matrix operations ~4x faster, so chunked wins.
+const CHUNK_THRESHOLD: i64 = 64;
+
+/// Minimum GPU architecture generation for the chunked kernel.
+/// M5 (gen 17) has Neural Accelerators that make chunked prefill faster than per-step.
+/// On M1–M4 (gen 13–16), the per-step kernel is faster due to simpler ALU patterns.
+const CHUNK_MIN_GPU_GEN: i32 = 17;
+
+/// Returns the GPU architecture generation, cached after first call.
+fn gpu_architecture_gen() -> i32 {
+    use std::sync::OnceLock;
+    static GEN: OnceLock<i32> = OnceLock::new();
+    *GEN.get_or_init(|| unsafe { sys::mlx_gpu_architecture_gen() })
+}
+
 /// Compute decay gate: g = exp(-exp(A_log) * softplus(a + dt_bias))
 ///
 /// Uses a fused C++ implementation that builds the full expression in a single
@@ -19,6 +37,82 @@ fn compute_g(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxArray>
         sys::mlx_fused_compute_g(a_log.as_raw_ptr(), a.as_raw_ptr(), dt_bias.as_raw_ptr())
     };
     MxArray::from_handle(handle, "fused_compute_g")
+}
+
+/// Fused gating: computes both beta and g in a single Metal kernel dispatch.
+///
+/// beta = sigmoid(b)
+/// g = -exp(a_log) * softplus(a + dt_bias)
+///
+/// Returns: (beta [B, T, Hv] in input dtype, g [B, T, Hv] in f32)
+fn fused_gdn_gating(
+    b: &MxArray,
+    a: &MxArray,
+    a_log: &MxArray,
+    dt_bias: &MxArray,
+    num_heads: i32,
+) -> Result<(MxArray, MxArray)> {
+    let total_elements = b.size()? as i32;
+    let mut out_beta: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_g: *mut sys::mlx_array = std::ptr::null_mut();
+
+    let ok = unsafe {
+        sys::mlx_fused_gdn_gating(
+            b.as_raw_ptr(),
+            a.as_raw_ptr(),
+            a_log.as_raw_ptr(),
+            dt_bias.as_raw_ptr(),
+            num_heads,
+            total_elements,
+            &mut out_beta,
+            &mut out_g,
+        )
+    };
+
+    if !ok {
+        return Err(Error::from_reason("Fused GDN gating kernel failed"));
+    }
+
+    let beta = MxArray::from_handle(out_beta, "fused_gating:beta")?;
+    let g = MxArray::from_handle(out_g, "fused_gating:g")?;
+    Ok((beta, g))
+}
+
+/// Chunked gated delta recurrence for prefill (BT=32 tokens per chunk).
+/// Processes multiple tokens in parallel within each chunk.
+fn gated_delta_chunked(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    let mut out_y: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_state: *mut sys::mlx_array = std::ptr::null_mut();
+
+    let ok = unsafe {
+        sys::mlx_gated_delta_chunked(
+            q.as_raw_ptr(),
+            k.as_raw_ptr(),
+            v.as_raw_ptr(),
+            g.as_raw_ptr(),
+            beta.as_raw_ptr(),
+            state.as_raw_ptr(),
+            &mut out_y,
+            &mut out_state,
+        )
+    };
+
+    if !ok {
+        return Err(Error::from_reason(
+            "Chunked gated delta kernel failed (check stderr for details)",
+        ));
+    }
+
+    let y = MxArray::from_handle(out_y, "gated_delta_chunked:y")?;
+    let new_state = MxArray::from_handle(out_state, "gated_delta_chunked:state")?;
+    Ok((y, new_state))
 }
 
 /// Run the gated delta recurrence using a custom Metal kernel.
@@ -247,11 +341,24 @@ pub fn gated_delta_update(
     let v_dim = v.shape_at(3)?;
     let k_dim = q.shape_at(3)?;
 
-    // Compute beta = sigmoid(b): [B, T, Hv]
-    let beta = Activations::sigmoid(b)?;
-
-    // Compute g = exp(-exp(A_log) * softplus(a + dt_bias)): [B, T, Hv]
-    let g = compute_g(a_log, a, dt_bias)?;
+    // Compute beta = sigmoid(b) and g_log = -exp(A_log) * softplus(a + dt_bias)
+    // Try fused Metal kernel first (single dispatch), fall back to separate ops.
+    // g_log is the log-space gate; per-step kernel needs exp(g_log), chunked needs g_log directly.
+    let (beta, g_log) = match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32) {
+        Ok((beta_flat, g_flat)) => {
+            let seq_len_tmp = b.shape_at(1)?;
+            let beta = beta_flat.reshape(&[batch, seq_len_tmp, num_v_heads])?;
+            let g_log = g_flat.reshape(&[batch, seq_len_tmp, num_v_heads])?;
+            (beta, g_log)
+        }
+        Err(_) => {
+            let beta = Activations::sigmoid(b)?;
+            // compute_g returns exp(g_log), so take log to get g_log
+            let g = compute_g(a_log, a, dt_bias)?;
+            let g_log = g.log()?;
+            (beta, g_log)
+        }
+    };
 
     // GQA head expansion: repeat q,k from Hk to Hv heads
     let (q, k) = if num_v_heads != num_k_heads {
@@ -281,16 +388,33 @@ pub fn gated_delta_update(
         None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
     };
 
+    let seq_len = q.shape_at(1)?;
+
     // Use Metal kernel for recurrence (requires Dk divisible by 32 for SIMD register blocking)
     if k_dim % 32 == 0 {
-        match gated_delta_kernel(&q, &k, v, &g, &beta, &initial_state, mask) {
-            Ok(result) => return Ok(result),
-            Err(_) => {
-                // Fall back to ops-based loop (e.g., CPU device or Metal not available)
+        // Chunked kernel for long sequences on M5+ (Neural Accelerator-accelerated prefill).
+        // On M1–M4, per-step kernel is faster (no tensor cores for O(BT^2) matmuls).
+        // Chunked kernel needs g in log-space directly (no exp/log roundtrip).
+        if seq_len >= CHUNK_THRESHOLD
+            && mask.is_none()
+            && gpu_architecture_gen() >= CHUNK_MIN_GPU_GEN
+        {
+            match gated_delta_chunked(&q, &k, v, &g_log, &beta, &initial_state) {
+                Ok(result) => return Ok(result),
+                Err(_) => {
+                    // Fall through to per-step kernel
+                }
             }
+        }
+
+        // Per-step kernel needs exponentiated decay factor
+        let g = g_log.exp()?;
+        if let Ok(result) = gated_delta_kernel(&q, &k, v, &g, &beta, &initial_state, mask) {
+            return Ok(result);
         }
     }
 
-    // Ops-based sequential loop fallback
+    // Ops-based sequential loop fallback (also needs exp(g_log))
+    let g = g_log.exp()?;
     gated_delta_ops(&q, &k, v, &g, &beta, &initial_state, mask)
 }

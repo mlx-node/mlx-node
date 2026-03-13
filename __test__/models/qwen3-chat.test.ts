@@ -37,7 +37,7 @@ describe.sequential('Qwen3 Chat API', () => {
       expect(result).toBeDefined();
       expect(typeof result.text).toBe('string');
       expect(Array.isArray(result.toolCalls)).toBe(true);
-      expect(result.thinking === null || typeof result.thinking === 'string').toBe(true);
+      expect(result.thinking == null || typeof result.thinking === 'string').toBe(true);
       expect(['stop', 'length', 'tool_calls', 'repetition']).toContain(result.finishReason);
       expect(typeof result.numTokens).toBe('number');
       expect(result.numTokens).toBeGreaterThan(0);
@@ -176,7 +176,7 @@ describe.sequential('Qwen3 Chat API', () => {
 
       // With random weights, unlikely to generate <think> tags
       // But thinking field should exist (null or string)
-      expect(result.thinking === null || typeof result.thinking === 'string').toBe(true);
+      expect(result.thinking == null || typeof result.thinking === 'string').toBe(true);
     });
   });
 

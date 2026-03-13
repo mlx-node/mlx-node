@@ -543,6 +543,14 @@ See `docs/FEATURE_ALIGNMENT_SESSION.md` for detailed examples
 - **Achieved speedups**: Sampling (3-5x), advantages (2-3x), padding (5-10x)
 - **Memory efficiency**: BatchKVCache, RotatingKVCache for bounded memory usage
 
+### Profiling API
+
+Enable via `enableProfiling()` / `disableProfiling()` from `@mlx-node/lm`, or set `MLX_PROFILE_DECODE=1` env var (highest priority). Writes a JSON report with per-generation timing, phase breakdown, memory snapshots, and TTFT.
+
+**Key files**: `crates/mlx-core/src/profiling.rs` (global store + NAPI exports), `crates/mlx-core/src/decode_profiler.rs` (per-loop instrumentation), `packages/lm/src/profiling.ts` (JS API + env var auto-mode)
+
+**MLX lazy evaluation and profiling metrics**: MLX uses lazy evaluation — `forward_inner()` only builds the computation graph without executing GPU work. The actual prefill computation is triggered by the first `y.eval()` call in the decode loop. As a result, the profiler's `prefillMs` field measures only graph construction time (~1ms), not the real GPU prefill latency. The true user-perceived prefill cost is captured by `timeToFirstTokenMs` (TTFT), which measures from prefill start to first token extraction and includes the first `eval_token` where the lazy prefill graph is materialized on GPU. When interpreting profiling reports, use TTFT (not `prefillMs`) as the real prefill latency indicator.
+
 ---
 
 ## 📚 References

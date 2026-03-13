@@ -455,6 +455,65 @@ fn u16_to_bytes(data: &[u16]) -> Vec<u8> {
     data.iter().flat_map(|&x| x.to_le_bytes()).collect()
 }
 
+/// Load tensors from a safetensors file using MLX's native lazy loader.
+/// Arrays are backed by deferred disk reads — data is only materialized on eval.
+/// This uses near-zero memory at load time vs the eager `SafeTensorsFile::load_tensors`.
+pub fn load_safetensors_lazy<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<HashMap<String, crate::array::MxArray>> {
+    use mlx_sys as sys;
+    use std::collections::HashMap;
+
+    let path_str = path
+        .as_ref()
+        .to_str()
+        .ok_or_else(|| Error::from_reason("Path is not valid UTF-8"))?;
+    let c_path = std::ffi::CString::new(path_str)
+        .map_err(|_| Error::from_reason("Path contains null byte"))?;
+
+    // Context struct passed through FFI callback
+    struct LoadCtx {
+        tensors: HashMap<String, crate::array::MxArray>,
+    }
+
+    unsafe extern "C" fn on_tensor(
+        name: *const std::os::raw::c_char,
+        name_len: usize,
+        handle: *mut sys::mlx_array,
+        ctx: *mut std::os::raw::c_void,
+    ) {
+        unsafe {
+            let ctx = &mut *(ctx as *mut LoadCtx);
+            let name_bytes = std::slice::from_raw_parts(name as *const u8, name_len);
+            let name = String::from_utf8_lossy(name_bytes).to_string();
+            if let Ok(arr) = crate::array::MxArray::from_handle(handle, "lazy_load") {
+                ctx.tensors.insert(name, arr);
+            }
+        }
+    }
+
+    let mut ctx = LoadCtx {
+        tensors: HashMap::new(),
+    };
+
+    let count = unsafe {
+        sys::mlx_load_safetensors(
+            c_path.as_ptr(),
+            on_tensor,
+            &mut ctx as *mut LoadCtx as *mut std::os::raw::c_void,
+        )
+    };
+
+    if count < 0 {
+        return Err(Error::from_reason(format!(
+            "Failed to load safetensors: {}",
+            path_str
+        )));
+    }
+
+    Ok(ctx.tensors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
