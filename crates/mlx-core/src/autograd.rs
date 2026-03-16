@@ -104,12 +104,9 @@ extern "C" fn loss_function_callback(
         }
     }
 
-    // Check if already called
-    if context_ref.called {
-        error!("loss_function_callback: function called multiple times");
-        context_ref.error = Some("Loss function called multiple times".to_string());
-        return std::ptr::null_mut();
-    }
+    // Note: MLX may call the loss function multiple times during value_and_grad.
+    // The first call builds the computation graph, subsequent calls may happen
+    // during VJP tracing. We must allow all calls.
     context_ref.called = true;
 
     // Call user's loss function

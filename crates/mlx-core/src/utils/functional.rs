@@ -792,34 +792,29 @@ fn rms_norm_gated_functional(
     y_normed.mul(&z_activated)
 }
 
-/// Functional depthwise conv1d.
-/// weight: [channels, 1, kernel_size], input: [B, T, channels]
-/// Implements as a series of shifts and multiplies (differentiable).
+/// Functional depthwise conv1d using MLX's native conv1d (has VJP support).
+/// weight: [channels, kernel_size, 1] (MLX Conv1d format for depthwise)
+/// input: [B, T, channels]
+/// groups = channels (depthwise convolution)
 fn functional_depthwise_conv1d(
     input: &MxArray,
     weight: &MxArray,
     channels: i64,
-    kernel_size: i64,
+    _kernel_size: i64,
 ) -> Result<MxArray> {
-    let batch = input.shape_at(0)?;
-    let seq_len = input.shape_at(1)?;
-    let out_len = seq_len - kernel_size + 1;
-
-    // weight shape: [channels, 1, kernel_size] -> squeeze to [channels, kernel_size]
-    let w = weight.squeeze(Some(&[1]))?;
-
-    // For each kernel position k, slice input[:, k:k+out_len, :] and multiply by w[:, k]
-    let mut result = MxArray::zeros(&[batch, out_len, channels], Some(input.dtype()?))?;
-    for k in 0..kernel_size {
-        let input_slice = input.slice_axis(1, k, k + out_len)?; // [B, out_len, C]
-        let w_k = w.slice_axis(1, k, k + 1)?; // [C, 1]
-        let w_k = w_k.squeeze(Some(&[1]))?; // [C]
-        // Broadcast multiply: [B, out_len, C] * [C] -> [B, out_len, C]
-        let contribution = input_slice.mul(&w_k)?;
-        result = result.add(&contribution)?;
-    }
-
-    Ok(result)
+    // Use MLX's native conv1d which has proper VJP for autograd.
+    // Parameters: stride=1, padding=0, dilation=1, groups=channels (depthwise)
+    let handle = unsafe {
+        mlx_sys::mlx_conv1d(
+            input.as_raw_ptr(),
+            weight.as_raw_ptr(),
+            1,               // stride
+            0,               // padding (we prepend zeros manually)
+            1,               // dilation
+            channels as i32, // groups = channels for depthwise
+        )
+    };
+    MxArray::from_handle(handle, "functional_conv1d")
 }
 
 /// GatedDeltaNet functional forward (linear attention layer).
@@ -1145,13 +1140,15 @@ pub fn qwen3_5_forward_hidden_states(
     // Transformer blocks
     for layer_idx in 0..config.num_layers as usize {
         h = qwen3_5_block_functional(params, &h, config, layer_idx)?;
+        if layer_idx < 3 || layer_idx == config.num_layers as usize - 1 {}
     }
 
     // Final norm
     let final_norm_weight = params
         .get("final_norm.weight")
         .ok_or_else(|| Error::from_reason("Missing final_norm.weight"))?;
-    rms_norm_functional(&h, final_norm_weight, config.rms_norm_eps)
+    let result = rms_norm_functional(&h, final_norm_weight, config.rms_norm_eps)?;
+    Ok(result)
 }
 
 // ============================================

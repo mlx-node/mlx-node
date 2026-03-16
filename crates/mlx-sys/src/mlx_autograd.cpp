@@ -32,20 +32,28 @@ class LossFunctionWrapper {
 
   array operator()(const std::vector<array>& inputs) {
     // Convert arrays to mlx_array* handles for FFI boundary
-    // Note: This creates heap allocations but does NOT copy tensor data.
-    // MLX arrays use shared_ptr internally, so the "copy" is just a
-    // reference count increment (~16-24 bytes per array object).
     std::vector<mlx_array*> handles;
     handles.reserve(inputs.size());
     for (const auto& arr : inputs) {
-      // new array(arr) is a shallow copy - just copies the shared_ptr
       handles.push_back(reinterpret_cast<mlx_array*>(new array(arr)));
     }
 
-    // Call user function
-    mlx_array* loss_handle = fn_(handles.data(), handles.size(), context_);
+    // Call user function — the Rust callback may invoke MLX FFI functions
+    // that throw C++ exceptions (e.g., shape mismatches). We catch those
+    // here to prevent them from propagating through the Rust FFI boundary.
+    mlx_array* loss_handle = nullptr;
+    try {
+      loss_handle = fn_(handles.data(), handles.size(), context_);
+    } catch (const std::exception& e) {
+      // Clean up handles before rethrowing
+      for (auto* handle : handles) {
+        delete reinterpret_cast<array*>(handle);
+      }
+      std::cerr << "[MLX AUTOGRAD] Loss callback threw C++ exception: " << e.what() << std::endl;
+      throw;  // Rethrow to be caught by outer try/catch
+    }
 
-    // Clean up input handles - Rust callback copies these, so we own them
+    // Clean up input handles
     for (auto* handle : handles) {
       delete reinterpret_cast<array*>(handle);
     }
@@ -56,11 +64,7 @@ class LossFunctionWrapper {
       throw std::runtime_error("Loss function returned invalid handle");
     }
 
-    // Move the result to avoid an extra copy
     array result = std::move(*loss_ptr);
-
-    // Clean up the handle that Rust returned (via std::mem::forget)
-    // Rust prevents its drop to avoid double-free, so we must delete it here
     delete loss_ptr;
 
     return result;
@@ -195,16 +199,30 @@ extern "C" size_t mlx_value_and_gradients(LossFunctionPtr loss_fn,
   auto value_and_grad_fn = mlx::core::value_and_grad(loss_func, argnums);
 
   // Call with inputs
-  auto [value, gradients] = value_and_grad_fn(inputs);
+  std::vector<array> gradients;
+  array value = array(0.0f);
+  try {
+    auto result = value_and_grad_fn(inputs);
+    value = std::move(result.first);
+    gradients = std::move(result.second);
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX AUTOGRAD ERROR] value_and_grad failed: " << e.what() << std::endl;
+    return 0;
+  }
 
   // Force evaluation AND synchronization to prevent command buffer overflow during training
   // eval() materializes the computation graph, synchronize() waits for GPU completion
   // This is critical for long training runs to avoid Metal GPU timeout and context leaks
-  value.eval();
-  for (auto& grad : gradients) {
-    grad.eval();
+  try {
+    value.eval();
+    for (auto& grad : gradients) {
+      grad.eval();
+    }
+    mlx::core::synchronize();  // Wait for GPU to finish before continuing
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX AUTOGRAD ERROR] eval/sync failed: " << e.what() << std::endl;
+    return 0;
   }
-  mlx::core::synchronize();  // Wait for GPU to finish before continuing
 
   // Store loss value (for scalar functions, value is directly an array)
   *loss_handle = reinterpret_cast<mlx_array*>(new array(std::move(value)));
