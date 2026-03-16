@@ -339,7 +339,7 @@ impl SftTrainingEngine {
                     let model = model_arc.read().map_err(|_| {
                         Error::new(Status::GenericFailure, "Failed to acquire model read lock")
                     })?;
-                    model.get_parameters()
+                    model.get_parameters()?
                 };
 
                 // Build loss config
@@ -600,7 +600,7 @@ impl SftTrainingEngine {
                         let model = model_arc.read().map_err(|_| {
                             Error::new(Status::GenericFailure, "Failed to acquire model read lock")
                         })?;
-                        model.get_parameters()
+                        model.get_parameters()?
                     } else {
                         // Reuse params from start of step - no weights changed
                         params.clone()
@@ -715,7 +715,7 @@ impl SftTrainingEngine {
             let model = model_arc.read().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire model read lock")
             })?;
-            model.get_parameters()
+            model.get_parameters()?
         };
 
         // Apply weight decay to gradients if configured

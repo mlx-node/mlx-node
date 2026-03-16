@@ -2200,7 +2200,7 @@ impl Qwen3_5Model {
     /// - All layers: `layers.{i}.{input_layernorm,post_attention_layernorm}.weight`
     /// - `final_norm.weight`
     /// - `lm_head.weight` (if not tied)
-    pub(crate) fn get_parameters_for_training(&self) -> HashMap<String, MxArray> {
+    pub(crate) fn get_parameters_for_training(&self) -> Result<HashMap<String, MxArray>> {
         use super::decoder_layer::AttentionType;
 
         let mut params = HashMap::new();
@@ -2208,15 +2208,15 @@ impl Qwen3_5Model {
         let layers_guard = self
             .layers
             .read()
-            .expect("Failed to acquire layers read lock");
+            .map_err(|_| Error::from_reason("Failed to acquire layers read lock"))?;
         let final_norm_guard = self
             .final_norm
             .read()
-            .expect("Failed to acquire final_norm read lock");
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
         let lm_head_guard = self
             .lm_head
             .read()
-            .expect("Failed to acquire lm_head read lock");
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
 
         // Embedding
         params.insert("embedding.weight".to_string(), self.embedding.get_weight());
@@ -2316,7 +2316,7 @@ impl Qwen3_5Model {
             params.insert("lm_head.weight".to_string(), lm_head.get_weight());
         }
 
-        params
+        Ok(params)
     }
 
     /// Apply gradients to model parameters using pre-fetched params.
@@ -2431,6 +2431,11 @@ impl Qwen3_5Model {
             layer.set_input_layernorm_weight(updated_param)?;
         } else if name.ends_with(".post_attention_layernorm.weight") {
             layer.set_post_attention_layernorm_weight(updated_param)?;
+        } else {
+            tracing::warn!(
+                "Unrecognized parameter name in apply_layer_gradient: {}",
+                name
+            );
         }
 
         Ok(())
@@ -2468,19 +2473,19 @@ impl Qwen3_5Model {
         let mut layers_guard = self
             .layers
             .write()
-            .map_err(|_| Error::from_reason("Lock"))?;
+            .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
         let final_norm_guard = self
             .final_norm
             .read()
-            .map_err(|_| Error::from_reason("Lock"))?;
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
         let lm_head_guard = self
             .lm_head
             .read()
-            .map_err(|_| Error::from_reason("Lock"))?;
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
         let mut caches_guard = self
             .caches
             .write()
-            .map_err(|_| Error::from_reason("Lock"))?;
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
 
         let fa_idx = self.fa_idx;
         let mut forward_fn = |ids: &MxArray| -> Result<MxArray> {

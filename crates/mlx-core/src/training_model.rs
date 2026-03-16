@@ -86,7 +86,7 @@ impl ModelType {
 /// wrapping in `TrainableModelEnum`.
 pub(crate) trait TrainableModel: Send + Sync {
     /// Extract all trainable parameters as a name→array map.
-    fn get_parameters(&self) -> HashMap<String, MxArray>;
+    fn get_parameters(&self) -> Result<HashMap<String, MxArray>>;
 
     /// Apply gradients using SGD: param = param - lr * grad.
     fn apply_gradients_with_params(
@@ -134,9 +134,9 @@ pub(crate) enum TrainableModelEnum {
 }
 
 impl TrainableModel for TrainableModelEnum {
-    fn get_parameters(&self) -> HashMap<String, MxArray> {
+    fn get_parameters(&self) -> Result<HashMap<String, MxArray>> {
         match self {
-            TrainableModelEnum::Qwen3(m) => m.get_parameters(),
+            TrainableModelEnum::Qwen3(m) => Ok(m.get_parameters()),
             TrainableModelEnum::Qwen35Dense(m) => m.get_parameters_for_training(),
             TrainableModelEnum::Qwen35Moe(m) => m.get_parameters_for_training(),
         }

@@ -529,8 +529,10 @@ export class GRPOTrainer<T = unknown> {
       this.engine = GrpoTrainingEngine.fromQwen35(model, engineConfig);
     } else if (model instanceof Qwen35MoeModel) {
       this.engine = GrpoTrainingEngine.fromQwen35Moe(model, engineConfig);
-    } else {
+    } else if (model instanceof Qwen3Model) {
       this.engine = new GrpoTrainingEngine(model, engineConfig);
+    } else {
+      throw new Error(`Unsupported model type: ${(model as object).constructor?.name ?? typeof model}`);
     }
 
     // Setup stdin handler if TUI mode
@@ -995,8 +997,10 @@ export class GRPOTrainer<T = unknown> {
       model = await Qwen35MoeModel.loadPretrained(modelPath);
     } else if (modelType === 'qwen3_5') {
       model = await Qwen35Model.loadPretrained(modelPath);
-    } else {
+    } else if (modelType === 'qwen3') {
       model = await Qwen3Model.loadPretrained(modelPath);
+    } else {
+      throw new Error(`Unsupported model_type "${modelType}" in ${modelPath}/config.json`);
     }
 
     logger.status('loading', `${modelName} loaded (${modelType})`);

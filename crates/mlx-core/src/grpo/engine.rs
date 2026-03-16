@@ -651,7 +651,7 @@ impl GRPOTrainingEngine {
                 let model = model_arc.read().map_err(|_| {
                     Error::new(Status::GenericFailure, "Failed to acquire model read lock")
                 })?;
-                model.get_parameters()
+                model.get_parameters()?
             };
 
             let prompt_refs: Vec<&MxArray> = prompt_tokens_all.iter().collect();
@@ -1262,7 +1262,7 @@ impl GRPOTrainingEngine {
                 let model = model_arc.read().map_err(|_| {
                     Error::new(Status::GenericFailure, "Failed to acquire model read lock")
                 })?;
-                model.get_parameters()
+                model.get_parameters()?
             };
 
             let prompt_refs: Vec<&MxArray> = prompt_tokens_all.iter().collect();
@@ -1944,7 +1944,7 @@ impl GRPOTrainingEngine {
                 let model = model_arc.read().map_err(|_| {
                     Error::new(Status::GenericFailure, "Failed to acquire model read lock")
                 })?;
-                model.get_parameters()
+                model.get_parameters()?
             };
 
             let prompt_refs: Vec<&MxArray> = prompt_tokens.iter().collect();

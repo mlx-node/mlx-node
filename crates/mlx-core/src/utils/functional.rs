@@ -788,7 +788,7 @@ fn rms_norm_gated_functional(
     eps: f64,
 ) -> Result<MxArray> {
     let y_normed = rms_norm_functional(y, weight, eps)?;
-    let z_activated = Activations::silu(z)?;
+    let z_activated = Activations::silu_for_autograd(z)?;
     y_normed.mul(&z_activated)
 }
 
@@ -888,8 +888,8 @@ fn gated_delta_net_functional(
         conv_out
     };
 
-    // SiLU activation
-    let conv_out = Activations::silu(&conv_out)?;
+    // SiLU activation (autograd-safe: tanh-based, avoids NaN gradients)
+    let conv_out = Activations::silu_for_autograd(&conv_out)?;
 
     // Split into q, k, v
     let q_flat = conv_out.slice_axis(2, 0, key_dim as i64)?;
@@ -1190,7 +1190,9 @@ fn functional_gather_sort(x: &MxArray, indices: &MxArray) -> Result<GatherSortRe
     let idx_sorted = flat_indices.take(&order, 0)?;
 
     let x_shape = x.shape()?;
-    let d = *x_shape.last().unwrap();
+    let d = *x_shape
+        .last()
+        .ok_or_else(|| Error::from_reason("gather_sort: x has empty shape"))?;
     let x_flat = x.reshape(&[-1, 1, d])?;
     let m_scalar = MxArray::scalar_int(m as i32)?;
     let token_indices = order.floor_divide(&m_scalar)?;
@@ -1284,13 +1286,15 @@ fn sparse_moe_functional(
         let idx = &sorted.idx_sorted;
         let gate_out = sorted.x_sorted.gather_mm(&gate_proj_t, idx, true)?;
         let up_out = sorted.x_sorted.gather_mm(&up_proj_t, idx, true)?;
-        let activated = Activations::swiglu(&gate_out, &up_out)?;
+        let gate_act = Activations::silu_for_autograd(&gate_out)?;
+        let activated = gate_act.mul(&up_out)?;
         let expert_out = activated.gather_mm(&down_proj_t, idx, true)?;
         functional_scatter_unsort(&expert_out, &sorted.inv_order, &[ne, k as i64])?
     } else {
         let gate_out = x_expanded.gather_mm(&gate_proj_t, &top_indices, false)?;
         let up_out = x_expanded.gather_mm(&up_proj_t, &top_indices, false)?;
-        let activated = Activations::swiglu(&gate_out, &up_out)?;
+        let gate_act = Activations::silu_for_autograd(&gate_out)?;
+        let activated = gate_act.mul(&up_out)?;
         activated.gather_mm(&down_proj_t, &top_indices, false)?
     };
 
