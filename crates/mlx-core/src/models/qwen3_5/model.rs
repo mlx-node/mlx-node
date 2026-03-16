@@ -2543,37 +2543,6 @@ impl Qwen3_5Model {
         let token_ids = tokens.to_uint32()?;
         tokenizer.decode_sync(&token_ids, true)
     }
-
-    /// Calculate total memory size of all parameters in bytes.
-    pub(crate) fn calculate_memory_size(&self) -> usize {
-        let params = self.get_parameters_for_training();
-        params.values().map(|p| p.nbytes()).sum()
-    }
-
-    /// Save model weights and config to a directory.
-    pub(crate) fn save_model_sync(&self, path: &str) -> Result<()> {
-        use std::fs;
-
-        // Ensure directory exists
-        fs::create_dir_all(path)
-            .map_err(|e| Error::from_reason(format!("Failed to create directory: {}", e)))?;
-
-        // Save config.json
-        let config_json = serde_json::to_string_pretty(&self.config)
-            .map_err(|e| Error::from_reason(format!("Failed to serialize config: {}", e)))?;
-        fs::write(format!("{}/config.json", path), config_json)
-            .map_err(|e| Error::from_reason(format!("Failed to write config: {}", e)))?;
-
-        // Save weights as safetensors
-        let params = self.get_parameters_for_training();
-        crate::utils::safetensors::save_safetensors(
-            format!("{}/model.safetensors", path),
-            &params,
-            None,
-        )?;
-
-        Ok(())
-    }
 }
 
 // ============================================================================

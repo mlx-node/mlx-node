@@ -207,53 +207,6 @@ pub(crate) fn compute_token_accuracy(
     }
 }
 
-/// Compute SFT loss only (no gradients)
-///
-/// Useful for evaluation/validation without the overhead of gradient computation.
-pub(crate) fn compute_sft_loss_only(
-    model_type: &ModelType,
-    model_params: &HashMap<String, MxArray>,
-    input_ids: &MxArray,
-    labels: &MxArray,
-    loss_config: SftLossConfig,
-) -> Result<f64> {
-    // Build param dict
-    let param_dict: HashMap<String, MxArray> = model_params.clone();
-
-    // Forward pass
-    let logits = functional::forward_functional_dispatch(model_type, &param_dict, input_ids)?;
-
-    // Get shapes
-    let batch_size = logits.shape_at(0)?;
-    let seq_len = logits.shape_at(1)?;
-    let vocab_size = logits.shape_at(2)?;
-
-    // Shift for next-token prediction
-    let shift_logits = logits.slice(&[0, 0, 0], &[batch_size, seq_len - 1, vocab_size])?;
-    let shift_labels = labels.slice(&[0, 1], &[batch_size, seq_len])?;
-
-    // Reshape
-    let logits_flat = shift_logits.reshape(&[(batch_size) * (seq_len - 1), vocab_size])?;
-    let labels_flat = shift_labels.reshape(&[(batch_size) * (seq_len - 1)])?;
-
-    // Compute loss
-    let ignore_idx = loss_config.ignore_index.unwrap_or(-100);
-    let label_smoothing = loss_config.label_smoothing.unwrap_or(0.0);
-
-    let loss = Losses::cross_entropy(
-        &logits_flat,
-        &labels_flat,
-        None,
-        Some(ignore_idx),
-        Some(label_smoothing),
-    )?;
-
-    loss.eval();
-    let loss_value = loss.item_at_float32(0)? as f64;
-
-    Ok(loss_value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

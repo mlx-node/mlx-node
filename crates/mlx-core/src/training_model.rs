@@ -79,12 +79,12 @@ impl ModelType {
 
 /// Common training interface for all model families.
 ///
-/// This trait is Rust-internal only (not exposed via NAPI). All methods are synchronous
-/// to be compatible with `spawn_blocking` usage in engines.
+/// This trait is Rust-internal only (not exposed via NAPI). Methods that engines
+/// call through the trait during training steps. Methods like `clone_for_training`,
+/// `calculate_memory_size`, and `save_model_sync` exist on concrete model types
+/// but are NOT in this trait — engines call them on the concrete types before
+/// wrapping in `TrainableModelEnum`.
 pub(crate) trait TrainableModel: Send + Sync {
-    /// Get the model type (with config) for autograd dispatch.
-    fn model_type(&self) -> ModelType;
-
     /// Extract all trainable parameters as a name→array map.
     fn get_parameters(&self) -> HashMap<String, MxArray>;
 
@@ -95,9 +95,6 @@ pub(crate) trait TrainableModel: Send + Sync {
         lr: f64,
         params: &HashMap<String, MxArray>,
     ) -> Result<()>;
-
-    /// Create a cheap clone for training sessions (Arc-clone, fresh caches).
-    fn clone_for_training(&self) -> Result<TrainableModelEnum>;
 
     /// Tokenize messages using the model's chat template.
     fn apply_chat_template_sync(
@@ -125,12 +122,6 @@ pub(crate) trait TrainableModel: Send + Sync {
 
     /// Decode token IDs to text.
     fn decode_tokens_sync(&self, tokens: &MxArray) -> Result<String>;
-
-    /// Calculate total memory size of all parameters in bytes.
-    fn calculate_memory_size(&self) -> usize;
-
-    /// Save model weights and config to a directory.
-    fn save_model_sync(&self, path: &str) -> Result<()>;
 }
 
 /// Enum wrapping all trainable model types.
@@ -143,15 +134,6 @@ pub(crate) enum TrainableModelEnum {
 }
 
 impl TrainableModel for TrainableModelEnum {
-    // These two methods have non-uniform dispatch (different method names per variant)
-    fn model_type(&self) -> ModelType {
-        match self {
-            TrainableModelEnum::Qwen3(m) => ModelType::Qwen3(m.get_config()),
-            TrainableModelEnum::Qwen35Dense(m) => ModelType::Qwen35Dense(m.get_config()),
-            TrainableModelEnum::Qwen35Moe(m) => ModelType::Qwen35Moe(m.get_config()),
-        }
-    }
-
     fn get_parameters(&self) -> HashMap<String, MxArray> {
         match self {
             TrainableModelEnum::Qwen3(m) => m.get_parameters(),
@@ -160,19 +142,6 @@ impl TrainableModel for TrainableModelEnum {
         }
     }
 
-    fn clone_for_training(&self) -> Result<TrainableModelEnum> {
-        match self {
-            TrainableModelEnum::Qwen3(m) => Ok(TrainableModelEnum::Qwen3(m.clone_for_session()?)),
-            TrainableModelEnum::Qwen35Dense(m) => {
-                Ok(TrainableModelEnum::Qwen35Dense(m.clone_for_training()?))
-            }
-            TrainableModelEnum::Qwen35Moe(m) => {
-                Ok(TrainableModelEnum::Qwen35Moe(m.clone_for_training()?))
-            }
-        }
-    }
-
-    // All remaining methods have uniform dispatch (same method name on all variants)
     fn apply_gradients_with_params(
         &mut self,
         grads: HashMap<String, &MxArray>,
@@ -217,14 +186,6 @@ impl TrainableModel for TrainableModelEnum {
 
     fn decode_tokens_sync(&self, tokens: &MxArray) -> Result<String> {
         dispatch!(self, decode_tokens_sync(tokens))
-    }
-
-    fn calculate_memory_size(&self) -> usize {
-        dispatch!(self, calculate_memory_size())
-    }
-
-    fn save_model_sync(&self, path: &str) -> Result<()> {
-        dispatch!(self, save_model_sync(path))
     }
 }
 

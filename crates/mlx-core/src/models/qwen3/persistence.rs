@@ -635,31 +635,6 @@ impl Qwen3Model {
         Ok(promise)
     }
 
-    /// Save model synchronously (for use from training engines via TrainableModel trait)
-    pub(crate) fn save_model_sync(&self, path: &str) -> Result<()> {
-        let params = self.get_parameters();
-
-        // Ensure directory exists
-        std::fs::create_dir_all(path)
-            .map_err(|e| Error::from_reason(format!("Failed to create directory: {}", e)))?;
-
-        // Save config.json
-        let config = self.get_config();
-        let config_json = serde_json::to_string_pretty(&config)
-            .map_err(|e| Error::from_reason(format!("Failed to serialize config: {}", e)))?;
-        std::fs::write(format!("{}/config.json", path), config_json)
-            .map_err(|e| Error::from_reason(format!("Failed to write config: {}", e)))?;
-
-        // Save weights as safetensors
-        save_safetensors(
-            std::path::Path::new(path).join("weights.safetensors"),
-            &params,
-            None,
-        )?;
-
-        Ok(())
-    }
-
     /// Validate that a set of parameters has all required weights with correct shapes
     ///
     /// This is useful for validating parameters before loading them into a model,
