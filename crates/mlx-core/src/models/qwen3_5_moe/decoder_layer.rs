@@ -80,12 +80,13 @@ impl DecoderLayer {
         mask: Option<&MxArray>,
         cache: Option<&mut Qwen3_5LayerCache>,
         position_ids: Option<&MxArray>,
+        use_kernel: bool,
     ) -> Result<MxArray> {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = match &mut self.attn {
             AttentionType::Linear(gdn) => {
                 let ac = cache.and_then(|c| c.as_arrays_cache_mut());
-                gdn.forward(&normed, mask, ac)?
+                gdn.forward(&normed, mask, ac, use_kernel)?
             }
             AttentionType::Full(attn) => {
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
@@ -110,6 +111,16 @@ impl DecoderLayer {
 
     pub fn set_post_attention_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {
         self.post_attention_layernorm.set_weight(w)
+    }
+
+    // ========== Weight getters (for training parameter extraction) ==========
+
+    pub fn get_input_layernorm_weight(&self) -> MxArray {
+        self.input_layernorm.get_weight()
+    }
+
+    pub fn get_post_attention_layernorm_weight(&self) -> MxArray {
+        self.post_attention_layernorm.get_weight()
     }
 
     pub fn set_quantized_dense_mlp(

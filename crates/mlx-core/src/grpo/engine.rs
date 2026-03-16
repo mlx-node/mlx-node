@@ -51,10 +51,13 @@ use crate::grpo::rewards::{
     BuiltinRewardConfig, JsonSchemaReward, LengthReward, RewardRegistry, ToolUseReward,
     XMLFormatReward,
 };
-use crate::models::qwen3::{GenerationConfig, Qwen3Config, Qwen3Model};
+use crate::models::qwen3::{GenerationConfig, Qwen3Model};
+use crate::models::qwen3_5::model::Qwen3_5Model;
+use crate::models::qwen3_5_moe::model::Qwen3_5MoeModel;
 use crate::optimizers::GradientUtils;
 use crate::tokenizer::{ChatMessage, ToolDefinition};
 use crate::tools::build_reward_outputs;
+use crate::training_model::{ModelType, TrainableModel, TrainableModelEnum};
 
 /// Configuration for the GRPO training engine
 #[napi(object)]
@@ -343,9 +346,9 @@ impl Default for EngineState {
 #[napi]
 pub struct GRPOTrainingEngine {
     /// The model being trained
-    model: Arc<RwLock<Qwen3Model>>,
-    /// Model configuration (for functional forward pass)
-    model_config: Qwen3Config,
+    model: Arc<RwLock<TrainableModelEnum>>,
+    /// Model type (carries config for functional forward pass in autograd)
+    model_type: ModelType,
     /// Engine configuration
     config: GRPOEngineConfig,
     /// Reward registry (built-in rewards)
@@ -356,26 +359,72 @@ pub struct GRPOTrainingEngine {
 
 #[napi]
 impl GRPOTrainingEngine {
-    /// Create a new training engine from an existing model
+    /// Create a new training engine from a Qwen3 model
     ///
     /// # Arguments
     /// * `model` - The Qwen3 model to train (will be cloned internally)
     /// * `config` - Engine configuration
     #[napi(constructor)]
     pub fn new(model: &Qwen3Model, config: GRPOEngineConfig) -> Result<Self> {
-        let model_config = model.get_config();
+        let model_type = ModelType::Qwen3(model.get_config());
 
         info!(
             "Creating training engine: {} layers, {} hidden, eos_token_id={}, pad_token_id={}",
-            model_config.num_layers,
-            model_config.hidden_size,
-            model_config.eos_token_id,
-            model_config.pad_token_id
+            model_type.num_layers(),
+            model_type.hidden_size(),
+            model_type.eos_token_id(),
+            model_type.pad_token_id()
         );
 
         Ok(Self {
-            model: Arc::new(RwLock::new(model.clone_for_session()?)),
-            model_config,
+            model: Arc::new(RwLock::new(TrainableModelEnum::Qwen3(
+                model.clone_for_session()?,
+            ))),
+            model_type,
+            config,
+            reward_registry: RewardRegistry::new(),
+            state: Arc::new(RwLock::new(EngineState::default())),
+        })
+    }
+
+    /// Create a new training engine from a Qwen3.5 dense model
+    #[napi(factory)]
+    pub fn from_qwen35(model: &Qwen3_5Model, config: GRPOEngineConfig) -> Result<Self> {
+        let model_type = ModelType::Qwen35Dense(model.get_config());
+
+        info!(
+            "Creating training engine (Qwen3.5 Dense): {} layers, {} hidden",
+            model_type.num_layers(),
+            model_type.hidden_size()
+        );
+
+        Ok(Self {
+            model: Arc::new(RwLock::new(TrainableModelEnum::Qwen35Dense(
+                model.clone_for_training()?,
+            ))),
+            model_type,
+            config,
+            reward_registry: RewardRegistry::new(),
+            state: Arc::new(RwLock::new(EngineState::default())),
+        })
+    }
+
+    /// Create a new training engine from a Qwen3.5 MoE model
+    #[napi(factory)]
+    pub fn from_qwen35_moe(model: &Qwen3_5MoeModel, config: GRPOEngineConfig) -> Result<Self> {
+        let model_type = ModelType::Qwen35Moe(model.get_config());
+
+        info!(
+            "Creating training engine (Qwen3.5 MoE): {} layers, {} hidden",
+            model_type.num_layers(),
+            model_type.hidden_size()
+        );
+
+        Ok(Self {
+            model: Arc::new(RwLock::new(TrainableModelEnum::Qwen35Moe(
+                model.clone_for_training()?,
+            ))),
+            model_type,
             config,
             reward_registry: RewardRegistry::new(),
             state: Arc::new(RwLock::new(EngineState::default())),
@@ -493,7 +542,7 @@ impl GRPOTrainingEngine {
         // Clone Arcs for the blocking task
         let model_arc = Arc::clone(&self.model);
         let state_arc = Arc::clone(&self.state);
-        let model_config = self.model_config.clone();
+        let model_type = self.model_type.clone();
         let config = self.config.clone();
         let enable_thinking = config.enable_thinking;
         let tools = config.tools.clone();
@@ -510,7 +559,7 @@ impl GRPOTrainingEngine {
             max_consecutive_tokens: Some(16),
             max_ngram_repeats: Some(8),
             ngram_size: Some(3),
-            eos_token_id: Some(model_config.eos_token_id),
+            eos_token_id: Some(model_type.eos_token_id()),
             return_logprobs: Some(true),
             prefill_step_size: None, // Use default (2048)
             kv_cache_bits: None,     // Default: no quantization
@@ -610,7 +659,7 @@ impl GRPOTrainingEngine {
             let logprob_refs: Vec<&MxArray> = completion_logprobs_all.iter().collect();
 
             let (loss_value, gradients) = compute_loss_and_gradients_autograd(
-                &model_config,
+                &model_type,
                 &params,
                 &prompt_refs,
                 &completion_refs,
@@ -816,7 +865,7 @@ impl GRPOTrainingEngine {
 
                 let grads_refs: HashMap<String, &MxArray> =
                     grads.iter().map(|(k, v)| (k.clone(), v)).collect();
-                model_mut.apply_gradients(grads_refs, lr)?;
+                model_mut.apply_gradients_with_params(grads_refs, lr, &params)?;
 
                 debug!("Applied gradients with lr: {}", lr);
 
@@ -937,7 +986,7 @@ impl GRPOTrainingEngine {
 
         let model_arc = Arc::clone(&self.model);
         let config = self.config.clone();
-        let model_config = self.model_config.clone();
+        let model_type = self.model_type.clone();
         let enable_thinking = config.enable_thinking;
         let tools = config.tools.clone();
 
@@ -953,7 +1002,7 @@ impl GRPOTrainingEngine {
             max_consecutive_tokens: Some(16),
             max_ngram_repeats: Some(8),
             ngram_size: Some(3),
-            eos_token_id: Some(model_config.eos_token_id),
+            eos_token_id: Some(model_type.eos_token_id()),
             return_logprobs: Some(true),
             prefill_step_size: None, // Use default (2048)
             kv_cache_bits: None,     // Default: no quantization
@@ -994,7 +1043,16 @@ impl GRPOTrainingEngine {
                     Error::new(Status::GenericFailure, "Failed to acquire model read lock")
                 })?;
                 if use_parallel {
-                    model.generate_batch_parallel_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
+                    // Parallel batch generation is only available for Qwen3 models
+                    match &*model {
+                        TrainableModelEnum::Qwen3(m) => {
+                            m.generate_batch_parallel_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
+                        }
+                        _ => {
+                            // Fall back to sequential for non-Qwen3 models
+                            model.generate_batch_for_training_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
+                        }
+                    }
                 } else {
                     model.generate_batch_for_training_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
                 }
@@ -1035,7 +1093,7 @@ impl GRPOTrainingEngine {
                 // Bounds check with helpful error message
                 let reason = batch_result.finish_reasons
                     .get(prompt_idx)
-                    .and_then(|reasons| reasons.get(group_idx))
+                    .and_then(|reasons: &Vec<String>| reasons.get(group_idx))
                     .cloned()
                     .unwrap_or_else(|| {
                         eprintln!(
@@ -1125,7 +1183,7 @@ impl GRPOTrainingEngine {
         // Clone Arcs for the blocking task
         let model_arc = Arc::clone(&self.model);
         let state_arc = Arc::clone(&self.state);
-        let model_config = self.model_config.clone();
+        let model_type = self.model_type.clone();
         let config = self.config.clone();
         let enable_thinking = config.enable_thinking;
         let tools = config.tools.clone();
@@ -1212,7 +1270,7 @@ impl GRPOTrainingEngine {
             let logprob_refs: Vec<&MxArray> = completion_logprobs_all.iter().collect();
 
             let (loss_value, gradients) = compute_loss_and_gradients_autograd(
-                &model_config,
+                &model_type,
                 &params,
                 &prompt_refs,
                 &completion_refs,
@@ -1412,7 +1470,7 @@ impl GRPOTrainingEngine {
 
                 let grads_refs: HashMap<String, &MxArray> =
                     grads.iter().map(|(k, v)| (k.clone(), v)).collect();
-                model_mut.apply_gradients(grads_refs, lr)?;
+                model_mut.apply_gradients_with_params(grads_refs, lr, &params)?;
 
                 debug!("Applied gradients with lr: {}", lr);
 
@@ -1538,7 +1596,7 @@ impl GRPOTrainingEngine {
 
         // Clone Arcs for the blocking task
         let model_arc = Arc::clone(&self.model);
-        let model_config = self.model_config.clone();
+        let model_type = self.model_type.clone();
         let config = self.config.clone();
         let enable_thinking = config.enable_thinking;
         let tools = config.tools.clone();
@@ -1555,7 +1613,7 @@ impl GRPOTrainingEngine {
             max_consecutive_tokens: Some(16),
             max_ngram_repeats: Some(8),
             ngram_size: Some(3),
-            eos_token_id: Some(model_config.eos_token_id),
+            eos_token_id: Some(model_type.eos_token_id()),
             return_logprobs: Some(true),
             prefill_step_size: None, // Use default (2048)
             kv_cache_bits: None,     // Default: no quantization
@@ -1859,7 +1917,7 @@ impl GRPOTrainingEngine {
 
         let model_arc = Arc::clone(&self.model);
         let state_arc = Arc::clone(&self.state);
-        let model_config = self.model_config.clone();
+        let model_type = self.model_type.clone();
         let config = self.config.clone();
         let rewards_clone = filtered_rewards.clone();
         let group_size_for_training = effective_group_size as i32;
@@ -1901,7 +1959,7 @@ impl GRPOTrainingEngine {
             let grad_start = std::time::Instant::now();
 
             let (loss_value, gradients) = compute_loss_and_gradients_autograd(
-                &model_config,
+                &model_type,
                 &params,
                 &prompt_refs,
                 &completion_refs,
@@ -2073,7 +2131,7 @@ impl GRPOTrainingEngine {
 
                 let grads_refs: HashMap<String, &MxArray> =
                     grads.iter().map(|(k, v)| (k.clone(), v)).collect();
-                model_mut.apply_gradients(grads_refs, lr)?;
+                model_mut.apply_gradients_with_params(grads_refs, lr, &params)?;
                 drop(model_mut);
                 drop(grads);
 

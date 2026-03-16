@@ -59,6 +59,20 @@ impl LinearProj {
     pub fn set_quantized(&mut self, ql: QuantizedLinear) {
         *self = LinearProj::Quantized(ql);
     }
+
+    pub fn get_weight(&self) -> MxArray {
+        match self {
+            LinearProj::Standard(l) => l.get_weight(),
+            LinearProj::Quantized(ql) => ql.get_weight().clone(),
+        }
+    }
+
+    pub fn get_bias(&self) -> Option<MxArray> {
+        match self {
+            LinearProj::Standard(l) => l.get_bias(),
+            LinearProj::Quantized(_) => None,
+        }
+    }
 }
 
 /// An MLP that can be either standard or quantized.
@@ -86,6 +100,54 @@ impl MLPVariant {
                 let up = up_proj.forward(x)?;
                 let activated = Activations::swiglu(&gate, &up)?;
                 down_proj.forward(&activated)
+            }
+        }
+    }
+
+    pub fn get_gate_proj_weight(&self) -> MxArray {
+        match self {
+            MLPVariant::Standard(mlp) => mlp.get_gate_proj_weight(),
+            MLPVariant::Quantized { gate_proj, .. } => gate_proj.get_weight().clone(),
+        }
+    }
+
+    pub fn get_up_proj_weight(&self) -> MxArray {
+        match self {
+            MLPVariant::Standard(mlp) => mlp.get_up_proj_weight(),
+            MLPVariant::Quantized { up_proj, .. } => up_proj.get_weight().clone(),
+        }
+    }
+
+    pub fn get_down_proj_weight(&self) -> MxArray {
+        match self {
+            MLPVariant::Standard(mlp) => mlp.get_down_proj_weight(),
+            MLPVariant::Quantized { down_proj, .. } => down_proj.get_weight().clone(),
+        }
+    }
+
+    pub fn set_gate_proj_weight(&mut self, w: &MxArray) -> Result<()> {
+        match self {
+            MLPVariant::Standard(mlp) => mlp.set_gate_proj_weight(w),
+            MLPVariant::Quantized { .. } => {
+                Err(Error::from_reason("Cannot set weight on quantized MLP"))
+            }
+        }
+    }
+
+    pub fn set_up_proj_weight(&mut self, w: &MxArray) -> Result<()> {
+        match self {
+            MLPVariant::Standard(mlp) => mlp.set_up_proj_weight(w),
+            MLPVariant::Quantized { .. } => {
+                Err(Error::from_reason("Cannot set weight on quantized MLP"))
+            }
+        }
+    }
+
+    pub fn set_down_proj_weight(&mut self, w: &MxArray) -> Result<()> {
+        match self {
+            MLPVariant::Standard(mlp) => mlp.set_down_proj_weight(w),
+            MLPVariant::Quantized { .. } => {
+                Err(Error::from_reason("Cannot set weight on quantized MLP"))
             }
         }
     }

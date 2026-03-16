@@ -19,7 +19,7 @@ pub mod rewards;
 
 // Re-export all public items
 pub use advantages::*;
-pub use autograd::*;
+// autograd functions are pub(crate) - used directly by engine
 pub use callbacks::*;
 pub use engine::*;
 pub use entropy::*;

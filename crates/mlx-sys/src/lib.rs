@@ -375,6 +375,7 @@ unsafe extern "C" {
     pub fn mlx_synchronize();
     pub fn mlx_clear_cache();
     pub fn mlx_compile_clear_cache() -> bool;
+    pub fn mlx_stop_gradient(a: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_compiled_categorical_sample(
         logits: *mut mlx_array,
         temperature: f32,

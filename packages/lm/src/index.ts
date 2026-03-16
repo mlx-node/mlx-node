@@ -46,7 +46,7 @@ export {
   getQwen3Config,
 } from './models/qwen3-configs';
 
-export { ModelLoader } from './models/model-loader';
+export { ModelLoader, detectModelType } from './models/model-loader';
 
 export { QWEN35_CONFIGS, getQwen35Config } from './models/qwen3_5-configs';
 

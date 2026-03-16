@@ -264,4 +264,25 @@ impl Qwen3_5Attention {
     pub fn set_quantized_o_proj(&mut self, ql: QuantizedLinear) {
         self.o_proj.set_quantized(ql);
     }
+
+    // ========== Weight getters (for training parameter extraction) ==========
+
+    pub fn get_q_proj_weight(&self) -> MxArray {
+        self.q_proj.get_weight()
+    }
+    pub fn get_k_proj_weight(&self) -> MxArray {
+        self.k_proj.get_weight()
+    }
+    pub fn get_v_proj_weight(&self) -> MxArray {
+        self.v_proj.get_weight()
+    }
+    pub fn get_o_proj_weight(&self) -> MxArray {
+        self.o_proj.get_weight()
+    }
+    pub fn get_q_norm_weight(&self) -> MxArray {
+        self.q_norm.get_weight()
+    }
+    pub fn get_k_norm_weight(&self) -> MxArray {
+        self.k_norm.get_weight()
+    }
 }

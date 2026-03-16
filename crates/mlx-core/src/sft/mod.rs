@@ -13,6 +13,6 @@ pub mod engine;
 pub mod loss;
 
 // Re-export all public items
-pub use autograd::*;
+// autograd functions are pub(crate) - used directly by engine
 pub use engine::*;
 pub use loss::*;

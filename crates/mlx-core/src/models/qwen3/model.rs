@@ -22,6 +22,7 @@ use crate::sampling::{
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools;
+use crate::training_model::ModelType;
 use crate::transformer::{
     ContinuousBatchingScheduler, KVCache, PagedAttentionConfig, PagedKVCache, PendingRequest,
     SchedulerConfig, TransformerBlock,
@@ -4077,8 +4078,9 @@ impl Qwen3Model {
         let params = self.get_parameters();
 
         // 2. Compute loss and gradients using autograd
+        let model_type = ModelType::Qwen3(self.config.clone());
         let (loss_value, gradients) = compute_loss_and_gradients_autograd(
-            &self.config,
+            &model_type,
             &params,
             &prompt_tokens,
             &completion_tokens,
@@ -4155,8 +4157,9 @@ impl Qwen3Model {
         let params = self.get_parameters();
 
         // 2. Compute loss and gradients using autograd
+        let model_type = ModelType::Qwen3(self.config.clone());
         let (loss_value, gradients) = compute_loss_and_gradients_autograd(
-            &self.config,
+            &model_type,
             &params,
             &prompt_tokens,
             &completion_tokens,

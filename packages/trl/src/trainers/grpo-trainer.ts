@@ -59,6 +59,8 @@ import {
   GrpoTrainingEngine,
   NativeRewardRegistry,
   Qwen3Model,
+  Qwen35Model,
+  Qwen35MoeModel,
   OutputStore,
   buildRewardOutputs,
   type GrpoEngineConfig,
@@ -69,6 +71,9 @@ import {
   type RewardOutput,
   type ToolDefinition,
 } from '@mlx-node/core';
+import { detectModelType } from '@mlx-node/lm';
+
+type TrainableModel = Qwen3Model | Qwen35Model | Qwen35MoeModel;
 
 import type { ChatMessage, DatasetExample, RewardFunction } from '../types';
 import { createTrainingLogger, type TrainingLogger } from './training-logger';
@@ -425,7 +430,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: st
  */
 export class GRPOTrainer<T = unknown> {
   private engine: GrpoTrainingEngine;
-  private model: Qwen3Model;
+  private model: TrainableModel;
   private config: GRPOTrainerConfig<T>;
   private rewardFn?: RewardFunction<T>;
   private currentEpoch: number = 0;
@@ -464,7 +469,7 @@ export class GRPOTrainer<T = unknown> {
    * @param model - Pre-loaded Qwen3 model
    * @param config - Training configuration
    */
-  constructor(model: Qwen3Model, config: Partial<GRPOTrainerConfig<T>> = {}, logger?: TrainingLogger) {
+  constructor(model: TrainableModel, config: Partial<GRPOTrainerConfig<T>> = {}, logger?: TrainingLogger) {
     // Auto-detect TUI mode from environment variable (set by mlx-train TUI)
     const tuiModeFromEnv = process.env.MLX_TUI_MODE === '1';
     if (tuiModeFromEnv && config.tuiMode === undefined) {
@@ -520,7 +525,13 @@ export class GRPOTrainer<T = unknown> {
       useParallelBatchGeneration: this.config.useParallelBatchGeneration,
     };
 
-    this.engine = new GrpoTrainingEngine(model, engineConfig);
+    if (model instanceof Qwen35Model) {
+      this.engine = GrpoTrainingEngine.fromQwen35(model, engineConfig);
+    } else if (model instanceof Qwen35MoeModel) {
+      this.engine = GrpoTrainingEngine.fromQwen35Moe(model, engineConfig);
+    } else {
+      this.engine = new GrpoTrainingEngine(model, engineConfig);
+    }
 
     // Setup stdin handler if TUI mode
     if (this.config.tuiMode) {
@@ -977,10 +988,18 @@ export class GRPOTrainer<T = unknown> {
     const modelName = modelPath.split('/').pop() ?? 'Unknown';
     logger.status('loading', `Loading ${modelName}...`);
 
-    // Load model from disk (checkpoint or original)
-    const model = await Qwen3Model.loadPretrained(modelPath);
+    // Detect model type and load appropriate model class
+    const modelType = await detectModelType(modelPath);
+    let model: TrainableModel;
+    if (modelType === 'qwen3_5_moe') {
+      model = await Qwen35MoeModel.loadPretrained(modelPath);
+    } else if (modelType === 'qwen3_5') {
+      model = await Qwen35Model.loadPretrained(modelPath);
+    } else {
+      model = await Qwen3Model.loadPretrained(modelPath);
+    }
 
-    logger.status('loading', `${modelName} loaded`);
+    logger.status('loading', `${modelName} loaded (${modelType})`);
 
     // Create trainer with the pre-created logger
     const trainer = new GRPOTrainer(model, config, logger);
@@ -1843,8 +1862,13 @@ export class GRPOTrainer<T = unknown> {
     const statePath = join(checkpointPath, 'training_state.json');
     writeFileSync(statePath, JSON.stringify(state, null, 2));
 
-    // Save model weights
-    await this.model.saveModel(checkpointPath);
+    // Save model weights (only Qwen3 has saveModel exposed via NAPI currently)
+    if (this.model instanceof Qwen3Model) {
+      await this.model.saveModel(checkpointPath);
+    } else {
+      // TODO: Add NAPI saveModel() for Qwen3.5 models
+      this.logger.warn('Checkpoint model weight saving not yet supported for Qwen3.5 models');
+    }
 
     // Copy tokenizer files from original model path (required for loading checkpoints)
     const tokenizerSource = this.originalModelPath ?? this.config.modelPath;

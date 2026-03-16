@@ -131,7 +131,33 @@ impl SparseMoeBlock {
         output.reshape(&[batch, seq_len, hidden_size])
     }
 
-    // ========== Weight accessors ==========
+    // ========== Weight getters (for training parameter extraction) ==========
+
+    pub fn get_gate_weight(&self) -> MxArray {
+        self.gate.get_weight()
+    }
+
+    pub fn get_switch_mlp(&self) -> &SwitchGLU {
+        &self.switch_mlp
+    }
+
+    pub fn get_shared_expert_gate_proj_weight(&self) -> MxArray {
+        self.shared_expert.get_gate_proj_weight()
+    }
+
+    pub fn get_shared_expert_up_proj_weight(&self) -> MxArray {
+        self.shared_expert.get_up_proj_weight()
+    }
+
+    pub fn get_shared_expert_down_proj_weight(&self) -> MxArray {
+        self.shared_expert.get_down_proj_weight()
+    }
+
+    pub fn get_shared_expert_gate_weight(&self) -> MxArray {
+        self.shared_expert_gate.get_weight()
+    }
+
+    // ========== Weight setters ==========
 
     pub fn set_gate_weight(&mut self, w: &MxArray) -> Result<()> {
         self.gate.set_weight(w, "gate")

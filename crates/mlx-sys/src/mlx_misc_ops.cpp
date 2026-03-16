@@ -588,4 +588,16 @@ void mlx_compiled_sample_and_logprobs(
   *out_logprobs = reinterpret_cast<mlx_array*>(new array(std::move(original_logprobs)));
 }
 
+// Stop gradient: detach tensor from computation graph
+mlx_array* mlx_stop_gradient(mlx_array* a) {
+    try {
+        auto arr = reinterpret_cast<mlx::core::array*>(a);
+        auto result = mlx::core::stop_gradient(*arr);
+        return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_stop_gradient error: " << e.what() << std::endl;
+        return nullptr;
+    }
+}
+
 }  // extern "C"

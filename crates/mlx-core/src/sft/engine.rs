@@ -17,9 +17,12 @@ use tracing::{debug, info, warn};
 
 use crate::array::{MxArray, heavy_cleanup, synchronize_and_clear_cache};
 use crate::models::qwen3::{Qwen3Config, Qwen3Model};
+use crate::models::qwen3_5::model::Qwen3_5Model;
+use crate::models::qwen3_5_moe::model::Qwen3_5MoeModel;
 use crate::optimizers::GradientUtils;
 use crate::sft::SftLossConfig;
 use crate::sft::autograd::{compute_sft_loss_and_gradients, compute_token_accuracy};
+use crate::training_model::{ModelType, TrainableModel, TrainableModelEnum};
 
 /// Configuration for the SFT training engine
 #[napi(object)]
@@ -152,18 +155,18 @@ impl Default for EngineState {
 /// SFT Training Engine
 #[napi]
 pub struct SftTrainingEngine {
-    model: Arc<RwLock<Qwen3Model>>,
-    model_config: Qwen3Config,
+    model: Arc<RwLock<TrainableModelEnum>>,
+    model_type: ModelType,
     config: SftEngineConfig,
     state: Arc<RwLock<EngineState>>,
 }
 
 #[napi]
 impl SftTrainingEngine {
-    /// Create a new SFT training engine
+    /// Create a new SFT training engine from a Qwen3 model
     #[napi(constructor)]
     pub fn new(model: &Qwen3Model, config: SftEngineConfig) -> Result<Self> {
-        let model_config = model.get_config();
+        let model_type = ModelType::Qwen3(model.get_config());
 
         // Let MLX manage memory dynamically - no explicit cache limits
         // Previously set cache_limit which conflicted with other limit calls
@@ -171,8 +174,8 @@ impl SftTrainingEngine {
 
         info!(
             "Creating SFT training engine: {} layers, {} hidden, lr={}",
-            model_config.num_layers,
-            model_config.hidden_size,
+            model_type.num_layers(),
+            model_type.hidden_size(),
             config.learning_rate.unwrap_or(2e-5)
         );
 
@@ -181,8 +184,54 @@ impl SftTrainingEngine {
             // The model uses RwLock for interior mutability, so apply_gradients()
             // can acquire write locks without needing unique Arc ownership.
             // This eliminates the previous ~4GB memory overhead from deep cloning.
-            model: Arc::new(RwLock::new(model.clone_for_session()?)),
-            model_config,
+            model: Arc::new(RwLock::new(TrainableModelEnum::Qwen3(
+                model.clone_for_session()?,
+            ))),
+            model_type,
+            config,
+            state: Arc::new(RwLock::new(EngineState::default())),
+        })
+    }
+
+    /// Create a new SFT training engine from a Qwen3.5 dense model
+    #[napi(factory)]
+    pub fn from_qwen35(model: &Qwen3_5Model, config: SftEngineConfig) -> Result<Self> {
+        let model_type = ModelType::Qwen35Dense(model.get_config());
+
+        info!(
+            "Creating SFT training engine (Qwen3.5 Dense): {} layers, {} hidden, lr={}",
+            model_type.num_layers(),
+            model_type.hidden_size(),
+            config.learning_rate.unwrap_or(2e-5)
+        );
+
+        Ok(Self {
+            model: Arc::new(RwLock::new(TrainableModelEnum::Qwen35Dense(
+                model.clone_for_training()?,
+            ))),
+            model_type,
+            config,
+            state: Arc::new(RwLock::new(EngineState::default())),
+        })
+    }
+
+    /// Create a new SFT training engine from a Qwen3.5 MoE model
+    #[napi(factory)]
+    pub fn from_qwen35_moe(model: &Qwen3_5MoeModel, config: SftEngineConfig) -> Result<Self> {
+        let model_type = ModelType::Qwen35Moe(model.get_config());
+
+        info!(
+            "Creating SFT training engine (Qwen3.5 MoE): {} layers, {} hidden, lr={}",
+            model_type.num_layers(),
+            model_type.hidden_size(),
+            config.learning_rate.unwrap_or(2e-5)
+        );
+
+        Ok(Self {
+            model: Arc::new(RwLock::new(TrainableModelEnum::Qwen35Moe(
+                model.clone_for_training()?,
+            ))),
+            model_type,
             config,
             state: Arc::new(RwLock::new(EngineState::default())),
         })
@@ -276,7 +325,7 @@ impl SftTrainingEngine {
         // Clone Arcs for the blocking task
         let model_arc = Arc::clone(&self.model);
         let state_arc = Arc::clone(&self.state);
-        let model_config = self.model_config.clone();
+        let model_type = self.model_type.clone();
         let config = self.config.clone();
         let input_ids = input_ids.clone();
         let labels = labels.clone();
@@ -301,7 +350,7 @@ impl SftTrainingEngine {
 
                 // Compute loss and gradients
                 let (loss_value, gradients) = compute_sft_loss_and_gradients(
-                    &model_config,
+                    &model_type,
                     &params,
                     &input_ids,
                     &labels,
@@ -556,7 +605,7 @@ impl SftTrainingEngine {
                         // Reuse params from start of step - no weights changed
                         params.clone()
                     };
-                    match compute_token_accuracy(&model_config, &accuracy_params, &input_ids, &labels) {
+                    match compute_token_accuracy(&model_type, &accuracy_params, &input_ids, &labels) {
                         Ok(acc) => Some(acc),
                         Err(e) => {
                             warn!("Failed to compute accuracy: {}", e);
@@ -855,14 +904,20 @@ impl SftTrainingEngine {
         Ok(())
     }
 
-    /// Get the underlying model for checkpointing
+    /// Get the underlying Qwen3 model for checkpointing (only works for Qwen3 variant)
     #[napi]
     pub fn get_model(&self) -> Result<Qwen3Model> {
         let model = self
             .model
             .read()
             .map_err(|_| Error::new(Status::GenericFailure, "Lock error"))?;
-        model.clone_for_session()
+        match &*model {
+            TrainableModelEnum::Qwen3(m) => m.clone_for_session(),
+            _ => Err(Error::new(
+                Status::GenericFailure,
+                "get_model() only supports Qwen3 models. Use save_model() for other model types.",
+            )),
+        }
     }
 }
 

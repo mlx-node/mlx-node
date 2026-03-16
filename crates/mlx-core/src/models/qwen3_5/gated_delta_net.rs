@@ -113,6 +113,7 @@ impl GatedDeltaNet {
         x: &MxArray,
         mask: Option<&MxArray>,
         mut cache: Option<&mut ArraysCache>,
+        use_kernel: bool,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
@@ -243,6 +244,7 @@ impl GatedDeltaNet {
             &self.dt_bias,
             recurrent_state,
             mask,
+            use_kernel,
         )?;
 
         // Update recurrent state in cache
@@ -315,6 +317,30 @@ impl GatedDeltaNet {
     }
     pub fn set_quantized_out_proj(&mut self, ql: QuantizedLinear) {
         self.out_proj.set_quantized(ql);
+    }
+
+    // ========== Weight getters (for training parameter extraction) ==========
+
+    pub fn get_in_proj_qkvz_weight(&self) -> MxArray {
+        self.in_proj_qkvz.get_weight()
+    }
+    pub fn get_in_proj_ba_weight(&self) -> MxArray {
+        self.in_proj_ba.get_weight()
+    }
+    pub fn get_conv1d_weight(&self) -> MxArray {
+        self.conv1d.get_weight()
+    }
+    pub fn get_norm_weight(&self) -> MxArray {
+        self.norm.get_weight()
+    }
+    pub fn get_out_proj_weight(&self) -> MxArray {
+        self.out_proj.get_weight()
+    }
+    pub fn get_dt_bias(&self) -> MxArray {
+        self.dt_bias.clone()
+    }
+    pub fn get_a_log(&self) -> MxArray {
+        self.a_log.clone()
     }
 }
 

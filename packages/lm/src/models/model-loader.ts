@@ -74,7 +74,7 @@ export class ModelLoader {
   }
 }
 
-async function detectModelType(modelPath: string): Promise<string> {
+export async function detectModelType(modelPath: string): Promise<string> {
   try {
     const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
     const config = JSON.parse(raw);

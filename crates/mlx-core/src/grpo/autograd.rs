@@ -31,9 +31,9 @@ use napi::bindgen_prelude::*;
 use crate::array::{MxArray, pad_float_sequences, pad_sequences};
 use crate::autograd;
 use crate::grpo::{advantages::compute_advantages, loss as grpo_loss};
-use crate::models::qwen3::Qwen3Config;
 use crate::nn::efficient_selective_log_softmax;
 use crate::param_manager;
+use crate::training_model::ModelType;
 use crate::utils::functional;
 
 /// Compute GRPO loss with automatic differentiation using functional forward pass
@@ -57,54 +57,12 @@ use crate::utils::functional;
 /// # Returns
 /// * `(loss_value, gradients)` - Scalar loss and gradients for each parameter
 ///
-/// # Example
+/// # Usage
 ///
-/// ```no_run
-/// # use mlx_core::grpo::compute_loss_and_gradients_autograd;
-/// # use mlx_core::models::qwen3::Qwen3Config;
-/// # use mlx_core::grpo::GRPOLossConfig;
-/// # use std::collections::HashMap;
-/// # let config = Qwen3Config {
-/// #     vocab_size: 151936,
-/// #     hidden_size: 1024,
-/// #     num_layers: 28,
-/// #     num_heads: 16,
-/// #     num_kv_heads: 8,
-/// #     intermediate_size: 3072,
-/// #     rms_norm_eps: 1e-6,
-/// #     rope_theta: 1000000.0,
-/// #     max_position_embeddings: 40960,
-/// #     head_dim: 64,
-/// #     use_qk_norm: true,
-/// #     tie_word_embeddings: true,
-/// #     pad_token_id: 151643,
-/// #     eos_token_id: 151645,
-/// #     bos_token_id: 151643,
-/// #     use_paged_attention: None,
-/// #     paged_cache_memory_mb: None,
-/// #     paged_block_size: None,
-/// #     use_fp8_cache: None,
-/// # };
-/// # let params = HashMap::new();
-/// # let prompt_tokens = vec![];
-/// # let completion_tokens = vec![];
-/// # let old_logprobs = vec![];
-/// # let rewards = vec![];
-/// # let group_size = 4;
-/// # let loss_config = GRPOLossConfig::default();
-/// let (loss, grads) = compute_loss_and_gradients_autograd(
-///     &config,
-///     &params,
-///     &prompt_tokens,
-///     &completion_tokens,
-///     &old_logprobs,
-///     &rewards,
-///     group_size,
-///     loss_config,
-/// ).unwrap();
-/// ```
-pub fn compute_loss_and_gradients_autograd(
-    model_config: &Qwen3Config,
+/// Called by GRPO engine with a `ModelType` enum that dispatches to the correct
+/// functional forward pass (Qwen3, Qwen3.5 Dense, or Qwen3.5 MoE).
+pub(crate) fn compute_loss_and_gradients_autograd(
+    model_type: &ModelType,
     model_params: &HashMap<String, MxArray>,
     prompt_tokens: &[&MxArray],
     completion_tokens: &[&MxArray],
@@ -191,7 +149,7 @@ pub fn compute_loss_and_gradients_autograd(
 
     // Use the model's actual pad_token_id for padding sequences
     // Using wrong padding (like 0) can cause extreme logits and NaN
-    let pad_token_id = model_config.pad_token_id;
+    let pad_token_id = model_type.pad_token_id();
 
     let padded_prompts_result = pad_sequences(prompts_expanded, pad_token_id)?;
     let padded_prompts = padded_prompts_result.get_padded()?;
@@ -234,7 +192,7 @@ pub fn compute_loss_and_gradients_autograd(
         // CHUNKED AUTOGRAD PATH: Run autograd per chunk and accumulate gradients
         // This allows MLX to release the computation graph after each chunk.
         return compute_loss_and_gradients_chunked_autograd(
-            model_config,
+            model_type,
             &param_names,
             &param_arrays,
             &input_ids,
@@ -255,7 +213,7 @@ pub fn compute_loss_and_gradients_autograd(
     let padded_old_logprobs_clone = padded_old_logprobs.clone();
     let advantages_clone = advantages_array.clone();
     let completion_masks_clone = completion_masks.clone();
-    let config_clone = model_config.clone();
+    let config_clone = model_type.clone();
     let loss_config_clone = loss_config.clone();
 
     // 5. Define loss function for autograd
@@ -281,7 +239,7 @@ pub fn compute_loss_and_gradients_autograd(
             // we process the LM head in chunks to reduce peak memory.
 
             // Get hidden states (before LM head)
-            let hidden_states = functional::qwen3_forward_hidden_states(
+            let hidden_states = functional::forward_hidden_states_dispatch(
                 &config_clone,
                 &param_dict,
                 &input_ids_clone,
@@ -290,11 +248,11 @@ pub fn compute_loss_and_gradients_autograd(
             // Extract completion hidden states: [B, prompt_len:, :]
             let completion_hidden = hidden_states.slice(
                 &[0, prompt_len, 0],
-                &[batch_size, total_seq_len, config_clone.hidden_size as i64],
+                &[batch_size, total_seq_len, config_clone.hidden_size() as i64],
             )?;
 
             // Get LM head weight
-            let lm_head_weight = if config_clone.tie_word_embeddings {
+            let lm_head_weight = if config_clone.tie_word_embeddings() {
                 param_dict
                     .get("embedding.weight")
                     .ok_or_else(|| Error::from_reason("Missing embedding.weight"))?
@@ -310,19 +268,22 @@ pub fn compute_loss_and_gradients_autograd(
                 lm_head_weight,
                 &padded_completions_clone,
                 chunk_size,
-                config_clone.tie_word_embeddings,
+                config_clone.tie_word_embeddings(),
             )?
         } else {
             // FULL PATH: Standard computation (for small batches or testing)
             //
             // Recompute forward pass with parameters in native dtype
-            let logits =
-                functional::qwen3_forward_functional(&config_clone, &param_dict, &input_ids_clone)?;
+            let logits = functional::forward_functional_dispatch(
+                &config_clone,
+                &param_dict,
+                &input_ids_clone,
+            )?;
 
             // Get logits for completion tokens only
             let completion_logits = logits.slice(
                 &[0, prompt_len, 0],
-                &[batch_size, total_seq_len, config_clone.vocab_size as i64],
+                &[batch_size, total_seq_len, config_clone.vocab_size() as i64],
             )?;
 
             // Memory-efficient log-softmax using logsumexp decomposition
@@ -420,7 +381,7 @@ pub fn compute_loss_and_gradients_autograd(
 /// * `loss_config` - GRPO loss configuration
 /// * `chunk_size` - Number of sequences per chunk
 fn compute_loss_and_gradients_chunked_autograd(
-    model_config: &Qwen3Config,
+    model_type: &ModelType,
     param_names: &[String],
     param_arrays: &[&MxArray],
     input_ids: &MxArray,
@@ -459,7 +420,7 @@ fn compute_loss_and_gradients_chunked_autograd(
         let chunk_old_logprobs_clone = chunk_old_logprobs.clone();
         let chunk_advantages_clone = chunk_advantages.clone();
         let chunk_masks_clone = chunk_masks.clone();
-        let config_clone = model_config.clone();
+        let config_clone = model_type.clone();
         let loss_config_clone = loss_config.clone();
         let lm_head_chunk_size = loss_config.lm_head_chunk_size;
 
@@ -475,7 +436,7 @@ fn compute_loss_and_gradients_chunked_autograd(
             // Compute logprobs for this chunk
             let completion_logprobs = if let Some(lm_chunk) = lm_head_chunk_size {
                 // Chunked LM head path
-                let hidden_states = functional::qwen3_forward_hidden_states(
+                let hidden_states = functional::forward_hidden_states_dispatch(
                     &config_clone,
                     &param_dict,
                     &chunk_input_ids_clone,
@@ -486,11 +447,11 @@ fn compute_loss_and_gradients_chunked_autograd(
                     &[
                         chunk_batch,
                         chunk_total_seq,
-                        config_clone.hidden_size as i64,
+                        config_clone.hidden_size() as i64,
                     ],
                 )?;
 
-                let lm_head_weight = if config_clone.tie_word_embeddings {
+                let lm_head_weight = if config_clone.tie_word_embeddings() {
                     param_dict
                         .get("embedding.weight")
                         .ok_or_else(|| Error::from_reason("Missing embedding.weight"))?
@@ -505,11 +466,11 @@ fn compute_loss_and_gradients_chunked_autograd(
                     lm_head_weight,
                     &chunk_completions_clone,
                     lm_chunk,
-                    config_clone.tie_word_embeddings,
+                    config_clone.tie_word_embeddings(),
                 )?
             } else {
                 // Full path
-                let logits = functional::qwen3_forward_functional(
+                let logits = functional::forward_functional_dispatch(
                     &config_clone,
                     &param_dict,
                     &chunk_input_ids_clone,
@@ -517,7 +478,11 @@ fn compute_loss_and_gradients_chunked_autograd(
 
                 let completion_logits = logits.slice(
                     &[0, chunk_prompt_len, 0],
-                    &[chunk_batch, chunk_total_seq, config_clone.vocab_size as i64],
+                    &[
+                        chunk_batch,
+                        chunk_total_seq,
+                        config_clone.vocab_size() as i64,
+                    ],
                 )?;
 
                 efficient_selective_log_softmax(

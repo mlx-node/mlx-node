@@ -121,6 +121,26 @@ impl MxArray {
         MxArray::from_handle(handle, "array_addmm")
     }
 
+    /// Indexed matrix multiply for MoE expert selection.
+    /// Uses MLX's gather_mm which has full VJP support for autograd.
+    ///
+    /// - `self` (a): input tokens (expanded shape)
+    /// - `b`: expert weights (pre-transposed)
+    /// - `rhs_indices`: which experts per token
+    /// - `sorted`: whether indices are pre-sorted by expert
+    pub fn gather_mm(&self, b: &MxArray, rhs_indices: &MxArray, sorted: bool) -> Result<MxArray> {
+        let handle = unsafe {
+            sys::mlx_gather_mm(
+                self.handle.0,
+                b.handle.0,
+                std::ptr::null_mut(), // no lhs_indices
+                rhs_indices.handle.0,
+                sorted,
+            )
+        };
+        MxArray::from_handle(handle, "gather_mm")
+    }
+
     // Additional math operations
 
     #[napi]
@@ -334,6 +354,13 @@ impl MxArray {
         sum.eval();
         let count = sum.item_at_int32(0)?;
         Ok(count > 0)
+    }
+
+    /// Detach tensor from the computation graph (no gradients flow through).
+    /// Used for MoE routing indices during training.
+    pub fn stop_gradient(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_stop_gradient(self.handle.0) };
+        MxArray::from_handle(handle, "stop_gradient")
     }
 
     /// Check if array contains any NaN or Inf values (GPU-native)

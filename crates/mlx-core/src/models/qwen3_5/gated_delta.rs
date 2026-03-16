@@ -334,12 +334,50 @@ pub fn gated_delta_update(
     dt_bias: &MxArray,
     state: Option<&MxArray>,
     mask: Option<&MxArray>,
+    use_kernel: bool,
 ) -> Result<(MxArray, MxArray)> {
     let batch = q.shape_at(0)?;
     let num_k_heads = q.shape_at(2)?;
     let num_v_heads = v.shape_at(2)?;
     let v_dim = v.shape_at(3)?;
     let k_dim = q.shape_at(3)?;
+
+    // When use_kernel=false, use only ops-based paths for full differentiability (autograd).
+    // compute_g builds a standard MLX expression graph via C++ (differentiable),
+    // but the fused_gdn_gating Metal kernel and recurrence kernels are NOT differentiable.
+    if !use_kernel {
+        let beta = Activations::sigmoid(b)?;
+        // compute_g returns exp(g_log) directly — use it as the decay gate without log/exp round-trip
+        let g = compute_g(a_log, a, dt_bias)?;
+
+        // GQA head expansion
+        let (q, k) = if num_v_heads != num_k_heads {
+            if num_k_heads == 0 {
+                return Err(Error::from_reason(
+                    "GatedDelta: num_k_heads is 0, cannot compute GQA repeat factor",
+                ));
+            }
+            if num_v_heads % num_k_heads != 0 {
+                return Err(Error::from_reason(format!(
+                    "GatedDelta: num_v_heads ({}) must be divisible by num_k_heads ({})",
+                    num_v_heads, num_k_heads
+                )));
+            }
+            let repeat_factor = num_v_heads / num_k_heads;
+            let q_expanded = q.repeat(repeat_factor as i32, 2)?;
+            let k_expanded = k.repeat(repeat_factor as i32, 2)?;
+            (q_expanded, k_expanded)
+        } else {
+            (q.clone(), k.clone())
+        };
+
+        let initial_state = match state {
+            Some(s) => s.clone(),
+            None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
+        };
+
+        return gated_delta_ops(&q, &k, v, &g, &beta, &initial_state, mask);
+    }
 
     // Compute beta = sigmoid(b) and g_log = -exp(A_log) * softplus(a + dt_bias)
     // Try fused Metal kernel first (single dispatch), fall back to separate ops.

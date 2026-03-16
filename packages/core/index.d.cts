@@ -124,13 +124,17 @@ export declare class GenerationResult {
  */
 export declare class GrpoTrainingEngine {
   /**
-   * Create a new training engine from an existing model
+   * Create a new training engine from a Qwen3 model
    *
    * # Arguments
    * * `model` - The Qwen3 model to train (will be cloned internally)
    * * `config` - Engine configuration
    */
   constructor(model: Qwen3Model, config: GrpoEngineConfig);
+  /** Create a new training engine from a Qwen3.5 dense model */
+  static fromQwen35(model: Qwen3_5Model, config: GrpoEngineConfig): GrpoTrainingEngine;
+  /** Create a new training engine from a Qwen3.5 MoE model */
+  static fromQwen35Moe(model: Qwen3_5MoeModel, config: GrpoEngineConfig): GrpoTrainingEngine;
   /** Register a built-in reward function */
   registerBuiltinReward(config: BuiltinRewardConfig): void;
   /**
@@ -1408,8 +1412,12 @@ export declare class Qwen3Tokenizer {
 
 /** SFT Training Engine */
 export declare class SftTrainingEngine {
-  /** Create a new SFT training engine */
+  /** Create a new SFT training engine from a Qwen3 model */
   constructor(model: Qwen3Model, config: SftEngineConfig);
+  /** Create a new SFT training engine from a Qwen3.5 dense model */
+  static fromQwen35(model: Qwen35Model, config: SftEngineConfig): SftTrainingEngine;
+  /** Create a new SFT training engine from a Qwen3.5 MoE model */
+  static fromQwen35Moe(model: Qwen35MoeModel, config: SftEngineConfig): SftTrainingEngine;
   /** Run a single training step */
   trainStep(inputIds: MxArray, labels: MxArray): Promise<SftStepMetrics>;
   /** Get current step number */
@@ -1448,7 +1456,7 @@ export declare class SftTrainingEngine {
   reset(): void;
   /** Restore training state (for resuming from checkpoint) */
   restoreState(step: number, epoch: number): void;
-  /** Get the underlying model for checkpointing */
+  /** Get the underlying Qwen3 model for checkpointing (only works for Qwen3 variant) */
   getModel(): Qwen3Model;
 }
 

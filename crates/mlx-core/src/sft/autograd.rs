@@ -20,9 +20,9 @@ use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 use crate::autograd;
-use crate::models::qwen3::Qwen3Config;
 use crate::nn::Losses;
 use crate::param_manager;
+use crate::training_model::ModelType;
 use crate::utils::functional;
 
 use super::SftLossConfig;
@@ -43,8 +43,8 @@ use super::SftLossConfig;
 ///
 /// # Returns
 /// * `(loss_value, gradients)` - Scalar loss and gradients for each parameter
-pub fn compute_sft_loss_and_gradients(
-    model_config: &Qwen3Config,
+pub(crate) fn compute_sft_loss_and_gradients(
+    model_type: &ModelType,
     model_params: &HashMap<String, MxArray>,
     input_ids: &MxArray,
     labels: &MxArray,
@@ -69,7 +69,7 @@ pub fn compute_sft_loss_and_gradients(
         let param_names_clone = param_names.clone();
         let input_ids_clone = input_ids.clone();
         let labels_clone = labels.clone();
-        let config_clone = model_config.clone();
+        let config_clone = model_type.clone();
         let loss_config_clone = loss_config.clone();
 
         // Define loss function for autograd
@@ -78,8 +78,11 @@ pub fn compute_sft_loss_and_gradients(
             let param_dict = param_manager::map_params_to_dict(params, &param_names_clone)?;
 
             // Forward pass using functional implementation
-            let logits =
-                functional::qwen3_forward_functional(&config_clone, &param_dict, &input_ids_clone)?;
+            let logits = functional::forward_functional_dispatch(
+                &config_clone,
+                &param_dict,
+                &input_ids_clone,
+            )?;
 
             // Get shapes
             let batch_size = logits.shape_at(0)?;
@@ -156,14 +159,14 @@ pub fn compute_sft_loss_and_gradients(
 ///
 /// # Returns
 /// * Accuracy value between 0.0 and 1.0
-pub fn compute_token_accuracy(
-    model_config: &Qwen3Config,
+pub(crate) fn compute_token_accuracy(
+    model_type: &ModelType,
     model_params: &HashMap<String, MxArray>,
     input_ids: &MxArray,
     labels: &MxArray,
 ) -> Result<f64> {
     // Forward pass
-    let logits = functional::qwen3_forward_functional(model_config, model_params, input_ids)?;
+    let logits = functional::forward_functional_dispatch(model_type, model_params, input_ids)?;
 
     // Get shapes
     let batch_size = logits.shape_at(0)?;
@@ -207,8 +210,8 @@ pub fn compute_token_accuracy(
 /// Compute SFT loss only (no gradients)
 ///
 /// Useful for evaluation/validation without the overhead of gradient computation.
-pub fn compute_sft_loss_only(
-    model_config: &Qwen3Config,
+pub(crate) fn compute_sft_loss_only(
+    model_type: &ModelType,
     model_params: &HashMap<String, MxArray>,
     input_ids: &MxArray,
     labels: &MxArray,
@@ -218,7 +221,7 @@ pub fn compute_sft_loss_only(
     let param_dict: HashMap<String, MxArray> = model_params.clone();
 
     // Forward pass
-    let logits = functional::qwen3_forward_functional(model_config, &param_dict, input_ids)?;
+    let logits = functional::forward_functional_dispatch(model_type, &param_dict, input_ids)?;
 
     // Get shapes
     let batch_size = logits.shape_at(0)?;
