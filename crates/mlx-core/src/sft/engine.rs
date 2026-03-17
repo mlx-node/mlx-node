@@ -53,6 +53,9 @@ pub struct SftEngineConfig {
     /// boolean to CPU. When true, transfers the entire gradient tensor to CPU for detailed
     /// per-element analysis - useful for debugging but has significant performance overhead.
     pub verbose_nan_detection: Option<bool>,
+    /// Enable gradient checkpointing to reduce memory (default: true)
+    /// Trades ~30% more compute for O(1) layer memory instead of O(num_layers).
+    pub gradient_checkpointing: Option<bool>,
 }
 
 impl Default for SftEngineConfig {
@@ -69,6 +72,7 @@ impl Default for SftEngineConfig {
             emergency_save_threshold: Some(5),
             compute_accuracy: Some(false),
             verbose_nan_detection: Some(false),
+            gradient_checkpointing: Some(true),
         }
     }
 }
@@ -355,6 +359,7 @@ impl SftTrainingEngine {
                     &input_ids,
                     &labels,
                     loss_config,
+                    config.gradient_checkpointing.unwrap_or(true),
                 )?;
 
                 // Check for NaN/Inf in gradients BEFORE accumulation

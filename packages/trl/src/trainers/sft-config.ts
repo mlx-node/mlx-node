@@ -36,6 +36,9 @@ export interface SFTTrainerConfig {
   log_jsonl: boolean;
   tui_mode: boolean;
 
+  // Memory optimization
+  gradient_checkpointing: boolean;
+
   // Misc
   seed: number;
   resume_from_checkpoint: string;
@@ -64,6 +67,8 @@ const DEFAULT_SFT_CONFIG: SFTTrainerConfig = Object.freeze({
   log_jsonl: true,
   tui_mode: false,
 
+  gradient_checkpointing: true,
+
   seed: 42,
   resume_from_checkpoint: '',
 });
@@ -90,6 +95,7 @@ const SFT_CONFIG_VALUE_TYPES: Record<SFTConfigKey, 'number' | 'boolean' | 'strin
   log_jsonl: 'boolean',
   tui_mode: 'boolean',
   seed: 'number',
+  gradient_checkpointing: 'boolean',
   resume_from_checkpoint: 'string',
 };
 

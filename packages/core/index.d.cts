@@ -3111,6 +3111,11 @@ export interface SftEngineConfig {
    * per-element analysis - useful for debugging but has significant performance overhead.
    */
   verboseNanDetection?: boolean;
+  /**
+   * Enable gradient checkpointing to reduce memory (default: true)
+   * Trades ~30% more compute for O(1) layer memory instead of O(num_layers).
+   */
+  gradientCheckpointing?: boolean;
 }
 
 /** Metrics from a training epoch */

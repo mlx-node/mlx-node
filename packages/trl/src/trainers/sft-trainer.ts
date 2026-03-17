@@ -135,6 +135,7 @@ export class SFTTrainer {
       gradientClipNorm: this.config.max_grad_norm,
       weightDecay: this.config.weight_decay,
       labelSmoothing: this.config.label_smoothing,
+      gradientCheckpointing: this.config.gradient_checkpointing,
     };
 
     if (model instanceof Qwen35Model) {
@@ -552,14 +553,8 @@ export class SFTTrainer {
     const statePath = join(checkpointPath, 'training_state.json');
     writeFileSync(statePath, JSON.stringify(state, null, 2));
 
-    // Save model weights (only Qwen3 has getModel()/saveModel() exposed via NAPI currently)
-    if (this.model instanceof Qwen3Model) {
-      const trainedModel = this.engine.getModel();
-      await trainedModel.saveModel(checkpointPath);
-    } else {
-      // TODO: Add NAPI saveModel() for Qwen3.5 models
-      this.logger.warn('Checkpoint model weight saving not yet supported for Qwen3.5 models');
-    }
+    // Save model weights
+    await this.model.saveModel(checkpointPath);
 
     // Copy tokenizer files
     const tokenizerSource = this.originalModelPath ?? this.config.model_name;

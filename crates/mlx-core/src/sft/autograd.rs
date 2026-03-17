@@ -49,6 +49,7 @@ pub(crate) fn compute_sft_loss_and_gradients(
     input_ids: &MxArray,
     labels: &MxArray,
     loss_config: SftLossConfig,
+    use_checkpointing: bool,
 ) -> Result<(f64, HashMap<String, MxArray>)> {
     // 1. Flatten parameters into ordered list (keep native dtype - bfloat16)
     let mut param_names: Vec<String> = model_params.keys().cloned().collect();
@@ -85,7 +86,7 @@ pub(crate) fn compute_sft_loss_and_gradients(
                 &config_clone,
                 &param_dict,
                 &input_ids_clone,
-                false,
+                use_checkpointing,
                 &mut ckpt_ctx.borrow_mut(),
             )?;
 
