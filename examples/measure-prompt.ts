@@ -99,7 +99,7 @@ async function main() {
 
   // Phase 2: Training (autograd)
   console.log('\n=== Phase 2: Autograd (10 completions, forwardChunkSize=1, lmHeadChunkSize=2) ===');
-  const rewards = new Array(genResult.completionTexts.length).fill(5.0);
+  const rewards = Array.from({ length: genResult.completionTexts.length }, () => 5.0);
   showMemory('before trainStep');
   const t2 = Date.now();
   try {
@@ -111,7 +111,7 @@ async function main() {
     console.log(`Total tokens: ${metrics.totalTokens}`);
   } catch (e) {
     showMemory('after trainStep ERROR');
-    console.error(`Training failed: ${e}`);
+    console.error(`Training failed: ${String(e)}`);
   }
 
   showMemory('final');

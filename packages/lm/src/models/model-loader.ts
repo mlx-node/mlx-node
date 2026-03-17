@@ -79,7 +79,7 @@ export async function detectModelType(modelPath: string): Promise<string> {
     const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
     const config = JSON.parse(raw);
     return config.model_type ?? 'qwen3';
-  } catch (e) {
+  } catch {
     throw new Error(`Cannot detect model type: config.json not found in ${modelPath}`);
   }
 }

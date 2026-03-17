@@ -1066,7 +1066,7 @@ export class GRPOTrainer<T = unknown> {
           trainer.engine.loadOptimizerState(optimizerStatePath);
           logger.info(`Restored optimizer state from checkpoint`);
         } catch (e) {
-          logger.warn(`Failed to restore optimizer state: ${e}`);
+          logger.warn(`Failed to restore optimizer state: ${String(e)}`);
         }
       }
 
@@ -1925,7 +1925,7 @@ export class GRPOTrainer<T = unknown> {
       writeFileSync(statePath, JSON.stringify(state, null, 2));
     } catch (e) {
       // Non-fatal: training can continue without optimizer state on resume
-      this.logger.warn(`Failed to save optimizer state: ${e}`);
+      this.logger.warn(`Failed to save optimizer state: ${String(e)}`);
     }
 
     this.logger.info(`Checkpoint saved: ${checkpointPath}`);
