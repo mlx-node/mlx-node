@@ -3,6 +3,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use futures::TryFutureExt;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
@@ -1837,6 +1838,126 @@ impl Qwen3_5Model {
 
         total
     }
+
+    /// Save the model weights and configuration to a directory.
+    ///
+    /// This saves:
+    /// - config.json: Model configuration (with model_type for detectModelType)
+    /// - weights.safetensors: Full model weights in SafeTensors format
+    /// - weights.mlx: Parameter metadata (for reference)
+    ///
+    /// # Arguments
+    /// * `save_path` - Directory to save the model
+    #[napi]
+    pub fn save_model<'env>(
+        &self,
+        env: &'env Env,
+        save_path: String,
+    ) -> Result<PromiseRaw<'env, ()>> {
+        let mut params = self.get_parameters_for_training()?;
+
+        // Include vision encoder weights when present (VLM models)
+        if let Some(ref vision_enc) = self.vision_encoder {
+            let vision_params = vision_enc.get_parameters();
+            params.extend(vision_params);
+        }
+
+        // Validate all parameters for NaN/Inf before saving
+        for (name, param) in params.iter() {
+            let data = param.to_float32()?;
+            let invalid_count = data
+                .iter()
+                .filter(|v| v.is_nan() || v.is_infinite())
+                .count();
+            if invalid_count > 0 {
+                return Err(napi::Error::new(
+                    Status::GenericFailure,
+                    format!(
+                        "Cannot save model: parameter '{}' contains {} NaN/Inf values. \
+                        Model weights are corrupted, likely due to training instability. \
+                        Consider reducing learning rate or using an earlier checkpoint.",
+                        name, invalid_count
+                    ),
+                ));
+            }
+        }
+
+        let params_clone: HashMap<String, MxArray> =
+            params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        // Create weights metadata (for reference)
+        let mut weights_metadata = serde_json::Map::new();
+        for (key, array) in params.iter() {
+            let shape_data = array.shape()?;
+            let shape: Vec<i64> = shape_data.as_ref().to_vec();
+            let dtype = array.dtype()?;
+
+            let mut param_info = serde_json::Map::new();
+            param_info.insert("shape".to_string(), serde_json::json!(shape));
+            param_info.insert("dtype".to_string(), serde_json::json!(dtype as i32));
+
+            weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
+        }
+
+        // Serialize config and inject model_type for detectModelType
+        let config = self.get_config();
+        let mut config_value = serde_json::to_value(&config).map_err(|e| {
+            napi::Error::new(Status::GenericFailure, format!("Failed to serialize config: {e}"))
+        })?;
+        if let serde_json::Value::Object(ref mut map) = config_value {
+            map.insert("model_type".to_string(), serde_json::json!("qwen3_5"));
+        }
+
+        let weights_json = serde_json::json!({
+            "version": "1.0",
+            "config": config_value,
+            "weights": weights_metadata,
+            "note": "Full weights are in weights.safetensors"
+        });
+
+        let promise = env.spawn_future(async move {
+            tokio::task::spawn_blocking(move || {
+                let path = std::path::Path::new(&save_path);
+                std::fs::create_dir_all(path)?;
+
+                info!("Saving model to {}", save_path);
+
+                // 1. Save configuration as JSON
+                let config_path = path.join("config.json");
+                let config_json = serde_json::to_string_pretty(&config_value)?;
+                std::fs::write(&config_path, config_json)?;
+                info!("Saved config.json");
+
+                // 2. Save full weights in SafeTensors format
+                let safetensors_path = path.join("weights.safetensors");
+                let metadata = Some(serde_json::json!({
+                    "format": "mlx-node",
+                    "version": "1.0"
+                }));
+                crate::utils::safetensors::save_safetensors(&safetensors_path, &params_clone, metadata)?;
+                info!("Saved weights.safetensors");
+
+                // 3. Save weights metadata (for reference)
+                let weights_str = serde_json::to_string_pretty(&weights_json)?;
+                let weights_path = path.join("weights.mlx");
+                std::fs::write(&weights_path, weights_str)?;
+                info!("Saved weights.mlx metadata");
+
+                Ok::<_, Error>(())
+            })
+            .map_err(|err| {
+                napi::Error::new(
+                    Status::GenericFailure,
+                    format!("Failed to save model: {}", err),
+                )
+            })
+            .await
+            .flatten()?;
+            Ok(())
+        })?;
+
+        Ok(promise)
+    }
 }
 
 /// Forward pass through the model, acquiring all necessary locks.
@@ -2456,7 +2577,10 @@ impl Qwen3_5Model {
     }
 
     /// Generate a single completion with logprob tracking (for GRPO training).
-    /// Uses the Rust forward path (NOT compiled C++) to ensure differentiability.
+    ///
+    /// Uses the compiled C++ forward path when available (~10x faster than Rust).
+    /// Generation does NOT need differentiability — gradients are computed separately
+    /// via the functional forward path in autograd Phase 2.
     pub(crate) fn generate_for_training_sync(
         &self,
         input_ids: &MxArray,
@@ -2464,6 +2588,18 @@ impl Qwen3_5Model {
     ) -> Result<GenerationResult> {
         let config = config.unwrap_or_default();
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
+
+        // Check if compiled path is available (C++ weights loaded from safetensors)
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+
+        // Try to acquire compiled mutex (non-blocking, safe from sync context).
+        // If locked (concurrent generate() call), fall back to Rust path.
+        let compiled_lock = if use_compiled {
+            DENSE_COMPILED_MUTEX.try_lock().ok()
+        } else {
+            None
+        };
+        let use_compiled = compiled_lock.is_some();
 
         // Ensure caches exist
         self.init_caches()?;
@@ -2488,31 +2624,130 @@ impl Qwen3_5Model {
             .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
 
         let fa_idx = self.fa_idx;
-        let mut forward_fn = |ids: &MxArray| -> Result<MxArray> {
-            forward_inner(
-                ids,
-                &embedding_weight,
-                &mut layers_guard,
-                &mut caches_guard,
-                &final_norm_guard,
-                &lm_head_guard,
-                fa_idx,
-                None,
-            )
+
+        // === Prefill (always uses Rust forward — runs once) ===
+        let logits = forward_inner(
+            input_ids,
+            &embedding_weight,
+            &mut layers_guard,
+            &mut caches_guard,
+            &final_norm_guard,
+            &lm_head_guard,
+            fa_idx,
+            None,
+        )?;
+        let seq_len = logits.shape_at(1)?;
+        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+        let last_logits = last_logits.squeeze(Some(&[1]))?;
+        let input_tokens = input_ids.to_uint32()?;
+
+        let result = if use_compiled {
+            // === Compiled C++ decode path ===
+            let _compiled_guard = CompiledResetGuard;
+            let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+            let prefill_len = seq_len as i32;
+            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+            let num_layers = self.config.num_layers as usize;
+            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                vec![std::ptr::null_mut(); num_layers * 2];
+            if let Some(ref caches) = *caches_guard {
+                for (i, cache) in caches.iter().enumerate() {
+                    let (p0, p1) = cache.export_ptrs();
+                    cache_ptrs[i * 2] = p0;
+                    cache_ptrs[i * 2 + 1] = p1;
+                }
+            }
+            // Drop locks not needed during compiled decode
+            drop(layers_guard);
+            drop(final_norm_guard);
+            drop(lm_head_guard);
+            // Keep caches_guard alive through init_from_prefill so cache_ptrs remain valid
+            unsafe {
+                mlx_sys::mlx_qwen35_compiled_init_from_prefill(
+                    self.config.num_layers,
+                    self.config.hidden_size,
+                    self.config.num_heads,
+                    self.config.num_kv_heads,
+                    self.config.head_dim,
+                    self.config.rope_theta as f32,
+                    self.config.rope_dims(),
+                    self.config.rms_norm_eps as f32,
+                    self.config.full_attention_interval,
+                    self.config.linear_num_key_heads,
+                    self.config.linear_num_value_heads,
+                    self.config.linear_key_head_dim,
+                    self.config.linear_value_head_dim,
+                    self.config.linear_conv_kernel_dim,
+                    if self.config.tie_word_embeddings {
+                        1
+                    } else {
+                        0
+                    },
+                    max_kv_len,
+                    1, // batch_size
+                    cache_ptrs.as_mut_ptr(),
+                    prefill_len,
+                );
+            }
+            // C++ has copied arrays into g_compiled_caches — safe to release
+            drop(caches_guard);
+
+            // Decode using compiled forward with synchronous cache eval.
+            // Caches are eval'd BEFORE each forward call to ensure the previous step's
+            // caches are materialized, breaking lazy dependency chains that would otherwise
+            // cause O(N²) graph growth and 100+GB memory.
+            let mut forward_fn = |ids: &MxArray| -> Result<MxArray> {
+                // Sync-eval compiled caches from the previous step before building new graph.
+                // Uses synchronous eval (not async_eval) to avoid interaction issues with
+                // the training loop's own synchronous eval calls.
+                unsafe { mlx_sys::mlx_qwen35_sync_eval_compiled_caches() };
+                let logits = forward_compiled(ids, &embedding_weight)?;
+                // forward_compiled returns [1, vocab] but training loop expects [1, 1, vocab]
+                let logits = logits.reshape(&[1, 1, -1])?;
+                Ok(logits)
+            };
+
+            crate::models::training_generate::generate_decode_loop_for_training(
+                &last_logits,
+                &input_tokens,
+                &config,
+                eos_token_id,
+                &mut forward_fn,
+            )?
+            // _compiled_guard dropped here → mlx_qwen35_compiled_reset()
+        } else {
+            // === Rust fallback decode path ===
+            let mut forward_fn = |ids: &MxArray| -> Result<MxArray> {
+                forward_inner(
+                    ids,
+                    &embedding_weight,
+                    &mut layers_guard,
+                    &mut caches_guard,
+                    &final_norm_guard,
+                    &lm_head_guard,
+                    fa_idx,
+                    None,
+                )
+            };
+
+            let result = crate::models::training_generate::generate_decode_loop_for_training(
+                &last_logits,
+                &input_tokens,
+                &config,
+                eos_token_id,
+                &mut forward_fn,
+            )?;
+
+            drop(layers_guard);
+            drop(final_norm_guard);
+            drop(lm_head_guard);
+            drop(caches_guard);
+
+            result
         };
 
-        let result = crate::models::training_generate::generate_for_training_loop(
-            input_ids,
-            &config,
-            eos_token_id,
-            &mut forward_fn,
-        )?;
-
-        // Reset caches after generation
-        drop(layers_guard);
-        drop(final_norm_guard);
-        drop(lm_head_guard);
-        drop(caches_guard);
+        // Drop compiled lock before reset_caches
+        drop(compiled_lock);
         self.reset_caches()?;
 
         Ok(result)

@@ -73,6 +73,8 @@ pub(crate) fn compute_sft_loss_and_gradients(
         let loss_config_clone = loss_config.clone();
 
         // Define loss function for autograd
+        let ckpt_contexts = std::rc::Rc::new(std::cell::RefCell::new(autograd::CheckpointContexts::new()));
+        let ckpt_ctx = ckpt_contexts.clone();
         let loss_fn = move |params: &[MxArray]| -> Result<MxArray> {
             // Map params to structured dictionary
             let param_dict = param_manager::map_params_to_dict(params, &param_names_clone)?;
@@ -82,6 +84,8 @@ pub(crate) fn compute_sft_loss_and_gradients(
                 &config_clone,
                 &param_dict,
                 &input_ids_clone,
+                false,
+                &mut ckpt_ctx.borrow_mut(),
             )?;
 
             // Get shapes
@@ -129,6 +133,9 @@ pub(crate) fn compute_sft_loss_and_gradients(
             grad.eval();
         }
 
+        // Reclaim checkpoint contexts now that the graph is eval'd
+        ckpt_contexts.borrow_mut().reclaim();
+
         // Extract values before scope ends
         let loss_val = loss_array.item_at_float32(0)? as f64;
         let grads: HashMap<String, MxArray> = param_names
@@ -165,8 +172,10 @@ pub(crate) fn compute_token_accuracy(
     input_ids: &MxArray,
     labels: &MxArray,
 ) -> Result<f64> {
-    // Forward pass
-    let logits = functional::forward_functional_dispatch(model_type, model_params, input_ids)?;
+    // Forward pass (no checkpointing needed for validation — no backward pass)
+    let mut ckpt = autograd::CheckpointContexts::new();
+    let logits =
+        functional::forward_functional_dispatch(model_type, model_params, input_ids, false, &mut ckpt)?;
 
     // Get shapes
     let batch_size = logits.shape_at(0)?;

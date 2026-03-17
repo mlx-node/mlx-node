@@ -11,6 +11,7 @@ use crate::vision::encoder::VisionEncoderLayer;
 use crate::vision::projector::SpatialProjector;
 use crate::vision::rope_vision::VisionRotaryEmbedding;
 use napi::bindgen_prelude::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Qwen3.5 Vision Encoder configuration
@@ -106,6 +107,99 @@ impl Qwen3_5VisionEncoder {
     /// Set the merger (spatial projector)
     pub fn set_merger(&mut self, merger: SpatialProjector) {
         self.merger = Some(Arc::new(merger));
+    }
+
+    /// Extract all vision encoder parameters as a flat map.
+    ///
+    /// Keys use the `visual.` prefix so they round-trip through save/load
+    /// (load_pretrained detects keys starting with `visual.`).
+    /// Internal keys mirror the load convention: `patch_embed.proj.weight`,
+    /// `pos_embed.weight`, `blocks.{i}.attn.qkv.weight`, etc.
+    pub fn get_parameters(&self) -> HashMap<String, MxArray> {
+        let mut params = HashMap::new();
+
+        // Patch embedding
+        params.insert(
+            "visual.patch_embed.proj.weight".to_string(),
+            self.patch_embed.weight(),
+        );
+
+        // Position embedding
+        if let Some(ref pe) = self.pos_embed {
+            params.insert("visual.pos_embed.weight".to_string(), pe.as_ref().clone());
+        }
+
+        // Encoder layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("visual.blocks.{}", i);
+
+            // Attention
+            let attn = layer.self_attn();
+            params.insert(format!("{}.attn.qkv.weight", prefix), attn.get_qkv_weight());
+            if let Some(b) = attn.get_qkv_bias() {
+                params.insert(format!("{}.attn.qkv.bias", prefix), b);
+            }
+            params.insert(
+                format!("{}.attn.proj.weight", prefix),
+                attn.get_out_proj_weight(),
+            );
+            if let Some(b) = attn.get_out_proj_bias() {
+                params.insert(format!("{}.attn.proj.bias", prefix), b);
+            }
+
+            // MLP
+            let mlp = layer.mlp();
+            params.insert(
+                format!("{}.mlp.linear_fc1.weight", prefix),
+                mlp.get_fc1_weight(),
+            );
+            if let Some(b) = mlp.get_fc1_bias() {
+                params.insert(format!("{}.mlp.linear_fc1.bias", prefix), b);
+            }
+            params.insert(
+                format!("{}.mlp.linear_fc2.weight", prefix),
+                mlp.get_fc2_weight(),
+            );
+            if let Some(b) = mlp.get_fc2_bias() {
+                params.insert(format!("{}.mlp.linear_fc2.bias", prefix), b);
+            }
+
+            // Layer norms
+            let ln1 = layer.layer_norm1();
+            params.insert(format!("{}.norm1.weight", prefix), ln1.get_weight());
+            params.insert(format!("{}.norm1.bias", prefix), ln1.get_bias());
+
+            let ln2 = layer.layer_norm2();
+            params.insert(format!("{}.norm2.weight", prefix), ln2.get_weight());
+            params.insert(format!("{}.norm2.bias", prefix), ln2.get_bias());
+        }
+
+        // Merger (spatial projector)
+        if let Some(ref merger) = self.merger {
+            let norm = merger.pre_norm();
+            params.insert("visual.merger.norm.weight".to_string(), norm.get_weight());
+            params.insert("visual.merger.norm.bias".to_string(), norm.get_bias());
+
+            let l1 = merger.linear_1();
+            params.insert(
+                "visual.merger.linear_fc1.weight".to_string(),
+                l1.get_weight(),
+            );
+            if let Some(b) = l1.get_bias() {
+                params.insert("visual.merger.linear_fc1.bias".to_string(), b);
+            }
+
+            let l2 = merger.linear_2();
+            params.insert(
+                "visual.merger.linear_fc2.weight".to_string(),
+                l2.get_weight(),
+            );
+            if let Some(b) = l2.get_bias() {
+                params.insert("visual.merger.linear_fc2.bias".to_string(), b);
+            }
+        }
+
+        params
     }
 
     /// Compute 2D rotary position embeddings for the grid

@@ -9,6 +9,7 @@
  * gradients through the entire forward pass from parameters to loss.
  */
 use crate::array::{MxArray, scaled_dot_product_attention};
+use crate::autograd;
 use crate::models::qwen3::Qwen3Config;
 use crate::models::qwen3_5::Qwen3_5Config;
 use crate::models::qwen3_5_moe::Qwen3_5MoeConfig;
@@ -347,6 +348,18 @@ pub fn qwen3_forward_hidden_states(
     params: &HashMap<String, MxArray>,
     input_ids: &MxArray,
 ) -> Result<MxArray> {
+    let mut ckpt = autograd::CheckpointContexts::new();
+    qwen3_forward_hidden_states_impl(config, params, input_ids, false, &mut ckpt)
+}
+
+/// Qwen3 forward with optional gradient checkpointing.
+pub fn qwen3_forward_hidden_states_impl(
+    config: &Qwen3Config,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+    use_checkpointing: bool,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
+) -> Result<MxArray> {
     // 1. Embedding lookup
     let embedding_weight = params
         .get("embedding.weight")
@@ -357,21 +370,62 @@ pub fn qwen3_forward_hidden_states(
     // 2. Transformer layers
     let num_layers = config.num_layers as usize;
     for layer_idx in 0..num_layers {
-        // Get layer parameters
-        let layer_params = get_layer_params(params, layer_idx, config)?;
+        if use_checkpointing {
+            // Checkpointed path: collect layer params, wrap in checkpoint
+            let prefix = format!("layers.{}.", layer_idx);
+            let layer_param_names = collect_layer_param_names(params, &prefix);
 
-        // Forward through transformer block
-        hidden_states = transformer_block_functional(
-            &hidden_states,
-            &layer_params,
-            config.num_heads as u32,
-            config.num_kv_heads as u32,
-            config.head_dim as u32, // Use explicit head_dim from config (critical for Qwen3!)
-            config.rope_theta,
-            config.use_qk_norm,
-            config.rms_norm_eps,
-            0, // offset (no KV caching for training)
-        )?;
+            let mut inputs: Vec<&MxArray> = vec![&hidden_states];
+            for name in &layer_param_names {
+                inputs.push(
+                    params
+                        .get(name)
+                        .ok_or_else(|| Error::from_reason(format!("Missing {}", name)))?,
+                );
+            }
+
+            let names_clone = layer_param_names.clone();
+            let config_clone = config.clone();
+            let layer = layer_idx;
+
+            let outputs = autograd::checkpoint_apply(inputs, move |arrays| {
+                let h_in = &arrays[0];
+                let layer_params: HashMap<String, MxArray> = names_clone
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (name.clone(), arrays[i + 1].clone()))
+                    .collect();
+                let block_params = get_layer_params(&layer_params, layer, &config_clone)?;
+                let h_out = transformer_block_functional(
+                    h_in,
+                    &block_params,
+                    config_clone.num_heads as u32,
+                    config_clone.num_kv_heads as u32,
+                    config_clone.head_dim as u32,
+                    config_clone.rope_theta,
+                    config_clone.use_qk_norm,
+                    config_clone.rms_norm_eps,
+                    0,
+                )?;
+                Ok(vec![h_out])
+            }, ckpt_contexts)?;
+
+            hidden_states = outputs.into_iter().next().unwrap();
+        } else {
+            // Standard path
+            let layer_params = get_layer_params(params, layer_idx, config)?;
+            hidden_states = transformer_block_functional(
+                &hidden_states,
+                &layer_params,
+                config.num_heads as u32,
+                config.num_kv_heads as u32,
+                config.head_dim as u32,
+                config.rope_theta,
+                config.use_qk_norm,
+                config.rms_norm_eps,
+                0,
+            )?;
+        }
     }
 
     // 3. Final layer norm
@@ -1125,11 +1179,77 @@ pub fn qwen3_5_forward_functional(
     lm_head_functional(&hidden_states, params, config.tie_word_embeddings)
 }
 
+/// Collect sorted parameter names that match a prefix (e.g., "layers.0.")
+fn collect_layer_param_names(params: &HashMap<String, MxArray>, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = params
+        .keys()
+        .filter(|k| k.starts_with(prefix))
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// Run a Qwen3.5 Dense block through gradient checkpointing.
+///
+/// Flattens [hidden_states, layer_param1, layer_param2, ...] into a single
+/// array vec for checkpoint, then reconstructs params inside the callback.
+fn qwen3_5_block_checkpointed(
+    params: &HashMap<String, MxArray>,
+    h: &MxArray,
+    config: &Qwen3_5Config,
+    layer_idx: usize,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
+) -> Result<MxArray> {
+    let prefix = format!("layers.{}.", layer_idx);
+    let layer_param_names = collect_layer_param_names(params, &prefix);
+
+    // Build inputs: [hidden_states, param1, param2, ...]
+    let mut inputs: Vec<&MxArray> = vec![h];
+    for name in &layer_param_names {
+        inputs.push(
+            params
+                .get(name)
+                .ok_or_else(|| Error::from_reason(format!("Missing {}", name)))?,
+        );
+    }
+
+    let names_clone = layer_param_names.clone();
+    let config_clone = config.clone();
+    let layer = layer_idx;
+
+    let outputs = autograd::checkpoint_apply(inputs, move |arrays| {
+        // arrays[0] = hidden_states, arrays[1..] = layer params
+        let h_in = &arrays[0];
+        let layer_params: HashMap<String, MxArray> = names_clone
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), arrays[i + 1].clone()))
+            .collect();
+        let h_out = qwen3_5_block_functional(&layer_params, h_in, &config_clone, layer)?;
+        Ok(vec![h_out])
+    }, ckpt_contexts)?;
+
+    Ok(outputs.into_iter().next().unwrap())
+}
+
 /// Qwen3.5 Dense forward returning hidden states before LM head.
 pub fn qwen3_5_forward_hidden_states(
     config: &Qwen3_5Config,
     params: &HashMap<String, MxArray>,
     input_ids: &MxArray,
+) -> Result<MxArray> {
+    let mut ckpt = autograd::CheckpointContexts::new();
+    qwen3_5_forward_hidden_states_impl(config, params, input_ids, false, &mut ckpt)
+}
+
+/// Qwen3.5 Dense forward with optional gradient checkpointing.
+pub fn qwen3_5_forward_hidden_states_impl(
+    config: &Qwen3_5Config,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+    use_checkpointing: bool,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
 ) -> Result<MxArray> {
     // Embedding
     let embed_weight = params
@@ -1137,10 +1257,17 @@ pub fn qwen3_5_forward_hidden_states(
         .ok_or_else(|| Error::from_reason("Missing embedding.weight"))?;
     let mut h = embedding_functional(embed_weight, input_ids)?;
 
-    // Transformer blocks
+    // Transformer blocks — NO eval() between layers!
+    // During value_and_grad tracing, eval() would materialize data without calling
+    // detach() (because is_tracer() is true), preventing checkpoint from freeing
+    // intermediates. The lazy graph is built here; the final eval() (outside tracing)
+    // processes it with proper detach, freeing each layer's intermediates in turn.
     for layer_idx in 0..config.num_layers as usize {
-        h = qwen3_5_block_functional(params, &h, config, layer_idx)?;
-        if layer_idx < 3 || layer_idx == config.num_layers as usize - 1 {}
+        if use_checkpointing {
+            h = qwen3_5_block_checkpointed(params, &h, config, layer_idx, ckpt_contexts)?;
+        } else {
+            h = qwen3_5_block_functional(params, &h, config, layer_idx)?;
+        }
     }
 
     // Final norm
@@ -1391,21 +1518,77 @@ pub fn qwen3_5_moe_forward_functional(
     lm_head_functional(&hidden_states, params, config.tie_word_embeddings)
 }
 
+/// Run a Qwen3.5 MoE block through gradient checkpointing.
+fn qwen3_5_moe_block_checkpointed(
+    params: &HashMap<String, MxArray>,
+    h: &MxArray,
+    config: &Qwen3_5MoeConfig,
+    dense_config: &Qwen3_5Config,
+    layer_idx: usize,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
+) -> Result<MxArray> {
+    let prefix = format!("layers.{}.", layer_idx);
+    let layer_param_names = collect_layer_param_names(params, &prefix);
+
+    let mut inputs: Vec<&MxArray> = vec![h];
+    for name in &layer_param_names {
+        inputs.push(
+            params
+                .get(name)
+                .ok_or_else(|| Error::from_reason(format!("Missing {}", name)))?,
+        );
+    }
+
+    let names_clone = layer_param_names.clone();
+    let config_clone = config.clone();
+    let dense_clone = dense_config.clone();
+    let layer = layer_idx;
+
+    let outputs = autograd::checkpoint_apply(inputs, move |arrays| {
+        let h_in = &arrays[0];
+        let layer_params: HashMap<String, MxArray> = names_clone
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), arrays[i + 1].clone()))
+            .collect();
+        let h_out =
+            qwen3_5_moe_block_functional(&layer_params, h_in, &config_clone, &dense_clone, layer)?;
+        Ok(vec![h_out])
+    }, ckpt_contexts)?;
+
+    Ok(outputs.into_iter().next().unwrap())
+}
+
 /// Qwen3.5 MoE forward returning hidden states.
 pub fn qwen3_5_moe_forward_hidden_states(
     config: &Qwen3_5MoeConfig,
     params: &HashMap<String, MxArray>,
     input_ids: &MxArray,
 ) -> Result<MxArray> {
+    let mut ckpt = autograd::CheckpointContexts::new();
+    qwen3_5_moe_forward_hidden_states_impl(config, params, input_ids, false, &mut ckpt)
+}
+
+/// Qwen3.5 MoE forward with optional gradient checkpointing.
+pub fn qwen3_5_moe_forward_hidden_states_impl(
+    config: &Qwen3_5MoeConfig,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+    use_checkpointing: bool,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
+) -> Result<MxArray> {
     let embed_weight = params
         .get("embedding.weight")
         .ok_or_else(|| Error::from_reason("Missing embedding.weight"))?;
     let mut h = embedding_functional(embed_weight, input_ids)?;
 
-    // Compute dense_config once (not per-layer) to avoid repeated allocation
     let dense_config = config.to_dense_config();
     for layer_idx in 0..config.num_layers as usize {
-        h = qwen3_5_moe_block_functional(params, &h, config, &dense_config, layer_idx)?;
+        if use_checkpointing {
+            h = qwen3_5_moe_block_checkpointed(params, &h, config, &dense_config, layer_idx, ckpt_contexts)?;
+        } else {
+            h = qwen3_5_moe_block_functional(params, &h, config, &dense_config, layer_idx)?;
+        }
     }
 
     let final_norm_weight = params
@@ -1423,25 +1606,31 @@ pub(crate) fn forward_functional_dispatch(
     model_type: &ModelType,
     params: &HashMap<String, MxArray>,
     input_ids: &MxArray,
+    use_checkpointing: bool,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
 ) -> Result<MxArray> {
-    match model_type {
-        ModelType::Qwen3(config) => qwen3_forward_functional(config, params, input_ids),
-        ModelType::Qwen35Dense(config) => qwen3_5_forward_functional(config, params, input_ids),
-        ModelType::Qwen35Moe(config) => qwen3_5_moe_forward_functional(config, params, input_ids),
-    }
+    let hidden_states =
+        forward_hidden_states_dispatch(model_type, params, input_ids, use_checkpointing, ckpt_contexts)?;
+    lm_head_functional(&hidden_states, params, model_type.tie_word_embeddings())
 }
 
-/// Dispatch forward pass returning hidden states.
+/// Dispatch forward pass returning hidden states with optional checkpointing.
 pub(crate) fn forward_hidden_states_dispatch(
     model_type: &ModelType,
     params: &HashMap<String, MxArray>,
     input_ids: &MxArray,
+    use_checkpointing: bool,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
 ) -> Result<MxArray> {
     match model_type {
-        ModelType::Qwen3(config) => qwen3_forward_hidden_states(config, params, input_ids),
-        ModelType::Qwen35Dense(config) => qwen3_5_forward_hidden_states(config, params, input_ids),
+        ModelType::Qwen3(config) => {
+            qwen3_forward_hidden_states_impl(config, params, input_ids, use_checkpointing, ckpt_contexts)
+        }
+        ModelType::Qwen35Dense(config) => {
+            qwen3_5_forward_hidden_states_impl(config, params, input_ids, use_checkpointing, ckpt_contexts)
+        }
         ModelType::Qwen35Moe(config) => {
-            qwen3_5_moe_forward_hidden_states(config, params, input_ids)
+            qwen3_5_moe_forward_hidden_states_impl(config, params, input_ids, use_checkpointing, ckpt_contexts)
         }
     }
 }

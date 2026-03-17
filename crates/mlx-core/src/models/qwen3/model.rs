@@ -4088,6 +4088,7 @@ impl Qwen3Model {
             rewards,
             group_size,
             config,
+            false, // No gradient checkpointing in legacy API
         )?;
 
         // 3. Apply gradients to update parameters
@@ -4167,6 +4168,7 @@ impl Qwen3Model {
             rewards,
             group_size,
             config,
+            false, // No gradient checkpointing in legacy API
         )?;
 
         // 3. Compute metrics (DON'T apply gradients)

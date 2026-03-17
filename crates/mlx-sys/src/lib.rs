@@ -426,6 +426,16 @@ unsafe extern "C" {
         grad_handles: *mut *mut mlx_array,
     ) -> usize;
 
+    // Gradient checkpointing
+    pub fn mlx_checkpoint_apply(
+        layer_fn: LayerFunctionPtr,
+        context: *mut std::os::raw::c_void,
+        input_handles: *const *mut mlx_array,
+        input_count: usize,
+        output_handles: *mut *mut mlx_array,
+        max_outputs: usize,
+    ) -> usize;
+
     // Comparison operations
     pub fn mlx_array_equal(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_not_equal(lhs: *mut mlx_array, rhs: *mut mlx_array) -> *mut mlx_array;
@@ -1038,6 +1048,9 @@ unsafe extern "C" {
     /// Eval next_token and all compiled cache arrays to prevent graph accumulation.
     pub fn mlx_qwen35_eval_token_and_compiled_caches(next_token: *mut mlx_array);
 
+    /// Synchronously eval all compiled cache arrays (for training decode loop).
+    pub fn mlx_qwen35_sync_eval_compiled_caches();
+
     /// Adjust the compiled offset by delta (for VLM rope_deltas).
     pub fn mlx_qwen35_compiled_adjust_offset(delta: i32);
 
@@ -1123,6 +1136,9 @@ unsafe extern "C" {
     /// Eval next_token and all MoE cache arrays to prevent graph accumulation.
     pub fn mlx_qwen35_moe_eval_token_and_caches(next_token: *mut mlx_array);
 
+    /// Synchronously eval all MoE cache arrays (for training decode loop).
+    pub fn mlx_qwen35_moe_sync_eval_caches();
+
     /// Reset MoE state.
     pub fn mlx_qwen35_moe_reset();
 
@@ -1147,3 +1163,12 @@ pub type LossFunctionPtr = extern "C" fn(
     input_count: usize,
     context: *mut std::os::raw::c_void,
 ) -> *mut mlx_array;
+
+// Checkpoint layer function type: takes inputs, writes outputs, returns count
+pub type LayerFunctionPtr = extern "C" fn(
+    inputs: *const *mut mlx_array,
+    input_count: usize,
+    outputs: *mut *mut mlx_array,
+    max_outputs: usize,
+    context: *mut std::os::raw::c_void,
+) -> usize;

@@ -135,6 +135,16 @@ impl LayerNorm {
     /// * `weight` - Scale parameter [dims]
     /// * `bias` - Bias parameter [dims] (optional, defaults to zeros)
     /// * `eps` - Small constant for numerical stability
+    /// Get the weight (scale) parameter
+    pub fn get_weight(&self) -> MxArray {
+        self.weight.clone()
+    }
+
+    /// Get the bias parameter
+    pub fn get_bias(&self) -> MxArray {
+        self.bias.clone()
+    }
+
     pub fn from_weights(
         weight: &MxArray,
         bias: Option<&MxArray>,

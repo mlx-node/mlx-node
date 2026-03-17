@@ -76,6 +76,26 @@ impl VisionAttention {
         })
     }
 
+    /// Get the QKV projection weight
+    pub fn get_qkv_weight(&self) -> MxArray {
+        self.qkv.get_weight()
+    }
+
+    /// Get the QKV projection bias
+    pub fn get_qkv_bias(&self) -> Option<MxArray> {
+        self.qkv.get_bias()
+    }
+
+    /// Get the output projection weight
+    pub fn get_out_proj_weight(&self) -> MxArray {
+        self.out_proj.get_weight()
+    }
+
+    /// Get the output projection bias
+    pub fn get_out_proj_bias(&self) -> Option<MxArray> {
+        self.out_proj.get_bias()
+    }
+
     /// Build attention mask from cumulative sequence lengths.
     ///
     /// Creates a mask where positions within the same sub-sequence can attend
@@ -249,6 +269,26 @@ impl VisionMLP {
         })
     }
 
+    /// Get fc1 weight
+    pub fn get_fc1_weight(&self) -> MxArray {
+        self.fc1.get_weight()
+    }
+
+    /// Get fc1 bias
+    pub fn get_fc1_bias(&self) -> Option<MxArray> {
+        self.fc1.get_bias()
+    }
+
+    /// Get fc2 weight
+    pub fn get_fc2_weight(&self) -> MxArray {
+        self.fc2.get_weight()
+    }
+
+    /// Get fc2 bias
+    pub fn get_fc2_bias(&self) -> Option<MxArray> {
+        self.fc2.get_bias()
+    }
+
     /// Forward pass with GELU activation
     ///
     /// # Arguments
@@ -301,6 +341,26 @@ impl VisionEncoderLayer {
                 fc2: mlp.fc2.clone(),
             }),
         }
+    }
+
+    /// Get the self-attention module
+    pub fn self_attn(&self) -> &VisionAttention {
+        &self.self_attn
+    }
+
+    /// Get the MLP module
+    pub fn mlp(&self) -> &VisionMLP {
+        &self.mlp
+    }
+
+    /// Get LayerNorm 1 (pre-attention)
+    pub fn layer_norm1(&self) -> &LayerNorm {
+        &self.layer_norm1
+    }
+
+    /// Get LayerNorm 2 (post-attention)
+    pub fn layer_norm2(&self) -> &LayerNorm {
+        &self.layer_norm2
     }
 
     /// Forward pass

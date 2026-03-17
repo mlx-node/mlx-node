@@ -43,14 +43,11 @@ use tracing::error;
 /// This struct holds all the data needed by the loss function, including:
 /// - Closure for computing loss given parameters
 /// - Error storage for propagating Rust errors through C FFI
-/// - Flag to ensure closure is only called once
 struct LossFunctionContext {
     /// User-provided loss function closure (FnMut to allow multiple calls if needed)
     loss_fn: Option<Box<dyn FnMut(&[MxArray]) -> Result<MxArray>>>,
     /// Error message if loss function fails
     error: Option<String>,
-    /// Track if function has been called
-    called: bool,
 }
 
 /// External C callback function for MLX autograd
@@ -103,11 +100,6 @@ extern "C" fn loss_function_callback(
             }
         }
     }
-
-    // Note: MLX may call the loss function multiple times during value_and_grad.
-    // The first call builds the computation graph, subsequent calls may happen
-    // during VJP tracing. We must allow all calls.
-    context_ref.called = true;
 
     // Call user's loss function
     let result = if let Some(ref mut loss_fn) = context_ref.loss_fn {
@@ -189,7 +181,6 @@ where
     let mut context = Box::new(LossFunctionContext {
         loss_fn: Some(Box::new(loss_fn)),
         error: None,
-        called: false,
     });
     let context_ptr = &mut *context as *mut LossFunctionContext as *mut c_void;
 
@@ -263,7 +254,6 @@ where
     let mut context = Box::new(LossFunctionContext {
         loss_fn: Some(Box::new(loss_fn)),
         error: None,
-        called: false,
     });
     let context_ptr = &mut *context as *mut LossFunctionContext as *mut c_void;
 
@@ -307,6 +297,210 @@ where
         .collect();
 
     gradients
+}
+
+// ============================================================================
+// Gradient Checkpointing
+// ============================================================================
+
+/// Context for the layer function callback used by checkpoint
+struct LayerFunctionContext {
+    layer_fn: Option<Box<dyn FnMut(&[MxArray]) -> Result<Vec<MxArray>>>>,
+    error: Option<String>,
+}
+
+/// External C callback for checkpoint layer function
+///
+/// Takes input arrays, calls the Rust layer function, writes output arrays.
+/// Returns number of outputs written.
+extern "C" fn layer_function_callback(
+    inputs: *const *mut sys::mlx_array,
+    input_count: usize,
+    outputs: *mut *mut sys::mlx_array,
+    max_outputs: usize,
+    context: *mut c_void,
+) -> usize {
+    let context_ptr = context as *mut LayerFunctionContext;
+    let context_ref = unsafe {
+        if context_ptr.is_null() {
+            error!("layer_function_callback: null context pointer");
+            return 0;
+        }
+        &mut *context_ptr
+    };
+
+    // Convert input handles to MxArray
+    let input_slice = unsafe {
+        if inputs.is_null() || input_count == 0 {
+            context_ref.error = Some("Invalid input handles".to_string());
+            return 0;
+        }
+        std::slice::from_raw_parts(inputs, input_count)
+    };
+
+    let mut param_arrays = Vec::with_capacity(input_count);
+    for &handle in input_slice {
+        match MxArray::from_handle(handle, "checkpoint_input") {
+            Ok(arr) => param_arrays.push(arr),
+            Err(e) => {
+                context_ref.error = Some(format!("Failed to create array: {:?}", e));
+                return 0;
+            }
+        }
+    }
+
+    // Call user's layer function
+    let result = if let Some(ref mut layer_fn) = context_ref.layer_fn {
+        layer_fn(&param_arrays)
+    } else {
+        context_ref.error = Some("Layer function not available".to_string());
+        return 0;
+    };
+
+    // CRITICAL: Don't drop param_arrays — C++ owns these handles
+    std::mem::forget(param_arrays);
+
+    match result {
+        Ok(output_arrays) => {
+            if output_arrays.len() > max_outputs {
+                context_ref.error = Some(format!(
+                    "Layer returned {} outputs but max is {}",
+                    output_arrays.len(),
+                    max_outputs
+                ));
+                return 0;
+            }
+
+            let count = output_arrays.len();
+            let output_slice = unsafe { std::slice::from_raw_parts_mut(outputs, max_outputs) };
+
+            for (i, arr) in output_arrays.into_iter().enumerate() {
+                let handle = arr.handle.0;
+                std::mem::forget(arr); // MLX takes ownership
+                output_slice[i] = handle;
+            }
+
+            count
+        }
+        Err(e) => {
+            context_ref.error = Some(format!("{:?}", e));
+            0
+        }
+    }
+}
+
+/// Apply a function with gradient checkpointing
+///
+/// Wraps the given layer function with MLX's `checkpoint()` transform, which
+/// discards intermediate activations during the forward pass and recomputes
+/// them during backward. This reduces memory from O(num_layers) to O(1) for
+/// intermediate states.
+///
+/// # Arguments
+/// * `inputs` - Input arrays (typically [hidden_states, param1, param2, ...])
+/// * `layer_fn` - Function implementing the layer forward pass
+///
+/// # Returns
+/// * Output arrays from the layer function, annotated with checkpoint metadata
+///   so MLX autograd knows to recompute during backward
+/// Collects checkpoint context pointers that must survive until the backward pass.
+///
+/// During `checkpoint_apply`, contexts are allocated via `Box::into_raw` so the C++
+/// callback pointer stays valid through MLX's backward recomputation. After
+/// `value_and_grad` + eval completes, call `reclaim()` to free them all.
+///
+/// Create one per `value_and_grad` call, pass it through the forward functions,
+/// and reclaim after eval.
+pub struct CheckpointContexts {
+    contexts: Vec<*mut LayerFunctionContext>,
+}
+
+impl CheckpointContexts {
+    pub fn new() -> Self {
+        Self {
+            contexts: Vec::new(),
+        }
+    }
+
+    /// Reclaim all checkpoint contexts. Call after value_and_grad + eval completes
+    /// (when the MLX computation graph has been freed and no callbacks reference them).
+    pub fn reclaim(&mut self) {
+        for ptr in self.contexts.drain(..) {
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
+        }
+    }
+}
+
+impl Drop for CheckpointContexts {
+    fn drop(&mut self) {
+        self.reclaim();
+    }
+}
+
+pub fn checkpoint_apply<F>(
+    inputs: Vec<&MxArray>,
+    layer_fn: F,
+    contexts: &mut CheckpointContexts,
+) -> Result<Vec<MxArray>>
+where
+    F: FnMut(&[MxArray]) -> Result<Vec<MxArray>> + 'static,
+{
+    if inputs.is_empty() {
+        return Err(Error::from_reason(
+            "checkpoint_apply: inputs cannot be empty",
+        ));
+    }
+
+    let input_handles: Vec<*mut sys::mlx_array> = inputs.iter().map(|p| p.handle.0).collect();
+    let input_count = input_handles.len();
+
+    const MAX_OUTPUTS: usize = 16;
+    let mut output_handles: Vec<*mut sys::mlx_array> = vec![std::ptr::null_mut(); MAX_OUTPUTS];
+
+    let context = Box::new(LayerFunctionContext {
+        layer_fn: Some(Box::new(layer_fn)),
+        error: None,
+    });
+    // Box::into_raw so the context survives until MLX's backward pass
+    // re-invokes the callback. Tracked in `contexts` for later reclamation.
+    let context_ptr = Box::into_raw(context);
+    contexts.contexts.push(context_ptr);
+
+    let num_outputs = unsafe {
+        sys::mlx_checkpoint_apply(
+            layer_function_callback,
+            context_ptr as *mut c_void,
+            input_handles.as_ptr(),
+            input_count,
+            output_handles.as_mut_ptr(),
+            MAX_OUTPUTS,
+        )
+    };
+
+    // Read error from context (still valid — reclaimed later via contexts.reclaim())
+    let context_ref = unsafe { &*context_ptr };
+    if let Some(ref error) = context_ref.error {
+        return Err(Error::from_reason(format!(
+            "checkpoint_apply: layer function failed: {}",
+            error
+        )));
+    }
+
+    if num_outputs == 0 {
+        return Err(Error::from_reason(
+            "checkpoint_apply: MLX checkpoint failed (returned 0)".to_string(),
+        ));
+    }
+
+    let outputs: Result<Vec<MxArray>> = output_handles[..num_outputs]
+        .iter()
+        .enumerate()
+        .map(|(_, &handle)| MxArray::from_handle(handle, "checkpoint_output"))
+        .collect();
+
+    outputs
 }
 
 #[cfg(test)]
@@ -496,5 +690,61 @@ mod tests {
             (get_scalar(&grads[0]) - 6.0).abs() < 1e-5,
             "gradient should be 6.0"
         );
+    }
+
+    #[test]
+    fn test_checkpoint_produces_correct_gradients() {
+        // Test that checkpoint_apply produces the same gradients as direct computation.
+        // checkpoint() should only affect memory (discard/recompute intermediates),
+        // not the mathematical result.
+
+        let x = MxArray::from_float32(&[1.0, 2.0, 3.0], &[3]).unwrap();
+        let w = MxArray::from_float32(&[0.5, -0.5, 1.0], &[3]).unwrap();
+
+        // Path 1: Direct computation (no checkpointing)
+        let (loss_direct, grads_direct) = value_and_grad(vec![&x, &w], |params| {
+            let product = params[0].mul(&params[1])?;
+            let squared = product.square()?;
+            to_scalar(squared)
+        })
+        .unwrap();
+
+        // Path 2: Same computation wrapped in checkpoint_apply
+        let ckpt_rc = std::rc::Rc::new(std::cell::RefCell::new(CheckpointContexts::new()));
+        let ckpt_inner = ckpt_rc.clone();
+        let (loss_ckpt, grads_ckpt) = value_and_grad(vec![&x, &w], move |params| {
+            // Wrap the "layer" computation in checkpoint
+            let outputs = super::checkpoint_apply(vec![&params[0], &params[1]], |arrays| {
+                let product = arrays[0].mul(&arrays[1])?;
+                let squared = product.square()?;
+                Ok(vec![squared])
+            }, &mut ckpt_inner.borrow_mut())?;
+            to_scalar(outputs.into_iter().next().unwrap())
+        })
+        .unwrap();
+        ckpt_rc.borrow_mut().reclaim();
+
+        // Both paths should produce identical results
+        let loss_d = get_scalar(&loss_direct);
+        let loss_c = get_scalar(&loss_ckpt);
+        assert!(
+            (loss_d - loss_c).abs() < 1e-5,
+            "Loss mismatch: direct={}, checkpoint={}",
+            loss_d,
+            loss_c
+        );
+
+        // Gradients should match
+        for i in 0..2 {
+            let gd = get_scalar(&grads_direct[i]);
+            let gc = get_scalar(&grads_ckpt[i]);
+            assert!(
+                (gd - gc).abs() < 1e-5,
+                "Gradient {} mismatch: direct={}, checkpoint={}",
+                i,
+                gd,
+                gc
+            );
+        }
     }
 }

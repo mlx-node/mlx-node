@@ -163,6 +163,21 @@ impl SpatialProjector {
         }
     }
 
+    /// Get the pre-norm LayerNorm
+    pub fn pre_norm(&self) -> &LayerNorm {
+        &self.pre_norm
+    }
+
+    /// Get the first linear layer
+    pub fn linear_1(&self) -> &Linear {
+        &self.linear_1
+    }
+
+    /// Get the second linear layer
+    pub fn linear_2(&self) -> &Linear {
+        &self.linear_2
+    }
+
     /// Get the spatial merge size
     pub fn spatial_merge_size(&self) -> u32 {
         self.spatial_merge_size

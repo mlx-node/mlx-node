@@ -155,6 +155,24 @@ pub struct GRPOEngineConfig {
     /// When false, uses the sequential generation (process one prompt at a time,
     /// then expand KV cache for G completions).
     pub use_parallel_batch_generation: Option<bool>,
+
+    /// Enable gradient checkpointing (default: true).
+    /// When true, each transformer layer's activations are discarded during the forward
+    /// pass and recomputed during backward, reducing peak memory from O(num_layers) to O(1)
+    /// for intermediate states. For Qwen3.5 0.8B, this reduces autograd peak from ~105GB to ~11GB.
+    /// The trade-off is ~30% more compute (one extra forward pass per layer during backward).
+    pub gradient_checkpointing: Option<bool>,
+
+    /// Optimizer type: "sgd" or "adamw" (default: "adamw")
+    pub optimizer_type: Option<String>,
+    /// AdamW beta1 (default: 0.9)
+    pub adamw_beta1: Option<f64>,
+    /// AdamW beta2 (default: 0.999)
+    pub adamw_beta2: Option<f64>,
+    /// AdamW epsilon (default: 1e-8)
+    pub adamw_eps: Option<f64>,
+    /// Weight decay for AdamW (default: 0.01)
+    pub weight_decay: Option<f64>,
 }
 
 impl Default for GRPOEngineConfig {
@@ -178,10 +196,16 @@ impl Default for GRPOEngineConfig {
             verbose_nan_detection: Some(false),
             enable_thinking: Some(true),
             tools: None,
-            lm_head_chunk_size: None,      // Default: no chunking
-            forward_chunk_size: None,      // Default: no chunking
+            lm_head_chunk_size: Some(2), // Default: 2 (chunked for memory efficiency)
+            forward_chunk_size: None,    // Default: no chunking
             vocab_chunk_size: Some(65536), // Default: 2^16 chunks for large vocabularies
             use_parallel_batch_generation: Some(false), // Default: use sequential for stability
+            gradient_checkpointing: Some(true), // Default: enable for memory efficiency
+            optimizer_type: Some("adamw".to_string()),
+            adamw_beta1: Some(0.9),
+            adamw_beta2: Some(0.999),
+            adamw_eps: Some(1e-8),
+            weight_decay: Some(0.01),
         }
     }
 }
@@ -355,6 +379,111 @@ pub struct GRPOTrainingEngine {
     reward_registry: RewardRegistry,
     /// Training state
     state: Arc<RwLock<EngineState>>,
+    /// AdamW optimizer (used when optimizer_type is "adamw")
+    optimizer: Option<Arc<std::sync::Mutex<crate::optimizers::AdamW>>>,
+}
+
+/// Apply gradients to model using either AdamW or SGD.
+fn apply_optimizer_step(
+    model: &mut TrainableModelEnum,
+    grads: &HashMap<String, MxArray>,
+    params: &HashMap<String, MxArray>,
+    lr: f64,
+    optimizer: &Option<Arc<std::sync::Mutex<crate::optimizers::AdamW>>>,
+    grad_acc_steps: i32,
+) -> Result<()> {
+    if let Some(opt_arc) = optimizer {
+        // AdamW path
+        let mut opt = opt_arc
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire optimizer lock"))?;
+
+        let mut param_names_vec: Vec<String> = Vec::new();
+        let mut param_refs: Vec<&MxArray> = Vec::new();
+        let mut grad_refs: Vec<&MxArray> = Vec::new();
+
+        // When using gradient accumulation, gradients are summed (not averaged).
+        // SGD compensates by dividing lr, but AdamW ignores lr (uses delta trick with 1.0).
+        // So we must average the gradients explicitly before passing to AdamW.
+        let scaled_grads: HashMap<String, MxArray>;
+        let grads_to_use = if grad_acc_steps > 1 {
+            let scale = 1.0 / grad_acc_steps as f32;
+            let scale_arr = MxArray::from_float32(&[scale], &[]).unwrap();
+            scaled_grads = grads
+                .iter()
+                .map(|(name, grad)| (name.clone(), grad.mul(&scale_arr).unwrap()))
+                .collect();
+            &scaled_grads
+        } else {
+            grads
+        };
+
+        for (name, grad) in grads_to_use {
+            if let Some(param) = params.get(name) {
+                param_names_vec.push(name.clone());
+                param_refs.push(param);
+                grad_refs.push(grad);
+            }
+        }
+
+        let updated = opt.update_batch(param_names_vec.clone(), param_refs.clone(), grad_refs)?;
+
+        // Create deltas: delta = param - updated (so param - 1.0 * delta = updated)
+        let deltas: HashMap<String, MxArray> = param_names_vec
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let delta = param_refs[i].sub(&updated[i]).unwrap();
+                (name.clone(), delta)
+            })
+            .collect();
+
+        let delta_refs: HashMap<String, &MxArray> =
+            deltas.iter().map(|(k, v)| (k.clone(), v)).collect();
+        model.apply_gradients_with_params(delta_refs, 1.0, params)?;
+
+        debug!("Applied AdamW update (step={})", opt.get_step());
+    } else {
+        // SGD path
+        let grads_refs: HashMap<String, &MxArray> =
+            grads.iter().map(|(k, v)| (k.clone(), v)).collect();
+        model.apply_gradients_with_params(grads_refs, lr, params)?;
+
+        debug!("Applied SGD gradients with lr: {}", lr);
+    }
+
+    Ok(())
+}
+
+/// Create an AdamW optimizer from engine config, or None for SGD.
+fn create_optimizer(
+    config: &GRPOEngineConfig,
+) -> Option<Arc<std::sync::Mutex<crate::optimizers::AdamW>>> {
+    let opt_type = config.optimizer_type.as_deref().unwrap_or("adamw");
+    if opt_type == "adamw" {
+        let optimizer = crate::optimizers::AdamW::new(
+            config.learning_rate,
+            config.adamw_beta1,
+            config.adamw_beta2,
+            config.adamw_eps,
+            config.weight_decay,
+            Some(true), // bias correction
+        );
+        info!(
+            "Using AdamW optimizer (lr={}, beta1={}, beta2={}, wd={})",
+            config.learning_rate.unwrap_or(1e-6),
+            config.adamw_beta1.unwrap_or(0.9),
+            config.adamw_beta2.unwrap_or(0.999),
+            config.weight_decay.unwrap_or(0.01),
+        );
+        Some(Arc::new(std::sync::Mutex::new(optimizer)))
+    } else {
+        info!(
+            "Using SGD optimizer (lr={})",
+            config.learning_rate.unwrap_or(1e-6)
+        );
+        None
+    }
 }
 
 #[napi]
@@ -376,6 +505,8 @@ impl GRPOTrainingEngine {
             model_type.pad_token_id()
         );
 
+        let optimizer = create_optimizer(&config);
+
         Ok(Self {
             model: Arc::new(RwLock::new(TrainableModelEnum::Qwen3(
                 model.clone_for_session()?,
@@ -384,6 +515,7 @@ impl GRPOTrainingEngine {
             config,
             reward_registry: RewardRegistry::new(),
             state: Arc::new(RwLock::new(EngineState::default())),
+            optimizer,
         })
     }
 
@@ -398,6 +530,8 @@ impl GRPOTrainingEngine {
             model_type.hidden_size()
         );
 
+        let optimizer = create_optimizer(&config);
+
         Ok(Self {
             model: Arc::new(RwLock::new(TrainableModelEnum::Qwen35Dense(
                 model.clone_for_training()?,
@@ -406,6 +540,7 @@ impl GRPOTrainingEngine {
             config,
             reward_registry: RewardRegistry::new(),
             state: Arc::new(RwLock::new(EngineState::default())),
+            optimizer,
         })
     }
 
@@ -420,6 +555,8 @@ impl GRPOTrainingEngine {
             model_type.hidden_size()
         );
 
+        let optimizer = create_optimizer(&config);
+
         Ok(Self {
             model: Arc::new(RwLock::new(TrainableModelEnum::Qwen35Moe(
                 model.clone_for_training()?,
@@ -428,6 +565,7 @@ impl GRPOTrainingEngine {
             config,
             reward_registry: RewardRegistry::new(),
             state: Arc::new(RwLock::new(EngineState::default())),
+            optimizer,
         })
     }
 
@@ -542,6 +680,7 @@ impl GRPOTrainingEngine {
         // Clone Arcs for the blocking task
         let model_arc = Arc::clone(&self.model);
         let state_arc = Arc::clone(&self.state);
+        let optimizer_arc = self.optimizer.clone();
         let model_type = self.model_type.clone();
         let config = self.config.clone();
         let enable_thinking = config.enable_thinking;
@@ -667,6 +806,7 @@ impl GRPOTrainingEngine {
                 &rewards,
                 config.group_size.unwrap_or(4),
                 loss_config,
+                config.gradient_checkpointing.unwrap_or(true),
             )?;
 
             // Check for NaN
@@ -863,11 +1003,7 @@ impl GRPOTrainingEngine {
                     Error::new(Status::GenericFailure, "Failed to acquire model write lock")
                 })?;
 
-                let grads_refs: HashMap<String, &MxArray> =
-                    grads.iter().map(|(k, v)| (k.clone(), v)).collect();
-                model_mut.apply_gradients_with_params(grads_refs, lr, &params)?;
-
-                debug!("Applied gradients with lr: {}", lr);
+                apply_optimizer_step(&mut model_mut, &grads, &params, lr, &optimizer_arc, grad_acc_steps)?;
 
                 // Re-acquire state lock
                 let mut state = state_arc.write().map_err(|_| {
@@ -1183,6 +1319,7 @@ impl GRPOTrainingEngine {
         // Clone Arcs for the blocking task
         let model_arc = Arc::clone(&self.model);
         let state_arc = Arc::clone(&self.state);
+        let optimizer_arc = self.optimizer.clone();
         let model_type = self.model_type.clone();
         let config = self.config.clone();
         let enable_thinking = config.enable_thinking;
@@ -1278,6 +1415,7 @@ impl GRPOTrainingEngine {
                 &rewards,
                 config.group_size.unwrap_or(4),
                 loss_config,
+                config.gradient_checkpointing.unwrap_or(true),
             )?;
 
             // Check for NaN
@@ -1468,11 +1606,7 @@ impl GRPOTrainingEngine {
                     Error::new(Status::GenericFailure, "Failed to acquire model write lock")
                 })?;
 
-                let grads_refs: HashMap<String, &MxArray> =
-                    grads.iter().map(|(k, v)| (k.clone(), v)).collect();
-                model_mut.apply_gradients_with_params(grads_refs, lr, &params)?;
-
-                debug!("Applied gradients with lr: {}", lr);
+                apply_optimizer_step(&mut model_mut, &grads, &params, lr, &optimizer_arc, grad_acc_steps)?;
 
                 // Re-acquire state lock
                 let mut state = state_arc.write().map_err(|_| {
@@ -1917,6 +2051,7 @@ impl GRPOTrainingEngine {
 
         let model_arc = Arc::clone(&self.model);
         let state_arc = Arc::clone(&self.state);
+        let optimizer_arc = self.optimizer.clone();
         let model_type = self.model_type.clone();
         let config = self.config.clone();
         let rewards_clone = filtered_rewards.clone();
@@ -1967,6 +2102,7 @@ impl GRPOTrainingEngine {
                 &rewards_clone,
                 group_size_for_training,
                 loss_config,
+                config.gradient_checkpointing.unwrap_or(true),
             )?;
 
             info!(
@@ -2129,9 +2265,14 @@ impl GRPOTrainingEngine {
                     Error::new(Status::GenericFailure, "Failed to acquire model write lock")
                 })?;
 
-                let grads_refs: HashMap<String, &MxArray> =
-                    grads.iter().map(|(k, v)| (k.clone(), v)).collect();
-                model_mut.apply_gradients_with_params(grads_refs, lr, &params)?;
+                apply_optimizer_step(
+                    &mut model_mut,
+                    &grads,
+                    &params,
+                    lr,
+                    &optimizer_arc,
+                    grad_acc_steps,
+                )?;
                 drop(model_mut);
                 drop(grads);
 
@@ -2327,6 +2468,14 @@ impl GRPOTrainingEngine {
             .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?;
 
         *state = EngineState::default();
+
+        // Reset optimizer state if present
+        if let Some(ref optimizer) = self.optimizer
+            && let Ok(mut opt) = optimizer.lock()
+        {
+            opt.reset();
+        }
+
         synchronize_and_clear_cache();
 
         info!("Training engine reset");
@@ -2384,6 +2533,94 @@ impl GRPOTrainingEngine {
             .write()
             .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?;
         state.needs_emergency_save = false;
+        Ok(())
+    }
+
+    /// Save optimizer state (moment tensors + step) to a SafeTensors file.
+    ///
+    /// The step counter is stored in the `__metadata__` field.
+    /// Each parameter's first moment (m) and second moment (v) are stored as
+    /// `{param_name}.m` and `{param_name}.v` tensors.
+    ///
+    /// No-op if the engine uses SGD (no optimizer state to save).
+    #[napi]
+    pub fn save_optimizer_state(&self, path: String) -> Result<()> {
+        let opt_arc = match &self.optimizer {
+            Some(opt) => opt,
+            None => return Ok(()), // SGD — no state to save
+        };
+
+        let opt = opt_arc
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire optimizer lock"))?;
+
+        let step = opt.get_step();
+        let keys = opt.get_state_keys();
+
+        if keys.is_empty() {
+            return Ok(()); // No state accumulated yet
+        }
+
+        let mut tensors: HashMap<String, MxArray> = HashMap::new();
+
+        for key in &keys {
+            if let Some(m) = opt.get_first_moment(key.clone()) {
+                tensors.insert(format!("{}.m", key), m);
+            }
+            if let Some(v) = opt.get_second_moment(key.clone()) {
+                tensors.insert(format!("{}.v", key), v);
+            }
+        }
+
+        let metadata = serde_json::json!({
+            "step": step.to_string(),
+            "format": "adamw_optimizer_state",
+        });
+
+        crate::utils::safetensors::save_safetensors(&path, &tensors, Some(metadata))
+    }
+
+    /// Load optimizer state (moment tensors + step) from a SafeTensors file.
+    ///
+    /// Restores the step counter from metadata and sets first/second moment
+    /// tensors for each parameter found in the file.
+    ///
+    /// No-op if the engine uses SGD (no optimizer to restore).
+    #[napi]
+    pub fn load_optimizer_state(&self, path: String) -> Result<()> {
+        let opt_arc = match &self.optimizer {
+            Some(opt) => opt,
+            None => return Ok(()), // SGD — nothing to restore
+        };
+
+        let mut opt = opt_arc
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire optimizer lock"))?;
+
+        // Load SafeTensors file
+        let st_file = crate::utils::safetensors::SafeTensorsFile::load(&path)?;
+
+        // Restore step from metadata
+        if let Some(metadata) = &st_file.metadata {
+            if let Some(step_str) = metadata.get("step").and_then(|v| v.as_str()) {
+                if let Ok(step) = step_str.parse::<i64>() {
+                    opt.set_step(step);
+                }
+            }
+        }
+
+        // Load all tensors
+        let tensors = st_file.load_tensors(&path)?;
+
+        // Restore moment tensors: keys are "{param_name}.m" and "{param_name}.v"
+        for (tensor_key, array) in &tensors {
+            if let Some(param_name) = tensor_key.strip_suffix(".m") {
+                opt.set_first_moment(param_name.to_string(), array)?;
+            } else if let Some(param_name) = tensor_key.strip_suffix(".v") {
+                opt.set_second_moment(param_name.to_string(), array)?;
+            }
+        }
+
         Ok(())
     }
 }

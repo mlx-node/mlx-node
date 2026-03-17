@@ -239,6 +239,25 @@ export declare class GrpoTrainingEngine {
   get nanGradientCount(): number;
   /** Clear the emergency save flag (call after saving emergency checkpoint) */
   clearEmergencySaveFlag(): void;
+  /**
+   * Save optimizer state (moment tensors + step) to a SafeTensors file.
+   *
+   * The step counter is stored in the `__metadata__` field.
+   * Each parameter's first moment (m) and second moment (v) are stored as
+   * `{param_name}.m` and `{param_name}.v` tensors.
+   *
+   * No-op if the engine uses SGD (no optimizer state to save).
+   */
+  saveOptimizerState(path: string): void;
+  /**
+   * Load optimizer state (moment tensors + step) from a SafeTensors file.
+   *
+   * Restores the step counter from metadata and sets first/second moment
+   * tensors for each parameter found in the file.
+   *
+   * No-op if the engine uses SGD (no optimizer to restore).
+   */
+  loadOptimizerState(path: string): void;
 }
 export type GRPOTrainingEngine = GrpoTrainingEngine;
 
@@ -683,6 +702,18 @@ export declare class Qwen35Model {
   ): Promise<ChatStreamHandle>;
   /** Get the number of parameters in the model. */
   numParameters(): number;
+  /**
+   * Save the model weights and configuration to a directory.
+   *
+   * This saves:
+   * - config.json: Model configuration (with model_type for detectModelType)
+   * - weights.safetensors: Full model weights in SafeTensors format
+   * - weights.mlx: Parameter metadata (for reference)
+   *
+   * # Arguments
+   * * `save_path` - Directory to save the model
+   */
+  saveModel(savePath: string): Promise<undefined>;
 }
 export type Qwen3_5Model = Qwen35Model;
 
@@ -715,6 +746,18 @@ export declare class Qwen35MoeModel {
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
   numParameters(): number;
+  /**
+   * Save the model weights and configuration to a directory.
+   *
+   * This saves:
+   * - config.json: Model configuration (with model_type for detectModelType)
+   * - weights.safetensors: Full model weights in SafeTensors format
+   * - weights.mlx: Parameter metadata (for reference)
+   *
+   * # Arguments
+   * * `save_path` - Directory to save the model
+   */
+  saveModel(savePath: string): Promise<undefined>;
 }
 export type Qwen3_5MoeModel = Qwen35MoeModel;
 
@@ -2475,6 +2518,24 @@ export interface GrpoEngineConfig {
    * then expand KV cache for G completions).
    */
   useParallelBatchGeneration?: boolean;
+  /**
+   * Enable gradient checkpointing (default: true).
+   * When true, each transformer layer's activations are discarded during the forward
+   * pass and recomputed during backward, reducing peak memory from O(num_layers) to O(1)
+   * for intermediate states. For Qwen3.5 0.8B, this reduces autograd peak from ~105GB to ~11GB.
+   * The trade-off is ~30% more compute (one extra forward pass per layer during backward).
+   */
+  gradientCheckpointing?: boolean;
+  /** Optimizer type: "sgd" or "adamw" (default: "adamw") */
+  optimizerType?: string;
+  /** AdamW beta1 (default: 0.9) */
+  adamwBeta1?: number;
+  /** AdamW beta2 (default: 0.999) */
+  adamwBeta2?: number;
+  /** AdamW epsilon (default: 1e-8) */
+  adamwEps?: number;
+  /** Weight decay for AdamW (default: 0.01) */
+  weightDecay?: number;
 }
 
 /** Configuration for GRPO loss computation */

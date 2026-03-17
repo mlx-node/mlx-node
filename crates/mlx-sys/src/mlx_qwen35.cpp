@@ -270,6 +270,24 @@ void mlx_qwen35_eval_token_and_compiled_caches(mlx_array* next_token_ptr) {
   }
 }
 
+void mlx_qwen35_sync_eval_compiled_caches() {
+  try {
+    if (g_compiled_caches.empty()) return;
+    std::vector<array> to_eval;
+    to_eval.reserve(g_compiled_caches.size());
+    for (const auto& c : g_compiled_caches) {
+      to_eval.push_back(c);
+    }
+    mlx::core::eval(std::move(to_eval));
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in sync_eval_compiled_caches: %s\n", e.what());
+    fflush(stderr);
+  } catch (...) {
+    fprintf(stderr, "[MLX] Unknown exception in sync_eval_compiled_caches\n");
+    fflush(stderr);
+  }
+}
+
 void mlx_qwen35_compiled_adjust_offset(int delta) {
   g_offset_int += delta;
   g_compiled_offset = array(g_offset_int, mlx::core::int32);

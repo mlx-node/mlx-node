@@ -68,7 +68,7 @@ export class ModelLoader {
    * Note: This saves configuration and parameter metadata only.
    * For full model weight serialization, use safetensors or binary format.
    */
-  static saveModel(model: Qwen3Model, savePath: string): Promise<void> {
+  static saveModel(model: Qwen3Model | Qwen3_5Model | Qwen3_5MoeModel, savePath: string): Promise<void> {
     // Delegate to Rust implementation for efficient saving
     return model.saveModel(savePath);
   }
@@ -79,7 +79,7 @@ export async function detectModelType(modelPath: string): Promise<string> {
     const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
     const config = JSON.parse(raw);
     return config.model_type ?? 'qwen3';
-  } catch {
-    return 'qwen3';
+  } catch (e) {
+    throw new Error(`Cannot detect model type: config.json not found in ${modelPath}`);
   }
 }

@@ -66,10 +66,11 @@ pub(crate) fn compute_loss_and_gradients_autograd(
     model_params: &HashMap<String, MxArray>,
     prompt_tokens: &[&MxArray],
     completion_tokens: &[&MxArray],
-    old_logprobs: &[&MxArray], // Changed: use old_logprobs instead of recomputing
+    old_logprobs: &[&MxArray],
     rewards: &[f64],
     group_size: i32,
     loss_config: grpo_loss::GRPOLossConfig,
+    use_checkpointing: bool,
 ) -> Result<(f64, HashMap<String, MxArray>)> {
     // Early validation: KL penalty (beta > 0) requires reference model which isn't supported
     if loss_config.beta > 0.0 {
@@ -202,6 +203,7 @@ pub(crate) fn compute_loss_and_gradients_autograd(
             &completion_masks,
             &loss_config,
             chunk_size,
+            use_checkpointing,
         );
     }
 
@@ -220,6 +222,9 @@ pub(crate) fn compute_loss_and_gradients_autograd(
     // This closure will be called by MLX with updated parameter values
     // Parameters are in native dtype (bfloat16 for pretrained models)
     let lm_head_chunk_size = loss_config.lm_head_chunk_size;
+    let use_ckpt = use_checkpointing;
+    let ckpt_contexts = std::rc::Rc::new(std::cell::RefCell::new(autograd::CheckpointContexts::new()));
+    let ckpt_ctx = ckpt_contexts.clone();
     let loss_fn = move |params: &[MxArray]| -> Result<MxArray> {
         // Map params to structured dictionary
         let param_dict = param_manager::map_params_to_dict(params, &param_names_clone)?;
@@ -243,6 +248,8 @@ pub(crate) fn compute_loss_and_gradients_autograd(
                 &config_clone,
                 &param_dict,
                 &input_ids_clone,
+                use_ckpt,
+                &mut ckpt_ctx.borrow_mut(),
             )?;
 
             // Extract completion hidden states: [B, prompt_len:, :]
@@ -278,6 +285,8 @@ pub(crate) fn compute_loss_and_gradients_autograd(
                 &config_clone,
                 &param_dict,
                 &input_ids_clone,
+                use_ckpt,
+                &mut ckpt_ctx.borrow_mut(),
             )?;
 
             // Get logits for completion tokens only
@@ -324,20 +333,13 @@ pub(crate) fn compute_loss_and_gradients_autograd(
     // 6. Compute value and gradients using MLX autograd
     let (loss_array, grad_arrays) = autograd::value_and_grad(param_arrays.clone(), loss_fn)?;
 
-    // === CRITICAL MEMORY OPTIMIZATION: Eval ALL tensors IMMEDIATELY, then cleanup ===
-    //
-    // MLX builds a computation graph during value_and_grad. This graph holds references
-    // to ALL intermediate tensors. Calling eval() materializes the results and allows
-    // the graph nodes to be released. We MUST:
-    // Eval all outputs before extracting values
     loss_array.eval();
-
     for grad in &grad_arrays {
         grad.eval();
     }
 
-    // CRITICAL: heavy_cleanup releases the autograd computation graph
-    // synchronize_and_clear_cache only clears MLX cache, not the graph
+    // Reclaim checkpoint contexts now that the computation graph has been eval'd
+    ckpt_contexts.borrow_mut().reclaim();
     crate::array::heavy_cleanup();
 
     // Extract the loss value
@@ -391,6 +393,7 @@ fn compute_loss_and_gradients_chunked_autograd(
     completion_masks: &MxArray,
     loss_config: &grpo_loss::GRPOLossConfig,
     chunk_size: i64,
+    use_checkpointing: bool,
 ) -> Result<(f64, HashMap<String, MxArray>)> {
     let batch_size = input_ids.shape_at(0)?;
     let total_seq_len = input_ids.shape_at(1)?;
@@ -423,6 +426,9 @@ fn compute_loss_and_gradients_chunked_autograd(
         let config_clone = model_type.clone();
         let loss_config_clone = loss_config.clone();
         let lm_head_chunk_size = loss_config.lm_head_chunk_size;
+        let use_ckpt = use_checkpointing;
+        let ckpt_contexts = std::rc::Rc::new(std::cell::RefCell::new(autograd::CheckpointContexts::new()));
+        let ckpt_ctx = ckpt_contexts.clone();
 
         // Define loss function for this chunk
         let chunk_loss_fn = move |params: &[MxArray]| -> Result<MxArray> {
@@ -440,6 +446,8 @@ fn compute_loss_and_gradients_chunked_autograd(
                     &config_clone,
                     &param_dict,
                     &chunk_input_ids_clone,
+                    use_ckpt,
+                    &mut ckpt_ctx.borrow_mut(),
                 )?;
 
                 let completion_hidden = hidden_states.slice(
@@ -474,6 +482,8 @@ fn compute_loss_and_gradients_chunked_autograd(
                     &config_clone,
                     &param_dict,
                     &chunk_input_ids_clone,
+                    use_ckpt,
+                    &mut ckpt_ctx.borrow_mut(),
                 )?;
 
                 let completion_logits = logits.slice(
@@ -521,6 +531,9 @@ fn compute_loss_and_gradients_chunked_autograd(
             grad.eval();
         }
 
+        // Reclaim checkpoint contexts now that this chunk's graph is eval'd
+        ckpt_contexts.borrow_mut().reclaim();
+
         // Extract loss value
         let chunk_loss_value = chunk_loss_array.item_at_float32(0)? as f64;
 
@@ -529,16 +542,19 @@ fn compute_loss_and_gradients_chunked_autograd(
 
         // Accumulate gradients
         if let Some(ref mut acc_grads) = accumulated_gradients {
-            // Add to existing gradients
+            // Add to existing gradients and eval immediately to break the lazy chain.
+            // Without eval, each add creates a lazy graph referencing ALL previous chunks'
+            // gradients, causing +1.5GB leak per chunk (entire model's gradient set).
             for (i, grad) in chunk_grad_arrays.into_iter().enumerate() {
                 acc_grads[i] = acc_grads[i].add(&grad)?;
+                acc_grads[i].eval();
             }
         } else {
             // First chunk - initialize accumulated gradients
             accumulated_gradients = Some(chunk_grad_arrays);
         }
 
-        // CRITICAL: Release computation graph for this chunk
+        // Release computation graph for this chunk
         crate::array::heavy_cleanup();
 
         start = end;

@@ -10,12 +10,14 @@ use crate::models::qwen3::{BatchGenerationResult, GenerationConfig, GenerationRe
 use crate::sampling::{SamplingConfig, apply_repetition_penalty, check_repetition_cutoff, sample};
 use crate::tokenizer::Qwen3Tokenizer;
 
-/// Run autoregressive generation with logprob tracking for training.
+/// Decode-only generation loop with logprob tracking for training.
 ///
-/// Takes a `forward_fn` closure that maps input_ids -> logits,
-/// allowing different model architectures to share the same generation loop.
-pub(crate) fn generate_for_training_loop(
-    input_ids: &MxArray,
+/// Starts from pre-computed initial logits (after prefill) and runs autoregressive
+/// decoding. This allows callers to handle prefill separately — e.g. to initialize
+/// compiled C++ state between prefill and decode.
+pub(crate) fn generate_decode_loop_for_training(
+    initial_logits: &MxArray,
+    input_tokens: &[u32],
     config: &GenerationConfig,
     eos_token_id: Option<i32>,
     forward_fn: &mut dyn FnMut(&MxArray) -> Result<MxArray>,
@@ -39,21 +41,13 @@ pub(crate) fn generate_for_training_loop(
         min_p: Some(min_p),
     };
 
-    // Prefill: process input through model
-    let logits = forward_fn(input_ids)?;
-
-    // Get last token logits
-    let seq_len = logits.shape_at(1)?;
-    let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-    let last_logits = last_logits.squeeze(Some(&[1]))?;
-
     // Track all generated tokens for repetition penalty
-    let mut all_tokens: Vec<u32> = input_ids.to_uint32()?.to_vec();
+    let mut all_tokens: Vec<u32> = input_tokens.to_vec();
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
     let mut logprobs: Vec<f32> = Vec::with_capacity(max_new_tokens as usize);
     let mut finish_reason = "length".to_string();
 
-    let mut current_logits = last_logits;
+    let mut current_logits = initial_logits.clone();
 
     for _step in 0..max_new_tokens {
         // Apply repetition penalty

@@ -225,6 +225,24 @@ export interface GRPOTrainerConfig<T = unknown> {
   useParallelBatchGeneration?: boolean;
 
   /**
+   * Enable gradient checkpointing (default: true).
+   * Discards intermediate activations during forward pass and recomputes during backward,
+   * reducing peak memory from O(num_layers) to O(1) for intermediate states.
+   * For Qwen3.5 0.8B, this reduces autograd peak from ~105GB to ~11GB.
+   * Trade-off: ~30% more compute (one extra forward pass per layer during backward).
+   */
+  gradientCheckpointing?: boolean;
+
+  /** Optimizer type: 'sgd' or 'adamw' (default: 'adamw') */
+  optimizerType?: 'sgd' | 'adamw';
+  /** AdamW beta1 (default: 0.9) */
+  adamwBeta1?: number;
+  /** AdamW beta2 (default: 0.999) */
+  adamwBeta2?: number;
+  /** AdamW epsilon (default: 1e-8) */
+  adamwEps?: number;
+
+  /**
    * Chunk size for vocabulary dimension in cross-entropy computation.
    * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
    * the computation is split into chunks of this size to reduce peak memory usage.
@@ -282,6 +300,8 @@ export interface TrainingState {
   timestamp: string;
   /** Dataset information for resume validation */
   dataset?: DatasetMetadata;
+  /** Whether optimizer state was saved alongside this checkpoint */
+  hasOptimizerState?: boolean;
 }
 
 /**
@@ -323,6 +343,7 @@ export const DEFAULT_GRPO_CONFIG: GRPOTrainerConfig = {
   logConsole: true,
   logJsonl: true,
   maxCheckpoints: 3,
+  lmHeadChunkSize: 2,
 };
 
 /**
@@ -523,6 +544,14 @@ export class GRPOTrainer<T = unknown> {
       vocabChunkSize: this.config.vocabChunkSize,
       // Parallel batch generation
       useParallelBatchGeneration: this.config.useParallelBatchGeneration,
+      // Gradient checkpointing
+      gradientCheckpointing: this.config.gradientCheckpointing,
+      // Optimizer
+      optimizerType: this.config.optimizerType,
+      adamwBeta1: this.config.adamwBeta1,
+      adamwBeta2: this.config.adamwBeta2,
+      adamwEps: this.config.adamwEps,
+      weightDecay: this.config.weightDecay,
     };
 
     if (model instanceof Qwen35Model) {
@@ -913,11 +942,6 @@ export class GRPOTrainer<T = unknown> {
     if (config.advantageNormalization === false) {
       throw new Error('advantageNormalization=false is not yet supported. Remove this option or set to true.');
     }
-    if (config.weightDecay !== undefined && config.weightDecay !== 0.01) {
-      throw new Error(
-        'Custom weightDecay is not yet implemented. Optimizer uses simple SGD. Remove weightDecay from config or use default (0.01).',
-      );
-    }
     if (config.rewardType === 'model') {
       throw new Error(
         'rewardType="model" is not implemented. Use rewardType="function" with a custom reward function.',
@@ -1033,6 +1057,17 @@ export class GRPOTrainer<T = unknown> {
           `Restored dataset metadata: size=${resumedState.dataset.size}, hash=${resumedState.dataset.contentHash}, ` +
             `${trainer.processedBatchIndices.size} processed batches`,
         );
+      }
+
+      // Restore optimizer state if available
+      if (resumedState.hasOptimizerState) {
+        const optimizerStatePath = join(modelPath, 'optimizer_state.safetensors');
+        try {
+          trainer.engine.loadOptimizerState(optimizerStatePath);
+          logger.info(`Restored optimizer state from checkpoint`);
+        } catch (e) {
+          logger.warn(`Failed to restore optimizer state: ${e}`);
+        }
       }
 
       // If resuming from a regular checkpoint (not emergency), track it as last known good
@@ -1866,13 +1901,8 @@ export class GRPOTrainer<T = unknown> {
     const statePath = join(checkpointPath, 'training_state.json');
     writeFileSync(statePath, JSON.stringify(state, null, 2));
 
-    // Save model weights (only Qwen3 has saveModel exposed via NAPI currently)
-    if (this.model instanceof Qwen3Model) {
-      await this.model.saveModel(checkpointPath);
-    } else {
-      // TODO: Add NAPI saveModel() for Qwen3.5 models
-      this.logger.warn('Checkpoint model weight saving not yet supported for Qwen3.5 models');
-    }
+    // Save model weights
+    await this.model.saveModel(checkpointPath);
 
     // Copy tokenizer files from original model path (required for loading checkpoints)
     const tokenizerSource = this.originalModelPath ?? this.config.modelPath;
@@ -1885,6 +1915,17 @@ export class GRPOTrainer<T = unknown> {
           copyFileSync(srcPath, destPath);
         }
       }
+    }
+
+    // Save optimizer state (AdamW moments + step counter)
+    try {
+      this.engine.saveOptimizerState(join(checkpointPath, 'optimizer_state.safetensors'));
+      state.hasOptimizerState = true;
+      // Re-write training_state.json with updated hasOptimizerState flag
+      writeFileSync(statePath, JSON.stringify(state, null, 2));
+    } catch (e) {
+      // Non-fatal: training can continue without optimizer state on resume
+      this.logger.warn(`Failed to save optimizer state: ${e}`);
     }
 
     this.logger.info(`Checkpoint saved: ${checkpointPath}`);
