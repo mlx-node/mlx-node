@@ -223,7 +223,8 @@ pub(crate) fn compute_loss_and_gradients_autograd(
     // Parameters are in native dtype (bfloat16 for pretrained models)
     let lm_head_chunk_size = loss_config.lm_head_chunk_size;
     let use_ckpt = use_checkpointing;
-    let ckpt_contexts = std::rc::Rc::new(std::cell::RefCell::new(autograd::CheckpointContexts::new()));
+    let ckpt_contexts =
+        std::rc::Rc::new(std::cell::RefCell::new(autograd::CheckpointContexts::new()));
     let ckpt_ctx = ckpt_contexts.clone();
     let loss_fn = move |params: &[MxArray]| -> Result<MxArray> {
         // Map params to structured dictionary
@@ -427,7 +428,8 @@ fn compute_loss_and_gradients_chunked_autograd(
         let loss_config_clone = loss_config.clone();
         let lm_head_chunk_size = loss_config.lm_head_chunk_size;
         let use_ckpt = use_checkpointing;
-        let ckpt_contexts = std::rc::Rc::new(std::cell::RefCell::new(autograd::CheckpointContexts::new()));
+        let ckpt_contexts =
+            std::rc::Rc::new(std::cell::RefCell::new(autograd::CheckpointContexts::new()));
         let ckpt_ctx = ckpt_contexts.clone();
 
         // Define loss function for this chunk

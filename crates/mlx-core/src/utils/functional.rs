@@ -388,27 +388,31 @@ pub fn qwen3_forward_hidden_states_impl(
             let config_clone = config.clone();
             let layer = layer_idx;
 
-            let outputs = autograd::checkpoint_apply(inputs, move |arrays| {
-                let h_in = &arrays[0];
-                let layer_params: HashMap<String, MxArray> = names_clone
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| (name.clone(), arrays[i + 1].clone()))
-                    .collect();
-                let block_params = get_layer_params(&layer_params, layer, &config_clone)?;
-                let h_out = transformer_block_functional(
-                    h_in,
-                    &block_params,
-                    config_clone.num_heads as u32,
-                    config_clone.num_kv_heads as u32,
-                    config_clone.head_dim as u32,
-                    config_clone.rope_theta,
-                    config_clone.use_qk_norm,
-                    config_clone.rms_norm_eps,
-                    0,
-                )?;
-                Ok(vec![h_out])
-            }, ckpt_contexts)?;
+            let outputs = autograd::checkpoint_apply(
+                inputs,
+                move |arrays| {
+                    let h_in = &arrays[0];
+                    let layer_params: HashMap<String, MxArray> = names_clone
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| (name.clone(), arrays[i + 1].clone()))
+                        .collect();
+                    let block_params = get_layer_params(&layer_params, layer, &config_clone)?;
+                    let h_out = transformer_block_functional(
+                        h_in,
+                        &block_params,
+                        config_clone.num_heads as u32,
+                        config_clone.num_kv_heads as u32,
+                        config_clone.head_dim as u32,
+                        config_clone.rope_theta,
+                        config_clone.use_qk_norm,
+                        config_clone.rms_norm_eps,
+                        0,
+                    )?;
+                    Ok(vec![h_out])
+                },
+                ckpt_contexts,
+            )?;
 
             hidden_states = outputs.into_iter().next().unwrap();
         } else {
@@ -1218,17 +1222,21 @@ fn qwen3_5_block_checkpointed(
     let config_clone = config.clone();
     let layer = layer_idx;
 
-    let outputs = autograd::checkpoint_apply(inputs, move |arrays| {
-        // arrays[0] = hidden_states, arrays[1..] = layer params
-        let h_in = &arrays[0];
-        let layer_params: HashMap<String, MxArray> = names_clone
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (name.clone(), arrays[i + 1].clone()))
-            .collect();
-        let h_out = qwen3_5_block_functional(&layer_params, h_in, &config_clone, layer)?;
-        Ok(vec![h_out])
-    }, ckpt_contexts)?;
+    let outputs = autograd::checkpoint_apply(
+        inputs,
+        move |arrays| {
+            // arrays[0] = hidden_states, arrays[1..] = layer params
+            let h_in = &arrays[0];
+            let layer_params: HashMap<String, MxArray> = names_clone
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.clone(), arrays[i + 1].clone()))
+                .collect();
+            let h_out = qwen3_5_block_functional(&layer_params, h_in, &config_clone, layer)?;
+            Ok(vec![h_out])
+        },
+        ckpt_contexts,
+    )?;
 
     Ok(outputs.into_iter().next().unwrap())
 }
@@ -1544,17 +1552,26 @@ fn qwen3_5_moe_block_checkpointed(
     let dense_clone = dense_config.clone();
     let layer = layer_idx;
 
-    let outputs = autograd::checkpoint_apply(inputs, move |arrays| {
-        let h_in = &arrays[0];
-        let layer_params: HashMap<String, MxArray> = names_clone
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (name.clone(), arrays[i + 1].clone()))
-            .collect();
-        let h_out =
-            qwen3_5_moe_block_functional(&layer_params, h_in, &config_clone, &dense_clone, layer)?;
-        Ok(vec![h_out])
-    }, ckpt_contexts)?;
+    let outputs = autograd::checkpoint_apply(
+        inputs,
+        move |arrays| {
+            let h_in = &arrays[0];
+            let layer_params: HashMap<String, MxArray> = names_clone
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.clone(), arrays[i + 1].clone()))
+                .collect();
+            let h_out = qwen3_5_moe_block_functional(
+                &layer_params,
+                h_in,
+                &config_clone,
+                &dense_clone,
+                layer,
+            )?;
+            Ok(vec![h_out])
+        },
+        ckpt_contexts,
+    )?;
 
     Ok(outputs.into_iter().next().unwrap())
 }
@@ -1585,7 +1602,14 @@ pub fn qwen3_5_moe_forward_hidden_states_impl(
     let dense_config = config.to_dense_config();
     for layer_idx in 0..config.num_layers as usize {
         if use_checkpointing {
-            h = qwen3_5_moe_block_checkpointed(params, &h, config, &dense_config, layer_idx, ckpt_contexts)?;
+            h = qwen3_5_moe_block_checkpointed(
+                params,
+                &h,
+                config,
+                &dense_config,
+                layer_idx,
+                ckpt_contexts,
+            )?;
         } else {
             h = qwen3_5_moe_block_functional(params, &h, config, &dense_config, layer_idx)?;
         }
@@ -1609,8 +1633,13 @@ pub(crate) fn forward_functional_dispatch(
     use_checkpointing: bool,
     ckpt_contexts: &mut autograd::CheckpointContexts,
 ) -> Result<MxArray> {
-    let hidden_states =
-        forward_hidden_states_dispatch(model_type, params, input_ids, use_checkpointing, ckpt_contexts)?;
+    let hidden_states = forward_hidden_states_dispatch(
+        model_type,
+        params,
+        input_ids,
+        use_checkpointing,
+        ckpt_contexts,
+    )?;
     lm_head_functional(&hidden_states, params, model_type.tie_word_embeddings())
 }
 
@@ -1623,15 +1652,27 @@ pub(crate) fn forward_hidden_states_dispatch(
     ckpt_contexts: &mut autograd::CheckpointContexts,
 ) -> Result<MxArray> {
     match model_type {
-        ModelType::Qwen3(config) => {
-            qwen3_forward_hidden_states_impl(config, params, input_ids, use_checkpointing, ckpt_contexts)
-        }
-        ModelType::Qwen35Dense(config) => {
-            qwen3_5_forward_hidden_states_impl(config, params, input_ids, use_checkpointing, ckpt_contexts)
-        }
-        ModelType::Qwen35Moe(config) => {
-            qwen3_5_moe_forward_hidden_states_impl(config, params, input_ids, use_checkpointing, ckpt_contexts)
-        }
+        ModelType::Qwen3(config) => qwen3_forward_hidden_states_impl(
+            config,
+            params,
+            input_ids,
+            use_checkpointing,
+            ckpt_contexts,
+        ),
+        ModelType::Qwen35Dense(config) => qwen3_5_forward_hidden_states_impl(
+            config,
+            params,
+            input_ids,
+            use_checkpointing,
+            ckpt_contexts,
+        ),
+        ModelType::Qwen35Moe(config) => qwen3_5_moe_forward_hidden_states_impl(
+            config,
+            params,
+            input_ids,
+            use_checkpointing,
+            ckpt_contexts,
+        ),
     }
 }
 

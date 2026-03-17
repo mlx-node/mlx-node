@@ -1784,7 +1784,10 @@ impl Qwen3_5MoeModel {
         // Serialize config and inject model_type for detectModelType
         let config = self.get_config();
         let mut config_value = serde_json::to_value(&config).map_err(|e| {
-            napi::Error::new(Status::GenericFailure, format!("Failed to serialize config: {e}"))
+            napi::Error::new(
+                Status::GenericFailure,
+                format!("Failed to serialize config: {e}"),
+            )
         })?;
         if let serde_json::Value::Object(ref mut map) = config_value {
             map.insert("model_type".to_string(), serde_json::json!("qwen3_5_moe"));
@@ -1816,7 +1819,11 @@ impl Qwen3_5MoeModel {
                     "format": "mlx-node",
                     "version": "1.0"
                 }));
-                crate::utils::safetensors::save_safetensors(&safetensors_path, &params_clone, metadata)?;
+                crate::utils::safetensors::save_safetensors(
+                    &safetensors_path,
+                    &params_clone,
+                    metadata,
+                )?;
                 info!("Saved weights.safetensors");
 
                 // 3. Save weights metadata (for reference)

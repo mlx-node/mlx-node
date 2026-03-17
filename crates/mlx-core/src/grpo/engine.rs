@@ -2601,12 +2601,11 @@ impl GRPOTrainingEngine {
         let st_file = crate::utils::safetensors::SafeTensorsFile::load(&path)?;
 
         // Restore step from metadata
-        if let Some(metadata) = &st_file.metadata {
-            if let Some(step_str) = metadata.get("step").and_then(|v| v.as_str()) {
-                if let Ok(step) = step_str.parse::<i64>() {
-                    opt.set_step(step);
-                }
-            }
+        if let Some(metadata) = &st_file.metadata
+            && let Some(step_str) = metadata.get("step").and_then(|v| v.as_str())
+            && let Ok(step) = step_str.parse::<i64>()
+        {
+            opt.set_step(step);
         }
 
         // Load all tensors

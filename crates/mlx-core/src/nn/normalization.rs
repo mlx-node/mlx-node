@@ -129,13 +129,7 @@ impl Clone for LayerNorm {
 }
 
 impl LayerNorm {
-    /// Create a LayerNorm layer from pre-loaded weights
-    ///
-    /// # Arguments
-    /// * `weight` - Scale parameter [dims]
-    /// * `bias` - Bias parameter [dims] (optional, defaults to zeros)
-    /// * `eps` - Small constant for numerical stability
-    /// Get the weight (scale) parameter
+    /// Get the weight (scale) parameter.
     pub fn get_weight(&self) -> MxArray {
         self.weight.clone()
     }

@@ -389,20 +389,6 @@ extern "C" fn layer_function_callback(
     }
 }
 
-/// Apply a function with gradient checkpointing
-///
-/// Wraps the given layer function with MLX's `checkpoint()` transform, which
-/// discards intermediate activations during the forward pass and recomputes
-/// them during backward. This reduces memory from O(num_layers) to O(1) for
-/// intermediate states.
-///
-/// # Arguments
-/// * `inputs` - Input arrays (typically [hidden_states, param1, param2, ...])
-/// * `layer_fn` - Function implementing the layer forward pass
-///
-/// # Returns
-/// * Output arrays from the layer function, annotated with checkpoint metadata
-///   so MLX autograd knows to recompute during backward
 /// Collects checkpoint context pointers that must survive until the backward pass.
 ///
 /// During `checkpoint_apply`, contexts are allocated via `Box::into_raw` so the C++
@@ -413,6 +399,12 @@ extern "C" fn layer_function_callback(
 /// and reclaim after eval.
 pub struct CheckpointContexts {
     contexts: Vec<*mut LayerFunctionContext>,
+}
+
+impl Default for CheckpointContexts {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CheckpointContexts {
@@ -439,6 +431,21 @@ impl Drop for CheckpointContexts {
     }
 }
 
+/// Apply a function with gradient checkpointing.
+///
+/// Wraps the given layer function with MLX's `checkpoint()` transform, which
+/// discards intermediate activations during the forward pass and recomputes
+/// them during backward. This reduces memory from O(num_layers) to O(1) for
+/// intermediate states.
+///
+/// # Arguments
+/// * `inputs` - Input arrays (typically `[hidden_states, param1, param2, ...]`)
+/// * `layer_fn` - Function implementing the layer forward pass
+/// * `contexts` - Collector for checkpoint context pointers (reclaimed after eval)
+///
+/// # Returns
+/// Output arrays from the layer function, annotated with checkpoint metadata
+/// so MLX autograd knows to recompute during backward.
 pub fn checkpoint_apply<F>(
     inputs: Vec<&MxArray>,
     layer_fn: F,
@@ -496,8 +503,7 @@ where
 
     let outputs: Result<Vec<MxArray>> = output_handles[..num_outputs]
         .iter()
-        .enumerate()
-        .map(|(_, &handle)| MxArray::from_handle(handle, "checkpoint_output"))
+        .map(|&handle| MxArray::from_handle(handle, "checkpoint_output"))
         .collect();
 
     outputs
@@ -714,11 +720,15 @@ mod tests {
         let ckpt_inner = ckpt_rc.clone();
         let (loss_ckpt, grads_ckpt) = value_and_grad(vec![&x, &w], move |params| {
             // Wrap the "layer" computation in checkpoint
-            let outputs = super::checkpoint_apply(vec![&params[0], &params[1]], |arrays| {
-                let product = arrays[0].mul(&arrays[1])?;
-                let squared = product.square()?;
-                Ok(vec![squared])
-            }, &mut ckpt_inner.borrow_mut())?;
+            let outputs = super::checkpoint_apply(
+                vec![&params[0], &params[1]],
+                |arrays| {
+                    let product = arrays[0].mul(&arrays[1])?;
+                    let squared = product.square()?;
+                    Ok(vec![squared])
+                },
+                &mut ckpt_inner.borrow_mut(),
+            )?;
             to_scalar(outputs.into_iter().next().unwrap())
         })
         .unwrap();

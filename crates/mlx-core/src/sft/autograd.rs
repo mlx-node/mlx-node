@@ -73,7 +73,8 @@ pub(crate) fn compute_sft_loss_and_gradients(
         let loss_config_clone = loss_config.clone();
 
         // Define loss function for autograd
-        let ckpt_contexts = std::rc::Rc::new(std::cell::RefCell::new(autograd::CheckpointContexts::new()));
+        let ckpt_contexts =
+            std::rc::Rc::new(std::cell::RefCell::new(autograd::CheckpointContexts::new()));
         let ckpt_ctx = ckpt_contexts.clone();
         let loss_fn = move |params: &[MxArray]| -> Result<MxArray> {
             // Map params to structured dictionary
@@ -174,8 +175,13 @@ pub(crate) fn compute_token_accuracy(
 ) -> Result<f64> {
     // Forward pass (no checkpointing needed for validation — no backward pass)
     let mut ckpt = autograd::CheckpointContexts::new();
-    let logits =
-        functional::forward_functional_dispatch(model_type, model_params, input_ids, false, &mut ckpt)?;
+    let logits = functional::forward_functional_dispatch(
+        model_type,
+        model_params,
+        input_ids,
+        false,
+        &mut ckpt,
+    )?;
 
     // Get shapes
     let batch_size = logits.shape_at(0)?;
