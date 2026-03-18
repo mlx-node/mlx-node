@@ -302,10 +302,10 @@ pub fn apply_sampling(logits: &MxArray, config: Option<SamplingConfig>) -> Resul
         filtered_opt = Some(apply_min_p(input, min_p)?);
     }
 
-    // If no filtering was applied, create a copy; otherwise return the filtered result
+    // If no filtering was applied, return the original; otherwise return the filtered result
     match filtered_opt {
         Some(filtered) => Ok(filtered),
-        None => logits.copy(), // No filters applied, return a copy
+        None => Ok(logits.clone()), // No filters applied, return as-is (lazy clone, no GPU copy)
     }
 }
 

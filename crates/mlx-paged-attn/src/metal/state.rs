@@ -29,6 +29,8 @@ pub struct MetalState {
     pub device: Device,
     /// Compiled Metal library
     pub library: Library,
+    /// Reusable command queue (avoids per-dispatch allocation)
+    pub command_queue: metal::CommandQueue,
     /// Pipeline states keyed by kernel name (uses RwLock for interior mutability)
     pipelines: RwLock<HashMap<String, ComputePipelineState>>,
 }
@@ -56,9 +58,12 @@ impl MetalState {
             .new_library_with_file(&temp_path)
             .map_err(|e| format!("Failed to load metallib: {}", e))?;
 
+        let command_queue = device.new_command_queue();
+
         Ok(MetalState {
             device,
             library,
+            command_queue,
             pipelines: RwLock::new(HashMap::new()),
         })
     }

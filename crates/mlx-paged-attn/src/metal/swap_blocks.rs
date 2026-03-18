@@ -150,8 +150,8 @@ pub fn swap_out(
     let state = MetalState::get()?;
 
     // Create command buffer for blit operations
-    let command_queue = state.device.new_command_queue();
-    let command_buffer = command_queue.new_command_buffer();
+    
+    let command_buffer = state.command_queue.new_command_buffer();
     let blit_encoder = command_buffer.new_blit_command_encoder();
 
     let key_block_size = params.key_block_size();
@@ -218,8 +218,8 @@ pub fn swap_in(
     let state = MetalState::get()?;
 
     // Create command buffer for blit operations
-    let command_queue = state.device.new_command_queue();
-    let command_buffer = command_queue.new_command_buffer();
+    
+    let command_buffer = state.command_queue.new_command_buffer();
     let blit_encoder = command_buffer.new_blit_command_encoder();
 
     let key_block_size = params.key_block_size();

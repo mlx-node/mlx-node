@@ -89,8 +89,8 @@ impl TextRecModel {
     pub fn recognize_batch(&self, images: Vec<Buffer>) -> Result<Vec<RecResult>> {
         let mut results = Vec::with_capacity(images.len());
 
-        // Process images one at a time through the model
-        // (batching requires all images to have same dimensions after processing)
+        // Sequential processing: text line crops have variable widths so true batching
+        // would require padding to max width. MLX lazy eval amortizes the overhead.
         for image_data in &images {
             let pixel_values = self.image_processor.process(image_data)?;
             let logits = self.forward(&pixel_values)?;
