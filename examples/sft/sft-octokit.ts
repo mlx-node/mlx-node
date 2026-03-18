@@ -60,46 +60,46 @@ const DEFAULT_OUTPUT_DIR = 'outputs/sft-octokit';
 function getDefaultConfig(): Partial<SFTTrainerConfig> {
   return {
     // Lower LR for stable factual knowledge learning
-    learning_rate: 2e-5,
+    learningRate: 2e-5,
 
     // Batch size that fits Metal GPU memory
-    batch_size: 4,
+    batchSize: 4,
 
     // Gradient accumulation for effective batch size of 32
-    gradient_accumulation_steps: 8,
+    gradientAccumulationSteps: 8,
 
     // More epochs for better knowledge internalization
-    num_epochs: 5,
+    numEpochs: 5,
 
     // Regularization
-    weight_decay: 0.01,
+    weightDecay: 0.01,
 
     // Gradient clipping for stability
-    max_grad_norm: 1.0,
+    maxGradNorm: 1.0,
 
     // Label smoothing reduces overconfidence
-    label_smoothing: 0.1,
+    labelSmoothing: 0.1,
 
     // Only train on assistant responses (not system/user prompts)
-    completion_only: true,
+    completionOnly: true,
 
     // Room for prompts + detailed answers
-    max_seq_length: 2048,
+    maxSeqLength: 2048,
 
     // Logging frequency
-    logging_steps: 10,
+    loggingSteps: 10,
 
     // Checkpoint frequency
-    save_steps: 50,
+    saveSteps: 50,
 
     // Keep last N checkpoints
-    max_checkpoints: 3,
+    maxCheckpoints: 3,
 
     // Reproducibility
     seed: 42,
 
     // Enable JSONL logging
-    log_jsonl: true,
+    logJsonl: true,
   };
 }
 
@@ -299,17 +299,17 @@ for (const warning of validation.warnings) {
 // Build configuration
 const config: Partial<SFTTrainerConfig> = {
   ...getDefaultConfig(),
-  model_name: args.modelPath,
-  output_dir: args.outputDir,
-  run_name: args.runName,
-  num_epochs: args.numEpochs,
-  learning_rate: args.learningRate,
-  batch_size: args.batchSize,
-  resume_from_checkpoint: args.resume ? 'latest' : undefined,
+  modelName: args.modelPath,
+  outputDir: args.outputDir,
+  runName: args.runName,
+  numEpochs: args.numEpochs,
+  learningRate: args.learningRate,
+  batchSize: args.batchSize,
+  resumeFromCheckpoint: args.resume ? 'latest' : undefined,
 };
 
 // Calculate effective batch size
-const effectiveBatchSize = args.batchSize * (config.gradient_accumulation_steps ?? 1);
+const effectiveBatchSize = args.batchSize * (config.gradientAccumulationSteps ?? 1);
 
 // Print configuration
 logger.banner(
@@ -324,13 +324,13 @@ logger.banner(
   `  Epochs: ${args.numEpochs}`,
   `  Learning rate: ${args.learningRate}`,
   `  Batch size: ${args.batchSize} (effective: ${effectiveBatchSize})`,
-  `  Gradient accumulation: ${config.gradient_accumulation_steps}`,
-  `  Weight decay: ${config.weight_decay}`,
-  `  Label smoothing: ${config.label_smoothing}`,
-  `  Max sequence length: ${config.max_seq_length}`,
+  `  Gradient accumulation: ${config.gradientAccumulationSteps}`,
+  `  Weight decay: ${config.weightDecay}`,
+  `  Label smoothing: ${config.labelSmoothing}`,
+  `  Max sequence length: ${config.maxSeqLength}`,
   '',
   'Training mode:',
-  `  Completion only: ${config.completion_only ? 'yes (train on assistant responses only)' : 'no'}`,
+  `  Completion only: ${config.completionOnly ? 'yes (train on assistant responses only)' : 'no'}`,
   `  Resume: ${args.resume ? 'yes' : 'no'}`,
   '-----------------------------------------------------',
   '',

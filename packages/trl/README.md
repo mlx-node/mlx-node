@@ -42,12 +42,12 @@ await trainer.train(dataset);
 import { SFTTrainer } from '@mlx-node/trl';
 
 const trainer = await SFTTrainer.create({
-  model_name: './models/Qwen3-0.6B',
-  output_dir: './output/sft-run',
-  learning_rate: 2e-5,
-  batch_size: 4,
-  num_epochs: 3,
-  completion_only: true,
+  modelName: './models/Qwen3-0.6B',
+  outputDir: './output/sft-run',
+  learningRate: 2e-5,
+  batchSize: 4,
+  numEpochs: 3,
+  completionOnly: true,
 });
 
 await trainer.train('./data/training.jsonl');
@@ -126,7 +126,7 @@ Load training config from a TOML file:
 import { loadTomlConfig, applyOverrides } from '@mlx-node/trl';
 
 const config = loadTomlConfig('./train.toml');
-applyOverrides(config, ['learning_rate=2e-6', 'batch_size=2']);
+applyOverrides(config, ['learningRate=2e-6', 'batchSize=2']);
 ```
 
 ### Built-in Rewards
@@ -240,21 +240,21 @@ Two formats are auto-detected from JSONL files:
 import { SFTTrainer, SFTTrainerConfig } from '@mlx-node/trl';
 
 const config: SFTTrainerConfig = {
-  model_name: './models/Qwen3-0.6B',
-  output_dir: './output/sft',
-  learning_rate: 2e-5,
-  batch_size: 4,
-  gradient_accumulation_steps: 8,
-  num_epochs: 3,
-  max_seq_length: 2048,
-  completion_only: true, // only compute loss on assistant tokens
-  label_smoothing: 0.1,
-  max_grad_norm: 1.0,
-  weight_decay: 0.01,
-  logging_steps: 10,
-  save_steps: 100,
-  max_checkpoints: 3,
-  gradient_checkpointing: true,
+  modelName: './models/Qwen3-0.6B',
+  outputDir: './output/sft',
+  learningRate: 2e-5,
+  batchSize: 4,
+  gradientAccumulationSteps: 8,
+  numEpochs: 3,
+  maxSeqLength: 2048,
+  completionOnly: true, // only compute loss on assistant tokens
+  labelSmoothing: 0.1,
+  maxGradNorm: 1.0,
+  weightDecay: 0.01,
+  loggingSteps: 10,
+  saveSteps: 100,
+  maxCheckpoints: 3,
+  gradientCheckpointing: true,
 };
 ```
 

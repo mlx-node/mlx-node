@@ -11,103 +11,103 @@ export class SFTConfigError extends Error {
 
 export interface SFTTrainerConfig {
   // Model
-  model_name: string;
-  output_dir: string;
-  run_name: string;
+  modelName: string;
+  outputDir: string;
+  runName: string;
 
   // Training hyperparameters
-  learning_rate: number;
-  batch_size: number;
-  gradient_accumulation_steps: number;
-  num_epochs: number;
-  max_train_samples: number;
-  max_grad_norm: number;
-  weight_decay: number;
+  learningRate: number;
+  batchSize: number;
+  gradientAccumulationSteps: number;
+  numEpochs: number;
+  maxTrainSamples: number;
+  maxGradNorm: number;
+  weightDecay: number;
 
   // SFT-specific
-  max_seq_length: number;
-  completion_only: boolean;
-  label_smoothing: number;
+  maxSeqLength: number;
+  completionOnly: boolean;
+  labelSmoothing: number;
 
   // Logging & checkpointing
-  logging_steps: number;
-  save_steps: number;
-  max_checkpoints: number;
-  log_jsonl: boolean;
-  tui_mode: boolean;
+  loggingSteps: number;
+  saveSteps: number;
+  maxCheckpoints: number;
+  logJsonl: boolean;
+  tuiMode: boolean;
 
   // Memory optimization
-  gradient_checkpointing: boolean;
+  gradientCheckpointing: boolean;
 
   // Misc
   seed: number;
-  resume_from_checkpoint: string;
+  resumeFromCheckpoint: string;
 }
 
 const DEFAULT_SFT_CONFIG: SFTTrainerConfig = Object.freeze({
-  model_name: 'Qwen/Qwen3-0.6B',
-  output_dir: 'outputs/sft',
-  run_name: 'sft-run',
+  modelName: 'Qwen/Qwen3-0.6B',
+  outputDir: 'outputs/sft',
+  runName: 'sft-run',
 
-  learning_rate: 2e-5,
-  batch_size: 4,
-  gradient_accumulation_steps: 1,
-  num_epochs: 3,
-  max_train_samples: 0,
-  max_grad_norm: 1.0,
-  weight_decay: 0.01,
+  learningRate: 2e-5,
+  batchSize: 4,
+  gradientAccumulationSteps: 1,
+  numEpochs: 3,
+  maxTrainSamples: 0,
+  maxGradNorm: 1.0,
+  weightDecay: 0.01,
 
-  max_seq_length: 2048,
-  completion_only: false, // Changed to false for TRL parity
-  label_smoothing: 0.0,
+  maxSeqLength: 2048,
+  completionOnly: false, // Changed to false for TRL parity
+  labelSmoothing: 0.0,
 
-  logging_steps: 10,
-  save_steps: 100,
-  max_checkpoints: 3,
-  log_jsonl: true,
-  tui_mode: false,
+  loggingSteps: 10,
+  saveSteps: 100,
+  maxCheckpoints: 3,
+  logJsonl: true,
+  tuiMode: false,
 
-  gradient_checkpointing: true,
+  gradientCheckpointing: true,
 
   seed: 42,
-  resume_from_checkpoint: '',
+  resumeFromCheckpoint: '',
 });
 
 type SFTConfigKey = keyof SFTTrainerConfig;
 
 const SFT_CONFIG_VALUE_TYPES: Record<SFTConfigKey, 'number' | 'boolean' | 'string'> = {
-  model_name: 'string',
-  output_dir: 'string',
-  run_name: 'string',
-  learning_rate: 'number',
-  batch_size: 'number',
-  gradient_accumulation_steps: 'number',
-  num_epochs: 'number',
-  max_train_samples: 'number',
-  max_grad_norm: 'number',
-  weight_decay: 'number',
-  max_seq_length: 'number',
-  completion_only: 'boolean',
-  label_smoothing: 'number',
-  logging_steps: 'number',
-  save_steps: 'number',
-  max_checkpoints: 'number',
-  log_jsonl: 'boolean',
-  tui_mode: 'boolean',
+  modelName: 'string',
+  outputDir: 'string',
+  runName: 'string',
+  learningRate: 'number',
+  batchSize: 'number',
+  gradientAccumulationSteps: 'number',
+  numEpochs: 'number',
+  maxTrainSamples: 'number',
+  maxGradNorm: 'number',
+  weightDecay: 'number',
+  maxSeqLength: 'number',
+  completionOnly: 'boolean',
+  labelSmoothing: 'number',
+  loggingSteps: 'number',
+  saveSteps: 'number',
+  maxCheckpoints: 'number',
+  logJsonl: 'boolean',
+  tuiMode: 'boolean',
   seed: 'number',
-  gradient_checkpointing: 'boolean',
-  resume_from_checkpoint: 'string',
+  gradientCheckpointing: 'boolean',
+  resumeFromCheckpoint: 'string',
 };
 
 const SFT_INTEGER_KEYS: ReadonlySet<SFTConfigKey> = new Set([
-  'batch_size',
-  'gradient_accumulation_steps',
-  'num_epochs',
-  'max_train_samples',
-  'max_seq_length',
-  'logging_steps',
-  'save_steps',
-  'max_checkpoints',
+  'batchSize',
+  'gradientAccumulationSteps',
+  'numEpochs',
+  'maxTrainSamples',
+  'maxSeqLength',
+  'loggingSteps',
+  'saveSteps',
+  'maxCheckpoints',
   'seed',
 ]);
 
@@ -167,13 +167,19 @@ function setConfigValue<T extends Partial<SFTTrainerConfig>>(
   (config as Record<SFTConfigKey, SFTTrainerConfig[SFTConfigKey]>)[key] = value;
 }
 
+function snakeToCamel(s: string): string {
+  return s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+}
+
 function normalizeTomlRecord(record: Record<string, unknown>): Partial<SFTTrainerConfig> {
   const normalized: Partial<SFTTrainerConfig> = {};
   for (const [rawKey, rawValue] of Object.entries(record)) {
-    if (!isConfigKey(rawKey)) {
+    // TOML uses snake_case, config uses camelCase
+    const key = snakeToCamel(rawKey);
+    if (!isConfigKey(key)) {
       continue;
     }
-    setConfigValue(normalized, rawKey, coerceValue(rawKey, rawValue));
+    setConfigValue(normalized, key, coerceValue(key, rawValue));
   }
   return normalized;
 }
@@ -231,10 +237,12 @@ export function applySFTOverrides(config: SFTTrainerConfig, overrides: string[])
     if (idx === -1) {
       throw new SFTConfigError(`Invalid override "${entry}", expected key=value format`);
     }
-    const key = entry.slice(0, idx).trim();
+    const rawKey = entry.slice(0, idx).trim();
     const rawValue = entry.slice(idx + 1).trim();
+    // Accept both snake_case and camelCase overrides
+    const key = snakeToCamel(rawKey);
     if (!isConfigKey(key)) {
-      throw new SFTConfigError(`Unknown configuration key in override: ${key as string}`);
+      throw new SFTConfigError(`Unknown configuration key in override: ${rawKey}`);
     }
     setConfigValue(accumulated, key, coerceValue(key, rawValue));
   }
