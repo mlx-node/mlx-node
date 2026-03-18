@@ -15,6 +15,8 @@
     "forceConsistentCasingInFileNames": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "target": "ESNext"
+    "target": "ESNext",
+    "declaration": true,
+    "declarationMap": true
   }
 }
