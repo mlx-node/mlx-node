@@ -135,10 +135,10 @@ pub struct ChatConfig {
     /// Max consecutive identical tokens before stopping (default: 16, 0 = disabled)
     #[napi(ts_type = "number | undefined")]
     pub max_consecutive_tokens: Option<i32>,
-    /// Max n-gram repetitions before stopping (default: 8, 0 = disabled)
+    /// Max n-gram repetitions before stopping (default: 3, 0 = disabled)
     #[napi(ts_type = "number | undefined")]
     pub max_ngram_repeats: Option<i32>,
-    /// N-gram size for repetition detection (default: 3)
+    /// Max pattern size for n-gram repetition detection (default: 64)
     #[napi(ts_type = "number | undefined")]
     pub ngram_size: Option<i32>,
     #[napi(ts_type = "Array<ToolDefinition>")]
