@@ -340,7 +340,9 @@ describe('Qwen3Tokenizer', () => {
       const tokens = await tokenizer.applyChatTemplate(messages, false);
       const formatted = await tokenizer.decode(tokens, false);
 
-      expect(formatted).toContain('<|im_start|>tool');
+      // Qwen3's Jinja2 template converts tool messages to user role with <tool_response> wrapping
+      expect(formatted).toContain('Tool result');
+      expect(formatted).toContain('<tool_response>');
     });
 
     it('should strip endoftext token from content', async () => {

@@ -1,6 +1,16 @@
 {
   "name": "@mlx-node/cli",
   "version": "0.0.0",
+  "homepage": "https://github.com/mlx-node/mlx-node",
+  "bugs": {
+    "url": "https://github.com/mlx-node/mlx-node/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mlx-node/mlx-node.git",
+    "directory": "packages/cli"
+  },
   "bin": {
     "mlx": "./dist/cli.js"
   },

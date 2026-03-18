@@ -39,9 +39,9 @@ python -m mlx_lm.convert \
 **Node.js (mlx-node):**
 
 ```bash
-node examples/test-converted-model.ts
-# Or with tsx
-npx tsx examples/test-converted-model.ts
+node examples/lm.ts
+# Or with oxnode
+npx oxnode examples/lm.ts
 ```
 
 **Python (mlx-lm):**

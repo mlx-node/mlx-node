@@ -79,7 +79,7 @@ ${contentStr}
 // Constants
 // ============================================================================
 
-const DEFAULT_MODEL_PATH = resolve(process.cwd(), '.cache/models/qwen3-1.7b-mlx-bf16');
+const DEFAULT_MODEL_PATH = resolve(process.cwd(), '.cache/models/qwen3-0.8b-mlx-bf16');
 const SFT_MODEL_PATH = resolve(process.cwd(), 'outputs/sft-octokit/final');
 const DEFAULT_NUM_EXAMPLES = 100;
 

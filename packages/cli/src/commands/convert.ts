@@ -59,7 +59,7 @@ Examples:
   mlx convert -i model-BF16.gguf -o ./models/mixed-4-6 -q --q-recipe mixed_4_6
   mlx convert -i .cache/models/qwen3.5-9b -o ./models/qwen35-recipe -q --q-recipe qwen3_5 -m qwen3_5
   mlx convert -i model-BF16.gguf -o ./models/awq-4bit -q --q-recipe unsloth --imatrix-path imatrix.gguf
-  mlx convert -i model-BF16.gguf -o ./models/qwen35-vl -q --q-recipe unsloth --mmproj mmproj-BF16.gguf
+  mlx convert -i .cache/models/Qwen3.5-27B -o ./models/qwen3.5-unsloth -q --q-recipe unsloth --mmproj mmproj-BF16.gguf
 `);
 }
 

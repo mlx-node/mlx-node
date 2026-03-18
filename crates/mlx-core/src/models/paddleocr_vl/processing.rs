@@ -157,6 +157,35 @@ impl ProcessedImage {
     }
 }
 
+/// Aggregate individually processed images into a batched result.
+///
+/// Concatenates pixel values along axis 0 and builds the grid_thw array.
+/// Shared by both PaddleOCR-VL and Qwen3.5-VL image processors.
+pub fn aggregate_processed_images(images: Vec<ProcessedImage>) -> Result<ProcessedImages> {
+    if images.is_empty() {
+        return Err(Error::new(Status::InvalidArg, "images cannot be empty"));
+    }
+
+    let num_images = images.len() as i64;
+    let mut all_pixel_values: Vec<MxArray> = Vec::with_capacity(images.len());
+    let mut all_grid_thw: Vec<i32> = Vec::with_capacity(images.len() * 3);
+
+    for processed in images {
+        all_pixel_values.push(processed.pixel_values());
+        all_grid_thw.extend_from_slice(&processed.image_grid_thw());
+    }
+
+    let pixel_values = if all_pixel_values.len() == 1 {
+        all_pixel_values.remove(0)
+    } else {
+        let refs: Vec<&MxArray> = all_pixel_values.iter().collect();
+        MxArray::concatenate_many(refs, Some(0))?
+    };
+
+    let grid_thw = MxArray::from_int32(&all_grid_thw, &[num_images, 3])?;
+    Ok(ProcessedImages::new(pixel_values, grid_thw))
+}
+
 /// Processed multiple images output (internal)
 ///
 /// Used internally by VLModel::chat() to pass batch-processed image data.
@@ -221,35 +250,11 @@ impl ImageProcessor {
     ///
     /// Used internally by VLModel::chat() - users pass images to chat() directly.
     pub fn process_many(&self, images: &[&[u8]]) -> Result<ProcessedImages> {
-        if images.is_empty() {
-            return Err(Error::new(Status::InvalidArg, "images cannot be empty"));
-        }
-
-        let mut all_pixel_values: Vec<MxArray> = Vec::new();
-        let mut all_grid_thw: Vec<i32> = Vec::new();
-
-        for data in images {
-            let processed = self.process_bytes(data)?;
-            all_pixel_values.push(processed.pixel_values());
-            all_grid_thw.extend_from_slice(&processed.image_grid_thw());
-        }
-
-        // Concatenate pixel values along axis 0
-        let pixel_values = if all_pixel_values.len() == 1 {
-            all_pixel_values.remove(0)
-        } else {
-            let refs: Vec<&MxArray> = all_pixel_values.iter().collect();
-            MxArray::concatenate_many(refs, Some(0))?
-        };
-
-        // Create grid_thw with shape [num_images, 3]
-        let num_images = images.len() as i64;
-        let grid_thw = MxArray::from_int32(&all_grid_thw, &[num_images, 3])?;
-
-        Ok(ProcessedImages {
-            pixel_values,
-            grid_thw,
-        })
+        let processed: Vec<ProcessedImage> = images
+            .iter()
+            .map(|data| self.process_bytes(data))
+            .collect::<Result<_>>()?;
+        aggregate_processed_images(processed)
     }
 
     /// Internal: Process a loaded image

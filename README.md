@@ -35,7 +35,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 | :-: | :---------------------------- | :---------------------------------------------------------------------------------------- |
 | ⚡  | **Metal GPU Acceleration**    | Native Apple Silicon performance via MLX with lazy evaluation and operation fusion        |
 | 🎯  | **GRPO Training**             | Complete reinforcement learning pipeline with 4 loss variants (GRPO, DAPO, Dr.GRPO, BNPO) |
-| 🤖  | **Qwen3 Models**              | Support for 0.6B, 1.7B, 4B, 8B, 14B, 32B parameter models with advanced sampling          |
+| 🤖  | **Qwen Models**               | Support for 0.6B, 1.7B, 4B, 8B, 14B, 32B parameter models with advanced sampling          |
 | 🔄  | **Automatic Differentiation** | Compute gradients through entire models via functional forward pass                       |
 | 🚫  | **Zero Python Dependency**    | Pure Rust/TypeScript implementation — no Python runtime required                          |
 | 📊  | **TypedArray-First API**      | Zero-copy operations using native JavaScript typed arrays                                 |
@@ -51,8 +51,8 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 ### Model Inference
 
 - Qwen3 (0.6B, 1.7B, 4B, 8B, 14B, 32B)
-- Streaming generation [WIP]
-- KV cache variants
+- Qwen3.5 (0.8B, 2B, 4B, 9B, 27B, 35B-A3B, 122B-A10B, 397B-A17B)
+- Streaming generation
 - Chat templates
 
 </td>
@@ -116,7 +116,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 
 ### Prerequisites
 
-- macOS with Apple Silicon (M1/M2/M3/M4) with Metal (Linux with CUDA is coming soon)
+- macOS with Apple Silicon (M1/M2/M3/M4/M5) with Metal (Linux/Windows with CUDA is coming soon)
 - Node.js 18+
 - Rust 1.90
 
@@ -140,7 +140,7 @@ yarn mlx convert --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models
 ### Test the converted model
 
 ```bash
-yarn oxnode ./examples/test-converted-model.ts
+yarn oxnode ./examples/lm.ts
 ```
 
 ### Generate Text
@@ -236,11 +236,8 @@ trainer.registerBuiltinReward({
 ### Training Examples
 
 ```bash
-# Quick demo (15-20 minutes)
-yarn oxnode examples/grpo/train-simple.ts
-
-# Tool-use training with ast-grep
-yarn oxnode examples/grpo/train-tool-use.ts
+# training with complex reward function
+yarn oxnode examples/grpo/train-github-tool.ts
 ```
 
 ---
@@ -339,7 +336,6 @@ MLX-Node uses a clean two-layer architecture: **Rust for compute**, **TypeScript
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                     TypeScript Orchestration Layer                       │
-│                          (2,528 lines)                                   │
 │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐           │
 │  │  @mlx-node/lm   │  │  @mlx-node/trl  │  │ @mlx-node/core  │           │
 │  │  Model loading  │  │  GRPO Trainer   │  │  (internal)     │           │
@@ -347,10 +343,9 @@ MLX-Node uses a clean two-layer architecture: **Rust for compute**, **TypeScript
 │  │  Configs        │  │  Datasets       │  │  Type exports   │           │
 │  └─────────────────┘  └─────────────────┘  └─────────────────┘           │
 ├──────────────────────────────────────────────────────────────────────────┤
-│                       NAPI-RS Bridge (344 exports)                       │
+│                       NAPI-RS Bridge                                     │
 ├──────────────────────────────────────────────────────────────────────────┤
-│                        Rust Compute Layer                                │
-│                         (15,052+ lines)                                  │
+│                       Rust Compute Layer                                 │
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐     │
 │  │   array/     │ │ transformer/ │ │   grpo/      │ │  optimizers/ │     │
 │  │  90+ ops     │ │  Attention   │ │  Loss        │ │  Adam(W)     │     │
@@ -358,14 +353,13 @@ MLX-Node uses a clean two-layer architecture: **Rust for compute**, **TypeScript
 │  │  Padding     │ │  MLP         │ │  Autograd    │ │  RMSprop     │     │
 │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘     │
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐     │
-│  │   nn/        │ │ models/qwen3 │ │  sampling    │ │  tokenizer   │     │
+│  │   nn/        │ │ models       │ │  sampling    │ │  tokenizer   │     │
 │  │  Linear      │ │  Forward     │ │  Top-k/p     │ │  HuggingFace │     │
 │  │  RMSNorm     │ │  Generation  │ │  Min-p       │ │  Chat        │     │
 │  │  Embedding   │ │  Persistence │ │  Rep. Pen.   │ │  Templates   │     │
 │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘     │
 ├──────────────────────────────────────────────────────────────────────────┤
 │                     mlx-sys FFI + C++ Bridge                             │
-│                       (683 + 3,732 lines)                                │
 ├──────────────────────────────────────────────────────────────────────────┤
 │                  MLX Library + Metal GPU Backend                         │
 │              Lazy evaluation · Operation fusion · GPU kernels            │
@@ -374,129 +368,13 @@ MLX-Node uses a clean two-layer architecture: **Rust for compute**, **TypeScript
 
 ### Package Overview
 
-| Package          | Purpose                    | Use For                                          |
-| :--------------- | :------------------------- | :----------------------------------------------- |
-| `@mlx-node/lm`   | Model loading & inference  | Loading models, generating text, model configs   |
-| `@mlx-node/trl`  | Training & optimization    | GRPO training, custom rewards, optimizers        |
-| `@mlx-node/core` | Native bindings (internal) | Low-level operations (usually import via lm/trl) |
-
-### Import Patterns
-
-```typescript
-// For inference
-import { Qwen3Model, Qwen3Tokenizer, QWEN3_CONFIGS, ModelLoader } from '@mlx-node/lm';
-
-// For training
-import {
-  GRPOTrainer,
-  GRPOConfig,
-  Adam,
-  AdamW,
-  SGD,
-  RMSprop,
-  loadLocalGsm8kDataset,
-  correctnessReward,
-  strictFormatReward,
-} from '@mlx-node/trl';
-
-// For low-level operations (via trl re-exports)
-import {
-  MxArray,
-  Linear,
-  RMSNorm,
-  Attention,
-  TransformerBlock,
-  KVCache,
-  BatchKVCache,
-  RotatingKVCache,
-  Activations,
-  Losses,
-  Gradients,
-} from '@mlx-node/trl';
-```
-
----
-
-## API Reference
-
-### Model Loading & Generation
-
-```typescript
-import { Qwen3Model } from '@mlx-node/lm';
-
-// Load a model
-const model = await Qwen3Model.loadPretrained(modelPath);
-
-// Generate with full sampling options
-const result = await model.generate(messages, {
-  maxNewTokens: 256,
-  temperature: 0.8,
-  topK: 50,
-  topP: 0.95,
-  minP: 0.05,
-  repetitionPenalty: 1.1,
-});
-
-console.log(result.text);
-console.log(`Generated ${result.tokenCount} tokens`);
-
-// Save fine-tuned model
-await model.saveModel('outputs/fine-tuned');
-```
-
-### Sampling Strategies
-
-| Strategy           | Parameter                | Description                                |
-| :----------------- | :----------------------- | :----------------------------------------- |
-| Temperature        | `temperature: 0.8`       | Controls randomness (lower = more focused) |
-| Top-K              | `topK: 50`               | Keep top K most likely tokens              |
-| Top-P (Nucleus)    | `topP: 0.95`             | Cumulative probability threshold           |
-| Min-P              | `minP: 0.05`             | Minimum probability relative to max        |
-| Repetition Penalty | `repetitionPenalty: 1.2` | Reduce repetitive text                     |
-
-### Low-Level Operations
-
-```typescript
-import { MxArray, Linear, RMSNorm, Activations } from '@mlx-node/trl';
-
-// Create arrays using TypedArrays
-const x = MxArray.fromFloat32(
-  new Float32Array([1, 2, 3, 4, 5, 6]),
-  BigInt64Array.from([2n, 3n]), // shape: [2, 3]
-);
-
-// Matrix operations
-const y = x.matmul(weights);
-const sum = x.sum();
-const mean = x.mean(0); // Along axis 0
-
-// Neural network layers
-const linear = new Linear(512, 1024);
-const norm = new RMSNorm(1024, 1e-5);
-
-let h = linear.forward(input);
-h = norm.forward(h);
-h = Activations.silu(h);
-```
-
-### KV Cache Options
-
-```typescript
-import { KVCache, BatchKVCache, RotatingKVCache } from '@mlx-node/trl';
-
-// Standard cache for single sequences
-const cache = new KVCache();
-
-// Batch cache for variable-length sequences with left-padding
-const batchCache = new BatchKVCache([1, 2, 0]); // Padding per sequence
-const [keys, values] = batchCache.updateAndFetch(newKeys, newValues);
-batchCache.filter([0, 2]); // Keep only certain sequences
-
-// Rotating cache for bounded memory
-const rotatingCache = new RotatingKVCache({ maxSize: 2048, keep: 128 });
-```
-
----
+| Package                             | Purpose                    | Use For                                          |
+| :---------------------------------- | :------------------------- | :----------------------------------------------- |
+| [`@mlx-node/lm`](./packages/lm)     | Model loading & inference  | Loading models, generating text, model configs   |
+| [`@mlx-node/trl`](./packages/trl)   | Training & optimization    | GRPO training, custom rewards, optimizers        |
+| [`@mlx-node/core`](./packages/core) | Native bindings (internal) | Low-level operations (usually import via lm/trl) |
+| [`@mlx-node/cli`](./packages/cli)   | CLI                        | Download models, quantize weights                |
+| [`@mlx-node/vlm`](./packages/vlm)   | Vision-language models     | PaddleOCR-VL, document processing                |
 
 ### Optimizations
 
@@ -519,80 +397,12 @@ yarn build:native       # Native addon only
 yarn build:ts           # TypeScript packages only
 
 # Test
-yarn test                  # All tests
-yarn vite test run <path>  # Specific test file
+vp test                  # All tests
+vp test run <path>       # Specific test file
 
 # Quality
-yarn typecheck          # TypeScript validation
-yarn lint               # Linting with oxlint
+vp check                 # Linting & formatting & Typechecking
 ```
-
-### Project Structure
-
-```
-mlx-node/
-├── crates/                     # Rust workspace
-│   ├── mlx-sys/                # Low-level MLX bindings + C++ bridge
-│   │   ├── src/lib.rs          # FFI bindings (683 lines)
-│   │   └── src/mlx.cpp         # C++ bridge (3,732 lines)
-│   └── mlx-core/               # All NAPI exports
-│       └── src/
-│           ├── array/          # Tensor operations
-│           ├── nn/             # Neural network layers
-│           ├── transformer/    # Attention, caches, blocks
-│           ├── models/qwen3/   # Qwen3 implementation
-│           ├── grpo/           # Training components
-│           ├── optimizers/     # Adam, SGD, RMSprop
-│           └── sampling.rs     # Generation strategies
-├── packages/                   # npm workspace
-│   ├── core/                   # @mlx-node/core (native addon)
-│   ├── lm/                     # @mlx-node/lm (inference API)
-│   └── trl/                    # @mlx-node/trl (training API)
-├── examples/grpo/              # Training examples
-└── __test__/                   # Test suite (20,211 lines)
-```
-
----
-
-## Project Status
-
-| Phase           | Status      | Description                           |
-| :-------------- | :---------- | :------------------------------------ |
-| Core Operations | ✅ Complete | 90+ array/tensor operations           |
-| Neural Networks | ✅ Complete | Layers, activations, losses           |
-| Gradients       | ✅ Complete | Manual + automatic differentiation    |
-| Transformers    | ✅ Complete | Attention, KVCache variants, MLP      |
-| GRPO Training   | ✅ Complete | Production-ready with 4 loss variants |
-| Autograd        | ✅ Complete | Functional forward pass architecture  |
-
-**Test Coverage:** 1,036/1,039 tests passing (100%)
-
----
-
-## Documentation
-
-- [GRPO Training Guide](docs/grpo/README.md)
-- [Autograd Integration](docs/AUTOGRAD_INTEGRATION.md)
-- [Feature Alignment](docs/FEATURE_ALIGNMENT_SESSION.md)
-- [Causal Mask Fix](docs/causal-mask-bug-fix.md)
-- [Development History](docs/DEVELOPMENT_HISTORY.md)
-- [SafeTensors Loader](docs/SAFETENSORS_LOADER.md)
-
-### Security Note
-
-MLX-Node loads model weights and tokenizer configurations from disk. **These files are assumed to be from trusted sources** (official Hugging Face repositories, your own models, verified providers).
-
-Do not load model files from untrusted sources. In particular, `tokenizer_config.json` contains Jinja2 chat templates that could potentially be crafted to cause denial of service. For more details, see the security documentation in `crates/mlx-core/src/tokenizer.rs`.
-
----
-
-## References
-
-- [MLX Documentation](https://ml-explore.github.io/mlx/) — Apple's ML framework
-- [GRPO Paper](https://arxiv.org/abs/2402.03300) — Group Relative Policy Optimization
-- [TRL Library](https://github.com/huggingface/trl) — HuggingFace training library
-- [Qwen3 Models](https://huggingface.co/Qwen) — Model weights
-- [NAPI-RS](https://napi.rs/) — Rust Node.js bindings
 
 ---
 
@@ -606,6 +416,7 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 - [Apple MLX Team](https://github.com/ml-explore/mlx) for the ML framework
 - [HuggingFace TRL](https://github.com/huggingface/trl) for GRPO reference implementation
+- [unsloth](https://unsloth.ai) for dynamic quantization
 - [NAPI-RS](https://napi.rs/) for seamless Node.js bindings
 - [Qwen Team](https://huggingface.co/Qwen) for the model architecture
 

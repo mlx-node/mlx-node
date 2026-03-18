@@ -6,7 +6,7 @@
  * Auto-detects model type (Qwen3 vs Qwen3.5) from config.json.
  *
  * Usage:
- *   oxnode examples/test-converted-model.ts <model-name> [--image <path>]
+ *   oxnode examples/lm.ts <model-name> [--image <path>]
  */
 
 import { resolve } from 'node:path';
@@ -23,7 +23,7 @@ const { values, positionals } = parseArgs({
   allowPositionals: true,
 });
 
-const modelName = positionals[0] || 'qwen3.5-9b-mlx';
+const modelName = positionals[0] || 'qwen3.5-9B-unsloth';
 const imagePath = values.ocr;
 
 const MODEL_PATH = resolve(process.cwd(), '.cache', 'models', modelName);
@@ -55,18 +55,18 @@ if (imagePath) {
   const messages = [
     { role: 'user' as const, content: 'OCR this image and extract all text you can see.', images: [imageBytes] },
   ];
-  const startTime = Date.now();
 
   const result = await model.chat(messages, {
-    maxNewTokens: 4096,
-    temperature: 0.1,
+    maxNewTokens: 2048,
+    temperature: 1.0,
+    reportPerformance: true,
   });
 
-  const duration = Date.now() - startTime;
-  const tokensPerSecond = (result.numTokens / duration) * 1000;
-
-  console.log(`\nGenerated (${result.numTokens} tokens, ${duration}ms, ${tokensPerSecond.toFixed(2)} tokens/s):`);
   console.log(result.text);
+  console.log('─'.repeat(60));
+  console.log(
+    `TTFT: ${result.performance?.ttftMs.toFixed(2)}ms, Prefill: ${result.performance?.prefillTokensPerSecond.toFixed(2)} tokens/s, Decode: ${result.performance?.decodeTokensPerSecond.toFixed(2)} tokens/s`,
+  );
   console.log('');
 } else {
   // Text-only test prompts
@@ -83,23 +83,19 @@ if (imagePath) {
     console.log('─'.repeat(60));
 
     const messages = [{ role: 'user', content: prompt }];
-    const startTime = Date.now();
 
     const result = await model.chat(messages, {
       maxNewTokens: 2048,
-      temperature: 0.7,
+      temperature: 0.6,
       topP: 0.9,
+      reportPerformance: true,
     });
 
-    const duration = Date.now() - startTime;
-    const tokensPerSecond = (result.numTokens / duration) * 1000;
-
-    console.log(`\nGenerated (${result.numTokens} tokens, ${duration}ms, ${tokensPerSecond.toFixed(2)} tokens/s):`);
     console.log(result.text);
+    console.log('─'.repeat(60));
+    console.log(
+      `TTFT: ${result.performance?.ttftMs.toFixed(2)}ms, Prefill: ${result.performance?.prefillTokensPerSecond.toFixed(2)} tokens/s, Decode: ${result.performance?.decodeTokensPerSecond.toFixed(2)} tokens/s`,
+    );
     console.log('');
   }
 }
-
-console.log('╔════════════════════════════════════════════════════════╗');
-console.log('║   Test Complete                                        ║');
-console.log('╚════════════════════════════════════════════════════════╝\n');

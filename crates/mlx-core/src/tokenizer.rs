@@ -538,21 +538,22 @@ impl Qwen3Tokenizer {
         env.spawn_future_with_callback(
             async move {
                 napi::bindgen_prelude::spawn_blocking(move || {
-                    // Use Jinja2 rendering if tools provided or template exists
-                    let formatted = if tools.is_some()
-                        && let Some(chat_template) = chat_template
-                    {
+                    // Sanitize messages before formatting (prevents injection in all paths)
+                    let sanitized: Vec<ChatMessage> = Self::sanitize_messages(&messages);
+
+                    // Use Jinja2 rendering if template exists, fallback to ChatML otherwise
+                    let formatted = if let Some(chat_template) = chat_template {
                         Self::render_chat_template_jinja2(
                             &chat_template,
-                            &messages,
+                            &sanitized,
                             tools.as_deref(),
                             add_prompt,
                             enable_thinking,
                         )
                         .map_err(Error::from_reason)?
                     } else {
-                        // Fallback to simple ChatML for backward compatibility
-                        Self::format_chatml(&messages, add_prompt)
+                        // Fallback to simple ChatML when no template in tokenizer_config.json
+                        Self::format_chatml_presanitized(&sanitized, add_prompt)
                     };
 
                     Self::encode_internal(&tokenizer, formatted, Some(false)) // Don't add extra special tokens
@@ -582,18 +583,36 @@ impl Qwen3Tokenizer {
         )
     }
 
-    /// Format messages using simple ChatML format (fallback when no template/tools)
-    ///
-    /// Security: This function validates roles against a whitelist and sanitizes
-    /// content to prevent ChatML injection attacks where malicious input could
-    /// manipulate message boundaries or inject fake roles.
-    fn format_chatml(messages: &[ChatMessage], add_generation_prompt: bool) -> String {
+    /// Sanitize all messages (role validation + content injection prevention).
+    /// Called once before any formatting path to ensure consistent security.
+    /// Note: images are not cloned as they are not used in template formatting.
+    fn sanitize_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        messages
+            .iter()
+            .map(|msg| ChatMessage {
+                role: Self::validate_chatml_role(&msg.role).to_string(),
+                content: Self::sanitize_chatml_content(&msg.content),
+                tool_calls: msg.tool_calls.clone(),
+                tool_call_id: msg.tool_call_id.clone(),
+                reasoning_content: msg.reasoning_content.clone(),
+                images: None,
+            })
+            .collect()
+    }
+
+    /// Format messages using simple ChatML format (fallback when no template).
+    /// Expects pre-sanitized messages (call sanitize_messages first).
+    fn format_chatml_presanitized(
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+    ) -> String {
         let mut formatted = String::new();
 
         for msg in messages {
-            let role = Self::validate_chatml_role(&msg.role);
-            let content = Self::sanitize_chatml_content(&msg.content);
-            formatted.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", role, content));
+            formatted.push_str(&format!(
+                "<|im_start|>{}\n{}<|im_end|>\n",
+                msg.role, msg.content
+            ));
         }
 
         if add_generation_prompt {
@@ -840,7 +859,7 @@ impl Qwen3Tokenizer {
                 .collect()
         });
 
-        // Convert messages to JSON-serializable format
+        // Convert messages to JSON-serializable format (already sanitized by caller)
         let messages_value: Vec<serde_json::Value> = messages
             .iter()
             .map(|msg| {
@@ -1000,21 +1019,22 @@ impl Qwen3Tokenizer {
     ) -> Result<Vec<u32>> {
         let add_prompt = add_generation_prompt.unwrap_or(true);
 
-        // Use Jinja2 rendering if tools provided or template exists
-        let formatted = if tools.is_some()
-            && let Some(chat_template) = &self.chat_template
-        {
+        // Sanitize messages before formatting (prevents injection in all paths)
+        let sanitized: Vec<ChatMessage> = Self::sanitize_messages(messages);
+
+        // Use Jinja2 rendering if template exists, fallback to ChatML otherwise
+        let formatted = if let Some(chat_template) = &self.chat_template {
             Self::render_chat_template_jinja2(
                 chat_template,
-                messages,
+                &sanitized,
                 tools,
                 add_prompt,
                 enable_thinking,
             )
             .map_err(Error::from_reason)?
         } else {
-            // Fallback to simple ChatML for backward compatibility
-            Self::format_chatml(messages, add_prompt)
+            // Fallback to simple ChatML when no template in tokenizer_config.json
+            Self::format_chatml_presanitized(&sanitized, add_prompt)
         };
 
         // Encode the formatted text (don't add extra special tokens)
