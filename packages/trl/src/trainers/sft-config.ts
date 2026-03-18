@@ -1,3 +1,4 @@
+import { camelCase } from 'change-case';
 import { parse as parseToml } from '@std/toml';
 import { readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
@@ -167,15 +168,11 @@ function setConfigValue<T extends Partial<SFTTrainerConfig>>(
   (config as Record<SFTConfigKey, SFTTrainerConfig[SFTConfigKey]>)[key] = value;
 }
 
-function snakeToCamel(s: string): string {
-  return s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-}
-
 function normalizeTomlRecord(record: Record<string, unknown>): Partial<SFTTrainerConfig> {
   const normalized: Partial<SFTTrainerConfig> = {};
   for (const [rawKey, rawValue] of Object.entries(record)) {
     // TOML uses snake_case, config uses camelCase
-    const key = snakeToCamel(rawKey);
+    const key = camelCase(rawKey);
     if (!isConfigKey(key)) {
       continue;
     }
@@ -240,7 +237,7 @@ export function applySFTOverrides(config: SFTTrainerConfig, overrides: string[])
     const rawKey = entry.slice(0, idx).trim();
     const rawValue = entry.slice(idx + 1).trim();
     // Accept both snake_case and camelCase overrides
-    const key = snakeToCamel(rawKey);
+    const key = camelCase(rawKey);
     if (!isConfigKey(key)) {
       throw new SFTConfigError(`Unknown configuration key in override: ${rawKey}`);
     }

@@ -494,6 +494,7 @@ __metadata:
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@std/toml": "npm:@jsr/std__toml@^1.0.11"
+    change-case: "npm:^5.4.4"
   languageName: unknown
   linkType: soft
 
@@ -2844,6 +2845,13 @@ __metadata:
     ssri: "npm:^13.0.0"
     unique-filename: "npm:^5.0.0"
   checksum: 10c0/c7da1ca694d20e8f8aedabd21dc11518f809a7d2b59aa76a1fc655db5a9e62379e465c157ddd2afe34b19230808882288effa6911b2de26a088a6d5645123462
+  languageName: node
+  linkType: hard
+
+"change-case@npm:^5.4.4":
+  version: 5.4.4
+  resolution: "change-case@npm:5.4.4"
+  checksum: 10c0/2a9c2b9c9ad6ab2491105aaf506db1a9acaf543a18967798dcce20926c6a173aa63266cb6189f3086e3c14bf7ae1f8ea4f96ecc466fcd582310efa00372f3734
   languageName: node
   linkType: hard
 
