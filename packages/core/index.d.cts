@@ -673,7 +673,7 @@ export declare class Qwen35Model {
    * - model.safetensors (or model-*.safetensors)
    * - tokenizer.json + tokenizer_config.json
    */
-  static loadPretrained(path: string): Promise<Qwen35Model>;
+  static load(path: string): Promise<Qwen35Model>;
   /**
    * Generate text from a prompt token sequence.
    *
@@ -730,7 +730,7 @@ export declare class Qwen35MoeModel {
   resetCaches(): void;
   forward(inputIds: MxArray): MxArray;
   forwardWithCache(inputIds: MxArray): MxArray;
-  static loadPretrained(path: string): Promise<Qwen35MoeModel>;
+  static load(path: string): Promise<Qwen35MoeModel>;
   generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
   chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
@@ -927,8 +927,8 @@ export declare class Qwen3Model {
    *
    * # Example (TypeScript)
    * ```typescript
-   * const targetModel = await ModelLoader.loadPretrained('qwen3-7b');
-   * const draftModel = await ModelLoader.loadPretrained('qwen3-0.5b');
+   * const targetModel = await loadModel('qwen3-7b');
+   * const draftModel = await loadModel('qwen3-0.5b');
    *
    * const result = targetModel.generateSpeculativeSync(draftModel, inputIds, {
    *   numDraftTokens: 5,
@@ -1118,7 +1118,7 @@ export declare class Qwen3Model {
    *
    * # Example
    * ```typescript
-   * const model = await Qwen3Model.loadPretrained("path/to/model");
+   * const model = await Qwen3Model.load("path/to/model");
    * const messages = [
    *   { role: "user", content: "What is 2+2?" }
    * ];
@@ -1247,7 +1247,7 @@ export declare class Qwen3Model {
    * Decode token IDs to text using the internal tokenizer
    *
    * Helper method for decoding generated tokens. The model must have been loaded
-   * via load_pretrained() to have a tokenizer available.
+   * via load() to have a tokenizer available.
    *
    * # Arguments
    * * `token_ids` - Token IDs to decode as Uint32Array
@@ -1261,7 +1261,7 @@ export declare class Qwen3Model {
    * Apply chat template and encode to token IDs
    *
    * Formats messages using ChatML format (or Jinja2 template with tools) and encodes to tokens.
-   * The model must have been loaded via load_pretrained() to have a tokenizer available.
+   * The model must have been loaded via load() to have a tokenizer available.
    *
    * # Arguments
    * * `messages` - Array of chat messages
@@ -1292,7 +1292,7 @@ export declare class Qwen3Model {
    * # Returns
    * * A fully initialized Qwen3Model with loaded weights
    */
-  static loadPretrained(modelPath: string): Promise<Qwen3Model>;
+  static load(modelPath: string): Promise<Qwen3Model>;
   /**
    * Save model configuration and weights to disk
    *

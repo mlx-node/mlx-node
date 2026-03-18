@@ -205,10 +205,7 @@ impl Qwen3Model {
     /// # Returns
     /// * A fully initialized Qwen3Model with loaded weights
     #[napi]
-    pub fn load_pretrained<'env>(
-        env: &'env Env,
-        model_path: String,
-    ) -> Result<PromiseRaw<'env, Qwen3Model>> {
+    pub fn load<'env>(env: &'env Env, model_path: String) -> Result<PromiseRaw<'env, Qwen3Model>> {
         env.spawn_future_with_callback(async move {
           tokio::task::spawn_blocking(move || {
             let path = Path::new(&model_path);

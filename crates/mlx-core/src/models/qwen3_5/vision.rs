@@ -112,7 +112,7 @@ impl Qwen3_5VisionEncoder {
     /// Extract all vision encoder parameters as a flat map.
     ///
     /// Keys use the `visual.` prefix so they round-trip through save/load
-    /// (load_pretrained detects keys starting with `visual.`).
+    /// (load detects keys starting with `visual.`).
     /// Internal keys mirror the load convention: `patch_embed.proj.weight`,
     /// `pos_embed.weight`, `blocks.{i}.attn.qkv.weight`, etc.
     pub fn get_parameters(&self) -> HashMap<String, MxArray> {

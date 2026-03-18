@@ -16,9 +16,9 @@ npm install @mlx-node/lm
 ## Quick Start
 
 ```typescript
-import { ModelLoader } from '@mlx-node/lm';
+import { loadModel } from '@mlx-node/lm';
 
-const model = await ModelLoader.loadPretrained('./models/Qwen3-0.6B');
+const model = await loadModel('./models/Qwen3-0.6B');
 
 const result = model.chat([{ role: 'user', content: 'What is the capital of France?' }]);
 
@@ -30,9 +30,9 @@ console.log(result.text);
 Qwen3.5 models support token-by-token streaming via `AsyncGenerator`:
 
 ```typescript
-import { ModelLoader } from '@mlx-node/lm';
+import { loadModel } from '@mlx-node/lm';
 
-const model = await ModelLoader.loadPretrained('./models/Qwen3.5-0.6B');
+const model = await loadModel('./models/Qwen3.5-0.6B');
 
 for await (const event of model.chatStream(messages, config)) {
   if (!event.done) {
@@ -50,9 +50,9 @@ Breaking out of the loop automatically cancels generation.
 OpenAI-compatible function calling with `createToolDefinition`:
 
 ```typescript
-import { ModelLoader, createToolDefinition, formatToolResponse } from '@mlx-node/lm';
+import { loadModel, createToolDefinition, formatToolResponse } from '@mlx-node/lm';
 
-const model = await ModelLoader.loadPretrained('./models/Qwen3-0.6B');
+const model = await loadModel('./models/Qwen3-0.6B');
 
 const tools = [
   createToolDefinition(
@@ -83,17 +83,17 @@ if (result.toolCalls?.length) {
 
 ## Model Loading
 
-`ModelLoader` auto-detects the model architecture from `config.json`:
+`loadModel()` auto-detects the model architecture from `config.json`:
 
 ```typescript
-import { ModelLoader } from '@mlx-node/lm';
+import { loadModel, Qwen35Model, Qwen35MoeModel } from '@mlx-node/lm';
 
 // Auto-detect (reads config.json model_type field)
-const model = await ModelLoader.loadPretrained('./models/Qwen3-0.6B');
+const model = await loadModel('./models/Qwen3-0.6B');
 
 // Or load a specific architecture directly
-const dense = await ModelLoader.loadQwen35('./models/Qwen3.5-0.8B');
-const moe = await ModelLoader.loadQwen35Moe('./models/Qwen3.5-35B-A3B');
+const dense = await Qwen35Model.load('./models/Qwen3.5-0.8B');
+const moe = await Qwen35MoeModel.load('./models/Qwen3.5-35B-A3B');
 ```
 
 ### Pre-defined Configs
@@ -128,12 +128,12 @@ Or set `MLX_PROFILE_DECODE=1` to auto-enable and write a report on exit.
 
 ### Classes
 
-| Class            | Description                                                                                |
-| ---------------- | ------------------------------------------------------------------------------------------ |
-| `ModelLoader`    | Static model loading with auto-detection (`loadPretrained`, `loadQwen35`, `loadQwen35Moe`) |
-| `Qwen3Model`     | Qwen3 inference — `generate()`, `chat()`, paged attention, speculative decoding            |
-| `Qwen35Model`    | Qwen3.5 Dense — `generate()`, `chat()`, `chatStream()` with compiled C++ forward           |
-| `Qwen35MoeModel` | Qwen3.5 MoE — same API as Dense with expert routing                                        |
+| Class            | Description                                                                      |
+| ---------------- | -------------------------------------------------------------------------------- |
+| `loadModel()`    | Auto-detect and load any supported model from disk                               |
+| `Qwen3Model`     | Qwen3 inference — `generate()`, `chat()`, paged attention, speculative decoding  |
+| `Qwen35Model`    | Qwen3.5 Dense — `generate()`, `chat()`, `chatStream()` with compiled C++ forward |
+| `Qwen35MoeModel` | Qwen3.5 MoE — same API as Dense with expert routing                              |
 
 ### Streaming Types
 

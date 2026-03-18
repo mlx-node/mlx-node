@@ -23,7 +23,7 @@
 ///
 /// ## Usage
 /// ```ignore
-/// const model = await Qwen3Model.loadPretrained(modelPath);
+/// const model = await Qwen3Model.load(modelPath);
 /// const engine = new GRPOTrainingEngine(model, config);
 /// engine.registerBuiltinReward({ rewardType: 'ToolUse', allowedTools: ['search'] });
 ///

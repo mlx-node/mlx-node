@@ -72,7 +72,7 @@ pub fn dispatch_copy_blocks(
     let pipeline = state.get_pipeline(&kernel_name)?;
 
     // Create command buffer and encoder
-    
+
     let command_buffer = state.command_queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
 
@@ -139,7 +139,7 @@ pub unsafe fn dispatch_copy_blocks_raw(
     let pipeline = state.get_pipeline(&kernel_name)?;
 
     // Create command buffer and encoder
-    
+
     let command_buffer = state.command_queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
 

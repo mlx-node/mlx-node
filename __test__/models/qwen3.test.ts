@@ -117,7 +117,7 @@ describe.sequential('Qwen3 Model', () => {
       }
 
       // Load model with tokenizer
-      const model = await Qwen3Model.loadPretrained(modelPath);
+      const model = await Qwen3Model.load(modelPath);
 
       // Generate text using the new message-based API
       const messages = [{ role: 'user', content: 'Hello, how are you?' }];

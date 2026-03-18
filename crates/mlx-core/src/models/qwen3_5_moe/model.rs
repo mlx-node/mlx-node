@@ -11,9 +11,9 @@ use tracing::{info, warn};
 
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
-    ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle, VisionCache,
-    VisionCacheInner, compute_image_cache_key, compute_num_image_tokens,
-    extract_images_from_messages, inject_image_placeholders, vlm_prepare_vision_features,
+    ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle, VisionCache, VisionCacheInner,
+    compute_image_cache_key, compute_num_image_tokens, extract_images_from_messages,
+    inject_image_placeholders, vlm_prepare_vision_features,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
@@ -215,8 +215,8 @@ impl Qwen3_5MoeModel {
     }
 
     #[napi]
-    pub async fn load_pretrained(path: String) -> Result<Qwen3_5MoeModel> {
-        persistence::load_pretrained(&path).await
+    pub async fn load(path: String) -> Result<Qwen3_5MoeModel> {
+        persistence::load(&path).await
     }
 
     #[napi]
@@ -637,8 +637,12 @@ impl Qwen3_5MoeModel {
         napi::bindgen_prelude::spawn_blocking(move || {
             let tool_defs = config.tools.as_deref();
             let enable_thinking = config.enable_thinking;
-            let tokens =
-                tokenizer.apply_chat_template_sync(&messages, Some(true), tool_defs, enable_thinking)?;
+            let tokens = tokenizer.apply_chat_template_sync(
+                &messages,
+                Some(true),
+                tool_defs,
+                enable_thinking,
+            )?;
 
             let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
             let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
@@ -2548,9 +2552,10 @@ impl Qwen3_5MoeModel {
         tools: Option<&[ToolDefinition]>,
         enable_thinking: Option<bool>,
     ) -> Result<Vec<u32>> {
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
-            Error::from_reason("Tokenizer not loaded - call load_pretrained first")
-        })?;
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded - call load() first"))?;
         tokenizer.apply_chat_template_sync(messages, add_generation_prompt, tools, enable_thinking)
     }
 

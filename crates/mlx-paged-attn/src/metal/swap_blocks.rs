@@ -150,7 +150,7 @@ pub fn swap_out(
     let state = MetalState::get()?;
 
     // Create command buffer for blit operations
-    
+
     let command_buffer = state.command_queue.new_command_buffer();
     let blit_encoder = command_buffer.new_blit_command_encoder();
 
@@ -218,7 +218,7 @@ pub fn swap_in(
     let state = MetalState::get()?;
 
     // Create command buffer for blit operations
-    
+
     let command_buffer = state.command_queue.new_command_buffer();
     let blit_encoder = command_buffer.new_blit_command_encoder();
 

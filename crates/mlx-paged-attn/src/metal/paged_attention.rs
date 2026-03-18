@@ -142,7 +142,7 @@ pub fn dispatch_paged_attention_v1(
     let pipeline = state.get_pipeline(&kernel_name)?;
 
     // Create command buffer and encoder
-    
+
     let command_buffer = state.command_queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
 
@@ -297,7 +297,6 @@ pub fn dispatch_paged_attention_v2(
         );
         let pipeline = state.get_pipeline(&kernel_name)?;
 
-        
         let command_buffer = state.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
 
@@ -394,7 +393,6 @@ pub fn dispatch_paged_attention_v2(
             MetalState::paged_attention_v2_reduce_kernel_name(dtype, params.head_size);
         let pipeline = state.get_pipeline(&kernel_name)?;
 
-        
         let command_buffer = state.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
 
@@ -495,7 +493,7 @@ impl PagedAttentionOutput {
         );
 
         // Blit copy from private to shared
-        
+
         let command_buffer = state.command_queue.new_command_buffer();
         let blit_encoder = command_buffer.new_blit_command_encoder();
 
@@ -628,7 +626,7 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     let pipeline = state.get_pipeline(&kernel_name)?;
 
     // Create command buffer and encoder
-    
+
     let command_buffer = state.command_queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
 
@@ -802,7 +800,6 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         );
         let pipeline = state.get_pipeline(&kernel_name)?;
 
-        
         let command_buffer = state.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
 
@@ -899,7 +896,6 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
             MetalState::paged_attention_v2_reduce_kernel_name(dtype, params.head_size);
         let pipeline = state.get_pipeline(&kernel_name)?;
 
-        
         let command_buffer = state.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
 

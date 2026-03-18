@@ -130,7 +130,7 @@ Qwen3.5 models use `mlx::core::compile` for graph caching — traces forward pas
 Production-ready with 4 loss variants (GRPO, DAPO, Dr.GRPO, BNPO), entropy filtering, importance sampling, batch generation, reward functions.
 
 ```typescript
-import { ModelLoader } from '@mlx-node/lm';
+import { loadModel } from '@mlx-node/lm';
 import { GRPOTrainer, GRPOConfig } from '@mlx-node/trl';
 ```
 
@@ -246,7 +246,7 @@ mlx-node/
 │   │   └── src/
 │   │       ├── stream.ts             # AsyncGenerator chatStream wrapper
 │   │       ├── profiling.ts          # JS profiling API
-│   │       ├── models/               # ModelLoader, Qwen3/3.5 configs
+│   │       ├── models/               # loadModel, Qwen3/3.5 configs
 │   │       └── tools/                # Tool definition types
 │   ├── trl/                          # @mlx-node/trl (5,298 lines)
 │   │   └── src/
@@ -330,7 +330,7 @@ yarn build:ts     → packages/*/dist/ (via tsc -b with project references)
 
 ```typescript
 // Inference
-import { Qwen3Model, Qwen35Model, ModelLoader, QWEN3_CONFIGS } from '@mlx-node/lm';
+import { Qwen3Model, Qwen35Model, loadModel, QWEN3_CONFIGS } from '@mlx-node/lm';
 
 // Training
 import { GRPOTrainer, GRPOConfig, SFTTrainer } from '@mlx-node/trl';

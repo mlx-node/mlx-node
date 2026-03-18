@@ -24,7 +24,7 @@
  *
  * ## Low-Level Usage (step-by-step)
  * ```typescript
- * const model = await Qwen3Model.loadPretrained(modelPath);
+ * const model = await Qwen3Model.load(modelPath);
  * const trainer = new GRPOTrainer(model, config);
  *
  * trainer.registerBuiltinReward({
@@ -71,9 +71,7 @@ import {
   type RewardOutput,
   type ToolDefinition,
 } from '@mlx-node/core';
-import { detectModelType } from '@mlx-node/lm';
-
-type TrainableModel = Qwen3Model | Qwen35Model | Qwen35MoeModel;
+import { loadModel, type TrainableModel } from '@mlx-node/lm';
 
 import type { ChatMessage, DatasetExample, RewardFunction } from '../types';
 import { createTrainingLogger, type TrainingLogger } from './training-logger';
@@ -1014,20 +1012,10 @@ export class GRPOTrainer<T = unknown> {
     const modelName = modelPath.split('/').pop() ?? 'Unknown';
     logger.status('loading', `Loading ${modelName}...`);
 
-    // Detect model type and load appropriate model class
-    const modelType = await detectModelType(modelPath);
-    let model: TrainableModel;
-    if (modelType === 'qwen3_5_moe') {
-      model = await Qwen35MoeModel.loadPretrained(modelPath);
-    } else if (modelType === 'qwen3_5') {
-      model = await Qwen35Model.loadPretrained(modelPath);
-    } else if (modelType === 'qwen3') {
-      model = await Qwen3Model.loadPretrained(modelPath);
-    } else {
-      throw new Error(`Unsupported model_type "${modelType}" in ${modelPath}/config.json`);
-    }
+    // Load model (auto-detects architecture from config.json)
+    const model = await loadModel(modelPath);
 
-    logger.status('loading', `${modelName} loaded (${modelType})`);
+    logger.status('loading', `${modelName} loaded (${model.constructor.name})`);
 
     // Create trainer with the pre-created logger
     const trainer = new GRPOTrainer(model, config, logger);

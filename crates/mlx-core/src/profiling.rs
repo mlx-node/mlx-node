@@ -178,9 +178,7 @@ pub fn reset_profiling_data() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
-    *SESSION_START
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    *SESSION_START.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
 }
 
 // ── Internal API (called by DecodeProfiler) ────────────────────────

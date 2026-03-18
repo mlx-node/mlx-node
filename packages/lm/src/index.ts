@@ -6,9 +6,9 @@
  *
  * @example
  * ```typescript
- * import { Qwen3Model, ModelLoader, QWEN3_CONFIGS } from '@mlx-node/lm';
+ * import { loadModel, Qwen3Model } from '@mlx-node/lm';
  *
- * const model = await ModelLoader.loadPretrained('./models/qwen3-0.6b');
+ * const model = await loadModel('./models/qwen3-0.6b');
  * const result = await model.generate([{ role: 'user', content: 'Hello!' }]);
  * ```
  */
@@ -47,7 +47,11 @@ export {
   getQwen3Config,
 } from './models/qwen3-configs';
 
-export { ModelLoader, detectModelType } from './models/model-loader';
+// Model loading
+export { loadModel, detectModelType, type ModelType } from './models/model-loader';
+
+// Interfaces
+export type { TrainableModel } from './interfaces';
 
 export { QWEN35_CONFIGS, getQwen35Config } from './models/qwen3_5-configs';
 

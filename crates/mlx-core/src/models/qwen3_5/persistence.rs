@@ -726,7 +726,7 @@ fn apply_weights(
 }
 
 /// Load a pretrained Qwen3.5 dense model from a directory.
-pub async fn load_pretrained(model_path: &str) -> Result<Qwen3_5Model> {
+pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
     let model_path = model_path.to_string();
 
     napi::tokio::task::spawn_blocking(move || {

@@ -9,9 +9,9 @@
  * @example
  * ```typescript
  * import { GRPOTrainer, GRPOConfig, loadLocalGsm8kDataset } from '@mlx-node/trl';
- * import { ModelLoader } from '@mlx-node/lm';
+ * import { loadModel } from '@mlx-node/lm';
  *
- * const model = await ModelLoader.loadPretrained('./models/qwen3-0.6b');
+ * const model = await loadModel('./models/qwen3-0.6b');
  * const trainer = await GRPOTrainer.create({ modelPath: './models/qwen3-0.6b' });
  * ```
  */

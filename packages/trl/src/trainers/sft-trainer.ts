@@ -38,9 +38,7 @@ import {
   type SftStepMetrics,
   type SftEpochMetrics,
 } from '@mlx-node/core';
-import { detectModelType } from '@mlx-node/lm';
-
-type TrainableModel = Qwen3Model | Qwen35Model | Qwen35MoeModel;
+import { loadModel, type TrainableModel } from '@mlx-node/lm';
 
 import type { SFTTrainerConfig } from './sft-config';
 import { getDefaultSFTConfig, mergeSFTConfig } from './sft-config';
@@ -302,22 +300,12 @@ export class SFTTrainer {
     const modelName = parse(modelPath).base || 'Unknown';
     logger.status('loading', `Loading ${modelName}...`);
 
-    // Detect model type and load appropriate model class
-    const modelType = await detectModelType(modelPath);
-    let model: TrainableModel;
-    if (modelType === 'qwen3_5_moe') {
-      model = await Qwen35MoeModel.loadPretrained(modelPath);
-    } else if (modelType === 'qwen3_5') {
-      model = await Qwen35Model.loadPretrained(modelPath);
-    } else if (modelType === 'qwen3') {
-      model = await Qwen3Model.loadPretrained(modelPath);
-    } else {
-      throw new Error(`Unsupported model_type "${modelType}" in ${modelPath}/config.json`);
-    }
+    // Load model (auto-detects architecture from config.json)
+    const model = await loadModel(modelPath);
 
     const tokenizer = await Qwen3Tokenizer.fromPretrained(join(modelPath, 'tokenizer.json'));
 
-    logger.status('loading', `${modelName} loaded (${modelType})`);
+    logger.status('loading', `${modelName} loaded (${model.constructor.name})`);
 
     // Create trainer
     const trainer = new SFTTrainer(model, tokenizer, config, logger);

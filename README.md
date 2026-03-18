@@ -148,7 +148,7 @@ yarn oxnode ./examples/lm.ts
 ```typescript
 import { Qwen3Model } from '@mlx-node/lm';
 
-const model = await Qwen3Model.loadPretrained('.cache/models/qwen3-0.6b-mlx-bf16');
+const model = await Qwen3Model.load('.cache/models/qwen3-0.6b-mlx-bf16');
 
 const result = await model.generate([{ role: 'user', content: 'Write a haiku about TypeScript.' }], {
   maxNewTokens: 50,

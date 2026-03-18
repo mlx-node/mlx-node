@@ -124,7 +124,7 @@ pub struct Qwen3Model {
     lm_head: Arc<RwLock<Linear>>,
     // KV caches for incremental generation (one per layer)
     kv_caches: Arc<RwLock<Option<Vec<KVCache>>>>,
-    // Tokenizer for text-to-text generation (loaded via load_pretrained)
+    // Tokenizer for text-to-text generation (loaded via load)
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
 
     // Paged attention state (opt-in, for memory-efficient inference)
@@ -1312,7 +1312,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained().",
+                "Tokenizer not available. Model must be loaded via load().",
             )
         })?;
 
@@ -1343,7 +1343,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained().",
+                "Tokenizer not available. Model must be loaded via load().",
             )
         })?;
 
@@ -1388,7 +1388,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained().",
+                "Tokenizer not available. Model must be loaded via load().",
             )
         })?;
 
@@ -1418,7 +1418,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained().",
+                "Tokenizer not available. Model must be loaded via load().",
             )
         })?;
 
@@ -1833,8 +1833,8 @@ impl Qwen3Model {
     ///
     /// # Example (TypeScript)
     /// ```typescript
-    /// const targetModel = await ModelLoader.loadPretrained('qwen3-7b');
-    /// const draftModel = await ModelLoader.loadPretrained('qwen3-0.5b');
+    /// const targetModel = await loadModel('qwen3-7b');
+    /// const draftModel = await loadModel('qwen3-0.5b');
     ///
     /// const result = targetModel.generateSpeculativeSync(draftModel, inputIds, {
     ///   numDraftTokens: 5,
@@ -5021,7 +5021,7 @@ impl Qwen3Model {
     ///
     /// # Example
     /// ```typescript
-    /// const model = await Qwen3Model.loadPretrained("path/to/model");
+    /// const model = await Qwen3Model.load("path/to/model");
     /// const messages = [
     ///   { role: "user", content: "What is 2+2?" }
     /// ];
@@ -5044,7 +5044,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained() to use generate().",
+                "Tokenizer not available. Model must be loaded via load() to use generate().",
             )
         })?;
 
@@ -5174,7 +5174,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained() to use chat().",
+                "Tokenizer not available. Model must be loaded via load() to use chat().",
             )
         })?;
 
@@ -5346,7 +5346,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained() to use generateBatch().",
+                "Tokenizer not available. Model must be loaded via load() to use generateBatch().",
             )
         })?;
 
@@ -5449,7 +5449,7 @@ impl Qwen3Model {
     /// Decode token IDs to text using the internal tokenizer
     ///
     /// Helper method for decoding generated tokens. The model must have been loaded
-    /// via load_pretrained() to have a tokenizer available.
+    /// via load() to have a tokenizer available.
     ///
     /// # Arguments
     /// * `token_ids` - Token IDs to decode as Uint32Array
@@ -5466,7 +5466,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained().",
+                "Tokenizer not available. Model must be loaded via load().",
             )
         })?;
 
@@ -5488,7 +5488,7 @@ impl Qwen3Model {
     /// Apply chat template and encode to token IDs
     ///
     /// Formats messages using ChatML format (or Jinja2 template with tools) and encodes to tokens.
-    /// The model must have been loaded via load_pretrained() to have a tokenizer available.
+    /// The model must have been loaded via load() to have a tokenizer available.
     ///
     /// # Arguments
     /// * `messages` - Array of chat messages
@@ -5510,7 +5510,7 @@ impl Qwen3Model {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load_pretrained().",
+                "Tokenizer not available. Model must be loaded via load().",
             )
         })?;
 

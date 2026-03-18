@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
-import { ModelLoader, Qwen3Model, createToolDefinition } from '@mlx-node/lm';
+import { loadModel, Qwen3Model, createToolDefinition } from '@mlx-node/lm';
 import type { ToolCallResult } from '@mlx-node/lm';
 import { createTempModel, TINY_TEST_CONFIG } from '../test-model-utils';
 
@@ -19,8 +19,8 @@ describe.sequential('Qwen3 Chat API', () => {
     const temp = await createTempModel(TINY_TEST_CONFIG);
     cleanup = temp.cleanup;
 
-    // Load the model using ModelLoader
-    model = (await ModelLoader.loadPretrained(temp.modelPath)) as Qwen3Model;
+    // Load the model using loadModel
+    model = (await loadModel(temp.modelPath)) as Qwen3Model;
   }, 60000); // 60s timeout for model creation
 
   afterAll(() => {

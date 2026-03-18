@@ -171,8 +171,8 @@ mlx convert \
   --quantize --q-bits 4
 
 # 5. Use in your application
-# import { ModelLoader } from '@mlx-node/lm';
-# const model = await ModelLoader.loadPretrained('.cache/models/Qwen3-0.6B-q4');
+# import { loadModel } from '@mlx-node/lm';
+# const model = await loadModel('.cache/models/Qwen3-0.6B-q4');
 ```
 
 ### GGUF Conversion

@@ -351,8 +351,8 @@ impl Qwen3_5Model {
     /// - model.safetensors (or model-*.safetensors)
     /// - tokenizer.json + tokenizer_config.json
     #[napi]
-    pub async fn load_pretrained(path: String) -> Result<Qwen3_5Model> {
-        persistence::load_pretrained(&path).await
+    pub async fn load(path: String) -> Result<Qwen3_5Model> {
+        persistence::load(&path).await
     }
 
     /// Generate text from a prompt token sequence.
@@ -782,8 +782,12 @@ impl Qwen3_5Model {
 
             let tool_defs = config.tools.as_deref();
             let enable_thinking = config.enable_thinking;
-            let tokens =
-                tokenizer.apply_chat_template_sync(&messages, Some(true), tool_defs, enable_thinking)?;
+            let tokens = tokenizer.apply_chat_template_sync(
+                &messages,
+                Some(true),
+                tool_defs,
+                enable_thinking,
+            )?;
 
             let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
             let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
@@ -2598,9 +2602,10 @@ impl Qwen3_5Model {
         tools: Option<&[ToolDefinition]>,
         enable_thinking: Option<bool>,
     ) -> Result<Vec<u32>> {
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
-            Error::from_reason("Tokenizer not loaded - call load_pretrained first")
-        })?;
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded - call load() first"))?;
         tokenizer.apply_chat_template_sync(messages, add_generation_prompt, tools, enable_thinking)
     }
 

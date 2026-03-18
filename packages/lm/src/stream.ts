@@ -108,15 +108,15 @@ export async function* _createChatStream(
  *
  * @example
  * ```typescript
- * const model = await ModelLoader.loadPretrained('./models/qwen3.5-3b');
+ * const model = await Qwen35Model.load('./models/qwen3.5-3b');
  * for await (const event of model.chatStream(messages)) {
  *   if (!event.done) process.stdout.write(event.text);
  * }
  * ```
  */
 export class Qwen35Model extends Qwen35ModelNative {
-  static override async loadPretrained(modelPath: string): Promise<Qwen35Model> {
-    const instance = await Qwen35ModelNative.loadPretrained(modelPath);
+  static override async load(modelPath: string): Promise<Qwen35Model> {
+    const instance = await Qwen35ModelNative.load(modelPath);
     Object.setPrototypeOf(instance, Qwen35Model.prototype);
     return instance as unknown as Qwen35Model;
   }
@@ -132,15 +132,15 @@ export class Qwen35Model extends Qwen35ModelNative {
  *
  * @example
  * ```typescript
- * const model = await ModelLoader.loadPretrained('./models/qwen3.5-moe');
+ * const model = await Qwen35MoeModel.load('./models/qwen3.5-moe');
  * for await (const event of model.chatStream(messages)) {
  *   if (!event.done) process.stdout.write(event.text);
  * }
  * ```
  */
 export class Qwen35MoeModel extends Qwen35MoeModelNative {
-  static override async loadPretrained(modelPath: string): Promise<Qwen35MoeModel> {
-    const instance = await Qwen35MoeModelNative.loadPretrained(modelPath);
+  static override async load(modelPath: string): Promise<Qwen35MoeModel> {
+    const instance = await Qwen35MoeModelNative.load(modelPath);
     Object.setPrototypeOf(instance, Qwen35MoeModel.prototype);
     return instance as unknown as Qwen35MoeModel;
   }

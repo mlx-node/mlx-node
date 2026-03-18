@@ -1,4 +1,4 @@
-import { readdir, stat, copyFile } from 'node:fs/promises';
+import { readdir, copyFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';

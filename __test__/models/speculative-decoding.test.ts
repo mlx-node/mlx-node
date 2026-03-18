@@ -22,9 +22,9 @@ describe.skipIf(!modelsAvailable)('Speculative Decoding', () => {
 
   beforeAll(async () => {
     // Dynamic import to avoid errors when models not available
-    const { ModelLoader } = await import('@mlx-node/lm');
-    targetModel = await ModelLoader.loadPretrained(MODEL_PATH);
-    draftModel = await ModelLoader.loadPretrained(DRAFT_MODEL_PATH);
+    const { loadModel } = await import('@mlx-node/lm');
+    targetModel = await loadModel(MODEL_PATH);
+    draftModel = await loadModel(DRAFT_MODEL_PATH);
   }, 120000);
 
   afterAll(() => {

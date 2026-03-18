@@ -166,7 +166,7 @@ async function main() {
   console.log('+' + '-'.repeat(58) + '+\n');
 
   console.log(`Loading model from: ${MODEL_PATH}\n`);
-  const model = await Qwen35Model.loadPretrained(MODEL_PATH);
+  const model = await Qwen35Model.load(MODEL_PATH);
   console.log('[OK] Model loaded\n');
 
   // Example prompts that should trigger tool use

@@ -12,7 +12,7 @@
 import { resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
-import { ModelLoader } from '@mlx-node/lm';
+import { loadModel } from '@mlx-node/lm';
 import { Qwen3Model } from '@mlx-node/core';
 
 const { values, positionals } = parseArgs({
@@ -37,7 +37,7 @@ if (imagePath) console.log(`Image: ${imagePath}`);
 console.log('(Tokenizer will be loaded automatically)\n');
 
 // Load model — auto-detects Qwen3 vs Qwen3.5 from config.json
-const model = await ModelLoader.loadPretrained(MODEL_PATH);
+const model = await loadModel(MODEL_PATH);
 const isQwen3 = model instanceof Qwen3Model;
 
 console.log(`✓ Model loaded (${isQwen3 ? 'Qwen3' : 'Qwen3.5'})`);

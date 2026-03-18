@@ -603,10 +603,7 @@ impl Qwen3Tokenizer {
 
     /// Format messages using simple ChatML format (fallback when no template).
     /// Expects pre-sanitized messages (call sanitize_messages first).
-    fn format_chatml_presanitized(
-        messages: &[ChatMessage],
-        add_generation_prompt: bool,
-    ) -> String {
+    fn format_chatml_presanitized(messages: &[ChatMessage], add_generation_prompt: bool) -> String {
         let mut formatted = String::new();
 
         for msg in messages {
@@ -970,7 +967,7 @@ impl Qwen3Tokenizer {
 
     /// Load tokenizer from file synchronously (for internal use)
     ///
-    /// This is used by load_pretrained to load the tokenizer without async overhead.
+    /// This is used by load() to load the tokenizer without async overhead.
     pub(crate) fn load_from_file_sync(tokenizer_path: &str) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| Error::from_reason(format!("Failed to load tokenizer: {}", e)))?;
