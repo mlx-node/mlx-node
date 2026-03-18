@@ -3574,22 +3574,22 @@ impl Qwen3Model {
     ///
     /// This matches the TypeScript API for compatibility
     #[napi]
-    pub fn get_parameters(&self) -> HashMap<String, MxArray> {
+    pub fn get_parameters(&self) -> Result<HashMap<String, MxArray>> {
         let mut params = HashMap::new();
 
         // Acquire read locks for model components
         let layers_guard = self
             .layers
             .read()
-            .expect("Failed to acquire layers read lock");
+            .map_err(|_| Error::from_reason("Failed to acquire layers read lock"))?;
         let final_norm_guard = self
             .final_norm
             .read()
-            .expect("Failed to acquire final_norm read lock");
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
         let lm_head_guard = self
             .lm_head
             .read()
-            .expect("Failed to acquire lm_head read lock");
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
 
         // Embedding
         params.insert("embedding.weight".to_string(), self.embedding.get_weight());
@@ -3663,7 +3663,7 @@ impl Qwen3Model {
             params.insert("lm_head.weight".to_string(), lm_head_guard.get_weight());
         }
 
-        params
+        Ok(params)
     }
 
     /// Calculate total memory size of model parameters in bytes
@@ -3673,7 +3673,10 @@ impl Qwen3Model {
     ///
     /// Equivalent to mlx-lm's: `tree_reduce(lambda acc, x: acc + x.nbytes, model, 0)`
     pub fn calculate_memory_size(&self) -> usize {
-        let params = self.get_parameters();
+        let params = match self.get_parameters() {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
         params.values().map(|p| p.nbytes()).sum()
     }
 
@@ -3950,7 +3953,7 @@ impl Qwen3Model {
         let loss = crate::nn::Losses::cross_entropy(&logits_flat, &labels_flat, None, None, None)?;
 
         // 3. Compute gradients
-        let params = self.get_parameters();
+        let params = self.get_parameters()?;
         let mut gradients = HashMap::new();
 
         // Compute gradient of loss w.r.t. logits (starting point for backprop)
@@ -4075,7 +4078,7 @@ impl Qwen3Model {
         learning_rate: f64,
     ) -> Result<(f64, HashMap<String, f64>)> {
         // 1. Get current model parameters
-        let params = self.get_parameters();
+        let params = self.get_parameters()?;
 
         // 2. Compute loss and gradients using autograd
         let model_type = ModelType::Qwen3(self.config.clone());
@@ -4155,7 +4158,7 @@ impl Qwen3Model {
         config: crate::grpo::loss::GRPOLossConfig,
     ) -> Result<(f64, HashMap<String, MxArray>, HashMap<String, f64>)> {
         // 1. Get current model parameters
-        let params = self.get_parameters();
+        let params = self.get_parameters()?;
 
         // 2. Compute loss and gradients using autograd
         let model_type = ModelType::Qwen3(self.config.clone());
@@ -4312,7 +4315,7 @@ impl Qwen3Model {
         loss.eval();
 
         // 4. Compute gradients (manual for MVP, like compute_loss_and_gradients)
-        let params = self.get_parameters();
+        let params = self.get_parameters()?;
         let mut gradients = HashMap::new();
 
         // For MVP: Use small random gradients scaled by loss
@@ -4413,7 +4416,7 @@ impl Qwen3Model {
         learning_rate: f64,
     ) -> Result<()> {
         // Get current parameters (for NAPI callers who don't have params cached)
-        let params = self.get_parameters();
+        let params = self.get_parameters()?;
         self.apply_gradients_with_params(gradients, learning_rate, &params)
     }
 

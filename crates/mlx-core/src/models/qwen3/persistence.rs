@@ -541,7 +541,7 @@ impl Qwen3Model {
         save_path: String,
     ) -> Result<PromiseRaw<'env, ()>> {
         // Get all parameters
-        let params = self.get_parameters();
+        let params = self.get_parameters()?;
 
         // Validate all parameters for NaN/Inf before saving
         // This prevents saving corrupted checkpoints that would fail on resume

@@ -241,7 +241,8 @@ impl DecodeProfiler {
             .first_token_time
             .map(|t| {
                 // TTFT = prefill time + time from decode loop start to first token
-                let from_loop_start = t.duration_since(self.loop_start).as_secs_f64() * 1000.0;
+                let from_loop_start =
+                    t.saturating_duration_since(self.loop_start).as_secs_f64() * 1000.0;
                 self.prefill_ms + from_loop_start
             })
             .unwrap_or(0.0);

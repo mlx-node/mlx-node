@@ -3312,7 +3312,9 @@ pub(crate) fn vlm_prepare_vision_features(
     let combined_hash = image_cache_key;
 
     let cached = {
-        let mut cache = vision_cache.lock().unwrap();
+        let mut cache = vision_cache
+            .lock()
+            .map_err(|_| Error::from_reason("Vision cache mutex poisoned"))?;
         cache.generation += 1;
         let lru_gen = cache.generation;
         if let Some((features, grid, lru)) = cache.entries.get_mut(&combined_hash) {
@@ -3338,7 +3340,9 @@ pub(crate) fn vlm_prepare_vision_features(
         };
 
         {
-            let mut cache = vision_cache.lock().unwrap();
+            let mut cache = vision_cache
+                .lock()
+                .map_err(|_| Error::from_reason("Vision cache mutex poisoned"))?;
             if cache.entries.len() >= VISION_CACHE_MAX_ENTRIES
                 && let Some((&oldest_key, _)) =
                     cache.entries.iter().min_by_key(|(_, (_, _, lru))| *lru)

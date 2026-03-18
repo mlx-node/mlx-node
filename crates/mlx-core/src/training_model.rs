@@ -136,7 +136,7 @@ pub(crate) enum TrainableModelEnum {
 impl TrainableModel for TrainableModelEnum {
     fn get_parameters(&self) -> Result<HashMap<String, MxArray>> {
         match self {
-            TrainableModelEnum::Qwen3(m) => Ok(m.get_parameters()),
+            TrainableModelEnum::Qwen3(m) => m.get_parameters(),
             TrainableModelEnum::Qwen35Dense(m) => m.get_parameters_for_training(),
             TrainableModelEnum::Qwen35Moe(m) => m.get_parameters_for_training(),
         }

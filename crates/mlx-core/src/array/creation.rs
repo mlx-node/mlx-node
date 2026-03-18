@@ -4,7 +4,21 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 fn validate_data_shape(data_len: usize, shape: &[i64], context: &str) -> Result<()> {
-    let expected: usize = shape.iter().map(|&d| d as usize).product();
+    let mut expected: usize = 1;
+    for (i, &d) in shape.iter().enumerate() {
+        if d < 0 {
+            return Err(Error::from_reason(format!(
+                "{}: negative dimension {} at axis {}",
+                context, d, i
+            )));
+        }
+        expected = expected.checked_mul(d as usize).ok_or_else(|| {
+            Error::from_reason(format!(
+                "{}: shape {:?} overflows usize at axis {}",
+                context, shape, i
+            ))
+        })?;
+    }
     if data_len != expected {
         return Err(Error::from_reason(format!(
             "{}: data length {} does not match shape {:?} (expected {})",

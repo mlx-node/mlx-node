@@ -1728,7 +1728,7 @@ mod forward_pass_equivalence_tests {
         let model = Qwen3Model::new(config.clone()).unwrap();
 
         // Get parameters as HashMap
-        let params = model.get_parameters();
+        let params = model.get_parameters().unwrap();
 
         // Create input tokens [batch=1, seq_len=5]
         let input_ids = MxArray::from_int32(&[0, 1, 2, 3, 4], &[1, 5]).unwrap();
@@ -1765,7 +1765,7 @@ mod forward_pass_equivalence_tests {
     fn test_equivalence_across_batch_sizes() {
         let config = tiny_config();
         let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters();
+        let params = model.get_parameters().unwrap();
 
         for batch_size in [1, 2, 4] {
             // Create input tokens [batch, seq_len=4]
@@ -1803,7 +1803,7 @@ mod forward_pass_equivalence_tests {
     fn test_equivalence_across_sequence_lengths() {
         let config = tiny_config();
         let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters();
+        let params = model.get_parameters().unwrap();
 
         for seq_len in [1, 4, 16] {
             // Create input tokens [batch=1, seq_len]
@@ -1841,7 +1841,7 @@ mod forward_pass_equivalence_tests {
         config.tie_word_embeddings = true;
 
         let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters();
+        let params = model.get_parameters().unwrap();
 
         // Create input
         let input_ids = MxArray::from_int32(&[0, 1, 2, 3], &[1, 4]).unwrap();
@@ -2154,7 +2154,7 @@ mod chunked_forward_tests {
         // Chunked forward should produce identical results to full forward
         let config = tiny_config();
         let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters();
+        let params = model.get_parameters().unwrap();
 
         // Create input with batch_size > chunk_size to trigger chunking
         // batch=8, seq=4, chunk_size=2 -> 4 chunks
@@ -2200,7 +2200,7 @@ mod chunked_forward_tests {
     fn test_chunked_forward_various_chunk_sizes() {
         let config = tiny_config();
         let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters();
+        let params = model.get_parameters().unwrap();
 
         let batch = 12;
         let seq = 4;
@@ -2238,7 +2238,7 @@ mod chunked_forward_tests {
         // When batch_size <= chunk_size, should skip chunking (identical path)
         let config = tiny_config();
         let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters();
+        let params = model.get_parameters().unwrap();
 
         let batch = 2;
         let seq = 4;
@@ -2267,7 +2267,7 @@ mod chunked_forward_tests {
     fn test_chunked_forward_output_shape() {
         let config = tiny_config();
         let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters();
+        let params = model.get_parameters().unwrap();
 
         let batch = 8;
         let seq = 6;
@@ -2294,7 +2294,7 @@ mod chunked_forward_tests {
         config.tie_word_embeddings = true;
 
         let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters();
+        let params = model.get_parameters().unwrap();
 
         let batch = 6;
         let seq = 4;

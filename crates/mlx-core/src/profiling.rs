@@ -146,8 +146,16 @@ pub fn is_profiling_enabled() -> bool {
 /// Retrieve all collected profiling data as a `ProfilingSession`.
 #[napi]
 pub fn get_profiling_data() -> ProfilingSession {
-    let generations = PROFILING_STORE.lock().unwrap().clone();
-    let session_ms = SESSION_START.lock().unwrap().elapsed().as_secs_f64() * 1000.0;
+    let generations = PROFILING_STORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let session_ms = SESSION_START
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .elapsed()
+        .as_secs_f64()
+        * 1000.0;
 
     let gpu_info = GpuInfo {
         architecture_gen: unsafe { mlx_sys::mlx_gpu_architecture_gen() },
@@ -166,8 +174,13 @@ pub fn get_profiling_data() -> ProfilingSession {
 /// Clear all collected profiling data and reset session timer.
 #[napi]
 pub fn reset_profiling_data() {
-    PROFILING_STORE.lock().unwrap().clear();
-    *SESSION_START.lock().unwrap() = Instant::now();
+    PROFILING_STORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    *SESSION_START
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Instant::now();
 }
 
 // ── Internal API (called by DecodeProfiler) ────────────────────────
@@ -180,7 +193,10 @@ pub fn is_active() -> bool {
 
 /// Push a completed generation profile into the global store.
 pub fn push_generation(profile: GenerationProfile) {
-    PROFILING_STORE.lock().unwrap().push(profile);
+    PROFILING_STORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(profile);
 }
 
 /// Take a memory snapshot at this instant.

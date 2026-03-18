@@ -1903,7 +1903,7 @@ export declare const enum BuiltinRewardType {
   XmlFormat = 'XmlFormat',
   /** Length-based scoring */
   Length = 'Length',
-  /** JSON schema validation */
+  /** JSON format validation (brace matching + field name check, not full JSON parsing) */
   JsonSchema = 'JsonSchema',
 }
 
