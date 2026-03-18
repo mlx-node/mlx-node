@@ -504,7 +504,7 @@ __metadata:
   dependencies:
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
-    "@napi-rs/image": "npm:1.12.0"
+    "@napi-rs/image": "npm:^1.12.0"
   languageName: unknown
   linkType: soft
 
@@ -672,7 +672,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/image@npm:1.12.0":
+"@napi-rs/image@npm:1.12.0, @napi-rs/image@npm:^1.12.0":
   version: 1.12.0
   resolution: "@napi-rs/image@npm:1.12.0"
   dependencies:
