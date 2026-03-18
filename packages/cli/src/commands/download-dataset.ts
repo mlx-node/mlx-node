@@ -97,9 +97,7 @@ export async function run(argv: string[]) {
 
   const dataset = args.dataset!;
   const revision = args.revision!;
-  const outputDir = resolve(
-    args.output ?? process.env.MLX_DATASET_OUTPUT ?? join('data', datasetSlug(dataset)),
-  );
+  const outputDir = resolve(args.output ?? process.env.MLX_DATASET_OUTPUT ?? join('data', datasetSlug(dataset)));
 
   console.log(`Downloading ${dataset}@${revision} snapshot from Hugging Face…`);
 
