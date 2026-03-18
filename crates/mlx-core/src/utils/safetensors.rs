@@ -476,7 +476,7 @@ pub fn load_safetensors_lazy<P: AsRef<std::path::Path>>(
         tensors: HashMap<String, crate::array::MxArray>,
     }
 
-    unsafe extern "C" fn on_tensor(
+    unsafe extern "C-unwind" fn on_tensor(
         name: *const std::os::raw::c_char,
         name_len: usize,
         handle: *mut sys::mlx_array,

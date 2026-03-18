@@ -183,7 +183,10 @@ int mlx_qwen35_vlm_cache_count() {
 
 mlx_array* mlx_qwen35_vlm_get_cache(int index) {
   if (index < 0 || index >= static_cast<int>(g_vlm_caches.size())) return nullptr;
-  return reinterpret_cast<mlx_array*>(&g_vlm_caches[index]);
+  // Heap-allocate a copy so the returned pointer is safe to pass to mlx_array_delete.
+  // The caller (compiled_init_from_prefill) copies the array value immediately,
+  // and vlm_reset() clears g_vlm_caches independently.
+  return reinterpret_cast<mlx_array*>(new array(g_vlm_caches[index]));
 }
 
 int mlx_qwen35_vlm_get_offset() {

@@ -23,7 +23,7 @@ where
 }
 
 /// Extern "C" callback that bridges Rust closures to C++ function pointers
-extern "C" fn gradient_callback<F>(
+extern "C-unwind" fn gradient_callback<F>(
     inputs: *const *mut sys::mlx_array,
     input_count: usize,
     context: *mut std::os::raw::c_void,

@@ -13,7 +13,7 @@ pub struct mlx_stream {
     pub device_type: i32, // 0 = CPU, 1 = GPU
 }
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     pub fn mlx_version() -> *const std::os::raw::c_char;
     pub fn mlx_seed(seed: u64);
     pub fn mlx_array_from_int32(data: *const i32, shape: *const i64, ndim: usize)
@@ -762,7 +762,7 @@ unsafe extern "C" {
 //
 // Note: mlx_metal_is_available() is already declared earlier in this file.
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     /// Get the raw Metal buffer pointer from an MLX array
     /// Returns the MTLBuffer* as a void* for FFI compatibility
     /// Returns nullptr if:
@@ -793,7 +793,7 @@ unsafe extern "C" {
 // Quantization Operations (for QuantizedKVCache)
 // ================================================================================
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     /// Quantize a matrix along its last axis.
     /// Mode: "affine" (returns 3 arrays), "mxfp4"/"mxfp8" (returns 2 arrays, biases=nullptr).
     pub fn mlx_quantize(
@@ -1147,7 +1147,7 @@ unsafe extern "C" {
     /// Returns number of tensors loaded, or -1 on error.
     pub fn mlx_load_safetensors(
         path: *const std::os::raw::c_char,
-        callback: unsafe extern "C" fn(
+        callback: unsafe extern "C-unwind" fn(
             name: *const std::os::raw::c_char,
             name_len: usize,
             handle: *mut mlx_array,
@@ -1158,14 +1158,14 @@ unsafe extern "C" {
 }
 
 // Gradient computation types
-pub type LossFunctionPtr = extern "C" fn(
+pub type LossFunctionPtr = extern "C-unwind" fn(
     inputs: *const *mut mlx_array,
     input_count: usize,
     context: *mut std::os::raw::c_void,
 ) -> *mut mlx_array;
 
 // Checkpoint layer function type: takes inputs, writes outputs, returns count
-pub type LayerFunctionPtr = extern "C" fn(
+pub type LayerFunctionPtr = extern "C-unwind" fn(
     inputs: *const *mut mlx_array,
     input_count: usize,
     outputs: *mut *mut mlx_array,

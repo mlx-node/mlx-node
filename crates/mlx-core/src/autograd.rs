@@ -58,7 +58,7 @@ struct LossFunctionContext {
 /// # Safety
 /// This function is called from C++, so we must be careful with error handling.
 /// Any panics would cross FFI boundary which is UB.
-extern "C" fn loss_function_callback(
+extern "C-unwind" fn loss_function_callback(
     inputs: *const *mut sys::mlx_array,
     input_count: usize,
     context: *mut c_void,
@@ -313,7 +313,7 @@ struct LayerFunctionContext {
 ///
 /// Takes input arrays, calls the Rust layer function, writes output arrays.
 /// Returns number of outputs written.
-extern "C" fn layer_function_callback(
+extern "C-unwind" fn layer_function_callback(
     inputs: *const *mut sys::mlx_array,
     input_count: usize,
     outputs: *mut *mut sys::mlx_array,

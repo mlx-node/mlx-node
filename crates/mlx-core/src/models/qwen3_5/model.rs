@@ -3160,6 +3160,7 @@ fn vlm_prefill(
         }
 
         // Transfer VLM caches to compiled decode path
+        // vlm_get_cache returns heap-allocated copies — we must delete them after use
         let num_caches = unsafe { sys::mlx_qwen35_vlm_cache_count() };
         let mut cache_ptrs: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_caches as usize);
         for idx in 0..num_caches {
@@ -3196,6 +3197,13 @@ fn vlm_prefill(
             // Adjust offset for rope_deltas (VLM positions differ from sequential)
             if rope_deltas != 0 {
                 sys::mlx_qwen35_compiled_adjust_offset(rope_deltas as i32);
+            }
+
+            // Clean up heap-allocated cache copies from vlm_get_cache
+            for ptr in &cache_ptrs {
+                if !ptr.is_null() {
+                    sys::mlx_array_delete(*ptr);
+                }
             }
 
             // Clean up VLM prefill state (caches now owned by compiled decode)
