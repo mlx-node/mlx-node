@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 
+import pkgJson from '../package.json' with { type: 'json' };
+
 const args = process.argv.slice(2);
 const command = args[0];
 const subcommand = args[1];
 
 function printHelp() {
   console.log(`
-mlx - MLX-Node CLI
+mlx - MLX-Node CLI v${pkgJson.version}
 
 Usage:
   mlx <command> [options]
@@ -18,6 +20,7 @@ Commands:
 
 Options:
   -h, --help         Show this help message
+  -v, --version      Show version number
 
 Examples:
   mlx download model -m Qwen/Qwen3-0.6B
@@ -29,6 +32,11 @@ Examples:
 async function main() {
   if (!command || command === '--help' || command === '-h') {
     printHelp();
+    return;
+  }
+
+  if (command === '--version' || command === '-v') {
+    console.log(pkgJson.version);
     return;
   }
 

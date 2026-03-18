@@ -1,12 +1,15 @@
 import { readdir, stat, copyFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { listFiles, whoAmI, downloadFileToCacheDir, type ListFileEntry } from '@huggingface/hub';
 import { AsyncEntry } from '@napi-rs/keyring';
 import { input } from '@inquirer/prompts';
 
 import { ensureDir, formatBytes } from '../utils.js';
+
+const DEFAULT_CACHE_DIR = join(homedir(), '.cache', 'huggingface');
 
 const DEFAULT_MODEL = 'Qwen/Qwen3-0.6B';
 
@@ -20,11 +23,12 @@ Usage:
   mlx download model [options]
 
 Options:
-  -m, --model <name>    HuggingFace model name (default: ${DEFAULT_MODEL})
-  -o, --output <dir>    Output directory (default: .cache/models/<model-slug>)
-  -g, --glob <pattern>  Filter files by glob pattern (can be repeated)
-  -h, --help            Show this help message
-  --set-token           Set HuggingFace token
+  -m, --model <name>      HuggingFace model name (default: ${DEFAULT_MODEL})
+  -o, --output <dir>      Output directory (default: .cache/models/<model-slug>)
+  -g, --glob <pattern>    Filter files by glob pattern (can be repeated)
+  --cache-dir <dir>       HuggingFace cache directory (default: ~/.cache/huggingface)
+  -h, --help              Show this help message
+  --set-token             Set HuggingFace token
 
 Glob Filtering:
   Use --glob to download only specific files from a repo. This is especially
@@ -200,6 +204,9 @@ export async function run(argv: string[]) {
         type: 'boolean',
         default: false,
       },
+      'cache-dir': {
+        type: 'string',
+      },
     },
   });
 
@@ -304,25 +311,26 @@ export async function run(argv: string[]) {
   const sizeStr = formatBytes(totalSize);
   console.log(`Downloading ${filesToDownload.length} file(s) (~${sizeStr})...\n`);
 
-  const cacheDir = join(process.cwd(), '.cache', 'huggingface');
+  const cacheDir = args['cache-dir'] ? resolve(args['cache-dir']) : DEFAULT_CACHE_DIR;
   const weightFiles: string[] = [];
 
-  for (const file of filesToDownload) {
+  const total = filesToDownload.length;
+  for (let i = 0; i < total; i++) {
+    const file = filesToDownload[i];
+    const fileSizeStr = file.size ? formatBytes(file.size) : '';
+    console.log(`  [${i + 1}/${total}] ${file.path}${fileSizeStr ? ` (${fileSizeStr})` : ''}...`);
     const snapshotPath = await downloadFileToCacheDir({
       repo: { type: 'model', name: modelName },
       path: file.path,
       cacheDir,
       accessToken: HUGGINGFACE_TOKEN,
     });
-    const stats = await stat(snapshotPath);
-    const fileSizeStr = formatBytes(stats.size);
     const destPath = join(outputDir, file.path);
     await ensureDir(dirname(destPath));
     await copyFile(snapshotPath, destPath);
     if (file.path.endsWith('.safetensors') || file.path.endsWith('.pdiparams') || file.path.endsWith('.gguf')) {
       weightFiles.push(file.path);
     }
-    console.log(`  ✓ ${file.path} (${fileSizeStr})`);
   }
 
   // For GGUF downloads, skip strict verification (no config.json required in GGUF repos)

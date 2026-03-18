@@ -1,5 +1,6 @@
 import { readdir, stat, copyFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
+import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { snapshotDownload } from '@huggingface/hub';
 
@@ -9,11 +10,15 @@ import { ensureDir } from '../utils.js';
 
 const DEFAULT_DATASET = 'openai/gsm8k';
 const DEFAULT_REVISION = 'main';
-const DEFAULT_OUTPUT_DIR = resolve(process.cwd(), 'data', 'gsm8k');
+const DEFAULT_CACHE_DIR = join(homedir(), '.cache', 'huggingface');
 const FILE_SPECS = [
   { output: 'train.jsonl', parquetPrefix: 'train-' },
   { output: 'test.jsonl', parquetPrefix: 'test-' },
 ];
+
+function datasetSlug(name: string): string {
+  return name.replace(/\//g, '-').toLowerCase();
+}
 
 function printHelp(): void {
   console.log(`
@@ -23,14 +28,16 @@ Usage:
   mlx download dataset [options]
 
 Options:
-  -d, --dataset <name>    HuggingFace dataset name (default: ${DEFAULT_DATASET})
-  -r, --revision <rev>    Dataset revision (default: ${DEFAULT_REVISION})
-  -o, --output <dir>      Output directory (default: data/gsm8k)
-  -h, --help              Show this help message
+  -d, --dataset <name>      HuggingFace dataset name (default: ${DEFAULT_DATASET})
+  -r, --revision <rev>      Dataset revision (default: ${DEFAULT_REVISION})
+  -o, --output <dir>        Output directory (default: data/<dataset-slug>)
+  --cache-dir <dir>         HuggingFace cache directory (default: ~/.cache/huggingface)
+  -h, --help                Show this help message
 
 Examples:
   mlx download dataset
-  mlx download dataset --dataset openai/gsm8k --output data/gsm8k
+  mlx download dataset --dataset openai/gsm8k
+  mlx download dataset --dataset tatsu-lab/alpaca --output data/alpaca
 `);
 }
 
@@ -61,17 +68,19 @@ export async function run(argv: string[]) {
       dataset: {
         type: 'string',
         short: 'd',
-        default: process.env.GSM8K_DATASET ?? DEFAULT_DATASET,
+        default: process.env.MLX_DATASET ?? DEFAULT_DATASET,
       },
       revision: {
         type: 'string',
         short: 'r',
-        default: process.env.GSM8K_REVISION ?? DEFAULT_REVISION,
+        default: process.env.MLX_DATASET_REVISION ?? DEFAULT_REVISION,
       },
       output: {
         type: 'string',
         short: 'o',
-        default: process.env.GSM8K_OUTPUT_DIR ?? DEFAULT_OUTPUT_DIR,
+      },
+      'cache-dir': {
+        type: 'string',
       },
       help: {
         type: 'boolean',
@@ -88,11 +97,13 @@ export async function run(argv: string[]) {
 
   const dataset = args.dataset!;
   const revision = args.revision!;
-  const outputDir = resolve(args.output!);
+  const outputDir = resolve(
+    args.output ?? process.env.MLX_DATASET_OUTPUT ?? join('data', datasetSlug(dataset)),
+  );
 
   console.log(`Downloading ${dataset}@${revision} snapshot from Hugging Face…`);
 
-  const cacheDir = join(process.cwd(), '.cache', 'huggingface');
+  const cacheDir = args['cache-dir'] ? resolve(args['cache-dir']) : DEFAULT_CACHE_DIR;
   const snapshotPath = await snapshotDownload({
     repo: { type: 'dataset', name: dataset },
     revision,

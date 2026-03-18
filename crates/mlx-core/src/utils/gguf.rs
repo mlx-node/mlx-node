@@ -446,12 +446,14 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
         let offset = read_u64(&mut reader)
             .map_err(|e| Error::from_reason(format!("Failed to read tensor offset: {e}")))?;
 
-        // We still record unsupported types; we'll error when loading
         let tensor_type = match tensor_type {
             Some(t) => t,
             None => {
-                warn!("Tensor '{name}' has unsupported GGUF type {type_u32}, will skip");
-                continue;
+                return Err(Error::from_reason(format!(
+                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q8_0(8), BF16(30) are supported. \
+                     K-quant formats (Q4_K, Q5_K, Q6_K, etc.) require dequantization before conversion.",
+                    name, type_u32
+                )));
             }
         };
 
