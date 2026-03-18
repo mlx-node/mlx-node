@@ -330,7 +330,10 @@ pub(crate) fn unpickle(data: &[u8]) -> Result<PickleValue> {
                     {
                         // OrderedDict constructed via REDUCE then populated with SETITEMS.
                         // Replace the Object with a plain Dict.
-                        *stack.last_mut().unwrap() = StackItem::Value(PickleValue::Dict(pairs));
+                        // Safety: last_mut() is guaranteed Some — we're inside a match on it.
+                        if let Some(slot) = stack.last_mut() {
+                            *slot = StackItem::Value(PickleValue::Dict(pairs));
+                        }
                     }
                     _ => {
                         return Err(Error::from_reason(
@@ -672,7 +675,8 @@ fn long_from_bytes(bytes: &[u8]) -> i64 {
         result |= (b as i64) << (i * 8);
     }
     // Sign extend
-    if bytes.last().unwrap() & 0x80 != 0 {
+    // Safety: bytes is non-empty (checked by is_empty() guard above)
+    if bytes[bytes.len() - 1] & 0x80 != 0 {
         let shift = bytes.len() * 8;
         if shift < 64 {
             result |= !0i64 << shift;
