@@ -122,7 +122,7 @@ pub struct GenerationResult {
     pub(crate) logprobs: MxArray,
 
     /// Whether generation stopped due to EOS token (true) or max_tokens (false)
-    pub(crate) finish_reason: String, // "eos" or "length"
+    pub(crate) finish_reason: String, // "stop" or "length"
 
     /// Number of tokens generated
     pub(crate) num_tokens: usize,
@@ -152,8 +152,8 @@ impl GenerationResult {
         self.logprobs.clone()
     }
 
-    /// Get the finish reason ("eos", "length", or "repetition")
-    #[napi(getter, ts_return_type = "'eos' | 'length' | 'repetition'")]
+    /// Get the finish reason ("stop", "length", or "repetition")
+    #[napi(getter, ts_return_type = "'stop' | 'length' | 'repetition'")]
     pub fn get_finish_reason(&self) -> String {
         self.finish_reason.clone()
     }

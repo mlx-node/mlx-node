@@ -314,7 +314,7 @@ export interface GenerateBatchResult {
   nativeResult: NativeGenerateBatchResult;
   /** Completion token counts (derived from nativeResult) */
   tokenCounts: number[];
-  /** Finish reasons for each completion ("eos", "length", or "repetition") */
+  /** Finish reasons for each completion ("stop", "length", or "repetition") */
   finishReasons: string[];
 }
 
@@ -1207,7 +1207,7 @@ export class GRPOTrainer<T = unknown> {
    * @param context - Context for the reward function
    * @param groupSize - Number of completions per prompt (optional, defaults to config.groupSize)
    * @param tokenCounts - Token counts for each completion (optional, defaults to 0s)
-   * @param finishReasons - Finish reasons from generation (optional, e.g. "eos", "length", "repetition")
+   * @param finishReasons - Finish reasons from generation (optional, e.g. "stop", "length", "repetition")
    * @returns Promise<Float32Array> of reward scores
    */
   async scoreGenerations(
@@ -1515,7 +1515,7 @@ export class GRPOTrainer<T = unknown> {
         tool_calls: [],
         thinking: null,
         num_tokens: text.length, // Approximate
-        finish_reason: 'eos',
+        finish_reason: 'stop',
       },
       expected_answer: null,
     }));

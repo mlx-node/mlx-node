@@ -81,7 +81,7 @@ pub(crate) fn generate_decode_loop_for_training(
             if let Some(eos) = eos_token_id
                 && token_id == eos as u32
             {
-                finish_reason = "eos".to_string();
+                finish_reason = "stop".to_string();
                 generated_tokens.push(token_id);
                 all_tokens.push(token_id);
                 break;
@@ -117,7 +117,7 @@ pub(crate) fn generate_decode_loop_for_training(
             if let Some(eos) = eos_token_id
                 && token_id == eos as u32
             {
-                finish_reason = "eos".to_string();
+                finish_reason = "stop".to_string();
                 generated_tokens.push(token_id);
                 all_tokens.push(token_id);
                 break;

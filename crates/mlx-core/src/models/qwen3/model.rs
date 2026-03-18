@@ -103,7 +103,7 @@ pub struct PagedCompletedSequence {
     pub request_id: String,
     /// All generated tokens (excluding prompt)
     pub tokens: Vec<u32>,
-    /// Reason for completion ("eos", "max_tokens", etc.)
+    /// Reason for completion ("stop", "length", "repetition", "tool_calls")
     pub finish_reason: String,
 }
 

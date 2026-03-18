@@ -272,7 +272,7 @@ pub struct GenerateBatchResult {
     pub completion_logprobs: Vec<f64>,
     /// Lengths of each completion (for reconstruction)
     pub completion_lengths: Vec<i32>,
-    /// Finish reasons for each completion ("eos", "length", or "repetition")
+    /// Finish reasons for each completion ("stop", "length", or "repetition")
     pub finish_reasons: Vec<String>,
 }
 
@@ -2643,7 +2643,7 @@ struct IntermediateGenerationResult {
     completion_logprobs: Vec<MxArray>,
     /// Token counts for each completion
     token_counts: Vec<u32>,
-    /// Finish reasons for each completion ("eos", "length", or "repetition")
+    /// Finish reasons for each completion ("stop", "length", or "repetition")
     finish_reasons: Vec<String>,
 }
 

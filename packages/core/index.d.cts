@@ -111,8 +111,8 @@ export declare class GenerationResult {
   get tokens(): MxArray;
   /** Get the log probabilities */
   get logprobs(): MxArray;
-  /** Get the finish reason ("eos", "length", or "repetition") */
-  get finishReason(): 'eos' | 'length' | 'repetition';
+  /** Get the finish reason ("stop", "length", or "repetition") */
+  get finishReason(): 'stop' | 'length' | 'repetition';
   /** Get the number of tokens generated */
   get numTokens(): number;
 }
@@ -2237,7 +2237,7 @@ export interface GenerateBatchResult {
   completionLogprobs: Array<number>;
   /** Lengths of each completion (for reconstruction) */
   completionLengths: Array<number>;
-  /** Finish reasons for each completion ("eos", "length", or "repetition") */
+  /** Finish reasons for each completion ("stop", "length", or "repetition") */
   finishReasons: Array<string>;
 }
 
@@ -2677,7 +2677,7 @@ export interface PagedCompletedSequence {
   requestId: string;
   /** All generated tokens (excluding prompt) */
   tokens: Array<number>;
-  /** Reason for completion ("eos", "max_tokens", etc.) */
+  /** Reason for completion ("stop", "length", "repetition", "tool_calls") */
   finishReason: string;
 }
 

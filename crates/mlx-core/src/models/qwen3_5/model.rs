@@ -578,7 +578,7 @@ impl Qwen3_5Model {
                     generated_tokens.push(token_id);
 
                     if token_id == eos_id {
-                        finish_reason = String::from("eos");
+                        finish_reason = String::from("stop");
                         break;
                     }
 
@@ -645,7 +645,7 @@ impl Qwen3_5Model {
                     generated_tokens.push(token_id);
 
                     if token_id == eos_id {
-                        finish_reason = String::from("eos");
+                        finish_reason = String::from("stop");
                         break;
                     }
 
@@ -1005,7 +1005,7 @@ impl Qwen3_5Model {
                     token_history.push(token_id);
 
                     if token_id == eos_id {
-                        finish_reason = String::from("eos");
+                        finish_reason = String::from("stop");
                         break;
                     }
 
@@ -1129,7 +1129,7 @@ impl Qwen3_5Model {
                     token_history.push(token_id);
 
                     if token_id == eos_id {
-                        finish_reason = String::from("eos");
+                        finish_reason = String::from("stop");
                         break;
                     }
 
@@ -1577,7 +1577,7 @@ impl Qwen3_5Model {
                             );
 
                             if token_id == eos_id {
-                                finish_reason = String::from("eos");
+                                finish_reason = String::from("stop");
                                 break;
                             }
 
@@ -1656,7 +1656,7 @@ impl Qwen3_5Model {
                             );
 
                             if token_id == eos_id {
-                                finish_reason = String::from("eos");
+                                finish_reason = String::from("stop");
                                 break;
                             }
 
