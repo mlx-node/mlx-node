@@ -112,7 +112,7 @@ export interface ToolCall {
 }
 
 /**
- * Chat message roles
+ * Chat message roles (matches core ChatMessage.role type)
  */
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 

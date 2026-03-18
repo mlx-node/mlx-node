@@ -111,6 +111,7 @@ pub struct ToolDefinition {
 #[derive(Serialize, Deserialize)]
 pub struct ChatMessage {
     /// Role: "system", "user", "assistant", or "tool"
+    #[napi(ts_type = "'system' | 'user' | 'assistant' | 'tool' | (string & {})")]
     pub role: String,
     /// Message content
     pub content: String,

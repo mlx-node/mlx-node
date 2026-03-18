@@ -8,16 +8,22 @@ use napi_derive::napi;
 
 use crate::array::MxArray;
 
-/// Chat message role
+/// Chat message role (lowercase values matching standard convention)
 #[napi(string_enum)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatRole {
     /// User message
+    #[napi(value = "user")]
     User,
     /// Assistant response
+    #[napi(value = "assistant")]
     Assistant,
     /// System prompt
+    #[napi(value = "system")]
     System,
+    /// Tool response
+    #[napi(value = "tool")]
+    Tool,
 }
 
 /// A chat message with optional image

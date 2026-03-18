@@ -1932,7 +1932,7 @@ export interface ChatConfig {
 /** Chat message with tool calling support */
 export interface ChatMessage {
   /** Role: "system", "user", "assistant", or "tool" */
-  role: string;
+  role: 'system' | 'user' | 'assistant' | 'tool' | (string & {});
   /** Message content */
   content: string;
   /** Tool calls made by the assistant (for assistant messages) */
@@ -1957,14 +1957,16 @@ export interface ChatResult {
   performance?: PerformanceMetrics;
 }
 
-/** Chat message role */
+/** Chat message role (lowercase values matching standard convention) */
 export declare const enum ChatRole {
   /** User message */
-  User = 'User',
+  User = 'user',
   /** Assistant response */
-  Assistant = 'Assistant',
+  Assistant = 'assistant',
   /** System prompt */
-  System = 'System',
+  System = 'system',
+  /** Tool response */
+  Tool = 'tool',
 }
 
 /** A single chunk emitted during streaming chat generation. */
