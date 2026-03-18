@@ -350,11 +350,13 @@ impl RewardFunction for LengthReward {
     }
 }
 
-/// JSON Schema Reward - Validates JSON structure
+/// JSON Format Reward — validates JSON-like structure via brace matching
 ///
-/// Checks if completion contains valid JSON with expected fields.
+/// Checks if completion contains balanced braces and required field names
+/// as string keys. Does NOT parse JSON or validate against a JSON Schema.
+/// For strict JSON validation, use a custom reward function with serde_json.
 pub struct JsonSchemaReward {
-    /// Required top-level fields
+    /// Required top-level fields (checked as `"field"` string presence)
     required_fields: Vec<String>,
     /// Whether JSON must be parseable (reserved for future use)
     _must_parse: bool,
@@ -447,7 +449,7 @@ pub enum BuiltinRewardType {
     XmlFormat,
     /// Length-based scoring
     Length,
-    /// JSON schema validation
+    /// JSON format validation (brace matching + field name check, not full JSON parsing)
     JsonSchema,
 }
 

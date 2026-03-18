@@ -78,9 +78,6 @@ export {
   type PromptOptions,
 } from './trainers/training-logger';
 
-// Entropy configuration
-export { type EntropyFilteringConfig, DEFAULT_ENTROPY_CONFIG } from './trainers/grpo-entropy';
-
 // SFT Trainer
 export {
   SFTTrainer,
@@ -103,7 +100,14 @@ export {
 } from './trainers/sft-config';
 
 // Data
-export * from './data/dataset';
+export {
+  loadLocalGsm8kDataset,
+  LocalGsm8kDatasetLoader,
+  createDatasetExample,
+  extractGsm8kAnswer,
+  validateDatasetExample,
+  type LocalDatasetOptions,
+} from './data/dataset';
 export {
   SFTDataset,
   loadSFTDataset,
@@ -117,7 +121,7 @@ export {
 } from './data/sft-dataset';
 
 // Utils
-export * from './utils/xml-parser';
+export { parseXmlCot, extractXmlAnswer, extractXmlReasoning, extractHashAnswer } from './utils/xml-parser';
 export {
   validatePathContainment,
   resolveAndValidatePath,

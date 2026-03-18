@@ -6,12 +6,10 @@
 // - advantages: Group-based advantage computation
 // - autograd: Autograd-based training implementation
 // - rewards: Built-in reward functions and registry
-// - callbacks: JavaScript callback support via ThreadsafeFunction
 // - engine: Complete Rust-native training engine
 
 pub mod advantages;
 pub mod autograd;
-pub mod callbacks;
 pub mod engine;
 pub mod entropy;
 pub mod loss;
@@ -20,7 +18,6 @@ pub mod rewards;
 // Re-export all public items
 pub use advantages::*;
 // autograd functions are pub(crate) - used directly by engine
-pub use callbacks::*;
 pub use engine::*;
 pub use entropy::*;
 pub use loss::*;

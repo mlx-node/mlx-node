@@ -34,7 +34,8 @@ export type { ChatConfig, ChatResult, ChatMessage, ToolCallResult, PerformanceMe
 // Streaming chat API
 export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent } from './stream';
 export type { ChatStreamChunk, ChatStreamHandle } from '@mlx-node/core';
-/** @internal Exported for testing the callback-to-AsyncGenerator bridge. */
+// Internal: exported for testing the callback-to-AsyncGenerator bridge
+// Not part of the public API — may change without notice
 export { _createChatStream } from './stream';
 
 // Model utilities (TypeScript-only)
