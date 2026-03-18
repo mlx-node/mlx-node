@@ -92,6 +92,7 @@ export class SFTTrainer {
   private stdinInterface?: readline.Interface;
   private logger: TrainingLogger;
   private sampleDisplayMode: 'all' | 'best_worst' | 'random' = 'all';
+  private signalHandlersInstalled: boolean = false;
 
   /**
    * Create a new SFT trainer from a model
@@ -152,6 +153,40 @@ export class SFTTrainer {
     if (this.config.tui_mode) {
       this.setupStdinHandler();
     }
+  }
+
+  /**
+   * Setup OS signal handlers for graceful shutdown on interrupt.
+   * Saves an emergency checkpoint before exiting to prevent progress loss.
+   */
+  private setupSignalHandlers(): void {
+    if (this.signalHandlersInstalled) return;
+    this.signalHandlersInstalled = true;
+
+    const gracefulShutdown = async (signal: string) => {
+      this.logger.warn(`Received ${signal}, initiating graceful shutdown...`);
+      this.stopRequested = true;
+
+      try {
+        if (this.config.output_dir && this.currentStep > 0) {
+          this.logger.info(`Saving emergency checkpoint at step ${this.currentStep}...`);
+          await this.saveCheckpoint(`emergency-checkpoint-${this.currentStep}`);
+          this.logger.info('Emergency checkpoint saved.');
+        }
+      } catch (e) {
+        console.error('Failed to save emergency checkpoint:', e);
+      }
+
+      process.exit(0);
+    };
+
+    process.on('SIGTERM', () => {
+      gracefulShutdown('SIGTERM').catch(console.error);
+    });
+
+    process.on('SIGINT', () => {
+      gracefulShutdown('SIGINT').catch(console.error);
+    });
   }
 
   /**
@@ -370,6 +405,9 @@ export class SFTTrainer {
     if (sftDataset.length === 0) {
       return;
     }
+
+    // Setup signal handlers for crash recovery
+    this.setupSignalHandlers();
 
     const numEpochs = this.config.num_epochs;
     const batchSize = this.config.batch_size;
