@@ -1438,7 +1438,7 @@ impl Qwen3Model {
         let config = config.unwrap_or_default();
         let input_ids = input_ids.clone();
         // Extract configuration with defaults
-        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
         let temperature = config.temperature.unwrap_or(1.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -1874,7 +1874,7 @@ impl Qwen3Model {
         let input_ids = input_ids.clone();
 
         // Extract configuration
-        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
         let temperature = config.temperature.unwrap_or(1.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -2332,7 +2332,7 @@ impl Qwen3Model {
         let total_completions = num_prompts * group_size;
 
         // Extract configuration with defaults
-        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
         let temperature = config.temperature.unwrap_or(1.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -2947,7 +2947,7 @@ impl Qwen3Model {
         let total_batch_size = num_prompts * group_size;
 
         // Extract configuration with defaults
-        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
         let temperature = config.temperature.unwrap_or(1.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -4583,7 +4583,7 @@ impl Qwen3Model {
         let config = config.unwrap_or_default();
         let input_ids = input_ids.clone();
         // Extract configuration with defaults
-        let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
         let temperature = config.temperature.unwrap_or(1.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -5178,8 +5178,9 @@ impl Qwen3Model {
             )
         })?;
 
-        // Extract tools and report_performance from config
+        // Extract tools, enable_thinking, and report_performance from config
         let tools = config.as_ref().and_then(|c| c.tools.clone());
+        let enable_thinking = config.as_ref().and_then(|c| c.enable_thinking);
         let report_perf = config
             .as_ref()
             .and_then(|c| c.report_performance)
@@ -5222,7 +5223,7 @@ impl Qwen3Model {
                 &messages,
                 Some(true),
                 tools.as_deref(),
-                None,
+                enable_thinking,
             )?;
 
             // Create MxArray from token IDs

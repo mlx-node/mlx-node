@@ -1925,6 +1925,11 @@ export interface ChatConfig {
   /** Max pattern size for n-gram repetition detection (default: 64) */
   ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
+  /**
+   * Enable thinking mode (Qwen3's <think> tags). Default: true (model thinks naturally).
+   * Set to false to suppress thinking by injecting empty <think></think> tags.
+   */
+  enableThinking?: boolean | undefined;
   /** When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result */
   reportPerformance?: boolean | undefined;
 }
@@ -2249,7 +2254,7 @@ export interface GenerateBatchResult {
 
 /** Configuration for text generation */
 export interface GenerationConfig {
-  /** Maximum number of new tokens to generate (default: 100) */
+  /** Maximum number of new tokens to generate (default: 2048) */
   maxNewTokens?: number;
   /** Sampling temperature (0 = greedy, higher = more random) (default: 1.0) */
   temperature?: number;

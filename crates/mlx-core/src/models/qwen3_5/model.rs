@@ -143,6 +143,10 @@ pub struct ChatConfig {
     pub ngram_size: Option<i32>,
     #[napi(ts_type = "Array<ToolDefinition>")]
     pub tools: Option<Vec<ToolDefinition>>,
+    /// Enable thinking mode (Qwen3's <think> tags). Default: true (model thinks naturally).
+    /// Set to false to suppress thinking by injecting empty <think></think> tags.
+    #[napi(ts_type = "boolean | undefined")]
+    pub enable_thinking: Option<bool>,
     /// When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result
     #[napi(ts_type = "boolean | undefined")]
     pub report_performance: Option<bool>,
@@ -714,6 +718,7 @@ impl Qwen3_5Model {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
+            enable_thinking: None,
             report_performance: None,
         });
 
@@ -776,8 +781,9 @@ impl Qwen3_5Model {
             let mut first_token_instant: Option<std::time::Instant> = None;
 
             let tool_defs = config.tools.as_deref();
+            let enable_thinking = config.enable_thinking;
             let tokens =
-                tokenizer.apply_chat_template_sync(&messages, Some(true), tool_defs, None)?;
+                tokenizer.apply_chat_template_sync(&messages, Some(true), tool_defs, enable_thinking)?;
 
             let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
             let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
@@ -787,7 +793,7 @@ impl Qwen3_5Model {
             let ngram_size = config.ngram_size.unwrap_or(64);
             let sampling_config = Some(SamplingConfig {
                 temperature: config.temperature,
-                top_k: config.top_k.or(Some(20)), // Qwen3.5 recommends top_k=20
+                top_k: config.top_k, // Qwen3.5 recommends top_k=20
                 top_p: config.top_p,
                 min_p: config.min_p,
             });
@@ -1248,6 +1254,7 @@ impl Qwen3_5Model {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
+            enable_thinking: None,
             report_performance: None,
         });
 
@@ -1319,11 +1326,12 @@ impl Qwen3_5Model {
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
                     let tool_defs = config.tools.as_deref();
+                    let enable_thinking = config.enable_thinking;
                     let tokens = tokenizer.apply_chat_template_sync(
                         &messages,
                         Some(true),
                         tool_defs,
-                        None,
+                        enable_thinking,
                     )?;
 
                     let mut first_token_instant: Option<std::time::Instant> = None;
@@ -1336,7 +1344,7 @@ impl Qwen3_5Model {
                     let ngram_size = config.ngram_size.unwrap_or(64);
                     let sampling_config = Some(SamplingConfig {
                         temperature: config.temperature,
-                        top_k: config.top_k.or(Some(20)),
+                        top_k: config.top_k,
                         top_p: config.top_p,
                         min_p: config.min_p,
                     });

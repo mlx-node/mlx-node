@@ -578,6 +578,7 @@ impl Qwen3_5MoeModel {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
+            enable_thinking: None,
             report_performance: None,
         });
 
@@ -635,8 +636,9 @@ impl Qwen3_5MoeModel {
 
         napi::bindgen_prelude::spawn_blocking(move || {
             let tool_defs = config.tools.as_deref();
+            let enable_thinking = config.enable_thinking;
             let tokens =
-                tokenizer.apply_chat_template_sync(&messages, Some(true), tool_defs, None)?;
+                tokenizer.apply_chat_template_sync(&messages, Some(true), tool_defs, enable_thinking)?;
 
             let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
             let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
@@ -646,7 +648,7 @@ impl Qwen3_5MoeModel {
             let ngram_size = config.ngram_size.unwrap_or(64);
             let sampling_config = Some(SamplingConfig {
                 temperature: config.temperature,
-                top_k: config.top_k.or(Some(20)), // Qwen3.5 recommends top_k=20
+                top_k: config.top_k, // Qwen3.5 recommends top_k=20
                 top_p: config.top_p,
                 min_p: config.min_p,
             });
@@ -1105,6 +1107,7 @@ impl Qwen3_5MoeModel {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
+            enable_thinking: None,
             report_performance: None,
         });
 
@@ -1175,11 +1178,12 @@ impl Qwen3_5MoeModel {
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
                     let tool_defs = config.tools.as_deref();
+                    let enable_thinking = config.enable_thinking;
                     let tokens = tokenizer.apply_chat_template_sync(
                         &messages,
                         Some(true),
                         tool_defs,
-                        None,
+                        enable_thinking,
                     )?;
 
                     let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
@@ -1190,7 +1194,7 @@ impl Qwen3_5MoeModel {
                     let ngram_size = config.ngram_size.unwrap_or(64);
                     let sampling_config = Some(SamplingConfig {
                         temperature: config.temperature,
-                        top_k: config.top_k.or(Some(20)),
+                        top_k: config.top_k,
                         top_p: config.top_p,
                         min_p: config.min_p,
                     });
