@@ -57,7 +57,7 @@ describe('Local GSM8K dataset loader', () => {
   });
 
   it('can load from explicit base path', async () => {
-    const basePath = resolve(process.cwd(), 'data/gsm8k');
+    const basePath = resolve(process.cwd(), 'data/openai-gsm8k');
     const examples = await loadLocalGsm8kDataset('train', { limit: 1, basePath });
     expect(examples).toHaveLength(1);
   });

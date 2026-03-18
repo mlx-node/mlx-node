@@ -23,7 +23,7 @@ interface Gsm8kRecord {
   answer: string;
 }
 
-const DEFAULT_BASE_PATH = resolvePath(process.cwd(), 'data/gsm8k');
+const DEFAULT_BASE_PATH = resolvePath(process.cwd(), 'data/openai-gsm8k');
 const VALID_SPLITS = new Set(['train', 'test']);
 
 export const SYSTEM_PROMPT = `
