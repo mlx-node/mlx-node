@@ -266,9 +266,12 @@ pub fn dispatch_paged_attention_v2(
     let exp_sums_size = (params.num_seqs * params.num_heads * max_num_partitions) as usize
         * std::mem::size_of::<f32>();
     let max_logits_size = exp_sums_size;
+    // tmp_out stores partitioned attention outputs in float16 (the I/O type),
+    // NOT the cache dtype. Using dtype.size() here would under-allocate for FP8
+    // (1 byte) when the kernel writes float16 (2 bytes), causing GPU buffer overrun.
     let tmp_out_size = (params.num_seqs * params.num_heads * max_num_partitions * params.head_size)
         as usize
-        * dtype.size();
+        * MetalDtype::Float16.size();
 
     let exp_sums = state.device.new_buffer(
         exp_sums_size as u64,
