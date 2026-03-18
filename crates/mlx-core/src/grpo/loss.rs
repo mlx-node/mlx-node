@@ -84,7 +84,7 @@ impl Default for GRPOLossConfig {
             epsilon_low: 0.2,
             epsilon_high: None,
             beta: 0.0,
-            loss_type: "dapo".to_string(),
+            loss_type: "grpo".to_string(),
             importance_sampling_level: "token".to_string(),
             max_completion_length: Some(256),
             num_items_in_batch: None,

@@ -1499,8 +1499,12 @@ export declare class SftTrainingEngine {
   reset(): void;
   /** Restore training state (for resuming from checkpoint) */
   restoreState(step: number, epoch: number): void;
-  /** Get the underlying Qwen3 model for checkpointing (only works for Qwen3 variant) */
+  /** Get the underlying Qwen3 model for checkpointing */
   getModel(): Qwen3Model;
+  /** Get the underlying Qwen3.5 dense model for checkpointing */
+  getQwen35Model(): Qwen35Model;
+  /** Get the underlying Qwen3.5 MoE model for checkpointing */
+  getQwen35MoeModel(): Qwen35MoeModel;
 }
 
 /**
@@ -1916,9 +1920,9 @@ export interface ChatConfig {
   repetitionContextSize?: number | undefined;
   /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
   maxConsecutiveTokens?: number | undefined;
-  /** Max n-gram repetitions before stopping (default: 8, 0 = disabled) */
+  /** Max n-gram repetitions before stopping (default: 3, 0 = disabled) */
   maxNgramRepeats?: number | undefined;
-  /** N-gram size for repetition detection (default: 3) */
+  /** Max pattern size for n-gram repetition detection (default: 64) */
   ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
   /** When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result */

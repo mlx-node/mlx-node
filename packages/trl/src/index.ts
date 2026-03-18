@@ -44,15 +44,6 @@ export type { ConversionOptions, ConversionResult } from '@mlx-node/core';
 
 // Trainers
 export {
-  type MLXGRPOConfig,
-  ConfigError,
-  getDefaultConfig,
-  mergeConfig,
-  loadTomlConfig,
-  applyOverrides,
-} from './trainers/grpo-config';
-
-export {
   GRPOTrainer,
   type GRPOTrainerConfig,
   DEFAULT_GRPO_CONFIG,

@@ -634,12 +634,13 @@ export class SFTTrainer {
    * Get the underlying model for inference
    */
   getModel(): TrainableModel {
-    if (this.model instanceof Qwen3Model) {
-      return this.engine.getModel();
+    if (this.model instanceof Qwen35MoeModel) {
+      return this.engine.getQwen35MoeModel();
     }
-    // For Qwen3.5 models, return the original model reference
-    // (engine.getModel() only supports Qwen3)
-    return this.model;
+    if (this.model instanceof Qwen35Model) {
+      return this.engine.getQwen35Model();
+    }
+    return this.engine.getModel();
   }
 
   /**

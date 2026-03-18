@@ -909,7 +909,7 @@ impl SftTrainingEngine {
         Ok(())
     }
 
-    /// Get the underlying Qwen3 model for checkpointing (only works for Qwen3 variant)
+    /// Get the underlying Qwen3 model for checkpointing
     #[napi]
     pub fn get_model(&self) -> Result<Qwen3Model> {
         let model = self
@@ -920,7 +920,39 @@ impl SftTrainingEngine {
             TrainableModelEnum::Qwen3(m) => m.clone_for_session(),
             _ => Err(Error::new(
                 Status::GenericFailure,
-                "get_model() only supports Qwen3 models. Use save_model() for other model types.",
+                "get_model() only supports Qwen3. Use get_qwen35_model() or get_qwen35_moe_model() for Qwen3.5 variants.",
+            )),
+        }
+    }
+
+    /// Get the underlying Qwen3.5 dense model for checkpointing
+    #[napi]
+    pub fn get_qwen35_model(&self) -> Result<Qwen3_5Model> {
+        let model = self
+            .model
+            .read()
+            .map_err(|_| Error::new(Status::GenericFailure, "Lock error"))?;
+        match &*model {
+            TrainableModelEnum::Qwen35Dense(m) => m.clone_for_training(),
+            _ => Err(Error::new(
+                Status::GenericFailure,
+                "get_qwen35_model() only supports Qwen3.5 dense models.",
+            )),
+        }
+    }
+
+    /// Get the underlying Qwen3.5 MoE model for checkpointing
+    #[napi]
+    pub fn get_qwen35_moe_model(&self) -> Result<Qwen3_5MoeModel> {
+        let model = self
+            .model
+            .read()
+            .map_err(|_| Error::new(Status::GenericFailure, "Lock error"))?;
+        match &*model {
+            TrainableModelEnum::Qwen35Moe(m) => m.clone_for_training(),
+            _ => Err(Error::new(
+                Status::GenericFailure,
+                "get_qwen35_moe_model() only supports Qwen3.5 MoE models.",
             )),
         }
     }
