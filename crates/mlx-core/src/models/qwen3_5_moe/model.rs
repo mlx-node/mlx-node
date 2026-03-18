@@ -458,7 +458,7 @@ impl Qwen3_5MoeModel {
                     profiler.step();
 
                     if (step + 1) % 256 == 0 {
-                        crate::array::clear_cache();
+                        crate::array::synchronize_and_clear_cache();
                     }
                 }
 
@@ -523,7 +523,7 @@ impl Qwen3_5MoeModel {
                     profiler.step();
 
                     if (step + 1) % 256 == 0 {
-                        crate::array::clear_cache();
+                        crate::array::synchronize_and_clear_cache();
                     }
                 }
 
@@ -924,7 +924,7 @@ impl Qwen3_5MoeModel {
                     profiler.step();
 
                     if (step + 1) % 256 == 0 {
-                        crate::array::clear_cache();
+                        crate::array::synchronize_and_clear_cache();
                     }
                 }
 
@@ -1009,7 +1009,7 @@ impl Qwen3_5MoeModel {
                     profiler.step();
 
                     if (step + 1) % 256 == 0 {
-                        crate::array::clear_cache();
+                        crate::array::synchronize_and_clear_cache();
                     }
                 }
 
@@ -1483,7 +1483,7 @@ impl Qwen3_5MoeModel {
                             profiler.step();
 
                             if (step + 1) % 256 == 0 {
-                                crate::array::clear_cache();
+                                crate::array::synchronize_and_clear_cache();
                             }
                         }
                         profiler.snapshot_memory_after();
@@ -1571,7 +1571,7 @@ impl Qwen3_5MoeModel {
                             profiler.step();
 
                             if (step + 1) % 256 == 0 {
-                                crate::array::clear_cache();
+                                crate::array::synchronize_and_clear_cache();
                             }
                         }
 

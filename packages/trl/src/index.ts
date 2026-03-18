@@ -23,20 +23,8 @@
 // Tool calling types (for tool-use training)
 export type { ToolDefinition, FunctionDefinition, FunctionParameters } from '@mlx-node/core';
 
-// Core tensor (for custom rewards/models)
-export { MxArray } from '@mlx-node/core';
-
-// Activations are internal-only (Rust) - used by transformers, sampling, GRPO
-
-// Transformer components are now internal-only (Rust)
-// Use model.chat() or model.generate() instead
-
-// GRPO utilities (computeAdvantages, computeEntropy, getHighEntropyMask) are internal-only
-// They are used by GRPOTrainingEngine in Rust
-
-// Model conversion
-export { convertModel, convertParquetToJsonl } from '@mlx-node/core';
-export type { ConversionOptions, ConversionResult } from '@mlx-node/core';
+// Note: MxArray, convertModel, convertParquetToJsonl are available from @mlx-node/core directly.
+// They are not re-exported here to avoid multiple-package export confusion.
 
 // =============================================================================
 // TRL-specific exports
