@@ -241,7 +241,7 @@ export class StructureV3Pipeline {
           lines: includeDetails ? textLines : undefined,
         });
       } else if (label === 'table') {
-        // Table: detect text lines in each cell (simplified - full table parsing in Phase 4)
+        // Table: detect text lines in each cell (simplified — no cell-level structure yet)
         const cropBuffer = await this.cropElement(imageBuffer, el);
         const textLines = await this.ocrRegion(cropBuffer, textDetThreshold);
         const fullText = textLines.map((l) => l.text).join('\n');
@@ -255,7 +255,7 @@ export class StructureV3Pipeline {
           lines: includeDetails ? textLines : undefined,
         });
       } else if (label === 'isolate_formula') {
-        // Formula: basic OCR for now (Phase 5 adds LaTeX recognition)
+        // Formula: basic OCR (no LaTeX recognition yet)
         const cropBuffer = await this.cropElement(imageBuffer, el);
         const textLines = await this.ocrRegion(cropBuffer, textDetThreshold);
         const fullText = textLines.map((l) => l.text).join(' ');
