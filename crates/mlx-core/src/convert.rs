@@ -808,38 +808,63 @@ pub(crate) fn build_qwen35_recipe(
 /// GatedDeltaNet (linear attention/SSM) + full attention architecture:
 /// (https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks)
 ///
-/// Key findings from Unsloth's per-tensor KLD analysis:
+/// Key findings from Unsloth's per-tensor 99.9% KLD analysis (sorted worst→best):
 ///
 /// **Most sensitive (skip quantization — keep bf16):**
-/// - `ssm_out` (`linear_attn.out_proj`): "dramatically increases KLD and the disk
-///   space savings is minuscule" — quantizing even to Q8 degrades quality severely
-/// - `attn_*` (`self_attn.*`): "quantizing any attn_* is especially sensitive for
-///   hybrid architectures, and so leaving them in higher precision works well"
+/// - `ssm_out` (`linear_attn.out_proj`): KLD ~6.0 at q2_k — by far the worst
+/// - `attn_qkv` (`self_attn.*`): KLD ~2.9 — "especially sensitive for hybrid architectures"
+/// - `attn_v/output/q/gate`: KLD ~1.5-2.1 — all attn_* tensors are high sensitivity
 /// - `attn_gate` (`linear_attn.in_proj_z`): "performs poorly with MXFP4"
 /// - `ssm_beta`, `ssm_alpha` (`in_proj_a/b`): degrade significantly with low bits
 ///   (already excluded by `should_quantize()` since they lack `.weight` suffix)
 ///
-/// **Slightly sensitive (default_bits + 1):**
-/// - `ffn_down_exps` (`down_proj`): "slightly more sensitive" than other FFN weights
+/// **Moderate sensitivity (default_bits + 1):**
+/// - `ffn_down` (`down_proj`): "slightly more sensitive" than other FFN weights
 ///
-/// **Safe to quantize aggressively (default bits):**
-/// - `ffn_up_exps`, `ffn_gate_exps`: "generally ok to quantize to 3-bit"
+/// **Safe to quantize aggressively (default bits = 3-bit):**
+/// - `ffn_up`, `ffn_gate`: "generally ok to quantize to 3-bit"
+/// - "leaving ffn_* (down, up, gate) at around iq3_xxs seems to be best compromise"
+///
+/// **Very low sensitivity (quantize at 5-6 bit):**
+/// - `token_embedding`: KLD ~0.15 at q5_k — among the least sensitive tensors
+/// - `output-tensor` (lm_head): KLD ~0.05 at q5_k — the safest tensor to quantize
 ///
 /// **Always 8-bit:**
 /// - Router gates: standard for MoE routing accuracy
 ///
 /// This recipe matches Unsloth Dynamic 2.0's approach of "upcasting important
-/// layers to 8 or 16-bit" while aggressively quantizing FFN expert weights.
-/// Results in larger model size than `qwen3_5` recipe but significantly better
-/// quality, particularly for the hybrid attention/SSM architecture.
+/// layers to 8 or 16-bit" while aggressively quantizing FFN weights to 3-bit.
+/// Embeddings and lm_head are quantized at higher precision (5-6 bit) following
+/// llama.cpp's standard practice (Q6_K for output, Q5_K for token_embd).
 pub(crate) fn build_unsloth_recipe(
     default_bits: i32,
     default_group_size: i32,
 ) -> Box<dyn Fn(&str) -> QuantDecision + Send + Sync> {
     let down_proj_bits = (default_bits + 1).min(8);
+    // Embed/lm_head: quantize at higher precision (5-6 bit)
+    // Per Unsloth's KLD chart: token_embedding KLD ~0.15, output KLD ~0.05 at q5_k
+    let embed_bits = (default_bits + 2).min(8);
+    let lm_head_bits = (default_bits + 3).min(8);
     let gs = default_group_size;
 
     Box::new(move |key: &str| -> QuantDecision {
+        // Handle embed_tokens and lm_head BEFORE should_quantize (which skips them)
+        // These are among the least sensitive tensors per Unsloth's KLD analysis
+        if key.contains("embed_tokens") && key.ends_with(".weight") {
+            return QuantDecision::Custom {
+                bits: embed_bits,
+                group_size: gs,
+                mode: "affine".to_string(),
+            };
+        }
+        if key.contains("lm_head") && key.ends_with(".weight") {
+            return QuantDecision::Custom {
+                bits: lm_head_bits,
+                group_size: gs,
+                mode: "affine".to_string(),
+            };
+        }
+
         if !should_quantize(key) {
             return QuantDecision::Skip;
         }
@@ -868,7 +893,7 @@ pub(crate) fn build_unsloth_recipe(
             return QuantDecision::Skip;
         }
 
-        // ffn_down_exps: "slightly more sensitive" than other FFN variants
+        // ffn_down: "slightly more sensitive" than other FFN variants
         if key.contains("down_proj") {
             return QuantDecision::Custom {
                 bits: down_proj_bits,
@@ -877,7 +902,7 @@ pub(crate) fn build_unsloth_recipe(
             };
         }
 
-        // Everything else (ffn_gate_proj, ffn_up_proj, etc.) → default bits
+        // Everything else (ffn_gate_proj, ffn_up_proj, etc.) → default bits (3-bit)
         QuantDecision::Default
     })
 }

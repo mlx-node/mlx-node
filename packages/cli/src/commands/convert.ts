@@ -33,6 +33,8 @@ Quantization Arguments:
   --q-mode <string>     Mode: "affine" (default) or "mxfp8"
   --q-recipe <string>   Per-layer mixed-bit quantization recipe
                         Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
+                        "unsloth" defaults to 3-bit base (gate/up=3b, down=4b,
+                        embed=5b, lm_head=6b, attn/SSM=bf16)
   --imatrix-path <path> imatrix GGUF file for AWQ-style pre-scaling
                         Improves quantization quality using calibration data
 
@@ -131,7 +133,18 @@ export async function run(argv: string[]) {
       console.error(`Error: Unknown recipe "${quantRecipe}". Available: ${validRecipes.join(', ')}`);
       process.exit(1);
     }
+    // Unsloth recipe defaults to 3-bit base (MLP gate/up at 3-bit, down at 4-bit,
+    // embed_tokens at 5-bit, lm_head at 6-bit, attention/SSM kept bf16).
+    // Based on Unsloth's per-tensor KLD analysis showing ffn_up/gate are
+    // "generally ok to quantize to 3-bit" and IQ3_XXS is the "best compromise".
+    if (quantRecipe === 'unsloth' && !args['q-bits']) {
+      console.log('Note: unsloth recipe defaults to 3-bit base (override with --q-bits)');
+    }
   }
+
+  // Apply recipe-specific defaults for bits when not explicitly set.
+  // Unsloth recipe: 3-bit base → MLP gate/up=3b, down=4b, embed=5b, lm_head=6b
+  const effectiveQuantBits = quantBits ?? (quantRecipe === 'unsloth' ? 3 : undefined);
 
   const mmprojPath = args.mmproj ? resolve(args.mmproj) : undefined;
   if (mmprojPath !== undefined) {
@@ -173,7 +186,7 @@ export async function run(argv: string[]) {
     console.log(`Dtype:      ${dtype}`);
     if (args.quantize) {
       const qMode = quantMode || 'affine';
-      const qBits = quantBits || (qMode === 'mxfp8' ? 8 : 4);
+      const qBits = effectiveQuantBits || (qMode === 'mxfp8' ? 8 : 4);
       const qGs = quantGroupSize || (qMode === 'mxfp8' ? 32 : 64);
       console.log(
         `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}`,
@@ -194,7 +207,7 @@ export async function run(argv: string[]) {
         dtype,
         verbose,
         quantize: args.quantize,
-        quantBits,
+        quantBits: effectiveQuantBits,
         quantGroupSize,
         quantMode,
         quantRecipe,
@@ -297,7 +310,7 @@ export async function run(argv: string[]) {
   }
   if (args.quantize) {
     const qMode = quantMode || 'affine';
-    const qBits = quantBits || (qMode === 'mxfp8' ? 8 : 4);
+    const qBits = effectiveQuantBits || (qMode === 'mxfp8' ? 8 : 4);
     const qGs = quantGroupSize || (qMode === 'mxfp8' ? 32 : 64);
     console.log(`Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}`);
   }
@@ -314,7 +327,7 @@ export async function run(argv: string[]) {
       verbose,
       modelType,
       quantize: args.quantize,
-      quantBits,
+      quantBits: effectiveQuantBits,
       quantGroupSize,
       quantMode,
       quantRecipe,

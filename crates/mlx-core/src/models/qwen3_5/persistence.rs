@@ -11,7 +11,7 @@ use tracing::{info, warn};
 use crate::array::{DType, MxArray};
 use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
-use crate::utils::safetensors::SafeTensorsFile;
+use crate::utils::safetensors::load_safetensors_lazy;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
 use crate::vision::projector::SpatialProjector;
 
@@ -26,6 +26,9 @@ use super::quantized_linear::{
 use super::vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 
 /// Load all safetensors files from a directory (supports sharded checkpoints).
+/// Uses MLX's native mmap-backed lazy loader — arrays are backed by deferred disk
+/// reads and data is only materialized on eval. This makes loading near-instant
+/// regardless of model size (vs the eager reader which took 3-4 min for 29GB).
 fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     let single_path = if dir.join("weights.safetensors").exists() {
         Some(dir.join("weights.safetensors"))
@@ -36,16 +39,14 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     };
 
     if let Some(path) = single_path {
-        info!("Loading weights from: {}", path.display());
-        let st_file = SafeTensorsFile::load(&path)?;
-        let mut params = st_file.load_tensors(&path)?;
+        info!("Loading weights from: {} (mmap)", path.display());
+        let mut params = load_safetensors_lazy(&path)?;
 
         // Also load vision.safetensors if present (VLM models)
         let vision_path = dir.join("vision.safetensors");
         if vision_path.exists() {
-            info!("Loading vision weights from: {}", vision_path.display());
-            let vision_st = SafeTensorsFile::load(&vision_path)?;
-            let vision_params = vision_st.load_tensors(&vision_path)?;
+            info!("Loading vision weights from: {} (mmap)", vision_path.display());
+            let vision_params = load_safetensors_lazy(&vision_path)?;
             info!("Loaded {} vision tensors", vision_params.len());
             params.extend(vision_params);
         }
@@ -77,13 +78,12 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     }
 
     shard_files.sort();
-    info!("Loading {} sharded safetensors files", shard_files.len());
+    info!("Loading {} sharded safetensors files (mmap)", shard_files.len());
 
     let mut all_params: HashMap<String, MxArray> = HashMap::new();
     for shard_path in &shard_files {
-        info!("  Loading shard: {}", shard_path.display());
-        let st_file = SafeTensorsFile::load(shard_path)?;
-        let shard_params = st_file.load_tensors(shard_path)?;
+        info!("  Loading shard: {} (mmap)", shard_path.display());
+        let shard_params = load_safetensors_lazy(shard_path)?;
         all_params.extend(shard_params);
     }
 
@@ -876,6 +876,20 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
             register_weights_with_cpp(&params);
         } else {
             info!("Skipping C++ compiled path for quantized model (using Rust quantized_matmul)");
+        }
+
+        // Materialize all mmap-backed weight arrays so the first inference
+        // prefill timing is not inflated by lazy disk reads.
+        {
+            let start = std::time::Instant::now();
+            let arrays: Vec<&MxArray> = params.values().collect();
+            MxArray::async_eval_arrays(&arrays);
+            crate::array::memory::synchronize();
+            info!(
+                "Materialized {} weight arrays in {:.2}s",
+                arrays.len(),
+                start.elapsed().as_secs_f64()
+            );
         }
 
         // Set tokenizer
