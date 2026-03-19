@@ -834,19 +834,37 @@ pub(crate) fn build_qwen35_recipe(
 ///
 /// This recipe matches Unsloth Dynamic 2.0's approach of "upcasting important
 /// layers to 8 or 16-bit" while aggressively quantizing FFN weights to 3-bit.
-///
-/// Note: embed_tokens and lm_head are kept at bf16 despite being low-sensitivity
-/// (KLD ~0.05-0.15 at q5_k) because the model loader does not yet support
-/// QuantizedEmbedding. Once QuantizedEmbedding support is added, these can be
-/// quantized at 5-6 bit for an additional ~3.5 GB savings on 27B models.
+/// Embeddings and lm_head are quantized at higher precision (5-6 bit) following
+/// llama.cpp's standard practice — they're dequantized at load time since the
+/// model accesses them every token (savings come from smaller file on disk).
 pub(crate) fn build_unsloth_recipe(
     default_bits: i32,
     default_group_size: i32,
 ) -> Box<dyn Fn(&str) -> QuantDecision + Send + Sync> {
     let down_proj_bits = (default_bits + 1).min(8);
+    let embed_bits = (default_bits + 2).min(8);
+    let lm_head_bits = (default_bits + 3).min(8);
     let gs = default_group_size;
 
     Box::new(move |key: &str| -> QuantDecision {
+        // Handle embed_tokens and lm_head BEFORE should_quantize (which skips them).
+        // These are among the least sensitive tensors per Unsloth's KLD analysis:
+        // token_embedding KLD ~0.15, output KLD ~0.05 at q5_k
+        if key.contains("embed_tokens") && key.ends_with(".weight") {
+            return QuantDecision::Custom {
+                bits: embed_bits,
+                group_size: gs,
+                mode: "affine".to_string(),
+            };
+        }
+        if key.contains("lm_head") && key.ends_with(".weight") {
+            return QuantDecision::Custom {
+                bits: lm_head_bits,
+                group_size: gs,
+                mode: "affine".to_string(),
+            };
+        }
+
         if !should_quantize(key) {
             return QuantDecision::Skip;
         }

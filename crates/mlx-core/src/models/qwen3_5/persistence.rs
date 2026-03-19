@@ -90,6 +90,33 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     Ok(all_params)
 }
 
+/// Dequantize a tensor using MLX's dequantize op (affine mode).
+/// Used at load time for embedding and lm_head — these are accessed every token
+/// so keeping them dequantized in memory is the right tradeoff.
+fn dequantize_tensor(
+    weight: &MxArray,
+    scales: &MxArray,
+    biases: Option<&MxArray>,
+    group_size: i32,
+    bits: i32,
+) -> Result<MxArray> {
+    use mlx_sys as sys;
+
+    let biases_ptr = biases.map_or(std::ptr::null_mut(), |b| b.as_raw_ptr());
+    let handle = unsafe {
+        sys::mlx_dequantize(
+            weight.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases_ptr,
+            group_size,
+            bits,
+            -1, // Use input dtype (bf16 from scales)
+            c"affine".as_ptr(),
+        )
+    };
+    MxArray::from_handle(handle, "dequantize_tensor")
+}
+
 /// FP8 E4M3 block-wise dequantization: weight * scale_inv with block_size=128
 fn dequant_fp8(weight: &MxArray, scale_inv: &MxArray, target_dtype: DType) -> Result<MxArray> {
     let weight = weight.from_fp8(target_dtype)?;
@@ -308,9 +335,9 @@ fn sanitize_weights(
             .unwrap_or(&name)
             .to_string();
 
-        // Rename special keys
-        let name = if name == "embed_tokens.weight" {
-            "embedding.weight".to_string()
+        // Rename special keys (including quantization metadata .scales/.biases)
+        let name = if let Some(suffix) = name.strip_prefix("embed_tokens.") {
+            format!("embedding.{}", suffix)
         } else if name == "norm.weight" {
             "final_norm.weight".to_string()
         } else {
@@ -318,7 +345,7 @@ fn sanitize_weights(
         };
 
         // Remove lm_head when tie_word_embeddings is set
-        if config.tie_word_embeddings && name == "lm_head.weight" {
+        if config.tie_word_embeddings && name.starts_with("lm_head.") {
             continue;
         }
 
@@ -385,8 +412,22 @@ fn apply_weights(
         try_build_quantized_linear(params, prefix, gs, bits)
     };
 
-    // Embedding
-    if let Some(w) = params.get("embedding.weight") {
+    // Embedding — dequantize at load time if quantized (no QuantizedEmbedding needed;
+    // the embedding table is accessed every token so keeping it dequantized in memory
+    // is the right tradeoff — the savings come from smaller file on disk)
+    if let Some(scales) = params.get("embedding.scales") {
+        let weight = params
+            .get("embedding.weight")
+            .ok_or_else(|| Error::from_reason("Missing embedding.weight for quantized embedding"))?;
+        let biases = params.get("embedding.biases");
+        let (bits, gs) = per_layer_quant
+            .get("embed_tokens")
+            .copied()
+            .unwrap_or((quant_bits, quant_group_size));
+        let dequantized = dequantize_tensor(weight, scales, biases, gs, bits)?;
+        model.embedding.set_weight(&dequantized)?;
+        info!("Dequantized embedding.weight ({}-bit → bf16)", bits);
+    } else if let Some(w) = params.get("embedding.weight") {
         model.embedding.set_weight(w)?;
     }
 
@@ -401,16 +442,28 @@ fn apply_weights(
         }
     }
 
-    // LM head
+    // LM head — dequantize at load time if quantized (same approach as embedding)
     {
         let mut lm_head = model
             .lm_head
             .write()
             .map_err(|_| Error::from_reason("Failed to acquire lm_head write lock"))?;
-        if let Some(ref mut head) = *lm_head
-            && let Some(w) = params.get("lm_head.weight")
-        {
-            head.set_weight(w)?;
+        if let Some(ref mut head) = *lm_head {
+            if let Some(scales) = params.get("lm_head.scales") {
+                let weight = params
+                    .get("lm_head.weight")
+                    .ok_or_else(|| Error::from_reason("Missing lm_head.weight for quantized lm_head"))?;
+                let biases = params.get("lm_head.biases");
+                let (bits, gs) = per_layer_quant
+                    .get("lm_head")
+                    .copied()
+                    .unwrap_or((quant_bits, quant_group_size));
+                let dequantized = dequantize_tensor(weight, scales, biases, gs, bits)?;
+                head.set_weight(&dequantized)?;
+                info!("Dequantized lm_head.weight ({}-bit → bf16)", bits);
+            } else if let Some(w) = params.get("lm_head.weight") {
+                head.set_weight(w)?;
+            }
         }
     }
 
