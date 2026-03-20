@@ -65,7 +65,10 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     }
 
     shard_files.sort();
-    info!("Loading {} sharded safetensors files (mmap)", shard_files.len());
+    info!(
+        "Loading {} sharded safetensors files (mmap)",
+        shard_files.len()
+    );
 
     let mut all_params: HashMap<String, MxArray> = HashMap::new();
     for shard_path in &shard_files {

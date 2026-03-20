@@ -45,7 +45,10 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
         // Also load vision.safetensors if present (VLM models)
         let vision_path = dir.join("vision.safetensors");
         if vision_path.exists() {
-            info!("Loading vision weights from: {} (mmap)", vision_path.display());
+            info!(
+                "Loading vision weights from: {} (mmap)",
+                vision_path.display()
+            );
             let vision_params = load_safetensors_lazy(&vision_path)?;
             info!("Loaded {} vision tensors", vision_params.len());
             params.extend(vision_params);
@@ -78,7 +81,10 @@ fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
     }
 
     shard_files.sort();
-    info!("Loading {} sharded safetensors files (mmap)", shard_files.len());
+    info!(
+        "Loading {} sharded safetensors files (mmap)",
+        shard_files.len()
+    );
 
     let mut all_params: HashMap<String, MxArray> = HashMap::new();
     for shard_path in &shard_files {
@@ -387,16 +393,21 @@ fn apply_weights(
 
     // Embedding — supports both dense and quantized weights
     if let Some(scales) = params.get("embedding.scales") {
-        let weight = params
-            .get("embedding.weight")
-            .ok_or_else(|| Error::from_reason("Missing embedding.weight for quantized embedding"))?;
+        let weight = params.get("embedding.weight").ok_or_else(|| {
+            Error::from_reason("Missing embedding.weight for quantized embedding")
+        })?;
         let biases = params.get("embedding.biases");
         let (bits, gs) = per_layer_quant
             .get("embed_tokens")
             .copied()
             .unwrap_or((quant_bits, quant_group_size));
-        model.embedding.load_quantized(weight, scales, biases, gs, bits)?;
-        info!("Loaded quantized embedding ({}-bit, quantized_matmul on forward)", bits);
+        model
+            .embedding
+            .load_quantized(weight, scales, biases, gs, bits)?;
+        info!(
+            "Loaded quantized embedding ({}-bit, quantized_matmul on forward)",
+            bits
+        );
     } else if let Some(w) = params.get("embedding.weight") {
         model.embedding.set_weight(w)?;
     }
@@ -420,16 +431,19 @@ fn apply_weights(
             .map_err(|_| Error::from_reason("Failed to acquire lm_head write lock"))?;
         if let Some(ref mut head) = *lm_head {
             if let Some(scales) = params.get("lm_head.scales") {
-                let weight = params
-                    .get("lm_head.weight")
-                    .ok_or_else(|| Error::from_reason("Missing lm_head.weight for quantized lm_head"))?;
+                let weight = params.get("lm_head.weight").ok_or_else(|| {
+                    Error::from_reason("Missing lm_head.weight for quantized lm_head")
+                })?;
                 let biases = params.get("lm_head.biases");
                 let (bits, gs) = per_layer_quant
                     .get("lm_head")
                     .copied()
                     .unwrap_or((quant_bits, quant_group_size));
                 head.load_quantized(weight, scales, biases, gs, bits)?;
-                info!("Loaded quantized lm_head ({}-bit, quantized_matmul on forward)", bits);
+                info!(
+                    "Loaded quantized lm_head ({}-bit, quantized_matmul on forward)",
+                    bits
+                );
             } else if let Some(w) = params.get("lm_head.weight") {
                 head.set_weight(w)?;
             }

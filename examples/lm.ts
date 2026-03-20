@@ -12,8 +12,7 @@
 import { resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
-import { loadModel } from '@mlx-node/lm';
-import { Qwen3Model } from '@mlx-node/core';
+import { loadModel, Qwen3Model } from '@mlx-node/lm';
 
 const { values, positionals } = parseArgs({
   args: process.argv.slice(2),

@@ -50,7 +50,13 @@ impl Embedding {
             // Per-row dequantize+gather is not available in MLX's C API,
             // so we dequantize fully — but the quantized weights use less
             // memory bandwidth when paging from mmap.
-            let dequantized = dequantize(&q.weight, &q.scales, q.biases.as_ref(), q.group_size, q.bits)?;
+            let dequantized = dequantize(
+                &q.weight,
+                &q.scales,
+                q.biases.as_ref(),
+                q.group_size,
+                q.bits,
+            )?;
             dequantized.take(indices, 0)
         } else {
             self.weight.take(indices, 0)
