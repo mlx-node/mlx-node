@@ -862,40 +862,15 @@ impl Qwen3_5MoeModel {
                 drop(caches_guard);
 
                 // C++ decode loop (all locks dropped — C++ owns the state)
+                // Pipelined: submit forward(N+1) BEFORE eval(N) so GPU
+                // computes the next step while CPU extracts the current token.
+                // Rep penalty uses token_history as-of graph build time (one
+                // token behind), matching Python mlx-lm's pipelining behavior.
                 profiler.set_label("moe_chat_compiled");
 
                 for step in 0..max_new_tokens {
-                    profiler.begin("eval_token");
-                    y.eval();
-                    profiler.end();
-
-                    profiler.begin("extract");
-                    let token_id = y.item_at_int32(0)? as u32;
-                    profiler.end();
-                    profiler.mark_first_token();
-                    if report_perf && first_token_instant.is_none() {
-                        first_token_instant = Some(std::time::Instant::now());
-                    }
-
-                    generated_tokens.push(token_id);
-                    token_history.push(token_id);
-
-                    if token_id == eos_id {
-                        finish_reason = String::from("stop");
-                        break;
-                    }
-
-                    if let Some(reason) = check_repetition_cutoff(
-                        &generated_tokens,
-                        max_consecutive_tokens,
-                        max_ngram_repeats,
-                        ngram_size,
-                    ) {
-                        finish_reason = reason.to_string();
-                        break;
-                    }
-
-                    if step + 1 < max_new_tokens {
+                    // Build and submit graph for step N+1 before waiting for N
+                    let next_y = if step + 1 < max_new_tokens {
                         profiler.begin("forward");
                         let next_ids = y.reshape(&[1, 1])?;
                         let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
@@ -920,26 +895,12 @@ impl Qwen3_5MoeModel {
                         eval_token_and_moe_caches(&next_token);
                         profiler.end();
 
-                        y = next_token;
+                        Some(next_token)
                     } else {
-                        break;
-                    }
+                        None
+                    };
 
-                    profiler.step();
-
-                    if (step + 1) % 256 == 0 {
-                        crate::array::synchronize_and_clear_cache();
-                    }
-                }
-
-                profiler.snapshot_memory_after();
-                profiler.report();
-                // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
-            } else {
-                // Rust fallback decode loop
-                profiler.set_label("moe_chat_rust");
-
-                for step in 0..max_new_tokens {
+                    // Wait for step N (GPU already computing N+1)
                     profiler.begin("eval_token");
                     y.eval();
                     profiler.end();
@@ -970,7 +931,28 @@ impl Qwen3_5MoeModel {
                         break;
                     }
 
-                    if step + 1 < max_new_tokens {
+                    match next_y {
+                        Some(next) => y = next,
+                        None => break,
+                    }
+
+                    profiler.step();
+
+                    if (step + 1) % 256 == 0 {
+                        crate::array::synchronize_and_clear_cache();
+                    }
+                }
+
+                profiler.snapshot_memory_after();
+                profiler.report();
+                // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
+            } else {
+                // Rust fallback decode loop (pipelined)
+                profiler.set_label("moe_chat_rust");
+
+                for step in 0..max_new_tokens {
+                    // Build and submit graph for step N+1 before waiting for N
+                    let next_y = if step + 1 < max_new_tokens {
                         profiler.begin("forward");
                         let next_ids = y.reshape(&[1, 1])?;
                         let logits = forward_inner(
@@ -1005,9 +987,45 @@ impl Qwen3_5MoeModel {
                         MxArray::async_eval_arrays(&[&next_token]);
                         profiler.end();
 
-                        y = next_token;
+                        Some(next_token)
                     } else {
+                        None
+                    };
+
+                    // Wait for step N (GPU already computing N+1)
+                    profiler.begin("eval_token");
+                    y.eval();
+                    profiler.end();
+
+                    profiler.begin("extract");
+                    let token_id = y.item_at_int32(0)? as u32;
+                    profiler.end();
+                    profiler.mark_first_token();
+                    if report_perf && first_token_instant.is_none() {
+                        first_token_instant = Some(std::time::Instant::now());
+                    }
+
+                    generated_tokens.push(token_id);
+                    token_history.push(token_id);
+
+                    if token_id == eos_id {
+                        finish_reason = String::from("stop");
                         break;
+                    }
+
+                    if let Some(reason) = check_repetition_cutoff(
+                        &generated_tokens,
+                        max_consecutive_tokens,
+                        max_ngram_repeats,
+                        ngram_size,
+                    ) {
+                        finish_reason = reason.to_string();
+                        break;
+                    }
+
+                    match next_y {
+                        Some(next) => y = next,
+                        None => break,
                     }
 
                     profiler.step();
@@ -1416,9 +1434,29 @@ impl Qwen3_5MoeModel {
                         // C++ has copied arrays into its own globals — safe to release
                         drop(caches_guard);
 
-                        // C++ decode loop (all locks dropped — C++ owns the state)
+                        // C++ decode loop (pipelined — submit N+1 before eval N)
                         profiler.set_label("moe_chat_stream_compiled");
                         for step in 0..max_new_tokens {
+                            // Build and submit graph for step N+1
+                            let next_y = if step + 1 < max_new_tokens {
+                                let next_ids = y.reshape(&[1, 1])?;
+                                let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
+                                if repetition_penalty != 1.0 {
+                                    logits = apply_repetition_penalty(
+                                        &logits,
+                                        &token_history,
+                                        repetition_penalty,
+                                        Some(repetition_context_size),
+                                    )?;
+                                }
+                                let next_token = sample(&logits, sampling_config)?;
+                                eval_token_and_moe_caches(&next_token);
+                                Some(next_token)
+                            } else {
+                                None
+                            };
+
+                            // Wait for step N (GPU already computing N+1)
                             y.eval();
                             let token_id = y.item_at_int32(0)? as u32;
                             profiler.mark_first_token();
@@ -1466,23 +1504,10 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            if step + 1 >= max_new_tokens {
-                                break;
+                            match next_y {
+                                Some(next) => y = next,
+                                None => break,
                             }
-
-                            let next_ids = y.reshape(&[1, 1])?;
-                            let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
-                            if repetition_penalty != 1.0 {
-                                logits = apply_repetition_penalty(
-                                    &logits,
-                                    &token_history,
-                                    repetition_penalty,
-                                    Some(repetition_context_size),
-                                )?;
-                            }
-                            let next_token = sample(&logits, sampling_config)?;
-                            eval_token_and_moe_caches(&next_token);
-                            y = next_token;
 
                             profiler.step();
 
@@ -1494,9 +1519,39 @@ impl Qwen3_5MoeModel {
                         profiler.report();
                         // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
                     } else {
-                        // Rust fallback decode loop (locks held for entire loop)
+                        // Rust fallback decode loop (pipelined)
                         profiler.set_label("moe_chat_stream_rust");
                         for step in 0..max_new_tokens {
+                            // Build and submit graph for step N+1
+                            let next_y = if step + 1 < max_new_tokens {
+                                let next_ids = y.reshape(&[1, 1])?;
+                                let logits = forward_inner(
+                                    &next_ids,
+                                    &embedding_weight,
+                                    &mut layers_guard,
+                                    &mut caches_guard,
+                                    &final_norm_guard,
+                                    &lm_head_guard,
+                                    fa_idx,
+                                    Some(&embedding_weight_t),
+                                )?;
+                                let mut logits = logits.squeeze(Some(&[1]))?;
+                                if repetition_penalty != 1.0 {
+                                    logits = apply_repetition_penalty(
+                                        &logits,
+                                        &token_history,
+                                        repetition_penalty,
+                                        Some(repetition_context_size),
+                                    )?;
+                                }
+                                let next_token = sample(&logits, sampling_config)?;
+                                MxArray::async_eval_arrays(&[&next_token]);
+                                Some(next_token)
+                            } else {
+                                None
+                            };
+
+                            // Wait for step N (GPU already computing N+1)
                             y.eval();
                             let token_id = y.item_at_int32(0)? as u32;
                             profiler.mark_first_token();
@@ -1544,33 +1599,10 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            if step + 1 >= max_new_tokens {
-                                break;
+                            match next_y {
+                                Some(next) => y = next,
+                                None => break,
                             }
-
-                            let next_ids = y.reshape(&[1, 1])?;
-                            let logits = forward_inner(
-                                &next_ids,
-                                &embedding_weight,
-                                &mut layers_guard,
-                                &mut caches_guard,
-                                &final_norm_guard,
-                                &lm_head_guard,
-                                fa_idx,
-                                Some(&embedding_weight_t),
-                            )?;
-                            let mut logits = logits.squeeze(Some(&[1]))?;
-                            if repetition_penalty != 1.0 {
-                                logits = apply_repetition_penalty(
-                                    &logits,
-                                    &token_history,
-                                    repetition_penalty,
-                                    Some(repetition_context_size),
-                                )?;
-                            }
-                            let next_token = sample(&logits, sampling_config)?;
-                            MxArray::async_eval_arrays(&[&next_token]);
-                            y = next_token;
 
                             profiler.step();
 

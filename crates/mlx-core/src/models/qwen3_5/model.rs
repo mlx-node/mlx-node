@@ -995,10 +995,44 @@ impl Qwen3_5Model {
                     drop(caches_guard);
                 }
 
-                // Compiled C++ decode loop (all locks dropped — C++ owns the state)
+                // Compiled C++ decode loop (pipelined — submit N+1 before eval N)
                 profiler.set_label("chat_compiled");
 
                 for step in 0..max_new_tokens {
+                    // Build and submit graph for step N+1 before waiting for N
+                    let next_y = if step + 1 < max_new_tokens {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+
+                        profiler.begin("forward");
+                        let next_ids = y.reshape(&[1, 1])?;
+                        let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
+                        profiler.end();
+
+                        profiler.begin("rep_penalty");
+                        if repetition_penalty != 1.0 {
+                            logits = apply_repetition_penalty(
+                                &logits,
+                                &token_history,
+                                repetition_penalty,
+                                Some(repetition_context_size),
+                            )?;
+                        }
+                        profiler.end();
+
+                        profiler.begin("sample");
+                        let next_token = sample(&logits, sampling_config)?;
+                        profiler.end();
+
+                        profiler.begin("eval_caches");
+                        eval_token_and_compiled_caches(&next_token);
+                        profiler.end();
+
+                        Some(next_token)
+                    } else {
+                        None
+                    };
+
+                    // Wait for step N (GPU already computing N+1)
                     profiler.begin("eval_token");
                     y.eval();
                     profiler.end();
@@ -1029,37 +1063,9 @@ impl Qwen3_5Model {
                         break;
                     }
 
-                    if step + 1 >= max_new_tokens {
-                        break;
-                    }
-                    {
-                        let _stream_ctx = StreamContext::new(generation_stream);
-
-                        profiler.begin("forward");
-                        let next_ids = y.reshape(&[1, 1])?;
-                        let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
-                        profiler.end();
-
-                        profiler.begin("rep_penalty");
-                        if repetition_penalty != 1.0 {
-                            logits = apply_repetition_penalty(
-                                &logits,
-                                &token_history,
-                                repetition_penalty,
-                                Some(repetition_context_size),
-                            )?;
-                        }
-                        profiler.end();
-
-                        profiler.begin("sample");
-                        let next_token = sample(&logits, sampling_config)?;
-                        profiler.end();
-
-                        profiler.begin("eval_caches");
-                        eval_token_and_compiled_caches(&next_token);
-                        profiler.end();
-
-                        y = next_token;
+                    match next_y {
+                        Some(next) => y = next,
+                        None => break,
                     }
 
                     profiler.step();
@@ -1553,60 +1559,11 @@ impl Qwen3_5Model {
                             drop(caches_guard);
                         }
 
-                        // Compiled C++ decode loop
+                        // Compiled C++ decode loop (pipelined — submit N+1 before eval N)
                         profiler.set_label("chat_stream_compiled");
                         for step in 0..max_new_tokens {
-                            y.eval();
-                            let token_id = y.item_at_int32(0)? as u32;
-                            profiler.mark_first_token();
-                            if report_perf && first_token_instant.is_none() {
-                                first_token_instant = Some(std::time::Instant::now());
-                            }
-                            generated_tokens.push(token_id);
-                            token_history.push(token_id);
-
-                            if cancelled_inner.load(Ordering::Relaxed) {
-                                finish_reason = String::from("cancelled");
-                                break;
-                            }
-
-                            // Decode and stream this token
-                            let token_text = tokenizer_for_decode
-                                .decode_sync(&[token_id], true)
-                                .unwrap_or_default();
-                            callback.call(
-                                Ok(ChatStreamChunk {
-                                    text: token_text,
-                                    done: false,
-                                    finish_reason: None,
-                                    tool_calls: None,
-                                    thinking: None,
-                                    num_tokens: None,
-                                    raw_text: None,
-                                    performance: None,
-                                }),
-                                ThreadsafeFunctionCallMode::NonBlocking,
-                            );
-
-                            if token_id == eos_id {
-                                finish_reason = String::from("stop");
-                                break;
-                            }
-
-                            if let Some(reason) = check_repetition_cutoff(
-                                &generated_tokens,
-                                max_consecutive_tokens,
-                                max_ngram_repeats,
-                                ngram_size,
-                            ) {
-                                finish_reason = reason.to_string();
-                                break;
-                            }
-
-                            if step + 1 >= max_new_tokens {
-                                break;
-                            }
-                            {
+                            // Build and submit graph for step N+1
+                            let next_y = if step + 1 < max_new_tokens {
                                 let _stream_ctx = StreamContext::new(generation_stream);
                                 let next_ids = y.reshape(&[1, 1])?;
                                 let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
@@ -1620,21 +1577,12 @@ impl Qwen3_5Model {
                                 }
                                 let next_token = sample(&logits, sampling_config)?;
                                 eval_token_and_compiled_caches(&next_token);
-                                y = next_token;
-                            }
+                                Some(next_token)
+                            } else {
+                                None
+                            };
 
-                            profiler.step();
-
-                            if (step + 1) % 256 == 0 {
-                                crate::array::synchronize_and_clear_cache();
-                            }
-                        }
-                        profiler.snapshot_memory_after();
-                        profiler.report();
-                    } else {
-                        // Rust fallback decode loop (locks held for entire loop)
-                        profiler.set_label("chat_stream_rust");
-                        for step in 0..max_new_tokens {
+                            // Wait for step N (GPU already computing N+1)
                             y.eval();
                             let token_id = y.item_at_int32(0)? as u32;
                             profiler.mark_first_token();
@@ -1682,10 +1630,25 @@ impl Qwen3_5Model {
                                 break;
                             }
 
-                            if step + 1 >= max_new_tokens {
-                                break;
+                            match next_y {
+                                Some(next) => y = next,
+                                None => break,
                             }
-                            {
+
+                            profiler.step();
+
+                            if (step + 1) % 256 == 0 {
+                                crate::array::synchronize_and_clear_cache();
+                            }
+                        }
+                        profiler.snapshot_memory_after();
+                        profiler.report();
+                    } else {
+                        // Rust fallback decode loop (pipelined)
+                        profiler.set_label("chat_stream_rust");
+                        for step in 0..max_new_tokens {
+                            // Build and submit graph for step N+1
+                            let next_y = if step + 1 < max_new_tokens {
                                 let _stream_ctx = StreamContext::new(generation_stream);
                                 let next_ids = y.reshape(&[1, 1])?;
                                 let logits = forward_inner(
@@ -1709,7 +1672,62 @@ impl Qwen3_5Model {
                                 }
                                 let next_token = sample(&logits, sampling_config)?;
                                 MxArray::async_eval_arrays(&[&next_token]);
-                                y = next_token;
+                                Some(next_token)
+                            } else {
+                                None
+                            };
+
+                            // Wait for step N (GPU already computing N+1)
+                            y.eval();
+                            let token_id = y.item_at_int32(0)? as u32;
+                            profiler.mark_first_token();
+                            if report_perf && first_token_instant.is_none() {
+                                first_token_instant = Some(std::time::Instant::now());
+                            }
+                            generated_tokens.push(token_id);
+                            token_history.push(token_id);
+
+                            if cancelled_inner.load(Ordering::Relaxed) {
+                                finish_reason = String::from("cancelled");
+                                break;
+                            }
+
+                            // Decode and stream this token
+                            let token_text = tokenizer_for_decode
+                                .decode_sync(&[token_id], true)
+                                .unwrap_or_default();
+                            callback.call(
+                                Ok(ChatStreamChunk {
+                                    text: token_text,
+                                    done: false,
+                                    finish_reason: None,
+                                    tool_calls: None,
+                                    thinking: None,
+                                    num_tokens: None,
+                                    raw_text: None,
+                                    performance: None,
+                                }),
+                                ThreadsafeFunctionCallMode::NonBlocking,
+                            );
+
+                            if token_id == eos_id {
+                                finish_reason = String::from("stop");
+                                break;
+                            }
+
+                            if let Some(reason) = check_repetition_cutoff(
+                                &generated_tokens,
+                                max_consecutive_tokens,
+                                max_ngram_repeats,
+                                ngram_size,
+                            ) {
+                                finish_reason = reason.to_string();
+                                break;
+                            }
+
+                            match next_y {
+                                Some(next) => y = next,
+                                None => break,
                             }
 
                             profiler.step();

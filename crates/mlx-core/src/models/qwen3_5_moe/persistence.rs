@@ -1048,15 +1048,8 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5MoeModel> {
         // Materialize all mmap-backed weight arrays so the first inference
         // prefill timing is not inflated by lazy disk reads.
         {
-            let start = std::time::Instant::now();
             let arrays: Vec<&MxArray> = params.values().collect();
-            MxArray::async_eval_arrays(&arrays);
-            crate::array::memory::synchronize();
-            info!(
-                "Materialized {} weight arrays in {:.2}s",
-                arrays.len(),
-                start.elapsed().as_secs_f64()
-            );
+            crate::array::memory::materialize_weights(&arrays);
         }
 
         if let Some(tok) = tokenizer {

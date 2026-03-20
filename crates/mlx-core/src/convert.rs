@@ -1474,42 +1474,110 @@ fn sanitize_qwen35_moe(
         }
     }
 
-    // Step 3: Stack individual expert weights
-    for l in 0..num_hidden_layers {
-        let prefix = format!("language_model.model.layers.{}.mlp", l);
-        let first_expert_key = format!("{}.experts.0.gate_proj.weight", prefix);
+    // Step 3: Stack/normalize expert weights
+    //
+    // Two source formats:
+    // A) Individual experts: experts.{i}.gate_proj.weight, experts.{i}.up_proj.weight, ...
+    //    → Stack into 3D [num_experts, out, in] → switch_mlp.{proj}.weight
+    // B) Pre-stacked fused: experts.gate_up_proj [E, fused_out, in], experts.down_proj [E, out, in]
+    //    → Split gate_up_proj along dim 1, rename → switch_mlp.{proj}.weight
+    //
+    // Format B comes from HuggingFace models that already fuse gate+up into one tensor
+    // and omit the .weight suffix. Without normalization, should_quantize() skips them
+    // (requires .weight suffix), leaving 60GB of expert weights unquantized.
 
-        if !new_weights.contains_key(&first_expert_key) {
-            continue;
-        }
+    let has_individual_experts = new_weights
+        .keys()
+        .any(|k| k.contains(".experts.0.gate_proj.weight"));
+    let has_prestacked_experts = new_weights
+        .keys()
+        .any(|k| k.contains(".experts.gate_up_proj") || k.contains(".experts.down_proj"));
 
-        info!("  Layer {}: stacking {} experts...", l, num_experts);
-
-        for proj in &["gate_proj", "up_proj", "down_proj"] {
-            let mut to_stack: Vec<MxArray> = Vec::with_capacity(num_experts);
-            for e in 0..num_experts {
-                let k = format!("{}.experts.{}.{}.weight", prefix, e, proj);
-                match new_weights.remove(&k) {
-                    Some(w) => to_stack.push(w),
-                    None => {
-                        return Err(Error::from_reason(format!("Missing expert weight: {}", k)));
-                    }
-                }
-            }
-            let refs: Vec<&MxArray> = to_stack.iter().collect();
-            let stacked = MxArray::stack(refs, Some(0))?;
-            new_weights.insert(format!("{}.switch_mlp.{}.weight", prefix, proj), stacked);
-        }
+    if has_individual_experts && has_prestacked_experts {
+        warn!("Model has both individual and pre-stacked expert weights — using individual format");
     }
 
-    // Clean up any remaining individual expert keys (shouldn't be any after stacking)
-    let expert_keys: Vec<String> = new_weights
-        .keys()
-        .filter(|k| k.contains(".mlp.experts.") && k.ends_with(".weight"))
-        .cloned()
-        .collect();
-    for k in expert_keys {
-        new_weights.remove(&k);
+    if has_individual_experts {
+        // Format A: individual experts → stack
+        for l in 0..num_hidden_layers {
+            let prefix = format!("language_model.model.layers.{}.mlp", l);
+            let first_expert_key = format!("{}.experts.0.gate_proj.weight", prefix);
+
+            if !new_weights.contains_key(&first_expert_key) {
+                continue;
+            }
+
+            info!(
+                "  Layer {}: stacking {} individual experts...",
+                l, num_experts
+            );
+
+            for proj in &["gate_proj", "up_proj", "down_proj"] {
+                let mut to_stack: Vec<MxArray> = Vec::with_capacity(num_experts);
+                for e in 0..num_experts {
+                    let k = format!("{}.experts.{}.{}.weight", prefix, e, proj);
+                    match new_weights.remove(&k) {
+                        Some(w) => to_stack.push(w),
+                        None => {
+                            return Err(Error::from_reason(format!(
+                                "Missing expert weight: {}",
+                                k
+                            )));
+                        }
+                    }
+                }
+                let refs: Vec<&MxArray> = to_stack.iter().collect();
+                let stacked = MxArray::stack(refs, Some(0))?;
+                new_weights.insert(format!("{}.switch_mlp.{}.weight", prefix, proj), stacked);
+            }
+        }
+
+        // Clean up any remaining individual expert keys
+        let expert_keys: Vec<String> = new_weights
+            .keys()
+            .filter(|k| k.contains(".mlp.experts.") && k.ends_with(".weight"))
+            .cloned()
+            .collect();
+        for k in expert_keys {
+            new_weights.remove(&k);
+        }
+    } else if has_prestacked_experts {
+        // Format B: pre-stacked fused experts → split gate_up_proj, rename with .weight suffix
+        let expert_keys: Vec<String> = new_weights
+            .keys()
+            .filter(|k| k.contains(".experts.gate_up_proj") || k.contains(".experts.down_proj"))
+            .cloned()
+            .collect();
+
+        info!(
+            "  Normalizing {} pre-stacked expert tensors (split gate_up_proj, add .weight suffix)",
+            expert_keys.len()
+        );
+
+        for k in expert_keys {
+            let array = new_weights.remove(&k).unwrap();
+
+            if k.ends_with(".experts.gate_up_proj") {
+                // Split fused [E, gate_dim+up_dim, in] → gate [E, dim, in] + up [E, dim, in]
+                let dim1 = array.shape_at(1)?;
+                if dim1 % 2 != 0 {
+                    return Err(Error::from_reason(format!(
+                        "gate_up_proj dim 1 must be even, got {} for '{}'",
+                        dim1, k
+                    )));
+                }
+                let half = dim1 / 2;
+                let gate = array.slice_axis(1, 0, half)?;
+                let up = array.slice_axis(1, half, dim1)?;
+
+                let base = k.strip_suffix(".experts.gate_up_proj").unwrap();
+                new_weights.insert(format!("{}.switch_mlp.gate_proj.weight", base), gate);
+                new_weights.insert(format!("{}.switch_mlp.up_proj.weight", base), up);
+            } else if k.ends_with(".experts.down_proj") {
+                let base = k.strip_suffix(".experts.down_proj").unwrap();
+                new_weights.insert(format!("{}.switch_mlp.down_proj.weight", base), array);
+            }
+        }
     }
 
     info!("  After expert stacking: {} tensors", new_weights.len());

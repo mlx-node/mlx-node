@@ -99,6 +99,90 @@ pub fn heavy_cleanup() {
     }
 }
 
+/// Materialize mmap-backed weight arrays in byte-budgeted chunks.
+///
+/// A single eval on all weights can cause Metal command buffer timeouts
+/// on large models (e.g. 65GB bf16). This function queries GPU memory
+/// via `max_recommended_working_set_size` and chunks eval calls so each
+/// batch stays within a fraction of available GPU memory.
+pub fn materialize_weights(arrays: &[&super::MxArray]) {
+    use tracing::info;
+
+    if arrays.is_empty() {
+        return;
+    }
+
+    let start = std::time::Instant::now();
+    let total = arrays.len();
+
+    // Query GPU memory to determine chunk budget
+    let device_info_ptr = unsafe { sys::mlx_metal_device_info() };
+    let max_working_set = if !device_info_ptr.is_null() {
+        let info_str = unsafe {
+            std::ffi::CStr::from_ptr(device_info_ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
+        crate::stream::WiredLimitContext::parse_max_working_set_size(&info_str)
+    } else {
+        0
+    };
+
+    // Budget per chunk: 1/4 of max working set, clamped to [512MB, 4GB]
+    let budget = if max_working_set > 0 {
+        (max_working_set / 4).clamp(512 << 20, 4 << 30)
+    } else {
+        1 << 30 // 1GB fallback
+    };
+
+    // Sum total bytes to decide: single eval or chunked
+    let total_bytes: usize = arrays.iter().map(|a| a.nbytes()).sum();
+
+    if total_bytes <= budget {
+        // Small enough for a single eval call
+        let mut handles: Vec<*mut sys::mlx_array> = arrays.iter().map(|arr| arr.handle.0).collect();
+        unsafe {
+            sys::mlx_eval(handles.as_mut_ptr(), handles.len());
+        }
+        info!(
+            "Materialized {} weight arrays ({:.1} GB) in {:.2}s",
+            total,
+            total_bytes as f64 / (1u64 << 30) as f64,
+            start.elapsed().as_secs_f64()
+        );
+    } else {
+        // Chunk by byte budget to avoid Metal command buffer timeout
+        let mut chunk_start = 0;
+        let mut chunk_bytes: usize = 0;
+        let mut num_chunks = 0u32;
+
+        for i in 0..total {
+            chunk_bytes += arrays[i].nbytes();
+
+            if chunk_bytes >= budget || i == total - 1 {
+                let chunk = &arrays[chunk_start..=i];
+                let mut handles: Vec<*mut sys::mlx_array> =
+                    chunk.iter().map(|arr| arr.handle.0).collect();
+                unsafe {
+                    sys::mlx_eval(handles.as_mut_ptr(), handles.len());
+                }
+                num_chunks += 1;
+                chunk_start = i + 1;
+                chunk_bytes = 0;
+            }
+        }
+
+        info!(
+            "Materialized {} weight arrays ({:.1} GB) in {} chunks ({:.2}s, budget {:.0} MB)",
+            total,
+            total_bytes as f64 / (1u64 << 30) as f64,
+            num_chunks,
+            start.elapsed().as_secs_f64(),
+            budget as f64 / (1u64 << 20) as f64,
+        );
+    }
+}
+
 /// Check if memory is safe for autograd graph construction
 ///
 /// Returns (is_safe, memory_info_message) where:

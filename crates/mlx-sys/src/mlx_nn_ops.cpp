@@ -45,6 +45,19 @@ void mlx_async_eval(mlx_array** handles, size_t count) {
   }
 }
 
+// Synchronous eval — matches Python's mx.eval(arrays).
+// Unlike async_eval, this blocks until all arrays are materialized.
+void mlx_eval(mlx_array** handles, size_t count) {
+  std::vector<array> arrays;
+  arrays.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    if (handles[i]) {
+      arrays.push_back(*reinterpret_cast<array*>(handles[i]));
+    }
+  }
+  mlx::core::eval(std::move(arrays));
+}
+
 size_t mlx_array_size(mlx_array* handle) {
   if (!handle) return 0;
   auto arr = reinterpret_cast<array*>(handle);

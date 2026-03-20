@@ -194,7 +194,7 @@ impl WiredLimitContext {
     }
 
     /// Parse max_recommended_working_set_size from JSON device info
-    fn parse_max_working_set_size(json: &str) -> usize {
+    pub(crate) fn parse_max_working_set_size(json: &str) -> usize {
         // Simple JSON parsing (format: {"available": true, "max_recommended_working_set_size": 123456})
         if let Some(start) = json.find("\"max_recommended_working_set_size\":") {
             let value_start = start + "\"max_recommended_working_set_size\":".len();

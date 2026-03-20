@@ -514,15 +514,8 @@ impl Qwen3Model {
             // Materialize all mmap-backed weight arrays so the first inference
             // prefill timing is not inflated by lazy disk reads.
             {
-                let start = std::time::Instant::now();
                 let arrays: Vec<&MxArray> = param_map.values().collect();
-                MxArray::async_eval_arrays(&arrays);
-                crate::array::memory::synchronize();
-                info!(
-                    "Materialized {} weight arrays in {:.2}s",
-                    arrays.len(),
-                    start.elapsed().as_secs_f64()
-                );
+                crate::array::memory::materialize_weights(&arrays);
             }
 
             // Set the tokenizer
