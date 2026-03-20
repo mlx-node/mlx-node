@@ -841,9 +841,21 @@ pub(crate) fn build_unsloth_recipe(
     default_bits: i32,
     default_group_size: i32,
 ) -> Box<dyn Fn(&str) -> QuantDecision + Send + Sync> {
-    let down_proj_bits = (default_bits + 1).min(8);
-    let embed_bits = (default_bits + 2).min(8);
-    let lm_head_bits = (default_bits + 3).min(8);
+    // MLX quantize supports: 2, 3, 4, 5, 6, 8 (no 7)
+    let snap_bits = |b: i32| -> i32 {
+        match b {
+            b if b <= 2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 5,
+            6 => 6,
+            7 => 8, // 7 not supported, snap up to 8
+            _ => 8,
+        }
+    };
+    let down_proj_bits = snap_bits(default_bits + 1);
+    let embed_bits = snap_bits(default_bits + 2);
+    let lm_head_bits = snap_bits(default_bits + 3);
     let gs = default_group_size;
 
     Box::new(move |key: &str| -> QuantDecision {

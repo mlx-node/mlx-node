@@ -472,10 +472,7 @@ fn apply_weights(
         model
             .embedding
             .load_quantized(weight, scales, biases, gs, bits)?;
-        info!(
-            "Loaded quantized embedding ({}-bit)",
-            bits
-        );
+        info!("Loaded quantized embedding ({}-bit)", bits);
     } else if let Some(w) = params.get("embedding.weight") {
         model.embedding.set_weight(w)?;
     }
