@@ -6,25 +6,17 @@ use napi::bindgen_prelude::*;
 // Embedding Layer (supports quantized weights)
 // ============================================
 
-/// Quantized weight storage for QuantizedEmbedding.
-struct QuantizedWeight {
-    weight: MxArray,         // Packed uint32 [num_embeddings, dim_packed]
-    scales: MxArray,         // Quantization scales
-    biases: Option<MxArray>, // Quantization biases (affine mode)
-    group_size: i32,
-    bits: i32,
-}
-
 pub struct Embedding {
     /// Dense (bf16) weight — always present. For quantized embeddings,
-    /// this is lazily populated on first `get_weight()` call.
+    /// `load_quantized()` pre-dequantizes the full table into this field.
     weight: MxArray,
     num_embeddings: u32,
     embedding_dim: u32,
-    /// When set, `forward()` dequantizes only the looked-up rows for
-    /// memory-bandwidth savings. `get_weight()` returns the full
-    /// dequantized table (lazily cached in `weight`).
-    quantized: Option<QuantizedWeight>,
+    /// True when weights were loaded via `load_quantized()`.
+    /// The packed weight/scales/biases are NOT retained — only the
+    /// pre-dequantized dense table in `weight` is kept to avoid
+    /// doubling memory for large vocab tables (248K × 4096 = ~2GB).
+    is_quantized_flag: bool,
 }
 
 impl Embedding {
@@ -38,15 +30,13 @@ impl Embedding {
             weight,
             num_embeddings,
             embedding_dim,
-            quantized: None,
+            is_quantized_flag: false,
         })
     }
 
     /// Forward pass: look up embeddings for indices.
     /// Always uses the dense weight (pre-dequantized for quantized embeddings).
     pub fn forward(&self, indices: &MxArray) -> Result<MxArray> {
-        // self.weight is always dense bf16 — for quantized embeddings,
-        // load_quantized() pre-dequantizes the full table into self.weight.
         self.weight.take(indices, 0)
     }
 
@@ -65,13 +55,13 @@ impl Embedding {
             )));
         }
         self.weight = weight.clone();
-        self.quantized = None;
+        self.is_quantized_flag = false;
         Ok(())
     }
 
-    /// Load quantized embedding weights. The packed weight is stored directly;
-    /// `forward()` will dequantize on the fly, and `get_weight()` will lazily
-    /// dequantize the full table.
+    /// Load quantized embedding weights.
+    /// Pre-dequantizes the full table into `self.weight` — the packed
+    /// weight/scales/biases are NOT retained to save memory.
     pub fn load_quantized(
         &mut self,
         weight: &MxArray,
@@ -93,14 +83,7 @@ impl Embedding {
         // This is needed for get_weight() (used by tied embeddings, compiled path, etc.)
         let dequantized = dequantize(weight, scales, biases, group_size, bits)?;
         self.weight = dequantized;
-
-        self.quantized = Some(QuantizedWeight {
-            weight: weight.clone(),
-            scales: scales.clone(),
-            biases: biases.cloned(),
-            group_size,
-            bits,
-        });
+        self.is_quantized_flag = true;
         Ok(())
     }
 
@@ -127,7 +110,7 @@ impl Embedding {
 
     /// Whether this embedding uses quantized weights
     pub fn is_quantized(&self) -> bool {
-        self.quantized.is_some()
+        self.is_quantized_flag
     }
 }
 
@@ -137,13 +120,7 @@ impl Clone for Embedding {
             weight: self.weight.clone(),
             num_embeddings: self.num_embeddings,
             embedding_dim: self.embedding_dim,
-            quantized: self.quantized.as_ref().map(|q| QuantizedWeight {
-                weight: q.weight.clone(),
-                scales: q.scales.clone(),
-                biases: q.biases.clone(),
-                group_size: q.group_size,
-                bits: q.bits,
-            }),
+            is_quantized_flag: self.is_quantized_flag,
         }
     }
 }
@@ -166,7 +143,7 @@ impl Embedding {
             weight: weight.clone(),
             num_embeddings: shape[0] as u32,
             embedding_dim: shape[1] as u32,
-            quantized: None,
+            is_quantized_flag: false,
         })
     }
 }
