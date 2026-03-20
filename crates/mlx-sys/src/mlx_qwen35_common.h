@@ -60,17 +60,27 @@ inline bool has_weight(const std::string& name) {
   return g_weights().count(name) > 0;
 }
 
+// Infer affine quantization bits from weight and scales shapes.
+// For affine: weight_cols = original_cols * bits / 32,
+//             scales_cols = original_cols / group_size
+// So: bits = (weight_cols * 32 * group_size) / (scales_cols * 32 * group_size / bits)
+//         = weight_cols * group_size / (scales_cols * 32 / bits)
+// Simpler: original_cols = scales_cols * group_size,
+//          bits = weight_cols * 32 / original_cols
+inline int infer_affine_bits(const array& w, const array& scales, int group_size = 64) {
+  int w_cols = w.shape(-1);
+  int s_cols = scales.shape(-1);
+  int original_cols = s_cols * group_size;
+  return (w_cols * 32) / original_cols;
+}
+
 // Auto-detecting linear projection: uses quantized_matmul if .scales exists,
 // otherwise plain matmul with transposed weight. Safe for both dense (bf16)
 // and quantized (MXFP8/affine) weights.
 //
 // Quant param heuristic: the presence of .biases distinguishes the format:
 //   - No .biases → MXFP8 quantization (group_size=32, bits=8, mode="mxfp8")
-//   - Has .biases → Affine quantization (group_size=64, bits=4, mode="affine")
-// This is correct for all currently supported Qwen3.5 model formats because:
-//   - MXFP8 (mlx-community fp8 models) never stores biases
-//   - Affine 4-bit (mlx-community 4bit models) always stores biases
-// The MoE path uses explicit quant param detection (detect_quant) instead.
+//   - Has .biases → Affine quantization (infer bits from weight/scales shape ratio)
 inline array linear_proj(const array& x, const std::string& prefix) {
   std::string scales_key = prefix + ".scales";
   if (has_weight(scales_key)) {
@@ -85,7 +95,8 @@ inline array linear_proj(const array& x, const std::string& prefix) {
     if (!biases.has_value()) {
       return mlx::core::quantized_matmul(x, w, scales, biases, true, 32, 8, "mxfp8");
     } else {
-      return mlx::core::quantized_matmul(x, w, scales, biases, true, 64, 4, "affine");
+      int bits = infer_affine_bits(w, scales, 64);
+      return mlx::core::quantized_matmul(x, w, scales, biases, true, 64, bits, "affine");
     }
   }
   return matmul(x, get_weight_t(prefix + ".weight"));

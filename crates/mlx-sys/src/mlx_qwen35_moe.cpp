@@ -138,40 +138,38 @@ array switch_linear_forward(
       sorted);
 }
 
-// Quantized switch linear forward: gather_qmm
-array quantized_switch_linear_forward(
-    const array& x,
-    const std::string& prefix,
-    const array& indices,
-    bool sorted,
-    int gs, int bits,
-    const std::string& mode) {
-  const auto& w = get_weight(prefix + ".weight");
-  const auto& scales = get_weight(prefix + ".scales");
-  std::optional<array> biases = std::nullopt;
-  if (has_weight(prefix + ".biases")) {
-    biases = get_weight(prefix + ".biases");
-  }
-  return mlx::core::gather_qmm(
-      x, w, scales, biases,
-      std::nullopt,  // lhs_indices (not used)
-      indices,       // rhs_indices (expert indices)
-      true,          // transpose
-      std::optional<int>(gs),
-      std::optional<int>(bits),
-      mode,
-      sorted);
-}
-
-// Switch linear forward (auto-dispatch quantized vs dense)
+// Switch linear forward (auto-dispatch quantized vs dense, auto-detect bits)
 array switch_linear_fwd(
     const array& x,
     const std::string& prefix,
     const array& indices,
     bool sorted,
-    bool is_quant, int gs, int bits, const std::string& mode) {
+    bool is_quant, int /*gs_hint*/, int /*bits_hint*/, const std::string& /*mode_hint*/) {
   if (is_quant && has_weight(prefix + ".scales")) {
-    return quantized_switch_linear_forward(x, prefix, indices, sorted, gs, bits, mode);
+    const auto& w = get_weight(prefix + ".weight");
+    const auto& scales = get_weight(prefix + ".scales");
+    std::optional<array> biases = std::nullopt;
+    if (has_weight(prefix + ".biases")) {
+      biases = get_weight(prefix + ".biases");
+    }
+    // Infer bits from weight/scales shape ratio (supports mixed-bit recipes)
+    // For 3D switch weights: w=[E, out, in_packed], scales=[E, out, in/gs]
+    int w_cols = w.shape(-1);
+    int s_cols = scales.shape(-1);
+    int gs = 64;
+    int original_cols = s_cols * gs;
+    int bits = (w_cols * 32) / original_cols;
+    std::string mode = biases.has_value() ? "affine" : "mxfp8";
+    if (!biases.has_value()) { gs = 32; bits = 8; }
+    return mlx::core::gather_qmm(
+        x, w, scales, biases,
+        std::nullopt,  // lhs_indices (not used)
+        indices,       // rhs_indices (expert indices)
+        true,          // transpose
+        std::optional<int>(gs),
+        std::optional<int>(bits),
+        mode,
+        sorted);
   }
   return switch_linear_forward(x, prefix, indices, sorted);
 }
@@ -291,15 +289,13 @@ array sparse_moe_fn(
   auto weighted = expert_out * weights_expanded;
   auto expert_output = sum(weighted, {1});
 
-  // Shared expert
+  // Shared expert — use linear_proj (auto-detects bits per tensor) since
+  // down_proj may have different bits than gate_proj/up_proj (e.g. unsloth recipe)
   std::string se_pfx = pfx + "shared_expert.";
-  auto se_gate_in = linear_forward(x_flat, se_pfx + "gate_proj",
-      qi.sh_quant, qi.sh_gs, qi.sh_bits, qi.sh_mode);
-  auto se_up_in = linear_forward(x_flat, se_pfx + "up_proj",
-      qi.sh_quant, qi.sh_gs, qi.sh_bits, qi.sh_mode);
+  auto se_gate_in = linear_proj(x_flat, se_pfx + "gate_proj");
+  auto se_up_in = linear_proj(x_flat, se_pfx + "up_proj");
   auto se_activated = swiglu(se_gate_in, se_up_in);
-  auto shared_out = linear_forward(se_activated, se_pfx + "down_proj",
-      qi.sh_quant, qi.sh_gs, qi.sh_bits, qi.sh_mode);
+  auto shared_out = linear_proj(se_activated, se_pfx + "down_proj");
 
   // Shared expert gate: sigmoid
   auto shared_gate = linear_forward(x_flat, pfx + "shared_expert_gate",
@@ -319,10 +315,12 @@ array dense_mlp_fn(
     int layer_idx,
     const MoeConfig& cfg,
     const DenseMLPQuantInfo& qi) {
+  // Use linear_proj (auto-detects bits per tensor) since down_proj may
+  // have different bits than gate_proj/up_proj (e.g. unsloth recipe)
   std::string mp = "layers." + std::to_string(layer_idx) + ".mlp.";
-  auto gate = linear_forward(x, mp + "gate_proj", qi.quant, qi.gs, qi.bits, qi.mode);
-  auto up   = linear_forward(x, mp + "up_proj",   qi.quant, qi.gs, qi.bits, qi.mode);
-  auto mlp_out = linear_forward(swiglu(gate, up), mp + "down_proj", qi.quant, qi.gs, qi.bits, qi.mode);
+  auto gate = linear_proj(x, mp + "gate_proj");
+  auto up   = linear_proj(x, mp + "up_proj");
+  auto mlp_out = linear_proj(swiglu(gate, up), mp + "down_proj");
   return mlp_out;
 }
 
@@ -615,8 +613,11 @@ void mlx_qwen35_moe_init_from_prefill(
         // MXFP8: group_size=32, bits=8
         return {true, 32, 8, "mxfp8"};
       }
-      // Affine: group_size=64, bits=4 (default)
-      return {true, 64, 4, "affine"};
+      // Affine: infer bits from weight/scales shape ratio
+      const auto& w = get_weight(prefix + ".weight");
+      const auto& scales = get_weight(prefix + ".scales");
+      int bits = infer_affine_bits(w, scales, 64);
+      return {true, 64, bits, "affine"};
     };
 
     auto detect_gate_quant = [](const std::string& prefix) -> std::tuple<bool, int, int, std::string> {
