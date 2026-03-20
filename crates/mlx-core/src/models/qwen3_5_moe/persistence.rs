@@ -235,15 +235,16 @@ fn sanitize_weights(
             .unwrap_or(&name)
             .to_string();
 
-        let name = if name == "embed_tokens.weight" {
-            "embedding.weight".to_string()
+        // Rename special keys (including quantization metadata .scales/.biases)
+        let name = if let Some(suffix) = name.strip_prefix("embed_tokens.") {
+            format!("embedding.{}", suffix)
         } else if name == "norm.weight" {
             "final_norm.weight".to_string()
         } else {
             name
         };
 
-        if config.tie_word_embeddings && name == "lm_head.weight" {
+        if config.tie_word_embeddings && name.starts_with("lm_head.") {
             continue;
         }
 
@@ -458,7 +459,24 @@ fn apply_weights(
         try_build_quantized_switch_linear(params, prefix, gs, bits)
     };
 
-    if let Some(w) = params.get("embedding.weight") {
+    // Embedding — supports both dense and quantized weights
+    if let Some(scales) = params.get("embedding.scales") {
+        let weight = params.get("embedding.weight").ok_or_else(|| {
+            Error::from_reason("Missing embedding.weight for quantized embedding")
+        })?;
+        let biases = params.get("embedding.biases");
+        let (bits, gs) = per_layer_quant
+            .get("embed_tokens")
+            .copied()
+            .unwrap_or((quant_bits, quant_group_size));
+        model
+            .embedding
+            .load_quantized(weight, scales, biases, gs, bits)?;
+        info!(
+            "Loaded quantized embedding ({}-bit)",
+            bits
+        );
+    } else if let Some(w) = params.get("embedding.weight") {
         model.embedding.set_weight(w)?;
     }
 

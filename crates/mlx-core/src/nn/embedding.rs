@@ -43,24 +43,11 @@ impl Embedding {
     }
 
     /// Forward pass: look up embeddings for indices.
-    /// When quantized, dequantizes only the selected rows (not the full table).
+    /// Always uses the dense weight (pre-dequantized for quantized embeddings).
     pub fn forward(&self, indices: &MxArray) -> Result<MxArray> {
-        if let Some(ref q) = self.quantized {
-            // Dequantize the full table, then gather.
-            // Per-row dequantize+gather is not available in MLX's C API,
-            // so we dequantize fully — but the quantized weights use less
-            // memory bandwidth when paging from mmap.
-            let dequantized = dequantize(
-                &q.weight,
-                &q.scales,
-                q.biases.as_ref(),
-                q.group_size,
-                q.bits,
-            )?;
-            dequantized.take(indices, 0)
-        } else {
-            self.weight.take(indices, 0)
-        }
+        // self.weight is always dense bf16 — for quantized embeddings,
+        // load_quantized() pre-dequantizes the full table into self.weight.
+        self.weight.take(indices, 0)
     }
 
     /// Load pretrained embeddings (dense bf16)
