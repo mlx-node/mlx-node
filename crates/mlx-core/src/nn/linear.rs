@@ -2,14 +2,25 @@ use crate::array::MxArray;
 use napi::bindgen_prelude::*;
 
 // ============================================
-// Linear Layer
+// Linear Layer (supports optional quantized backend)
 // ============================================
+
+/// Quantized weight storage for Linear.
+struct QuantizedBackend {
+    weight: MxArray,         // Packed uint32 [out, in_packed]
+    scales: MxArray,         // Quantization scales
+    biases: Option<MxArray>, // Quantization biases (affine mode)
+    group_size: i32,
+    bits: i32,
+}
 
 pub struct Linear {
     weight: MxArray,
     bias: Option<MxArray>,
     in_features: u32,
     out_features: u32,
+    /// When set, `forward()` uses quantized_matmul instead of plain matmul.
+    quantized: Option<QuantizedBackend>,
 }
 
 impl Linear {
@@ -35,26 +46,51 @@ impl Linear {
             bias,
             in_features,
             out_features,
+            quantized: None,
         })
     }
 
     /// Forward pass: y = xW^T + b
-    /// Uses fused addmm operation when bias is present for better performance
+    /// When quantized, uses fused dequantize+matmul Metal kernel.
     pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
-        // For 2D arrays, transpose swaps axes 0 and 1
-        let axes = [1, 0];
-        let weight_t = self.weight.transpose(Some(&axes))?;
+        if let Some(ref q) = self.quantized {
+            let mode_c = c"affine";
+            let biases_ptr = q
+                .biases
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |b| b.as_raw_ptr());
 
-        // Use fused addmm when bias is present: bias + input @ weight.T
-        // This is more efficient than separate matmul and add operations
-        if let Some(ref b) = self.bias {
-            input.addmm(b, &weight_t, None, None)
+            let handle = unsafe {
+                mlx_sys::mlx_quantized_matmul(
+                    input.as_raw_ptr(),
+                    q.weight.as_raw_ptr(),
+                    q.scales.as_raw_ptr(),
+                    biases_ptr,
+                    true, // transpose
+                    q.group_size,
+                    q.bits,
+                    mode_c.as_ptr(),
+                )
+            };
+            let mut result = MxArray::from_handle(handle, "quantized_linear_forward")?;
+
+            if let Some(ref b) = self.bias {
+                result = result.add(b)?;
+            }
+            Ok(result)
         } else {
-            input.matmul(&weight_t)
+            let axes = [1, 0];
+            let weight_t = self.weight.transpose(Some(&axes))?;
+
+            if let Some(ref b) = self.bias {
+                input.addmm(b, &weight_t, None, None)
+            } else {
+                input.matmul(&weight_t)
+            }
         }
     }
 
-    /// Set new weights
+    /// Set new weights (dense bf16)
     pub fn set_weight(&mut self, weight: &MxArray) -> Result<()> {
         let ndim = weight.ndim()?;
         if ndim != 2
@@ -68,8 +104,52 @@ impl Linear {
                 weight.shape()?.as_ref()
             )));
         }
-        // Clone the Arc reference (no need to copy the underlying MLX array)
         self.weight = weight.clone();
+        self.quantized = None;
+        Ok(())
+    }
+
+    /// Load quantized weights. `forward()` will use quantized_matmul.
+    /// The dense `weight` is lazily dequantized for `get_weight()`.
+    pub fn load_quantized(
+        &mut self,
+        weight: &MxArray,
+        scales: &MxArray,
+        biases: Option<&MxArray>,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<()> {
+        // Verify out_features matches
+        if weight.shape_at(0)? != self.out_features as i64 {
+            return Err(Error::from_reason(format!(
+                "Quantized weight out_features mismatch: expected {}, got {}",
+                self.out_features,
+                weight.shape_at(0)?
+            )));
+        }
+
+        // Dequantize for get_weight() (used by tied embeddings path)
+        let biases_ptr = biases.map_or(std::ptr::null_mut(), |b| b.as_raw_ptr());
+        let handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                weight.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases_ptr,
+                group_size,
+                bits,
+                -1,
+                c"affine".as_ptr(),
+            )
+        };
+        self.weight = MxArray::from_handle(handle, "dequantize_linear")?;
+
+        self.quantized = Some(QuantizedBackend {
+            weight: weight.clone(),
+            scales: scales.clone(),
+            biases: biases.cloned(),
+            group_size,
+            bits,
+        });
         Ok(())
     }
 
@@ -84,7 +164,6 @@ impl Linear {
                     b.shape()?.as_ref()
                 )));
             }
-            // Use copy() to create a new array handle, avoiding handle aliasing
             self.bias = Some(b.copy()?);
         } else {
             self.bias = None;
@@ -92,7 +171,7 @@ impl Linear {
         Ok(())
     }
 
-    /// Get the weight matrix
+    /// Get the weight matrix (always dense bf16)
     pub fn get_weight(&self) -> MxArray {
         self.weight.clone()
     }
@@ -100,6 +179,11 @@ impl Linear {
     /// Get the bias vector (if present)
     pub fn get_bias(&self) -> Option<MxArray> {
         self.bias.clone()
+    }
+
+    /// Whether this linear layer uses quantized weights
+    pub fn is_quantized(&self) -> bool {
+        self.quantized.is_some()
     }
 }
 
@@ -110,16 +194,19 @@ impl Clone for Linear {
             bias: self.bias.clone(),
             in_features: self.in_features,
             out_features: self.out_features,
+            quantized: self.quantized.as_ref().map(|q| QuantizedBackend {
+                weight: q.weight.clone(),
+                scales: q.scales.clone(),
+                biases: q.biases.clone(),
+                group_size: q.group_size,
+                bits: q.bits,
+            }),
         }
     }
 }
 
 impl Linear {
     /// Create a Linear layer from pre-loaded weights
-    ///
-    /// # Arguments
-    /// * `weight` - Weight matrix [out_features, in_features]
-    /// * `bias` - Optional bias vector [out_features]
     pub fn from_weights(weight: &MxArray, bias: Option<&MxArray>) -> Result<Self> {
         let shape = weight.shape()?;
         if shape.len() != 2 {
@@ -137,6 +224,7 @@ impl Linear {
             bias: bias.cloned(),
             in_features,
             out_features,
+            quantized: None,
         })
     }
 }
