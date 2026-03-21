@@ -18,8 +18,12 @@ pub struct PromptCache {
     pub(crate) token_history: Vec<u32>,
     /// Model type identifier for validation
     pub(crate) model_type: String,
+    /// Number of layers — used to validate compatible model on restore
+    pub(crate) num_layers: usize,
     /// Image cache key for VLM cache reuse (None for text-only)
     pub(crate) image_cache_key: Option<u64>,
+    /// Rope deltas from VLM prefill (None for text-only)
+    pub(crate) rope_deltas: Option<i32>,
 }
 
 #[napi]
@@ -42,6 +46,7 @@ impl PromptCache {
         self.caches = None;
         self.token_history.clear();
         self.image_cache_key = None;
+        self.rope_deltas = None;
     }
 }
 
@@ -51,12 +56,17 @@ impl PromptCache {
         caches: Vec<Qwen3_5LayerCache>,
         token_history: Vec<u32>,
         model_type: &str,
+        num_layers: usize,
+        image_cache_key: Option<u64>,
+        rope_deltas: Option<i32>,
     ) -> Self {
         Self {
             caches: Some(caches),
             token_history,
             model_type: model_type.to_string(),
-            image_cache_key: None,
+            num_layers,
+            image_cache_key,
+            rope_deltas,
         }
     }
 
@@ -73,5 +83,20 @@ impl PromptCache {
     /// Get the model type.
     pub(crate) fn model_type(&self) -> &str {
         &self.model_type
+    }
+
+    /// Get the number of layers.
+    pub(crate) fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    /// Get the image cache key (None for text-only caches).
+    pub(crate) fn image_cache_key(&self) -> Option<u64> {
+        self.image_cache_key
+    }
+
+    /// Get the rope deltas (None for text-only caches).
+    pub(crate) fn rope_deltas(&self) -> Option<i32> {
+        self.rope_deltas
     }
 }

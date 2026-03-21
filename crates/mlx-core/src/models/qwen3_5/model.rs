@@ -355,10 +355,15 @@ impl Qwen3_5Model {
             *caches_guard = Some(caches);
             return None;
         }
+        let image_key = self.cached_image_key.read().ok().and_then(|g| *g);
+        let rope_deltas = self.cached_rope_deltas.read().ok().and_then(|g| *g);
         Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
             caches,
             token_history_guard.clone(),
             "qwen3_5",
+            self.config.num_layers as usize,
+            image_key,
+            rope_deltas,
         ))
     }
 
@@ -377,6 +382,13 @@ impl Qwen3_5Model {
                 cache.model_type()
             )));
         }
+        if cache.num_layers() != self.config.num_layers as usize {
+            return Err(Error::from_reason(format!(
+                "Cache has {} layers but model has {} layers",
+                cache.num_layers(),
+                self.config.num_layers
+            )));
+        }
         let restored_caches = cache.take_caches().ok_or_else(|| {
             Error::from_reason("PromptCache is empty (already consumed or disposed)")
         })?;
@@ -390,6 +402,12 @@ impl Qwen3_5Model {
             .map_err(|_| Error::from_reason("Failed to acquire token history write lock"))?;
         *caches_guard = Some(restored_caches);
         *token_history_guard = cache.token_history().to_vec();
+        if let Ok(mut ik) = self.cached_image_key.write() {
+            *ik = cache.image_cache_key();
+        }
+        if let Ok(mut rd) = self.cached_rope_deltas.write() {
+            *rd = cache.rope_deltas();
+        }
         Ok(())
     }
 

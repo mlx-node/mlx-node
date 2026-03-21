@@ -179,10 +179,14 @@ impl Qwen3_5MoeModel {
             *caches_guard = Some(caches);
             return None;
         }
+        let image_key = self.cached_image_key.read().ok().and_then(|g| *g);
         Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
             caches,
             token_history_guard.clone(),
             "qwen3_5_moe",
+            self.config.num_layers as usize,
+            image_key,
+            None, // MoE doesn't use rope_deltas adjustment
         ))
     }
 
@@ -201,6 +205,13 @@ impl Qwen3_5MoeModel {
                 cache.model_type()
             )));
         }
+        if cache.num_layers() != self.config.num_layers as usize {
+            return Err(Error::from_reason(format!(
+                "Cache has {} layers but model has {} layers",
+                cache.num_layers(),
+                self.config.num_layers
+            )));
+        }
         let restored_caches = cache.take_caches().ok_or_else(|| {
             Error::from_reason("PromptCache is empty (already consumed or disposed)")
         })?;
@@ -214,6 +225,9 @@ impl Qwen3_5MoeModel {
             .map_err(|_| Error::from_reason("Failed to acquire token history write lock"))?;
         *caches_guard = Some(restored_caches);
         *token_history_guard = cache.token_history().to_vec();
+        if let Ok(mut ik) = self.cached_image_key.write() {
+            *ik = cache.image_cache_key();
+        }
         Ok(())
     }
 

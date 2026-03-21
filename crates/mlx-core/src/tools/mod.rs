@@ -437,7 +437,10 @@ pub fn has_tool_calls(text: &str) -> bool {
 ///
 /// Also handles the case where the chat template already added `<think>\n` as part
 /// of the assistant generation prompt — the generated text then starts with thinking
-/// content followed by `</think>` but without the opening `<think>` tag.
+/// content followed by `</think>` but without the opening `<think>` tag. To avoid
+/// misinterpreting literal `</think>` in non-thinking output (e.g., the model
+/// explaining XML tags), the fallback only applies when `</think>` is followed by
+/// a newline or end-of-text — not when it's embedded mid-sentence.
 pub fn parse_thinking(text: &str) -> (String, Option<String>) {
     let blocks = extract_tag_blocks(text, "<think>", "</think>");
 
@@ -459,17 +462,24 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
     }
 
     // Handle missing opening <think> tag (template already added it as prefix).
-    // If the text contains </think> without a matching <think>, treat everything
-    // before the first </think> as thinking content.
+    // The template adds `<think>\n` as the assistant generation prompt, so the
+    // model's output starts with thinking content + `</think>`.
+    //
+    // To distinguish from literal `</think>` in content (e.g., "Use </think> to
+    // close the tag"), only apply when `</think>` is followed by a newline or
+    // end-of-text — the model always generates `</think>\n\n` before the response.
     if let Some(close_pos) = text.find("</think>") {
-        let thinking_content = text[..close_pos].trim();
-        let after = text[close_pos + "</think>".len()..].trim();
-        let thinking = if thinking_content.is_empty() {
-            None
-        } else {
-            Some(thinking_content.to_string())
-        };
-        return (after.to_string(), thinking);
+        let after_tag = &text[close_pos + "</think>".len()..];
+        if after_tag.is_empty() || after_tag.starts_with('\n') {
+            let thinking_content = text[..close_pos].trim();
+            let after = after_tag.trim();
+            let thinking = if thinking_content.is_empty() {
+                None
+            } else {
+                Some(thinking_content.to_string())
+            };
+            return (after.to_string(), thinking);
+        }
     }
 
     (text.to_string(), None)
@@ -931,6 +941,18 @@ Here's the result."#;
 
         assert_eq!(text, "The answer is 42.");
         assert_eq!(thinking, Some("Let me analyze this problem.".to_string()));
+    }
+
+    #[test]
+    fn test_parse_thinking_literal_close_tag_mid_sentence() {
+        // Bare </think> in the middle of a sentence should NOT be treated
+        // as a thinking delimiter — it's literal content.
+        let input = "Use </think> to close the tag.";
+
+        let (text, thinking) = parse_thinking(input);
+
+        assert_eq!(text, "Use </think> to close the tag.");
+        assert!(thinking.is_none());
     }
 
     #[test]
