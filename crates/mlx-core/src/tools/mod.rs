@@ -434,23 +434,45 @@ pub fn has_tool_calls(text: &str) -> bool {
 /// - `thinking_content` is the extracted content from within the tags (None if no tags found)
 ///
 /// If multiple `<think>` blocks exist, they are concatenated with newlines.
+///
+/// Also handles the case where the chat template already added `<think>\n` as part
+/// of the assistant generation prompt — the generated text then starts with thinking
+/// content followed by `</think>` but without the opening `<think>` tag.
 pub fn parse_thinking(text: &str) -> (String, Option<String>) {
     let blocks = extract_tag_blocks(text, "<think>", "</think>");
 
-    let thinking_parts: Vec<&str> = blocks
-        .iter()
-        .map(|(_, _, inner)| inner.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
+    if !blocks.is_empty() {
+        let thinking_parts: Vec<&str> = blocks
+            .iter()
+            .map(|(_, _, inner)| inner.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
 
-    let thinking = if thinking_parts.is_empty() {
-        None
-    } else {
-        Some(thinking_parts.join("\n\n"))
-    };
+        let thinking = if thinking_parts.is_empty() {
+            None
+        } else {
+            Some(thinking_parts.join("\n\n"))
+        };
 
-    let cleaned_text = strip_tag_blocks(text, "<think>", "</think>");
-    (cleaned_text, thinking)
+        let cleaned_text = strip_tag_blocks(text, "<think>", "</think>");
+        return (cleaned_text, thinking);
+    }
+
+    // Handle missing opening <think> tag (template already added it as prefix).
+    // If the text contains </think> without a matching <think>, treat everything
+    // before the first </think> as thinking content.
+    if let Some(close_pos) = text.find("</think>") {
+        let thinking_content = text[..close_pos].trim();
+        let after = text[close_pos + "</think>".len()..].trim();
+        let thinking = if thinking_content.is_empty() {
+            None
+        } else {
+            Some(thinking_content.to_string())
+        };
+        return (after.to_string(), thinking);
+    }
+
+    (text.to_string(), None)
 }
 
 /// Check if text contains any thinking tags
@@ -894,6 +916,44 @@ Here's the result."#;
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].name, "get_current_time");
         assert_eq!(thinking, Some("I need to check the time.".to_string()));
+    }
+
+    // ---- Thinking: missing opening tag (template prefix) ----
+
+    #[test]
+    fn test_parse_thinking_no_opening_tag() {
+        // When enable_thinking=true, the chat template adds <think>\n as the
+        // assistant prefix. The model's generated text starts after that, so
+        // it contains thinking content + </think> but no opening <think>.
+        let input = "Let me analyze this problem.\n</think>\n\nThe answer is 42.";
+
+        let (text, thinking) = parse_thinking(input);
+
+        assert_eq!(text, "The answer is 42.");
+        assert_eq!(thinking, Some("Let me analyze this problem.".to_string()));
+    }
+
+    #[test]
+    fn test_parse_thinking_no_opening_tag_empty_thinking() {
+        // Model immediately closes thinking with no content
+        let input = "\n</think>\n\nThe response.";
+
+        let (text, thinking) = parse_thinking(input);
+
+        assert_eq!(text, "The response.");
+        assert!(thinking.is_none());
+    }
+
+    #[test]
+    fn test_parse_generation_output_no_opening_think_with_tools() {
+        let input = "I need to check.\n</think>\n\n<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
+
+        let (text, tool_calls, thinking) = parse_generation_output(input);
+
+        assert_eq!(text, "");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "get_time");
+        assert_eq!(thinking, Some("I need to check.".to_string()));
     }
 
     // ---- JSON sanitizer ----
