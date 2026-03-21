@@ -1468,7 +1468,8 @@ impl Qwen3_5Model {
             let num_tokens = generated_tokens.len() as u32;
 
             let has_think_end = tools::has_think_end_token(&generated_tokens, think_end_id);
-            let (clean_text, tool_calls, thinking) = tools::split_at_think_end(&text, has_think_end);
+            let (clean_text, tool_calls, thinking) =
+                tools::split_at_think_end(&text, has_think_end);
 
             // If we have valid tool calls, override finish reason
             let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {

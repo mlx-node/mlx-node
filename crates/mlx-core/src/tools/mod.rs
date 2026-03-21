@@ -565,18 +565,16 @@ pub fn split_at_think_end(
     raw_text: &str,
     has_think_end: bool,
 ) -> (String, Vec<ToolCallResult>, Option<String>) {
-    if has_think_end {
-        if let Some(close_pos) = raw_text.find("</think>") {
-            let thinking_text = raw_text[..close_pos].trim();
-            let response_text = raw_text[close_pos + "</think>".len()..].trim();
-            let thinking = if thinking_text.is_empty() {
-                None
-            } else {
-                Some(thinking_text.to_string())
-            };
-            let (clean_text, tool_calls) = parse_tool_calls(response_text);
-            return (clean_text.trim().to_string(), tool_calls, thinking);
-        }
+    if has_think_end && let Some(close_pos) = raw_text.find("</think>") {
+        let thinking_text = raw_text[..close_pos].trim();
+        let response_text = raw_text[close_pos + "</think>".len()..].trim();
+        let thinking = if thinking_text.is_empty() {
+            None
+        } else {
+            Some(thinking_text.to_string())
+        };
+        let (clean_text, tool_calls) = parse_tool_calls(response_text);
+        return (clean_text.trim().to_string(), tool_calls, thinking);
     }
     parse_generation_output(raw_text)
 }
