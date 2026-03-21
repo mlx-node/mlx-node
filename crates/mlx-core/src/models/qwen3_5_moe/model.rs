@@ -750,8 +750,7 @@ impl Qwen3_5MoeModel {
                     let all_images = extract_images_from_messages(&messages);
                     let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
                     let processed = img_proc.process_many(&image_refs)?;
-                    let num_image_tokens =
-                        compute_num_image_tokens(&processed.grid_thw(), sms)?;
+                    let num_image_tokens = compute_num_image_tokens(&processed.grid_thw(), sms)?;
                     let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
                     let key = compute_image_cache_key(&all_images);
                     (Some(final_tokens), key, Some(processed))
@@ -1120,8 +1119,7 @@ impl Qwen3_5MoeModel {
                         )
                     };
                     if exported > 0 {
-                        let cache_offset =
-                            unsafe { mlx_sys::mlx_qwen35_moe_get_cache_offset() };
+                        let cache_offset = unsafe { mlx_sys::mlx_qwen35_moe_get_cache_offset() };
                         let mut new_caches = Vec::with_capacity(num_layers);
                         for i in 0..num_layers {
                             let p0 = export_ptrs[i * 2];
@@ -1134,9 +1132,9 @@ impl Qwen3_5MoeModel {
                             lc.import_ptrs(p0, p1, cache_offset);
                             new_caches.push(lc);
                         }
-                        let mut cg = caches_arc
-                            .write()
-                            .map_err(|_| Error::from_reason("Failed to acquire caches lock for cache export"))?;
+                        let mut cg = caches_arc.write().map_err(|_| {
+                            Error::from_reason("Failed to acquire caches lock for cache export")
+                        })?;
                         *cg = Some(new_caches);
                     }
                 }
@@ -1477,8 +1475,7 @@ impl Qwen3_5MoeModel {
                             let processed = img_proc.process_many(&image_refs)?;
                             let num_image_tokens =
                                 compute_num_image_tokens(&processed.grid_thw(), sms)?;
-                            let final_tokens =
-                                inject_image_placeholders(&tokens, num_image_tokens);
+                            let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
                             let key = compute_image_cache_key(&all_images);
                             (Some(final_tokens), key, Some(processed))
                         } else {
@@ -1486,8 +1483,7 @@ impl Qwen3_5MoeModel {
                         };
 
                     // For prefix matching, use expanded tokens (with image placeholders) for VLM
-                    let tokens_for_matching =
-                        expanded_tokens.as_deref().unwrap_or(&tokens);
+                    let tokens_for_matching = expanded_tokens.as_deref().unwrap_or(&tokens);
 
                     // === Cache reuse: prefix verification ===
                     let cached_token_history_guard = cached_token_history_arc
@@ -1594,90 +1590,87 @@ impl Qwen3_5MoeModel {
 
                     // === VLM or text prefill branching ===
                     profiler.begin_prefill();
-                    let (mut last_logits, seq_len) =
-                        if has_images && cached_prefix_len > 0 {
-                            // --- VLM cache reuse: same images, incremental text-only prefill ---
-                            let expanded = expanded_tokens.as_ref().unwrap();
-                            let prompt = MxArray::from_uint32(
-                                &prefill_tokens,
-                                &[1, prefill_tokens.len() as i64],
-                            )?;
+                    let (mut last_logits, seq_len) = if has_images && cached_prefix_len > 0 {
+                        // --- VLM cache reuse: same images, incremental text-only prefill ---
+                        let expanded = expanded_tokens.as_ref().unwrap();
+                        let prompt = MxArray::from_uint32(
+                            &prefill_tokens,
+                            &[1, prefill_tokens.len() as i64],
+                        )?;
 
-                            let logits = forward_inner(
-                                &prompt,
-                                &embedding_weight,
-                                &mut layers_guard,
-                                &mut caches_guard,
-                                &final_norm_guard,
-                                &lm_head_guard,
-                                fa_idx,
-                                Some(&embedding_weight_t),
-                            )?;
+                        let logits = forward_inner(
+                            &prompt,
+                            &embedding_weight,
+                            &mut layers_guard,
+                            &mut caches_guard,
+                            &final_norm_guard,
+                            &lm_head_guard,
+                            fa_idx,
+                            Some(&embedding_weight_t),
+                        )?;
 
-                            let seq_len = logits.shape_at(1)?;
-                            let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-                            let last_logits = last_logits.squeeze(Some(&[1]))?;
-                            // seq_len is the TOTAL expanded tokens (cached + new)
-                            (last_logits, expanded.len() as i64)
-                        } else if let (true, Some(vision_enc), Some(_)) = (
-                            has_images,
-                            vision_encoder_arc.as_ref(),
-                            image_processor_arc.as_ref(),
-                        ) {
-                            // --- VLM path: full VLM prefill (no cache reuse) ---
-                            let sms = spatial_merge_size.unwrap_or(2);
-                            let final_tokens = expanded_tokens.as_ref().unwrap();
-                            let processed = vlm_processed.as_ref().unwrap();
+                        let seq_len = logits.shape_at(1)?;
+                        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+                        let last_logits = last_logits.squeeze(Some(&[1]))?;
+                        // seq_len is the TOTAL expanded tokens (cached + new)
+                        (last_logits, expanded.len() as i64)
+                    } else if let (true, Some(vision_enc), Some(_)) = (
+                        has_images,
+                        vision_encoder_arc.as_ref(),
+                        image_processor_arc.as_ref(),
+                    ) {
+                        // --- VLM path: full VLM prefill (no cache reuse) ---
+                        let sms = spatial_merge_size.unwrap_or(2);
+                        let final_tokens = expanded_tokens.as_ref().unwrap();
+                        let processed = vlm_processed.as_ref().unwrap();
 
-                            let input_ids = MxArray::from_uint32(
-                                final_tokens,
-                                &[1, final_tokens.len() as i64],
-                            )?;
+                        let input_ids =
+                            MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
 
-                            // VLM prefill using Rust path with M-RoPE position IDs
-                            let (logits, _rope_deltas) = vlm_prefill_moe(
-                                &input_ids,
-                                image_cache_key,
-                                processed,
-                                vision_enc,
-                                sms,
-                                &embedding_weight,
-                                &mut layers_guard,
-                                &mut caches_guard,
-                                &final_norm_guard,
-                                &lm_head_guard,
-                                generation_stream,
-                                fa_idx,
-                                Some(&embedding_weight_t),
-                                &vision_cache_stream,
-                            )?;
+                        // VLM prefill using Rust path with M-RoPE position IDs
+                        let (logits, _rope_deltas) = vlm_prefill_moe(
+                            &input_ids,
+                            image_cache_key,
+                            processed,
+                            vision_enc,
+                            sms,
+                            &embedding_weight,
+                            &mut layers_guard,
+                            &mut caches_guard,
+                            &final_norm_guard,
+                            &lm_head_guard,
+                            generation_stream,
+                            fa_idx,
+                            Some(&embedding_weight_t),
+                            &vision_cache_stream,
+                        )?;
 
-                            let vlm_seq_len = final_tokens.len() as i64;
-                            (logits, vlm_seq_len)
-                        } else {
-                            // --- Standard text prefill path ---
-                            let prompt = MxArray::from_uint32(
-                                &prefill_tokens,
-                                &[1, prefill_tokens.len() as i64],
-                            )?;
+                        let vlm_seq_len = final_tokens.len() as i64;
+                        (logits, vlm_seq_len)
+                    } else {
+                        // --- Standard text prefill path ---
+                        let prompt = MxArray::from_uint32(
+                            &prefill_tokens,
+                            &[1, prefill_tokens.len() as i64],
+                        )?;
 
-                            let logits = forward_inner(
-                                &prompt,
-                                &embedding_weight,
-                                &mut layers_guard,
-                                &mut caches_guard,
-                                &final_norm_guard,
-                                &lm_head_guard,
-                                fa_idx,
-                                Some(&embedding_weight_t),
-                            )?;
+                        let logits = forward_inner(
+                            &prompt,
+                            &embedding_weight,
+                            &mut layers_guard,
+                            &mut caches_guard,
+                            &final_norm_guard,
+                            &lm_head_guard,
+                            fa_idx,
+                            Some(&embedding_weight_t),
+                        )?;
 
-                            let seq_len = logits.shape_at(1)?;
-                            let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-                            let last_logits = last_logits.squeeze(Some(&[1]))?;
-                            // seq_len for the C++ init is the TOTAL tokens (cached + new)
-                            (last_logits, tokens.len() as i64)
-                        };
+                        let seq_len = logits.shape_at(1)?;
+                        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+                        let last_logits = last_logits.squeeze(Some(&[1]))?;
+                        // seq_len for the C++ init is the TOTAL tokens (cached + new)
+                        (last_logits, tokens.len() as i64)
+                    };
                     profiler.end_prefill();
 
                     // Apply repetition penalty to prefill logits
@@ -1871,9 +1864,11 @@ impl Qwen3_5MoeModel {
                                     lc.import_ptrs(p0, p1, cache_offset);
                                     new_caches.push(lc);
                                 }
-                                let mut cg = caches_arc
-                                    .write()
-                                    .map_err(|_| Error::from_reason("Failed to acquire caches lock for cache export"))?;
+                                let mut cg = caches_arc.write().map_err(|_| {
+                                    Error::from_reason(
+                                        "Failed to acquire caches lock for cache export",
+                                    )
+                                })?;
                                 *cg = Some(new_caches);
                             }
                         }

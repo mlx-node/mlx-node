@@ -5220,10 +5220,7 @@ impl Qwen3Model {
             .as_ref()
             .and_then(|c| c.report_performance)
             .unwrap_or(false);
-        let reuse_cache = config
-            .as_ref()
-            .and_then(|c| c.reuse_cache)
-            .unwrap_or(true);
+        let reuse_cache = config.as_ref().and_then(|c| c.reuse_cache).unwrap_or(true);
 
         // Convert ChatConfig to GenerationConfig for the internal generate call
         let gen_config = config.map(|c| GenerationConfig {
@@ -5416,10 +5413,8 @@ impl Qwen3Model {
 
             // Initialize KV caches: restore from cache or create fresh
             let num_layers = layers.len();
-            let mut kv_keys = initial_kv_keys
-                .unwrap_or_else(|| vec![None; num_layers]);
-            let mut kv_values = initial_kv_values
-                .unwrap_or_else(|| vec![None; num_layers]);
+            let mut kv_keys = initial_kv_keys.unwrap_or_else(|| vec![None; num_layers]);
+            let mut kv_values = initial_kv_values.unwrap_or_else(|| vec![None; num_layers]);
             let mut cache_idx: i32 = initial_cache_idx;
 
             // rope_offsets starts at cache_idx (0 for fresh, or restored value for cache hit)
@@ -5462,8 +5457,7 @@ impl Qwen3Model {
                         let chunk_end = offset + prefill_step_size;
                         let chunk =
                             current_ids.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
-                        rope_offsets =
-                            MxArray::from_int32(&[cache_idx + offset as i32], &[1])?;
+                        rope_offsets = MxArray::from_int32(&[cache_idx + offset as i32], &[1])?;
 
                         {
                             let _stream_ctx = StreamContext::new(generation_stream);
@@ -5495,8 +5489,7 @@ impl Qwen3Model {
                     // Final chunk
                     let final_chunk =
                         current_ids.slice(&[0, offset as i64], &[1, total_seq_len as i64])?;
-                    rope_offsets =
-                        MxArray::from_int32(&[cache_idx + offset as i32], &[1])?;
+                    rope_offsets = MxArray::from_int32(&[cache_idx + offset as i32], &[1])?;
 
                     let logits = {
                         let _stream_ctx = StreamContext::new(generation_stream);
@@ -5550,8 +5543,7 @@ impl Qwen3Model {
                 // Rewind cache_idx by 1 so the last token is re-processed
                 cache_idx -= 1;
                 rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
-                let last_token =
-                    MxArray::from_uint32(&[last_token_id], &[1, 1])?;
+                let last_token = MxArray::from_uint32(&[last_token_id], &[1, 1])?;
 
                 let logits = {
                     let _stream_ctx = StreamContext::new(generation_stream);
@@ -5657,8 +5649,7 @@ impl Qwen3Model {
                 )?;
                 rope_offsets = rope_offsets.add(&one_arr)?;
 
-                let next_last_logits =
-                    next_logits.slice_axis(1, 0, 1)?.squeeze(Some(&[0, 1]))?;
+                let next_last_logits = next_logits.slice_axis(1, 0, 1)?.squeeze(Some(&[0, 1]))?;
 
                 last_logits = if repetition_penalty != 1.0 {
                     let context_tokens: Vec<u32> = token_ids_vec
@@ -5677,8 +5668,7 @@ impl Qwen3Model {
                 };
 
                 let (next_tok, next_lp) = if return_logprobs {
-                    let (tok, lp) =
-                        sample_and_logprobs(&last_logits, Some(sampling_config))?;
+                    let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
                     (tok, Some(lp))
                 } else {
                     (sample(&last_logits, Some(sampling_config))?, None)
@@ -5726,10 +5716,7 @@ impl Qwen3Model {
             let tokens_array =
                 MxArray::from_uint32(&generated_tokens, &[generated_tokens.len() as i64])?;
             let logprobs_array = if return_logprobs {
-                MxArray::from_float32(
-                    &generated_logprobs,
-                    &[generated_logprobs.len() as i64],
-                )?
+                MxArray::from_float32(&generated_logprobs, &[generated_logprobs.len() as i64])?
             } else {
                 MxArray::from_float32(&[], &[0])?
             };
