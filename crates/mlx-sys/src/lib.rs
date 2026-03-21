@@ -1058,6 +1058,12 @@ unsafe extern "C-unwind" {
     /// Reset compiled state (call on model reset / new conversation).
     pub fn mlx_qwen35_compiled_reset();
 
+    /// Export compiled caches for PromptCache reuse.
+    pub fn mlx_qwen35_export_caches(out_ptrs: *mut *mut mlx_array, max_count: i32) -> i32;
+
+    /// Get current compiled cache offset (tokens processed).
+    pub fn mlx_qwen35_get_cache_offset() -> i32;
+
     // ============================================
     // Qwen3.5 VLM Prefill
     // ============================================
@@ -1142,6 +1148,14 @@ unsafe extern "C-unwind" {
 
     /// Reset MoE state.
     pub fn mlx_qwen35_moe_reset();
+
+    /// Export MoE caches for PromptCache reuse.
+    /// Copies cache arrays to caller-provided output pointers.
+    /// Returns number of arrays exported, or 0 if not initialized.
+    pub fn mlx_qwen35_moe_export_caches(out_ptrs: *mut *mut mlx_array, max_count: i32) -> i32;
+
+    /// Get current MoE cache offset (tokens processed).
+    pub fn mlx_qwen35_moe_get_cache_offset() -> i32;
 
     /// Load safetensors file using MLX's lazy loading (data read on eval, not upfront).
     /// Calls `callback` for each tensor with (name, name_len, array_handle, ctx).

@@ -300,4 +300,18 @@ void mlx_qwen35_compiled_reset() {
   g_compile_inited = false;
 }
 
+// Export compiled caches for PromptCache reuse.
+int mlx_qwen35_export_caches(mlx_array** out_ptrs, int max_count) {
+  if (!g_compile_inited || g_compiled_caches.empty()) return 0;
+  int count = std::min((int)g_compiled_caches.size(), max_count);
+  for (int i = 0; i < count; i++) {
+    out_ptrs[i] = reinterpret_cast<mlx_array*>(new array(g_compiled_caches[i]));
+  }
+  return count;
+}
+
+int mlx_qwen35_get_cache_offset() {
+  return g_offset_int;
+}
+
 }  // extern "C"

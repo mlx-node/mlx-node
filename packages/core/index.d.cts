@@ -640,6 +640,25 @@ export declare class OutputStore {
 }
 
 /**
+ * Opaque handle to KV cache state from a previous chat() call.
+ *
+ * Pass this back to the next chat() call via `model.setCache(cache)`
+ * to enable incremental prefill — only new tokens since the last turn
+ * are processed, avoiding redundant computation.
+ *
+ * Created internally by the model when `reuseCache: true` (default).
+ * Extract via `model.takeCache()`, restore via `model.setCache(cache)`.
+ */
+export declare class PromptCache {
+  /** Number of tokens stored in this cache. */
+  get tokenCount(): number;
+  /** Whether this cache has been consumed (caches moved out). */
+  get isEmpty(): boolean;
+  /** Release GPU memory held by this cache. */
+  dispose(): void;
+}
+
+/**
  * Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
  *
  * Uses interior mutability (RwLock) for layers, final_norm, lm_head, and caches
@@ -653,6 +672,21 @@ export declare class Qwen35Model {
   initCaches(): void;
   /** Reset all caches. */
   resetCaches(): void;
+  /**
+   * Take the KV cache from the model, returning a `PromptCache` handle.
+   *
+   * The cache is moved out of the model — calling `takeCache()` twice
+   * returns `null` the second time. Pass the cache back via `setCache()`
+   * before the next `chat()` call for incremental prefill.
+   */
+  takeCache(): PromptCache | null;
+  /**
+   * Restore a previously taken `PromptCache` into the model.
+   *
+   * On the next `chat()` call with `reuseCache: true`, the model will
+   * prefix-match the new tokens against the cache and only prefill the delta.
+   */
+  setCache(cache: PromptCache): void;
   /**
    * Forward pass through the model.
    *
@@ -726,6 +760,21 @@ export type Qwen3_5Model = Qwen35Model;
  */
 export declare class Qwen35MoeModel {
   constructor(config: Qwen35MoeConfig);
+  /**
+   * Take the KV cache from the model, returning a `PromptCache` handle.
+   *
+   * The cache is moved out of the model — calling `takeCache()` twice
+   * returns `null` the second time. Pass the cache back via `setCache()`
+   * before the next `chat()` call for incremental prefill.
+   */
+  takeCache(): PromptCache | null;
+  /**
+   * Restore a previously taken `PromptCache` into the model.
+   *
+   * On the next `chat()` call with `reuseCache: true`, the model will
+   * prefix-match the new tokens against the cache and only prefill the delta.
+   */
+  setCache(cache: PromptCache): void;
   initCaches(): void;
   resetCaches(): void;
   forward(inputIds: MxArray): MxArray;
@@ -1932,6 +1981,14 @@ export interface ChatConfig {
   enableThinking?: boolean | undefined;
   /** When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result */
   reportPerformance?: boolean | undefined;
+  /**
+   * Reuse KV cache across chat() calls for incremental prefill. Default: true.
+   * When true, the model preserves its KV cache after generation. On the next
+   * chat() call, it prefix-matches the new token sequence against the cached
+   * tokens and only prefills the delta — avoiding redundant computation for
+   * multi-turn conversations.
+   */
+  reuseCache?: boolean | undefined;
 }
 
 /** Chat message with tool calling support */

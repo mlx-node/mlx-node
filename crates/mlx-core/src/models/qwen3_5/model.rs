@@ -150,6 +150,13 @@ pub struct ChatConfig {
     /// When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result
     #[napi(ts_type = "boolean | undefined")]
     pub report_performance: Option<bool>,
+    /// Reuse KV cache across chat() calls for incremental prefill. Default: true.
+    /// When true, the model preserves its KV cache after generation. On the next
+    /// chat() call, it prefix-matches the new token sequence against the cached
+    /// tokens and only prefills the delta — avoiding redundant computation for
+    /// multi-turn conversations.
+    #[napi(ts_type = "boolean | undefined")]
+    pub reuse_cache: Option<bool>,
 }
 
 /// Unified chat result shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE).
@@ -223,6 +230,9 @@ pub struct Qwen3_5Model {
     /// LRU cache for vision encoder embeddings, avoids re-encoding the same
     /// image in multi-turn VLM conversations.
     pub(crate) vision_cache: VisionCache,
+    /// Token history for KV cache reuse across chat() calls.
+    /// Stores the full token sequence (template + generated) from the last call.
+    cached_token_history: Arc<RwLock<Vec<u32>>>,
 }
 
 #[napi]
@@ -274,6 +284,7 @@ impl Qwen3_5Model {
                 entries: HashMap::new(),
                 generation: 0,
             })),
+            cached_token_history: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -310,6 +321,63 @@ impl Qwen3_5Model {
             }
         }
         *caches_guard = None;
+        // Also clear token history so next chat() does a full prefill
+        if let Ok(mut th) = self.cached_token_history.write() {
+            th.clear();
+        }
+        Ok(())
+    }
+
+    /// Take the KV cache from the model, returning a `PromptCache` handle.
+    ///
+    /// The cache is moved out of the model — calling `takeCache()` twice
+    /// returns `null` the second time. Pass the cache back via `setCache()`
+    /// before the next `chat()` call for incremental prefill.
+    #[napi]
+    pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
+        let mut caches_guard = self.caches.write().ok()?;
+        let token_history_guard = self.cached_token_history.read().ok()?;
+        let caches = caches_guard.take()?;
+        if token_history_guard.is_empty() {
+            // No generation has happened yet — put caches back
+            *caches_guard = Some(caches);
+            return None;
+        }
+        Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
+            caches,
+            token_history_guard.clone(),
+            "qwen3_5",
+        ))
+    }
+
+    /// Restore a previously taken `PromptCache` into the model.
+    ///
+    /// On the next `chat()` call with `reuseCache: true`, the model will
+    /// prefix-match the new tokens against the cache and only prefill the delta.
+    #[napi]
+    pub fn set_cache(
+        &self,
+        cache: &mut crate::models::qwen3_5::prompt_cache::PromptCache,
+    ) -> Result<()> {
+        if cache.model_type() != "qwen3_5" {
+            return Err(Error::from_reason(format!(
+                "Cache type '{}' doesn't match model type 'qwen3_5'",
+                cache.model_type()
+            )));
+        }
+        let restored_caches = cache.take_caches().ok_or_else(|| {
+            Error::from_reason("PromptCache is empty (already consumed or disposed)")
+        })?;
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+        let mut token_history_guard = self
+            .cached_token_history
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire token history write lock"))?;
+        *caches_guard = Some(restored_caches);
+        *token_history_guard = cache.token_history().to_vec();
         Ok(())
     }
 
@@ -720,7 +788,10 @@ impl Qwen3_5Model {
             tools: None,
             enable_thinking: None,
             report_performance: None,
+            reuse_cache: None,
         });
+
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
 
         // Tokenize messages using chat template
         let tokenizer = self
@@ -739,6 +810,7 @@ impl Qwen3_5Model {
         let final_norm_arc = self.final_norm.clone();
         let lm_head_arc = self.lm_head.clone();
         let caches_arc = self.caches.clone();
+        let cached_token_history_arc = self.cached_token_history.clone();
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
         let tokenizer_for_decode = tokenizer.clone();
@@ -816,6 +888,53 @@ impl Qwen3_5Model {
                 .read()
                 .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
 
+            // === Cache reuse: prefix verification ===
+            let cached_token_history_guard = cached_token_history_arc
+                .read()
+                .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
+            let cached_prefix_len = if reuse_cache && !has_images {
+                let cached = &*cached_token_history_guard;
+                if !cached.is_empty()
+                    && tokens.len() >= cached.len()
+                    && tokens[..cached.len()] == cached[..]
+                    && caches_guard.is_some()
+                {
+                    cached.len()
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            drop(cached_token_history_guard);
+
+            let prefill_tokens = if cached_prefix_len > 0 {
+                info!(
+                    "Cache reuse: {} cached tokens, {} new tokens to prefill",
+                    cached_prefix_len,
+                    tokens.len() - cached_prefix_len
+                );
+                tokens[cached_prefix_len..].to_vec()
+            } else {
+                // Full reset
+                if let Some(ref mut caches) = *caches_guard {
+                    for cache in caches.iter_mut() {
+                        cache.reset();
+                    }
+                }
+                let new_caches = (0..model_config.num_layers as usize)
+                    .map(|i| {
+                        if model_config.is_linear_layer(i) {
+                            Qwen3_5LayerCache::new_linear()
+                        } else {
+                            Qwen3_5LayerCache::new_full_attention()
+                        }
+                    })
+                    .collect();
+                *caches_guard = Some(new_caches);
+                tokens.clone()
+            };
+
             let eos_id = model_config.eos_token_id as u32;
             let mut generated_tokens: Vec<u32> = Vec::new();
             let mut finish_reason = String::from("length");
@@ -878,20 +997,10 @@ impl Qwen3_5Model {
                     (logits, vlm_seq_len, use_compiled)
                 } else {
                     // --- Standard text prefill path ---
-                    let prompt = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64])?;
-
-                    // Init fresh caches (old ones dropped on overwrite)
-                    *caches_guard = Some(
-                        (0..model_config.num_layers as usize)
-                            .map(|i| {
-                                if model_config.is_linear_layer(i) {
-                                    Qwen3_5LayerCache::new_linear()
-                                } else {
-                                    Qwen3_5LayerCache::new_full_attention()
-                                }
-                            })
-                            .collect(),
-                    );
+                    let prompt = MxArray::from_uint32(
+                        &prefill_tokens,
+                        &[1, prefill_tokens.len() as i64],
+                    )?;
 
                     let logits = {
                         let _stream_ctx = StreamContext::new(generation_stream);
@@ -910,7 +1019,8 @@ impl Qwen3_5Model {
                     let seq_len = logits.shape_at(1)?;
                     let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
                     let last_logits = last_logits.squeeze(Some(&[1]))?;
-                    (last_logits, seq_len, false)
+                    // seq_len for the C++ init is the TOTAL tokens (cached + new)
+                    (last_logits, tokens.len() as i64, false)
                 };
             profiler.end_prefill();
 
@@ -1077,6 +1187,39 @@ impl Qwen3_5Model {
 
                 profiler.snapshot_memory_after();
                 profiler.report();
+
+                // === Export caches from C++ before CompiledResetGuard drops ===
+                if reuse_cache {
+                    let num_layers = model_config.num_layers as usize;
+                    let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                        vec![std::ptr::null_mut(); num_layers * 2];
+                    let exported = unsafe {
+                        mlx_sys::mlx_qwen35_export_caches(
+                            export_ptrs.as_mut_ptr(),
+                            (num_layers * 2) as i32,
+                        )
+                    };
+                    if exported > 0 {
+                        let cache_offset =
+                            unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
+                        let mut new_caches = Vec::with_capacity(num_layers);
+                        for i in 0..num_layers {
+                            let p0 = export_ptrs[i * 2];
+                            let p1 = export_ptrs[i * 2 + 1];
+                            let mut lc = if model_config.is_linear_layer(i) {
+                                Qwen3_5LayerCache::new_linear()
+                            } else {
+                                Qwen3_5LayerCache::new_full_attention()
+                            };
+                            lc.import_ptrs(p0, p1, cache_offset);
+                            new_caches.push(lc);
+                        }
+                        let mut cg = caches_arc
+                            .write()
+                            .map_err(|_| Error::from_reason("Failed to acquire caches lock for cache export"))?;
+                        *cg = Some(new_caches);
+                    }
+                }
             } else {
                 // Rust fallback decode loop — pipelined like mlx-lm:
                 // Build next step's graph before blocking on current token.
@@ -1178,6 +1321,19 @@ impl Qwen3_5Model {
 
             // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
 
+            // === Save token history for cache reuse on next call ===
+            if reuse_cache {
+                let mut full_history = tokens.clone();
+                full_history.extend_from_slice(&generated_tokens);
+                if let Ok(mut th) = cached_token_history_arc.write() {
+                    *th = full_history;
+                }
+            } else {
+                if let Ok(mut th) = cached_token_history_arc.write() {
+                    th.clear();
+                }
+            }
+
             // Decode text
             let text = tokenizer_for_decode
                 .decode_sync(&generated_tokens, true)
@@ -1266,7 +1422,11 @@ impl Qwen3_5Model {
             tools: None,
             enable_thinking: None,
             report_performance: None,
+            reuse_cache: None,
         });
+
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let report_perf = config.report_performance.unwrap_or(false);
 
         // Tokenize messages using chat template
         let tokenizer = self
@@ -1285,6 +1445,7 @@ impl Qwen3_5Model {
         let final_norm_arc = self.final_norm.clone();
         let lm_head_arc = self.lm_head.clone();
         let caches_arc = self.caches.clone();
+        let cached_token_history_arc = self.cached_token_history.clone();
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
         let tokenizer_for_decode = tokenizer.clone();
@@ -1308,7 +1469,6 @@ impl Qwen3_5Model {
 
         // Capture start time BEFORE compiled mutex + spawn_blocking so TTFT
         // reflects the full user-perceived latency.
-        let report_perf = config.report_performance.unwrap_or(false);
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
         } else {
@@ -1372,6 +1532,53 @@ impl Qwen3_5Model {
                     let lm_head_guard = lm_head_arc
                         .read()
                         .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+
+                    // === Cache reuse: prefix verification ===
+                    let cached_token_history_guard = cached_token_history_arc
+                        .read()
+                        .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
+                    let cached_prefix_len = if reuse_cache && !has_images {
+                        let cached = &*cached_token_history_guard;
+                        if !cached.is_empty()
+                            && tokens.len() >= cached.len()
+                            && tokens[..cached.len()] == cached[..]
+                            && caches_guard.is_some()
+                        {
+                            cached.len()
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    drop(cached_token_history_guard);
+
+                    let prefill_tokens = if cached_prefix_len > 0 {
+                        info!(
+                            "Cache reuse: {} cached tokens, {} new tokens to prefill",
+                            cached_prefix_len,
+                            tokens.len() - cached_prefix_len
+                        );
+                        tokens[cached_prefix_len..].to_vec()
+                    } else {
+                        // Full reset
+                        if let Some(ref mut caches) = *caches_guard {
+                            for cache in caches.iter_mut() {
+                                cache.reset();
+                            }
+                        }
+                        let new_caches = (0..model_config.num_layers as usize)
+                            .map(|i| {
+                                if model_config.is_linear_layer(i) {
+                                    Qwen3_5LayerCache::new_linear()
+                                } else {
+                                    Qwen3_5LayerCache::new_full_attention()
+                                }
+                            })
+                            .collect();
+                        *caches_guard = Some(new_caches);
+                        tokens.clone()
+                    };
 
                     let eos_id = model_config.eos_token_id as u32;
                     let mut generated_tokens: Vec<u32> = Vec::new();
@@ -1442,20 +1649,10 @@ impl Qwen3_5Model {
                             (logits, vlm_seq_len, use_compiled)
                         } else {
                             // --- Standard text prefill path ---
-                            let prompt = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64])?;
-
-                            // Init fresh caches (old ones dropped on overwrite)
-                            *caches_guard = Some(
-                                (0..model_config.num_layers as usize)
-                                    .map(|i| {
-                                        if model_config.is_linear_layer(i) {
-                                            Qwen3_5LayerCache::new_linear()
-                                        } else {
-                                            Qwen3_5LayerCache::new_full_attention()
-                                        }
-                                    })
-                                    .collect(),
-                            );
+                            let prompt = MxArray::from_uint32(
+                                &prefill_tokens,
+                                &[1, prefill_tokens.len() as i64],
+                            )?;
 
                             let logits = {
                                 let _stream_ctx = StreamContext::new(generation_stream);
@@ -1474,7 +1671,8 @@ impl Qwen3_5Model {
                             let seq_len = logits.shape_at(1)?;
                             let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
                             let last_logits = last_logits.squeeze(Some(&[1]))?;
-                            (last_logits, seq_len, false)
+                            // seq_len for the C++ init is the TOTAL tokens (cached + new)
+                            (last_logits, tokens.len() as i64, false)
                         };
                     profiler.end_prefill();
 
@@ -1643,6 +1841,39 @@ impl Qwen3_5Model {
                         }
                         profiler.snapshot_memory_after();
                         profiler.report();
+
+                        // === Export caches from C++ before CompiledResetGuard drops ===
+                        if reuse_cache {
+                            let num_layers = model_config.num_layers as usize;
+                            let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                                vec![std::ptr::null_mut(); num_layers * 2];
+                            let exported = unsafe {
+                                mlx_sys::mlx_qwen35_export_caches(
+                                    export_ptrs.as_mut_ptr(),
+                                    (num_layers * 2) as i32,
+                                )
+                            };
+                            if exported > 0 {
+                                let cache_offset =
+                                    unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
+                                let mut new_caches = Vec::with_capacity(num_layers);
+                                for i in 0..num_layers {
+                                    let p0 = export_ptrs[i * 2];
+                                    let p1 = export_ptrs[i * 2 + 1];
+                                    let mut lc = if model_config.is_linear_layer(i) {
+                                        Qwen3_5LayerCache::new_linear()
+                                    } else {
+                                        Qwen3_5LayerCache::new_full_attention()
+                                    };
+                                    lc.import_ptrs(p0, p1, cache_offset);
+                                    new_caches.push(lc);
+                                }
+                                let mut cg = caches_arc
+                                    .write()
+                                    .map_err(|_| Error::from_reason("Failed to acquire caches lock for cache export"))?;
+                                *cg = Some(new_caches);
+                            }
+                        }
                     } else {
                         // Rust fallback decode loop (pipelined)
                         profiler.set_label("chat_stream_rust");
@@ -1741,6 +1972,19 @@ impl Qwen3_5Model {
                     }
 
                     // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
+
+                    // === Save token history for cache reuse on next call ===
+                    if reuse_cache {
+                        let mut full_history = tokens.clone();
+                        full_history.extend_from_slice(&generated_tokens);
+                        if let Ok(mut th) = cached_token_history_arc.write() {
+                            *th = full_history;
+                        }
+                    } else {
+                        if let Ok(mut th) = cached_token_history_arc.write() {
+                            th.clear();
+                        }
+                    }
 
                     // Decode full text for final chunk
                     let text = tokenizer_for_decode
@@ -2356,6 +2600,7 @@ impl Qwen3_5Model {
                 entries: HashMap::new(),
                 generation: 0,
             })),
+            cached_token_history: Arc::new(RwLock::new(Vec::new())),
         })
     }
 

@@ -747,6 +747,7 @@ module.exports.GRPOTrainingEngine = nativeBinding.GRPOTrainingEngine;
 module.exports.MxArray = nativeBinding.MxArray;
 module.exports.NativeRewardRegistry = nativeBinding.NativeRewardRegistry;
 module.exports.OutputStore = nativeBinding.OutputStore;
+module.exports.PromptCache = nativeBinding.PromptCache;
 module.exports.Qwen35Model = nativeBinding.Qwen35Model;
 module.exports.Qwen3_5Model = nativeBinding.Qwen3_5Model;
 module.exports.Qwen35MoeModel = nativeBinding.Qwen35MoeModel;

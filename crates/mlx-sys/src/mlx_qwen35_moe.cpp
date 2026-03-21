@@ -788,4 +788,23 @@ void mlx_qwen35_moe_reset() {
   g_weight_transposes_3d.clear();
 }
 
+// Export MoE caches for PromptCache reuse.
+// Copies cache arrays to caller-provided output pointers (heap-allocated).
+// Returns number of arrays exported, or 0 if not initialized.
+int mlx_qwen35_moe_export_caches(mlx_array** out_ptrs, int max_count) {
+  if (!g_moe_inited || g_moe_caches.empty()) return 0;
+  int count = std::min((int)g_moe_caches.size(), max_count);
+  for (int i = 0; i < count; i++) {
+    // Heap-allocate a copy — MLX arrays are ref-counted internally,
+    // so the underlying Metal buffer is shared (not duplicated).
+    out_ptrs[i] = reinterpret_cast<mlx_array*>(new array(g_moe_caches[i]));
+  }
+  return count;
+}
+
+// Get current MoE cache offset (number of tokens processed).
+int mlx_qwen35_moe_get_cache_offset() {
+  return g_moe_offset_int;
+}
+
 }  // extern "C"
