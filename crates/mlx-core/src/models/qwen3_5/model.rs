@@ -1033,7 +1033,7 @@ impl Qwen3_5Model {
 
             // Profiler — covers both compiled and rust chat decode paths
             let mut profiler = crate::decode_profiler::DecodeProfiler::new("chat", "qwen3_5");
-            profiler.set_prompt_tokens(tokens.len() as u32);
+            profiler.set_prompt_tokens(prefill_tokens.len() as u32);
             profiler.snapshot_memory_before();
 
             // === VLM or text prefill branching ===
@@ -1481,14 +1481,14 @@ impl Qwen3_5Model {
                 (generation_start, first_token_instant)
             {
                 let generation_end = std::time::Instant::now();
-                let prompt_toks = tokens.len() as f64;
+                let actual_prefill_toks = prefill_tokens.len() as f64;
                 let gen_toks = generated_tokens.len() as f64;
                 let ttft_ms = first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
                 let decode_ms = generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
                 Some(crate::profiling::PerformanceMetrics {
                     ttft_ms,
                     prefill_tokens_per_second: if ttft_ms > 0.0 {
-                        prompt_toks / (ttft_ms / 1000.0)
+                        actual_prefill_toks / (ttft_ms / 1000.0)
                     } else {
                         0.0
                     },
@@ -1772,7 +1772,7 @@ impl Qwen3_5Model {
                     // Profiler — covers both compiled and rust chat_stream decode paths
                     let mut profiler =
                         crate::decode_profiler::DecodeProfiler::new("chat_stream", "qwen3_5");
-                    profiler.set_prompt_tokens(tokens.len() as u32);
+                    profiler.set_prompt_tokens(prefill_tokens.len() as u32);
                     profiler.snapshot_memory_before();
 
                     // === VLM or text prefill branching ===
@@ -2226,7 +2226,7 @@ impl Qwen3_5Model {
                         (generation_start, first_token_instant)
                     {
                         let generation_end = std::time::Instant::now();
-                        let prompt_toks = tokens.len() as f64;
+                        let actual_prefill_toks = prefill_tokens.len() as f64;
                         let gen_toks = generated_tokens.len() as f64;
                         let ttft_ms = first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
                         let decode_ms =
@@ -2234,7 +2234,7 @@ impl Qwen3_5Model {
                         Some(crate::profiling::PerformanceMetrics {
                             ttft_ms,
                             prefill_tokens_per_second: if ttft_ms > 0.0 {
-                                prompt_toks / (ttft_ms / 1000.0)
+                                actual_prefill_toks / (ttft_ms / 1000.0)
                             } else {
                                 0.0
                             },

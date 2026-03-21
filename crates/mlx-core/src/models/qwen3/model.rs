@@ -5356,8 +5356,14 @@ impl Qwen3Model {
                 (None, None, 0, Some(input_ids.clone()))
             };
 
+        // Actual prefill count: delta tokens on cache hit, full prompt on miss
+        let actual_prefill_count = match &prefill_input_ids {
+            Some(ids) => ids.shape_at(1).unwrap_or(token_ids_vec.len() as i64) as f64,
+            None => 1.0, // Cache hit with zero delta — re-runs last token
+        };
+
         // Generate tokens using the internal generate method with optional cache state
-        let prompt_token_count = token_ids_vec.len() as f64;
+        let prompt_token_count = actual_prefill_count;
         let config = gen_config.unwrap_or_default();
 
         let embedding_weight = self.embedding.get_weight();
