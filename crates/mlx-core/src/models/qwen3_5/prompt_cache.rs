@@ -18,6 +18,8 @@ pub struct PromptCache {
     pub(crate) token_history: Vec<u32>,
     /// Model type identifier for validation
     pub(crate) model_type: String,
+    /// Image cache key for VLM cache reuse (None for text-only)
+    pub(crate) image_cache_key: Option<u64>,
 }
 
 #[napi]
@@ -39,6 +41,7 @@ impl PromptCache {
     pub fn dispose(&mut self) {
         self.caches = None;
         self.token_history.clear();
+        self.image_cache_key = None;
     }
 }
 
@@ -53,11 +56,11 @@ impl PromptCache {
             caches: Some(caches),
             token_history,
             model_type: model_type.to_string(),
+            image_cache_key: None,
         }
     }
 
     /// Take ownership of the caches, leaving this cache empty.
-    /// Returns None if already consumed.
     pub(crate) fn take_caches(&mut self) -> Option<Vec<Qwen3_5LayerCache>> {
         self.caches.take()
     }
@@ -71,6 +74,4 @@ impl PromptCache {
     pub(crate) fn model_type(&self) -> &str {
         &self.model_type
     }
-
-
 }

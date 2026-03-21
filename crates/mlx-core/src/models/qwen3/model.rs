@@ -132,6 +132,14 @@ pub struct Qwen3Model {
     paged_cache: Option<Arc<RwLock<PagedKVCache>>>,
     /// Scheduler for continuous batching (optional)
     scheduler: Option<Arc<RwLock<ContinuousBatchingScheduler>>>,
+
+    /// KV cache arrays for cache reuse across chat() calls
+    cached_kv_keys: Arc<RwLock<Vec<Option<MxArray>>>>,
+    cached_kv_values: Arc<RwLock<Vec<Option<MxArray>>>>,
+    /// Cache index (number of tokens in cache)
+    cached_cache_idx: Arc<RwLock<i32>>,
+    /// Token history for prefix verification
+    cached_token_history: Arc<RwLock<Vec<u32>>>,
 }
 
 #[napi]
@@ -231,7 +239,30 @@ impl Qwen3Model {
             tokenizer: None,
             paged_cache,
             scheduler,
+            cached_kv_keys: Arc::new(RwLock::new(Vec::new())),
+            cached_kv_values: Arc::new(RwLock::new(Vec::new())),
+            cached_cache_idx: Arc::new(RwLock::new(0)),
+            cached_token_history: Arc::new(RwLock::new(Vec::new())),
         })
+    }
+
+    /// Reset the KV cache used for cache reuse across chat() calls.
+    /// Call this when starting a new conversation to ensure a full prefill.
+    #[napi]
+    pub fn reset_cache(&self) -> Result<()> {
+        if let Ok(mut keys) = self.cached_kv_keys.write() {
+            keys.clear();
+        }
+        if let Ok(mut vals) = self.cached_kv_values.write() {
+            vals.clear();
+        }
+        if let Ok(mut idx) = self.cached_cache_idx.write() {
+            *idx = 0;
+        }
+        if let Ok(mut th) = self.cached_token_history.write() {
+            th.clear();
+        }
+        Ok(())
     }
 
     /// Forward pass through the model
@@ -1302,6 +1333,10 @@ impl Qwen3Model {
             // Don't clone paged attention for training - use standard KVCache
             paged_cache: None,
             scheduler: None,
+            cached_kv_keys: Arc::new(RwLock::new(Vec::new())),
+            cached_kv_values: Arc::new(RwLock::new(Vec::new())),
+            cached_cache_idx: Arc::new(RwLock::new(0)),
+            cached_token_history: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -5178,13 +5213,17 @@ impl Qwen3Model {
             )
         })?;
 
-        // Extract tools, enable_thinking, and report_performance from config
+        // Extract tools, enable_thinking, report_performance, and reuse_cache from config
         let tools = config.as_ref().and_then(|c| c.tools.clone());
         let enable_thinking = config.as_ref().and_then(|c| c.enable_thinking);
         let report_perf = config
             .as_ref()
             .and_then(|c| c.report_performance)
             .unwrap_or(false);
+        let reuse_cache = config
+            .as_ref()
+            .and_then(|c| c.reuse_cache)
+            .unwrap_or(true);
 
         // Convert ChatConfig to GenerationConfig for the internal generate call
         let gen_config = config.map(|c| GenerationConfig {
@@ -5215,9 +5254,10 @@ impl Qwen3Model {
             None
         };
 
-        // Apply chat template with tools and encode in a blocking task
+        // Apply chat template with tools and encode in a blocking task.
+        // Return both the token IDs (Vec<u32>) and the MxArray for prefix matching.
         let tokenizer_clone = tokenizer.clone();
-        let input_ids = napi::bindgen_prelude::spawn_blocking(move || {
+        let (token_ids_vec, input_ids) = napi::bindgen_prelude::spawn_blocking(move || {
             // Use the tokenizer's apply_chat_template_sync method which handles Jinja2 + tools
             let token_ids = tokenizer_clone.apply_chat_template_sync(
                 &messages,
@@ -5227,7 +5267,8 @@ impl Qwen3Model {
             )?;
 
             // Create MxArray from token IDs
-            MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])
+            let arr = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
+            Ok::<(Vec<u32>, MxArray), napi::Error>((token_ids, arr))
         })
         .await
         .map_err(|e| {
@@ -5237,9 +5278,479 @@ impl Qwen3Model {
             )
         })??;
 
-        // Generate tokens using the internal generate method
-        let prompt_token_count = input_ids.shape_at(1).unwrap_or(0) as f64;
-        let result = self.generate_for_training(&input_ids, gen_config).await?;
+        // === Cache reuse: prefix verification ===
+        let (initial_kv_keys, initial_kv_values, initial_cache_idx, prefill_input_ids) =
+            if reuse_cache {
+                let (prefix_len, cached_len) = {
+                    let cached_th = self
+                        .cached_token_history
+                        .read()
+                        .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
+                    let cached = &*cached_th;
+                    let clen = cached.len();
+
+                    // Prefix match: new token sequence must start with the cached sequence
+                    let plen = if !cached.is_empty()
+                        && token_ids_vec.len() >= clen
+                        && token_ids_vec[..clen] == cached[..]
+                    {
+                        clen
+                    } else {
+                        0
+                    };
+                    (plen, clen)
+                }; // cached_th lock dropped here
+
+                if prefix_len > 0 {
+                    // Cache hit: restore cached KV state and only prefill delta tokens
+                    let cached_keys = self
+                        .cached_kv_keys
+                        .read()
+                        .map_err(|_| Error::from_reason("Failed to read cached kv keys"))?;
+                    let cached_vals = self
+                        .cached_kv_values
+                        .read()
+                        .map_err(|_| Error::from_reason("Failed to read cached kv values"))?;
+                    let cached_idx = self
+                        .cached_cache_idx
+                        .read()
+                        .map_err(|_| Error::from_reason("Failed to read cached cache idx"))?;
+
+                    let keys = cached_keys.clone();
+                    let vals = cached_vals.clone();
+                    let idx = *cached_idx;
+                    drop(cached_keys);
+                    drop(cached_vals);
+                    drop(cached_idx);
+
+                    // Delta tokens: everything after the cached prefix
+                    let delta_tokens = &token_ids_vec[prefix_len..];
+                    let delta_ids = if delta_tokens.is_empty() {
+                        // No new prompt tokens — entire prompt was cached.
+                        // Re-run the last token to get logits for sampling.
+                        None
+                    } else {
+                        Some(MxArray::from_uint32(
+                            delta_tokens,
+                            &[1, delta_tokens.len() as i64],
+                        )?)
+                    };
+
+                    info!(
+                        "Cache hit: prefix_len={}, delta_tokens={}, cache_idx={}",
+                        prefix_len,
+                        delta_tokens.len(),
+                        idx
+                    );
+
+                    (Some(keys), Some(vals), idx, delta_ids)
+                } else {
+                    // Cache miss: full prefill
+                    if cached_len > 0 {
+                        info!(
+                            "Cache miss: cached {} tokens, new {} tokens — full prefill",
+                            cached_len,
+                            token_ids_vec.len()
+                        );
+                    }
+                    (None, None, 0, Some(input_ids.clone()))
+                }
+            } else {
+                (None, None, 0, Some(input_ids.clone()))
+            };
+
+        // Generate tokens using the internal generate method with optional cache state
+        let prompt_token_count = token_ids_vec.len() as f64;
+        let config = gen_config.unwrap_or_default();
+
+        let embedding_weight = self.embedding.get_weight();
+        let layers_arc = self.layers.clone();
+        let final_norm_arc = self.final_norm.clone();
+        let lm_head_arc = self.lm_head.clone();
+        let model_config = self.config.clone();
+        let cached_kv_keys_arc = self.cached_kv_keys.clone();
+        let cached_kv_values_arc = self.cached_kv_values.clone();
+        let cached_cache_idx_arc = self.cached_cache_idx.clone();
+        let cached_token_history_arc = self.cached_token_history.clone();
+
+        let result = napi::bindgen_prelude::spawn_blocking(move || {
+            let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
+            let temperature = config.temperature.unwrap_or(0.7);
+            let top_k = config.top_k.unwrap_or(0);
+            let top_p = config.top_p.unwrap_or(0.9);
+            let min_p = config.min_p.unwrap_or(0.0);
+            let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+            let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+            let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+            let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+            let ngram_size = config.ngram_size.unwrap_or(64);
+            let eos_token_id = config.eos_token_id.or(Some(model_config.eos_token_id));
+            let return_logprobs = config.return_logprobs.unwrap_or(false);
+            let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
+            let report_performance = config.report_performance.unwrap_or(false);
+
+            // Acquire read locks
+            let layers_guard = layers_arc.read().map_err(|_| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire layers read lock",
+                )
+            })?;
+            let final_norm_guard = final_norm_arc.read().map_err(|_| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire final_norm read lock",
+                )
+            })?;
+            let lm_head_guard = lm_head_arc.read().map_err(|_| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire lm_head read lock",
+                )
+            })?;
+            let layers = &*layers_guard;
+            let final_norm = &*final_norm_guard;
+            let lm_head = &*lm_head_guard;
+
+            let generation_stream = Stream::new(DeviceType::Gpu);
+
+            // Initialize KV caches: restore from cache or create fresh
+            let num_layers = layers.len();
+            let mut kv_keys = initial_kv_keys
+                .unwrap_or_else(|| vec![None; num_layers]);
+            let mut kv_values = initial_kv_values
+                .unwrap_or_else(|| vec![None; num_layers]);
+            let mut cache_idx: i32 = initial_cache_idx;
+
+            // rope_offsets starts at cache_idx (0 for fresh, or restored value for cache hit)
+            let mut rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
+            let left_padding = MxArray::from_int32(&[0], &[1])?;
+
+            let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+            let mut generated_logprobs: Vec<f32> = if return_logprobs {
+                Vec::with_capacity(max_new_tokens as usize)
+            } else {
+                Vec::new()
+            };
+            let mut finish_reason = "length";
+
+            let sampling_config = SamplingConfig {
+                temperature: Some(temperature),
+                top_k: Some(top_k),
+                top_p: Some(top_p),
+                min_p: Some(min_p),
+            };
+
+            // Track timing for TTFT
+            let decode_start = if report_performance {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let mut first_token_elapsed_ms: Option<f64> = None;
+
+            // PREFILL: Process delta tokens (or full prompt if no cache hit)
+            let mut last_logits = if let Some(current_ids) = prefill_input_ids {
+                let total_seq_len = current_ids.shape_at(1)? as usize;
+                let use_chunked_prefill =
+                    prefill_step_size > 0 && total_seq_len > prefill_step_size;
+
+                if use_chunked_prefill {
+                    let mut offset = 0usize;
+
+                    while offset + prefill_step_size < total_seq_len {
+                        let chunk_end = offset + prefill_step_size;
+                        let chunk =
+                            current_ids.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
+                        rope_offsets =
+                            MxArray::from_int32(&[cache_idx + offset as i32], &[1])?;
+
+                        {
+                            let _stream_ctx = StreamContext::new(generation_stream);
+                            let _ = Self::forward_fused(
+                                &chunk,
+                                &embedding_weight,
+                                layers,
+                                final_norm,
+                                lm_head,
+                                &model_config,
+                                &mut kv_keys,
+                                &mut kv_values,
+                                &mut cache_idx,
+                                &rope_offsets,
+                                &left_padding,
+                            )?;
+                        }
+
+                        for kv_key in kv_keys.iter().flatten() {
+                            kv_key.eval();
+                        }
+                        for kv_value in kv_values.iter().flatten() {
+                            kv_value.eval();
+                        }
+                        synchronize_and_clear_cache();
+                        offset = chunk_end;
+                    }
+
+                    // Final chunk
+                    let final_chunk =
+                        current_ids.slice(&[0, offset as i64], &[1, total_seq_len as i64])?;
+                    rope_offsets =
+                        MxArray::from_int32(&[cache_idx + offset as i32], &[1])?;
+
+                    let logits = {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        Self::forward_fused(
+                            &final_chunk,
+                            &embedding_weight,
+                            layers,
+                            final_norm,
+                            lm_head,
+                            &model_config,
+                            &mut kv_keys,
+                            &mut kv_values,
+                            &mut cache_idx,
+                            &rope_offsets,
+                            &left_padding,
+                        )?
+                    };
+
+                    let chunk_seq_len = logits.shape_at(1)?;
+                    logits
+                        .slice_axis(1, chunk_seq_len - 1, chunk_seq_len)?
+                        .squeeze(Some(&[0, 1]))?
+                } else {
+                    // Single-pass prefill
+                    let logits = {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        Self::forward_fused(
+                            &current_ids,
+                            &embedding_weight,
+                            layers,
+                            final_norm,
+                            lm_head,
+                            &model_config,
+                            &mut kv_keys,
+                            &mut kv_values,
+                            &mut cache_idx,
+                            &rope_offsets,
+                            &left_padding,
+                        )?
+                    };
+
+                    let seq_len = logits.shape_at(1)?;
+                    logits
+                        .slice_axis(1, seq_len - 1, seq_len)?
+                        .squeeze(Some(&[0, 1]))?
+                }
+            } else {
+                // No delta tokens — entire prompt was cached.
+                // Re-run the last cached token to get logits for sampling.
+                let last_token_id = token_ids_vec[token_ids_vec.len() - 1];
+                // Rewind cache_idx by 1 so the last token is re-processed
+                cache_idx -= 1;
+                rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
+                let last_token =
+                    MxArray::from_uint32(&[last_token_id], &[1, 1])?;
+
+                let logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    Self::forward_fused(
+                        &last_token,
+                        &embedding_weight,
+                        layers,
+                        final_norm,
+                        lm_head,
+                        &model_config,
+                        &mut kv_keys,
+                        &mut kv_values,
+                        &mut cache_idx,
+                        &rope_offsets,
+                        &left_padding,
+                    )?
+                };
+
+                logits.squeeze(Some(&[0, 1]))?
+            };
+
+            // Update rope_offsets after prefill
+            rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
+
+            // Apply repetition penalty if enabled
+            if repetition_penalty != 1.0 && !token_ids_vec.is_empty() {
+                last_logits = apply_repetition_penalty(
+                    &last_logits,
+                    &token_ids_vec,
+                    repetition_penalty,
+                    Some(repetition_context_size),
+                )?;
+            }
+
+            // Sample first token
+            let (mut token, mut logprobs_arr) = if return_logprobs {
+                let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
+                (tok, Some(lp))
+            } else {
+                let tok = sample(&last_logits, Some(sampling_config))?;
+                (tok, None)
+            };
+
+            // Decode loop
+            const DECODE_CLEANUP_INTERVAL: i32 = 256;
+            let one_arr = MxArray::from_int32(&[1], &[1])?;
+
+            for step in 0..max_new_tokens {
+                let _stream_ctx = StreamContext::new(generation_stream);
+
+                token.eval();
+
+                if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
+                    synchronize_and_clear_cache();
+                }
+
+                let token_value = token.item_at_int32(0)? as u32;
+                if let Some(ds) = decode_start
+                    && first_token_elapsed_ms.is_none()
+                {
+                    first_token_elapsed_ms = Some(ds.elapsed().as_secs_f64() * 1000.0);
+                }
+
+                generated_tokens.push(token_value);
+
+                if return_logprobs && let Some(ref lp) = logprobs_arr {
+                    lp.eval();
+                    let token_logprob = lp.item_at_float32(token_value as usize)?;
+                    generated_logprobs.push(token_logprob);
+                }
+
+                if let Some(reason) = check_repetition_cutoff(
+                    &generated_tokens,
+                    max_consecutive_tokens,
+                    max_ngram_repeats,
+                    ngram_size,
+                ) {
+                    finish_reason = reason;
+                    break;
+                }
+
+                if let Some(eos_id) = eos_token_id
+                    && token_value == eos_id as u32
+                {
+                    finish_reason = "stop";
+                    break;
+                }
+
+                // Forward pass with just the new token
+                let next_input = MxArray::from_uint32(&[token_value], &[1, 1])?;
+                let next_logits = Self::forward_fused(
+                    &next_input,
+                    &embedding_weight,
+                    layers,
+                    final_norm,
+                    lm_head,
+                    &model_config,
+                    &mut kv_keys,
+                    &mut kv_values,
+                    &mut cache_idx,
+                    &rope_offsets,
+                    &left_padding,
+                )?;
+                rope_offsets = rope_offsets.add(&one_arr)?;
+
+                let next_last_logits =
+                    next_logits.slice_axis(1, 0, 1)?.squeeze(Some(&[0, 1]))?;
+
+                last_logits = if repetition_penalty != 1.0 {
+                    let context_tokens: Vec<u32> = token_ids_vec
+                        .iter()
+                        .copied()
+                        .chain(generated_tokens.iter().copied())
+                        .collect();
+                    apply_repetition_penalty(
+                        &next_last_logits,
+                        &context_tokens,
+                        repetition_penalty,
+                        Some(repetition_context_size),
+                    )?
+                } else {
+                    next_last_logits
+                };
+
+                let (next_tok, next_lp) = if return_logprobs {
+                    let (tok, lp) =
+                        sample_and_logprobs(&last_logits, Some(sampling_config))?;
+                    (tok, Some(lp))
+                } else {
+                    (sample(&last_logits, Some(sampling_config))?, None)
+                };
+
+                token = next_tok;
+                logprobs_arr = next_lp;
+            }
+
+            // === Save cache state for reuse ===
+            if reuse_cache {
+                // Save KV caches
+                if let Ok(mut keys_guard) = cached_kv_keys_arc.write() {
+                    *keys_guard = kv_keys;
+                }
+                if let Ok(mut vals_guard) = cached_kv_values_arc.write() {
+                    *vals_guard = kv_values;
+                }
+                if let Ok(mut idx_guard) = cached_cache_idx_arc.write() {
+                    *idx_guard = cache_idx;
+                }
+                // Save token history: prompt tokens + generated tokens
+                if let Ok(mut th) = cached_token_history_arc.write() {
+                    let mut full_history = token_ids_vec.clone();
+                    full_history.extend_from_slice(&generated_tokens);
+                    *th = full_history;
+                }
+            } else {
+                // Clear cache state when reuse is disabled
+                if let Ok(mut keys_guard) = cached_kv_keys_arc.write() {
+                    keys_guard.clear();
+                }
+                if let Ok(mut vals_guard) = cached_kv_values_arc.write() {
+                    vals_guard.clear();
+                }
+                if let Ok(mut idx_guard) = cached_cache_idx_arc.write() {
+                    *idx_guard = 0;
+                }
+                if let Ok(mut th) = cached_token_history_arc.write() {
+                    th.clear();
+                }
+            }
+
+            // Build result
+            let tokens_array =
+                MxArray::from_uint32(&generated_tokens, &[generated_tokens.len() as i64])?;
+            let logprobs_array = if return_logprobs {
+                MxArray::from_float32(
+                    &generated_logprobs,
+                    &[generated_logprobs.len() as i64],
+                )?
+            } else {
+                MxArray::from_float32(&[], &[0])?
+            };
+
+            Ok::<GenerationResult, napi::Error>(GenerationResult {
+                text: String::new(),
+                tokens: tokens_array,
+                logprobs: logprobs_array,
+                finish_reason: finish_reason.to_string(),
+                num_tokens: generated_tokens.len(),
+                first_token_elapsed_ms,
+            })
+        })
+        .await
+        .map_err(|join_error| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Chat generation thread panicked: {}", join_error),
+            )
+        })??;
+
         let gen_elapsed = gen_start.map(|s| s.elapsed());
 
         // Decode the generated tokens in a blocking task
@@ -5272,7 +5783,6 @@ impl Qwen3Model {
         {
             let total_ms = gen_elapsed.as_secs_f64() * 1000.0;
             let gen_toks = result.num_tokens as f64;
-            // TTFT = gen_start → first token extracted (includes tokenization + prefill + first eval)
             let ttft_ms = first_tok_ms;
             let decode_ms = total_ms - ttft_ms;
             Some(crate::profiling::PerformanceMetrics {

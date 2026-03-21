@@ -233,6 +233,8 @@ pub struct Qwen3_5Model {
     /// Token history for KV cache reuse across chat() calls.
     /// Stores the full token sequence (template + generated) from the last call.
     cached_token_history: Arc<RwLock<Vec<u32>>>,
+    /// Image cache key for VLM cache reuse (None for text-only conversations).
+    cached_image_key: Arc<RwLock<Option<u64>>>,
 }
 
 #[napi]
@@ -285,6 +287,7 @@ impl Qwen3_5Model {
                 generation: 0,
             })),
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
+            cached_image_key: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -811,6 +814,7 @@ impl Qwen3_5Model {
         let lm_head_arc = self.lm_head.clone();
         let caches_arc = self.caches.clone();
         let cached_token_history_arc = self.cached_token_history.clone();
+        let cached_image_key_arc = self.cached_image_key.clone();
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
         let tokenizer_for_decode = tokenizer.clone();
@@ -888,20 +892,62 @@ impl Qwen3_5Model {
                 .read()
                 .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
 
+            // === VLM image processing (before cache check, needed for expanded tokens) ===
+            let sms = spatial_merge_size.unwrap_or(2);
+            let (expanded_tokens, current_image_cache_key) = if has_images {
+                if let (Some(_vision_enc), Some(img_proc)) = (
+                    vision_encoder_arc.as_ref(),
+                    image_processor_arc.as_ref(),
+                ) {
+                    let all_images = extract_images_from_messages(&messages);
+                    let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
+                    let processed_pre = img_proc.process_many(&image_refs)?;
+                    let num_image_tokens = compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
+                    let expanded = inject_image_placeholders(&tokens, num_image_tokens);
+                    let cache_key = compute_image_cache_key(&all_images);
+                    (expanded, cache_key)
+                } else {
+                    (tokens.clone(), 0u64)
+                }
+            } else {
+                (tokens.clone(), 0u64)
+            };
+
             // === Cache reuse: prefix verification ===
             let cached_token_history_guard = cached_token_history_arc
                 .read()
                 .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
-            let cached_prefix_len = if reuse_cache && !has_images {
+            let cached_prefix_len = if reuse_cache {
                 let cached = &*cached_token_history_guard;
-                if !cached.is_empty()
-                    && tokens.len() >= cached.len()
-                    && tokens[..cached.len()] == cached[..]
-                    && caches_guard.is_some()
-                {
-                    cached.len()
+                if has_images {
+                    // VLM: check image_cache_key matches AND expanded token prefix matches
+                    let cached_img_key = cached_image_key_arc.read()
+                        .map_err(|_| Error::from_reason("Failed to read cached image key"))?;
+                    if let Some(cached_key) = *cached_img_key {
+                        if cached_key == current_image_cache_key
+                            && !cached.is_empty()
+                            && expanded_tokens.len() >= cached.len()
+                            && expanded_tokens[..cached.len()] == cached[..]
+                            && caches_guard.is_some()
+                        {
+                            cached.len()
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    }
                 } else {
-                    0
+                    // Text-only: existing logic unchanged
+                    if !cached.is_empty()
+                        && tokens.len() >= cached.len()
+                        && tokens[..cached.len()] == cached[..]
+                        && caches_guard.is_some()
+                    {
+                        cached.len()
+                    } else {
+                        0
+                    }
                 }
             } else {
                 0
@@ -909,12 +955,21 @@ impl Qwen3_5Model {
             drop(cached_token_history_guard);
 
             let prefill_tokens = if cached_prefix_len > 0 {
-                info!(
-                    "Cache reuse: {} cached tokens, {} new tokens to prefill",
-                    cached_prefix_len,
-                    tokens.len() - cached_prefix_len
-                );
-                tokens[cached_prefix_len..].to_vec()
+                if has_images {
+                    info!(
+                        "VLM cache reuse: {} cached tokens, {} new tokens to prefill",
+                        cached_prefix_len,
+                        expanded_tokens.len() - cached_prefix_len
+                    );
+                    expanded_tokens[cached_prefix_len..].to_vec()
+                } else {
+                    info!(
+                        "Cache reuse: {} cached tokens, {} new tokens to prefill",
+                        cached_prefix_len,
+                        tokens.len() - cached_prefix_len
+                    );
+                    tokens[cached_prefix_len..].to_vec()
+                }
             } else {
                 // Full reset
                 if let Some(ref mut caches) = *caches_guard {
@@ -954,49 +1009,48 @@ impl Qwen3_5Model {
             // vlm_compiled_init_done: true if vlm_prefill already called compiled_init_from_prefill
             profiler.begin_prefill();
             let (mut last_logits, seq_len, vlm_compiled_init_done) =
-                if let (true, Some(vision_enc), Some(img_proc)) = (
-                    has_images,
-                    vision_encoder_arc.as_ref(),
-                    image_processor_arc.as_ref(),
-                ) {
-                    // --- VLM path: process images and run VLM prefill ---
-                    let sms = spatial_merge_size.unwrap_or(2);
-                    let all_images = extract_images_from_messages(&messages);
+                if has_images && cached_prefix_len == 0 {
+                    // --- VLM full prefill (first call or different images) ---
+                    if let (Some(vision_enc), Some(img_proc)) = (
+                        vision_encoder_arc.as_ref(),
+                        image_processor_arc.as_ref(),
+                    ) {
+                        let all_images = extract_images_from_messages(&messages);
+                        let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
+                        let processed = img_proc.process_many(&image_refs)?;
+                        let num_image_tokens = compute_num_image_tokens(&processed.grid_thw(), sms)?;
+                        let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
+                        let image_cache_key = compute_image_cache_key(&all_images);
 
-                    // Process images and inject placeholders
-                    let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
-                    let processed = img_proc.process_many(&image_refs)?;
-                    let num_image_tokens = compute_num_image_tokens(&processed.grid_thw(), sms)?;
-                    let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
+                        let input_ids =
+                            MxArray::from_uint32(&final_tokens, &[1, final_tokens.len() as i64])?;
 
-                    // Compute vision cache key from raw image bytes
-                    let image_cache_key = compute_image_cache_key(&all_images);
+                        let (logits, _rope_deltas) = vlm_prefill(
+                            &input_ids,
+                            image_cache_key,
+                            &processed,
+                            vision_enc,
+                            sms,
+                            &embedding_weight,
+                            &mut layers_guard,
+                            &mut caches_guard,
+                            &final_norm_guard,
+                            &lm_head_guard,
+                            &model_config,
+                            max_new_tokens,
+                            generation_stream,
+                            &vision_cache,
+                        )?;
 
-                    let input_ids =
-                        MxArray::from_uint32(&final_tokens, &[1, final_tokens.len() as i64])?;
-
-                    let (logits, _rope_deltas) = vlm_prefill(
-                        &input_ids,
-                        image_cache_key,
-                        &processed,
-                        vision_enc,
-                        sms,
-                        &embedding_weight,
-                        &mut layers_guard,
-                        &mut caches_guard,
-                        &final_norm_guard,
-                        &lm_head_guard,
-                        &model_config,
-                        max_new_tokens,
-                        generation_stream,
-                        &vision_cache,
-                    )?;
-
-                    // VLM prefill already did compiled_init_from_prefill for compiled path
-                    let vlm_seq_len = final_tokens.len() as i64;
-                    (logits, vlm_seq_len, use_compiled)
+                        let vlm_seq_len = final_tokens.len() as i64;
+                        (logits, vlm_seq_len, use_compiled)
+                    } else {
+                        return Err(Error::from_reason(
+                            "VLM prefill requested but vision encoder/processor not loaded",
+                        ));
+                    }
                 } else {
-                    // --- Standard text prefill path ---
+                    // --- Text prefill path (text-only OR VLM cache reuse with same images) ---
                     let prompt = MxArray::from_uint32(
                         &prefill_tokens,
                         &[1, prefill_tokens.len() as i64],
@@ -1020,7 +1074,13 @@ impl Qwen3_5Model {
                     let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
                     let last_logits = last_logits.squeeze(Some(&[1]))?;
                     // seq_len for the C++ init is the TOTAL tokens (cached + new)
-                    (last_logits, tokens.len() as i64, false)
+                    // For VLM cache reuse, use expanded_tokens length; for text-only, use tokens length
+                    let total_seq_len = if has_images {
+                        expanded_tokens.len() as i64
+                    } else {
+                        tokens.len() as i64
+                    };
+                    (last_logits, total_seq_len, false)
                 };
             profiler.end_prefill();
 
@@ -1321,16 +1381,30 @@ impl Qwen3_5Model {
 
             // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
 
-            // === Save token history for cache reuse on next call ===
+            // === Save token history and image key for cache reuse on next call ===
             if reuse_cache {
-                let mut full_history = tokens.clone();
+                let mut full_history = if has_images {
+                    expanded_tokens.clone()
+                } else {
+                    tokens.clone()
+                };
                 full_history.extend_from_slice(&generated_tokens);
                 if let Ok(mut th) = cached_token_history_arc.write() {
                     *th = full_history;
                 }
+                if let Ok(mut ik) = cached_image_key_arc.write() {
+                    *ik = if has_images {
+                        Some(current_image_cache_key)
+                    } else {
+                        None
+                    };
+                }
             } else {
                 if let Ok(mut th) = cached_token_history_arc.write() {
                     th.clear();
+                }
+                if let Ok(mut ik) = cached_image_key_arc.write() {
+                    *ik = None;
                 }
             }
 
@@ -1446,6 +1520,7 @@ impl Qwen3_5Model {
         let lm_head_arc = self.lm_head.clone();
         let caches_arc = self.caches.clone();
         let cached_token_history_arc = self.cached_token_history.clone();
+        let cached_image_key_arc = self.cached_image_key.clone();
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
         let tokenizer_for_decode = tokenizer.clone();
@@ -1533,20 +1608,62 @@ impl Qwen3_5Model {
                         .read()
                         .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
 
+                    // === VLM image processing (before cache check, needed for expanded tokens) ===
+                    let sms = spatial_merge_size.unwrap_or(2);
+                    let (expanded_tokens, current_image_cache_key) = if has_images {
+                        if let (Some(_vision_enc), Some(img_proc)) = (
+                            vision_encoder_arc.as_ref(),
+                            image_processor_arc.as_ref(),
+                        ) {
+                            let all_images = extract_images_from_messages(&messages);
+                            let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
+                            let processed_pre = img_proc.process_many(&image_refs)?;
+                            let num_image_tokens = compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
+                            let expanded = inject_image_placeholders(&tokens, num_image_tokens);
+                            let cache_key = compute_image_cache_key(&all_images);
+                            (expanded, cache_key)
+                        } else {
+                            (tokens.clone(), 0u64)
+                        }
+                    } else {
+                        (tokens.clone(), 0u64)
+                    };
+
                     // === Cache reuse: prefix verification ===
                     let cached_token_history_guard = cached_token_history_arc
                         .read()
                         .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
-                    let cached_prefix_len = if reuse_cache && !has_images {
+                    let cached_prefix_len = if reuse_cache {
                         let cached = &*cached_token_history_guard;
-                        if !cached.is_empty()
-                            && tokens.len() >= cached.len()
-                            && tokens[..cached.len()] == cached[..]
-                            && caches_guard.is_some()
-                        {
-                            cached.len()
+                        if has_images {
+                            // VLM: check image_cache_key matches AND expanded token prefix matches
+                            let cached_img_key = cached_image_key_arc.read()
+                                .map_err(|_| Error::from_reason("Failed to read cached image key"))?;
+                            if let Some(cached_key) = *cached_img_key {
+                                if cached_key == current_image_cache_key
+                                    && !cached.is_empty()
+                                    && expanded_tokens.len() >= cached.len()
+                                    && expanded_tokens[..cached.len()] == cached[..]
+                                    && caches_guard.is_some()
+                                {
+                                    cached.len()
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            }
                         } else {
-                            0
+                            // Text-only: existing logic unchanged
+                            if !cached.is_empty()
+                                && tokens.len() >= cached.len()
+                                && tokens[..cached.len()] == cached[..]
+                                && caches_guard.is_some()
+                            {
+                                cached.len()
+                            } else {
+                                0
+                            }
                         }
                     } else {
                         0
@@ -1554,12 +1671,21 @@ impl Qwen3_5Model {
                     drop(cached_token_history_guard);
 
                     let prefill_tokens = if cached_prefix_len > 0 {
-                        info!(
-                            "Cache reuse: {} cached tokens, {} new tokens to prefill",
-                            cached_prefix_len,
-                            tokens.len() - cached_prefix_len
-                        );
-                        tokens[cached_prefix_len..].to_vec()
+                        if has_images {
+                            info!(
+                                "VLM cache reuse: {} cached tokens, {} new tokens to prefill",
+                                cached_prefix_len,
+                                expanded_tokens.len() - cached_prefix_len
+                            );
+                            expanded_tokens[cached_prefix_len..].to_vec()
+                        } else {
+                            info!(
+                                "Cache reuse: {} cached tokens, {} new tokens to prefill",
+                                cached_prefix_len,
+                                tokens.len() - cached_prefix_len
+                            );
+                            tokens[cached_prefix_len..].to_vec()
+                        }
                     } else {
                         // Full reset
                         if let Some(ref mut caches) = *caches_guard {
@@ -1602,53 +1728,52 @@ impl Qwen3_5Model {
                     // vlm_compiled_init_done: true if vlm_prefill already called compiled_init_from_prefill
                     profiler.begin_prefill();
                     let (mut last_logits, seq_len, vlm_compiled_init_done) =
-                        if let (true, Some(vision_enc), Some(img_proc)) = (
-                            has_images,
-                            vision_encoder_arc.as_ref(),
-                            image_processor_arc.as_ref(),
-                        ) {
-                            // --- VLM path: process images and run VLM prefill ---
-                            let sms = spatial_merge_size.unwrap_or(2);
-                            let all_images = extract_images_from_messages(&messages);
+                        if has_images && cached_prefix_len == 0 {
+                            // --- VLM full prefill (first call or different images) ---
+                            if let (Some(vision_enc), Some(img_proc)) = (
+                                vision_encoder_arc.as_ref(),
+                                image_processor_arc.as_ref(),
+                            ) {
+                                let all_images = extract_images_from_messages(&messages);
+                                let image_refs: Vec<&[u8]> =
+                                    all_images.iter().map(|v| v.as_slice()).collect();
+                                let processed = img_proc.process_many(&image_refs)?;
+                                let num_image_tokens =
+                                    compute_num_image_tokens(&processed.grid_thw(), sms)?;
+                                let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
+                                let image_cache_key = compute_image_cache_key(&all_images);
 
-                            // Process images and inject placeholders
-                            let image_refs: Vec<&[u8]> =
-                                all_images.iter().map(|v| v.as_slice()).collect();
-                            let processed = img_proc.process_many(&image_refs)?;
-                            let num_image_tokens =
-                                compute_num_image_tokens(&processed.grid_thw(), sms)?;
-                            let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
+                                let input_ids = MxArray::from_uint32(
+                                    &final_tokens,
+                                    &[1, final_tokens.len() as i64],
+                                )?;
 
-                            // Compute vision cache key from raw image bytes
-                            let image_cache_key = compute_image_cache_key(&all_images);
+                                let (logits, _rope_deltas) = vlm_prefill(
+                                    &input_ids,
+                                    image_cache_key,
+                                    &processed,
+                                    vision_enc,
+                                    sms,
+                                    &embedding_weight,
+                                    &mut layers_guard,
+                                    &mut caches_guard,
+                                    &final_norm_guard,
+                                    &lm_head_guard,
+                                    &model_config,
+                                    max_new_tokens,
+                                    generation_stream,
+                                    &vision_cache_stream,
+                                )?;
 
-                            let input_ids = MxArray::from_uint32(
-                                &final_tokens,
-                                &[1, final_tokens.len() as i64],
-                            )?;
-
-                            let (logits, _rope_deltas) = vlm_prefill(
-                                &input_ids,
-                                image_cache_key,
-                                &processed,
-                                vision_enc,
-                                sms,
-                                &embedding_weight,
-                                &mut layers_guard,
-                                &mut caches_guard,
-                                &final_norm_guard,
-                                &lm_head_guard,
-                                &model_config,
-                                max_new_tokens,
-                                generation_stream,
-                                &vision_cache_stream,
-                            )?;
-
-                            // VLM prefill already did compiled_init_from_prefill for compiled path
-                            let vlm_seq_len = final_tokens.len() as i64;
-                            (logits, vlm_seq_len, use_compiled)
+                                let vlm_seq_len = final_tokens.len() as i64;
+                                (logits, vlm_seq_len, use_compiled)
+                            } else {
+                                return Err(Error::from_reason(
+                                    "VLM prefill requested but vision encoder/processor not loaded",
+                                ));
+                            }
                         } else {
-                            // --- Standard text prefill path ---
+                            // --- Text prefill path (text-only OR VLM cache reuse with same images) ---
                             let prompt = MxArray::from_uint32(
                                 &prefill_tokens,
                                 &[1, prefill_tokens.len() as i64],
@@ -1672,7 +1797,13 @@ impl Qwen3_5Model {
                             let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
                             let last_logits = last_logits.squeeze(Some(&[1]))?;
                             // seq_len for the C++ init is the TOTAL tokens (cached + new)
-                            (last_logits, tokens.len() as i64, false)
+                            // For VLM cache reuse, use expanded_tokens length; for text-only, use tokens length
+                            let total_seq_len = if has_images {
+                                expanded_tokens.len() as i64
+                            } else {
+                                tokens.len() as i64
+                            };
+                            (last_logits, total_seq_len, false)
                         };
                     profiler.end_prefill();
 
@@ -1973,16 +2104,30 @@ impl Qwen3_5Model {
 
                     // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
 
-                    // === Save token history for cache reuse on next call ===
+                    // === Save token history and image key for cache reuse on next call ===
                     if reuse_cache {
-                        let mut full_history = tokens.clone();
+                        let mut full_history = if has_images {
+                            expanded_tokens.clone()
+                        } else {
+                            tokens.clone()
+                        };
                         full_history.extend_from_slice(&generated_tokens);
                         if let Ok(mut th) = cached_token_history_arc.write() {
                             *th = full_history;
                         }
+                        if let Ok(mut ik) = cached_image_key_arc.write() {
+                            *ik = if has_images {
+                                Some(current_image_cache_key)
+                            } else {
+                                None
+                            };
+                        }
                     } else {
                         if let Ok(mut th) = cached_token_history_arc.write() {
                             th.clear();
+                        }
+                        if let Ok(mut ik) = cached_image_key_arc.write() {
+                            *ik = None;
                         }
                     }
 
@@ -2601,6 +2746,7 @@ impl Qwen3_5Model {
                 generation: 0,
             })),
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
+            cached_image_key: Arc::new(RwLock::new(None)),
         })
     }
 
