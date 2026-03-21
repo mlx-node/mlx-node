@@ -188,12 +188,7 @@ impl Qwen3Tokenizer {
                 // Load chat template from tokenizer_config.json (in same directory)
                 let chat_template = Self::load_chat_template(&tokenizer_path);
 
-                // Detect </think> token ID from vocabulary for token-level thinking detection
-                let vocab = tokenizer.get_vocab(true);
-                let think_end_id = vocab
-                    .get("</think>")
-                    .or_else(|| vocab.get("</longcat_think>"))
-                    .copied();
+                let think_end_id = Self::detect_think_end_id(&tokenizer);
 
                 Ok(Self {
                     tokenizer: Arc::new(tokenizer),
@@ -277,11 +272,7 @@ impl Qwen3Tokenizer {
         // Load chat template from tokenizer_config.json (in same directory)
         let chat_template = Self::load_chat_template(tokenizer_path.to_string_lossy().as_ref());
 
-        let vocab = tokenizer.get_vocab(true);
-        let think_end_id = vocab
-            .get("</think>")
-            .or_else(|| vocab.get("</longcat_think>"))
-            .copied();
+        let think_end_id = Self::detect_think_end_id(&tokenizer);
 
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
@@ -993,11 +984,7 @@ impl Qwen3Tokenizer {
         // Load chat template from tokenizer_config.json (in same directory)
         let chat_template = Self::load_chat_template(tokenizer_path);
 
-        let vocab = tokenizer.get_vocab(true);
-        let think_end_id = vocab
-            .get("</think>")
-            .or_else(|| vocab.get("</longcat_think>"))
-            .copied();
+        let think_end_id = Self::detect_think_end_id(&tokenizer);
 
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
@@ -1080,6 +1067,15 @@ impl Clone for Qwen3Tokenizer {
 }
 
 impl Qwen3Tokenizer {
+    /// Detect `</think>` token ID from tokenizer vocabulary.
+    fn detect_think_end_id(tokenizer: &Tokenizer) -> Option<u32> {
+        let vocab = tokenizer.get_vocab(true);
+        vocab
+            .get("</think>")
+            .or_else(|| vocab.get("</longcat_think>"))
+            .copied()
+    }
+
     /// Get the `</think>` token ID, if the tokenizer has thinking support.
     pub fn think_end_id(&self) -> Option<u32> {
         self.think_end_id

@@ -550,30 +550,22 @@ pub fn parse_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Opti
     (cleaned_text, tool_calls, thinking)
 }
 
-/// Find the position of the `</think>` token in generated tokens.
-///
-/// Used for token-level thinking detection during chat generation.
-/// Returns the index of the first `think_end_id` token, or None if not found.
-pub fn find_think_end_pos(generated_tokens: &[u32], think_end_id: Option<u32>) -> Option<usize> {
-    let end_id = think_end_id?;
-    generated_tokens.iter().position(|&t| t == end_id)
+/// Check if the `</think>` token exists in generated tokens.
+pub fn has_think_end_token(generated_tokens: &[u32], think_end_id: Option<u32>) -> bool {
+    think_end_id.is_some_and(|id| generated_tokens.contains(&id))
 }
 
-/// Split generated output using token-level thinking position.
+/// Split generated output using token-level thinking detection.
 ///
-/// When `think_end_pos` is known (from `find_think_end_pos`), splits the raw
-/// text at the `</think>` boundary without any text-level heuristics. The
-/// thinking content is everything before `</think>`, the response is everything
-/// after. Tool calls are still parsed from the response text.
-///
-/// This is more reliable than `parse_generation_output` because it uses token
-/// IDs rather than text pattern matching, following the mlx-lm approach.
-pub fn split_thinking_at_token_boundary(
+/// When the `</think>` token was found in generated tokens (`has_think_end = true`),
+/// splits at the `</think>` text boundary. Everything before is thinking, everything
+/// after is the response (with tool calls parsed). Falls back to `parse_generation_output`
+/// when no `</think>` token was detected.
+pub fn split_at_think_end(
     raw_text: &str,
-    think_end_pos: Option<usize>,
+    has_think_end: bool,
 ) -> (String, Vec<ToolCallResult>, Option<String>) {
-    if think_end_pos.is_some() {
-        // Token-level split: find </think> in text and split there
+    if has_think_end {
         if let Some(close_pos) = raw_text.find("</think>") {
             let thinking_text = raw_text[..close_pos].trim();
             let response_text = raw_text[close_pos + "</think>".len()..].trim();
@@ -586,7 +578,6 @@ pub fn split_thinking_at_token_boundary(
             return (clean_text.trim().to_string(), tool_calls, thinking);
         }
     }
-    // Fallback: use text-level parsing
     parse_generation_output(raw_text)
 }
 

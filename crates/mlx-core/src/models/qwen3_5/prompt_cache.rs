@@ -70,32 +70,26 @@ impl PromptCache {
         }
     }
 
-    /// Take ownership of the caches, leaving this cache empty.
     pub(crate) fn take_caches(&mut self) -> Option<Vec<Qwen3_5LayerCache>> {
         self.caches.take()
     }
 
-    /// Get a reference to the token history.
     pub(crate) fn token_history(&self) -> &[u32] {
         &self.token_history
     }
 
-    /// Get the model type.
     pub(crate) fn model_type(&self) -> &str {
         &self.model_type
     }
 
-    /// Get the number of layers.
     pub(crate) fn num_layers(&self) -> usize {
         self.num_layers
     }
 
-    /// Get the image cache key (None for text-only caches).
     pub(crate) fn image_cache_key(&self) -> Option<u64> {
         self.image_cache_key
     }
 
-    /// Get the rope deltas (None for text-only caches).
     pub(crate) fn rope_deltas(&self) -> Option<i32> {
         self.rope_deltas
     }
