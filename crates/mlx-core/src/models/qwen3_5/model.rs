@@ -1039,81 +1039,80 @@ impl Qwen3_5Model {
             // === VLM or text prefill branching ===
             // vlm_compiled_init_done: true if vlm_prefill already called compiled_init_from_prefill
             profiler.begin_prefill();
-            let (mut last_logits, seq_len, vlm_compiled_init_done) = if has_images
-                && cached_prefix_len == 0
-            {
-                // --- VLM full prefill (first call or different images) ---
-                // Reuse expanded_tokens and processed images from pre-cache-check step.
-                if let Some(vision_enc) = vision_encoder_arc.as_ref() {
-                    let final_tokens = &expanded_tokens;
-                    let processed = vlm_processed.as_ref().ok_or_else(|| {
-                        Error::from_reason("VLM processed images missing")
-                    })?;
-                    let image_cache_key = current_image_cache_key;
+            let (mut last_logits, seq_len, vlm_compiled_init_done) =
+                if has_images && cached_prefix_len == 0 {
+                    // --- VLM full prefill (first call or different images) ---
+                    // Reuse expanded_tokens and processed images from pre-cache-check step.
+                    if let Some(vision_enc) = vision_encoder_arc.as_ref() {
+                        let final_tokens = &expanded_tokens;
+                        let processed = vlm_processed
+                            .as_ref()
+                            .ok_or_else(|| Error::from_reason("VLM processed images missing"))?;
+                        let image_cache_key = current_image_cache_key;
 
-                    let input_ids =
-                        MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
+                        let input_ids =
+                            MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
 
-                    let (logits, rope_deltas) = vlm_prefill(
-                        &input_ids,
-                        image_cache_key,
-                        processed,
-                        vision_enc,
-                        sms,
-                        &embedding_weight,
-                        &mut layers_guard,
-                        &mut caches_guard,
-                        &final_norm_guard,
-                        &lm_head_guard,
-                        &model_config,
-                        max_new_tokens,
-                        generation_stream,
-                        &vision_cache,
-                    )?;
+                        let (logits, rope_deltas) = vlm_prefill(
+                            &input_ids,
+                            image_cache_key,
+                            processed,
+                            vision_enc,
+                            sms,
+                            &embedding_weight,
+                            &mut layers_guard,
+                            &mut caches_guard,
+                            &final_norm_guard,
+                            &lm_head_guard,
+                            &model_config,
+                            max_new_tokens,
+                            generation_stream,
+                            &vision_cache,
+                        )?;
 
-                    // Save rope_deltas for cache reuse on subsequent turns
-                    if let Ok(mut rd) = cached_rope_deltas_arc.write() {
-                        *rd = Some(rope_deltas as i32);
+                        // Save rope_deltas for cache reuse on subsequent turns
+                        if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                            *rd = Some(rope_deltas as i32);
+                        }
+
+                        let vlm_seq_len = final_tokens.len() as i64;
+                        (logits, vlm_seq_len, use_compiled)
+                    } else {
+                        return Err(Error::from_reason(
+                            "VLM prefill requested but vision encoder/processor not loaded",
+                        ));
                     }
-
-                    let vlm_seq_len = final_tokens.len() as i64;
-                    (logits, vlm_seq_len, use_compiled)
                 } else {
-                    return Err(Error::from_reason(
-                        "VLM prefill requested but vision encoder/processor not loaded",
-                    ));
-                }
-            } else {
-                // --- Text prefill path (text-only OR VLM cache reuse with same images) ---
-                let prompt =
-                    MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
+                    // --- Text prefill path (text-only OR VLM cache reuse with same images) ---
+                    let prompt =
+                        MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
 
-                let logits = {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    forward_inner(
-                        &prompt,
-                        &embedding_weight,
-                        &mut layers_guard,
-                        &mut caches_guard,
-                        &final_norm_guard,
-                        &lm_head_guard,
-                        fa_idx,
-                        Some(&embedding_weight_t),
-                    )?
-                };
+                    let logits = {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        forward_inner(
+                            &prompt,
+                            &embedding_weight,
+                            &mut layers_guard,
+                            &mut caches_guard,
+                            &final_norm_guard,
+                            &lm_head_guard,
+                            fa_idx,
+                            Some(&embedding_weight_t),
+                        )?
+                    };
 
-                let seq_len = logits.shape_at(1)?;
-                let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-                let last_logits = last_logits.squeeze(Some(&[1]))?;
-                // seq_len for the C++ init is the TOTAL tokens (cached + new)
-                // For VLM cache reuse, use expanded_tokens length; for text-only, use tokens length
-                let total_seq_len = if has_images {
-                    expanded_tokens.len() as i64
-                } else {
-                    tokens.len() as i64
+                    let seq_len = logits.shape_at(1)?;
+                    let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+                    let last_logits = last_logits.squeeze(Some(&[1]))?;
+                    // seq_len for the C++ init is the TOTAL tokens (cached + new)
+                    // For VLM cache reuse, use expanded_tokens length; for text-only, use tokens length
+                    let total_seq_len = if has_images {
+                        expanded_tokens.len() as i64
+                    } else {
+                        tokens.len() as i64
+                    };
+                    (last_logits, total_seq_len, false)
                 };
-                (last_logits, total_seq_len, false)
-            };
             profiler.end_prefill();
 
             // Track token history for repetition penalty
@@ -1779,85 +1778,84 @@ impl Qwen3_5Model {
                     // === VLM or text prefill branching ===
                     // vlm_compiled_init_done: true if vlm_prefill already called compiled_init_from_prefill
                     profiler.begin_prefill();
-                    let (mut last_logits, seq_len, vlm_compiled_init_done) = if has_images
-                        && cached_prefix_len == 0
-                    {
-                        // --- VLM full prefill (first call or different images) ---
-                        // Reuse expanded_tokens and processed images from pre-cache-check step.
-                        if let Some(vision_enc) = vision_encoder_arc.as_ref() {
-                            let final_tokens = &expanded_tokens;
-                            let processed = vlm_processed.as_ref().ok_or_else(|| {
-                                Error::from_reason("VLM processed images missing")
-                            })?;
-                            let image_cache_key = current_image_cache_key;
+                    let (mut last_logits, seq_len, vlm_compiled_init_done) =
+                        if has_images && cached_prefix_len == 0 {
+                            // --- VLM full prefill (first call or different images) ---
+                            // Reuse expanded_tokens and processed images from pre-cache-check step.
+                            if let Some(vision_enc) = vision_encoder_arc.as_ref() {
+                                let final_tokens = &expanded_tokens;
+                                let processed = vlm_processed.as_ref().ok_or_else(|| {
+                                    Error::from_reason("VLM processed images missing")
+                                })?;
+                                let image_cache_key = current_image_cache_key;
 
-                            let input_ids = MxArray::from_uint32(
-                                final_tokens,
-                                &[1, final_tokens.len() as i64],
-                            )?;
+                                let input_ids = MxArray::from_uint32(
+                                    final_tokens,
+                                    &[1, final_tokens.len() as i64],
+                                )?;
 
-                            let (logits, rope_deltas) = vlm_prefill(
-                                &input_ids,
-                                image_cache_key,
-                                processed,
-                                vision_enc,
-                                sms,
-                                &embedding_weight,
-                                &mut layers_guard,
-                                &mut caches_guard,
-                                &final_norm_guard,
-                                &lm_head_guard,
-                                &model_config,
-                                max_new_tokens,
-                                generation_stream,
-                                &vision_cache_stream,
-                            )?;
+                                let (logits, rope_deltas) = vlm_prefill(
+                                    &input_ids,
+                                    image_cache_key,
+                                    processed,
+                                    vision_enc,
+                                    sms,
+                                    &embedding_weight,
+                                    &mut layers_guard,
+                                    &mut caches_guard,
+                                    &final_norm_guard,
+                                    &lm_head_guard,
+                                    &model_config,
+                                    max_new_tokens,
+                                    generation_stream,
+                                    &vision_cache_stream,
+                                )?;
 
-                            // Save rope_deltas for cache reuse on subsequent turns
-                            if let Ok(mut rd) = cached_rope_deltas_arc.write() {
-                                *rd = Some(rope_deltas as i32);
+                                // Save rope_deltas for cache reuse on subsequent turns
+                                if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                                    *rd = Some(rope_deltas as i32);
+                                }
+
+                                let vlm_seq_len = final_tokens.len() as i64;
+                                (logits, vlm_seq_len, use_compiled)
+                            } else {
+                                return Err(Error::from_reason(
+                                    "VLM prefill requested but vision encoder/processor not loaded",
+                                ));
                             }
-
-                            let vlm_seq_len = final_tokens.len() as i64;
-                            (logits, vlm_seq_len, use_compiled)
                         } else {
-                            return Err(Error::from_reason(
-                                "VLM prefill requested but vision encoder/processor not loaded",
-                            ));
-                        }
-                    } else {
-                        // --- Text prefill path (text-only OR VLM cache reuse with same images) ---
-                        let prompt = MxArray::from_uint32(
-                            &prefill_tokens,
-                            &[1, prefill_tokens.len() as i64],
-                        )?;
+                            // --- Text prefill path (text-only OR VLM cache reuse with same images) ---
+                            let prompt = MxArray::from_uint32(
+                                &prefill_tokens,
+                                &[1, prefill_tokens.len() as i64],
+                            )?;
 
-                        let logits = {
-                            let _stream_ctx = StreamContext::new(generation_stream);
-                            forward_inner(
-                                &prompt,
-                                &embedding_weight,
-                                &mut layers_guard,
-                                &mut caches_guard,
-                                &final_norm_guard,
-                                &lm_head_guard,
-                                fa_idx,
-                                Some(&embedding_weight_t),
-                            )?
-                        };
+                            let logits = {
+                                let _stream_ctx = StreamContext::new(generation_stream);
+                                forward_inner(
+                                    &prompt,
+                                    &embedding_weight,
+                                    &mut layers_guard,
+                                    &mut caches_guard,
+                                    &final_norm_guard,
+                                    &lm_head_guard,
+                                    fa_idx,
+                                    Some(&embedding_weight_t),
+                                )?
+                            };
 
-                        let seq_len = logits.shape_at(1)?;
-                        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-                        let last_logits = last_logits.squeeze(Some(&[1]))?;
-                        // seq_len for the C++ init is the TOTAL tokens (cached + new)
-                        // For VLM cache reuse, use expanded_tokens length; for text-only, use tokens length
-                        let total_seq_len = if has_images {
-                            expanded_tokens.len() as i64
-                        } else {
-                            tokens.len() as i64
+                            let seq_len = logits.shape_at(1)?;
+                            let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+                            let last_logits = last_logits.squeeze(Some(&[1]))?;
+                            // seq_len for the C++ init is the TOTAL tokens (cached + new)
+                            // For VLM cache reuse, use expanded_tokens length; for text-only, use tokens length
+                            let total_seq_len = if has_images {
+                                expanded_tokens.len() as i64
+                            } else {
+                                tokens.len() as i64
+                            };
+                            (last_logits, total_seq_len, false)
                         };
-                        (last_logits, total_seq_len, false)
-                    };
                     profiler.end_prefill();
 
                     // Track token history for repetition penalty
