@@ -1157,6 +1157,9 @@ unsafe extern "C-unwind" {
     /// Get current MoE cache offset (tokens processed).
     pub fn mlx_qwen35_moe_get_cache_offset() -> i32;
 
+    /// Adjust MoE cache offset by delta (for VLM M-RoPE position correction).
+    pub fn mlx_qwen35_moe_adjust_offset(delta: i32);
+
     /// Load safetensors file using MLX's lazy loading (data read on eval, not upfront).
     /// Calls `callback` for each tensor with (name, name_len, array_handle, ctx).
     /// Returns number of tensors loaded, or -1 on error.

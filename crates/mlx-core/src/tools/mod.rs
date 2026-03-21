@@ -566,8 +566,15 @@ pub fn split_at_think_end(
     has_think_end: bool,
 ) -> (String, Vec<ToolCallResult>, Option<String>) {
     if has_think_end && let Some(close_pos) = raw_text.find("</think>") {
+        let after_tag = &raw_text[close_pos + "</think>".len()..];
+        // Guard: only split if </think> is followed by newline or end-of-text,
+        // matching the heuristic in parse_thinking(). This prevents splitting
+        // at a literal </think> embedded mid-sentence.
+        if !after_tag.is_empty() && !after_tag.starts_with('\n') {
+            return parse_generation_output(raw_text);
+        }
         let thinking_text = raw_text[..close_pos].trim();
-        let response_text = raw_text[close_pos + "</think>".len()..].trim();
+        let response_text = after_tag.trim();
         let thinking = if thinking_text.is_empty() {
             None
         } else {

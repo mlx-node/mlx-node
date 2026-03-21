@@ -807,4 +807,9 @@ int mlx_qwen35_moe_get_cache_offset() {
   return g_moe_offset_int;
 }
 
+// Adjust MoE cache offset by delta (for VLM M-RoPE position correction).
+void mlx_qwen35_moe_adjust_offset(int delta) {
+  g_moe_offset_int += delta;
+}
+
 }  // extern "C"

@@ -913,7 +913,7 @@ impl Qwen3_5MoeModel {
                     MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
 
                 // VLM prefill using Rust path with M-RoPE position IDs
-                let (logits, _rope_deltas) = vlm_prefill_moe(
+                let (logits, rope_deltas) = vlm_prefill_moe(
                     &input_ids,
                     image_cache_key,
                     processed,
@@ -929,6 +929,13 @@ impl Qwen3_5MoeModel {
                     Some(&embedding_weight_t),
                     &vision_cache,
                 )?;
+
+                // Adjust RoPE offset for VLM M-RoPE position correction
+                if rope_deltas != 0 && use_cpp {
+                    unsafe {
+                        mlx_sys::mlx_qwen35_moe_adjust_offset(rope_deltas as i32);
+                    }
+                }
 
                 let vlm_seq_len = final_tokens.len() as i64;
                 (logits, vlm_seq_len)
@@ -1644,7 +1651,7 @@ impl Qwen3_5MoeModel {
                             MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
 
                         // VLM prefill using Rust path with M-RoPE position IDs
-                        let (logits, _rope_deltas) = vlm_prefill_moe(
+                        let (logits, rope_deltas) = vlm_prefill_moe(
                             &input_ids,
                             image_cache_key,
                             processed,
@@ -1660,6 +1667,13 @@ impl Qwen3_5MoeModel {
                             Some(&embedding_weight_t),
                             &vision_cache_stream,
                         )?;
+
+                        // Adjust RoPE offset for VLM M-RoPE position correction
+                        if rope_deltas != 0 && use_cpp {
+                            unsafe {
+                                mlx_sys::mlx_qwen35_moe_adjust_offset(rope_deltas as i32);
+                            }
+                        }
 
                         let vlm_seq_len = final_tokens.len() as i64;
                         (logits, vlm_seq_len)
