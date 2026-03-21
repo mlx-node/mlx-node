@@ -550,6 +550,46 @@ pub fn parse_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Opti
     (cleaned_text, tool_calls, thinking)
 }
 
+/// Find the position of the `</think>` token in generated tokens.
+///
+/// Used for token-level thinking detection during chat generation.
+/// Returns the index of the first `think_end_id` token, or None if not found.
+pub fn find_think_end_pos(generated_tokens: &[u32], think_end_id: Option<u32>) -> Option<usize> {
+    let end_id = think_end_id?;
+    generated_tokens.iter().position(|&t| t == end_id)
+}
+
+/// Split generated output using token-level thinking position.
+///
+/// When `think_end_pos` is known (from `find_think_end_pos`), splits the raw
+/// text at the `</think>` boundary without any text-level heuristics. The
+/// thinking content is everything before `</think>`, the response is everything
+/// after. Tool calls are still parsed from the response text.
+///
+/// This is more reliable than `parse_generation_output` because it uses token
+/// IDs rather than text pattern matching, following the mlx-lm approach.
+pub fn split_thinking_at_token_boundary(
+    raw_text: &str,
+    think_end_pos: Option<usize>,
+) -> (String, Vec<ToolCallResult>, Option<String>) {
+    if think_end_pos.is_some() {
+        // Token-level split: find </think> in text and split there
+        if let Some(close_pos) = raw_text.find("</think>") {
+            let thinking_text = raw_text[..close_pos].trim();
+            let response_text = raw_text[close_pos + "</think>".len()..].trim();
+            let thinking = if thinking_text.is_empty() {
+                None
+            } else {
+                Some(thinking_text.to_string())
+            };
+            let (clean_text, tool_calls) = parse_tool_calls(response_text);
+            return (clean_text.trim().to_string(), tool_calls, thinking);
+        }
+    }
+    // Fallback: use text-level parsing
+    parse_generation_output(raw_text)
+}
+
 /// Build RewardOutput array from generation results.
 ///
 /// Parses tool calls and thinking from completions, creating structured outputs

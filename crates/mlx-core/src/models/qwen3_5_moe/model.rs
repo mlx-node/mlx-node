@@ -681,6 +681,7 @@ impl Qwen3_5MoeModel {
         let cached_image_key_arc = self.cached_image_key.clone();
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
+        let think_end_id = tokenizer.think_end_id();
         let tokenizer_for_decode = tokenizer.clone();
 
         // Clone vision fields if images present
@@ -1315,8 +1316,9 @@ impl Qwen3_5MoeModel {
 
             let num_tokens = generated_tokens.len() as u32;
 
-            // Parse tool calls and thinking from the generated text
-            let (clean_text, tool_calls, thinking) = tools::parse_generation_output(&text);
+            // Parse tool calls and thinking from the generated text using token-level detection
+            let think_end_pos = tools::find_think_end_pos(&generated_tokens, think_end_id);
+            let (clean_text, tool_calls, thinking) = tools::split_thinking_at_token_boundary(&text, think_end_pos);
 
             // If we have valid tool calls, override finish reason
             let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
