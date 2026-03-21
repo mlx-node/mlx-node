@@ -235,6 +235,10 @@ pub struct Qwen3_5Model {
     cached_token_history: Arc<RwLock<Vec<u32>>>,
     /// Image cache key for VLM cache reuse (None for text-only conversations).
     cached_image_key: Arc<RwLock<Option<u64>>>,
+    /// Rope deltas from VLM prefill, needed for cache reuse on subsequent turns.
+    /// Without this, the compiled decode path starts with wrong RoPE positions
+    /// when VLM prefill is skipped on Turn 2+.
+    cached_rope_deltas: Arc<RwLock<Option<i32>>>,
 }
 
 #[napi]
@@ -288,6 +292,7 @@ impl Qwen3_5Model {
             })),
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
+            cached_rope_deltas: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -327,6 +332,10 @@ impl Qwen3_5Model {
         // Also clear token history so next chat() does a full prefill
         if let Ok(mut th) = self.cached_token_history.write() {
             th.clear();
+        }
+        // Clear cached rope deltas so next VLM prefill recomputes them
+        if let Ok(mut rd) = self.cached_rope_deltas.write() {
+            *rd = None;
         }
         Ok(())
     }
@@ -815,6 +824,7 @@ impl Qwen3_5Model {
         let caches_arc = self.caches.clone();
         let cached_token_history_arc = self.cached_token_history.clone();
         let cached_image_key_arc = self.cached_image_key.clone();
+        let cached_rope_deltas_arc = self.cached_rope_deltas.clone();
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
         let tokenizer_for_decode = tokenizer.clone();
@@ -1025,7 +1035,7 @@ impl Qwen3_5Model {
                         let input_ids =
                             MxArray::from_uint32(&final_tokens, &[1, final_tokens.len() as i64])?;
 
-                        let (logits, _rope_deltas) = vlm_prefill(
+                        let (logits, rope_deltas) = vlm_prefill(
                             &input_ids,
                             image_cache_key,
                             &processed,
@@ -1041,6 +1051,11 @@ impl Qwen3_5Model {
                             generation_stream,
                             &vision_cache,
                         )?;
+
+                        // Save rope_deltas for cache reuse on subsequent turns
+                        if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                            *rd = Some(rope_deltas as i32);
+                        }
 
                         let vlm_seq_len = final_tokens.len() as i64;
                         (logits, vlm_seq_len, use_compiled)
@@ -1163,6 +1178,25 @@ impl Qwen3_5Model {
                     }
                     // C++ has copied arrays into g_compiled_caches — safe to release
                     drop(caches_guard);
+
+                    // VLM cache reuse: apply saved rope_deltas so compiled decode
+                    // uses correct M-RoPE positions (vlm_prefill was skipped).
+                    if has_images && cached_prefix_len > 0 {
+                        if let Ok(rd) = cached_rope_deltas_arc.read() {
+                            if let Some(delta) = *rd {
+                                unsafe {
+                                    mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // For text-only conversations, clear any stale cached rope deltas
+                if !has_images {
+                    if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                        *rd = None;
+                    }
                 }
 
                 // Compiled C++ decode loop (pipelined — submit N+1 before eval N)
@@ -1521,6 +1555,7 @@ impl Qwen3_5Model {
         let caches_arc = self.caches.clone();
         let cached_token_history_arc = self.cached_token_history.clone();
         let cached_image_key_arc = self.cached_image_key.clone();
+        let cached_rope_deltas_arc = self.cached_rope_deltas.clone();
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
         let tokenizer_for_decode = tokenizer.clone();
@@ -1748,7 +1783,7 @@ impl Qwen3_5Model {
                                     &[1, final_tokens.len() as i64],
                                 )?;
 
-                                let (logits, _rope_deltas) = vlm_prefill(
+                                let (logits, rope_deltas) = vlm_prefill(
                                     &input_ids,
                                     image_cache_key,
                                     &processed,
@@ -1764,6 +1799,11 @@ impl Qwen3_5Model {
                                     generation_stream,
                                     &vision_cache_stream,
                                 )?;
+
+                                // Save rope_deltas for cache reuse on subsequent turns
+                                if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                                    *rd = Some(rope_deltas as i32);
+                                }
 
                                 let vlm_seq_len = final_tokens.len() as i64;
                                 (logits, vlm_seq_len, use_compiled)
@@ -1886,6 +1926,25 @@ impl Qwen3_5Model {
                             }
                             // C++ has copied arrays into g_compiled_caches — safe to release
                             drop(caches_guard);
+
+                            // VLM cache reuse: apply saved rope_deltas so compiled decode
+                            // uses correct M-RoPE positions (vlm_prefill was skipped).
+                            if has_images && cached_prefix_len > 0 {
+                                if let Ok(rd) = cached_rope_deltas_arc.read() {
+                                    if let Some(delta) = *rd {
+                                        unsafe {
+                                            mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // For text-only conversations, clear any stale cached rope deltas
+                        if !has_images {
+                            if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                                *rd = None;
+                            }
                         }
 
                         // Compiled C++ decode loop (pipelined — submit N+1 before eval N)
@@ -2747,6 +2806,7 @@ impl Qwen3_5Model {
             })),
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
+            cached_rope_deltas: Arc::new(RwLock::new(None)),
         })
     }
 
