@@ -1,101 +1,155 @@
 #!/usr/bin/env node
 /**
- * Test Converted MLX Model
+ * Test MLX Model with Multi-Round Chat & Cache Reuse
  *
- * Simple script to test generation quality with the converted float32 model.
- * Auto-detects model type (Qwen3 vs Qwen3.5) from config.json.
+ * Demonstrates KV cache reuse across conversation turns — each turn only
+ * prefills the new tokens (assistant reply + user follow-up), not the
+ * entire conversation history.
  *
  * Usage:
- *   oxnode examples/lm.ts <model-name> [--image <path>]
+ *   oxnode examples/lm.ts [model-name] [--image <path>]
  */
 
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { loadModel, Qwen3Model } from '@mlx-node/lm';
+import { ChatResult, loadModel, Qwen3Model } from '@mlx-node/lm';
 
 const { values, positionals } = parseArgs({
   args: process.argv.slice(2),
   options: {
-    ocr: { type: 'string' },
+    image: { type: 'string' },
   },
   allowPositionals: true,
 });
 
 const modelName = positionals[0] || 'qwen3.5-9B-unsloth';
-const imagePath = values.ocr;
+const imagePath = values.image;
 
 const MODEL_PATH = resolve(process.cwd(), '.cache', 'models', modelName);
 
-console.log('╔════════════════════════════════════════════════════════╗');
-console.log('║   Testing Converted MLX Model                          ║');
-console.log('╚════════════════════════════════════════════════════════╝\n');
-
 console.log(`Loading model from: ${MODEL_PATH}`);
 if (imagePath) console.log(`Image: ${imagePath}`);
-console.log('(Tokenizer will be loaded automatically)\n');
 
-// Load model — auto-detects Qwen3 vs Qwen3.5 from config.json
 const model = await loadModel(MODEL_PATH);
 const isQwen3 = model instanceof Qwen3Model;
+console.log(`Model loaded (${isQwen3 ? 'Qwen3' : 'Qwen3.5'})\n`);
 
-console.log(`✓ Model loaded (${isQwen3 ? 'Qwen3' : 'Qwen3.5'})`);
+function printPerf(result: ChatResult) {
+  const p = result.performance;
+  if (!p) return;
+  console.log('-'.repeat(80));
+  console.log(
+    `Stop reason: ${result.finishReason} | ${result.numTokens} tokens | TTFT ${p.ttftMs.toFixed(0)}ms | Prefill ${p.prefillTokensPerSecond.toFixed(1)} tok/s | Decode ${p.decodeTokensPerSecond.toFixed(1)} tok/s`,
+  );
+}
 
-// If --image provided, do a single VLM chat with the image
 if (imagePath) {
+  // ── VLM multi-round: same image discussed across turns ──
   const imageBuffer = await readFile(resolve(process.cwd(), imagePath));
   const imageBytes = new Uint8Array(imageBuffer.buffer, imageBuffer.byteOffset, imageBuffer.byteLength);
+  console.log(`Image: ${imageBytes.length} bytes\n`);
 
-  console.log(`Image loaded: ${imageBytes.length} bytes`);
-  console.log('─'.repeat(60));
-  console.log('Prompt: "OCR this image. Extract all text."');
-  console.log('─'.repeat(60));
-
-  const messages = [
-    { role: 'user' as const, content: 'OCR this image and extract all text you can see.', images: [imageBytes] },
+  const messages: { role: string; content: string; images?: Uint8Array[] }[] = [
+    { role: 'user', content: 'Describe this image briefly.', images: [imageBytes] },
   ];
 
-  const result = await model.chat(messages, {
+  // Turn 1: full VLM prefill
+  console.log('── Turn 1 (full VLM prefill) ──');
+  console.log(`User: ${messages[0].content}`);
+  const r1 = await model.chat(messages, {
     maxNewTokens: 2048,
-    temperature: 1.0,
+    temperature: 0.6,
     reportPerformance: true,
   });
+  console.log(`Assistant: ${r1.text}`);
+  printPerf(r1);
 
-  console.log(result.text);
-  console.log('─'.repeat(60));
-  console.log(
-    `TTFT: ${result.performance?.ttftMs.toFixed(2)}ms, Prefill: ${result.performance?.prefillTokensPerSecond.toFixed(2)} tokens/s, Decode: ${result.performance?.decodeTokensPerSecond.toFixed(2)} tokens/s`,
-  );
-  console.log('');
+  // Turn 2: cache reuse — only prefills the new user message
+  messages.push({ role: 'assistant', content: r1.rawText });
+  messages.push({ role: 'user', content: 'What colors do you see in the image?' });
+
+  console.log('\n── Turn 2 (cache reuse, same image) ──');
+  console.log(`User: ${messages[2].content}`);
+  const r2 = await model.chat(messages, {
+    maxNewTokens: 2048,
+    temperature: 0.6,
+    reportPerformance: true,
+  });
+  console.log(`Assistant: ${r2.text}`);
+  printPerf(r2);
+
+  // Turn 3: another follow-up
+  messages.push({ role: 'assistant', content: r2.rawText });
+  messages.push({ role: 'user', content: 'Summarize everything you told me about this image in one sentence.' });
+
+  console.log('\n── Turn 3 (cache reuse) ──');
+  console.log(`User: ${messages[4].content}`);
+  const r3 = await model.chat(messages, {
+    maxNewTokens: 2048,
+    temperature: 0.6,
+    reportPerformance: true,
+  });
+  console.log(`Assistant: ${r3.text}`);
+  printPerf(r3);
 } else {
-  // Text-only test prompts
-  const prompts = [
-    'Hello! How are you today?',
-    'What is the capital of France?',
-    'Write a haiku about coding:',
-    'Explain what machine learning is in one sentence:',
+  // ── Text multi-round chat with cache reuse ──
+  const messages: { role: string; content: string }[] = [
+    { role: 'system', content: 'You are a helpful assistant. Be concise.' },
+    { role: 'user', content: 'What is the capital of France?' },
   ];
 
-  for (const prompt of prompts) {
-    console.log('─'.repeat(60));
-    console.log(`Prompt: "${prompt}"`);
-    console.log('─'.repeat(60));
+  // Turn 1: full prefill
+  console.log('── Turn 1 (full prefill) ──');
+  console.log(`User: ${messages[1].content}`);
+  const r1 = await model.chat(messages, {
+    maxNewTokens: 2048,
+    temperature: 0.6,
+    reportPerformance: true,
+  });
+  console.log(`Assistant: ${r1.text}`);
+  printPerf(r1);
 
-    const messages = [{ role: 'user', content: prompt }];
+  // Turn 2: cache reuse — only prefills assistant reply + new question
+  messages.push({ role: 'assistant', content: r1.rawText });
+  messages.push({ role: 'user', content: 'What about Germany?' });
 
-    const result = await model.chat(messages, {
-      maxNewTokens: 2048,
-      temperature: 0.6,
-      topP: 0.9,
-      reportPerformance: true,
-    });
+  console.log('\n── Turn 2 (cache reuse) ──');
+  console.log(`User: ${messages[3].content}`);
+  const r2 = await model.chat(messages, {
+    maxNewTokens: 2048,
+    temperature: 0.6,
+    reportPerformance: true,
+  });
+  console.log(`Assistant: ${r2.text}`);
+  printPerf(r2);
 
-    console.log(result.text);
-    console.log('─'.repeat(60));
-    console.log(
-      `TTFT: ${result.performance?.ttftMs.toFixed(2)}ms, Prefill: ${result.performance?.prefillTokensPerSecond.toFixed(2)} tokens/s, Decode: ${result.performance?.decodeTokensPerSecond.toFixed(2)} tokens/s`,
-    );
-    console.log('');
-  }
+  // Turn 3: cache reuse again
+  messages.push({ role: 'assistant', content: r2.rawText });
+  messages.push({ role: 'user', content: 'And Japan?' });
+
+  console.log('\n── Turn 3 (cache reuse) ──');
+  console.log(`User: ${messages[5].content}`);
+  const r3 = await model.chat(messages, {
+    maxNewTokens: 2048,
+    temperature: 0.6,
+    reportPerformance: true,
+  });
+  console.log(`Assistant: ${r3.text}`);
+  printPerf(r3);
+
+  // Turn 4: one more to show compounding savings
+  messages.push({ role: 'assistant', content: r3.rawText });
+  messages.push({ role: 'user', content: 'Which of those three cities has the largest population?' });
+
+  console.log('\n── Turn 4 (cache reuse) ──');
+  console.log(`User: ${messages[7].content}`);
+  const r4 = await model.chat(messages, {
+    maxNewTokens: 2048,
+    temperature: 0.6,
+    reportPerformance: true,
+  });
+  console.log(`Assistant: ${r4.text}`);
+  printPerf(r4);
 }
