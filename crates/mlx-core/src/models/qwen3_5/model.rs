@@ -922,8 +922,9 @@ impl Qwen3_5Model {
                 .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
 
             // === VLM image processing (before cache check, needed for expanded tokens) ===
+            // Save processed images for reuse in VLM prefill to avoid double processing.
             let sms = spatial_merge_size.unwrap_or(2);
-            let (expanded_tokens, current_image_cache_key) = if has_images {
+            let (expanded_tokens, current_image_cache_key, vlm_processed) = if has_images {
                 if let (Some(_vision_enc), Some(img_proc)) =
                     (vision_encoder_arc.as_ref(), image_processor_arc.as_ref())
                 {
@@ -934,12 +935,12 @@ impl Qwen3_5Model {
                         compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
                     let expanded = inject_image_placeholders(&tokens, num_image_tokens);
                     let cache_key = compute_image_cache_key(&all_images);
-                    (expanded, cache_key)
+                    (expanded, cache_key, Some(processed_pre))
                 } else {
-                    (tokens.clone(), 0u64)
+                    (tokens.clone(), 0u64, None)
                 }
             } else {
-                (tokens.clone(), 0u64)
+                (tokens.clone(), 0u64, None)
             };
 
             // === Cache reuse: prefix verification ===
@@ -1042,23 +1043,21 @@ impl Qwen3_5Model {
                 && cached_prefix_len == 0
             {
                 // --- VLM full prefill (first call or different images) ---
-                if let (Some(vision_enc), Some(img_proc)) =
-                    (vision_encoder_arc.as_ref(), image_processor_arc.as_ref())
-                {
-                    let all_images = extract_images_from_messages(&messages);
-                    let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
-                    let processed = img_proc.process_many(&image_refs)?;
-                    let num_image_tokens = compute_num_image_tokens(&processed.grid_thw(), sms)?;
-                    let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
-                    let image_cache_key = compute_image_cache_key(&all_images);
+                // Reuse expanded_tokens and processed images from pre-cache-check step.
+                if let Some(vision_enc) = vision_encoder_arc.as_ref() {
+                    let final_tokens = &expanded_tokens;
+                    let processed = vlm_processed.as_ref().ok_or_else(|| {
+                        Error::from_reason("VLM processed images missing")
+                    })?;
+                    let image_cache_key = current_image_cache_key;
 
                     let input_ids =
-                        MxArray::from_uint32(&final_tokens, &[1, final_tokens.len() as i64])?;
+                        MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
 
                     let (logits, rope_deltas) = vlm_prefill(
                         &input_ids,
                         image_cache_key,
-                        &processed,
+                        processed,
                         vision_enc,
                         sms,
                         &embedding_weight,
@@ -1661,7 +1660,7 @@ impl Qwen3_5Model {
 
                     // === VLM image processing (before cache check, needed for expanded tokens) ===
                     let sms = spatial_merge_size.unwrap_or(2);
-                    let (expanded_tokens, current_image_cache_key) = if has_images {
+                    let (expanded_tokens, current_image_cache_key, vlm_processed) = if has_images {
                         if let (Some(_vision_enc), Some(img_proc)) =
                             (vision_encoder_arc.as_ref(), image_processor_arc.as_ref())
                         {
@@ -1673,12 +1672,12 @@ impl Qwen3_5Model {
                                 compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
                             let expanded = inject_image_placeholders(&tokens, num_image_tokens);
                             let cache_key = compute_image_cache_key(&all_images);
-                            (expanded, cache_key)
+                            (expanded, cache_key, Some(processed_pre))
                         } else {
-                            (tokens.clone(), 0u64)
+                            (tokens.clone(), 0u64, None)
                         }
                     } else {
-                        (tokens.clone(), 0u64)
+                        (tokens.clone(), 0u64, None)
                     };
 
                     // === Cache reuse: prefix verification ===
@@ -1784,27 +1783,23 @@ impl Qwen3_5Model {
                         && cached_prefix_len == 0
                     {
                         // --- VLM full prefill (first call or different images) ---
-                        if let (Some(vision_enc), Some(img_proc)) =
-                            (vision_encoder_arc.as_ref(), image_processor_arc.as_ref())
-                        {
-                            let all_images = extract_images_from_messages(&messages);
-                            let image_refs: Vec<&[u8]> =
-                                all_images.iter().map(|v| v.as_slice()).collect();
-                            let processed = img_proc.process_many(&image_refs)?;
-                            let num_image_tokens =
-                                compute_num_image_tokens(&processed.grid_thw(), sms)?;
-                            let final_tokens = inject_image_placeholders(&tokens, num_image_tokens);
-                            let image_cache_key = compute_image_cache_key(&all_images);
+                        // Reuse expanded_tokens and processed images from pre-cache-check step.
+                        if let Some(vision_enc) = vision_encoder_arc.as_ref() {
+                            let final_tokens = &expanded_tokens;
+                            let processed = vlm_processed.as_ref().ok_or_else(|| {
+                                Error::from_reason("VLM processed images missing")
+                            })?;
+                            let image_cache_key = current_image_cache_key;
 
                             let input_ids = MxArray::from_uint32(
-                                &final_tokens,
+                                final_tokens,
                                 &[1, final_tokens.len() as i64],
                             )?;
 
                             let (logits, rope_deltas) = vlm_prefill(
                                 &input_ids,
                                 image_cache_key,
-                                &processed,
+                                processed,
                                 vision_enc,
                                 sms,
                                 &embedding_weight,
