@@ -1435,7 +1435,15 @@ impl Qwen3_5Model {
                 } else {
                     tokens.clone()
                 };
-                full_history.extend_from_slice(&generated_tokens);
+                // Only include tokens that were actually forwarded through the model.
+                // When stopped at max_tokens ("length"), the last token was never forwarded
+                // (the pipelined loop skips forward on the final step).
+                let history_tokens = if finish_reason == "length" && !generated_tokens.is_empty() {
+                    &generated_tokens[..generated_tokens.len() - 1]
+                } else {
+                    &generated_tokens
+                };
+                full_history.extend_from_slice(history_tokens);
                 if let Ok(mut th) = cached_token_history_arc.write() {
                     *th = full_history;
                 }
@@ -2181,7 +2189,15 @@ impl Qwen3_5Model {
                         } else {
                             tokens.clone()
                         };
-                        full_history.extend_from_slice(&generated_tokens);
+                        // Only include tokens that were actually forwarded through the model.
+                        // When stopped at max_tokens ("length"), the last token was never forwarded
+                        // (the pipelined loop skips forward on the final step).
+                        let history_tokens = if finish_reason == "length" && !generated_tokens.is_empty() {
+                            &generated_tokens[..generated_tokens.len() - 1]
+                        } else {
+                            &generated_tokens
+                        };
+                        full_history.extend_from_slice(history_tokens);
                         if let Ok(mut th) = cached_token_history_arc.write() {
                             *th = full_history;
                         }

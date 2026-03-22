@@ -110,6 +110,8 @@ pub struct Qwen3_5MoeModel {
     cached_token_history: Arc<RwLock<Vec<u32>>>,
     /// Image cache key for VLM cache reuse (None for text-only conversations).
     cached_image_key: Arc<RwLock<Option<u64>>>,
+    /// Rope deltas from VLM prefill, for cache reuse M-RoPE correction
+    cached_rope_deltas: Arc<RwLock<Option<i32>>>,
 }
 
 #[napi]
@@ -161,6 +163,7 @@ impl Qwen3_5MoeModel {
             })),
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
+            cached_rope_deltas: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -180,13 +183,14 @@ impl Qwen3_5MoeModel {
             return None;
         }
         let image_key = self.cached_image_key.read().ok().and_then(|g| *g);
+        let rope_deltas = self.cached_rope_deltas.read().ok().and_then(|g| *g);
         Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
             caches,
             token_history_guard.clone(),
             "qwen3_5_moe",
             self.config.num_layers as usize,
             image_key,
-            None, // MoE doesn't use rope_deltas adjustment
+            rope_deltas,
         ))
     }
 
@@ -228,6 +232,9 @@ impl Qwen3_5MoeModel {
         if let Ok(mut ik) = self.cached_image_key.write() {
             *ik = cache.image_cache_key();
         }
+        if let Ok(mut rd) = self.cached_rope_deltas.write() {
+            *rd = cache.rope_deltas();
+        }
         Ok(())
     }
 
@@ -265,6 +272,9 @@ impl Qwen3_5MoeModel {
         // Also clear token history so next chat() does a full prefill
         if let Ok(mut th) = self.cached_token_history.write() {
             th.clear();
+        }
+        if let Ok(mut rd) = self.cached_rope_deltas.write() {
+            *rd = None;
         }
         Ok(())
     }
@@ -679,6 +689,7 @@ impl Qwen3_5MoeModel {
         let caches_arc = self.caches.clone();
         let cached_token_history_arc = self.cached_token_history.clone();
         let cached_image_key_arc = self.cached_image_key.clone();
+        let cached_rope_deltas_arc = self.cached_rope_deltas.clone();
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
         let think_end_id = tokenizer.think_end_id();
@@ -937,6 +948,11 @@ impl Qwen3_5MoeModel {
                     }
                 }
 
+                // Save rope_deltas for cache reuse on subsequent turns
+                if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                    *rd = Some(rope_deltas as i32);
+                }
+
                 let vlm_seq_len = final_tokens.len() as i64;
                 (logits, vlm_seq_len)
             } else {
@@ -1043,6 +1059,23 @@ impl Qwen3_5MoeModel {
                 }
                 // C++ has copied arrays into its own globals — safe to release
                 drop(caches_guard);
+
+                // Reapply rope_deltas from the original VLM prefill
+                // (VLM cache reuse skips vlm_prefill, so C++ offset is unset)
+                if has_images
+                    && cached_prefix_len > 0
+                    && let Ok(rd) = cached_rope_deltas_arc.read()
+                    && let Some(delta) = *rd
+                {
+                    unsafe {
+                        mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                    }
+                }
+
+                // For text-only conversations, clear any stale cached rope deltas
+                if !has_images && let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                    *rd = None;
+                }
 
                 // C++ decode loop (all locks dropped — C++ owns the state)
                 // Pipelined: submit forward(N+1) BEFORE eval(N) so GPU
@@ -1267,7 +1300,15 @@ impl Qwen3_5MoeModel {
                 } else {
                     tokens.clone()
                 };
-                full_history.extend_from_slice(&generated_tokens);
+                // Only include tokens that were actually forwarded through the model.
+                // When stopped at max_tokens ("length"), the last token was never forwarded
+                // (the pipelined loop skips forward on the final step).
+                let history_tokens = if finish_reason == "length" && !generated_tokens.is_empty() {
+                    &generated_tokens[..generated_tokens.len() - 1]
+                } else {
+                    &generated_tokens
+                };
+                full_history.extend_from_slice(history_tokens);
                 if let Ok(mut th) = cached_token_history_arc.write() {
                     *th = full_history;
                 }
@@ -1399,6 +1440,7 @@ impl Qwen3_5MoeModel {
         let caches_arc = self.caches.clone();
         let cached_token_history_arc = self.cached_token_history.clone();
         let cached_image_key_arc = self.cached_image_key.clone();
+        let cached_rope_deltas_arc = self.cached_rope_deltas.clone();
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
         let tokenizer_for_decode = tokenizer.clone();
@@ -1675,6 +1717,11 @@ impl Qwen3_5MoeModel {
                             }
                         }
 
+                        // Save rope_deltas for cache reuse on subsequent turns
+                        if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                            *rd = Some(rope_deltas as i32);
+                        }
+
                         let vlm_seq_len = final_tokens.len() as i64;
                         (logits, vlm_seq_len)
                     } else {
@@ -1783,6 +1830,23 @@ impl Qwen3_5MoeModel {
                         }
                         // C++ has copied arrays into its own globals — safe to release
                         drop(caches_guard);
+
+                        // Reapply rope_deltas from the original VLM prefill
+                        // (VLM cache reuse skips vlm_prefill, so C++ offset is unset)
+                        if has_images
+                            && cached_prefix_len > 0
+                            && let Ok(rd) = cached_rope_deltas_arc.read()
+                            && let Some(delta) = *rd
+                        {
+                            unsafe {
+                                mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                            }
+                        }
+
+                        // For text-only conversations, clear any stale cached rope deltas
+                        if !has_images && let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                            *rd = None;
+                        }
 
                         // C++ decode loop (pipelined — submit N+1 before eval N)
                         profiler.set_label("moe_chat_stream_compiled");
@@ -2013,7 +2077,15 @@ impl Qwen3_5MoeModel {
                         } else {
                             tokens.clone()
                         };
-                        full_history.extend_from_slice(&generated_tokens);
+                        // Only include tokens that were actually forwarded through the model.
+                        // When stopped at max_tokens ("length"), the last token was never forwarded
+                        // (the pipelined loop skips forward on the final step).
+                        let history_tokens = if finish_reason == "length" && !generated_tokens.is_empty() {
+                            &generated_tokens[..generated_tokens.len() - 1]
+                        } else {
+                            &generated_tokens
+                        };
+                        full_history.extend_from_slice(history_tokens);
                         if let Ok(mut th) = cached_token_history_arc.write() {
                             *th = full_history;
                         }
@@ -2663,6 +2735,7 @@ impl Qwen3_5MoeModel {
             })),
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
+            cached_rope_deltas: Arc::new(RwLock::new(None)),
         })
     }
 
