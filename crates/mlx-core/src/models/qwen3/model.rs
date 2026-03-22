@@ -371,10 +371,18 @@ impl Qwen3Model {
             }
         }
         // Also clear cached chat state so next chat() does a full prefill
-        if let Ok(mut keys) = self.cached_kv_keys.write() { keys.clear(); }
-        if let Ok(mut vals) = self.cached_kv_values.write() { vals.clear(); }
-        if let Ok(mut idx) = self.cached_cache_idx.write() { *idx = 0; }
-        if let Ok(mut th) = self.cached_token_history.write() { th.clear(); }
+        if let Ok(mut keys) = self.cached_kv_keys.write() {
+            keys.clear();
+        }
+        if let Ok(mut vals) = self.cached_kv_values.write() {
+            vals.clear();
+        }
+        if let Ok(mut idx) = self.cached_cache_idx.write() {
+            *idx = 0;
+        }
+        if let Ok(mut th) = self.cached_token_history.write() {
+            th.clear();
+        }
         Ok(())
     }
 
