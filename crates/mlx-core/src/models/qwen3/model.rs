@@ -5723,11 +5723,12 @@ impl Qwen3Model {
                 // is NOT in the KV cache. Only include tokens actually forwarded.
                 if let Ok(mut th) = cached_token_history_arc.write() {
                     let mut full_history = token_ids_vec.clone();
-                    let history_tokens = if finish_reason != "length" && !generated_tokens.is_empty() {
-                        &generated_tokens[..generated_tokens.len() - 1]
-                    } else {
-                        &generated_tokens
-                    };
+                    let history_tokens =
+                        if finish_reason != "length" && !generated_tokens.is_empty() {
+                            &generated_tokens[..generated_tokens.len() - 1]
+                        } else {
+                            &generated_tokens
+                        };
                     full_history.extend_from_slice(history_tokens);
                     *th = full_history;
                 }
