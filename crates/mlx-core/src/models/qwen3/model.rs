@@ -250,18 +250,10 @@ impl Qwen3Model {
     /// Call this when starting a new conversation to ensure a full prefill.
     #[napi]
     pub fn reset_cache(&self) -> Result<()> {
-        if let Ok(mut keys) = self.cached_kv_keys.write() {
-            keys.clear();
-        }
-        if let Ok(mut vals) = self.cached_kv_values.write() {
-            vals.clear();
-        }
-        if let Ok(mut idx) = self.cached_cache_idx.write() {
-            *idx = 0;
-        }
-        if let Ok(mut th) = self.cached_token_history.write() {
-            th.clear();
-        }
+        self.cached_kv_keys.write().map_err(|_| Error::from_reason("Poisoned lock"))?.clear();
+        self.cached_kv_values.write().map_err(|_| Error::from_reason("Poisoned lock"))?.clear();
+        *self.cached_cache_idx.write().map_err(|_| Error::from_reason("Poisoned lock"))? = 0;
+        self.cached_token_history.write().map_err(|_| Error::from_reason("Poisoned lock"))?.clear();
         Ok(())
     }
 
@@ -371,18 +363,10 @@ impl Qwen3Model {
             }
         }
         // Also clear cached chat state so next chat() does a full prefill
-        if let Ok(mut keys) = self.cached_kv_keys.write() {
-            keys.clear();
-        }
-        if let Ok(mut vals) = self.cached_kv_values.write() {
-            vals.clear();
-        }
-        if let Ok(mut idx) = self.cached_cache_idx.write() {
-            *idx = 0;
-        }
-        if let Ok(mut th) = self.cached_token_history.write() {
-            th.clear();
-        }
+        self.cached_kv_keys.write().map_err(|_| Error::from_reason("Poisoned lock"))?.clear();
+        self.cached_kv_values.write().map_err(|_| Error::from_reason("Poisoned lock"))?.clear();
+        *self.cached_cache_idx.write().map_err(|_| Error::from_reason("Poisoned lock"))? = 0;
+        self.cached_token_history.write().map_err(|_| Error::from_reason("Poisoned lock"))?.clear();
         Ok(())
     }
 
