@@ -818,12 +818,15 @@ pub(crate) fn build_qwen35_recipe(
 ///
 /// Key findings from Unsloth's per-tensor 99.9% KLD analysis (sorted worst→best):
 ///
-/// **Most sensitive (quantize at 5-bit with imatrix AWQ pre-scaling):**
-/// - `ssm_out` (`linear_attn.out_proj`): KLD ~6.0 at q2_k — by far the worst,
-///   but Q5_K with imatrix is near-lossless per Unsloth's benchmarks
-/// - `attn_qkv` (`self_attn.*`): KLD ~2.9 — "especially sensitive for hybrid architectures"
-/// - `attn_v/output/q/gate`: KLD ~1.5-2.1 — all attn_* tensors are high sensitivity
-/// - `attn_gate` (`linear_attn.in_proj_z`): "performs poorly with MXFP4"
+/// **Most sensitive — AWQ-correctable (quantize at 5-bit with imatrix):**
+/// - `attn_qkv` (`self_attn.q/k/v_proj`): KLD ~1.5-2.9 — AWQ via input_layernorm
+/// - `attn_gate` (`linear_attn.in_proj_z`): "performs poorly with MXFP4" — AWQ via input_layernorm
+/// - `linear_attn.in_proj_qkv`: KLD ~2.9 — AWQ via input_layernorm
+///
+/// **Most sensitive — NOT AWQ-correctable (keep bf16):**
+/// - `ssm_out` (`linear_attn.out_proj`): KLD ~6.0 at q2_k — no preceding norm
+/// - `self_attn.o_proj`: KLD ~1.5 — no preceding norm
+///
 /// - `ssm_beta`, `ssm_alpha` (`in_proj_a/b`): degrade significantly with low bits
 ///   (already excluded by `should_quantize()` since they lack `.weight` suffix)
 ///
@@ -904,23 +907,33 @@ pub(crate) fn build_unsloth_recipe(
             };
         }
 
-        // Attention and SSM projections: quantize at higher bits (Q5_K equivalent).
-        // Unsloth's KLD benchmarks show Q5_K with imatrix is near-lossless for these.
-        // imatrix AWQ pre-scaling is required for the unsloth recipe to ensure quality.
-        //
-        // ssm_out (linear_attn.out_proj): KLD ~6.0 at q2_k — most sensitive tensor,
-        // but at 5-bit with imatrix pre-scaling, quality loss is negligible.
-        let is_attn_ssm = key.contains("self_attn.")
-            || key.contains("linear_attn.out_proj")
+        // Attention/SSM projections WITH AWQ pre-scaling (Groups C & D):
+        // input_layernorm absorbs inverse scales for these.
+        let is_awq_corrected_attn = key.contains("self_attn.q_proj")
+            || key.contains("self_attn.k_proj")
+            || key.contains("self_attn.v_proj")
             || key.contains("linear_attn.in_proj_qkv")
             || key.contains("linear_attn.in_proj_z");
 
-        if is_attn_ssm {
+        if is_awq_corrected_attn {
             return QuantDecision::Custom {
                 bits: attn_ssm_bits,
                 group_size: gs,
                 mode: "affine".to_string(),
             };
+        }
+
+        // Attention/SSM projections WITHOUT AWQ pre-scaling:
+        // o_proj input comes from attention computation (not a norm layer),
+        // out_proj input comes from GDN computation.
+        // These cannot be AWQ-corrected — keep at bf16 for quality.
+        // linear_attn.out_proj: KLD ~6.0 — worst tensor by far.
+        // self_attn.o_proj: KLD ~1.5 — sensitive but not catastrophic.
+        let is_non_awq_attn = key.contains("self_attn.o_proj")
+            || key.contains("linear_attn.out_proj");
+
+        if is_non_awq_attn {
+            return QuantDecision::Skip;
         }
 
         // ffn_down: "slightly more sensitive" than other FFN variants
