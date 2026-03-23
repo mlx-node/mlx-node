@@ -1819,6 +1819,12 @@ pub(crate) fn apply_awq_prescaling(
                     let scaled = norm.mul(&inv)?;
                     weights.insert(input_norm_key.clone(), scaled);
                     modified += 1;
+                } else {
+                    warn!(
+                        "AWQ Group C: input_layernorm.weight missing for layer {} — \
+                         projection weights were scaled but inverse not fused into norm",
+                        i
+                    );
                 }
             }
         }
@@ -1840,12 +1846,20 @@ pub(crate) fn apply_awq_prescaling(
                         modified += 1;
                     }
                 }
-                // input_layernorm.weight /= scales (only if not already absorbed by Group C)
+                // input_layernorm.weight /= scales
+                // Groups C and D are mutually exclusive — a layer is either
+                // full-attention or GDN, never both — so this norm is only modified once.
                 if let Some(norm) = weights.remove(&input_norm_key) {
                     let inv = invert_scales(&scales)?.astype(norm.dtype()?)?;
                     let scaled = norm.mul(&inv)?;
                     weights.insert(input_norm_key, scaled);
                     modified += 1;
+                } else {
+                    warn!(
+                        "AWQ Group D: input_layernorm.weight missing for layer {} — \
+                         projection weights were scaled but inverse not fused into norm",
+                        i
+                    );
                 }
             }
         }
@@ -1902,6 +1916,35 @@ fn compute_multi_key_scales(
 
     if importances.is_empty() {
         return Ok(None);
+    }
+
+    // Require ALL keys present — partial AWQ correction is worse than none
+    if importances.len() < keys.len() {
+        let missing: Vec<&str> = keys
+            .iter()
+            .filter(|k| !imatrix.importance.contains_key(**k))
+            .copied()
+            .collect();
+        warn!(
+            "AWQ: skipping group — imatrix missing {}/{} keys: {}",
+            missing.len(),
+            keys.len(),
+            missing.join(", ")
+        );
+        return Ok(None);
+    }
+
+    // Validate all importance vectors have the same length
+    if importances.len() > 1 {
+        let expected_len = importances[0].len();
+        for (i, imp) in importances.iter().enumerate().skip(1) {
+            if imp.len() != expected_len {
+                return Err(Error::from_reason(format!(
+                    "AWQ imatrix dimension mismatch: key[0] has {} entries but key[{}] has {}",
+                    expected_len, i, imp.len()
+                )));
+            }
+        }
     }
 
     let len = importances[0].len();

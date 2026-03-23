@@ -345,9 +345,14 @@ export async function run(argv: string[]) {
     }
     console.log('');
   } else if (weightFiles.length === 0 && globPatterns?.length) {
+    if (filesToDownload.length === 0) {
+      console.error(`\nNo files matched the glob pattern(s): ${globPatterns.join(', ')}`);
+      console.error('Check the pattern and available files in the repository.');
+      process.exit(1);
+    }
     // Glob filter matched non-weight files (e.g. imatrix, calibration data).
     // Skip model verification — user is downloading auxiliary files.
-    console.log(`\nDownload complete! ${filesToDownload.length} file(s) saved to ${outputDir}\n`);
+    console.log(`\nDownload complete! ${filesToDownload.length} non-weight file(s) saved to ${outputDir}\n`);
   } else {
     console.log(`Format: Base model (needs MLX conversion)`);
     console.log('Note: After download, convert to MLX format:');

@@ -442,16 +442,40 @@ fn apply_weights(
                 // Merged projection fallback: try pre-merge component names
                 if prefix.ends_with(".in_proj_qkvz") {
                     let base = prefix.strip_suffix(".in_proj_qkvz").unwrap();
-                    per_layer_quant
-                        .get(&format!("{}.in_proj_qkv", base))
-                        .or_else(|| per_layer_quant.get(&format!("{}.in_proj_z", base)))
-                        .copied()
+                    let qkv = per_layer_quant
+                        .get(&format!("{}.in_proj_qkv", base));
+                    let z = per_layer_quant
+                        .get(&format!("{}.in_proj_z", base));
+                    match (qkv, z) {
+                        (Some(&a), Some(&b)) if a != b => {
+                            warn!(
+                                "Merged in_proj_qkvz has conflicting overrides: \
+                                 qkv={:?}, z={:?}. Using higher precision.",
+                                a, b
+                            );
+                            Some(if a.0 > b.0 { a } else { b })
+                        }
+                        (Some(&a), _) | (_, Some(&a)) => Some(a),
+                        _ => None,
+                    }
                 } else if prefix.ends_with(".in_proj_ba") {
                     let base = prefix.strip_suffix(".in_proj_ba").unwrap();
-                    per_layer_quant
-                        .get(&format!("{}.in_proj_b", base))
-                        .or_else(|| per_layer_quant.get(&format!("{}.in_proj_a", base)))
-                        .copied()
+                    let b_val = per_layer_quant
+                        .get(&format!("{}.in_proj_b", base));
+                    let a_val = per_layer_quant
+                        .get(&format!("{}.in_proj_a", base));
+                    match (b_val, a_val) {
+                        (Some(&x), Some(&y)) if x != y => {
+                            warn!(
+                                "Merged in_proj_ba has conflicting overrides: \
+                                 b={:?}, a={:?}. Using higher precision.",
+                                x, y
+                            );
+                            Some(if x.0 > y.0 { x } else { y })
+                        }
+                        (Some(&x), _) | (_, Some(&x)) => Some(x),
+                        _ => None,
+                    }
                 } else {
                     None
                 }

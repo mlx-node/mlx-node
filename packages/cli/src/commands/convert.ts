@@ -174,6 +174,8 @@ export async function run(argv: string[]) {
       console.error(`Error: imatrix file not found: ${imatrixPath}`);
       process.exit(1);
     }
+    // HuggingFace Hub names some GGUF files with .gguf_file extension
+    // (e.g. Unsloth's imatrix_unsloth.gguf_file). Accept both extensions.
     if (!imatrixPath.endsWith('.gguf') && !imatrixPath.endsWith('.gguf_file')) {
       console.error('Error: --imatrix-path must point to a .gguf or .gguf_file');
       process.exit(1);
