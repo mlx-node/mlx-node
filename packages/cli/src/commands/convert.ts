@@ -35,7 +35,7 @@ Quantization Arguments:
   --q-recipe <string>   Per-layer mixed-bit quantization recipe
                         Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
                         "unsloth" defaults to 3-bit base (gate/up=3b, down=4b,
-                        embed=5b, lm_head=6b, attn/SSM=5b)
+                        embed=5b, lm_head=6b, attn q/k/v=5b+AWQ, out_proj=bf16)
                         "unsloth" requires --imatrix-path for quality
   --imatrix-path <path> imatrix GGUF file for AWQ-style pre-scaling
                         Improves quantization quality using calibration data
@@ -137,10 +137,10 @@ export async function run(argv: string[]) {
       process.exit(1);
     }
     // Unsloth recipe defaults to 3-bit base (MLP gate/up at 3-bit, down at 4-bit,
-    // embed_tokens at 5-bit, lm_head at 6-bit, attention/SSM at 5-bit).
-    // Based on Unsloth's per-tensor KLD analysis showing ffn_up/gate are
-    // "generally ok to quantize to 3-bit" and IQ3_XXS is the "best compromise".
-    // Requires imatrix for near-lossless quality on attention/SSM layers.
+    // embed_tokens at 5-bit, lm_head at 6-bit, attn q/k/v + SSM in_proj at 5-bit
+    // with AWQ pre-scaling via input_layernorm, out_proj/o_proj kept at bf16).
+    // Based on Unsloth's per-tensor KLD analysis. Requires imatrix for AWQ correction
+    // on the attention/SSM projections.
     if (quantRecipe === 'unsloth' && !args['q-bits']) {
       console.log('Note: unsloth recipe defaults to 3-bit base (override with --q-bits)');
     }
@@ -153,7 +153,7 @@ export async function run(argv: string[]) {
   }
 
   // Apply recipe-specific defaults for bits when not explicitly set.
-  // Unsloth recipe: 3-bit base → MLP gate/up=3b, down=4b, embed=5b, lm_head=6b, attn/SSM=5b
+  // Unsloth recipe: 3-bit base → MLP gate/up=3b, down=4b, embed=5b, lm_head=6b, attn q/k/v=5b+AWQ, out_proj=bf16
   const effectiveQuantBits = quantBits ?? (quantRecipe === 'unsloth' ? 3 : undefined);
 
   const mmprojPath = args.mmproj ? resolve(args.mmproj) : undefined;
