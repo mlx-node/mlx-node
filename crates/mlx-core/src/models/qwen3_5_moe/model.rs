@@ -693,6 +693,7 @@ impl Qwen3_5MoeModel {
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
         let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
 
         // Clone vision fields if images present
@@ -1321,11 +1322,18 @@ impl Qwen3_5MoeModel {
                     };
                 }
             } else {
+                // reuseCache: false — clear all cache state to free GPU memory
+                if let Ok(mut cg) = caches_arc.write() {
+                    *cg = None;
+                }
                 if let Ok(mut th) = cached_token_history_arc.write() {
                     th.clear();
                 }
                 if let Ok(mut ik) = cached_image_key_arc.write() {
                     *ik = None;
+                }
+                if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                    *rd = None;
                 }
             }
 
@@ -1364,9 +1372,12 @@ impl Qwen3_5MoeModel {
 
             let num_tokens = generated_tokens.len() as u32;
 
-            let has_think_end = tools::has_think_end_token(&generated_tokens, think_end_id);
-            let (clean_text, tool_calls, thinking) =
-                tools::split_at_think_end(&text, has_think_end);
+            let think_tag = if tools::has_think_end_token(&generated_tokens, think_end_id) {
+                think_end_str.as_deref()
+            } else {
+                None
+            };
+            let (clean_text, tool_calls, thinking) = tools::split_at_think_end(&text, think_tag);
 
             // If we have valid tool calls, override finish reason
             let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -2099,11 +2110,17 @@ impl Qwen3_5MoeModel {
                             };
                         }
                     } else {
+                        if let Ok(mut cg) = caches_arc.write() {
+                            *cg = None;
+                        }
                         if let Ok(mut th) = cached_token_history_arc.write() {
                             th.clear();
                         }
                         if let Ok(mut ik) = cached_image_key_arc.write() {
                             *ik = None;
+                        }
+                        if let Ok(mut rd) = cached_rope_deltas_arc.write() {
+                            *rd = None;
                         }
                     }
 

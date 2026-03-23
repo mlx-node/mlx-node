@@ -557,19 +557,19 @@ pub fn has_think_end_token(generated_tokens: &[u32], think_end_id: Option<u32>) 
 
 /// Split generated output using token-level thinking detection.
 ///
-/// When the `</think>` token was found in generated tokens (`has_think_end = true`),
-/// splits at the `</think>` text boundary. Everything before is thinking, everything
-/// after is the response (with tool calls parsed). Falls back to `parse_generation_output`
-/// when no `</think>` token was detected.
+/// When the think-end token was found in generated tokens (`think_end_tag` is Some),
+/// splits at the corresponding text boundary. Supports both `</think>` and
+/// `</longcat_think>` variants. Falls back to `parse_generation_output` when
+/// no think-end token was detected.
 pub fn split_at_think_end(
     raw_text: &str,
-    has_think_end: bool,
+    think_end_tag: Option<&str>,
 ) -> (String, Vec<ToolCallResult>, Option<String>) {
-    if has_think_end && let Some(close_pos) = raw_text.find("</think>") {
-        let after_tag = &raw_text[close_pos + "</think>".len()..];
-        // Guard: only split if </think> is followed by newline or end-of-text,
-        // matching the heuristic in parse_thinking(). This prevents splitting
-        // at a literal </think> embedded mid-sentence.
+    if let Some(tag) = think_end_tag
+        && let Some(close_pos) = raw_text.find(tag)
+    {
+        let after_tag = &raw_text[close_pos + tag.len()..];
+        // Guard: only split if the tag is followed by newline or end-of-text.
         if !after_tag.is_empty() && !after_tag.starts_with('\n') {
             return parse_generation_output(raw_text);
         }
