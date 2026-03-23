@@ -1454,6 +1454,8 @@ impl Qwen3_5MoeModel {
         let cached_rope_deltas_arc = self.cached_rope_deltas.clone();
         let model_config = self.config.clone();
         let fa_idx = self.fa_idx;
+        let think_end_id_stream = tokenizer.think_end_id();
+        let think_end_str_stream = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
 
         // Clone vision fields if images present
@@ -2161,8 +2163,12 @@ impl Qwen3_5MoeModel {
 
                     let num_tokens = generated_tokens.len() as u32;
 
-                    // Parse tool calls and thinking from the generated text
-                    let (clean_text, tool_calls, thinking) = tools::parse_generation_output(&text);
+                    let think_tag = if tools::has_think_end_token(&generated_tokens, think_end_id_stream) {
+                        think_end_str_stream.as_deref()
+                    } else {
+                        None
+                    };
+                    let (clean_text, tool_calls, thinking) = tools::split_at_think_end(&text, think_tag);
 
                     // If we have valid tool calls, override finish reason
                     let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
