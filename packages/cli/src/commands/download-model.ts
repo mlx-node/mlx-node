@@ -344,6 +344,10 @@ export async function run(argv: string[]) {
       console.log(`  mlx convert -i ${ggufPath} -o ${outputDir}-mlx`);
     }
     console.log('');
+  } else if (weightFiles.length === 0 && globPatterns?.length) {
+    // Glob filter matched non-weight files (e.g. imatrix, calibration data).
+    // Skip model verification — user is downloading auxiliary files.
+    console.log(`\nDownload complete! ${filesToDownload.length} file(s) saved to ${outputDir}\n`);
   } else {
     console.log(`Format: Base model (needs MLX conversion)`);
     console.log('Note: After download, convert to MLX format:');

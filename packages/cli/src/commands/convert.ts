@@ -35,9 +35,11 @@ Quantization Arguments:
   --q-recipe <string>   Per-layer mixed-bit quantization recipe
                         Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
                         "unsloth" defaults to 3-bit base (gate/up=3b, down=4b,
-                        embed=5b, lm_head=6b, attn/SSM=bf16)
+                        embed=5b, lm_head=6b, attn/SSM=5b)
+                        "unsloth" requires --imatrix-path for quality
   --imatrix-path <path> imatrix GGUF file for AWQ-style pre-scaling
                         Improves quantization quality using calibration data
+                        Required for "unsloth" recipe
 
 Model Types:
   (default)             SafeTensors dtype conversion (HuggingFace models)
@@ -62,7 +64,7 @@ Examples:
   mlx convert -i model-BF16.gguf -o ./models/mixed-4-6 -q --q-recipe mixed_4_6
   mlx convert -i .cache/models/qwen3.5-9b -o ./models/qwen35-recipe -q --q-recipe qwen3_5 -m qwen3_5
   mlx convert -i model-BF16.gguf -o ./models/awq-4bit -q --q-recipe unsloth --imatrix-path imatrix.gguf
-  mlx convert -i .cache/models/Qwen3.5-27B -o ./models/qwen3.5-unsloth -q --q-recipe unsloth --mmproj mmproj-BF16.gguf
+  mlx convert -i .cache/models/Qwen3.5-27B -o ./models/qwen3.5-unsloth -q --q-recipe unsloth --imatrix-path imatrix.gguf
 `);
 }
 
@@ -135,16 +137,23 @@ export async function run(argv: string[]) {
       process.exit(1);
     }
     // Unsloth recipe defaults to 3-bit base (MLP gate/up at 3-bit, down at 4-bit,
-    // embed_tokens at 5-bit, lm_head at 6-bit, attention/SSM kept bf16).
+    // embed_tokens at 5-bit, lm_head at 6-bit, attention/SSM at 5-bit).
     // Based on Unsloth's per-tensor KLD analysis showing ffn_up/gate are
     // "generally ok to quantize to 3-bit" and IQ3_XXS is the "best compromise".
+    // Requires imatrix for near-lossless quality on attention/SSM layers.
     if (quantRecipe === 'unsloth' && !args['q-bits']) {
       console.log('Note: unsloth recipe defaults to 3-bit base (override with --q-bits)');
+    }
+    if (quantRecipe === 'unsloth' && !args['imatrix-path']) {
+      console.error('Error: --q-recipe unsloth requires --imatrix-path for AWQ pre-scaling');
+      console.error('       imatrix calibration data is needed for near-lossless attention/SSM quantization');
+      console.error('       Generate with: llama-imatrix -m model.gguf -f calibration.txt -o imatrix.gguf');
+      process.exit(1);
     }
   }
 
   // Apply recipe-specific defaults for bits when not explicitly set.
-  // Unsloth recipe: 3-bit base → MLP gate/up=3b, down=4b, embed=5b, lm_head=6b
+  // Unsloth recipe: 3-bit base → MLP gate/up=3b, down=4b, embed=5b, lm_head=6b, attn/SSM=5b
   const effectiveQuantBits = quantBits ?? (quantRecipe === 'unsloth' ? 3 : undefined);
 
   const mmprojPath = args.mmproj ? resolve(args.mmproj) : undefined;
@@ -165,8 +174,8 @@ export async function run(argv: string[]) {
       console.error(`Error: imatrix file not found: ${imatrixPath}`);
       process.exit(1);
     }
-    if (!imatrixPath.endsWith('.gguf')) {
-      console.error('Error: --imatrix-path must point to a .gguf file');
+    if (!imatrixPath.endsWith('.gguf') && !imatrixPath.endsWith('.gguf_file')) {
+      console.error('Error: --imatrix-path must point to a .gguf or .gguf_file');
       process.exit(1);
     }
   }

@@ -821,6 +821,11 @@ export declare class Qwen3Model {
   /** Create a new Qwen3 model with the given configuration */
   constructor(config: Qwen3Config);
   /**
+   * Reset the KV cache used for cache reuse across chat() calls.
+   * Call this when starting a new conversation to ensure a full prefill.
+   */
+  resetCache(): void;
+  /**
    * Forward pass through the model
    *
    * # Arguments

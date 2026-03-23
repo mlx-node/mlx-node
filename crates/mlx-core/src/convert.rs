@@ -174,6 +174,14 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
                 valid.join(", ")
             )));
         }
+        // Unsloth recipe requires imatrix for near-lossless attention/SSM quantization
+        if recipe == "unsloth" && imatrix_path.is_none() {
+            return Err(Error::from_reason(
+                "unsloth recipe requires --imatrix-path: imatrix calibration data is needed \
+                 for near-lossless quantization of attention/SSM layers"
+                    .to_string(),
+            ));
+        }
     }
 
     // Validate input directory
@@ -810,13 +818,17 @@ pub(crate) fn build_qwen35_recipe(
 ///
 /// Key findings from Unsloth's per-tensor 99.9% KLD analysis (sorted worst→best):
 ///
-/// **Most sensitive (skip quantization — keep bf16):**
-/// - `ssm_out` (`linear_attn.out_proj`): KLD ~6.0 at q2_k — by far the worst
+/// **Most sensitive (quantize at 5-bit with imatrix AWQ pre-scaling):**
+/// - `ssm_out` (`linear_attn.out_proj`): KLD ~6.0 at q2_k — by far the worst,
+///   but Q5_K with imatrix is near-lossless per Unsloth's benchmarks
 /// - `attn_qkv` (`self_attn.*`): KLD ~2.9 — "especially sensitive for hybrid architectures"
 /// - `attn_v/output/q/gate`: KLD ~1.5-2.1 — all attn_* tensors are high sensitivity
 /// - `attn_gate` (`linear_attn.in_proj_z`): "performs poorly with MXFP4"
 /// - `ssm_beta`, `ssm_alpha` (`in_proj_a/b`): degrade significantly with low bits
 ///   (already excluded by `should_quantize()` since they lack `.weight` suffix)
+///
+/// NOTE: imatrix is **required** for this recipe — without AWQ pre-scaling,
+/// affine quantization of attention/SSM at 5-bit would have noticeable quality loss.
 ///
 /// **Moderate sensitivity (default_bits + 1):**
 /// - `ffn_down` (`down_proj`): "slightly more sensitive" than other FFN weights
@@ -832,8 +844,9 @@ pub(crate) fn build_qwen35_recipe(
 /// **Always 8-bit:**
 /// - Router gates: standard for MoE routing accuracy
 ///
-/// This recipe matches Unsloth Dynamic 2.0's approach of "upcasting important
-/// layers to 8 or 16-bit" while aggressively quantizing FFN weights to 3-bit.
+/// This recipe matches Unsloth Dynamic 2.0's approach of quantizing important
+/// layers at higher bits (5-bit with imatrix) while aggressively quantizing
+/// FFN weights to 3-bit. Requires imatrix for near-lossless quality.
 /// Embeddings and lm_head are quantized at higher precision (5-6 bit) following
 /// llama.cpp's standard practice — they're dequantized at load time since the
 /// model accesses them every token (savings come from smaller file on disk).
@@ -856,6 +869,7 @@ pub(crate) fn build_unsloth_recipe(
     let down_proj_bits = snap_bits(default_bits + 1);
     let embed_bits = snap_bits(default_bits + 2);
     let lm_head_bits = snap_bits(default_bits + 3);
+    let attn_ssm_bits = snap_bits(default_bits + 2); // 5-bit for attention/SSM (Q5_K equivalent)
     let gs = default_group_size;
 
     Box::new(move |key: &str| -> QuantDecision {
@@ -890,19 +904,23 @@ pub(crate) fn build_unsloth_recipe(
             };
         }
 
-        // ssm_out (linear_attn.out_proj): skip entirely — keep bf16
-        if key.contains("linear_attn.out_proj") {
-            return QuantDecision::Skip;
-        }
-
-        // All attention and SSM-sensitive projections: skip entirely — keep bf16
-        // This matches Unsloth Dynamic 2.0's "upcasted to 16-bit" approach
-        let is_attn_sensitive = key.contains("self_attn.")
+        // Attention and SSM projections: quantize at higher bits (Q5_K equivalent).
+        // Unsloth's KLD benchmarks show Q5_K with imatrix is near-lossless for these.
+        // imatrix AWQ pre-scaling is required for the unsloth recipe to ensure quality.
+        //
+        // ssm_out (linear_attn.out_proj): KLD ~6.0 at q2_k — most sensitive tensor,
+        // but at 5-bit with imatrix pre-scaling, quality loss is negligible.
+        let is_attn_ssm = key.contains("self_attn.")
+            || key.contains("linear_attn.out_proj")
             || key.contains("linear_attn.in_proj_qkv")
             || key.contains("linear_attn.in_proj_z");
 
-        if is_attn_sensitive {
-            return QuantDecision::Skip;
+        if is_attn_ssm {
+            return QuantDecision::Custom {
+                bits: attn_ssm_bits,
+                group_size: gs,
+                mode: "affine".to_string(),
+            };
         }
 
         // ffn_down: "slightly more sensitive" than other FFN variants

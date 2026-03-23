@@ -428,6 +428,9 @@ fn apply_weights(
 
     // Helper: try MXFP8 builder first (if applicable), then affine builder.
     // Checks per-layer overrides before falling back to global defaults.
+    // For merged projections (in_proj_qkvz, in_proj_ba), also checks the
+    // pre-merge component names (in_proj_qkv, in_proj_z, in_proj_b, in_proj_a)
+    // since config.json stores overrides using the original HuggingFace names.
     let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
         if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_linear(params, prefix) {
             return Some(ql);
@@ -435,6 +438,24 @@ fn apply_weights(
         let (bits, gs) = per_layer_quant
             .get(prefix)
             .copied()
+            .or_else(|| {
+                // Merged projection fallback: try pre-merge component names
+                if prefix.ends_with(".in_proj_qkvz") {
+                    let base = prefix.strip_suffix(".in_proj_qkvz").unwrap();
+                    per_layer_quant
+                        .get(&format!("{}.in_proj_qkv", base))
+                        .or_else(|| per_layer_quant.get(&format!("{}.in_proj_z", base)))
+                        .copied()
+                } else if prefix.ends_with(".in_proj_ba") {
+                    let base = prefix.strip_suffix(".in_proj_ba").unwrap();
+                    per_layer_quant
+                        .get(&format!("{}.in_proj_b", base))
+                        .or_else(|| per_layer_quant.get(&format!("{}.in_proj_a", base)))
+                        .copied()
+                } else {
+                    None
+                }
+            })
             .unwrap_or((quant_bits, quant_group_size));
         try_build_quantized_linear(params, prefix, gs, bits)
     };
