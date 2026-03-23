@@ -1701,6 +1701,11 @@ fn sanitize_qwen35_moe(
 ///   A: post_attention_layernorm → gate_proj, up_proj (input columns)
 ///   B: up_proj (output rows) → down_proj (input columns)
 ///   C: input_layernorm → self_attn.q_proj, k_proj, v_proj (full-attention layers)
+///   D: input_layernorm → linear_attn.in_proj_qkv, in_proj_z (GatedDeltaNet layers)
+///
+/// Note: self_attn.o_proj and linear_attn.out_proj are NOT covered — their inputs
+/// come from attention/GDN computation, not from a norm layer. These tensors should
+/// be kept at bf16 or quantized without AWQ correction.
 pub(crate) fn apply_awq_prescaling(
     weights: &mut HashMap<String, MxArray>,
     imatrix: &crate::utils::imatrix::ImatrixData,
@@ -1800,6 +1805,33 @@ pub(crate) fn apply_awq_prescaling(
                     let inv = invert_scales(&scales)?.astype(norm.dtype()?)?;
                     let scaled = norm.mul(&inv)?;
                     weights.insert(input_norm_key.clone(), scaled);
+                    modified += 1;
+                }
+            }
+        }
+
+        // ── Group D: input_layernorm → linear_attn.in_proj_qkv + in_proj_z ──
+        // (Only present in GatedDeltaNet layers)
+        let qkv_key = format!("{prefix}.linear_attn.in_proj_qkv.weight");
+        let z_key = format!("{prefix}.linear_attn.in_proj_z.weight");
+
+        // Only apply if this layer has linear_attn weights (GDN layer)
+        if weights.contains_key(&qkv_key) {
+            if let Some(scales) =
+                compute_multi_key_scales(imatrix, &[&qkv_key, &z_key], ratio)?
+            {
+                for proj_key in [&qkv_key, &z_key] {
+                    if let Some(proj) = weights.remove(proj_key) {
+                        let scaled = scale_columns(&proj, &scales)?;
+                        weights.insert(proj_key.to_string(), scaled);
+                        modified += 1;
+                    }
+                }
+                // input_layernorm.weight /= scales (only if not already absorbed by Group C)
+                if let Some(norm) = weights.remove(&input_norm_key) {
+                    let inv = invert_scales(&scales)?.astype(norm.dtype()?)?;
+                    let scaled = norm.mul(&inv)?;
+                    weights.insert(input_norm_key, scaled);
                     modified += 1;
                 }
             }
