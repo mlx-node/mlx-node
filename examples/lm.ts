@@ -14,7 +14,8 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { ChatResult, loadModel, Qwen3Model } from '@mlx-node/lm';
+import type { ChatResult } from '@mlx-node/lm';
+import { loadModel, Qwen3Model } from '@mlx-node/lm';
 
 const { values, positionals } = parseArgs({
   args: process.argv.slice(2),

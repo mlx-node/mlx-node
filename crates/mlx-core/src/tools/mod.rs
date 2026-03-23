@@ -565,11 +565,17 @@ pub fn split_at_think_end(
     raw_text: &str,
     think_end_tag: Option<&str>,
 ) -> (String, Vec<ToolCallResult>, Option<String>) {
+    // If the text contains paired <think>...</think> blocks, use the standard
+    // tag-pair parser (handles models that emit the full opening tag).
+    if raw_text.contains("<think>") || raw_text.contains("<longcat_think>") {
+        return parse_generation_output(raw_text);
+    }
+    // Token-level split: the template injected <think>\n as a prefix, so the
+    // generated text starts with thinking content followed by </think>.
     if let Some(tag) = think_end_tag
         && let Some(close_pos) = raw_text.find(tag)
     {
         let after_tag = &raw_text[close_pos + tag.len()..];
-        // Guard: only split if the tag is followed by newline or end-of-text.
         if !after_tag.is_empty() && !after_tag.starts_with('\n') {
             return parse_generation_output(raw_text);
         }

@@ -5717,10 +5717,18 @@ impl Qwen3Model {
                 if let Ok(mut idx_guard) = cached_cache_idx_arc.write() {
                     *idx_guard = cache_idx;
                 }
-                // Save token history: prompt tokens + generated tokens
+                // Save token history: prompt tokens + generated tokens.
+                // Qwen3's decode loop runs forward_fused AFTER the EOS/repetition
+                // checks, so when stopped by "stop" or repetition, the last token
+                // is NOT in the KV cache. Only include tokens actually forwarded.
                 if let Ok(mut th) = cached_token_history_arc.write() {
                     let mut full_history = token_ids_vec.clone();
-                    full_history.extend_from_slice(&generated_tokens);
+                    let history_tokens = if finish_reason != "length" && !generated_tokens.is_empty() {
+                        &generated_tokens[..generated_tokens.len() - 1]
+                    } else {
+                        &generated_tokens
+                    };
+                    full_history.extend_from_slice(history_tokens);
                     *th = full_history;
                 }
             } else {
