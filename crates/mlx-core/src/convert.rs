@@ -1693,13 +1693,14 @@ fn sanitize_qwen35_moe(
 
 /// Apply AWQ-style pre-scaling using imatrix importance scores.
 ///
-/// For each FFN scale group, amplifies important weight columns and fuses
+/// For each scale group, amplifies important weight columns and fuses
 /// the inverse into the preceding layer. This improves quantization quality
 /// without changing model size or inference speed.
 ///
 /// Scale groups per layer:
 ///   A: post_attention_layernorm → gate_proj, up_proj (input columns)
 ///   B: up_proj (output rows) → down_proj (input columns)
+///   C: input_layernorm → self_attn.q_proj, k_proj, v_proj (full-attention layers)
 pub(crate) fn apply_awq_prescaling(
     weights: &mut HashMap<String, MxArray>,
     imatrix: &crate::utils::imatrix::ImatrixData,
@@ -1774,6 +1775,35 @@ pub(crate) fn apply_awq_prescaling(
                 modified += 1;
             }
         }
+
+        // ── Group C: input_layernorm → self_attn.q_proj + k_proj + v_proj ──
+        // (Only present in full-attention layers, every full_attention_interval-th layer)
+        let q_key = format!("{prefix}.self_attn.q_proj.weight");
+        let k_key = format!("{prefix}.self_attn.k_proj.weight");
+        let v_key = format!("{prefix}.self_attn.v_proj.weight");
+        let input_norm_key = format!("{prefix}.input_layernorm.weight");
+
+        // Only apply if this layer has self_attn weights (full attention layer)
+        if weights.contains_key(&q_key) {
+            if let Some(scales) =
+                compute_multi_key_scales(imatrix, &[&q_key, &k_key, &v_key], ratio)?
+            {
+                for proj_key in [&q_key, &k_key, &v_key] {
+                    if let Some(proj) = weights.remove(proj_key) {
+                        let scaled = scale_columns(&proj, &scales)?;
+                        weights.insert(proj_key.to_string(), scaled);
+                        modified += 1;
+                    }
+                }
+                // input_layernorm.weight /= scales
+                if let Some(norm) = weights.remove(&input_norm_key) {
+                    let inv = invert_scales(&scales)?.astype(norm.dtype()?)?;
+                    let scaled = norm.mul(&inv)?;
+                    weights.insert(input_norm_key.clone(), scaled);
+                    modified += 1;
+                }
+            }
+        }
     }
 
     // Eval all modified weights to materialize
@@ -1812,6 +1842,35 @@ fn compute_group_a_scales(
         }
         (None, None) => Ok(None),
     }
+}
+
+/// Compute AWQ scales from multiple weight keys (element-wise max of all importances).
+fn compute_multi_key_scales(
+    imatrix: &crate::utils::imatrix::ImatrixData,
+    keys: &[&str],
+    ratio: f32,
+) -> Result<Option<MxArray>> {
+    let importances: Vec<&Vec<f32>> = keys
+        .iter()
+        .filter_map(|k| imatrix.importance.get(*k))
+        .collect();
+
+    if importances.is_empty() {
+        return Ok(None);
+    }
+
+    let len = importances[0].len();
+    let mut combined = vec![0.0f32; len];
+    for imp in &importances {
+        for (j, &val) in imp.iter().enumerate() {
+            if j < len {
+                combined[j] = combined[j].max(val);
+            }
+        }
+    }
+
+    let scales = compute_normalized_scales(&combined, ratio)?;
+    Ok(Some(scales))
 }
 
 /// Compute AWQ scales for a single weight key.
