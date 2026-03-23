@@ -2163,12 +2163,14 @@ impl Qwen3_5MoeModel {
 
                     let num_tokens = generated_tokens.len() as u32;
 
-                    let think_tag = if tools::has_think_end_token(&generated_tokens, think_end_id_stream) {
-                        think_end_str_stream.as_deref()
-                    } else {
-                        None
-                    };
-                    let (clean_text, tool_calls, thinking) = tools::split_at_think_end(&text, think_tag);
+                    let think_tag =
+                        if tools::has_think_end_token(&generated_tokens, think_end_id_stream) {
+                            think_end_str_stream.as_deref()
+                        } else {
+                            None
+                        };
+                    let (clean_text, tool_calls, thinking) =
+                        tools::split_at_think_end(&text, think_tag);
 
                     // If we have valid tool calls, override finish reason
                     let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {

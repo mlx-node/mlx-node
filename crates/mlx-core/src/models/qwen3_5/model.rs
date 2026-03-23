@@ -2252,7 +2252,8 @@ impl Qwen3_5Model {
                     } else {
                         None
                     };
-                    let (clean_text, tool_calls, thinking) = tools::split_at_think_end(&text, think_tag);
+                    let (clean_text, tool_calls, thinking) =
+                        tools::split_at_think_end(&text, think_tag);
 
                     // If we have valid tool calls, override finish reason
                     let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
