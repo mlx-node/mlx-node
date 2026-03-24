@@ -1,5 +1,5 @@
 use crate::array::MxArray;
-use crate::array::attention::scaled_dot_product_attention;
+use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::models::paddleocr_vl::language::{MultimodalRoPE, apply_multimodal_rotary_pos_emb};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
@@ -182,9 +182,20 @@ impl Qwen3_5Attention {
             (keys, values)
         };
 
-        // Scaled dot-product attention using fast kernel
-        let output =
-            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, mask)?;
+        // Scaled dot-product attention using fast kernel.
+        // When no explicit mask is provided:
+        //   - seq_len > 1 (prefill): use "causal" mode — MLX's fused Metal kernel handles
+        //     causal masking internally without materializing an O(N²) mask array.
+        //     This matches Python mlx-lm's `create_attention_mask` returning "causal".
+        //   - seq_len == 1 (decode): no mask needed (single token only attends to past).
+        // When an explicit mask is provided (e.g., sliding window): use it directly.
+        let output = if let Some(m) = mask {
+            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, Some(m))?
+        } else if seq_len > 1 {
+            scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?
+        } else {
+            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, None)?
+        };
 
         // Transpose back: [B, H, T, D] → [B, T, H, D] → flatten to [B, T, H*D]
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;

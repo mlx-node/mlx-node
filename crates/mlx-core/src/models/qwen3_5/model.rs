@@ -11,7 +11,6 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use crate::array::MxArray;
-use crate::array::mask::create_causal_mask;
 use crate::models::qwen3::{BatchGenerationResult, GenerationConfig, GenerationResult};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, apply_repetition_penalty, check_repetition_cutoff, sample};
@@ -488,7 +487,7 @@ impl Qwen3_5Model {
         let caches_arc = self.caches.clone();
         let model_config = self.config.clone();
         let tokenizer = self.tokenizer.clone();
-        let fa_idx = self.fa_idx;
+
         let prompt_tokens = prompt_tokens.clone();
 
         // Check if compiled path will be used (C++ weights loaded from safetensors).
@@ -558,26 +557,23 @@ impl Qwen3_5Model {
             profiler.set_prompt_tokens(prompt_tokens.shape_at(1).unwrap_or(0) as u32);
             profiler.snapshot_memory_before();
 
-            // Prefill: forward pass on entire prompt
+            // Prefill: chunked forward pass on prompt (stays on GPU, no roundtrip)
             profiler.begin_prefill();
-            let logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                forward_inner(
-                    &prompt_tokens,
-                    &embedding_weight,
-                    &mut layers_guard,
-                    &mut caches_guard,
-                    &final_norm_guard,
-                    &lm_head_guard,
-                    fa_idx,
-                    Some(&embedding_weight_t),
-                )?
-            };
+            let logits = chunked_prefill(
+                &prompt_tokens,
+                &embedding_weight,
+                &mut layers_guard,
+                &mut caches_guard,
+                &final_norm_guard,
+                &lm_head_guard,
+                Some(&embedding_weight_t),
+                generation_stream,
+            )?;
             profiler.end_prefill();
 
             // Get last token logits: [1, vocab]
-            let seq_len = logits.shape_at(1)?;
-            let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+            let last_chunk_len = logits.shape_at(1)?;
+            let last_logits = logits.slice_axis(1, last_chunk_len - 1, last_chunk_len)?;
             let last_logits = last_logits.squeeze(Some(&[1]))?; // [1, vocab]
 
             // Sample first token (lazy — not evaluated yet)
@@ -593,8 +589,10 @@ impl Qwen3_5Model {
 
             if use_compiled {
                 // Initialize compiled forward pass from prefill caches.
+                // Use TOTAL prompt length (not last chunk length) for correct
+                // RoPE offset and KV capacity pre-allocation.
                 use mlx_sys as sys;
-                let prefill_len = seq_len as i32;
+                let prefill_len = prompt_tokens.shape_at(1)? as i32;
                 let max_kv_len = ((prefill_len + max_tokens + 255) / 256) * 256;
                 let num_layers = model_config.num_layers as usize;
                 let mut cache_ptrs: Vec<*mut sys::mlx_array> =
@@ -715,7 +713,6 @@ impl Qwen3_5Model {
                                 &mut caches_guard,
                                 &final_norm_guard,
                                 &lm_head_guard,
-                                fa_idx,
                                 Some(&embedding_weight_t),
                             )?;
                             let logits = logits.squeeze(Some(&[1]))?;
@@ -844,7 +841,7 @@ impl Qwen3_5Model {
         let cached_image_key_arc = self.cached_image_key.clone();
         let cached_rope_deltas_arc = self.cached_rope_deltas.clone();
         let model_config = self.config.clone();
-        let fa_idx = self.fa_idx;
+
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
@@ -1087,20 +1084,16 @@ impl Qwen3_5Model {
                     // --- Text prefill path (text-only OR VLM cache reuse with same images) ---
                     let prompt =
                         MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-
-                    let logits = {
-                        let _stream_ctx = StreamContext::new(generation_stream);
-                        forward_inner(
-                            &prompt,
-                            &embedding_weight,
-                            &mut layers_guard,
-                            &mut caches_guard,
-                            &final_norm_guard,
-                            &lm_head_guard,
-                            fa_idx,
-                            Some(&embedding_weight_t),
-                        )?
-                    };
+                    let logits = chunked_prefill(
+                        &prompt,
+                        &embedding_weight,
+                        &mut layers_guard,
+                        &mut caches_guard,
+                        &final_norm_guard,
+                        &lm_head_guard,
+                        Some(&embedding_weight_t),
+                        generation_stream,
+                    )?;
 
                     let seq_len = logits.shape_at(1)?;
                     let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
@@ -1351,7 +1344,6 @@ impl Qwen3_5Model {
                             &mut caches_guard,
                             &final_norm_guard,
                             &lm_head_guard,
-                            fa_idx,
                             Some(&embedding_weight_t),
                         )?;
                         let mut logits = logits.squeeze(Some(&[1]))?;
@@ -1590,7 +1582,7 @@ impl Qwen3_5Model {
         let cached_image_key_arc = self.cached_image_key.clone();
         let cached_rope_deltas_arc = self.cached_rope_deltas.clone();
         let model_config = self.config.clone();
-        let fa_idx = self.fa_idx;
+
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
@@ -1850,20 +1842,16 @@ impl Qwen3_5Model {
                                 &prefill_tokens,
                                 &[1, prefill_tokens.len() as i64],
                             )?;
-
-                            let logits = {
-                                let _stream_ctx = StreamContext::new(generation_stream);
-                                forward_inner(
-                                    &prompt,
-                                    &embedding_weight,
-                                    &mut layers_guard,
-                                    &mut caches_guard,
-                                    &final_norm_guard,
-                                    &lm_head_guard,
-                                    fa_idx,
-                                    Some(&embedding_weight_t),
-                                )?
-                            };
+                            let logits = chunked_prefill(
+                                &prompt,
+                                &embedding_weight,
+                                &mut layers_guard,
+                                &mut caches_guard,
+                                &final_norm_guard,
+                                &lm_head_guard,
+                                Some(&embedding_weight_t),
+                                generation_stream,
+                            )?;
 
                             let seq_len = logits.shape_at(1)?;
                             let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
@@ -2111,7 +2099,6 @@ impl Qwen3_5Model {
                                     &mut caches_guard,
                                     &final_norm_guard,
                                     &lm_head_guard,
-                                    fa_idx,
                                     Some(&embedding_weight_t),
                                 )?;
                                 let mut logits = logits.squeeze(Some(&[1]))?;
@@ -2510,15 +2497,77 @@ impl Qwen3_5Model {
     }
 }
 
-/// Forward pass through the model, acquiring all necessary locks.
+/// Default prefill chunk size (tokens per chunk).
+/// Matches Python mlx-lm's `prefill_step_size` default of 2048.
+const PREFILL_STEP_SIZE: i64 = 2048;
+
+/// Evaluate all cache arrays across all layers to materialize them on GPU.
+/// Must be called between prefill chunks to break lazy dependency chains.
+fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) {
+    if let Some(caches) = caches {
+        let mut arrays: Vec<&MxArray> = Vec::new();
+        for cache in caches.iter() {
+            cache.collect_arrays(&mut arrays);
+        }
+        MxArray::eval_arrays(&arrays);
+    }
+}
+
+/// Chunked prefill: process prompt in chunks of `PREFILL_STEP_SIZE`, evaluating
+/// caches and clearing compute cache between chunks to bound peak memory.
 ///
-/// This is a free function (not a method) so it can be called from
-/// within spawn_blocking closures that have cloned the Arc fields.
-///
-/// `embedding_weight_t` is an optional pre-transposed embedding weight for
-/// tied embeddings. When provided, avoids recomputing the transpose every step.
-/// Lock-free forward pass that takes direct mutable refs instead of Arcs.
-/// Caller must acquire locks once and hold them for the entire prefill+decode sequence.
+/// Accepts `&MxArray` shaped `[1, seq_len]`. Slices on GPU — no data roundtrip.
+/// For `&[u32]` inputs (from tokenizer), callers convert with `MxArray::from_uint32` first.
+fn chunked_prefill(
+    prompt: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight_t: Option<&MxArray>,
+    generation_stream: crate::stream::Stream,
+) -> Result<MxArray> {
+    let total_len = prompt.shape_at(1)?;
+    let mut offset: i64 = 0;
+
+    while total_len - offset > PREFILL_STEP_SIZE {
+        let chunk = prompt.slice_axis(1, offset, offset + PREFILL_STEP_SIZE)?;
+        {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let _logits = forward_inner(
+                &chunk,
+                embedding_weight,
+                layers,
+                caches,
+                final_norm,
+                lm_head,
+                embedding_weight_t,
+            )?;
+        }
+        eval_layer_caches(caches);
+        crate::array::clear_cache();
+        offset += PREFILL_STEP_SIZE;
+    }
+
+    let remaining = prompt.slice_axis(1, offset, total_len)?;
+    let logits = {
+        let _stream_ctx = StreamContext::new(generation_stream);
+        forward_inner(
+            &remaining,
+            embedding_weight,
+            layers,
+            caches,
+            final_norm,
+            lm_head,
+            embedding_weight_t,
+        )?
+    };
+    Ok(logits)
+}
+
+/// Lock-free forward pass through all layers.
+/// Attention layer handles causal masking internally via "causal" SDPA mode.
 fn forward_inner(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
@@ -2526,33 +2575,16 @@ fn forward_inner(
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
     lm_head: &Option<Linear>,
-    fa_idx: usize,
     embedding_weight_t: Option<&MxArray>,
 ) -> Result<MxArray> {
     let embedding = Embedding::from_weight(embedding_weight)?;
     let hidden_states = embedding.forward(input_ids)?;
     let mut h = hidden_states.clone();
 
-    let seq_len = hidden_states.shape_at(1)?;
-    let fa_mask = {
-        let has_cache = caches.is_some();
-        if seq_len <= 1 && has_cache {
-            None
-        } else {
-            let offset = caches.as_ref().map(|c| c[fa_idx].offset()).unwrap_or(0);
-            Some(create_causal_mask(seq_len as i32, Some(offset), None)?)
-        }
-    };
-
     let num_layers = layers.len();
     for i in 0..num_layers {
-        let mask = if layers[i].is_linear() {
-            None
-        } else {
-            fa_mask.as_ref()
-        };
         let cache = caches.as_mut().map(|c| &mut c[i]);
-        h = layers[i].forward(&h, mask, cache, None, true)?;
+        h = layers[i].forward(&h, None, cache, None, true)?;
     }
 
     let h = final_norm.forward(&h)?;
@@ -2638,28 +2670,16 @@ impl Qwen3_5Model {
             .write()
             .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
 
-        // Create masks
-        let fa_mask = self.create_fa_mask(hidden_states, &caches_guard)?;
-        let ssm_mask = self.create_ssm_mask(hidden_states)?;
-
-        // Forward through layers
+        // Forward through layers — attention handles causal masking internally
         let num_layers = layers_guard.len();
         for i in 0..num_layers {
-            let mask = if layers_guard[i].is_linear() {
-                ssm_mask.as_ref()
-            } else {
-                fa_mask.as_ref()
-            };
-
             let cache = caches_guard.as_mut().map(|c| &mut c[i]);
-            h = layers_guard[i].forward(&h, mask, cache, None, true)?;
+            h = layers_guard[i].forward(&h, None, cache, None, true)?;
         }
 
-        // Drop locks early -- no longer needed
         drop(layers_guard);
         drop(caches_guard);
 
-        // Final norm
         let final_norm_guard = self
             .final_norm
             .read()
@@ -2702,25 +2722,15 @@ impl Qwen3_5Model {
             .write()
             .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
 
-        let fa_mask = self.create_fa_mask(hidden_states, &caches_guard)?;
-        let ssm_mask = self.create_ssm_mask(hidden_states)?;
-
         let num_layers = layers_guard.len();
         for i in 0..num_layers {
-            let mask = if layers_guard[i].is_linear() {
-                ssm_mask.as_ref()
-            } else {
-                fa_mask.as_ref()
-            };
-
             let cache = caches_guard.as_mut().map(|c| &mut c[i]);
-            // Only full attention layers receive position_ids
             let layer_pos = if layers_guard[i].is_linear() {
                 None
             } else {
                 position_ids
             };
-            h = layers_guard[i].forward(&h, mask, cache, layer_pos, true)?;
+            h = layers_guard[i].forward(&h, None, cache, layer_pos, true)?;
         }
 
         drop(layers_guard);
@@ -2790,40 +2800,6 @@ impl Qwen3_5Model {
             }
         }
         Ok(())
-    }
-
-    /// Create causal attention mask for full attention layers.
-    fn create_fa_mask(
-        &self,
-        hidden_states: &MxArray,
-        caches: &Option<Vec<Qwen3_5LayerCache>>,
-    ) -> Result<Option<MxArray>> {
-        let seq_len = hidden_states.shape_at(1)?;
-        if seq_len <= 1 && caches.is_some() {
-            // Single-token decode step with cache -- no mask needed
-            return Ok(None);
-        }
-
-        // Get cache offset from the first full attention layer
-        let offset = caches
-            .as_ref()
-            .map(|c| c[self.fa_idx].offset())
-            .unwrap_or(0);
-
-        // Create causal mask using existing utility
-        create_causal_mask(
-            seq_len as i32,
-            Some(offset),
-            None, // no sliding window
-        )
-        .map(Some)
-    }
-
-    /// Create mask for linear attention (SSM) layers.
-    /// Always returns None — mlx-vlm never creates an SSM mask for ArraysCache.
-    /// An all-ones mask is a no-op that adds unnecessary graph nodes and Metal overhead.
-    fn create_ssm_mask(&self, _hidden_states: &MxArray) -> Result<Option<MxArray>> {
-        Ok(None)
     }
 }
 
@@ -3177,8 +3153,6 @@ impl Qwen3_5Model {
             .write()
             .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
 
-        let fa_idx = self.fa_idx;
-
         // === Prefill (always uses Rust forward — runs once) ===
         let logits = forward_inner(
             input_ids,
@@ -3187,7 +3161,6 @@ impl Qwen3_5Model {
             &mut caches_guard,
             &final_norm_guard,
             &lm_head_guard,
-            fa_idx,
             None,
         )?;
         let seq_len = logits.shape_at(1)?;
@@ -3279,7 +3252,6 @@ impl Qwen3_5Model {
                     &mut caches_guard,
                     &final_norm_guard,
                     &lm_head_guard,
-                    fa_idx,
                     None,
                 )
             };
@@ -3766,32 +3738,17 @@ fn vlm_prefill(
             let _stream_ctx = StreamContext::new(generation_stream);
 
             let mut h = inputs_embeds.clone();
-            let seq_len = h.shape_at(1)?;
 
-            let fa_mask = if seq_len > 1 {
-                Some(crate::array::mask::create_causal_mask(
-                    seq_len as i32,
-                    None,
-                    None,
-                )?)
-            } else {
-                None
-            };
-
+            // No explicit mask — Qwen3_5Attention uses "causal" SDPA mode
             let num_layers = layers_guard.len();
             for i in 0..num_layers {
-                let mask = if layers_guard[i].is_linear() {
-                    None
-                } else {
-                    fa_mask.as_ref()
-                };
                 let cache = caches_guard.as_mut().map(|c| &mut c[i]);
                 let layer_pos = if layers_guard[i].is_linear() {
                     None
                 } else {
                     Some(&position_ids)
                 };
-                h = layers_guard[i].forward(&h, mask, cache, layer_pos, true)?;
+                h = layers_guard[i].forward(&h, None, cache, layer_pos, true)?;
             }
 
             let h = final_norm_guard.forward(&h)?;

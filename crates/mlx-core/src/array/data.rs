@@ -38,6 +38,18 @@ impl MxArray {
         }
     }
 
+    /// Synchronously evaluate multiple arrays (blocking).
+    /// Used between prefill chunks to materialize KV caches and break lazy dependency chains.
+    pub(crate) fn eval_arrays(arrays: &[&MxArray]) {
+        if arrays.is_empty() {
+            return;
+        }
+        let mut handles: Vec<*mut sys::mlx_array> = arrays.iter().map(|arr| arr.handle.0).collect();
+        unsafe {
+            sys::mlx_eval(handles.as_mut_ptr(), handles.len());
+        }
+    }
+
     #[napi]
     pub fn eval_async<'a>(&self, env: &'a Env) -> Result<PromiseRaw<'a, ()>> {
         let task = env.spawn(AsyncEvalTaskHandle {
