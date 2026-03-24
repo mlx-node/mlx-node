@@ -190,6 +190,7 @@ test-output
 test-integration-output
 Cargo.lock
 *.node
+/docs/superpowers/plans/*.md
 
 # TypeScript compiled output in packages (not NAPI-RS generated files)
 packages/*/src/**/*.js

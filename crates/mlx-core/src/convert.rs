@@ -929,8 +929,8 @@ pub(crate) fn build_unsloth_recipe(
         // These cannot be AWQ-corrected — keep at bf16 for quality.
         // linear_attn.out_proj: KLD ~6.0 — worst tensor by far.
         // self_attn.o_proj: KLD ~1.5 — sensitive but not catastrophic.
-        let is_non_awq_attn = key.contains("self_attn.o_proj")
-            || key.contains("linear_attn.out_proj");
+        let is_non_awq_attn =
+            key.contains("self_attn.o_proj") || key.contains("linear_attn.out_proj");
 
         if is_non_awq_attn {
             return QuantDecision::Skip;
@@ -1802,30 +1802,29 @@ pub(crate) fn apply_awq_prescaling(
         let input_norm_key = format!("{prefix}.input_layernorm.weight");
 
         // Only apply if this layer has self_attn weights (full attention layer)
-        if weights.contains_key(&q_key) {
-            if let Some(scales) =
+        if weights.contains_key(&q_key)
+            && let Some(scales) =
                 compute_multi_key_scales(imatrix, &[&q_key, &k_key, &v_key], ratio)?
-            {
-                for proj_key in [&q_key, &k_key, &v_key] {
-                    if let Some(proj) = weights.remove(proj_key) {
-                        let scaled = scale_columns(&proj, &scales)?;
-                        weights.insert(proj_key.to_string(), scaled);
-                        modified += 1;
-                    }
-                }
-                // input_layernorm.weight /= scales
-                if let Some(norm) = weights.remove(&input_norm_key) {
-                    let inv = invert_scales(&scales)?.astype(norm.dtype()?)?;
-                    let scaled = norm.mul(&inv)?;
-                    weights.insert(input_norm_key.clone(), scaled);
+        {
+            for proj_key in [&q_key, &k_key, &v_key] {
+                if let Some(proj) = weights.remove(proj_key) {
+                    let scaled = scale_columns(&proj, &scales)?;
+                    weights.insert(proj_key.to_string(), scaled);
                     modified += 1;
-                } else {
-                    warn!(
-                        "AWQ Group C: input_layernorm.weight missing for layer {} — \
-                         projection weights were scaled but inverse not fused into norm",
-                        i
-                    );
                 }
+            }
+            // input_layernorm.weight /= scales
+            if let Some(norm) = weights.remove(&input_norm_key) {
+                let inv = invert_scales(&scales)?.astype(norm.dtype()?)?;
+                let scaled = norm.mul(&inv)?;
+                weights.insert(input_norm_key.clone(), scaled);
+                modified += 1;
+            } else {
+                warn!(
+                    "AWQ Group C: input_layernorm.weight missing for layer {} — \
+                         projection weights were scaled but inverse not fused into norm",
+                    i
+                );
             }
         }
 
@@ -1835,32 +1834,30 @@ pub(crate) fn apply_awq_prescaling(
         let z_key = format!("{prefix}.linear_attn.in_proj_z.weight");
 
         // Only apply if this layer has linear_attn weights (GDN layer)
-        if weights.contains_key(&qkv_key) {
-            if let Some(scales) =
-                compute_multi_key_scales(imatrix, &[&qkv_key, &z_key], ratio)?
-            {
-                for proj_key in [&qkv_key, &z_key] {
-                    if let Some(proj) = weights.remove(proj_key) {
-                        let scaled = scale_columns(&proj, &scales)?;
-                        weights.insert(proj_key.to_string(), scaled);
-                        modified += 1;
-                    }
-                }
-                // input_layernorm.weight /= scales
-                // Groups C and D are mutually exclusive — a layer is either
-                // full-attention or GDN, never both — so this norm is only modified once.
-                if let Some(norm) = weights.remove(&input_norm_key) {
-                    let inv = invert_scales(&scales)?.astype(norm.dtype()?)?;
-                    let scaled = norm.mul(&inv)?;
-                    weights.insert(input_norm_key, scaled);
+        if weights.contains_key(&qkv_key)
+            && let Some(scales) = compute_multi_key_scales(imatrix, &[&qkv_key, &z_key], ratio)?
+        {
+            for proj_key in [&qkv_key, &z_key] {
+                if let Some(proj) = weights.remove(proj_key) {
+                    let scaled = scale_columns(&proj, &scales)?;
+                    weights.insert(proj_key.to_string(), scaled);
                     modified += 1;
-                } else {
-                    warn!(
-                        "AWQ Group D: input_layernorm.weight missing for layer {} — \
-                         projection weights were scaled but inverse not fused into norm",
-                        i
-                    );
                 }
+            }
+            // input_layernorm.weight /= scales
+            // Groups C and D are mutually exclusive — a layer is either
+            // full-attention or GDN, never both — so this norm is only modified once.
+            if let Some(norm) = weights.remove(&input_norm_key) {
+                let inv = invert_scales(&scales)?.astype(norm.dtype()?)?;
+                let scaled = norm.mul(&inv)?;
+                weights.insert(input_norm_key, scaled);
+                modified += 1;
+            } else {
+                warn!(
+                    "AWQ Group D: input_layernorm.weight missing for layer {} — \
+                         projection weights were scaled but inverse not fused into norm",
+                    i
+                );
             }
         }
     }
@@ -1941,7 +1938,9 @@ fn compute_multi_key_scales(
             if imp.len() != expected_len {
                 return Err(Error::from_reason(format!(
                     "AWQ imatrix dimension mismatch: key[0] has {} entries but key[{}] has {}",
-                    expected_len, i, imp.len()
+                    expected_len,
+                    i,
+                    imp.len()
                 )));
             }
         }

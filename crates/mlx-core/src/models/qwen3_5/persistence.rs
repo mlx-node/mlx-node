@@ -394,10 +394,8 @@ fn apply_weights(
                 // Merged projection fallback: try pre-merge component names
                 if prefix.ends_with(".in_proj_qkvz") {
                     let base = prefix.strip_suffix(".in_proj_qkvz").unwrap();
-                    let qkv = per_layer_quant
-                        .get(&format!("{}.in_proj_qkv", base));
-                    let z = per_layer_quant
-                        .get(&format!("{}.in_proj_z", base));
+                    let qkv = per_layer_quant.get(&format!("{}.in_proj_qkv", base));
+                    let z = per_layer_quant.get(&format!("{}.in_proj_z", base));
                     match (qkv, z) {
                         (Some(&a), Some(&b)) if a != b => {
                             warn!(
@@ -412,10 +410,8 @@ fn apply_weights(
                     }
                 } else if prefix.ends_with(".in_proj_ba") {
                     let base = prefix.strip_suffix(".in_proj_ba").unwrap();
-                    let b_val = per_layer_quant
-                        .get(&format!("{}.in_proj_b", base));
-                    let a_val = per_layer_quant
-                        .get(&format!("{}.in_proj_a", base));
+                    let b_val = per_layer_quant.get(&format!("{}.in_proj_b", base));
+                    let a_val = per_layer_quant.get(&format!("{}.in_proj_a", base));
                     match (b_val, a_val) {
                         (Some(&x), Some(&y)) if x != y => {
                             warn!(
