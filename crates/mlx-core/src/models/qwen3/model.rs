@@ -5484,7 +5484,8 @@ impl Qwen3Model {
                         let chunk_end = offset + prefill_step_size;
                         let chunk =
                             current_ids.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
-                        rope_offsets = MxArray::from_int32(&[cache_idx + offset as i32], &[1])?;
+                        // cache_idx already equals initial_cache_idx + offset (advanced by forward_fused)
+                        rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
 
                         {
                             let _stream_ctx = StreamContext::new(generation_stream);
@@ -5516,7 +5517,7 @@ impl Qwen3Model {
                     // Final chunk
                     let final_chunk =
                         current_ids.slice(&[0, offset as i64], &[1, total_seq_len as i64])?;
-                    rope_offsets = MxArray::from_int32(&[cache_idx + offset as i32], &[1])?;
+                    rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
 
                     let logits = {
                         let _stream_ctx = StreamContext::new(generation_stream);
