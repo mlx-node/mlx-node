@@ -1850,7 +1850,7 @@ impl Qwen3Model {
             } else {
                 next_last_logits
             };
-            {
+            if presence_penalty != 0.0 || frequency_penalty != 0.0 {
                 let context_tokens: Vec<u32> = input_tokens
                     .iter()
                     .copied()
@@ -5968,7 +5968,7 @@ impl Qwen3Model {
                 } else {
                     next_last_logits
                 };
-                {
+                if presence_penalty != 0.0 || frequency_penalty != 0.0 {
                     let context_tokens: Vec<u32> = token_ids_vec
                         .iter()
                         .copied()
