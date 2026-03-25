@@ -1833,29 +1833,22 @@ impl Qwen3Model {
             // Extract last token logits (shape: [1, 1, vocab_size] -> [vocab_size])
             let next_last_logits = next_logits.slice_axis(1, 0, 1)?.squeeze(Some(&[0, 1]))?;
 
-            // Apply repetition penalty if enabled
-            last_logits = if repetition_penalty != 1.0 {
-                // Build context from input + generated tokens
+            // Apply penalties
+            last_logits = next_last_logits;
+            if repetition_penalty != 1.0 || presence_penalty != 0.0 || frequency_penalty != 0.0 {
                 let context_tokens: Vec<u32> = input_tokens
                     .iter()
                     .copied()
                     .chain(generated_tokens.iter().copied())
                     .collect();
-                apply_repetition_penalty(
-                    &next_last_logits,
-                    &context_tokens,
-                    repetition_penalty,
-                    Some(repetition_context_size),
-                )?
-            } else {
-                next_last_logits
-            };
-            if presence_penalty != 0.0 || frequency_penalty != 0.0 {
-                let context_tokens: Vec<u32> = input_tokens
-                    .iter()
-                    .copied()
-                    .chain(generated_tokens.iter().copied())
-                    .collect();
+                if repetition_penalty != 1.0 {
+                    last_logits = apply_repetition_penalty(
+                        &last_logits,
+                        &context_tokens,
+                        repetition_penalty,
+                        Some(repetition_context_size),
+                    )?;
+                }
                 if presence_penalty != 0.0 {
                     last_logits = apply_presence_penalty(
                         &last_logits,
@@ -5953,27 +5946,22 @@ impl Qwen3Model {
 
                 let next_last_logits = next_logits.slice_axis(1, 0, 1)?.squeeze(Some(&[0, 1]))?;
 
-                last_logits = if repetition_penalty != 1.0 {
+                last_logits = next_last_logits;
+                if repetition_penalty != 1.0 || presence_penalty != 0.0 || frequency_penalty != 0.0
+                {
                     let context_tokens: Vec<u32> = token_ids_vec
                         .iter()
                         .copied()
                         .chain(generated_tokens.iter().copied())
                         .collect();
-                    apply_repetition_penalty(
-                        &next_last_logits,
-                        &context_tokens,
-                        repetition_penalty,
-                        Some(repetition_context_size),
-                    )?
-                } else {
-                    next_last_logits
-                };
-                if presence_penalty != 0.0 || frequency_penalty != 0.0 {
-                    let context_tokens: Vec<u32> = token_ids_vec
-                        .iter()
-                        .copied()
-                        .chain(generated_tokens.iter().copied())
-                        .collect();
+                    if repetition_penalty != 1.0 {
+                        last_logits = apply_repetition_penalty(
+                            &last_logits,
+                            &context_tokens,
+                            repetition_penalty,
+                            Some(repetition_context_size),
+                        )?;
+                    }
                     if presence_penalty != 0.0 {
                         last_logits = apply_presence_penalty(
                             &last_logits,
