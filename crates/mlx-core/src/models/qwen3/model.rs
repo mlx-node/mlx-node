@@ -5196,8 +5196,11 @@ impl Qwen3Model {
                     // Extract logits
                     let mut next_last_logits = logits.squeeze(Some(&[0, 1]))?;
 
-                    // Apply repetition penalty with COMPLETE token history
+                    // Apply penalties with COMPLETE token history
                     // generated_tokens now includes the current token (added above)
+                    if repetition_penalty != 1.0
+                        || presence_penalty != 0.0
+                        || frequency_penalty != 0.0
                     {
                         let mut all_tokens =
                             Vec::with_capacity(input_tokens.len() + generated_tokens.len());
