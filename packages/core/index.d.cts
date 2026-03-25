@@ -1972,6 +1972,20 @@ export interface ChatConfig {
   repetitionPenalty?: number | undefined;
   /** Size of the context window for repetition penalty (default: 256) */
   repetitionContextSize?: number | undefined;
+  /**
+   * Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
+   * token that appeared at least once in context. Matches OpenAI API semantics.
+   */
+  presencePenalty?: number | undefined;
+  /** Number of recent tokens to consider for presence penalty (default: 20) */
+  presenceContextSize?: number | undefined;
+  /**
+   * Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
+   * logits of each token in context. Matches OpenAI API semantics.
+   */
+  frequencyPenalty?: number | undefined;
+  /** Number of recent tokens to consider for frequency penalty (default: 20) */
+  frequencyContextSize?: number | undefined;
   /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
   maxConsecutiveTokens?: number | undefined;
   /** Max n-gram repetitions before stopping (default: 3, 0 = disabled) */
@@ -2334,6 +2348,20 @@ export interface GenerationConfig {
    */
   repetitionContextSize?: number;
   /**
+   * Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
+   * token that appeared at least once in context. Matches OpenAI API semantics.
+   */
+  presencePenalty?: number;
+  /** Number of recent tokens to consider for presence penalty (default: 20) */
+  presenceContextSize?: number;
+  /**
+   * Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
+   * logits of each token in context. Matches OpenAI API semantics.
+   */
+  frequencyPenalty?: number;
+  /** Number of recent tokens to consider for frequency penalty (default: 20) */
+  frequencyContextSize?: number;
+  /**
    * Stop if same token repeats this many times consecutively (default: 16)
    * Set to 0 to disable. Prevents OOM from degenerate repetitive generation.
    */
@@ -2526,6 +2554,16 @@ export interface GrpoEngineConfig {
   topK?: number;
   /** Repetition penalty (default: 1.1) */
   repetitionPenalty?: number;
+  /**
+   * Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
+   * token that appeared at least once in context.
+   */
+  presencePenalty?: number;
+  /**
+   * Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
+   * logits of each token in context.
+   */
+  frequencyPenalty?: number;
   /**
    * Maximum allowed NaN gradient occurrences before stopping training (default: 100)
    * When exceeded, training will stop with an error to prevent model corruption.
@@ -3462,6 +3500,20 @@ export interface VlmChatConfig {
   topP?: number;
   /** Repetition penalty (default: 1.5) */
   repetitionPenalty?: number;
+  /**
+   * Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
+   * token that appeared at least once in context. Matches OpenAI API semantics.
+   */
+  presencePenalty?: number;
+  /** Number of recent tokens to consider for presence penalty (default: 20) */
+  presenceContextSize?: number;
+  /**
+   * Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
+   * logits of each token in context. Matches OpenAI API semantics.
+   */
+  frequencyPenalty?: number;
+  /** Number of recent tokens to consider for frequency penalty (default: 20) */
+  frequencyContextSize?: number;
   /** Whether to return log probabilities (default: false) */
   returnLogprobs?: boolean;
 }
