@@ -96,6 +96,12 @@ pub struct GRPOEngineConfig {
     pub top_k: Option<i32>,
     /// Repetition penalty (default: 1.1)
     pub repetition_penalty: Option<f64>,
+    /// Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
+    /// token that appeared at least once in context.
+    pub presence_penalty: Option<f64>,
+    /// Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
+    /// logits of each token in context.
+    pub frequency_penalty: Option<f64>,
 
     // === NaN gradient protection ===
     /// Maximum allowed NaN gradient occurrences before stopping training (default: 100)
@@ -191,6 +197,8 @@ impl Default for GRPOEngineConfig {
             top_p: Some(0.95),
             top_k: None,
             repetition_penalty: Some(1.1),
+            presence_penalty: None,
+            frequency_penalty: None,
             max_nan_gradients: Some(100),
             emergency_save_threshold: Some(5),
             verbose_nan_detection: Some(false),
@@ -695,6 +703,10 @@ impl GRPOTrainingEngine {
             min_p: None,
             repetition_penalty: config.repetition_penalty,
             repetition_context_size: Some(256),
+            presence_penalty: config.presence_penalty,
+            presence_context_size: None,
+            frequency_penalty: config.frequency_penalty,
+            frequency_context_size: None,
             max_consecutive_tokens: Some(16),
             max_ngram_repeats: Some(8),
             ngram_size: Some(3),
@@ -1133,6 +1145,10 @@ impl GRPOTrainingEngine {
             min_p: None,
             repetition_penalty: config.repetition_penalty,
             repetition_context_size: Some(256),
+            presence_penalty: config.presence_penalty,
+            presence_context_size: None,
+            frequency_penalty: config.frequency_penalty,
+            frequency_context_size: None,
             max_consecutive_tokens: Some(16),
             max_ngram_repeats: Some(8),
             ngram_size: Some(3),
@@ -1740,6 +1756,10 @@ impl GRPOTrainingEngine {
             min_p: None,
             repetition_penalty: config.repetition_penalty,
             repetition_context_size: Some(256),
+            presence_penalty: config.presence_penalty,
+            presence_context_size: None,
+            frequency_penalty: config.frequency_penalty,
+            frequency_context_size: None,
             max_consecutive_tokens: Some(16),
             max_ngram_repeats: Some(8),
             ngram_size: Some(3),

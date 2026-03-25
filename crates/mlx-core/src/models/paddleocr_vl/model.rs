@@ -14,7 +14,10 @@ use crate::models::paddleocr_vl::processing::{ImageProcessor, ImageProcessorConf
 use crate::models::paddleocr_vl::vision::PaddleOCRVisionModel;
 use crate::models::qwen3::{GenerationConfig, GenerationResult};
 use crate::nn::LayerNorm;
-use crate::sampling::{SamplingConfig, apply_repetition_penalty, sample, sample_and_logprobs};
+use crate::sampling::{
+    SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
+    sample, sample_and_logprobs,
+};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::SafeTensorsFile;
@@ -118,6 +121,14 @@ impl VLModel {
                 top_k: c.top_k.or(default_config.top_k),
                 top_p: c.top_p.or(default_config.top_p),
                 repetition_penalty: c.repetition_penalty.or(default_config.repetition_penalty),
+                presence_penalty: c.presence_penalty.or(default_config.presence_penalty),
+                presence_context_size: c
+                    .presence_context_size
+                    .or(default_config.presence_context_size),
+                frequency_penalty: c.frequency_penalty.or(default_config.frequency_penalty),
+                frequency_context_size: c
+                    .frequency_context_size
+                    .or(default_config.frequency_context_size),
                 return_logprobs: c.return_logprobs.or(default_config.return_logprobs),
             },
             None => default_config,
@@ -195,6 +206,10 @@ impl VLModel {
                     min_p: None,
                     repetition_penalty: config.repetition_penalty,
                     repetition_context_size: None,
+                    presence_penalty: config.presence_penalty,
+                    presence_context_size: config.presence_context_size,
+                    frequency_penalty: config.frequency_penalty,
+                    frequency_context_size: config.frequency_context_size,
                     max_consecutive_tokens: None,
                     max_ngram_repeats: None,
                     ngram_size: None,
@@ -708,6 +723,10 @@ impl VLModel {
             let min_p = config.min_p.unwrap_or(0.0);
             let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
             let repetition_context_size = config.repetition_context_size.unwrap_or(20);
+            let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+            let presence_context_size = config.presence_context_size.unwrap_or(20);
+            let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+            let frequency_context_size = config.frequency_context_size.unwrap_or(20);
             let eos_token_id = config.eos_token_id.unwrap_or(model_config.eos_token_id);
             let return_logprobs = config.return_logprobs.unwrap_or(false);
 
@@ -848,6 +867,22 @@ impl VLModel {
                     Some(repetition_context_size),
                 )?;
             }
+            if presence_penalty != 0.0 {
+                last_logits = apply_presence_penalty(
+                    &last_logits,
+                    &all_tokens,
+                    presence_penalty,
+                    Some(presence_context_size),
+                )?;
+            }
+            if frequency_penalty != 0.0 {
+                last_logits = apply_frequency_penalty(
+                    &last_logits,
+                    &all_tokens,
+                    frequency_penalty,
+                    Some(frequency_context_size),
+                )?;
+            }
 
             // Sample first token
             let (mut token, mut logprobs_arr): (MxArray, Option<MxArray>) = if return_logprobs {
@@ -905,6 +940,22 @@ impl VLModel {
                             &all_tokens,
                             repetition_penalty,
                             Some(repetition_context_size),
+                        )?;
+                    }
+                    if presence_penalty != 0.0 {
+                        next_logits = apply_presence_penalty(
+                            &next_logits,
+                            &all_tokens,
+                            presence_penalty,
+                            Some(presence_context_size),
+                        )?;
+                    }
+                    if frequency_penalty != 0.0 {
+                        next_logits = apply_frequency_penalty(
+                            &next_logits,
+                            &all_tokens,
+                            frequency_penalty,
+                            Some(frequency_context_size),
                         )?;
                     }
 
@@ -1099,6 +1150,10 @@ impl VLModel {
                 top_k: base.top_k,
                 top_p: base.top_p,
                 repetition_penalty: base.repetition_penalty,
+                presence_penalty: base.presence_penalty,
+                presence_context_size: base.presence_context_size,
+                frequency_penalty: base.frequency_penalty,
+                frequency_context_size: base.frequency_context_size,
                 return_logprobs: base.return_logprobs,
             });
             let result = self.chat(item.messages.clone(), c).await?;
@@ -1114,6 +1169,14 @@ impl VLModel {
                 top_k: c.top_k.or(default_config.top_k),
                 top_p: c.top_p.or(default_config.top_p),
                 repetition_penalty: c.repetition_penalty.or(default_config.repetition_penalty),
+                presence_penalty: c.presence_penalty.or(default_config.presence_penalty),
+                presence_context_size: c
+                    .presence_context_size
+                    .or(default_config.presence_context_size),
+                frequency_penalty: c.frequency_penalty.or(default_config.frequency_penalty),
+                frequency_context_size: c
+                    .frequency_context_size
+                    .or(default_config.frequency_context_size),
                 return_logprobs: c.return_logprobs.or(default_config.return_logprobs),
             },
             None => default_config,
@@ -1138,6 +1201,10 @@ impl VLModel {
                 min_p: None,
                 repetition_penalty: config.repetition_penalty,
                 repetition_context_size: None,
+                presence_penalty: config.presence_penalty,
+                presence_context_size: config.presence_context_size,
+                frequency_penalty: config.frequency_penalty,
+                frequency_context_size: config.frequency_context_size,
                 max_consecutive_tokens: None,
                 max_ngram_repeats: None,
                 ngram_size: None,
@@ -1281,6 +1348,10 @@ impl VLModel {
         let min_p = config.min_p.unwrap_or(0.0);
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(20);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
         let eos_token_id = config.eos_token_id.unwrap_or(model_config.eos_token_id);
         let return_logprobs = config.return_logprobs.unwrap_or(false);
 
@@ -1383,14 +1454,32 @@ impl VLModel {
 
             // Apply repetition penalty to first token (matches single-item generate())
             let input_tokens = input_ids.to_uint32()?;
-            if repetition_penalty != 1.0 {
+            {
                 let all_tokens: Vec<u32> = input_tokens.to_vec();
-                last_logits = apply_repetition_penalty(
-                    &last_logits,
-                    &all_tokens,
-                    repetition_penalty,
-                    Some(repetition_context_size),
-                )?;
+                if repetition_penalty != 1.0 {
+                    last_logits = apply_repetition_penalty(
+                        &last_logits,
+                        &all_tokens,
+                        repetition_penalty,
+                        Some(repetition_context_size),
+                    )?;
+                }
+                if presence_penalty != 0.0 {
+                    last_logits = apply_presence_penalty(
+                        &last_logits,
+                        &all_tokens,
+                        presence_penalty,
+                        Some(presence_context_size),
+                    )?;
+                }
+                if frequency_penalty != 0.0 {
+                    last_logits = apply_frequency_penalty(
+                        &last_logits,
+                        &all_tokens,
+                        frequency_penalty,
+                        Some(frequency_context_size),
+                    )?;
+                }
             }
 
             let (first_token, first_logprobs) = if return_logprobs {
@@ -1559,7 +1648,7 @@ impl VLModel {
             let next_logits = logits.squeeze(Some(&[1]))?;
 
             // Apply repetition penalty per item
-            let next_logits = if repetition_penalty != 1.0 {
+            let mut next_logits = if repetition_penalty != 1.0 {
                 let mut rows = Vec::with_capacity(active_indices.len());
                 for (local_idx, &global_idx) in active_indices.iter().enumerate() {
                     let row = next_logits.slice_axis(0, local_idx as i64, local_idx as i64 + 1)?;
@@ -1577,6 +1666,36 @@ impl VLModel {
             } else {
                 next_logits
             };
+            if presence_penalty != 0.0 {
+                let mut rows = Vec::with_capacity(active_indices.len());
+                for (local_idx, &global_idx) in active_indices.iter().enumerate() {
+                    let row = next_logits.slice_axis(0, local_idx as i64, local_idx as i64 + 1)?;
+                    let row = row.squeeze(Some(&[0]))?;
+                    rows.push(apply_presence_penalty(
+                        &row,
+                        &item_all_tokens[global_idx],
+                        presence_penalty,
+                        Some(presence_context_size),
+                    )?);
+                }
+                let row_refs: Vec<&MxArray> = rows.iter().collect();
+                next_logits = MxArray::stack(row_refs, Some(0))?;
+            }
+            if frequency_penalty != 0.0 {
+                let mut rows = Vec::with_capacity(active_indices.len());
+                for (local_idx, &global_idx) in active_indices.iter().enumerate() {
+                    let row = next_logits.slice_axis(0, local_idx as i64, local_idx as i64 + 1)?;
+                    let row = row.squeeze(Some(&[0]))?;
+                    rows.push(apply_frequency_penalty(
+                        &row,
+                        &item_all_tokens[global_idx],
+                        frequency_penalty,
+                        Some(frequency_context_size),
+                    )?);
+                }
+                let row_refs: Vec<&MxArray> = rows.iter().collect();
+                next_logits = MxArray::stack(row_refs, Some(0))?;
+            }
 
             // Sample next tokens (with logprobs if requested)
             let (mut next_tokens, mut next_logprobs) = if return_logprobs {

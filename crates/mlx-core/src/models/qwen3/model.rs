@@ -17,7 +17,8 @@ use crate::array::{
 use crate::grpo::{advantages::compute_advantages, autograd::compute_loss_and_gradients_autograd};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{
-    SamplingConfig, apply_repetition_penalty, check_repetition_cutoff, sample, sample_and_logprobs,
+    SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
+    check_repetition_cutoff, sample, sample_and_logprobs,
 };
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
@@ -1501,6 +1502,10 @@ impl Qwen3Model {
         let min_p = config.min_p.unwrap_or(0.0);
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
@@ -1712,6 +1717,22 @@ impl Qwen3Model {
                 Some(repetition_context_size),
             )?;
         }
+        if presence_penalty != 0.0 {
+            last_logits = apply_presence_penalty(
+                &last_logits,
+                &input_tokens,
+                presence_penalty,
+                Some(presence_context_size),
+            )?;
+        }
+        if frequency_penalty != 0.0 {
+            last_logits = apply_frequency_penalty(
+                &last_logits,
+                &input_tokens,
+                frequency_penalty,
+                Some(frequency_context_size),
+            )?;
+        }
 
         // Sample first token
         let (mut token, mut logprobs_arr) = if return_logprobs {
@@ -1829,6 +1850,29 @@ impl Qwen3Model {
             } else {
                 next_last_logits
             };
+            {
+                let context_tokens: Vec<u32> = input_tokens
+                    .iter()
+                    .copied()
+                    .chain(generated_tokens.iter().copied())
+                    .collect();
+                if presence_penalty != 0.0 {
+                    last_logits = apply_presence_penalty(
+                        &last_logits,
+                        &context_tokens,
+                        presence_penalty,
+                        Some(presence_context_size),
+                    )?;
+                }
+                if frequency_penalty != 0.0 {
+                    last_logits = apply_frequency_penalty(
+                        &last_logits,
+                        &context_tokens,
+                        frequency_penalty,
+                        Some(frequency_context_size),
+                    )?;
+                }
+            }
 
             // Sample next token
             let (next_tok, next_lp) = if return_logprobs {
@@ -1937,6 +1981,10 @@ impl Qwen3Model {
         let min_p = config.min_p.unwrap_or(0.0);
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
@@ -2091,7 +2139,7 @@ impl Qwen3Model {
             .squeeze(Some(&[0, 1]))?;
 
         // Apply repetition penalty to first token
-        let last_logits = if repetition_penalty != 1.0 && !input_tokens.is_empty() {
+        let mut last_logits = if repetition_penalty != 1.0 && !input_tokens.is_empty() {
             apply_repetition_penalty(
                 &last_logits,
                 &input_tokens,
@@ -2101,6 +2149,22 @@ impl Qwen3Model {
         } else {
             last_logits
         };
+        if presence_penalty != 0.0 {
+            last_logits = apply_presence_penalty(
+                &last_logits,
+                &input_tokens,
+                presence_penalty,
+                Some(presence_context_size),
+            )?;
+        }
+        if frequency_penalty != 0.0 {
+            last_logits = apply_frequency_penalty(
+                &last_logits,
+                &input_tokens,
+                frequency_penalty,
+                Some(frequency_context_size),
+            )?;
+        }
 
         // Sample first token
         let first_token_result = sample_and_logprobs(&last_logits, Some(sampling_config))?;
@@ -2395,6 +2459,10 @@ impl Qwen3Model {
         let min_p = config.min_p.unwrap_or(0.0);
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
@@ -2620,7 +2688,7 @@ impl Qwen3Model {
             let batch_logits = last_logits.repeat_along_axis(0, group_size as i32)?;
 
             // Apply repetition penalty to initial logits
-            let batch_logits = if repetition_penalty != 1.0 && !prompt_tokens.is_empty() {
+            let mut batch_logits = if repetition_penalty != 1.0 && !prompt_tokens.is_empty() {
                 self.apply_batch_repetition_penalty(
                     &batch_logits,
                     &vec![prompt_tokens.clone(); group_size],
@@ -2630,6 +2698,41 @@ impl Qwen3Model {
             } else {
                 batch_logits
             };
+            {
+                let histories = vec![prompt_tokens.clone(); group_size];
+                if presence_penalty != 0.0 {
+                    let mut rows = Vec::with_capacity(group_size);
+                    for (i, ctx) in histories.iter().enumerate().take(group_size) {
+                        let row = batch_logits
+                            .slice_axis(0, i as i64, (i + 1) as i64)?
+                            .squeeze(Some(&[0]))?;
+                        rows.push(apply_presence_penalty(
+                            &row,
+                            ctx,
+                            presence_penalty,
+                            Some(presence_context_size),
+                        )?);
+                    }
+                    let refs: Vec<&MxArray> = rows.iter().collect();
+                    batch_logits = MxArray::stack(refs, Some(0))?;
+                }
+                if frequency_penalty != 0.0 {
+                    let mut rows = Vec::with_capacity(group_size);
+                    for (i, ctx) in histories.iter().enumerate().take(group_size) {
+                        let row = batch_logits
+                            .slice_axis(0, i as i64, (i + 1) as i64)?
+                            .squeeze(Some(&[0]))?;
+                        rows.push(apply_frequency_penalty(
+                            &row,
+                            ctx,
+                            frequency_penalty,
+                            Some(frequency_context_size),
+                        )?);
+                    }
+                    let refs: Vec<&MxArray> = rows.iter().collect();
+                    batch_logits = MxArray::stack(refs, Some(0))?;
+                }
+            }
 
             // === BATCHED DECODE STATE ===
             // Track per-sequence state
@@ -2871,7 +2974,7 @@ impl Qwen3Model {
                 let next_last_logits = next_logits.squeeze(Some(&[1]))?;
 
                 // Apply repetition penalty
-                let next_last_logits = if repetition_penalty != 1.0 {
+                let mut next_last_logits = if repetition_penalty != 1.0 {
                     self.apply_batch_repetition_penalty(
                         &next_last_logits,
                         &token_histories,
@@ -2881,6 +2984,41 @@ impl Qwen3Model {
                 } else {
                     next_last_logits
                 };
+                {
+                    let batch_size = token_histories.len();
+                    if presence_penalty != 0.0 {
+                        let mut rows = Vec::with_capacity(batch_size);
+                        for (i, ctx) in token_histories.iter().enumerate().take(batch_size) {
+                            let row = next_last_logits
+                                .slice_axis(0, i as i64, (i + 1) as i64)?
+                                .squeeze(Some(&[0]))?;
+                            rows.push(apply_presence_penalty(
+                                &row,
+                                ctx,
+                                presence_penalty,
+                                Some(presence_context_size),
+                            )?);
+                        }
+                        let refs: Vec<&MxArray> = rows.iter().collect();
+                        next_last_logits = MxArray::stack(refs, Some(0))?;
+                    }
+                    if frequency_penalty != 0.0 {
+                        let mut rows = Vec::with_capacity(batch_size);
+                        for (i, ctx) in token_histories.iter().enumerate().take(batch_size) {
+                            let row = next_last_logits
+                                .slice_axis(0, i as i64, (i + 1) as i64)?
+                                .squeeze(Some(&[0]))?;
+                            rows.push(apply_frequency_penalty(
+                                &row,
+                                ctx,
+                                frequency_penalty,
+                                Some(frequency_context_size),
+                            )?);
+                        }
+                        let refs: Vec<&MxArray> = rows.iter().collect();
+                        next_last_logits = MxArray::stack(refs, Some(0))?;
+                    }
+                }
 
                 // Sample next tokens
                 let (next_tokens, next_lp) = if return_logprobs {
@@ -3010,6 +3148,10 @@ impl Qwen3Model {
         let min_p = config.min_p.unwrap_or(0.0);
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
@@ -3258,6 +3400,41 @@ impl Qwen3Model {
         } else {
             last_logits
         };
+        {
+            let batch_size = token_histories.len();
+            if presence_penalty != 0.0 {
+                let mut rows = Vec::with_capacity(batch_size);
+                for (i, ctx) in token_histories.iter().enumerate().take(batch_size) {
+                    let row = current_logits
+                        .slice_axis(0, i as i64, (i + 1) as i64)?
+                        .squeeze(Some(&[0]))?;
+                    rows.push(apply_presence_penalty(
+                        &row,
+                        ctx,
+                        presence_penalty,
+                        Some(presence_context_size),
+                    )?);
+                }
+                let refs: Vec<&MxArray> = rows.iter().collect();
+                current_logits = MxArray::stack(refs, Some(0))?;
+            }
+            if frequency_penalty != 0.0 {
+                let mut rows = Vec::with_capacity(batch_size);
+                for (i, ctx) in token_histories.iter().enumerate().take(batch_size) {
+                    let row = current_logits
+                        .slice_axis(0, i as i64, (i + 1) as i64)?
+                        .squeeze(Some(&[0]))?;
+                    rows.push(apply_frequency_penalty(
+                        &row,
+                        ctx,
+                        frequency_penalty,
+                        Some(frequency_context_size),
+                    )?);
+                }
+                let refs: Vec<&MxArray> = rows.iter().collect();
+                current_logits = MxArray::stack(refs, Some(0))?;
+            }
+        }
 
         // Sample first tokens
         let (mut current_tokens, mut current_logprobs_arr) = if return_logprobs {
@@ -3471,6 +3648,41 @@ impl Qwen3Model {
             } else {
                 next_logits
             };
+            {
+                let batch_size = active_histories.len();
+                if presence_penalty != 0.0 {
+                    let mut rows = Vec::with_capacity(batch_size);
+                    for (i, ctx) in active_histories.iter().enumerate().take(batch_size) {
+                        let row = current_logits
+                            .slice_axis(0, i as i64, (i + 1) as i64)?
+                            .squeeze(Some(&[0]))?;
+                        rows.push(apply_presence_penalty(
+                            &row,
+                            ctx,
+                            presence_penalty,
+                            Some(presence_context_size),
+                        )?);
+                    }
+                    let refs: Vec<&MxArray> = rows.iter().collect();
+                    current_logits = MxArray::stack(refs, Some(0))?;
+                }
+                if frequency_penalty != 0.0 {
+                    let mut rows = Vec::with_capacity(batch_size);
+                    for (i, ctx) in active_histories.iter().enumerate().take(batch_size) {
+                        let row = current_logits
+                            .slice_axis(0, i as i64, (i + 1) as i64)?
+                            .squeeze(Some(&[0]))?;
+                        rows.push(apply_frequency_penalty(
+                            &row,
+                            ctx,
+                            frequency_penalty,
+                            Some(frequency_context_size),
+                        )?);
+                    }
+                    let refs: Vec<&MxArray> = rows.iter().collect();
+                    current_logits = MxArray::stack(refs, Some(0))?;
+                }
+            }
 
             // Sample next tokens
             let (next_toks, next_lp) = if return_logprobs {
@@ -4646,6 +4858,10 @@ impl Qwen3Model {
         let min_p = config.min_p.unwrap_or(0.0);
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
@@ -4874,6 +5090,22 @@ impl Qwen3Model {
                     Some(repetition_context_size),
                 )?;
             }
+            if presence_penalty != 0.0 {
+                last_logits = apply_presence_penalty(
+                    &last_logits,
+                    &input_tokens,
+                    presence_penalty,
+                    Some(presence_context_size),
+                )?;
+            }
+            if frequency_penalty != 0.0 {
+                last_logits = apply_frequency_penalty(
+                    &last_logits,
+                    &input_tokens,
+                    frequency_penalty,
+                    Some(frequency_context_size),
+                )?;
+            }
 
             // Sample first token
             let (mut token, mut logprobs) = if return_logprobs {
@@ -4973,17 +5205,35 @@ impl Qwen3Model {
 
                     // Apply repetition penalty with COMPLETE token history
                     // generated_tokens now includes the current token (added above)
-                    if repetition_penalty != 1.0 {
+                    {
                         let mut all_tokens =
                             Vec::with_capacity(input_tokens.len() + generated_tokens.len());
                         all_tokens.extend_from_slice(&input_tokens);
                         all_tokens.extend_from_slice(&generated_tokens);
-                        next_last_logits = apply_repetition_penalty(
-                            &next_last_logits,
-                            &all_tokens,
-                            repetition_penalty,
-                            Some(repetition_context_size),
-                        )?;
+                        if repetition_penalty != 1.0 {
+                            next_last_logits = apply_repetition_penalty(
+                                &next_last_logits,
+                                &all_tokens,
+                                repetition_penalty,
+                                Some(repetition_context_size),
+                            )?;
+                        }
+                        if presence_penalty != 0.0 {
+                            next_last_logits = apply_presence_penalty(
+                                &next_last_logits,
+                                &all_tokens,
+                                presence_penalty,
+                                Some(presence_context_size),
+                            )?;
+                        }
+                        if frequency_penalty != 0.0 {
+                            next_last_logits = apply_frequency_penalty(
+                                &next_last_logits,
+                                &all_tokens,
+                                frequency_penalty,
+                                Some(frequency_context_size),
+                            )?;
+                        }
                     }
 
                     // Sample
@@ -5252,6 +5502,10 @@ impl Qwen3Model {
             min_p: c.min_p,
             repetition_penalty: c.repetition_penalty,
             repetition_context_size: c.repetition_context_size,
+            presence_penalty: c.presence_penalty,
+            presence_context_size: c.presence_context_size,
+            frequency_penalty: c.frequency_penalty,
+            frequency_context_size: c.frequency_context_size,
             max_consecutive_tokens: c.max_consecutive_tokens,
             max_ngram_repeats: c.max_ngram_repeats,
             ngram_size: c.ngram_size,
@@ -5405,6 +5659,10 @@ impl Qwen3Model {
             let min_p = config.min_p.unwrap_or(0.0);
             let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
             let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+            let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+            let presence_context_size = config.presence_context_size.unwrap_or(20);
+            let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+            let frequency_context_size = config.frequency_context_size.unwrap_or(20);
             let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
             let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
             let ngram_size = config.ngram_size.unwrap_or(64);
@@ -5605,6 +5863,22 @@ impl Qwen3Model {
                     Some(repetition_context_size),
                 )?;
             }
+            if presence_penalty != 0.0 {
+                last_logits = apply_presence_penalty(
+                    &last_logits,
+                    &token_ids_vec,
+                    presence_penalty,
+                    Some(presence_context_size),
+                )?;
+            }
+            if frequency_penalty != 0.0 {
+                last_logits = apply_frequency_penalty(
+                    &last_logits,
+                    &token_ids_vec,
+                    frequency_penalty,
+                    Some(frequency_context_size),
+                )?;
+            }
 
             // Sample first token
             let (mut token, mut logprobs_arr) = if return_logprobs {
@@ -5694,6 +5968,29 @@ impl Qwen3Model {
                 } else {
                     next_last_logits
                 };
+                {
+                    let context_tokens: Vec<u32> = token_ids_vec
+                        .iter()
+                        .copied()
+                        .chain(generated_tokens.iter().copied())
+                        .collect();
+                    if presence_penalty != 0.0 {
+                        last_logits = apply_presence_penalty(
+                            &last_logits,
+                            &context_tokens,
+                            presence_penalty,
+                            Some(presence_context_size),
+                        )?;
+                    }
+                    if frequency_penalty != 0.0 {
+                        last_logits = apply_frequency_penalty(
+                            &last_logits,
+                            &context_tokens,
+                            frequency_penalty,
+                            Some(frequency_context_size),
+                        )?;
+                    }
+                }
 
                 let (next_tok, next_lp) = if return_logprobs {
                     let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;

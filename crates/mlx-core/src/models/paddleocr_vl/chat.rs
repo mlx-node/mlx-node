@@ -57,6 +57,20 @@ pub struct VLMChatConfig {
     /// Repetition penalty (default: 1.5)
     pub repetition_penalty: Option<f64>,
 
+    /// Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
+    /// token that appeared at least once in context. Matches OpenAI API semantics.
+    pub presence_penalty: Option<f64>,
+
+    /// Number of recent tokens to consider for presence penalty (default: 20)
+    pub presence_context_size: Option<i32>,
+
+    /// Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
+    /// logits of each token in context. Matches OpenAI API semantics.
+    pub frequency_penalty: Option<f64>,
+
+    /// Number of recent tokens to consider for frequency penalty (default: 20)
+    pub frequency_context_size: Option<i32>,
+
     /// Whether to return log probabilities (default: false)
     pub return_logprobs: Option<bool>,
 }
@@ -70,6 +84,10 @@ impl Default for VLMChatConfig {
             top_k: Some(0),
             top_p: Some(1.0),
             repetition_penalty: Some(1.5), // Reduce repetitive text generation
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
             return_logprobs: Some(false),
         }
     }

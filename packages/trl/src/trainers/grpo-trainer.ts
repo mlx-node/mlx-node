@@ -122,6 +122,10 @@ export interface GRPOTrainerConfig<T = unknown> {
   topP?: number;
   topK?: number;
   repetitionPenalty?: number;
+  /** Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any token in context. */
+  presencePenalty?: number;
+  /** Frequency penalty (0.0 = disabled). Subtracts penalty * count for each token in context. */
+  frequencyPenalty?: number;
 
   // Tool calling (for tool-use training)
   /**
@@ -533,6 +537,8 @@ export class GRPOTrainer<T = unknown> {
       topP: this.config.topP,
       topK: this.config.topK,
       repetitionPenalty: this.config.repetitionPenalty,
+      presencePenalty: this.config.presencePenalty,
+      frequencyPenalty: this.config.frequencyPenalty,
       // Tool calling support
       tools: this.config.tools,
       enableThinking: this.config.enableThinking,

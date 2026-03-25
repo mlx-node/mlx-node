@@ -7,7 +7,10 @@ use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 use crate::models::qwen3::{BatchGenerationResult, GenerationConfig, GenerationResult};
-use crate::sampling::{SamplingConfig, apply_repetition_penalty, check_repetition_cutoff, sample};
+use crate::sampling::{
+    SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
+    check_repetition_cutoff, sample,
+};
 use crate::tokenizer::Qwen3Tokenizer;
 
 /// Decode-only generation loop with logprob tracking for training.
@@ -29,6 +32,10 @@ pub(crate) fn generate_decode_loop_for_training(
     let min_p = config.min_p.unwrap_or(0.0);
     let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
     let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+    let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+    let presence_context_size = config.presence_context_size.unwrap_or(20);
+    let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+    let frequency_context_size = config.frequency_context_size.unwrap_or(20);
     let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
     let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
     let ngram_size = config.ngram_size.unwrap_or(64);
@@ -51,7 +58,7 @@ pub(crate) fn generate_decode_loop_for_training(
 
     for _step in 0..max_new_tokens {
         // Apply repetition penalty
-        let penalized_logits = if repetition_penalty != 1.0 && !all_tokens.is_empty() {
+        let mut penalized_logits = if repetition_penalty != 1.0 && !all_tokens.is_empty() {
             let context_start = if all_tokens.len() > repetition_context_size as usize {
                 all_tokens.len() - repetition_context_size as usize
             } else {
@@ -62,6 +69,22 @@ pub(crate) fn generate_decode_loop_for_training(
         } else {
             current_logits.clone()
         };
+        if presence_penalty != 0.0 {
+            penalized_logits = apply_presence_penalty(
+                &penalized_logits,
+                &all_tokens,
+                presence_penalty,
+                Some(presence_context_size),
+            )?;
+        }
+        if frequency_penalty != 0.0 {
+            penalized_logits = apply_frequency_penalty(
+                &penalized_logits,
+                &all_tokens,
+                frequency_penalty,
+                Some(frequency_context_size),
+            )?;
+        }
 
         // Compute logprob if needed
         if return_logprobs {

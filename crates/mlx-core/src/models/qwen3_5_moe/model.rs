@@ -23,7 +23,10 @@ use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
 use crate::models::qwen3::{BatchGenerationResult, GenerationConfig, GenerationResult};
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::sampling::{SamplingConfig, apply_repetition_penalty, check_repetition_cutoff, sample};
+use crate::sampling::{
+    SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
+    check_repetition_cutoff, sample,
+};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools;
@@ -662,6 +665,10 @@ impl Qwen3_5MoeModel {
             min_p: None,
             repetition_penalty: None,
             repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
             max_consecutive_tokens: None,
             max_ngram_repeats: None,
             ngram_size: None,
@@ -742,6 +749,10 @@ impl Qwen3_5MoeModel {
             let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
             let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
             let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+            let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+            let presence_context_size = config.presence_context_size.unwrap_or(20);
+            let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+            let frequency_context_size = config.frequency_context_size.unwrap_or(20);
             let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
             let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
             let ngram_size = config.ngram_size.unwrap_or(64);
@@ -989,6 +1000,22 @@ impl Qwen3_5MoeModel {
                     Some(repetition_context_size),
                 )?;
             }
+            if presence_penalty != 0.0 {
+                last_logits = apply_presence_penalty(
+                    &last_logits,
+                    &token_history,
+                    presence_penalty,
+                    Some(presence_context_size),
+                )?;
+            }
+            if frequency_penalty != 0.0 {
+                last_logits = apply_frequency_penalty(
+                    &last_logits,
+                    &token_history,
+                    frequency_penalty,
+                    Some(frequency_context_size),
+                )?;
+            }
 
             let mut y = sample(&last_logits, sampling_config)?;
             MxArray::async_eval_arrays(&[&y]);
@@ -1100,6 +1127,22 @@ impl Qwen3_5MoeModel {
                                 &token_history,
                                 repetition_penalty,
                                 Some(repetition_context_size),
+                            )?;
+                        }
+                        if presence_penalty != 0.0 {
+                            logits = apply_presence_penalty(
+                                &logits,
+                                &token_history,
+                                presence_penalty,
+                                Some(presence_context_size),
+                            )?;
+                        }
+                        if frequency_penalty != 0.0 {
+                            logits = apply_frequency_penalty(
+                                &logits,
+                                &token_history,
+                                frequency_penalty,
+                                Some(frequency_context_size),
                             )?;
                         }
                         profiler.end();
@@ -1224,6 +1267,22 @@ impl Qwen3_5MoeModel {
                                 &token_history,
                                 repetition_penalty,
                                 Some(repetition_context_size),
+                            )?;
+                        }
+                        if presence_penalty != 0.0 {
+                            logits = apply_presence_penalty(
+                                &logits,
+                                &token_history,
+                                presence_penalty,
+                                Some(presence_context_size),
+                            )?;
+                        }
+                        if frequency_penalty != 0.0 {
+                            logits = apply_frequency_penalty(
+                                &logits,
+                                &token_history,
+                                frequency_penalty,
+                                Some(frequency_context_size),
                             )?;
                         }
                         profiler.end();
@@ -1422,6 +1481,10 @@ impl Qwen3_5MoeModel {
             min_p: None,
             repetition_penalty: None,
             repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
             max_consecutive_tokens: None,
             max_ngram_repeats: None,
             ngram_size: None,
@@ -1515,6 +1578,10 @@ impl Qwen3_5MoeModel {
                     let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
                     let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
                     let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+                    let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+                    let presence_context_size = config.presence_context_size.unwrap_or(20);
+                    let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+                    let frequency_context_size = config.frequency_context_size.unwrap_or(20);
                     let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
                     let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
                     let ngram_size = config.ngram_size.unwrap_or(64);
@@ -1772,6 +1839,22 @@ impl Qwen3_5MoeModel {
                             Some(repetition_context_size),
                         )?;
                     }
+                    if presence_penalty != 0.0 {
+                        last_logits = apply_presence_penalty(
+                            &last_logits,
+                            &token_history,
+                            presence_penalty,
+                            Some(presence_context_size),
+                        )?;
+                    }
+                    if frequency_penalty != 0.0 {
+                        last_logits = apply_frequency_penalty(
+                            &last_logits,
+                            &token_history,
+                            frequency_penalty,
+                            Some(frequency_context_size),
+                        )?;
+                    }
 
                     let mut y = sample(&last_logits, sampling_config)?;
                     MxArray::async_eval_arrays(&[&y]);
@@ -1874,6 +1957,22 @@ impl Qwen3_5MoeModel {
                                         &token_history,
                                         repetition_penalty,
                                         Some(repetition_context_size),
+                                    )?;
+                                }
+                                if presence_penalty != 0.0 {
+                                    logits = apply_presence_penalty(
+                                        &logits,
+                                        &token_history,
+                                        presence_penalty,
+                                        Some(presence_context_size),
+                                    )?;
+                                }
+                                if frequency_penalty != 0.0 {
+                                    logits = apply_frequency_penalty(
+                                        &logits,
+                                        &token_history,
+                                        frequency_penalty,
+                                        Some(frequency_context_size),
                                     )?;
                                 }
                                 let next_token = sample(&logits, sampling_config)?;
@@ -2004,6 +2103,22 @@ impl Qwen3_5MoeModel {
                                         &token_history,
                                         repetition_penalty,
                                         Some(repetition_context_size),
+                                    )?;
+                                }
+                                if presence_penalty != 0.0 {
+                                    logits = apply_presence_penalty(
+                                        &logits,
+                                        &token_history,
+                                        presence_penalty,
+                                        Some(presence_context_size),
+                                    )?;
+                                }
+                                if frequency_penalty != 0.0 {
+                                    logits = apply_frequency_penalty(
+                                        &logits,
+                                        &token_history,
+                                        frequency_penalty,
+                                        Some(frequency_context_size),
                                     )?;
                                 }
                                 let next_token = sample(&logits, sampling_config)?;

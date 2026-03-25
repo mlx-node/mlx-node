@@ -402,6 +402,82 @@ pub(crate) fn sample_and_logprobs(
     Ok((token, logprobs))
 }
 
+/// Shared context for penalty functions: validates inputs, slices to recent tokens,
+/// and filters invalid IDs.
+///
+/// Returns `None` if no penalty should be applied (empty/invalid tokens).
+struct PenaltyContext {
+    /// The axis to operate on (last axis)
+    last_axis: i32,
+    /// Number of dimensions (1 or 2)
+    ndim: usize,
+    /// Valid token IDs after filtering (within vocab range, from recent context)
+    valid_tokens: Vec<u32>,
+}
+
+impl PenaltyContext {
+    /// Build an index MxArray from token IDs, shaped to match logit ndim.
+    fn make_indices(&self, token_ids: &[u32]) -> Result<MxArray> {
+        if self.ndim == 1 {
+            MxArray::from_uint32(token_ids, &[token_ids.len() as i64])
+        } else {
+            MxArray::from_uint32(token_ids, &[1, token_ids.len() as i64])
+        }
+    }
+}
+
+fn prepare_penalty_context(
+    logits: &MxArray,
+    tokens: &[u32],
+    context_size: i32,
+) -> Result<Option<PenaltyContext>> {
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+
+    if context_size <= 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("context_size must be positive, got {}", context_size),
+        ));
+    }
+
+    // Take last context_size tokens
+    let start_idx = tokens.len().saturating_sub(context_size as usize);
+    let recent_tokens = &tokens[start_idx..];
+
+    if recent_tokens.is_empty() {
+        return Ok(None);
+    }
+
+    let ndim = logits.ndim()? as usize;
+    if ndim == 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "expected logits with shape [vocab_size] or [batch, vocab_size], got scalar"
+                .to_string(),
+        ));
+    }
+
+    let vocab_size = logits.shape_at((ndim - 1) as u32)?;
+
+    let valid_tokens: Vec<u32> = recent_tokens
+        .iter()
+        .filter(|&&id| (id as i64) < vocab_size)
+        .copied()
+        .collect();
+
+    if valid_tokens.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(PenaltyContext {
+        last_axis: ndim as i32 - 1,
+        ndim,
+        valid_tokens,
+    }))
+}
+
 /// Apply repetition penalty to logits
 ///
 /// Reduces the probability of tokens that have recently appeared in the generated sequence.
@@ -420,24 +496,12 @@ pub(crate) fn sample_and_logprobs(
 /// For each token in the recent history (last context_size tokens):
 /// - If logit < 0: multiply by penalty (make more negative)
 /// - If logit ≥ 0: divide by penalty (reduce magnitude)
-///
-/// This asymmetric treatment ensures:
-/// - Already unlikely tokens (negative logits) become even more unlikely
-/// - Already likely tokens (positive logits) become less likely
-///
-/// # Example
-/// ```
-/// // With penalty=1.5:
-/// // Token 42 has logit=2.0 → becomes 2.0/1.5 = 1.33 (reduced)
-/// // Token 100 has logit=-1.0 → becomes -1.0*1.5 = -1.5 (more negative)
-/// ```
 pub(crate) fn apply_repetition_penalty(
     logits: &MxArray,
     tokens: &[u32],
     penalty: f64,
     context_size: Option<i32>,
 ) -> Result<MxArray> {
-    // Validate penalty
     if penalty <= 0.0 {
         return Err(Error::new(
             Status::InvalidArg,
@@ -445,89 +509,133 @@ pub(crate) fn apply_repetition_penalty(
         ));
     }
 
-    // If penalty is 1.0, no effect - just return a reference (no copy needed)
     if (penalty - 1.0).abs() < 1e-10 {
         return Ok(logits.clone());
     }
 
-    // If no tokens to penalize, return as-is
-    if tokens.is_empty() {
-        return Ok(logits.clone());
-    }
-
-    let context_size = context_size.unwrap_or(20);
-    if context_size <= 0 {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!("context_size must be positive, got {}", context_size),
-        ));
-    }
-
-    // Take last context_size tokens
-    let start_idx = if tokens.len() > context_size as usize {
-        tokens.len() - context_size as usize
-    } else {
-        0
-    };
-    let recent_tokens = &tokens[start_idx..];
-
-    // If no tokens after filtering, return as-is
-    if recent_tokens.is_empty() {
-        return Ok(logits.clone());
-    }
-
-    // OPTIMIZED: Get ndim and vocab_size without copying entire shape
-    let ndim = logits.ndim()? as usize;
-    if ndim == 0 {
-        return Err(Error::new(
-            Status::InvalidArg,
-            "apply_repetition_penalty: expected logits with shape [vocab_size] or [batch, vocab_size], got scalar"
-                .to_string(),
-        ));
-    }
-
-    let vocab_size = logits.shape_at((ndim - 1) as u32)?;
-
-    // Filter out invalid token IDs
-    let valid_tokens: Vec<u32> = recent_tokens
-        .iter()
-        .filter(|&&id| (id as i64) < vocab_size)
-        .copied()
-        .collect();
-
-    if valid_tokens.is_empty() {
-        return Ok(logits.clone());
-    }
-
-    // Create index array for gathering/scattering
-    let ndim_val = logits.ndim()?;
-    let last_axis = ndim_val as i32 - 1;
-
-    // For put_along_axis, indices must have the same ndim as the source array.
-    // 1D: indices shape [num_tokens], 2D: indices shape [1, num_tokens] (broadcasts over batch)
-    let indices = if ndim_val == 1 {
-        MxArray::from_uint32(&valid_tokens, &[valid_tokens.len() as i64])?
-    } else {
-        MxArray::from_uint32(&valid_tokens, &[1, valid_tokens.len() as i64])?
+    let ctx = match prepare_penalty_context(logits, tokens, context_size.unwrap_or(20))? {
+        Some(ctx) => ctx,
+        None => return Ok(logits.clone()),
     };
 
-    // Gather logits at the penalized token positions (vectorized, 1 FFI call)
-    let gathered = logits.take_along_axis(&indices, last_axis)?;
+    let indices = ctx.make_indices(&ctx.valid_tokens)?;
 
-    // Apply penalty to gathered values (vectorized, 4 FFI calls)
+    // Gather logits at the penalized token positions
+    let gathered = logits.take_along_axis(&indices, ctx.last_axis)?;
+
+    // Asymmetric penalty: divide positive logits, multiply negative logits
     let zero = MxArray::scalar_float(0.0)?;
     let is_negative = gathered.less(&zero)?;
     let penalized_positive = gathered.div_scalar(penalty)?;
     let penalized_negative = gathered.mul_scalar(penalty)?;
     let penalized = is_negative.where_(&penalized_negative, &penalized_positive)?;
 
-    // Scatter penalized values back in ONE operation (1 FFI call)
-    // put_along_axis(self, indices, values, axis) is equivalent to:
-    //   result = self.copy(); result[..., indices] = values
-    // This replaces the previous loop of ~N slice_assign_axis calls.
-    let result = logits.put_along_axis(&indices, &penalized, last_axis)?;
+    logits.put_along_axis(&indices, &penalized, ctx.last_axis)
+}
 
-    Ok(result)
+/// Apply presence penalty to logits
+///
+/// Subtracts a flat penalty from logits of any token that appeared at least once
+/// in the context window. Matches OpenAI API `presence_penalty` semantics.
+///
+/// Reference: mlx-lm/mlx_lm/sample_utils.py:make_presence_penalty
+///
+/// # Arguments
+/// * `logits` - Input logits [vocab_size] or [batch, vocab_size]
+/// * `tokens` - Previously generated tokens (token IDs)
+/// * `penalty` - Additive penalty to subtract (0.0 = disabled, recommended: 0.0-2.0)
+/// * `context_size` - Maximum number of recent tokens to consider (default: 20)
+pub(crate) fn apply_presence_penalty(
+    logits: &MxArray,
+    tokens: &[u32],
+    penalty: f64,
+    context_size: Option<i32>,
+) -> Result<MxArray> {
+    if penalty.abs() < 1e-10 {
+        return Ok(logits.clone());
+    }
+
+    let ctx = match prepare_penalty_context(logits, tokens, context_size.unwrap_or(20))? {
+        Some(ctx) => ctx,
+        None => return Ok(logits.clone()),
+    };
+
+    // Deduplicate tokens — presence is binary (one or five occurrences = same penalty)
+    let unique: Vec<u32> = {
+        let mut seen = std::collections::HashSet::new();
+        ctx.valid_tokens
+            .iter()
+            .filter(|id| seen.insert(**id))
+            .copied()
+            .collect()
+    };
+
+    let indices = ctx.make_indices(&unique)?;
+    let gathered = logits.take_along_axis(&indices, ctx.last_axis)?;
+    let penalized = gathered.sub_scalar(penalty)?;
+
+    logits.put_along_axis(&indices, &penalized, ctx.last_axis)
+}
+
+/// Apply frequency penalty to logits
+///
+/// Subtracts a penalty proportional to how many times each token appeared in the
+/// context window. Matches OpenAI API `frequency_penalty` semantics.
+///
+/// Reference: mlx-lm/mlx_lm/sample_utils.py:make_frequency_penalty
+///
+/// # Arguments
+/// * `logits` - Input logits [vocab_size] or [batch, vocab_size]
+/// * `tokens` - Previously generated tokens (token IDs)
+/// * `penalty` - Additive penalty per occurrence (0.0 = disabled, recommended: 0.0-2.0)
+/// * `context_size` - Maximum number of recent tokens to consider (default: 20)
+pub(crate) fn apply_frequency_penalty(
+    logits: &MxArray,
+    tokens: &[u32],
+    penalty: f64,
+    context_size: Option<i32>,
+) -> Result<MxArray> {
+    if penalty.abs() < 1e-10 {
+        return Ok(logits.clone());
+    }
+
+    let ctx = match prepare_penalty_context(logits, tokens, context_size.unwrap_or(20))? {
+        Some(ctx) => ctx,
+        None => return Ok(logits.clone()),
+    };
+
+    // Count frequency of each token on CPU — O(context_size), max ~256 iterations
+    let mut freq_map = std::collections::HashMap::new();
+    for &id in &ctx.valid_tokens {
+        *freq_map.entry(id).or_insert(0u32) += 1;
+    }
+
+    // For tokens that appear once, use sub_scalar (same as presence penalty).
+    // For mixed frequencies, build a per-token penalty array.
+    let unique_ids: Vec<u32> = freq_map.keys().copied().collect();
+    let all_single = freq_map.values().all(|&c| c == 1);
+
+    let indices = ctx.make_indices(&unique_ids)?;
+    let gathered = logits.take_along_axis(&indices, ctx.last_axis)?;
+
+    let penalized = if all_single {
+        // All tokens appear once — flat subtract like presence penalty
+        gathered.sub_scalar(penalty)?
+    } else {
+        // Mixed frequencies — per-token penalty array
+        let freq_penalties: Vec<f32> = unique_ids
+            .iter()
+            .map(|id| freq_map[id] as f32 * penalty as f32)
+            .collect();
+        let penalty_array = if ctx.ndim == 1 {
+            MxArray::from_float32(&freq_penalties, &[freq_penalties.len() as i64])?
+        } else {
+            MxArray::from_float32(&freq_penalties, &[1, freq_penalties.len() as i64])?
+        };
+        gathered.sub(&penalty_array)?
+    };
+
+    logits.put_along_axis(&indices, &penalized, ctx.last_axis)
 }
 
 /// Check if generation has fallen into a repetitive loop.
@@ -611,17 +719,18 @@ pub(crate) fn check_repetition_cutoff(
     None
 }
 
-// Unit tests for repetition_penalty (pub(crate) function) remain here
+// Unit tests for penalty functions (pub(crate) functions) remain here
 // Public API tests have been moved to node/tests/sampling_tests.rs
+
+#[cfg(test)]
+fn assert_close(a: f32, b: f32, tolerance: f32) {
+    assert!((a - b).abs() < tolerance, "Expected {}, got {}", b, a);
+}
 
 #[cfg(test)]
 mod repetition_penalty_tests {
     use super::*;
     use crate::array::MxArray;
-
-    fn assert_close(a: f32, b: f32, tolerance: f32) {
-        assert!((a - b).abs() < tolerance, "Expected {}, got {}", b, a);
-    }
 
     #[test]
     fn test_apply_penalty_to_positive_logits() {
@@ -878,5 +987,210 @@ mod repetition_penalty_tests {
         assert_close(result_data[2], 6.0, 1e-5); // Unchanged
         assert_close(result_data[3], 4.0, 1e-5); // 8.0 / 2.0 = 4.0
         assert_close(result_data[4], 5.0, 1e-5); // 10.0 / 2.0 = 5.0
+    }
+}
+
+#[cfg(test)]
+mod presence_penalty_tests {
+    use super::*;
+    use crate::array::MxArray;
+
+    #[test]
+    fn test_basic_presence_penalty() {
+        let logits = MxArray::from_float32(&[1.0f32, 2.0, 3.0, 4.0, 5.0], &[5]).unwrap();
+        let tokens = vec![1, 3];
+        let penalty = 1.5;
+
+        let result = apply_presence_penalty(&logits, &tokens, penalty, None).unwrap();
+        result.eval();
+        let data = result.to_float32().unwrap();
+
+        assert_close(data[0], 1.0, 1e-5); // Unchanged
+        assert_close(data[1], 0.5, 1e-5); // 2.0 - 1.5 = 0.5
+        assert_close(data[2], 3.0, 1e-5); // Unchanged
+        assert_close(data[3], 2.5, 1e-5); // 4.0 - 1.5 = 2.5
+        assert_close(data[4], 5.0, 1e-5); // Unchanged
+    }
+
+    #[test]
+    fn test_deduplication() {
+        // Token 1 appears 3 times, but presence penalty should only subtract once
+        let logits = MxArray::from_float32(&[1.0f32, 10.0, 3.0], &[3]).unwrap();
+        let tokens = vec![1, 1, 1];
+        let penalty = 2.0;
+
+        let result = apply_presence_penalty(&logits, &tokens, penalty, None).unwrap();
+        result.eval();
+        let data = result.to_float32().unwrap();
+
+        assert_close(data[0], 1.0, 1e-5); // Unchanged
+        assert_close(data[1], 8.0, 1e-5); // 10.0 - 2.0 = 8.0 (subtracted once, not 3x)
+        assert_close(data[2], 3.0, 1e-5); // Unchanged
+    }
+
+    #[test]
+    fn test_zero_disabled() {
+        let logits = MxArray::from_float32(&[1.0f32, 2.0, 3.0], &[3]).unwrap();
+        let tokens = vec![0, 1, 2];
+
+        let result = apply_presence_penalty(&logits, &tokens, 0.0, None).unwrap();
+        result.eval();
+        let data = result.to_float32().unwrap();
+        let orig = logits.to_float32().unwrap();
+
+        for i in 0..data.len() {
+            assert_close(data[i], orig[i], 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_context_size() {
+        let logits = MxArray::from_float32(&[1.0f32, 2.0, 3.0, 4.0, 5.0], &[5]).unwrap();
+        let tokens = vec![0, 1, 2, 3, 4];
+        let penalty = 1.0;
+
+        let result = apply_presence_penalty(&logits, &tokens, penalty, Some(2)).unwrap();
+        result.eval();
+        let data = result.to_float32().unwrap();
+
+        // Only last 2 tokens (3, 4) should be penalized
+        assert_close(data[0], 1.0, 1e-5);
+        assert_close(data[1], 2.0, 1e-5);
+        assert_close(data[2], 3.0, 1e-5);
+        assert_close(data[3], 3.0, 1e-5); // 4.0 - 1.0 = 3.0
+        assert_close(data[4], 4.0, 1e-5); // 5.0 - 1.0 = 4.0
+    }
+
+    #[test]
+    fn test_batch_2d() {
+        let logits = MxArray::from_float32(
+            &[
+                1.0f32, 2.0, 3.0, 4.0, // Batch 0
+                5.0, 6.0, 7.0, 8.0, // Batch 1
+            ],
+            &[2, 4],
+        )
+        .unwrap();
+        let tokens = vec![1, 3];
+        let penalty = 1.0;
+
+        let result = apply_presence_penalty(&logits, &tokens, penalty, None).unwrap();
+        result.eval();
+        let data = result.to_float32().unwrap();
+
+        // Batch 0
+        assert_close(data[0], 1.0, 1e-5);
+        assert_close(data[1], 1.0, 1e-5); // 2.0 - 1.0
+        assert_close(data[2], 3.0, 1e-5);
+        assert_close(data[3], 3.0, 1e-5); // 4.0 - 1.0
+
+        // Batch 1
+        assert_close(data[4], 5.0, 1e-5);
+        assert_close(data[5], 5.0, 1e-5); // 6.0 - 1.0
+        assert_close(data[6], 7.0, 1e-5);
+        assert_close(data[7], 7.0, 1e-5); // 8.0 - 1.0
+    }
+}
+
+#[cfg(test)]
+mod frequency_penalty_tests {
+    use super::*;
+    use crate::array::MxArray;
+
+    #[test]
+    fn test_basic_frequency_penalty() {
+        // Token 1 appears 3x → penalty = 3 * 1.0 = 3.0
+        // Token 2 appears 1x → penalty = 1 * 1.0 = 1.0
+        let logits = MxArray::from_float32(&[1.0f32, 10.0, 5.0, 4.0], &[4]).unwrap();
+        let tokens = vec![1, 1, 1, 2];
+        let penalty = 1.0;
+
+        let result = apply_frequency_penalty(&logits, &tokens, penalty, None).unwrap();
+        result.eval();
+        let data = result.to_float32().unwrap();
+
+        assert_close(data[0], 1.0, 1e-5); // Unchanged
+        assert_close(data[1], 7.0, 1e-5); // 10.0 - 3*1.0 = 7.0
+        assert_close(data[2], 4.0, 1e-5); // 5.0 - 1*1.0 = 4.0
+        assert_close(data[3], 4.0, 1e-5); // Unchanged
+    }
+
+    #[test]
+    fn test_single_occurrence_matches_presence() {
+        // With all unique tokens, frequency penalty = presence penalty
+        let logits = MxArray::from_float32(&[1.0f32, 2.0, 3.0, 4.0], &[4]).unwrap();
+        let tokens = vec![1, 3];
+        let penalty = 1.5;
+
+        let freq_result = apply_frequency_penalty(&logits, &tokens, penalty, None).unwrap();
+        freq_result.eval();
+        let freq_data = freq_result.to_float32().unwrap();
+
+        let pres_result = apply_presence_penalty(&logits, &tokens, penalty, None).unwrap();
+        pres_result.eval();
+        let pres_data = pres_result.to_float32().unwrap();
+
+        for i in 0..freq_data.len() {
+            assert_close(freq_data[i], pres_data[i], 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_zero_disabled() {
+        let logits = MxArray::from_float32(&[1.0f32, 2.0, 3.0], &[3]).unwrap();
+        let tokens = vec![0, 0, 0, 1, 2];
+
+        let result = apply_frequency_penalty(&logits, &tokens, 0.0, None).unwrap();
+        result.eval();
+        let data = result.to_float32().unwrap();
+        let orig = logits.to_float32().unwrap();
+
+        for i in 0..data.len() {
+            assert_close(data[i], orig[i], 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_context_size() {
+        // Tokens: [0, 0, 0, 1, 1], context_size=2 → only [1, 1]
+        let logits = MxArray::from_float32(&[1.0f32, 10.0, 3.0], &[3]).unwrap();
+        let tokens = vec![0, 0, 0, 1, 1];
+        let penalty = 1.0;
+
+        let result = apply_frequency_penalty(&logits, &tokens, penalty, Some(2)).unwrap();
+        result.eval();
+        let data = result.to_float32().unwrap();
+
+        assert_close(data[0], 1.0, 1e-5); // Token 0 not in last 2
+        assert_close(data[1], 8.0, 1e-5); // 10.0 - 2*1.0 = 8.0 (token 1 appears 2x)
+        assert_close(data[2], 3.0, 1e-5); // Unchanged
+    }
+
+    #[test]
+    fn test_batch_2d() {
+        let logits = MxArray::from_float32(
+            &[
+                1.0f32, 10.0, 3.0, // Batch 0
+                4.0, 20.0, 6.0, // Batch 1
+            ],
+            &[2, 3],
+        )
+        .unwrap();
+        let tokens = vec![1, 1]; // Token 1 appears 2x
+        let penalty = 2.0;
+
+        let result = apply_frequency_penalty(&logits, &tokens, penalty, None).unwrap();
+        result.eval();
+        let data = result.to_float32().unwrap();
+
+        // Batch 0: token 1 penalized by 2*2.0=4.0
+        assert_close(data[0], 1.0, 1e-5);
+        assert_close(data[1], 6.0, 1e-5); // 10.0 - 4.0 = 6.0
+        assert_close(data[2], 3.0, 1e-5);
+
+        // Batch 1: same penalty
+        assert_close(data[3], 4.0, 1e-5);
+        assert_close(data[4], 16.0, 1e-5); // 20.0 - 4.0 = 16.0
+        assert_close(data[5], 6.0, 1e-5);
     }
 }

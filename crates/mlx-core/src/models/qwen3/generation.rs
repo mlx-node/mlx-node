@@ -33,6 +33,20 @@ pub struct GenerationConfig {
     /// Matches mlx-lm default. Larger values catch longer patterns but use more memory
     pub repetition_context_size: Option<i32>,
 
+    /// Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
+    /// token that appeared at least once in context. Matches OpenAI API semantics.
+    pub presence_penalty: Option<f64>,
+
+    /// Number of recent tokens to consider for presence penalty (default: 20)
+    pub presence_context_size: Option<i32>,
+
+    /// Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
+    /// logits of each token in context. Matches OpenAI API semantics.
+    pub frequency_penalty: Option<f64>,
+
+    /// Number of recent tokens to consider for frequency penalty (default: 20)
+    pub frequency_context_size: Option<i32>,
+
     /// Stop if same token repeats this many times consecutively (default: 16)
     /// Set to 0 to disable. Prevents OOM from degenerate repetitive generation.
     pub max_consecutive_tokens: Option<i32>,
@@ -95,6 +109,10 @@ impl Default for GenerationConfig {
             min_p: Some(0.0),
             repetition_penalty: Some(1.0),
             repetition_context_size: Some(20),
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
             max_consecutive_tokens: Some(16),
             max_ngram_repeats: Some(3),
             ngram_size: Some(64),
