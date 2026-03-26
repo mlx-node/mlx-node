@@ -5482,6 +5482,7 @@ impl Qwen3Model {
 
         // Extract tools, enable_thinking, report_performance, and reuse_cache from config
         let tools = config.as_ref().and_then(|c| c.tools.clone());
+        let has_tools = tools.is_some();
         let enable_thinking = config.as_ref().and_then(|c| c.enable_thinking);
         let report_perf = config
             .as_ref()
@@ -5636,6 +5637,8 @@ impl Qwen3Model {
         // Generate tokens using the internal generate method with optional cache state
         let prompt_token_count = actual_prefill_count;
         let config = gen_config.unwrap_or_default();
+
+        let tool_call_end_id = tokenizer.tool_call_end_id();
 
         let embedding_weight = self.embedding.get_weight();
         let layers_arc = self.layers.clone();
@@ -5906,6 +5909,11 @@ impl Qwen3Model {
                 }
 
                 generated_tokens.push(token_value);
+
+                if has_tools && tool_call_end_id.is_some_and(|id| id == token_value) {
+                    finish_reason = "stop";
+                    break;
+                }
 
                 if return_logprobs && let Some(ref lp) = logprobs_arr {
                     lp.eval();

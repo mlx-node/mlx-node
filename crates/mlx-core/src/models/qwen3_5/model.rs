@@ -904,6 +904,8 @@ impl Qwen3_5Model {
         napi::bindgen_prelude::spawn_blocking(move || {
             let mut first_token_instant: Option<std::time::Instant> = None;
 
+            let has_tools = config.tools.is_some();
+            let tool_call_end_id = tokenizer.tool_call_end_id();
             let tool_defs = config.tools.as_deref();
             let enable_thinking = config.enable_thinking;
             let tokens = tokenizer.apply_chat_template_sync(
@@ -1317,6 +1319,11 @@ impl Qwen3_5Model {
                     generated_tokens.push(token_id);
                     token_history.push(token_id);
 
+                    if has_tools && tool_call_end_id.is_some_and(|id| id == token_id) {
+                        finish_reason = String::from("stop");
+                        break;
+                    }
+
                     if token_id == eos_id {
                         finish_reason = String::from("stop");
                         break;
@@ -1459,6 +1466,11 @@ impl Qwen3_5Model {
 
                     generated_tokens.push(token_id);
                     token_history.push(token_id);
+
+                    if has_tools && tool_call_end_id.is_some_and(|id| id == token_id) {
+                        finish_reason = String::from("stop");
+                        break;
+                    }
 
                     if token_id == eos_id {
                         finish_reason = String::from("stop");
@@ -1709,6 +1721,8 @@ impl Qwen3_5Model {
             let callback_err = callback.clone();
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
+                    let has_tools = config.tools.is_some();
+                    let tool_call_end_id = tokenizer.tool_call_end_id();
                     let tool_defs = config.tools.as_deref();
                     let enable_thinking = config.enable_thinking;
                     let tokens = tokenizer.apply_chat_template_sync(
@@ -2134,6 +2148,11 @@ impl Qwen3_5Model {
                                 ThreadsafeFunctionCallMode::NonBlocking,
                             );
 
+                            if has_tools && tool_call_end_id.is_some_and(|id| id == token_id) {
+                                finish_reason = String::from("stop");
+                                break;
+                            }
+
                             if token_id == eos_id {
                                 finish_reason = String::from("stop");
                                 break;
@@ -2278,6 +2297,11 @@ impl Qwen3_5Model {
                                 }),
                                 ThreadsafeFunctionCallMode::NonBlocking,
                             );
+
+                            if has_tools && tool_call_end_id.is_some_and(|id| id == token_id) {
+                                finish_reason = String::from("stop");
+                                break;
+                            }
 
                             if token_id == eos_id {
                                 finish_reason = String::from("stop");
