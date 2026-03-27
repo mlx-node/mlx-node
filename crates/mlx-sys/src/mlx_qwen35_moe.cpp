@@ -76,10 +76,11 @@ static std::vector<DenseMLPQuantInfo> g_dense_quant;  // per-layer dense MLP qua
 static std::unordered_map<std::string, array> g_weight_transposes_3d;
 
 // Pure read — 3D transposes are pre-computed in mlx_qwen35_moe_init_from_prefill.
-const array& get_weight_t3d(const std::string& name) {
+// Returns by VALUE so the caller's copy survives concurrent map mutations.
+array get_weight_t3d(const std::string& name) {
   auto it = g_weight_transposes_3d.find(name);
   if (it != g_weight_transposes_3d.end()) {
-    return it->second;
+    return it->second;  // copy (refcount bump)
   }
   throw std::runtime_error("3D transpose not found for weight: " + name);
 }
@@ -94,8 +95,8 @@ array quantized_linear_forward(
     const std::string& prefix,
     int gs, int bits,
     const std::string& mode) {
-  const auto& w = get_weight(prefix + ".weight");
-  const auto& scales = get_weight(prefix + ".scales");
+  auto w = get_weight(prefix + ".weight");
+  auto scales = get_weight(prefix + ".scales");
   std::optional<array> biases = std::nullopt;
   if (has_weight(prefix + ".biases")) {
     biases = get_weight(prefix + ".biases");
@@ -143,8 +144,8 @@ array switch_linear_fwd(
     bool sorted,
     bool is_quant, int /*gs_hint*/, int /*bits_hint*/, const std::string& /*mode_hint*/) {
   if (is_quant && has_weight(prefix + ".scales")) {
-    const auto& w = get_weight(prefix + ".weight");
-    const auto& scales = get_weight(prefix + ".scales");
+    auto w = get_weight(prefix + ".weight");
+    auto scales = get_weight(prefix + ".scales");
     std::optional<array> biases = std::nullopt;
     if (has_weight(prefix + ".biases")) {
       biases = get_weight(prefix + ".biases");
@@ -611,8 +612,8 @@ void mlx_qwen35_moe_init_from_prefill(
         return {true, 32, 8, "mxfp8"};
       }
       // Affine: infer bits from weight/scales shape ratio
-      const auto& w = get_weight(prefix + ".weight");
-      const auto& scales = get_weight(prefix + ".scales");
+      auto w = get_weight(prefix + ".weight");
+      auto scales = get_weight(prefix + ".scales");
       int bits = infer_affine_bits(w, scales, 64);
       return {true, 64, bits, "affine"};
     };

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use futures::TryFutureExt;
@@ -36,9 +36,9 @@ use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::persistence;
 
-/// Maximum number of entries in the vision encoder cache before LRU eviction.
-/// Monotonically incrementing counter for MoE model instance IDs.
-static MOE_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1); // 0 = no model
+// Import the shared model ID counter from the dense module — dense and MoE
+// share the same C++ weight map, so IDs must be globally unique.
+use crate::models::qwen3_5::model::QWEN35_MODEL_ID_COUNTER;
 
 /// Process-wide mutex serializing the MoE compiled forward lifecycle.
 ///
@@ -172,7 +172,7 @@ impl Qwen3_5MoeModel {
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
-            model_id: MOE_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -1766,6 +1766,8 @@ impl Qwen3_5MoeModel {
                     let eos_id = model_config.eos_token_id as u32;
                     let mut generated_tokens: Vec<u32> = Vec::new();
                     let mut finish_reason = String::from("length");
+                    // Track decoded text length for incremental delta streaming.
+                    let mut prev_decoded_len: usize = 0;
 
                     // Track token history for repetition penalty
                     let mut token_history: Vec<u32> = if let Some(ref et) = expanded_tokens {
@@ -2059,10 +2061,18 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            // Decode and stream this token
-                            let token_text = tokenizer_for_decode
-                                .decode_sync(&[token_id], true)
+                            // Incremental delta decode: decode the full sequence so far
+                            // and emit only the new characters. This correctly handles
+                            // multibyte UTF-8, byte-fallback, and whitespace-prefix tokens.
+                            let full_text = tokenizer_for_decode
+                                .decode_sync(&generated_tokens, true)
                                 .unwrap_or_default();
+                            let token_text = if full_text.len() > prev_decoded_len {
+                                full_text[prev_decoded_len..].to_string()
+                            } else {
+                                String::new()
+                            };
+                            prev_decoded_len = full_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2205,10 +2215,18 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            // Decode and stream this token
-                            let token_text = tokenizer_for_decode
-                                .decode_sync(&[token_id], true)
+                            // Incremental delta decode: decode the full sequence so far
+                            // and emit only the new characters. This correctly handles
+                            // multibyte UTF-8, byte-fallback, and whitespace-prefix tokens.
+                            let full_text = tokenizer_for_decode
+                                .decode_sync(&generated_tokens, true)
                                 .unwrap_or_default();
+                            let token_text = if full_text.len() > prev_decoded_len {
+                                full_text[prev_decoded_len..].to_string()
+                            } else {
+                                String::new()
+                            };
+                            prev_decoded_len = full_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2939,7 +2957,7 @@ impl Qwen3_5MoeModel {
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
-            model_id: MOE_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         })
     }
 
