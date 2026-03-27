@@ -5912,21 +5912,6 @@ impl Qwen3Model {
 
                 generated_tokens.push(token_value);
 
-                if has_tools {
-                    if tool_call_end_id.is_some_and(|id| id == token_value) {
-                        tool_call_stop_after = Some(2);
-                    } else if let Some(remaining) = tool_call_stop_after {
-                        if tool_call_start_id.is_some_and(|id| id == token_value) {
-                            tool_call_stop_after = None;
-                        } else if remaining == 0 {
-                            finish_reason = "stop";
-                            break;
-                        } else {
-                            tool_call_stop_after = Some(remaining - 1);
-                        }
-                    }
-                }
-
                 if return_logprobs && let Some(ref lp) = logprobs_arr {
                     lp.eval();
                     let token_logprob = lp.item_at_float32(token_value as usize)?;
@@ -5948,6 +5933,21 @@ impl Qwen3Model {
                 {
                     finish_reason = "stop";
                     break;
+                }
+
+                if has_tools {
+                    if tool_call_end_id.is_some_and(|id| id == token_value) {
+                        tool_call_stop_after = Some(4);
+                    } else if let Some(remaining) = tool_call_stop_after {
+                        if tool_call_start_id.is_some_and(|id| id == token_value) {
+                            tool_call_stop_after = None;
+                        } else if remaining == 0 {
+                            finish_reason = "stop";
+                            break;
+                        } else {
+                            tool_call_stop_after = Some(remaining - 1);
+                        }
+                    }
                 }
 
                 // Forward pass with just the new token

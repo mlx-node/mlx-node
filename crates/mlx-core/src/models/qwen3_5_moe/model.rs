@@ -1180,21 +1180,6 @@ impl Qwen3_5MoeModel {
                     generated_tokens.push(token_id);
                     token_history.push(token_id);
 
-                    if has_tools {
-                        if tool_call_end_id.is_some_and(|id| id == token_id) {
-                            tool_call_stop_after = Some(2);
-                        } else if let Some(remaining) = tool_call_stop_after {
-                            if tool_call_start_id.is_some_and(|id| id == token_id) {
-                                tool_call_stop_after = None;
-                            } else if remaining == 0 {
-                                finish_reason = String::from("stop");
-                                break;
-                            } else {
-                                tool_call_stop_after = Some(remaining - 1);
-                            }
-                        }
-                    }
-
                     if token_id == eos_id {
                         finish_reason = String::from("stop");
                         break;
@@ -1208,6 +1193,21 @@ impl Qwen3_5MoeModel {
                     ) {
                         finish_reason = reason.to_string();
                         break;
+                    }
+
+                    if has_tools {
+                        if tool_call_end_id.is_some_and(|id| id == token_id) {
+                            tool_call_stop_after = Some(4);
+                        } else if let Some(remaining) = tool_call_stop_after {
+                            if tool_call_start_id.is_some_and(|id| id == token_id) {
+                                tool_call_stop_after = None;
+                            } else if remaining == 0 {
+                                finish_reason = String::from("stop");
+                                break;
+                            } else {
+                                tool_call_stop_after = Some(remaining - 1);
+                            }
+                        }
                     }
 
                     match next_y {
@@ -1336,21 +1336,6 @@ impl Qwen3_5MoeModel {
                     generated_tokens.push(token_id);
                     token_history.push(token_id);
 
-                    if has_tools {
-                        if tool_call_end_id.is_some_and(|id| id == token_id) {
-                            tool_call_stop_after = Some(2);
-                        } else if let Some(remaining) = tool_call_stop_after {
-                            if tool_call_start_id.is_some_and(|id| id == token_id) {
-                                tool_call_stop_after = None;
-                            } else if remaining == 0 {
-                                finish_reason = String::from("stop");
-                                break;
-                            } else {
-                                tool_call_stop_after = Some(remaining - 1);
-                            }
-                        }
-                    }
-
                     if token_id == eos_id {
                         finish_reason = String::from("stop");
                         break;
@@ -1364,6 +1349,21 @@ impl Qwen3_5MoeModel {
                     ) {
                         finish_reason = reason.to_string();
                         break;
+                    }
+
+                    if has_tools {
+                        if tool_call_end_id.is_some_and(|id| id == token_id) {
+                            tool_call_stop_after = Some(4);
+                        } else if let Some(remaining) = tool_call_stop_after {
+                            if tool_call_start_id.is_some_and(|id| id == token_id) {
+                                tool_call_stop_after = None;
+                            } else if remaining == 0 {
+                                finish_reason = String::from("stop");
+                                break;
+                            } else {
+                                tool_call_stop_after = Some(remaining - 1);
+                            }
+                        }
                     }
 
                     match next_y {
@@ -2054,21 +2054,6 @@ impl Qwen3_5MoeModel {
                                 ThreadsafeFunctionCallMode::NonBlocking,
                             );
 
-                            if has_tools {
-                                if tool_call_end_id.is_some_and(|id| id == token_id) {
-                                    tool_call_stop_after = Some(2);
-                                } else if let Some(remaining) = tool_call_stop_after {
-                                    if tool_call_start_id.is_some_and(|id| id == token_id) {
-                                        tool_call_stop_after = None;
-                                    } else if remaining == 0 {
-                                        finish_reason = String::from("stop");
-                                        break;
-                                    } else {
-                                        tool_call_stop_after = Some(remaining - 1);
-                                    }
-                                }
-                            }
-
                             if token_id == eos_id {
                                 finish_reason = String::from("stop");
                                 break;
@@ -2082,6 +2067,21 @@ impl Qwen3_5MoeModel {
                             ) {
                                 finish_reason = reason.to_string();
                                 break;
+                            }
+
+                            if has_tools {
+                                if tool_call_end_id.is_some_and(|id| id == token_id) {
+                                    tool_call_stop_after = Some(4);
+                                } else if let Some(remaining) = tool_call_stop_after {
+                                    if tool_call_start_id.is_some_and(|id| id == token_id) {
+                                        tool_call_stop_after = None;
+                                    } else if remaining == 0 {
+                                        finish_reason = String::from("stop");
+                                        break;
+                                    } else {
+                                        tool_call_stop_after = Some(remaining - 1);
+                                    }
+                                }
                             }
 
                             match next_y {
@@ -2216,21 +2216,6 @@ impl Qwen3_5MoeModel {
                                 ThreadsafeFunctionCallMode::NonBlocking,
                             );
 
-                            if has_tools {
-                                if tool_call_end_id.is_some_and(|id| id == token_id) {
-                                    tool_call_stop_after = Some(2);
-                                } else if let Some(remaining) = tool_call_stop_after {
-                                    if tool_call_start_id.is_some_and(|id| id == token_id) {
-                                        tool_call_stop_after = None;
-                                    } else if remaining == 0 {
-                                        finish_reason = String::from("stop");
-                                        break;
-                                    } else {
-                                        tool_call_stop_after = Some(remaining - 1);
-                                    }
-                                }
-                            }
-
                             if token_id == eos_id {
                                 finish_reason = String::from("stop");
                                 break;
@@ -2244,6 +2229,21 @@ impl Qwen3_5MoeModel {
                             ) {
                                 finish_reason = reason.to_string();
                                 break;
+                            }
+
+                            if has_tools {
+                                if tool_call_end_id.is_some_and(|id| id == token_id) {
+                                    tool_call_stop_after = Some(4);
+                                } else if let Some(remaining) = tool_call_stop_after {
+                                    if tool_call_start_id.is_some_and(|id| id == token_id) {
+                                        tool_call_stop_after = None;
+                                    } else if remaining == 0 {
+                                        finish_reason = String::from("stop");
+                                        break;
+                                    } else {
+                                        tool_call_stop_after = Some(remaining - 1);
+                                    }
+                                }
                             }
 
                             match next_y {
