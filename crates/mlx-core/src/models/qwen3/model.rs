@@ -5482,7 +5482,6 @@ impl Qwen3Model {
 
         // Extract tools, enable_thinking, report_performance, and reuse_cache from config
         let tools = config.as_ref().and_then(|c| c.tools.clone());
-        let has_tools = tools.is_some();
         let enable_thinking = config.as_ref().and_then(|c| c.enable_thinking);
         let report_perf = config
             .as_ref()
@@ -5637,9 +5636,6 @@ impl Qwen3Model {
         // Generate tokens using the internal generate method with optional cache state
         let prompt_token_count = actual_prefill_count;
         let config = gen_config.unwrap_or_default();
-
-        let tool_call_start_id = tokenizer.tool_call_start_id();
-        let tool_call_end_id = tokenizer.tool_call_end_id();
 
         let embedding_weight = self.embedding.get_weight();
         let layers_arc = self.layers.clone();
@@ -5892,8 +5888,6 @@ impl Qwen3Model {
             // Decode loop
             const DECODE_CLEANUP_INTERVAL: i32 = 256;
             let one_arr = MxArray::from_int32(&[1], &[1])?;
-            let mut tool_call_stop_after: Option<u32> = None;
-
             for step in 0..max_new_tokens {
                 let _stream_ctx = StreamContext::new(generation_stream);
 
@@ -5933,21 +5927,6 @@ impl Qwen3Model {
                 {
                     finish_reason = "stop";
                     break;
-                }
-
-                if has_tools {
-                    if tool_call_end_id.is_some_and(|id| id == token_value) {
-                        tool_call_stop_after = Some(4);
-                    } else if let Some(remaining) = tool_call_stop_after {
-                        if tool_call_start_id.is_some_and(|id| id == token_value) {
-                            tool_call_stop_after = None;
-                        } else if remaining == 0 {
-                            finish_reason = "stop";
-                            break;
-                        } else {
-                            tool_call_stop_after = Some(remaining - 1);
-                        }
-                    }
                 }
 
                 // Forward pass with just the new token

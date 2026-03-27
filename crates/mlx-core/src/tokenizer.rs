@@ -163,10 +163,6 @@ pub struct Qwen3Tokenizer {
     think_end_id: Option<u32>,
     /// The actual think-end string (e.g., `"</think>"` or `"</longcat_think>"`).
     think_end_str: Option<String>,
-    /// Token ID for `<tool_call>` (None if not in vocabulary).
-    tool_call_start_id: Option<u32>,
-    /// Token ID for `</tool_call>` (None if not in vocabulary).
-    tool_call_end_id: Option<u32>,
 }
 
 #[napi]
@@ -195,8 +191,6 @@ impl Qwen3Tokenizer {
                 let chat_template = Self::load_chat_template(&tokenizer_path);
 
                 let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
-                let (tool_call_start_id, tool_call_end_id) =
-                    Self::detect_tool_call_tokens(&tokenizer);
 
                 Ok(Self {
                     tokenizer: Arc::new(tokenizer),
@@ -206,8 +200,6 @@ impl Qwen3Tokenizer {
                     chat_template,
                     think_end_id,
                     think_end_str,
-                    tool_call_start_id,
-                    tool_call_end_id,
                 })
             })
             .await
@@ -284,7 +276,6 @@ impl Qwen3Tokenizer {
         let chat_template = Self::load_chat_template(tokenizer_path.to_string_lossy().as_ref());
 
         let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
-        let (tool_call_start_id, tool_call_end_id) = Self::detect_tool_call_tokens(&tokenizer);
 
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
@@ -294,8 +285,6 @@ impl Qwen3Tokenizer {
             chat_template,
             think_end_id,
             think_end_str,
-            tool_call_start_id,
-            tool_call_end_id,
         })
     }
 
@@ -1006,7 +995,6 @@ impl Qwen3Tokenizer {
         let chat_template = Self::load_chat_template(tokenizer_path);
 
         let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
-        let (tool_call_start_id, tool_call_end_id) = Self::detect_tool_call_tokens(&tokenizer);
 
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
@@ -1016,8 +1004,6 @@ impl Qwen3Tokenizer {
             chat_template,
             think_end_id,
             think_end_str,
-            tool_call_start_id,
-            tool_call_end_id,
         })
     }
 
@@ -1088,8 +1074,6 @@ impl Clone for Qwen3Tokenizer {
             chat_template: self.chat_template.clone(),
             think_end_id: self.think_end_id,
             think_end_str: self.think_end_str.clone(),
-            tool_call_start_id: self.tool_call_start_id,
-            tool_call_end_id: self.tool_call_end_id,
         }
     }
 }
@@ -1115,24 +1099,6 @@ impl Qwen3Tokenizer {
     /// Get the think-end string (e.g., `"</think>"` or `"</longcat_think>"`).
     pub fn think_end_str(&self) -> Option<&str> {
         self.think_end_str.as_deref()
-    }
-
-    /// Detect tool-call start/end tokens from tokenizer vocabulary.
-    fn detect_tool_call_tokens(tokenizer: &Tokenizer) -> (Option<u32>, Option<u32>) {
-        let vocab = tokenizer.get_vocab(true);
-        let start = vocab.get("<tool_call>").copied();
-        let end = vocab.get("</tool_call>").copied();
-        (start, end)
-    }
-
-    /// Get the `<tool_call>` start token ID.
-    pub fn tool_call_start_id(&self) -> Option<u32> {
-        self.tool_call_start_id
-    }
-
-    /// Get the `</tool_call>` end token ID.
-    pub fn tool_call_end_id(&self) -> Option<u32> {
-        self.tool_call_end_id
     }
 }
 

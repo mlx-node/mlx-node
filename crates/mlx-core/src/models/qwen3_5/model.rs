@@ -904,9 +904,6 @@ impl Qwen3_5Model {
         napi::bindgen_prelude::spawn_blocking(move || {
             let mut first_token_instant: Option<std::time::Instant> = None;
 
-            let has_tools = config.tools.is_some();
-            let tool_call_start_id = tokenizer.tool_call_start_id();
-            let tool_call_end_id = tokenizer.tool_call_end_id();
             let tool_defs = config.tools.as_deref();
             let enable_thinking = config.enable_thinking;
             let tokens = tokenizer.apply_chat_template_sync(
@@ -1253,7 +1250,6 @@ impl Qwen3_5Model {
 
                 // Compiled C++ decode loop (pipelined — submit N+1 before eval N)
                 profiler.set_label("chat_compiled");
-                let mut tool_call_stop_after: Option<u32> = None;
 
                 for step in 0..max_new_tokens {
                     // Build and submit graph for step N+1 before waiting for N
@@ -1336,21 +1332,6 @@ impl Qwen3_5Model {
                         break;
                     }
 
-                    if has_tools {
-                        if tool_call_end_id.is_some_and(|id| id == token_id) {
-                            tool_call_stop_after = Some(4);
-                        } else if let Some(remaining) = tool_call_stop_after {
-                            if tool_call_start_id.is_some_and(|id| id == token_id) {
-                                tool_call_stop_after = None;
-                            } else if remaining == 0 {
-                                finish_reason = String::from("stop");
-                                break;
-                            } else {
-                                tool_call_stop_after = Some(remaining - 1);
-                            }
-                        }
-                    }
-
                     match next_y {
                         Some(next) => y = next,
                         None => break,
@@ -1401,7 +1382,6 @@ impl Qwen3_5Model {
                 // Rust fallback decode loop — pipelined like mlx-lm:
                 // Build next step's graph before blocking on current token.
                 profiler.set_label("chat_rust");
-                let mut tool_call_stop_after: Option<u32> = None;
 
                 // Kick off first token's async eval
                 MxArray::async_eval_arrays(&[&y]);
@@ -1493,21 +1473,6 @@ impl Qwen3_5Model {
                     ) {
                         finish_reason = reason.to_string();
                         break;
-                    }
-
-                    if has_tools {
-                        if tool_call_end_id.is_some_and(|id| id == token_id) {
-                            tool_call_stop_after = Some(4);
-                        } else if let Some(remaining) = tool_call_stop_after {
-                            if tool_call_start_id.is_some_and(|id| id == token_id) {
-                                tool_call_stop_after = None;
-                            } else if remaining == 0 {
-                                finish_reason = String::from("stop");
-                                break;
-                            } else {
-                                tool_call_stop_after = Some(remaining - 1);
-                            }
-                        }
                     }
 
                     profiler.step();
@@ -1744,9 +1709,6 @@ impl Qwen3_5Model {
             let callback_err = callback.clone();
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
-                    let has_tools = config.tools.is_some();
-                    let tool_call_start_id = tokenizer.tool_call_start_id();
-                    let tool_call_end_id = tokenizer.tool_call_end_id();
                     let tool_defs = config.tools.as_deref();
                     let enable_thinking = config.enable_thinking;
                     let tokens = tokenizer.apply_chat_template_sync(
@@ -2102,7 +2064,6 @@ impl Qwen3_5Model {
 
                         // Compiled C++ decode loop (pipelined — submit N+1 before eval N)
                         profiler.set_label("chat_stream_compiled");
-                        let mut tool_call_stop_after: Option<u32> = None;
                         for step in 0..max_new_tokens {
                             // Build and submit graph for step N+1
                             let next_y = if step + 1 < max_new_tokens {
@@ -2188,21 +2149,6 @@ impl Qwen3_5Model {
                                 break;
                             }
 
-                            if has_tools {
-                                if tool_call_end_id.is_some_and(|id| id == token_id) {
-                                    tool_call_stop_after = Some(4);
-                                } else if let Some(remaining) = tool_call_stop_after {
-                                    if tool_call_start_id.is_some_and(|id| id == token_id) {
-                                        tool_call_stop_after = None;
-                                    } else if remaining == 0 {
-                                        finish_reason = String::from("stop");
-                                        break;
-                                    } else {
-                                        tool_call_stop_after = Some(remaining - 1);
-                                    }
-                                }
-                            }
-
                             match next_y {
                                 Some(next) => y = next,
                                 None => break,
@@ -2254,7 +2200,6 @@ impl Qwen3_5Model {
                     } else {
                         // Rust fallback decode loop (pipelined)
                         profiler.set_label("chat_stream_rust");
-                        let mut tool_call_stop_after: Option<u32> = None;
                         for step in 0..max_new_tokens {
                             // Build and submit graph for step N+1
                             let next_y = if step + 1 < max_new_tokens {
@@ -2347,21 +2292,6 @@ impl Qwen3_5Model {
                             ) {
                                 finish_reason = reason.to_string();
                                 break;
-                            }
-
-                            if has_tools {
-                                if tool_call_end_id.is_some_and(|id| id == token_id) {
-                                    tool_call_stop_after = Some(4);
-                                } else if let Some(remaining) = tool_call_stop_after {
-                                    if tool_call_start_id.is_some_and(|id| id == token_id) {
-                                        tool_call_stop_after = None;
-                                    } else if remaining == 0 {
-                                        finish_reason = String::from("stop");
-                                        break;
-                                    } else {
-                                        tool_call_stop_after = Some(remaining - 1);
-                                    }
-                                }
                             }
 
                             match next_y {

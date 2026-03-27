@@ -737,9 +737,6 @@ impl Qwen3_5MoeModel {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
-            let has_tools = config.tools.is_some();
-            let tool_call_start_id = tokenizer.tool_call_start_id();
-            let tool_call_end_id = tokenizer.tool_call_end_id();
             let tool_defs = config.tools.as_deref();
             let enable_thinking = config.enable_thinking;
             let tokens = tokenizer.apply_chat_template_sync(
@@ -1114,8 +1111,6 @@ impl Qwen3_5MoeModel {
                 // Rep penalty uses token_history as-of graph build time (one
                 // token behind), matching Python mlx-lm's pipelining behavior.
                 profiler.set_label("moe_chat_compiled");
-                let mut tool_call_stop_after: Option<u32> = None;
-
                 for step in 0..max_new_tokens {
                     // Build and submit graph for step N+1 before waiting for N
                     let next_y = if step + 1 < max_new_tokens {
@@ -1195,21 +1190,6 @@ impl Qwen3_5MoeModel {
                         break;
                     }
 
-                    if has_tools {
-                        if tool_call_end_id.is_some_and(|id| id == token_id) {
-                            tool_call_stop_after = Some(4);
-                        } else if let Some(remaining) = tool_call_stop_after {
-                            if tool_call_start_id.is_some_and(|id| id == token_id) {
-                                tool_call_stop_after = None;
-                            } else if remaining == 0 {
-                                finish_reason = String::from("stop");
-                                break;
-                            } else {
-                                tool_call_stop_after = Some(remaining - 1);
-                            }
-                        }
-                    }
-
                     match next_y {
                         Some(next) => y = next,
                         None => break,
@@ -1260,8 +1240,6 @@ impl Qwen3_5MoeModel {
             } else {
                 // Rust fallback decode loop (pipelined)
                 profiler.set_label("moe_chat_rust");
-                let mut tool_call_stop_after: Option<u32> = None;
-
                 for step in 0..max_new_tokens {
                     // Build and submit graph for step N+1 before waiting for N
                     let next_y = if step + 1 < max_new_tokens {
@@ -1349,21 +1327,6 @@ impl Qwen3_5MoeModel {
                     ) {
                         finish_reason = reason.to_string();
                         break;
-                    }
-
-                    if has_tools {
-                        if tool_call_end_id.is_some_and(|id| id == token_id) {
-                            tool_call_stop_after = Some(4);
-                        } else if let Some(remaining) = tool_call_stop_after {
-                            if tool_call_start_id.is_some_and(|id| id == token_id) {
-                                tool_call_stop_after = None;
-                            } else if remaining == 0 {
-                                finish_reason = String::from("stop");
-                                break;
-                            } else {
-                                tool_call_stop_after = Some(remaining - 1);
-                            }
-                        }
                     }
 
                     match next_y {
@@ -1601,9 +1564,6 @@ impl Qwen3_5MoeModel {
             let callback_err = callback.clone();
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
-                    let has_tools = config.tools.is_some();
-                    let tool_call_start_id = tokenizer.tool_call_start_id();
-                    let tool_call_end_id = tokenizer.tool_call_end_id();
                     let tool_defs = config.tools.as_deref();
                     let enable_thinking = config.enable_thinking;
                     let tokens = tokenizer.apply_chat_template_sync(
@@ -1984,7 +1944,6 @@ impl Qwen3_5MoeModel {
 
                         // C++ decode loop (pipelined — submit N+1 before eval N)
                         profiler.set_label("moe_chat_stream_compiled");
-                        let mut tool_call_stop_after: Option<u32> = None;
                         for step in 0..max_new_tokens {
                             // Build and submit graph for step N+1
                             let next_y = if step + 1 < max_new_tokens {
@@ -2069,21 +2028,6 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            if has_tools {
-                                if tool_call_end_id.is_some_and(|id| id == token_id) {
-                                    tool_call_stop_after = Some(4);
-                                } else if let Some(remaining) = tool_call_stop_after {
-                                    if tool_call_start_id.is_some_and(|id| id == token_id) {
-                                        tool_call_stop_after = None;
-                                    } else if remaining == 0 {
-                                        finish_reason = String::from("stop");
-                                        break;
-                                    } else {
-                                        tool_call_stop_after = Some(remaining - 1);
-                                    }
-                                }
-                            }
-
                             match next_y {
                                 Some(next) => y = next,
                                 None => break,
@@ -2136,7 +2080,6 @@ impl Qwen3_5MoeModel {
                     } else {
                         // Rust fallback decode loop (pipelined)
                         profiler.set_label("moe_chat_stream_rust");
-                        let mut tool_call_stop_after: Option<u32> = None;
                         for step in 0..max_new_tokens {
                             // Build and submit graph for step N+1
                             let next_y = if step + 1 < max_new_tokens {
@@ -2229,21 +2172,6 @@ impl Qwen3_5MoeModel {
                             ) {
                                 finish_reason = reason.to_string();
                                 break;
-                            }
-
-                            if has_tools {
-                                if tool_call_end_id.is_some_and(|id| id == token_id) {
-                                    tool_call_stop_after = Some(4);
-                                } else if let Some(remaining) = tool_call_stop_after {
-                                    if tool_call_start_id.is_some_and(|id| id == token_id) {
-                                        tool_call_stop_after = None;
-                                    } else if remaining == 0 {
-                                        finish_reason = String::from("stop");
-                                        break;
-                                    } else {
-                                        tool_call_stop_after = Some(remaining - 1);
-                                    }
-                                }
                             }
 
                             match next_y {
