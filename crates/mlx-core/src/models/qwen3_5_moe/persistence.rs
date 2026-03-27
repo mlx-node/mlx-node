@@ -1084,7 +1084,7 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
         // Register weights with C++ MoE forward pass.
         // Works for both quantized and unquantized models (C++ detects quantization at init).
-        register_moe_weights_with_cpp(&params);
+        register_moe_weights_with_cpp(&params, model.model_id);
 
         // Materialize all mmap-backed weight arrays so the first inference
         // prefill timing is not inflated by lazy disk reads.
@@ -1289,7 +1289,8 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
 
 /// Register all sanitized weights with the C++ MoE forward pass.
 /// Uses the same shared g_weights map as the dense path (mlx_qwen35_store_weight).
-fn register_moe_weights_with_cpp(params: &HashMap<String, MxArray>) {
+/// Sets model_id AFTER all weights are stored.
+fn register_moe_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
     use mlx_sys as sys;
     use std::ffi::CString;
 
@@ -1312,4 +1313,7 @@ fn register_moe_weights_with_cpp(params: &HashMap<String, MxArray>) {
 
     let count = unsafe { sys::mlx_qwen35_weight_count() };
     info!("Registered {} weights with C++ MoE forward pass", count);
+
+    // Set model ID AFTER all weights are stored.
+    unsafe { sys::mlx_qwen35_set_model_id(model_id) };
 }

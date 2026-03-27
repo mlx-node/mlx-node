@@ -950,9 +950,12 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
         // Register weights with C++ compiled forward pass (dense-only).
         // Skip for quantized models — C++ path uses dense matmul, not quantized_matmul.
         if !is_quantized_checkpoint(&params) && !is_mxfp8_checkpoint(&params) {
-            register_weights_with_cpp(&params);
+            register_weights_with_cpp(&params, model.model_id);
         } else {
             info!("Skipping C++ compiled path for quantized model (using Rust quantized_matmul)");
+            // Clear stale weights so a previously-loaded non-quantized model's weights
+            // don't trick this model into the compiled path via weight_count > 0.
+            unsafe { mlx_sys::mlx_qwen35_clear_weights() };
         }
 
         // Materialize all mmap-backed weight arrays so the first inference
@@ -1005,7 +1008,9 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
 }
 
 /// Register all sanitized weights with the C++ fused forward pass.
-fn register_weights_with_cpp(params: &HashMap<String, MxArray>) {
+/// Sets model_id AFTER all weights are stored — ensures no inference sees
+/// a partially-populated weight map with the new model's ID.
+fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
     use mlx_sys as sys;
 
     unsafe { sys::mlx_qwen35_clear_weights() };
@@ -1061,6 +1066,10 @@ fn register_weights_with_cpp(params: &HashMap<String, MxArray>) {
 
     let count = unsafe { sys::mlx_qwen35_weight_count() };
     info!("Registered {} weights with C++ fused forward pass", count);
+
+    // Set model ID AFTER all weights are stored. This ordering ensures no
+    // inference sees a partially-populated map with the new model's ID.
+    unsafe { sys::mlx_qwen35_set_model_id(model_id) };
 }
 
 /// Parse Qwen3.5 dense config from JSON.

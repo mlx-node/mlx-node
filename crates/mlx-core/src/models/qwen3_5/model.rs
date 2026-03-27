@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use futures::TryFutureExt;
@@ -64,6 +64,11 @@ pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
     let individual_hashes: Vec<u64> = all_images.iter().map(|img| hash_image_bytes(img)).collect();
     combine_image_hashes(&individual_hashes)
 }
+
+/// Monotonically incrementing counter for assigning unique model IDs.
+/// Each Qwen3_5Model instance gets its own ID so the C++ compiled path gate
+/// can verify that the global weight map belongs to the calling model.
+static DENSE_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1); // 0 = no model
 
 /// Process-wide mutex serializing the dense compiled forward lifecycle.
 ///
@@ -255,6 +260,10 @@ pub struct Qwen3_5Model {
     /// Without this, the compiled decode path starts with wrong RoPE positions
     /// when VLM prefill is skipped on Turn 2+.
     cached_rope_deltas: Arc<RwLock<Option<i32>>>,
+    /// Unique model instance ID for compiled path ownership.
+    /// The C++ global weight map is shared across all models — this ID ensures
+    /// inference only uses the compiled path when the weights belong to this model.
+    pub(crate) model_id: u64,
 }
 
 #[napi]
@@ -309,6 +318,7 @@ impl Qwen3_5Model {
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
+            model_id: DENSE_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -506,10 +516,11 @@ impl Qwen3_5Model {
         let tokenizer = self.tokenizer.clone();
 
         let prompt_tokens = prompt_tokens.clone();
+        let model_id = self.model_id;
 
-        // Check if compiled path will be used (C++ weights loaded from safetensors).
+        // Check if compiled path will be used (C++ weights belong to this model).
         // Must be checked before spawn_blocking so we can acquire the mutex in async context.
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Serialize compiled lifecycle — prevents concurrent C++ global corruption
         let _compiled_lock = if use_compiled {
@@ -880,9 +891,10 @@ impl Qwen3_5Model {
         };
         let spatial_merge_size = self.spatial_merge_size;
         let vision_cache = self.vision_cache.clone();
+        let model_id = self.model_id;
 
-        // Check if compiled path will be used (C++ weights loaded from safetensors).
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Check if compiled path will be used (C++ weights belong to this model).
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Capture start time BEFORE compiled mutex + spawn_blocking so TTFT
         // reflects the full user-perceived latency (mutex wait + thread dispatch
@@ -1044,6 +1056,35 @@ impl Qwen3_5Model {
                 tokens.clone()
             };
 
+            // Zero-delta guard: if entire prompt was cached (exact same input repeated),
+            // reset caches and do a full re-prefill. GDN recurrence state cannot be
+            // rewound, so full re-prefill is the only correct approach for Qwen3.5.
+            let prefill_tokens = if prefill_tokens.is_empty() {
+                info!("Zero-delta cache hit: resetting caches for full re-prefill");
+                if let Some(ref mut caches) = *caches_guard {
+                    for cache in caches.iter_mut() {
+                        cache.reset();
+                    }
+                }
+                let new_caches = (0..model_config.num_layers as usize)
+                    .map(|i| {
+                        if model_config.is_linear_layer(i) {
+                            Qwen3_5LayerCache::new_linear()
+                        } else {
+                            Qwen3_5LayerCache::new_full_attention()
+                        }
+                    })
+                    .collect();
+                *caches_guard = Some(new_caches);
+                if has_images {
+                    expanded_tokens.clone()
+                } else {
+                    tokens.clone()
+                }
+            } else {
+                prefill_tokens
+            };
+
             let eos_id = model_config.eos_token_id as u32;
             let mut generated_tokens: Vec<u32> = Vec::new();
             let mut finish_reason = String::from("length");
@@ -1091,6 +1132,7 @@ impl Qwen3_5Model {
                             max_new_tokens,
                             generation_stream,
                             &vision_cache,
+                            model_id,
                         )?;
 
                         // Save rope_deltas for cache reuse on subsequent turns
@@ -1677,9 +1719,10 @@ impl Qwen3_5Model {
         };
         let spatial_merge_size = self.spatial_merge_size;
         let vision_cache_stream = self.vision_cache.clone();
+        let model_id = self.model_id;
 
-        // Check if compiled path will be used (C++ weights loaded from safetensors).
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Check if compiled path will be used (C++ weights belong to this model).
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Capture start time BEFORE compiled mutex + spawn_blocking so TTFT
         // reflects the full user-perceived latency.
@@ -1851,6 +1894,33 @@ impl Qwen3_5Model {
                         tokens.clone()
                     };
 
+                    // Zero-delta guard: if entire prompt was cached, reset and re-prefill.
+                    let prefill_tokens = if prefill_tokens.is_empty() {
+                        info!("Zero-delta cache hit: resetting caches for full re-prefill");
+                        if let Some(ref mut caches) = *caches_guard {
+                            for cache in caches.iter_mut() {
+                                cache.reset();
+                            }
+                        }
+                        let new_caches = (0..model_config.num_layers as usize)
+                            .map(|i| {
+                                if model_config.is_linear_layer(i) {
+                                    Qwen3_5LayerCache::new_linear()
+                                } else {
+                                    Qwen3_5LayerCache::new_full_attention()
+                                }
+                            })
+                            .collect();
+                        *caches_guard = Some(new_caches);
+                        if has_images {
+                            expanded_tokens.clone()
+                        } else {
+                            tokens.clone()
+                        }
+                    } else {
+                        prefill_tokens
+                    };
+
                     let eos_id = model_config.eos_token_id as u32;
                     let mut generated_tokens: Vec<u32> = Vec::new();
                     let mut finish_reason = String::from("length");
@@ -1903,6 +1973,7 @@ impl Qwen3_5Model {
                                     max_new_tokens,
                                     generation_stream,
                                     &vision_cache_stream,
+                                    model_id,
                                 )?;
 
                                 // Save rope_deltas for cache reuse on subsequent turns
@@ -2964,6 +3035,7 @@ impl Qwen3_5Model {
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
+            model_id: DENSE_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -3247,9 +3319,10 @@ impl Qwen3_5Model {
     ) -> Result<GenerationResult> {
         let config = config.unwrap_or_default();
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
+        let model_id = self.model_id;
 
-        // Check if compiled path is available (C++ weights loaded from safetensors)
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Check if compiled path is available (C++ weights belong to this model)
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Try to acquire compiled mutex (non-blocking, safe from sync context).
         // If locked (concurrent generate() call), fall back to Rust path.
@@ -3731,6 +3804,7 @@ fn vlm_prefill(
     max_new_tokens: i32,
     generation_stream: Stream,
     vision_cache: &VisionCache,
+    model_id: u64,
 ) -> Result<(MxArray, i64)> {
     use crate::array::clear_cache;
 
@@ -3746,7 +3820,7 @@ fn vlm_prefill(
     )?;
 
     // === STEP 4: Prefill with M-RoPE ===
-    let use_compiled = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+    let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
     let (last_logits, _seq_len) = if use_compiled {
         // C++ VLM prefill: runs all layers in one FFI call with M-RoPE

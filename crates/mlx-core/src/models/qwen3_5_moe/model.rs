@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use futures::TryFutureExt;
@@ -37,6 +37,9 @@ use super::layer_cache::Qwen3_5LayerCache;
 use super::persistence;
 
 /// Maximum number of entries in the vision encoder cache before LRU eviction.
+/// Monotonically incrementing counter for MoE model instance IDs.
+static MOE_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1); // 0 = no model
+
 /// Process-wide mutex serializing the MoE compiled forward lifecycle.
 ///
 /// The C++ MoE forward path uses process-wide globals (separate from dense).
@@ -115,6 +118,8 @@ pub struct Qwen3_5MoeModel {
     cached_image_key: Arc<RwLock<Option<u64>>>,
     /// Rope deltas from VLM prefill, for cache reuse M-RoPE correction
     cached_rope_deltas: Arc<RwLock<Option<i32>>>,
+    /// Unique model instance ID for compiled path ownership.
+    pub(crate) model_id: u64,
 }
 
 #[napi]
@@ -167,6 +172,7 @@ impl Qwen3_5MoeModel {
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
+            model_id: MOE_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -342,9 +348,10 @@ impl Qwen3_5MoeModel {
         let tokenizer = self.tokenizer.clone();
         let fa_idx = self.fa_idx;
         let prompt_tokens = prompt_tokens.clone();
+        let model_id = self.model_id;
 
-        // Check if C++ MoE path will be used (weights loaded from safetensors).
-        let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Check if C++ MoE path will be used (weights belong to this model).
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Serialize MoE compiled lifecycle — prevents concurrent C++ global corruption
         let _moe_lock = if use_cpp {
@@ -716,9 +723,10 @@ impl Qwen3_5MoeModel {
         };
         let spatial_merge_size = self.spatial_merge_size;
         let vision_cache = self.vision_cache.clone();
+        let model_id = self.model_id;
 
-        // Check if C++ MoE path will be used (weights loaded from safetensors).
-        let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Check if C++ MoE path will be used (weights belong to this model).
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Capture start time BEFORE mutex + spawn_blocking so TTFT
         // reflects the full user-perceived latency.
@@ -868,6 +876,34 @@ impl Qwen3_5MoeModel {
                     .collect();
                 *caches_guard = Some(new_caches);
                 tokens.clone()
+            };
+
+            // Zero-delta guard: if entire prompt was cached, reset and re-prefill.
+            // GDN recurrence state cannot be rewound.
+            let prefill_tokens = if prefill_tokens.is_empty() {
+                info!("Zero-delta cache hit: resetting caches for full re-prefill");
+                if let Some(ref mut caches) = *caches_guard {
+                    for cache in caches.iter_mut() {
+                        cache.reset();
+                    }
+                }
+                let new_caches = (0..model_config.num_layers as usize)
+                    .map(|i| {
+                        if model_config.is_linear_layer(i) {
+                            Qwen3_5LayerCache::new_linear()
+                        } else {
+                            Qwen3_5LayerCache::new_full_attention()
+                        }
+                    })
+                    .collect();
+                *caches_guard = Some(new_caches);
+                if has_images {
+                    expanded_tokens.as_ref().unwrap_or(&tokens).clone()
+                } else {
+                    tokens.clone()
+                }
+            } else {
+                prefill_tokens
             };
 
             let eos_id = model_config.eos_token_id as u32;
@@ -1532,9 +1568,10 @@ impl Qwen3_5MoeModel {
         };
         let spatial_merge_size = self.spatial_merge_size;
         let vision_cache_stream = self.vision_cache.clone();
+        let model_id = self.model_id;
 
-        // Check if C++ MoE path will be used (weights loaded from safetensors).
-        let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Check if C++ MoE path will be used (weights belong to this model).
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Capture start time BEFORE mutex + spawn_blocking so TTFT
         // reflects the full user-perceived latency.
@@ -1697,6 +1734,33 @@ impl Qwen3_5MoeModel {
                             .collect();
                         *caches_guard = Some(new_caches);
                         tokens.clone()
+                    };
+
+                    // Zero-delta guard: if entire prompt was cached, reset and re-prefill.
+                    let prefill_tokens = if prefill_tokens.is_empty() {
+                        info!("Zero-delta cache hit: resetting caches for full re-prefill");
+                        if let Some(ref mut caches) = *caches_guard {
+                            for cache in caches.iter_mut() {
+                                cache.reset();
+                            }
+                        }
+                        let new_caches = (0..model_config.num_layers as usize)
+                            .map(|i| {
+                                if model_config.is_linear_layer(i) {
+                                    Qwen3_5LayerCache::new_linear()
+                                } else {
+                                    Qwen3_5LayerCache::new_full_attention()
+                                }
+                            })
+                            .collect();
+                        *caches_guard = Some(new_caches);
+                        if has_images {
+                            expanded_tokens.as_ref().unwrap_or(&tokens).clone()
+                        } else {
+                            tokens.clone()
+                        }
+                    } else {
+                        prefill_tokens
                     };
 
                     let eos_id = model_config.eos_token_id as u32;
@@ -2875,6 +2939,7 @@ impl Qwen3_5MoeModel {
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
+            model_id: MOE_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -3231,9 +3296,10 @@ impl Qwen3_5MoeModel {
     ) -> Result<GenerationResult> {
         let config = config.unwrap_or_default();
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
+        let model_id = self.model_id;
 
-        // Check if C++ MoE path is available (weights loaded from safetensors)
-        let use_cpp = unsafe { mlx_sys::mlx_qwen35_weight_count() } > 0;
+        // Check if C++ MoE path is available (weights belong to this model)
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
         // Try to acquire MoE compiled mutex (non-blocking, safe from sync context).
         // If locked (concurrent generate() call), fall back to Rust path.

@@ -75,16 +75,13 @@ static std::vector<DenseMLPQuantInfo> g_dense_quant;  // per-layer dense MLP qua
 // Cached 3D transposes for expert weights [E,out,in] → [E,in,out]
 static std::unordered_map<std::string, array> g_weight_transposes_3d;
 
+// Pure read — 3D transposes are pre-computed in mlx_qwen35_moe_init_from_prefill.
 const array& get_weight_t3d(const std::string& name) {
   auto it = g_weight_transposes_3d.find(name);
   if (it != g_weight_transposes_3d.end()) {
     return it->second;
   }
-  const auto& w = get_weight(name);
-  // [E, out, in] → [E, in, out]
-  auto wt = transpose(w, {0, 2, 1});
-  auto [inserted_it, _] = g_weight_transposes_3d.emplace(name, std::move(wt));
-  return inserted_it->second;
+  throw std::runtime_error("3D transpose not found for weight: " + name);
 }
 
 // =====================================================================
@@ -659,8 +656,17 @@ void mlx_qwen35_moe_init_from_prefill(
     g_moe_offset_int = prefill_offset;
     g_moe_inited = true;
 
-    // Clear 3D transpose cache
+    // Pre-compute 3D transposes for all expert weights [E,out,in] → [E,in,out].
+    // This eliminates lazy mutation in get_weight_t3d() during inference.
     g_weight_transposes_3d.clear();
+    {
+      std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
+      for (const auto& [name, w] : g_weights()) {
+        if (w.ndim() == 3) {
+          g_weight_transposes_3d.insert_or_assign(name, transpose(w, {0, 2, 1}));
+        }
+      }
+    }
 
     // Break the lazy RNG split chain
     auto rng_key = mlx::core::random::KeySequence::default_().next();

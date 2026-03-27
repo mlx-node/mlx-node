@@ -113,20 +113,32 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
 extern "C" {
 
 void mlx_qwen35_store_weight(const char* name, mlx_array* weight) {
-  std::lock_guard<std::mutex> lock(g_weights_mutex());
+  std::unique_lock<std::shared_mutex> lock(g_weights_mutex());
   auto& arr = *reinterpret_cast<array*>(weight);
-  g_weights().insert_or_assign(std::string(name), arr);
+  std::string key(name);
+  g_weights().insert_or_assign(key, arr);
+  // Pre-compute transpose so get_weight_t() is a pure read (no lazy mutation).
+  g_weight_transposes().insert_or_assign(key, transpose(arr));
 }
 
 void mlx_qwen35_clear_weights() {
-  std::lock_guard<std::mutex> lock(g_weights_mutex());
+  std::unique_lock<std::shared_mutex> lock(g_weights_mutex());
   g_weights().clear();
   g_weight_transposes().clear();
+  g_active_model_id().store(0, std::memory_order_release);
 }
 
 size_t mlx_qwen35_weight_count() {
-  std::lock_guard<std::mutex> lock(g_weights_mutex());
+  std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
   return g_weights().size();
+}
+
+void mlx_qwen35_set_model_id(uint64_t id) {
+  g_active_model_id().store(id, std::memory_order_release);
+}
+
+uint64_t mlx_qwen35_get_model_id() {
+  return g_active_model_id().load(std::memory_order_acquire);
 }
 
 void mlx_qwen35_compiled_init_from_prefill(

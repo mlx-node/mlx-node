@@ -1011,6 +1011,13 @@ unsafe extern "C-unwind" {
     /// Get the number of stored weights (for debugging)
     pub fn mlx_qwen35_weight_count() -> usize;
 
+    /// Set the active model ID (called after all weights are stored).
+    /// Inference checks this against its own model_id to avoid cross-model contamination.
+    pub fn mlx_qwen35_set_model_id(id: u64);
+
+    /// Get the active model ID. Returns 0 if no model has registered weights.
+    pub fn mlx_qwen35_get_model_id() -> u64;
+
     /// Initialize compiled forward pass from post-prefill caches.
     /// Call once after prefill, before decode loop.
     /// cache_arrays: [num_layers * 2] non-null pointers to prefill cache arrays.

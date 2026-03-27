@@ -14,7 +14,8 @@
 
 #include <string>
 #include <unordered_map>
-#include <mutex>
+#include <shared_mutex>
+#include <atomic>
 
 namespace qwen35_common {
 
@@ -27,8 +28,8 @@ inline std::unordered_map<std::string, array>& g_weights() {
   return instance;
 }
 
-inline std::mutex& g_weights_mutex() {
-  static std::mutex instance;
+inline std::shared_mutex& g_weights_mutex() {
+  static std::shared_mutex instance;
   return instance;
 }
 
@@ -37,7 +38,16 @@ inline std::unordered_map<std::string, array>& g_weight_transposes() {
   return instance;
 }
 
+// Model identity: atomic counter set after all weights are stored.
+// Inference checks this against its own model_id to avoid using another model's weights.
+// Value 0 means no model has registered weights.
+inline std::atomic<uint64_t>& g_active_model_id() {
+  static std::atomic<uint64_t> instance{0};
+  return instance;
+}
+
 inline const array& get_weight(const std::string& name) {
+  std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
   auto it = g_weights().find(name);
   if (it == g_weights().end()) {
     throw std::runtime_error("Weight not found: " + name);
@@ -45,18 +55,18 @@ inline const array& get_weight(const std::string& name) {
   return it->second;
 }
 
+// Pure read — transposes are pre-computed during weight registration.
 inline const array& get_weight_t(const std::string& name) {
+  std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
   auto it = g_weight_transposes().find(name);
   if (it != g_weight_transposes().end()) {
     return it->second;
   }
-  const auto& w = get_weight(name);
-  auto wt = transpose(w);
-  auto [inserted_it, _] = g_weight_transposes().emplace(name, std::move(wt));
-  return inserted_it->second;
+  throw std::runtime_error("Transpose not found for weight: " + name);
 }
 
 inline bool has_weight(const std::string& name) {
+  std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
   return g_weights().count(name) > 0;
 }
 
