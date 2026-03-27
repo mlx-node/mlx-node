@@ -812,47 +812,42 @@ pub(crate) fn build_qwen35_recipe(
 
 /// Build the "unsloth" quantization recipe for Qwen3.5 hybrid models.
 ///
-/// Based on Unsloth's GGUF benchmark findings for Qwen3.5's hybrid
+/// MLX affine equivalent of Unsloth Dynamic 2.0 (UD) GGUF quantization.
+/// Based on Unsloth's per-tensor 99.9% KLD analysis for Qwen3.5's hybrid
 /// GatedDeltaNet (linear attention/SSM) + full attention architecture:
 /// (https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks)
 ///
-/// Key findings from Unsloth's per-tensor 99.9% KLD analysis (sorted worst→best):
+/// ## GGUF Equivalence
 ///
-/// **Most sensitive — AWQ-correctable (quantize at 5-bit with imatrix):**
-/// - `attn_qkv` (`self_attn.q/k/v_proj`): KLD ~1.5-2.9 — AWQ via input_layernorm
-/// - `attn_gate` (`linear_attn.in_proj_z`): "performs poorly with MXFP4" — AWQ via input_layernorm
-/// - `linear_attn.in_proj_qkv`: KLD ~2.9 — AWQ via input_layernorm
+/// | `--q-bits` | GGUF Equivalent    | Size (35B-A3B) |
+/// |------------|--------------------|----------------|
+/// | 3          | `UD-Q3_K_XL` 16 GB | ~17 GB         |
+/// | 4          | `UD-Q4_K_XL` 19 GB | ~20 GB         |
 ///
-/// **Most sensitive — NOT AWQ-correctable (keep bf16):**
-/// - `ssm_out` (`linear_attn.out_proj`): KLD ~6.0 at q2_k — no preceding norm
-/// - `self_attn.o_proj`: KLD ~1.5 — no preceding norm
+/// Size difference (~1 GB) is format-level: GGUF K-quants pack scales within
+/// blocks, while MLX affine stores separate scales+biases per group (~2 GB
+/// metadata overhead).
 ///
-/// - `ssm_beta`, `ssm_alpha` (`in_proj_a/b`): degrade significantly with low bits
-///   (already excluded by `should_quantize()` since they lack `.weight` suffix)
+/// ## Per-Tensor Bit Assignments (default_bits = N)
 ///
-/// NOTE: imatrix is **required** for this recipe — without AWQ pre-scaling,
-/// affine quantization of attention/SSM at 5-bit would have noticeable quality loss.
+/// | Weight                  | Bits    | GGUF Type  | Rationale                         |
+/// |-------------------------|---------|------------|-----------------------------------|
+/// | `embed_tokens`          | N+2     | Q5_K/Q6_K  | KLD ~0.15 — very low sensitivity  |
+/// | `lm_head`               | N+3     | Q6_K/Q8_0  | KLD ~0.05 — safest tensor         |
+/// | `self_attn.q/k/v_proj`  | N+2     | Q5_K/Q6_K  | KLD ~1.5-2.9, AWQ via layernorm   |
+/// | `linear_attn.in_proj_*` | N+2     | Q5_K/Q6_K  | KLD ~2.9, AWQ via layernorm       |
+/// | `self_attn.o_proj`      | bf16    | bf16       | KLD ~1.5, NOT AWQ-correctable     |
+/// | `linear_attn.out_proj`  | bf16    | bf16       | KLD ~6.0, worst tensor by far     |
+/// | `down_proj`             | N+1     | Q4_K/Q5_K  | "slightly more sensitive" than FFN |
+/// | `gate_proj`, `up_proj`  | N       | Q3_K/Q4_K  | "generally ok" at low bits        |
+/// | Router gates            | 8       | Q8_0       | Standard for MoE routing          |
+/// | GDN params (A_log, etc) | bf16    | bf16       | Excluded by `should_quantize()`   |
 ///
-/// **Moderate sensitivity (default_bits + 1):**
-/// - `ffn_down` (`down_proj`): "slightly more sensitive" than other FFN weights
+/// ## AWQ Pre-Scaling
 ///
-/// **Safe to quantize aggressively (default bits = 3-bit):**
-/// - `ffn_up`, `ffn_gate`: "generally ok to quantize to 3-bit"
-/// - "leaving ffn_* (down, up, gate) at around iq3_xxs seems to be best compromise"
-///
-/// **Very low sensitivity (quantize at 5-6 bit):**
-/// - `token_embedding`: KLD ~0.15 at q5_k — among the least sensitive tensors
-/// - `output-tensor` (lm_head): KLD ~0.05 at q5_k — the safest tensor to quantize
-///
-/// **Always 8-bit:**
-/// - Router gates: standard for MoE routing accuracy
-///
-/// This recipe matches Unsloth Dynamic 2.0's approach of quantizing important
-/// layers at higher bits (5-bit with imatrix) while aggressively quantizing
-/// FFN weights to 3-bit. Requires imatrix for near-lossless quality.
-/// Embeddings and lm_head are quantized at higher precision (5-6 bit) following
-/// llama.cpp's standard practice — they're dequantized at load time since the
-/// model accesses them every token (savings come from smaller file on disk).
+/// imatrix is **required** — attention/SSM weights fed by input_layernorm can
+/// be AWQ-corrected (layernorm absorbs inverse scales), but o_proj and out_proj
+/// have no preceding norm and must stay bf16.
 pub(crate) fn build_unsloth_recipe(
     default_bits: i32,
     default_group_size: i32,
@@ -872,7 +867,7 @@ pub(crate) fn build_unsloth_recipe(
     let down_proj_bits = snap_bits(default_bits + 1);
     let embed_bits = snap_bits(default_bits + 2);
     let lm_head_bits = snap_bits(default_bits + 3);
-    let attn_ssm_bits = snap_bits(default_bits + 2); // 5-bit for attention/SSM (Q5_K equivalent)
+    let attn_ssm_bits = snap_bits(default_bits + 2);
     let gs = default_group_size;
 
     Box::new(move |key: &str| -> QuantDecision {
@@ -945,7 +940,7 @@ pub(crate) fn build_unsloth_recipe(
             };
         }
 
-        // Everything else (ffn_gate_proj, ffn_up_proj, etc.) → default bits (3-bit)
+        // Everything else (ffn_gate_proj, ffn_up_proj, etc.) → default bits
         QuantDecision::Default
     })
 }

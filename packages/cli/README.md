@@ -141,14 +141,41 @@ Auto-detected from `config.json` when not specified:
 
 #### Quantization Recipes
 
-| Recipe      | Description                        |
-| ----------- | ---------------------------------- |
-| `mixed_2_6` | 2-bit embeddings, 6-bit layers     |
-| `mixed_3_4` | 3-bit embeddings, 4-bit layers     |
-| `mixed_3_6` | 3-bit embeddings, 6-bit layers     |
-| `mixed_4_6` | 4-bit embeddings, 6-bit layers     |
-| `qwen3_5`   | Optimized for Qwen3.5 architecture |
-| `unsloth`   | Unsloth dynamic quantization       |
+| Recipe      | Description                                     |
+| ----------- | ----------------------------------------------- |
+| `mixed_2_6` | 2-bit base, 6-bit sensitive layers              |
+| `mixed_3_4` | 3-bit base, 4-bit sensitive layers              |
+| `mixed_3_6` | 3-bit base, 6-bit sensitive layers              |
+| `mixed_4_6` | 4-bit base, 6-bit sensitive layers              |
+| `qwen3_5`   | Optimized for Qwen3.5 hybrid architecture       |
+| `unsloth`   | Unsloth Dynamic 2.0 (requires `--imatrix-path`) |
+
+#### Unsloth Recipe
+
+MLX affine equivalent of [Unsloth Dynamic 2.0](https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks) (UD) GGUF quantization. Designed for Qwen3.5's hybrid GatedDeltaNet + full attention architecture. Requires imatrix for AWQ pre-scaling of attention/SSM weights.
+
+```bash
+# UD-Q3_K_XL equivalent (~17 GB for 35B-A3B)
+mlx convert -i ./model -o ./model-q3 -q --q-bits 3 --q-recipe unsloth --imatrix-path ./imatrix.gguf
+
+# UD-Q4_K_XL equivalent (~20 GB for 35B-A3B)
+mlx convert -i ./model -o ./model-q4 -q --q-bits 4 --q-recipe unsloth --imatrix-path ./imatrix.gguf
+```
+
+Per-tensor bit assignments (N = `--q-bits`):
+
+| Weight                      | Bits | Rationale                                         |
+| --------------------------- | ---- | ------------------------------------------------- |
+| `gate_proj`, `up_proj`      | N    | Bulk of MoE expert params, safe at low bits       |
+| `down_proj`                 | N+1  | Slightly more sensitive than other FFN weights    |
+| `embed_tokens`              | N+2  | Very low KLD sensitivity (~0.15)                  |
+| `self_attn.q/k/v_proj`      | N+2  | AWQ-correctable via input_layernorm               |
+| `linear_attn.in_proj_qkv/z` | N+2  | AWQ-correctable via input_layernorm               |
+| `lm_head`                   | N+3  | Safest tensor (KLD ~0.05)                         |
+| Router gates                | 8    | Standard for MoE routing accuracy                 |
+| `self_attn.o_proj`          | bf16 | No preceding norm — not AWQ-correctable           |
+| `linear_attn.out_proj`      | bf16 | Worst tensor (KLD ~6.0) — not AWQ-correctable     |
+| GDN params (`A_log`, etc.)  | bf16 | Recurrent state params, errors compound over time |
 
 ## Examples
 

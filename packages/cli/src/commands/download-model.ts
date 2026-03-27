@@ -134,7 +134,8 @@ async function getModelFiles(modelName: string, accessToken?: string, globPatter
         file.path.endsWith('.safetensors') ||
         file.path.endsWith('.json') ||
         file.path.endsWith('.pdiparams') ||
-        file.path.endsWith('.yml')
+        file.path.endsWith('.yml') ||
+        file.path.endsWith('.gguf')
       ) {
         filesToDownload.push(file);
         if (file.size) {
