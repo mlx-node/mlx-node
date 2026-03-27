@@ -188,6 +188,73 @@ describe('Error Status Values', () => {
   });
 });
 
+describe('formatToolResponse removal', () => {
+  it('formatToolResponse should not be exported', async () => {
+    const lm = await import('@mlx-node/lm');
+    expect('formatToolResponse' in lm).toBe(false);
+  });
+});
+
+describe('ToolCallResult to ToolCall conversion', () => {
+  it('should convert ToolCallResult arguments to ToolCall arguments', () => {
+    // ToolCallResult has arguments as an object
+    const result: ToolCallResult = {
+      id: 'call_abc123',
+      name: 'get_weather',
+      arguments: { city: 'Tokyo', units: 'celsius' },
+      status: 'ok' as const,
+      rawContent: '{"name": "get_weather", "arguments": {"city": "Tokyo", "units": "celsius"}}',
+    };
+
+    // Convert to ToolCall format (arguments as JSON string)
+    const toolCall = {
+      id: result.id,
+      name: result.name,
+      arguments: typeof result.arguments === 'string' ? result.arguments : JSON.stringify(result.arguments),
+    };
+
+    expect(toolCall.arguments).toBe('{"city":"Tokyo","units":"celsius"}');
+    expect(typeof toolCall.arguments).toBe('string');
+
+    // Verify round-trip: parse back to object
+    const parsed = JSON.parse(toolCall.arguments);
+    expect(parsed.city).toBe('Tokyo');
+    expect(parsed.units).toBe('celsius');
+  });
+
+  it('should handle multiple tool calls in result', () => {
+    const toolCalls: ToolCallResult[] = [
+      {
+        id: 'call_1',
+        name: 'get_weather',
+        arguments: { city: 'Tokyo' },
+        status: 'ok' as const,
+        rawContent: '{"name": "get_weather", "arguments": {"city": "Tokyo"}}',
+      },
+      {
+        id: 'call_2',
+        name: 'get_time',
+        arguments: { timezone: 'JST' },
+        status: 'ok' as const,
+        rawContent: '{"name": "get_time", "arguments": {"timezone": "JST"}}',
+      },
+    ];
+
+    const validCalls = toolCalls.filter((tc) => tc.status === 'ok');
+    expect(validCalls.length).toBe(2);
+
+    const converted = validCalls.map((tc) => ({
+      id: tc.id,
+      name: tc.name,
+      arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
+    }));
+
+    expect(converted[0].name).toBe('get_weather');
+    expect(converted[1].name).toBe('get_time');
+    expect(JSON.parse(converted[0].arguments)).toEqual({ city: 'Tokyo' });
+  });
+});
+
 describe('Thinking Content Extraction', () => {
   it('thinking field type is string | null', () => {
     // Verify the thinking field can be string or null

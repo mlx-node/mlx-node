@@ -65,17 +65,6 @@ import { initLspService, executeToolCall, type LspService } from './lsp';
 // Helper Functions
 // ============================================================================
 
-/**
- * Format a tool response for inclusion in a message.
- * Creates a properly formatted tool response string wrapped in `<tool_response>` tags.
- */
-function formatToolResponse(content: unknown): string {
-  const contentStr = typeof content === 'string' ? content : JSON.stringify(content);
-  return `<tool_response>
-${contentStr}
-</tool_response>`;
-}
-
 // ============================================================================
 // Constants
 // ============================================================================
@@ -673,7 +662,7 @@ async function main() {
             // Execute LSP tool and generate second turn
             stepLspCalls++;
             const lspResult = executeLspTool(toolCall.arguments as { method?: string; kind?: string });
-            const toolResponse = formatToolResponse(lspResult);
+            const toolResponse = typeof lspResult === 'string' ? lspResult : JSON.stringify(lspResult);
 
             // Build extended conversation for second turn
             const promptIdx = Math.floor(j / groupSize);

@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokenizers::{EncodeInput, Encoding, Tokenizer};
+use tracing::warn;
 
 /// Special token IDs for Qwen3 models
 const ENDOFTEXT_TOKEN_ID: u32 = 151643;
@@ -162,6 +163,8 @@ pub struct Qwen3Tokenizer {
     think_end_id: Option<u32>,
     /// The actual think-end string (e.g., `"</think>"` or `"</longcat_think>"`).
     think_end_str: Option<String>,
+    /// Token ID for `<tool_call>` (None if not in vocabulary).
+    tool_call_start_id: Option<u32>,
     /// Token ID for `</tool_call>` (None if not in vocabulary).
     tool_call_end_id: Option<u32>,
 }
@@ -192,7 +195,8 @@ impl Qwen3Tokenizer {
                 let chat_template = Self::load_chat_template(&tokenizer_path);
 
                 let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
-                let tool_call_end_id = Self::detect_tool_call_end(&tokenizer);
+                let (tool_call_start_id, tool_call_end_id) =
+                    Self::detect_tool_call_tokens(&tokenizer);
 
                 Ok(Self {
                     tokenizer: Arc::new(tokenizer),
@@ -202,6 +206,7 @@ impl Qwen3Tokenizer {
                     chat_template,
                     think_end_id,
                     think_end_str,
+                    tool_call_start_id,
                     tool_call_end_id,
                 })
             })
@@ -279,7 +284,7 @@ impl Qwen3Tokenizer {
         let chat_template = Self::load_chat_template(tokenizer_path.to_string_lossy().as_ref());
 
         let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
-        let tool_call_end_id = Self::detect_tool_call_end(&tokenizer);
+        let (tool_call_start_id, tool_call_end_id) = Self::detect_tool_call_tokens(&tokenizer);
 
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
@@ -289,6 +294,7 @@ impl Qwen3Tokenizer {
             chat_template,
             think_end_id,
             think_end_str,
+            tool_call_start_id,
             tool_call_end_id,
         })
     }
@@ -855,9 +861,13 @@ impl Qwen3Tokenizer {
                         params_obj.insert("type".to_string(), serde_json::json!(params.r#type));
                         if let Some(props) = &params.properties {
                             // Parse the JSON string to include it properly
-                            if let Ok(props_val) = serde_json::from_str::<serde_json::Value>(props)
-                            {
-                                params_obj.insert("properties".to_string(), props_val);
+                            match serde_json::from_str::<serde_json::Value>(props) {
+                                Ok(props_val) => {
+                                    params_obj.insert("properties".to_string(), props_val);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse tool properties JSON: {}", e);
+                                }
                             }
                         }
                         if let Some(req) = &params.required {
@@ -892,8 +902,10 @@ impl Qwen3Tokenizer {
                                 call_obj.insert("id".to_string(), serde_json::json!(id));
                             }
                             call_obj.insert("name".to_string(), serde_json::json!(tc.name));
-                            call_obj
-                                .insert("arguments".to_string(), serde_json::json!(tc.arguments));
+                            let args_value =
+                                serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                    .unwrap_or_else(|_| serde_json::json!(tc.arguments));
+                            call_obj.insert("arguments".to_string(), args_value);
                             serde_json::Value::Object(call_obj)
                         })
                         .collect();
@@ -994,7 +1006,7 @@ impl Qwen3Tokenizer {
         let chat_template = Self::load_chat_template(tokenizer_path);
 
         let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
-        let tool_call_end_id = Self::detect_tool_call_end(&tokenizer);
+        let (tool_call_start_id, tool_call_end_id) = Self::detect_tool_call_tokens(&tokenizer);
 
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
@@ -1004,6 +1016,7 @@ impl Qwen3Tokenizer {
             chat_template,
             think_end_id,
             think_end_str,
+            tool_call_start_id,
             tool_call_end_id,
         })
     }
@@ -1075,6 +1088,7 @@ impl Clone for Qwen3Tokenizer {
             chat_template: self.chat_template.clone(),
             think_end_id: self.think_end_id,
             think_end_str: self.think_end_str.clone(),
+            tool_call_start_id: self.tool_call_start_id,
             tool_call_end_id: self.tool_call_end_id,
         }
     }
@@ -1103,13 +1117,20 @@ impl Qwen3Tokenizer {
         self.think_end_str.as_deref()
     }
 
-    /// Detect tool-call-end token from tokenizer vocabulary.
-    fn detect_tool_call_end(tokenizer: &Tokenizer) -> Option<u32> {
+    /// Detect tool-call start/end tokens from tokenizer vocabulary.
+    fn detect_tool_call_tokens(tokenizer: &Tokenizer) -> (Option<u32>, Option<u32>) {
         let vocab = tokenizer.get_vocab(true);
-        vocab.get("</tool_call>").copied()
+        let start = vocab.get("<tool_call>").copied();
+        let end = vocab.get("</tool_call>").copied();
+        (start, end)
     }
 
-    /// Get the tool-call-end token ID, if the tokenizer has tool calling support.
+    /// Get the `<tool_call>` start token ID.
+    pub fn tool_call_start_id(&self) -> Option<u32> {
+        self.tool_call_start_id
+    }
+
+    /// Get the `</tool_call>` end token ID.
     pub fn tool_call_end_id(&self) -> Option<u32> {
         self.tool_call_end_id
     }

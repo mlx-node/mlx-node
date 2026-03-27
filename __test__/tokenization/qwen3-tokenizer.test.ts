@@ -382,6 +382,62 @@ describe('Qwen3Tokenizer', () => {
     });
   });
 
+  describe('Tool Message Template Rendering', () => {
+    it('should not double-wrap tool response with plain content', async () => {
+      const messages: ChatMessage[] = [{ role: 'tool', content: '{"temperature": 22}' }];
+      const tokens = await tokenizer.applyChatTemplate(messages, false);
+      const formatted = await tokenizer.decode(tokens, false);
+      // Should contain exactly ONE <tool_response> wrapping (from template), not two
+      const count = (formatted.match(/<tool_response>/g) || []).length;
+      expect(count).toBe(1);
+    });
+
+    it('should double-wrap if content already has tool_response tags', async () => {
+      // This is the bug that formatToolResponse + role:'tool' caused
+      const messages: ChatMessage[] = [{ role: 'tool', content: '<tool_response>\n{"temp": 22}\n</tool_response>' }];
+      const tokens = await tokenizer.applyChatTemplate(messages, false);
+      const formatted = await tokenizer.decode(tokens, false);
+      // Two <tool_response> occurrences — the template added another wrapper
+      const count = (formatted.match(/<tool_response>/g) || []).length;
+      expect(count).toBe(2);
+    });
+
+    it('should group consecutive tool messages under one user block', async () => {
+      const messages: ChatMessage[] = [
+        { role: 'tool', content: '{"result": "sunny"}' },
+        { role: 'tool', content: '{"result": "14:00"}' },
+      ];
+      const tokens = await tokenizer.applyChatTemplate(messages, false);
+      const formatted = await tokenizer.decode(tokens, false);
+      // Should have only ONE <|im_start|>user ... <|im_end|> block
+      const imStartCount = (formatted.match(/<\|im_start\|>user/g) || []).length;
+      expect(imStartCount).toBe(1);
+      // But TWO <tool_response> blocks
+      const toolResponseCount = (formatted.match(/<tool_response>/g) || []).length;
+      expect(toolResponseCount).toBe(2);
+    });
+
+    it('should render assistant message with tool_calls', async () => {
+      const messages: ChatMessage[] = [
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [
+            {
+              name: 'get_weather',
+              arguments: '{"city": "Tokyo"}',
+            },
+          ],
+        },
+      ];
+      const tokens = await tokenizer.applyChatTemplate(messages, false);
+      const formatted = await tokenizer.decode(tokens, false);
+      expect(formatted).toContain('<tool_call>');
+      expect(formatted).toContain('get_weather');
+      expect(formatted).toContain('Tokyo');
+    });
+  });
+
   describe('Edge Cases', () => {
     it('should handle very long text', async () => {
       const longText = 'Hello '.repeat(1000);

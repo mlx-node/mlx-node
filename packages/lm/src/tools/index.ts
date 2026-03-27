@@ -5,7 +5,7 @@
  *
  * @example
  * ```typescript
- * import { createToolDefinition, formatToolResponse } from '@mlx-node/lm';
+ * import { createToolDefinition } from '@mlx-node/lm';
  *
  * const weatherTool = createToolDefinition(
  *   'get_weather',
@@ -19,8 +19,8 @@
  * for (const call of result.toolCalls) {
  *   if (call.status === 'ok') {
  *     const toolResult = await executeMyTool(call.name, call.arguments);
- *     // Continue conversation with tool result
- *     messages.push({ role: 'user', content: formatToolResponse(toolResult) });
+ *     // Use role: 'tool' — the Jinja2 template wraps content in <tool_response> tags
+ *     messages.push({ role: 'tool', content: JSON.stringify(toolResult) });
  *   }
  * }
  * ```

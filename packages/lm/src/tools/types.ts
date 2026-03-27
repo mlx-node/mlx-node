@@ -212,30 +212,3 @@ export function createToolDefinition(
     },
   };
 }
-
-/**
- * Format a tool response for inclusion in a message
- *
- * Creates a properly formatted tool response string that can be used
- * in tool messages when continuing a conversation after a tool call.
- *
- * @param content - The response content (will be JSON stringified if object)
- * @returns Formatted tool response string wrapped in `<tool_response>` tags
- *
- * @example
- * ```typescript
- * // After executing a tool call from model.chat()
- * const toolResult = await executeMyTool(call.arguments);
- * const responseMessage = {
- *   role: 'user',
- *   content: formatToolResponse(toolResult)
- * };
- * const finalResult = await model.chat([...messages, responseMessage]);
- * ```
- */
-export function formatToolResponse(content: unknown): string {
-  const contentStr = typeof content === 'string' ? content : JSON.stringify(content);
-  // Qwen3/3.5 expects <tool_response> XML wrapping for tool results.
-  // Other model families may require a different format.
-  return `<tool_response>\n${contentStr}\n</tool_response>`;
-}

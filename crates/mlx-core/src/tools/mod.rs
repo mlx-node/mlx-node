@@ -1125,4 +1125,124 @@ console.log(x + y)"
         assert!(code.contains("const y = 2"));
         assert!(code.contains("console.log"));
     }
+
+    // ---- Critical tool call code paths ----
+
+    #[test]
+    fn test_parse_multiple_json_tool_calls_with_text() {
+        // Two JSON-format tool calls (Qwen3 style) with leading text
+        let text = r#"Let me check both.
+<tool_call>
+{"name": "get_weather", "arguments": {"city": "Tokyo"}}
+</tool_call>
+<tool_call>
+{"name": "get_weather", "arguments": {"city": "Paris"}}
+</tool_call>"#;
+        let (clean, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[1].name, "get_weather");
+        assert_eq!(calls[0].status, "ok");
+        assert_eq!(calls[1].status, "ok");
+        assert_eq!(calls[0].arguments["city"], "Tokyo");
+        assert_eq!(calls[1].arguments["city"], "Paris");
+        assert_eq!(clean.trim(), "Let me check both.");
+    }
+
+    #[test]
+    fn test_parse_multiple_function_tool_calls_different_names() {
+        // Two function-format tool calls (Qwen3.5 style) with different function names
+        let text = r#"<tool_call>
+<function=get_weather>
+<parameter=city>Tokyo</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=get_time>
+<parameter=timezone>JST</parameter>
+</function>
+</tool_call>"#;
+        let (clean, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[1].name, "get_time");
+        assert_eq!(calls[0].status, "ok");
+        assert_eq!(calls[1].status, "ok");
+        assert_eq!(calls[0].arguments["city"], "Tokyo");
+        assert_eq!(calls[1].arguments["timezone"], "JST");
+        assert!(clean.trim().is_empty());
+    }
+
+    #[test]
+    fn test_parse_generation_output_multiple_tools_with_thinking() {
+        // Thinking block followed by multiple JSON tool calls
+        let text = r#"<think>I need to check both cities.</think>
+<tool_call>
+{"name": "get_weather", "arguments": {"city": "Tokyo"}}
+</tool_call>
+<tool_call>
+{"name": "get_weather", "arguments": {"city": "Paris"}}
+</tool_call>"#;
+        let (clean, calls, thinking) = parse_generation_output(text);
+        assert_eq!(calls.len(), 2);
+        assert!(thinking.is_some());
+        assert_eq!(thinking.unwrap().trim(), "I need to check both cities.");
+        assert!(clean.trim().is_empty());
+    }
+
+    #[test]
+    fn test_split_at_think_end_with_multiple_tools() {
+        // Simulate Qwen3.5 path: thinking prefix (no opening <think> tag) then tool calls.
+        // The chat template injects `<think>\n` as a prefix so the generated text
+        // starts with thinking content followed by `</think>`.
+        let text = r#"I need weather data.
+</think>
+
+<tool_call>
+{"name": "get_weather", "arguments": {"city": "Tokyo"}}
+</tool_call>
+<tool_call>
+{"name": "get_weather", "arguments": {"city": "Paris"}}
+</tool_call>"#;
+        let (clean, calls, thinking) = split_at_think_end(text, Some("</think>"));
+        assert_eq!(calls.len(), 2);
+        assert!(thinking.is_some());
+        assert_eq!(thinking.unwrap().trim(), "I need weather data.");
+        assert!(clean.trim().is_empty());
+    }
+
+    #[test]
+    fn test_parse_unclosed_tool_call() {
+        // Truncated by max_tokens — no closing </tool_call> tag
+        let text = r#"<tool_call>
+{"name": "get_weather", "arguments": {"city": "Tok"#;
+        let (clean, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 0); // No complete tool call
+        assert_eq!(clean, text); // Text preserved as-is
+    }
+
+    #[test]
+    fn test_parse_tool_call_with_trailing_hallucination() {
+        // Model generates a tool call then hallucinates a response
+        let text = r#"<tool_call>
+{"name": "get_weather", "arguments": {"city": "Tokyo"}}
+</tool_call>
+The weather in Tokyo is sunny."#;
+        let (clean, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].status, "ok");
+        // The trailing hallucinated text remains in clean text
+        assert!(clean.contains("The weather in Tokyo is sunny."));
+    }
+
+    #[test]
+    fn test_parse_empty_tool_call() {
+        // Empty tool_call block — recognized as a tag pair but no parseable format inside
+        let text = "<tool_call></tool_call>";
+        let (_, calls) = parse_tool_calls(text);
+        // Empty content doesn't start with '{', contain '<function=', or '<name>',
+        // so classify_and_parse_tool_call returns None — no tool call produced.
+        assert_eq!(calls.len(), 0);
+    }
 }

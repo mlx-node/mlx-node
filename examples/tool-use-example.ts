@@ -23,8 +23,8 @@
 
 import { resolve } from 'node:path';
 
-import { Qwen35Model } from '@mlx-node/core';
-import { formatToolResponse, createToolDefinition } from '@mlx-node/lm';
+import { Qwen35Model, type ChatMessage } from '@mlx-node/core';
+import { createToolDefinition } from '@mlx-node/lm';
 
 // Get model path from CLI args, environment, or default
 const DEFAULT_MODEL_PATH = resolve(process.cwd(), '.cache', 'models', 'qwen3.5-4B-mlx-bf16');
@@ -97,7 +97,7 @@ async function runToolConversation(model: Qwen35Model, userPrompt: string) {
   console.log(`User: ${userPrompt}`);
   console.log('='.repeat(75));
 
-  let messages = [{ role: 'user', content: userPrompt }];
+  let messages: ChatMessage[] = [{ role: 'user', content: userPrompt }];
 
   // Use chat() API - returns ChatResult with structured tool calls and thinking
   console.log('\n[->] Generating response with tools...');
@@ -115,42 +115,51 @@ async function runToolConversation(model: Qwen35Model, userPrompt: string) {
   console.log(`[INFO] Finish reason: ${result.finishReason}`);
 
   // Check for tool calls - they're already parsed!
-  if (result.toolCalls.length > 0) {
-    console.log(`\n[TOOL] Found ${result.toolCalls.length} tool call(s):`);
+  const validCalls = result.toolCalls.filter((tc) => tc.status === 'ok');
+  if (validCalls.length > 0) {
+    console.log(`\n[TOOL] Found ${validCalls.length} tool call(s):`);
 
+    // Add the assistant message with all tool calls
+    messages = [
+      ...messages,
+      {
+        role: 'assistant',
+        content: result.text,
+        toolCalls: validCalls.map((tc) => ({
+          id: tc.id,
+          name: tc.name,
+          arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
+        })),
+      },
+    ];
+
+    // Execute each tool call and append results as role: 'tool' messages
+    for (const call of validCalls) {
+      console.log(`   - ${call.name}(${JSON.stringify(call.arguments)})`);
+
+      const toolResult = await executeTool(call.name, call.arguments as Record<string, unknown>);
+      const displayResult = toolResult.length > 200 ? toolResult.substring(0, 200) + '...' : toolResult;
+      console.log(`   [<-] ${displayResult}`);
+
+      messages = [...messages, { role: 'tool', content: toolResult, toolCallId: call.id }];
+    }
+
+    // Generate final response with all tool results
+    console.log('\n[->] Generating final response...');
+    const finalResult = await model.chat(messages, {
+      tools,
+      maxNewTokens: 2048,
+      temperature: 0.9,
+    });
+
+    if (finalResult.thinking) {
+      console.log(`\n[THINK] ${finalResult.thinking}`);
+    }
+    console.log(`\n[AI] Final response: ${finalResult.text}`);
+
+    // Log any parsing errors
     for (const call of result.toolCalls) {
-      if (call.status === 'ok') {
-        // Arguments are already a JS object - no JSON.parse needed!
-        console.log(`   - ${call.name}(${JSON.stringify(call.arguments)})`);
-        console.log(`     ID: ${call.id}`);
-
-        // Execute the tool
-        const toolResult = await executeTool(call.name, call.arguments as Record<string, unknown>);
-        const displayResult = toolResult.length > 200 ? toolResult.substring(0, 200) + '...' : toolResult;
-        console.log(`\n[<-] Tool result: ${displayResult}`);
-
-        // Continue conversation with tool result
-        messages = [
-          ...messages,
-          { role: 'assistant', content: result.rawText }, // Use rawText to preserve tool_call tags
-          { role: 'user', content: formatToolResponse(toolResult) },
-        ];
-
-        // Generate final response using chat() API
-        console.log('\n[->] Generating final response...');
-        const finalResult = await model.chat(messages, {
-          tools,
-          maxNewTokens: 2048,
-          temperature: 0.9,
-        });
-
-        // Show thinking if model reasoned through the tool result
-        if (finalResult.thinking) {
-          console.log(`\n[THINK] ${finalResult.thinking}`);
-        }
-        console.log(`\n[AI] Final response: ${finalResult.text}`);
-      } else {
-        // Handle parsing errors gracefully
+      if (call.status !== 'ok') {
         console.log(`   [WARN] ${call.name || '(unknown)'}: ${call.status} - ${call.error}`);
       }
     }

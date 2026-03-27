@@ -5638,6 +5638,7 @@ impl Qwen3Model {
         let prompt_token_count = actual_prefill_count;
         let config = gen_config.unwrap_or_default();
 
+        let tool_call_start_id = tokenizer.tool_call_start_id();
         let tool_call_end_id = tokenizer.tool_call_end_id();
 
         let embedding_weight = self.embedding.get_weight();
@@ -5891,6 +5892,7 @@ impl Qwen3Model {
             // Decode loop
             const DECODE_CLEANUP_INTERVAL: i32 = 256;
             let one_arr = MxArray::from_int32(&[1], &[1])?;
+            let mut tool_call_stop_after: Option<u32> = None;
 
             for step in 0..max_new_tokens {
                 let _stream_ctx = StreamContext::new(generation_stream);
@@ -5910,9 +5912,19 @@ impl Qwen3Model {
 
                 generated_tokens.push(token_value);
 
-                if has_tools && tool_call_end_id.is_some_and(|id| id == token_value) {
-                    finish_reason = "stop";
-                    break;
+                if has_tools {
+                    if tool_call_end_id.is_some_and(|id| id == token_value) {
+                        tool_call_stop_after = Some(2);
+                    } else if let Some(remaining) = tool_call_stop_after {
+                        if tool_call_start_id.is_some_and(|id| id == token_value) {
+                            tool_call_stop_after = None;
+                        } else if remaining == 0 {
+                            finish_reason = "stop";
+                            break;
+                        } else {
+                            tool_call_stop_after = Some(remaining - 1);
+                        }
+                    }
                 }
 
                 if return_logprobs && let Some(ref lp) = logprobs_arr {

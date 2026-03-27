@@ -50,7 +50,7 @@ Breaking out of the loop automatically cancels generation.
 OpenAI-compatible function calling with `createToolDefinition`:
 
 ```typescript
-import { loadModel, createToolDefinition, formatToolResponse } from '@mlx-node/lm';
+import { loadModel, createToolDefinition } from '@mlx-node/lm';
 
 const model = await loadModel('./models/Qwen3-0.6B');
 
@@ -67,17 +67,27 @@ const tools = [
 
 const result = model.chat([{ role: 'user', content: 'What is the weather in Tokyo?' }], { tools });
 
-// If the model calls a tool, execute it and continue
-if (result.toolCalls?.length) {
-  const toolResult = executeMyTool(result.toolCalls[0]);
-  const followUp = model.chat(
-    [
-      ...messages,
-      { role: 'assistant', content: result.rawText },
-      { role: 'tool', content: formatToolResponse(toolResult) },
-    ],
-    { tools },
-  );
+// If the model calls tools, execute them and continue
+const validCalls = result.toolCalls?.filter((tc) => tc.status === 'ok') ?? [];
+if (validCalls.length) {
+  // Add assistant message with structured tool calls
+  const toolMessages = [
+    {
+      role: 'assistant',
+      content: result.text,
+      toolCalls: validCalls.map((tc) => ({
+        id: tc.id,
+        name: tc.name,
+        arguments: JSON.stringify(tc.arguments),
+      })),
+    },
+    // Execute each tool and add results as role: 'tool' messages
+    ...validCalls.map((tc) => ({
+      role: 'tool' as const,
+      content: JSON.stringify(executeMyTool(tc)),
+    })),
+  ];
+  const followUp = model.chat([...messages, ...toolMessages], { tools });
 }
 ```
 
@@ -179,8 +189,6 @@ function createToolDefinition(
   properties?: Record<string, FunctionParameterProperty>,
   required?: string[],
 ): ToolDefinition;
-
-function formatToolResponse(content: string): string;
 ```
 
 ### Functions
@@ -188,7 +196,6 @@ function formatToolResponse(content: string): string;
 | Function                 | Description                                          |
 | ------------------------ | ---------------------------------------------------- |
 | `createToolDefinition()` | Create an OpenAI-compatible tool definition          |
-| `formatToolResponse()`   | Wrap tool output in `<tool_response>` tags           |
 | `detectModelType()`      | Read `config.json` and return the `model_type` field |
 | `enableProfiling()`      | Start profiling with auto-report on exit             |
 | `disableProfiling()`     | Stop profiling and write JSON report                 |
