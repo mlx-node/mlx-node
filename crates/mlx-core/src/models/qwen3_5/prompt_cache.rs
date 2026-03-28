@@ -24,6 +24,9 @@ pub struct PromptCache {
     pub(crate) image_cache_key: Option<u64>,
     /// Rope deltas from VLM prefill (None for text-only)
     pub(crate) rope_deltas: Option<i32>,
+    /// Model instance ID — prevents restoring cache into a different checkpoint.
+    /// Each Qwen3_5Model/MoeModel instance gets a unique ID from a shared counter.
+    pub(crate) model_id: u64,
 }
 
 #[napi]
@@ -59,6 +62,7 @@ impl PromptCache {
         num_layers: usize,
         image_cache_key: Option<u64>,
         rope_deltas: Option<i32>,
+        model_id: u64,
     ) -> Self {
         Self {
             caches: Some(caches),
@@ -67,6 +71,7 @@ impl PromptCache {
             num_layers,
             image_cache_key,
             rope_deltas,
+            model_id,
         }
     }
 
@@ -92,5 +97,9 @@ impl PromptCache {
 
     pub(crate) fn rope_deltas(&self) -> Option<i32> {
         self.rope_deltas
+    }
+
+    pub(crate) fn model_id(&self) -> u64 {
+        self.model_id
     }
 }

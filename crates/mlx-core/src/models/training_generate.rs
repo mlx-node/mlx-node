@@ -110,21 +110,21 @@ pub(crate) fn generate_decode_loop_for_training(
                 break;
             }
 
-            // Check repetition cutoff
-            if check_repetition_cutoff(
+            // Append BEFORE repetition check (matches inference loop ordering).
+            // check_repetition_cutoff inspects the tail of the token list,
+            // so the just-sampled token must be present.
+            generated_tokens.push(token_id);
+            all_tokens.push(token_id);
+
+            if let Some(reason) = check_repetition_cutoff(
                 &all_tokens,
                 max_consecutive_tokens,
                 max_ngram_repeats,
                 ngram_size,
-            )
-            .is_some()
-            {
-                finish_reason = "repetition".to_string();
+            ) {
+                finish_reason = reason.to_string();
                 break;
             }
-
-            generated_tokens.push(token_id);
-            all_tokens.push(token_id);
 
             // Forward next token
             let token_input = MxArray::from_uint32(&[token_id], &[1, 1])?;
@@ -146,8 +146,19 @@ pub(crate) fn generate_decode_loop_for_training(
                 break;
             }
 
+            // Append BEFORE repetition check.
             generated_tokens.push(token_id);
             all_tokens.push(token_id);
+
+            if let Some(reason) = check_repetition_cutoff(
+                &all_tokens,
+                max_consecutive_tokens,
+                max_ngram_repeats,
+                ngram_size,
+            ) {
+                finish_reason = reason.to_string();
+                break;
+            }
 
             let token_input = MxArray::from_uint32(&[token_id], &[1, 1])?;
             let next_logits = forward_fn(&token_input)?;

@@ -200,6 +200,7 @@ impl Qwen3_5MoeModel {
             self.config.num_layers as usize,
             image_key,
             rope_deltas,
+            self.model_id,
         ))
     }
 
@@ -224,6 +225,11 @@ impl Qwen3_5MoeModel {
                 cache.num_layers(),
                 self.config.num_layers
             )));
+        }
+        if cache.model_id() != self.model_id {
+            return Err(Error::from_reason(
+                "Cache was created by a different model instance (different checkpoint or config)",
+            ));
         }
         let restored_caches = cache.take_caches().ok_or_else(|| {
             Error::from_reason("PromptCache is empty (already consumed or disposed)")
