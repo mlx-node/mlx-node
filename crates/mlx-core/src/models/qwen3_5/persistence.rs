@@ -955,6 +955,7 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
             info!("Skipping C++ compiled path for quantized model (using Rust quantized_matmul)");
             // Clear stale weights so a previously-loaded non-quantized model's weights
             // don't trick this model into the compiled path via weight_count > 0.
+            let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
             unsafe { mlx_sys::mlx_qwen35_clear_weights() };
         }
 
@@ -1012,6 +1013,11 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
 /// a partially-populated weight map with the new model's ID.
 fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
     use mlx_sys as sys;
+
+    // Write-lock the weight RwLock for the entire registration.
+    // This blocks any in-flight compiled inference from reading weights
+    // until registration is complete and model_id is set.
+    let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
 
     unsafe { sys::mlx_qwen35_clear_weights() };
 

@@ -38,7 +38,7 @@ use super::persistence;
 
 // Import the shared model ID counter from the dense module — dense and MoE
 // share the same C++ weight map, so IDs must be globally unique.
-use crate::models::qwen3_5::model::QWEN35_MODEL_ID_COUNTER;
+use crate::models::qwen3_5::model::{COMPILED_WEIGHTS_RWLOCK, QWEN35_MODEL_ID_COUNTER};
 
 /// Process-wide mutex serializing the MoE compiled forward lifecycle.
 ///
@@ -361,6 +361,20 @@ impl Qwen3_5MoeModel {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
+            // Re-validate compiled path under weight lock.
+            let mut _weight_guard = None;
+            let use_cpp = if use_cpp {
+                let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+                if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                    _weight_guard = Some(guard);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             // Acquire all locks ONCE for the entire prefill+decode sequence
             let mut layers_guard = layers_arc
                 .write()
@@ -745,6 +759,20 @@ impl Qwen3_5MoeModel {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
+            // Re-validate compiled path under weight lock.
+            let mut _weight_guard = None;
+            let use_cpp = if use_cpp {
+                let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+                if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                    _weight_guard = Some(guard);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             let tool_defs = config.tools.as_deref();
             let enable_thinking = config.enable_thinking;
             let tokens = tokenizer.apply_chat_template_sync(
@@ -989,13 +1017,6 @@ impl Qwen3_5MoeModel {
                     &vision_cache,
                 )?;
 
-                // Adjust RoPE offset for VLM M-RoPE position correction
-                if rope_deltas != 0 && use_cpp {
-                    unsafe {
-                        mlx_sys::mlx_qwen35_moe_adjust_offset(rope_deltas as i32);
-                    }
-                }
-
                 // Save rope_deltas for cache reuse on subsequent turns
                 if let Ok(mut rd) = cached_rope_deltas_arc.write() {
                     *rd = Some(rope_deltas as i32);
@@ -1124,17 +1145,16 @@ impl Qwen3_5MoeModel {
                 // C++ has copied arrays into its own globals — safe to release
                 drop(caches_guard);
 
-                // Reapply rope_deltas from the original VLM prefill
-                // (VLM cache reuse skips vlm_prefill, so C++ offset is unset)
+                // Apply M-RoPE offset correction AFTER init_from_prefill (which sets
+                // g_moe_offset_int = prefill_len). Must come after, not before, or the
+                // correction gets overwritten.
                 if has_images
-                    && cached_prefix_len > 0
                     && let Ok(rd) = cached_rope_deltas_arc.read()
-                    && let Some(delta) = *rd
-                {
-                    unsafe {
-                        mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
-                    }
-                }
+                        && let Some(delta) = *rd {
+                            unsafe {
+                                mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                            }
+                        }
 
                 // For text-only conversations, clear any stale cached rope deltas
                 if !has_images && let Ok(mut rd) = cached_rope_deltas_arc.write() {
@@ -1601,6 +1621,20 @@ impl Qwen3_5MoeModel {
             let callback_err = callback.clone();
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
+                    // Re-validate compiled path under weight lock.
+                    let mut _weight_guard = None;
+                    let use_cpp = if use_cpp {
+                        let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+                        if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                            _weight_guard = Some(guard);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
                     let tool_defs = config.tools.as_deref();
                     let enable_thinking = config.enable_thinking;
                     let tokens = tokenizer.apply_chat_template_sync(
@@ -1854,13 +1888,6 @@ impl Qwen3_5MoeModel {
                             &vision_cache_stream,
                         )?;
 
-                        // Adjust RoPE offset for VLM M-RoPE position correction
-                        if rope_deltas != 0 && use_cpp {
-                            unsafe {
-                                mlx_sys::mlx_qwen35_moe_adjust_offset(rope_deltas as i32);
-                            }
-                        }
-
                         // Save rope_deltas for cache reuse on subsequent turns
                         if let Ok(mut rd) = cached_rope_deltas_arc.write() {
                             *rd = Some(rope_deltas as i32);
@@ -1991,17 +2018,14 @@ impl Qwen3_5MoeModel {
                         // C++ has copied arrays into its own globals — safe to release
                         drop(caches_guard);
 
-                        // Reapply rope_deltas from the original VLM prefill
-                        // (VLM cache reuse skips vlm_prefill, so C++ offset is unset)
+                        // Apply M-RoPE offset correction AFTER init_from_prefill.
                         if has_images
-                            && cached_prefix_len > 0
                             && let Ok(rd) = cached_rope_deltas_arc.read()
-                            && let Some(delta) = *rd
-                        {
-                            unsafe {
-                                mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
-                            }
-                        }
+                                && let Some(delta) = *rd {
+                                    unsafe {
+                                        mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                                    }
+                                }
 
                         // For text-only conversations, clear any stale cached rope deltas
                         if !has_images && let Ok(mut rd) = cached_rope_deltas_arc.write() {
@@ -3327,6 +3351,20 @@ impl Qwen3_5MoeModel {
             None
         };
         let use_cpp = compiled_lock.is_some();
+
+        // Acquire weight read lock to prevent concurrent model loads.
+        let mut _weight_guard = None;
+        let use_cpp = if use_cpp {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         // Ensure caches exist
         self.init_caches()?;

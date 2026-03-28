@@ -70,6 +70,13 @@ pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
 /// so IDs must be globally unique across all Qwen3.5 model variants.
 pub(crate) static QWEN35_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1); // 0 = no model
 
+/// RwLock protecting the C++ global weight map against concurrent mutation.
+/// Write-locked during weight registration (model load), read-locked during
+/// compiled inference. This prevents a concurrent model load from swapping
+/// weights underneath an in-flight compiled decode, and eliminates the TOCTOU
+/// between has_weight() / get_weight() in linear_proj().
+pub(crate) static COMPILED_WEIGHTS_RWLOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 /// Process-wide mutex serializing the dense compiled forward lifecycle.
 ///
 /// The C++ compiled decode path uses process-wide globals (`g_compiled_caches`,
@@ -530,6 +537,21 @@ impl Qwen3_5Model {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
+            // Re-validate compiled path under weight lock. The read lock prevents
+            // concurrent model loads from mutating the C++ weight map mid-decode.
+            let mut _weight_guard = None;
+            let use_compiled = if use_compiled {
+                let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+                if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                    _weight_guard = Some(guard);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             // Acquire all locks ONCE for the entire prefill+decode sequence
             let mut layers_guard = layers_arc
                 .write()
@@ -914,6 +936,20 @@ impl Qwen3_5Model {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
+            // Re-validate compiled path under weight lock.
+            let mut _weight_guard = None;
+            let use_compiled = if use_compiled {
+                let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+                if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                    _weight_guard = Some(guard);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             let mut first_token_instant: Option<std::time::Instant> = None;
 
             let tool_defs = config.tools.as_deref();
@@ -1117,7 +1153,7 @@ impl Qwen3_5Model {
                         let input_ids =
                             MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
 
-                        let (logits, rope_deltas) = vlm_prefill(
+                        let (logits, rope_deltas, vlm_compiled) = vlm_prefill(
                             &input_ids,
                             image_cache_key,
                             processed,
@@ -1141,7 +1177,7 @@ impl Qwen3_5Model {
                         }
 
                         let vlm_seq_len = final_tokens.len() as i64;
-                        (logits, vlm_seq_len, use_compiled)
+                        (logits, vlm_seq_len, vlm_compiled)
                     } else {
                         return Err(Error::from_reason(
                             "VLM prefill requested but vision encoder/processor not loaded",
@@ -1752,6 +1788,20 @@ impl Qwen3_5Model {
             let callback_err = callback.clone();
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
+                    // Re-validate compiled path under weight lock.
+                    let mut _weight_guard = None;
+                    let use_compiled = if use_compiled {
+                        let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+                        if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                            _weight_guard = Some(guard);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
                     let tool_defs = config.tools.as_deref();
                     let enable_thinking = config.enable_thinking;
                     let tokens = tokenizer.apply_chat_template_sync(
@@ -1963,7 +2013,7 @@ impl Qwen3_5Model {
                                     &[1, final_tokens.len() as i64],
                                 )?;
 
-                                let (logits, rope_deltas) = vlm_prefill(
+                                let (logits, rope_deltas, vlm_compiled) = vlm_prefill(
                                     &input_ids,
                                     image_cache_key,
                                     processed,
@@ -1987,7 +2037,7 @@ impl Qwen3_5Model {
                                 }
 
                                 let vlm_seq_len = final_tokens.len() as i64;
-                                (logits, vlm_seq_len, use_compiled)
+                                (logits, vlm_seq_len, vlm_compiled)
                             } else {
                                 return Err(Error::from_reason(
                                     "VLM prefill requested but vision encoder/processor not loaded",
@@ -3354,6 +3404,21 @@ impl Qwen3_5Model {
         };
         let use_compiled = compiled_lock.is_some();
 
+        // Acquire weight read lock to prevent concurrent model loads from
+        // swapping weights during compiled decode. Re-validate model ID under lock.
+        let mut _weight_guard = None;
+        let use_compiled = if use_compiled {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Ensure caches exist
         self.init_caches()?;
 
@@ -3826,7 +3891,7 @@ fn vlm_prefill(
     generation_stream: Stream,
     vision_cache: &VisionCache,
     model_id: u64,
-) -> Result<(MxArray, i64)> {
+) -> Result<(MxArray, i64, bool)> {
     use crate::array::clear_cache;
 
     let (inputs_embeds, position_ids, rope_deltas) = vlm_prepare_vision_features(
@@ -3843,7 +3908,7 @@ fn vlm_prefill(
     // === STEP 4: Prefill with M-RoPE ===
     let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
-    let (last_logits, _seq_len) = if use_compiled {
+    let (last_logits, _seq_len, compiled_init_done) = if use_compiled {
         // C++ VLM prefill: runs all layers in one FFI call with M-RoPE
         use mlx_sys as sys;
 
@@ -3942,7 +4007,7 @@ fn vlm_prefill(
 
         let logits = MxArray::from_handle(output_ptr, "vlm_cpp_prefill")?;
         // logits is already [1, vocab] from C++ prefill
-        (logits, seq_len_i32 as i64)
+        (logits, seq_len_i32 as i64, true) // compiled init done
     } else {
         // Rust fallback prefill (when C++ weights not loaded, e.g. test models)
         // Init fresh caches
@@ -4001,10 +4066,10 @@ fn vlm_prefill(
         let seq_len = logits.shape_at(1)?;
         let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
         let last_logits = last_logits.squeeze(Some(&[1]))?;
-        (last_logits, seq_len)
+        (last_logits, seq_len, false) // compiled init NOT done
     };
 
-    Ok((last_logits, rope_deltas))
+    Ok((last_logits, rope_deltas, compiled_init_done))
 }
 
 /// Shared VLM prefill steps 1-3: vision cache lookup, vision encoder,

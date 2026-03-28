@@ -1294,6 +1294,11 @@ fn register_moe_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u6
     use mlx_sys as sys;
     use std::ffi::CString;
 
+    // Write-lock the weight RwLock for the entire registration.
+    let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+        .write()
+        .unwrap();
+
     // Clear weights (shared map)
     unsafe { sys::mlx_qwen35_clear_weights() };
 
