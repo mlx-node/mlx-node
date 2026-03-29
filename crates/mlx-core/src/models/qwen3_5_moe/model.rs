@@ -1793,7 +1793,7 @@ impl Qwen3_5MoeModel {
                     let eos_id = model_config.eos_token_id as u32;
                     let mut generated_tokens: Vec<u32> = Vec::new();
                     let mut finish_reason = String::from("length");
-                    let mut prev_decoded_len: usize = 0;
+                    let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
 
                     // Track token history for repetition penalty
                     let mut token_history: Vec<u32> = if let Some(ref et) = expanded_tokens {
@@ -2077,17 +2077,11 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            // Decode full sequence and emit delta. ByteLevel BPE
-                            // decoders need full context for correct output.
-                            let full_text = tokenizer_for_decode
-                                .decode_sync(&generated_tokens, true)
+                            let token_text = decode_stream
+                                .step(token_id)
+                                .ok()
+                                .flatten()
                                 .unwrap_or_default();
-                            let token_text = if full_text.len() > prev_decoded_len {
-                                full_text[prev_decoded_len..].to_string()
-                            } else {
-                                String::new()
-                            };
-                            prev_decoded_len = full_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2230,17 +2224,11 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            // Decode full sequence and emit delta. ByteLevel BPE
-                            // decoders need full context for correct output.
-                            let full_text = tokenizer_for_decode
-                                .decode_sync(&generated_tokens, true)
+                            let token_text = decode_stream
+                                .step(token_id)
+                                .ok()
+                                .flatten()
                                 .unwrap_or_default();
-                            let token_text = if full_text.len() > prev_decoded_len {
-                                full_text[prev_decoded_len..].to_string()
-                            } else {
-                                String::new()
-                            };
-                            prev_decoded_len = full_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,

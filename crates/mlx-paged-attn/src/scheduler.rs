@@ -371,11 +371,8 @@ impl ContinuousBatchingScheduler {
         outputs: Vec<TokenOutput>,
         cache: &mut PagedKVCache,
     ) -> Result<(), String> {
-        let eos_token = self.config.eos_token_id.unwrap_or(151645);
-
         for output in outputs {
             if let Some(seq) = self.running.get_mut(&output.seq_id) {
-                // Transition from prefill to decode
                 if seq.is_prefill {
                     seq.is_prefill = false;
                 }
@@ -383,18 +380,18 @@ impl ContinuousBatchingScheduler {
                 seq.generated_tokens.push(output.token);
                 seq.position += 1;
 
-                // Check for completion BEFORE extending cache —
-                // avoids allocating a block for a nonexistent next token
-                // when the sequence ends exactly on a block boundary.
+                // The model sets is_eos and finish_reason_override based on
+                // the per-call GenerationConfig.eos_token_id. The scheduler
+                // does NOT duplicate the EOS check — that would use the stale
+                // construction-time config and ignore per-call overrides.
                 let should_stop = output.is_eos
                     || output.finish_reason_override.is_some()
-                    || output.token == eos_token
                     || seq.generated_tokens.len() >= seq.max_new_tokens as usize;
 
                 if should_stop {
                     let finish_reason = if let Some(reason) = output.finish_reason_override {
                         reason
-                    } else if output.is_eos || output.token == eos_token {
+                    } else if output.is_eos {
                         "stop"
                     } else {
                         "length"

@@ -1028,6 +1028,11 @@ impl Qwen3Tokenizer {
             .map_err(|e| Error::from_reason(format!("Failed to decode tokens: {}", e)))
     }
 
+    /// Get a reference to the inner tokenizer for creating a DecodeStream.
+    pub(crate) fn inner(&self) -> &tokenizers::Tokenizer {
+        &self.tokenizer
+    }
+
     /// Apply chat template synchronously (for internal use by chat())
     ///
     /// This is a synchronous version of apply_chat_template for use in blocking tasks.
