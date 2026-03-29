@@ -117,9 +117,10 @@ void mlx_qwen35_store_weight(const char* name, mlx_array* weight) {
   auto& arr = *reinterpret_cast<array*>(weight);
   std::string key(name);
   g_weights().insert_or_assign(key, arr);
-  // Pre-compute transpose only for weights accessed via get_weight_t() / linear_proj().
-  // Norm weights, A_log, dt_bias, conv1d, scales, biases are only accessed via get_weight().
-  if (key.size() >= 7 && key.compare(key.size() - 7, 7, ".weight") == 0) {
+  // Pre-compute 2D transpose only for weights accessed via get_weight_t() / linear_proj().
+  // Gate to ndim==2 to exclude 3D MoE expert tensors (those use get_weight_t3d instead).
+  if (key.size() >= 7 && key.compare(key.size() - 7, 7, ".weight") == 0
+      && arr.ndim() == 2) {
     g_weight_transposes().insert_or_assign(key, transpose(arr));
   }
 }

@@ -263,6 +263,13 @@ impl Qwen3_5MoeModel {
 
     #[napi]
     pub fn init_caches(&self) -> Result<()> {
+        let _guard = self.generation_lock.try_lock().map_err(|_| {
+            Error::from_reason("Cannot init caches while generation is in progress")
+        })?;
+        self.init_caches_inner()
+    }
+
+    fn init_caches_inner(&self) -> Result<()> {
         let caches = (0..self.config.num_layers as usize)
             .map(|i| {
                 if self.config.is_linear_layer(i) {
@@ -277,16 +284,7 @@ impl Qwen3_5MoeModel {
             .write()
             .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
         *caches_guard = Some(caches);
-        // Clear reuse state so stale history doesn't cause a false cache hit
-        if let Ok(mut th) = self.cached_token_history.write() {
-            th.clear();
-        }
-        if let Ok(mut ik) = self.cached_image_key.write() {
-            *ik = None;
-        }
-        if let Ok(mut rd) = self.cached_rope_deltas.write() {
-            *rd = None;
-        }
+        self.clear_reuse_state();
         Ok(())
     }
 
@@ -295,6 +293,10 @@ impl Qwen3_5MoeModel {
         let _guard = self.generation_lock.try_lock().map_err(|_| {
             Error::from_reason("Cannot reset caches while generation is in progress")
         })?;
+        self.reset_caches_inner()
+    }
+
+    fn reset_caches_inner(&self) -> Result<()> {
         let mut caches_guard = self
             .caches
             .write()
@@ -305,14 +307,20 @@ impl Qwen3_5MoeModel {
             }
         }
         *caches_guard = None;
-        // Also clear token history so next chat() does a full prefill
+        self.clear_reuse_state();
+        Ok(())
+    }
+
+    fn clear_reuse_state(&self) {
         if let Ok(mut th) = self.cached_token_history.write() {
             th.clear();
+        }
+        if let Ok(mut ik) = self.cached_image_key.write() {
+            *ik = None;
         }
         if let Ok(mut rd) = self.cached_rope_deltas.write() {
             *rd = None;
         }
-        Ok(())
     }
 
     #[napi]
@@ -3387,8 +3395,7 @@ impl Qwen3_5MoeModel {
         };
         let use_cpp = _weight_guard.is_some();
 
-        // Ensure caches exist
-        self.init_caches()?;
+        self.init_caches_inner()?;
 
         // Acquire locks
         let embedding_weight = self.embedding.get_weight();
@@ -3544,9 +3551,8 @@ impl Qwen3_5MoeModel {
             result
         };
 
-        // Drop compiled lock before reset_caches
         drop(compiled_lock);
-        self.reset_caches()?;
+        self.reset_caches_inner()?;
 
         Ok(result)
     }
