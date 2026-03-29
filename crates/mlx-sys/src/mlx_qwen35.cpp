@@ -117,12 +117,12 @@ void mlx_qwen35_store_weight(const char* name, mlx_array* weight) {
   auto& arr = *reinterpret_cast<array*>(weight);
   std::string key(name);
   g_weights().insert_or_assign(key, arr);
-  // Pre-compute 2D transpose only for weights actually consumed via get_weight_t().
-  // These are: *_proj.weight (attention/MLP projections via linear_proj()),
-  // embedding.weight, and lm_head.weight. Skip vision encoder weights and
-  // other 2D tensors (norm, A_log, dt_bias, scales, biases) that only use get_weight().
+  // Pre-compute 2D transpose only for weights consumed via get_weight_t() / linear_proj().
+  // Match: any key containing "_proj" (covers q_proj, k_proj, v_proj, o_proj, out_proj,
+  // gate_proj, up_proj, down_proj, in_proj_qkvz, in_proj_ba, etc.), plus embedding/lm_head.
+  // Excludes vision encoder weights, norm weights, A_log, dt_bias, scales, biases.
   if (arr.ndim() == 2 && (
-      key.find("_proj.weight") != std::string::npos ||
+      key.find("_proj") != std::string::npos ||
       key == "embedding.weight" ||
       key == "lm_head.weight")) {
     g_weight_transposes().insert_or_assign(key, transpose(arr));
