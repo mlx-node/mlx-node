@@ -173,6 +173,14 @@ impl ContinuousBatchingScheduler {
         }
     }
 
+    /// Get the generated token history for an active sequence.
+    /// Used by the model to apply repetition/presence/frequency penalties during sampling.
+    pub fn get_generated_tokens(&self, seq_id: u32) -> Option<&[u32]> {
+        self.running
+            .get(&seq_id)
+            .map(|seq| seq.generated_tokens.as_slice())
+    }
+
     /// Add a new request to the waiting queue
     pub fn add_request(&mut self, request: PendingRequest) {
         // Insert based on priority (higher priority first)

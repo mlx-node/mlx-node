@@ -934,6 +934,19 @@ impl VLModel {
                     let logits = lm_guard.forward_fused(&input_embeds, &decode_pos)?;
                     let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
 
+                    // Append the previous token to all_tokens BEFORE applying penalties,
+                    // so the penalty functions see the most recent token.
+                    token.eval();
+                    let token_value = token.item_at_int32(0)? as u32;
+                    generated_tokens.push(token_value);
+                    all_tokens.push(token_value);
+
+                    if return_logprobs && let Some(ref lp) = logprobs_arr {
+                        lp.eval();
+                        let token_logprob = lp.item_at_float32(token_value as usize)?;
+                        generated_logprobs.push(token_logprob);
+                    }
+
                     if repetition_penalty != 1.0 {
                         next_logits = apply_repetition_penalty(
                             &next_logits,
@@ -979,17 +992,8 @@ impl VLModel {
                     MxArray::async_eval_arrays(&[&next_tok]);
                 }
 
-                token.eval();
-                let token_value = token.item_at_int32(0)? as u32;
-
-                generated_tokens.push(token_value);
-                all_tokens.push(token_value);
-
-                if return_logprobs && let Some(ref lp) = logprobs_arr {
-                    lp.eval();
-                    let token_logprob = lp.item_at_float32(token_value as usize)?;
-                    generated_logprobs.push(token_logprob);
-                }
+                // Token was already evaluated and pushed above (before penalties)
+                let token_value = *all_tokens.last().unwrap();
 
                 if token_value == eos_token_id as u32 {
                     finish_reason = "stop";
@@ -1647,6 +1651,27 @@ impl VLModel {
             // Sample next tokens [active_batch, 1, vocab] -> [active_batch, vocab]
             let next_logits = logits.squeeze(Some(&[1]))?;
 
+            // Append previous tokens to item_all_tokens BEFORE applying penalties,
+            // so the penalty functions see the most recent token.
+            current_tokens.eval();
+            let token_values_for_push = current_tokens.to_int32()?;
+            if return_logprobs
+                && let Some(ref lp_vec) = current_logprobs {
+                    for (local_idx, &global_idx) in active_indices.iter().enumerate() {
+                        let tv = token_values_for_push[local_idx] as u32;
+                        if let Some(ref lp) = lp_vec[global_idx] {
+                            lp.eval();
+                            let token_logprob = lp.item_at_float32(tv as usize)?;
+                            generated_logprobs[global_idx].push(token_logprob);
+                        }
+                    }
+                }
+            for (local_idx, &global_idx) in active_indices.iter().enumerate() {
+                let tv = token_values_for_push[local_idx] as u32;
+                generated_tokens[global_idx].push(tv);
+                item_all_tokens[global_idx].push(tv);
+            }
+
             // Apply repetition penalty per item
             let mut next_logits = if repetition_penalty != 1.0 {
                 let mut rows = Vec::with_capacity(active_indices.len());
@@ -1705,29 +1730,12 @@ impl VLModel {
                 (sample(&next_logits, Some(sampling_config))?, None)
             };
 
-            // --- Phase 2: Extract CURRENT tokens and CURRENT logprobs (aligned pair) ---
-            current_tokens.eval();
-            let token_values = current_tokens.to_int32()?;
-
-            // Extract logprobs for current tokens
-            if return_logprobs && let Some(ref lp_vec) = current_logprobs {
-                for (local_idx, &global_idx) in active_indices.iter().enumerate() {
-                    let token_value = token_values[local_idx] as u32;
-                    if let Some(ref lp) = lp_vec[global_idx] {
-                        lp.eval();
-                        let token_logprob = lp.item_at_float32(token_value as usize)?;
-                        generated_logprobs[global_idx].push(token_logprob);
-                    }
-                }
-            }
-
-            // Track deactivations
+            // --- Phase 2: Check EOS and deactivation for current tokens ---
+            // (Tokens were already extracted and pushed before penalties above)
             let mut to_deactivate: Vec<(usize, String)> = Vec::new();
 
-            for (local_idx, &global_idx) in active_indices.iter().enumerate() {
-                let token_value = token_values[local_idx] as u32;
-                generated_tokens[global_idx].push(token_value);
-                item_all_tokens[global_idx].push(token_value);
+            for (local_idx, &_global_idx) in active_indices.iter().enumerate() {
+                let token_value = token_values_for_push[local_idx] as u32;
 
                 // Check EOS
                 if token_value == eos_token_id as u32 {

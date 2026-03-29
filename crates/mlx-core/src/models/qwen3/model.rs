@@ -558,11 +558,6 @@ impl Qwen3Model {
             )
         })?;
 
-        // Embedding lookup: [num_seqs, 1] -> [num_seqs, 1, hidden_dim]
-        let mut hidden_states = self.embedding.forward(input_ids)?;
-        let num_seqs = hidden_states.shape_at(0)?;
-        let seq_len = hidden_states.shape_at(1)?;
-
         // Acquire read lock for paged cache
         let paged_cache_guard = paged_cache.read().map_err(|_| {
             Error::new(
@@ -570,6 +565,25 @@ impl Qwen3Model {
                 "Failed to acquire paged cache read lock",
             )
         })?;
+
+        self.forward_paged_with_cache(input_ids, slot_mapping, seq_ids, positions, &paged_cache_guard)
+    }
+
+    /// Internal paged forward pass that accepts an already-locked cache reference.
+    /// This avoids deadlock when called from step_paged_generation() which already
+    /// holds a write lock on the same paged_cache RwLock.
+    fn forward_paged_with_cache(
+        &self,
+        input_ids: &MxArray,
+        slot_mapping: &MxArray,
+        seq_ids: Vec<u32>,
+        positions: &MxArray,
+        paged_cache_guard: &mlx_paged_attn::PagedKVCache,
+    ) -> Result<MxArray> {
+        // Embedding lookup: [num_seqs, 1] -> [num_seqs, 1, hidden_dim]
+        let mut hidden_states = self.embedding.forward(input_ids)?;
+        let num_seqs = hidden_states.shape_at(0)?;
+        let seq_len = hidden_states.shape_at(1)?;
 
         // Acquire read locks for model components
         let layers_guard = self.layers.read().map_err(|_| {
@@ -598,7 +612,7 @@ impl Qwen3Model {
         for (layer_idx, layer) in layers_guard.iter().enumerate() {
             hidden_states = layer.forward_paged_metal(
                 &hidden_states,
-                &paged_cache_guard,
+                paged_cache_guard,
                 layer_idx as u32,
                 slot_mapping,
                 &seq_ids,
@@ -842,6 +856,17 @@ impl Qwen3Model {
         };
         let eos_token_id = config.eos_token_id.unwrap_or(self.config.eos_token_id);
 
+        // Penalty config (previously ignored in paged path)
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.map(|v| v);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.map(|v| v);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.map(|v| v);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
+
         // Separate batch into prefill and decode sequences
         let mut prefill_indices: Vec<usize> = Vec::new();
         let mut decode_indices: Vec<usize> = Vec::new();
@@ -1028,12 +1053,14 @@ impl Qwen3Model {
             let slot_mapping_arr =
                 MxArray::from_int64(&slot_mapping, &[slot_mapping.len() as i64])?;
 
-            // Run paged attention forward pass (now takes seq_ids instead of block_tables/context_lens)
-            let logits = self.forward_paged(
+            // Run paged attention forward pass using the already-held write guard
+            // (avoids deadlock — forward_paged() would try to read-lock the same RwLock)
+            let logits = self.forward_paged_with_cache(
                 &input_ids,
                 &slot_mapping_arr,
                 decode_seq_ids.clone(),
                 &positions_arr,
+                &cache_guard,
             )?;
 
             // Sample from logits
@@ -1057,7 +1084,36 @@ impl Qwen3Model {
                 }
 
                 let logit_slice = &logits_data[start..end];
-                let logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
+                let mut logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
+
+                // Apply penalties using the sequence's generated token history
+                if let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id)
+                    && !gen_tokens.is_empty() {
+                        if repetition_penalty != 1.0 {
+                            logit_arr = crate::sampling::apply_repetition_penalty(
+                                &logit_arr,
+                                gen_tokens,
+                                repetition_penalty,
+                                repetition_context_size,
+                            )?;
+                        }
+                        if presence_penalty != 0.0 {
+                            logit_arr = crate::sampling::apply_presence_penalty(
+                                &logit_arr,
+                                gen_tokens,
+                                presence_penalty,
+                                presence_context_size,
+                            )?;
+                        }
+                        if frequency_penalty != 0.0 {
+                            logit_arr = crate::sampling::apply_frequency_penalty(
+                                &logit_arr,
+                                gen_tokens,
+                                frequency_penalty,
+                                frequency_context_size,
+                            )?;
+                        }
+                    }
 
                 let (next_token_arr, logprobs_arr) =
                     crate::sampling::sample_and_logprobs(&logit_arr, Some(sampling_config))?;
@@ -1066,7 +1122,25 @@ impl Qwen3Model {
                 logprobs_arr.eval();
                 let next_token = next_token_arr.item_at_int32(0)? as u32;
                 let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
-                let is_finished = next_token == eos_token_id as u32;
+                let mut is_finished = next_token == eos_token_id as u32;
+
+                // Check repetition cutoff (after the token is known)
+                if !is_finished
+                    && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
+                        // Build temp history with the new token appended
+                        let mut history = gen_tokens.to_vec();
+                        history.push(next_token);
+                        if crate::sampling::check_repetition_cutoff(
+                            &history,
+                            max_consecutive_tokens,
+                            max_ngram_repeats,
+                            ngram_size,
+                        )
+                        .is_some()
+                        {
+                            is_finished = true;
+                        }
+                    }
 
                 outputs.push(PagedTokenOutput {
                     seq_id,
