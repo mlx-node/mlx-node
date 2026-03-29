@@ -778,6 +778,11 @@ impl Qwen3Model {
         max_new_tokens: u32,
         priority: Option<i32>,
     ) -> Result<u32> {
+        if max_new_tokens == 0 {
+            return Err(napi::Error::from_reason(
+                "max_new_tokens must be > 0 for paged generation",
+            ));
+        }
         let scheduler = self
             .scheduler
             .as_ref()
@@ -981,7 +986,37 @@ impl Qwen3Model {
             }
 
             let logit_slice = &logits_data[start..end];
-            let logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
+            let mut logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
+
+            // Apply penalties against prompt tokens before sampling the first token,
+            // matching the non-paged generation path's behavior.
+            if let Some(penalty_ctx) = scheduler_guard.get_penalty_context(seq_id)
+                && !penalty_ctx.is_empty() {
+                    if repetition_penalty != 1.0 {
+                        logit_arr = crate::sampling::apply_repetition_penalty(
+                            &logit_arr,
+                            &penalty_ctx,
+                            repetition_penalty,
+                            repetition_context_size,
+                        )?;
+                    }
+                    if presence_penalty != 0.0 {
+                        logit_arr = crate::sampling::apply_presence_penalty(
+                            &logit_arr,
+                            &penalty_ctx,
+                            presence_penalty,
+                            presence_context_size,
+                        )?;
+                    }
+                    if frequency_penalty != 0.0 {
+                        logit_arr = crate::sampling::apply_frequency_penalty(
+                            &logit_arr,
+                            &penalty_ctx,
+                            frequency_penalty,
+                            frequency_context_size,
+                        )?;
+                    }
+                }
 
             let (next_token_arr, logprobs_arr) =
                 crate::sampling::sample_and_logprobs(&logit_arr, Some(sampling_config))?;
@@ -990,7 +1025,28 @@ impl Qwen3Model {
             logprobs_arr.eval();
             let next_token = next_token_arr.item_at_int32(0)? as u32;
             let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
-            let is_finished = next_token == eos_token_id as u32;
+            let is_eos = next_token == eos_token_id as u32;
+            let mut finish_reason_override: Option<String> = None;
+
+            // Check repetition cutoff on the first token too
+            if !is_eos
+                && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
+                    let mut history = gen_tokens.to_vec();
+                    history.push(next_token);
+                    if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                        &history,
+                        max_consecutive_tokens,
+                        max_ngram_repeats,
+                        ngram_size,
+                    ) {
+                        finish_reason_override = Some(reason.to_string());
+                    }
+                }
+
+            let is_finished = is_eos || finish_reason_override.is_some();
+            if let Some(ref reason) = finish_reason_override {
+                finish_reason_overrides.insert(seq_id, reason.clone());
+            }
 
             outputs.push(PagedTokenOutput {
                 seq_id,
