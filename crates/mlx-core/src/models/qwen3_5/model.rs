@@ -900,6 +900,7 @@ impl Qwen3_5Model {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
 
         let gen_lock = self.generation_lock.clone();
+        let _gen_guard = gen_lock.lock().await;
 
         let tokenizer = self
             .tokenizer
@@ -1003,11 +1004,6 @@ impl Qwen3_5Model {
                 top_p: config.top_p,
                 min_p: config.min_p,
             });
-
-            // Acquire generation lock AFTER tokenization (which is pure CPU work
-            // that doesn't need cache protection). blocking_lock() is safe here
-            // since we're inside spawn_blocking.
-            let _gen_guard = gen_lock.blocking_lock();
 
             let mut layers_guard = layers_arc
                 .write()
@@ -1746,15 +1742,14 @@ impl Qwen3_5Model {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
-        let gen_lock = self.generation_lock.clone();
+        // Use lock_owned() so the guard is 'static and can be moved into tokio::spawn.
+        let gen_guard = Arc::clone(&self.generation_lock).lock_owned().await;
 
-        // Tokenize messages using chat template
         let tokenizer = self
             .tokenizer
             .clone()
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
 
-        // Detect images in messages
         let has_images = messages
             .iter()
             .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
@@ -1814,6 +1809,7 @@ impl Qwen3_5Model {
         let callback = Arc::new(callback);
 
         tokio::spawn(async move {
+            let _gen_guard = gen_guard;
             let _compiled_lock = compiled_lock;
 
             let callback_err = callback.clone();
@@ -1861,7 +1857,6 @@ impl Qwen3_5Model {
                         min_p: config.min_p,
                     });
 
-                    let _gen_guard = gen_lock.blocking_lock();
 
                     let mut layers_guard = layers_arc
                         .write()
@@ -2006,6 +2001,7 @@ impl Qwen3_5Model {
                     let eos_id = model_config.eos_token_id as u32;
                     let mut generated_tokens: Vec<u32> = Vec::new();
                     let mut finish_reason = String::from("length");
+                    let mut prev_decoded_len: usize = 0;
 
                     let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
                     let generation_stream = Stream::new(DeviceType::Gpu);
@@ -2269,30 +2265,17 @@ impl Qwen3_5Model {
                                 break;
                             }
 
-                            // Incremental delta decode: decode a bounded tail of the
-                            // sequence and diff against the previous decode. Avoids O(n²)
-                            // total cost for long generations while correctly handling
-                            // multibyte UTF-8 and byte-fallback tokens.
-                            let token_text = {
-                                const TAIL: usize = 64;
-                                let n = generated_tokens.len();
-                                let start = n.saturating_sub(TAIL);
-                                let cur = tokenizer_for_decode
-                                    .decode_sync(&generated_tokens[start..], true)
-                                    .unwrap_or_default();
-                                let prev = if n > 1 {
-                                    tokenizer_for_decode
-                                        .decode_sync(&generated_tokens[start..n - 1], true)
-                                        .unwrap_or_default()
-                                } else {
-                                    String::new()
-                                };
-                                if cur.len() > prev.len() {
-                                    cur[prev.len()..].to_string()
-                                } else {
-                                    String::new()
-                                }
+                            // Decode full sequence and emit delta. ByteLevel BPE
+                            // decoders need full context for correct output.
+                            let full_text = tokenizer_for_decode
+                                .decode_sync(&generated_tokens, true)
+                                .unwrap_or_default();
+                            let token_text = if full_text.len() > prev_decoded_len {
+                                full_text[prev_decoded_len..].to_string()
+                            } else {
+                                String::new()
                             };
+                            prev_decoded_len = full_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2434,30 +2417,17 @@ impl Qwen3_5Model {
                                 break;
                             }
 
-                            // Incremental delta decode: decode a bounded tail of the
-                            // sequence and diff against the previous decode. Avoids O(n²)
-                            // total cost for long generations while correctly handling
-                            // multibyte UTF-8 and byte-fallback tokens.
-                            let token_text = {
-                                const TAIL: usize = 64;
-                                let n = generated_tokens.len();
-                                let start = n.saturating_sub(TAIL);
-                                let cur = tokenizer_for_decode
-                                    .decode_sync(&generated_tokens[start..], true)
-                                    .unwrap_or_default();
-                                let prev = if n > 1 {
-                                    tokenizer_for_decode
-                                        .decode_sync(&generated_tokens[start..n - 1], true)
-                                        .unwrap_or_default()
-                                } else {
-                                    String::new()
-                                };
-                                if cur.len() > prev.len() {
-                                    cur[prev.len()..].to_string()
-                                } else {
-                                    String::new()
-                                }
+                            // Decode full sequence and emit delta. ByteLevel BPE
+                            // decoders need full context for correct output.
+                            let full_text = tokenizer_for_decode
+                                .decode_sync(&generated_tokens, true)
+                                .unwrap_or_default();
+                            let token_text = if full_text.len() > prev_decoded_len {
+                                full_text[prev_decoded_len..].to_string()
+                            } else {
+                                String::new()
                             };
+                            prev_decoded_len = full_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
