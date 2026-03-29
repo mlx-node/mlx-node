@@ -52,6 +52,8 @@ pub struct ActiveSequence {
     pub seq_id: u32,
     /// Original request ID
     pub request_id: String,
+    /// Original prompt token IDs (for penalty context)
+    pub prompt_tokens: Vec<u32>,
     /// Tokens generated so far
     pub generated_tokens: Vec<u32>,
     /// Maximum tokens to generate
@@ -107,6 +109,9 @@ pub struct TokenOutput {
     pub token: u32,
     /// Whether this token is an EOS token
     pub is_eos: bool,
+    /// Override finish reason (e.g. "repetition"). When set, takes precedence
+    /// over the default EOS/length logic in process_outputs.
+    pub finish_reason_override: Option<String>,
 }
 
 /// Scheduler configuration
@@ -173,8 +178,20 @@ impl ContinuousBatchingScheduler {
         }
     }
 
-    /// Get the generated token history for an active sequence.
+    /// Get the full penalty context (prompt + generated tokens) for an active sequence.
     /// Used by the model to apply repetition/presence/frequency penalties during sampling.
+    /// Includes prompt tokens so penalties are conditioned on the full context,
+    /// matching the behavior of the non-paged generation path.
+    pub fn get_penalty_context(&self, seq_id: u32) -> Option<Vec<u32>> {
+        self.running.get(&seq_id).map(|seq| {
+            let mut ctx = Vec::with_capacity(seq.prompt_tokens.len() + seq.generated_tokens.len());
+            ctx.extend_from_slice(&seq.prompt_tokens);
+            ctx.extend_from_slice(&seq.generated_tokens);
+            ctx
+        })
+    }
+
+    /// Get just the generated token history for an active sequence.
     pub fn get_generated_tokens(&self, seq_id: u32) -> Option<&[u32]> {
         self.running
             .get(&seq_id)
@@ -277,6 +294,7 @@ impl ContinuousBatchingScheduler {
                     let seq = ActiveSequence {
                         seq_id, // Use cache's seq_id, not our own counter
                         request_id: request.request_id.clone(),
+                        prompt_tokens: request.prompt_tokens.clone(),
                         generated_tokens: Vec::new(),
                         max_new_tokens: request.max_new_tokens,
                         prompt_len,
@@ -367,11 +385,14 @@ impl ContinuousBatchingScheduler {
 
                 // Check for completion
                 let should_stop = output.is_eos
+                    || output.finish_reason_override.is_some()
                     || output.token == eos_token
                     || seq.generated_tokens.len() >= seq.max_new_tokens as usize;
 
                 if should_stop {
-                    let finish_reason = if output.is_eos || output.token == eos_token {
+                    let finish_reason = if let Some(ref reason) = output.finish_reason_override {
+                        reason.as_str()
+                    } else if output.is_eos || output.token == eos_token {
                         "stop"
                     } else {
                         "length"

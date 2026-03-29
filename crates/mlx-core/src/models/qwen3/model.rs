@@ -856,16 +856,19 @@ impl Qwen3Model {
         };
         let eos_token_id = config.eos_token_id.unwrap_or(self.config.eos_token_id);
 
-        // Penalty config (previously ignored in paged path)
+        // Penalty config — defaults match the normal (non-paged) generation path
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-        let repetition_context_size = config.repetition_context_size.map(|v| v);
+        let repetition_context_size = Some(config.repetition_context_size.unwrap_or(256));
         let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-        let presence_context_size = config.presence_context_size.map(|v| v);
+        let presence_context_size = Some(config.presence_context_size.unwrap_or(20));
         let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-        let frequency_context_size = config.frequency_context_size.map(|v| v);
+        let frequency_context_size = Some(config.frequency_context_size.unwrap_or(20));
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
+
+        // Track per-sequence finish reason overrides (e.g. "repetition")
+        let mut finish_reason_overrides: HashMap<u32, String> = HashMap::new();
 
         // Separate batch into prefill and decode sequences
         let mut prefill_indices: Vec<usize> = Vec::new();
@@ -1086,13 +1089,14 @@ impl Qwen3Model {
                 let logit_slice = &logits_data[start..end];
                 let mut logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
 
-                // Apply penalties using the sequence's generated token history
-                if let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id)
-                    && !gen_tokens.is_empty() {
+                // Apply penalties using the full context (prompt + generated tokens),
+                // matching the non-paged generation path's behavior.
+                if let Some(penalty_ctx) = scheduler_guard.get_penalty_context(seq_id)
+                    && !penalty_ctx.is_empty() {
                         if repetition_penalty != 1.0 {
                             logit_arr = crate::sampling::apply_repetition_penalty(
                                 &logit_arr,
-                                gen_tokens,
+                                &penalty_ctx,
                                 repetition_penalty,
                                 repetition_context_size,
                             )?;
@@ -1100,7 +1104,7 @@ impl Qwen3Model {
                         if presence_penalty != 0.0 {
                             logit_arr = crate::sampling::apply_presence_penalty(
                                 &logit_arr,
-                                gen_tokens,
+                                &penalty_ctx,
                                 presence_penalty,
                                 presence_context_size,
                             )?;
@@ -1108,7 +1112,7 @@ impl Qwen3Model {
                         if frequency_penalty != 0.0 {
                             logit_arr = crate::sampling::apply_frequency_penalty(
                                 &logit_arr,
-                                gen_tokens,
+                                &penalty_ctx,
                                 frequency_penalty,
                                 frequency_context_size,
                             )?;
@@ -1122,25 +1126,28 @@ impl Qwen3Model {
                 logprobs_arr.eval();
                 let next_token = next_token_arr.item_at_int32(0)? as u32;
                 let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
-                let mut is_finished = next_token == eos_token_id as u32;
+                let is_eos = next_token == eos_token_id as u32;
+                let mut finish_reason_override: Option<String> = None;
 
                 // Check repetition cutoff (after the token is known)
-                if !is_finished
+                if !is_eos
                     && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
-                        // Build temp history with the new token appended
                         let mut history = gen_tokens.to_vec();
                         history.push(next_token);
-                        if crate::sampling::check_repetition_cutoff(
+                        if let Some(reason) = crate::sampling::check_repetition_cutoff(
                             &history,
                             max_consecutive_tokens,
                             max_ngram_repeats,
                             ngram_size,
-                        )
-                        .is_some()
-                        {
-                            is_finished = true;
+                        ) {
+                            finish_reason_override = Some(reason.to_string());
                         }
                     }
+
+                let is_finished = is_eos || finish_reason_override.is_some();
+                if let Some(ref reason) = finish_reason_override {
+                    finish_reason_overrides.insert(seq_id, reason.clone());
+                }
 
                 outputs.push(PagedTokenOutput {
                     seq_id,
@@ -1159,6 +1166,7 @@ impl Qwen3Model {
                 seq_id: o.seq_id,
                 token: o.token,
                 is_eos: o.is_finished,
+                finish_reason_override: finish_reason_overrides.get(&o.seq_id).cloned(),
             })
             .collect();
         scheduler_guard
