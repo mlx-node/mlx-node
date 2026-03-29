@@ -2011,7 +2011,7 @@ impl Qwen3_5Model {
                     let eos_id = model_config.eos_token_id as u32;
                     let mut generated_tokens: Vec<u32> = Vec::new();
                     let mut finish_reason = String::from("length");
-                    let mut decode_stream = Some(tokenizer_for_decode.inner().decode_stream(true));
+                    let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
                     let mut streamed_text_len: usize = 0;
 
                     let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
@@ -2277,36 +2277,27 @@ impl Qwen3_5Model {
                             }
 
                             // Use DecodeStream for correct incremental decoding.
-                            // On InvalidPrefix error, fall back to full-decode diff.
-                            let token_text = if let Some(ref mut ds) = decode_stream {
-                                match ds.step(token_id) {
-                                    Ok(Some(text)) => text,
-                                    Ok(None) => String::new(),
-                                    Err(_) => {
-                                        // Stream state is broken — fall back to full decode
-                                        decode_stream = None;
-                                        let full = tokenizer_for_decode
-                                            .decode_sync(&generated_tokens, true)
-                                            .unwrap_or_default();
-                                        let delta = if full.len() > streamed_text_len {
-                                            full[streamed_text_len..].to_string()
-                                        } else {
-                                            String::new()
-                                        };
-                                        delta
+                            // On InvalidPrefix, recreate stream and replay all tokens
+                            // to re-establish correct detokenization state.
+                            let token_text = match decode_stream.step(token_id) {
+                                Ok(Some(text)) => text,
+                                Ok(None) => String::new(),
+                                Err(_) => {
+                                    let mut new_ds = tokenizer_for_decode.inner().decode_stream(true);
+                                    let mut replayed = String::new();
+                                    for &tid in &generated_tokens {
+                                        if let Ok(Some(t)) = new_ds.step(tid) {
+                                            replayed.push_str(&t);
+                                        }
                                     }
+                                    decode_stream = new_ds;
+                                    let delta = if replayed.len() > streamed_text_len {
+                                        replayed[streamed_text_len..].to_string()
+                                    } else {
+                                        String::new()
+                                    };
+                                    delta
                                 }
-                            } else {
-                                // Fallback mode: full-decode diff
-                                let full = tokenizer_for_decode
-                                    .decode_sync(&generated_tokens, true)
-                                    .unwrap_or_default();
-                                let delta = if full.len() > streamed_text_len {
-                                    full[streamed_text_len..].to_string()
-                                } else {
-                                    String::new()
-                                };
-                                delta
                             };
                             streamed_text_len += token_text.len();
                             callback.call(
@@ -2451,36 +2442,27 @@ impl Qwen3_5Model {
                             }
 
                             // Use DecodeStream for correct incremental decoding.
-                            // On InvalidPrefix error, fall back to full-decode diff.
-                            let token_text = if let Some(ref mut ds) = decode_stream {
-                                match ds.step(token_id) {
-                                    Ok(Some(text)) => text,
-                                    Ok(None) => String::new(),
-                                    Err(_) => {
-                                        // Stream state is broken — fall back to full decode
-                                        decode_stream = None;
-                                        let full = tokenizer_for_decode
-                                            .decode_sync(&generated_tokens, true)
-                                            .unwrap_or_default();
-                                        let delta = if full.len() > streamed_text_len {
-                                            full[streamed_text_len..].to_string()
-                                        } else {
-                                            String::new()
-                                        };
-                                        delta
+                            // On InvalidPrefix, recreate stream and replay all tokens
+                            // to re-establish correct detokenization state.
+                            let token_text = match decode_stream.step(token_id) {
+                                Ok(Some(text)) => text,
+                                Ok(None) => String::new(),
+                                Err(_) => {
+                                    let mut new_ds = tokenizer_for_decode.inner().decode_stream(true);
+                                    let mut replayed = String::new();
+                                    for &tid in &generated_tokens {
+                                        if let Ok(Some(t)) = new_ds.step(tid) {
+                                            replayed.push_str(&t);
+                                        }
                                     }
+                                    decode_stream = new_ds;
+                                    let delta = if replayed.len() > streamed_text_len {
+                                        replayed[streamed_text_len..].to_string()
+                                    } else {
+                                        String::new()
+                                    };
+                                    delta
                                 }
-                            } else {
-                                // Fallback mode: full-decode diff
-                                let full = tokenizer_for_decode
-                                    .decode_sync(&generated_tokens, true)
-                                    .unwrap_or_default();
-                                let delta = if full.len() > streamed_text_len {
-                                    full[streamed_text_len..].to_string()
-                                } else {
-                                    String::new()
-                                };
-                                delta
                             };
                             streamed_text_len += token_text.len();
                             callback.call(
