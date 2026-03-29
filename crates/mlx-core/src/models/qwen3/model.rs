@@ -1048,9 +1048,15 @@ impl Qwen3Model {
                     }
                 }
 
-            // Also check if this token hits the length limit
-            let hits_length = scheduler_guard.would_hit_length_limit(seq_id);
-            let is_finished = is_eos || finish_reason_override.is_some() || hits_length;
+            // Check if this token hits the length limit
+            if finish_reason_override.is_none()
+                && !is_eos
+                && scheduler_guard.would_hit_length_limit(seq_id)
+            {
+                finish_reason_override = Some("length".to_string());
+            }
+
+            let is_finished = is_eos || finish_reason_override.is_some();
             if let Some(ref reason) = finish_reason_override {
                 finish_reason_overrides.insert(seq_id, reason.clone());
             }
@@ -1207,9 +1213,15 @@ impl Qwen3Model {
                         }
                     }
 
-                // Also check if this token hits the length limit
-                let hits_length = scheduler_guard.would_hit_length_limit(seq_id);
-                let is_finished = is_eos || finish_reason_override.is_some() || hits_length;
+                // Check if this token hits the length limit
+                if finish_reason_override.is_none()
+                    && !is_eos
+                    && scheduler_guard.would_hit_length_limit(seq_id)
+                {
+                    finish_reason_override = Some("length".to_string());
+                }
+
+                let is_finished = is_eos || finish_reason_override.is_some();
                 if let Some(ref reason) = finish_reason_override {
                     finish_reason_overrides.insert(seq_id, reason.clone());
                 }
@@ -1227,11 +1239,16 @@ impl Qwen3Model {
         // Update scheduler with outputs (handles prefill→decode transition)
         let token_outputs: Vec<_> = outputs
             .iter()
-            .map(|o| crate::transformer::TokenOutput {
-                seq_id: o.seq_id,
-                token: o.token,
-                is_eos: o.is_finished,
-                finish_reason_override: finish_reason_overrides.get(&o.seq_id).cloned(),
+            .map(|o| {
+                let override_reason = finish_reason_overrides.get(&o.seq_id).cloned();
+                crate::transformer::TokenOutput {
+                    seq_id: o.seq_id,
+                    token: o.token,
+                    // is_eos should only be true for actual EOS tokens, not for
+                    // length/repetition stops — those flow through finish_reason_override.
+                    is_eos: o.is_finished && override_reason.is_none(),
+                    finish_reason_override: override_reason,
+                }
             })
             .collect();
         scheduler_guard
