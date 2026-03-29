@@ -873,11 +873,11 @@ impl Qwen3Model {
         let eos_token_id = config.eos_token_id.unwrap_or(self.config.eos_token_id);
 
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-        let repetition_context_size = Some(config.repetition_context_size.unwrap_or(256));
+        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
         let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-        let presence_context_size = Some(config.presence_context_size.unwrap_or(20));
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
         let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-        let frequency_context_size = Some(config.frequency_context_size.unwrap_or(20));
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
@@ -1001,10 +1001,8 @@ impl Qwen3Model {
                 // Build penalty context from the tail of prompt+generated,
                 // bounded by the largest context_size to cap allocation.
                 let max_ctx = repetition_context_size
-                    .unwrap_or(256)
-                    .max(presence_context_size.unwrap_or(20))
-                    .max(frequency_context_size.unwrap_or(20))
-                    as usize;
+                    .max(presence_context_size)
+                    .max(frequency_context_size) as usize;
                 let total = prompt.len() + generated.len();
                 let skip = total.saturating_sub(max_ctx);
                 let prompt_skip = skip.min(prompt.len());
@@ -1019,7 +1017,7 @@ impl Qwen3Model {
                             &logit_arr,
                             &ctx,
                             repetition_penalty,
-                            repetition_context_size,
+                            Some(repetition_context_size),
                         )?;
                     }
                     if presence_penalty != 0.0 {
@@ -1027,7 +1025,7 @@ impl Qwen3Model {
                             &logit_arr,
                             &ctx,
                             presence_penalty,
-                            presence_context_size,
+                            Some(presence_context_size),
                         )?;
                     }
                     if frequency_penalty != 0.0 {
@@ -1035,7 +1033,7 @@ impl Qwen3Model {
                             &logit_arr,
                             &ctx,
                             frequency_penalty,
-                            frequency_context_size,
+                            Some(frequency_context_size),
                         )?;
                     }
                 }
@@ -1176,10 +1174,8 @@ impl Qwen3Model {
 
                 if let Some((prompt, generated)) = scheduler_guard.get_penalty_context(seq_id) {
                     let max_ctx = repetition_context_size
-                        .unwrap_or(256)
-                        .max(presence_context_size.unwrap_or(20))
-                        .max(frequency_context_size.unwrap_or(20))
-                        as usize;
+                        .max(presence_context_size)
+                        .max(frequency_context_size) as usize;
                     let total = prompt.len() + generated.len();
                     let skip = total.saturating_sub(max_ctx);
                     let prompt_skip = skip.min(prompt.len());
@@ -1195,7 +1191,7 @@ impl Qwen3Model {
                                 &logit_arr,
                                 &ctx,
                                 repetition_penalty,
-                                repetition_context_size,
+                                Some(repetition_context_size),
                             )?;
                         }
                         if presence_penalty != 0.0 {
@@ -1203,7 +1199,7 @@ impl Qwen3Model {
                                 &logit_arr,
                                 &ctx,
                                 presence_penalty,
-                                presence_context_size,
+                                Some(presence_context_size),
                             )?;
                         }
                         if frequency_penalty != 0.0 {
@@ -1211,7 +1207,7 @@ impl Qwen3Model {
                                 &logit_arr,
                                 &ctx,
                                 frequency_penalty,
-                                frequency_context_size,
+                                Some(frequency_context_size),
                             )?;
                         }
                     }
@@ -1249,8 +1245,8 @@ impl Qwen3Model {
                 }
 
                 let is_finished = is_eos || finish_reason_override.is_some();
-                if let Some(ref reason) = finish_reason_override {
-                    finish_reason_overrides.insert(seq_id, reason.clone());
+                if let Some(reason) = finish_reason_override {
+                    finish_reason_overrides.insert(seq_id, reason);
                 }
 
                 outputs.push(PagedTokenOutput {
