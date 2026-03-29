@@ -43,6 +43,10 @@ export default defineConfig({
       typeAware: true,
     },
   },
+  staged: {
+    '*': ['vp check --fix'],
+    "*.rs": ["cargo fmt --all --"]
+  },
   test: {
     globals: true,
     environment: 'node',
