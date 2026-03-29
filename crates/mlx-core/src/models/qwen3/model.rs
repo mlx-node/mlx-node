@@ -866,7 +866,6 @@ impl Qwen3Model {
         };
         let eos_token_id = config.eos_token_id.unwrap_or(self.config.eos_token_id);
 
-        // Penalty config — defaults match the normal (non-paged) generation path
         let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
         let repetition_context_size = Some(config.repetition_context_size.unwrap_or(256));
         let presence_penalty = config.presence_penalty.unwrap_or(0.0);
@@ -877,7 +876,6 @@ impl Qwen3Model {
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
 
-        // Track per-sequence finish reason overrides (e.g. "repetition")
         let mut finish_reason_overrides: HashMap<u32, &'static str> = HashMap::new();
 
         // Separate batch into prefill and decode sequences
@@ -993,33 +991,36 @@ impl Qwen3Model {
             let logit_slice = &logits_data[start..end];
             let mut logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
 
-            // Apply penalties against prompt tokens before sampling the first token,
-            // matching the non-paged generation path's behavior.
-            if let Some(penalty_ctx) = scheduler_guard.get_penalty_context(seq_id)
-                && !penalty_ctx.is_empty() {
-                    if repetition_penalty != 1.0 {
-                        logit_arr = crate::sampling::apply_repetition_penalty(
-                            &logit_arr,
-                            &penalty_ctx,
-                            repetition_penalty,
-                            repetition_context_size,
-                        )?;
-                    }
-                    if presence_penalty != 0.0 {
-                        logit_arr = crate::sampling::apply_presence_penalty(
-                            &logit_arr,
-                            &penalty_ctx,
-                            presence_penalty,
-                            presence_context_size,
-                        )?;
-                    }
-                    if frequency_penalty != 0.0 {
-                        logit_arr = crate::sampling::apply_frequency_penalty(
-                            &logit_arr,
-                            &penalty_ctx,
-                            frequency_penalty,
-                            frequency_context_size,
-                        )?;
+            if let Some((prompt, generated)) = scheduler_guard.get_penalty_context(seq_id) {
+                    // Build penalty context from the tail of prompt+generated,
+                    // bounded by the largest context_size to cap allocation.
+                    let max_ctx = repetition_context_size
+                        .unwrap_or(256)
+                        .max(presence_context_size.unwrap_or(20))
+                        .max(frequency_context_size.unwrap_or(20)) as usize;
+                    let total = prompt.len() + generated.len();
+                    let skip = total.saturating_sub(max_ctx);
+                    let prompt_skip = skip.min(prompt.len());
+                    let ctx: Vec<u32> = prompt[prompt_skip..].iter()
+                        .chain(generated.iter())
+                        .copied()
+                        .collect();
+                    if !ctx.is_empty() {
+                        if repetition_penalty != 1.0 {
+                            logit_arr = crate::sampling::apply_repetition_penalty(
+                                &logit_arr, &ctx, repetition_penalty, repetition_context_size,
+                            )?;
+                        }
+                        if presence_penalty != 0.0 {
+                            logit_arr = crate::sampling::apply_presence_penalty(
+                                &logit_arr, &ctx, presence_penalty, presence_context_size,
+                            )?;
+                        }
+                        if frequency_penalty != 0.0 {
+                            logit_arr = crate::sampling::apply_frequency_penalty(
+                                &logit_arr, &ctx, frequency_penalty, frequency_context_size,
+                            )?;
+                        }
                     }
                 }
 
@@ -1033,7 +1034,6 @@ impl Qwen3Model {
             let is_eos = next_token == eos_token_id as u32;
             let mut finish_reason_override: Option<&'static str> = None;
 
-            // Check repetition cutoff on the first token too
             if !is_eos
                 && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
                     let mut history = gen_tokens.to_vec();
@@ -1158,35 +1158,36 @@ impl Qwen3Model {
                 let logit_slice = &logits_data[start..end];
                 let mut logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
 
-                // Apply penalties using the full context (prompt + generated tokens),
-                // matching the non-paged generation path's behavior.
-                if let Some(penalty_ctx) = scheduler_guard.get_penalty_context(seq_id)
-                    && !penalty_ctx.is_empty() {
+                if let Some((prompt, generated)) = scheduler_guard.get_penalty_context(seq_id) {
+                    let max_ctx = repetition_context_size
+                        .unwrap_or(256)
+                        .max(presence_context_size.unwrap_or(20))
+                        .max(frequency_context_size.unwrap_or(20)) as usize;
+                    let total = prompt.len() + generated.len();
+                    let skip = total.saturating_sub(max_ctx);
+                    let prompt_skip = skip.min(prompt.len());
+                    let ctx: Vec<u32> = prompt[prompt_skip..].iter()
+                        .chain(generated.iter())
+                        .copied()
+                        .collect();
+                    if !ctx.is_empty() {
                         if repetition_penalty != 1.0 {
                             logit_arr = crate::sampling::apply_repetition_penalty(
-                                &logit_arr,
-                                &penalty_ctx,
-                                repetition_penalty,
-                                repetition_context_size,
+                                &logit_arr, &ctx, repetition_penalty, repetition_context_size,
                             )?;
                         }
                         if presence_penalty != 0.0 {
                             logit_arr = crate::sampling::apply_presence_penalty(
-                                &logit_arr,
-                                &penalty_ctx,
-                                presence_penalty,
-                                presence_context_size,
+                                &logit_arr, &ctx, presence_penalty, presence_context_size,
                             )?;
                         }
                         if frequency_penalty != 0.0 {
                             logit_arr = crate::sampling::apply_frequency_penalty(
-                                &logit_arr,
-                                &penalty_ctx,
-                                frequency_penalty,
-                                frequency_context_size,
+                                &logit_arr, &ctx, frequency_penalty, frequency_context_size,
                             )?;
                         }
                     }
+                }
 
                 let (next_token_arr, logprobs_arr) =
                     crate::sampling::sample_and_logprobs(&logit_arr, Some(sampling_config))?;
@@ -1198,7 +1199,6 @@ impl Qwen3Model {
                 let is_eos = next_token == eos_token_id as u32;
                 let mut finish_reason_override: Option<&'static str> = None;
 
-                // Check repetition cutoff (after the token is known)
                 if !is_eos
                     && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
                         let mut history = gen_tokens.to_vec();
@@ -1236,7 +1236,6 @@ impl Qwen3Model {
             }
         }
 
-        // Update scheduler with outputs (handles prefill→decode transition)
         let token_outputs: Vec<_> = outputs
             .iter()
             .map(|o| {

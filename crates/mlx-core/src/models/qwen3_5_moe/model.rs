@@ -712,9 +712,7 @@ impl Qwen3_5MoeModel {
 
         let reuse_cache = config.reuse_cache.unwrap_or(true);
 
-        // Hold generation lock for the entire lifecycle.
         let gen_lock = self.generation_lock.clone();
-        let _gen_guard = gen_lock.lock().await;
 
         let tokenizer = self
             .tokenizer
@@ -799,12 +797,13 @@ impl Qwen3_5MoeModel {
             let ngram_size = config.ngram_size.unwrap_or(64);
             let sampling_config = Some(SamplingConfig {
                 temperature: config.temperature,
-                top_k: config.top_k, // Qwen3.5 recommends top_k=20
+                top_k: config.top_k,
                 top_p: config.top_p,
                 min_p: config.min_p,
             });
 
-            // Acquire all locks ONCE for the entire prefill+decode sequence
+            let _gen_guard = gen_lock.blocking_lock();
+
             let mut layers_guard = layers_arc
                 .write()
                 .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
@@ -1556,9 +1555,7 @@ impl Qwen3_5MoeModel {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
-        // Hold generation lock for the entire lifecycle.
-        // Use lock_owned() so the guard is 'static and can be moved into tokio::spawn.
-        let gen_guard = Arc::clone(&self.generation_lock).lock_owned().await;
+        let gen_lock = self.generation_lock.clone();
 
         let tokenizer = self
             .tokenizer
@@ -1624,8 +1621,6 @@ impl Qwen3_5MoeModel {
         let callback = Arc::new(callback);
 
         tokio::spawn(async move {
-            // Hold both locks for the duration of generation
-            let _gen_guard = gen_guard;
             let _moe_lock = moe_lock;
 
             let callback_err = callback.clone();
@@ -1660,7 +1655,8 @@ impl Qwen3_5MoeModel {
                         min_p: config.min_p,
                     });
 
-                    // Acquire all locks ONCE for the entire prefill+decode sequence
+                    let _gen_guard = gen_lock.blocking_lock();
+
                     let mut layers_guard = layers_arc
                         .write()
                         .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
@@ -1799,8 +1795,6 @@ impl Qwen3_5MoeModel {
                     let eos_id = model_config.eos_token_id as u32;
                     let mut generated_tokens: Vec<u32> = Vec::new();
                     let mut finish_reason = String::from("length");
-                    // Track decoded text length for incremental delta streaming.
-                    let mut prev_decoded_len: usize = 0;
 
                     // Track token history for repetition penalty
                     let mut token_history: Vec<u32> = if let Some(ref et) = expanded_tokens {
@@ -2084,18 +2078,27 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            // Incremental delta decode: decode the full sequence so far
-                            // and emit only the new characters. This correctly handles
-                            // multibyte UTF-8, byte-fallback, and whitespace-prefix tokens.
-                            let full_text = tokenizer_for_decode
-                                .decode_sync(&generated_tokens, true)
-                                .unwrap_or_default();
-                            let token_text = if full_text.len() > prev_decoded_len {
-                                full_text[prev_decoded_len..].to_string()
-                            } else {
-                                String::new()
+                            // Incremental delta decode with bounded tail window.
+                            let token_text = {
+                                const TAIL: usize = 64;
+                                let n = generated_tokens.len();
+                                let start = n.saturating_sub(TAIL);
+                                let cur = tokenizer_for_decode
+                                    .decode_sync(&generated_tokens[start..], true)
+                                    .unwrap_or_default();
+                                let prev = if n > 1 {
+                                    tokenizer_for_decode
+                                        .decode_sync(&generated_tokens[start..n - 1], true)
+                                        .unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
+                                if cur.len() > prev.len() {
+                                    cur[prev.len()..].to_string()
+                                } else {
+                                    String::new()
+                                }
                             };
-                            prev_decoded_len = full_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2238,18 +2241,27 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            // Incremental delta decode: decode the full sequence so far
-                            // and emit only the new characters. This correctly handles
-                            // multibyte UTF-8, byte-fallback, and whitespace-prefix tokens.
-                            let full_text = tokenizer_for_decode
-                                .decode_sync(&generated_tokens, true)
-                                .unwrap_or_default();
-                            let token_text = if full_text.len() > prev_decoded_len {
-                                full_text[prev_decoded_len..].to_string()
-                            } else {
-                                String::new()
+                            // Incremental delta decode with bounded tail window.
+                            let token_text = {
+                                const TAIL: usize = 64;
+                                let n = generated_tokens.len();
+                                let start = n.saturating_sub(TAIL);
+                                let cur = tokenizer_for_decode
+                                    .decode_sync(&generated_tokens[start..], true)
+                                    .unwrap_or_default();
+                                let prev = if n > 1 {
+                                    tokenizer_for_decode
+                                        .decode_sync(&generated_tokens[start..n - 1], true)
+                                        .unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
+                                if cur.len() > prev.len() {
+                                    cur[prev.len()..].to_string()
+                                } else {
+                                    String::new()
+                                }
                             };
-                            prev_decoded_len = full_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,

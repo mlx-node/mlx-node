@@ -178,17 +178,13 @@ impl ContinuousBatchingScheduler {
         }
     }
 
-    /// Get the full penalty context (prompt + generated tokens) for an active sequence.
-    /// Used by the model to apply repetition/presence/frequency penalties during sampling.
-    /// Includes prompt tokens so penalties are conditioned on the full context,
-    /// matching the behavior of the non-paged generation path.
-    pub fn get_penalty_context(&self, seq_id: u32) -> Option<Vec<u32>> {
-        self.running.get(&seq_id).map(|seq| {
-            let mut ctx = Vec::with_capacity(seq.prompt_tokens.len() + seq.generated_tokens.len());
-            ctx.extend_from_slice(&seq.prompt_tokens);
-            ctx.extend_from_slice(&seq.generated_tokens);
-            ctx
-        })
+    /// Get the penalty context slices (prompt, generated) for an active sequence.
+    /// Returns borrowed slices to avoid per-step allocation. Callers pass both
+    /// to penalty functions which accept &[u32].
+    pub fn get_penalty_context(&self, seq_id: u32) -> Option<(&[u32], &[u32])> {
+        self.running
+            .get(&seq_id)
+            .map(|seq| (seq.prompt_tokens.as_slice(), seq.generated_tokens.as_slice()))
     }
 
     /// Get just the generated token history for an active sequence.
@@ -384,7 +380,6 @@ impl ContinuousBatchingScheduler {
                     seq.is_prefill = false;
                 }
 
-                // Add generated token
                 seq.generated_tokens.push(output.token);
                 seq.position += 1;
 
