@@ -369,6 +369,9 @@ impl Qwen3Model {
     /// Clears cached key-value states. Call this between different generation sequences.
     #[napi]
     pub fn reset_kv_caches(&self) -> Result<()> {
+        let _guard = self.generation_lock.try_lock().map_err(|_| {
+            Error::from_reason("Cannot reset KV cache while generation is in progress")
+        })?;
         if let Some(caches) = self
             .kv_caches
             .write()
@@ -384,10 +387,6 @@ impl Qwen3Model {
                 cache.reset();
             }
         }
-        // Also clear cached chat state so next chat() does a full prefill
-        let _guard = self.generation_lock.try_lock().map_err(|_| {
-            Error::from_reason("Cannot reset KV cache while generation is in progress")
-        })?;
         self.cached_kv_keys
             .write()
             .map_err(|_| Error::from_reason("Poisoned lock"))?
