@@ -2011,7 +2011,7 @@ impl Qwen3_5Model {
                     let eos_id = model_config.eos_token_id as u32;
                     let mut generated_tokens: Vec<u32> = Vec::new();
                     let mut finish_reason = String::from("length");
-                    let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
+                    let mut decode_stream = Some(tokenizer_for_decode.inner().decode_stream(true));
                     let mut streamed_text_len: usize = 0;
 
                     let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
@@ -2276,11 +2276,38 @@ impl Qwen3_5Model {
                                 break;
                             }
 
-                            let token_text = decode_stream
-                                .step(token_id)
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default();
+                            // Use DecodeStream for correct incremental decoding.
+                            // On InvalidPrefix error, fall back to full-decode diff.
+                            let token_text = if let Some(ref mut ds) = decode_stream {
+                                match ds.step(token_id) {
+                                    Ok(Some(text)) => text,
+                                    Ok(None) => String::new(),
+                                    Err(_) => {
+                                        // Stream state is broken — fall back to full decode
+                                        decode_stream = None;
+                                        let full = tokenizer_for_decode
+                                            .decode_sync(&generated_tokens, true)
+                                            .unwrap_or_default();
+                                        let delta = if full.len() > streamed_text_len {
+                                            full[streamed_text_len..].to_string()
+                                        } else {
+                                            String::new()
+                                        };
+                                        delta
+                                    }
+                                }
+                            } else {
+                                // Fallback mode: full-decode diff
+                                let full = tokenizer_for_decode
+                                    .decode_sync(&generated_tokens, true)
+                                    .unwrap_or_default();
+                                let delta = if full.len() > streamed_text_len {
+                                    full[streamed_text_len..].to_string()
+                                } else {
+                                    String::new()
+                                };
+                                delta
+                            };
                             streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
@@ -2423,11 +2450,38 @@ impl Qwen3_5Model {
                                 break;
                             }
 
-                            let token_text = decode_stream
-                                .step(token_id)
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default();
+                            // Use DecodeStream for correct incremental decoding.
+                            // On InvalidPrefix error, fall back to full-decode diff.
+                            let token_text = if let Some(ref mut ds) = decode_stream {
+                                match ds.step(token_id) {
+                                    Ok(Some(text)) => text,
+                                    Ok(None) => String::new(),
+                                    Err(_) => {
+                                        // Stream state is broken — fall back to full decode
+                                        decode_stream = None;
+                                        let full = tokenizer_for_decode
+                                            .decode_sync(&generated_tokens, true)
+                                            .unwrap_or_default();
+                                        let delta = if full.len() > streamed_text_len {
+                                            full[streamed_text_len..].to_string()
+                                        } else {
+                                            String::new()
+                                        };
+                                        delta
+                                    }
+                                }
+                            } else {
+                                // Fallback mode: full-decode diff
+                                let full = tokenizer_for_decode
+                                    .decode_sync(&generated_tokens, true)
+                                    .unwrap_or_default();
+                                let delta = if full.len() > streamed_text_len {
+                                    full[streamed_text_len..].to_string()
+                                } else {
+                                    String::new()
+                                };
+                                delta
+                            };
                             streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
