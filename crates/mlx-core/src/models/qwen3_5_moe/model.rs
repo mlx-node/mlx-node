@@ -120,6 +120,8 @@ pub struct Qwen3_5MoeModel {
     cached_rope_deltas: Arc<RwLock<Option<i32>>>,
     /// Unique model instance ID for compiled path ownership.
     pub(crate) model_id: u64,
+    /// Serializes cache state access during generation.
+    generation_lock: Arc<TokioMutex<()>>,
 }
 
 #[napi]
@@ -173,6 +175,7 @@ impl Qwen3_5MoeModel {
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
             model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            generation_lock: Arc::new(TokioMutex::new(())),
         })
     }
 
@@ -183,6 +186,7 @@ impl Qwen3_5MoeModel {
     /// before the next `chat()` call for incremental prefill.
     #[napi]
     pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
+        let _guard = self.generation_lock.try_lock().ok()?;
         let mut caches_guard = self.caches.write().ok()?;
         let token_history_guard = self.cached_token_history.read().ok()?;
         let caches = caches_guard.take()?;
@@ -213,6 +217,9 @@ impl Qwen3_5MoeModel {
         &self,
         cache: &mut crate::models::qwen3_5::prompt_cache::PromptCache,
     ) -> Result<()> {
+        let _guard = self.generation_lock.try_lock().map_err(|_| {
+            Error::from_reason("Cannot set cache while generation is in progress")
+        })?;
         if cache.model_type() != "qwen3_5_moe" {
             return Err(Error::from_reason(format!(
                 "Cache type '{}' doesn't match model type 'qwen3_5_moe'",
@@ -274,6 +281,9 @@ impl Qwen3_5MoeModel {
 
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
+        let _guard = self.generation_lock.try_lock().map_err(|_| {
+            Error::from_reason("Cannot reset caches while generation is in progress")
+        })?;
         let mut caches_guard = self
             .caches
             .write()
@@ -344,6 +354,10 @@ impl Qwen3_5MoeModel {
                 batch_size
             )));
         }
+
+        // Hold generation lock for the entire lifecycle.
+        let gen_lock = self.generation_lock.clone();
+        let _gen_guard = gen_lock.lock().await;
 
         let embedding_weight = self.embedding.get_weight();
         let layers_arc = self.layers.clone();
@@ -706,6 +720,11 @@ impl Qwen3_5MoeModel {
         });
 
         let reuse_cache = config.reuse_cache.unwrap_or(true);
+
+        // Hold generation lock for the entire lifecycle.
+        let gen_lock = self.generation_lock.clone();
+        let _gen_guard = gen_lock.lock().await;
+
         let tokenizer = self
             .tokenizer
             .clone()
@@ -1557,6 +1576,10 @@ impl Qwen3_5MoeModel {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
+        // Hold generation lock for the entire lifecycle.
+        // Use lock_owned() so the guard is 'static and can be moved into tokio::spawn.
+        let gen_guard = Arc::clone(&self.generation_lock).lock_owned().await;
+
         let tokenizer = self
             .tokenizer
             .clone()
@@ -1621,7 +1644,8 @@ impl Qwen3_5MoeModel {
         let callback = Arc::new(callback);
 
         tokio::spawn(async move {
-            // Hold the MoE lock for the duration of generation
+            // Hold both locks for the duration of generation
+            let _gen_guard = gen_guard;
             let _moe_lock = moe_lock;
 
             let callback_err = callback.clone();
@@ -2988,6 +3012,7 @@ impl Qwen3_5MoeModel {
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
             model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            generation_lock: Arc::new(TokioMutex::new(())),
         })
     }
 
@@ -3345,6 +3370,9 @@ impl Qwen3_5MoeModel {
         let config = config.unwrap_or_default();
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let model_id = self.model_id;
+
+        // Hold generation lock (blocking — called from spawn_blocking context).
+        let _gen_guard = self.generation_lock.blocking_lock();
 
         // Check if C++ MoE path is available (weights belong to this model)
         let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;

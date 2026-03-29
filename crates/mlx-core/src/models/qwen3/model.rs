@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::iter;
 use std::sync::{Arc, RwLock};
+use tokio::sync::Mutex as TokioMutex;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -141,6 +142,10 @@ pub struct Qwen3Model {
     cached_cache_idx: Arc<RwLock<i32>>,
     /// Token history for prefix verification
     cached_token_history: Arc<RwLock<Vec<u32>>>,
+    /// Serializes cache state access: held during the entire chat() lifecycle
+    /// (both prefix-match reads and post-generation writes) to prevent concurrent
+    /// chat()/reset_cache() from splicing state across conversations.
+    generation_lock: Arc<TokioMutex<()>>,
 }
 
 #[napi]
@@ -244,6 +249,7 @@ impl Qwen3Model {
             cached_kv_values: Arc::new(RwLock::new(Vec::new())),
             cached_cache_idx: Arc::new(RwLock::new(0)),
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
+            generation_lock: Arc::new(TokioMutex::new(())),
         })
     }
 
@@ -251,6 +257,9 @@ impl Qwen3Model {
     /// Call this when starting a new conversation to ensure a full prefill.
     #[napi]
     pub fn reset_cache(&self) -> Result<()> {
+        let _guard = self.generation_lock.try_lock().map_err(|_| {
+            Error::from_reason("Cannot reset cache while generation is in progress")
+        })?;
         self.cached_kv_keys
             .write()
             .map_err(|_| Error::from_reason("Poisoned lock"))?
@@ -376,6 +385,9 @@ impl Qwen3Model {
             }
         }
         // Also clear cached chat state so next chat() does a full prefill
+        let _guard = self.generation_lock.try_lock().map_err(|_| {
+            Error::from_reason("Cannot reset KV cache while generation is in progress")
+        })?;
         self.cached_kv_keys
             .write()
             .map_err(|_| Error::from_reason("Poisoned lock"))?
@@ -1359,6 +1371,7 @@ impl Qwen3Model {
             cached_kv_values: Arc::new(RwLock::new(Vec::new())),
             cached_cache_idx: Arc::new(RwLock::new(0)),
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
+            generation_lock: Arc::new(TokioMutex::new(())),
         })
     }
 
@@ -5545,6 +5558,11 @@ impl Qwen3Model {
                 format!("Chat template task failed: {}", e),
             )
         })??;
+
+        // Hold generation lock for the entire cache-read + generation + cache-write lifecycle.
+        // This prevents concurrent chat()/reset_cache() from splicing state across conversations.
+        let gen_lock = self.generation_lock.clone();
+        let _gen_guard = gen_lock.lock().await;
 
         // === Cache reuse: prefix verification ===
         let (initial_kv_keys, initial_kv_values, initial_cache_idx, prefill_input_ids) =
