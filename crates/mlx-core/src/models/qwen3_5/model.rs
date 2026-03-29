@@ -444,9 +444,10 @@ impl Qwen3_5Model {
         &self,
         cache: &mut crate::models::qwen3_5::prompt_cache::PromptCache,
     ) -> Result<()> {
-        let _guard = self.generation_lock.try_lock().map_err(|_| {
-            Error::from_reason("Cannot set cache while generation is in progress")
-        })?;
+        let _guard = self
+            .generation_lock
+            .try_lock()
+            .map_err(|_| Error::from_reason("Cannot set cache while generation is in progress"))?;
         if cache.model_type() != "qwen3_5" {
             return Err(Error::from_reason(format!(
                 "Cache type '{}' doesn't match model type 'qwen3_5'",
@@ -584,7 +585,11 @@ impl Qwen3_5Model {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
-            let _weight_guard = if use_compiled { acquire_compiled_weight_guard(model_id) } else { None };
+            let _weight_guard = if use_compiled {
+                acquire_compiled_weight_guard(model_id)
+            } else {
+                None
+            };
             let use_compiled = _weight_guard.is_some();
 
             // Acquire all locks ONCE for the entire prefill+decode sequence
@@ -1131,7 +1136,8 @@ impl Qwen3_5Model {
             // Zero-delta guard: if entire prompt was cached (exact same input repeated),
             // reset caches and do a full re-prefill. GDN recurrence state cannot be
             // rewound, so full re-prefill is the only correct approach for Qwen3.5.
-            let prefill_tokens = if prefill_tokens.is_empty() {
+            // Also reset cached_prefix_len so VLM routing correctly triggers vlm_prefill.
+            let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
                 info!("Zero-delta cache hit: resetting caches for full re-prefill");
                 if let Some(ref mut caches) = *caches_guard {
                     for cache in caches.iter_mut() {
@@ -1148,13 +1154,14 @@ impl Qwen3_5Model {
                     })
                     .collect();
                 *caches_guard = Some(new_caches);
-                if has_images {
+                let tokens = if has_images {
                     expanded_tokens.clone()
                 } else {
                     tokens.clone()
-                }
+                };
+                (tokens, 0)
             } else {
-                prefill_tokens
+                (prefill_tokens, cached_prefix_len)
             };
 
             let eos_id = model_config.eos_token_id as u32;
@@ -1867,7 +1874,6 @@ impl Qwen3_5Model {
                         min_p: config.min_p,
                     });
 
-
                     let mut layers_guard = layers_arc
                         .write()
                         .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
@@ -1981,8 +1987,8 @@ impl Qwen3_5Model {
                         tokens.clone()
                     };
 
-                    // Zero-delta guard: if entire prompt was cached, reset and re-prefill.
-                    let prefill_tokens = if prefill_tokens.is_empty() {
+                    // Zero-delta guard: also reset cached_prefix_len for VLM routing.
+                    let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
                         info!("Zero-delta cache hit: resetting caches for full re-prefill");
                         if let Some(ref mut caches) = *caches_guard {
                             for cache in caches.iter_mut() {
@@ -1999,13 +2005,14 @@ impl Qwen3_5Model {
                             })
                             .collect();
                         *caches_guard = Some(new_caches);
-                        if has_images {
+                        let tokens = if has_images {
                             expanded_tokens.clone()
                         } else {
                             tokens.clone()
-                        }
+                        };
+                        (tokens, 0)
                     } else {
-                        prefill_tokens
+                        (prefill_tokens, cached_prefix_len)
                     };
 
                     let eos_id = model_config.eos_token_id as u32;
@@ -2276,29 +2283,13 @@ impl Qwen3_5Model {
                                 break;
                             }
 
-                            // Use DecodeStream for correct incremental decoding.
-                            // On InvalidPrefix, recreate stream and replay all tokens
-                            // to re-establish correct detokenization state.
-                            let token_text = match decode_stream.step(token_id) {
-                                Ok(Some(text)) => text,
-                                Ok(None) => String::new(),
-                                Err(_) => {
-                                    let mut new_ds = tokenizer_for_decode.inner().decode_stream(true);
-                                    let mut replayed = String::new();
-                                    for &tid in &generated_tokens {
-                                        if let Ok(Some(t)) = new_ds.step(tid) {
-                                            replayed.push_str(&t);
-                                        }
-                                    }
-                                    decode_stream = new_ds;
-                                    let delta = if replayed.len() > streamed_text_len {
-                                        replayed[streamed_text_len..].to_string()
-                                    } else {
-                                        String::new()
-                                    };
-                                    delta
-                                }
-                            };
+                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                                &mut decode_stream,
+                                tokenizer_for_decode.inner(),
+                                token_id,
+                                &generated_tokens,
+                                streamed_text_len,
+                            );
                             streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
@@ -2441,29 +2432,13 @@ impl Qwen3_5Model {
                                 break;
                             }
 
-                            // Use DecodeStream for correct incremental decoding.
-                            // On InvalidPrefix, recreate stream and replay all tokens
-                            // to re-establish correct detokenization state.
-                            let token_text = match decode_stream.step(token_id) {
-                                Ok(Some(text)) => text,
-                                Ok(None) => String::new(),
-                                Err(_) => {
-                                    let mut new_ds = tokenizer_for_decode.inner().decode_stream(true);
-                                    let mut replayed = String::new();
-                                    for &tid in &generated_tokens {
-                                        if let Ok(Some(t)) = new_ds.step(tid) {
-                                            replayed.push_str(&t);
-                                        }
-                                    }
-                                    decode_stream = new_ds;
-                                    let delta = if replayed.len() > streamed_text_len {
-                                        replayed[streamed_text_len..].to_string()
-                                    } else {
-                                        String::new()
-                                    };
-                                    delta
-                                }
-                            };
+                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                                &mut decode_stream,
+                                tokenizer_for_decode.inner(),
+                                token_id,
+                                &generated_tokens,
+                                streamed_text_len,
+                            );
                             streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
@@ -3484,7 +3459,11 @@ impl Qwen3_5Model {
         };
         let use_compiled = compiled_lock.is_some();
 
-        let _weight_guard = if use_compiled { acquire_compiled_weight_guard(model_id) } else { None };
+        let _weight_guard = if use_compiled {
+            acquire_compiled_weight_guard(model_id)
+        } else {
+            None
+        };
         let use_compiled = _weight_guard.is_some();
 
         // Ensure caches exist

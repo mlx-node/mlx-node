@@ -182,9 +182,12 @@ impl ContinuousBatchingScheduler {
     /// Returns borrowed slices to avoid per-step allocation. Callers pass both
     /// to penalty functions which accept &[u32].
     pub fn get_penalty_context(&self, seq_id: u32) -> Option<(&[u32], &[u32])> {
-        self.running
-            .get(&seq_id)
-            .map(|seq| (seq.prompt_tokens.as_slice(), seq.generated_tokens.as_slice()))
+        self.running.get(&seq_id).map(|seq| {
+            (
+                seq.prompt_tokens.as_slice(),
+                seq.generated_tokens.as_slice(),
+            )
+        })
     }
 
     /// Get just the generated token history for an active sequence.

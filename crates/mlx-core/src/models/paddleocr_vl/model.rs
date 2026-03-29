@@ -1655,17 +1655,16 @@ impl VLModel {
             // so the penalty functions see the most recent token.
             current_tokens.eval();
             let token_values_for_push = current_tokens.to_int32()?;
-            if return_logprobs
-                && let Some(ref lp_vec) = current_logprobs {
-                    for (local_idx, &global_idx) in active_indices.iter().enumerate() {
-                        let tv = token_values_for_push[local_idx] as u32;
-                        if let Some(ref lp) = lp_vec[global_idx] {
-                            lp.eval();
-                            let token_logprob = lp.item_at_float32(tv as usize)?;
-                            generated_logprobs[global_idx].push(token_logprob);
-                        }
+            if return_logprobs && let Some(ref lp_vec) = current_logprobs {
+                for (local_idx, &global_idx) in active_indices.iter().enumerate() {
+                    let tv = token_values_for_push[local_idx] as u32;
+                    if let Some(ref lp) = lp_vec[global_idx] {
+                        lp.eval();
+                        let token_logprob = lp.item_at_float32(tv as usize)?;
+                        generated_logprobs[global_idx].push(token_logprob);
                     }
                 }
+            }
             for (local_idx, &global_idx) in active_indices.iter().enumerate() {
                 let tv = token_values_for_push[local_idx] as u32;
                 generated_tokens[global_idx].push(tv);

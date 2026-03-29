@@ -38,9 +38,7 @@ use super::persistence;
 
 // Import the shared model ID counter from the dense module — dense and MoE
 // share the same C++ weight map, so IDs must be globally unique.
-use crate::models::qwen3_5::model::{
-    QWEN35_MODEL_ID_COUNTER, acquire_compiled_weight_guard,
-};
+use crate::models::qwen3_5::model::{QWEN35_MODEL_ID_COUNTER, acquire_compiled_weight_guard};
 
 /// Process-wide mutex serializing the MoE compiled forward lifecycle.
 ///
@@ -219,9 +217,10 @@ impl Qwen3_5MoeModel {
         &self,
         cache: &mut crate::models::qwen3_5::prompt_cache::PromptCache,
     ) -> Result<()> {
-        let _guard = self.generation_lock.try_lock().map_err(|_| {
-            Error::from_reason("Cannot set cache while generation is in progress")
-        })?;
+        let _guard = self
+            .generation_lock
+            .try_lock()
+            .map_err(|_| Error::from_reason("Cannot set cache while generation is in progress"))?;
         if cache.model_type() != "qwen3_5_moe" {
             return Err(Error::from_reason(format!(
                 "Cache type '{}' doesn't match model type 'qwen3_5_moe'",
@@ -393,7 +392,11 @@ impl Qwen3_5MoeModel {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
-            let _weight_guard = if use_cpp { acquire_compiled_weight_guard(model_id) } else { None };
+            let _weight_guard = if use_cpp {
+                acquire_compiled_weight_guard(model_id)
+            } else {
+                None
+            };
             let use_cpp = _weight_guard.is_some();
 
             // Acquire all locks ONCE for the entire prefill+decode sequence
@@ -783,7 +786,11 @@ impl Qwen3_5MoeModel {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
-            let _weight_guard = if use_cpp { acquire_compiled_weight_guard(model_id) } else { None };
+            let _weight_guard = if use_cpp {
+                acquire_compiled_weight_guard(model_id)
+            } else {
+                None
+            };
             let use_cpp = _weight_guard.is_some();
 
             let tool_defs = config.tools.as_deref();
@@ -918,9 +925,8 @@ impl Qwen3_5MoeModel {
                 tokens.clone()
             };
 
-            // Zero-delta guard: if entire prompt was cached, reset and re-prefill.
-            // GDN recurrence state cannot be rewound.
-            let prefill_tokens = if prefill_tokens.is_empty() {
+            // Zero-delta guard: also reset cached_prefix_len for VLM routing.
+            let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
                 info!("Zero-delta cache hit: resetting caches for full re-prefill");
                 if let Some(ref mut caches) = *caches_guard {
                     for cache in caches.iter_mut() {
@@ -937,13 +943,14 @@ impl Qwen3_5MoeModel {
                     })
                     .collect();
                 *caches_guard = Some(new_caches);
-                if has_images {
+                let tokens = if has_images {
                     expanded_tokens.as_ref().unwrap_or(&tokens).clone()
                 } else {
                     tokens.clone()
-                }
+                };
+                (tokens, 0)
             } else {
-                prefill_tokens
+                (prefill_tokens, cached_prefix_len)
             };
 
             let eos_id = model_config.eos_token_id as u32;
@@ -1162,11 +1169,12 @@ impl Qwen3_5MoeModel {
                 // correction gets overwritten.
                 if has_images
                     && let Ok(rd) = cached_rope_deltas_arc.read()
-                        && let Some(delta) = *rd {
-                            unsafe {
-                                mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
-                            }
-                        }
+                    && let Some(delta) = *rd
+                {
+                    unsafe {
+                        mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                    }
+                }
 
                 // For text-only conversations, clear any stale cached rope deltas
                 if !has_images && let Ok(mut rd) = cached_rope_deltas_arc.write() {
@@ -1634,7 +1642,11 @@ impl Qwen3_5MoeModel {
             let callback_err = callback.clone();
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
-                    let _weight_guard = if use_cpp { acquire_compiled_weight_guard(model_id) } else { None };
+                    let _weight_guard = if use_cpp {
+                        acquire_compiled_weight_guard(model_id)
+                    } else {
+                        None
+                    };
                     let use_cpp = _weight_guard.is_some();
 
                     let tool_defs = config.tools.as_deref();
@@ -1662,8 +1674,6 @@ impl Qwen3_5MoeModel {
                         top_p: config.top_p,
                         min_p: config.min_p,
                     });
-
-
 
                     let mut layers_guard = layers_arc
                         .write()
@@ -1773,8 +1783,8 @@ impl Qwen3_5MoeModel {
                         tokens.clone()
                     };
 
-                    // Zero-delta guard: if entire prompt was cached, reset and re-prefill.
-                    let prefill_tokens = if prefill_tokens.is_empty() {
+                    // Zero-delta guard: also reset cached_prefix_len for VLM routing.
+                    let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
                         info!("Zero-delta cache hit: resetting caches for full re-prefill");
                         if let Some(ref mut caches) = *caches_guard {
                             for cache in caches.iter_mut() {
@@ -1791,13 +1801,14 @@ impl Qwen3_5MoeModel {
                             })
                             .collect();
                         *caches_guard = Some(new_caches);
-                        if has_images {
+                        let tokens = if has_images {
                             expanded_tokens.as_ref().unwrap_or(&tokens).clone()
                         } else {
                             tokens.clone()
-                        }
+                        };
+                        (tokens, 0)
                     } else {
-                        prefill_tokens
+                        (prefill_tokens, cached_prefix_len)
                     };
 
                     let eos_id = model_config.eos_token_id as u32;
@@ -2024,11 +2035,12 @@ impl Qwen3_5MoeModel {
                         // Apply M-RoPE offset correction AFTER init_from_prefill.
                         if has_images
                             && let Ok(rd) = cached_rope_deltas_arc.read()
-                                && let Some(delta) = *rd {
-                                    unsafe {
-                                        mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
-                                    }
-                                }
+                            && let Some(delta) = *rd
+                        {
+                            unsafe {
+                                mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                            }
+                        }
 
                         // For text-only conversations, clear any stale cached rope deltas
                         if !has_images && let Ok(mut rd) = cached_rope_deltas_arc.write() {
@@ -2088,26 +2100,13 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            let token_text = match decode_stream.step(token_id) {
-                                Ok(Some(text)) => text,
-                                Ok(None) => String::new(),
-                                Err(_) => {
-                                    let mut new_ds = tokenizer_for_decode.inner().decode_stream(true);
-                                    let mut replayed = String::new();
-                                    for &tid in &generated_tokens {
-                                        if let Ok(Some(t)) = new_ds.step(tid) {
-                                            replayed.push_str(&t);
-                                        }
-                                    }
-                                    decode_stream = new_ds;
-                                    let delta = if replayed.len() > streamed_text_len {
-                                        replayed[streamed_text_len..].to_string()
-                                    } else {
-                                        String::new()
-                                    };
-                                    delta
-                                }
-                            };
+                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                                &mut decode_stream,
+                                tokenizer_for_decode.inner(),
+                                token_id,
+                                &generated_tokens,
+                                streamed_text_len,
+                            );
                             streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
@@ -2251,26 +2250,13 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
-                            let token_text = match decode_stream.step(token_id) {
-                                Ok(Some(text)) => text,
-                                Ok(None) => String::new(),
-                                Err(_) => {
-                                    let mut new_ds = tokenizer_for_decode.inner().decode_stream(true);
-                                    let mut replayed = String::new();
-                                    for &tid in &generated_tokens {
-                                        if let Ok(Some(t)) = new_ds.step(tid) {
-                                            replayed.push_str(&t);
-                                        }
-                                    }
-                                    decode_stream = new_ds;
-                                    let delta = if replayed.len() > streamed_text_len {
-                                        replayed[streamed_text_len..].to_string()
-                                    } else {
-                                        String::new()
-                                    };
-                                    delta
-                                }
-                            };
+                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                                &mut decode_stream,
+                                tokenizer_for_decode.inner(),
+                                token_id,
+                                &generated_tokens,
+                                streamed_text_len,
+                            );
                             streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
@@ -3394,7 +3380,11 @@ impl Qwen3_5MoeModel {
         };
         let use_cpp = compiled_lock.is_some();
 
-        let _weight_guard = if use_cpp { acquire_compiled_weight_guard(model_id) } else { None };
+        let _weight_guard = if use_cpp {
+            acquire_compiled_weight_guard(model_id)
+        } else {
+            None
+        };
         let use_cpp = _weight_guard.is_some();
 
         // Ensure caches exist

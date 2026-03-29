@@ -566,7 +566,13 @@ impl Qwen3Model {
             )
         })?;
 
-        self.forward_paged_with_cache(input_ids, slot_mapping, seq_ids, positions, &paged_cache_guard)
+        self.forward_paged_with_cache(
+            input_ids,
+            slot_mapping,
+            seq_ids,
+            positions,
+            &paged_cache_guard,
+        )
     }
 
     /// Internal paged forward pass that accepts an already-locked cache reference.
@@ -992,37 +998,48 @@ impl Qwen3Model {
             let mut logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
 
             if let Some((prompt, generated)) = scheduler_guard.get_penalty_context(seq_id) {
-                    // Build penalty context from the tail of prompt+generated,
-                    // bounded by the largest context_size to cap allocation.
-                    let max_ctx = repetition_context_size
-                        .unwrap_or(256)
-                        .max(presence_context_size.unwrap_or(20))
-                        .max(frequency_context_size.unwrap_or(20)) as usize;
-                    let total = prompt.len() + generated.len();
-                    let skip = total.saturating_sub(max_ctx);
-                    let prompt_skip = skip.min(prompt.len());
-                    let ctx: Vec<u32> = prompt[prompt_skip..].iter()
-                        .chain(generated.iter())
-                        .copied()
-                        .collect();
-                    if !ctx.is_empty() {
-                        if repetition_penalty != 1.0 {
-                            logit_arr = crate::sampling::apply_repetition_penalty(
-                                &logit_arr, &ctx, repetition_penalty, repetition_context_size,
-                            )?;
-                        }
-                        if presence_penalty != 0.0 {
-                            logit_arr = crate::sampling::apply_presence_penalty(
-                                &logit_arr, &ctx, presence_penalty, presence_context_size,
-                            )?;
-                        }
-                        if frequency_penalty != 0.0 {
-                            logit_arr = crate::sampling::apply_frequency_penalty(
-                                &logit_arr, &ctx, frequency_penalty, frequency_context_size,
-                            )?;
-                        }
+                // Build penalty context from the tail of prompt+generated,
+                // bounded by the largest context_size to cap allocation.
+                let max_ctx = repetition_context_size
+                    .unwrap_or(256)
+                    .max(presence_context_size.unwrap_or(20))
+                    .max(frequency_context_size.unwrap_or(20))
+                    as usize;
+                let total = prompt.len() + generated.len();
+                let skip = total.saturating_sub(max_ctx);
+                let prompt_skip = skip.min(prompt.len());
+                let ctx: Vec<u32> = prompt[prompt_skip..]
+                    .iter()
+                    .chain(generated.iter())
+                    .copied()
+                    .collect();
+                if !ctx.is_empty() {
+                    if repetition_penalty != 1.0 {
+                        logit_arr = crate::sampling::apply_repetition_penalty(
+                            &logit_arr,
+                            &ctx,
+                            repetition_penalty,
+                            repetition_context_size,
+                        )?;
+                    }
+                    if presence_penalty != 0.0 {
+                        logit_arr = crate::sampling::apply_presence_penalty(
+                            &logit_arr,
+                            &ctx,
+                            presence_penalty,
+                            presence_context_size,
+                        )?;
+                    }
+                    if frequency_penalty != 0.0 {
+                        logit_arr = crate::sampling::apply_frequency_penalty(
+                            &logit_arr,
+                            &ctx,
+                            frequency_penalty,
+                            frequency_context_size,
+                        )?;
                     }
                 }
+            }
 
             let (next_token_arr, logprobs_arr) =
                 crate::sampling::sample_and_logprobs(&logit_arr, Some(sampling_config))?;
@@ -1034,19 +1051,18 @@ impl Qwen3Model {
             let is_eos = next_token == eos_token_id as u32;
             let mut finish_reason_override: Option<&'static str> = None;
 
-            if !is_eos
-                && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
-                    let mut history = gen_tokens.to_vec();
-                    history.push(next_token);
-                    if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                        &history,
-                        max_consecutive_tokens,
-                        max_ngram_repeats,
-                        ngram_size,
-                    ) {
-                        finish_reason_override = Some(reason);
-                    }
+            if !is_eos && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
+                let mut history = gen_tokens.to_vec();
+                history.push(next_token);
+                if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                    &history,
+                    max_consecutive_tokens,
+                    max_ngram_repeats,
+                    ngram_size,
+                ) {
+                    finish_reason_override = Some(reason);
                 }
+            }
 
             // Check if this token hits the length limit
             if finish_reason_override.is_none()
@@ -1162,28 +1178,40 @@ impl Qwen3Model {
                     let max_ctx = repetition_context_size
                         .unwrap_or(256)
                         .max(presence_context_size.unwrap_or(20))
-                        .max(frequency_context_size.unwrap_or(20)) as usize;
+                        .max(frequency_context_size.unwrap_or(20))
+                        as usize;
                     let total = prompt.len() + generated.len();
                     let skip = total.saturating_sub(max_ctx);
                     let prompt_skip = skip.min(prompt.len());
-                    let ctx: Vec<u32> = prompt[prompt_skip..].iter()
-                        .chain(generated.iter())
+                    let gen_skip = skip.saturating_sub(prompt.len());
+                    let ctx: Vec<u32> = prompt[prompt_skip..]
+                        .iter()
+                        .chain(generated[gen_skip..].iter())
                         .copied()
                         .collect();
                     if !ctx.is_empty() {
                         if repetition_penalty != 1.0 {
                             logit_arr = crate::sampling::apply_repetition_penalty(
-                                &logit_arr, &ctx, repetition_penalty, repetition_context_size,
+                                &logit_arr,
+                                &ctx,
+                                repetition_penalty,
+                                repetition_context_size,
                             )?;
                         }
                         if presence_penalty != 0.0 {
                             logit_arr = crate::sampling::apply_presence_penalty(
-                                &logit_arr, &ctx, presence_penalty, presence_context_size,
+                                &logit_arr,
+                                &ctx,
+                                presence_penalty,
+                                presence_context_size,
                             )?;
                         }
                         if frequency_penalty != 0.0 {
                             logit_arr = crate::sampling::apply_frequency_penalty(
-                                &logit_arr, &ctx, frequency_penalty, frequency_context_size,
+                                &logit_arr,
+                                &ctx,
+                                frequency_penalty,
+                                frequency_context_size,
                             )?;
                         }
                     }
@@ -1199,19 +1227,18 @@ impl Qwen3Model {
                 let is_eos = next_token == eos_token_id as u32;
                 let mut finish_reason_override: Option<&'static str> = None;
 
-                if !is_eos
-                    && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
-                        let mut history = gen_tokens.to_vec();
-                        history.push(next_token);
-                        if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                            &history,
-                            max_consecutive_tokens,
-                            max_ngram_repeats,
-                            ngram_size,
-                        ) {
-                            finish_reason_override = Some(reason);
-                        }
+                if !is_eos && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
+                    let mut history = gen_tokens.to_vec();
+                    history.push(next_token);
+                    if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                        &history,
+                        max_consecutive_tokens,
+                        max_ngram_repeats,
+                        ngram_size,
+                    ) {
+                        finish_reason_override = Some(reason);
                     }
+                }
 
                 // Check if this token hits the length limit
                 if finish_reason_override.is_none()
