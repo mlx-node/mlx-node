@@ -783,6 +783,11 @@ impl Qwen3Model {
                 "max_new_tokens must be > 0 for paged generation",
             ));
         }
+        if prompt_tokens.is_empty() {
+            return Err(napi::Error::from_reason(
+                "prompt_tokens must not be empty for paged generation",
+            ));
+        }
         let scheduler = self
             .scheduler
             .as_ref()
@@ -1043,7 +1048,9 @@ impl Qwen3Model {
                     }
                 }
 
-            let is_finished = is_eos || finish_reason_override.is_some();
+            // Also check if this token hits the length limit
+            let hits_length = scheduler_guard.would_hit_length_limit(seq_id);
+            let is_finished = is_eos || finish_reason_override.is_some() || hits_length;
             if let Some(ref reason) = finish_reason_override {
                 finish_reason_overrides.insert(seq_id, reason.clone());
             }
@@ -1200,7 +1207,9 @@ impl Qwen3Model {
                         }
                     }
 
-                let is_finished = is_eos || finish_reason_override.is_some();
+                // Also check if this token hits the length limit
+                let hits_length = scheduler_guard.would_hit_length_limit(seq_id);
+                let is_finished = is_eos || finish_reason_override.is_some() || hits_length;
                 if let Some(ref reason) = finish_reason_override {
                     finish_reason_overrides.insert(seq_id, reason.clone());
                 }

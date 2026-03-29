@@ -198,6 +198,14 @@ impl ContinuousBatchingScheduler {
             .map(|seq| seq.generated_tokens.as_slice())
     }
 
+    /// Check if adding one more token would hit or exceed max_new_tokens for a sequence.
+    /// Used by the model to set is_finished on the last token so clients see it immediately.
+    pub fn would_hit_length_limit(&self, seq_id: u32) -> bool {
+        self.running
+            .get(&seq_id)
+            .is_some_and(|seq| seq.generated_tokens.len() + 1 >= seq.max_new_tokens as usize)
+    }
+
     /// Add a new request to the waiting queue
     pub fn add_request(&mut self, request: PendingRequest) {
         // Insert based on priority (higher priority first)
@@ -380,10 +388,9 @@ impl ContinuousBatchingScheduler {
                 seq.generated_tokens.push(output.token);
                 seq.position += 1;
 
-                // Extend cache for the new token
-                cache.extend_sequence(output.seq_id, 1)?;
-
-                // Check for completion
+                // Check for completion BEFORE extending cache —
+                // avoids allocating a block for a nonexistent next token
+                // when the sequence ends exactly on a block boundary.
                 let should_stop = output.is_eos
                     || output.finish_reason_override.is_some()
                     || output.token == eos_token
@@ -410,6 +417,9 @@ impl ContinuousBatchingScheduler {
 
                     // Free memory
                     cache.remove_sequence(output.seq_id)?;
+                } else {
+                    // Only extend cache if sequence continues generating
+                    cache.extend_sequence(output.seq_id, 1)?;
                 }
             }
         }
@@ -623,6 +633,7 @@ mod tests {
                     seq_id,
                     token: 100,
                     is_eos: false,
+                    finish_reason_override: None,
                 }],
                 &mut cache,
             )
@@ -638,6 +649,7 @@ mod tests {
                     seq_id,
                     token: 101,
                     is_eos: false,
+                    finish_reason_override: None,
                 }],
                 &mut cache,
             )
@@ -649,6 +661,7 @@ mod tests {
                     seq_id,
                     token: 102,
                     is_eos: false,
+                    finish_reason_override: None,
                 }],
                 &mut cache,
             )
@@ -691,6 +704,7 @@ mod tests {
                     seq_id,
                     token: 999,
                     is_eos: true,
+                    finish_reason_override: None,
                 }],
                 &mut cache,
             )
@@ -780,6 +794,7 @@ mod tests {
                         seq_id,
                         token: 100,
                         is_eos: false,
+                        finish_reason_override: None,
                     }],
                     &mut cache,
                 )
