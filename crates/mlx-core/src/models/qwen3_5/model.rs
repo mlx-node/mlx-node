@@ -366,6 +366,16 @@ impl Qwen3_5Model {
             .write()
             .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
         *caches_guard = Some(caches);
+        // Clear reuse state so stale history doesn't cause a false cache hit
+        if let Ok(mut th) = self.cached_token_history.write() {
+            th.clear();
+        }
+        if let Ok(mut ik) = self.cached_image_key.write() {
+            *ik = None;
+        }
+        if let Ok(mut rd) = self.cached_rope_deltas.write() {
+            *rd = None;
+        }
         Ok(())
     }
 
@@ -2001,9 +2011,8 @@ impl Qwen3_5Model {
                     let eos_id = model_config.eos_token_id as u32;
                     let mut generated_tokens: Vec<u32> = Vec::new();
                     let mut finish_reason = String::from("length");
-                    // Use the HF tokenizer's incremental DecodeStream for correct
-                    // streaming with ByteLevel BPE decoders.
                     let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
+                    let mut streamed_text_len: usize = 0;
 
                     let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
                     let generation_stream = Stream::new(DeviceType::Gpu);
@@ -2272,6 +2281,7 @@ impl Qwen3_5Model {
                                 .ok()
                                 .flatten()
                                 .unwrap_or_default();
+                            streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2418,6 +2428,7 @@ impl Qwen3_5Model {
                                 .ok()
                                 .flatten()
                                 .unwrap_or_default();
+                            streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2506,13 +2517,31 @@ impl Qwen3_5Model {
                         }
                     }
 
-                    // Decode full text for final chunk
                     let text = tokenizer_for_decode
                         .decode_sync(&generated_tokens, true)
                         .unwrap_or_else(|e| {
                             warn!("Failed to decode generated tokens: {}", e);
                             String::new()
                         });
+
+                    // Flush any residual bytes buffered by DecodeStream that
+                    // weren't emitted as intermediate chunks.
+                    if text.len() > streamed_text_len {
+                        let residual = text[streamed_text_len..].to_string();
+                        callback.call(
+                            Ok(ChatStreamChunk {
+                                text: residual,
+                                done: false,
+                                finish_reason: None,
+                                tool_calls: None,
+                                thinking: None,
+                                num_tokens: None,
+                                raw_text: None,
+                                performance: None,
+                            }),
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
 
                     let num_tokens = generated_tokens.len() as u32;
 

@@ -5698,19 +5698,18 @@ impl Qwen3Model {
             None
         };
 
-        // Apply chat template with tools and encode in a blocking task.
-        // Return both the token IDs (Vec<u32>) and the MxArray for prefix matching.
+        // Hold generation lock for the entire cache-read + generation + cache-write lifecycle.
+        let gen_lock = self.generation_lock.clone();
+        let _gen_guard = gen_lock.lock().await;
+
         let tokenizer_clone = tokenizer.clone();
         let (token_ids_vec, input_ids) = napi::bindgen_prelude::spawn_blocking(move || {
-            // Use the tokenizer's apply_chat_template_sync method which handles Jinja2 + tools
             let token_ids = tokenizer_clone.apply_chat_template_sync(
                 &messages,
                 Some(true),
                 tools.as_deref(),
                 enable_thinking,
             )?;
-
-            // Create MxArray from token IDs
             let arr = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
             Ok::<(Vec<u32>, MxArray), napi::Error>((token_ids, arr))
         })
@@ -5721,11 +5720,6 @@ impl Qwen3Model {
                 format!("Chat template task failed: {}", e),
             )
         })??;
-
-        // Hold generation lock for the entire cache-read + generation + cache-write lifecycle.
-        // This prevents concurrent chat()/reset_cache() from splicing state across conversations.
-        let gen_lock = self.generation_lock.clone();
-        let _gen_guard = gen_lock.lock().await;
 
         // === Cache reuse: prefix verification ===
         let (initial_kv_keys, initial_kv_values, initial_cache_idx, prefill_input_ids) =

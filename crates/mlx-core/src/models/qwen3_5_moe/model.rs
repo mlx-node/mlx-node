@@ -278,6 +278,16 @@ impl Qwen3_5MoeModel {
             .write()
             .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
         *caches_guard = Some(caches);
+        // Clear reuse state so stale history doesn't cause a false cache hit
+        if let Ok(mut th) = self.cached_token_history.write() {
+            th.clear();
+        }
+        if let Ok(mut ik) = self.cached_image_key.write() {
+            *ik = None;
+        }
+        if let Ok(mut rd) = self.cached_rope_deltas.write() {
+            *rd = None;
+        }
         Ok(())
     }
 
@@ -1794,6 +1804,7 @@ impl Qwen3_5MoeModel {
                     let mut generated_tokens: Vec<u32> = Vec::new();
                     let mut finish_reason = String::from("length");
                     let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
+                    let mut streamed_text_len: usize = 0;
 
                     // Track token history for repetition penalty
                     let mut token_history: Vec<u32> = if let Some(ref et) = expanded_tokens {
@@ -2082,6 +2093,7 @@ impl Qwen3_5MoeModel {
                                 .ok()
                                 .flatten()
                                 .unwrap_or_default();
+                            streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2229,6 +2241,7 @@ impl Qwen3_5MoeModel {
                                 .ok()
                                 .flatten()
                                 .unwrap_or_default();
+                            streamed_text_len += token_text.len();
                             callback.call(
                                 Ok(ChatStreamChunk {
                                     text: token_text,
@@ -2350,13 +2363,30 @@ impl Qwen3_5MoeModel {
                         None
                     };
 
-                    // Decode full text for final chunk
                     let text = tokenizer_for_decode
                         .decode_sync(&generated_tokens, true)
                         .unwrap_or_else(|e| {
                             warn!("Failed to decode generated tokens: {}", e);
                             String::new()
                         });
+
+                    // Flush residual bytes buffered by DecodeStream
+                    if text.len() > streamed_text_len {
+                        let residual = text[streamed_text_len..].to_string();
+                        callback.call(
+                            Ok(ChatStreamChunk {
+                                text: residual,
+                                done: false,
+                                finish_reason: None,
+                                tool_calls: None,
+                                thinking: None,
+                                num_tokens: None,
+                                raw_text: None,
+                                performance: None,
+                            }),
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
 
                     let num_tokens = generated_tokens.len() as u32;
 
