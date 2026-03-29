@@ -878,7 +878,7 @@ impl Qwen3Model {
         let ngram_size = config.ngram_size.unwrap_or(64);
 
         // Track per-sequence finish reason overrides (e.g. "repetition")
-        let mut finish_reason_overrides: HashMap<u32, String> = HashMap::new();
+        let mut finish_reason_overrides: HashMap<u32, &'static str> = HashMap::new();
 
         // Separate batch into prefill and decode sequences
         let mut prefill_indices: Vec<usize> = Vec::new();
@@ -1031,7 +1031,7 @@ impl Qwen3Model {
             let next_token = next_token_arr.item_at_int32(0)? as u32;
             let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
             let is_eos = next_token == eos_token_id as u32;
-            let mut finish_reason_override: Option<String> = None;
+            let mut finish_reason_override: Option<&'static str> = None;
 
             // Check repetition cutoff on the first token too
             if !is_eos
@@ -1044,7 +1044,7 @@ impl Qwen3Model {
                         max_ngram_repeats,
                         ngram_size,
                     ) {
-                        finish_reason_override = Some(reason.to_string());
+                        finish_reason_override = Some(reason);
                     }
                 }
 
@@ -1053,12 +1053,12 @@ impl Qwen3Model {
                 && !is_eos
                 && scheduler_guard.would_hit_length_limit(seq_id)
             {
-                finish_reason_override = Some("length".to_string());
+                finish_reason_override = Some("length");
             }
 
             let is_finished = is_eos || finish_reason_override.is_some();
-            if let Some(ref reason) = finish_reason_override {
-                finish_reason_overrides.insert(seq_id, reason.clone());
+            if let Some(reason) = finish_reason_override {
+                finish_reason_overrides.insert(seq_id, reason);
             }
 
             outputs.push(PagedTokenOutput {
@@ -1196,7 +1196,7 @@ impl Qwen3Model {
                 let next_token = next_token_arr.item_at_int32(0)? as u32;
                 let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
                 let is_eos = next_token == eos_token_id as u32;
-                let mut finish_reason_override: Option<String> = None;
+                let mut finish_reason_override: Option<&'static str> = None;
 
                 // Check repetition cutoff (after the token is known)
                 if !is_eos
@@ -1209,7 +1209,7 @@ impl Qwen3Model {
                             max_ngram_repeats,
                             ngram_size,
                         ) {
-                            finish_reason_override = Some(reason.to_string());
+                            finish_reason_override = Some(reason);
                         }
                     }
 
@@ -1218,7 +1218,7 @@ impl Qwen3Model {
                     && !is_eos
                     && scheduler_guard.would_hit_length_limit(seq_id)
                 {
-                    finish_reason_override = Some("length".to_string());
+                    finish_reason_override = Some("length");
                 }
 
                 let is_finished = is_eos || finish_reason_override.is_some();
@@ -1240,7 +1240,7 @@ impl Qwen3Model {
         let token_outputs: Vec<_> = outputs
             .iter()
             .map(|o| {
-                let override_reason = finish_reason_overrides.get(&o.seq_id).cloned();
+                let override_reason = finish_reason_overrides.get(&o.seq_id).copied();
                 crate::transformer::TokenOutput {
                     seq_id: o.seq_id,
                     token: o.token,

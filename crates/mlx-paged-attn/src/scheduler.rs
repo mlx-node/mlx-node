@@ -111,7 +111,7 @@ pub struct TokenOutput {
     pub is_eos: bool,
     /// Override finish reason (e.g. "repetition"). When set, takes precedence
     /// over the default EOS/length logic in process_outputs.
-    pub finish_reason_override: Option<String>,
+    pub finish_reason_override: Option<&'static str>,
 }
 
 /// Scheduler configuration
@@ -397,8 +397,8 @@ impl ContinuousBatchingScheduler {
                     || seq.generated_tokens.len() >= seq.max_new_tokens as usize;
 
                 if should_stop {
-                    let finish_reason = if let Some(ref reason) = output.finish_reason_override {
-                        reason.as_str()
+                    let finish_reason = if let Some(reason) = output.finish_reason_override {
+                        reason
                     } else if output.is_eos || output.token == eos_token {
                         "stop"
                     } else {

@@ -38,7 +38,9 @@ use super::persistence;
 
 // Import the shared model ID counter from the dense module — dense and MoE
 // share the same C++ weight map, so IDs must be globally unique.
-use crate::models::qwen3_5::model::{COMPILED_WEIGHTS_RWLOCK, QWEN35_MODEL_ID_COUNTER};
+use crate::models::qwen3_5::model::{
+    QWEN35_MODEL_ID_COUNTER, acquire_compiled_weight_guard,
+};
 
 /// Process-wide mutex serializing the MoE compiled forward lifecycle.
 ///
@@ -381,19 +383,8 @@ impl Qwen3_5MoeModel {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
-            // Re-validate compiled path under weight lock.
-            let mut _weight_guard = None;
-            let use_cpp = if use_cpp {
-                let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-                if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                    _weight_guard = Some(guard);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+            let _weight_guard = if use_cpp { acquire_compiled_weight_guard(model_id) } else { None };
+            let use_cpp = _weight_guard.is_some();
 
             // Acquire all locks ONCE for the entire prefill+decode sequence
             let mut layers_guard = layers_arc
@@ -784,19 +775,8 @@ impl Qwen3_5MoeModel {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
-            // Re-validate compiled path under weight lock.
-            let mut _weight_guard = None;
-            let use_cpp = if use_cpp {
-                let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-                if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                    _weight_guard = Some(guard);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+            let _weight_guard = if use_cpp { acquire_compiled_weight_guard(model_id) } else { None };
+            let use_cpp = _weight_guard.is_some();
 
             let tool_defs = config.tools.as_deref();
             let enable_thinking = config.enable_thinking;
@@ -1651,19 +1631,8 @@ impl Qwen3_5MoeModel {
             let callback_err = callback.clone();
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
-                    // Re-validate compiled path under weight lock.
-                    let mut _weight_guard = None;
-                    let use_cpp = if use_cpp {
-                        let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-                        if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                            _weight_guard = Some(guard);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
+                    let _weight_guard = if use_cpp { acquire_compiled_weight_guard(model_id) } else { None };
+                    let use_cpp = _weight_guard.is_some();
 
                     let tool_defs = config.tools.as_deref();
                     let enable_thinking = config.enable_thinking;
@@ -3386,19 +3355,8 @@ impl Qwen3_5MoeModel {
         };
         let use_cpp = compiled_lock.is_some();
 
-        // Acquire weight read lock to prevent concurrent model loads.
-        let mut _weight_guard = None;
-        let use_cpp = if use_cpp {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                _weight_guard = Some(guard);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        let _weight_guard = if use_cpp { acquire_compiled_weight_guard(model_id) } else { None };
+        let use_cpp = _weight_guard.is_some();
 
         // Ensure caches exist
         self.init_caches()?;

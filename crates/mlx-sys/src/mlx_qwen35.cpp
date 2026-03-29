@@ -117,8 +117,11 @@ void mlx_qwen35_store_weight(const char* name, mlx_array* weight) {
   auto& arr = *reinterpret_cast<array*>(weight);
   std::string key(name);
   g_weights().insert_or_assign(key, arr);
-  // Pre-compute transpose so get_weight_t() is a pure read (no lazy mutation).
-  g_weight_transposes().insert_or_assign(key, transpose(arr));
+  // Pre-compute transpose only for weights accessed via get_weight_t() / linear_proj().
+  // Norm weights, A_log, dt_bias, conv1d, scales, biases are only accessed via get_weight().
+  if (key.size() >= 7 && key.compare(key.size() - 7, 7, ".weight") == 0) {
+    g_weight_transposes().insert_or_assign(key, transpose(arr));
+  }
 }
 
 void mlx_qwen35_clear_weights() {

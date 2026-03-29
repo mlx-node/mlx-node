@@ -77,6 +77,21 @@ pub(crate) static QWEN35_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1); // 0 =
 /// between has_weight() / get_weight() in linear_proj().
 pub(crate) static COMPILED_WEIGHTS_RWLOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+/// Acquire the compiled weight read lock and verify model ownership in one step.
+/// Returns `Some(guard)` if this model owns the compiled weights, `None` otherwise.
+/// The guard must be held for the lifetime of the compiled decode to prevent
+/// concurrent model loads from swapping weights mid-generation.
+pub(crate) fn acquire_compiled_weight_guard(
+    model_id: u64,
+) -> Option<std::sync::RwLockReadGuard<'static, ()>> {
+    let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+    if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+        Some(guard)
+    } else {
+        None
+    }
+}
+
 /// Process-wide mutex serializing the dense compiled forward lifecycle.
 ///
 /// The C++ compiled decode path uses process-wide globals (`g_compiled_caches`,
@@ -559,20 +574,8 @@ impl Qwen3_5Model {
         };
 
         napi::bindgen_prelude::spawn_blocking(move || {
-            // Re-validate compiled path under weight lock. The read lock prevents
-            // concurrent model loads from mutating the C++ weight map mid-decode.
-            let mut _weight_guard = None;
-            let use_compiled = if use_compiled {
-                let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-                if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                    _weight_guard = Some(guard);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+            let _weight_guard = if use_compiled { acquire_compiled_weight_guard(model_id) } else { None };
+            let use_compiled = _weight_guard.is_some();
 
             // Acquire all locks ONCE for the entire prefill+decode sequence
             let mut layers_guard = layers_arc
@@ -3439,20 +3442,8 @@ impl Qwen3_5Model {
         };
         let use_compiled = compiled_lock.is_some();
 
-        // Acquire weight read lock to prevent concurrent model loads from
-        // swapping weights during compiled decode. Re-validate model ID under lock.
-        let mut _weight_guard = None;
-        let use_compiled = if use_compiled {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                _weight_guard = Some(guard);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        let _weight_guard = if use_compiled { acquire_compiled_weight_guard(model_id) } else { None };
+        let use_compiled = _weight_guard.is_some();
 
         // Ensure caches exist
         self.init_caches()?;
