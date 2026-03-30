@@ -21,7 +21,6 @@ use crate::transformer::kv_cache::KVCache;
 /// Standard transformer with GQA, SiLU MLP, RMSNorm, 1D RoPE, and QK norm.
 /// Differs from the standalone Qwen3Model in that it accepts pre-computed
 /// embeddings from the vision-text merge step.
-#[allow(dead_code)] // Used by the main QianfanOCR model (Step 8)
 pub(crate) struct InternVLLanguageModel {
     embedding: Embedding,
     layers: Vec<TransformerBlock>,
@@ -31,7 +30,6 @@ pub(crate) struct InternVLLanguageModel {
     kv_caches: Option<Vec<KVCache>>,
 }
 
-#[allow(dead_code)] // Used by the main QianfanOCR model (Step 8)
 impl InternVLLanguageModel {
     /// Build the language model from pre-loaded weights.
     ///
@@ -224,11 +222,7 @@ impl InternVLLanguageModel {
     ///
     /// Must be called before starting generation with caching.
     pub fn init_kv_caches(&mut self) {
-        self.kv_caches = Some(
-            (0..self.layers.len())
-                .map(|_| KVCache::new())
-                .collect(),
-        );
+        self.kv_caches = Some((0..self.layers.len()).map(|_| KVCache::new()).collect());
     }
 
     /// Reset KV caches, clearing all cached key-value states.
@@ -248,11 +242,13 @@ impl InternVLLanguageModel {
     }
 
     /// Get the number of transformer layers.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
     /// Get the current cache offset (number of cached tokens).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get_cache_offset(&self) -> i32 {
         self.kv_caches
             .as_ref()
@@ -267,10 +263,7 @@ mod tests {
     use super::*;
 
     /// Create minimal dummy weights for testing.
-    fn make_dummy_weights(
-        prefix: &str,
-        config: &Qwen3LMConfig,
-    ) -> HashMap<String, MxArray> {
+    fn make_dummy_weights(prefix: &str, config: &Qwen3LMConfig) -> HashMap<String, MxArray> {
         let mut w = HashMap::new();
         let h = config.hidden_size as i64;
         let inter = config.intermediate_size as i64;

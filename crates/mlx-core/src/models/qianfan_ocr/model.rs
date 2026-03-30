@@ -1,0 +1,1272 @@
+/**
+ * Qianfan-OCR Main Model
+ *
+ * Integrates InternViT vision encoder, MLP bridge, and Qwen3 language model
+ * for OCR and document understanding tasks.
+ *
+ * Provides NAPI-exposed load(), chat(), chatStream(), and generate() APIs.
+ */
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::{Env, Status, bindgen_prelude::*};
+use napi_derive::napi;
+use serde_json::Value;
+use tracing::info;
+
+use crate::array::{MxArray, clear_cache};
+use crate::models::qianfan_ocr::bridge::InternVLBridge;
+use crate::models::qianfan_ocr::chat::{extract_images_from_messages, format_qianfan_chat};
+use crate::models::qianfan_ocr::config::{InternVisionConfig, QianfanOCRConfig, Qwen3LMConfig};
+use crate::models::qianfan_ocr::language::InternVLLanguageModel;
+use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
+use crate::models::qianfan_ocr::processing::QianfanImageProcessor;
+use crate::models::qianfan_ocr::vision::InternViTModel;
+use crate::models::qwen3_5::model::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
+use crate::sampling::{
+    SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
+    sample,
+};
+use crate::stream::{DeviceType, Stream, StreamContext};
+use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::tools;
+use crate::tools::ToolCallResult;
+use crate::utils::safetensors::SafeTensorsFile;
+
+// ============================================================================
+// ChatResult
+// ============================================================================
+
+/// Result from a Qianfan-OCR chat() call.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct QianfanChatResult {
+    /// Generated text (with thinking/tool_call tags stripped)
+    pub text: String,
+    /// Parsed tool calls (if any)
+    pub tool_calls: Vec<ToolCallResult>,
+    /// Thinking content (text inside <think>...</think> tags)
+    pub thinking: Option<String>,
+    /// Number of generated tokens
+    pub num_tokens: u32,
+    /// Why generation stopped: "eos", "length", or "repetition"
+    pub finish_reason: String,
+    /// Raw generated text before parsing
+    pub raw_text: String,
+}
+
+// ============================================================================
+// QianfanOCRModel
+// ============================================================================
+
+/// Qianfan-OCR Vision-Language Model (InternVL architecture).
+///
+/// Combines InternViT vision encoder, MLP bridge with pixel shuffle,
+/// and Qwen3 language model for OCR and document understanding.
+#[napi(js_name = "QianfanOCRModel")]
+pub struct QianfanOCRModel {
+    config: QianfanOCRConfig,
+    vision: Option<Arc<InternViTModel>>,
+    bridge: Option<Arc<InternVLBridge>>,
+    language_model: Option<Arc<RwLock<InternVLLanguageModel>>>,
+    tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    /// Token history for KV cache reuse across chat() calls.
+    cached_token_history: Arc<RwLock<Vec<u32>>>,
+}
+
+#[napi]
+impl QianfanOCRModel {
+    /// Create a new QianfanOCRModel from config (uninitialized, no weights).
+    #[napi(constructor)]
+    pub fn new(config: QianfanOCRConfig) -> Self {
+        Self {
+            config,
+            vision: None,
+            bridge: None,
+            language_model: None,
+            tokenizer: None,
+            cached_token_history: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Returns true if weights have been loaded.
+    #[napi(getter)]
+    pub fn is_initialized(&self) -> bool {
+        self.vision.is_some() && self.bridge.is_some() && self.language_model.is_some()
+    }
+
+    /// Load a QianfanOCRModel from a directory.
+    ///
+    /// Reads config.json, loads SafeTensors weights (single or sharded),
+    /// builds vision encoder, bridge, and language model, and loads tokenizer.
+    #[napi]
+    pub fn load<'env>(
+        env: &'env Env,
+        model_path: String,
+    ) -> Result<PromiseRaw<'env, QianfanOCRModel>> {
+        env.spawn_future_with_callback(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let path = Path::new(&model_path);
+
+                    if !path.exists() {
+                        return Err(napi::Error::from_reason(format!(
+                            "Model path does not exist: {}",
+                            model_path
+                        )));
+                    }
+
+                    // --- Parse config.json ---
+                    let config_path = path.join("config.json");
+                    if !config_path.exists() {
+                        return Err(napi::Error::from_reason(format!(
+                            "Config file not found: {}",
+                            config_path.display()
+                        )));
+                    }
+
+                    let config_data = fs::read_to_string(&config_path)?;
+                    let raw: Value = serde_json::from_str(&config_data)?;
+
+                    let config = parse_config_json(&raw);
+
+                    info!(
+                        "Loading Qianfan-OCR model from: {} (vision: {} layers, LM: {} layers)",
+                        model_path,
+                        config.vision_config.num_hidden_layers,
+                        config.llm_config.num_hidden_layers
+                    );
+
+                    // --- Load SafeTensors weights ---
+                    let all_weights = load_safetensors_weights(path)?;
+                    info!("  Loaded {} total tensors", all_weights.len());
+
+                    // Transform keys to internal format
+                    let weights = load_qianfan_ocr_weights(all_weights)?;
+                    info!("  After transformation: {} tensors", weights.len());
+
+                    Ok::<_, Error>((config, weights, model_path))
+                })
+                .await
+                .map_err(|err| {
+                    Error::new(
+                        Status::GenericFailure,
+                        format!("Failed to load model: {err}"),
+                    )
+                })
+                .flatten()
+            },
+            |_env, (config, weights, model_path)| {
+                build_qianfan_ocr_from_weights(config, weights, &model_path)
+            },
+        )
+    }
+
+    /// Chat with the model.
+    ///
+    /// High-level API: processes images, formats prompt, generates, and decodes.
+    #[napi]
+    pub async fn chat(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<QianfanChatResult> {
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            enable_thinking: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        let max_new_tokens = config.max_new_tokens.unwrap_or(512);
+        let temperature = config.temperature.unwrap_or(0.0);
+        let top_k = config.top_k.unwrap_or(0);
+        let top_p = config.top_p.unwrap_or(1.0);
+        let min_p = config.min_p.unwrap_or(0.0);
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+        let enable_thinking = config.enable_thinking.unwrap_or(false);
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+        let vision_arc = self.vision.clone();
+        let bridge_arc = self.bridge.clone();
+        let lm_arc = self
+            .language_model
+            .clone()
+            .ok_or_else(|| Error::from_reason("Language model not loaded"))?;
+        let model_config = self.config.clone();
+        let cached_token_history_arc = self.cached_token_history.clone();
+
+        // Extract images from messages (CPU bound)
+        let image_bytes = extract_images_from_messages(&messages);
+
+        napi::bindgen_prelude::spawn_blocking(move || {
+            // --- Step 1: Process images ---
+            let processor = QianfanImageProcessor::new(&model_config);
+            let image_refs: Vec<&[u8]> = image_bytes.iter().map(|b| &b[..]).collect();
+            let processed_images = processor.process_many(&image_refs)?;
+
+            let num_patches_list: Vec<u32> = processed_images.iter().map(|p| p.num_tiles).collect();
+            let num_image_token = model_config.num_image_token() as u32;
+
+            // --- Step 2: Format chat template ---
+            let prompt = format_qianfan_chat(
+                &messages,
+                &num_patches_list,
+                num_image_token,
+                enable_thinking,
+            )?;
+
+            // --- Step 3: Tokenize ---
+            let token_ids = tokenizer.encode_sync(&prompt, None)?;
+            let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
+
+            // --- Step 4: Vision encoding ---
+            let generation_stream = Stream::new(DeviceType::Gpu);
+            let vision_features = if !processed_images.is_empty() {
+                let vision = vision_arc
+                    .as_ref()
+                    .ok_or_else(|| Error::from_reason("Vision model not loaded"))?;
+                let bridge = bridge_arc
+                    .as_ref()
+                    .ok_or_else(|| Error::from_reason("Bridge not loaded"))?;
+
+                // Stack all tiles from all images: [total_tiles, H, W, C]
+                let all_pixels = stack_processed_images(&processed_images)?;
+
+                let vit_out = {
+                    let _ctx = StreamContext::new(generation_stream);
+                    vision.forward(&all_pixels)?
+                };
+
+                // Bridge: pixel shuffle + MLP projection
+                let bridge_out = {
+                    let _ctx = StreamContext::new(generation_stream);
+                    bridge.forward(&vit_out)?
+                };
+
+                // bridge_out: [total_tiles, tokens_per_tile, llm_hidden]
+                // Flatten to [total_visual_tokens, llm_hidden]
+                let bridge_shape = bridge_out.shape()?;
+                let total_tiles = bridge_shape[0];
+                let tokens_per_tile = bridge_shape[1];
+                let hidden = bridge_shape[2];
+                Some(bridge_out.reshape(&[total_tiles * tokens_per_tile, hidden])?)
+            } else {
+                None
+            };
+
+            // --- Step 5: Prefix matching for KV cache reuse ---
+            let mut lm_guard = lm_arc.write().map_err(|_| {
+                Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
+            })?;
+
+            let prefix_len = if reuse_cache {
+                let history = cached_token_history_arc
+                    .read()
+                    .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
+                compute_prefix_match(&token_ids, &history)
+            } else {
+                0
+            };
+
+            if prefix_len == 0 || !reuse_cache {
+                // Full reset for fresh generation
+                lm_guard.reset_kv_caches();
+                lm_guard.init_kv_caches();
+            }
+
+            // --- Step 6: Prefill ---
+            let eos_token_id = model_config.eos_token_id;
+
+            let merged_embeds = if let Some(ref vf) = vision_features {
+                let text_embeds = {
+                    let _ctx = StreamContext::new(generation_stream);
+                    lm_guard.get_embeddings(&input_ids)?
+                };
+                let embed_dtype = text_embeds.dtype()?;
+                let vf_cast = if vf.dtype()? != embed_dtype {
+                    vf.astype(embed_dtype)?
+                } else {
+                    vf.clone()
+                };
+                merge_vision_features(
+                    &input_ids,
+                    &text_embeds,
+                    &vf_cast,
+                    model_config.img_context_token_id,
+                )?
+            } else {
+                let _ctx = StreamContext::new(generation_stream);
+                lm_guard.get_embeddings(&input_ids)?
+            };
+
+            // Run prefill from prefix_len onwards
+            let seq_len = merged_embeds.shape()?[1];
+            let prefill_embeds = if prefix_len > 0 && prefix_len < seq_len as usize {
+                merged_embeds.slice_axis(1, prefix_len as i64, seq_len)?
+            } else {
+                merged_embeds
+            };
+
+            let mut cache = lm_guard.kv_caches_mut().take();
+
+            let prefill_logits = {
+                let _ctx = StreamContext::new(generation_stream);
+                lm_guard.forward_from_embeddings(&prefill_embeds, &mut cache)?
+            };
+            *lm_guard.kv_caches_mut() = cache;
+
+            // Eval prefill logits -- caches materialize through dependency graph
+            prefill_logits.eval();
+            clear_cache();
+
+            // Get last logits for first token sampling
+            let prefill_seq = prefill_logits.shape()?[1];
+            let mut last_logits = prefill_logits
+                .slice_axis(1, prefill_seq - 1, prefill_seq)?
+                .squeeze(Some(&[0, 1]))?;
+
+            // --- Step 7: Sampling config ---
+            let sampling_config = SamplingConfig {
+                temperature: Some(temperature),
+                top_k: Some(top_k),
+                top_p: Some(top_p),
+                min_p: Some(min_p),
+            };
+
+            // Track all tokens for repetition penalty
+            let mut all_tokens: Vec<u32> = token_ids.clone();
+
+            // Apply penalties to first token
+            if repetition_penalty != 1.0 {
+                last_logits = apply_repetition_penalty(
+                    &last_logits,
+                    &all_tokens,
+                    repetition_penalty,
+                    Some(repetition_context_size),
+                )?;
+            }
+            if presence_penalty != 0.0 {
+                last_logits = apply_presence_penalty(
+                    &last_logits,
+                    &all_tokens,
+                    presence_penalty,
+                    Some(presence_context_size),
+                )?;
+            }
+            if frequency_penalty != 0.0 {
+                last_logits = apply_frequency_penalty(
+                    &last_logits,
+                    &all_tokens,
+                    frequency_penalty,
+                    Some(frequency_context_size),
+                )?;
+            }
+
+            // Sample first token
+            let mut token = sample(&last_logits, Some(sampling_config))?;
+            token.eval();
+
+            let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+            let mut finish_reason = "length".to_string();
+
+            // --- Step 8: Decode loop ---
+            for _step in 0..max_new_tokens {
+                token.eval();
+                let token_value = token.item_at_int32(0)? as u32;
+                generated_tokens.push(token_value);
+                all_tokens.push(token_value);
+
+                // Check EOS
+                if token_value == eos_token_id as u32 {
+                    finish_reason = "eos".to_string();
+                    break;
+                }
+
+                // Forward single token
+                let token_2d = token.reshape(&[1, 1])?;
+                let mut cache = lm_guard.kv_caches_mut().take();
+
+                let logits = {
+                    let _ctx = StreamContext::new(generation_stream);
+                    lm_guard.forward(&token_2d, &mut cache)?
+                };
+                *lm_guard.kv_caches_mut() = cache;
+
+                let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
+
+                // Apply penalties
+                if repetition_penalty != 1.0 {
+                    next_logits = apply_repetition_penalty(
+                        &next_logits,
+                        &all_tokens,
+                        repetition_penalty,
+                        Some(repetition_context_size),
+                    )?;
+                }
+                if presence_penalty != 0.0 {
+                    next_logits = apply_presence_penalty(
+                        &next_logits,
+                        &all_tokens,
+                        presence_penalty,
+                        Some(presence_context_size),
+                    )?;
+                }
+                if frequency_penalty != 0.0 {
+                    next_logits = apply_frequency_penalty(
+                        &next_logits,
+                        &all_tokens,
+                        frequency_penalty,
+                        Some(frequency_context_size),
+                    )?;
+                }
+
+                token = sample(&next_logits, Some(sampling_config))?;
+                token.eval();
+
+                // Periodic cache clearing to prevent memory accumulation
+                if (_step + 1) % 256 == 0 {
+                    clear_cache();
+                }
+            }
+
+            // --- Step 9: Store token history for cache reuse ---
+            if reuse_cache {
+                let mut full_history = token_ids.clone();
+                full_history.extend_from_slice(&generated_tokens);
+                if let Ok(mut history) = cached_token_history_arc.write() {
+                    *history = full_history;
+                }
+            }
+
+            // --- Step 10: Decode and parse ---
+            let raw_text = tokenizer.decode_sync(&generated_tokens, true)?;
+            let raw_text = raw_text.replace("<|im_end|>", "").trim().to_string();
+
+            let (text_after_thinking, thinking) = tools::parse_thinking(&raw_text);
+            let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
+
+            Ok(QianfanChatResult {
+                text: text.trim().to_string(),
+                tool_calls,
+                thinking,
+                num_tokens: generated_tokens.len() as u32,
+                finish_reason,
+                raw_text,
+            })
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Chat generation failed: {e}"),
+            )
+        })?
+    }
+
+    /// Streaming chat with the model.
+    ///
+    /// Same as chat() but emits tokens incrementally via callback.
+    #[napi(
+        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_clone = cancelled.clone();
+
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            enable_thinking: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        let max_new_tokens = config.max_new_tokens.unwrap_or(512);
+        let temperature = config.temperature.unwrap_or(0.0);
+        let top_k = config.top_k.unwrap_or(0);
+        let top_p = config.top_p.unwrap_or(1.0);
+        let min_p = config.min_p.unwrap_or(0.0);
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+        let enable_thinking = config.enable_thinking.unwrap_or(false);
+
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+        let vision_arc = self.vision.clone();
+        let bridge_arc = self.bridge.clone();
+        let lm_arc = self
+            .language_model
+            .clone()
+            .ok_or_else(|| Error::from_reason("Language model not loaded"))?;
+        let model_config = self.config.clone();
+
+        let image_bytes = extract_images_from_messages(&messages);
+
+        tokio::task::spawn_blocking(move || {
+            let emit = |chunk: ChatStreamChunk| {
+                callback.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
+            };
+
+            let result: Result<()> = (|| {
+                // --- Process images ---
+                let processor = QianfanImageProcessor::new(&model_config);
+                let image_refs: Vec<&[u8]> = image_bytes.iter().map(|b| &b[..]).collect();
+                let processed_images = processor.process_many(&image_refs)?;
+
+                let num_patches_list: Vec<u32> =
+                    processed_images.iter().map(|p| p.num_tiles).collect();
+                let num_image_token = model_config.num_image_token() as u32;
+
+                // --- Format and tokenize ---
+                let prompt = format_qianfan_chat(
+                    &messages,
+                    &num_patches_list,
+                    num_image_token,
+                    enable_thinking,
+                )?;
+                let token_ids = tokenizer.encode_sync(&prompt, None)?;
+                let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
+
+                // --- Vision encoding ---
+                let generation_stream = Stream::new(DeviceType::Gpu);
+                let vision_features = if !processed_images.is_empty() {
+                    let vision = vision_arc
+                        .as_ref()
+                        .ok_or_else(|| Error::from_reason("Vision model not loaded"))?;
+                    let bridge = bridge_arc
+                        .as_ref()
+                        .ok_or_else(|| Error::from_reason("Bridge not loaded"))?;
+
+                    let all_pixels = stack_processed_images(&processed_images)?;
+                    let vit_out = {
+                        let _ctx = StreamContext::new(generation_stream);
+                        vision.forward(&all_pixels)?
+                    };
+                    let bridge_out = {
+                        let _ctx = StreamContext::new(generation_stream);
+                        bridge.forward(&vit_out)?
+                    };
+                    let bridge_shape = bridge_out.shape()?;
+                    let total_tiles = bridge_shape[0];
+                    let tokens_per_tile = bridge_shape[1];
+                    let hidden = bridge_shape[2];
+                    Some(bridge_out.reshape(&[total_tiles * tokens_per_tile, hidden])?)
+                } else {
+                    None
+                };
+
+                // --- Prefill ---
+                let mut lm_guard = lm_arc.write().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
+                })?;
+
+                lm_guard.reset_kv_caches();
+                lm_guard.init_kv_caches();
+
+                let eos_token_id = model_config.eos_token_id;
+
+                let merged_embeds = if let Some(ref vf) = vision_features {
+                    let text_embeds = {
+                        let _ctx = StreamContext::new(generation_stream);
+                        lm_guard.get_embeddings(&input_ids)?
+                    };
+                    let embed_dtype = text_embeds.dtype()?;
+                    let vf_cast = if vf.dtype()? != embed_dtype {
+                        vf.astype(embed_dtype)?
+                    } else {
+                        vf.clone()
+                    };
+                    merge_vision_features(
+                        &input_ids,
+                        &text_embeds,
+                        &vf_cast,
+                        model_config.img_context_token_id,
+                    )?
+                } else {
+                    let _ctx = StreamContext::new(generation_stream);
+                    lm_guard.get_embeddings(&input_ids)?
+                };
+
+                let mut cache = lm_guard.kv_caches_mut().take();
+                let prefill_logits = {
+                    let _ctx = StreamContext::new(generation_stream);
+                    lm_guard.forward_from_embeddings(&merged_embeds, &mut cache)?
+                };
+                *lm_guard.kv_caches_mut() = cache;
+
+                // Eval prefill logits -- caches materialize through dependency graph
+                prefill_logits.eval();
+                clear_cache();
+
+                let seq_len = prefill_logits.shape()?[1];
+                let mut last_logits = prefill_logits
+                    .slice_axis(1, seq_len - 1, seq_len)?
+                    .squeeze(Some(&[0, 1]))?;
+
+                let sampling_config = SamplingConfig {
+                    temperature: Some(temperature),
+                    top_k: Some(top_k),
+                    top_p: Some(top_p),
+                    min_p: Some(min_p),
+                };
+
+                let mut all_tokens: Vec<u32> = token_ids;
+
+                if repetition_penalty != 1.0 {
+                    last_logits = apply_repetition_penalty(
+                        &last_logits,
+                        &all_tokens,
+                        repetition_penalty,
+                        Some(repetition_context_size),
+                    )?;
+                }
+
+                let mut token = sample(&last_logits, Some(sampling_config))?;
+                token.eval();
+
+                let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+                let mut finish_reason = "length".to_string();
+
+                // --- Streaming decode loop ---
+                for step in 0..max_new_tokens {
+                    if cancelled_clone.load(Ordering::Relaxed) {
+                        finish_reason = "cancelled".to_string();
+                        break;
+                    }
+
+                    token.eval();
+                    let token_value = token.item_at_int32(0)? as u32;
+                    generated_tokens.push(token_value);
+                    all_tokens.push(token_value);
+
+                    if token_value == eos_token_id as u32 {
+                        finish_reason = "eos".to_string();
+                        break;
+                    }
+
+                    // Decode this single token for streaming
+                    let token_text = tokenizer
+                        .decode_sync(&[token_value], true)
+                        .unwrap_or_default();
+
+                    emit(ChatStreamChunk {
+                        text: token_text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        raw_text: None,
+                        performance: None,
+                    });
+
+                    // Forward single token
+                    let token_2d = token.reshape(&[1, 1])?;
+                    let mut cache = lm_guard.kv_caches_mut().take();
+                    let logits = {
+                        let _ctx = StreamContext::new(generation_stream);
+                        lm_guard.forward(&token_2d, &mut cache)?
+                    };
+                    *lm_guard.kv_caches_mut() = cache;
+
+                    let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
+
+                    if repetition_penalty != 1.0 {
+                        next_logits = apply_repetition_penalty(
+                            &next_logits,
+                            &all_tokens,
+                            repetition_penalty,
+                            Some(repetition_context_size),
+                        )?;
+                    }
+                    if presence_penalty != 0.0 {
+                        next_logits = apply_presence_penalty(
+                            &next_logits,
+                            &all_tokens,
+                            presence_penalty,
+                            Some(presence_context_size),
+                        )?;
+                    }
+                    if frequency_penalty != 0.0 {
+                        next_logits = apply_frequency_penalty(
+                            &next_logits,
+                            &all_tokens,
+                            frequency_penalty,
+                            Some(frequency_context_size),
+                        )?;
+                    }
+
+                    token = sample(&next_logits, Some(sampling_config))?;
+                    token.eval();
+
+                    if (step + 1) % 256 == 0 {
+                        clear_cache();
+                    }
+                }
+
+                // Final chunk
+                let raw_text = tokenizer.decode_sync(&generated_tokens, true)?;
+                let raw_text = raw_text.replace("<|im_end|>", "").trim().to_string();
+                let (text_after_thinking, thinking) = tools::parse_thinking(&raw_text);
+                let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
+
+                emit(ChatStreamChunk {
+                    text: String::new(),
+                    done: true,
+                    finish_reason: Some(finish_reason),
+                    tool_calls: Some(tool_calls),
+                    thinking,
+                    num_tokens: Some(generated_tokens.len() as u32),
+                    raw_text: Some(text.trim().to_string()),
+                    performance: None,
+                });
+
+                Ok(())
+            })();
+
+            if let Err(e) = result {
+                emit(ChatStreamChunk {
+                    text: String::new(),
+                    done: true,
+                    finish_reason: Some("error".to_string()),
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    raw_text: Some(format!("Error: {e}")),
+                    performance: None,
+                });
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
+    }
+
+    /// Generate text tokens given pre-tokenized input.
+    ///
+    /// Lower-level API — prefer chat() for typical usage.
+    #[napi]
+    pub async fn generate(
+        &self,
+        input_ids: &MxArray,
+        max_new_tokens: Option<i32>,
+        temperature: Option<f64>,
+    ) -> Result<Vec<u32>> {
+        let max_new_tokens = max_new_tokens.unwrap_or(256);
+        let temperature = temperature.unwrap_or(0.0);
+
+        let lm_arc = self
+            .language_model
+            .clone()
+            .ok_or_else(|| Error::from_reason("Language model not loaded"))?;
+        let eos_token_id = self.config.eos_token_id;
+        let input_ids = input_ids.clone();
+
+        napi::bindgen_prelude::spawn_blocking(move || {
+            let generation_stream = Stream::new(DeviceType::Gpu);
+
+            let sampling_config = SamplingConfig {
+                temperature: Some(temperature),
+                top_k: Some(0),
+                top_p: Some(1.0),
+                min_p: Some(0.0),
+            };
+
+            let mut lm_guard = lm_arc.write().map_err(|_| {
+                Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
+            })?;
+
+            lm_guard.reset_kv_caches();
+            lm_guard.init_kv_caches();
+
+            // Prefill
+            let mut cache = lm_guard.kv_caches_mut().take();
+            let logits = {
+                let _ctx = StreamContext::new(generation_stream);
+                lm_guard.forward(&input_ids, &mut cache)?
+            };
+            *lm_guard.kv_caches_mut() = cache;
+
+            // Eval prefill logits -- caches materialize through dependency graph
+            logits.eval();
+            clear_cache();
+
+            let seq_len = logits.shape()?[1];
+            let last_logits = logits
+                .slice_axis(1, seq_len - 1, seq_len)?
+                .squeeze(Some(&[0, 1]))?;
+
+            let mut token = sample(&last_logits, Some(sampling_config))?;
+            token.eval();
+
+            let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+
+            for step in 0..max_new_tokens {
+                token.eval();
+                let token_value = token.item_at_int32(0)? as u32;
+                generated.push(token_value);
+
+                if token_value == eos_token_id as u32 {
+                    break;
+                }
+
+                let token_2d = token.reshape(&[1, 1])?;
+                let mut cache = lm_guard.kv_caches_mut().take();
+                let logits = {
+                    let _ctx = StreamContext::new(generation_stream);
+                    lm_guard.forward(&token_2d, &mut cache)?
+                };
+                *lm_guard.kv_caches_mut() = cache;
+
+                let next_logits = logits.squeeze(Some(&[0, 1]))?;
+                token = sample(&next_logits, Some(sampling_config))?;
+                token.eval();
+
+                if (step + 1) % 256 == 0 {
+                    clear_cache();
+                }
+            }
+
+            Ok(generated)
+        })
+        .await
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Generation failed: {e}")))?
+    }
+
+    /// Reset KV caches and token history.
+    #[napi]
+    pub fn reset_caches(&self) -> Result<()> {
+        if let Some(ref lm) = self.language_model {
+            let mut guard = lm.write().map_err(|_| {
+                Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
+            })?;
+            guard.reset_kv_caches();
+        }
+        if let Ok(mut history) = self.cached_token_history.write() {
+            history.clear();
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+/// Parse config.json into QianfanOCRConfig.
+fn parse_config_json(raw: &Value) -> QianfanOCRConfig {
+    let vision_raw = &raw["vision_config"];
+    let vision_config = InternVisionConfig {
+        hidden_size: vision_raw["hidden_size"].as_i64().unwrap_or(1024) as i32,
+        intermediate_size: vision_raw["intermediate_size"].as_i64().unwrap_or(4096) as i32,
+        num_hidden_layers: vision_raw["num_hidden_layers"].as_i64().unwrap_or(24) as i32,
+        num_attention_heads: vision_raw["num_attention_heads"].as_i64().unwrap_or(16) as i32,
+        num_channels: vision_raw["num_channels"].as_i64().unwrap_or(3) as i32,
+        image_size: vision_raw["image_size"].as_i64().unwrap_or(448) as i32,
+        patch_size: vision_raw["patch_size"].as_i64().unwrap_or(14) as i32,
+        layer_norm_eps: vision_raw["layer_norm_eps"].as_f64().unwrap_or(1e-6),
+        qkv_bias: vision_raw["qkv_bias"].as_bool().unwrap_or(true),
+        drop_path_rate: vision_raw["drop_path_rate"].as_f64().unwrap_or(0.0),
+    };
+
+    let llm_raw = &raw["llm_config"];
+    let llm_config = Qwen3LMConfig {
+        hidden_size: llm_raw["hidden_size"].as_i64().unwrap_or(2560) as i32,
+        num_hidden_layers: llm_raw["num_hidden_layers"].as_i64().unwrap_or(36) as i32,
+        intermediate_size: llm_raw["intermediate_size"].as_i64().unwrap_or(9728) as i32,
+        num_attention_heads: llm_raw["num_attention_heads"].as_i64().unwrap_or(32) as i32,
+        num_key_value_heads: llm_raw["num_key_value_heads"].as_i64().unwrap_or(8) as i32,
+        head_dim: llm_raw["head_dim"].as_i64().unwrap_or(128) as i32,
+        rms_norm_eps: llm_raw["rms_norm_eps"].as_f64().unwrap_or(1e-6),
+        vocab_size: llm_raw["vocab_size"].as_i64().unwrap_or(153678) as i32,
+        max_position_embeddings: llm_raw["max_position_embeddings"].as_i64().unwrap_or(32768)
+            as i32,
+        rope_theta: llm_raw["rope_theta"].as_f64().unwrap_or(5_000_000.0),
+        use_qk_norm: llm_raw["use_qk_norm"].as_bool().unwrap_or(true),
+        tie_word_embeddings: llm_raw["tie_word_embeddings"].as_bool().unwrap_or(false),
+    };
+
+    QianfanOCRConfig {
+        vision_config,
+        llm_config,
+        model_type: raw["model_type"]
+            .as_str()
+            .unwrap_or("internvl_chat")
+            .to_string(),
+        img_context_token_id: raw["img_context_token_id"].as_i64().unwrap_or(151671) as i32,
+        img_start_token_id: raw["img_start_token_id"].as_i64().unwrap_or(151669) as i32,
+        img_end_token_id: raw["img_end_token_id"].as_i64().unwrap_or(151670) as i32,
+        eos_token_id: raw["eos_token_id"].as_i64().unwrap_or(151645) as i32,
+        select_layer: raw["select_layer"].as_i64().unwrap_or(-1) as i32,
+        ps_version: raw["ps_version"].as_str().unwrap_or("v2").to_string(),
+        downsample_ratio: raw["downsample_ratio"].as_f64().unwrap_or(0.5),
+        dynamic_image_size: raw["dynamic_image_size"].as_bool().unwrap_or(true),
+        use_thumbnail: raw["use_thumbnail"].as_bool().unwrap_or(true),
+        max_dynamic_patch: raw["max_dynamic_patch"].as_i64().unwrap_or(12) as i32,
+        min_dynamic_patch: raw["min_dynamic_patch"].as_i64().unwrap_or(1) as i32,
+    }
+}
+
+/// Load SafeTensors weights from a model directory (single or sharded).
+fn load_safetensors_weights(path: &Path) -> Result<HashMap<String, MxArray>> {
+    let single = path.join("model.safetensors");
+    let mut all_weights: HashMap<String, MxArray> = HashMap::new();
+
+    if single.exists() {
+        let st = SafeTensorsFile::load(&single)?;
+        info!(
+            "  Loading {} tensors from model.safetensors",
+            st.tensor_names().len()
+        );
+        all_weights = st.load_tensors(&single)?;
+    } else {
+        // Try sharded format
+        let mut shard_index = 1;
+        loop {
+            let mut found_shard = None;
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(&format!("model-{:05}-of-", shard_index))
+                    && name.ends_with(".safetensors")
+                {
+                    found_shard = Some(entry.path());
+                    break;
+                }
+            }
+
+            match found_shard {
+                Some(shard_path) => {
+                    info!("  Loading shard: {}", shard_path.display());
+                    let st = SafeTensorsFile::load(&shard_path)?;
+                    let shard_weights = st.load_tensors(&shard_path)?;
+                    all_weights.extend(shard_weights);
+                    shard_index += 1;
+                }
+                None => {
+                    if shard_index == 1 {
+                        return Err(Error::new(
+                            Status::InvalidArg,
+                            format!("No SafeTensors files found in {}", path.display()),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(all_weights)
+}
+
+/// Build a QianfanOCRModel from transformed weights.
+fn build_qianfan_ocr_from_weights(
+    config: QianfanOCRConfig,
+    weights: HashMap<String, MxArray>,
+    model_path: &str,
+) -> Result<QianfanOCRModel> {
+    info!("Building Qianfan-OCR model from weights...");
+
+    // --- Build vision encoder ---
+    info!(
+        "  Building vision encoder ({} layers)...",
+        config.vision_config.num_hidden_layers
+    );
+    let vision = InternViTModel::build(
+        &weights,
+        "vision",
+        &config.vision_config,
+        config.select_layer,
+    )?;
+
+    // --- Build bridge ---
+    info!("  Building MLP bridge...");
+    let bridge = InternVLBridge::build(&weights, "bridge", config.downsample_ratio)?;
+
+    // --- Build language model ---
+    info!(
+        "  Building language model ({} layers)...",
+        config.llm_config.num_hidden_layers
+    );
+    let language_model = InternVLLanguageModel::build(&weights, "lm", &config.llm_config)?;
+
+    // --- Load tokenizer ---
+    let tokenizer_path = Path::new(model_path).join("tokenizer.json");
+    let tokenizer = if tokenizer_path.exists() {
+        info!("  Loading tokenizer from {}", tokenizer_path.display());
+        Some(Arc::new(Qwen3Tokenizer::load_from_file_sync(
+            tokenizer_path.to_str().unwrap_or("tokenizer.json"),
+        )?))
+    } else {
+        info!("  No tokenizer.json found, tokenizer not loaded");
+        None
+    };
+
+    info!(
+        "Qianfan-OCR model loaded: vision={} layers, LM={} layers, {} total weights",
+        config.vision_config.num_hidden_layers,
+        config.llm_config.num_hidden_layers,
+        weights.len()
+    );
+
+    Ok(QianfanOCRModel {
+        config,
+        vision: Some(Arc::new(vision)),
+        bridge: Some(Arc::new(bridge)),
+        language_model: Some(Arc::new(RwLock::new(language_model))),
+        tokenizer,
+        cached_token_history: Arc::new(RwLock::new(Vec::new())),
+    })
+}
+
+/// Merge vision features into text embeddings at image placeholder positions.
+///
+/// Replaces positions in `text_embeddings` where `input_ids == img_context_token_id`
+/// with corresponding vision features from `vision_features`.
+fn merge_vision_features(
+    input_ids: &MxArray,
+    text_embeddings: &MxArray,
+    vision_features: &MxArray,
+    img_context_token_id: i32,
+) -> Result<MxArray> {
+    let input_shape = input_ids.shape()?;
+    let batch_size = input_shape[0];
+
+    let image_token = MxArray::scalar_int(img_context_token_id)?;
+    let image_positions = input_ids.equal(&image_token)?;
+
+    let embed_shape = text_embeddings.shape()?;
+    let hidden_dim = embed_shape[2];
+
+    let mut batch_outputs: Vec<MxArray> = Vec::new();
+    let mut feature_start_idx = 0i64;
+
+    for batch_idx in 0..batch_size {
+        let batch_mask = image_positions.slice_axis(0, batch_idx, batch_idx + 1)?;
+        let batch_mask = batch_mask.squeeze(Some(&[0]))?;
+
+        let mask_sum = batch_mask.sum(None, None)?;
+        let num_positions = mask_sum.to_int32()?[0] as i64;
+
+        if num_positions > 0 {
+            let batch_features = vision_features.slice_axis(
+                0,
+                feature_start_idx,
+                feature_start_idx + num_positions,
+            )?;
+
+            let batch_embeds = text_embeddings.slice_axis(0, batch_idx, batch_idx + 1)?;
+            let batch_embeds = batch_embeds.squeeze(Some(&[0]))?;
+
+            let mask_int = batch_mask.astype(crate::array::DType::Int32)?;
+            let cumsum = mask_int.cumsum(0)?;
+
+            let ones = MxArray::scalar_int(1)?;
+            let feature_indices = cumsum.sub(&ones)?;
+            let zeros =
+                MxArray::zeros(&feature_indices.shape()?, Some(crate::array::DType::Int32))?;
+            let feature_indices = batch_mask.where_(&feature_indices, &zeros)?;
+
+            let gathered_features = batch_features.take(&feature_indices, 0)?;
+
+            let mask_expanded = batch_mask.reshape(&[-1, 1])?;
+            let mask_expanded =
+                MxArray::broadcast_to(&mask_expanded, &[batch_mask.shape()?[0], hidden_dim])?;
+
+            let batch_output = mask_expanded.where_(&gathered_features, &batch_embeds)?;
+            batch_outputs.push(batch_output);
+            feature_start_idx += num_positions;
+        } else {
+            let batch_embeds = text_embeddings.slice_axis(0, batch_idx, batch_idx + 1)?;
+            batch_outputs.push(batch_embeds.squeeze(Some(&[0]))?);
+        }
+    }
+
+    let refs: Vec<&MxArray> = batch_outputs.iter().collect();
+    MxArray::stack(refs, Some(0))
+}
+
+/// Stack pixel values from multiple ProcessedImages into a single array.
+fn stack_processed_images(
+    images: &[crate::models::qianfan_ocr::processing::ProcessedImage],
+) -> Result<MxArray> {
+    if images.len() == 1 {
+        return Ok(images[0].pixel_values.clone());
+    }
+
+    // Concatenate along batch dimension: [tiles_1, H, W, C] + [tiles_2, H, W, C] -> [total, H, W, C]
+    let mut result = images[0].pixel_values.clone();
+    for img in &images[1..] {
+        result = MxArray::concatenate(&result, &img.pixel_values, 0)?;
+    }
+    Ok(result)
+}
+
+/// Compute the longest common prefix between two token sequences.
+fn compute_prefix_match(new_tokens: &[u32], cached_tokens: &[u32]) -> usize {
+    new_tokens
+        .iter()
+        .zip(cached_tokens.iter())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::qianfan_ocr::config::QianfanOCRConfig;
+
+    #[test]
+    fn test_config_defaults_work() {
+        let config = QianfanOCRConfig::default();
+        assert_eq!(config.model_type, "internvl_chat");
+        assert_eq!(config.eos_token_id, 151645);
+        assert_eq!(config.num_image_token(), 256);
+    }
+
+    #[test]
+    fn test_model_construction_uninitialized() {
+        let config = QianfanOCRConfig::default();
+        let model = QianfanOCRModel::new(config);
+        assert!(!model.is_initialized());
+    }
+
+    #[test]
+    fn test_chat_result_creation() {
+        let result = QianfanChatResult {
+            text: "Hello".to_string(),
+            tool_calls: vec![],
+            thinking: None,
+            num_tokens: 1,
+            finish_reason: "eos".to_string(),
+            raw_text: "Hello".to_string(),
+        };
+        assert_eq!(result.text, "Hello");
+        assert_eq!(result.num_tokens, 1);
+        assert_eq!(result.finish_reason, "eos");
+        assert!(result.thinking.is_none());
+        assert!(result.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_prefix_match_full() {
+        let a = vec![1, 2, 3, 4, 5];
+        let b = vec![1, 2, 3, 4, 5];
+        assert_eq!(compute_prefix_match(&a, &b), 5);
+    }
+
+    #[test]
+    fn test_prefix_match_partial() {
+        let a = vec![1, 2, 3, 4, 5];
+        let b = vec![1, 2, 3, 6, 7];
+        assert_eq!(compute_prefix_match(&a, &b), 3);
+    }
+
+    #[test]
+    fn test_prefix_match_none() {
+        let a = vec![1, 2, 3];
+        let b = vec![4, 5, 6];
+        assert_eq!(compute_prefix_match(&a, &b), 0);
+    }
+
+    #[test]
+    fn test_prefix_match_empty() {
+        let a: Vec<u32> = vec![];
+        let b: Vec<u32> = vec![1, 2, 3];
+        assert_eq!(compute_prefix_match(&a, &b), 0);
+        assert_eq!(compute_prefix_match(&b, &a), 0);
+    }
+
+    #[test]
+    fn test_parse_config_json_defaults() {
+        let raw: Value = serde_json::from_str("{}").unwrap();
+        let config = parse_config_json(&raw);
+        assert_eq!(config.model_type, "internvl_chat");
+        assert_eq!(config.vision_config.hidden_size, 1024);
+        assert_eq!(config.llm_config.hidden_size, 2560);
+        assert_eq!(config.eos_token_id, 151645);
+    }
+
+    #[test]
+    fn test_parse_config_json_custom_values() {
+        let json = r#"{
+            "model_type": "test_model",
+            "eos_token_id": 12345,
+            "downsample_ratio": 0.25,
+            "vision_config": {
+                "hidden_size": 512,
+                "num_hidden_layers": 12
+            },
+            "llm_config": {
+                "hidden_size": 1024,
+                "num_hidden_layers": 16,
+                "vocab_size": 50000
+            }
+        }"#;
+        let raw: Value = serde_json::from_str(json).unwrap();
+        let config = parse_config_json(&raw);
+        assert_eq!(config.model_type, "test_model");
+        assert_eq!(config.eos_token_id, 12345);
+        assert_eq!(config.downsample_ratio, 0.25);
+        assert_eq!(config.vision_config.hidden_size, 512);
+        assert_eq!(config.vision_config.num_hidden_layers, 12);
+        assert_eq!(config.llm_config.hidden_size, 1024);
+        assert_eq!(config.llm_config.num_hidden_layers, 16);
+        assert_eq!(config.llm_config.vocab_size, 50000);
+    }
+}

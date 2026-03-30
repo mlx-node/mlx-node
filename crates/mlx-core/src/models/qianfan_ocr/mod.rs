@@ -8,17 +8,11 @@ pub mod bridge;
 pub mod chat;
 pub mod config;
 pub mod language;
+pub mod model;
 pub mod persistence;
 pub mod processing;
 pub mod vision;
 
 // Re-export public items
-#[allow(unused_imports)]
-pub(crate) use bridge::InternVLBridge;
-#[allow(unused_imports)]
-pub(crate) use chat::{count_images_in_messages, extract_images_from_messages, format_qianfan_chat};
-pub use config::{
-    InternVisionConfig, Qwen3LMConfig, QianfanOCRConfig, create_qianfan_ocr_config,
-};
-#[allow(unused_imports)]
-pub(crate) use persistence::load_qianfan_ocr_weights;
+pub use config::{InternVisionConfig, QianfanOCRConfig, Qwen3LMConfig, create_qianfan_ocr_config};
+pub use model::{QianfanChatResult, QianfanOCRModel};

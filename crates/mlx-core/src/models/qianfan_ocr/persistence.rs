@@ -13,7 +13,6 @@ use std::collections::HashMap;
 /// - `vision_model.*` (340 keys) → `vision.*`
 /// - `language_model.*` (399 keys) → `lm.*`
 /// - `mlp1.*` (6 keys) → `bridge.*`
-#[allow(dead_code)] // Used by the main QianfanOCR model (Step 8)
 pub(crate) fn transform_key(key: &str) -> String {
     // --- Vision encoder keys ---
     if let Some(rest) = key.strip_prefix("vision_model.") {
@@ -138,7 +137,6 @@ fn transpose_conv2d_weight(weight: &MxArray) -> napi::Result<MxArray> {
 /// Load and transform Qianfan-OCR weights from HuggingFace format.
 ///
 /// Applies key transformations and Conv2d transposition for all weights.
-#[allow(dead_code)] // Used by the main QianfanOCR model (Step 8)
 pub(crate) fn load_qianfan_ocr_weights(
     weights: HashMap<String, MxArray>,
 ) -> napi::Result<HashMap<String, MxArray>> {
@@ -280,9 +278,7 @@ mod tests {
         // Verify various layer indices
         for i in [0, 1, 11, 23] {
             assert_eq!(
-                transform_key(&format!(
-                    "vision_model.encoder.layers.{i}.attn.qkv.weight"
-                )),
+                transform_key(&format!("vision_model.encoder.layers.{i}.attn.qkv.weight")),
                 format!("vision.layers.{i}.attn.qkv.weight")
             );
         }
@@ -419,21 +415,30 @@ mod tests {
         // 4D patch conv weight should be transposed
         let weight = MxArray::from_float32(&[0.0; 1024 * 3 * 14 * 14], &[1024, 3, 14, 14])
             .expect("create array");
-        assert!(needs_conv2d_transpose("vision.embeddings.patch_conv.weight", &weight));
+        assert!(needs_conv2d_transpose(
+            "vision.embeddings.patch_conv.weight",
+            &weight
+        ));
     }
 
     #[test]
     fn test_needs_conv2d_transpose_non_patch() {
         // Non-patch keys should not be transposed
         let weight = MxArray::from_float32(&[0.0; 16], &[2, 2, 2, 2]).expect("create array");
-        assert!(!needs_conv2d_transpose("vision.layers.0.attn.qkv.weight", &weight));
+        assert!(!needs_conv2d_transpose(
+            "vision.layers.0.attn.qkv.weight",
+            &weight
+        ));
     }
 
     #[test]
     fn test_needs_conv2d_transpose_non_4d() {
         // 2D weight with patch_conv name should not be transposed
         let weight = MxArray::from_float32(&[0.0; 4], &[2, 2]).expect("create array");
-        assert!(!needs_conv2d_transpose("vision.embeddings.patch_conv.weight", &weight));
+        assert!(!needs_conv2d_transpose(
+            "vision.embeddings.patch_conv.weight",
+            &weight
+        ));
     }
 
     // ========================================
@@ -475,10 +480,7 @@ mod tests {
             "vision_model.embeddings.cls_token".to_string(),
             small.clone(),
         );
-        weights.insert(
-            "language_model.lm_head.weight".to_string(),
-            small.clone(),
-        );
+        weights.insert("language_model.lm_head.weight".to_string(), small.clone());
 
         let result = load_qianfan_ocr_weights(weights).expect("load weights");
 
@@ -496,8 +498,7 @@ mod tests {
 
         // Patch embedding weight in PyTorch NCHW format
         let data: Vec<f32> = (0..2 * 3 * 4 * 4).map(|i| i as f32).collect();
-        let patch_weight =
-            MxArray::from_float32(&data, &[2, 3, 4, 4]).expect("create array");
+        let patch_weight = MxArray::from_float32(&data, &[2, 3, 4, 4]).expect("create array");
 
         weights.insert(
             "vision_model.embeddings.patch_embedding.weight".to_string(),

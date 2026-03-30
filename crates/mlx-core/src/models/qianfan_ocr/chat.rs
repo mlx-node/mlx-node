@@ -13,9 +13,6 @@
 //! `<img>` + N copies of `<IMG_CONTEXT>` + `</img>`
 //! where N = `num_image_token * num_tiles_for_that_image`.
 
-// Suppress dead_code until the downstream consumer (main model, Step 8) is implemented.
-#![allow(dead_code)]
-
 use napi::bindgen_prelude::*;
 
 use crate::tokenizer::ChatMessage;
@@ -62,10 +59,7 @@ pub(crate) fn format_qianfan_chat(
 
     // Auto-prepend <image> placeholders for the first user message that carries
     // images but does not already mention <image> in its text.
-    if let Some((role, content)) = messages
-        .iter_mut()
-        .find(|(role, _)| role == "user")
-    {
+    if let Some((role, content)) = messages.iter_mut().find(|(role, _)| role == "user") {
         // Count how many images belong to the first user message.
         // We approximate by checking if this is the first user message
         // and num_patches_list is non-empty.
@@ -166,6 +160,7 @@ pub(crate) fn format_qianfan_chat(
 // ---------------------------------------------------------------------------
 
 /// Count total number of images across all messages.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn count_images_in_messages(messages: &[ChatMessage]) -> u32 {
     messages
         .iter()
@@ -248,8 +243,9 @@ mod tests {
         // After auto-prepend, content becomes: "<image>\nWhat is this?"
         // Then <image> is replaced with <img> + 768 <IMG_CONTEXT> + </img>
         let expected_token_count = 256 * 3;
-        let img_context_block: String =
-            std::iter::repeat(IMG_CONTEXT).take(expected_token_count).collect();
+        let img_context_block: String = std::iter::repeat(IMG_CONTEXT)
+            .take(expected_token_count)
+            .collect();
 
         let expected = format!(
             "<|im_start|>user\n<img>{img_context_block}</img>\nWhat is this?<|im_end|>\n<|im_start|>assistant\n"
@@ -264,8 +260,9 @@ mod tests {
         let result = format_qianfan_chat(&messages, &[2], 256, false).unwrap();
 
         let expected_token_count = 256 * 2;
-        let img_context_block: String =
-            std::iter::repeat(IMG_CONTEXT).take(expected_token_count).collect();
+        let img_context_block: String = std::iter::repeat(IMG_CONTEXT)
+            .take(expected_token_count)
+            .collect();
 
         let expected = format!(
             "<|im_start|>user\nLook at <img>{img_context_block}</img> please<|im_end|>\n<|im_start|>assistant\n"
@@ -276,10 +273,7 @@ mod tests {
     #[test]
     fn test_multi_image_replacement() {
         // Two images: 5 tiles and 3 tiles.
-        let messages = vec![text_msg(
-            "user",
-            "Compare these:\n<image>\n<image>",
-        )];
+        let messages = vec![text_msg("user", "Compare these:\n<image>\n<image>")];
         let result = format_qianfan_chat(&messages, &[5, 3], 256, false).unwrap();
 
         let block1: String = std::iter::repeat(IMG_CONTEXT).take(256 * 5).collect();
@@ -306,10 +300,7 @@ mod tests {
 
     #[test]
     fn test_empty_system_message_omitted() {
-        let messages = vec![
-            text_msg("system", ""),
-            text_msg("user", "Hello"),
-        ];
+        let messages = vec![text_msg("system", ""), text_msg("user", "Hello")];
         let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
 
         // Empty system message should be skipped entirely.
@@ -387,7 +378,11 @@ mod tests {
 
     #[test]
     fn test_count_images_single_message() {
-        let messages = vec![image_msg("user", "Look", vec![vec![1, 2, 3], vec![4, 5, 6]])];
+        let messages = vec![image_msg(
+            "user",
+            "Look",
+            vec![vec![1, 2, 3], vec![4, 5, 6]],
+        )];
         assert_eq!(count_images_in_messages(&messages), 2);
     }
 

@@ -9,9 +9,6 @@
 //! 3. Linear(4096, 2560) + GELU
 //! 4. Linear(2560, 2560)
 
-// Suppress dead_code until the downstream consumers (main model) are implemented.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use napi::bindgen_prelude::*;
@@ -241,11 +238,7 @@ mod tests {
     }
 
     /// Build bridge test weights.
-    fn make_bridge_weights(
-        prefix: &str,
-        mlp_in: i64,
-        llm_hidden: i64,
-    ) -> HashMap<String, MxArray> {
+    fn make_bridge_weights(prefix: &str, mlp_in: i64, llm_hidden: i64) -> HashMap<String, MxArray> {
         let mut w: HashMap<String, MxArray> = HashMap::new();
 
         // LayerNorm

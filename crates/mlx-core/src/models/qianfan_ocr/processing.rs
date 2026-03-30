@@ -13,10 +13,6 @@
 //! 5. Normalize each tile with ImageNet mean/std
 //! 6. Stack into a single MxArray [num_tiles, 448, 448, 3] (NHWC for MLX)
 
-// These structs are consumed by later steps (main model, chat).
-// Suppress dead_code until the downstream consumers are implemented.
-#![allow(dead_code)]
-
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
 use napi::bindgen_prelude::*;
@@ -118,8 +114,14 @@ fn dynamic_preprocess(
     let (orig_width, orig_height) = image.dimensions();
     let aspect_ratio = orig_width as f64 / orig_height as f64;
 
-    let (rows, cols) =
-        find_closest_aspect_ratio(aspect_ratio, min_num, max_num, image_size, orig_width, orig_height);
+    let (rows, cols) = find_closest_aspect_ratio(
+        aspect_ratio,
+        min_num,
+        max_num,
+        image_size,
+        orig_width,
+        orig_height,
+    );
 
     let target_width = cols * image_size;
     let target_height = rows * image_size;
@@ -314,8 +316,7 @@ mod tests {
         // When two ratios tie, the one whose area covers more of the original wins.
         // 1.5 aspect ratio: (2, 3) -> 3/2 = 1.5, (4, 6) -> 6/4 = 1.5
         // Both match exactly. For a large image, the larger grid should win.
-        let (rows, cols) =
-            find_closest_aspect_ratio(1.5, 1, 12, 448, 2000, 1333);
+        let (rows, cols) = find_closest_aspect_ratio(1.5, 1, 12, 448, 2000, 1333);
         // Both (2,3) and (4,6) are 1.5 — area decides
         // Original area = 2000*1333 = 2,666,000
         // (2,3) grid area = 6 * 448^2 = 1,203,264 -> 0.5 * 1,203,264 = 601,632 < 2,666,000 -> upgrade
@@ -455,7 +456,10 @@ mod tests {
 
         // 448x448 -> 1 tile (no thumbnail for single tile)
         assert_eq!(result.num_tiles, 1);
-        assert_eq!(shape_to_vec(result.pixel_values.shape().unwrap()), vec![1, 448, 448, 3]); // NHWC
+        assert_eq!(
+            shape_to_vec(result.pixel_values.shape().unwrap()),
+            vec![1, 448, 448, 3]
+        ); // NHWC
     }
 
     #[test]
@@ -474,7 +478,10 @@ mod tests {
         let result = processor.process(&png_bytes).unwrap();
 
         assert_eq!(result.num_tiles, 3);
-        assert_eq!(shape_to_vec(result.pixel_values.shape().unwrap()), vec![3, 448, 448, 3]);
+        assert_eq!(
+            shape_to_vec(result.pixel_values.shape().unwrap()),
+            vec![3, 448, 448, 3]
+        );
     }
 
     #[test]

@@ -9,10 +9,6 @@
 //! - Layer scale (learnable per-element multipliers on attention/MLP outputs)
 //! - DropPath is identity at inference (no-op, no weights)
 
-// These structs are consumed by later steps (MLP bridge, main model).
-// Suppress dead_code until the downstream consumers are implemented.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use napi::bindgen_prelude::*;
@@ -30,9 +26,10 @@ use crate::vision::interpolate::bilinear_interpolate;
 
 /// Look up a weight by key, returning a clear error if missing.
 pub(crate) fn get_weight(weights: &HashMap<String, MxArray>, key: &str) -> Result<MxArray> {
-    weights.get(key).cloned().ok_or_else(|| {
-        Error::from_reason(format!("Missing weight: {key}"))
-    })
+    weights
+        .get(key)
+        .cloned()
+        .ok_or_else(|| Error::from_reason(format!("Missing weight: {key}")))
 }
 
 // ============================================================================
@@ -73,8 +70,7 @@ impl InternVisionEmbeddings {
         )?;
 
         let cls_token = get_weight(weights, &format!("{prefix}.cls_token"))?;
-        let position_embedding =
-            get_weight(weights, &format!("{prefix}.position_embedding"))?;
+        let position_embedding = get_weight(weights, &format!("{prefix}.position_embedding"))?;
 
         let default_grid_size = config.image_size as u32 / patch_size;
 
@@ -129,7 +125,9 @@ impl InternVisionEmbeddings {
         // position_embedding: [1, num_positions, hidden_size]
         // Split into CLS (first token) and patch positions (rest)
         let cls_pos = self.position_embedding.slice_axis(1, 0, 1)?; // [1, 1, D]
-        let patch_pos = self.position_embedding.slice_axis(1, 1, default * default + 1)?; // [1, N, D]
+        let patch_pos = self
+            .position_embedding
+            .slice_axis(1, 1, default * default + 1)?; // [1, N, D]
 
         let hidden_size = self.position_embedding.shape()?[2];
 
@@ -140,8 +138,7 @@ impl InternVisionEmbeddings {
         let patch_pos_interp = bilinear_interpolate(&patch_pos_2d, grid_h, grid_w)?;
 
         // Flatten back to [1, grid_h * grid_w, hidden_size]
-        let patch_pos_flat =
-            patch_pos_interp.reshape(&[1, grid_h * grid_w, hidden_size])?;
+        let patch_pos_flat = patch_pos_interp.reshape(&[1, grid_h * grid_w, hidden_size])?;
 
         // Re-concatenate: [1, 1 + grid_h*grid_w, hidden_size]
         MxArray::concatenate(&cls_pos, &patch_pos_flat, 1)
@@ -277,10 +274,7 @@ pub(crate) struct InternVisionMLP {
 }
 
 impl InternVisionMLP {
-    pub fn build(
-        weights: &HashMap<String, MxArray>,
-        prefix: &str,
-    ) -> Result<Self> {
+    pub fn build(weights: &HashMap<String, MxArray>, prefix: &str) -> Result<Self> {
         let fc1 = Linear::from_weights(
             &get_weight(weights, &format!("{prefix}.mlp.fc1.weight"))?,
             Some(&get_weight(weights, &format!("{prefix}.mlp.fc1.bias"))?),
@@ -352,10 +346,8 @@ impl InternVisionEncoderLayer {
         let attn = InternVisionAttention::build(weights, prefix, config)?;
         let mlp = InternVisionMLP::build(weights, prefix)?;
 
-        let layer_scale_1 =
-            get_weight(weights, &format!("{prefix}.ls1"))?;
-        let layer_scale_2 =
-            get_weight(weights, &format!("{prefix}.ls2"))?;
+        let layer_scale_1 = get_weight(weights, &format!("{prefix}.ls1"))?;
+        let layer_scale_2 = get_weight(weights, &format!("{prefix}.ls2"))?;
 
         Ok(Self {
             layer_norm1,
@@ -421,11 +413,8 @@ impl InternViTModel {
         config: &InternVisionConfig,
         select_layer: i32,
     ) -> Result<Self> {
-        let embeddings = InternVisionEmbeddings::build(
-            weights,
-            &format!("{prefix}.embeddings"),
-            config,
-        )?;
+        let embeddings =
+            InternVisionEmbeddings::build(weights, &format!("{prefix}.embeddings"), config)?;
 
         let num_layers = config.num_hidden_layers as usize;
         let mut layers = Vec::with_capacity(num_layers);
@@ -469,6 +458,7 @@ impl InternViTModel {
     }
 
     /// Number of encoder layers
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
@@ -527,10 +517,22 @@ mod tests {
         for i in 0..config.num_hidden_layers {
             let lp = format!("{prefix}.encoder.layers.{i}");
             // LayerNorm
-            w.insert(format!("{lp}.norm1.weight"), MxArray::ones(&[d], None).unwrap());
-            w.insert(format!("{lp}.norm1.bias"), MxArray::zeros(&[d], None).unwrap());
-            w.insert(format!("{lp}.norm2.weight"), MxArray::ones(&[d], None).unwrap());
-            w.insert(format!("{lp}.norm2.bias"), MxArray::zeros(&[d], None).unwrap());
+            w.insert(
+                format!("{lp}.norm1.weight"),
+                MxArray::ones(&[d], None).unwrap(),
+            );
+            w.insert(
+                format!("{lp}.norm1.bias"),
+                MxArray::zeros(&[d], None).unwrap(),
+            );
+            w.insert(
+                format!("{lp}.norm2.weight"),
+                MxArray::ones(&[d], None).unwrap(),
+            );
+            w.insert(
+                format!("{lp}.norm2.bias"),
+                MxArray::zeros(&[d], None).unwrap(),
+            );
             // Attention
             w.insert(
                 format!("{lp}.attn.qkv.weight"),
@@ -566,14 +568,8 @@ mod tests {
                 MxArray::zeros(&[d], None).unwrap(),
             );
             // Layer scales
-            w.insert(
-                format!("{lp}.ls1"),
-                MxArray::ones(&[d], None).unwrap(),
-            );
-            w.insert(
-                format!("{lp}.ls2"),
-                MxArray::ones(&[d], None).unwrap(),
-            );
+            w.insert(format!("{lp}.ls1"), MxArray::ones(&[d], None).unwrap());
+            w.insert(format!("{lp}.ls2"), MxArray::ones(&[d], None).unwrap());
         }
 
         w
@@ -632,7 +628,11 @@ mod tests {
         let output = mlp.forward(&input).unwrap();
         output.eval();
         let shape: Vec<i64> = output.shape().unwrap().to_vec();
-        assert_eq!(shape, vec![b, n, d], "MLP output shape must match input shape");
+        assert_eq!(
+            shape,
+            vec![b, n, d],
+            "MLP output shape must match input shape"
+        );
     }
 
     #[test]
@@ -652,7 +652,11 @@ mod tests {
         let output = layer.forward(&input).unwrap();
         output.eval();
         let shape: Vec<i64> = output.shape().unwrap().to_vec();
-        assert_eq!(shape, vec![b, n, d], "Encoder layer must preserve shape (residual)");
+        assert_eq!(
+            shape,
+            vec![b, n, d],
+            "Encoder layer must preserve shape (residual)"
+        );
     }
 
     #[test]
@@ -707,10 +711,7 @@ mod tests {
 
         let grid = config.image_size / config.patch_size;
         let expected_patches = (grid * grid) as i64;
-        assert_eq!(
-            shape,
-            vec![b, expected_patches, config.hidden_size as i64],
-        );
+        assert_eq!(shape, vec![b, expected_patches, config.hidden_size as i64],);
     }
 
     #[test]
