@@ -3010,10 +3010,12 @@ export interface QianfanChatResult {
   thinking?: string;
   /** Number of generated tokens */
   numTokens: number;
-  /** Why generation stopped: "eos", "length", or "repetition" */
+  /** Why generation stopped: "stop", "length", or "repetition" */
   finishReason: string;
   /** Raw generated text before parsing */
   rawText: string;
+  /** Performance metrics (only present when `reportPerformance: true`) */
+  performance?: PerformanceMetrics;
 }
 
 /** Full Qianfan-OCR model configuration */

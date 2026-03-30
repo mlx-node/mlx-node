@@ -493,10 +493,10 @@ impl QianfanOCRModel {
             }
 
             // --- Step 10: Decode and parse ---
-            let raw_text = tokenizer.decode_sync(&generated_tokens, true)?;
-            let raw_text = raw_text.replace("<|im_end|>", "").trim().to_string();
+            let raw_decoded = tokenizer.decode_sync(&generated_tokens, true)?;
+            let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
 
-            let (text_after_thinking, thinking) = tools::parse_thinking(&raw_text);
+            let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
             let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
 
             let performance = if let (Some(gen_start), Some(first_tok)) =
@@ -530,7 +530,7 @@ impl QianfanOCRModel {
                 thinking,
                 num_tokens: generated_tokens.len() as u32,
                 finish_reason,
-                raw_text,
+                raw_text: raw_decoded,
                 performance,
             })
         })
@@ -842,9 +842,9 @@ impl QianfanOCRModel {
                 }
 
                 // Final chunk
-                let raw_text = tokenizer.decode_sync(&generated_tokens, true)?;
-                let raw_text = raw_text.replace("<|im_end|>", "").trim().to_string();
-                let (text_after_thinking, thinking) = tools::parse_thinking(&raw_text);
+                let raw_decoded = tokenizer.decode_sync(&generated_tokens, true)?;
+                let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
+                let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
                 let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
 
                 let performance = if let (Some(gen_start), Some(first_tok)) =
@@ -875,13 +875,13 @@ impl QianfanOCRModel {
                 };
 
                 emit(ChatStreamChunk {
-                    text: String::new(),
+                    text: text.trim().to_string(),
                     done: true,
                     finish_reason: Some(finish_reason),
                     tool_calls: Some(tool_calls),
                     thinking,
                     num_tokens: Some(generated_tokens.len() as u32),
-                    raw_text: Some(text.trim().to_string()),
+                    raw_text: Some(raw_decoded),
                     performance,
                 });
 

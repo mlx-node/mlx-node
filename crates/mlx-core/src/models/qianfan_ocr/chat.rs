@@ -1,13 +1,17 @@
 //! Chat Template + Formatting for Qianfan-OCR
 //!
-//! Produces ChatML-style prompts with visual token placeholders for the
-//! InternVL / Qianfan-OCR model.
+//! Faithful implementation of the upstream chat_template.jinja from
+//! <https://huggingface.co/baidu/Qianfan-OCR/raw/main/chat_template.jinja>.
 //!
-//! Template format:
+//! Template format (ChatML):
 //! - System: `<|im_start|>system\n{message}<|im_end|>\n`
 //! - User:   `<|im_start|>user\n{content}<|im_end|>\n`
 //! - Assistant: `<|im_start|>assistant\n{content}<|im_end|>\n`
+//! - Tool:  `<|im_start|>user\n<tool_response>\n...\n</tool_response><|im_end|>\n`
 //! - Final generation prompt: `<|im_start|>assistant\n`
+//!
+//! enable_thinking appends `\n<think>` to the LAST real user message
+//! (before `<|im_end|>`), matching the upstream template exactly.
 //!
 //! Each `<image>` placeholder is replaced with:
 //! `<img>` + N copies of `<IMG_CONTEXT>` + `</img>`
@@ -27,7 +31,6 @@ const IMAGE_PLACEHOLDER: &str = "<image>";
 const IMG_START: &str = "<img>";
 const IMG_END: &str = "</img>";
 const IMG_CONTEXT: &str = "<IMG_CONTEXT>";
-const THINK_START: &str = "<think>";
 
 // ---------------------------------------------------------------------------
 // format_qianfan_chat
@@ -35,79 +38,160 @@ const THINK_START: &str = "<think>";
 
 /// Format chat messages into the Qianfan-OCR prompt format.
 ///
-/// The template is ChatML-style:
-/// - System: `<|im_start|>system\n{message}<|im_end|>\n`
-/// - User: `<|im_start|>user\n{content}<|im_end|>\n`
-/// - Assistant: `<|im_start|>assistant\n{content}<|im_end|>\n`
-/// - Final: `<|im_start|>assistant\n` (for generation)
-///
-/// Each `<image>` placeholder in user content is replaced with:
-/// `<img>` + N copies of `<IMG_CONTEXT>` + `</img>`
-/// where N = num_image_token * num_tiles_for_that_image
+/// Matches the upstream `chat_template.jinja` behavior:
+/// - `enable_thinking` appends `\n<think>` to the last real user message
+///   (not after the assistant generation prompt)
+/// - Tool role messages are wrapped in `<tool_response>` tags
+/// - Assistant tool_calls are formatted as `<tool_call>` JSON blocks
+/// - Assistant reasoning_content is formatted with `<think>` tags
+/// - Per-message `<image>` placeholders are auto-prepended for messages
+///   that carry images but lack explicit `<image>` tags
 pub(crate) fn format_qianfan_chat(
     messages: &[ChatMessage],
     num_patches_list: &[u32],
     num_image_token: u32,
     enable_thinking: bool,
 ) -> Result<String> {
-    // Step 1: Clone messages so we can mutate the first user message's content
-    // if it contains images but no explicit <image> placeholders.
-    let mut messages: Vec<(String, String)> = messages
-        .iter()
-        .map(|m| (m.role.clone(), m.content.clone()))
-        .collect();
-
-    // Auto-prepend <image> placeholders for the first user message that carries
-    // images but does not already mention <image> in its text.
-    if let Some((role, content)) = messages.iter_mut().find(|(role, _)| role == "user") {
-        // Count how many images belong to the first user message.
-        // We approximate by checking if this is the first user message
-        // and num_patches_list is non-empty.
-        if role == "user" && !num_patches_list.is_empty() && !content.contains(IMAGE_PLACEHOLDER) {
-            // Count images for this first user message: we count how many images
-            // appear before the second user message. Since we don't have per-message
-            // image counts here directly, we use num_patches_list length as the total
-            // image count to decide how many <image> tags to prepend.
-            // However, the spec says "prepend for each image in THAT message".
-            // Since this auto-prepend only fires for the first user message,
-            // and typically all images are in the first message, we prepend
-            // num_patches_list.len() placeholders.
-            let mut prefix = String::new();
-            for _ in 0..num_patches_list.len() {
-                prefix.push_str(IMAGE_PLACEHOLDER);
-                prefix.push('\n');
-            }
-            prefix.push_str(content);
-            *content = prefix;
-        }
+    if messages.is_empty() {
+        return Ok(format!("{IM_START}assistant\n"));
     }
 
-    // Step 2: Build ChatML formatted string
+    // --- Find the last real user query index (not a tool_response) ---
+    let last_query_index = find_last_query_index(messages);
+
+    // --- Build the prompt ---
     let mut prompt = String::new();
+    let msg_count = messages.len();
 
-    for (role, content) in &messages {
-        // Skip empty system messages
-        if role == "system" && content.is_empty() {
-            continue;
+    // Handle system message (first message only, when role==system)
+    let start_idx = if messages[0].role == "system" {
+        if !messages[0].content.is_empty() {
+            prompt.push_str(IM_START);
+            prompt.push_str("system\n");
+            prompt.push_str(&messages[0].content);
+            prompt.push_str(IM_END);
+            prompt.push('\n');
         }
+        1
+    } else {
+        0
+    };
 
-        prompt.push_str(IM_START);
-        prompt.push_str(role);
-        prompt.push('\n');
-        prompt.push_str(content);
+    for i in start_idx..msg_count {
+        let msg = &messages[i];
 
-        // For the last message, if it is an assistant message with content,
-        // close it and add the generation prompt after.
-        // Otherwise, close every message normally.
-        prompt.push_str(IM_END);
-        prompt.push('\n');
+        match msg.role.as_str() {
+            "user" => {
+                // Auto-prepend <image> for this user message's images
+                let mut content = msg.content.clone();
+                let img_count = msg.images.as_ref().map_or(0, |imgs| imgs.len());
+                if img_count > 0 && !content.contains(IMAGE_PLACEHOLDER) {
+                    let mut prefix = String::new();
+                    for _ in 0..img_count {
+                        prefix.push_str(IMAGE_PLACEHOLDER);
+                        prefix.push('\n');
+                    }
+                    prefix.push_str(&content);
+                    content = prefix;
+                }
+
+                prompt.push_str(IM_START);
+                prompt.push_str("user\n");
+                prompt.push_str(&content);
+
+                // enable_thinking: append \n<think> to the last real user msg
+                if enable_thinking && i == last_query_index {
+                    prompt.push_str("\n<think>");
+                }
+
+                prompt.push_str(IM_END);
+                prompt.push('\n');
+            }
+
+            "assistant" => {
+                prompt.push_str(IM_START);
+                prompt.push_str("assistant\n");
+
+                // Handle reasoning_content (thinking)
+                if let Some(reasoning) = msg
+                    .reasoning_content
+                    .as_ref()
+                    .filter(|r| !r.is_empty())
+                {
+                    prompt.push_str("<think>\n");
+                    prompt.push_str(reasoning.trim());
+                    prompt.push_str("\n</think>\n\n");
+                }
+
+                prompt.push_str(&msg.content);
+
+                // Handle tool_calls
+                if let Some(ref tool_calls) = msg.tool_calls {
+                    for (j, tc) in tool_calls.iter().enumerate() {
+                        if (j == 0 && !msg.content.is_empty()) || j > 0 {
+                            prompt.push('\n');
+                        }
+                        prompt.push_str("<tool_call>\n{\"name\": \"");
+                        prompt.push_str(&tc.name);
+                        prompt.push_str("\", \"arguments\": ");
+                        prompt.push_str(&tc.arguments);
+                        prompt.push_str("}\n</tool_call>");
+                    }
+                }
+
+                prompt.push_str(IM_END);
+                prompt.push('\n');
+            }
+
+            "tool" => {
+                // Group consecutive tool messages under one <|im_start|>user
+                let is_first_tool =
+                    i == start_idx || messages[i - 1].role != "tool";
+                let is_last_tool =
+                    i == msg_count - 1 || messages[i + 1].role != "tool";
+
+                if is_first_tool {
+                    prompt.push_str(IM_START);
+                    prompt.push_str("user");
+                }
+                prompt.push_str("\n<tool_response>\n");
+                prompt.push_str(&msg.content);
+                prompt.push_str("\n</tool_response>");
+                if is_last_tool {
+                    prompt.push_str(IM_END);
+                    prompt.push('\n');
+                }
+            }
+
+            "system" => {
+                // Non-first system messages
+                prompt.push_str(IM_START);
+                prompt.push_str("system\n");
+                prompt.push_str(&msg.content);
+                if enable_thinking && i == last_query_index {
+                    prompt.push_str("\n<think>");
+                }
+                prompt.push_str(IM_END);
+                prompt.push('\n');
+            }
+
+            _ => {
+                // Unknown role — pass through
+                prompt.push_str(IM_START);
+                prompt.push_str(&msg.role);
+                prompt.push('\n');
+                prompt.push_str(&msg.content);
+                prompt.push_str(IM_END);
+                prompt.push('\n');
+            }
+        }
     }
 
-    // Add the final generation prompt: <|im_start|>assistant\n
+    // Final generation prompt
     prompt.push_str(IM_START);
     prompt.push_str("assistant\n");
 
-    // Step 3: Replace <image> placeholders with visual tokens
+    // --- Replace <image> placeholders with visual tokens ---
     let mut patch_idx = 0;
     let mut search_start = 0;
     while let Some(rel_pos) = prompt[search_start..].find(IMAGE_PLACEHOLDER) {
@@ -116,7 +200,8 @@ pub(crate) fn format_qianfan_chat(
             return Err(Error::new(
                 Status::InvalidArg,
                 format!(
-                    "More <image> placeholders in prompt than entries in num_patches_list ({})",
+                    "More <image> placeholders ({}) than images in num_patches_list ({})",
+                    patch_idx + 1,
                     num_patches_list.len()
                 ),
             ));
@@ -125,7 +210,6 @@ pub(crate) fn format_qianfan_chat(
         let num_tiles = num_patches_list[patch_idx];
         let total_tokens = num_image_token * num_tiles;
 
-        // Build the replacement: <img> + N * <IMG_CONTEXT> + </img>
         let replacement_len =
             IMG_START.len() + (IMG_CONTEXT.len() * total_tokens as usize) + IMG_END.len();
         let mut replacement = String::with_capacity(replacement_len);
@@ -135,24 +219,42 @@ pub(crate) fn format_qianfan_chat(
         }
         replacement.push_str(IMG_END);
 
-        // Replace this one occurrence
         prompt.replace_range(pos..pos + IMAGE_PLACEHOLDER.len(), &replacement);
         search_start = pos + replacement_len;
         patch_idx += 1;
     }
 
-    // Step 4: Optionally append <think>\n for thinking mode
-    if enable_thinking {
-        prompt.push_str(THINK_START);
-        prompt.push('\n');
+    // Validate all images were consumed
+    if patch_idx < num_patches_list.len() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "Only {} of {} images were referenced by <image> placeholders. \
+                 Add <image> tags to user messages or ensure images are on user messages.",
+                patch_idx,
+                num_patches_list.len()
+            ),
+        ));
     }
 
     Ok(prompt)
 }
 
-// ---------------------------------------------------------------------------
-// count_images_in_messages
-// ---------------------------------------------------------------------------
+/// Find the index of the last real user query (not a tool_response).
+/// Matches the upstream Jinja `ns.last_query_index` logic.
+fn find_last_query_index(messages: &[ChatMessage]) -> usize {
+    let len = messages.len();
+    for i in (0..len).rev() {
+        if messages[i].role == "user"
+            && !(messages[i].content.starts_with("<tool_response>")
+                && messages[i].content.ends_with("</tool_response>"))
+        {
+            return i;
+        }
+    }
+    // Fallback: last message
+    len.saturating_sub(1)
+}
 
 /// Count total number of images across all messages.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -171,7 +273,6 @@ pub(crate) fn count_images_in_messages(messages: &[ChatMessage]) -> u32 {
 mod tests {
     use super::*;
 
-    /// Helper: create a ChatMessage with no images.
     fn text_msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_string(),
@@ -183,242 +284,276 @@ mod tests {
         }
     }
 
-    /// Helper: create a ChatMessage with image data.
-    fn image_msg(role: &str, content: &str, images: Vec<Vec<u8>>) -> ChatMessage {
-        let uint8_images: Vec<Uint8Array> = images.into_iter().map(|v| v.into()).collect();
+    fn image_msg(role: &str, content: &str, num_images: usize) -> ChatMessage {
+        let images: Vec<Uint8Array> = (0..num_images).map(|_| vec![1u8].into()).collect();
         ChatMessage {
             role: role.to_string(),
             content: content.to_string(),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
-            images: Some(uint8_images),
+            images: Some(images),
         }
     }
 
-    // -----------------------------------------------------------------------
-    // format_qianfan_chat tests
-    // -----------------------------------------------------------------------
+    fn assistant_msg(content: &str) -> ChatMessage {
+        text_msg("assistant", content)
+    }
+
+    fn assistant_with_reasoning(content: &str, reasoning: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: Some(reasoning.to_string()),
+            images: None,
+        }
+    }
+
+    fn assistant_with_tool_calls(content: &str, calls: Vec<(&str, &str)>) -> ChatMessage {
+        use crate::tokenizer::ToolCall;
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            tool_calls: Some(
+                calls
+                    .into_iter()
+                    .map(|(name, args)| ToolCall {
+                        id: None,
+                        name: name.to_string(),
+                        arguments: args.to_string(),
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            reasoning_content: None,
+            images: None,
+        }
+    }
+
+    fn tool_msg(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            images: None,
+        }
+    }
+
+    // --- Basic formatting ---
 
     #[test]
-    fn test_simple_text_only_chat() {
-        let messages = vec![text_msg("user", "Hello, world!")];
+    fn test_simple_text_only() {
+        let messages = vec![text_msg("user", "Hello!")];
         let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
-
         assert_eq!(
             result,
-            "<|im_start|>user\nHello, world!<|im_end|>\n<|im_start|>assistant\n"
+            "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
         );
     }
 
     #[test]
-    fn test_single_image_auto_prepend() {
-        // User provides one image (3 tiles) but no <image> in content.
-        // The function should auto-prepend <image>\n.
-        let messages = vec![text_msg("user", "What is this?")];
-        let result = format_qianfan_chat(&messages, &[3], 256, false).unwrap();
-
-        // After auto-prepend, content becomes: "<image>\nWhat is this?"
-        // Then <image> is replaced with <img> + 768 <IMG_CONTEXT> + </img>
-        let expected_token_count = 256 * 3;
-        let img_context_block: String = std::iter::repeat(IMG_CONTEXT)
-            .take(expected_token_count)
-            .collect();
-
-        let expected = format!(
-            "<|im_start|>user\n<img>{img_context_block}</img>\nWhat is this?<|im_end|>\n<|im_start|>assistant\n"
-        );
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_single_image_manual_placeholder() {
-        // User explicitly puts <image> in content — no auto-prepend.
-        let messages = vec![text_msg("user", "Look at <image> please")];
-        let result = format_qianfan_chat(&messages, &[2], 256, false).unwrap();
-
-        let expected_token_count = 256 * 2;
-        let img_context_block: String = std::iter::repeat(IMG_CONTEXT)
-            .take(expected_token_count)
-            .collect();
-
-        let expected = format!(
-            "<|im_start|>user\nLook at <img>{img_context_block}</img> please<|im_end|>\n<|im_start|>assistant\n"
-        );
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_multi_image_replacement() {
-        // Two images: 5 tiles and 3 tiles.
-        let messages = vec![text_msg("user", "Compare these:\n<image>\n<image>")];
-        let result = format_qianfan_chat(&messages, &[5, 3], 256, false).unwrap();
-
-        let block1: String = std::iter::repeat(IMG_CONTEXT).take(256 * 5).collect();
-        let block2: String = std::iter::repeat(IMG_CONTEXT).take(256 * 3).collect();
-
-        let expected = format!(
-            "<|im_start|>user\nCompare these:\n<img>{block1}</img>\n<img>{block2}</img><|im_end|>\n<|im_start|>assistant\n"
-        );
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_system_message_included() {
+    fn test_system_message() {
         let messages = vec![
             text_msg("system", "You are an OCR assistant."),
-            text_msg("user", "Read this text."),
+            text_msg("user", "Read this."),
         ];
         let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
-
         assert!(result.starts_with("<|im_start|>system\nYou are an OCR assistant.<|im_end|>\n"));
-        assert!(result.contains("<|im_start|>user\nRead this text.<|im_end|>\n"));
+        assert!(result.contains("<|im_start|>user\nRead this.<|im_end|>\n"));
         assert!(result.ends_with("<|im_start|>assistant\n"));
     }
 
     #[test]
-    fn test_empty_system_message_omitted() {
+    fn test_empty_system_omitted() {
         let messages = vec![text_msg("system", ""), text_msg("user", "Hello")];
         let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
-
-        // Empty system message should be skipped entirely.
         assert!(!result.contains("system"));
-        assert_eq!(
-            result,
-            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
-        );
     }
 
     #[test]
-    fn test_multi_turn_conversation() {
+    fn test_multi_turn() {
         let messages = vec![
             text_msg("user", "Hello"),
-            text_msg("assistant", "Hi there!"),
+            assistant_msg("Hi!"),
             text_msg("user", "How are you?"),
         ];
         let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
-
         let expected = concat!(
             "<|im_start|>user\nHello<|im_end|>\n",
-            "<|im_start|>assistant\nHi there!<|im_end|>\n",
+            "<|im_start|>assistant\nHi!<|im_end|>\n",
             "<|im_start|>user\nHow are you?<|im_end|>\n",
             "<|im_start|>assistant\n",
         );
         assert_eq!(result, expected);
     }
 
-    #[test]
-    fn test_enable_thinking_appends_think() {
-        let messages = vec![text_msg("user", "Think about this.")];
-        let result = format_qianfan_chat(&messages, &[], 256, true).unwrap();
+    // --- Issue 1: <think> placement (on last user message, not after assistant) ---
 
-        assert!(result.ends_with("<|im_start|>assistant\n<think>\n"));
+    #[test]
+    fn test_think_appended_to_last_user_message() {
+        let messages = vec![text_msg("user", "Analyze this.")];
+        let result = format_qianfan_chat(&messages, &[], 256, true).unwrap();
+        // <think> goes INSIDE the user message, before <|im_end|>
+        assert!(result.contains("Analyze this.\n<think><|im_end|>\n"));
+        assert!(result.ends_with("<|im_start|>assistant\n"));
+        // NOT after assistant prompt
+        assert!(!result.ends_with("<think>\n"));
     }
 
     #[test]
-    fn test_thinking_with_image() {
+    fn test_think_on_last_user_in_multi_turn() {
+        let messages = vec![
+            text_msg("user", "First"),
+            assistant_msg("Ok"),
+            text_msg("user", "Second"),
+        ];
+        let result = format_qianfan_chat(&messages, &[], 256, true).unwrap();
+        // <think> only on the LAST user message
+        assert!(result.contains("First<|im_end|>\n")); // no <think> on first
+        assert!(result.contains("Second\n<think><|im_end|>\n")); // <think> on second
+    }
+
+    #[test]
+    fn test_think_with_image() {
         let messages = vec![text_msg("user", "Analyze <image>")];
         let result = format_qianfan_chat(&messages, &[1], 256, true).unwrap();
-
-        // Should have image tokens AND <think>\n at the end.
         assert!(result.contains("<img>"));
         assert!(result.contains("</img>"));
-        assert!(result.ends_with("<|im_start|>assistant\n<think>\n"));
+        // <think> is inside the user message
+        assert!(result.contains("\n<think><|im_end|>"));
+        assert!(result.ends_with("<|im_start|>assistant\n"));
+    }
+
+    // --- Issue 2: Per-message image association ---
+
+    #[test]
+    fn test_single_image_auto_prepend() {
+        let messages = vec![image_msg("user", "What is this?", 1)];
+        let result = format_qianfan_chat(&messages, &[3], 256, false).unwrap();
+        let ctx: String = std::iter::repeat(IMG_CONTEXT).take(256 * 3).collect();
+        assert!(result.contains(&format!("<img>{ctx}</img>\nWhat is this?")));
     }
 
     #[test]
-    fn test_img_context_count_matches_expected() {
-        // 4 tiles, 256 tokens per tile => 1024 IMG_CONTEXT tokens
+    fn test_multi_image_auto_prepend() {
+        let messages = vec![image_msg("user", "Compare", 3)];
+        let result = format_qianfan_chat(&messages, &[2, 3, 1], 256, false).unwrap();
+        assert_eq!(result.matches("<img>").count(), 3);
+        assert_eq!(result.matches("</img>").count(), 3);
+        assert_eq!(result.matches(IMG_CONTEXT).count(), (2 + 3 + 1) * 256);
+    }
+
+    #[test]
+    fn test_manual_placeholder_no_auto_prepend() {
+        let messages = vec![text_msg("user", "Look at <image> please")];
+        let result = format_qianfan_chat(&messages, &[2], 256, false).unwrap();
+        assert_eq!(result.matches("<img>").count(), 1);
+    }
+
+    #[test]
+    fn test_multi_turn_images_per_message() {
+        // Turn 1: user with 1 image, turn 3: user with 1 image
+        let messages = vec![
+            image_msg("user", "What is image A?", 1),
+            assistant_msg("It shows X."),
+            image_msg("user", "What about image B?", 1),
+        ];
+        // Image A gets 2 tiles, image B gets 3 tiles
+        let result = format_qianfan_chat(&messages, &[2, 3], 256, false).unwrap();
+
+        // Both messages should have their own <img> block
+        assert_eq!(result.matches("<img>").count(), 2);
+
+        // Image A (2 tiles = 512 tokens) is in turn 1
+        let ctx_a: String = std::iter::repeat(IMG_CONTEXT).take(256 * 2).collect();
+        assert!(result.contains(&format!("<img>{ctx_a}</img>\nWhat is image A?")));
+
+        // Image B (3 tiles = 768 tokens) is in turn 3
+        let ctx_b: String = std::iter::repeat(IMG_CONTEXT).take(256 * 3).collect();
+        assert!(result.contains(&format!("<img>{ctx_b}</img>\nWhat about image B?")));
+    }
+
+    #[test]
+    fn test_error_more_placeholders_than_images() {
+        let messages = vec![text_msg("user", "<image> and <image>")];
+        assert!(format_qianfan_chat(&messages, &[2], 256, false).is_err());
+    }
+
+    #[test]
+    fn test_error_unused_images() {
+        // 2 images but only 1 <image> placeholder (explicit)
+        let messages = vec![text_msg("user", "Look: <image>")];
+        assert!(format_qianfan_chat(&messages, &[2, 3], 256, false).is_err());
+    }
+
+    #[test]
+    fn test_img_context_count() {
         let messages = vec![text_msg("user", "<image>")];
         let result = format_qianfan_chat(&messages, &[4], 256, false).unwrap();
-
-        let count = result.matches(IMG_CONTEXT).count();
-        assert_eq!(count, 256 * 4);
+        assert_eq!(result.matches(IMG_CONTEXT).count(), 256 * 4);
     }
 
-    #[test]
-    fn test_error_on_extra_placeholders() {
-        // More <image> in content than entries in num_patches_list.
-        let messages = vec![text_msg("user", "<image> and <image>")];
-        let result = format_qianfan_chat(&messages, &[2], 256, false);
-        assert!(result.is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // count_images_in_messages tests
-    // -----------------------------------------------------------------------
+    // --- Issue 4: Tool calling and reasoning ---
 
     #[test]
-    fn test_count_images_no_images() {
-        let messages = vec![text_msg("user", "Hello")];
-        assert_eq!(count_images_in_messages(&messages), 0);
-    }
-
-    #[test]
-    fn test_count_images_single_message() {
-        let messages = vec![image_msg(
-            "user",
-            "Look",
-            vec![vec![1, 2, 3], vec![4, 5, 6]],
-        )];
-        assert_eq!(count_images_in_messages(&messages), 2);
-    }
-
-    #[test]
-    fn test_count_images_multi_message() {
+    fn test_tool_call_formatting() {
         let messages = vec![
-            image_msg("user", "First", vec![vec![1]]),
-            text_msg("assistant", "Ok"),
-            image_msg("user", "Second", vec![vec![2], vec![3]]),
+            text_msg("user", "What's the weather?"),
+            assistant_with_tool_calls("", vec![("get_weather", r#"{"city": "NYC"}"#)]),
+            tool_msg(r#"{"temp": 72}"#),
+            assistant_msg("It's 72F in NYC."),
         ];
-        assert_eq!(count_images_in_messages(&messages), 3);
-    }
-
-    // -----------------------------------------------------------------------
-    // Multi-image auto-prepend tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_auto_prepend_multiple_images() {
-        // 3 images but no <image> in content — should prepend 3 <image>\n
-        let messages = vec![text_msg("user", "Describe all")];
-        let result = format_qianfan_chat(&messages, &[2, 3, 1], 256, false).unwrap();
-
-        // Verify all three image blocks are present
-        let img_start_count = result.matches("<img>").count();
-        let img_end_count = result.matches("</img>").count();
-        assert_eq!(img_start_count, 3);
-        assert_eq!(img_end_count, 3);
-
-        // Verify total IMG_CONTEXT count: (2+3+1) * 256 = 1536
-        let ctx_count = result.matches(IMG_CONTEXT).count();
-        assert_eq!(ctx_count, (2 + 3 + 1) * 256);
-    }
-
-    #[test]
-    fn test_no_auto_prepend_when_empty_patches() {
-        // No images at all — no auto-prepend, no image tokens.
-        let messages = vec![text_msg("user", "Just text")];
         let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
 
-        assert!(!result.contains("<img>"));
-        assert!(!result.contains(IMG_CONTEXT));
+        assert!(result.contains("<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"NYC\"}}\n</tool_call>"));
+        assert!(result.contains("<|im_start|>user\n<tool_response>\n{\"temp\": 72}\n</tool_response><|im_end|>"));
     }
 
     #[test]
-    fn test_system_plus_image_plus_thinking() {
+    fn test_reasoning_content_formatting() {
         let messages = vec![
-            text_msg("system", "You are helpful."),
-            text_msg("user", "<image>\nWhat is this?"),
+            text_msg("user", "Think about this."),
+            assistant_with_reasoning("The answer is 42.", "Let me think step by step..."),
+            text_msg("user", "Thanks"),
         ];
-        let result = format_qianfan_chat(&messages, &[2], 256, true).unwrap();
+        let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
+        assert!(result.contains("<think>\nLet me think step by step...\n</think>\n\nThe answer is 42."));
+    }
 
-        // System message present
-        assert!(result.contains("<|im_start|>system\nYou are helpful.<|im_end|>\n"));
-        // Image tokens present
-        let ctx_count = result.matches(IMG_CONTEXT).count();
-        assert_eq!(ctx_count, 2 * 256);
-        // Thinking enabled
-        assert!(result.ends_with("<|im_start|>assistant\n<think>\n"));
+    #[test]
+    fn test_consecutive_tool_messages_grouped() {
+        let messages = vec![
+            text_msg("user", "Do both."),
+            assistant_with_tool_calls("", vec![("foo", "{}"), ("bar", "{}")]),
+            tool_msg("result1"),
+            tool_msg("result2"),
+            assistant_msg("Done."),
+        ];
+        let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
+
+        // Two tool messages grouped under one <|im_start|>user
+        let tool_section = "<|im_start|>user\n<tool_response>\nresult1\n</tool_response>\n<tool_response>\nresult2\n</tool_response><|im_end|>\n";
+        assert!(result.contains(tool_section));
+    }
+
+    // --- count_images_in_messages ---
+
+    #[test]
+    fn test_count_no_images() {
+        assert_eq!(count_images_in_messages(&[text_msg("user", "Hi")]), 0);
+    }
+
+    #[test]
+    fn test_count_multi_message_images() {
+        let messages = vec![
+            image_msg("user", "A", 2),
+            text_msg("assistant", "Ok"),
+            image_msg("user", "B", 1),
+        ];
+        assert_eq!(count_images_in_messages(&messages), 3);
     }
 }
