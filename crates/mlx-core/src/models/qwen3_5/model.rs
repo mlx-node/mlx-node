@@ -2,10 +2,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[cfg(not(target_family = "wasm"))]
 use futures::TryFutureExt;
 use napi::bindgen_prelude::*;
-#[cfg(not(target_family = "wasm"))]
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use tracing::{info, warn};
@@ -30,7 +28,6 @@ use super::chat_common::{
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
-#[cfg(not(target_family = "wasm"))]
 use super::persistence;
 use super::processing::Qwen35VLImageProcessor;
 use super::vision::Qwen3_5VisionEncoder;
@@ -4418,7 +4415,6 @@ impl Qwen35Inner {
 /// `Promise.all()` would race on these globals since `spawn_blocking` dispatches
 /// to separate threads. This mutex is acquired in the async context *before*
 /// `spawn_blocking`, ensuring only one compiled lifecycle runs at a time.
-#[cfg(not(target_family = "wasm"))]
 static DENSE_COMPILED_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
 
 /// RAII guard that calls `mlx_qwen35_compiled_reset()` on drop.
@@ -4557,12 +4553,10 @@ pub struct ChatResult {
     /// re-prefilled.
     pub cached_tokens: u32,
     /// Performance metrics (present when `reportPerformance: true` in config)
-    #[cfg(not(target_family = "wasm"))]
     pub performance: Option<crate::profiling::PerformanceMetrics>,
 }
 
 /// A single chunk emitted during streaming chat generation.
-#[cfg(not(target_family = "wasm"))]
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct ChatStreamChunk {
@@ -4605,7 +4599,6 @@ pub struct ChatStreamHandle {
     pub(crate) cancelled: Arc<AtomicBool>,
 }
 
-#[cfg(not(target_family = "wasm"))]
 #[napi]
 impl ChatStreamHandle {
     #[napi]
@@ -4710,7 +4703,6 @@ impl Qwen3_5Model {
     /// Initialize caches for incremental generation.
     #[napi]
     pub fn init_caches(&self) -> Result<()> {
-        #[cfg(not(target_family = "wasm"))]
         {
             let _guard = self.generation_lock.try_lock().map_err(|_| {
                 Error::from_reason("Cannot init caches while generation is in progress")
@@ -4743,7 +4735,6 @@ impl Qwen3_5Model {
     /// Reset all caches.
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
-        #[cfg(not(target_family = "wasm"))]
         {
             let _guard = self.generation_lock.try_lock().map_err(|_| {
                 Error::from_reason("Cannot reset caches while generation is in progress")
@@ -4846,7 +4837,6 @@ impl Qwen3_5Model {
     /// - config.json
     /// - model.safetensors (or model-*.safetensors)
     /// - tokenizer.json + tokenizer_config.json
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn load(path: String) -> Result<Qwen3_5Model> {
         persistence::load_with_thread(&path).await
@@ -4856,7 +4846,6 @@ impl Qwen3_5Model {
     ///
     /// Runs generation on a worker thread via spawn_blocking to avoid
     /// blocking the Node.js event loop.
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn generate(
         &self,
@@ -4904,7 +4893,7 @@ impl Qwen3_5Model {
             None
         };
 
-        crate::compat::run_blocking(move || {
+        napi::bindgen_prelude::spawn_blocking(move || {
             let _weight_guard = if use_compiled {
                 acquire_compiled_weight_guard(model_id)
             } else {
@@ -5424,7 +5413,7 @@ impl Qwen3_5Model {
 
             let callback_err = callback.clone();
             let result =
-                crate::compat::run_blocking(move || -> std::result::Result<(), Error> {
+                napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
                     // Re-validate compiled path under weight lock.
                     let mut _weight_guard = None;
                     let use_compiled = if use_compiled {
@@ -6504,8 +6493,8 @@ impl Qwen3_5Model {
     ///
     /// # Arguments
     /// * `save_path` - Directory to save the model
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
+    #[cfg(not(target_family = "wasm"))]
     pub fn save_model<'env>(
         &self,
         env: &'env Env,
@@ -6790,13 +6779,11 @@ impl Qwen3_5Model {
     }
 
     /// Set the vision encoder (wraps in Arc).
-    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) {
         self.vision_encoder = Some(Arc::new(enc));
     }
 
     /// Set the image processor.
-    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn set_image_processor(&mut self, proc: Qwen35VLImageProcessor) {
         self.image_processor = Some(Arc::new(proc));
     }
@@ -6844,8 +6831,6 @@ impl Qwen3_5Model {
 
     /// Create a cheap clone for training sessions.
     /// Arc-clones all shared components, no deep copy.
-    #[cfg(not(target_family = "wasm"))]
-    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn clone_for_training(&self) -> Result<Self> {
         Ok(Self {
             config: self.config.clone(),
@@ -7004,7 +6989,6 @@ impl Qwen3_5Model {
 
     /// Apply gradients to model parameters using pre-fetched params.
     /// SGD update: param = param - lr * grad.
-    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn apply_gradients_with_params(
         &mut self,
         gradients: HashMap<String, &MxArray>,
@@ -7145,7 +7129,6 @@ impl Qwen3_5Model {
     /// Uses the compiled C++ forward path when available (~10x faster than Rust).
     /// Generation does NOT need differentiability — gradients are computed separately
     /// via the functional forward path in autograd Phase 2.
-    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn generate_for_training_sync(
         &self,
         input_ids: &MxArray,

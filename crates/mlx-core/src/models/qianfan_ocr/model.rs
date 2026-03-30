@@ -27,7 +27,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(not(target_family = "wasm"))]
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Status, bindgen_prelude::*};
 use napi_derive::napi;

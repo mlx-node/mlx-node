@@ -2,12 +2,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[cfg(not(target_family = "wasm"))]
 use futures::TryFutureExt;
 use napi::bindgen_prelude::*;
-#[cfg(not(target_family = "wasm"))]
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
-#[cfg(not(target_family = "wasm"))]
 use crate::models::qwen3_5::model::{ChatStreamChunk, ChatStreamHandle};
 use napi_derive::napi;
 use tracing::{info, warn};
@@ -56,7 +53,7 @@ use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 
-use crate::compat::run_blocking;
+use napi::bindgen_prelude::spawn_blocking;
 
 // Import the shared model ID counter from the dense module — dense and MoE
 // share the same C++ weight map, so IDs must be globally unique.
@@ -621,7 +618,6 @@ impl Qwen35MoeInner {
     /// The cache is moved out of the model — calling `takeCache()` twice
     /// returns `null` the second time. Pass the cache back via `setCache()`
     /// before the next `chat()` call for incremental prefill.
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
         let _guard = self.generation_lock.try_lock().ok()?;
@@ -4687,7 +4683,6 @@ impl Qwen3_5MoeModel {
 
     #[napi]
     pub fn init_caches(&self) -> Result<()> {
-        #[cfg(not(target_family = "wasm"))]
         {
             let _guard = self.generation_lock.try_lock().map_err(|_| {
                 Error::from_reason("Cannot init caches while generation is in progress")
@@ -4717,7 +4712,6 @@ impl Qwen3_5MoeModel {
 
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
-        #[cfg(not(target_family = "wasm"))]
         {
             let _guard = self.generation_lock.try_lock().map_err(|_| {
                 Error::from_reason("Cannot reset caches while generation is in progress")
@@ -4828,7 +4822,7 @@ impl Qwen3_5MoeModel {
             None
         };
 
-        run_blocking(move || {
+        napi::bindgen_prelude::spawn_blocking(move || {
             let _weight_guard = if use_cpp {
                 acquire_compiled_weight_guard(model_id)
             } else {
@@ -6467,6 +6461,7 @@ impl Qwen3_5MoeModel {
     ///
     /// Dispatches to model thread.
     #[napi]
+    #[cfg(not(target_family = "wasm"))]
     pub fn save_model<'env>(
         &self,
         env: &'env Env,

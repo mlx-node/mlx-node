@@ -30,7 +30,6 @@ use crate::training_model::ModelType;
 use crate::transformer::{
     KVCache, TransformerBlock,
 };
-#[cfg(not(target_family = "wasm"))]
 use crate::transformer::{
     ContinuousBatchingScheduler, PagedAttentionConfig, PagedKVCache, PendingRequest,
     SchedulerConfig,
@@ -660,7 +659,6 @@ impl Qwen3Inner {
         )?;
 
         // Initialize paged attention if enabled
-        #[cfg(not(target_family = "wasm"))]
         let (paged_cache, scheduler) = if config.use_paged_attention.unwrap_or(false) {
             let paged_config = PagedAttentionConfig {
                 block_size: config.paged_block_size.unwrap_or(16),
@@ -715,9 +713,7 @@ impl Qwen3Inner {
             lm_head,
             kv_caches: None,
             tokenizer: None,
-            #[cfg(not(target_family = "wasm"))]
             paged_cache,
-            #[cfg(not(target_family = "wasm"))]
             scheduler,
             cached_kv_keys: Vec::new(),
             cached_kv_values: Vec::new(),
@@ -5122,7 +5118,6 @@ impl Qwen3Model {
     /// Call this when starting a new conversation to ensure a full prefill.
     #[napi]
     pub fn reset_cache(&self) -> Result<()> {
-        #[cfg(not(target_family = "wasm"))]
         {
             let _guard = self.generation_lock.try_lock().map_err(|_| {
                 Error::from_reason("Cannot reset cache while generation is in progress")
@@ -5219,7 +5214,6 @@ impl Qwen3Model {
     /// Clears cached key-value states. Call this between different generation sequences.
     #[napi]
     pub fn reset_kv_caches(&self) -> Result<()> {
-        #[cfg(not(target_family = "wasm"))]
         {
             let _guard = self.generation_lock.try_lock().map_err(|_| {
                 Error::from_reason("Cannot reset KV cache while generation is in progress")
@@ -5262,16 +5256,13 @@ impl Qwen3Model {
     /// Check if paged attention is enabled for this model
     #[napi]
     pub fn has_paged_attention(&self) -> bool {
-        #[cfg(not(target_family = "wasm"))]
         { self.paged_cache.is_some() }
-        #[cfg(target_family = "wasm")]
         { false }
     }
 
     /// Get paged attention memory statistics (if enabled)
     ///
     /// Returns memory usage statistics for the paged KV cache.
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn paged_cache_stats(&self) -> Result<Option<PagedCacheStats>> {
         send_and_block(&self.thread, |reply| Qwen3Cmd::PagedCacheStats { reply })
@@ -5280,7 +5271,6 @@ impl Qwen3Model {
     /// Get scheduler statistics (if paged attention is enabled)
     ///
     /// Returns the number of waiting, running, and completed sequences.
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn scheduler_stats(&self) -> Result<Option<SchedulerStatsNapi>> {
         send_and_block(&self.thread, |reply| Qwen3Cmd::SchedulerStats { reply })
@@ -5301,7 +5291,6 @@ impl Qwen3Model {
     ///
     /// # Returns
     /// * Logits, shape: [num_seqs, 1, vocab_size] for decode
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn forward_paged(
         &self,
@@ -5322,7 +5311,6 @@ impl Qwen3Model {
     /// Internal paged forward pass that accepts an already-locked cache reference.
     /// This avoids deadlock when called from step_paged_generation() which already
     /// holds a write lock on the same paged_cache RwLock.
-    #[cfg(not(target_family = "wasm"))]
     fn forward_paged_with_cache(
         &self,
         input_ids: &MxArray,
@@ -5401,7 +5389,6 @@ impl Qwen3Model {
     ///
     /// # Returns
     /// * Logits for the last token, shape: [1, vocab_size]
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn prefill_paged(&self, prompt_tokens: Vec<u32>, seq_id: u32) -> Result<MxArray> {
         send_and_block(&self.thread, |reply| Qwen3Cmd::PrefillPaged {
@@ -5428,7 +5415,6 @@ impl Qwen3Model {
     ///
     /// # Returns
     /// * Number of pending requests in the queue
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn add_paged_request(
         &self,
@@ -5459,7 +5445,6 @@ impl Qwen3Model {
     ///
     /// # Returns
     /// * `PagedGenerationStep` with token outputs for each sequence
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn step_paged_generation(
         &self,
@@ -5474,7 +5459,6 @@ impl Qwen3Model {
     /// Get completed sequences from the scheduler.
     ///
     /// Call this after `step_paged_generation()` returns outputs with `is_finished: true`.
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn get_completed_sequences(&self) -> Result<Vec<PagedCompletedSequence>> {
         send_and_block(&self.thread, |reply| Qwen3Cmd::GetCompletedSequences {
@@ -5483,7 +5467,6 @@ impl Qwen3Model {
     }
 
     /// Check if the scheduler has pending work.
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn has_paged_work(&self) -> Result<bool> {
         send_and_block(&self.thread, |reply| Qwen3Cmd::HasPagedWork { reply })
@@ -5659,7 +5642,6 @@ impl Qwen3Model {
     ///
     /// Note: Paged attention is not cloned for training sessions since
     /// training uses standard KVCache with gradient flow.
-    #[cfg(not(target_family = "wasm"))]
     pub fn clone_for_session(&self) -> Result<Self> {
         // Cheap Arc clones - O(1) operation, no deep copying of model weights
         // The RwLock inside allows shared mutable access for gradient updates
@@ -5685,7 +5667,6 @@ impl Qwen3Model {
     /// Decode tokens from an MxArray to text
     ///
     /// Internal method for use by training session.
-    #[cfg(not(target_family = "wasm"))]
     pub async fn decode_tokens(&self, tokens: &MxArray) -> Result<String> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
@@ -5697,7 +5678,7 @@ impl Qwen3Model {
         // Convert MxArray to Vec<u32>
         let token_ids = tokens.to_uint32()?;
 
-        crate::compat::run_blocking(move || {
+        napi::bindgen_prelude::spawn_blocking(move || {
             tokenizer.decode_sync(&token_ids, true) // skip special tokens
         })
         .await
@@ -5713,7 +5694,6 @@ impl Qwen3Model {
     ///
     /// Internal async method for use by training session.
     /// Named differently to avoid conflict with the NAPI-exported version.
-    #[cfg(not(target_family = "wasm"))]
     pub async fn apply_chat_template_internal(
         &self,
         messages: &[ChatMessage],
@@ -5748,7 +5728,7 @@ impl Qwen3Model {
         }
         formatted.push_str(suffix);
 
-        crate::compat::run_blocking(move || {
+        napi::bindgen_prelude::spawn_blocking(move || {
             tokenizer.encode_sync(&formatted, Some(false))
         })
         .await
@@ -5763,7 +5743,6 @@ impl Qwen3Model {
     /// Decode tokens from an MxArray to text (sync version)
     ///
     /// Internal method for use by training session - does not use spawn_blocking.
-    #[cfg(not(target_family = "wasm"))]
     pub fn decode_tokens_sync(&self, tokens: &MxArray) -> Result<String> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
@@ -5788,7 +5767,6 @@ impl Qwen3Model {
     /// * `add_generation_prompt` - Whether to add assistant prompt at end
     /// * `tools` - Optional tool definitions for function calling
     /// * `enable_thinking` - Optional flag to enable thinking mode (<think> tags)
-    #[cfg(not(target_family = "wasm"))]
     pub fn apply_chat_template_sync(
         &self,
         messages: &[ChatMessage],
@@ -5811,6 +5789,7 @@ impl Qwen3Model {
     ///
     /// Internal sync method for use by training session - does not use spawn_blocking.
     /// This is a synchronous version that runs generation on the calling thread.
+    #[cfg(not(target_family = "wasm"))]
     pub fn generate_for_training_sync(
         &self,
         input_ids: &MxArray,
@@ -5909,9 +5888,7 @@ impl Qwen3Model {
         };
 
         // Profiler for generate decode loop
-        #[cfg(not(target_family = "wasm"))]
         let mut profiler = crate::decode_profiler::DecodeProfiler::new("generate", "qwen3");
-        #[cfg(not(target_family = "wasm"))]
         {
             profiler.set_prompt_tokens(current_ids.shape_at(1).unwrap_or(0) as u32);
             profiler.snapshot_memory_before();
@@ -5925,7 +5902,6 @@ impl Qwen3Model {
         // Use chunking if prefill_step_size > 0 and seq_len exceeds it
         let use_chunked_prefill = prefill_step_size > 0 && total_seq_len > prefill_step_size;
 
-        #[cfg(not(target_family = "wasm"))]
         profiler.begin_prefill();
         let mut last_logits = if use_chunked_prefill {
             // === CHUNKED PREFILL ===
@@ -6032,7 +6008,6 @@ impl Qwen3Model {
                 .squeeze(Some(&[0, 1]))?
         };
 
-        #[cfg(not(target_family = "wasm"))]
         profiler.end_prefill();
 
         // Update rope_offsets after prefill (all tokens have been processed)
@@ -6106,7 +6081,6 @@ impl Qwen3Model {
 
             // Extract current token value
             let token_value = token.item_at_int32(0)? as u32;
-            #[cfg(not(target_family = "wasm"))]
             profiler.mark_first_token();
             if let Some(ds) = decode_start
                 && first_token_elapsed_ms.is_none()
@@ -6209,11 +6183,9 @@ impl Qwen3Model {
             token = next_tok;
             logprobs_arr = next_lp;
 
-            #[cfg(not(target_family = "wasm"))]
             profiler.step();
         }
 
-        #[cfg(not(target_family = "wasm"))]
         {
             profiler.snapshot_memory_after();
             profiler.report();
@@ -8524,7 +8496,6 @@ impl Qwen3Model {
     /// - ⚠️ Numerical approximations for other layers
     ///
     /// Future: Full MLX autograd will compute exact gradients for all 250+ parameters
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn compute_loss_and_gradients(
         &self,
@@ -8663,7 +8634,6 @@ impl Qwen3Model {
     ///
     /// # Returns
     /// * Tuple of (loss_value, metrics_dict)
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn train_step_grpo_autograd(
         &mut self,
@@ -8745,7 +8715,6 @@ impl Qwen3Model {
     ///
     /// # Returns
     /// * Tuple of (loss_value, gradients_dict, metrics_dict)
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn compute_gradients_only_grpo_autograd(
         &mut self,
@@ -8866,7 +8835,6 @@ impl Qwen3Model {
     ///
     /// # Returns
     /// * Tuple of (loss_value, metrics_dict)
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn train_step_grpo(
         &mut self,
@@ -9175,7 +9143,6 @@ impl Qwen3Model {
     /// This is the primary generation API for training workloads (e.g., GRPO).
     /// Uses fused C++ implementation for maximum performance.
     /// For text-to-text generation with chat messages, use `generate()` instead.
-    #[cfg(not(target_family = "wasm"))]
     pub async fn generate_for_training(
         &self,
         input_ids: &MxArray,
@@ -9211,7 +9178,7 @@ impl Qwen3Model {
         let lm_head_arc = self.lm_head.clone();
         let model_config = self.config.clone(); // For fused forward
 
-        crate::compat::run_blocking(move || {
+        napi::bindgen_prelude::spawn_blocking(move || {
             debug!(
                 "Starting generation: max_tokens={}, temp={}, top_k={}, top_p={}, rep_penalty={}",
                 max_new_tokens, temperature, top_k, top_p, repetition_penalty
@@ -9678,7 +9645,6 @@ impl Qwen3Model {
     /// console.log(result.tokens); // Token IDs (for GRPO)
     /// console.log(result.logprobs); // Log probabilities (for GRPO)
     /// ```
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn generate(
         &self,
@@ -9695,7 +9661,7 @@ impl Qwen3Model {
 
         // Apply chat template and encode in a blocking task
         let tokenizer_clone = tokenizer.clone();
-        let input_ids = crate::compat::run_blocking(move || {
+        let input_ids = napi::bindgen_prelude::spawn_blocking(move || {
             // Format messages using ChatML template
             let formatted = messages
                 .iter()
@@ -9722,7 +9688,7 @@ impl Qwen3Model {
 
         // Decode the generated tokens in a blocking task
         let result_tokens = result.tokens.clone();
-        let decoded_text = crate::compat::run_blocking(move || {
+        let decoded_text = napi::bindgen_prelude::spawn_blocking(move || {
             let generated_ids = result_tokens.to_uint32()?;
 
             tokenizer.decode_sync(&generated_ids, true)
@@ -9888,7 +9854,7 @@ impl Qwen3Model {
         let cached_cache_idx_arc = self.cached_cache_idx.clone();
         let cached_token_history_arc = self.cached_token_history.clone();
 
-        let result = crate::compat::run_blocking(move || {
+        let result = napi::bindgen_prelude::spawn_blocking(move || {
             let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
             let temperature = config.temperature.unwrap_or(0.7);
             let top_k = config.top_k.unwrap_or(0);
@@ -10307,7 +10273,7 @@ impl Qwen3Model {
 
         // Decode the generated tokens in a blocking task
         let result_tokens = result.tokens.clone();
-        let raw_text = crate::compat::run_blocking(move || {
+        let raw_text = napi::bindgen_prelude::spawn_blocking(move || {
             let generated_ids = result_tokens.to_uint32()?;
             tokenizer.decode_sync(&generated_ids, true)
         })
@@ -10573,7 +10539,6 @@ impl Qwen3Model {
     ///   config
     /// );
     /// ```
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn generate_batch(
         &self,
@@ -10594,7 +10559,7 @@ impl Qwen3Model {
 
         // STEP 1: Tokenize all prompts in one blocking task
         let tokenizer_clone = tokenizer.clone();
-        let prompt_token_arrays = crate::compat::run_blocking(move || {
+        let prompt_token_arrays = napi::bindgen_prelude::spawn_blocking(move || {
             let mut results = Vec::with_capacity(num_prompts);
 
             for messages in prompts {
@@ -10654,7 +10619,7 @@ impl Qwen3Model {
 
         // STEP 3: Decode all N*G completions in one blocking task
         let all_tokens_clone = all_tokens.clone();
-        let decoded_texts = crate::compat::run_blocking(move || {
+        let decoded_texts = napi::bindgen_prelude::spawn_blocking(move || {
             let mut texts = Vec::with_capacity(all_tokens_clone.len());
 
             for token_array in &all_tokens_clone {
@@ -10699,7 +10664,6 @@ impl Qwen3Model {
     ///
     /// # Returns
     /// * Decoded text string
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn decode(
         &self,
@@ -10709,7 +10673,7 @@ impl Qwen3Model {
         let skip_special = skip_special_tokens.unwrap_or(true);
         let token_ids_vec = token_ids.to_vec();
 
-        crate::compat::run_blocking(move || {
+        napi::bindgen_prelude::spawn_blocking(move || {
             tokenizer.decode_sync(&token_ids_vec, skip_special)
         })
         .await
@@ -10728,7 +10692,6 @@ impl Qwen3Model {
     ///
     /// # Returns
     /// * Encoded token IDs as Uint32Array
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn apply_chat_template<'env>(
         &self,

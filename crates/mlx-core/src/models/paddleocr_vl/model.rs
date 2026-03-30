@@ -26,9 +26,7 @@ use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::SafeTensorsFile;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
-#[cfg(not(target_family = "wasm"))]
 use napi::{Env, Status, bindgen_prelude::*, tokio};
-#[cfg(target_family = "wasm")]
 use napi::{Env, Status, bindgen_prelude::*};
 use napi_derive::napi;
 use serde_json::Value;
@@ -243,7 +241,6 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
     ///   { images: [readFileSync('./photo.jpg')], maxNewTokens: 256 }
     /// );
     /// ```
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn chat(
         &self,
@@ -285,7 +282,7 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
         let eos_token_id = self.config.eos_token_id;
         let tokenizer_clone = tokenizer.clone();
         let (input_ids, pixel_values, grid_thw, gen_config) =
-            crate::compat::run_blocking(move || {
+            napi::bindgen_prelude::spawn_blocking(move || {
                 // Process images if image buffers provided
                 let (pixel_values, grid_thw) = if let Some(ref images) = config.images {
                     if images.is_empty() {
@@ -392,7 +389,7 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
 
         // spawn_blocking: decode tokens → text (CPU-bound)
         let result_tokens = result.tokens.clone();
-        let text = crate::compat::run_blocking(move || {
+        let text = napi::bindgen_prelude::spawn_blocking(move || {
             result_tokens.eval();
             let tokens_vec = result_tokens.to_uint32()?;
             let text = tokenizer.decode_sync(&tokens_vec, true)?;
@@ -504,7 +501,6 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
     ///
     /// # Returns
     /// * GenerationResult with tokens, logprobs, and finish reason
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn generate(
         &self,
@@ -516,7 +512,7 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
         let config = config.unwrap_or_default();
         let model_config = self.config.clone();
 
-        crate::compat::run_blocking(move || {
+        napi::bindgen_prelude::spawn_blocking(move || {
             // Extract config with defaults - aligned with mlx-vlm generate_step defaults
             let max_new_tokens = config.max_new_tokens.unwrap_or(256); // mlx-vlm DEFAULT_MAX_TOKENS
             let temperature = config.temperature.unwrap_or(0.0); // mlx-vlm: greedy by default
@@ -876,7 +872,6 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
     /// const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
     /// const texts = await model.ocrBatch(images);
     /// ```
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn ocr_batch(
         &self,
@@ -920,7 +915,6 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
     ///
     /// # Returns
     /// * Vec of VLMChatResult, one per batch item
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn batch(
         &self,
@@ -986,7 +980,7 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
         let model_config = &self.config;
 
         // spawn_blocking: image processing + tokenization + generate_batch + decoding
-        crate::compat::run_blocking(move || {
+        napi::bindgen_prelude::spawn_blocking(move || {
             let gen_config = GenerationConfig {
                 max_new_tokens: config.max_new_tokens,
                 temperature: config.temperature,
@@ -1909,7 +1903,6 @@ impl VLModel {
     /// const model = await VLModel.load('./models/paddleocr-vl');
     /// const result = await model.chat(messages, { images: [readFileSync('./image.jpg')] });
     /// ```
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn load<'env>(env: &'env Env, model_path: String) -> Result<PromiseRaw<'env, VLModel>> {
         env.spawn_future_with_callback(
@@ -1967,7 +1960,6 @@ impl VLModel {
     /// const config = await VLModel.loadConfig('./models/paddleocr-vl');
     /// console.log(config.visionConfig.hiddenSize);
     /// ```
-    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn load_config<'env>(
         env: &'env Env,
