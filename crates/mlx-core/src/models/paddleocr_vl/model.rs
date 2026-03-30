@@ -26,6 +26,9 @@ use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::SafeTensorsFile;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
+#[cfg(not(target_family = "wasm"))]
+use napi::{Env, Status, bindgen_prelude::*, tokio};
+#[cfg(target_family = "wasm")]
 use napi::{Env, Status, bindgen_prelude::*};
 use napi_derive::napi;
 use serde_json::Value;
@@ -63,10 +66,34 @@ pub(crate) enum VLModelCmd {
         image_bytes: Option<Vec<Vec<u8>>>,
         reply: ResponseTx<VLMChatResult>,
     },
+    Generate {
+        input_ids: MxArray,
+        pixel_values: Option<MxArray>,
+        image_grid_thw: Option<MxArray>,
+        config: Option<GenerationConfig>,
+        reply: ResponseTx<GenerationResult>,
+    },
     Batch {
         items: Vec<SendableVLMBatchItem>,
         config: Option<VLMChatConfig>,
         reply: ResponseTx<Vec<VLMChatResult>>,
+    },
+    GetInputEmbeddings {
+        input_ids: MxArray,
+        image_features: Option<MxArray>,
+        image_grid_thw: Option<MxArray>,
+        reply: ResponseTx<MxArray>,
+    },
+    Forward {
+        input_ids: MxArray,
+        pixel_values: Option<MxArray>,
+        image_grid_thw: Option<MxArray>,
+        mask: Option<MxArray>,
+        reply: ResponseTx<MxArray>,
+    },
+    SetTokenizer {
+        tokenizer: Arc<Qwen3Tokenizer>,
+        reply: ResponseTx<()>,
     },
 }
 
@@ -94,6 +121,8 @@ pub struct VLModel {
     config: ModelConfig,
     /// Whether the model has been fully initialized (visual + language model loaded).
     initialized: bool,
+    /// Whether a tokenizer has been set.
+    has_tokenizer_flag: bool,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop. `None` for instances constructed via
     /// `new(config)` that never loaded weights — there's no baseline
@@ -117,6 +146,21 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
             let result = inner.chat_sync(messages, config, image_bytes);
             let _ = reply.send(result);
         }
+        VLModelCmd::Generate {
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            config,
+            reply,
+        } => {
+            let result = inner.generate_sync(
+                &input_ids,
+                pixel_values.as_ref(),
+                image_grid_thw.as_ref(),
+                config,
+            );
+            let _ = reply.send(result);
+        }
         VLModelCmd::Batch {
             items,
             config,
@@ -125,6 +169,38 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
             let result = inner.batch_sync(items, config);
             let _ = reply.send(result);
         }
+        VLModelCmd::GetInputEmbeddings {
+            input_ids,
+            image_features,
+            image_grid_thw,
+            reply,
+        } => {
+            let result = inner.get_input_embeddings_sync(
+                &input_ids,
+                image_features.as_ref(),
+                image_grid_thw.as_ref(),
+            );
+            let _ = reply.send(result);
+        }
+        VLModelCmd::Forward {
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            mask,
+            reply,
+        } => {
+            let result = inner.forward_sync(
+                &input_ids,
+                pixel_values.as_ref(),
+                image_grid_thw.as_ref(),
+                mask.as_ref(),
+            );
+            let _ = reply.send(result);
+        }
+        VLModelCmd::SetTokenizer { tokenizer, reply } => {
+            inner.tokenizer = Some(tokenizer);
+            let _ = reply.send(Ok(()));
+        }
     }
 }
 
@@ -132,10 +208,45 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
 // VLModelInner implementation
 // ---------------------------------------------------------------------------
 
-impl VLModelInner {
-    /// Synchronous chat implementation. Runs on the dedicated model thread.
-    fn chat_sync(
-        &mut self,
+    /// Set the language model (internal - used by VLModel::load())
+    pub fn set_language_model(&mut self, lm: &ERNIELanguageModel) {
+        self.language_model = Some(Arc::new(RwLock::new(lm.clone())));
+    }
+
+    /// Set the tokenizer
+    #[napi]
+    pub fn set_tokenizer(&mut self, tokenizer: &Qwen3Tokenizer) {
+        self.tokenizer = Some(Arc::new(tokenizer.clone()));
+    }
+
+    /// Check if tokenizer is available
+    #[napi(getter)]
+    pub fn has_tokenizer(&self) -> bool {
+        self.tokenizer.is_some()
+    }
+
+    /// Chat with the VLM model
+    ///
+    /// High-level API for conversational interaction with images.
+    ///
+    /// # Arguments
+    /// * `messages` - Chat messages (role + content)
+    /// * `config` - Chat configuration (including images for automatic processing)
+    ///
+    /// # Returns
+    /// * VLMChatResult with generated text
+    ///
+    /// # Example
+    /// ```typescript
+    /// const result = await model.chat(
+    ///   [{ role: 'user', content: 'Describe this image.' }],
+    ///   { images: [readFileSync('./photo.jpg')], maxNewTokens: 256 }
+    /// );
+    /// ```
+    #[cfg(not(target_family = "wasm"))]
+    #[napi]
+    pub async fn chat(
+        &self,
         messages: Vec<VLMChatMessage>,
         config: Option<VLMChatConfig>,
         image_bytes: Option<Vec<Vec<u8>>>,
@@ -172,6 +283,22 @@ impl VLModelInner {
 
         let vision_config = self.config.vision_config.clone();
         let eos_token_id = self.config.eos_token_id;
+        let tokenizer_clone = tokenizer.clone();
+        let (input_ids, pixel_values, grid_thw, gen_config) =
+            crate::compat::run_blocking(move || {
+                // Process images if image buffers provided
+                let (pixel_values, grid_thw) = if let Some(ref images) = config.images {
+                    if images.is_empty() {
+                        (None, None)
+                    } else {
+                        let processor_config = ImageProcessorConfig {
+                            patch_size: vision_config.patch_size,
+                            merge_size: vision_config.spatial_merge_size,
+                            ..ImageProcessorConfig::default()
+                        };
+                        let processor = ImageProcessor::new(Some(processor_config));
+                        let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
+                        let processed = processor.process_many(&image_refs)?;
 
         // Process images
         let (pixel_values, grid_thw) = if let Some(ref images) = image_bytes {
@@ -249,6 +376,9 @@ impl VLModelInner {
             eos_token_id: Some(eos_token_id),
             return_logprobs: config.return_logprobs,
             prefill_step_size: None,
+            kv_cache_bits: None,
+            kv_cache_group_size: None,
+            num_draft_tokens: None,
             report_performance: None,
         };
 
@@ -260,11 +390,22 @@ impl VLModelInner {
             Some(gen_config),
         )?;
 
-        // Decode tokens → text
-        result.tokens.eval();
-        let tokens_vec = result.tokens.to_uint32()?;
-        let text = tokenizer.decode_sync(&tokens_vec, true)?;
-        let text = text.replace("<|im_end|>", "").trim().to_string();
+        // spawn_blocking: decode tokens → text (CPU-bound)
+        let result_tokens = result.tokens.clone();
+        let text = crate::compat::run_blocking(move || {
+            result_tokens.eval();
+            let tokens_vec = result_tokens.to_uint32()?;
+            let text = tokenizer.decode_sync(&tokens_vec, true)?;
+            let text = text.replace("<|im_end|>", "").trim().to_string();
+            Ok::<String, Error>(text)
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("VLM chat decoding failed: {}", e),
+            )
+        })??;
 
         Ok(VLMChatResult {
             text,
@@ -275,9 +416,98 @@ impl VLModelInner {
         })
     }
 
-    /// Synchronous generate. Runs on the dedicated model thread.
-    fn generate_sync(
-        &mut self,
+    /// Get input embeddings with vision features merged.
+    fn get_input_embeddings_sync(
+        &self,
+        input_ids: &MxArray,
+        pixel_values: Option<&MxArray>,
+        image_grid_thw: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let lm = self
+            .language_model
+            .as_ref()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Language model not set"))?;
+
+        // If no images, just get text embeddings
+        if pixel_values.is_none() {
+            return lm.get_embeddings(input_ids);
+        }
+
+        let pixel_values = pixel_values.unwrap();
+        let grid_thw = image_grid_thw.ok_or_else(|| {
+            Error::new(
+                Status::InvalidArg,
+                "image_grid_thw required when pixel_values provided",
+            )
+        })?;
+
+        let visual = self
+            .visual
+            .as_ref()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Vision model not set"))?;
+
+        // Get text embeddings
+        let inputs_embeds = lm.get_embeddings(input_ids)?;
+
+        // Get vision features
+        let hidden_states = visual.forward(pixel_values, grid_thw)?;
+
+        // Cast vision features to match embedding dtype to prevent float32 promotion
+        let embed_dtype = inputs_embeds.dtype()?;
+        let hidden_states = if hidden_states.dtype()? != embed_dtype {
+            hidden_states.astype(embed_dtype)?
+        } else {
+            hidden_states
+        };
+
+        // Merge vision features into text embeddings at image token positions
+        merge_input_ids_with_image_features(
+            self.config.image_token_id,
+            &hidden_states,
+            &inputs_embeds,
+            input_ids,
+        )
+    }
+
+    /// Forward pass through the full model.
+    fn forward_sync(
+        &self,
+        input_ids: &MxArray,
+        pixel_values: Option<&MxArray>,
+        image_grid_thw: Option<&MxArray>,
+        mask: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let lm = self
+            .language_model
+            .as_ref()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Language model not set"))?;
+
+        // Get merged embeddings
+        let inputs_embeds =
+            self.get_input_embeddings_sync(input_ids, pixel_values, image_grid_thw)?;
+
+        // Forward through language model
+        lm.forward(input_ids, Some(&inputs_embeds), mask, None)
+    }
+
+    /// Generate text tokens given input tokens and optional image
+    ///
+    /// Uses KV caching for efficient generation - each step only processes the
+    /// new token(s) while reusing cached key-value states from previous tokens.
+    /// Vision features are computed once at the start and cached.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Input token IDs [1, seq_len]
+    /// * `pixel_values` - Optional image patches [1, num_patches, C, H, W]
+    /// * `image_grid_thw` - Optional grid dimensions [1, 3]
+    /// * `config` - Generation configuration
+    ///
+    /// # Returns
+    /// * GenerationResult with tokens, logprobs, and finish reason
+    #[cfg(not(target_family = "wasm"))]
+    #[napi]
+    pub async fn generate(
+        &self,
         input_ids: &MxArray,
         pixel_values: Option<&MxArray>,
         image_grid_thw: Option<&MxArray>,
@@ -286,23 +516,21 @@ impl VLModelInner {
         let config = config.unwrap_or_default();
         let model_config = self.config.clone();
 
-        // Extract config with defaults
-        // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(.. as
-        // usize)` below never sees a negative `i32` (`-1 as usize` would
-        // request `usize::MAX`); the `0..max_new_tokens` loop then emits 0.
-        let max_new_tokens = config.max_new_tokens.unwrap_or(256).max(0);
-        let temperature = config.temperature.unwrap_or(0.0);
-        let top_k = config.top_k.unwrap_or(0);
-        let top_p = config.top_p.unwrap_or(1.0);
-        let min_p = config.min_p.unwrap_or(0.0);
-        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-        let repetition_context_size = config.repetition_context_size.unwrap_or(20);
-        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-        let presence_context_size = config.presence_context_size.unwrap_or(20);
-        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let eos_token_id = config.eos_token_id.unwrap_or(model_config.eos_token_id);
-        let return_logprobs = config.return_logprobs.unwrap_or(false);
+        crate::compat::run_blocking(move || {
+            // Extract config with defaults - aligned with mlx-vlm generate_step defaults
+            let max_new_tokens = config.max_new_tokens.unwrap_or(256); // mlx-vlm DEFAULT_MAX_TOKENS
+            let temperature = config.temperature.unwrap_or(0.0); // mlx-vlm: greedy by default
+            let top_k = config.top_k.unwrap_or(0);
+            let top_p = config.top_p.unwrap_or(1.0);
+            let min_p = config.min_p.unwrap_or(0.0);
+            let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+            let repetition_context_size = config.repetition_context_size.unwrap_or(20);
+            let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+            let presence_context_size = config.presence_context_size.unwrap_or(20);
+            let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+            let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+            let eos_token_id = config.eos_token_id.unwrap_or(model_config.eos_token_id);
+            let return_logprobs = config.return_logprobs.unwrap_or(false);
 
         debug!(
             "Starting VLM generation with KV cache: max_tokens={}, temp={}, top_k={}, top_p={}, rep_penalty={}",
@@ -479,10 +707,9 @@ impl VLModelInner {
         token.eval();
 
         // Track generated tokens
-        let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens))
+            Vec::with_capacity(max_new_tokens as usize)
         } else {
             Vec::new()
         };
@@ -632,10 +859,72 @@ impl VLModelInner {
         })
     }
 
-    /// Synchronous batch processing. Runs on the dedicated model thread.
-    fn batch_sync(
-        &mut self,
-        batch: Vec<SendableVLMBatchItem>,
+    /// Batch OCR: extract text from multiple images simultaneously
+    ///
+    /// Processes N images with sequential prefill + batched decode for ~N× decode throughput.
+    ///
+    /// # Arguments
+    /// * `images` - Encoded image buffers
+    /// * `config` - Optional chat configuration (shared across all items)
+    ///
+    /// # Returns
+    /// * Vec of extracted text strings, one per image
+    ///
+    /// # Example
+    /// ```typescript
+    /// import { readFileSync } from 'fs';
+    /// const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
+    /// const texts = await model.ocrBatch(images);
+    /// ```
+    #[cfg(not(target_family = "wasm"))]
+    #[napi]
+    pub async fn ocr_batch(
+        &self,
+        images: Vec<Buffer>,
+        config: Option<VLMChatConfig>,
+    ) -> Result<Vec<String>> {
+        let prompt = "Extract all text from this image.".to_string();
+
+        let batch: Vec<VLMBatchItem> = images
+            .into_iter()
+            .map(|image_data| VLMBatchItem {
+                messages: vec![VLMChatMessage {
+                    role: ChatRole::User,
+                    content: prompt.clone(),
+                }],
+                images: Some(vec![image_data]),
+            })
+            .collect();
+
+        let results = self.batch(batch, config).await?;
+
+        Ok(results
+            .into_iter()
+            .map(|r| {
+                let text = r.text;
+                text.strip_prefix("\\(\\text{")
+                    .and_then(|s| s.strip_suffix("}\\)"))
+                    .map(|s| s.to_string())
+                    .unwrap_or(text)
+            })
+            .collect())
+    }
+
+    /// Batch chat: process multiple items simultaneously
+    ///
+    /// Sequential prefill + batched decode. Each item can have different images/prompts.
+    ///
+    /// # Arguments
+    /// * `batch` - Batch items, each with messages and optional images
+    /// * `config` - Optional shared chat configuration
+    ///
+    /// # Returns
+    /// * Vec of VLMChatResult, one per batch item
+    #[cfg(not(target_family = "wasm"))]
+    #[napi]
+    pub async fn batch(
+        &self,
+        batch: Vec<VLMBatchItem>,
         config: Option<VLMChatConfig>,
     ) -> Result<Vec<VLMChatResult>> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
@@ -649,14 +938,27 @@ impl VLModelInner {
             return Ok(Vec::new());
         }
 
-        // Fall back to sequential for batch_size == 1 — chat_sync owns the config merge.
+        // Fall back to sequential for batch_size == 1
         if batch.len() == 1 {
             let item = &batch[0];
-            return Ok(vec![self.chat_sync(
-                item.messages.clone(),
-                config,
-                item.images.clone(),
-            )?]);
+            let default_cfg = VLMChatConfig::default();
+            let base = config.as_ref().unwrap_or(&default_cfg);
+            let merged_config = Some(VLMChatConfig {
+                images: None, // already extracted
+                max_new_tokens: base.max_new_tokens,
+                temperature: base.temperature,
+                top_k: base.top_k,
+                top_p: base.top_p,
+                repetition_penalty: base.repetition_penalty,
+                presence_penalty: base.presence_penalty,
+                presence_context_size: base.presence_context_size,
+                frequency_penalty: base.frequency_penalty,
+                frequency_context_size: base.frequency_context_size,
+                return_logprobs: base.return_logprobs,
+            });
+            let result =
+                self.chat_sync(item.messages.clone(), merged_config, item.images.clone())?;
+            return Ok(vec![result]);
         }
 
         let default_config = VLMChatConfig::default();
@@ -683,61 +985,30 @@ impl VLModelInner {
 
         let model_config = &self.config;
 
-        let gen_config = GenerationConfig {
-            max_new_tokens: config.max_new_tokens,
-            temperature: config.temperature,
-            top_k: config.top_k,
-            top_p: config.top_p,
-            min_p: None,
-            repetition_penalty: config.repetition_penalty,
-            repetition_context_size: None,
-            presence_penalty: config.presence_penalty,
-            presence_context_size: config.presence_context_size,
-            frequency_penalty: config.frequency_penalty,
-            frequency_context_size: config.frequency_context_size,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            eos_token_id: Some(model_config.eos_token_id),
-            return_logprobs: config.return_logprobs,
-            prefill_step_size: None,
-            report_performance: None,
-        };
-
-        // Prepare per-item inputs
-        let batch_size = batch.len();
-        let mut all_input_ids = Vec::with_capacity(batch_size);
-        let mut all_pixel_values = Vec::with_capacity(batch_size);
-        let mut all_grid_thws = Vec::with_capacity(batch_size);
-
-        for item in &batch {
-            let (pixel_values, grid_thw) = if let Some(ref images) = item.images {
-                if images.is_empty() {
-                    (None, None)
-                } else {
-                    let processor_config = ImageProcessorConfig {
-                        patch_size: model_config.vision_config.patch_size,
-                        merge_size: model_config.vision_config.spatial_merge_size,
-                        ..ImageProcessorConfig::default()
-                    };
-                    let processor = ImageProcessor::new(Some(processor_config));
-                    let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
-                    let processed = processor.process_many(&image_refs)?;
-                    let pv = processed.pixel_values();
-                    let pv_shape = pv.shape()?;
-                    let new_shape = BigInt64Array::from(vec![
-                        1i64,
-                        pv_shape[0],
-                        pv_shape[1],
-                        pv_shape[2],
-                        pv_shape[3],
-                    ]);
-                    let pixel_values = pv.reshape(&new_shape)?;
-                    let grid_thw = processed.grid_thw();
-                    (Some(pixel_values), Some(grid_thw))
-                }
-            } else {
-                (None, None)
+        // spawn_blocking: image processing + tokenization + generate_batch + decoding
+        crate::compat::run_blocking(move || {
+            let gen_config = GenerationConfig {
+                max_new_tokens: config.max_new_tokens,
+                temperature: config.temperature,
+                top_k: config.top_k,
+                top_p: config.top_p,
+                min_p: None,
+                repetition_penalty: config.repetition_penalty,
+                repetition_context_size: None,
+                presence_penalty: config.presence_penalty,
+                presence_context_size: config.presence_context_size,
+                frequency_penalty: config.frequency_penalty,
+                frequency_context_size: config.frequency_context_size,
+                max_consecutive_tokens: None,
+                max_ngram_repeats: None,
+                ngram_size: None,
+                eos_token_id: Some(model_config.eos_token_id),
+                return_logprobs: config.return_logprobs,
+                prefill_step_size: None,
+                kv_cache_bits: None,
+                kv_cache_group_size: None,
+                num_draft_tokens: None,
+                report_performance: None,
             };
 
             let num_image_tokens = if let Some(ref grid) = grid_thw {
@@ -816,10 +1087,7 @@ impl VLModelInner {
         }
 
         let batch_size = all_input_ids.len();
-        // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(.. as
-        // usize)` below never sees a negative `i32` (`-1 as usize` would
-        // request `usize::MAX`); the `0..max_new_tokens` loop then emits 0.
-        let max_new_tokens = config.max_new_tokens.unwrap_or(256).max(0);
+        let max_new_tokens = config.max_new_tokens.unwrap_or(256);
         let temperature = config.temperature.unwrap_or(0.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -1035,10 +1303,7 @@ impl VLModelInner {
 
         // === STEP 3: Batched decode loop ===
         let mut generated_tokens: Vec<Vec<u32>> =
-            vec![
-                Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
-                batch_size
-            ];
+            vec![Vec::with_capacity(max_new_tokens as usize); batch_size];
         let mut generated_logprobs: Vec<Vec<f32>> = vec![Vec::new(); batch_size];
         let mut finish_reasons: Vec<Option<String>> = vec![None; batch_size];
 
@@ -1339,8 +1604,27 @@ impl VLModel {
             thread,
             config: config_clone,
             initialized: false,
+            has_tokenizer_flag: false,
             _cache_limit_guard: None,
         })
+    }
+
+    /// Set the tokenizer
+    #[napi]
+    pub fn set_tokenizer(&mut self, tokenizer: &Qwen3Tokenizer) -> Result<()> {
+        let arc = Arc::new(tokenizer.clone());
+        crate::model_thread::send_and_block(&self.thread, |reply| VLModelCmd::SetTokenizer {
+            tokenizer: arc,
+            reply,
+        })?;
+        self.has_tokenizer_flag = true;
+        Ok(())
+    }
+
+    /// Check if tokenizer is available
+    #[napi(getter)]
+    pub fn has_tokenizer(&self) -> bool {
+        self.has_tokenizer_flag
     }
 
     /// Chat with the VLM model
@@ -1425,6 +1709,141 @@ impl VLModel {
         Ok(text)
     }
 
+    /// Get input embeddings with vision features merged
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `pixel_values` - Optional image patches [batch, seq, channels, patch_h, patch_w]
+    /// * `image_grid_thw` - Optional grid dimensions [num_images, 3]
+    ///
+    /// # Returns
+    /// * Input embeddings with vision features inserted at image token positions
+    #[napi]
+    pub fn get_input_embeddings(
+        &self,
+        input_ids: &MxArray,
+        pixel_values: Option<&MxArray>,
+        image_grid_thw: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        crate::model_thread::send_and_block(&self.thread, |reply| VLModelCmd::GetInputEmbeddings {
+            input_ids: input_ids.clone(),
+            image_features: pixel_values.cloned(),
+            image_grid_thw: image_grid_thw.cloned(),
+            reply,
+        })
+    }
+
+    /// Forward pass
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `pixel_values` - Optional image patches
+    /// * `image_grid_thw` - Optional grid dimensions
+    /// * `mask` - Optional attention mask
+    ///
+    /// # Returns
+    /// * Logits [batch, seq_len, vocab_size]
+    #[napi]
+    pub fn forward(
+        &self,
+        input_ids: &MxArray,
+        pixel_values: Option<&MxArray>,
+        image_grid_thw: Option<&MxArray>,
+        mask: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        crate::model_thread::send_and_block(&self.thread, |reply| VLModelCmd::Forward {
+            input_ids: input_ids.clone(),
+            pixel_values: pixel_values.cloned(),
+            image_grid_thw: image_grid_thw.cloned(),
+            mask: mask.cloned(),
+            reply,
+        })
+    }
+
+    /// Generate text tokens given input tokens and optional image
+    ///
+    /// Uses KV caching for efficient generation.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Input token IDs [1, seq_len]
+    /// * `pixel_values` - Optional image patches [1, num_patches, C, H, W]
+    /// * `image_grid_thw` - Optional grid dimensions [1, 3]
+    /// * `config` - Generation configuration
+    ///
+    /// # Returns
+    /// * GenerationResult with tokens, logprobs, and finish reason
+    #[napi]
+    pub async fn generate(
+        &self,
+        input_ids: &MxArray,
+        pixel_values: Option<&MxArray>,
+        image_grid_thw: Option<&MxArray>,
+        config: Option<GenerationConfig>,
+    ) -> Result<GenerationResult> {
+        let input_ids = input_ids.clone();
+        let pixel_values = pixel_values.cloned();
+        let image_grid_thw = image_grid_thw.cloned();
+
+        crate::model_thread::send_and_await(&self.thread, |reply| VLModelCmd::Generate {
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            config,
+            reply,
+        })
+        .await
+    }
+
+    /// Batch OCR: extract text from multiple images simultaneously
+    ///
+    /// Processes N images with sequential prefill + batched decode for ~N× decode throughput.
+    ///
+    /// # Arguments
+    /// * `images` - Encoded image buffers
+    /// * `config` - Optional chat configuration (shared across all items)
+    ///
+    /// # Returns
+    /// * Vec of extracted text strings, one per image
+    ///
+    /// # Example
+    /// ```typescript
+    /// import { readFileSync } from 'fs';
+    /// const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
+    /// const texts = await model.ocrBatch(images);
+    /// ```
+    #[napi]
+    pub async fn ocr_batch(
+        &self,
+        images: Vec<Buffer>,
+        config: Option<VLMChatConfig>,
+    ) -> Result<Vec<String>> {
+        let prompt = "Extract all text from this image.".to_string();
+
+        let batch: Vec<VLMBatchItem> = images
+            .into_iter()
+            .map(|image_data| VLMBatchItem {
+                messages: vec![VLMChatMessage {
+                    role: ChatRole::User,
+                    content: prompt.clone(),
+                }],
+                images: Some(vec![image_data]),
+            })
+            .collect();
+
+        let results = self.batch(batch, config).await?;
+
+        Ok(results
+            .into_iter()
+            .map(|r| {
+                let text = r.text;
+                text.strip_prefix("\\(\\text{")
+                    .and_then(|s| s.strip_suffix("}\\)"))
+                    .map(|s| s.to_string())
+                    .unwrap_or(text)
+            })
+            .collect())
+    }
+
     /// Batch chat: process multiple items simultaneously
     ///
     /// Sequential prefill + batched decode. Each item can have different images/prompts.
@@ -1490,6 +1909,7 @@ impl VLModel {
     /// const model = await VLModel.load('./models/paddleocr-vl');
     /// const result = await model.chat(messages, { images: [readFileSync('./image.jpg')] });
     /// ```
+    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn load<'env>(env: &'env Env, model_path: String) -> Result<PromiseRaw<'env, VLModel>> {
         env.spawn_future_with_callback(
@@ -1507,25 +1927,199 @@ impl VLModel {
                         let cache_limit_guard =
                             crate::cache_limit::coordinator().register(weight_bytes);
                         let config = inner.config.clone();
-                        Ok((inner, (config, cache_limit_guard)))
+                        let has_tokenizer = inner.tokenizer.is_some();
+                        Ok((inner, (config, has_tokenizer, cache_limit_guard)))
                     },
                     handle_vlmodel_cmd,
                 );
 
-                let (config, cache_limit_guard) = init_rx
+                let (config, has_tokenizer, cache_limit_guard) = init_rx
                     .await
                     .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
-                Ok((thread, config, cache_limit_guard))
+                Ok((thread, config, has_tokenizer, cache_limit_guard))
             },
-            |_, (thread, config, cache_limit_guard)| {
+            |_, (thread, config, has_tokenizer, cache_limit_guard)| {
                 Ok(VLModel {
                     thread,
                     config,
                     initialized: true,
+                    has_tokenizer_flag: has_tokenizer,
                     _cache_limit_guard: Some(cache_limit_guard),
                 })
             },
+        )
+    }
+
+    /// Load model configuration from disk without loading weights
+    ///
+    /// This is useful for inspecting model configuration before loading the full model.
+    ///
+    /// # Arguments
+    /// * `model_path` - Path to the model directory containing config.json
+    ///
+    /// # Returns
+    /// * ModelConfig with vision and text configuration
+    ///
+    /// # Example
+    /// ```typescript
+    /// import { VLModel } from '@mlx-node/vlm';
+    /// const config = await VLModel.loadConfig('./models/paddleocr-vl');
+    /// console.log(config.visionConfig.hiddenSize);
+    /// ```
+    #[cfg(not(target_family = "wasm"))]
+    #[napi]
+    pub fn load_config<'env>(
+        env: &'env Env,
+        model_path: String,
+    ) -> Result<PromiseRaw<'env, ModelConfig>> {
+        env.spawn_future_with_callback(
+            async move {
+                napi::tokio::task::spawn_blocking(move || {
+                    let path = Path::new(&model_path);
+
+                    // Check if path exists
+                    if !path.exists() {
+                        return Err(napi::Error::from_reason(format!(
+                            "Model path does not exist: {}",
+                            model_path
+                        )));
+                    }
+
+                    // Load configuration
+                    let config_path = path.join("config.json");
+                    if !config_path.exists() {
+                        return Err(napi::Error::from_reason(format!(
+                            "Config file not found: {}",
+                            config_path.display()
+                        )));
+                    }
+
+                    let config_data = fs::read_to_string(&config_path)?;
+                    let raw_config: Value = serde_json::from_str(&config_data)?;
+
+                    // Parse vision config
+                    let vision_raw = &raw_config["vision_config"];
+                    let vision_config = VisionConfig {
+                        model_type: vision_raw["model_type"]
+                            .as_str()
+                            .unwrap_or("paddleocr_vl")
+                            .to_string(),
+                        hidden_size: vision_raw["hidden_size"].as_i64().unwrap_or_else(|| {
+                            warn!("vision_config.hidden_size not found in config.json, using default 1152");
+                            1152
+                        }) as i32,
+                        intermediate_size: vision_raw["intermediate_size"].as_i64().unwrap_or(4304)
+                            as i32,
+                        num_hidden_layers: vision_raw["num_hidden_layers"].as_i64().unwrap_or_else(|| {
+                            warn!("vision_config.num_hidden_layers not found in config.json, using default 27");
+                            27
+                        }) as i32,
+                        num_attention_heads: vision_raw["num_attention_heads"]
+                            .as_i64()
+                            .unwrap_or_else(|| {
+                                warn!("vision_config.num_attention_heads not found in config.json, using default 16");
+                                16
+                            }) as i32,
+                        num_channels: vision_raw["num_channels"].as_i64().unwrap_or(3) as i32,
+                        image_size: vision_raw["image_size"].as_i64().unwrap_or(384) as i32,
+                        patch_size: vision_raw["patch_size"].as_i64().unwrap_or_else(|| {
+                            warn!("vision_config.patch_size not found in config.json, using default 14");
+                            14
+                        }) as i32,
+                        hidden_act: vision_raw["hidden_act"]
+                            .as_str()
+                            .unwrap_or("gelu_pytorch_tanh")
+                            .to_string(),
+                        layer_norm_eps: vision_raw["layer_norm_eps"].as_f64().unwrap_or(1e-6),
+                        attention_dropout: vision_raw["attention_dropout"].as_f64().unwrap_or(0.0),
+                        spatial_merge_size: vision_raw["spatial_merge_size"].as_i64().unwrap_or_else(|| {
+                            warn!("vision_config.spatial_merge_size not found in config.json, using default 2");
+                            2
+                        }) as i32,
+                    };
+
+                    // Parse text config
+                    let text_raw = &raw_config["text_config"];
+                    let mrope_section: Vec<i32> = text_raw["mrope_section"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_i64().map(|x| x as i32))
+                                .collect()
+                        })
+                        .unwrap_or_else(|| vec![16, 24, 24]);
+
+                    let text_config = TextConfig {
+                        model_type: text_raw["model_type"]
+                            .as_str()
+                            .unwrap_or("paddleocr_vl")
+                            .to_string(),
+                        hidden_size: text_raw["hidden_size"].as_i64().unwrap_or_else(|| {
+                            warn!("text_config.hidden_size not found in config.json, using default 1024");
+                            1024
+                        }) as i32,
+                        num_hidden_layers: text_raw["num_hidden_layers"].as_i64().unwrap_or_else(|| {
+                            warn!("text_config.num_hidden_layers not found in config.json, using default 18");
+                            18
+                        }) as i32,
+                        intermediate_size: text_raw["intermediate_size"].as_i64().unwrap_or(3072)
+                            as i32,
+                        num_attention_heads: text_raw["num_attention_heads"].as_i64().unwrap_or_else(|| {
+                            warn!("text_config.num_attention_heads not found in config.json, using default 16");
+                            16
+                        }) as i32,
+                        rms_norm_eps: text_raw["rms_norm_eps"].as_f64().unwrap_or(1e-5),
+                        vocab_size: text_raw["vocab_size"].as_i64().unwrap_or_else(|| {
+                            warn!("text_config.vocab_size not found in config.json, using default 103424");
+                            103424
+                        }) as i32,
+                        num_key_value_heads: text_raw["num_key_value_heads"].as_i64().unwrap_or(2)
+                            as i32,
+                        max_position_embeddings: text_raw["max_position_embeddings"]
+                            .as_i64()
+                            .unwrap_or(131072)
+                            as i32,
+                        rope_theta: text_raw["rope_theta"].as_f64().unwrap_or(500000.0),
+                        rope_traditional: text_raw["rope_traditional"].as_bool().unwrap_or(false),
+                        use_bias: text_raw["use_bias"].as_bool().unwrap_or(false),
+                        head_dim: text_raw["head_dim"].as_i64().unwrap_or(128) as i32,
+                        mrope_section,
+                    };
+
+                    // Build model config
+                    Ok(ModelConfig {
+                        vision_config,
+                        text_config,
+                        model_type: raw_config["model_type"]
+                            .as_str()
+                            .unwrap_or("paddleocr_vl")
+                            .to_string(),
+                        ignore_index: raw_config["ignore_index"].as_i64().unwrap_or(-100) as i32,
+                        image_token_id: raw_config["image_token_id"].as_i64().unwrap_or(100295)
+                            as i32,
+                        video_token_id: raw_config["video_token_id"].as_i64().unwrap_or(100296)
+                            as i32,
+                        vision_start_token_id: raw_config["vision_start_token_id"]
+                            .as_i64()
+                            .unwrap_or(101305)
+                            as i32,
+                        vision_end_token_id: raw_config["vision_end_token_id"]
+                            .as_i64()
+                            .unwrap_or(101306) as i32,
+                        eos_token_id: raw_config["eos_token_id"].as_i64().unwrap_or(2) as i32,
+                    })
+                })
+                .await
+                .map_err(|err| {
+                    Error::new(
+                        Status::GenericFailure,
+                        format!("Failed to load config: {err}"),
+                    )
+                })
+                .flatten()
+            },
+            |_, config| Ok(config),
         )
     }
 }

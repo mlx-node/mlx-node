@@ -5697,7 +5697,7 @@ impl Qwen3Model {
         // Convert MxArray to Vec<u32>
         let token_ids = tokens.to_uint32()?;
 
-        napi::bindgen_prelude::spawn_blocking(move || {
+        crate::compat::run_blocking(move || {
             tokenizer.decode_sync(&token_ids, true) // skip special tokens
         })
         .await
@@ -5748,7 +5748,7 @@ impl Qwen3Model {
         }
         formatted.push_str(suffix);
 
-        napi::bindgen_prelude::spawn_blocking(move || {
+        crate::compat::run_blocking(move || {
             tokenizer.encode_sync(&formatted, Some(false))
         })
         .await
@@ -9211,7 +9211,7 @@ impl Qwen3Model {
         let lm_head_arc = self.lm_head.clone();
         let model_config = self.config.clone(); // For fused forward
 
-        napi::bindgen_prelude::spawn_blocking(move || {
+        crate::compat::run_blocking(move || {
             debug!(
                 "Starting generation: max_tokens={}, temp={}, top_k={}, top_p={}, rep_penalty={}",
                 max_new_tokens, temperature, top_k, top_p, repetition_penalty
@@ -9685,12 +9685,60 @@ impl Qwen3Model {
         messages: Vec<ChatMessage>,
         config: Option<GenerationConfig>,
     ) -> Result<GenerationResult> {
-        send_and_await(&self.thread, |reply| Qwen3Cmd::Generate {
-            messages,
-            config,
-            reply,
+        // Check if tokenizer is available
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
+            Error::new(
+                Status::InvalidArg,
+                "Tokenizer not available. Model must be loaded via load() to use generate().",
+            )
+        })?;
+
+        // Apply chat template and encode in a blocking task
+        let tokenizer_clone = tokenizer.clone();
+        let input_ids = crate::compat::run_blocking(move || {
+            // Format messages using ChatML template
+            let formatted = messages
+                .iter()
+                .map(|msg| format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content))
+                .chain(iter::once("<|im_start|>assistant\n".to_string()))
+                .collect::<String>();
+
+            // Encode the formatted text
+            let token_ids = tokenizer_clone.encode_sync(&formatted, Some(false))?;
+
+            // Create MxArray from token IDs
+            MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])
         })
         .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Chat template task failed: {}", e),
+            )
+        })??;
+
+        // Generate tokens using the training API (which has the optimized implementation)
+        let mut result = self.generate_for_training(&input_ids, config).await?;
+
+        // Decode the generated tokens in a blocking task
+        let result_tokens = result.tokens.clone();
+        let decoded_text = crate::compat::run_blocking(move || {
+            let generated_ids = result_tokens.to_uint32()?;
+
+            tokenizer.decode_sync(&generated_ids, true)
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Decoding task failed: {}", e),
+            )
+        })??;
+
+        // Populate the text field
+        result.text = decoded_text;
+
+        Ok(result)
     }
 
     /// Reset all caches and clear cached token history. Exposed so
@@ -9732,6 +9780,589 @@ impl Qwen3Model {
             reply,
         })
         .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Chat template task failed: {}", e),
+            )
+        })??;
+
+        // === Cache reuse: prefix verification ===
+        let (initial_kv_keys, initial_kv_values, initial_cache_idx, prefill_input_ids) =
+            if reuse_cache {
+                let (prefix_len, cached_len) = {
+                    let cached_th = self
+                        .cached_token_history
+                        .read()
+                        .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
+                    let cached = &*cached_th;
+                    let clen = cached.len();
+
+                    // Prefix match: new token sequence must start with the cached sequence
+                    let plen = if !cached.is_empty()
+                        && token_ids_vec.len() >= clen
+                        && token_ids_vec[..clen] == cached[..]
+                    {
+                        clen
+                    } else {
+                        0
+                    };
+                    (plen, clen)
+                }; // cached_th lock dropped here
+
+                if prefix_len > 0 {
+                    // Cache hit: restore cached KV state and only prefill delta tokens
+                    let cached_keys = self
+                        .cached_kv_keys
+                        .read()
+                        .map_err(|_| Error::from_reason("Failed to read cached kv keys"))?;
+                    let cached_vals = self
+                        .cached_kv_values
+                        .read()
+                        .map_err(|_| Error::from_reason("Failed to read cached kv values"))?;
+                    let cached_idx = self
+                        .cached_cache_idx
+                        .read()
+                        .map_err(|_| Error::from_reason("Failed to read cached cache idx"))?;
+
+                    let keys = cached_keys.clone();
+                    let vals = cached_vals.clone();
+                    let idx = *cached_idx;
+                    drop(cached_keys);
+                    drop(cached_vals);
+                    drop(cached_idx);
+
+                    // Delta tokens: everything after the cached prefix
+                    let delta_tokens = &token_ids_vec[prefix_len..];
+                    let delta_ids = if delta_tokens.is_empty() {
+                        // No new prompt tokens — entire prompt was cached.
+                        // Re-run the last token to get logits for sampling.
+                        None
+                    } else {
+                        Some(MxArray::from_uint32(
+                            delta_tokens,
+                            &[1, delta_tokens.len() as i64],
+                        )?)
+                    };
+
+                    info!(
+                        "Cache hit: prefix_len={}, delta_tokens={}, cache_idx={}",
+                        prefix_len,
+                        delta_tokens.len(),
+                        idx
+                    );
+
+                    (Some(keys), Some(vals), idx, delta_ids)
+                } else {
+                    // Cache miss: full prefill
+                    if cached_len > 0 {
+                        info!(
+                            "Cache miss: cached {} tokens, new {} tokens — full prefill",
+                            cached_len,
+                            token_ids_vec.len()
+                        );
+                    }
+                    (None, None, 0, Some(input_ids.clone()))
+                }
+            } else {
+                (None, None, 0, Some(input_ids.clone()))
+            };
+
+        // Actual prefill count: delta tokens on cache hit, full prompt on miss
+        let actual_prefill_count = match &prefill_input_ids {
+            Some(ids) => ids.shape_at(1).unwrap_or(token_ids_vec.len() as i64) as f64,
+            None => 1.0, // Cache hit with zero delta — re-runs last token
+        };
+
+        // Generate tokens using the internal generate method with optional cache state
+        let prompt_token_count = actual_prefill_count;
+        let config = gen_config.unwrap_or_default();
+
+        let embedding_weight = self.embedding.get_weight();
+        let layers_arc = self.layers.clone();
+        let final_norm_arc = self.final_norm.clone();
+        let lm_head_arc = self.lm_head.clone();
+        let model_config = self.config.clone();
+        let cached_kv_keys_arc = self.cached_kv_keys.clone();
+        let cached_kv_values_arc = self.cached_kv_values.clone();
+        let cached_cache_idx_arc = self.cached_cache_idx.clone();
+        let cached_token_history_arc = self.cached_token_history.clone();
+
+        let result = crate::compat::run_blocking(move || {
+            let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
+            let temperature = config.temperature.unwrap_or(0.7);
+            let top_k = config.top_k.unwrap_or(0);
+            let top_p = config.top_p.unwrap_or(0.9);
+            let min_p = config.min_p.unwrap_or(0.0);
+            let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+            let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+            let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+            let presence_context_size = config.presence_context_size.unwrap_or(20);
+            let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+            let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+            let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+            let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+            let ngram_size = config.ngram_size.unwrap_or(64);
+            let eos_token_id = config.eos_token_id.or(Some(model_config.eos_token_id));
+            let return_logprobs = config.return_logprobs.unwrap_or(false);
+            let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
+            let report_performance = config.report_performance.unwrap_or(false);
+
+            // Acquire read locks
+            let layers_guard = layers_arc.read().map_err(|_| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire layers read lock",
+                )
+            })?;
+            let final_norm_guard = final_norm_arc.read().map_err(|_| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire final_norm read lock",
+                )
+            })?;
+            let lm_head_guard = lm_head_arc.read().map_err(|_| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire lm_head read lock",
+                )
+            })?;
+            let layers = &*layers_guard;
+            let final_norm = &*final_norm_guard;
+            let lm_head = &*lm_head_guard;
+
+            let generation_stream = Stream::new(DeviceType::Gpu);
+
+            // Initialize KV caches: restore from cache or create fresh
+            let num_layers = layers.len();
+            let mut kv_keys = initial_kv_keys.unwrap_or_else(|| vec![None; num_layers]);
+            let mut kv_values = initial_kv_values.unwrap_or_else(|| vec![None; num_layers]);
+            let mut cache_idx: i32 = initial_cache_idx;
+
+            // rope_offsets starts at cache_idx (0 for fresh, or restored value for cache hit)
+            let mut rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
+            let left_padding = MxArray::from_int32(&[0], &[1])?;
+
+            let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+            let mut generated_logprobs: Vec<f32> = if return_logprobs {
+                Vec::with_capacity(max_new_tokens as usize)
+            } else {
+                Vec::new()
+            };
+            let mut finish_reason = "length";
+
+            let sampling_config = SamplingConfig {
+                temperature: Some(temperature),
+                top_k: Some(top_k),
+                top_p: Some(top_p),
+                min_p: Some(min_p),
+            };
+
+            // Track timing for TTFT
+            let decode_start = if report_performance {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let mut first_token_elapsed_ms: Option<f64> = None;
+
+            // PREFILL: Process delta tokens (or full prompt if no cache hit)
+            let mut last_logits = if let Some(current_ids) = prefill_input_ids {
+                let total_seq_len = current_ids.shape_at(1)? as usize;
+                let use_chunked_prefill =
+                    prefill_step_size > 0 && total_seq_len > prefill_step_size;
+
+                if use_chunked_prefill {
+                    let mut offset = 0usize;
+
+                    while offset + prefill_step_size < total_seq_len {
+                        let chunk_end = offset + prefill_step_size;
+                        let chunk =
+                            current_ids.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
+                        // cache_idx already equals initial_cache_idx + offset (advanced by forward_fused)
+                        rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
+
+                        {
+                            let _stream_ctx = StreamContext::new(generation_stream);
+                            let _ = Self::forward_fused(
+                                &chunk,
+                                &embedding_weight,
+                                layers,
+                                final_norm,
+                                lm_head,
+                                &model_config,
+                                &mut kv_keys,
+                                &mut kv_values,
+                                &mut cache_idx,
+                                &rope_offsets,
+                                &left_padding,
+                            )?;
+                        }
+
+                        for kv_key in kv_keys.iter().flatten() {
+                            kv_key.eval();
+                        }
+                        for kv_value in kv_values.iter().flatten() {
+                            kv_value.eval();
+                        }
+                        synchronize_and_clear_cache();
+                        offset = chunk_end;
+                    }
+
+                    // Final chunk
+                    let final_chunk =
+                        current_ids.slice(&[0, offset as i64], &[1, total_seq_len as i64])?;
+                    rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
+
+                    let logits = {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        Self::forward_fused(
+                            &final_chunk,
+                            &embedding_weight,
+                            layers,
+                            final_norm,
+                            lm_head,
+                            &model_config,
+                            &mut kv_keys,
+                            &mut kv_values,
+                            &mut cache_idx,
+                            &rope_offsets,
+                            &left_padding,
+                        )?
+                    };
+
+                    let chunk_seq_len = logits.shape_at(1)?;
+                    logits
+                        .slice_axis(1, chunk_seq_len - 1, chunk_seq_len)?
+                        .squeeze(Some(&[0, 1]))?
+                } else {
+                    // Single-pass prefill
+                    let logits = {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        Self::forward_fused(
+                            &current_ids,
+                            &embedding_weight,
+                            layers,
+                            final_norm,
+                            lm_head,
+                            &model_config,
+                            &mut kv_keys,
+                            &mut kv_values,
+                            &mut cache_idx,
+                            &rope_offsets,
+                            &left_padding,
+                        )?
+                    };
+
+                    let seq_len = logits.shape_at(1)?;
+                    logits
+                        .slice_axis(1, seq_len - 1, seq_len)?
+                        .squeeze(Some(&[0, 1]))?
+                }
+            } else {
+                // No delta tokens — entire prompt was cached.
+                // Re-run the last cached token to get logits for sampling.
+                let last_token_id = token_ids_vec[token_ids_vec.len() - 1];
+                // Rewind cache_idx by 1 so the last token is re-processed
+                cache_idx -= 1;
+                rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
+                let last_token = MxArray::from_uint32(&[last_token_id], &[1, 1])?;
+
+                let logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    Self::forward_fused(
+                        &last_token,
+                        &embedding_weight,
+                        layers,
+                        final_norm,
+                        lm_head,
+                        &model_config,
+                        &mut kv_keys,
+                        &mut kv_values,
+                        &mut cache_idx,
+                        &rope_offsets,
+                        &left_padding,
+                    )?
+                };
+
+                logits.squeeze(Some(&[0, 1]))?
+            };
+
+            // Update rope_offsets after prefill
+            rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
+
+            // Apply repetition penalty if enabled
+            if repetition_penalty != 1.0 && !token_ids_vec.is_empty() {
+                last_logits = apply_repetition_penalty(
+                    &last_logits,
+                    &token_ids_vec,
+                    repetition_penalty,
+                    Some(repetition_context_size),
+                )?;
+            }
+            if presence_penalty != 0.0 {
+                last_logits = apply_presence_penalty(
+                    &last_logits,
+                    &token_ids_vec,
+                    presence_penalty,
+                    Some(presence_context_size),
+                )?;
+            }
+            if frequency_penalty != 0.0 {
+                last_logits = apply_frequency_penalty(
+                    &last_logits,
+                    &token_ids_vec,
+                    frequency_penalty,
+                    Some(frequency_context_size),
+                )?;
+            }
+
+            // Sample first token
+            let (mut token, mut logprobs_arr) = if return_logprobs {
+                let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
+                (tok, Some(lp))
+            } else {
+                let tok = sample(&last_logits, Some(sampling_config))?;
+                (tok, None)
+            };
+
+            // Decode loop
+            const DECODE_CLEANUP_INTERVAL: i32 = 256;
+            let one_arr = MxArray::from_int32(&[1], &[1])?;
+            for step in 0..max_new_tokens {
+                let _stream_ctx = StreamContext::new(generation_stream);
+
+                token.eval();
+
+                if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
+                    synchronize_and_clear_cache();
+                }
+
+                let token_value = token.item_at_int32(0)? as u32;
+                if let Some(ds) = decode_start
+                    && first_token_elapsed_ms.is_none()
+                {
+                    first_token_elapsed_ms = Some(ds.elapsed().as_secs_f64() * 1000.0);
+                }
+
+                generated_tokens.push(token_value);
+
+                if return_logprobs && let Some(ref lp) = logprobs_arr {
+                    lp.eval();
+                    let token_logprob = lp.item_at_float32(token_value as usize)?;
+                    generated_logprobs.push(token_logprob);
+                }
+
+                if let Some(reason) = check_repetition_cutoff(
+                    &generated_tokens,
+                    max_consecutive_tokens,
+                    max_ngram_repeats,
+                    ngram_size,
+                ) {
+                    finish_reason = reason;
+                    break;
+                }
+
+                if let Some(eos_id) = eos_token_id
+                    && token_value == eos_id as u32
+                {
+                    finish_reason = "stop";
+                    break;
+                }
+
+                // Forward pass with just the new token
+                let next_input = MxArray::from_uint32(&[token_value], &[1, 1])?;
+                let next_logits = Self::forward_fused(
+                    &next_input,
+                    &embedding_weight,
+                    layers,
+                    final_norm,
+                    lm_head,
+                    &model_config,
+                    &mut kv_keys,
+                    &mut kv_values,
+                    &mut cache_idx,
+                    &rope_offsets,
+                    &left_padding,
+                )?;
+                rope_offsets = rope_offsets.add(&one_arr)?;
+
+                let next_last_logits = next_logits.slice_axis(1, 0, 1)?.squeeze(Some(&[0, 1]))?;
+
+                last_logits = next_last_logits;
+                if repetition_penalty != 1.0 || presence_penalty != 0.0 || frequency_penalty != 0.0
+                {
+                    let context_tokens: Vec<u32> = token_ids_vec
+                        .iter()
+                        .copied()
+                        .chain(generated_tokens.iter().copied())
+                        .collect();
+                    if repetition_penalty != 1.0 {
+                        last_logits = apply_repetition_penalty(
+                            &last_logits,
+                            &context_tokens,
+                            repetition_penalty,
+                            Some(repetition_context_size),
+                        )?;
+                    }
+                    if presence_penalty != 0.0 {
+                        last_logits = apply_presence_penalty(
+                            &last_logits,
+                            &context_tokens,
+                            presence_penalty,
+                            Some(presence_context_size),
+                        )?;
+                    }
+                    if frequency_penalty != 0.0 {
+                        last_logits = apply_frequency_penalty(
+                            &last_logits,
+                            &context_tokens,
+                            frequency_penalty,
+                            Some(frequency_context_size),
+                        )?;
+                    }
+                }
+
+                let (next_tok, next_lp) = if return_logprobs {
+                    let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
+                    (tok, Some(lp))
+                } else {
+                    (sample(&last_logits, Some(sampling_config))?, None)
+                };
+
+                token = next_tok;
+                logprobs_arr = next_lp;
+            }
+
+            // === Save cache state for reuse ===
+            if reuse_cache {
+                // Save KV caches
+                if let Ok(mut keys_guard) = cached_kv_keys_arc.write() {
+                    *keys_guard = kv_keys;
+                }
+                if let Ok(mut vals_guard) = cached_kv_values_arc.write() {
+                    *vals_guard = kv_values;
+                }
+                if let Ok(mut idx_guard) = cached_cache_idx_arc.write() {
+                    *idx_guard = cache_idx;
+                }
+                // Save token history: prompt tokens + generated tokens.
+                // Qwen3's decode loop runs forward_fused AFTER the EOS/repetition
+                // checks, so when stopped by "stop" or repetition, the last token
+                // is NOT in the KV cache. Only include tokens actually forwarded.
+                if let Ok(mut th) = cached_token_history_arc.write() {
+                    let mut full_history = token_ids_vec.clone();
+                    let history_tokens =
+                        if finish_reason != "length" && !generated_tokens.is_empty() {
+                            &generated_tokens[..generated_tokens.len() - 1]
+                        } else {
+                            &generated_tokens
+                        };
+                    full_history.extend_from_slice(history_tokens);
+                    *th = full_history;
+                }
+            } else {
+                // Clear cache state when reuse is disabled
+                if let Ok(mut keys_guard) = cached_kv_keys_arc.write() {
+                    keys_guard.clear();
+                }
+                if let Ok(mut vals_guard) = cached_kv_values_arc.write() {
+                    vals_guard.clear();
+                }
+                if let Ok(mut idx_guard) = cached_cache_idx_arc.write() {
+                    *idx_guard = 0;
+                }
+                if let Ok(mut th) = cached_token_history_arc.write() {
+                    th.clear();
+                }
+            }
+
+            // Build result
+            let tokens_array =
+                MxArray::from_uint32(&generated_tokens, &[generated_tokens.len() as i64])?;
+            let logprobs_array = if return_logprobs {
+                MxArray::from_float32(&generated_logprobs, &[generated_logprobs.len() as i64])?
+            } else {
+                MxArray::from_float32(&[], &[0])?
+            };
+
+            Ok::<GenerationResult, napi::Error>(GenerationResult {
+                text: String::new(),
+                tokens: tokens_array,
+                logprobs: logprobs_array,
+                finish_reason: finish_reason.to_string(),
+                num_tokens: generated_tokens.len(),
+                first_token_elapsed_ms,
+            })
+        })
+        .await
+        .map_err(|join_error| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Chat generation thread panicked: {}", join_error),
+            )
+        })??;
+
+        let gen_elapsed = gen_start.map(|s| s.elapsed());
+
+        // Decode the generated tokens in a blocking task
+        let result_tokens = result.tokens.clone();
+        let raw_text = crate::compat::run_blocking(move || {
+            let generated_ids = result_tokens.to_uint32()?;
+            tokenizer.decode_sync(&generated_ids, true)
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Decoding task failed: {}", e),
+            )
+        })??;
+
+        // Parse tool calls and thinking from the generated text
+        let (cleaned_text, tool_calls, thinking) = tools::parse_generation_output(&raw_text);
+
+        // Determine finish reason - if we have valid tool calls, it's "tool_calls"
+        let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            result.finish_reason.clone()
+        };
+
+        // Compute performance metrics using actual first-token timing from the decode loop
+        let performance = if let (Some(gen_elapsed), Some(first_tok_ms)) =
+            (gen_elapsed, result.first_token_elapsed_ms)
+        {
+            let total_ms = gen_elapsed.as_secs_f64() * 1000.0;
+            let gen_toks = result.num_tokens as f64;
+            let ttft_ms = first_tok_ms;
+            let decode_ms = total_ms - ttft_ms;
+            Some(crate::profiling::PerformanceMetrics {
+                ttft_ms,
+                prefill_tokens_per_second: if ttft_ms > 0.0 {
+                    prompt_token_count / (ttft_ms / 1000.0)
+                } else {
+                    0.0
+                },
+                decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                    (gen_toks - 1.0) / (decode_ms / 1000.0)
+                } else {
+                    0.0
+                },
+            })
+        } else {
+            None
+        };
+
+        Ok(ChatResult {
+            text: cleaned_text,
+            tool_calls,
+            thinking,
+            num_tokens: result.num_tokens as u32,
+            finish_reason,
+            raw_text,
+            performance,
+        })
     }
 
     /// Continue an existing chat session with a new user message.
@@ -9950,8 +10581,106 @@ impl Qwen3Model {
         group_size: u32,
         config: Option<GenerationConfig>,
     ) -> Result<BatchGenerationResult> {
-        send_and_await(&self.thread, |reply| Qwen3Cmd::GenerateBatch {
-            prompts,
+        // Check if tokenizer is available
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
+            Error::new(
+                Status::InvalidArg,
+                "Tokenizer not available. Model must be loaded via load() to use generateBatch().",
+            )
+        })?;
+
+        let num_prompts = prompts.len();
+        let group_size_usize = group_size as usize;
+
+        // STEP 1: Tokenize all prompts in one blocking task
+        let tokenizer_clone = tokenizer.clone();
+        let prompt_token_arrays = crate::compat::run_blocking(move || {
+            let mut results = Vec::with_capacity(num_prompts);
+
+            for messages in prompts {
+                // Format messages using ChatML template
+                let formatted = messages
+                    .iter()
+                    .map(|msg| format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content))
+                    .chain(iter::once("<|im_start|>assistant\n".to_string()))
+                    .collect::<String>();
+
+                // Encode the formatted text
+                let token_ids = tokenizer_clone.encode_sync(&formatted, Some(false))?;
+
+                // Create MxArray from token IDs
+                let prompt_tokens = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
+
+                results.push(prompt_tokens);
+            }
+
+            Ok::<Vec<MxArray>, Error>(results)
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Batch tokenization task failed: {}", e),
+            )
+        })??;
+
+        // STEP 2: Generate N*G completions using async calls
+        // Note: This uses N*G blocking tasks for generation, but still saves 2*N blocking tasks
+        // for tokenization and decoding compared to the naive approach
+        let mut all_tokens = Vec::with_capacity(num_prompts * group_size_usize);
+        let mut all_logprobs = Vec::with_capacity(num_prompts * group_size_usize);
+        let mut all_finish_reasons = Vec::with_capacity(num_prompts);
+        let mut all_token_counts = Vec::with_capacity(num_prompts);
+
+        // For each prompt, generate G completions
+        for prompt_tokens in prompt_token_arrays.into_iter() {
+            let mut prompt_finish_reasons = Vec::with_capacity(group_size_usize);
+            let mut prompt_token_counts = Vec::with_capacity(group_size_usize);
+
+            // Generate G completions for this prompt
+            for _group_idx in 0..group_size {
+                let result = self
+                    .generate_for_training(&prompt_tokens, config.clone())
+                    .await?;
+                all_tokens.push(result.tokens);
+                all_logprobs.push(result.logprobs);
+                prompt_finish_reasons.push(result.finish_reason);
+                prompt_token_counts.push(result.num_tokens as u32);
+            }
+
+            all_finish_reasons.push(prompt_finish_reasons);
+            all_token_counts.push(prompt_token_counts);
+        }
+
+        // STEP 3: Decode all N*G completions in one blocking task
+        let all_tokens_clone = all_tokens.clone();
+        let decoded_texts = crate::compat::run_blocking(move || {
+            let mut texts = Vec::with_capacity(all_tokens_clone.len());
+
+            for token_array in &all_tokens_clone {
+                let generated_ids = token_array.to_uint32()?;
+
+                let decoded = tokenizer.decode_sync(&generated_ids, true)?;
+                texts.push(decoded);
+            }
+
+            Ok::<Vec<String>, Error>(texts)
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Batch decoding task failed: {}", e),
+            )
+        })??;
+
+        Ok(BatchGenerationResult {
+            tokens: all_tokens,
+            logprobs: all_logprobs,
+            texts: decoded_texts,
+            finish_reasons: all_finish_reasons,
+            token_counts: all_token_counts,
+            num_prompts,
             group_size,
             config,
             reply,
@@ -9980,10 +10709,8 @@ impl Qwen3Model {
         let skip_special = skip_special_tokens.unwrap_or(true);
         let token_ids_vec = token_ids.to_vec();
 
-        send_and_await(&self.thread, |reply| Qwen3Cmd::Decode {
-            token_ids: token_ids_vec,
-            skip_special_tokens: skip_special,
-            reply,
+        crate::compat::run_blocking(move || {
+            tokenizer.decode_sync(&token_ids_vec, skip_special)
         })
         .await
     }

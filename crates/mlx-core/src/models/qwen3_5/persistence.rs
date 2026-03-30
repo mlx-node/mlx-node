@@ -1708,11 +1708,9 @@ fn validate_mandatory_weights(
     Ok(())
 }
 
-/// Load a Qwen3.5 dense model using a dedicated model thread.
-///
-/// Spawns a `ModelThread<Qwen35Cmd>` that loads all weights inside the init_fn.
-/// Returns a `Qwen3_5Model` thin shell with the thread handle.
-pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
+/// Load a pretrained Qwen3.5 dense model from a directory.
+#[cfg(not(target_family = "wasm"))]
+pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
     let model_path = model_path.to_string();
 
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(

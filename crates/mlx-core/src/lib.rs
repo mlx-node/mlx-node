@@ -41,6 +41,8 @@ pub mod convert;
 pub mod dataset;
 #[cfg(not(target_family = "wasm"))]
 pub mod decode_profiler;
+#[cfg(target_family = "wasm")]
+pub use compat::decode_profiler;
 #[cfg(not(target_family = "wasm"))]
 pub mod gradients;
 #[cfg(not(target_family = "wasm"))]
@@ -53,6 +55,8 @@ pub mod output_store;
 pub mod param_manager;
 #[cfg(not(target_family = "wasm"))]
 pub mod profiling;
+#[cfg(target_family = "wasm")]
+pub use compat::profiling;
 #[cfg(not(target_family = "wasm"))]
 pub mod sft;
 #[cfg(not(target_family = "wasm"))]

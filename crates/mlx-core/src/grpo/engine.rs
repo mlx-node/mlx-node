@@ -671,7 +671,15 @@ impl GRPOTrainingEngine {
             )
             .await?;
 
-        let total_tokens: i32 = gen_data.token_counts.iter().map(|&tc| tc as i32).sum();
+        // Run the entire training step in spawn_blocking
+        let metrics = crate::compat::run_blocking(move || {
+            // === Phase 1: Generate completions ===
+            let mut prompt_tokens_all: Vec<MxArray> = Vec::with_capacity(num_prompts);
+            let mut completion_tokens_all: Vec<MxArray> =
+                Vec::with_capacity(num_prompts * group_size);
+            let mut completion_logprobs_all: Vec<MxArray> =
+                Vec::with_capacity(num_prompts * group_size);
+            let mut token_counts_all: Vec<i32> = Vec::with_capacity(num_prompts * group_size);
 
         let generation_time_ms = generation_start.elapsed().as_secs_f64() * 1000.0;
         let training_start = std::time::Instant::now();
@@ -768,15 +776,148 @@ impl GRPOTrainingEngine {
         let group_size = self.config.group_size.unwrap_or(4) as usize;
         let gen_config = self.build_gen_config();
 
-        // Single batched dispatch — the returned GenerationPlainData already
-        // holds all prompts' data in prompt-major order.
-        let gen_data = self
-            .dispatch_generate(
-                &prompts,
-                group_size,
-                gen_config.clone(),
-                self.config.enable_thinking,
-                self.config.tools.clone(),
+        let model_arc = Arc::clone(&self.model);
+        let config = self.config.clone();
+        let model_type = self.model_type.clone();
+        let enable_thinking = config.enable_thinking;
+        let tools = config.tools.clone();
+
+        // Build generation config - use model's eos_token_id explicitly
+        let gen_config = GenerationConfig {
+            max_new_tokens: config.max_completion_length,
+            temperature: config.temperature,
+            top_p: config.top_p,
+            top_k: config.top_k,
+            min_p: None,
+            repetition_penalty: config.repetition_penalty,
+            repetition_context_size: Some(256),
+            presence_penalty: config.presence_penalty,
+            presence_context_size: None,
+            frequency_penalty: config.frequency_penalty,
+            frequency_context_size: None,
+            max_consecutive_tokens: Some(16),
+            max_ngram_repeats: Some(8),
+            ngram_size: Some(3),
+            eos_token_id: Some(model_type.eos_token_id()),
+            return_logprobs: Some(true),
+            prefill_step_size: None, // Use default (2048)
+            kv_cache_bits: None,     // Default: no quantization
+            kv_cache_group_size: None,
+            num_draft_tokens: None, // Speculative decoding not used in GRPO
+            report_performance: None,
+        };
+
+        let result = crate::compat::run_blocking(move || {
+            let num_completions = num_prompts * group_size;
+            let max_tokens = gen_config.max_new_tokens.unwrap_or(256) as usize;
+
+            // Step 1: Tokenize all prompts first
+            let mut prompt_arrays: Vec<MxArray> = Vec::with_capacity(num_prompts);
+            for prompt_messages in &prompts {
+                let prompt_token_ids = {
+                    let model = model_arc.read().map_err(|_| {
+                        Error::new(Status::GenericFailure, "Failed to acquire model read lock")
+                    })?;
+                    model.apply_chat_template_sync(
+                        prompt_messages,
+                        Some(true),
+                        tools.as_deref(),
+                        enable_thinking,
+                    )?
+                };
+                let prompt_array =
+                    MxArray::from_uint32(&prompt_token_ids, &[1, prompt_token_ids.len() as i64])?;
+                prompt_arrays.push(prompt_array);
+            }
+
+            // Step 2: Batched generation
+            // Use parallel batch generation if enabled (true batch with per-sequence RoPE offsets)
+            // Otherwise use sequential (prefill once per prompt, batch decode G completions)
+            let use_parallel = config.use_parallel_batch_generation.unwrap_or(false);
+            let batch_result = {
+                let model = model_arc.read().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire model read lock")
+                })?;
+                if use_parallel {
+                    // Parallel batch generation is only available for Qwen3 models
+                    match &*model {
+                        TrainableModelEnum::Qwen3(m) => {
+                            m.generate_batch_parallel_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
+                        }
+                        _ => {
+                            // Fall back to sequential for non-Qwen3 models
+                            model.generate_batch_for_training_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
+                        }
+                    }
+                } else {
+                    model.generate_batch_for_training_sync(&prompt_arrays, group_size, Some(gen_config.clone()))?
+                }
+            };
+
+            // Step 3: Decode all completions and convert to expected format
+            let mut completion_texts: Vec<String> = Vec::with_capacity(num_completions);
+            let mut all_tokens: Vec<i64> = Vec::with_capacity(num_completions * max_tokens);
+            let mut all_logprobs: Vec<f64> = Vec::with_capacity(num_completions * max_tokens);
+            let mut completion_lengths: Vec<i32> = Vec::with_capacity(num_completions);
+            let mut finish_reasons: Vec<String> = Vec::with_capacity(num_completions);
+
+            // Results are ordered: [prompt0_comp0, prompt0_comp1, ..., prompt1_comp0, ...]
+            for (i, tokens_arr) in batch_result.tokens.iter().enumerate() {
+                // Decode tokens to text
+                let text = {
+                    let model = model_arc.read().map_err(|_| {
+                        Error::new(Status::GenericFailure, "Failed to acquire model read lock")
+                    })?;
+                    model.decode_tokens_sync(tokens_arr)?
+                };
+                completion_texts.push(text);
+
+                // Extract token IDs and logprobs
+                let tokens = tokens_arr.to_int32()?;
+                let logprobs = batch_result.logprobs[i].to_float32()?;
+
+                completion_lengths.push(tokens.len() as i32);
+                all_tokens.extend(tokens.iter().map(|&x| x as i64));
+                all_logprobs.extend(logprobs.iter().map(|&x| x as f64));
+
+                // Get finish reason from batch result
+                // Use batch_result's group_size to ensure consistent indexing
+                let result_group_size = batch_result.group_size as usize;
+                let prompt_idx = i / result_group_size;
+                let group_idx = i % result_group_size;
+
+                // Bounds check with helpful error message
+                let reason = batch_result.finish_reasons
+                    .get(prompt_idx)
+                    .and_then(|reasons: &Vec<String>| reasons.get(group_idx))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "WARN: finish_reasons out of bounds - i={}, prompt_idx={}, group_idx={}, \
+                             finish_reasons.len()={}, result_group_size={}, tokens.len()={}",
+                            i, prompt_idx, group_idx,
+                            batch_result.finish_reasons.len(), result_group_size, batch_result.tokens.len()
+                        );
+                        "unknown".to_string()
+                    });
+                finish_reasons.push(reason);
+            }
+
+            // Heavy cleanup after generation phase to release ALL Metal contexts
+            heavy_cleanup();
+            Ok::<GenerateBatchResult, Error>(GenerateBatchResult {
+                completion_texts,
+                completion_tokens: all_tokens,
+                completion_logprobs: all_logprobs,
+                completion_lengths,
+                finish_reasons,
+            })
+        })
+        .await
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("spawn_blocking error: {}", e),
             )
             .await?;
 
@@ -861,11 +1002,10 @@ impl GRPOTrainingEngine {
         // concurrent reset wins cleanly.
         let start_generation = self.ensure_valid_snapshot_generation()?;
 
-        // Dispatch train step to model thread (uses cached MxArrays from generate phase)
-        let loss_config = self.build_loss_config(num_prompts, group_size);
-        let metrics = self
-            .dispatch_train_step(rewards.clone(), group_size as i32, loss_config, None)
-            .await?;
+        // Run the training step in spawn_blocking
+        let metrics = crate::compat::run_blocking(move || {
+            // === Phase 1: Tokenize prompts and reconstruct completion arrays ===
+            let mut prompt_tokens_all: Vec<MxArray> = Vec::with_capacity(num_prompts);
 
         let training_time_ms = training_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -956,6 +1096,15 @@ impl GRPOTrainingEngine {
             "Phase 1: Generating {} completions ({} prompts × {} groups)",
             expected_completions, num_prompts, group_size
         );
+        let gen_result = crate::compat::run_blocking(move || {
+            let mut completion_texts: Vec<String> = Vec::with_capacity(expected_completions);
+            let mut prompt_texts: Vec<String> = Vec::with_capacity(num_prompts);
+            let mut prompt_tokens_all: Vec<MxArray> = Vec::with_capacity(num_prompts);
+            let mut completion_tokens_all: Vec<MxArray> = Vec::with_capacity(expected_completions);
+            let mut completion_logprobs_all: Vec<MxArray> =
+                Vec::with_capacity(expected_completions);
+            let mut token_counts_all: Vec<u32> = Vec::with_capacity(expected_completions);
+            let mut finish_reasons_all: Vec<String> = Vec::with_capacity(expected_completions);
 
         let mut all_completion_texts: Vec<String> = Vec::with_capacity(expected_completions);
         let mut all_prompt_texts: Vec<String> = Vec::with_capacity(num_prompts);
@@ -1228,14 +1377,50 @@ impl GRPOTrainingEngine {
             vocab_chunk_size: self.config.vocab_chunk_size.map(|n| n as i64),
         };
 
-        // Final re-check before the training dispatch: this is the last
-        // await gap where a concurrent `reset()` could have invalidated
-        // this handle between the reward callback and the training step.
-        self.ensure_valid()?;
-        let metrics = self
-            .dispatch_train_step(
-                filtered_rewards.clone(),
-                effective_group_size as i32,
+        let metrics = crate::compat::run_blocking(move || {
+            let loss_config = GRPOLossConfig {
+                epsilon_low: config.clip_epsilon.unwrap_or(0.2),
+                epsilon_high: None,
+                beta: config.kl_coef.unwrap_or(0.0),
+                loss_type: config
+                    .loss_type
+                    .clone()
+                    .unwrap_or_else(|| "grpo".to_string()),
+                importance_sampling_level: "token".to_string(),
+                max_completion_length: config.max_completion_length.map(|n| n as i64),
+                num_items_in_batch: Some(usable_count as f64),
+                gradient_accumulation_steps: config.gradient_accumulation_steps.unwrap_or(1) as i64,
+                lm_head_chunk_size: config.lm_head_chunk_size.map(|n| n as i64),
+                forward_chunk_size: config.forward_chunk_size.map(|n| n as i64),
+                vocab_chunk_size: config.vocab_chunk_size.map(|n| n as i64),
+            };
+
+            let params = {
+                let model = model_arc.read().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire model read lock")
+                })?;
+                model.get_parameters()?
+            };
+
+            let prompt_refs: Vec<&MxArray> = prompt_tokens.iter().collect();
+            let completion_refs: Vec<&MxArray> = filtered_completion_tokens.iter().collect();
+            let logprob_refs: Vec<&MxArray> = filtered_completion_logprobs.iter().collect();
+
+            info!(
+                "Computing loss and gradients ({} prompts, {} completions)",
+                prompt_refs.len(),
+                completion_refs.len()
+            );
+            let grad_start = std::time::Instant::now();
+
+            let (loss_value, gradients) = compute_loss_and_gradients_autograd(
+                &model_type,
+                &params,
+                &prompt_refs,
+                &completion_refs,
+                &logprob_refs,
+                &rewards_clone,
+                group_size_for_training,
                 loss_config,
                 Some(valid_indices.clone()),
             )

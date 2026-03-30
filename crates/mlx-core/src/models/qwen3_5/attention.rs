@@ -1,6 +1,5 @@
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
-#[cfg(not(target_family = "wasm"))]
 use crate::models::paddleocr_vl::language::{MultimodalRoPE, apply_multimodal_rotary_pos_emb};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
@@ -26,7 +25,6 @@ pub struct Qwen3_5Attention {
 
     rope: RoPE,
     /// Optional M-RoPE for VLM mode (3D position encoding: temporal, height, width)
-    #[cfg(not(target_family = "wasm"))]
     mrope: Option<MultimodalRoPE>,
 
     num_heads: i32,
@@ -82,7 +80,6 @@ impl Qwen3_5Attention {
             q_norm,
             k_norm,
             rope,
-            #[cfg(not(target_family = "wasm"))]
             mrope: None,
             num_heads,
             num_kv_heads,
@@ -153,7 +150,6 @@ impl Qwen3_5Attention {
         let keys = self.k_norm.forward(&keys)?;
 
         // Apply RoPE: either M-RoPE (VLM) or standard scalar offset (text-only)
-        #[cfg(not(target_family = "wasm"))]
         let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
             // M-RoPE: compute cos/sin from 3D position IDs [3, B, T]
             let (cos, sin) = mrope.forward(&queries, pos_ids)?;
@@ -168,13 +164,6 @@ impl Qwen3_5Attention {
             (q_out, k_out)
         } else {
             // Standard scalar offset RoPE (text-only path, existing behavior)
-            let offset = cache.as_ref().map_or(0, |c| c.get_offset());
-            let queries = self.rope.forward(&queries, Some(offset))?;
-            let keys = self.rope.forward(&keys, Some(offset))?;
-            (queries, keys)
-        };
-        #[cfg(target_family = "wasm")]
-        let (queries, keys) = {
             let offset = cache.as_ref().map_or(0, |c| c.get_offset());
             let queries = self.rope.forward(&queries, Some(offset))?;
             let keys = self.rope.forward(&keys, Some(offset))?;
@@ -222,7 +211,6 @@ impl Qwen3_5Attention {
     }
 
     /// Initialize M-RoPE for VLM mode.
-    #[cfg(not(target_family = "wasm"))]
     pub fn init_mrope(
         &mut self,
         mrope_section: Vec<i32>,
