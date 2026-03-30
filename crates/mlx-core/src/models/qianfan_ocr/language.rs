@@ -196,6 +196,10 @@ impl InternVLLanguageModel {
             h = h.matmul(&embed_weight.transpose(Some(&[1, 0]))?)?;
         } else if let Some(ref lm_head) = self.lm_head {
             h = lm_head.forward(&h)?;
+        } else {
+            return Err(Error::from_reason(
+                "LM head is None but tie_word_embeddings is false",
+            ));
         }
 
         Ok(h)

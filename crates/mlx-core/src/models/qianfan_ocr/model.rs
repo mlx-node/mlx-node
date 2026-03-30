@@ -184,6 +184,12 @@ impl QianfanOCRModel {
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
     ) -> Result<QianfanChatResult> {
+        if !self.is_initialized() {
+            return Err(Error::from_reason(
+                "Model not initialized. Call QianfanOCRModel.load() first.",
+            ));
+        }
+
         let config = config.unwrap_or(ChatConfig {
             max_new_tokens: None,
             temperature: None,
@@ -303,7 +309,9 @@ impl QianfanOCRModel {
                 Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
             })?;
 
-            let prefix_len = if reuse_cache {
+            let prefix_len = if reuse_cache && image_bytes.is_empty() {
+                // Only reuse cache for text-only; images need full re-prefill
+                // since IMG_CONTEXT token IDs don't capture image content
                 let history = cached_token_history_arc
                     .read()
                     .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
@@ -547,6 +555,12 @@ impl QianfanOCRModel {
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
+        if !self.is_initialized() {
+            return Err(Error::from_reason(
+                "Model not initialized. Call QianfanOCRModel.load() first.",
+            ));
+        }
+
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_clone = cancelled.clone();
 
@@ -605,12 +619,17 @@ impl QianfanOCRModel {
 
         let image_bytes = extract_images_from_messages(&messages);
 
-        tokio::task::spawn_blocking(move || {
-            let emit = |chunk: ChatStreamChunk| {
-                callback.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
-            };
+        let callback = Arc::new(callback);
 
-            let result: Result<()> = (|| {
+        tokio::spawn(async move {
+            let callback_err = callback.clone();
+            let result =
+                napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
+                let emit = |chunk: ChatStreamChunk| {
+                    callback.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
+                };
+
+                let result: Result<()> = (|| {
                 // --- Process images ---
                 let processor = QianfanImageProcessor::new(&model_config);
                 let image_refs: Vec<&[u8]> = image_bytes.iter().map(|b| &b[..]).collect();
@@ -765,9 +784,7 @@ impl QianfanOCRModel {
                     }
 
                     // Decode this single token for streaming
-                    let token_text = tokenizer
-                        .decode_sync(&[token_value], true)
-                        .unwrap_or_default();
+                    let token_text = tokenizer.decode_sync(&[token_value], true)?;
 
                     emit(ChatStreamChunk {
                         text: token_text,
@@ -882,6 +899,28 @@ impl QianfanOCRModel {
                     raw_text: Some(format!("Error: {e}")),
                     performance: None,
                 });
+            }
+
+            Ok(())
+                })
+                .await;
+
+            match result {
+                Ok(Ok(())) => {} // Success — final chunk already sent via callback
+                Ok(Err(e)) => {
+                    // Inner closure error (tokenization, lock, array ops, etc.)
+                    callback_err.call(Err(e), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+                Err(e) => {
+                    // JoinError (panic in spawn_blocking)
+                    callback_err.call(
+                        Err(Error::from_reason(format!(
+                            "Chat stream task panicked: {}",
+                            e
+                        ))),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                }
             }
         });
 

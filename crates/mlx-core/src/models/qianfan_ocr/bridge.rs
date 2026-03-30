@@ -40,6 +40,12 @@ pub fn pixel_shuffle_v2(x: &MxArray, scale_factor: f64) -> Result<MxArray> {
     let c = shape[2];
 
     let hw = (seq_len as f64).sqrt() as i64;
+    if hw * hw != seq_len {
+        return Err(Error::from_reason(format!(
+            "pixel_shuffle_v2: seq_len ({}) is not a perfect square",
+            seq_len
+        )));
+    }
     let h = hw;
     let w = hw;
 
