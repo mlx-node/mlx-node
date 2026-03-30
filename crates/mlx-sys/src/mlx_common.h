@@ -8,7 +8,9 @@
 #include "mlx/memory.h"
 #include "mlx/compile.h"
 #include "mlx/compile_impl.h"
+#ifdef MLX_USE_METAL
 #include "mlx/backend/metal/metal.h"
+#endif
 #include "mlx/backend/gpu/device_info.h"
 
 #include <algorithm>

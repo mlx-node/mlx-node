@@ -1675,6 +1675,7 @@ fn apply_gguf_awq_prescaling(
     Ok(())
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[napi]
 pub async fn convert_gguf_to_safetensors(
     options: GgufConversionOptions,

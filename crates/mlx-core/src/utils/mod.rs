@@ -7,6 +7,7 @@
 // - foreign_weights: PyTorch/Paddle weight loaders
 
 pub mod foreign_weights;
+#[cfg(not(target_family = "wasm"))]
 pub mod functional;
 pub mod gemma_quant_repack;
 pub mod gguf;
@@ -16,6 +17,7 @@ pub mod safetensors;
 
 // Re-export all public items
 pub use foreign_weights::*;
+#[cfg(not(target_family = "wasm"))]
 pub use functional::*;
 pub use gguf::*;
 pub use safetensors::*;

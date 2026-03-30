@@ -1,0 +1,19 @@
+{
+  "name": "@mlx-node/browser",
+  "version": "0.0.1",
+  "description": "MLX inference in the browser via WebGPU + WASM",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "echo 'TODO: build WASM + bundle'"
+  },
+  "dependencies": {
+    "@napi-rs/wasm-runtime": "^0.2.9"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

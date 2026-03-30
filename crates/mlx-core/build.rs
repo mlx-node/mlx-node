@@ -1,5 +1,6 @@
-extern crate napi_build;
-
 fn main() {
-    napi_build::setup();
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if !target.contains("wasm") {
+        napi_build::setup();
+    }
 }

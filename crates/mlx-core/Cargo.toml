@@ -6,34 +6,56 @@ edition.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["full"]
+full = [
+  "dep:mlx-paged-attn",
+  "dep:mlx-db",
+  "dep:sqlx",
+  "dep:parquet",
+  "dep:mimalloc-safe",
+  "dep:rust_xlsxwriter",
+  "dep:tracing-subscriber",
+]
+# Minimal feature set for browser/WASM builds (inference only)
+browser = []
+mimalloc-safe = ["dep:mimalloc-safe"]
+
 [dependencies]
 futures = { workspace = true }
 half = { workspace = true }
 libc = { workspace = true }
 mlx-sys = { workspace = true }
-napi = { workspace = true }
 napi-derive = { workspace = true }
-parquet = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
-tokenizers = { workspace = true }
 minijinja = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-image = { workspace = true }
-mlx-paged-attn = { workspace = true }
-mlx-db = { workspace = true }
-sqlx = { workspace = true }
 unicode-width = { workspace = true }
-rust_xlsxwriter = { workspace = true }
 zip = { workspace = true }
+image = { workspace = true }
+tokenizers = { workspace = true }
 
-[dependencies.mimalloc-safe]
-workspace = true
-features = ["skip_collect_on_exit", "v3"]
+# Optional deps (excluded in browser builds via --no-default-features)
+parquet = { workspace = true, optional = true }
+mlx-paged-attn = { workspace = true, optional = true }
+mlx-db = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+rust_xlsxwriter = { workspace = true, optional = true }
+mimalloc-safe = { workspace = true, features = ["skip_collect_on_exit", "v3"], optional = true }
+
+# Platform-specific: napi with different features for native vs WASM
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+napi = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+napi = { version = "3", features = ["napi10", "noop", "serde-json"] }
+napi-derive = { version = "3", features = ["noop"] }
+tokio = { version = "1.48", features = ["sync", "macros", "io-util", "rt", "time"] }
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -1,727 +1,73 @@
-use std::cell::Cell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(not(target_family = "wasm"))]
+use futures::TryFutureExt;
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::ThreadsafeFunctionCallMode;
+#[cfg(not(target_family = "wasm"))]
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
-use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, MtpBackend, MtpStepper, MtpTurnSetup, PagedBackend,
-    PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs, ThinkingSetup, TrainBackend,
-    TurnOutput, TurnSetup, WholeTurnArgs,
-};
-use crate::engine::cmd::{
-    ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
-};
-use crate::engine::plan::{
-    DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
-    SpeculativePlan,
-};
-use crate::inference_trace::{
-    elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
-};
-use crate::model_thread::ResponseTx;
+use crate::model_thread::{ResponseTx, StreamTx};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
-use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::tokenizer::ChatMessage;
+use crate::tokenizer::Qwen3Tokenizer;
+use crate::tokenizer::ToolDefinition;
+use crate::tools;
+use crate::tools::ToolCallResult;
 
+use super::chat_common;
+use super::chat_common::{
+    apply_all_penalties, build_chatml_continue_delta_text, build_synthetic_user_message,
+    compute_image_cache_key, compute_performance_metrics, extract_chat_params,
+    finalize_chat_result, save_cache_state_direct, send_stream_error, verify_cache_prefix_direct,
+};
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
-#[cfg(test)]
-use super::gdn_checkpoint_store::compute_paged_prefix_block_hash;
-use super::gdn_checkpoint_store::{
-    GDN_PREFIX_CHECKPOINT_LIMIT, GDN_PREFIX_CHECKPOINTS_PER_OWNER, GdnCheckpointLineage,
-    compute_paged_prefix_block_hashes, find_longest_valid_gdn_checkpoint_index,
-    prune_gdn_checkpoints, replay_gdn_cache_and_commit,
-};
 use super::layer_cache::Qwen3_5LayerCache;
-use super::mtp::Qwen3_5MTPModule;
-use super::mtp_decode;
+#[cfg(not(target_family = "wasm"))]
 use super::persistence;
-use super::processing::{Qwen35VLImageProcessor, merged_image_token_count};
+use super::processing::Qwen35VLImageProcessor;
 use super::vision::Qwen3_5VisionEncoder;
-use crate::engine;
-use crate::engine::vision::VisionMerge;
-use crate::engine::{
-    apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
-    save_cache_state_direct, verify_cache_prefix_direct,
-};
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 
-/// Hard cap on inactive per-image feature entries retained by the vision LRU.
-/// The active request is protected from eviction even when it is larger than
-/// this cap; this prevents scan thrash while one large prompt is being built.
-pub(crate) const VISION_CACHE_MAX_ENTRIES: usize = 128;
+/// Maximum number of entries in the vision encoder cache before LRU eviction.
+pub(crate) const VISION_CACHE_MAX_ENTRIES: usize = 32;
 
-const VISION_GIB: u64 = 1024 * 1024 * 1024;
-
-/// Used only when neither MLX nor Metal can report a usable cap. Do not derive
-/// this from physical RAM: unified-memory pressure and the configured MLX limit
-/// are the constraints that matter to inference.
-const VISION_FALLBACK_EFFECTIVE_CAP_BYTES: u64 = 8 * VISION_GIB;
-const VISION_SAFETY_RESERVE_MIN_BYTES: u64 = 2 * VISION_GIB;
-const VISION_SAFETY_RESERVE_MAX_BYTES: u64 = 16 * VISION_GIB;
-const VISION_CACHE_MAX_BYTES: u64 = VISION_GIB;
-const VISION_MISS_BATCH_MIN_PATCHES: u64 = 1;
-const VISION_MISS_BATCH_MAX_PATCHES: u64 = 32 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VisionMemoryCapSource {
-    TotalUnifiedMemory,
-    MlxMemoryLimit,
-    MetalWorkingSet,
-    ConservativeFallback,
-}
-
-impl VisionMemoryCapSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::TotalUnifiedMemory => "total_unified_memory_85pct",
-            Self::MlxMemoryLimit => "mlx_memory_limit",
-            Self::MetalWorkingSet => "metal_recommended_working_set",
-            Self::ConservativeFallback => "conservative_fallback",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct VisionMemorySnapshot {
-    total_system_memory_bytes: u64,
-    mlx_memory_limit_bytes: u64,
-    metal_working_set_bytes: u64,
-    allocator_active_bytes: u64,
-    allocator_active_probe_ok: bool,
-    /// Process-wide Metal allocation snapshot. This includes MLX allocations
-    /// plus external LayerKVPool buffers that MLX's active counter omits.
-    metal_current_allocated_bytes: u64,
-    metal_current_probe_ok: bool,
-    /// Informational only. The caller drains MLX's reclaimable allocator cache
-    /// immediately before probing, and this value is deliberately not charged
-    /// against headroom. Any residue is logged for diagnosis.
-    allocator_cache_bytes: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct VisionMemoryBudget {
-    cap_source: VisionMemoryCapSource,
-    effective_cap_bytes: u64,
-    safety_reserve_bytes: u64,
-    usage_probe_available: bool,
-    metal_nonreclaimable_bytes: u64,
-    used_memory_bytes: u64,
-    output_headroom_bytes: u64,
-    projected_output_fits: bool,
-    headroom_bytes: u64,
-    projected_output_bytes: u64,
-    transient_budget_bytes: u64,
-    cache_budget_bytes: u64,
-    peak_bytes_per_patch: u64,
-    miss_batch_patch_budget: i64,
-}
-
-fn percentage_of(value: u64, percent: u64) -> u64 {
-    ((u128::from(value) * u128::from(percent)) / 100)
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
-fn lower_nonzero_cap(snapshot: VisionMemorySnapshot) -> (u64, VisionMemoryCapSource) {
-    let candidates = [
-        (
-            percentage_of(snapshot.total_system_memory_bytes, 85),
-            VisionMemoryCapSource::TotalUnifiedMemory,
-        ),
-        (
-            snapshot.mlx_memory_limit_bytes,
-            VisionMemoryCapSource::MlxMemoryLimit,
-        ),
-        (
-            percentage_of(snapshot.metal_working_set_bytes, 95),
-            VisionMemoryCapSource::MetalWorkingSet,
-        ),
-    ];
-    candidates
-        .into_iter()
-        .filter(|(bytes, _)| *bytes > 0)
-        .min_by_key(|(bytes, _)| *bytes)
-        .unwrap_or((
-            VISION_FALLBACK_EFFECTIVE_CAP_BYTES,
-            VisionMemoryCapSource::ConservativeFallback,
-        ))
-}
-
-fn probe_u64(probe: unsafe extern "C-unwind" fn(*mut u64) -> i32) -> u64 {
-    probe_u64_with_status(probe).0
-}
-
-fn probe_u64_with_status(probe: unsafe extern "C-unwind" fn(*mut u64) -> i32) -> (u64, bool) {
-    let mut value = 0u64;
-    // SAFETY: every accepted MLX probe writes at most one u64 to a valid
-    // pointer and reports failure through its return code.
-    if unsafe { probe(&mut value) } == 0 {
-        (value, true)
-    } else {
-        (0, false)
-    }
-}
-
-fn resolve_vision_memory_budget(
-    snapshot: VisionMemorySnapshot,
-    current_vision_cache_bytes: u64,
-    protected_feature_bytes: u64,
-    hidden_size: u64,
-    intermediate_size: u64,
-    activation_dtype_bytes: u64,
-    raw_pixel_bytes_per_patch: u64,
-    projected_output_bytes: u64,
-) -> VisionMemoryBudget {
-    let (effective_cap_bytes, cap_source) = lower_nonzero_cap(snapshot);
-
-    // Keep 12.5% of the effective cap free for text prefill, paged KV growth,
-    // command buffers, and process allocations outside MLX. Clamps keep the
-    // reserve useful on both small and workstation-class systems.
-    let reserve_ceiling = VISION_SAFETY_RESERVE_MAX_BYTES.min(effective_cap_bytes / 2);
-    let reserve_floor = VISION_SAFETY_RESERVE_MIN_BYTES.min(reserve_ceiling);
-    let safety_reserve_bytes = (effective_cap_bytes / 8).clamp(reserve_floor, reserve_ceiling);
-    // Metal's current allocation includes both active MLX buffers, MLX's
-    // reclaimable free pool, and external paged-KV buffers. Remove the
-    // allocator cache, then take the larger non-reclaimable counter rather
-    // than summing and double charging MLX-owned arrays.
-    let usage_probe_available = (snapshot.allocator_active_probe_ok
-        && snapshot.allocator_active_bytes > 0)
-        || (snapshot.metal_current_probe_ok && snapshot.metal_current_allocated_bytes > 0);
-    let metal_nonreclaimable_bytes = snapshot
-        .metal_current_allocated_bytes
-        .saturating_sub(snapshot.allocator_cache_bytes);
-    let measured_used_memory_bytes = snapshot
-        .allocator_active_bytes
-        .max(metal_nonreclaimable_bytes);
-    // A loaded vision model cannot genuinely consume zero bytes. If both
-    // probes fail/return zero, fail closed by exposing no headroom; the caller
-    // can still satisfy an all-hit request but must not start new encoding.
-    let used_memory_bytes = if usage_probe_available {
-        measured_used_memory_bytes
-    } else {
-        effective_cap_bytes.saturating_sub(safety_reserve_bytes)
-    };
-    let output_headroom_bytes = effective_cap_bytes
-        .saturating_sub(safety_reserve_bytes)
-        .saturating_sub(used_memory_bytes);
-    let projected_output_fits = projected_output_bytes <= output_headroom_bytes;
-    let headroom_bytes = output_headroom_bytes
-        // Miss outputs become protected active cache entries and remain live
-        // while later batches encode. Reserve their full request total before
-        // choosing any batch size so the initial snapshot cannot overcommit.
-        .saturating_sub(projected_output_bytes);
-
-    // Per-image feature arrays are active MLX allocations, so subtract them
-    // from active usage before resolving the total cache allowance. This
-    // avoids charging the current cache twice. Allocate at most one quarter of
-    // the non-model capacity to retained vision features.
-    let active_without_vision_cache =
-        used_memory_bytes.saturating_sub(current_vision_cache_bytes.min(used_memory_bytes));
-    let cache_capacity = effective_cap_bytes
-        .saturating_sub(safety_reserve_bytes)
-        .saturating_sub(active_without_vision_cache);
-    // The active request is the floor; only inactive retention is capped at
-    // one GiB. Spend at most one quarter of remaining live capacity beyond the
-    // protected request. When usage probes are unavailable, advertise zero so
-    // no optional retention or new encoding is authorized.
-    let cache_budget_bytes = if usage_probe_available {
-        protected_feature_bytes.max(
-            protected_feature_bytes
-                .saturating_add(cache_capacity / 4)
-                .min(VISION_CACHE_MAX_BYTES),
-        )
-    } else {
-        0
-    };
-
-    // One barrier-delimited encoder block can retain normalized residuals,
-    // QKV/rotary projections, attention/output residuals, and FC1/GELU/FC2.
-    // 14H + 3I is intentionally conservative for those simultaneously-live
-    // linear tensors. The saturating calculation makes invalid/extreme model
-    // metadata resolve to the minimum patch batch instead of wrapping large.
-    let live_elements_per_patch = hidden_size
-        .saturating_mul(14)
-        .saturating_add(intermediate_size.saturating_mul(3));
-    let peak_bytes_per_patch = live_elements_per_patch
-        .saturating_mul(activation_dtype_bytes.max(1))
-        .saturating_add(raw_pixel_bytes_per_patch)
-        .max(1);
-    // Spend no more than one quarter of currently free headroom on one vision
-    // layer; the remainder stays available to SDPA workspaces, the input
-    // aggregate, text prefill, and non-MLX allocations.
-    let transient_budget_bytes = headroom_bytes / 4;
-    let raw_patch_budget = transient_budget_bytes / peak_bytes_per_patch;
-    let miss_batch_patch_budget = if raw_patch_budget == 0 {
-        0
-    } else {
-        raw_patch_budget
-            .clamp(VISION_MISS_BATCH_MIN_PATCHES, VISION_MISS_BATCH_MAX_PATCHES)
-            .try_into()
-            .unwrap_or(i64::MAX)
-    };
-
-    VisionMemoryBudget {
-        cap_source,
-        effective_cap_bytes,
-        safety_reserve_bytes,
-        usage_probe_available,
-        metal_nonreclaimable_bytes,
-        used_memory_bytes,
-        output_headroom_bytes,
-        projected_output_fits,
-        headroom_bytes,
-        projected_output_bytes,
-        transient_budget_bytes,
-        cache_budget_bytes,
-        peak_bytes_per_patch,
-        miss_batch_patch_budget,
-    }
-}
-
-fn probe_vision_memory() -> VisionMemorySnapshot {
-    let (allocator_active_bytes, allocator_active_probe_ok) =
-        probe_u64_with_status(mlx_sys::mlx_get_active_memory);
-    let allocator_cache_bytes = probe_u64(mlx_sys::mlx_get_cache_memory);
-    #[cfg(target_os = "macos")]
-    let (metal_current_allocated_bytes, metal_current_probe_ok) =
-        match mlx_paged_attn::metal::MetalState::get() {
-            Ok(state) => (state.device.current_allocated_size(), true),
-            Err(_) => (0, false),
-        };
-    #[cfg(not(target_os = "macos"))]
-    let (metal_current_allocated_bytes, metal_current_probe_ok) = (0, false);
-
-    VisionMemorySnapshot {
-        total_system_memory_bytes: probe_u64(mlx_sys::mlx_total_system_memory),
-        mlx_memory_limit_bytes: probe_u64(mlx_sys::mlx_get_memory_limit),
-        metal_working_set_bytes: probe_u64(mlx_sys::mlx_max_recommended_working_set_size),
-        allocator_active_bytes,
-        allocator_active_probe_ok,
-        metal_current_allocated_bytes,
-        metal_current_probe_ok,
-        allocator_cache_bytes,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct VisionFeatureCacheKey {
-    image_hash: u64,
-    grid_thw: [i32; 3],
-}
-
-struct VisionFeatureCacheEntry {
-    features: MxArray,
-    bytes: usize,
-    lru_generation: u64,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct VisionCacheEviction {
-    entries: usize,
-    bytes: usize,
-}
-
-impl VisionCacheEviction {
-    fn merge(&mut self, other: Self) {
-        self.entries = self.entries.saturating_add(other.entries);
-        self.bytes = self.bytes.saturating_add(other.bytes);
-    }
-}
-
-/// LRU cache for individually materialized vision encoder embeddings. The
-/// content hash makes features reusable when a later cumulative turn appends
-/// new images; including the processed grid prevents reuse across a different
-/// resize/processor geometry.
+/// LRU cache for vision encoder embeddings, keyed by image content hash.
 pub(crate) struct VisionCacheInner {
-    entries: HashMap<VisionFeatureCacheKey, VisionFeatureCacheEntry>,
+    pub entries: HashMap<u64, (MxArray, MxArray, u64)>,
     /// Monotonically increasing counter for LRU generation tracking.
-    generation: u64,
-    retained_bytes: usize,
-}
-
-impl VisionCacheInner {
-    pub(crate) fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            generation: 0,
-            retained_bytes: 0,
-        }
-    }
-
-    fn get(&mut self, key: &VisionFeatureCacheKey) -> Option<MxArray> {
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-        self.entries.get_mut(key).map(|entry| {
-            entry.lru_generation = generation;
-            entry.features.clone()
-        })
-    }
-
-    fn insert(
-        &mut self,
-        key: VisionFeatureCacheKey,
-        features: MxArray,
-        bytes: usize,
-        protected: &HashSet<VisionFeatureCacheKey>,
-        max_bytes: usize,
-    ) -> VisionCacheEviction {
-        if let Some(previous) = self.entries.remove(&key) {
-            self.retained_bytes = self.retained_bytes.saturating_sub(previous.bytes);
-        }
-        self.generation = self.generation.wrapping_add(1);
-        self.entries.insert(
-            key,
-            VisionFeatureCacheEntry {
-                features,
-                bytes,
-                lru_generation: self.generation,
-            },
-        );
-        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
-        self.evict_to_limits(protected, VISION_CACHE_MAX_ENTRIES, max_bytes)
-    }
-
-    fn evict_to_limits(
-        &mut self,
-        protected: &HashSet<VisionFeatureCacheKey>,
-        max_entries: usize,
-        max_bytes: usize,
-    ) -> VisionCacheEviction {
-        let mut eviction = VisionCacheEviction::default();
-        while self.entries.len() > max_entries || self.retained_bytes > max_bytes {
-            let Some(oldest_key) = self
-                .entries
-                .iter()
-                .filter(|(key, _)| !protected.contains(key))
-                .min_by_key(|(_, entry)| entry.lru_generation)
-                .map(|(key, _)| *key)
-            else {
-                // The active request itself is the cache floor. Keeping it for
-                // the duration of this request avoids evict/re-encode scanning;
-                // a later request can evict these entries once unprotected.
-                break;
-            };
-            if let Some(evicted) = self.entries.remove(&oldest_key) {
-                self.retained_bytes = self.retained_bytes.saturating_sub(evicted.bytes);
-                eviction.entries = eviction.entries.saturating_add(1);
-                eviction.bytes = eviction.bytes.saturating_add(evicted.bytes);
-            }
-        }
-        eviction
-    }
+    pub generation: u64,
 }
 
 pub(crate) type VisionCache = Arc<Mutex<VisionCacheInner>>;
 
-// The shared model-id counter lives in `crate::engine::compiled_lock` so the
-// dense + MoE families draw from one id space (per-instance ids never
-// overlap). Re-exported here for unqualified use by this module's
-// `Qwen35Inner::new`; MoE imports it from `crate::engine::compiled_lock`
-// directly.
-pub(crate) use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
+/// Monotonically incrementing counter for assigning unique model IDs.
+/// Shared by BOTH dense and MoE models — the C++ weight map is shared,
+/// so IDs must be globally unique across all Qwen3.5 model variants.
+pub(crate) static QWEN35_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1); // 0 = no model
 
-fn fresh_dense_layer_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
-    (0..config.num_layers as usize)
-        .map(|i| {
-            if config.is_linear_layer(i) {
-                Qwen3_5LayerCache::new_linear()
-            } else {
-                Qwen3_5LayerCache::new_full_attention()
-            }
-        })
-        .collect()
-}
+/// RwLock protecting the C++ global weight map against concurrent mutation.
+/// Write-locked during weight registration (model load), read-locked during
+/// compiled inference. This prevents a concurrent model load from swapping
+/// weights underneath an in-flight compiled decode, and eliminates the TOCTOU
+/// between has_weight() / get_weight() in linear_proj().
+pub(crate) static COMPILED_WEIGHTS_RWLOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-/// Create the profiler owned by a paged-MTP turn before its prefill starts.
-///
-/// Paged AR intentionally keeps its existing terminal-only metrics path and
-/// therefore does not allocate a decode profiler here. This helper starts the
-/// prefill timer immediately before the actual paged prefill; the caller ends
-/// it immediately afterward, then carries this same instance into
-/// `run_mtp_turn` for decode and acceptance accounting.
-fn configure_paged_mtp_profiler(
-    mut profiler: crate::decode_profiler::DecodeProfiler,
-    fresh_suffix_tokens: u32,
-) -> crate::decode_profiler::DecodeProfiler {
-    profiler.set_prompt_tokens(fresh_suffix_tokens);
-    profiler.snapshot_memory_before();
-    profiler.begin_prefill();
-    profiler
-}
-
-fn begin_paged_mtp_profiler(
-    eager_mtp_paged: bool,
-    fresh_suffix_tokens: u32,
-) -> Option<crate::decode_profiler::DecodeProfiler> {
-    eager_mtp_paged.then(|| {
-        configure_paged_mtp_profiler(
-            crate::decode_profiler::DecodeProfiler::new("chat_paged_mtp_eager", "qwen3_5"),
-            fresh_suffix_tokens,
-        )
-    })
-}
-
-#[cfg(test)]
-mod paged_mtp_profiler_tests {
-    use super::*;
-
-    #[test]
-    fn paged_mtp_profiler_is_gated_away_from_ar() {
-        assert!(begin_paged_mtp_profiler(false, 37).is_none());
-        assert!(begin_paged_mtp_profiler(true, 37).is_some());
-    }
-
-    #[test]
-    fn paged_mtp_profiler_starts_with_fresh_suffix_metadata() {
-        let mut profiler = crate::decode_profiler::DecodeProfiler::new("paged_mtp_test", "qwen3_5");
-        profiler.enable_for_test();
-
-        let mut profiler = configure_paged_mtp_profiler(profiler, 37);
-        let (prompt_tokens, prefill_active, memory_before, prefill_ms) =
-            profiler.turn_start_state_for_test();
-        assert_eq!(prompt_tokens, 37);
-        assert!(prefill_active);
-        assert!(memory_before);
-        assert_eq!(prefill_ms, 0.0);
-
-        profiler.end_prefill();
-        let (_, prefill_active, _, prefill_ms) = profiler.turn_start_state_for_test();
-        assert!(!prefill_active);
-        assert!(prefill_ms.is_finite());
-    }
-}
-
-/// Enforce one fixed paged-pool token ceiling against already-resolved chat
-/// parameters. Shared by dense and MoE so every native paged executor uses the
-/// same prompt rejection marker and the same last-sampled-token accounting.
-pub(crate) fn constrain_paged_context_params(
-    family: &str,
-    prompt_tokens: usize,
-    capacity: u32,
-    params: &mut engine::ChatParams,
-) -> Result<()> {
-    let prompt = u32::try_from(prompt_tokens).unwrap_or(u32::MAX);
-    if prompt > capacity {
-        return Err(Error::from_reason(format!(
-            "context_length_exceeded: rendered prompt has {prompt} tokens, effective active \
-             context is {capacity} tokens"
-        )));
-    }
-    // The final sampled token is returned without another model forward, so N
-    // generated tokens consume only N-1 additional KV positions.
-    let max_output = capacity.saturating_sub(prompt).saturating_add(1);
-    let requested = params.max_new_tokens.max(0) as u32;
-    if requested > max_output {
-        warn!(
-            "{family} clamping max_new_tokens from {} to {} for effective context {} \
-             (prompt_tokens={})",
-            requested, max_output, capacity, prompt
-        );
-        params.max_new_tokens = max_output as i32;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod paged_context_capacity_tests {
-    use super::*;
-    use crate::engine::types::ChatConfig;
-
-    fn make_params(max_new_tokens: i32) -> engine::ChatParams {
-        extract_chat_params(&ChatConfig {
-            cache_owner_id: None,
-            cache_root_owner_id: None,
-            max_new_tokens: Some(max_new_tokens),
-            ..ChatConfig::default()
-        })
-    }
-
-    #[test]
-    fn rejects_a_prompt_larger_than_the_physical_pool() {
-        let mut params = make_params(32);
-        let err = constrain_paged_context_params("test", 65, 64, &mut params).unwrap_err();
-        assert!(
-            err.reason
-                .starts_with("context_length_exceeded: rendered prompt has 65 tokens")
-        );
-    }
-
-    #[test]
-    fn clamps_output_with_last_sampled_token_accounting() {
-        let mut params = make_params(100);
-        constrain_paged_context_params("test", 48, 64, &mut params).unwrap();
-        assert_eq!(params.max_new_tokens, 17);
-
-        let mut full_prompt = make_params(100);
-        constrain_paged_context_params("test", 64, 64, &mut full_prompt).unwrap();
-        assert_eq!(full_prompt.max_new_tokens, 1);
-    }
-
-    #[test]
-    fn preserves_an_already_safe_output_budget() {
-        let mut params = make_params(10);
-        constrain_paged_context_params("test", 48, 64, &mut params).unwrap();
-        assert_eq!(params.max_new_tokens, 10);
-    }
-}
-
-struct DenseGdnPrefixCheckpoint {
-    owner_id: String,
-    prefix_len: u32,
-    block_size: u32,
-    final_block_hash: u64,
-    block_hashes: Vec<u64>,
-    tokens: Vec<u32>,
-    caches: Vec<Qwen3_5LayerCache>,
-}
-
-impl GdnCheckpointLineage for DenseGdnPrefixCheckpoint {
-    fn owner_id(&self) -> &str {
-        &self.owner_id
-    }
-
-    fn prefix_len(&self) -> u32 {
-        self.prefix_len
-    }
-
-    fn block_size(&self) -> u32 {
-        self.block_size
-    }
-
-    fn final_block_hash(&self) -> u64 {
-        self.final_block_hash
-    }
-
-    fn tokens(&self) -> &[u32] {
-        &self.tokens
-    }
-
-    fn block_hashes(&self) -> &[u64] {
-        &self.block_hashes
-    }
-}
-
-struct DenseGdnHistoryCheckpoint {
-    owner_id: String,
-    image_key: Option<u64>,
-    tokens: Vec<u32>,
-    caches: Vec<Qwen3_5LayerCache>,
-}
-
-struct DenseGdnPrefixPreparation {
-    state: &'static str,
-    already_primed: bool,
-    restored_prefix_tokens: u32,
-    replayed_prefix_tokens: u32,
-}
-
-#[derive(Default)]
-struct DenseGdnCheckpointStoreTrace {
-    stored: bool,
-    eval_ms: f64,
-    clone_ms: f64,
-    token_clone_ms: f64,
-    update_ms: f64,
-    total_ms: f64,
-}
-
-impl DenseGdnCheckpointStoreTrace {
-    fn finish(mut self, start: Option<std::time::Instant>) -> Self {
-        self.total_ms = start.map(elapsed_ms).unwrap_or(0.0);
-        self
-    }
-}
-
-#[derive(Clone, Copy)]
-struct TokenPrefixMismatchTrace {
-    index: i64,
-    prompt_token: i64,
-    cached_token: i64,
-}
-
-impl Default for TokenPrefixMismatchTrace {
-    fn default() -> Self {
-        Self {
-            index: -1,
-            prompt_token: -1,
-            cached_token: -1,
-        }
-    }
-}
-
-fn token_prefix_mismatch_trace(prompt: &[u32], cached: &[u32]) -> TokenPrefixMismatchTrace {
-    let common_len = prompt.len().min(cached.len());
-    for i in 0..common_len {
-        if prompt[i] != cached[i] {
-            return TokenPrefixMismatchTrace {
-                index: i as i64,
-                prompt_token: prompt[i] as i64,
-                cached_token: cached[i] as i64,
-            };
-        }
-    }
-
-    TokenPrefixMismatchTrace {
-        index: common_len as i64,
-        prompt_token: prompt.get(common_len).map_or(-1, |token| *token as i64),
-        cached_token: cached.get(common_len).map_or(-1, |token| *token as i64),
-    }
-}
-
-fn dense_paged_linear_caches_ready(
-    config: &Qwen3_5Config,
-    caches: Option<&[Qwen3_5LayerCache]>,
-) -> bool {
-    let Some(caches) = caches else {
-        return false;
-    };
-    if caches.len() != config.num_layers as usize {
-        return false;
-    }
-    for (i, cache) in caches.iter().enumerate() {
-        if !config.is_linear_layer(i) {
-            continue;
-        }
-        let Qwen3_5LayerCache::Linear(arrays) = cache else {
-            return false;
-        };
-        if arrays.get(0).is_none() || arrays.get(1).is_none() {
-            return false;
-        }
-    }
-    true
-}
-
-fn clone_dense_linear_layer_caches(
-    config: &Qwen3_5Config,
-    caches: &[Qwen3_5LayerCache],
-) -> Option<Vec<Qwen3_5LayerCache>> {
-    if !dense_paged_linear_caches_ready(config, Some(caches)) {
-        return None;
-    }
-
-    let mut cloned = fresh_dense_layer_caches(config);
-    for i in 0..config.num_layers as usize {
-        if !config.is_linear_layer(i) {
-            continue;
-        }
-        let Qwen3_5LayerCache::Linear(arrays) = &caches[i] else {
-            return None;
-        };
-        cloned[i] = Qwen3_5LayerCache::Linear(arrays.clone());
-    }
-    Some(cloned)
-}
+/// Acquire the compiled weight read lock and verify model ownership in one step.
+/// Returns `Some(guard)` if this model owns the compiled weights, `None` otherwise.
+/// The guard must be held for the lifetime of the compiled decode to prevent
+/// Process-wide mutex serializing the dense compiled forward lifecycle across
+/// model instances. Within a single model instance, the dedicated model thread
+/// serializes calls. But with multiple model instances, compiled C++ forward
+/// calls from different model threads can collide on process-wide globals.
+static DENSE_COMPILED_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
@@ -732,7 +78,7 @@ pub(crate) struct Qwen35Inner {
     pub(crate) embedding: Embedding,
     pub(crate) layers: Vec<DecoderLayer>,
     pub(crate) final_norm: RMSNorm,
-    pub(crate) lm_head: Option<LinearProj>,
+    pub(crate) lm_head: Option<Linear>,
     pub(crate) caches: Option<Vec<Qwen3_5LayerCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) vision_encoder: Option<Arc<Qwen3_5VisionEncoder>>,
@@ -741,301 +87,254 @@ pub(crate) struct Qwen35Inner {
     pub(crate) vision_cache: VisionCache,
     pub(crate) cached_token_history: Vec<u32>,
     pub(crate) cached_image_key: Option<u64>,
-    /// Absolute expanded-token positions paired with their per-image content
-    /// hashes for the live paged request. These keys must remain attached to
-    /// the image-conditioned prefix when a later text turn extends it and
-    /// re-finalizes the request in the shared prefix cache.
-    pub(crate) cached_paged_image_token_positions: Vec<(u32, u64)>,
     pub(crate) cached_rope_deltas: Option<i32>,
     pub(crate) model_id: u64,
-    active_cache_owner_id: String,
-    gdn_root_cache_owner_id: Option<String>,
-    gdn_root_cache_owner_is_explicit: bool,
-    gdn_prefix_checkpoints: VecDeque<DenseGdnPrefixCheckpoint>,
-    gdn_last_history_checkpoint: Option<DenseGdnHistoryCheckpoint>,
-    /// Set when the infallible [`PagedBackend::finalize_paged_turn`] hook could
-    /// not register or release the adapter request. The engine calls
-    /// `save_paged_history` immediately afterwards, so that save must consume
-    /// this latch and refuse to republish placeholder-token history as a live
-    /// image-derived session.
-    paged_finalize_failed: bool,
-    /// Block-paged KV adapter (vLLM-style refcounted prefix cache) for
-    /// full-attention layers.
-    ///
-    /// **Opt-in via `Qwen3_5Config::use_block_paged_cache`** — see the
-    /// flag's rustdoc for the full architectural rationale. When
-    /// `Some(...)`, full-attention layers route through this adapter
-    /// while linear-attention (GDN) layers stay on
-    /// `Qwen3_5LayerCache::Linear` with no cross-request prefix reuse.
-    /// Paged turns run the pure-Rust eager paged forward
-    /// (`paged_forward::run_paged_prefill_chunk` / `run_paged_decode_step`).
-    pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
-    /// True when a paged-core turn has populated
-    /// the paged adapter's `LayerKVPool` since the last flat full-attention
-    /// prefill, so the flat `self.caches` full-attention slots do NOT
-    /// reflect the conversation history. The streaming dense-MTP fallback
-    /// (`chat_stream_tokens_delta_sync_inner`) consults this to decide
-    /// whether it must rebuild the flat caches from the full history before
-    /// decoding. Set by the paged cores; cleared after a flat prefill. This
-    /// keeps the rebuild a ONE-TIME cost on the paged→dense transition
-    /// instead of re-prefilling the whole history on every MTP turn.
-    pub(crate) paged_full_attn_caches_dirty: bool,
-    /// Set when a flat eager-MTP turn stopped mid-cycle leaving `self.caches`
-    /// advanced past the emitted token history (GDN state cannot be rewound).
-    /// Forces the next turn to discard `self.caches` and re-prefill the full
-    /// history. Pure-flat sessions only; the paged path rolls back its adapter
-    /// directly.
-    pub(crate) flat_mtp_caches_desynced: bool,
-    /// Count of full-history flat re-prefills taken by the streaming delta path
-    /// because the caches were desynced (the discard+re-prefill heal at
-    /// `chat_stream_tokens_delta_sync_inner`). Monotonic; lets a test confirm a
-    /// continue turn actually took the heal path (the streaming chunk's
-    /// `prompt_tokens`/`cached_tokens` are reported identically for heal and warm,
-    /// so they can't distinguish the two).
-    pub(crate) flat_full_reprefill_count: u64,
-    /// Engine-observed accepted-token tail passed to the most recent flat MTP
-    /// turn's `rollback_unemitted` hook. Unlike
-    /// `flat_mtp_caches_desynced`, this value is computed before the family
-    /// stepper handles the rollback, so tests can verify that a positive tail
-    /// actually arms the family latch.
-    pub(crate) flat_mtp_last_rollback_unemitted: usize,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
-    /// Optional Multi-Token Prediction head.
-    ///
-    /// Constructed when `config.n_mtp_layers > 0`. The speculative decode loop
-    /// is the only intended caller; the single-token decode path ignores this
-    /// field. Weight loading is performed by `persistence::apply_weights_inner`
-    /// after the main per-layer weights are loaded.
-    pub(crate) mtp: Option<Qwen3_5MTPModule>,
-    /// True only after persistence has seen a complete MTP tensor set and
-    /// applied it to `mtp`. The module may exist from config alone; this
-    /// flag prevents random-init MTP modules from advertising capability.
-    pub(crate) mtp_weights_loaded: bool,
-    /// Whether the CURRENT generic-flow turn is streaming. Set by the
-    /// [`ChatBackend::profiler_label`] hook (the session core calls it
-    /// exactly once per generic-flow turn, before `begin_decode`);
-    /// consumed by [`ChatBackend::begin_decode`]'s
-    /// profiler relabel, which must pick the `chat_*` vs `chat_stream_*`
-    /// label family (`TurnSetup` does not carry streaming-ness).
-    /// Whole-turn override paths (vision/paged/MTP) never consult it.
-    turn_is_streaming: Cell<bool>,
-    /// Sampling + stop-token defaults parsed from the checkpoint's
-    /// `generation_config.json` at load time. Empty for checkpoints that
-    /// ship no such file. Consumed by the [`ChatBackend`] sampling/EOS
-    /// hooks and the raw `generate` loop.
-    gen_defaults: crate::engine::ModelGenerationDefaults,
-}
-
-/// Build the dense media admission contract from the components wired into
-/// one loaded Qwen3.5 instance.
-///
-/// Image execution needs all three pieces. Missing combinations remain
-/// backend-validated so the family core preserves its established diagnostic
-/// instead of the engine replacing it with a generic unsupported-media error.
-pub(crate) const fn qwen35_dense_vision_active(
-    has_vision_encoder: bool,
-    has_image_processor: bool,
-    has_paged_adapter: bool,
-) -> bool {
-    has_vision_encoder && has_image_processor && has_paged_adapter
-}
-
-const fn qwen35_dense_media_plan(
-    has_vision_encoder: bool,
-    has_image_processor: bool,
-    has_paged_adapter: bool,
-) -> MediaPlan {
-    let images_available =
-        qwen35_dense_vision_active(has_vision_encoder, has_image_processor, has_paged_adapter);
-    MediaPlan::with_backend_validation(
-        MediaCapabilities {
-            images: images_available,
-            audio: false,
-        },
-        MediaCapabilities::IMAGES,
-    )
-}
-
-/// Media represented by the live dense session state.
-///
-/// The content hash identifies a freshly saved image turn. Generic paged
-/// continuations intentionally clear that key, but retain the M-RoPE delta
-/// while they keep extending the same live image-derived KV prefix. Treat
-/// either signal as image context so request planning stays truthful across
-/// every successive text continuation.
-const fn qwen35_dense_session_media(
-    has_cached_image_key: bool,
-    has_cached_rope_delta: bool,
-) -> MediaCapabilities {
-    if has_cached_image_key || has_cached_rope_delta {
-        MediaCapabilities::IMAGES
-    } else {
-        MediaCapabilities::NONE
-    }
-}
-
-/// Make the resolved decoder authoritative for legacy Qwen3.5 whole-turn
-/// cores, which still derive their local `ChatParams` from a `ChatConfig`.
-fn apply_qwen35_dense_planned_decoder(config: &mut ChatConfig, decoder: DecoderPlan) -> bool {
-    let planned_mtp = matches!(
-        decoder,
-        DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
-    );
-    config.enable_mtp = Some(planned_mtp);
-    planned_mtp
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Qwen35Cmd {
-    /// All chat-session traffic (sync + streaming starts/continues/tool
-    /// turns + cache reset), routed through the model-neutral engine
-    /// dispatcher ([`crate::engine::cmd::handle_chat_cmd`]) against the
-    /// [`ChatBackend`] impl on [`Qwen35Inner`]. The per-variant
-    /// behavioural contracts live on [`crate::engine::cmd::ChatCmd`].
-    Chat(ChatCmd),
+    /// Session-based chat continuation: prefill a pre-tokenized delta on top
+    /// of the existing KV caches, then decode. Text-only; requires an active
+    /// session (prior `ChatSessionStart` call that initialized `self.caches`).
+    ///
+    /// This bypasses the jinja chat template entirely — the caller is
+    /// responsible for producing the correctly-formatted delta tokens
+    /// (typically `\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`).
+    ///
+    /// Constructed internally by `chat_session_continue_sync` after building
+    /// and tokenizing the delta. Not currently wired through a NAPI method
+    /// directly — external callers use `ChatSessionContinue` instead, which
+    /// handles delta construction on the model thread. Kept as its own
+    /// variant so the lower-level pre-tokenized entry point stays exposed
+    /// for the gated integration test and future advanced use cases.
+    #[allow(dead_code)]
+    ChatTokensDelta {
+        delta_tokens: Vec<u32>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Start a new session via the text-only jinja-render path with
+    /// `<|im_end|>` as the stop token. See
+    /// [`Qwen35Inner::chat_session_start_sync`] for the behavioural
+    /// contract (full cache reset, text-only, session boundary).
+    ChatSessionStart {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Continue an existing session by appending a user turn. See
+    /// [`Qwen35Inner::chat_session_continue_sync`] — builds a raw ChatML
+    /// delta from `user_message`, tokenizes it, and prefills on top of
+    /// the live caches.
+    ///
+    /// `images` is an opt-in guard parameter: non-empty input is rejected
+    /// with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error so
+    /// the TS `ChatSession` layer can route image-changes back through a
+    /// fresh `chat_session_start`.
+    ChatSessionContinue {
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Continue an existing session with a tool-result delta. See
+    /// [`Qwen35Inner::chat_session_continue_tool_sync`] — builds a
+    /// ChatML `<tool_response>` delta and prefills on top of the live
+    /// caches.
+    ChatSessionContinueTool {
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Streaming session-start: same semantics as
+    /// [`ChatSessionStart`](Self::ChatSessionStart) but streams token
+    /// deltas through `stream_tx`.
+    ChatStreamSessionStart {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
+    /// Streaming session-continue: same semantics as
+    /// [`ChatSessionContinue`](Self::ChatSessionContinue) but streams
+    /// token deltas through `stream_tx`. Carries the same opt-in
+    /// `images` guard parameter.
+    ChatStreamSessionContinue {
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
+    /// Streaming tool-result continuation: same semantics as
+    /// [`ChatSessionContinueTool`](Self::ChatSessionContinueTool) but
+    /// streams token deltas through `stream_tx`.
+    ChatStreamSessionContinueTool {
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
     Generate {
         prompt_tokens: MxArray,
         config: Qwen3_5GenerationConfig,
         reply: ResponseTx<Qwen3_5GenerationResult>,
     },
-    /// Static FP8 activation-amax calibration prefill (NVIDIA modelopt
-    /// `MaxCalibrator`). For each raw text: tokenize WITHOUT the chat template,
-    /// truncate to `calib_seq` tokens, then run PREFILL ONLY (no generation, no
-    /// generated token) so every mxfp8 attn/GDN projection's activation tap
-    /// fires once, resetting caches between rows. Runs on the model thread where
-    /// the tokenizer lives. The command body SELF-ARMS this model thread's
-    /// thread-local `ActivationAmaxCollector` flag (via `CalibrationArmGuard`)
-    /// for the prefill's duration; the NAPI caller drains+persists the collected
-    /// amax afterwards — this command never touches `config.json`. Replies with
-    /// the number of rows actually prefilled (rows that were empty after
-    /// tokenize+truncate are skipped).
-    CalibratePrefillRaw {
-        texts: Vec<String>,
-        calib_seq: u32,
-        reply: ResponseTx<u32>,
+    TakeCache {
+        reply: ResponseTx<Option<crate::models::qwen3_5::prompt_cache::PromptCache>>,
+    },
+    SetCache {
+        cache: crate::models::qwen3_5::prompt_cache::PromptCache,
+        reply: ResponseTx<()>,
+    },
+    InitCaches {
+        reply: ResponseTx<()>,
+    },
+    ResetCaches {
+        reply: ResponseTx<()>,
     },
     SaveModel {
         save_path: String,
         reply: ResponseTx<()>,
     },
-    /// Test-only: snapshot the flat-MTP cache state between turns —
-    /// `(cached_token_history.len(), flat_mtp_caches_desynced,
-    /// flat_full_reprefill_count, flat_mtp_last_rollback_unemitted)`. The length
-    /// is the committed prompt+generation history (how many tokens a turn
-    /// actually committed, independent of the warm/heal path a later turn
-    /// takes); the flag is whether a mid-cycle stop stranded tokens and armed
-    /// the heal; the count is the monotonic number of full-history re-prefill
-    /// heals taken so far; and the final value is the independently
-    /// engine-computed tail passed to the family rollback hook.
-    #[doc(hidden)]
-    MtpFlatStateForTest {
-        reply: ResponseTx<(usize, bool, u64, usize)>,
-    },
-    /// Test-only: arm the flat-MTP desync heal (`flat_mtp_caches_desynced =
-    /// true`) so the NEXT delta turn takes the discard+re-prefill path
-    /// deterministically. The heal re-prefills from `cached_token_history` and
-    /// ignores the (discarded) cache contents, so arming the flag on a clean
-    /// session faithfully exercises the heal without a host-timing-dependent
-    /// mid-cycle cancel.
-    #[doc(hidden)]
-    ForceFlatMtpDesyncForTest { reply: ResponseTx<()> },
-    /// Training-session commands shared with the model-neutral engine. The
-    /// thread loop routes these to
-    /// [`crate::engine::cmd::handle_train_cmd`], which drives the
-    /// [`TrainBackend`] impl on [`Qwen35Inner`].
-    Train(TrainCmd),
-}
-
-impl FromChatCmd for Qwen35Cmd {
-    #[inline]
-    fn from_chat(cmd: ChatCmd) -> Self {
-        Qwen35Cmd::Chat(cmd)
-    }
-}
-
-impl FromTrainCmd for Qwen35Cmd {
-    #[inline]
-    fn from_train(cmd: TrainCmd) -> Self {
-        Qwen35Cmd::Train(cmd)
-    }
-}
-
-/// Training backend the model-neutral [`handle_train_cmd`] drives. Each
-/// method forwards to the inherent `*_sync_impl` body on [`Qwen35Inner`].
-impl TrainBackend for Qwen35Inner {
-    fn training_state_mut(
-        &mut self,
-    ) -> &mut Option<crate::training_state::ModelThreadTrainingState> {
-        &mut self.training_state
-    }
-
-    fn init_training_sync(
-        &mut self,
+    // --- Training commands ---
+    InitTraining {
         config: Box<crate::grpo::engine::GRPOEngineConfig>,
         model_type: crate::training_model::ModelType,
-    ) -> Result<()> {
-        self.init_training_sync_impl(*config, model_type)
-    }
-
-    fn generate_for_training_thread_sync(
-        &mut self,
-        prompts: Vec<Vec<ChatMessage>>,
+        reply: ResponseTx<()>,
+    },
+    GenerateForTraining {
+        prompts: Vec<Vec<crate::tokenizer::ChatMessage>>,
         group_size: usize,
         gen_config: crate::models::qwen3::GenerationConfig,
         enable_thinking: Option<bool>,
-        tools: Option<Vec<ToolDefinition>>,
-    ) -> Result<crate::training_model::GenerationPlainData> {
-        self.generate_for_training_thread_sync_impl(
-            prompts,
-            group_size,
-            gen_config,
-            enable_thinking,
-            tools,
-        )
-    }
-
-    fn train_step_grpo_sync(
-        &mut self,
+        tools: Option<Vec<crate::tokenizer::ToolDefinition>>,
+        reply: ResponseTx<crate::training_model::GenerationPlainData>,
+    },
+    TrainStepGRPO {
         rewards: Vec<f64>,
         group_size: i32,
         loss_config: crate::grpo::loss::GRPOLossConfig,
         valid_indices: Option<Vec<usize>>,
-    ) -> Result<crate::training_model::TrainStepPlainMetrics> {
-        self.train_step_grpo_sync_impl(rewards, group_size, loss_config, valid_indices)
-    }
-
-    fn train_step_sft_sync(
-        &mut self,
+        reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
+    },
+    /// Bump the training step counter without applying gradients
+    /// (used by engine skip paths that abort before training).
+    /// Also clears cached generation MxArrays.
+    /// Returns the new step.
+    BumpSkippedStep {
+        reply: ResponseTx<i64>,
+    },
+    /// Restore the training step counter (for resume from checkpoint).
+    /// Does not touch optimizer state — that's loaded via LoadOptimizerState.
+    SetTrainingStep {
+        step: i64,
+        reply: ResponseTx<()>,
+    },
+    /// Drop the training state on the model thread.
+    /// After this, InitTraining can be called again. No-op if no training state.
+    ResetTraining {
+        reply: ResponseTx<()>,
+    },
+    TrainStepSFT {
         input_ids: Vec<i32>,
         input_shape: Vec<i64>,
         labels: Vec<i32>,
         labels_shape: Vec<i64>,
         config: crate::sft::engine::SftEngineConfig,
-    ) -> Result<crate::training_model::TrainStepPlainMetrics> {
-        self.train_step_sft_sync_impl(input_ids, input_shape, labels, labels_shape, config)
-    }
-
-    fn save_optimizer_state_sync(&self, path: String) -> Result<()> {
-        self.save_optimizer_state_sync_impl(path)
-    }
-
-    fn load_optimizer_state_sync(&mut self, path: String) -> Result<()> {
-        self.load_optimizer_state_sync_impl(path)
-    }
+        reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
+    },
+    SaveOptimizerState {
+        path: String,
+        reply: ResponseTx<()>,
+    },
+    LoadOptimizerState {
+        path: String,
+        reply: ResponseTx<()>,
+    },
 }
 
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
     match cmd {
-        // All chat-session traffic routes through the model-neutral
-        // engine dispatcher against `Qwen35Inner`'s `ChatBackend` impl.
-        // (The engine dispatcher carries the historical NOTE forward: no
-        // per-request cache drain here — the TS idle sweeper in
-        // `@mlx-node/server` handles between-turn drains.)
-        Qwen35Cmd::Chat(chat_cmd) => {
-            handle_chat_cmd(inner, chat_cmd);
+        Qwen35Cmd::ChatTokensDelta {
+            delta_tokens,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.chat_tokens_delta_sync(delta_tokens, config));
+        }
+        Qwen35Cmd::ChatSessionStart {
+            messages,
+            config,
+            reply,
+        } => {
+            // NOTE: no per-request cache drain here. On a multi-model
+            // server the MLX allocator free-pool is process-wide, so
+            // flushing after a request on model A discards blocks about
+            // to be reused by model B. The TS idle sweeper in
+            // `@mlx-node/server` handles between-turn drains.
+            let _ = reply.send(inner.chat_session_start_sync(messages, config));
+        }
+        Qwen35Cmd::ChatSessionContinue {
+            user_message,
+            images,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.chat_session_continue_sync(user_message, images, config));
+        }
+        Qwen35Cmd::ChatSessionContinueTool {
+            tool_call_id,
+            content,
+            config,
+            reply,
+        } => {
+            let _ =
+                reply.send(inner.chat_session_continue_tool_sync(tool_call_id, content, config));
+        }
+        Qwen35Cmd::ChatStreamSessionStart {
+            messages,
+            config,
+            stream_tx,
+            cancelled,
+        } => {
+            inner.chat_stream_session_start_sync(messages, config, stream_tx, cancelled);
+        }
+        Qwen35Cmd::ChatStreamSessionContinue {
+            user_message,
+            images,
+            config,
+            stream_tx,
+            cancelled,
+        } => {
+            inner.chat_stream_session_continue_sync(
+                user_message,
+                images,
+                config,
+                stream_tx,
+                cancelled,
+            );
+        }
+        Qwen35Cmd::ChatStreamSessionContinueTool {
+            tool_call_id,
+            content,
+            stream_tx,
+            config,
+            cancelled,
+        } => {
+            inner.chat_stream_session_continue_tool_sync(
+                tool_call_id,
+                content,
+                config,
+                stream_tx,
+                cancelled,
+            );
         }
         Qwen35Cmd::Generate {
             prompt_tokens,
@@ -1044,31 +343,107 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         } => {
             let _ = reply.send(inner.generate_sync(prompt_tokens, config));
         }
-        Qwen35Cmd::CalibratePrefillRaw {
-            texts,
-            calib_seq,
-            reply,
-        } => {
-            let _ = reply.send(inner.calibrate_prefill_raw_sync(texts, calib_seq));
+        Qwen35Cmd::TakeCache { reply } => {
+            let _ = reply.send(Ok(inner.take_cache_sync()));
+        }
+        Qwen35Cmd::SetCache { cache, reply } => {
+            let _ = reply.send(inner.set_cache_sync(cache));
+        }
+        Qwen35Cmd::InitCaches { reply } => {
+            let _ = reply.send(inner.init_caches_sync());
+        }
+        Qwen35Cmd::ResetCaches { reply } => {
+            let _ = reply.send(inner.reset_caches_sync());
         }
         Qwen35Cmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
         }
-        Qwen35Cmd::MtpFlatStateForTest { reply } => {
-            let _ = reply.send(Ok((
-                inner.cached_token_history.len(),
-                inner.flat_mtp_caches_desynced,
-                inner.flat_full_reprefill_count,
-                inner.flat_mtp_last_rollback_unemitted,
-            )));
+        // --- Training commands ---
+        Qwen35Cmd::InitTraining {
+            config,
+            model_type,
+            reply,
+        } => {
+            let _ = reply.send(inner.init_training_sync(*config, model_type));
         }
-        Qwen35Cmd::ForceFlatMtpDesyncForTest { reply } => {
-            inner.flat_mtp_caches_desynced = true;
+        Qwen35Cmd::GenerateForTraining {
+            prompts,
+            group_size,
+            gen_config,
+            enable_thinking,
+            tools,
+            reply,
+        } => {
+            let _ = reply.send(inner.generate_for_training_thread_sync(
+                prompts,
+                group_size,
+                gen_config,
+                enable_thinking,
+                tools,
+            ));
+        }
+        Qwen35Cmd::TrainStepGRPO {
+            rewards,
+            group_size,
+            loss_config,
+            valid_indices,
+            reply,
+        } => {
+            let _ = reply.send(inner.train_step_grpo_sync(
+                rewards,
+                group_size,
+                loss_config,
+                valid_indices,
+            ));
+        }
+        Qwen35Cmd::BumpSkippedStep { reply } => {
+            let result = if let Some(ref mut ts) = inner.training_state {
+                ts.clear_generation_cache();
+                ts.step += 1;
+                Ok(ts.step)
+            } else {
+                Err(napi::Error::from_reason(
+                    "Training state not initialized. Call InitTraining first.",
+                ))
+            };
+            let _ = reply.send(result);
+        }
+        Qwen35Cmd::SetTrainingStep { step, reply } => {
+            let result = if let Some(ref mut ts) = inner.training_state {
+                ts.step = step;
+                Ok(())
+            } else {
+                Err(napi::Error::from_reason(
+                    "Training state not initialized. Call InitTraining first.",
+                ))
+            };
+            let _ = reply.send(result);
+        }
+        Qwen35Cmd::ResetTraining { reply } => {
+            inner.training_state = None;
             let _ = reply.send(Ok(()));
         }
-        // --- Training commands ---
-        Qwen35Cmd::Train(train_cmd) => {
-            handle_train_cmd(inner, train_cmd);
+        Qwen35Cmd::TrainStepSFT {
+            input_ids,
+            input_shape,
+            labels,
+            labels_shape,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.train_step_sft_sync(
+                input_ids,
+                input_shape,
+                labels,
+                labels_shape,
+                config,
+            ));
+        }
+        Qwen35Cmd::SaveOptimizerState { path, reply } => {
+            let _ = reply.send(inner.save_optimizer_state_sync(path));
+        }
+        Qwen35Cmd::LoadOptimizerState { path, reply } => {
+            let _ = reply.send(inner.load_optimizer_state_sync(path));
         }
     }
 }
@@ -1077,21 +452,27 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
 ///
 /// Packs every value the shared post-prefill pipeline needs into a single
 /// named struct so callers don't have to thread 20+ positional arguments.
-/// Constructed by the prefill-side of [`Qwen35Inner::vision_mtp_whole_turn_core`] and
+/// Constructed by the prefill-side of [`Qwen35Inner::chat_sync`] and
 /// [`Qwen35Inner::chat_tokens_delta_sync`].
 ///
 /// The caller is responsible for:
+///   - acquiring `DENSE_COMPILED_MUTEX` and `COMPILED_WEIGHTS_RWLOCK` in
+///     the correct order (when `use_compiled == true`),
 ///   - constructing a `WiredLimitContext` tied to `generation_stream` for
 ///     the lifetime of the call,
-///   - running prefill and packaging the resulting `last_logits` and
-///     `seq_len`.
+///   - running prefill and packaging the resulting `last_logits`,
+///     `seq_len`, and `vlm_compiled_init_done`.
 pub(crate) struct ChatDecodeInputs {
     // --- Prefill outputs -------------------------------------------------
     /// Logits for the last position of the prefill chunk. Penalties and
     /// sampling run against this to produce the first decoded token.
     pub last_logits: MxArray,
     /// Total context length after prefill (cached + newly-prefilled).
+    /// Used to compute the compiled path's `max_kv_len`.
     pub seq_len: i64,
+    /// `true` when the VLM prefill has already run the compiled init.
+    /// `false` for text-only paths and the session delta path.
+    pub vlm_compiled_init_done: bool,
     /// `true` when this invocation is a session DELTA continuation
     /// (text-only append on top of the live KV cache). Drives the
     /// post-decode save pathway: deltas keep `cached_image_key` sticky
@@ -1100,8 +481,15 @@ pub(crate) struct ChatDecodeInputs {
     /// the fresh turn's `has_images`.
     pub is_delta: bool,
 
+    // --- Compiled-path state --------------------------------------------
+    /// `true` when this model owns the compiled weights and the compiled
+    /// forward path is usable for decode.
+    pub use_compiled: bool,
     /// `true` when the current turn carries images.
     pub has_images: bool,
+    /// Length of the cached prefix that the prefill reused. Only
+    /// consulted by the VLM rope-delta replay branch.
+    pub cached_prefix_len: usize,
 
     // --- Token bookkeeping ----------------------------------------------
     /// Full pre-decode token sequence. Seeds the decode loop's running
@@ -1121,11 +509,8 @@ pub(crate) struct ChatDecodeInputs {
     pub tokenizer: Arc<Qwen3Tokenizer>,
     pub think_end_id: Option<u32>,
     pub think_end_str: Option<String>,
-    /// Resolved thinking-mode state for the turn — the single source of
-    /// truth, threaded from `WholeTurnArgs::thinking` so the cores share
-    /// one `resolve_enable_thinking` result.
-    pub thinking: ThinkingSetup,
-    /// End-of-sequence token id for the decode loop. For `vision_mtp_whole_turn_core` this
+    pub enable_thinking: Option<bool>,
+    /// End-of-sequence token id for the decode loop. For `chat_sync` this
     /// is `config.eos_token_id`; for the session delta path it's
     /// `<|im_end|>` so cache boundaries stay clean.
     pub eos_id: u32,
@@ -1152,26 +537,7 @@ pub(crate) struct ChatDecodeInputs {
     pub embedding_weight: MxArray,
     pub embedding_weight_t: MxArray,
     pub generation_stream: Stream,
-    pub params: crate::engine::ChatParams,
-
-    // --- prompt-prefix MTP prefill --------------------------------------
-    /// Post-final-norm hidden state for every prefilled prompt token,
-    /// `[1, prefill_len, hidden]`. `Some` only when MTP is active for this
-    /// turn (`params.enable_mtp && has_mtp_weights`) and the prefill ran
-    /// the hidden-emitting `chunked_prefill_with_hidden`. Consumed once,
-    /// by `begin_mtp_decode`'s prompt-prefix seed, to commit the prompt
-    /// prefix into the MTP committed-history cache.
-    /// `None` for non-MTP turns and for the streaming/delta paths.
-    pub prompt_hidden: Option<MxArray>,
-    /// The exact prompt token ids whose hiddens `prompt_hidden` holds —
-    /// i.e. the `prefill_tokens` slice the hidden-emitting prefill
-    /// forwarded. `prompt_hidden.shape(1) == prompt_hidden_ids.len()`.
-    /// `Some` iff `prompt_hidden` is `Some`.
-    pub prompt_hidden_ids: Option<Vec<u32>>,
-    /// Absolute committed-history position of `prompt_hidden_ids[0]`'s hidden
-    /// row. Zero for full committed history; non-zero for last-window prompt
-    /// seeding.
-    pub prompt_hidden_position_base: usize,
+    pub params: super::chat_common::ChatParams,
 }
 
 // ========== Qwen35Inner implementation ==========
@@ -1191,31 +557,14 @@ impl Qwen35Inner {
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(LinearProj::Standard(Linear::new(
+            Some(Linear::new(
                 config.hidden_size as u32,
                 config.vocab_size as u32,
                 Some(false),
-            )?))
+            )?)
         };
 
         let model_id = QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-        // The physical paged pool is intentionally created only after weight
-        // loading/materialization. At this point the MLX allocator does not yet
-        // know the resident model footprint, so sizing here can overcommit
-        // unified memory. Persistence calls `initialize_paged_adapter()` at the
-        // post-materialization seam.
-        let paged_adapter = None;
-
-        // MTP head — constructed only when the checkpoint config
-        // declares MTP layers. Weight load happens later, inside
-        // `persistence::apply_weights_inner`, so the module starts
-        // with random init here.
-        let mtp = if config.n_mtp_layers > 0 {
-            Some(Qwen3_5MTPModule::new(&config)?)
-        } else {
-            None
-        };
 
         Ok(Self {
             config,
@@ -1228,176 +577,30 @@ impl Qwen35Inner {
             vision_encoder: None,
             image_processor: None,
             spatial_merge_size: None,
-            vision_cache: Arc::new(Mutex::new(VisionCacheInner::new())),
+            vision_cache: Arc::new(Mutex::new(VisionCacheInner {
+                entries: HashMap::new(),
+                generation: 0,
+            })),
             cached_token_history: Vec::new(),
             cached_image_key: None,
-            cached_paged_image_token_positions: Vec::new(),
             cached_rope_deltas: None,
             model_id,
-            active_cache_owner_id: String::new(),
-            gdn_root_cache_owner_id: None,
-            gdn_root_cache_owner_is_explicit: false,
-            gdn_prefix_checkpoints: VecDeque::new(),
-            gdn_last_history_checkpoint: None,
-            paged_finalize_failed: false,
-            paged_adapter,
-            paged_full_attn_caches_dirty: false,
-            flat_mtp_caches_desynced: false,
-            flat_full_reprefill_count: 0,
-            flat_mtp_last_rollback_unemitted: 0,
             training_state: None,
-            mtp,
-            mtp_weights_loaded: false,
-            turn_is_streaming: Cell::new(false),
-            gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
-    }
-
-    /// Construct the physical paged KV pool after checkpoint weights have
-    /// been installed and materialized. The configured memory value is a
-    /// requested maximum; live unified-memory/Metal probes may only reduce it.
-    pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
-        if !self.config.use_block_paged_cache.unwrap_or(false)
-            || !crate::engine::persistence::compiled_forward_backend_available()
-        {
-            return Ok(());
-        }
-        if self.paged_adapter.is_some() {
-            return Ok(());
-        }
-
-        let attn_layer_count = self.config.full_attention_layer_count() as u32;
-        if attn_layer_count == 0 {
-            return Err(Error::from_reason(
-                "Qwen3.5 block-paged adapter: config has no full_attention layers; paged KV \
-                 cache requires at least one attention layer",
-            ));
-        }
-        let block_size = self.config.paged_block_size.unwrap_or(16);
-        let head_size = self.config.head_dim as u32;
-        let num_kv_heads = self.config.num_kv_heads as u32;
-        let max_seq_len = self.config.max_position_embeddings as u32;
-        let default_memory_mb = super::config::qwen35_default_paged_cache_memory_mb(
-            max_seq_len,
-            block_size,
-            head_size,
-            num_kv_heads,
-            attn_layer_count,
-        );
-        let (requested_memory_mb, requested_source) =
-            super::config::qwen35_resolve_paged_cache_memory_mb(
-                self.config.paged_cache_memory_mb,
-                default_memory_mb,
-            );
-        let pa_config = mlx_paged_attn::PagedAttentionConfig {
-            block_size,
-            gpu_memory_mb: requested_memory_mb,
-            head_size,
-            num_kv_heads,
-            num_layers: attn_layer_count,
-            use_fp8_cache: Some(false),
-            max_seq_len: Some(max_seq_len),
-            max_batch_size: Some(32),
-        };
-        let requested_blocks = pa_config.calculate_num_blocks();
-        if requested_blocks == 0 {
-            return Err(Error::from_reason(format!(
-                "Qwen3.5 block-paged adapter: requested paged cache {requested_memory_mb} MiB \
-                 cannot hold one block"
-            )));
-        }
-        let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-        let (num_blocks, sizing_source) = match mlx_paged_attn::profile::load_time_pool_sizing(
-            requested_blocks,
-            attn_layer_count,
-            num_kv_heads,
-            head_size,
-            block_size,
-            cache_dtype,
-        ) {
-            Ok(sizing) => (
-                sizing.selected_blocks,
-                format!(
-                    "adaptive(requested_blocks={}, active_mib={}, working_set_mib={})",
-                    sizing.requested_blocks,
-                    sizing.metal_active_bytes / (1024 * 1024),
-                    sizing
-                        .metal_working_set_bytes
-                        .map(|v| (v / (1024 * 1024)).to_string())
-                        .unwrap_or_else(|| "n/a".to_string())
-                ),
-            ),
-            Err(e) => {
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 adaptive paged cache sizing failed safely; refusing an uncapped \
-                     pool request: {e}"
-                )));
-            }
-        };
-
-        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            num_blocks, block_size,
-        )));
-        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
-            .map_err(|e| Error::from_reason(format!("Failed to construct Qwen3.5 KV pool: {e}")))?;
-        self.paged_adapter = Some(
-            PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
-                Error::from_reason(format!("Failed to construct Qwen3.5 paged adapter: {e}"))
-            })?,
-        );
-        info!(
-            "Qwen3.5 paged adapter enabled after weight materialization: num_blocks={}, \
-             block_size={}, effective_window_tokens={}, trained_window_tokens={}, \
-             requested_memory_mib={}, requested_source={}, sizing_source={}",
-            num_blocks,
-            block_size,
-            num_blocks.saturating_mul(block_size).min(max_seq_len),
-            max_seq_len,
-            requested_memory_mb,
-            requested_source,
-            sizing_source,
-        );
-        Ok(())
-    }
-
-    pub(crate) fn paged_context_limits(&self) -> (u32, u32, u32, u32) {
-        let trained = self.config.max_position_embeddings.max(0) as u32;
-        let Some(adapter) = self.paged_adapter.as_ref() else {
-            return (trained, trained, 0, 0);
-        };
-        let blocks = adapter.block_capacity();
-        let block_size = adapter.block_size();
-        (
-            trained,
-            trained.min(adapter.max_capacity_tokens()),
-            blocks,
-            block_size,
-        )
-    }
-
-    fn preflight_paged_context(
-        &self,
-        prompt_tokens: usize,
-        params: &mut engine::ChatParams,
-    ) -> Result<()> {
-        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-            Error::from_reason("context_length_exceeded: paged cache is not initialized")
-        })?;
-        let capacity = adapter
-            .max_capacity_tokens()
-            .min(self.config.max_position_embeddings.max(0) as u32);
-        constrain_paged_context_params("Qwen3.5", prompt_tokens, capacity, params)
-    }
-
-    /// Store the checkpoint's parsed `generation_config.json` defaults.
-    /// Called once at load time after construction.
-    pub(crate) fn set_gen_defaults(&mut self, defaults: crate::engine::ModelGenerationDefaults) {
-        self.gen_defaults = defaults;
     }
 
     /// Initialize KV caches.
     pub(crate) fn init_caches_sync(&mut self) -> Result<()> {
-        self.caches = Some(fresh_dense_layer_caches(&self.config));
+        let caches = (0..self.config.num_layers as usize)
+            .map(|i| {
+                if self.config.is_linear_layer(i) {
+                    Qwen3_5LayerCache::new_linear()
+                } else {
+                    Qwen3_5LayerCache::new_full_attention()
+                }
+            })
+            .collect();
+        self.caches = Some(caches);
         self.clear_reuse_state();
         Ok(())
     }
@@ -1418,659 +621,46 @@ impl Qwen35Inner {
     fn clear_reuse_state(&mut self) {
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        self.cached_paged_image_token_positions.clear();
         self.cached_rope_deltas = None;
-        self.gdn_prefix_checkpoints.clear();
-        self.gdn_last_history_checkpoint = None;
-        self.gdn_root_cache_owner_id = None;
-        self.gdn_root_cache_owner_is_explicit = false;
-        self.paged_finalize_failed = false;
     }
 
-    /// Tear down a partially prepared or partially executed paged turn.
-    ///
-    /// Releasing only the adapter is insufficient for this hybrid model: the
-    /// GDN caches may already have advanced while `cached_token_history`, the
-    /// image identity, and the M-RoPE delta still describe the previous turn.
-    /// A subsequent delta would then observe `caches.is_some()` and attempt to
-    /// continue a session whose K/V and recurrent state no longer agree. Keep
-    /// content-addressed full blocks in the allocator, but invalidate every
-    /// model-local live-session signal and recurrent checkpoint.
-    fn discard_dense_paged_session(&mut self) {
-        if let Some(adapter) = self.paged_adapter.as_mut()
-            && let Err(release_error) = adapter.release_request()
-        {
-            tracing::warn!(
-                target: "mlx_core::qwen3_5::paged",
-                "failed to release dense paged request during invalidation: {release_error}",
-            );
-        }
-        if let Some(caches) = self.caches.as_mut() {
-            for cache in caches {
-                cache.reset();
-            }
-        }
-        self.caches = None;
-        self.clear_reuse_state();
-        self.paged_full_attn_caches_dirty = false;
-        self.flat_mtp_caches_desynced = false;
-    }
-
-    fn invalidate_dense_paged_session(&mut self, context: &str) {
-        tracing::warn!(
-            target: "mlx_core::qwen3_5::paged",
-            "invalidating dense paged session after {context}",
-        );
-        self.discard_dense_paged_session();
-    }
-
-    /// Fallible terminal lifecycle for the hand-written paged cores.
-    ///
-    /// Unlike [`PagedBackend::finalize_paged_turn`], these cores can propagate
-    /// an error directly. Never publish token history or a GDN sidecar after a
-    /// failed registration: release the request and make the session cold.
-    fn finalize_dense_manual_paged_turn(
+    /// Take the KV cache from the model, returning a `PromptCache` handle.
+    pub(crate) fn take_cache_sync(
         &mut self,
-        image_token_positions: &[(u32, u64)],
-    ) -> Result<()> {
-        let finalize_result = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| "dense manual paged finalization: paged_adapter is None".to_owned())
-            .and_then(|adapter| {
-                let finalize_extra_keys = engine::build_paged_extra_keys(
-                    adapter.request_tokens().len(),
-                    adapter.block_size(),
-                    image_token_positions,
-                );
-                adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
-            });
-        match finalize_result {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                self.invalidate_dense_paged_session("manual finalization failure");
-                Err(Error::from_reason(format!(
-                    "dense paged finalization failed: {error}"
-                )))
-            }
-        }
-    }
-
-    /// Downgrade a paged turn whose terminal adapter lifecycle failed.
-    ///
-    /// `PagedBackend::finalize_paged_turn` is intentionally infallible, and the
-    /// engine calls `save_paged_history` immediately after it. Merely releasing
-    /// the adapter is therefore insufficient: the save would otherwise publish
-    /// the expanded image-placeholder ids as a continuable session even though
-    /// their image-conditioned K/V was not kept live or registered. Drop every
-    /// live-session signal here and leave a latch for `save_paged_history` to
-    /// consume without publishing.
-    fn downgrade_failed_paged_finalize(&mut self, error: &str) {
-        tracing::warn!(
-            target: "mlx_core::qwen3_5::paged",
-            "paged adapter finalization failed; invalidating the dense session: {error}",
-        );
-        self.discard_dense_paged_session();
-        self.paged_finalize_failed = true;
-    }
-
-    fn find_dense_gdn_history_checkpoint(
-        &self,
-        tokens: &[u32],
-        prefix_len: u32,
-        expected_image_key: Option<u64>,
-    ) -> Option<Vec<Qwen3_5LayerCache>> {
-        let prefix_tokens = tokens.get(..prefix_len as usize)?;
-        let checkpoint = self.gdn_last_history_checkpoint.as_ref()?;
-        if checkpoint.owner_id != self.active_cache_owner_id
-            || checkpoint.image_key != expected_image_key
-            || checkpoint.tokens.as_slice() != prefix_tokens
-        {
+    ) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
+        if self.cached_token_history.is_empty() {
             return None;
         }
-        clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)
-    }
-
-    fn remember_dense_gdn_history_checkpoint(&mut self) -> Result<DenseGdnCheckpointStoreTrace> {
-        let trace_enabled = inference_trace_enabled();
-        let total_start = trace_enabled.then(std::time::Instant::now);
-        let mut trace = DenseGdnCheckpointStoreTrace::default();
-        if self.cached_token_history.is_empty() {
-            self.gdn_last_history_checkpoint = None;
-            return Ok(trace.finish(total_start));
-        }
-
-        let eval_start = trace_enabled.then(std::time::Instant::now);
-        eval_layer_caches(&self.caches)?;
-        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
-        let clone_start = trace_enabled.then(std::time::Instant::now);
-        let Some(caches) = self
-            .caches
-            .as_ref()
-            .and_then(|caches| clone_dense_linear_layer_caches(&self.config, caches))
-        else {
-            self.gdn_last_history_checkpoint = None;
-            trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
-        };
-        trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-        let token_clone_start = trace_enabled.then(std::time::Instant::now);
-        let tokens = self.cached_token_history.clone();
-        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let update_start = trace_enabled.then(std::time::Instant::now);
-        self.gdn_last_history_checkpoint = Some(DenseGdnHistoryCheckpoint {
-            owner_id: self.active_cache_owner_id.clone(),
-            image_key: self.cached_image_key,
-            tokens,
+        let caches = self.caches.take()?;
+        Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
             caches,
-        });
-        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
-        trace.stored = true;
-        Ok(trace.finish(total_start))
+            self.cached_token_history.clone(),
+            "qwen3_5",
+            self.config.num_layers as usize,
+            self.cached_image_key,
+            self.cached_rope_deltas,
+            self.model_id,
+        ))
     }
 
-    fn find_dense_gdn_prefix_checkpoint(
+    /// Restore a previously taken `PromptCache` into the model.
+    pub(crate) fn set_cache_sync(
         &mut self,
-        tokens: &[u32],
-        requested_prefix_len: u32,
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-    ) -> Option<(u32, Vec<Qwen3_5LayerCache>)> {
-        let checkpoint_idx = find_longest_valid_gdn_checkpoint_index(
-            &self.gdn_prefix_checkpoints,
-            &self.active_cache_owner_id,
-            tokens,
-            requested_prefix_len,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-            |checkpoint| dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
-        )?;
-        let checkpoint = &self.gdn_prefix_checkpoints[checkpoint_idx];
-        let prefix_len = checkpoint.prefix_len;
-        let caches = clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)?;
-        // Successful lookup is an LRU touch. The model thread serializes all
-        // turns, so moving the owner entry cannot race another request.
-        let checkpoint = self.gdn_prefix_checkpoints.remove(checkpoint_idx)?;
-        self.gdn_prefix_checkpoints.push_back(checkpoint);
-        Some((prefix_len, caches))
-    }
-
-    fn remember_dense_gdn_materialized_prefix_checkpoint(
-        &mut self,
-        tokens: &[u32],
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-        checkpoint: super::paged_forward::MaterializedGdnPrefixCheckpoint,
-    ) -> bool {
-        let prefix_len = checkpoint.prefix_len;
-        if !dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)) {
-            return false;
-        }
-        let Some(block_hashes) = compute_paged_prefix_block_hashes(
-            tokens,
-            prefix_len,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-        ) else {
-            return false;
-        };
-        let Some(final_block_hash) = block_hashes.last().copied() else {
-            return false;
-        };
-        let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
-            return false;
-        };
-
-        self.gdn_prefix_checkpoints.retain(|existing| {
-            !(existing.owner_id == self.active_cache_owner_id
-                && existing.prefix_len == prefix_len
-                && existing.block_size == block_size
-                && existing.final_block_hash == final_block_hash
-                && existing.tokens.as_slice() == prefix_tokens)
-        });
-        self.gdn_prefix_checkpoints
-            .push_back(DenseGdnPrefixCheckpoint {
-                owner_id: self.active_cache_owner_id.clone(),
-                prefix_len,
-                block_size,
-                final_block_hash,
-                block_hashes,
-                tokens: prefix_tokens.to_vec(),
-                caches: checkpoint.caches,
-            });
-        self.prune_dense_gdn_prefix_checkpoints();
-        true
-    }
-
-    fn prune_dense_gdn_prefix_checkpoints(&mut self) {
-        let active_owner_id = self.active_cache_owner_id.clone();
-        let root_owner_id = self
-            .gdn_root_cache_owner_id
-            .get_or_insert(active_owner_id)
-            .clone();
-        let checkpoint_limit = if self.gdn_root_cache_owner_is_explicit {
-            GDN_PREFIX_CHECKPOINT_LIMIT
-        } else {
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER
-        };
-        prune_gdn_checkpoints(
-            &mut self.gdn_prefix_checkpoints,
-            checkpoint_limit,
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
-            &root_owner_id,
-        );
-    }
-
-    fn publish_dense_gdn_materialized_prefix_checkpoint(
-        &mut self,
-        tokens: &[u32],
-        checkpoint: Option<super::paged_forward::MaterializedGdnPrefixCheckpoint>,
-    ) {
-        let Some(block_size) = self
-            .paged_adapter
-            .as_ref()
-            .map(|adapter| adapter.block_size())
-        else {
-            return;
-        };
-        let extra_keys = engine::build_paged_extra_keys(
-            tokens.len(),
-            block_size,
-            &self.cached_paged_image_token_positions,
-        );
-        self.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
-            tokens,
-            &extra_keys,
-            0,
-            checkpoint,
-        );
-    }
-
-    fn publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
-        &mut self,
-        tokens: &[u32],
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-        checkpoint: Option<super::paged_forward::MaterializedGdnPrefixCheckpoint>,
-    ) {
-        let Some(checkpoint) = checkpoint else {
-            return;
-        };
-        let prefix_len = checkpoint.prefix_len;
-        let Some(block_size) = self
-            .paged_adapter
-            .as_ref()
-            .map(|adapter| adapter.block_size())
-        else {
-            return;
-        };
-        let stored = self.remember_dense_gdn_materialized_prefix_checkpoint(
-            tokens,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-            checkpoint,
-        );
-        if tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO) {
-            tracing::info!(
-                target: "mlx_core::inference",
-                event = "gdn_prefix_checkpoint_store",
-                prefix_tokens = prefix_len,
-                block_size,
-                cache_owner_id = %self.active_cache_owner_id,
-                cache_root_owner_id = %self.gdn_root_cache_owner_id.as_deref().unwrap_or(""),
-                stored,
-                retained_checkpoints = self.gdn_prefix_checkpoints.len(),
-                "dense GDN prefix checkpoint stored"
-            );
-        }
-    }
-
-    fn prepare_dense_gdn_prefix_state(
-        &mut self,
-        tokens: &[u32],
-        cached_prefix_len: u32,
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-        continued_live_prefix: bool,
-    ) -> Result<DenseGdnPrefixPreparation> {
-        let image_aware_prefix = extra_keys_per_block.iter().any(|keys| !keys.is_empty());
-        let trace_enabled = inference_trace_enabled();
-        let inference_info_enabled =
-            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
-        let prepare_start = (trace_enabled || inference_info_enabled).then(std::time::Instant::now);
-        let cache_owner_id = self.active_cache_owner_id.clone();
-        let cache_root_owner_id = self.gdn_root_cache_owner_id.clone().unwrap_or_default();
-        let finish = |state: &'static str,
-                      restored_prefix_tokens: u32,
-                      replayed_prefix_tokens: u32|
-         -> DenseGdnPrefixPreparation {
-            if inference_info_enabled {
-                tracing::info!(
-                    target: "mlx_core::inference",
-                    event = "gdn_prefix_prepare",
-                    cache_owner_id = %cache_owner_id,
-                    cache_root_owner_id = %cache_root_owner_id,
-                    state,
-                    cached_prefix_tokens = cached_prefix_len,
-                    restored_prefix_tokens,
-                    replayed_prefix_tokens,
-                    elapsed_ms = prepare_start.map(elapsed_ms).unwrap_or(0.0),
-                    "dense GDN prefix state prepared"
-                );
-            }
-            let preparation = DenseGdnPrefixPreparation {
-                state,
-                already_primed: cached_prefix_len > 0,
-                restored_prefix_tokens,
-                replayed_prefix_tokens,
-            };
-            debug_assert_eq!(
-                preparation.already_primed,
-                preparation.restored_prefix_tokens > 0 || preparation.replayed_prefix_tokens > 0,
-                "dense GDN prefix preparation must account for every primed prefix"
-            );
-            preparation
-        };
-        let gdn_caches_ready =
-            dense_paged_linear_caches_ready(&self.config, self.caches.as_deref());
-        if gdn_caches_ready && continued_live_prefix {
-            return Ok(finish("live", cached_prefix_len, 0));
-        }
-
-        let gdn_prefix_from_history = cached_prefix_len > 0
-            && self.cached_token_history.len() == cached_prefix_len as usize
-            && tokens.starts_with(&self.cached_token_history);
-        if gdn_caches_ready && gdn_prefix_from_history {
-            return Ok(finish("last_history", cached_prefix_len, 0));
-        }
-
-        if cached_prefix_len > 0 {
-            let history_lookup_start = trace_enabled.then(std::time::Instant::now);
-            let history_checkpoint =
-                self.find_dense_gdn_history_checkpoint(tokens, cached_prefix_len, None);
-            let history_lookup_ms = history_lookup_start.map(elapsed_ms);
-            if let Some(checkpoint) = history_checkpoint {
-                self.caches = Some(checkpoint);
-                return Ok(finish("last_history_checkpoint", cached_prefix_len, 0));
-            } else if trace_enabled {
-                let history_checkpoint_len = self
-                    .gdn_last_history_checkpoint
-                    .as_ref()
-                    .map_or(0, |checkpoint| checkpoint.tokens.len());
-                let history_mismatch =
-                    token_prefix_mismatch_trace(tokens, &self.cached_token_history);
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint_miss \
-                     cached_prefix_tokens={} history_len={} checkpoint_len={} \
-                     history_match={} history_mismatch_at={} prompt_token={} \
-                     history_token={} history_lookup_ms={:.1}",
-                    cached_prefix_len,
-                    self.cached_token_history.len(),
-                    history_checkpoint_len,
-                    gdn_prefix_from_history,
-                    history_mismatch.index,
-                    history_mismatch.prompt_token,
-                    history_mismatch.cached_token,
-                    history_lookup_ms.unwrap_or(0.0)
-                ));
-            }
-        }
-
-        let prefix_checkpoint = self.find_dense_gdn_prefix_checkpoint(
-            tokens,
-            cached_prefix_len,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-        );
-        if let Some((restored_prefix_len, checkpoint)) = prefix_checkpoint {
-            let replayed_prefix_len = cached_prefix_len
-                .checked_sub(restored_prefix_len)
-                .ok_or_else(|| {
-                    Error::from_reason(
-                        "dense GDN checkpoint is longer than the cached paged prefix",
-                    )
-                })?;
-            if replayed_prefix_len == 0 {
-                self.caches = Some(checkpoint);
-                return Ok(finish("checkpoint", restored_prefix_len, 0));
-            }
-            if image_aware_prefix {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
-                self.caches = Some(fresh_dense_layer_caches(&self.config));
-                return Err(Error::from_reason(
-                    "image-conditioned GDN prefix requires an exact checkpoint or the original image embeddings",
-                ));
-            }
-
-            let replay_suffix = tokens
-                .get(restored_prefix_len as usize..cached_prefix_len as usize)
-                .ok_or_else(|| {
-                    Error::from_reason(
-                        "dense paged GDN checkpoint replay range exceeds prompt length",
-                    )
-                })?;
-            let embed = self.embedding.clone();
-            let layers = &mut self.layers;
-            replay_gdn_cache_and_commit(&mut self.caches, checkpoint, |staged| {
-                super::paged_forward::run_gdn_only_prefill_materialized(
-                    replay_suffix,
-                    &embed,
-                    layers,
-                    staged,
-                )
-            })?;
-            return Ok(finish(
-                "checkpoint_replay_materialized",
-                restored_prefix_len,
-                replayed_prefix_len,
-            ));
-        }
-
-        let fresh_caches = fresh_dense_layer_caches(&self.config);
-        if cached_prefix_len == 0 {
-            self.caches = Some(fresh_caches);
-            return Ok(finish("cold", 0, 0));
-        }
-        if image_aware_prefix {
-            if let Some(adapter) = self.paged_adapter.as_mut() {
-                let _ = adapter.release_request();
-            }
-            self.caches = Some(fresh_caches);
-            return Err(Error::from_reason(
-                "image-conditioned GDN prefix cannot be reconstructed from placeholder token ids",
-            ));
-        }
-
-        let prefix = tokens.get(..cached_prefix_len as usize).ok_or_else(|| {
-            Error::from_reason("dense paged GDN prefix replay length exceeds prompt length")
+        mut cache: crate::models::qwen3_5::prompt_cache::PromptCache,
+    ) -> Result<()> {
+        let restored_caches = cache.take_caches().ok_or_else(|| {
+            Error::from_reason("PromptCache is empty (already consumed or disposed)")
         })?;
-        let embed = self.embedding.clone();
-        let layers = &mut self.layers;
-        replay_gdn_cache_and_commit(&mut self.caches, fresh_caches, |staged| {
-            super::paged_forward::run_gdn_only_prefill_materialized(prefix, &embed, layers, staged)
-        })?;
-        Ok(finish("replay_materialized", 0, cached_prefix_len))
-    }
-
-    /// Restore only an identity-matched GDN sidecar for an image-bearing
-    /// paged prefix. If no exact sidecar exists, install fresh recurrent caches;
-    /// the caller must discard the K/V candidate and rerun the full image merge
-    /// from position zero.
-    fn prepare_dense_gdn_vlm_prefix_state(
-        &mut self,
-        tokens: &[u32],
-        cached_prefix_len: u32,
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-        continued_live_prefix: bool,
-        image_key: u64,
-    ) -> Result<bool> {
-        if cached_prefix_len == 0 {
-            self.caches = Some(fresh_dense_layer_caches(&self.config));
-            return Ok(false);
-        }
-
-        let caches_ready = dense_paged_linear_caches_ready(&self.config, self.caches.as_deref());
-        if caches_ready && continued_live_prefix && self.cached_image_key == Some(image_key) {
-            return Ok(true);
-        }
-        let active_history_matches = caches_ready
-            && self.cached_image_key == Some(image_key)
-            && self.cached_token_history.len() == cached_prefix_len as usize
-            && tokens.starts_with(&self.cached_token_history);
-        if active_history_matches {
-            return Ok(true);
-        }
-        if let Some(checkpoint) =
-            self.find_dense_gdn_history_checkpoint(tokens, cached_prefix_len, Some(image_key))
-        {
-            self.caches = Some(checkpoint);
-            return Ok(true);
-        }
-        if let Some((restored_prefix_len, checkpoint)) = self.find_dense_gdn_prefix_checkpoint(
-            tokens,
-            cached_prefix_len,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-        ) && restored_prefix_len == cached_prefix_len
-        {
-            self.caches = Some(checkpoint);
-            return Ok(true);
-        }
-
-        self.caches = Some(fresh_dense_layer_caches(&self.config));
-        Ok(false)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_dense_vlm_paged_prefix(
-        &mut self,
-        tokens: &[u32],
-        total_budget: u32,
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        reuse_cache: bool,
-        allow_live_continue: bool,
-        image_key: u64,
-    ) -> Result<engine::VlmPagedPrefixResolution> {
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let candidate_plan_result = match self.paged_adapter.as_mut() {
-            Some(adapter) => adapter
-                .prepare_turn_per_block_with_max_cache_hit_tokens(
-                    0,
-                    tokens,
-                    total_budget,
-                    allow_live_continue,
-                    extra_keys_per_block,
-                    0,
-                    !reuse_cache,
-                    max_cache_hit_tokens,
-                )
-                .map_err(Error::from_reason),
-            None => Err(Error::from_reason(
-                "prepare_dense_vlm_paged_prefix: paged_adapter is None",
-            )),
-        };
-        let candidate_plan = match candidate_plan_result {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.invalidate_dense_paged_session("VLM paged-prefix preparation failure");
-                return Err(error);
-            }
-        };
-
-        let gdn_prefix_already_primed = match self.prepare_dense_gdn_vlm_prefix_state(
-            tokens,
-            candidate_plan.cached_prefix_len,
-            block_size,
-            extra_keys_per_block,
-            0,
-            candidate_plan.continued_live_prefix,
-            image_key,
-        ) {
-            Ok(primed) => primed,
-            Err(error) => {
-                self.invalidate_dense_paged_session("VLM GDN-prefix preparation failure");
-                return Err(error);
-            }
-        };
-
-        let resolution =
-            engine::resolve_vlm_paged_prefix(candidate_plan, gdn_prefix_already_primed, || {
-                self.paged_adapter
-                    .as_mut()
-                    .ok_or_else(|| {
-                        "prepare_dense_vlm_paged_prefix: paged_adapter dropped before cold restart"
-                            .to_string()
-                    })?
-                    .restart_prepared_turn_cold_per_block(
-                        0,
-                        tokens,
-                        total_budget,
-                        extra_keys_per_block,
-                        0,
-                    )
-            });
-        match resolution {
-            Ok(resolution) => Ok(resolution),
-            Err(error) => {
-                self.invalidate_dense_paged_session("VLM cold-restart failure");
-                Err(Error::from_reason(error))
-            }
-        }
-    }
-
-    fn first_quantized_save_component(&self) -> Option<String> {
-        if self.embedding.is_quantized() {
-            return Some("embedding".to_string());
-        }
-        for (index, layer) in self.layers.iter().enumerate() {
-            if layer.is_quantized() {
-                return Some(format!("layers.{index}"));
-            }
-        }
-        if self
-            .lm_head
-            .as_ref()
-            .is_some_and(|head| head.is_quantized())
-        {
-            return Some("lm_head".to_string());
-        }
-        if self.mtp_weights_loaded
-            && self
-                .mtp
-                .as_ref()
-                .is_some_and(|mtp| mtp.has_quantized_weights())
-        {
-            return Some("mtp".to_string());
-        }
-        None
+        self.caches = Some(restored_caches);
+        self.cached_token_history = cache.token_history().to_vec();
+        self.cached_image_key = cache.image_cache_key();
+        self.cached_rope_deltas = cache.rope_deltas();
+        Ok(())
     }
 
     /// Save model weights and configuration to a directory (synchronous).
     pub(crate) fn save_model_sync(&self, save_path: &str) -> Result<()> {
         use super::decoder_layer::AttentionType;
-
-        if let Some(component) = self.first_quantized_save_component() {
-            return Err(Error::from_reason(format!(
-                "Cannot save model: save_model is dense/BF16-only, but main-model component \
-                 '{component}' contains quantized projections. Refusing before creating the \
-                 destination because packed weights require sidecars and quantization metadata \
-                 that this save format cannot preserve losslessly."
-            )));
-        }
 
         let mut params = HashMap::new();
 
@@ -2173,23 +763,6 @@ impl Qwen35Inner {
             params.extend(vision_params);
         }
 
-        // Multi-Token Prediction head. `config.n_mtp_layers` round-trips
-        // through config.json, so a reloaded checkpoint will reconstruct the
-        // MTP module from config and expect the `mtp.*` tensors present —
-        // without this block the loader would find them absent, set
-        // `mtp_weights_loaded = false`, and silently disable speculative
-        // decode (only a `warn!`). The `mtp_weights_loaded` guard is
-        // essential: `mtp.is_some()` alone would serialize a random-init
-        // module (constructed from config even when no weights were loaded).
-        if self.mtp_weights_loaded
-            && let Some(ref mtp) = self.mtp
-        {
-            // The early fail-closed quantized-state gate above guarantees this
-            // MTP head is dense; partial omission would make the saved model
-            // silently lose speculative decoding.
-            params.extend(mtp.get_parameters());
-        }
-
         // Validate for NaN/Inf
         for (name, param) in params.iter() {
             let data = param.to_float32()?;
@@ -2208,7 +781,7 @@ impl Qwen35Inner {
             }
         }
 
-        let mut params_clone: HashMap<String, MxArray> =
+        let params_clone: HashMap<String, MxArray> =
             params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
         // Weights metadata
@@ -2232,17 +805,6 @@ impl Qwen35Inner {
         })?;
         if let serde_json::Value::Object(ref mut map) = config_value {
             map.insert("model_type".to_string(), serde_json::json!("qwen3_5"));
-            // `parse_config` reads the MTP layer count ONLY from the
-            // HF-convention keys `mtp_num_hidden_layers` /
-            // `num_nextn_predict_layers`; the serde field name
-            // `n_mtp_layers` is ignored on load. Without this, a saved MTP
-            // checkpoint reloads with `n_mtp_layers = 0` and its head is
-            // silently dropped. Mirrors the MoE saver
-            // (`qwen3_5_moe::model::Qwen35MoeInner::save_model_sync`).
-            map.insert(
-                "mtp_num_hidden_layers".to_string(),
-                serde_json::json!(self.config.n_mtp_layers),
-            );
         }
 
         let weights_json = serde_json::json!({
@@ -2267,11 +829,7 @@ impl Qwen35Inner {
             "format": "mlx-node",
             "version": "1.0"
         }));
-        crate::utils::safetensors::save_safetensors(
-            &safetensors_path,
-            &mut params_clone,
-            metadata,
-        )?;
+        crate::utils::safetensors::save_safetensors(&safetensors_path, &params_clone, metadata)?;
         info!("Saved weights.safetensors");
 
         let weights_str = serde_json::to_string_pretty(&weights_json)?;
@@ -2288,35 +846,18 @@ impl Qwen35Inner {
     }
 
     /// Set the vision encoder.
-    ///
-    /// Paged VLM checkpoints wire this alongside the image processor and
-    /// adapter. Image-bearing turns then route through the dedicated paged
-    /// vision prefill/decode cores; incomplete stacks stay backend-validated
-    /// so those cores can report the precise missing component.
-    ///
-    /// For text-only inputs M-RoPE collapses to standard scalar-offset
-    /// RoPE — `Qwen3_5Attention::forward` uses `self.rope` whenever
-    /// `position_ids` is `None`, which is the case for every text-only
-    /// flat call. The paged forward (`Qwen3_5Attention::forward_paged`)
-    /// also goes through `self.rope` unconditionally. Both paths share
-    /// the same RoPE on text-only inputs, so byte-equal parity holds
-    /// on VLM checkpoints provided no images are passed.
-    pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) -> Result<()> {
+    pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) {
         self.vision_encoder = Some(Arc::new(enc));
-        self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
-        Ok(())
     }
 
     /// Set the image processor.
     pub(crate) fn set_image_processor(&mut self, proc: Qwen35VLImageProcessor) {
         self.image_processor = Some(Arc::new(proc));
-        self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
     }
 
     /// Set spatial merge size.
     pub(crate) fn set_spatial_merge_size(&mut self, size: i32) {
         self.spatial_merge_size = Some(size);
-        self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
     }
 
     /// Initialize M-RoPE on all full attention layers (VLM mode).
@@ -2340,23 +881,91 @@ impl Qwen35Inner {
         Ok(())
     }
 
+    /// Start a new chat session.
+    ///
+    /// Delegates to [`Self::chat_sync_core`] with `<|im_end|>` (from the
+    /// tokenizer vocab) as the stop token so the cached history ends on a
+    /// clean ChatML boundary that subsequent `chat_session_continue_sync`
+    /// / [`Self::chat_tokens_delta_sync`] calls can append a raw delta on
+    /// top of without re-rendering the jinja template.
+    ///
+    /// Unlike the pre-refactor contract, this method no longer resets the
+    /// caches up-front. The core path runs `verify_cache_prefix_direct`
+    /// against the freshly-tokenized prompt and reuses the cached prefix
+    /// on an exact-append hit or resets + fully prefills on a miss. This
+    /// is what enables prefix-cache reuse for stateless agent clients
+    /// that resend the full transcript on every turn. See the matching
+    /// block comment in the method body for the GDN-safety rationale.
+    ///
+    /// Images are accepted on session start — the downstream
+    /// [`Self::chat_sync_core`] already handles the VLM prefill path
+    /// (vision encoder, image cache key, expanded tokens). Subsequent
+    /// turns in the same session MUST go through `chat_session_continue_sync`
+    /// which is text-only; changing the image set mid-session requires
+    /// starting a new session via this method again.
+    pub(crate) fn chat_session_start_sync(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        // Mirror the symmetric guard in `chat_tokens_delta_sync`. The session
+        // API only makes sense with cache reuse enabled: if we silently accept
+        // `reuse_cache = false` here, the post-decode `save_cache_state_direct`
+        // path wipes the caches we just populated, and the next
+        // `chat_session_continue` call fails with a cryptic "missing session"
+        // error. Fail fast before mutating any state.
+        if config.reuse_cache == Some(false) {
+            return Err(Error::from_reason(
+                "chat_session_start requires reuse_cache=true (pass ChatConfig { reuse_cache: Some(true), .. } or leave as None). The session API only makes sense with cache reuse enabled.",
+            ));
+        }
+
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+        let im_end_id = tokenizer
+            .im_end_id()
+            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))?;
+
+        // Prefix-cache reuse contract: the caches may carry state from a
+        // prior session-start turn. `chat_sync_core` runs
+        // `verify_cache_prefix_direct` against the freshly-tokenized prompt
+        // and either (a) reuses the cached prefix and prefills only the
+        // trailing delta (exact-append hit) or (b) resets + fully prefills
+        // from scratch on a cache miss. Driving the reset from inside the
+        // core — rather than wiping up-front here — is what lets
+        // stateless-agent clients (Aider, Codex CLI, pi-mono, etc.) that
+        // resend the full transcript on every turn avoid paying an O(N)
+        // prefill cost on every turn.
+        //
+        // Safety: the invariant on `verify_cache_prefix_direct` (returns
+        // either `0` or the full cached length — never an intermediate
+        // value) guarantees a non-zero hit means the new tokens are a
+        // pure *append* on the live caches, so Qwen3.5's GDN linear-
+        // attention layers (whose recurrent state cannot be rewound
+        // mid-sequence) stay consistent without any snapshot
+        // machinery. See the rustdoc on `verify_cache_prefix_direct`.
+
+        self.chat_sync_core(messages, config, im_end_id)
+    }
+
     /// Core synchronous chat implementation (runs on the model thread).
     ///
-    /// Whole-turn core for fresh SYNC turns reached through the engine's
-    /// `vision_turn` (image-bearing) and `mtp_turn` (MTP-enabled) probes.
-    /// The engine already rendered the prompt (`tokens`) and extracted the
-    /// raw image payloads (`images`); everything from the paged dispatch
-    /// onward runs the whole-turn pipeline. `eos_token_id` is the
-    /// caller-supplied stop-on token id (`<|im_end|>` for ChatML
-    /// boundaries) so the cached history ends on a clean delimiter that
-    /// subsequent session-delta turns can append to.
-    fn vision_mtp_whole_turn_core(
+    /// Shared jinja rendering + prefill + decode plumbing for the session
+    /// surface. `eos_token_id` is the caller-supplied stop-on token id
+    /// (`<|im_end|>` for ChatML boundaries) so the cached history ends on
+    /// a clean delimiter that subsequent session-delta turns can append
+    /// to.
+    ///
+    /// Only called from [`Self::chat_session_start_sync`]; there is no
+    /// longer a non-session entry point.
+    fn chat_sync_core(
         &mut self,
-        tokens: Vec<u32>,
-        images: &[Vec<u8>],
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
         eos_token_id: u32,
-        thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -2367,13 +976,24 @@ impl Qwen35Inner {
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
             .clone();
 
-        let has_images = !images.is_empty();
+        let has_images = messages
+            .iter()
+            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
 
-        let mut p = extract_chat_params(&config);
-        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
+        let tool_defs = config.tools.as_deref();
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let tokens = tokenizer.apply_chat_template_sync(
+            &messages,
+            Some(true),
+            tool_defs,
+            enable_thinking,
+        )?;
+
+        let p = extract_chat_params(&config);
+        let max_new_tokens = p.max_new_tokens;
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -2382,68 +1002,70 @@ impl Qwen35Inner {
         };
         let first_token_instant: Option<std::time::Instant> = None;
 
-        // Paged dispatch with native MTP support; the paged path self-handles
-        // MTP via the gate inside `paged_turn_sync_core_inner`.
-        if self.paged_adapter.is_some() {
-            if has_images {
-                // All image turns prefill through the paged-vision core, which
-                // runs plain autoregressive decode. MTP weights are ignored
-                // here (the core has no draft/verify), so an MTP-enabled
-                // session decodes cleanly as AR.
-                return self.vision_paged_turn_sync_core(
-                    tokens,
-                    images,
-                    tokenizer,
-                    eos_token_id,
-                    p,
-                    report_perf,
-                    thinking,
-                );
-            }
-            return self.paged_turn_sync_core(
-                tokens,
-                tokenizer,
-                eos_token_id,
-                p,
-                report_perf,
-                thinking,
-            );
-        }
+        let model_id = self.model_id;
 
-        // The flat fallback below is text-only. A dense image turn requires the
-        // block-paged backend; reaching here with images means the model was
-        // loaded without a paged adapter (use_block_paged_cache=false, non-Metal
-        // build, or a sym8 checkpoint).
-        if has_images {
-            return Err(Error::from_reason(
-                "qwen3.5 dense image turns require the block-paged KV backend; the model was \
-                 loaded without a paged adapter (use_block_paged_cache=false, non-Metal build, \
-                 or sym8 checkpoint)",
-            ));
-        }
+        // Check if compiled path will be used
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+
+        // Serialize compiled lifecycle across model instances
+        let _compiled_lock = if use_compiled {
+            Some(
+                DENSE_COMPILED_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+
+        // Re-validate compiled path under weight lock
+        let mut _weight_guard = None;
+        let use_compiled = if use_compiled {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         let embedding_weight = self.embedding.get_weight();
 
-        // Text-only from here: the `has_images` early-return above is the only
-        // image path. These bindings preserve the shared cache-reuse / decode
-        // plumbing (`has_images` is always false on this branch).
-        let (expanded_tokens, current_image_cache_key) = (tokens.clone(), 0u64);
+        // === VLM image processing ===
+        let sms = self.spatial_merge_size.unwrap_or(2);
+        let (expanded_tokens, current_image_cache_key, vlm_processed) = if has_images {
+            if let (Some(_vision_enc), Some(img_proc)) =
+                (self.vision_encoder.as_ref(), self.image_processor.as_ref())
+            {
+                let all_images = extract_images_from_messages(&messages);
+                let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
+                let processed_pre = img_proc.process_many(&image_refs)?;
+                let per_image_token_counts =
+                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
+                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
+                let cache_key = compute_image_cache_key(&all_images);
+                (expanded, cache_key, Some(processed_pre))
+            } else {
+                (tokens.clone(), 0u64, None)
+            }
+        } else {
+            (tokens.clone(), 0u64, None)
+        };
 
         // === Cache reuse: prefix verification ===
-        let cached_prefix_len = if self.flat_mtp_caches_desynced {
-            0
-        } else {
-            verify_cache_prefix_direct(
-                reuse_cache,
-                has_images,
-                &tokens,
-                &expanded_tokens,
-                current_image_cache_key,
-                &self.cached_token_history,
-                &self.cached_image_key,
-                self.caches.is_some(),
-            )
-        };
+        let cached_prefix_len = verify_cache_prefix_direct(
+            reuse_cache,
+            has_images,
+            &tokens,
+            &expanded_tokens,
+            current_image_cache_key,
+            &self.cached_token_history,
+            &self.cached_image_key,
+            self.caches.is_some(),
+        );
 
         let prefill_tokens = if cached_prefix_len > 0 {
             if has_images {
@@ -2543,66 +1165,70 @@ impl Qwen35Inner {
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
-        // Prompt-prefix MTP prefill. When MTP is active for this turn the
-        // prefill runs the hidden-emitting `chunked_prefill_with_hidden` so the
-        // per-prompt-token hiddens can be committed into the MTP
-        // committed-history cache; this raises draft acceptance (especially for
-        // long prompts). The VLM / cached-prefix branches keep the cheaper
-        // logits-only prefill — they do not feed the dense MTP
-        // committed-history path.
-        //
-        // `MLX_MTP_NO_PROMPT_PREFILL=1` opts OUT — the prefill stays
-        // logits-only and the MTP committed-history starts empty.
-        //
-        // Cache-reuse turns: when `cached_prefix_len > 0` the prefill
-        // only processes the uncached SUFFIX, so the captured hidden
-        // tensor would cover the suffix — not the full prompt. The
-        // prompt-prefill seed REQUIRES the full prompt's hiddens, so it
-        // is skipped on cache-reuse turns; committed-history still runs
-        // (it starts empty and builds from decode tokens — correct).
-        let want_prompt_hidden = p.enable_mtp
-            && self.has_mtp_weights()
-            && !mtp_decode::mtp_no_prompt_prefill()
-            && cached_prefix_len == 0;
-        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(prefill_tokens.len());
-
-        // === Text prefill ===
+        // === VLM or text prefill branching ===
         profiler.begin_prefill();
-        let mut prompt_hidden: Option<MxArray> = None;
-        let (last_logits, seq_len) = {
-            let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-            let last_logits = if want_prompt_hidden {
-                let (logits, ph) = chunked_prefill_with_hidden(
-                    &prompt,
-                    &embedding_weight,
-                    &mut self.layers,
-                    &mut self.caches,
-                    &self.final_norm,
-                    &self.lm_head,
-                    Some(&embedding_weight_t),
-                    generation_stream,
-                    Some(mtp_prompt_history.keep_tokens),
-                )?;
-                prompt_hidden = Some(ph);
-                logits
-            } else {
-                chunked_prefill(
-                    &prompt,
-                    &embedding_weight,
-                    &mut self.layers,
-                    &mut self.caches,
-                    &self.final_norm,
-                    &self.lm_head,
-                    Some(&embedding_weight_t),
-                    generation_stream,
-                )?
-            };
+        let (last_logits, seq_len, vlm_compiled_init_done) = if has_images && cached_prefix_len == 0
+        {
+            if let Some(vision_enc) = self.vision_encoder.clone() {
+                let final_tokens = &expanded_tokens;
+                let processed = vlm_processed
+                    .as_ref()
+                    .ok_or_else(|| Error::from_reason("VLM processed images missing"))?;
 
-            (last_logits, tokens.len() as i64)
+                let input_ids =
+                    MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
+
+                let (logits, rope_deltas, vlm_compiled) = vlm_prefill(
+                    &input_ids,
+                    current_image_cache_key,
+                    processed,
+                    &vision_enc,
+                    sms,
+                    &embedding_weight,
+                    &mut self.layers,
+                    &mut self.caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &self.config,
+                    max_new_tokens,
+                    generation_stream,
+                    &self.vision_cache,
+                    model_id,
+                )?;
+
+                self.cached_rope_deltas = Some(rope_deltas as i32);
+
+                let vlm_seq_len = final_tokens.len() as i64;
+                (logits, vlm_seq_len, vlm_compiled)
+            } else {
+                return Err(Error::from_reason(
+                    "VLM prefill requested but vision encoder/processor not loaded",
+                ));
+            }
+        } else {
+            let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
+            let logits = chunked_prefill(
+                &prompt,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+                generation_stream,
+            )?;
+
+            let seq_len = logits.shape_at(1)?;
+            let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+            let last_logits = last_logits.squeeze(Some(&[1]))?;
+            let total_seq_len = if has_images {
+                expanded_tokens.len() as i64
+            } else {
+                tokens.len() as i64
+            };
+            (last_logits, total_seq_len, false)
         };
         profiler.end_prefill();
-        // caches now reflect the prefilled history
-        self.flat_mtp_caches_desynced = false;
 
         let prompt_tokens_for_result = if has_images {
             expanded_tokens.len() as u32
@@ -2619,8 +1245,11 @@ impl Qwen35Inner {
         self.chat_with_caches_inner(ChatDecodeInputs {
             last_logits,
             seq_len,
+            vlm_compiled_init_done,
             is_delta: false,
+            use_compiled,
             has_images,
+            cached_prefix_len,
             token_history_init: tokens.clone(),
             save_tokens: tokens,
             save_expanded_tokens,
@@ -2628,7 +1257,7 @@ impl Qwen35Inner {
             tokenizer,
             think_end_id,
             think_end_str,
-            thinking,
+            enable_thinking,
             eos_id,
             profiler,
             generation_start,
@@ -2641,19 +1270,6 @@ impl Qwen35Inner {
             embedding_weight_t,
             generation_stream,
             params: p,
-            // `prompt_hidden` is `Some` iff the hidden-emitting prefill ran;
-            // pair it with the exact prompt tail whose hiddens it holds.
-            prompt_hidden_ids: prompt_hidden.as_ref().map(|_| {
-                let start = mtp_prompt_history
-                    .hidden_start_token_index()
-                    .min(prefill_tokens.len());
-                prefill_tokens[start..].to_vec()
-            }),
-            prompt_hidden_position_base: prompt_hidden
-                .as_ref()
-                .map(|_| mtp_prompt_history.position_base)
-                .unwrap_or(0),
-            prompt_hidden,
         })
     }
 
@@ -2667,18 +1283,15 @@ impl Qwen35Inner {
     ///   of `config.eos_token_id`, yielding clean cache boundaries for the next
     ///   turn's delta,
     /// - resolves `enable_thinking` from `config.reasoning_effort` via
-    ///   `engine::resolve_enable_thinking`,
+    ///   `chat_common::resolve_enable_thinking`,
     /// - is text-only: errors if the session has images.
     ///
     /// Requires a live session: `self.caches` must have been initialized by a
-    /// prior session-start turn. Errors otherwise. (The engine's delta
-    /// guards already enforce this; the checks here are defense-in-depth
-    /// for the `mtp_turn` caller.)
+    /// prior [`Self::chat_session_start_sync`] call. Errors otherwise.
     pub(crate) fn chat_tokens_delta_sync(
         &mut self,
         delta_tokens: Vec<u32>,
         config: ChatConfig,
-        thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         // The delta path is a session-reuse operation by construction: it
         // prefills on top of the existing caches. `reuse_cache = Some(false)`
@@ -2720,7 +1333,7 @@ impl Qwen35Inner {
             .clone();
 
         // Session path: use <|im_end|> as eos, NOT config.eos_token_id.
-        // This yields clean cache boundaries.
+        // This yields clean cache boundaries (see Phase 0 validation notes).
         let eos_id = tokenizer
             .im_end_id()
             .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))?;
@@ -2736,8 +1349,8 @@ impl Qwen35Inner {
         let mut full_token_history = self.cached_token_history.clone();
         full_token_history.extend(delta_tokens.iter().copied());
 
-        let mut p = extract_chat_params(&config);
-        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
+        let p = extract_chat_params(&config);
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -2746,18 +1359,32 @@ impl Qwen35Inner {
         };
         let first_token_instant: Option<std::time::Instant> = None;
 
-        // Paged dispatch with native MTP support inside
-        // `paged_turn_sync_core_inner`.
-        if self.paged_adapter.is_some() {
-            return self.paged_turn_sync_core(
-                full_token_history.clone(),
-                tokenizer.clone(),
-                eos_id,
-                p,
-                report_perf,
-                thinking,
-            );
-        }
+        let model_id = self.model_id;
+
+        // Check compiled path availability (same contract as chat_sync).
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let _compiled_lock = if use_compiled {
+            Some(
+                DENSE_COMPILED_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+
+        let mut _weight_guard = None;
+        let use_compiled = if use_compiled {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
@@ -2772,51 +1399,36 @@ impl Qwen35Inner {
 
         // Text-only prefill of the delta on top of the existing caches.
         profiler.begin_prefill();
-        let last_logits = if self.flat_mtp_caches_desynced {
-            // A prior eager-MTP turn stopped mid-cycle, leaving self.caches
-            // advanced past the emitted history; GDN state cannot be rewound,
-            // so discard and re-prefill the full conversation into fresh caches.
-            self.caches = Some(fresh_dense_layer_caches(&self.config));
-            profiler.set_prompt_tokens(full_token_history.len() as u32);
-            let prompt =
-                MxArray::from_uint32(&full_token_history, &[1, full_token_history.len() as i64])?;
-            let logits = chunked_prefill(
-                &prompt,
-                &embedding_weight,
-                &mut self.layers,
-                &mut self.caches,
-                &self.final_norm,
-                &self.lm_head,
-                Some(&embedding_weight_t),
-                generation_stream,
-            )?;
-            self.flat_mtp_caches_desynced = false;
-            logits
-        } else {
-            let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
-            chunked_prefill(
-                &prompt,
-                &embedding_weight,
-                &mut self.layers,
-                &mut self.caches,
-                &self.final_norm,
-                &self.lm_head,
-                Some(&embedding_weight_t),
-                generation_stream,
-            )?
-        };
+        let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
+        let logits = chunked_prefill(
+            &prompt,
+            &embedding_weight,
+            &mut self.layers,
+            &mut self.caches,
+            &self.final_norm,
+            &self.lm_head,
+            Some(&embedding_weight_t),
+            generation_stream,
+        )?;
+        let prefill_out_seq_len = logits.shape_at(1)?;
+        let last_logits = logits.slice_axis(1, prefill_out_seq_len - 1, prefill_out_seq_len)?;
+        let last_logits = last_logits.squeeze(Some(&[1]))?;
         // Total context length post-prefill = full history length.
         let total_seq_len = full_token_history.len() as i64;
         profiler.end_prefill();
 
         let prompt_tokens_for_result = full_token_history.len() as u32;
 
-        // For the delta path the caches already reflect the entire prior
-        // history. For ChatResult observability we still report the
-        // cached-prefix length so clients can see the session delta reused
-        // the full history: `prior_cached_len` feeds the reported
-        // `cached_tokens`.
+        // For the delta path there is no cached_prefix_len distinction for
+        // the prefill branching — the caches already reflect the entire
+        // prior history. However, for ChatResult observability we report
+        // the cached-prefix length so clients can see the session delta
+        // reused the full history. `prior_cached_len` feeds the reported
+        // `cached_tokens`; `cached_prefix_len` stays 0 so the VLM
+        // rope-deltas re-apply branch inside the decode helper is
+        // skipped (text-only delta anyway).
         let prior_cached_len = full_token_history.len().saturating_sub(delta_tokens.len());
+        let cached_prefix_len = 0usize;
 
         // For cache save, pass the full token history (cached + delta) as
         // `save_tokens`; the helper / `save_cache_state_direct` will append
@@ -2826,8 +1438,11 @@ impl Qwen35Inner {
         self.chat_with_caches_inner(ChatDecodeInputs {
             last_logits,
             seq_len: total_seq_len,
+            vlm_compiled_init_done: false,
             is_delta: true,
+            use_compiled,
             has_images: false,
+            cached_prefix_len,
             token_history_init: full_token_history,
             save_tokens,
             save_expanded_tokens: None,
@@ -2835,7 +1450,7 @@ impl Qwen35Inner {
             tokenizer,
             think_end_id,
             think_end_str,
-            thinking,
+            enable_thinking,
             eos_id,
             profiler,
             generation_start,
@@ -2848,37 +1463,130 @@ impl Qwen35Inner {
             embedding_weight_t,
             generation_stream,
             params: p,
-            // Delta path: the prefill runs on top of the live KV caches,
-            // so there is no fresh full-prompt hidden to commit into the
-            // MTP committed-history cache.
-            prompt_hidden: None,
-            prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
         })
     }
 
-    /// Shared post-prefill pipeline: penalty → sample → decode loop (eager
-    /// MTP or AR) → save cache state → finalize result.
+    /// Session-based chat continuation via a plain user message string.
     ///
-    /// Extracted from `vision_mtp_whole_turn_core` so it can also be driven by the text-only
+    /// Convenience entry point on top of `chat_tokens_delta_sync`: builds the
+    /// ChatML delta that closes the previous assistant turn (the cache ended
+    /// on `<|im_end|>` courtesy of `chat_session_start_sync`), opens a new
+    /// user turn with `user_message`, and opens a fresh assistant turn.
+    /// Then tokenizes the delta and delegates to `chat_tokens_delta_sync`.
+    ///
+    /// The delta is built manually (NOT via jinja) to keep prefix stability
+    /// against the cached state: re-rendering the full conversation through
+    /// jinja would tokenize differently than the accumulated cache and break
+    /// the prefix match that makes session reuse correct.
+    ///
+    /// Text-only; errors propagate from `chat_tokens_delta_sync`.
+    ///
+    /// `images` is an opt-in guard parameter: non-empty input is rejected
+    /// with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error so
+    /// the TS `ChatSession` layer can catch the prefix and route
+    /// image-changes back through a fresh `chat_session_start_sync`. A
+    /// `None`/empty vector takes the normal text-only delta path.
+    pub(crate) fn chat_session_continue_sync(
+        &mut self,
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        if images.as_ref().is_some_and(|v| !v.is_empty()) {
+            return Err(Error::from_reason(format!(
+                "{} chat_session_continue is text-only; start a new session with chat_session_start to change the image",
+                chat_common::IMAGE_CHANGE_RESTART_PREFIX
+            )));
+        }
+
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        // Match `chat_sync`'s sanitization so the session path is subject to
+        // the same role/content injection protection as the legacy path.
+        // The delta is text-only — images are stripped here anyway because
+        // they are never valid on the session continue path.
+        let synthetic = build_synthetic_user_message(&user_message);
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
+        let sanitized_user = &sanitized[0].content;
+
+        // Build the delta in ChatML wire format. See
+        // `chat_common::build_chatml_continue_delta_text` for the exact
+        // wire format and thinking-prefix semantics.
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
+
+        // `add_special_tokens: Some(false)` — we do NOT want the tokenizer
+        // auto-prepending BOS. The delta is already a raw ChatML snippet.
+        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
+
+        self.chat_tokens_delta_sync(delta_tokens, config)
+    }
+
+    /// Session-based chat continuation via a tool-result turn.
+    ///
+    /// Builds a ChatML `<tool_response>`-wrapped delta from `content`
+    /// (see [`chat_common::build_chatml_tool_delta_text`] for the exact
+    /// wire format) and prefills it on top of the live session caches.
+    /// The `tool_call_id` is currently ignored by the wire format —
+    /// Qwen3.5's chat template identifies tool responses by the
+    /// surrounding `<tool_response>` tags + position, not an explicit
+    /// id. Callers may still log it for their own bookkeeping.
+    ///
+    /// Text-only; delegates to [`Self::chat_tokens_delta_sync`] which
+    /// inherits the same text-only-delta invariant (errors if the
+    /// session currently holds image state).
+    pub(crate) fn chat_session_continue_tool_sync(
+        &mut self,
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let delta_text =
+            chat_common::build_chatml_tool_delta_text(&tool_call_id, &content, enable_thinking);
+
+        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
+
+        self.chat_tokens_delta_sync(delta_tokens, config)
+    }
+
+    /// Shared post-prefill pipeline: penalty → sample → compiled init (if needed)
+    /// → decode loop → cache export → save cache state → finalize result.
+    ///
+    /// Extracted from `chat_sync` so it can also be driven by the text-only
     /// session path (`chat_tokens_delta_sync`). Preserves the exact semantics
-    /// of `vision_mtp_whole_turn_core` for the existing caller — `token_history_init` is the
+    /// of `chat_sync` for the existing caller — `token_history_init` is the
     /// full pre-decode token sequence (used for penalty context and the decode
     /// loop's running history), and the decode loop mutates it in place.
     ///
     /// The caller is responsible for:
+    /// - Holding the `DENSE_COMPILED_MUTEX` / `COMPILED_WEIGHTS_RWLOCK` guards
+    ///   (when `inputs.use_compiled == true`) for the lifetime of this call.
     /// - Creating a `WiredLimitContext` tied to `inputs.generation_stream` for
     ///   the lifetime of this call.
-    /// - Running prefill and populating the resulting `last_logits` and
-    ///   `seq_len` fields of `ChatDecodeInputs`.
+    /// - Running prefill and populating the resulting `last_logits`, `seq_len`,
+    ///   and `vlm_compiled_init_done` fields of `ChatDecodeInputs`.
     /// - Pre-starting the profiler (`set_prompt_tokens`, `snapshot_memory_before`,
     ///   `begin_prefill`, `end_prefill`).
     fn chat_with_caches_inner(&mut self, inputs: ChatDecodeInputs) -> Result<ChatResult> {
         let ChatDecodeInputs {
             last_logits,
             seq_len,
+            vlm_compiled_init_done,
             is_delta,
+            use_compiled,
             has_images,
+            cached_prefix_len,
             token_history_init,
             save_tokens,
             save_expanded_tokens,
@@ -2886,7 +1594,7 @@ impl Qwen35Inner {
             tokenizer,
             think_end_id,
             think_end_str,
-            thinking,
+            enable_thinking,
             eos_id,
             mut profiler,
             generation_start,
@@ -2898,129 +1606,174 @@ impl Qwen35Inner {
             embedding_weight_t,
             generation_stream,
             params: p,
-            prompt_hidden,
-            prompt_hidden_ids,
-            prompt_hidden_position_base,
         } = inputs;
-
-        // Pure-Rust ("eager") dense MTP. Gated on the same per-request /
-        // per-checkpoint preconditions (`enable_mtp`, MTP weights present),
-        // restricted to the dense FLAT path (no live paged adapter, text-only
-        // — the paged adapter has its own MTP gate and VLM routes through the
-        // text decode path).
-        let eager_mtp =
-            p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_none() && !has_images;
 
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let max_new_tokens = p.max_new_tokens;
 
-        // Decode-entry trace. Snapshot all the inputs that decide the
-        // AR-vs-MTP branch so MLX_NODE_LOG=info captures everything
-        // needed to reconstruct a turn's control flow.
-        {
-            let prefill_len = seq_len as i32;
-            let max_kv_len_estimate =
-                engine::kv_capacity_round_up_saturating(prefill_len, max_new_tokens);
-            let has_mtp = self.has_mtp_weights();
-            let branch = if eager_mtp {
-                "MTP (eager)"
-            } else if !p.enable_mtp {
-                "AR (enable_mtp=false)"
-            } else if !has_mtp {
-                "AR (no MTP weights on model)"
-            } else {
-                "AR"
-            };
-            info!(
-                "Qwen3.5 chat_decode entry: prompt_len={} max_new_tokens={} enable_mtp={} \
-                 mtp_depth={} prefill_seq_len={} max_kv_len={} has_mtp_weights={} \
-                 is_delta={} has_images={} branch=\"{}\"",
-                token_history_init.len(),
-                max_new_tokens,
-                p.enable_mtp,
-                p.mtp_depth,
-                prefill_len,
-                max_kv_len_estimate,
-                has_mtp,
-                is_delta,
-                has_images,
-                branch,
-            );
-        }
-
         let last_logits = apply_all_penalties(last_logits, &token_history_init, &p)?;
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
+        let _compiled_guard = if use_compiled {
+            Some(CompiledResetGuard)
+        } else {
+            None
+        };
+
         let mut token_history: Vec<u32> = token_history_init;
 
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+            enable_thinking.unwrap_or(true),
+            p.thinking_token_budget,
+            think_end_id,
+        );
 
-        // Whether the final committed token reached the physical KV/GDN cache.
-        // The decode macros write `false` when they stop on an unforwarded
-        // token so the save below can drop it from `cached_token_history`.
-        let mut last_in_cache = true;
+        if use_compiled {
+            if vlm_compiled_init_done {
+                // VLM prefill already initialized compiled state
+            } else {
+                use mlx_sys as sys;
+                let prefill_len = seq_len as i32;
+                let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+                let num_layers = self.config.num_layers as usize;
+                let mut cache_ptrs: Vec<*mut sys::mlx_array> =
+                    vec![std::ptr::null_mut(); num_layers * 2];
+                if let Some(ref caches) = self.caches {
+                    for (i, cache) in caches.iter().enumerate() {
+                        let (p0, p1) = cache.export_ptrs();
+                        cache_ptrs[i * 2] = p0;
+                        cache_ptrs[i * 2 + 1] = p1;
+                    }
+                }
+                unsafe {
+                    sys::mlx_qwen35_compiled_init_from_prefill(
+                        self.config.num_layers,
+                        self.config.hidden_size,
+                        self.config.num_heads,
+                        self.config.num_kv_heads,
+                        self.config.head_dim,
+                        self.config.rope_theta as f32,
+                        self.config.rope_dims(),
+                        self.config.rms_norm_eps as f32,
+                        self.config.full_attention_interval,
+                        self.config.linear_num_key_heads,
+                        self.config.linear_num_value_heads,
+                        self.config.linear_key_head_dim,
+                        self.config.linear_value_head_dim,
+                        self.config.linear_conv_kernel_dim,
+                        if self.config.tie_word_embeddings {
+                            1
+                        } else {
+                            0
+                        },
+                        max_kv_len,
+                        1,
+                        cache_ptrs.as_mut_ptr(),
+                        prefill_len,
+                    );
+                }
 
-        if eager_mtp {
-            // Pure-Rust eager dense MTP — the propose/verify whole-turn loop is
-            // engine-owned (`engine::run_mtp_turn`) and drives the
-            // `DenseMtpStepper` (`MtpBackend::begin_mtp_decode`). The stepper
-            // captures the embedding table + config and runs the prompt-prefix
-            // seed before the loop; the 11 former `MtpOps` closures are its
-            // `MtpStepper` methods. The `profiler.set_label("mtp_eager")` relabel
-            // moved into `DenseMtpStepper::profiler_relabel` (applied once at
-            // turn entry by the engine).
-            let mut rng = rand::rng();
+                // Re-apply the saved M-RoPE offset when the compiled
+                // state is being (re)initialized from a KV cache that
+                // encodes image attention — see
+                // `chat_common::should_reapply_rope_delta`.
+                if let Some(delta) = self.cached_rope_deltas
+                    && chat_common::should_reapply_rope_delta(
+                        true,
+                        is_delta,
+                        has_images,
+                        cached_prefix_len,
+                    )
+                {
+                    unsafe {
+                        mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
+                    }
+                }
+            }
 
-            // Preserve the eager block's initial `async_eval_arrays(&[&y])`
-            // (scheduling hint for the first sampled token) right before the
-            // engine takes over.
-            MxArray::async_eval_arrays(&[&y]);
+            // Clear stale rope deltas only on fresh text-only prefills —
+            // see `chat_common::should_clear_rope_delta`.
+            if chat_common::should_clear_rope_delta(is_delta, has_images) {
+                self.cached_rope_deltas = None;
+            }
 
-            let outcome = crate::engine::mtp_turn::run_mtp_turn(
-                self,
-                &mut rng,
-                crate::engine::mtp_turn::MtpTurnArgs {
-                    // Cheap refcounted clone: `run_mtp_turn` consumes `y`, but the
-                    // post-block `let _final_sampled_token = y;` discard (shared
-                    // with the AR `decode_loop!` arm, which reassigns `y`) still
-                    // reads it. The clone is the same lazy handle — byte-identical.
-                    y: y.clone(),
-                    depth: p.mtp_depth,
-                    params: &p,
-                    reasoning_tracker: &mut reasoning_tracker,
-                    profiler: &mut profiler,
-                    max_new_tokens,
-                    eos_id,
-                    generated_tokens: &mut generated_tokens,
-                    token_history: &mut token_history,
-                    finish_reason: &mut finish_reason,
-                    first_token_instant: &mut first_token_instant,
-                    report_perf: p.report_performance,
-                    generation_stream,
-                    prompt_hidden,
-                    prompt_hidden_ids,
-                    prompt_hidden_position_base,
+            profiler.set_label("chat_compiled");
+
+            let mut ops = chat_common::DecodeOps {
+                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                    Ok((forward_compiled(ids, emb)?, false))
                 },
-                // SYNC site: no streaming sink (the streaming flat site wires
-                // its own `StreamingCtx` and shares this one loop).
-                None,
-            )?;
+                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                    eval_token_and_compiled_caches(token);
+                    if budget_forced {
+                        logits.eval();
+                    }
+                },
+            };
+            chat_common::decode_loop!(
+                ops: ops,
+                y: y,
+                embedding_weight: embedding_weight,
+                params: p,
+                reasoning_tracker: reasoning_tracker,
+                profiler: profiler,
+                max_new_tokens: max_new_tokens,
+                eos_id: eos_id,
+                generated_tokens: generated_tokens,
+                token_history: token_history,
+                finish_reason: finish_reason,
+                first_token_instant: first_token_instant,
+                report_perf: p.report_performance,
+                generation_stream: generation_stream
+            );
 
-            last_in_cache = outcome.last_in_cache;
-            self.flat_mtp_last_rollback_unemitted = outcome.rollback_unemitted;
-            // Propagate a mid-cycle stop: self.caches advanced past the emitted
-            // history, so force a full re-prefill next turn.
-            if outcome.desynced {
-                self.flat_mtp_caches_desynced = true;
+            // Export caches from C++ before CompiledResetGuard drops
+            if p.reuse_cache {
+                let num_layers = self.config.num_layers as usize;
+                let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                    vec![std::ptr::null_mut(); num_layers * 2];
+                let exported = unsafe {
+                    mlx_sys::mlx_qwen35_export_caches(
+                        export_ptrs.as_mut_ptr(),
+                        (num_layers * 2) as i32,
+                    )
+                };
+                if exported > 0 {
+                    let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
+                    let mut new_caches = Vec::with_capacity(num_layers);
+                    for i in 0..num_layers {
+                        let p0 = export_ptrs[i * 2];
+                        let p1 = export_ptrs[i * 2 + 1];
+                        let mut lc = if self.config.is_linear_layer(i) {
+                            Qwen3_5LayerCache::new_linear()
+                        } else {
+                            Qwen3_5LayerCache::new_full_attention()
+                        };
+                        lc.import_ptrs(p0, p1, cache_offset);
+                        new_caches.push(lc);
+                    }
+                    self.caches = Some(new_caches);
+                    // Force-materialize the exported cache arrays before
+                    // `CompiledResetGuard` drops at end of scope and tears
+                    // down `g_compiled_caches`. `mlx_qwen35_export_caches`
+                    // hands back lazy `array` copies whose compute graph
+                    // still references compiled-graph nodes; without this
+                    // eval those handles point at buffers that get freed
+                    // when the compile cache resets, and the next turn's
+                    // compile init would feed stale handles to the GPU —
+                    // triggering Metal page-faults / innocent-victim hangs
+                    // on the first forward of the next turn.
+                    eval_layer_caches(&self.caches);
+                }
             }
         } else {
             profiler.set_label("chat_rust");
 
             MxArray::async_eval_arrays(&[&y]);
 
-            let mut ops = mtp_decode::DecodeOps {
+            let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
                         ids,
@@ -3037,7 +1790,7 @@ impl Qwen35Inner {
                     MxArray::async_eval_arrays(&[token, logits]);
                 },
             };
-            mtp_decode::decode_loop!(
+            chat_common::decode_loop!(
                 ops: ops,
                 y: y,
                 embedding_weight: embedding_weight,
@@ -3049,7 +1802,6 @@ impl Qwen35Inner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
-                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream
@@ -3062,11 +1814,10 @@ impl Qwen35Inner {
         // text-only. Prefill paths (re)set the key based on the fresh
         // turn's `has_images`.
         if is_delta {
-            engine::save_cache_state_after_delta(
+            chat_common::save_cache_state_after_delta(
                 p.reuse_cache,
                 &generated_tokens,
                 &finish_reason,
-                /* drop_last_always */ !last_in_cache,
                 &save_tokens,
                 &mut self.cached_token_history,
                 &mut self.cached_image_key,
@@ -3079,7 +1830,6 @@ impl Qwen35Inner {
                 has_images,
                 &generated_tokens,
                 &finish_reason,
-                /* drop_last_always */ !last_in_cache,
                 &save_tokens,
                 save_expanded_tokens.as_deref(),
                 save_image_cache_key,
@@ -3089,20 +1839,13 @@ impl Qwen35Inner {
                 &mut self.caches,
             );
         }
-        // This turn committed flat caches, not the paged adapter. Never carry
-        // per-block image identities into a later unrelated paged lifecycle.
-        self.cached_paged_image_token_positions.clear();
 
         let performance = compute_performance_metrics(
             generation_start,
             first_token_instant,
             prefill_tokens_len,
             generated_tokens.len(),
-        )
-        .map(|mut m| {
-            profiler.fill_mtp_acceptance(&mut m);
-            m
-        });
+        );
 
         // `y` is the last sampled token from the decode loop. The
         // `decode_loop!` macro assigns to `y` each iteration and the final
@@ -3120,7 +1863,7 @@ impl Qwen35Inner {
             think_end_str.as_deref(),
             performance,
             p.include_reasoning,
-            thinking.enabled,
+            enable_thinking.unwrap_or(true),
             prompt_tokens_for_result,
             reasoning_tracker.reasoning_token_count(),
         )?;
@@ -3133,2419 +1876,253 @@ impl Qwen35Inner {
         Ok(result)
     }
 
-    /// Shared pure-Rust eager-MTP decode loop for the dense FLAT STREAMING
-    /// cores (`chat_stream_sync_inner` / `chat_stream_tokens_delta_sync_inner`).
+    /// Streaming chat (session-start variant): same semantics as
+    /// [`Self::chat_session_start_sync`] but streams token deltas through
+    /// `stream_tx` rather than returning a `ChatResult`. Stops on
+    /// `<|im_end|>`. Inherits the prefix-cache reuse contract — the
+    /// caches may carry state from a prior turn; `chat_stream_sync_inner`
+    /// verifies the prefix and resets on miss.
     ///
-    /// This is the streaming analogue of the `eager_mtp` arm of
-    /// [`Self::chat_with_caches_inner`]: the propose/verify whole-turn loop is
-    /// engine-owned ([`crate::engine::mtp_turn::run_mtp_turn`]) and drives the
-    /// [`DenseMtpStepper`] ([`MtpBackend::begin_mtp_decode`]) — the SAME stepper
-    /// and prompt-prefix committed-history seed the SYNC site uses. The only
-    /// difference is the streaming sink: this site wires a
-    /// [`crate::engine::decode::StreamingCtx`] (incremental detokenization plus
-    /// the default [`crate::engine::backend::DefaultStreamEmitter`]) so accepted
-    /// tokens stream out the `cb` sink incrementally, sharing ONE loop with the
-    /// sync site. Caller owns prefill, sampling of the first `y`, the
-    /// `WiredLimitContext`, and the post-loop save-cache / final-chunk tail.
-    ///
-    /// Preconditions (enforced by the callers' gate): `enable_mtp`,
-    /// `has_mtp_weights()`, `paged_adapter.is_none()`, text-only. The body is
-    /// byte-identical to the non-streaming eager MTP decode (same accept/rewind
-    /// math, same GDN tape replay) — only the streamed deltas differ.
-    #[allow(clippy::too_many_arguments)]
-    fn run_flat_stream_eager_mtp<'a>(
+    /// Images are accepted on session start — the downstream
+    /// `chat_stream_sync_inner` already handles VLM prefill. Subsequent
+    /// turns in the same session go through
+    /// `chat_stream_session_continue_sync` which is text-only; changing
+    /// the image set mid-session requires starting a new session.
+    pub(crate) fn chat_stream_session_start_sync(
         &mut self,
-        y: MxArray,
-        token_history: &mut Vec<u32>,
-        generated_tokens: &mut Vec<u32>,
-        finish_reason: &mut String,
-        reasoning_tracker: &mut engine::ReasoningTracker,
-        profiler: &mut crate::decode_profiler::DecodeProfiler,
-        first_token_instant: &mut Option<std::time::Instant>,
-        streamed_text_len: &mut usize,
-        last_is_reasoning: &mut bool,
-        decode_stream: &mut tokenizers::DecodeStream<
-            'a,
-            tokenizers::ModelWrapper,
-            tokenizers::NormalizerWrapper,
-            tokenizers::PreTokenizerWrapper,
-            tokenizers::PostProcessorWrapper,
-            tokenizers::DecoderWrapper,
-        >,
-        tokenizer: &'a Arc<Qwen3Tokenizer>,
-        cb: &StreamSender<'_>,
-        cancelled: &AtomicBool,
-        // The embedding table + its transpose are owned by the model and
-        // pulled inside `begin_mtp_decode` (`self.embedding.get_weight()`),
-        // so the engine-owned loop does not read these; kept in the signature
-        // for call-site parity with the AR streaming arm.
-        _embedding_weight: MxArray,
-        _embedding_weight_t: MxArray,
-        p: &engine::ChatParams,
-        eos_id: u32,
-        max_new_tokens: i32,
-        generation_stream: Stream,
-        prompt_hidden: Option<MxArray>,
-        prompt_hidden_ids: Option<Vec<u32>>,
-        prompt_hidden_position_base: usize,
-        last_in_cache: &mut bool,
-    ) -> Result<()> {
-        // The turn profiler relabel ("mtp_eager") now moves into
-        // `DenseMtpStepper::profiler_relabel`, applied once at turn entry by
-        // the engine — mirroring the SYNC site.
-        MxArray::async_eval_arrays(&[&y]);
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        let cb = StreamSender(stream_tx.clone());
 
-        let mut rng = rand::rng();
-
-        // Wire the streaming sink: incremental detokenization through the
-        // shared `step_decode_stream` + the default ChatML emitter (qwen3_5
-        // does not override `stream_emitter`, so the macro's inline emit is
-        // byte-identical to `DefaultStreamEmitter::on_token_text`). The
-        // engine's `run_mtp_turn` routes the SAME three emit sites + the
-        // pre-loop cancel break through this `StreamingCtx`.
-        let mut emitter = crate::engine::backend::DefaultStreamEmitter;
-        let streaming = crate::engine::decode::StreamingCtx {
-            callback: cb.0,
-            cancelled,
-            decode_stream,
-            tokenizer: tokenizer.inner(),
-            streamed_text_len,
-            last_is_reasoning,
-            emitter: &mut emitter,
-        };
-
-        let outcome = crate::engine::mtp_turn::run_mtp_turn(
-            self,
-            &mut rng,
-            crate::engine::mtp_turn::MtpTurnArgs {
-                y,
-                depth: p.mtp_depth,
-                params: p,
-                reasoning_tracker,
-                profiler,
-                max_new_tokens,
-                eos_id,
-                generated_tokens,
-                token_history,
-                finish_reason,
-                first_token_instant,
-                report_perf: p.report_performance,
-                generation_stream,
-                prompt_hidden,
-                prompt_hidden_ids,
-                prompt_hidden_position_base,
-            },
-            Some(streaming),
-        )?;
-
-        *last_in_cache = outcome.last_in_cache;
-        self.flat_mtp_last_rollback_unemitted = outcome.rollback_unemitted;
-        // Propagate a mid-cycle stop: self.caches advanced past the emitted
-        // history, so force a full re-prefill next turn.
-        if outcome.desynced {
-            self.flat_mtp_caches_desynced = true;
-        }
-
-        Ok(())
-    }
-
-    /// Block-paged variant of [`Self::vision_mtp_whole_turn_core`].
-    ///
-    /// Mirrors the flat path's control flow (penalty stack, decode
-    /// loop, EOS / repetition cutoff, performance timing, output
-    /// post-processing) but routes full-attention layers through
-    /// `forward_paged_or_flat` against the paged KV adapter. GDN
-    /// (linear-attention) layers continue to use their existing
-    /// `Qwen3_5LayerCache::Linear(ArraysCache)` storage and are
-    /// reset+re-prefilled every turn (no cross-request prefix reuse —
-    /// vLLM's `MambaManager` stance).
-    ///
-    /// Per-turn lifecycle:
-    /// 1. Adapter lifecycle: warm-continue when the prior turn ended
-    ///    via `finalize_turn_keep_live`; cold-start (reset →
-    ///    find_cached_prefix → allocate_suffix) otherwise.
-    /// 2. Prepare GDN prefix state from live/session checkpoints when
-    ///    available; otherwise replay the cached prefix through GDN.
-    /// 3. Prefill via `paged_forward::run_paged_prefill_chunk`.
-    /// 4. Decode loop via `paged_forward::run_paged_decode_step`.
-    /// 5. End-of-turn: `finalize_turn_keep_live` keeps the partial
-    ///    trailing block live for the next turn's warm
-    ///    `continue_turn` (mirrors LFM2 / Qwen3).
-    ///
-    /// Limitations:
-    /// * VLM is rejected upstream — paged dispatch is text-only.
-    /// * Cross-turn GDN prefix reuse is limited to live/history/prefix
-    ///   checkpoints whose identity matches the paged KV prefix. Misses
-    ///   fall back to GDN replay from token 0.
-    /// * Pure-cache prompt (every prompt token already in the paged
-    ///   pool) is rejected — same caveat as LFM2 / Qwen3 paged paths.
-    /// * Paged turns run the pure-Rust
-    ///   `DecoderLayer::forward_paged_or_flat`.
-    fn paged_turn_sync_core(
-        &mut self,
-        tokens: Vec<u32>,
-        tokenizer: Arc<Qwen3Tokenizer>,
-        eos_token_id: u32,
-        mut p: engine::ChatParams,
-        report_perf: bool,
-        thinking: ThinkingSetup,
-    ) -> Result<ChatResult> {
-        if tokens.is_empty() {
-            return Err(Error::from_reason("Empty prompt"));
-        }
-        self.preflight_paged_context(tokens.len(), &mut p)?;
-
-        // This paged turn writes full-attention K/V into the paged adapter
-        // pool, NOT the flat `self.caches`, so the flat full-attention slots no
-        // longer reflect the conversation. A later streaming dense-MTP fallback
-        // must rebuild the flat caches before decoding. See
-        // `paged_full_attn_caches_dirty`.
-        self.paged_full_attn_caches_dirty = true;
-
-        let prompt_token_count = tokens.len() as u32;
-        let sampling_config = p.sampling_config;
-
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        // Thinking is resolved ONCE at turn entry and honors
-        // `enable_thinking=false`.
-        let thinking_enabled = thinking.enabled;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
-        let trace_enabled = inference_trace_enabled();
-
-        // === Adapter lifecycle: warm continuation OR cold start ===
-        let seq_id: u32 = 0;
-        // Lazy decode allocation: pass the prompt length only.
-        let total_budget = tokens.len() as u32;
-        // Per-block extra_keys for prefix-cache lookup. Text-only dispatch
-        // (image-bearing turns route to the flat path) yields all-empty
-        // per-block vecs; the resulting hashes are bit-equal to passing `&[]`
-        // to the uniform API. VLM-paged forward integration would swap in real
-        // image-position pairs here to enable image-aware cache isolation.
-        let block_size = {
-            let adapter = self
-                .paged_adapter
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("paged_turn_sync_core: paged_adapter is None"))?;
-            adapter.block_size()
-        };
-        let carries_image_lineage = self.cached_image_key.is_some()
-            && !self.cached_paged_image_token_positions.is_empty()
-            && !self.cached_token_history.is_empty()
-            && tokens.starts_with(&self.cached_token_history);
-        let image_positions = if carries_image_lineage {
-            self.cached_paged_image_token_positions.as_slice()
-        } else {
-            &[]
-        };
-        let lookup_extra_keys =
-            engine::build_paged_extra_keys(tokens.len(), block_size, image_positions);
-        let cache_salt = 0;
-        // vLLM exact-prefix cap — see qwen3/model.rs:paged_turn_sync_core.
-        // Ensures every paged turn has at least one suffix token to prefill,
-        // even when the live cache (or a prior request's residue) already
-        // covers the entire new prompt.
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let live_ready;
-        let live_prefix_match;
-        let live_tokens_len;
-        let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        // Adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
-        // reads the PRE-turn live state, so probe the adapter immutably FIRST
-        // (prepare_turn mutates request_tokens via continue_turn/reset). The
-        // adapter re-reads the same state internally, so live_* matches what
-        // prepare_turn decides. extra_keys=&[] (uniform API) is bit-equal to
-        // `&lookup_extra_keys` for text-only dispatch (all-empty per-block vec
-        // → identical hashes; see the block_size comment above).
-        // Suffix blocks are allocated inside prepare_turn.
-        {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason(
-                    "paged_turn_sync_core: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?;
-            live_ready = adapter.is_live_for_continue();
-            let live_tokens = adapter.request_tokens();
-            live_tokens_len = live_tokens.len();
-            live_prefix_match = tokens.starts_with(live_tokens);
-            if trace_enabled && live_ready && !live_prefix_match {
-                live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
-            }
-        }
-        let plan_result = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| {
-                Error::from_reason(
-                    "paged_turn_sync_core: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                seq_id,
-                &tokens,
-                total_budget,
-                true,
-                &lookup_extra_keys,
-                cache_salt,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(Error::from_reason);
-        let plan = match plan_result {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.invalidate_dense_paged_session("planned-MTP adapter preparation failure");
-                return Err(error);
-            }
-        };
-        let cached_prefix_len = plan.cached_prefix_len;
-        let continued_live_prefix = plan.continued_live_prefix;
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \
-                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
-                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
-                tokens.len(),
-                cached_prefix_len,
-                continued_live_prefix,
-                live_ready,
-                live_prefix_match,
-                live_tokens_len,
-                live_mismatch.index,
-                live_mismatch.prompt_token,
-                live_mismatch.cached_token
-            ));
-        }
-
-        let gdn_prefix_preparation = match self.prepare_dense_gdn_prefix_state(
-            &tokens,
-            cached_prefix_len,
-            block_size,
-            &lookup_extra_keys,
-            cache_salt,
-            continued_live_prefix,
-        ) {
-            Ok(preparation) => preparation,
-            Err(error) => {
-                self.invalidate_dense_paged_session("planned-MTP GDN-prefix preparation failure");
-                return Err(error);
-            }
-        };
-        let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
-        let preserves_image_lineage = carries_image_lineage && cached_prefix_len > 0;
-        self.cached_token_history.clear();
-        if !preserves_image_lineage {
-            self.cached_image_key = None;
-            self.cached_paged_image_token_positions.clear();
-        }
-        // Carry the cross-turn M-RoPE delta only when this turn extends the live
-        // image sequence (continued_live_prefix). A cold start OR a non-live
-        // prefix-cache hit (cached_prefix_len > 0 but not a live continuation)
-        // can only restore pure-text prefix blocks, so a stale image delta is
-        // dropped and the text suffix rotates at the raw physical slot.
-        self.cached_rope_deltas = super::paged_forward::rope_delta_for_paged_turn(
-            self.cached_rope_deltas,
-            preserves_image_lineage,
-        );
-
-        let suffix_len = match prompt_token_count.checked_sub(cached_prefix_len) {
-            Some(suffix_len) => suffix_len,
-            None => {
-                self.invalidate_dense_paged_session("planned-MTP prefix length mismatch");
-                return Err(Error::from_reason(
-                    "paged_turn_sync_core: cached_prefix_len > total_prompt_tokens",
-                ));
-            }
-        };
-
-        let forward_result = self.paged_turn_sync_core_inner(
-            &tokens,
-            cached_prefix_len,
-            suffix_len,
-            &p,
-            eos_token_id,
-            &sampling_config,
-            &mut reasoning_tracker,
-            report_perf,
-            &mut first_token_instant,
-            gdn_prefix_already_primed,
-        );
-
-        let (generated_tokens, finish_reason, mtp_profiler) = match forward_result {
-            Ok(t) => {
-                let image_token_positions = self.cached_paged_image_token_positions.clone();
-                self.finalize_dense_manual_paged_turn(&image_token_positions)?;
-                t
-            }
-            Err(e) => {
-                self.invalidate_dense_paged_session("planned-MTP sync prefill/decode failure");
-                return Err(e);
-            }
-        };
-
-        // Persist the full token history so subsequent
-        // `chat_session_continue` /
-        // `chat_tokens_delta_sync` calls find an initialized session
-        // to extend. The paged decode loop never feeds the LAST
-        // sampled token through the model, so drop it from the
-        // saved history (mirrors LFM2 / Qwen3 paged path).
-        let last_token_in_cache = false;
-        let mut full_history = tokens.clone();
-        if !generated_tokens.is_empty() {
-            let upto = if last_token_in_cache {
-                generated_tokens.len()
-            } else {
-                generated_tokens.len().saturating_sub(1)
-            };
-            full_history.extend_from_slice(&generated_tokens[..upto]);
-        }
-        self.cached_token_history = full_history;
-        let gdn_history_checkpoint_store = match self.remember_dense_gdn_history_checkpoint() {
-            Ok(store) => store,
-            Err(error) => {
-                self.invalidate_dense_paged_session(
-                    "planned-MTP sync GDN history checkpoint failure",
-                );
-                return Err(error);
-            }
-        };
-        if inference_trace_enabled() {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint stored={} tokens={} \
-                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
-                gdn_history_checkpoint_store.stored,
-                self.cached_token_history.len(),
-                gdn_history_checkpoint_store.eval_ms,
-                gdn_history_checkpoint_store.clone_ms,
-                gdn_history_checkpoint_store.token_clone_ms,
-                gdn_history_checkpoint_store.update_ms,
-                gdn_history_checkpoint_store.total_ms
-            ));
-        }
-
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                tokens.len() - cached_prefix_len as usize,
-                generated_tokens.len(),
-            )
-            .map(|mut m| {
-                if let Some(prof) = mtp_profiler.as_ref() {
-                    prof.fill_mtp_acceptance(&mut m);
-                }
-                m
-            })
-        } else {
-            None
-        };
-
-        let mut result = finalize_chat_result(
-            &tokenizer,
-            &generated_tokens,
-            finish_reason,
-            think_end_id,
-            think_end_str.as_deref(),
-            performance,
-            p.include_reasoning,
-            thinking_enabled,
-            prompt_token_count,
-            reasoning_tracker.reasoning_token_count(),
-        )?;
-        result.cached_tokens = cached_prefix_len;
-        Ok(result)
-    }
-
-    /// Inner forward + decode loop for `paged_turn_sync_core`. Split
-    /// out so the caller can wrap it with `release_request` on either
-    /// path.
-    ///
-    /// The pure-Rust paged prefill populates the GDN linear caches and
-    /// writes K/V into the adapter pool; decode steps then run through
-    /// `paged_forward::run_paged_decode_step`.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_turn_sync_core_inner(
-        &mut self,
-        tokens: &[u32],
-        cached_prefix_len: u32,
-        suffix_len: u32,
-        p: &engine::ChatParams,
-        eos_token_id: u32,
-        sampling_config: &Option<crate::sampling::SamplingConfig>,
-        reasoning_tracker: &mut engine::ReasoningTracker,
-        report_perf: bool,
-        first_token_instant: &mut Option<std::time::Instant>,
-        gdn_prefix_already_primed: bool,
-    ) -> Result<(
-        Vec<u32>,
-        String,
-        Option<crate::decode_profiler::DecodeProfiler>,
-    )> {
-        // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
-        debug_assert!(
-            suffix_len > 0,
-            "paged_turn_sync_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
-        );
-
-        let suffix = &tokens[(cached_prefix_len as usize)..];
-        let layer_kinds =
-            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
-                self.config.is_linear_layer(i)
-            });
-
-        // Paged prompt-prefix MTP prefill. Mirrors the dense gate's
-        // `want_prompt_hidden` predicate. Capturing the post-`final_norm`
-        // hidden for every prompt token lets `begin_mtp_decode`'s
-        // prompt-prefix seed commit the full prompt (advancing the stepper's
-        // `committed_len` to N) before cycle 1, so
-        // MTP drafts attend over the prompt (matches the dense MTP path). The
-        // `cached_prefix_len == 0` clause matches dense: on a cache-reuse turn
-        // the suffix-only prefill cannot produce the full prompt's hidden
-        // tensor.
-        let eager_mtp_paged = p.enable_mtp && self.has_mtp_weights();
-        let want_prompt_hidden =
-            eager_mtp_paged && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
-        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(tokens.len());
-        let mut mtp_profiler = begin_paged_mtp_profiler(eager_mtp_paged, suffix_len);
-
-        // === PREFILL ===
-        let mut prompt_hidden: Option<MxArray> = None;
-        let (last_logits, gdn_checkpoint) = {
-            let embed = self.embedding.clone();
-            let embedding_weight = embed.get_weight();
-            let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("paged_turn_sync_core_inner: caches not initialized")
-            })?;
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("paged_turn_sync_core_inner: paged_adapter dropped")
-            })?;
-            // Cross-turn M-RoPE delta (0 unless this text turn warm-continues
-            // an image prefill). Feeds the scalar-offset RoPE so the suffix
-            // keys stay aligned with the compressed-position image keys.
-            let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-            if want_prompt_hidden {
-                let (logits, ph, checkpoint) =
-                    super::paged_forward::run_paged_prefill_chunk_with_hidden_and_checkpoint(
-                        tokens,
-                        suffix,
-                        cached_prefix_len,
-                        gdn_prefix_already_primed,
-                        &embed,
-                        &mut self.layers,
-                        caches_ref,
-                        &self.final_norm,
-                        &self.lm_head,
-                        &embedding_weight,
-                        &layer_kinds,
-                        adapter,
-                        Some(mtp_prompt_history.keep_tokens),
-                        rope_deltas,
-                    )?;
-                prompt_hidden = Some(ph);
-                (logits, checkpoint)
-            } else {
-                super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
-                    tokens,
-                    suffix,
-                    cached_prefix_len,
-                    gdn_prefix_already_primed,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &embedding_weight,
-                    &layer_kinds,
-                    adapter,
-                    rope_deltas,
-                )?
-            }
-        };
-        if let Some(profiler) = mtp_profiler.as_mut() {
-            profiler.end_prefill();
-        }
-        self.publish_dense_gdn_materialized_prefix_checkpoint(tokens, gdn_checkpoint);
-
-        // First-token sample.
-        let mut token_history: Vec<u32> = tokens.to_vec();
-        let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
-        let mut y = sample(&last_logits, *sampling_config)?;
-        y.eval();
-
-        // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating. Prefill builds a massive MLX subgraph; once
-        // we have the last logits, those intermediates are dead but
-        // MLX's caching allocator holds them.
-        crate::array::synchronize_and_clear_cache();
-
-        if let Some(profiler) = mtp_profiler.as_mut() {
-            profiler.mark_first_token();
-        }
-        if report_perf {
-            *first_token_instant = Some(std::time::Instant::now());
-        }
-
-        // === DECODE LOOP ===
-        let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
-        let mut finish_reason = String::from("length");
-
-        // Pure-Rust ("eager") paged MTP gate. The paged adapter IS present
-        // here (this is the paged core), so — unlike the flat eager gate —
-        // the gate does NOT require `paged_adapter.is_none()`.
-        info!(
-            "Qwen3.5 MTP gate (paged): enable_mtp={} has_mtp_weights={} -> eager_mtp_paged={}",
-            p.enable_mtp,
-            self.has_mtp_weights(),
-            eager_mtp_paged
-        );
-
-        if eager_mtp_paged {
-            // Pure-Rust ("eager") paged MTP.
-            // The main Step-A / verify forwards route through the paged adapter
-            // (`run_paged_step_with_hidden` / `run_paged_verify_step`); the GDN
-            // recurrent state stays FLAT in `self.caches` Linear slots, so the
-            // GDN tape replay (the rollback keystone) is IDENTICAL to the flat
-            // eager arm. Full-attention K/V lives in the paged pool, so the
-            // rollback rewinds it via `adapter.rollback_last_tokens(rejected)`,
-            // NOT a `self.caches` KV trim.
-            MxArray::async_eval_arrays(&[&y]);
-
-            let mut profiler = mtp_profiler
-                .take()
-                .expect("paged MTP profiler must be created before prefill");
-
-            let eos_id = eos_token_id;
-            let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
-            let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-            let _wired_ctx =
-                crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
-
-            // Prompt-tail ids + position base for the committed-history seed.
-            // `prompt_hidden` is only `Some` when `want_prompt_hidden` held,
-            // which already requires `cached_prefix_len == 0` (=> position_base
-            // is 0 on those turns), so committed-history v2 is correct.
-            let prompt_hidden_position_base = mtp_prompt_history.position_base;
-            let prompt_hidden_ids: Vec<u32> = {
-                let start = mtp_prompt_history
-                    .hidden_start_token_index()
-                    .min(tokens.len());
-                tokens[start..].to_vec()
-            };
-
-            let mut rng = rand::rng();
-
-            // The propose/verify whole-turn loop is engine-owned
-            // (`run_mtp_turn`) and drives the `DenseMtpStepper` in its PAGED
-            // mode: `begin_mtp_decode` moves `self.paged_adapter` into the
-            // stepper for the turn, runs the committed-history prompt seed, and
-            // routes the Step-A / verify forwards through the adapter; the
-            // stepper's `Drop` restores the adapter into `self.paged_adapter`
-            // before this call returns, so the paged-history save below finds
-            // it. The paged path commits cache state through its own
-            // paged-history save, so `outcome.last_in_cache` is unused here.
-            let outcome = crate::engine::mtp_turn::run_mtp_turn(
-                self,
-                &mut rng,
-                crate::engine::mtp_turn::MtpTurnArgs {
-                    y: y.clone(),
-                    depth: p.mtp_depth,
-                    params: p,
-                    reasoning_tracker,
-                    profiler: &mut profiler,
-                    max_new_tokens,
-                    eos_id,
-                    generated_tokens: &mut generated_tokens,
-                    token_history: &mut token_history,
-                    finish_reason: &mut finish_reason,
-                    first_token_instant,
-                    report_perf: p.report_performance,
-                    generation_stream,
-                    prompt_hidden,
-                    prompt_hidden_ids: Some(prompt_hidden_ids),
-                    prompt_hidden_position_base,
-                },
-                None,
-            )?;
-            let _ = outcome.last_in_cache;
-
-            // `self.caches` already holds the live GDN state (the eager paged
-            // forwards wrote it directly) — nothing to export.
-            return Ok((generated_tokens, finish_reason, Some(profiler)));
-        }
-
-        for step in 0..max_new_tokens {
-            let token_id = y.item_at_int32(0)? as u32;
-            generated_tokens.push(token_id);
-            token_history.push(token_id);
-            reasoning_tracker.observe_token(token_id);
-
-            if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
-                finish_reason = String::from("stop");
-                break;
-            }
-            if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                &generated_tokens,
-                p.max_consecutive_tokens,
-                p.max_ngram_repeats,
-                p.ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
-            }
-            if step + 1 >= max_new_tokens {
-                break;
-            }
-
-            // Decode forward (pure-Rust paged step).
-            let next_logits = {
-                let embed = self.embedding.clone();
-                let embedding_weight = embed.get_weight();
-                let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("paged_turn_sync_core_inner: caches dropped mid-decode")
-                })?;
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "paged_turn_sync_core_inner: paged_adapter dropped mid-decode",
-                    )
-                })?;
-                let logits = super::paged_forward::run_paged_decode_step(
-                    token_id,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &embedding_weight,
-                    &layer_kinds,
-                    adapter,
-                    self.cached_rope_deltas.unwrap_or(0),
-                )?;
-                logits.squeeze(Some(&[1]))?
-            };
-
-            let next_logits = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id()? as i32;
-                y = MxArray::from_int32(&[forced_id], &[1])?;
-                y.eval();
-                continue;
-            } else {
-                apply_all_penalties(next_logits, &token_history, p)?
-            };
-
-            y = sample(&next_logits, *sampling_config)?;
-            y.eval();
-
-            crate::array::maybe_clear_cache_for_paged_step(step);
-        }
-
-        Ok((generated_tokens, finish_reason, None))
-    }
-
-    /// Single-turn image-bearing block-paged dispatch (non-streaming).
-    ///
-    /// The paged sibling of the flat VLM prefill: it processes the images,
-    /// merges the vision features into the token embeddings, computes M-RoPE
-    /// positions, then prefills through the paged adapter via
-    /// [`super::paged_forward::run_paged_vlm_prefill`] and runs the plain
-    /// autoregressive decode loop.
-    ///
-    /// Same-image live histories continue in place; fresh histories look up
-    /// full blocks using per-image content keys and prefill only the uncached
-    /// suffix. Decode rotates at the physical token count plus the cached
-    /// M-RoPE delta (`cached_rope_deltas`). This core runs plain autoregressive
-    /// decode with no draft/verify; MTP weights are ignored, so an MTP-enabled
-    /// session's image turns route here and decode as AR.
-    #[allow(clippy::too_many_arguments)]
-    fn vision_paged_turn_sync_core(
-        &mut self,
-        tokens: Vec<u32>,
-        images: &[Vec<u8>],
-        tokenizer: Arc<Qwen3Tokenizer>,
-        eos_token_id: u32,
-        mut p: engine::ChatParams,
-        report_perf: bool,
-        thinking: ThinkingSetup,
-    ) -> Result<ChatResult> {
-        if tokens.is_empty() {
-            return Err(Error::from_reason("Empty prompt"));
-        }
-        self.preflight_paged_context(tokens.len(), &mut p)?;
-
-        let (vision_encoder, img_proc) =
-            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
-                (Some(enc), Some(proc)) => (enc, proc),
-                _ => {
-                    return Err(Error::from_reason(
-                        "VLM prefill requested but vision encoder/processor not loaded",
-                    ));
-                }
-            };
-
-        // This paged turn writes full-attention K/V into the paged adapter pool,
-        // leaving the flat `self.caches` full-attention slots stale. A later
-        // dense-MTP fallback must rebuild them first.
-        self.paged_full_attn_caches_dirty = true;
-
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        let thinking_enabled = thinking.enabled;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
-        let sampling_config = p.sampling_config;
-
-        // === VLM image processing: expand placeholders + merge features ===
-        let sms = self.spatial_merge_size.unwrap_or(2);
-        let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
-        let processed = img_proc.process_many(&image_refs)?;
-        let per_image_token_counts =
-            compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
-        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
-        self.preflight_paged_context(expanded_tokens.len(), &mut p)?;
-        let (image_cache_key, per_image_hashes) = engine::compute_image_cache_keys(images);
-        let image_token_positions = engine::map_expanded_image_token_positions(
-            &expanded_tokens,
-            IMAGE_TOKEN_ID as u32,
-            &per_image_token_counts,
-            &per_image_hashes,
-        )
-        .map_err(Error::from_reason)?;
-        let prompt_token_count = expanded_tokens.len() as u32;
-
-        let embed = self.embedding.clone();
-        let embedding_weight = embed.get_weight();
-        let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
-
-        let generation_stream = Stream::new(DeviceType::Gpu);
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
-
-        let merge = vlm_prepare_vision_features(
-            &input_ids,
-            &per_image_hashes,
-            &processed,
-            &vision_encoder,
-            sms,
-            &embedding_weight,
-            generation_stream,
-            &self.vision_cache,
-        )?;
-        // `merge` only retains evaluated per-image features and newly-built
-        // text/position arrays. Release the aggregate f32 pixel tensor before
-        // language prefill instead of keeping every historical image alive for
-        // the rest of the turn.
-        drop(processed);
-        crate::array::clear_cache();
-
-        // === Image-aware paged-prefix lifecycle ===
-        let total_budget = expanded_tokens.len() as u32;
-        let block_size = self
-            .paged_adapter
-            .as_ref()
-            .ok_or_else(|| {
-                Error::from_reason("vision_paged_turn_sync_core: paged_adapter is None")
-            })?
-            .block_size();
-        let lookup_extra_keys = engine::build_paged_extra_keys(
-            expanded_tokens.len(),
-            block_size,
-            &image_token_positions,
-        );
-        let same_live_image = self.cached_image_key == Some(image_cache_key);
-        let prefix_resolution = self.prepare_dense_vlm_paged_prefix(
-            &expanded_tokens,
-            total_budget,
-            block_size,
-            &lookup_extra_keys,
-            p.reuse_cache,
-            p.reuse_cache && same_live_image,
-            image_cache_key,
-        )?;
-        let plan = prefix_resolution.effective_plan;
-        let cached_prefix_len = plan.cached_prefix_len;
-        tracing::info!(
-            target: "mlx_core::inference",
-            event = "vlm_prefix_plan",
-            model = "qwen3_5_dense",
-            prompt_tokens = expanded_tokens.len(),
-            image_count = images.len(),
-            image_tokens = image_token_positions.len(),
-            candidate_cached_prefix_tokens = prefix_resolution.candidate_cached_prefix_len,
-            effective_cached_prefix_tokens = cached_prefix_len,
-            cached_prefix_tokens = cached_prefix_len,
-            suffix_tokens = expanded_tokens.len() - cached_prefix_len as usize,
-            continued_live_prefix = plan.continued_live_prefix,
-            same_live_image,
-            gdn_prefix_already_primed = prefix_resolution.gdn_prefix_already_primed,
-            downgraded_to_cold = prefix_resolution.downgraded_to_cold,
-            "image-aware paged prefix planned"
-        );
-        let gdn_prefix_already_primed = prefix_resolution.gdn_prefix_already_primed;
-        self.cached_token_history.clear();
-        self.cached_image_key = None;
-        self.cached_paged_image_token_positions.clear();
-        // Store the image prefill's compressed-position delta so a later text
-        // warm-continuation rotates its queries at the same compressed M-RoPE
-        // positions the image keys were written with.
-        self.cached_rope_deltas = Some(merge.rope_deltas as i32);
-
-        let layer_kinds =
-            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
-                self.config.is_linear_layer(i)
-            });
-
-        let forward_result = (|| -> Result<(Vec<u32>, String)> {
-            // === PREFILL ===
-            let last_logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("vision_paged_turn_sync_core: caches not initialized")
-                })?;
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason("vision_paged_turn_sync_core: paged_adapter dropped")
-                })?;
-                super::paged_forward::run_paged_vlm_prefill(
-                    &expanded_tokens,
-                    &merge,
-                    cached_prefix_len,
-                    gdn_prefix_already_primed,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &embedding_weight,
-                    &layer_kinds,
-                    adapter,
-                )?
-            };
-            let (last_logits, gdn_checkpoint) = last_logits;
-            self.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
-                &expanded_tokens,
-                &lookup_extra_keys,
-                0,
-                gdn_checkpoint,
+        // Guard: respect cancellation before doing any work.
+        if cancelled.load(Ordering::Relaxed) {
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_session_start cancelled before start",
             );
+            return;
+        }
 
-            let mut token_history: Vec<u32> = expanded_tokens.clone();
-            let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
-            let mut y = sample(&last_logits, sampling_config)?;
-            y.eval();
+        // Guard: reuse_cache must not be explicitly disabled.
+        if config.reuse_cache == Some(false) {
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_session_start requires reuse_cache=true (leave as None or set to true). \
+                 The session API only makes sense with cache reuse enabled.",
+            );
+            return;
+        }
 
-            crate::array::synchronize_and_clear_cache();
-            if report_perf {
-                first_token_instant = Some(std::time::Instant::now());
+        // Resolve <|im_end|> for the eos override.
+        let im_end_id = match self.tokenizer.as_ref().and_then(|t| t.im_end_id()) {
+            Some(id) => id,
+            None => {
+                send_stream_error(
+                    &stream_tx,
+                    "chat_stream_session_start requires a tokenizer with an <|im_end|> special token",
+                );
+                return;
             }
+        };
 
-            // === DECODE LOOP (autoregressive, scalar-offset RoPE) ===
-            let max_new_tokens = p.max_new_tokens;
-            let mut generated_tokens: Vec<u32> =
-                Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
-            let mut finish_reason = String::from("length");
+        // Prefix-cache reuse contract: same as `chat_session_start_sync`.
+        // Any cached state from a prior turn is intentionally preserved so
+        // `chat_stream_sync_inner` can run `verify_cache_prefix_direct`
+        // against the freshly-tokenized prompt. The inner path resets the
+        // caches on a miss and reuses them on an exact-append hit. See
+        // the rustdoc on `verify_cache_prefix_direct` for the GDN-safety
+        // invariant that keeps this sound.
 
-            for step in 0..max_new_tokens {
-                let token_id = y.item_at_int32(0)? as u32;
-                generated_tokens.push(token_id);
-                token_history.push(token_id);
-                reasoning_tracker.observe_token(token_id);
+        let result = self.chat_stream_sync_inner(messages, config, im_end_id, &cb, &cancelled);
+        if let Err(e) = result {
+            let _ = stream_tx.send(Err(e));
+        }
+    }
 
-                if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
-                    finish_reason = String::from("stop");
-                    break;
-                }
-                if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                    &generated_tokens,
-                    p.max_consecutive_tokens,
-                    p.max_ngram_repeats,
-                    p.ngram_size,
-                ) {
-                    finish_reason = reason.to_string();
-                    break;
-                }
-                if step + 1 >= max_new_tokens {
-                    break;
-                }
+    /// Streaming chat (session-continue variant): same semantics as
+    /// [`Self::chat_session_continue_sync`] but streams token deltas
+    /// through `stream_tx`. Builds the ChatML delta, tokenizes it, and
+    /// delegates to [`Self::chat_stream_tokens_delta_sync`].
+    ///
+    /// `images` is an opt-in guard parameter: non-empty input is
+    /// rejected via `send_stream_error` with an
+    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed message so
+    /// the TS `ChatSession` layer can catch the prefix and route
+    /// image-changes back through a fresh session start.
+    pub(crate) fn chat_stream_session_continue_sync(
+        &mut self,
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        if cancelled.load(Ordering::Relaxed) {
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_session_continue cancelled before start",
+            );
+            return;
+        }
 
-                let next_logits = {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason("vision_paged_turn_sync_core: caches dropped mid-decode")
-                    })?;
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "vision_paged_turn_sync_core: paged_adapter dropped mid-decode",
-                        )
-                    })?;
-                    let logits = super::paged_forward::run_paged_decode_step(
-                        token_id,
-                        &embed,
-                        &mut self.layers,
-                        caches_ref,
-                        &self.final_norm,
-                        &self.lm_head,
-                        &embedding_weight,
-                        &layer_kinds,
-                        adapter,
-                        self.cached_rope_deltas.unwrap_or(0),
-                    )?;
-                    logits.squeeze(Some(&[1]))?
-                };
+        if images.as_ref().is_some_and(|v| !v.is_empty()) {
+            send_stream_error(
+                &stream_tx,
+                &format!(
+                    "{} chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the image",
+                    chat_common::IMAGE_CHANGE_RESTART_PREFIX
+                ),
+            );
+            return;
+        }
 
-                if reasoning_tracker.should_force_think_end() {
-                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
-                    y = MxArray::from_int32(&[forced_id], &[1])?;
-                    y.eval();
-                    continue;
-                }
-                let next_logits = apply_all_penalties(next_logits, &token_history, &p)?;
-
-                y = sample(&next_logits, sampling_config)?;
-                y.eval();
-
-                crate::array::maybe_clear_cache_for_paged_step(step);
+        let tokenizer = match self.tokenizer.as_ref() {
+            Some(t) => t.clone(),
+            None => {
+                send_stream_error(&stream_tx, "Tokenizer not loaded");
+                return;
             }
+        };
 
-            Ok((generated_tokens, finish_reason))
-        })();
+        // Sanitize the user message the same way chat_session_continue_sync
+        // does so the streaming path is subject to the same role/content
+        // injection protection.
+        let synthetic = build_synthetic_user_message(&user_message);
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
+        let sanitized_user = &sanitized[0].content;
 
-        // Terminal lifecycle, mirroring the text paged core
-        // (`paged_turn_sync_core` / `finalize_paged_turn`). The error path
-        // always releases the request and returns. The success path is
-        // resolved below so the session ends in exactly one of two states,
-        // never a partial one: FULLY continuable (keep-live registered AND GDN
-        // checkpoint stored AND history + image key published) or
-        // NON-continuable (request released AND history cleared AND image key
-        // None) so a follow-up text continue is safely rejected instead of
-        // cold-prefilling image-placeholder ids as ordinary tokens.
-        let (generated_tokens, finish_reason) = match forward_result {
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
+
+        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
             Ok(t) => t,
             Err(e) => {
-                self.invalidate_dense_paged_session("VLM sync prefill/decode failure");
-                return Err(e);
+                // Forward the tokenizer error as an mpsc send — this path
+                // signals generic errors via an error-result send rather
+                // than an error chunk, matching the `chat_stream_sync`
+                // final-catch behavior.
+                let _ = stream_tx.send(Err(e));
+                return;
             }
         };
 
-        // Build the saved history: the EXPANDED (image-placeholder) prompt plus
-        // all generated tokens except the last — the paged decode loop never
-        // forwards the final sampled token into the cache, so it would not match
-        // the live `request_tokens` (drop-last rule shared with the text paged
-        // core).
-        let mut full_history = expanded_tokens.clone();
-        if !generated_tokens.is_empty() {
-            full_history.extend_from_slice(&generated_tokens[..generated_tokens.len() - 1]);
-        }
-
-        // Keep-live registration must run before the GDN checkpoint, which
-        // snapshots the live recurrent state; short-circuit `&&` preserves that
-        // order. `remember_dense_gdn_history_checkpoint` snapshots from
-        // `cached_token_history`, so publish the history first, then checkpoint.
-        // Any failure downgrades to NON-continuable rather than discarding the
-        // already-successful generation output.
-        let keep_live_ok = p.reuse_cache
-            && self
-                .finalize_dense_manual_paged_turn(&image_token_positions)
-                .is_ok();
-        let continuable = if keep_live_ok {
-            self.cached_token_history = full_history;
-            self.cached_image_key = Some(image_cache_key);
-            self.cached_paged_image_token_positions = image_token_positions.clone();
-            match self.remember_dense_gdn_history_checkpoint() {
-                Ok(_) => true,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "mlx_core::qwen3_5::paged",
-                        "dense VLM GDN history checkpoint failed: {error}",
-                    );
-                    self.invalidate_dense_paged_session("VLM sync GDN history checkpoint failure");
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        if continuable {
-            // FULLY continuable: live KV + GDN recurrent state encode the image
-            // context; `cached_image_key` records it (flat vision save contract).
-        } else if self.caches.is_some() {
-            // No-reuse, keep-live failure, or checkpoint failure: release the
-            // request and reset to a pristine non-live state. `reset_caches_sync`
-            // nulls `self.caches` (so `has_live_session()` reports false) and
-            // clears token history, image key, rope deltas, and GDN checkpoints,
-            // so a follow-up continue is rejected ("requires an initialized
-            // session") instead of cold-prefilling image-placeholder ids.
-            if p.reuse_cache {
-                self.invalidate_dense_paged_session("non-continuable VLM sync completion");
-            } else {
-                self.discard_dense_paged_session();
-            }
-        }
-
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                expanded_tokens.len() - cached_prefix_len as usize,
-                generated_tokens.len(),
-            )
-        } else {
-            None
-        };
-
-        let mut result = finalize_chat_result(
-            &tokenizer,
-            &generated_tokens,
-            finish_reason,
-            think_end_id,
-            think_end_str.as_deref(),
-            performance,
-            p.include_reasoning,
-            thinking_enabled,
-            prompt_token_count,
-            reasoning_tracker.reasoning_token_count(),
-        )?;
-        result.cached_tokens = cached_prefix_len;
-        Ok(result)
+        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
     }
 
-    /// Streaming twin of [`Self::vision_paged_turn_sync_core`].
+    /// Streaming analog of [`Self::chat_session_continue_tool_sync`].
     ///
-    /// Single-turn image-bearing block-paged dispatch that emits each
-    /// generated token through the streaming callback. Same prefill + decode
-    /// spine; plain AR decode, MTP weights ignored.
-    #[allow(clippy::too_many_arguments)]
-    fn vision_paged_turn_stream_core(
+    /// Builds a ChatML tool-response delta, tokenizes it, and delegates
+    /// to [`Self::chat_stream_tokens_delta_sync`]. Inherits the same
+    /// text-only-delta invariant.
+    pub(crate) fn chat_stream_session_continue_tool_sync(
         &mut self,
-        tokens: Vec<u32>,
-        images: &[Vec<u8>],
-        tokenizer: Arc<Qwen3Tokenizer>,
-        eos_token_id: u32,
-        mut p: engine::ChatParams,
-        report_perf: bool,
-        cb: &StreamSender<'_>,
-        cancelled: &AtomicBool,
-        thinking: ThinkingSetup,
-    ) -> Result<()> {
-        if tokens.is_empty() {
-            return Err(Error::from_reason("Empty prompt"));
-        }
-        self.preflight_paged_context(tokens.len(), &mut p)?;
-
-        let (vision_encoder, img_proc) =
-            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
-                (Some(enc), Some(proc)) => (enc, proc),
-                _ => {
-                    return Err(Error::from_reason(
-                        "VLM prefill requested but vision encoder/processor not loaded",
-                    ));
-                }
-            };
-
-        self.paged_full_attn_caches_dirty = true;
-
-        let include_reasoning = p.include_reasoning;
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        let thinking_enabled = thinking.enabled;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
-        let sampling_config = p.sampling_config;
-
-        let mut decode_stream = tokenizer.inner().decode_stream(true);
-        let mut streamed_text_len = 0usize;
-        let mut last_is_reasoning = thinking_enabled;
-
-        // === VLM image processing: expand placeholders + merge features ===
-        let sms = self.spatial_merge_size.unwrap_or(2);
-        let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
-        let processed = img_proc.process_many(&image_refs)?;
-        let per_image_token_counts =
-            compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
-        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
-        self.preflight_paged_context(expanded_tokens.len(), &mut p)?;
-        let (image_cache_key, per_image_hashes) = engine::compute_image_cache_keys(images);
-        let image_token_positions = engine::map_expanded_image_token_positions(
-            &expanded_tokens,
-            IMAGE_TOKEN_ID as u32,
-            &per_image_token_counts,
-            &per_image_hashes,
-        )
-        .map_err(Error::from_reason)?;
-        let prompt_token_count = expanded_tokens.len() as u32;
-
-        let embed = self.embedding.clone();
-        let embedding_weight = embed.get_weight();
-        let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
-
-        let generation_stream = Stream::new(DeviceType::Gpu);
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
-
-        let merge = vlm_prepare_vision_features(
-            &input_ids,
-            &per_image_hashes,
-            &processed,
-            &vision_encoder,
-            sms,
-            &embedding_weight,
-            generation_stream,
-            &self.vision_cache,
-        )?;
-        drop(processed);
-        crate::array::clear_cache();
-
-        // === Image-aware paged-prefix lifecycle ===
-        let total_budget = expanded_tokens.len() as u32;
-        let block_size = self
-            .paged_adapter
-            .as_ref()
-            .ok_or_else(|| {
-                Error::from_reason("vision_paged_turn_stream_core: paged_adapter is None")
-            })?
-            .block_size();
-        let lookup_extra_keys = engine::build_paged_extra_keys(
-            expanded_tokens.len(),
-            block_size,
-            &image_token_positions,
-        );
-        let same_live_image = self.cached_image_key == Some(image_cache_key);
-        let prefix_resolution = self.prepare_dense_vlm_paged_prefix(
-            &expanded_tokens,
-            total_budget,
-            block_size,
-            &lookup_extra_keys,
-            p.reuse_cache,
-            p.reuse_cache && same_live_image,
-            image_cache_key,
-        )?;
-        let plan = prefix_resolution.effective_plan;
-        let cached_prefix_len = plan.cached_prefix_len;
-        tracing::info!(
-            target: "mlx_core::inference",
-            event = "vlm_prefix_plan",
-            model = "qwen3_5_dense",
-            prompt_tokens = expanded_tokens.len(),
-            image_count = images.len(),
-            image_tokens = image_token_positions.len(),
-            candidate_cached_prefix_tokens = prefix_resolution.candidate_cached_prefix_len,
-            effective_cached_prefix_tokens = cached_prefix_len,
-            cached_prefix_tokens = cached_prefix_len,
-            suffix_tokens = expanded_tokens.len() - cached_prefix_len as usize,
-            continued_live_prefix = plan.continued_live_prefix,
-            same_live_image,
-            gdn_prefix_already_primed = prefix_resolution.gdn_prefix_already_primed,
-            downgraded_to_cold = prefix_resolution.downgraded_to_cold,
-            "image-aware paged prefix planned"
-        );
-        let gdn_prefix_already_primed = prefix_resolution.gdn_prefix_already_primed;
-        self.cached_token_history.clear();
-        self.cached_image_key = None;
-        self.cached_paged_image_token_positions.clear();
-        // Store the image prefill's compressed-position delta so a later text
-        // warm-continuation rotates its queries at the same compressed M-RoPE
-        // positions the image keys were written with.
-        self.cached_rope_deltas = Some(merge.rope_deltas as i32);
-
-        let layer_kinds =
-            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
-                self.config.is_linear_layer(i)
-            });
-
-        let forward_result = (|| -> Result<(Vec<u32>, String)> {
-            // === PREFILL ===
-            let last_logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("vision_paged_turn_stream_core: caches not initialized")
-                })?;
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason("vision_paged_turn_stream_core: paged_adapter dropped")
-                })?;
-                super::paged_forward::run_paged_vlm_prefill(
-                    &expanded_tokens,
-                    &merge,
-                    cached_prefix_len,
-                    gdn_prefix_already_primed,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &embedding_weight,
-                    &layer_kinds,
-                    adapter,
-                )?
-            };
-            let (last_logits, gdn_checkpoint) = last_logits;
-            self.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
-                &expanded_tokens,
-                &lookup_extra_keys,
-                0,
-                gdn_checkpoint,
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        if cancelled.load(Ordering::Relaxed) {
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_session_continue_tool cancelled before start",
             );
+            return;
+        }
 
-            let mut token_history: Vec<u32> = expanded_tokens.clone();
-            let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
-            let mut y = sample(&last_logits, sampling_config)?;
-            y.eval();
-
-            crate::array::synchronize_and_clear_cache();
-            if report_perf {
-                first_token_instant = Some(std::time::Instant::now());
+        let tokenizer = match self.tokenizer.as_ref() {
+            Some(t) => t.clone(),
+            None => {
+                send_stream_error(&stream_tx, "Tokenizer not loaded");
+                return;
             }
+        };
 
-            let max_new_tokens = p.max_new_tokens;
-            let mut generated_tokens: Vec<u32> =
-                Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
-            let mut finish_reason = String::from("length");
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let delta_text =
+            chat_common::build_chatml_tool_delta_text(&tool_call_id, &content, enable_thinking);
 
-            for step in 0..max_new_tokens {
-                let token_id = y.item_at_int32(0)? as u32;
-                generated_tokens.push(token_id);
-                token_history.push(token_id);
-                let is_reasoning = reasoning_tracker.observe_token(token_id);
-                last_is_reasoning = is_reasoning;
-
-                if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
-                    finish_reason = String::from("stop");
-                    break;
-                }
-                if cancelled.load(Ordering::Relaxed) {
-                    finish_reason = String::from("cancelled");
-                    break;
-                }
-
-                let token_text = Qwen3Tokenizer::step_decode_stream(
-                    &mut decode_stream,
-                    tokenizer.inner(),
-                    token_id,
-                    &generated_tokens,
-                    streamed_text_len,
-                );
-                streamed_text_len += token_text.len();
-                if include_reasoning || !is_reasoning {
-                    cb.call(
-                        Ok(ChatStreamChunk {
-                            text: token_text,
-                            done: false,
-                            finish_reason: None,
-                            tool_calls: None,
-                            thinking: None,
-                            num_tokens: None,
-                            prompt_tokens: None,
-                            reasoning_tokens: None,
-                            raw_text: None,
-                            cached_tokens: None,
-                            performance: None,
-                            is_reasoning: Some(is_reasoning),
-                        }),
-                        ThreadsafeFunctionCallMode::NonBlocking,
-                    );
-                }
-
-                if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                    &generated_tokens,
-                    p.max_consecutive_tokens,
-                    p.max_ngram_repeats,
-                    p.ngram_size,
-                ) {
-                    finish_reason = reason.to_string();
-                    break;
-                }
-                if step + 1 >= max_new_tokens {
-                    break;
-                }
-
-                let next_logits = {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "vision_paged_turn_stream_core: caches dropped mid-decode",
-                        )
-                    })?;
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "vision_paged_turn_stream_core: paged_adapter dropped mid-decode",
-                        )
-                    })?;
-                    let logits = super::paged_forward::run_paged_decode_step(
-                        token_id,
-                        &embed,
-                        &mut self.layers,
-                        caches_ref,
-                        &self.final_norm,
-                        &self.lm_head,
-                        &embedding_weight,
-                        &layer_kinds,
-                        adapter,
-                        self.cached_rope_deltas.unwrap_or(0),
-                    )?;
-                    logits.squeeze(Some(&[1]))?
-                };
-
-                if reasoning_tracker.should_force_think_end() {
-                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
-                    y = MxArray::from_int32(&[forced_id], &[1])?;
-                    y.eval();
-                    continue;
-                }
-                let next_logits = apply_all_penalties(next_logits, &token_history, &p)?;
-
-                y = sample(&next_logits, sampling_config)?;
-                y.eval();
-
-                crate::array::maybe_clear_cache_for_paged_step(step);
-            }
-
-            Ok((generated_tokens, finish_reason))
-        })();
-
-        // Terminal lifecycle, mirroring the text paged core. The error path
-        // always releases and returns. The success path is resolved below so
-        // the session ends FULLY continuable (keep-live + GDN checkpoint +
-        // history + image key) or NON-continuable (released + history cleared +
-        // image key None), never partial — a follow-up text continue must never
-        // cold-prefill image-placeholder ids as ordinary tokens.
-        let (generated_tokens, finish_reason) = match forward_result {
+        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
             Ok(t) => t,
             Err(e) => {
-                self.invalidate_dense_paged_session("VLM stream prefill/decode failure");
-                return Err(e);
+                let _ = stream_tx.send(Err(e));
+                return;
             }
         };
 
-        // Saved history: expanded prompt + generated[..len-1] (drop-last rule
-        // shared with the sync sibling / text paged core).
-        let mut full_history = expanded_tokens.clone();
-        if !generated_tokens.is_empty() {
-            full_history.extend_from_slice(&generated_tokens[..generated_tokens.len() - 1]);
-        }
-
-        // Keep-live before the GDN checkpoint (which snapshots the live state);
-        // checkpoint reads `cached_token_history`, so publish it first. Any
-        // failure downgrades to NON-continuable rather than discarding output.
-        let keep_live_ok = p.reuse_cache
-            && self
-                .finalize_dense_manual_paged_turn(&image_token_positions)
-                .is_ok();
-        let continuable = if keep_live_ok {
-            self.cached_token_history = full_history;
-            self.cached_image_key = Some(image_cache_key);
-            self.cached_paged_image_token_positions = image_token_positions.clone();
-            match self.remember_dense_gdn_history_checkpoint() {
-                Ok(_) => true,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "mlx_core::qwen3_5::paged",
-                        "dense streaming VLM GDN history checkpoint failed: {error}",
-                    );
-                    self.invalidate_dense_paged_session(
-                        "VLM stream GDN history checkpoint failure",
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        if continuable {
-        } else if self.caches.is_some() {
-            // Non-continuable: release the request and reset to a pristine
-            // non-live state so a follow-up continue is rejected instead of
-            // cold-prefilling image-placeholder ids. `reset_caches_sync` nulls
-            // `self.caches` (so `has_live_session()` is false) and clears token
-            // history, image key, rope deltas, and GDN checkpoints.
-            if p.reuse_cache {
-                self.invalidate_dense_paged_session("non-continuable VLM stream completion");
-            } else {
-                self.discard_dense_paged_session();
-            }
-        }
-
-        // Flush residual buffered bytes (mirrors flat / text paged streaming).
-        let full_text = tokenizer
-            .decode_sync(&generated_tokens, true)
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to decode generated tokens: {}", e);
-                String::new()
-            });
-        if full_text.len() > streamed_text_len {
-            let residual = full_text[streamed_text_len..].to_string();
-            if include_reasoning || !last_is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: residual,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(last_is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
-        }
-
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                expanded_tokens.len() - cached_prefix_len as usize,
-                generated_tokens.len(),
-            )
-        } else {
-            None
-        };
-
-        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
-        let result = finalize_chat_result(
-            &tokenizer,
-            &generated_tokens,
-            finish_reason,
-            think_end_id,
-            think_end_str.as_deref(),
-            performance,
-            include_reasoning,
-            thinking_enabled,
-            prompt_token_count,
-            reasoning_tokens,
-        )?;
-
-        cb.call(
-            Ok(ChatStreamChunk {
-                text: result.text.clone(),
-                done: true,
-                finish_reason: Some(result.finish_reason.clone()),
-                tool_calls: Some(result.tool_calls.clone()),
-                thinking: result.thinking.clone(),
-                num_tokens: Some(result.num_tokens),
-                prompt_tokens: Some(result.prompt_tokens),
-                reasoning_tokens: Some(result.reasoning_tokens),
-                raw_text: Some(result.raw_text.clone()),
-                cached_tokens: Some(cached_prefix_len),
-                performance: result.performance.clone(),
-                is_reasoning: None,
-            }),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
-
-        Ok(())
+        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
     }
 
-    /// Block-paged streaming variant of [`Self::chat_stream_sync_inner`].
+    /// Streaming analog of [`Self::chat_tokens_delta_sync`]: prefill the
+    /// caller-provided delta tokens on top of the existing KV caches and
+    /// stream the reply through `stream_tx`.
     ///
-    /// Mirrors `paged_turn_sync_core`'s adapter lifecycle and
-    /// per-layer dispatch but emits each generated token through the
-    /// streaming callback as it is produced.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_turn_stream_core(
+    /// Applies the same four guards as the non-streaming path and —
+    /// critically — still calls `save_cache_state_direct` at the end
+    /// regardless of whether cancellation fired, so the cache stays
+    /// consistent for the next turn even on an early abort.
+    pub(crate) fn chat_stream_tokens_delta_sync(
         &mut self,
-        tokens: Vec<u32>,
-        tokenizer: Arc<Qwen3Tokenizer>,
-        eos_token_id: u32,
-        mut p: engine::ChatParams,
-        report_perf: bool,
-        cb: &StreamSender<'_>,
-        cancelled: &AtomicBool,
-        thinking: ThinkingSetup,
-    ) -> Result<()> {
-        static NEXT_TRACE_TURN_ID: AtomicU64 = AtomicU64::new(1);
-        if tokens.is_empty() {
-            return Err(Error::from_reason("Empty prompt"));
-        }
-        let inference_info_enabled =
-            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
-        let trace_turn_id = if inference_info_enabled {
-            NEXT_TRACE_TURN_ID.fetch_add(1, Ordering::Relaxed)
-        } else {
-            0
-        };
-        let turn_trace_start = inference_info_enabled.then(std::time::Instant::now);
-        if inference_info_enabled {
-            tracing::info!(
-                target: "mlx_core::inference",
-                event = "turn_start",
-                turn_id = trace_turn_id,
-                path = "qwen3_5_dense_paged_stream",
-                prompt_tokens = tokens.len(),
-                mtp_requested = p.enable_mtp,
-                mtp_depth = p.mtp_depth,
-                report_performance = report_perf,
-                "inference turn started"
+        delta_tokens: Vec<u32>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        // Respect cancellation before any work.
+        if cancelled.load(Ordering::Relaxed) {
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta cancelled before start",
             );
-        }
-        self.preflight_paged_context(tokens.len(), &mut p)?;
-
-        // This paged turn writes full-attention K/V into the paged adapter
-        // pool, NOT the flat `self.caches`, so a later streaming dense-MTP
-        // fallback must rebuild the flat caches before decoding. See
-        // `paged_full_attn_caches_dirty`.
-        self.paged_full_attn_caches_dirty = true;
-
-        let prompt_token_count = tokens.len() as u32;
-        let sampling_config = p.sampling_config;
-        let include_reasoning = p.include_reasoning;
-
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        // Thinking is resolved ONCE at turn entry and honors
-        // `enable_thinking=false`.
-        let thinking_enabled = thinking.enabled;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
-        let trace_enabled = inference_trace_enabled();
-
-        // Streaming decode state.
-        let mut decode_stream = tokenizer.inner().decode_stream(true);
-        let mut streamed_text_len = 0usize;
-        let mut last_is_reasoning = thinking_enabled;
-        let prefix_plan_start = inference_info_enabled.then(std::time::Instant::now);
-
-        // === Adapter lifecycle: warm continue OR cold start ===
-        let seq_id: u32 = 0;
-        // Lazy decode allocation: pass the prompt length only.
-        let total_budget = tokens.len() as u32;
-        // Per-block extra_keys for prefix-cache lookup. See the matching
-        // comment in `paged_turn_sync_core`.
-        let block_size = {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason("paged_turn_stream_core: paged_adapter is None")
-            })?;
-            adapter.block_size()
-        };
-        let carries_image_lineage = self.cached_image_key.is_some()
-            && !self.cached_paged_image_token_positions.is_empty()
-            && !self.cached_token_history.is_empty()
-            && tokens.starts_with(&self.cached_token_history);
-        let image_positions = if carries_image_lineage {
-            self.cached_paged_image_token_positions.as_slice()
-        } else {
-            &[]
-        };
-        let lookup_extra_keys =
-            engine::build_paged_extra_keys(tokens.len(), block_size, image_positions);
-        let cache_salt = 0;
-        // See `paged_turn_sync_core` for the vLLM exact-prefix cap rationale.
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let live_ready;
-        let live_prefix_match;
-        let live_tokens_len;
-        let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        // Adapter-owned warm/cold lifecycle (see paged_turn_sync_core for
-        // the full bit-identity rationale: pre-turn immutable probe for the
-        // trace, extra_keys=&[] bit-equal to per-block for text-only,
-        // reuse_cache=true, suffix blocks allocated internally).
-        {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason(
-                    "paged_turn_stream_core: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?;
-            live_ready = adapter.is_live_for_continue();
-            let live_tokens = adapter.request_tokens();
-            live_tokens_len = live_tokens.len();
-            live_prefix_match = tokens.starts_with(live_tokens);
-            if trace_enabled && live_ready && !live_prefix_match {
-                live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
-            }
-        }
-        let plan_result = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| {
-                Error::from_reason(
-                    "paged_turn_stream_core: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                seq_id,
-                &tokens,
-                total_budget,
-                true,
-                &lookup_extra_keys,
-                cache_salt,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(Error::from_reason);
-        let plan = match plan_result {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.invalidate_dense_paged_session(
-                    "planned-MTP stream adapter preparation failure",
-                );
-                return Err(error);
-            }
-        };
-        let cached_prefix_len = plan.cached_prefix_len;
-        let continued_live_prefix = plan.continued_live_prefix;
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \
-                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
-                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
-                tokens.len(),
-                cached_prefix_len,
-                continued_live_prefix,
-                live_ready,
-                live_prefix_match,
-                live_tokens_len,
-                live_mismatch.index,
-                live_mismatch.prompt_token,
-                live_mismatch.cached_token
-            ));
+            return;
         }
 
-        let gdn_prefix_preparation = match self.prepare_dense_gdn_prefix_state(
-            &tokens,
-            cached_prefix_len,
-            block_size,
-            &lookup_extra_keys,
-            cache_salt,
-            continued_live_prefix,
-        ) {
-            Ok(preparation) => preparation,
-            Err(error) => {
-                self.invalidate_dense_paged_session(
-                    "planned-MTP stream GDN-prefix preparation failure",
-                );
-                return Err(error);
-            }
-        };
-        let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
-        let gdn_prefix_state = gdn_prefix_preparation.state;
-        let gdn_restored_prefix_tokens = gdn_prefix_preparation.restored_prefix_tokens;
-        let gdn_replayed_prefix_tokens = gdn_prefix_preparation.replayed_prefix_tokens;
-        let preserves_image_lineage = carries_image_lineage && cached_prefix_len > 0;
-        self.cached_token_history.clear();
-        if !preserves_image_lineage {
-            self.cached_image_key = None;
-            self.cached_paged_image_token_positions.clear();
-        }
-        // Carry the cross-turn M-RoPE delta only when this turn extends the live
-        // image sequence (continued_live_prefix); a cold start or a non-live
-        // prefix-cache hit (text-only prefix) drops a stale image delta so the
-        // text suffix prefill + decode rotate at the raw physical slot.
-        self.cached_rope_deltas = super::paged_forward::rope_delta_for_paged_turn(
-            self.cached_rope_deltas,
-            preserves_image_lineage,
-        );
-
-        let suffix_len = match prompt_token_count.checked_sub(cached_prefix_len) {
-            Some(suffix_len) => suffix_len,
-            None => {
-                self.invalidate_dense_paged_session("planned-MTP stream prefix length mismatch");
-                return Err(Error::from_reason(
-                    "paged_turn_stream_core: cached_prefix_len > total_prompt_tokens",
-                ));
-            }
-        };
-
-        if inference_info_enabled {
-            tracing::info!(
-                target: "mlx_core::inference",
-                event = "prefix_plan",
-                turn_id = trace_turn_id,
-                prompt_tokens = prompt_token_count,
-                cached_prefix_tokens = cached_prefix_len,
-                suffix_tokens = suffix_len,
-                continued_live_prefix,
-                live_ready,
-                live_prefix_match,
-                live_tokens = live_tokens_len,
-                block_size,
-                gdn_prefix_state,
-                gdn_already_primed = gdn_prefix_already_primed,
-                gdn_restored_prefix_tokens,
-                gdn_replayed_prefix_tokens,
-                elapsed_ms = prefix_plan_start.map(elapsed_ms).unwrap_or(0.0),
-                "paged prefix plan resolved"
+        // --- Same four guards as chat_tokens_delta_sync ---
+        if config.reuse_cache == Some(false) {
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta requires reuse_cache to be enabled; \
+                 the delta path operates on session state by construction",
             );
+            return;
         }
-
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense stream_paged_start prompt_tokens={} \
-                 cached_prefix_tokens={} suffix_tokens={} block_size={} \
-                 prefill_chunk_size={} prefill_eval_interval={} decode_clear_interval={} \
-                 gdn_prefix_state={}",
-                prompt_token_count,
-                cached_prefix_len,
-                suffix_len,
-                block_size,
-                crate::array::paged_prefill_chunk_size(),
-                crate::array::paged_prefill_eval_interval(),
-                crate::array::paged_decode_cache_clear_interval(),
-                gdn_prefix_state
-            ));
-        }
-
-        let result = self.paged_turn_stream_core_inner(
-            &tokens,
-            cached_prefix_len,
-            suffix_len,
-            &p,
-            sampling_config,
-            eos_token_id,
-            &mut reasoning_tracker,
-            report_perf,
-            &mut first_token_instant,
-            &tokenizer,
-            &mut decode_stream,
-            &mut streamed_text_len,
-            &mut last_is_reasoning,
-            cb,
-            cancelled,
-            gdn_prefix_already_primed,
-            trace_turn_id,
-            turn_trace_start,
-        );
-
-        let (generated_tokens, finish_reason, decode_profiler) = match result {
-            Ok(t) => {
-                let image_token_positions = self.cached_paged_image_token_positions.clone();
-                self.finalize_dense_manual_paged_turn(&image_token_positions)?;
-                t
-            }
-            Err(e) => {
-                self.invalidate_dense_paged_session("planned-MTP stream prefill/decode failure");
-                if inference_info_enabled {
-                    tracing::info!(
-                        target: "mlx_core::inference",
-                        event = "turn_done",
-                        turn_id = trace_turn_id,
-                        status = "error",
-                        stage = "prefill_or_decode",
-                        elapsed_ms = turn_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                        "inference turn completed"
-                    );
-                }
-                return Err(e);
-            }
-        };
-
-        // Persist token history for subsequent session-continue calls.
-        let last_token_in_cache = false;
-        let mut full_history = tokens.clone();
-        if !generated_tokens.is_empty() {
-            let upto = if last_token_in_cache {
-                generated_tokens.len()
-            } else {
-                generated_tokens.len().saturating_sub(1)
-            };
-            full_history.extend_from_slice(&generated_tokens[..upto]);
-        }
-        self.cached_token_history = full_history;
-        let gdn_history_checkpoint_store = match self.remember_dense_gdn_history_checkpoint() {
-            Ok(store) => store,
-            Err(error) => {
-                self.invalidate_dense_paged_session(
-                    "planned-MTP stream GDN history checkpoint failure",
-                );
-                return Err(error);
-            }
-        };
-        if inference_info_enabled {
-            tracing::info!(
-                target: "mlx_core::inference",
-                event = "cache_commit",
-                turn_id = trace_turn_id,
-                stored = gdn_history_checkpoint_store.stored,
-                history_tokens = self.cached_token_history.len(),
-                eval_ms = gdn_history_checkpoint_store.eval_ms,
-                clone_ms = gdn_history_checkpoint_store.clone_ms,
-                update_ms = gdn_history_checkpoint_store.update_ms,
-                elapsed_ms = gdn_history_checkpoint_store.total_ms,
-                "inference cache committed"
+        if self.caches.is_none() {
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta requires an initialized session (call chatStreamSessionStart first)",
             );
+            return;
         }
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint stored={} tokens={} \
-                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
-                gdn_history_checkpoint_store.stored,
-                self.cached_token_history.len(),
-                gdn_history_checkpoint_store.eval_ms,
-                gdn_history_checkpoint_store.clone_ms,
-                gdn_history_checkpoint_store.token_clone_ms,
-                gdn_history_checkpoint_store.update_ms,
-                gdn_history_checkpoint_store.total_ms
-            ));
-        }
-
-        // Flush residual buffered bytes (mirrors flat streaming).
-        let full_text = tokenizer
-            .decode_sync(&generated_tokens, true)
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to decode generated tokens: {}", e);
-                String::new()
-            });
-        if full_text.len() > streamed_text_len {
-            let residual = full_text[streamed_text_len..].to_string();
-            // Suppress residual when it is reasoning text and
-            // include_reasoning == false.
-            if include_reasoning || !last_is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: residual,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(last_is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
-        }
-
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                tokens.len() - cached_prefix_len as usize,
-                generated_tokens.len(),
-            )
-            .map(|mut metrics| {
-                if let Some(profiler) = decode_profiler.as_ref() {
-                    profiler.fill_mtp_acceptance(&mut metrics);
-                }
-                metrics
-            })
-        } else {
-            None
-        };
-
-        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
-
-        let mut result = finalize_chat_result(
-            &tokenizer,
-            &generated_tokens,
-            finish_reason,
-            think_end_id,
-            think_end_str.as_deref(),
-            performance,
-            include_reasoning,
-            thinking_enabled,
-            prompt_token_count,
-            reasoning_tokens,
-        )?;
-        result.cached_tokens = cached_prefix_len;
-
-        if inference_info_enabled {
-            let (ttft_ms, prefill_tok_s, decode_tok_s, mtp_cycles, mtp_mean_total) = result
-                .performance
-                .as_ref()
-                .map(|metrics| {
-                    (
-                        metrics.ttft_ms,
-                        metrics.prefill_tokens_per_second,
-                        metrics.decode_tokens_per_second,
-                        metrics.mtp_cycles.unwrap_or(0),
-                        metrics.mtp_mean_accepted_tokens_total.unwrap_or(0.0),
-                    )
-                })
-                .unwrap_or((0.0, 0.0, 0.0, 0, 0.0));
-            tracing::info!(
-                target: "mlx_core::inference",
-                event = "turn_done",
-                turn_id = trace_turn_id,
-                status = "ok",
-                prompt_tokens = prompt_token_count,
-                cached_prefix_tokens = cached_prefix_len,
-                fresh_prefill_tokens = tokens.len().saturating_sub(cached_prefix_len as usize),
-                generated_tokens = generated_tokens.len(),
-                finish_reason = result.finish_reason.as_str(),
-                elapsed_ms = turn_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                ttft_ms,
-                prefill_tok_s,
-                decode_tok_s,
-                mtp_cycles,
-                mtp_mean_total,
-                "inference turn completed"
+        if delta_tokens.is_empty() {
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta requires a non-empty delta",
             );
+            return;
         }
+        // Text-only deltas are allowed on sessions whose KV cache carries
+        // prior image attention state — see `chat_tokens_delta_sync` for
+        // the full rationale. The outer `chat_stream_session_continue`
+        // gate already filters IMAGE-SET CHANGES via the
+        // `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix path.
 
-        // Terminal chunk.
-        cb.call(
-            Ok(ChatStreamChunk {
-                text: result.text.clone(),
-                done: true,
-                finish_reason: Some(result.finish_reason.clone()),
-                tool_calls: Some(result.tool_calls.clone()),
-                thinking: result.thinking.clone(),
-                num_tokens: Some(result.num_tokens),
-                prompt_tokens: Some(result.prompt_tokens),
-                reasoning_tokens: Some(result.reasoning_tokens),
-                raw_text: Some(result.raw_text.clone()),
-                cached_tokens: Some(cached_prefix_len),
-                performance: result.performance.clone(),
-                is_reasoning: None,
-            }),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
-
-        Ok(())
-    }
-
-    /// Inner forward + streaming decode loop for
-    /// [`Self::paged_turn_stream_core`]. Mirrors LFM2's
-    /// `paged_turn_stream_core_inner`.
-    ///
-    /// Runs the pure-Rust paged path — same dispatch as the sync sibling
-    /// `paged_turn_sync_core_inner`: prefill populates the GDN linear
-    /// caches and writes K/V into the adapter pool, then decode steps run
-    /// through `paged_forward::run_paged_decode_step` (or the eager paged
-    /// MTP arm when the MTP gate holds).
-    #[allow(clippy::too_many_arguments)]
-    fn paged_turn_stream_core_inner<'a>(
-        &mut self,
-        tokens: &[u32],
-        cached_prefix_len: u32,
-        suffix_len: u32,
-        p: &engine::ChatParams,
-        sampling_config: Option<crate::sampling::SamplingConfig>,
-        eos_token_id: u32,
-        reasoning_tracker: &mut engine::ReasoningTracker,
-        report_perf: bool,
-        first_token_instant: &mut Option<std::time::Instant>,
-        tokenizer: &'a Arc<Qwen3Tokenizer>,
-        decode_stream: &mut tokenizers::DecodeStream<
-            'a,
-            tokenizers::ModelWrapper,
-            tokenizers::NormalizerWrapper,
-            tokenizers::PreTokenizerWrapper,
-            tokenizers::PostProcessorWrapper,
-            tokenizers::DecoderWrapper,
-        >,
-        streamed_text_len: &mut usize,
-        last_is_reasoning: &mut bool,
-        cb: &StreamSender<'_>,
-        cancelled: &AtomicBool,
-        gdn_prefix_already_primed: bool,
-        trace_turn_id: u64,
-        turn_trace_start: Option<std::time::Instant>,
-    ) -> Result<(
-        Vec<u32>,
-        String,
-        Option<crate::decode_profiler::DecodeProfiler>,
-    )> {
-        // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
-        debug_assert!(
-            suffix_len > 0,
-            "paged_turn_stream_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
-        );
-
-        let suffix = &tokens[(cached_prefix_len as usize)..];
-        let layer_kinds =
-            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
-                self.config.is_linear_layer(i)
-            });
-
-        // Eager paged MTP needs the prompt-tail hidden for the
-        // committed-history v2 seed, same as the sync core. Only capture it
-        // when the eager paged MTP arm will actually run.
-        let eager_mtp_paged = p.enable_mtp && self.has_mtp_weights();
-        let want_prompt_hidden =
-            eager_mtp_paged && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
-        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(tokens.len());
-        let inference_info_enabled =
-            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
-        let prefill_trace_start = inference_info_enabled.then(std::time::Instant::now);
-        if inference_info_enabled {
-            tracing::info!(
-                target: "mlx_core::inference",
-                event = "prefill_start",
-                turn_id = trace_turn_id,
-                suffix_tokens = suffix_len,
-                cached_prefix_tokens = cached_prefix_len,
-                mtp = eager_mtp_paged,
-                keep_prompt_hidden_tokens = if want_prompt_hidden {
-                    mtp_prompt_history.keep_tokens
-                } else {
-                    0
-                },
-                "prefill started"
-            );
+        // All guards passed — enter the prefill+decode helper. Any error
+        // returned from here propagates as an mpsc error, same as
+        // `chat_stream_sync`.
+        let cb = StreamSender(stream_tx.clone());
+        let result =
+            self.chat_stream_tokens_delta_sync_inner(delta_tokens, config, &cb, &cancelled);
+        if let Err(e) = result {
+            let _ = stream_tx.send(Err(e));
         }
-
-        let mut mtp_profiler = begin_paged_mtp_profiler(eager_mtp_paged, suffix_len);
-        let mut prompt_hidden: Option<MxArray> = None;
-        let (last_logits, gdn_checkpoint) = {
-            let embed = self.embedding.clone();
-            let embedding_weight = embed.get_weight();
-            let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("paged_turn_stream_core_inner: caches not initialized")
-            })?;
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("paged_turn_stream_core_inner: paged_adapter dropped")
-            })?;
-            // Cross-turn M-RoPE delta (0 unless this text turn warm-continues
-            // an image prefill); feeds the scalar-offset RoPE for the suffix.
-            let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-            if want_prompt_hidden {
-                let (logits, ph, checkpoint) =
-                    super::paged_forward::run_paged_prefill_chunk_with_hidden_and_checkpoint(
-                        tokens,
-                        suffix,
-                        cached_prefix_len,
-                        gdn_prefix_already_primed,
-                        &embed,
-                        &mut self.layers,
-                        caches_ref,
-                        &self.final_norm,
-                        &self.lm_head,
-                        &embedding_weight,
-                        &layer_kinds,
-                        adapter,
-                        Some(mtp_prompt_history.keep_tokens),
-                        rope_deltas,
-                    )?;
-                prompt_hidden = Some(ph);
-                (logits, checkpoint)
-            } else {
-                super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
-                    tokens,
-                    suffix,
-                    cached_prefix_len,
-                    gdn_prefix_already_primed,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &embedding_weight,
-                    &layer_kinds,
-                    adapter,
-                    rope_deltas,
-                )?
-            }
-        };
-        if let Some(profiler) = mtp_profiler.as_mut() {
-            profiler.end_prefill();
-        }
-        self.publish_dense_gdn_materialized_prefix_checkpoint(tokens, gdn_checkpoint);
-
-        let mut token_history: Vec<u32> = tokens.to_vec();
-        let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
-        let mut y = sample(&last_logits, sampling_config)?;
-        y.eval();
-
-        if inference_info_enabled {
-            let prefill_elapsed = prefill_trace_start.map(elapsed_ms).unwrap_or(0.0);
-            tracing::info!(
-                target: "mlx_core::inference",
-                event = "first_token_sampled",
-                turn_id = trace_turn_id,
-                suffix_tokens = suffix_len,
-                elapsed_ms = prefill_elapsed,
-                materialized_prefill_tok_s = if prefill_elapsed > 0.0 {
-                    suffix_len as f64 / (prefill_elapsed / 1000.0)
-                } else {
-                    0.0
-                },
-                "first token sampled"
-            );
-        }
-
-        // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating (see paged_turn_sync_core_inner for rationale).
-        crate::array::synchronize_and_clear_cache();
-
-        if let Some(profiler) = mtp_profiler.as_mut() {
-            profiler.mark_first_token();
-        }
-        if report_perf {
-            *first_token_instant = Some(std::time::Instant::now());
-        }
-
-        let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
-        let mut finish_reason = String::from("length");
-        let decode_progress_start = std::time::Instant::now();
-        let mut decode_progress_window_start = decode_progress_start;
-        let mut decode_progress_last_generated = 0usize;
-        let mut decode_progress_next_generated = 32usize;
-
-        if eager_mtp_paged {
-            // Pure-Rust ("eager") paged MTP — streaming twin of the sync core's
-            // `eager_mtp_paged` arm. Same stepper spine; the engine's
-            // `run_mtp_turn` streaming path emits decoded text per token via `cb`.
-            MxArray::async_eval_arrays(&[&y]);
-
-            let mut profiler = mtp_profiler
-                .take()
-                .expect("paged MTP profiler must be created before prefill");
-
-            let eos_id = eos_token_id;
-            let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
-            let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-            let _wired_ctx =
-                crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
-
-            let prompt_hidden_position_base = mtp_prompt_history.position_base;
-            let prompt_hidden_ids: Vec<u32> = {
-                let start = mtp_prompt_history
-                    .hidden_start_token_index()
-                    .min(tokens.len());
-                tokens[start..].to_vec()
-            };
-
-            let mut rng = rand::rng();
-
-            if inference_info_enabled {
-                tracing::info!(
-                    target: "mlx_core::inference",
-                    event = "mtp_decode_start",
-                    turn_id = trace_turn_id,
-                    depth = p.mtp_depth,
-                    prompt_hidden_tokens = prompt_hidden_ids.len(),
-                    position_base = prompt_hidden_position_base,
-                    elapsed_ms = turn_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                    "MTP decode started"
-                );
-            }
-
-            // Streaming twin of the sync paged arm: the propose/verify whole-turn
-            // loop is engine-owned (`run_mtp_turn`) and drives the
-            // `DenseMtpStepper` in its PAGED mode. The streaming sink wires the
-            // shared incremental detokenizer + the default ChatML emitter so
-            // accepted tokens stream out `cb` per token; the stepper's `Drop`
-            // restores `self.paged_adapter` before this call returns (the
-            // paged-history save below relies on it). `outcome.last_in_cache` is
-            // unused (the paged-history save owns cache state).
-            let mut emitter = crate::engine::backend::DefaultStreamEmitter;
-            let streaming = crate::engine::decode::StreamingCtx {
-                callback: cb.0,
-                cancelled,
-                decode_stream,
-                tokenizer: tokenizer.inner(),
-                streamed_text_len,
-                last_is_reasoning,
-                emitter: &mut emitter,
-            };
-
-            let outcome = crate::engine::mtp_turn::run_mtp_turn(
-                self,
-                &mut rng,
-                crate::engine::mtp_turn::MtpTurnArgs {
-                    y: y.clone(),
-                    depth: p.mtp_depth,
-                    params: p,
-                    reasoning_tracker,
-                    profiler: &mut profiler,
-                    max_new_tokens,
-                    eos_id,
-                    generated_tokens: &mut generated_tokens,
-                    token_history: &mut token_history,
-                    finish_reason: &mut finish_reason,
-                    first_token_instant,
-                    report_perf: p.report_performance,
-                    generation_stream,
-                    prompt_hidden,
-                    prompt_hidden_ids: Some(prompt_hidden_ids),
-                    prompt_hidden_position_base,
-                },
-                Some(streaming),
-            )?;
-            let _ = outcome.last_in_cache;
-
-            return Ok((generated_tokens, finish_reason, Some(profiler)));
-        }
-
-        for step in 0..max_new_tokens {
-            let token_id = y.item_at_int32(0)? as u32;
-            generated_tokens.push(token_id);
-            token_history.push(token_id);
-            let is_reasoning = reasoning_tracker.observe_token(token_id);
-            *last_is_reasoning = is_reasoning;
-
-            if inference_info_enabled && generated_tokens.len() >= decode_progress_next_generated {
-                let now = std::time::Instant::now();
-                let window_tokens = generated_tokens
-                    .len()
-                    .saturating_sub(decode_progress_last_generated);
-                let window_elapsed_ms = now
-                    .saturating_duration_since(decode_progress_window_start)
-                    .as_secs_f64()
-                    * 1000.0;
-                tracing::info!(
-                    target: "mlx_core::inference",
-                    event = "decode_progress",
-                    mode = "ar",
-                    generated_tokens = generated_tokens.len(),
-                    window_tokens,
-                    window_elapsed_ms,
-                    window_tok_s = if window_elapsed_ms > 0.0 {
-                        window_tokens as f64 / (window_elapsed_ms / 1000.0)
-                    } else {
-                        0.0
-                    },
-                    elapsed_ms = now
-                        .saturating_duration_since(decode_progress_start)
-                        .as_secs_f64()
-                        * 1000.0,
-                    "decode progress"
-                );
-                decode_progress_last_generated = generated_tokens.len();
-                decode_progress_window_start = now;
-                decode_progress_next_generated = generated_tokens
-                    .len()
-                    .saturating_div(32)
-                    .saturating_add(1)
-                    .saturating_mul(32);
-            }
-
-            if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
-                finish_reason = String::from("stop");
-                break;
-            }
-            if cancelled.load(Ordering::Relaxed) {
-                finish_reason = String::from("cancelled");
-                break;
-            }
-
-            // Stream delta chunk.
-            let token_text = Qwen3Tokenizer::step_decode_stream(
-                decode_stream,
-                tokenizer.inner(),
-                token_id,
-                &generated_tokens,
-                *streamed_text_len,
-            );
-            *streamed_text_len += token_text.len();
-            // Suppress reasoning deltas when include_reasoning == false.
-            // Detokenize + length-advance above stay OUTSIDE this gate.
-            if p.include_reasoning || !is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: token_text,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
-
-            if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                &generated_tokens,
-                p.max_consecutive_tokens,
-                p.max_ngram_repeats,
-                p.ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
-            }
-            if step + 1 >= max_new_tokens {
-                break;
-            }
-
-            // Decode forward (pure-Rust paged step).
-            let next_logits = {
-                let embed = self.embedding.clone();
-                let embedding_weight = embed.get_weight();
-                let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("paged_turn_stream_core_inner: caches dropped mid-decode")
-                })?;
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "paged_turn_stream_core_inner: paged_adapter dropped mid-decode",
-                    )
-                })?;
-                let logits = super::paged_forward::run_paged_decode_step(
-                    token_id,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &embedding_weight,
-                    &layer_kinds,
-                    adapter,
-                    self.cached_rope_deltas.unwrap_or(0),
-                )?;
-                logits.squeeze(Some(&[1]))?
-            };
-
-            let next_logits = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id()? as i32;
-                y = MxArray::from_int32(&[forced_id], &[1])?;
-                y.eval();
-                continue;
-            } else {
-                apply_all_penalties(next_logits, &token_history, p)?
-            };
-
-            y = sample(&next_logits, sampling_config)?;
-            y.eval();
-
-            crate::array::maybe_clear_cache_for_paged_step(step);
-        }
-
-        Ok((generated_tokens, finish_reason, None))
     }
 
     /// Prefill the delta tokens and run the streaming decode loop.
     ///
-    /// Whole-turn core for STREAMING delta turns reached through the
-    /// engine's `mtp_turn` probe (MTP-enabled sessions; non-MTP
-    /// streaming deltas run the engine's generic flow or the paged
-    /// probe). Mirrors [`Self::chat_stream_sync_inner`] but skips the
+    /// This mirrors [`Self::chat_stream_sync_inner`] but skips the
     /// message rendering + prefix verification stages — the caller owns
     /// cache coherence by construction. Uses `<|im_end|>` as eos so the
     /// cached history continues to end on a clean ChatML boundary after
@@ -5554,11 +2131,10 @@ impl Qwen35Inner {
         &mut self,
         delta_tokens: Vec<u32>,
         config: ChatConfig,
-        cb: &StreamSender<'_>,
-        cancelled: &AtomicBool,
-        thinking: ThinkingSetup,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
     ) -> Result<()> {
-        let _reuse_cache = config.reuse_cache.unwrap_or(true);
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
         let tokenizer = self
@@ -5585,8 +2161,8 @@ impl Qwen35Inner {
         let mut full_token_history = self.cached_token_history.clone();
         full_token_history.extend(delta_tokens.iter().copied());
 
-        let mut p = extract_chat_params(&config);
-        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
+        let p = extract_chat_params(&config);
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -5595,32 +2171,32 @@ impl Qwen35Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        // MTP-on-paged delta streams fall through to the dense (flat)
-        // streaming path; non-MTP paged streams take the paged
-        // streaming core.
-        let mtp_takes_dense_path =
-            p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_some();
-        if mtp_takes_dense_path
-            && let Some(ref mut adapter) = self.paged_adapter
-            && let Err(e) = adapter.release_request()
-        {
-            tracing::warn!(
-                target: "mlx_core::qwen3_5::paged",
-                "MTP-on-paged dispatch (stream-delta): release_request failed (ignored): {e}",
-            );
-        }
-        if self.paged_adapter.is_some() && !mtp_takes_dense_path {
-            return self.paged_turn_stream_core(
-                full_token_history.clone(),
-                tokenizer_for_decode,
-                eos_id,
-                p,
-                report_perf,
-                cb,
-                cancelled,
-                thinking,
-            );
-        }
+        let model_id = self.model_id;
+
+        // Compiled path availability check, same pattern as chat_tokens_delta_sync.
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let _compiled_lock = if use_compiled {
+            Some(
+                DENSE_COMPILED_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+
+        let mut _weight_guard = None;
+        let use_compiled = if use_compiled {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
@@ -5631,98 +2207,26 @@ impl Qwen35Inner {
 
         let mut profiler =
             crate::decode_profiler::DecodeProfiler::new("chat_stream_delta", "qwen3_5");
-        // Prefill token count is reported below per-branch: the paged→dense
-        // fallback re-prefills the FULL history (see `rebuild_full_flat_prefill`),
-        // every other delta turn prefills only the delta.
+        profiler.set_prompt_tokens(delta_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
-        // Paged→dense-MTP cache-source transition.
-        //
-        // When `mtp_takes_dense_path` is true we arrived here off a PAGED
-        // session (`self.paged_adapter.is_some()`) that fell through the
-        // paged streaming core because it carries no MTP gate yet. On the
-        // paged path the authoritative FULL-ATTENTION K/V lives in the
-        // paged adapter's `LayerKVPool`, NOT in the flat `self.caches`
-        // (which only ever received GDN linear conv/recurrent state). A
-        // prior NON-streaming paged turn (`send()` → `chat_tokens_delta_sync`
-        // → `paged_turn_sync_core`) therefore leaves `self.caches`'
-        // full-attention slots EMPTY/STALE for the prior turn's tokens.
-        // Delta-prefilling only `delta_tokens` on top of that and running
-        // the eager MTP decode against `self.caches` would decode from an
-        // incomplete flat prefix (missing the prior turn's attention KV).
-        //
-        // Fix: when taking this dense fallback AND the flat caches are dirty
-        // (a paged-core turn ran since the last flat prefill —
-        // `paged_full_attn_caches_dirty`), rebuild the flat caches from
-        // scratch over the FULL token history: reset to fresh caches and
-        // prefill `full_token_history` instead of just the delta. This
-        // mirrors how the dense session-start path recovers from a
-        // cache-prefix miss (full reset + full re-prefill). The GDN recurrent
-        // state cannot be rewound mid-sequence, so a full reset + full
-        // prefill is the only coherent way to seed both the GDN linear and
-        // full-attention flat caches for the eager MTP decode.
-        //
-        // The dirty gate keeps this a ONE-TIME cost on the paged→dense
-        // transition: the flag is cleared once at end-of-turn success (atomic
-        // with the `cached_token_history` commit), so subsequent streaming MTP
-        // turns delta-prefill on the now-authoritative flat caches (no O(n²)
-        // full re-prefill every turn). It re-arms only if a later paged-core
-        // turn runs again. The common non-paged dense
-        // session (`paged_adapter.is_none()`, `mtp_takes_dense_path == false`,
-        // flag never set) is untouched: it keeps the delta-on-existing-caches
-        // prefill below, byte-identical.
-        let rebuild_full_flat_prefill = (mtp_takes_dense_path && self.paged_full_attn_caches_dirty)
-            || self.flat_mtp_caches_desynced;
-        profiler.set_prompt_tokens(if rebuild_full_flat_prefill {
-            full_token_history.len() as u32
-        } else {
-            delta_tokens.len() as u32
-        });
+        // Text-only prefill of the delta on top of the existing caches.
         profiler.begin_prefill();
-        let mut last_logits = if rebuild_full_flat_prefill {
-            // Discard the paged-session flat caches (full-attn slots are
-            // stale, GDN state belongs to the released paged request) and
-            // re-prefill the entire conversation into fresh flat caches.
-            self.flat_full_reprefill_count += 1;
-            self.caches = Some(fresh_dense_layer_caches(&self.config));
-            let prompt =
-                MxArray::from_uint32(&full_token_history, &[1, full_token_history.len() as i64])?;
-            chunked_prefill(
-                &prompt,
-                &embedding_weight,
-                &mut self.layers,
-                &mut self.caches,
-                &self.final_norm,
-                &self.lm_head,
-                Some(&embedding_weight_t),
-                generation_stream,
-            )?
-        } else {
-            // Text-only prefill of the delta on top of the existing caches.
-            let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
-            chunked_prefill(
-                &prompt,
-                &embedding_weight,
-                &mut self.layers,
-                &mut self.caches,
-                &self.final_norm,
-                &self.lm_head,
-                Some(&embedding_weight_t),
-                generation_stream,
-            )?
-        };
-        // caches now reflect the prefilled history
-        self.flat_mtp_caches_desynced = false;
-        // The flat full-attention caches now cover the full history (rebuild
-        // branch) or were already authoritative (delta branch). We do NOT
-        // clear `paged_full_attn_caches_dirty` here: the clear is co-located
-        // with the `cached_token_history` commit at the end-of-turn success
-        // boundary (`save_cache_state_after_delta` below), so that ANY
-        // mid-turn error — prefill OR decode — leaves the flag dirty. That
-        // way the next paged→dense turn still performs the protective one-time
-        // full rebuild over the authoritative history rather than trusting
-        // half-advanced flat caches paired with a stale `cached_token_history`.
-        let _seq_len = full_token_history.len() as i64;
+        let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
+        let logits = chunked_prefill(
+            &prompt,
+            &embedding_weight,
+            &mut self.layers,
+            &mut self.caches,
+            &self.final_norm,
+            &self.lm_head,
+            Some(&embedding_weight_t),
+            generation_stream,
+        )?;
+        let prefill_out_seq_len = logits.shape_at(1)?;
+        let mut last_logits = logits.slice_axis(1, prefill_out_seq_len - 1, prefill_out_seq_len)?;
+        last_logits = last_logits.squeeze(Some(&[1]))?;
+        let seq_len = full_token_history.len() as i64;
         profiler.end_prefill();
 
         // Save snapshot for save_cache_state_direct (prior history + delta).
@@ -5739,52 +2243,153 @@ impl Qwen35Inner {
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
-        let starts_in_thinking = thinking.enabled;
+        let _compiled_guard = if use_compiled {
+            Some(CompiledResetGuard)
+        } else {
+            None
+        };
+
+        let starts_in_thinking = enable_thinking.unwrap_or(true);
         let mut last_is_reasoning = starts_in_thinking;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+            starts_in_thinking,
+            p.thinking_token_budget,
+            think_end_id,
+        );
 
-        // Pure-Rust ("eager") dense MTP gate for the FLAT streaming delta path.
-        // Delta is text-only (no `has_images`) by construction; paged sessions
-        // returned earlier. Continuations have a live cache prefix so the
-        // committed-history builds from decode tokens with NO prompt seed
-        // (mirrors the non-stream delta path's `None, None, 0`).
-        let eager_mtp = p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_none();
+        if use_compiled {
+            // Initialize compiled state from prefill — text-only path, no
+            // VLM adjustments.
+            use mlx_sys as sys;
+            let prefill_len = seq_len as i32;
+            let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
+            let num_layers = self.config.num_layers as usize;
+            let mut cache_ptrs: Vec<*mut sys::mlx_array> =
+                vec![std::ptr::null_mut(); num_layers * 2];
+            if let Some(ref caches) = self.caches {
+                for (i, cache) in caches.iter().enumerate() {
+                    let (p0, p1) = cache.export_ptrs();
+                    cache_ptrs[i * 2] = p0;
+                    cache_ptrs[i * 2 + 1] = p1;
+                }
+            }
+            unsafe {
+                sys::mlx_qwen35_compiled_init_from_prefill(
+                    self.config.num_layers,
+                    self.config.hidden_size,
+                    self.config.num_heads,
+                    self.config.num_kv_heads,
+                    self.config.head_dim,
+                    self.config.rope_theta as f32,
+                    self.config.rope_dims(),
+                    self.config.rms_norm_eps as f32,
+                    self.config.full_attention_interval,
+                    self.config.linear_num_key_heads,
+                    self.config.linear_num_value_heads,
+                    self.config.linear_key_head_dim,
+                    self.config.linear_value_head_dim,
+                    self.config.linear_conv_kernel_dim,
+                    if self.config.tie_word_embeddings {
+                        1
+                    } else {
+                        0
+                    },
+                    max_kv_len,
+                    1,
+                    cache_ptrs.as_mut_ptr(),
+                    prefill_len,
+                );
+            }
+            // Re-apply the saved M-RoPE offset if the session carries
+            // image state. The delta prefill just ran against the live
+            // KV caches, which still encode the prior VLM prefill's
+            // image attention; without re-applying the offset here, the
+            // newly-built compiled graph would use a sequential M-RoPE
+            // position and misposition all decoded tokens relative to
+            // the cached image patches. `cached_rope_deltas` stays
+            // alive across deltas so chained text-only turns on the
+            // same image session keep the offset.
+            if let Some(delta) = self.cached_rope_deltas {
+                unsafe {
+                    mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
+                }
+            }
 
-        // Whether the final committed token reached the physical KV/GDN cache;
-        // written by the decode driver so the save below drops it when it was
-        // never forwarded (unforwarded stop token).
-        let mut last_in_cache = true;
+            profiler.set_label("chat_stream_delta_compiled");
 
-        if eager_mtp {
-            self.run_flat_stream_eager_mtp(
-                y,
-                &mut token_history,
-                &mut generated_tokens,
-                &mut finish_reason,
-                &mut reasoning_tracker,
-                &mut profiler,
-                &mut first_token_instant,
-                &mut streamed_text_len,
-                &mut last_is_reasoning,
-                &mut decode_stream,
-                &tokenizer_for_decode,
-                cb,
-                cancelled,
-                embedding_weight,
-                embedding_weight_t,
-                &p,
-                eos_id,
-                p.max_new_tokens,
-                generation_stream,
-                None,
-                None,
-                0,
-                &mut last_in_cache,
-            )?;
+            let mut ops = chat_common::DecodeOps {
+                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                    Ok((forward_compiled(ids, emb)?, false))
+                },
+                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                    eval_token_and_compiled_caches(token);
+                    if budget_forced {
+                        logits.eval();
+                    }
+                },
+            };
+            chat_common::decode_loop!(
+                ops: ops,
+                y: y,
+                embedding_weight: embedding_weight,
+                params: p,
+                reasoning_tracker: reasoning_tracker,
+                profiler: profiler,
+                max_new_tokens: p.max_new_tokens,
+                eos_id: eos_id,
+                generated_tokens: generated_tokens,
+                token_history: token_history,
+                finish_reason: finish_reason,
+                first_token_instant: first_token_instant,
+                report_perf: p.report_performance,
+                generation_stream: generation_stream,
+                streaming: {
+                    callback: cb,
+                    cancelled: cancelled,
+                    decode_stream: decode_stream,
+                    tokenizer: tokenizer_for_decode,
+                    streamed_text_len: streamed_text_len,
+                    last_is_reasoning: last_is_reasoning
+                }
+            );
+
+            // Export caches from C++ so the next turn's Rust-side cache
+            // state is consistent with the compiled forward's view.
+            if reuse_cache {
+                let num_layers = self.config.num_layers as usize;
+                let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                    vec![std::ptr::null_mut(); num_layers * 2];
+                let exported = unsafe {
+                    mlx_sys::mlx_qwen35_export_caches(
+                        export_ptrs.as_mut_ptr(),
+                        (num_layers * 2) as i32,
+                    )
+                };
+                if exported > 0 {
+                    let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
+                    let mut new_caches = Vec::with_capacity(num_layers);
+                    for i in 0..num_layers {
+                        let p0 = export_ptrs[i * 2];
+                        let p1 = export_ptrs[i * 2 + 1];
+                        let mut lc = if self.config.is_linear_layer(i) {
+                            Qwen3_5LayerCache::new_linear()
+                        } else {
+                            Qwen3_5LayerCache::new_full_attention()
+                        };
+                        lc.import_ptrs(p0, p1, cache_offset);
+                        new_caches.push(lc);
+                    }
+                    self.caches = Some(new_caches);
+                    // See `chat_with_caches_inner` for rationale: force-eval
+                    // the exported lazy handles before `CompiledResetGuard`
+                    // clears `g_compiled_caches` at end of scope.
+                    eval_layer_caches(&self.caches);
+                }
+            }
         } else {
             profiler.set_label("chat_stream_delta_rust");
 
-            let mut ops = mtp_decode::DecodeOps {
+            let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
                         ids,
@@ -5801,7 +2406,7 @@ impl Qwen35Inner {
                     MxArray::async_eval_arrays(&[token, logits]);
                 },
             };
-            mtp_decode::decode_loop!(
+            chat_common::decode_loop!(
                 ops: ops,
                 y: y,
                 embedding_weight: embedding_weight,
@@ -5813,7 +2418,6 @@ impl Qwen35Inner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
-                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
@@ -5833,24 +2437,16 @@ impl Qwen35Inner {
         // consistent for the next turn. Delta continuations preserve
         // `cached_image_key` so the next turn's cache-prefix verify
         // still sees the prior prefill's image state.
-        engine::save_cache_state_after_delta(
+        chat_common::save_cache_state_after_delta(
             p.reuse_cache,
             &generated_tokens,
             &finish_reason,
-            /* drop_last_always */ !last_in_cache,
             &save_tokens,
             &mut self.cached_token_history,
             &mut self.cached_image_key,
             &mut self.cached_rope_deltas,
             &mut self.caches,
         );
-        // Clear the paged-dirty flag ATOMICALLY with the
-        // `cached_token_history` commit above: a successful turn updates the
-        // committed history and the flat caches together, so the one-time
-        // protective rebuild is no longer needed until a later paged-core turn
-        // re-dirties it. Placing the clear here (not after prefill) guarantees
-        // any mid-turn `?`-error leaves the flag dirty.
-        self.paged_full_attn_caches_dirty = false;
 
         // Decode the full reply text and emit the final done chunk.
         let text = tokenizer_for_decode
@@ -5862,36 +2458,32 @@ impl Qwen35Inner {
 
         if text.len() > streamed_text_len {
             let residual = text[streamed_text_len..].to_string();
-            // Suppress residual when it is reasoning text and
-            // include_reasoning == false.
-            if p.include_reasoning || !last_is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: residual,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(last_is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
+            cb.call(
+                Ok(ChatStreamChunk {
+                    text: residual,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    prompt_tokens: None,
+                    reasoning_tokens: None,
+                    raw_text: None,
+                    cached_tokens: None,
+                    performance: None,
+                    is_reasoning: Some(last_is_reasoning),
+                }),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
         }
 
         let num_tokens = generated_tokens.len() as u32;
         let prompt_token_count = delta_tokens.len() as u32;
 
-        let (clean_text, tool_calls, thinking) = engine::parse_thinking_and_tools(
+        let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
             &text,
             &generated_tokens,
-            starts_in_thinking,
+            enable_thinking.unwrap_or(true),
             think_end_id,
             think_end_str.as_deref(),
             p.include_reasoning,
@@ -5908,11 +2500,7 @@ impl Qwen35Inner {
             first_token_instant,
             delta_tokens.len(),
             generated_tokens.len(),
-        )
-        .map(|mut m| {
-            profiler.fill_mtp_acceptance(&mut m);
-            m
-        });
+        );
 
         cb.call(
             Ok(ChatStreamChunk {
@@ -5924,14 +2512,7 @@ impl Qwen35Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(engine::raw_text_with_reasoning_suppressed(
-                    &text,
-                    &generated_tokens,
-                    starts_in_thinking,
-                    think_end_id,
-                    think_end_str.as_deref(),
-                    p.include_reasoning,
-                )),
+                raw_text: Some(text),
                 // Delta path reuses the full prior history by construction
                 // — report `prior_cached_len` (captured before the
                 // `self.cached_token_history` extend above) as the
@@ -5946,21 +2527,13 @@ impl Qwen35Inner {
         Ok(())
     }
 
-    /// Whole-turn core for fresh STREAMING turns reached through the
-    /// engine's `vision_turn` (image-bearing) and `mtp_turn`
-    /// (MTP-enabled) probes. The engine already rendered the prompt
-    /// (`tokens`) and extracted the raw image payloads (`images`);
-    /// everything from the MTP-on-paged dispatch onward runs the
-    /// whole-turn pipeline.
     fn chat_stream_sync_inner(
         &mut self,
-        tokens: Vec<u32>,
-        images: &[Vec<u8>],
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
         eos_token_id: u32,
-        cb: &StreamSender<'_>,
-        cancelled: &AtomicBool,
-        thinking: ThinkingSetup,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
     ) -> Result<()> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -5971,14 +2544,25 @@ impl Qwen35Inner {
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
             .clone();
 
-        let has_images = !images.is_empty();
+        let has_images = messages
+            .iter()
+            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
 
-        let mut p = engine::extract_chat_params(&config);
-        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
+        let tool_defs = config.tools.as_deref();
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let tokens = tokenizer.apply_chat_template_sync(
+            &messages,
+            Some(true),
+            tool_defs,
+            enable_thinking,
+        )?;
+
+        let p = chat_common::extract_chat_params(&config);
+        let model_id = self.model_id;
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -5987,70 +2571,53 @@ impl Qwen35Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        // All image turns route to the paged-vision streaming core, which runs
-        // plain autoregressive decode regardless of MTP (the core has no
-        // draft/verify; MTP weights are ignored). This precedes the text-only
-        // MTP-on-paged gate below so an image+MTP stream still reaches the
-        // paged-vision core rather than the text dense fallback.
-        if has_images && self.paged_adapter.is_some() {
-            return self.vision_paged_turn_stream_core(
-                tokens,
-                images,
-                tokenizer_for_decode,
-                eos_token_id,
-                p,
-                report_perf,
-                cb,
-                cancelled,
-                thinking,
-            );
-        }
+        // Check compiled path
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let _compiled_lock = if use_compiled {
+            Some(
+                DENSE_COMPILED_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
 
-        // Text-only paged dispatch. MTP-on-paged streams fall through to the
-        // dense (flat) streaming path; non-MTP paged streams take the paged
-        // streaming core.
-        let mtp_takes_dense_path =
-            p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_some();
-        if mtp_takes_dense_path
-            && let Some(ref mut adapter) = self.paged_adapter
-            && let Err(e) = adapter.release_request()
-        {
-            tracing::warn!(
-                target: "mlx_core::qwen3_5::paged",
-                "MTP-on-paged dispatch (stream-start): release_request failed (ignored): {e}",
-            );
-        }
-        if self.paged_adapter.is_some() && !mtp_takes_dense_path {
-            return self.paged_turn_stream_core(
-                tokens,
-                tokenizer_for_decode,
-                eos_token_id,
-                p,
-                report_perf,
-                cb,
-                cancelled,
-                thinking,
-            );
-        }
-
-        // The dense (flat) streaming fallback is text-only. A dense image turn
-        // requires the block-paged backend; reaching here with images means the
-        // model was loaded without a paged adapter (use_block_paged_cache=false,
-        // non-Metal build, or a sym8 checkpoint).
-        if has_images {
-            return Err(Error::from_reason(
-                "qwen3.5 dense image turns require the block-paged KV backend; the model was \
-                 loaded without a paged adapter (use_block_paged_cache=false, non-Metal build, \
-                 or sym8 checkpoint)",
-            ));
-        }
+        let mut _weight_guard = None;
+        let use_compiled = if use_compiled {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         let embedding_weight = self.embedding.get_weight();
 
-        // Text-only from here: the `has_images` early-return above is the only
-        // image path. These bindings preserve the shared cache-reuse / decode
-        // plumbing (`has_images` is always false on this branch).
-        let (expanded_tokens, current_image_cache_key) = (tokens.clone(), 0u64);
+        // VLM image processing
+        let sms = self.spatial_merge_size.unwrap_or(2);
+        let (expanded_tokens, current_image_cache_key, vlm_processed) = if has_images {
+            if let (Some(_vision_enc), Some(img_proc)) =
+                (self.vision_encoder.as_ref(), self.image_processor.as_ref())
+            {
+                let all_images = extract_images_from_messages(&messages);
+                let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
+                let processed_pre = img_proc.process_many(&image_refs)?;
+                let per_image_token_counts =
+                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
+                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
+                let cache_key = compute_image_cache_key(&all_images);
+                (expanded, cache_key, Some(processed_pre))
+            } else {
+                (tokens.clone(), 0u64, None)
+            }
+        } else {
+            (tokens.clone(), 0u64, None)
+        };
 
         // Cache reuse
         let cached_prefix_len = verify_cache_prefix_direct(
@@ -6063,42 +2630,6 @@ impl Qwen35Inner {
             &self.cached_image_key,
             self.caches.is_some(),
         );
-
-        // Same paged→dense-MTP stale-flat-cache hazard
-        // as the streaming delta path, but for the stream-START dense
-        // fallback. A prior paged-core turn wrote full-attention K/V into the
-        // paged adapter pool, leaving the flat `self.caches` full-attention
-        // slots empty/stale (only GDN linear state was imported). A prefix
-        // hit from `verify_cache_prefix_direct` (matched against
-        // `cached_token_history`) would then decode from an incomplete flat
-        // prefix. When the flat caches are dirty, drop any prefix reuse so the
-        // branch below does a full reset + re-prefill (cached_prefix_len = 0),
-        // rebuilding the flat full-attention caches over the whole prompt.
-        //
-        // Reachability note: the flag is set ONLY by the two paged cores, and
-        // a non-MTP paged turn returns earlier at the
-        // `self.paged_adapter.is_some() && !mtp_takes_dense_path` branch above.
-        // So whenever control reaches here the flag can be true only on the
-        // paged+MTP (`mtp_takes_dense_path`) fallback; a non-paged dense start
-        // (`paged_adapter.is_none()`) never sets it → this is a no-op and the
-        // common path stays byte-identical. The ungated read is therefore
-        // equivalent to gating on `mtp_takes_dense_path`.
-        //
-        // The flag is cleared at the END-OF-TURN success boundary, co-located
-        // with the `cached_token_history` commit (`save_cache_state_direct`
-        // below), NOT here and NOT right after prefill. This makes the clear
-        // atomic with the history commit: ANY mid-turn `?`-error — prefill OR
-        // decode — aborts the turn with the flat caches still un-rebuilt and
-        // `cached_token_history` still holding the prior paged turn's tokens,
-        // so the flag stays dirty and the NEXT paged→dense turn performs the
-        // protective one-time full rebuild instead of decoding from an
-        // incomplete flat prefix. Mirrors the reviewed delta path.
-        let cached_prefix_len =
-            if self.paged_full_attn_caches_dirty || self.flat_mtp_caches_desynced {
-                0
-            } else {
-                cached_prefix_len
-            };
 
         let prefill_tokens = if cached_prefix_len > 0 {
             if has_images {
@@ -6135,7 +2666,7 @@ impl Qwen35Inner {
             tokens.clone()
         };
 
-        // Zero-delta guard. See the matching `vision_mtp_whole_turn_core` comment for
+        // Zero-delta guard. See the matching `chat_sync_core` comment for
         // the design rationale — rewinding a GDN recurrent cache by one
         // token is not possible, so the only safe response to an exact-
         // match prompt is a full reset + re-prefill.
@@ -6182,127 +2713,223 @@ impl Qwen35Inner {
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
-        // Pure-Rust ("eager") dense MTP gate for the FLAT streaming path.
-        // Same preconditions as `chat_with_caches_inner`: per-request /
-        // per-checkpoint enablement, no live paged adapter (paged streams
-        // returned earlier), text-only.
-        let eager_mtp =
-            p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_none() && !has_images;
-        // The committed-history v2 seed needs the prompt tail's hiddens, which
-        // only the hidden-emitting prefill produces. Skip on cache-reuse turns
-        // (the captured hidden would cover the SUFFIX, not the full prompt) —
-        // committed-history still runs (it builds from decode tokens).
-        let want_prompt_hidden =
-            eager_mtp && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
-        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(prefill_tokens.len());
-        let mut prompt_hidden: Option<MxArray> = None;
-
-        // Text prefill
+        // VLM or text prefill
         profiler.begin_prefill();
-        let (mut last_logits, _seq_len) = {
-            let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-            let last_logits = if want_prompt_hidden {
-                let (logits, ph) = chunked_prefill_with_hidden(
-                    &prompt,
-                    &embedding_weight,
-                    &mut self.layers,
-                    &mut self.caches,
-                    &self.final_norm,
-                    &self.lm_head,
-                    Some(&embedding_weight_t),
-                    generation_stream,
-                    Some(mtp_prompt_history.keep_tokens),
-                )?;
-                prompt_hidden = Some(ph);
-                logits
-            } else {
-                chunked_prefill(
-                    &prompt,
-                    &embedding_weight,
-                    &mut self.layers,
-                    &mut self.caches,
-                    &self.final_norm,
-                    &self.lm_head,
-                    Some(&embedding_weight_t),
-                    generation_stream,
-                )?
-            };
+        let (mut last_logits, seq_len, vlm_compiled_init_done) = if has_images
+            && cached_prefix_len == 0
+        {
+            if let Some(vision_enc) = self.vision_encoder.clone() {
+                let final_tokens = &expanded_tokens;
+                let processed = vlm_processed
+                    .as_ref()
+                    .ok_or_else(|| Error::from_reason("VLM processed images missing"))?;
 
-            (last_logits, tokens.len() as i64)
+                let input_ids =
+                    MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
+
+                let (logits, rope_deltas, vlm_compiled) = vlm_prefill(
+                    &input_ids,
+                    current_image_cache_key,
+                    processed,
+                    &vision_enc,
+                    sms,
+                    &embedding_weight,
+                    &mut self.layers,
+                    &mut self.caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &self.config,
+                    p.max_new_tokens,
+                    generation_stream,
+                    &self.vision_cache,
+                    model_id,
+                )?;
+
+                self.cached_rope_deltas = Some(rope_deltas as i32);
+                let vlm_seq_len = final_tokens.len() as i64;
+                (logits, vlm_seq_len, vlm_compiled)
+            } else {
+                return Err(Error::from_reason(
+                    "VLM prefill requested but vision encoder/processor not loaded",
+                ));
+            }
+        } else {
+            let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
+            let logits = chunked_prefill(
+                &prompt,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+                generation_stream,
+            )?;
+
+            let seq_len = logits.shape_at(1)?;
+            let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+            let last_logits = last_logits.squeeze(Some(&[1]))?;
+            let total_seq_len = if has_images {
+                expanded_tokens.len() as i64
+            } else {
+                tokens.len() as i64
+            };
+            (last_logits, total_seq_len, false)
         };
         profiler.end_prefill();
-        // caches now reflect the prefilled history
-        self.flat_mtp_caches_desynced = false;
-
-        // On a paged→dense-MTP transition the dirty gate
-        // forced `cached_prefix_len = 0`, so the prefill above was a full reset
-        // + full re-prefill and the flat full-attention caches now cover the
-        // entire prompt. We do NOT clear `paged_full_attn_caches_dirty` here:
-        // the clear is co-located with the `cached_token_history` commit at the
-        // end-of-turn success boundary (`save_cache_state_direct` below), so it
-        // is atomic with the history write. That way ANY mid-turn `?`-error —
-        // prefill OR decode — leaves the flag dirty and the next paged→dense
-        // turn still performs the protective one-time full rebuild rather than
-        // trusting half-advanced flat caches against a stale committed history.
-        // (No-op on the common non-paged path, where the flag is never set.)
 
         let mut token_history: Vec<u32> = tokens.clone();
         last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
-        let starts_in_thinking = thinking.enabled;
+        let _compiled_guard = if use_compiled {
+            Some(CompiledResetGuard)
+        } else {
+            None
+        };
+
+        let starts_in_thinking = enable_thinking.unwrap_or(true);
         let mut last_is_reasoning = starts_in_thinking;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+            starts_in_thinking,
+            p.thinking_token_budget,
+            think_end_id,
+        );
 
-        // Pair the captured prompt hidden with the exact prompt tail whose
-        // hiddens it holds (mirrors the non-stream caller at 1708-1717).
-        let prompt_hidden_ids: Option<Vec<u32>> = prompt_hidden.as_ref().map(|_| {
-            let start = mtp_prompt_history
-                .hidden_start_token_index()
-                .min(prefill_tokens.len());
-            prefill_tokens[start..].to_vec()
-        });
-        let prompt_hidden_position_base = prompt_hidden
-            .as_ref()
-            .map(|_| mtp_prompt_history.position_base)
-            .unwrap_or(0);
+        if use_compiled {
+            if vlm_compiled_init_done {
+                // VLM prefill already initialized compiled state
+            } else {
+                use mlx_sys as sys;
+                let prefill_len = seq_len as i32;
+                let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
+                let num_layers = self.config.num_layers as usize;
+                let mut cache_ptrs: Vec<*mut sys::mlx_array> =
+                    vec![std::ptr::null_mut(); num_layers * 2];
+                if let Some(ref caches) = self.caches {
+                    for (i, cache) in caches.iter().enumerate() {
+                        let (p0, p1) = cache.export_ptrs();
+                        cache_ptrs[i * 2] = p0;
+                        cache_ptrs[i * 2 + 1] = p1;
+                    }
+                }
+                unsafe {
+                    sys::mlx_qwen35_compiled_init_from_prefill(
+                        self.config.num_layers,
+                        self.config.hidden_size,
+                        self.config.num_heads,
+                        self.config.num_kv_heads,
+                        self.config.head_dim,
+                        self.config.rope_theta as f32,
+                        self.config.rope_dims(),
+                        self.config.rms_norm_eps as f32,
+                        self.config.full_attention_interval,
+                        self.config.linear_num_key_heads,
+                        self.config.linear_num_value_heads,
+                        self.config.linear_key_head_dim,
+                        self.config.linear_value_head_dim,
+                        self.config.linear_conv_kernel_dim,
+                        if self.config.tie_word_embeddings {
+                            1
+                        } else {
+                            0
+                        },
+                        max_kv_len,
+                        1,
+                        cache_ptrs.as_mut_ptr(),
+                        prefill_len,
+                    );
+                }
 
-        // Whether the final committed token reached the physical KV/GDN cache;
-        // written by the decode driver so the save below drops it when it was
-        // never forwarded (unforwarded stop token).
-        let mut last_in_cache = true;
+                if has_images
+                    && cached_prefix_len > 0
+                    && let Some(delta) = self.cached_rope_deltas
+                {
+                    unsafe {
+                        mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
+                    }
+                }
+            }
 
-        if eager_mtp {
-            self.run_flat_stream_eager_mtp(
-                y,
-                &mut token_history,
-                &mut generated_tokens,
-                &mut finish_reason,
-                &mut reasoning_tracker,
-                &mut profiler,
-                &mut first_token_instant,
-                &mut streamed_text_len,
-                &mut last_is_reasoning,
-                &mut decode_stream,
-                &tokenizer_for_decode,
-                cb,
-                cancelled,
-                embedding_weight,
-                embedding_weight_t,
-                &p,
-                eos_id,
-                p.max_new_tokens,
-                generation_stream,
-                prompt_hidden,
-                prompt_hidden_ids,
-                prompt_hidden_position_base,
-                &mut last_in_cache,
-            )?;
+            if !has_images {
+                self.cached_rope_deltas = None;
+            }
+
+            profiler.set_label("chat_stream_compiled");
+
+            let mut ops = chat_common::DecodeOps {
+                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                    Ok((forward_compiled(ids, emb)?, false))
+                },
+                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                    eval_token_and_compiled_caches(token);
+                    if budget_forced {
+                        logits.eval();
+                    }
+                },
+            };
+            chat_common::decode_loop!(
+                ops: ops,
+                y: y,
+                embedding_weight: embedding_weight,
+                params: p,
+                reasoning_tracker: reasoning_tracker,
+                profiler: profiler,
+                max_new_tokens: p.max_new_tokens,
+                eos_id: eos_id,
+                generated_tokens: generated_tokens,
+                token_history: token_history,
+                finish_reason: finish_reason,
+                first_token_instant: first_token_instant,
+                report_perf: p.report_performance,
+                generation_stream: generation_stream,
+                streaming: {
+                    callback: cb,
+                    cancelled: cancelled,
+                    decode_stream: decode_stream,
+                    tokenizer: tokenizer_for_decode,
+                    streamed_text_len: streamed_text_len,
+                    last_is_reasoning: last_is_reasoning
+                }
+            );
+
+            // Export caches
+            if reuse_cache {
+                let num_layers = self.config.num_layers as usize;
+                let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                    vec![std::ptr::null_mut(); num_layers * 2];
+                let exported = unsafe {
+                    mlx_sys::mlx_qwen35_export_caches(
+                        export_ptrs.as_mut_ptr(),
+                        (num_layers * 2) as i32,
+                    )
+                };
+                if exported > 0 {
+                    let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
+                    let mut new_caches = Vec::with_capacity(num_layers);
+                    for i in 0..num_layers {
+                        let p0 = export_ptrs[i * 2];
+                        let p1 = export_ptrs[i * 2 + 1];
+                        let mut lc = if self.config.is_linear_layer(i) {
+                            Qwen3_5LayerCache::new_linear()
+                        } else {
+                            Qwen3_5LayerCache::new_full_attention()
+                        };
+                        lc.import_ptrs(p0, p1, cache_offset);
+                        new_caches.push(lc);
+                    }
+                    self.caches = Some(new_caches);
+                    // See `chat_with_caches_inner` for rationale: force-eval
+                    // the exported lazy handles before `CompiledResetGuard`
+                    // clears `g_compiled_caches` at end of scope.
+                    eval_layer_caches(&self.caches);
+                }
+            }
         } else {
             profiler.set_label("chat_stream_rust");
 
-            let mut ops = mtp_decode::DecodeOps {
+            let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
                         ids,
@@ -6319,7 +2946,7 @@ impl Qwen35Inner {
                     MxArray::async_eval_arrays(&[token, logits]);
                 },
             };
-            mtp_decode::decode_loop!(
+            chat_common::decode_loop!(
                 ops: ops,
                 y: y,
                 embedding_weight: embedding_weight,
@@ -6331,7 +2958,6 @@ impl Qwen35Inner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
-                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
@@ -6352,7 +2978,6 @@ impl Qwen35Inner {
             has_images,
             &generated_tokens,
             &finish_reason,
-            /* drop_last_always */ !last_in_cache,
             &tokens,
             Some(&expanded_tokens),
             current_image_cache_key,
@@ -6361,15 +2986,6 @@ impl Qwen35Inner {
             &mut self.cached_rope_deltas,
             &mut self.caches,
         );
-        self.cached_paged_image_token_positions.clear();
-        // Clear the paged-dirty flag ATOMICALLY with the
-        // `cached_token_history` commit above: a successful turn updates the
-        // committed history and the rebuilt flat caches together, so the
-        // one-time protective rebuild is no longer needed until a later
-        // paged-core turn re-dirties it. Placing the clear here (not after
-        // prefill) guarantees any mid-turn `?`-error — prefill OR decode —
-        // leaves the flag dirty so the next paged→dense turn rebuilds.
-        self.paged_full_attn_caches_dirty = false;
 
         let text = tokenizer_for_decode
             .decode_sync(&generated_tokens, true)
@@ -6381,27 +2997,23 @@ impl Qwen35Inner {
         // Flush residual bytes
         if text.len() > streamed_text_len {
             let residual = text[streamed_text_len..].to_string();
-            // Suppress residual when it is reasoning text and
-            // include_reasoning == false.
-            if p.include_reasoning || !last_is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: residual,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(last_is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
+            cb.call(
+                Ok(ChatStreamChunk {
+                    text: residual,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    prompt_tokens: None,
+                    reasoning_tokens: None,
+                    raw_text: None,
+                    cached_tokens: None,
+                    performance: None,
+                    is_reasoning: Some(last_is_reasoning),
+                }),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
         }
 
         let num_tokens = generated_tokens.len() as u32;
@@ -6411,10 +3023,10 @@ impl Qwen35Inner {
             tokens.len() as u32
         };
 
-        let (clean_text, tool_calls, thinking) = engine::parse_thinking_and_tools(
+        let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
             &text,
             &generated_tokens,
-            starts_in_thinking,
+            enable_thinking.unwrap_or(true),
             think_end_id,
             think_end_str.as_deref(),
             p.include_reasoning,
@@ -6431,11 +3043,7 @@ impl Qwen35Inner {
             first_token_instant,
             prefill_tokens.len(),
             generated_tokens.len(),
-        )
-        .map(|mut m| {
-            profiler.fill_mtp_acceptance(&mut m);
-            m
-        });
+        );
 
         // Send final done chunk
         cb.call(
@@ -6448,14 +3056,7 @@ impl Qwen35Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(engine::raw_text_with_reasoning_suppressed(
-                    &text,
-                    &generated_tokens,
-                    starts_in_thinking,
-                    think_end_id,
-                    think_end_str.as_deref(),
-                    p.include_reasoning,
-                )),
+                raw_text: Some(text),
                 // Start path: report the matched prefix length from
                 // `verify_cache_prefix_direct`. Zero on a miss, full
                 // cached length on an exact-append hit.
@@ -6503,29 +3104,14 @@ impl Qwen35Inner {
         let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
         let last_logits = last_logits.squeeze(Some(&[1]))?;
 
-        // Request value wins; otherwise fall back to the checkpoint's
-        // generation_config.json default; otherwise the sampler's builtin.
-        // When the request omits temperature, a `do_sample:false` in
-        // generation_config.json forces greedy decoding (temperature 0),
-        // overriding any gen-config temperature (HuggingFace transformers
-        // semantics) — `effective_temperature()` folds that rule in.
-        // This raw `generate` surface exposes only the four SamplingConfig
-        // fields (no repetition/presence/frequency penalty), so a
-        // generation_config repetition_penalty is honored on the ChatSession
-        // path but intentionally not here. ChatSession is the full-parity surface.
         let sampling_config = Some(SamplingConfig {
-            temperature: config
-                .temperature
-                .or(self.gen_defaults.effective_temperature()),
-            top_k: config.top_k.or(self.gen_defaults.top_k),
-            top_p: config.top_p.or(self.gen_defaults.top_p),
-            min_p: config.min_p.or(self.gen_defaults.min_p),
+            temperature: config.temperature,
+            top_k: config.top_k,
+            top_p: config.top_p,
+            min_p: config.min_p,
         });
 
         let eos_id = self.config.eos_token_id as u32;
-        // Extra stop ids from generation_config.json (e.g. a second EOS).
-        let extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
-        let is_eos = |t: u32| t == eos_id || extra_eos_ids.contains(&t);
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut y = sample(&last_logits, sampling_config)?;
 
@@ -6534,7 +3120,7 @@ impl Qwen35Inner {
             let token_id = y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
 
-            if is_eos(token_id) {
+            if token_id == eos_id {
                 break;
             }
 
@@ -6561,10 +3147,13 @@ impl Qwen35Inner {
             }
         }
 
-        let stopped_on_eos = generated_tokens.last().is_some_and(|&t| is_eos(t));
         self.reset_caches_sync()?;
 
-        let finish_reason = if stopped_on_eos { "stop" } else { "length" };
+        let finish_reason = if generated_tokens.last().is_some_and(|&t| t == eos_id) {
+            "stop"
+        } else {
+            "length"
+        };
 
         let text = if let Some(ref tok) = tokenizer {
             tok.decode_sync(&generated_tokens, true).unwrap_or_default()
@@ -6580,82 +3169,10 @@ impl Qwen35Inner {
         })
     }
 
-    /// Static FP8 activation-amax calibration prefill (runs on the model
-    /// thread). Inherent body of [`Qwen35Cmd::CalibratePrefillRaw`].
-    ///
-    /// For each raw text: tokenize WITHOUT the chat template (`encode_sync` with
-    /// `add_special_tokens = false`, so no `<|im_start|>`/`<|im_end|>` control
-    /// tokens and no BOS), truncate to `calib_seq` tokens, then run PREFILL ONLY
-    /// (no generation) so every mxfp8 attention/GDN projection's activation tap
-    /// fires exactly once over realistic raw-text activations — the NVIDIA
-    /// modelopt `MaxCalibrator` is defined over raw-text prefill, NOT
-    /// chat-templated prompts plus a decode step. Caches are re-initialized per
-    /// row so each is an independent turn-0 position-0 prefill.
-    ///
-    /// This method SELF-ARMS the model thread's thread-local
-    /// [`ActivationAmaxCollector`] flag for the prefill's duration (RAII
-    /// `CalibrationArmGuard`, disarmed on every exit path), so the tap records
-    /// each projection's running `max|activation|` during the forward. The NAPI
-    /// caller drains+persists afterwards; this method never touches
-    /// `config.json`. Returns the number of rows actually prefilled (rows that
-    /// tokenized to nothing after truncation are skipped).
-    pub(crate) fn calibrate_prefill_raw_sync(
-        &mut self,
-        texts: Vec<String>,
-        calib_seq: u32,
-    ) -> Result<u32> {
-        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
-            Error::from_reason("calibration prefill requires a tokenizer, but none is loaded")
-        })?;
-        let cap = calib_seq.max(1) as usize;
-        let mut rows_prefilled: u32 = 0;
-
-        // Arm THIS (model) thread's calibration flag for the whole prefill loop.
-        // The tap in `QuantizedLinear::forward` runs synchronously on this same
-        // thread, so it observes the armed flag and records raw `max|x|`; any
-        // other loaded model on its own thread stays unaffected. The RAII guard
-        // disarms on EVERY exit path — normal return, a `?` error, or a panic —
-        // so a later inference command on this thread never sees a stray armed
-        // flag. The NAPI caller drains + persists the collected amax afterwards.
-        let _calib_guard = crate::calibration::activation_amax::CalibrationArmGuard::arm();
-
-        for text in &texts {
-            // RAW tokenize — no chat template, no special/control tokens. This
-            // is the crux of the modelopt-parity fix: repeated chat control
-            // tokens must not dominate a tensor's activation amax.
-            let mut tokens = tokenizer.encode_sync(text, Some(false))?;
-            tokens.truncate(cap);
-            if tokens.is_empty() {
-                continue;
-            }
-
-            // Fresh turn-0 caches per row (prefill asserts `self.caches` is set,
-            // and a stale cache would append rows into one growing context).
-            self.init_caches_sync()?;
-            let generation_stream = Stream::new(DeviceType::Gpu);
-            // PREFILL ONLY — trips every mxfp8 attn/GDN tap once. No generated
-            // token: a decode step would fold a synthetic argmax token's
-            // activations into the amax.
-            let logits = self.prefill(&tokens, generation_stream)?;
-            // Force the row's forward to complete (the taps already `.item()`
-            // each projection input, but eval bounds the lazy graph and makes
-            // per-row memory reclamation deterministic).
-            logits.eval();
-            self.reset_caches_sync()?;
-            rows_prefilled += 1;
-
-            // Bound resident scratch across many rows (large models × 1024 rows).
-            crate::array::synchronize_and_clear_cache();
-        }
-
-        Ok(rows_prefilled)
-    }
-
     // ========== Training methods (run on model thread) ==========
 
     /// Initialize training state with optimizer and configuration.
-    /// Inherent body of [`TrainBackend::init_training_sync`].
-    fn init_training_sync_impl(
+    fn init_training_sync(
         &mut self,
         config: crate::grpo::engine::GRPOEngineConfig,
         _model_type: crate::training_model::ModelType,
@@ -6693,16 +3210,14 @@ impl Qwen35Inner {
         Ok(())
     }
 
-    /// Inherent body of [`TrainBackend::save_optimizer_state_sync`].
-    fn save_optimizer_state_sync_impl(&self, path: String) -> Result<()> {
+    fn save_optimizer_state_sync(&self, path: String) -> Result<()> {
         let ts = self.training_state.as_ref().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
         })?;
         ts.save_optimizer_state_sync(&path)
     }
 
-    /// Inherent body of [`TrainBackend::load_optimizer_state_sync`].
-    fn load_optimizer_state_sync_impl(&mut self, path: String) -> Result<()> {
+    fn load_optimizer_state_sync(&mut self, path: String) -> Result<()> {
         let ts = self.training_state.as_mut().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
         })?;
@@ -6714,8 +3229,7 @@ impl Qwen35Inner {
     /// Tokenizes prompts using Jinja2 chat template, generates completions,
     /// caches MxArray results in training_state for the subsequent training step,
     /// and returns plain data across the thread boundary.
-    /// Inherent body of [`TrainBackend::generate_for_training_thread_sync`].
-    fn generate_for_training_thread_sync_impl(
+    fn generate_for_training_thread_sync(
         &mut self,
         prompts: Vec<Vec<ChatMessage>>,
         group_size: usize,
@@ -6838,15 +3352,9 @@ impl Qwen35Inner {
         let presence_context_size = config.presence_context_size.unwrap_or(20);
         let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
         let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens = config
-            .max_consecutive_tokens
-            .unwrap_or(crate::sampling::DEFAULT_MAX_CONSECUTIVE_TOKENS);
-        let max_ngram_repeats = config
-            .max_ngram_repeats
-            .unwrap_or(crate::sampling::DEFAULT_MAX_NGRAM_REPEATS);
-        let ngram_size = config
-            .ngram_size
-            .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
 
@@ -6869,17 +3377,9 @@ impl Qwen35Inner {
 
         let input_tokens = input_ids.to_uint32()?;
         let current_ids = input_ids.clone();
-        // Bounded, floored capacity hint (see `generated_capacity_hint`): this
-        // training-only path takes `max_new_tokens` from training config
-        // (SFT/GRPO) where panics are banned. The helper prevents both the
-        // negative-budget `.. as usize` wrap to `usize::MAX` (which would abort)
-        // and a multi-GiB eager reservation for an absurd budget, without
-        // changing behavior for valid budgets — the buffer still grows to hold
-        // every generated token.
-        let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens))
+            Vec::with_capacity(max_new_tokens as usize)
         } else {
             Vec::new()
         };
@@ -7049,8 +3549,7 @@ impl Qwen35Inner {
     /// Consumes cached MxArrays from the generation phase, computes loss and
     /// gradients via autograd, validates and clips gradients, accumulates them,
     /// and applies the optimizer step when accumulation is complete.
-    /// Inherent body of [`TrainBackend::train_step_grpo_sync`].
-    fn train_step_grpo_sync_impl(
+    fn train_step_grpo_sync(
         &mut self,
         rewards: Vec<f64>,
         group_size: i32,
@@ -7267,8 +3766,8 @@ impl Qwen35Inner {
                     let scale_arr = MxArray::from_float32(&[scale], &[])?;
                     scaled_grads = grads
                         .iter()
-                        .map(|(name, grad)| Ok((name.clone(), grad.mul(&scale_arr)?)))
-                        .collect::<Result<HashMap<_, _>>>()?;
+                        .map(|(name, grad)| (name.clone(), grad.mul(&scale_arr).unwrap()))
+                        .collect();
                     &scaled_grads
                 } else {
                     &grads
@@ -7288,21 +3787,15 @@ impl Qwen35Inner {
                     grad_refs,
                 )?;
 
-                // `update_batch` above has already committed the optimizer's step
-                // counter and moment tensors. If this fallible delta build (or the
-                // atomic apply below) errors, the optimizer is left one step ahead
-                // of the still-unchanged model params (all deltas are built before
-                // any are applied). Accepted over panicking; such `?` failures are
-                // fatal device errors that abort the run.
                 // Create deltas: delta = param - updated (so param - 1.0 * delta = updated)
                 let delta_map: HashMap<String, MxArray> = param_names_vec
                     .iter()
                     .enumerate()
                     .map(|(i, name)| {
-                        let delta = param_refs[i].sub(&updated[i])?;
-                        Ok((name.clone(), delta))
+                        let delta = param_refs[i].sub(&updated[i]).unwrap();
+                        (name.clone(), delta)
                     })
-                    .collect::<Result<HashMap<_, _>>>()?;
+                    .collect();
 
                 let delta_refs: HashMap<String, &MxArray> =
                     delta_map.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -7389,8 +3882,7 @@ impl Qwen35Inner {
     /// Receives plain data (Vec<i32> + shape) from the SFT engine, reconstructs
     /// MxArrays on the model thread, computes SFT loss + gradients, validates,
     /// clips, accumulates, and applies optimizer step when accumulation is complete.
-    /// Inherent body of [`TrainBackend::train_step_sft_sync`].
-    fn train_step_sft_sync_impl(
+    fn train_step_sft_sync(
         &mut self,
         input_ids: Vec<i32>,
         input_shape: Vec<i64>,
@@ -7578,8 +4070,8 @@ impl Qwen35Inner {
                     let scale_arr = MxArray::from_float32(&[scale], &[])?;
                     scaled_grads = grads
                         .iter()
-                        .map(|(name, grad)| Ok((name.clone(), grad.mul(&scale_arr)?)))
-                        .collect::<Result<HashMap<_, _>>>()?;
+                        .map(|(name, grad)| (name.clone(), grad.mul(&scale_arr).unwrap()))
+                        .collect();
                     &scaled_grads
                 } else {
                     &grads
@@ -7599,20 +4091,14 @@ impl Qwen35Inner {
                     grad_refs,
                 )?;
 
-                // `update_batch` above has already committed the optimizer's step
-                // counter and moment tensors. If this fallible delta build (or the
-                // atomic apply below) errors, the optimizer is left one step ahead
-                // of the still-unchanged model params (all deltas are built before
-                // any are applied). Accepted over panicking; such `?` failures are
-                // fatal device errors that abort the run.
                 let delta_map: HashMap<String, MxArray> = param_names_vec
                     .iter()
                     .enumerate()
                     .map(|(i, name)| {
-                        let delta = param_refs[i].sub(&updated[i])?;
-                        Ok((name.clone(), delta))
+                        let delta = param_refs[i].sub(&updated[i]).unwrap();
+                        (name.clone(), delta)
                     })
-                    .collect::<Result<HashMap<_, _>>>()?;
+                    .collect();
 
                 let delta_refs: HashMap<String, &MxArray> =
                     delta_map.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -7748,7 +4234,7 @@ impl Qwen35Inner {
         for (name, updated_param) in updated_params.iter() {
             if name == "lm_head.weight" {
                 if let Some(ref mut lm) = self.lm_head {
-                    lm.set_weight(updated_param, "lm_head")?;
+                    lm.set_weight(updated_param)?;
                 }
             } else if name == "final_norm.weight" {
                 self.final_norm.set_weight(updated_param)?;
@@ -7922,1765 +4408,31 @@ impl Qwen35Inner {
 
         Ok(params)
     }
-
-    /// True when this model checkpoint includes an MTP head (module loaded by
-    /// `persistence::apply_weights_inner`). The speculative decode loop gates
-    /// on this together with the per-request `enable_mtp` flag — both must be
-    /// true for the MTP-accelerated path to take over.
-    pub(crate) fn has_mtp_weights(&self) -> bool {
-        self.mtp.is_some() && self.mtp_weights_loaded
-    }
 }
 
-/// Adapter giving the engine's [`ChunkSink`] the `.call()` shape the
-/// `decode_loop!` macro and the engine's `run_mtp_turn` loop (and the
-/// streaming cores behind the whole-turn probes) expect from a
-/// `ThreadsafeFunction`-like callback.
+/// Wrapper around `StreamTx` that provides a `.call()` method matching the
+/// `ThreadsafeFunction` interface expected by the `decode_loop!` macro.
 ///
-/// The engine owns the channel and hands the probes a `&dyn ChunkSink`,
-/// so the wrapper forwards `.call()` to [`ChunkSink::send`]; the call
-/// mode is meaningless on the mpsc path and is dropped.
-struct StreamSender<'a>(&'a dyn ChunkSink);
+/// The C++ compiled decode path uses process-wide globals (`g_compiled_caches`,
+/// `g_offset_int`, etc.). Concurrent `generate()`/`chat()` calls via
+/// `Promise.all()` would race on these globals since `spawn_blocking` dispatches
+/// to separate threads. This mutex is acquired in the async context *before*
+/// `spawn_blocking`, ensuring only one compiled lifecycle runs at a time.
+#[cfg(not(target_family = "wasm"))]
+static DENSE_COMPILED_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
 
-impl StreamSender<'_> {
-    fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
-        self.0.send(result);
-    }
-}
-
-/// Paged decode stepper for qwen3_5 dense (the paged analog of the FLAT
-/// [`Qwen35Decode`]). Drives
-/// [`crate::engine::decode::run_decode_loop`] through the generic
-/// [`crate::engine::paged_turn::run_paged_turn`]: each `forward` runs the
-/// pure-Rust eager paged step against the live post-prefill adapter pools +
-/// GDN caches. Created by `<Qwen35Inner as PagedBackend>::begin_paged_decode`,
-/// consumed across the whole decode loop.
-pub(crate) struct Qwen35PagedDecode<'a> {
-    inner: &'a mut Qwen35Inner,
-}
-
-impl DecodeStep for Qwen35PagedDecode<'_> {
-    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
-        // NOT on the hot path — the engine drives decode via
-        // `forward_with_token` (which hands the scalar the loop already read).
-        // Kept only to satisfy the trait; extract then delegate.
-        let token_id = input_ids.item_at_int32(0)? as u32;
-        self.forward_with_token(input_ids, token_id)
-    }
-
-    fn forward_with_token(
-        &mut self,
-        _input_ids: &MxArray,
-        token_id: u32,
-    ) -> Result<(MxArray, bool)> {
-        // Pure-Rust eager paged decode step.
-        //
-        // PERF: `token_id` is HANDED by the engine (already read once at the
-        // loop top via `y.item_at_int32`), so we do NOT re-`item_at_int32` the
-        // fresh `_input_ids` reshape — that redundant second per-step eval/sync
-        // measurably regressed decode. `_input_ids` is unused (kept for
-        // signature parity).
-        let logits = {
-            let embed = self.inner.embedding.clone();
-            let embedding_weight = embed.get_weight();
-            let layer_kinds = super::decoder_layer::compute_layer_kinds(
-                self.inner.config.num_layers as usize,
-                |i| self.inner.config.is_linear_layer(i),
-            );
-            let caches_ref = self.inner.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("Qwen35PagedDecode::forward: caches dropped mid-decode")
-            })?;
-            let adapter = self.inner.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("Qwen35PagedDecode::forward: paged_adapter dropped mid-decode")
-            })?;
-            super::paged_forward::run_paged_decode_step(
-                token_id,
-                &embed,
-                &mut self.inner.layers,
-                caches_ref,
-                &self.inner.final_norm,
-                &self.inner.lm_head,
-                &embedding_weight,
-                &layer_kinds,
-                adapter,
-                self.inner.cached_rope_deltas.unwrap_or(0),
-            )?
-            .squeeze(Some(&[1]))?
-        };
-
-        // `run_paged_decode_step` returns [1, 1, vocab]; the `squeeze([1])`
-        // above already collapses to [1, vocab], so `needs_squeeze = FALSE`.
-        Ok((logits, false))
-    }
-
-    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        // Single SYNCHRONOUS eval of `next_token`: the paged forward
-        // is bandwidth-bound, so an async two-wait (bottom `async_eval` +
-        // loop-top `y.eval`) would buy ZERO overlap. One `y.eval()` per sample
-        // is the cheapest correct cadence.
-        next_token.eval();
-    }
-
-    fn maintain_cache(&mut self, step: i32) {
-        // Per-step paged cache-clear cadence.
-        crate::array::maybe_clear_cache_for_paged_step(step);
-    }
-
-    // `materialize_final` — DO NOT override (default no-op). CRITICAL: dense
-    // paged drops the last token UNCONDITIONALLY (see `save_paged_history`).
-    // The adapter only advanced for the tokens the loop actually forwarded;
-    // re-running a decode step here for the final length-exit token would
-    // record a token the GDN/adapter state never advanced → recurrent-state
-    // desync vs the saved drop-last history.
-}
-
-/// qwen3_5 dense paged prefix state — the effective prefix/suffix split from
-/// `prepare_turn_with_max_cache_hit_tokens`, PLUS the full prompt tokens and
-/// the GDN-prime flag.
+/// RAII guard that calls `mlx_qwen35_compiled_reset()` on drop.
 ///
-/// `full_tokens` is needed because the engine hands `paged_prefill` ONLY the
-/// suffix (`tokens[effective_cached_prefix_len..]`), but
-/// `run_paged_prefill_chunk` needs the FULL prompt for the GDN pre-pass over
-/// the cached prefix. `gdn_prefix_already_primed` is the dense-specific bit the
-/// prime resolves (the GDN recurrent state was already populated live / from a
-/// checkpoint / via replay) and `paged_prefill` threads into
-/// `run_paged_prefill_chunk` so the prefill skips re-priming the GDN prefix.
-pub(crate) struct Qwen35PrefixState {
-    effective_cached_prefix_len: usize,
-    suffix_len: usize,
-    full_tokens: Vec<u32>,
-    gdn_prefix_already_primed: bool,
-}
+/// Ensures C++ compiled state is always cleaned up, even if the decode
+/// loop returns early via `?` operator. Without this, an error during decode
+/// would leave stale compiled state that corrupts the next generation call.
+struct CompiledResetGuard;
 
-impl PagedPrefix for Qwen35PrefixState {
-    fn effective_cached_prefix_len(&self) -> usize {
-        self.effective_cached_prefix_len
-    }
-    fn suffix_len(&self) -> usize {
-        self.suffix_len
-    }
-}
-
-impl PagedBackend for Qwen35Inner {
-    type PagedDecode<'a>
-        = Qwen35PagedDecode<'a>
-    where
-        Self: 'a;
-    type PrefixState = Qwen35PrefixState;
-
-    fn prime_prefix_state(
-        &mut self,
-        plan: &[u32],
-        _reuse_cache: bool,
-        _block_size: usize,
-        _extra_keys: &[u64],
-        cache_salt: u64,
-    ) -> Result<Self::PrefixState> {
-        // The `prepare_turn_…` + `prepare_dense_gdn_prefix_state` block that
-        // opens a dense paged turn.
-        self.paged_finalize_failed = false;
-        let trace_enabled = inference_trace_enabled();
-        let total_budget = plan.len() as u32;
-        // vLLM exact-prefix cap: leave at least one prompt token to prefill so
-        // the decoder always has something to consume.
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let seq_id: u32 = 0;
-        let block_size = {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason(
-                    "prime_prefix_state: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?;
-            adapter.block_size()
-        };
-        let carries_image_lineage = self.cached_image_key.is_some()
-            && !self.cached_paged_image_token_positions.is_empty()
-            && !self.cached_token_history.is_empty()
-            && plan.starts_with(&self.cached_token_history);
-        let image_positions = if carries_image_lineage {
-            self.cached_paged_image_token_positions.as_slice()
-        } else {
-            &[]
-        };
-        let lookup_extra_keys =
-            engine::build_paged_extra_keys(plan.len(), block_size, image_positions);
-
-        // Adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
-        // reads the PRE-turn live state, so probe the adapter immutably FIRST
-        // (prepare_turn mutates request_tokens via continue_turn/reset). The
-        // adapter re-reads the same state internally, so live_* is identical to
-        // what prepare_turn decides on. reuse_cache=true literal: continuation
-        // eligibility carries no reuse term (the engine's reuse_cache drives
-        // finalize/save instead). Suffix blocks are allocated inside
-        // prepare_turn.
-        let live_ready;
-        let live_prefix_match;
-        let live_tokens_len;
-        let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        {
-            let adapter = self
-                .paged_adapter
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?;
-            live_ready = adapter.is_live_for_continue();
-            let live_tokens = adapter.request_tokens();
-            live_tokens_len = live_tokens.len();
-            live_prefix_match = plan.starts_with(live_tokens);
-            if trace_enabled && live_ready && !live_prefix_match {
-                live_mismatch = token_prefix_mismatch_trace(plan, live_tokens);
-            }
-        }
-        let turn_plan = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                seq_id,
-                plan,
-                total_budget,
-                true,
-                &lookup_extra_keys,
-                cache_salt,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(Error::from_reason)?;
-        let cached_prefix_len = turn_plan.cached_prefix_len;
-        let continued_live_prefix = turn_plan.continued_live_prefix;
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \
-                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
-                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
-                plan.len(),
-                cached_prefix_len,
-                continued_live_prefix,
-                live_ready,
-                live_prefix_match,
-                live_tokens_len,
-                live_mismatch.index,
-                live_mismatch.prompt_token,
-                live_mismatch.cached_token
-            ));
-        }
-
-        // GDN recurrent-state prime (live / checkpoint / replay). No qwen3/lfm2
-        // analog — dense carries GDN recurrent state across turns.
-        let gdn_prefix_preparation = self.prepare_dense_gdn_prefix_state(
-            plan,
-            cached_prefix_len,
-            block_size,
-            &lookup_extra_keys,
-            cache_salt,
-            continued_live_prefix,
-        )?;
-        let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
-        let preserves_image_lineage = carries_image_lineage && cached_prefix_len > 0;
-        // Clear the per-turn session state here (history is re-set in
-        // `save_paged_history`; image key is reset because the paged path does
-        // not carry it across turns). The cross-turn M-RoPE delta is carried
-        // only when this turn extends the live image sequence
-        // (continued_live_prefix); a cold start or a non-live prefix-cache hit
-        // (text-only prefix) drops a stale image delta so the text suffix
-        // rotates at the raw physical slot.
-        self.cached_token_history.clear();
-        if !preserves_image_lineage {
-            self.cached_image_key = None;
-            self.cached_paged_image_token_positions.clear();
-        }
-        self.cached_rope_deltas = super::paged_forward::rope_delta_for_paged_turn(
-            self.cached_rope_deltas,
-            preserves_image_lineage,
-        );
-
-        let suffix_len = total_budget.checked_sub(cached_prefix_len).ok_or_else(|| {
-            Error::from_reason("prime_prefix_state: cached_prefix_len > total_prompt_tokens")
-        })? as usize;
-
-        Ok(Qwen35PrefixState {
-            effective_cached_prefix_len: cached_prefix_len as usize,
-            suffix_len,
-            full_tokens: plan.to_vec(),
-            gdn_prefix_already_primed,
-        })
-    }
-
-    fn paged_prefill(
-        &mut self,
-        suffix_tokens: &[u32],
-        prefix: &Self::PrefixState,
-        _stream: Stream,
-    ) -> Result<MxArray> {
-        // The NON-hidden paged prefill. `run_paged_prefill_chunk` writes K/V
-        // into the adapter pool, populates the GDN linear caches, runs the GDN
-        // pre-pass over the cached prefix from `full_tokens` (skipped when
-        // `gdn_prefix_already_primed`), then the full forward over the suffix,
-        // folding in the last-token slice (returns `[vocab]`). The engine fires
-        // the post-prefill `synchronize_and_clear_cache` AFTER this returns
-        // (NOT here). The MTP `_with_hidden` variant is NOT used here — MTP
-        // turns route through `paged_turn_sync_core`, not the engine.
-        let layer_kinds =
-            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
-                self.config.is_linear_layer(i)
-            });
-        let embed = self.embedding.clone();
-        let embedding_weight = embed.get_weight();
-        // Cross-turn M-RoPE delta (0 unless this engine-driven text turn warm-
-        // continues an image prefill); aligns the suffix keys with the
-        // compressed-position image keys.
-        let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-        let (logits, checkpoint) = {
-            let caches_ref = self
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("paged_prefill: caches not initialized"))?;
-            let adapter = self
-                .paged_adapter
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
-            super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
-                &prefix.full_tokens,
-                suffix_tokens,
-                prefix.effective_cached_prefix_len as u32,
-                prefix.gdn_prefix_already_primed,
-                &embed,
-                &mut self.layers,
-                caches_ref,
-                &self.final_norm,
-                &self.lm_head,
-                &embedding_weight,
-                &layer_kinds,
-                adapter,
-                rope_deltas,
-            )?
-        };
-        self.publish_dense_gdn_materialized_prefix_checkpoint(&prefix.full_tokens, checkpoint);
-        Ok(logits)
-    }
-
-    fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
-        // Pure-Rust eager paged decode: the stepper drives
-        // `run_paged_decode_step` against the live post-prefill adapter pools +
-        // GDN caches. No compiled-graph seeding / lifecycle locks needed.
-        Ok(Qwen35PagedDecode { inner: self })
-    }
-
-    fn finalize_paged_turn(&mut self, reuse_cache: bool) {
-        // Terminal lifecycle block of a paged turn. Success: keep the request
-        // live across turns when reuse is on, using PER-BLOCK extra keys (NOT
-        // qwen3's empty `&[]`), so the next turn's continue builds on the
-        // partial trailing block's live K/V; otherwise register full blocks
-        // for reuse + release. The trait hook remains infallible, but an adapter
-        // error must downgrade the session before the engine's unconditional
-        // `save_paged_history` call can publish image-placeholder history.
-        self.paged_finalize_failed = false;
-        let finalize_error = match self.paged_adapter.as_mut() {
-            Some(adapter) if reuse_cache => {
-                let total_for_finalize = adapter.request_tokens().len();
-                let block_size = adapter.block_size();
-                let finalize_extra_keys = engine::build_paged_extra_keys(
-                    total_for_finalize,
-                    block_size,
-                    &self.cached_paged_image_token_positions,
-                );
-                adapter
-                    .finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
-                    .err()
-            }
-            Some(adapter) => {
-                let total_for_finalize = adapter.request_tokens().len();
-                let block_size = adapter.block_size();
-                let finalize_extra_keys = engine::build_paged_extra_keys(
-                    total_for_finalize,
-                    block_size,
-                    &self.cached_paged_image_token_positions,
-                );
-                // Always attempt the release, even when registration fails.
-                let register_error = adapter
-                    .register_full_blocks_for_reuse_per_block(&finalize_extra_keys, 0)
-                    .err();
-                let release_error = adapter.release_request().err();
-                register_error.or(release_error)
-            }
-            None => Some("paged_adapter is None during dense finalization".to_owned()),
-        };
-        if let Some(error) = finalize_error {
-            self.downgrade_failed_paged_finalize(&error);
-        }
-    }
-
-    fn abort_paged_turn(&mut self) {
-        // Hybrid error-path teardown: K/V and GDN may have advanced by
-        // different amounts, so a bare adapter release would leave a false-live
-        // recurrent session behind. Never register / keep live; invalidate all
-        // model-local continuation state without masking the original error.
-        self.invalidate_dense_paged_session("generic paged turn abort");
-    }
-
-    fn paged_decode_stream(&self, _generation_stream: Stream) -> Stream {
-        // Run the paged DECODE on the canonical DEFAULT stream, NOT the
-        // per-turn `generation_stream`. dense's paged forward + every
-        // `y.eval()` run on the MLX DEFAULT stream; running the forward on a
-        // queue separate from the shared loop's top-of-iteration `y.eval()`
-        // (always on the default stream) would force a cross-queue
-        // completion-wait every token (~5% on bandwidth-bound decode).
-        // `paged_prefill` still runs on `generation_stream`. See the
-        // `PagedBackend::paged_decode_stream` doc for the full mechanism.
-        Stream::default(crate::stream::DeviceType::Gpu)
-    }
-
-    fn save_paged_history(
-        &mut self,
-        save_tokens: &[u32],
-        generated: &[u32],
-        _keep_all: bool,
-        reuse_cache: bool,
-    ) -> Result<()> {
-        // `finalize_paged_turn` is an infallible trait hook. When its adapter
-        // operation failed it already invalidated the native caches and left
-        // this one-turn latch so the engine's unconditional save cannot revive
-        // the session from expanded image-placeholder ids.
-        if std::mem::take(&mut self.paged_finalize_failed) {
-            self.cached_token_history.clear();
-            self.cached_image_key = None;
-            self.cached_paged_image_token_positions.clear();
-            self.cached_rope_deltas = None;
-            self.gdn_last_history_checkpoint = None;
-            self.caches = None;
-            return Ok(());
-        }
-        // dense paged ALWAYS drops the last token, regardless of the engine's
-        // `keep_all` (length-exit) signal — the paged decode loop NEVER forwards
-        // the LAST sampled token (the engine's forward gate skips it AND
-        // `materialize_final` is a no-op for dense), so the last `generated`
-        // entry is NOT in the adapter / GDN caches and must be dropped to keep
-        // the saved history aligned with the live cache state. Ordering:
-        // finalize → set history (drop-last, last_token_in_cache=false) → GDN
-        // checkpoint → clear image key. PRESERVE THIS EXACT ORDER — it is the
-        // most delicate part for T=0 byte-equality.
-        if !reuse_cache {
-            self.cached_token_history.clear();
-            self.cached_image_key = None;
-            self.cached_paged_image_token_positions.clear();
-            self.cached_rope_deltas = None;
-            return Ok(());
-        }
-        let mut full_history = save_tokens.to_vec();
-        if !generated.is_empty() {
-            // last_token_in_cache == false → drop-last UNCONDITIONAL.
-            let upto = generated.len().saturating_sub(1);
-            full_history.extend_from_slice(&generated[..upto]);
-        }
-        self.cached_token_history = full_history;
-        // GDN history checkpoint — must run AFTER the history is set (it
-        // snapshots the live recurrent caches keyed on `cached_token_history`),
-        // BEFORE clearing the image key. A checkpoint/eval failure here
-        // PROPAGATES (`?`) to abort the turn: a half-snapshotted or
-        // failed-eval GDN state must NOT be published as a reusable
-        // warm-continue checkpoint, or the next turn reads corrupt
-        // recurrent state.
-        let store = self.remember_dense_gdn_history_checkpoint()?;
-        if inference_trace_enabled() {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint stored={} tokens={} \
-                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} \
-                 total_ms={:.1}",
-                store.stored,
-                self.cached_token_history.len(),
-                store.eval_ms,
-                store.clone_ms,
-                store.token_clone_ms,
-                store.update_ms,
-                store.total_ms
-            ));
-        }
-        Ok(())
-    }
-
-    fn reconcile_paged_request_tokens(
-        &mut self,
-        prompt_len: usize,
-        generated: &[u32],
-        _keep_all: bool,
-    ) -> bool {
-        // dense ALWAYS drops the last token (see `save_paged_history`), so the
-        // to-be-saved history length is `prompt_len + (generated.len() - 1)` (or
-        // `prompt_len` when nothing was generated). Roll the adapter back to that
-        // length so the next turn's warm-continue gate
-        // (`prompt.starts_with(request_tokens())`) is not defeated by a trailing
-        // token the pipelined loop recorded at the loop top before the
-        // stop-check. `_keep_all` is intentionally ignored (qwen3 signal).
-        //
-        // Token accounting: on BOTH length and early-stop exits the to-be-saved
-        // history equals the adapter cursor (the final/terminal forward was
-        // skipped), so `surplus` is 0 and this is a true no-op for dense — but
-        // the rollback is kept as the defensive contract the trait mandates.
-        let Some(adapter) = self.paged_adapter.as_mut() else {
-            return true;
-        };
-        let history_len = if generated.is_empty() {
-            0
-        } else {
-            generated.len() - 1
-        };
-        let target_len = prompt_len + history_len;
-        let surplus = adapter.request_tokens().len().saturating_sub(target_len);
-        if surplus > 0
-            && let Err(e) = adapter.rollback_last_tokens(surplus as u32)
-        {
-            tracing::warn!(
-                target: "mlx_core::qwen3_5::paged",
-                "reconcile_paged_request_tokens: rollback_last_tokens({surplus}) failed \
-                 (finalize releases the request; next turn cold-prefills): {e}",
-            );
-            return false;
-        }
-        true
-    }
-}
-
-impl Qwen35Inner {
-    /// Whole-turn dense dispatch behind the engine's multimodal and
-    /// speculative handlers.
-    ///
-    /// Routes the four turn shapes onto the whole-turn cores:
-    /// fresh sync → [`Self::vision_mtp_whole_turn_core`], delta sync →
-    /// [`Self::chat_tokens_delta_sync`], fresh streaming →
-    /// [`Self::chat_stream_sync_inner`], delta streaming →
-    /// [`Self::chat_stream_tokens_delta_sync_inner`]. These cores own
-    /// every dense-path subtlety the generic flow does not model: VLM
-    /// prefill + M-RoPE deltas, the MTP gate (eager MTP, falling back to
-    /// AR when ineligible), the legacy defensive paged-to-flat cache rebuild,
-    /// and requires-paged image routing (including the missing-adapter
-    /// diagnostic).
-    ///
-    /// Delta turns recover the raw delta from the engine-composed
-    /// `args.tokens` (`cached_history + delta` by construction — the
-    /// probes run before any state mutation).
-    fn dense_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Fold generation_config.json defaults into the config the whole-turn
-        // cores re-extract params from, so VLM/MTP turns honor the same
-        // sampling defaults as the generic AR path (whose `args.params`
-        // already had them applied via `resolve_params`). No-op when the
-        // checkpoint ships no defaults (`gen_defaults` all-None).
-        let mut config = args.config.clone();
-        crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
-        // The engine resolved MTP admission once, before any cache mutation.
-        // These legacy whole-turn cores still extract their own `ChatParams`,
-        // so project the selected decoder back into their config instead of
-        // letting the raw request independently re-open the MTP gate.
-        let planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
-        debug_assert!(!planned_mtp || self.has_mtp_weights());
-        let thinking = args.thinking;
-        match (args.sink, args.cancelled) {
-            (Some(sink), Some(cancelled)) => {
-                let cb = StreamSender(sink);
-                if args.plan.is_delta {
-                    let delta_start = self.cached_token_history.len().min(args.tokens.len());
-                    let delta_tokens = args.tokens[delta_start..].to_vec();
-                    self.chat_stream_tokens_delta_sync_inner(
-                        delta_tokens,
-                        config,
-                        &cb,
-                        cancelled,
-                        thinking,
-                    )?;
-                } else {
-                    self.chat_stream_sync_inner(
-                        args.tokens.to_vec(),
-                        args.media.images,
-                        config,
-                        args.eos_id,
-                        &cb,
-                        cancelled,
-                        thinking,
-                    )?;
-                }
-                Ok(TurnOutput::Streamed)
-            }
-            _ => {
-                let result = if args.plan.is_delta {
-                    let delta_start = self.cached_token_history.len().min(args.tokens.len());
-                    let delta_tokens = args.tokens[delta_start..].to_vec();
-                    self.chat_tokens_delta_sync(delta_tokens, config, thinking)?
-                } else {
-                    self.vision_mtp_whole_turn_core(
-                        args.tokens.to_vec(),
-                        args.media.images,
-                        config,
-                        args.eos_id,
-                        thinking,
-                    )?
-                };
-                Ok(TurnOutput::Complete(Box::new(result)))
-            }
-        }
-    }
-
-    /// Whole-turn block-paged dispatch behind [`ChatBackend::run_paged_turn`].
-    ///
-    /// Conditional router (dense differs from MoE here — `run_decode_loop` has
-    /// no MTP gate, so planned MTP must use the native paged-MTP cores):
-    ///   * planned MTP turns (sync or stream) use the matching eager paged-MTP
-    ///     core, including text deltas over an image-derived live session;
-    ///   * autoregressive turns (sync or stream) use the generic paged path via
-    ///     `engine::paged_turn::run_paged_turn`, which drives the adapter
-    ///     lifecycle through [`PagedBackend`] and reuses `run_decode_loop`.
-    fn paged_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // The MTP cores re-derive `p` from config (`extract_chat_params`). To
-        // match the engine's default `resolve_params`, fold
-        // generation_config.json defaults in first so the paged-MTP path
-        // honors them too (no-op when the checkpoint ships none).
-        let mut config = args.config.clone();
-        crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
-        let planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
-        debug_assert!(!planned_mtp || self.has_mtp_weights());
-        let mut p = extract_chat_params(&config);
-        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
-        if planned_mtp {
-            let report_perf = args.config.report_performance.unwrap_or(false);
-            let tokenizer = args.tokenizer.clone();
-            let thinking = args.thinking;
-            return match (args.sink, args.cancelled) {
-                (Some(sink), Some(cancelled)) => {
-                    let cb = StreamSender(sink);
-                    self.paged_turn_stream_core(
-                        args.tokens.to_vec(),
-                        tokenizer,
-                        args.eos_id,
-                        p,
-                        report_perf,
-                        &cb,
-                        cancelled,
-                        thinking,
-                    )?;
-                    Ok(TurnOutput::Streamed)
-                }
-                _ => {
-                    let result = self.paged_turn_sync_core(
-                        args.tokens.to_vec(),
-                        tokenizer,
-                        args.eos_id,
-                        p,
-                        report_perf,
-                        thinking,
-                    )?;
-                    Ok(TurnOutput::Complete(Box::new(result)))
-                }
-            };
-        }
-
-        // NON-MTP (sync or stream) → the generic AR+paged engine path.
-        //
-        // This paged turn writes full-attention K/V into the paged adapter
-        // pool, NOT the flat `self.caches`, so the flat full-attention slots no
-        // longer reflect the conversation. A later streaming dense-MTP fallback
-        // must rebuild the flat caches before decoding. The MTP paged cores
-        // set this at their core entry; this is the set-site for the
-        // generic path. See `paged_full_attn_caches_dirty`.
-        // The specialized MTP/VLM paged cores perform their own hard capacity
-        // preflight. The ordinary AR path delegates directly to the generic
-        // paged engine, so constrain a copy of the already-resolved params here
-        // and make that exact copy authoritative for prefill + decode. This is
-        // the native backstop for callers that bypass the TypeScript
-        // `ChatSession` preflight.
-        let mut constrained_params = args.params.clone();
-        self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
-        // Only dirty the flat-attention mirror after deterministic preflight
-        // succeeds. A rejected request has not touched the paged adapter.
-        self.paged_full_attn_caches_dirty = true;
-        let mut constrained_args = WholeTurnArgs {
-            tokens: args.tokens,
-            tokenizer: args.tokenizer,
-            eos_id: args.eos_id,
-            config: args.config,
-            params: &constrained_params,
-            thinking: args.thinking,
-            plan: args.plan,
-            sink: args.sink,
-            cancelled: args.cancelled,
-            media: args.media,
-        };
-        crate::engine::paged_turn::run_paged_turn(self, &mut constrained_args)
-    }
-}
-
-/// Per-turn decode stepper for the engine's generic (text-only,
-/// non-paged, non-MTP) flow on Qwen3.5 dense
-/// ([`ChatBackend::begin_decode`]).
-///
-/// Drives the pure-Rust eager `forward_inner` over the flat caches.
-pub(crate) struct Qwen35Decode<'a> {
-    inner: &'a mut Qwen35Inner,
-    embedding_weight: MxArray,
-    embedding_weight_t: MxArray,
-    /// Decode-path profiler relabel (`chat_rust` and its
-    /// `chat_stream[_delta]_*` streaming variants), resolved in
-    /// `begin_decode` from the turn's streaming-ness.
-    relabel: &'static str,
-}
-
-impl DecodeStep for Qwen35Decode<'_> {
-    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
-        let inner = &mut *self.inner;
-        let logits = forward_inner(
-            input_ids,
-            &self.embedding_weight,
-            &mut inner.layers,
-            &mut inner.caches,
-            &inner.final_norm,
-            &inner.lm_head,
-            Some(&self.embedding_weight_t),
-        )?;
-        // `true` == the eager Rust forward returns `[1, 1, vocab]`;
-        // the loop squeezes axis 1.
-        Ok((logits, true))
-    }
-
-    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, _budget_forced: bool) {
-        MxArray::async_eval_arrays(&[next_token, logits]);
-    }
-
-    fn profiler_relabel(&self) -> Option<&'static str> {
-        Some(self.relabel)
-    }
-}
-
-/// Per-turn pure-Rust ("eager") dense MTP stepper the engine-owned
-/// [`crate::engine::mtp_turn::run_mtp_turn`] drives.
-///
-/// The 11 `MtpOps` closures of the old `chat_with_caches_inner` eager-MTP
-/// block become [`MtpStepper`] methods; the per-cycle scratch the closures
-/// captured in `RefCell`/`Cell` (the GDN tape, the pre-verify snapshot, the
-/// stashed replay error, the desync latch, the committed-history bookkeeping)
-/// becomes PLAIN struct fields — the engine calls the methods strictly
-/// sequentially and non-nested, so the interior mutability the closures needed
-/// to share `&mut self` is gone.
-///
-/// Drives BOTH the FLAT and the block-PAGED dense MTP turn, selected by
-/// [`MtpStepMode`]: the flat mode runs the eager pre-norm forwards against
-/// `inner.caches`; the paged mode routes the main Step-A / verify forwards
-/// through the captured [`PagedKVCacheAdapter`]
-/// ([`super::paged_forward::run_paged_step_with_hidden`] /
-/// [`super::paged_forward::run_paged_verify_step`]) while the GDN recurrent
-/// state stays FLAT in `inner.caches` Linear slots. Only four methods
-/// (`forward_with_hidden`, `verify_step`, `rollback`, `rollback_unemitted`)
-/// branch on the mode; every other method is mode-identical (the drafter and
-/// the committed-history commit are paged-agnostic). The paged adapter is moved
-/// into the stepper at [`MtpBackend::begin_mtp_decode`] and restored into
-/// `inner.paged_adapter` by [`Drop`] so the post-turn paged-history save finds
-/// it, on EVERY exit path of `run_mtp_turn`.
-pub(crate) struct DenseMtpStepper<'a> {
-    /// The model — owns layers / caches / mtp / final_norm / lm_head and the
-    /// `flat_mtp_caches_desynced` latch. == the closures'
-    /// `inner_cell.borrow_mut()`.
-    inner: &'a mut Qwen35Inner,
-    /// Drafter K/V caches. == the closures' `mtp_caches_cell`. v2
-    /// committed-history mode holds the persistent committed prefix; v1
-    /// cycle-history mode is reset fresh by `begin_cycle`.
-    mtp_caches: Vec<Qwen3_5LayerCache>,
-    /// Eager analogue of `g_mtp_committed_len`: committed tokens whose exact
-    /// K/V live in `mtp_caches`. == the closures' `committed_len` cell.
-    committed_len: i32,
-    /// Committed-history active iff the prompt tail's hiddens start at
-    /// absolute position 0. == the closures' `use_committed`.
-    use_committed: bool,
-    /// Pre-verify snapshot of the main caches, taken in
-    /// `snapshot_main_linear`, consumed by `rollback`. == the closures'
-    /// `snap_cell`.
-    snap: Option<Result<Vec<super::layer_cache::Qwen3_5LayerSnapshot>>>,
-    /// GDN tape recorded by `verify_step`, consumed by `rollback`. == the
-    /// closures' `tape_cell`.
-    tape: Vec<Option<super::gated_delta_net::GdnLayerTape>>,
-    /// Error stashed by the infallible `rollback` replay, surfaced by
-    /// `take_replay_error`. == the closures' `replay_err_cell`.
-    replay_err: Option<Error>,
-    /// Mid-cycle-stop desync latch (set by `rollback_unemitted`), reported by
-    /// `into_desynced`. == the closures' `mtp_desynced` cell.
-    mtp_desynced: bool,
-    /// The model's embedding table. == the closures' `embedding_weight` /
-    /// `emb_capture`.
-    embedding_weight: MxArray,
-    /// Transposed embedding for the tied-LM-head projection. ==
-    /// `Some(&embedding_weight_t)` (`emb_t_ref`) in the closures.
-    embedding_weight_t: MxArray,
-    /// Config clone for the per-cycle drafter cache reset/fresh build. == the
-    /// closures' captured `config`.
-    config: Qwen3_5Config,
-    /// Flat vs. paged main-forward routing. `Paged` owns the turn's
-    /// [`PagedKVCacheAdapter`] (moved in at `begin_mtp_decode`, restored into
-    /// `inner.paged_adapter` by [`Drop`]).
-    mode: MtpStepMode,
-    /// Per-layer attention/linear classification consumed by the paged
-    /// forwards. Empty on the flat path (unused there).
-    layer_kinds: Vec<super::decoder_layer::Qwen3_5LayerKind>,
-}
-
-/// Main-forward routing for [`DenseMtpStepper`]: `Flat` runs the eager
-/// pre-norm forwards against `inner.caches`; `Paged` routes full-attention
-/// K/V through the owned adapter while GDN state stays flat. The adapter is
-/// boxed so the unit `Flat` variant does not pad out to the adapter's size.
-enum MtpStepMode {
-    Flat,
-    Paged(Box<PagedKVCacheAdapter>),
-}
-
-impl Drop for DenseMtpStepper<'_> {
+impl Drop for CompiledResetGuard {
     fn drop(&mut self) {
-        // Restore the paged adapter into the model so the post-turn
-        // paged-history save (which runs AFTER `run_mtp_turn` returns) finds
-        // `inner.paged_adapter == Some`. Firing in `Drop` covers EVERY exit
-        // path of `run_mtp_turn` — the `Ok` tail, the `take_replay_error`
-        // early return, and any mid-loop `?` propagation. Idempotent: the
-        // adapter is taken out of `mode` here, so a second drop is a no-op.
-        if let MtpStepMode::Paged(adapter) = std::mem::replace(&mut self.mode, MtpStepMode::Flat) {
-            self.inner.paged_adapter = Some(*adapter);
+        unsafe {
+            mlx_sys::mlx_qwen35_compiled_reset();
         }
-    }
-}
-
-impl MtpStepper for DenseMtpStepper<'_> {
-    fn embedding_weight(&self) -> &MxArray {
-        &self.embedding_weight
-    }
-
-    fn committed_history_active(&self) -> bool {
-        self.use_committed
-    }
-
-    fn profiler_relabel(&self) -> Option<&'static str> {
-        // The eager dense MTP path set the turn label via
-        // `profiler.set_label("mtp_eager")` at the migration site; the engine
-        // applies this relabel once at turn entry instead.
-        Some("mtp_eager")
-    }
-
-    // Step A main forward: eager pre-norm + final-norm + project. Returns
-    // `hidden` shaped `[1, hidden]` (squeeze the time axis) to match the
-    // [`MtpStepper::forward_with_hidden`] contract; `logits` stays
-    // `[1, 1, vocab]` with `needs_squeeze = true`.
-    fn forward_with_hidden(
-        &mut self,
-        ids: &MxArray,
-        emb: &MxArray,
-    ) -> Result<(MxArray, MxArray, bool)> {
-        match &mut self.mode {
-            MtpStepMode::Flat => {
-                let inner = &mut *self.inner;
-                let pre = forward_pre_norm_inner(ids, emb, &mut inner.layers, &mut inner.caches)?;
-                let h3 = inner.final_norm.forward(&pre)?;
-                let logits = project_logits_from_hidden(
-                    &h3,
-                    &inner.lm_head,
-                    emb,
-                    Some(&self.embedding_weight_t),
-                )?;
-                let hidden = h3.squeeze(Some(&[1]))?;
-                Ok((logits, hidden, true))
-            }
-            MtpStepMode::Paged(adapter) => {
-                ids.eval();
-                let token_id = ids.item_at_int32(0)? as u32;
-                let inner = &mut *self.inner;
-                // Cross-turn M-RoPE delta carried by a text turn that warm-
-                // continues an image prefill; 0 for pure-text sessions.
-                let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
-                let caches = inner.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("eager paged MTP forward_with_hidden: caches is None")
-                })?;
-                let (logits, hidden) = super::paged_forward::run_paged_step_with_hidden(
-                    token_id,
-                    &inner.embedding,
-                    &mut inner.layers,
-                    caches,
-                    &inner.final_norm,
-                    &inner.lm_head,
-                    emb,
-                    Some(&self.embedding_weight_t),
-                    &self.layer_kinds,
-                    adapter,
-                    rope_deltas,
-                )?;
-                Ok((logits, hidden, true))
-            }
-        }
-    }
-
-    // One MTP draft step on the eager drafter. `h_next` is `[1, 1, hidden]`;
-    // project to `draft_logits` `[1, 1, vocab]` then squeeze the time axis to
-    // `[1, vocab]`.
-    fn draft_step(
-        &mut self,
-        prev_hidden: &MxArray,
-        prev_emb: &MxArray,
-    ) -> Result<(MxArray, MxArray)> {
-        let inner = &mut *self.inner;
-        let mtp_caches = &mut self.mtp_caches;
-        let mtp = inner.mtp.as_mut().ok_or_else(|| {
-            Error::from_reason(
-                "eager MTP draft_step: inner.mtp is None despite \
-                 has_mtp_weights() gate",
-            )
-        })?;
-        let h_next = mtp.forward(prev_hidden, prev_emb, Some(mtp_caches))?;
-        let dl3 = project_logits_from_hidden(
-            &h_next,
-            &inner.lm_head,
-            &self.embedding_weight,
-            Some(&self.embedding_weight_t),
-        )?;
-        let draft_logits = dl3.squeeze(Some(&[1]))?;
-        Ok((h_next, draft_logits))
-    }
-
-    // Batched verify: run the K+1 verify ids through the main stack,
-    // advancing `inner.caches` by K+1, recording the GDN tape.
-    fn verify_step(
-        &mut self,
-        ids: &MxArray,
-        emb: &MxArray,
-        depth: usize,
-    ) -> Result<mtp_decode::MtpVerifyOutput> {
-        match &mut self.mode {
-            MtpStepMode::Flat => {
-                let _ = depth;
-                let inner = &mut *self.inner;
-                let tape = &mut self.tape;
-                eager_verify_step(
-                    &mut inner.layers,
-                    &mut inner.caches,
-                    &inner.final_norm,
-                    &inner.lm_head,
-                    ids,
-                    emb,
-                    Some(&self.embedding_weight_t),
-                    Some(tape),
-                )
-            }
-            MtpStepMode::Paged(adapter) => {
-                // Slice `ids` to exactly `depth+1` defensively so the adapter
-                // records exactly K+1 tokens — the rollback count depends on it.
-                let id_window = ids.to_int32().map_err(|e| {
-                    Error::from_reason(format!(
-                        "eager paged MTP verify_step: ids to_int32: {}",
-                        e.reason
-                    ))
-                })?;
-                if id_window.len() < depth + 1 {
-                    return Err(Error::from_reason(format!(
-                        "eager paged MTP verify_step: ids has {} elements, need {}",
-                        id_window.len(),
-                        depth + 1
-                    )));
-                }
-                let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
-                let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
-                let inner = &mut *self.inner;
-                // Cross-turn M-RoPE delta carried by a text turn that warm-
-                // continues an image prefill; 0 for pure-text sessions.
-                let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
-                let caches = inner.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("eager paged MTP verify_step: caches is None")
-                })?;
-                let tape = &mut self.tape;
-                super::paged_forward::run_paged_verify_step(
-                    &verify_in,
-                    &inner.embedding,
-                    &mut inner.layers,
-                    caches,
-                    &inner.final_norm,
-                    &inner.lm_head,
-                    emb,
-                    Some(&self.embedding_weight_t),
-                    &self.layer_kinds,
-                    adapter,
-                    tape,
-                    rope_deltas,
-                )
-            }
-        }
-    }
-
-    // No native argmax-only / sparse verify on the eager path — the accept
-    // loop falls back to dense-logits accept. (Defaults `None`.)
-
-    // Snapshot the main caches before verify mutates them. Stash the fallible
-    // result; surfaced in `rollback` / `restore_and_replay_main`.
-    fn snapshot_main_linear(&mut self) {
-        // On the paged backend the FullAttention K/V lives in the paged pool,
-        // not `inner.caches`, so its flat slot is an empty shell. Snapshot
-        // paged-aware so we capture only the GDN (Linear) state and skip the
-        // shells — `rollback` rewinds those via the adapter and never reads
-        // their snapshot.
-        let paged = matches!(self.mode, MtpStepMode::Paged(_));
-        let inner = &*self.inner;
-        let snap = match inner.caches.as_ref() {
-            Some(caches) => super::layer_cache::snapshot_all_mtp(caches, paged),
-            None => Err(Error::from_reason(
-                "eager MTP snapshot_main_linear: inner.caches is None",
-            )),
-        };
-        self.snap = Some(snap);
-    }
-
-    // Pure-Rust GDN tape replay — the correctness keystone. Fires on BOTH
-    // full and partial accept. Infallible signature: any error is stashed in
-    // `self.replay_err` and surfaced later.
-    fn rollback(&mut self, accepted_drafts: usize, depth: usize) {
-        if self.replay_err.is_some() {
-            return;
-        }
-        // Paged path rewinds the full-attention K/V (which lives in the paged
-        // pool, not `inner.caches`) by `rejected` tokens before the shared GDN
-        // tape replay. On full accept `rejected == 0` (no-op). Flat layers keep
-        // their full-attention K/V in `inner.caches` and rewind it via `kv.trim`
-        // inside the replay loop instead.
-        let paged = matches!(self.mode, MtpStepMode::Paged(_));
-        if let MtpStepMode::Paged(adapter) = &mut self.mode {
-            let rejected = depth.saturating_sub(accepted_drafts);
-            if rejected > 0
-                && let Err(e) = adapter.rollback_last_tokens(rejected as u32)
-            {
-                tracing::warn!(
-                    target: "mlx_core::qwen3_5::paged",
-                    "eager MTP-paged rollback_last_tokens({rejected}) failed \
-                     (ignored): {e}",
-                );
-            }
-        }
-        let accepted_steps = accepted_drafts + 1;
-        let result: Result<()> = (|| {
-            let snap = match self.snap.as_ref() {
-                Some(Ok(s)) => s,
-                Some(Err(e)) => {
-                    return Err(Error::from_reason(format!(
-                        "eager MTP rollback: snapshot failed: {}",
-                        e.reason
-                    )));
-                }
-                None => {
-                    return Err(Error::from_reason(
-                        "eager MTP rollback: snapshot missing (snapshot_main_linear \
-                         did not run)",
-                    ));
-                }
-            };
-            let tape = &self.tape;
-            let inner = &mut *self.inner;
-            let caches = inner
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("eager MTP rollback: inner.caches is None"))?;
-            if caches.len() != snap.len() || caches.len() != tape.len() {
-                return Err(Error::from_reason(format!(
-                    "eager MTP rollback: length mismatch (caches {}, snapshot {}, \
-                     tape {})",
-                    caches.len(),
-                    snap.len(),
-                    tape.len(),
-                )));
-            }
-            for (idx, cache) in caches.iter_mut().enumerate() {
-                let Some(layer_tape) = tape[idx].as_ref() else {
-                    if paged {
-                        // Full-attention layer on the paged path: K/V lives in
-                        // the paged pool and was already rewound by
-                        // `adapter.rollback_last_tokens` above. The
-                        // `inner.caches` FullAttention slot is unused on the
-                        // paged path, so skip it.
-                        continue;
-                    }
-                    // Full-attention layer: rewind the offset to
-                    // `snapshot_offset + accepted_steps` so the next forward
-                    // overwrites the rejected drafts. No-op on full accept.
-                    match &snap[idx] {
-                        super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { offset } => {
-                            let kv = cache.as_kv_cache_mut().ok_or_else(|| {
-                                Error::from_reason(format!(
-                                    "eager MTP rollback: layer {idx} has a \
-                                     FullAttention snapshot but its cache slot is \
-                                     not FullAttention",
-                                ))
-                            })?;
-                            let target = *offset + accepted_steps as i32;
-                            kv.trim(target);
-                        }
-                        super::layer_cache::Qwen3_5LayerSnapshot::Linear { .. } => {
-                            return Err(Error::from_reason(format!(
-                                "eager MTP rollback: layer {idx} has no GDN tape \
-                                 but a Linear snapshot",
-                            )));
-                        }
-                    }
-                    continue;
-                };
-                let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "eager MTP rollback: layer {idx} has a GDN tape but its \
-                         cache slot is not Linear",
-                    ))
-                })?;
-                let (snap_conv, snap_rec) = match &snap[idx] {
-                    super::layer_cache::Qwen3_5LayerSnapshot::Linear {
-                        conv_state,
-                        recurrent_state,
-                    } => (conv_state.as_ref(), recurrent_state.as_ref()),
-                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { .. } => {
-                        return Err(Error::from_reason(format!(
-                            "eager MTP rollback: layer {idx} GDN tape but \
-                             FullAttention snapshot",
-                        )));
-                    }
-                };
-                let window = layer_tape.kernel.window_len()? as usize;
-                if accepted_steps > window {
-                    return Err(Error::from_reason(format!(
-                        "eager MTP rollback: accepted_steps {accepted_steps} \
-                         exceeds recorded window {window} at layer {idx}",
-                    )));
-                }
-                layer_tape.replay_into(arrays, snap_conv, snap_rec, accepted_steps)?;
-            }
-            Ok(())
-        })();
-        if let Err(e) = result {
-            self.replay_err = Some(e);
-        }
-    }
-
-    // On rejection (partial accept): the GDN tape replay in `rollback`
-    // already reconstructed the AR-exact main cache state, so no re-forward
-    // loop is needed. This only surfaces a stashed replay error and clears
-    // the per-cycle snapshot + tape.
-    fn restore_and_replay_main(&mut self, _accepted: &[u32], _emb: &MxArray) -> Result<()> {
-        self.snap = None;
-        self.tape.clear();
-        if let Some(e) = self.replay_err.take() {
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    // Committed-history commit.
-    //
-    // v1 (`!use_committed`): no-op.
-    //
-    // v2 (`use_committed`): append the M newly committed tokens' EXACT K/V to
-    // the persistent MTP cache via one multi-token drafter forward.
-    fn commit_mtp(
-        &mut self,
-        anchor: mtp_decode::MtpCommitAnchor,
-        seed_hidden: &MxArray,
-        verify_hiddens: &MxArray,
-        committed_ids: &[u32],
-        _k_accepted: usize,
-        emb: &MxArray,
-    ) -> Result<()> {
-        if !self.use_committed {
-            return Ok(());
-        }
-        let m = committed_ids.len();
-        if m == 0 {
-            return Ok(());
-        }
-        let hidden_dim = verify_hiddens.shape_at(2)?;
-
-        // Assemble hidden_seq [1, M, hidden] per anchor.
-        let hidden_seq = match anchor {
-            mtp_decode::MtpCommitAnchor::IncludeAnchor => {
-                // seed_hidden ++ verify_hiddens[:, 0..M-1, :].
-                let vh_prefix =
-                    verify_hiddens.slice(&[0, 0, 0], &[1, (m - 1) as i64, hidden_dim])?;
-                MxArray::concatenate(seed_hidden, &vh_prefix, 1)?
-            }
-            mtp_decode::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
-                // verify_hiddens[:, 0..M, :].
-                verify_hiddens.slice(&[0, 0, 0], &[1, m as i64, hidden_dim])?
-            }
-        };
-
-        // Gather the M committed-token input embeddings → [1, M, hidden].
-        let ids_i32: Vec<i32> = committed_ids.iter().map(|&v| v as i32).collect();
-        let ids_arr = MxArray::from_int32(&ids_i32, &[m as i64])?;
-        let gathered = emb.take(&ids_arr, 0)?;
-        let emb_seq = gathered.reshape(&[1, m as i64, hidden_dim])?;
-
-        // Drop this cycle's draft K/V (written past committed_len by the draft
-        // steps), then write the exact committed K/V via one multi-token
-        // forward.
-        let inner = &mut *self.inner;
-        let mtp = inner.mtp.as_mut().ok_or_else(|| {
-            Error::from_reason(
-                "eager MTP commit_mtp: inner.mtp is None despite \
-                 has_mtp_weights() gate",
-            )
-        })?;
-        let caches = &mut self.mtp_caches;
-        for c in caches.iter_mut() {
-            if let Some(kv) = c.as_kv_cache_mut() {
-                kv.trim(self.committed_len);
-            }
-        }
-        let _ = mtp.forward(&hidden_seq, &emb_seq, Some(caches))?;
-        self.committed_len += m as i32;
-        Ok(())
-    }
-
-    // Re-anchor the drafter cache at the start of each cycle.
-    //
-    // v1 (`!use_committed`): reset to a fresh cache.
-    //
-    // v2 (`use_committed`): the cache is PERSISTENT; truncate the prior
-    // cycle's draft tail back to the re-anchor target. `chained_anchor`
-    // cycles anchor one slot earlier (`committed_len - 1`); Step-A cycles at
-    // `committed_len`.
-    fn begin_cycle(&mut self, chained_anchor: bool) {
-        if !self.use_committed {
-            self.mtp_caches = Qwen3_5MTPModule::fresh_caches(&self.config);
-            return;
-        }
-        let target = if chained_anchor {
-            (self.committed_len - 1).max(0)
-        } else {
-            self.committed_len
-        };
-        for c in self.mtp_caches.iter_mut() {
-            if let Some(kv) = c.as_kv_cache_mut() {
-                kv.trim(target);
-            }
-        }
-    }
-
-    // Bound the lazy graph: materialize the token plus the main GDN/full-attn
-    // caches; on a budget-forced step also the logits.
-    fn eval_step(&self, token: &MxArray, logits: &MxArray, budget_forced: bool) {
-        async_eval_layer_caches(&self.inner.caches);
-        token.eval();
-        if budget_forced {
-            logits.eval();
-        }
-    }
-
-    // Chained end-of-iteration eval: keep the chained `verify_hidden[K]` slice
-    // materialized alongside the token and the main caches so the next cycle's
-    // draft graph does not force a separate Metal roundtrip.
-    fn eval_step_with_chained_hidden(&self, token: &MxArray, chained_hidden: &MxArray) {
-        async_eval_layer_caches(&self.inner.caches);
-        MxArray::async_eval_arrays(&[token, chained_hidden]);
-    }
-
-    fn rollback_unemitted(&mut self, unemitted: usize) {
-        match &mut self.mode {
-            MtpStepMode::Flat => {
-                if unemitted > 0 {
-                    self.mtp_desynced = true;
-                }
-            }
-            MtpStepMode::Paged(adapter) => {
-                // Truncate the live paged adapter by the accepted-but-unemitted
-                // tokens; the paged path never sets the FLAT desync latch.
-                if let Err(e) = adapter.rollback_last_tokens(unemitted as u32) {
-                    tracing::warn!(
-                        target: "mlx_core::qwen3_5::paged",
-                        "eager MTP-paged rollback_unemitted({unemitted}) failed \
-                         (ignored): {e}",
-                    );
-                }
-            }
-        }
-    }
-
-    fn take_replay_error(&mut self) -> Option<Error> {
-        self.replay_err.take()
-    }
-
-    fn into_desynced(self) -> bool {
-        // Paged truncates its adapter in `rollback_unemitted` and never touches
-        // the FLAT desync latch, so it always reports `false`. The adapter is
-        // restored into `inner.paged_adapter` by the `Drop` impl that runs as
-        // `self` falls out of scope here. (`self` is consumed by value rather
-        // than destructured because the `Drop` impl forbids moving fields out.)
-        match self.mode {
-            MtpStepMode::Flat => self.mtp_desynced,
-            MtpStepMode::Paged(_) => false,
-        }
-    }
-}
-
-impl MtpBackend for Qwen35Inner {
-    type MtpDecode<'a>
-        = DenseMtpStepper<'a>
-    where
-        Self: 'a;
-
-    fn begin_mtp_decode(&mut self, setup: &MtpTurnSetup<'_>) -> Result<Self::MtpDecode<'_>> {
-        let inference_info_enabled =
-            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
-        let seed_trace_start = inference_info_enabled.then(std::time::Instant::now);
-        let mut seed_tokens = 0usize;
-        let mut seed_chunks = 0usize;
-        // Turn-constant captures the eager-MTP block built before the loop:
-        // the embedding table (+ its transpose for the tied projection) and a
-        // config clone for the per-cycle drafter cache reset.
-        let embedding_weight = self.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let config = self.config.clone();
-
-        // Committed-history is only correct when the prompt tail's hiddens
-        // start at absolute position 0 (the eager drafter derives RoPE purely
-        // from the local cache offset). Continuation/delta turns
-        // (`position_base != 0`) fall back to v1 cycle-history.
-        let use_committed = setup.prompt_hidden_position_base == 0;
-
-        // Auto-select the main-forward routing: the paged cores leave a paged
-        // adapter on `self`, so `take()` moves it into the stepper for the turn
-        // (restored by `Drop`); the flat cores have none and run flat. The
-        // paged forwards need the per-layer kind classification (unused flat).
-        let (mode, layer_kinds) = match self.paged_adapter.take() {
-            Some(adapter) => {
-                let layer_kinds = super::decoder_layer::compute_layer_kinds(
-                    self.config.num_layers as usize,
-                    |i| self.config.is_linear_layer(i),
-                );
-                (MtpStepMode::Paged(Box::new(adapter)), layer_kinds)
-            }
-            None => (MtpStepMode::Flat, Vec::new()),
-        };
-
-        let mut stepper = DenseMtpStepper {
-            inner: self,
-            mtp_caches: Qwen3_5MTPModule::fresh_caches(&config),
-            committed_len: 0,
-            use_committed,
-            snap: None,
-            tape: Vec::new(),
-            replay_err: None,
-            mtp_desynced: false,
-            embedding_weight,
-            embedding_weight_t,
-            config,
-            mode,
-            layer_kinds,
-        };
-
-        // Prompt-prefix seed (v2 committed-history only): commit the
-        // contiguous run
-        // `[prompt_hidden_ids[1..], y]` (length P, token 0 skipped, the first
-        // sampled token `y` appended) into the persistent MTP cache so the
-        // drafter attends the prompt from cycle 1. Each committed token `x` is
-        // paired with `prompt_hidden[:, idx, :]` = h(token before `x`). Chunk
-        // into pieces of size <= 7 and run the SAME multi-token eager KV-writer
-        // as `commit_mtp` per chunk. `position_base == 0` is guaranteed by
-        // `use_committed`, so RoPE (= local cache offset) aligns with absolute
-        // position.
-        if use_committed
-            && let (Some(ph), Some(ph_ids)) = (setup.prompt_hidden, setup.prompt_hidden_ids)
-            && !ph_ids.is_empty()
-        {
-            let prompt_len = ph_ids.len();
-            let hidden_dim = ph.shape_at(2)?;
-            let hidden_len = ph.shape_at(1)? as usize;
-            if hidden_len != prompt_len {
-                return Err(Error::from_reason(format!(
-                    "eager MTP prompt-seed: prompt_hidden length {hidden_len} \
-                     does not match prompt_hidden_ids length {prompt_len}"
-                )));
-            }
-            // The first sampled token `y` is supplied by the engine via the
-            // setup so the prompt seed can commit `[prompt_ids[1..], y]`.
-            let y_id = setup.first_sampled_token;
-
-            // Committed run = [prompt_ids[1..prompt_len], y] (length P).
-            let mut committed_ids: Vec<i32> = Vec::with_capacity(prompt_len);
-            committed_ids.extend(ph_ids[1..prompt_len].iter().map(|&v| v as i32));
-            committed_ids.push(y_id as i32);
-
-            let chunk_sizes = partition_prefill_chunks(prompt_len);
-            seed_tokens = prompt_len;
-            seed_chunks = chunk_sizes.len();
-            let mut cursor: usize = 0;
-            for &chunk in &chunk_sizes {
-                let chunk_i64 = chunk as i64;
-                let start = cursor as i64;
-                // hidden_seq = prompt_hidden[:, cursor..cursor+chunk, :].
-                let hidden_seq = ph.slice(&[0, start, 0], &[1, start + chunk_i64, hidden_dim])?;
-                // emb_seq = gather embedding rows for the chunk's ids.
-                let ids_arr =
-                    MxArray::from_int32(&committed_ids[cursor..cursor + chunk], &[chunk_i64])?;
-                let gathered = stepper.embedding_weight.take(&ids_arr, 0)?;
-                let emb_seq = gathered.reshape(&[1, chunk_i64, hidden_dim])?;
-
-                let inner = &mut *stepper.inner;
-                let mtp = inner.mtp.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "eager MTP prompt-seed: inner.mtp is None despite \
-                         has_mtp_weights() gate",
-                    )
-                })?;
-                let caches = &mut stepper.mtp_caches;
-                let _ = mtp.forward(&hidden_seq, &emb_seq, Some(caches))?;
-                stepper.committed_len += chunk as i32;
-                cursor += chunk;
-            }
-        }
-
-        if inference_info_enabled {
-            tracing::info!(
-                target: "mlx_core::inference",
-                event = "mtp_prompt_seed_done",
-                mode = if use_committed {
-                    "committed_history"
-                } else {
-                    "cycle_history"
-                },
-                seed_tokens,
-                chunks = seed_chunks,
-                max_chunk_tokens = 7,
-                position_base = setup.prompt_hidden_position_base,
-                setup_elapsed_ms = seed_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                "MTP prompt seed completed"
-            );
-        }
-
-        Ok(stepper)
-    }
-}
-
-impl ChatBackend for Qwen35Inner {
-    fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
-        self.tokenizer
-            .clone()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))
-    }
-
-    fn family_name(&self) -> &'static str {
-        "qwen3_5"
-    }
-
-    fn set_cache_owner_id(&mut self, owner_id: &str, root_owner_id: Option<&str>) {
-        self.active_cache_owner_id.clear();
-        self.active_cache_owner_id.push_str(owner_id);
-        if let Some(root_owner_id) = root_owner_id {
-            self.gdn_root_cache_owner_id = Some(root_owner_id.to_owned());
-            self.gdn_root_cache_owner_is_explicit = true;
-        } else {
-            self.gdn_root_cache_owner_id = Some(owner_id.to_owned());
-            self.gdn_root_cache_owner_is_explicit = false;
-        }
-    }
-
-    fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
-        tok.im_end_id()
-            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))
-    }
-
-    fn generation_defaults(&self) -> Option<&crate::engine::ModelGenerationDefaults> {
-        Some(&self.gen_defaults)
-    }
-
-    fn extra_eos_ids(&self) -> Vec<u32> {
-        self.gen_defaults.eos_token_ids.clone()
-    }
-
-    // thinking: engine default `policy()` == `ThinkingPolicy::TemplateHonoring`
-    // → `thinking_setup` resolves to
-    // `{enabled: resolve_enable_thinking(config).unwrap_or(true),
-    //   budget: config.thinking_token_budget}`.
-
-    fn cached_token_history(&self) -> &[u32] {
-        &self.cached_token_history
-    }
-
-    fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
-        match scope {
-            // Prefix-miss reset: reset each live layer cache, then install a
-            // fresh hybrid cache vec. PRESERVES `cached_token_history` /
-            // `cached_image_key` / `cached_rope_deltas` (the end-of-turn
-            // save overwrites them) and the GDN checkpoints (paged-path
-            // state the flat reset never touches).
-            ResetScope::PrefixMiss => {
-                if let Some(ref mut caches) = self.caches {
-                    for cache in caches.iter_mut() {
-                        cache.reset();
-                    }
-                }
-                self.caches = Some(fresh_dense_layer_caches(&self.config));
-                Ok(())
-            }
-            // Full clear including history, image key, rope deltas, GDN
-            // checkpoints, via `reset_caches_sync`.
-            ResetScope::Command => {
-                self.reset_caches_sync()?;
-                // The EXPLICIT command reset must restore a fully cold
-                // state. `reset_caches_sync` clears the flat caches +
-                // reuse/GDN state but leaves the paged request's FULL
-                // blocks content-addressed in the per-instance
-                // BlockAllocator's prefix cache, so a reset-then-rerun of
-                // the same prompt would take the prefix-hit suffix-prefill
-                // path (`verify_cache_prefix_direct` > 0) — a different
-                // bf16 reduction order than the cold full prefill, enough
-                // to flip a greedy near-tie (observed on the lfm2 sibling:
-                // "says," vs "said" at token ~6; qwen3.5 shares the
-                // identical adapter lifecycle).
-                // Releasing the live request AND purging the prefix cache
-                // makes the next turn replay the cold prefill byte-for-byte.
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    adapter
-                        .release_request_and_purge_prefix_cache()
-                        .map_err(|e| {
-                            Error::from_reason(format!(
-                                "qwen3_5 reset_caches: paged prefix-cache purge failed: {e}"
-                            ))
-                        })?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// All-or-nothing prefix match (NO exact-match rewind — the GDN
-    /// recurrent state cannot rewind one slot; the engine's
-    /// exact-match-as-miss handling performs a full reset + re-prefill on a
-    /// zero-delta hit). Text-only by construction: the
-    /// generic flow never carries images (the vision probe owns those
-    /// turns), so the expanded-token / image-key inputs collapse to the
-    /// plain prompt.
-    fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize {
-        verify_cache_prefix_direct(
-            reuse_cache,
-            false,
-            tokens,
-            tokens,
-            0,
-            &self.cached_token_history,
-            &self.cached_image_key,
-            self.caches.is_some(),
-        )
-    }
-
-    fn flat_caches_desynced(&self) -> bool {
-        self.flat_mtp_caches_desynced
-    }
-
-    fn clear_flat_caches_desynced(&mut self) {
-        self.flat_mtp_caches_desynced = false;
-    }
-
-    fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
-        // Delta continuations preserve `cached_image_key` — the KV cache
-        // still holds the prior prefill's image attention state even
-        // though this turn was text-only. Fresh turns (re)set the key
-        // from the turn's (always-false here) `has_images`.
-        //
-        // `drop_last_always = true`: this is the generic `run_decode_loop`
-        // flow (flat, non-MTP, non-image dense turns), which never forwards
-        // the final committed token into the physical cache on ANY exit
-        // kind. The GDN recurrent state is non-invertible, so we drop that
-        // token (rather than materialize it) to keep
-        // `cached_token_history.len() == physical_cache_len`.
-        if args.is_delta {
-            engine::save_cache_state_after_delta(
-                args.reuse_cache,
-                args.generated_tokens,
-                args.finish_reason,
-                /* drop_last_always */ true,
-                args.save_tokens,
-                &mut self.cached_token_history,
-                &mut self.cached_image_key,
-                &mut self.cached_rope_deltas,
-                &mut self.caches,
-            );
-        } else {
-            save_cache_state_direct(
-                args.reuse_cache,
-                args.has_images,
-                args.generated_tokens,
-                args.finish_reason,
-                /* drop_last_always */ true,
-                args.save_tokens,
-                args.save_expanded_tokens,
-                args.image_cache_key,
-                &mut self.cached_token_history,
-                &mut self.cached_image_key,
-                &mut self.cached_rope_deltas,
-                &mut self.caches,
-            );
-        }
-        self.cached_paged_image_token_positions.clear();
-    }
-
-    fn eval_caches(&self) -> Result<()> {
-        // No post-prefill cache sync on qwen3.5's reference paths:
-        // `chunked_prefill` evals internally per chunk and the decode
-        // loop schedules async evals. A blocking sync here would
-        // introduce an unnecessary stall.
-        Ok(())
-    }
-
-    fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
-        // Text-only prefill block (the engine's reset-or-delta split already
-        // ran; `self.caches` holds either fresh caches or the live session
-        // state).
-        let embedding_weight = self.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        let prompt = MxArray::from_uint32(prompt_tokens, &[1, prompt_tokens.len() as i64])?;
-        chunked_prefill(
-            &prompt,
-            &embedding_weight,
-            &mut self.layers,
-            &mut self.caches,
-            &self.final_norm,
-            &self.lm_head,
-            Some(&embedding_weight_t),
-            stream,
-        )
-    }
-
-    type Decode<'a>
-        = Qwen35Decode<'a>
-    where
-        Self: 'a;
-
-    fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
-        let p = turn.params;
-
-        let is_streaming = self.turn_is_streaming.get();
-
-        // Decode-entry trace (sync paths only — the streaming cores never
-        // logged it). `enable_mtp && has_mtp_weights` turns route through
-        // `mtp_turn`, so the MTP branch string is unreachable here.
-        if !is_streaming {
-            let prefill_len = turn.total_seq_len as i32;
-            let max_kv_len_estimate =
-                engine::kv_capacity_round_up_saturating(prefill_len, p.max_new_tokens);
-            let has_mtp = self.has_mtp_weights();
-            let branch = if !p.enable_mtp {
-                "AR (enable_mtp=false)"
-            } else if !has_mtp {
-                "AR (no MTP weights on model)"
-            } else {
-                "AR"
-            };
-            info!(
-                "Qwen3.5 chat_decode entry: prompt_len={} max_new_tokens={} enable_mtp={} \
-                 mtp_depth={} prefill_seq_len={} max_kv_len={} has_mtp_weights={} \
-                 is_delta={} has_images={} branch=\"{}\"",
-                turn.total_seq_len,
-                p.max_new_tokens,
-                p.enable_mtp,
-                p.mtp_depth,
-                prefill_len,
-                max_kv_len_estimate,
-                has_mtp,
-                turn.is_delta,
-                turn.has_images,
-                branch,
-            );
-        }
-
-        let embedding_weight = self.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-
-        let relabel = match (is_streaming, turn.is_delta) {
-            (false, _) => "chat_rust",
-            (true, false) => "chat_stream_rust",
-            (true, true) => "chat_stream_delta_rust",
-        };
-
-        Ok(Qwen35Decode {
-            inner: self,
-            embedding_weight,
-            embedding_weight_t,
-            relabel,
-        })
-    }
-
-    fn execution_plan(&self) -> ExecutionPlan {
-        ExecutionPlan {
-            media: qwen35_dense_media_plan(
-                self.vision_encoder.is_some(),
-                self.image_processor.is_some(),
-                self.paged_adapter.is_some(),
-            ),
-            paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
-                supports_delta: true,
-            }),
-            speculative: self.has_mtp_weights().then_some(SpeculativePlan {
-                kind: SpeculativeKind::NativeMtp,
-                supported_input_media: MediaCapabilities::NONE,
-                // A text delta can continue an image-derived live session
-                // with native MTP. The current turn carries no image bytes;
-                // the eager paged-MTP core verifies against the target's
-                // existing paged KV context. This is the same route the old
-                // session dispatcher selected: its paged probe ran before the
-                // MTP probe and dense `paged_turn` handled MTP directly.
-                supported_context_media: MediaCapabilities::IMAGES,
-                supports_paged_attention: true,
-            }),
-        }
-    }
-
-    fn wired_limit_bytes(&self) -> Option<usize> {
-        // Per-turn wired-memory limit = the model's estimated footprint.
-        Some(self.config.estimate_memory_bytes() as usize)
-    }
-
-    fn profiler_label(&self, is_delta: bool, is_streaming: bool) -> &'static str {
-        // Record the turn's streaming-ness for `begin_decode`'s relabel
-        // (`TurnSetup` does not carry it). The session core calls this
-        // hook exactly once per generic-flow turn, before
-        // `begin_decode`; specialized whole-turn paths return from their
-        // planned executor earlier and never consult either hook. The labels
-        // are the engine defaults.
-        self.turn_is_streaming.set(is_streaming);
-        match (is_streaming, is_delta) {
-            (false, false) => "chat",
-            (false, true) => "chat_delta",
-            (true, false) => "chat_stream",
-            (true, true) => "chat_stream_delta",
-        }
-    }
-
-    fn has_live_session(&self) -> bool {
-        // Delta guard: `self.caches.is_none()` means there is no
-        // initialized session to continue.
-        self.caches.is_some()
-    }
-
-    fn session_media(&self) -> MediaCapabilities {
-        qwen35_dense_session_media(
-            self.cached_image_key.is_some(),
-            self.cached_rope_deltas.is_some(),
-        )
-    }
-
-    fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Both SYNC and STREAMING turns take the paged core. The paged
-        // cores self-handle MTP via the `eager_mtp_paged` arm
-        // (`paged_turn_sync_core_inner` / `paged_turn_stream_core_inner`),
-        // the streaming eager-MTP path.
-        debug_assert!(args.plan.use_paged_attention);
-        debug_assert!(self.paged_adapter.is_some());
-        self.paged_whole_turn(args)
-    }
-
-    fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // The execution plan has already established request opt-in, loaded
-        // MTP weights, flat-cache admission, and text-only input. The dense
-        // core retains the algorithm-specific MTP gate and AR fallback.
-        debug_assert!(args.media.is_empty());
-        debug_assert!(matches!(
-            args.plan.decoder,
-            DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
-        ));
-        self.dense_whole_turn(args)
-    }
-
-    fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // The dense cores own the full image pipeline (VLM prefill, M-RoPE
-        // deltas, paged-backend validation, missing-encoder error).
-        self.dense_whole_turn(args)
     }
 }
 
@@ -9709,32 +4461,155 @@ pub struct Qwen3_5GenerationResult {
     pub finish_reason: String,
 }
 
-/// Trained and physically available active-context limits for one loaded
-/// Qwen3.5 model. Values are snapshots because the physical pool is fixed for
-/// the lifetime of the resident model.
+/// Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE).
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct ChatConfig {
+    #[napi(ts_type = "number | undefined")]
+    pub max_new_tokens: Option<i32>,
+    #[napi(ts_type = "number | undefined")]
+    pub temperature: Option<f64>,
+    #[napi(ts_type = "number | undefined")]
+    pub top_k: Option<i32>,
+    #[napi(ts_type = "number | undefined")]
+    pub top_p: Option<f64>,
+    #[napi(ts_type = "number | undefined")]
+    pub min_p: Option<f64>,
+    /// Repetition penalty (1.0 = disabled). Penalizes tokens already in context.
+    #[napi(ts_type = "number | undefined")]
+    pub repetition_penalty: Option<f64>,
+    /// Size of the context window for repetition penalty (default: 256)
+    #[napi(ts_type = "number | undefined")]
+    pub repetition_context_size: Option<i32>,
+    /// Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
+    /// token that appeared at least once in context. Matches OpenAI API semantics.
+    #[napi(ts_type = "number | undefined")]
+    pub presence_penalty: Option<f64>,
+    /// Number of recent tokens to consider for presence penalty (default: 20)
+    #[napi(ts_type = "number | undefined")]
+    pub presence_context_size: Option<i32>,
+    /// Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
+    /// logits of each token in context. Matches OpenAI API semantics.
+    #[napi(ts_type = "number | undefined")]
+    pub frequency_penalty: Option<f64>,
+    /// Number of recent tokens to consider for frequency penalty (default: 20)
+    #[napi(ts_type = "number | undefined")]
+    pub frequency_context_size: Option<i32>,
+    /// Max consecutive identical tokens before stopping (default: 16, 0 = disabled)
+    #[napi(ts_type = "number | undefined")]
+    pub max_consecutive_tokens: Option<i32>,
+    /// Max n-gram repetitions before stopping (default: 3, 0 = disabled)
+    #[napi(ts_type = "number | undefined")]
+    pub max_ngram_repeats: Option<i32>,
+    /// Max pattern size for n-gram repetition detection (default: 64)
+    #[napi(ts_type = "number | undefined")]
+    pub ngram_size: Option<i32>,
+    #[napi(ts_type = "Array<ToolDefinition>")]
+    pub tools: Option<Vec<ToolDefinition>>,
+    /// Reasoning effort level. Controls whether the model thinks before answering.
+    /// - "none" / "low": thinking disabled (template injects closed think block).
+    ///   "none" also sets includeReasoning to false by default.
+    /// - "medium" / "high": thinking enabled (default behavior).
+    /// - Not set: thinking enabled (model thinks naturally).
+    #[napi(ts_type = "string | undefined")]
+    pub reasoning_effort: Option<String>,
+    /// Maximum number of thinking tokens before forcing </think>.
+    /// When the model has generated this many tokens while in thinking mode,
+    /// the next token is forced to be the think_end token. None = unlimited.
+    #[napi(ts_type = "number | undefined")]
+    pub thinking_token_budget: Option<i32>,
+    /// Whether to include reasoning/thinking content in the output.
+    /// When false, the `thinking` field of ChatResult/ChatStreamChunk will always be None.
+    /// Default: true (false when reasoningEffort is "none").
+    #[napi(ts_type = "boolean | undefined")]
+    pub include_reasoning: Option<bool>,
+    /// When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result
+    #[napi(ts_type = "boolean | undefined")]
+    pub report_performance: Option<bool>,
+    /// Reuse KV cache across chat-session turns for incremental prefill. Default: true.
+    /// When true, the model preserves its KV cache after generation. On the next
+    /// `chatSessionStart` / `chatSessionContinue` call, it prefix-matches the new
+    /// token sequence against the cached tokens and only prefills the delta —
+    /// avoiding redundant computation for multi-turn conversations.
+    #[napi(ts_type = "boolean | undefined")]
+    pub reuse_cache: Option<bool>,
+}
+
+/// Unified chat result shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE).
 #[napi(object)]
 #[derive(Debug, Clone)]
-pub struct Qwen3_5ContextLimits {
-    pub trained_window_tokens: u32,
-    pub effective_window_tokens: u32,
-    pub paged_block_capacity: u32,
-    pub paged_block_size: u32,
+pub struct ChatResult {
+    pub text: String,
+    pub tool_calls: Vec<ToolCallResult>,
+    pub thinking: Option<String>,
+    pub num_tokens: u32,
+    pub prompt_tokens: u32,
+    pub reasoning_tokens: u32,
+    pub finish_reason: String,
+    pub raw_text: String,
+    /// Number of prompt tokens served from the reused KV-cache prefix.
+    ///
+    /// When the native prefix-cache machinery successfully matches the new
+    /// prompt against the cached conversation history (via
+    /// `verify_cache_prefix_direct`), only the trailing delta is re-prefilled
+    /// and this field reports the length of the reused prefix. `0` when
+    /// the cache was missed or disabled and the full prompt had to be
+    /// re-prefilled.
+    pub cached_tokens: u32,
+    /// Performance metrics (present when `reportPerformance: true` in config)
+    pub performance: Option<crate::profiling::PerformanceMetrics>,
 }
 
-impl Qwen3_5ContextLimits {
-    pub(crate) fn from_tuple(value: (u32, u32, u32, u32)) -> Self {
-        Self {
-            trained_window_tokens: value.0,
-            effective_window_tokens: value.1,
-            paged_block_capacity: value.2,
-            paged_block_size: value.3,
-        }
+/// A single chunk emitted during streaming chat generation.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ChatStreamChunk {
+    pub text: String,
+    pub done: bool,
+    pub finish_reason: Option<String>,
+    pub tool_calls: Option<Vec<ToolCallResult>>,
+    pub thinking: Option<String>,
+    pub num_tokens: Option<u32>,
+    pub prompt_tokens: Option<u32>,
+    pub reasoning_tokens: Option<u32>,
+    pub raw_text: Option<String>,
+    /// Number of prompt tokens served from the reused KV-cache prefix on
+    /// this turn. Populated on the terminal chunk (`done == true`) only;
+    /// `None` on mid-stream delta chunks.
+    ///
+    /// Zero on a cache miss or disabled reuse; equal to the matched
+    /// prefix length on a hit. Mirrors `ChatResult.cached_tokens`
+    /// verbatim so session-aware streaming consumers can observe
+    /// prefix-cache reuse without round-tripping to the non-streaming
+    /// path. Non-terminal chunks always carry `None` — only the
+    /// terminal chunk is authoritative.
+    #[napi(ts_type = "number | undefined")]
+    pub cached_tokens: Option<u32>,
+    /// Performance metrics (only present in the final chunk when `reportPerformance: true`)
+    pub performance: Option<crate::profiling::PerformanceMetrics>,
+    /// Whether this delta chunk contains reasoning/thinking content.
+    /// true = reasoning (inside <think>...</think>), false = content (after </think>).
+    /// Only present on intermediate (non-final) chunks.
+    #[napi(ts_type = "boolean | undefined")]
+    pub is_reasoning: Option<bool>,
+}
+
+/// Handle returned by the streaming chat-session entry points
+/// (`chat_stream_session_start`, `chat_stream_session_continue`,
+/// `chat_stream_session_continue_tool`) to control an in-progress
+/// streaming generation.
+#[napi]
+pub struct ChatStreamHandle {
+    pub(crate) cancelled: Arc<AtomicBool>,
+}
+
+#[napi]
+impl ChatStreamHandle {
+    #[napi]
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 }
-
-// Shared chat types live in the model-neutral engine module; import them for
-// internal use (no re-export — consumers import from `crate::engine::types`).
-use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 
 /// Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
 ///
@@ -9747,35 +4622,25 @@ pub struct Qwen3_5Model {
     pub(crate) thread: crate::model_thread::ModelThread<Qwen35Cmd>,
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5Config,
-    /// Snapshot of `Qwen35Inner::paged_adapter.is_some()` captured at
-    /// construction time. Text-only checkpoints default-OFF on Qwen3.5
-    /// (parity-pending — see CLAUDE.md and
-    /// `Qwen3_5Config::use_block_paged_cache`). VLM checkpoints default the
-    /// adapter ON: dense image turns ONLY run on the paged-vision core, and a
-    /// vision turn that reaches a None adapter errors at dispatch. Surfaced
-    /// through the `hasBlockPagedCache()` NAPI method.
-    pub(crate) paged_active: bool,
-    /// Snapshot of `Qwen35Inner::has_mtp_weights()` captured
-    /// at construction time, mirroring `paged_active`. Surfaced through
-    /// the `hasMtpWeights()` NAPI method so the TS ChatSession can
-    /// auto-default `enableMtp = true` for checkpoints that ship an MTP
-    /// head without round-tripping through the model thread.
-    pub(crate) mtp_active: bool,
-    /// Snapshot of the fully loaded image execution stack. `true` only when
-    /// the vision encoder and image processor were both installed and the
-    /// block-paged adapter required by the Qwen3.5 vision core is active.
-    /// Config metadata alone is insufficient: sym8 checkpoints can retain a
-    /// `vision_config` while deliberately dropping the incompatible vision
-    /// weights at load time.
-    pub(crate) vision_active: bool,
-    /// Loaded image processor retained by the public wrapper for CPU-only
-    /// expanded-token planning before a streaming response commits headers.
-    /// This is the same `Arc` used by the model thread's real vision prefill.
+    pub(crate) embedding: Embedding,
+    /// Decoder layers wrapped in RwLock for interior mutability during generation.
+    pub(crate) layers: Arc<RwLock<Vec<DecoderLayer>>>,
+    /// Final layer norm wrapped in RwLock for interior mutability.
+    pub(crate) final_norm: Arc<RwLock<RMSNorm>>,
+    /// LM head wrapped in RwLock for interior mutability.
+    pub(crate) lm_head: Arc<RwLock<Option<Linear>>>, // None when tie_word_embeddings
+    /// KV/SSM caches wrapped in RwLock for interior mutability during generation.
+    pub(crate) caches: Arc<RwLock<Option<Vec<Qwen3_5LayerCache>>>>,
+    pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    pub(crate) fa_idx: usize,
+    pub(crate) vision_encoder: Option<Arc<Qwen3_5VisionEncoder>>,
     pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
-    /// Actual merge size installed on the loaded inner model, paired with
-    /// `image_processor` for exact preflight geometry.
-    pub(crate) spatial_merge_size: i32,
-    pub(crate) context_limits: Qwen3_5ContextLimits,
+    pub(crate) spatial_merge_size: Option<i32>,
+    pub(crate) vision_cache: VisionCache,
+    cached_token_history: Arc<RwLock<Vec<u32>>>,
+    cached_image_key: Arc<RwLock<Option<u64>>>,
+    cached_rope_deltas: Arc<RwLock<Option<i32>>>,
+    pub(crate) model_id: u64,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop, so the global cap can shrink once JS GCs
     /// the wrapper.
@@ -9784,73 +4649,195 @@ pub struct Qwen3_5Model {
 
 #[napi]
 impl Qwen3_5Model {
-    /// Whether the block-paged KV cache adapter is active on this model
-    /// instance.
-    ///
-    /// `true` iff `Qwen35Inner::paged_adapter` was successfully
-    /// constructed at load time (driven by
-    /// `Qwen3_5Config::use_block_paged_cache`, default-OFF for text-only
-    /// checkpoints because parity is pending real-weights validation, and
-    /// default-ON for VLM checkpoints). On VLM checkpoints dense image turns
-    /// ONLY run on the paged-vision core; a vision turn that reaches a None
-    /// adapter errors at dispatch. Surfaced through this NAPI method so
-    /// server endpoints can branch on it without round-tripping through
-    /// the model thread.
-    #[napi]
-    pub fn has_block_paged_cache(&self) -> bool {
-        self.paged_active
+    /// Create a new Qwen3.5 model with the given configuration.
+    #[napi(constructor)]
+    pub fn new(config: Qwen3_5Config) -> Result<Self> {
+        let embedding = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)?;
+
+        let layers = (0..config.num_layers as usize)
+            .map(|i| DecoderLayer::new(&config, i))
+            .collect::<Result<Vec<_>>>()?;
+
+        let final_norm = RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps))?;
+
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(Linear::new(
+                config.hidden_size as u32,
+                config.vocab_size as u32,
+                Some(false),
+            )?)
+        };
+
+        // Find first full attention layer index
+        let fa_idx = (0..config.num_layers as usize)
+            .find(|&i| !config.is_linear_layer(i))
+            .unwrap_or(0);
+
+        info!(
+            "Qwen3.5 model created: {} layers, fa_idx={}",
+            config.num_layers, fa_idx,
+        );
+
+        Ok(Self {
+            config,
+            embedding,
+            layers: Arc::new(RwLock::new(layers)),
+            final_norm: Arc::new(RwLock::new(final_norm)),
+            lm_head: Arc::new(RwLock::new(lm_head)),
+            caches: Arc::new(RwLock::new(None)),
+            tokenizer: None,
+            fa_idx,
+            #[cfg(not(target_family = "wasm"))]
+            vision_encoder: None,
+            #[cfg(not(target_family = "wasm"))]
+            image_processor: None,
+            spatial_merge_size: None,
+            vision_cache: Arc::new(Mutex::new(VisionCacheInner {
+                entries: HashMap::new(),
+                generation: 0,
+            })),
+            cached_token_history: Arc::new(RwLock::new(Vec::new())),
+            cached_image_key: Arc::new(RwLock::new(None)),
+            cached_rope_deltas: Arc::new(RwLock::new(None)),
+            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            #[cfg(not(target_family = "wasm"))]
+            generation_lock: Arc::new(TokioMutex::new(())),
+        })
     }
 
-    /// Whether this checkpoint shipped an MTP head (module loaded by
-    /// `persistence::apply_weights_inner`). Snapshotted at load time from
-    /// `Qwen35Inner::has_mtp_weights()` so the TS `ChatSession` can
-    /// auto-default `enableMtp = true` for MTP-capable checkpoints without
-    /// dispatching a command into the model thread.
-    ///
-    /// Note: this only reports weight availability. Whether the
-    /// speculative-decode path actually runs on a given call also requires the
-    /// per-request `enableMtp` flag.
+    /// Initialize caches for incremental generation.
     #[napi]
-    pub fn has_mtp_weights(&self) -> bool {
-        self.mtp_active
+    pub fn init_caches(&self) -> Result<()> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let _guard = self.generation_lock.try_lock().map_err(|_| {
+                Error::from_reason("Cannot init caches while generation is in progress")
+            })?;
+        }
+        self.init_caches_inner()
     }
 
-    /// Whether this loaded model instance can execute image-bearing turns.
-    ///
-    /// This is an authoritative load-time snapshot, not a `config.json`
-    /// family guess: it requires a loaded vision encoder, image processor,
-    /// and the block-paged KV adapter used by the dense vision path.
-    #[napi]
-    pub fn supports_images(&self) -> bool {
-        self.vision_active
+    /// Init caches without checking the generation lock (for internal use
+    /// by generate_for_training_sync which already holds the lock).
+    fn init_caches_inner(&self) -> Result<()> {
+        let caches = (0..self.config.num_layers as usize)
+            .map(|i| {
+                if self.config.is_linear_layer(i) {
+                    Qwen3_5LayerCache::new_linear()
+                } else {
+                    Qwen3_5LayerCache::new_full_attention()
+                }
+            })
+            .collect();
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+        *caches_guard = Some(caches);
+        self.clear_reuse_state();
+        Ok(())
     }
 
-    /// Synchronous snapshot used by higher layers to preflight rendered
-    /// prompts and clamp output before native cache allocation.
+    /// Reset all caches.
     #[napi]
-    pub fn context_limits(&self) -> Qwen3_5ContextLimits {
-        self.context_limits.clone()
+    pub fn reset_caches(&self) -> Result<()> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let _guard = self.generation_lock.try_lock().map_err(|_| {
+                Error::from_reason("Cannot reset caches while generation is in progress")
+            })?;
+        }
+        self.reset_caches_inner()
     }
 
-    /// Compute the exact prompt length after Qwen image-placeholder expansion
-    /// without running the vision encoder or touching inference caches.
+    /// Reset caches without checking the generation lock.
+    fn reset_caches_inner(&self) -> Result<()> {
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+        if let Some(ref mut caches) = *caches_guard {
+            for cache in caches.iter_mut() {
+                cache.reset();
+            }
+        }
+        *caches_guard = None;
+        self.clear_reuse_state();
+        Ok(())
+    }
+
+    /// Clear cached token history, image key, and rope deltas.
+    fn clear_reuse_state(&self) {
+        if let Ok(mut th) = self.cached_token_history.write() {
+            th.clear();
+        }
+        if let Ok(mut ik) = self.cached_image_key.write() {
+            *ik = None;
+        }
+        if let Ok(mut rd) = self.cached_rope_deltas.write() {
+            *rd = None;
+        }
+    }
+
+    /// Take the KV cache from the model, returning a `PromptCache` handle.
     ///
-    /// `prompt_tokens` is the already-rendered chat-template output. `messages`
-    /// supplies the complete image history so both fresh and leased-session
-    /// preflights account for every image in template order.
+    /// The cache is moved out of the model — calling `takeCache()` twice
+    /// returns `null` the second time. Pass the cache back via `setCache()`
+    /// before the next `chatSessionStart` / `chatSessionContinue` call for
+    /// incremental prefill.
     #[napi]
-    pub async fn expanded_prompt_token_count(
+    pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::TakeCache { reply })
+            .ok()?
+    }
+
+    /// Restore a previously taken `PromptCache` into the model.
+    ///
+    /// On the next `chatSessionStart` / `chatSessionContinue` call with
+    /// `reuseCache: true`, the model will prefix-match the new tokens against
+    /// the cache and only prefill the delta.
+    #[napi]
+    pub fn set_cache(
         &self,
-        prompt_tokens: Uint32Array,
-        messages: Vec<ChatMessage>,
-    ) -> Result<u32> {
-        qwen35_expanded_prompt_token_count(
-            self.image_processor.clone(),
-            self.spatial_merge_size,
-            prompt_tokens,
-            messages,
-        )
-        .await
+        cache: &mut crate::models::qwen3_5::prompt_cache::PromptCache,
+    ) -> Result<()> {
+        // Validate before sending (these checks don't need model-thread state)
+        if cache.model_type() != "qwen3_5" {
+            return Err(Error::from_reason(format!(
+                "Cache type '{}' doesn't match model type 'qwen3_5'",
+                cache.model_type()
+            )));
+        }
+        if cache.num_layers() != self.config.num_layers as usize {
+            return Err(Error::from_reason(format!(
+                "Cache has {} layers but model has {} layers",
+                cache.num_layers(),
+                self.config.num_layers
+            )));
+        }
+        if cache.model_id() != self.model_id {
+            return Err(Error::from_reason(
+                "Cache was created by a different model instance (different checkpoint or config)",
+            ));
+        }
+        // Extract the cache data to send to model thread
+        let owned_cache = crate::models::qwen3_5::prompt_cache::PromptCache::new(
+            cache.take_caches().ok_or_else(|| {
+                Error::from_reason("PromptCache is empty (already consumed or disposed)")
+            })?,
+            cache.token_history().to_vec(),
+            "qwen3_5",
+            cache.num_layers(),
+            cache.image_cache_key(),
+            cache.rope_deltas(),
+            cache.model_id(),
+        );
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::SetCache {
+            cache: owned_cache,
+            reply,
+        })
     }
 
     /// Load a pretrained model from a directory.
@@ -9859,17 +4846,22 @@ impl Qwen3_5Model {
     /// - config.json
     /// - model.safetensors (or model-*.safetensors)
     /// - tokenizer.json + tokenizer_config.json
+    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn load(path: String) -> Result<Qwen3_5Model> {
         persistence::load_with_thread(&path).await
     }
 
     /// Generate text from a prompt token sequence.
+    ///
+    /// Runs generation on a worker thread via spawn_blocking to avoid
+    /// blocking the Node.js event loop.
+    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub async fn generate(
         &self,
         prompt_tokens: &MxArray,
-        mut config: Qwen3_5GenerationConfig,
+        config: Qwen3_5GenerationConfig,
     ) -> Result<Qwen3_5GenerationResult> {
         if config.max_new_tokens <= 0 {
             return Err(Error::from_reason(format!(
@@ -9884,22 +4876,370 @@ impl Qwen3_5Model {
                 batch_size
             )));
         }
-        let prompt_len = prompt_tokens.shape_at(1)? as u32;
-        let capacity = self.context_limits.effective_window_tokens;
-        if prompt_len > capacity {
-            return Err(Error::from_reason(format!(
-                "context_length_exceeded: prompt has {prompt_len} tokens, effective active \
-                 context is {capacity} tokens"
-            )));
-        }
-        let max_output = capacity.saturating_sub(prompt_len).saturating_add(1);
-        config.max_new_tokens = config.max_new_tokens.min(max_output as i32);
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::Generate {
             prompt_tokens: prompt_tokens.clone(),
             config,
             reply,
         })
         .await
+    }
+
+    /// Start a new chat session.
+    ///
+    /// Runs the full jinja chat template once and uses `<|im_end|>` as
+    /// its stop token so the cached KV state ends on a clean ChatML
+    /// boundary. Image support is conditional on the loaded
+    /// checkpoint: a Qwen3.5-VL dense model loaded with vision weights
+    /// accepts images in `messages` (the vision encoder handles
+    /// prefill), while a plain text Qwen3.5 checkpoint rejects them
+    /// with a runtime error. Subsequent turns in the same session MUST
+    /// go through `chatSessionContinue` so the caller appends raw
+    /// ChatML deltas on top of the live caches without rerunning the
+    /// jinja template; a mid-session image change requires a fresh
+    /// `chatSessionStart` call. The session is owned end-to-end by
+    /// the `chatSession*` surface.
+    ///
+    /// This method is the production entry point used by the TypeScript
+    /// `ChatSession` wrapper for turn 1 of a multi-round conversation.
+    #[napi]
+    pub async fn chat_session_start(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::ChatSessionStart {
+            messages,
+            config,
+            reply,
+        })
+        .await
+    }
+
+    /// Continue an existing chat session with a new user message.
+    ///
+    /// Appends a raw ChatML user/assistant delta to the session's cached
+    /// KV state, then decodes the assistant reply. Stops on `<|im_end|>`
+    /// so the cache remains on a clean boundary for the next turn.
+    ///
+    /// Requires a live session started via `chatSessionStart`. Errors
+    /// if the session is empty, carries image state, or if
+    /// `config.reuse_cache` is explicitly set to `false`.
+    ///
+    /// `images` is an opt-in guard parameter: when non-empty, the native
+    /// side returns an error whose message begins with
+    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+    /// `ChatSession` layer can catch the prefix and route image-changes
+    /// back through a fresh `chatSessionStart`.
+    #[napi(
+        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
+    )]
+    pub async fn chat_session_continue(
+        &self,
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::ChatSessionContinue {
+            user_message,
+            images,
+            config,
+            reply,
+        })
+        .await
+    }
+
+    /// Continue an existing chat session with a tool-result turn.
+    ///
+    /// Builds a ChatML `<tool_response>`-wrapped delta from `content` and
+    /// prefills it on top of the live session caches, then decodes the
+    /// assistant reply. Stops on `<|im_end|>` so the cache stays on a
+    /// clean boundary for the next turn.
+    ///
+    /// The `tool_call_id` is currently dropped by the wire format —
+    /// Qwen3.5's chat template identifies tool responses by position +
+    /// wrapper tags, not an explicit id. Callers may still log it for
+    /// their own bookkeeping.
+    ///
+    /// Requires a live session started via `chatSessionStart`.
+    #[napi]
+    pub async fn chat_session_continue_tool(
+        &self,
+        tool_call_id: String,
+        content: String,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35Cmd::ChatSessionContinueTool {
+                tool_call_id,
+                content,
+                config,
+                reply,
+            }
+        })
+        .await
+    }
+
+    /// Streaming variant of `chatSessionStart`.
+    ///
+    /// Dispatches to the dedicated model thread. Behaviourally identical
+    /// to `chatSessionStart` (resets caches, uses `<|im_end|>` as
+    /// eos, inherits the same VLM-vs-text image-support contract) but
+    /// streams token deltas through the JS callback instead of
+    /// returning a `ChatResult`. Used by the TypeScript
+    /// `ChatSession.sendStream()` for turn 1 of a multi-round streaming
+    /// conversation.
+    #[napi(
+        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream_session_start(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        self.thread.send(Qwen35Cmd::ChatStreamSessionStart {
+            messages,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+
+        let callback = Arc::new(callback);
+        tokio::spawn(async move {
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
+    }
+
+    /// Streaming variant of `chatSessionContinue`.
+    ///
+    /// Appends a ChatML user/assistant delta on top of the live session
+    /// caches and streams the decoded reply. Requires a live session
+    /// started via `chatStreamSessionStart` (or the non-streaming
+    /// `chatSessionStart`). Used by the TypeScript
+    /// `ChatSession.sendStream()` for turns 2..N of a multi-round
+    /// streaming conversation.
+    ///
+    /// `images` is an opt-in guard parameter: when non-empty, the
+    /// streaming path emits an error chunk whose message begins with
+    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+    /// `ChatSession` layer can route image-changes through a fresh
+    /// session start.
+    #[napi(
+        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream_session_continue(
+        &self,
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        self.thread.send(Qwen35Cmd::ChatStreamSessionContinue {
+            user_message,
+            images,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+
+        let callback = Arc::new(callback);
+        tokio::spawn(async move {
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
+    }
+
+    /// Streaming variant of `chatSessionContinueTool`.
+    ///
+    /// Builds a ChatML tool-response delta on top of the live session
+    /// caches and streams the decoded reply. Requires a live session
+    /// started via `chatSessionStart` / `chatStreamSessionStart`.
+    #[napi(
+        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream_session_continue_tool(
+        &self,
+        tool_call_id: String,
+        content: String,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        self.thread.send(Qwen35Cmd::ChatStreamSessionContinueTool {
+            tool_call_id,
+            content,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+
+        let callback = Arc::new(callback);
+        tokio::spawn(async move {
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
     }
 
     // ---------------------------------------------------------------
@@ -9929,13 +5269,12 @@ impl Qwen3_5Model {
         let cancelled_inner = cancelled.clone();
         let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread
-            .send(Qwen35Cmd::Chat(ChatCmd::StreamSessionStart {
-                messages,
-                config,
-                stream_tx,
-                cancelled: cancelled_inner,
-            }))?;
+        self.thread.send(Qwen35Cmd::ChatStreamSessionStart {
+            messages,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
         Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 
@@ -9956,53 +5295,42 @@ impl Qwen3_5Model {
         let cancelled_inner = cancelled.clone();
         let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread
-            .send(Qwen35Cmd::Chat(ChatCmd::StreamSessionContinue {
-                user_message,
-                images,
-                audio: None,
-                config,
-                stream_tx,
-                cancelled: cancelled_inner,
-            }))?;
+        self.thread.send(Qwen35Cmd::ChatStreamSessionContinue {
+            user_message,
+            images,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
         Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 
-    /// Test-only snapshot of the flat-MTP cache state, read *between* turns:
-    /// `(committed_history_len, flat_mtp_caches_desynced,
-    /// full_reprefill_count, rollback_unemitted)`.
-    ///
-    /// `committed_history_len` is `cached_token_history.len()` — the prompt plus
-    /// the committed generation of every completed turn — i.e. exactly how many
-    /// tokens a turn committed. Unlike `ChatStreamChunk.prompt_tokens` (hardcoded
-    /// to the delta length on the streaming delta path, heal or warm), it is
-    /// path-independent and comparable across MTP and AR turns.
-    /// `flat_mtp_caches_desynced` reports whether the preceding turn stranded
-    /// tokens mid-cycle and armed the heal. `full_reprefill_count` is the
-    /// monotonic number of discard+re-prefill heals the streaming delta path has
-    /// taken. `rollback_unemitted` is the independently engine-computed accepted
-    /// tail sent to the family rollback hook, so a positive value must agree with
-    /// the desync flag on flat MTP. Serialized behind the model thread, so it
-    /// observes the fully-finalized preceding turn.
+    /// Test-only entry point that dispatches
+    /// `ChatStreamSessionContinueTool` and returns the raw mpsc
+    /// receiver the model thread writes into.
     #[doc(hidden)]
-    pub async fn mtp_flat_state_for_test(&self) -> (usize, bool, u64, usize) {
-        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::MtpFlatStateForTest {
-            reply,
-        })
-        .await
-        .expect("mtp_flat_state_for_test: model thread reply failed")
-    }
-
-    /// Test-only: arm the flat-MTP desync heal so the NEXT delta turn takes the
-    /// discard+re-prefill path. Lets a test exercise the heal deterministically
-    /// (the mid-cycle cancel that naturally arms it is host-timing-dependent).
-    #[doc(hidden)]
-    pub async fn force_flat_mtp_desync_for_test(&self) {
-        crate::model_thread::send_and_await(&self.thread, |reply| {
-            Qwen35Cmd::ForceFlatMtpDesyncForTest { reply }
-        })
-        .await
-        .expect("force_flat_mtp_desync_for_test: model thread reply failed")
+    pub fn chat_stream_session_continue_tool_for_test(
+        &self,
+        tool_call_id: String,
+        content: String,
+        config: Option<ChatConfig>,
+    ) -> Result<(
+        ChatStreamHandle,
+        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+    )> {
+        let config = config.unwrap_or_default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        self.thread.send(Qwen35Cmd::ChatStreamSessionContinueTool {
+            tool_call_id,
+            content,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+        Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 
     /// Get the number of parameters in the model.
@@ -10048,7 +5376,14 @@ impl Qwen3_5Model {
 
     /// Save the model weights and configuration to a directory.
     ///
-    /// Dispatches to model thread.
+    /// This saves:
+    /// - config.json: Model configuration (with model_type for detectModelType)
+    /// - weights.safetensors: Full model weights in SafeTensors format
+    /// - weights.mlx: Parameter metadata (for reference)
+    ///
+    /// # Arguments
+    /// * `save_path` - Directory to save the model
+    #[cfg(not(target_family = "wasm"))]
     #[napi]
     pub fn save_model<'env>(
         &self,
@@ -10068,97 +5403,19 @@ impl Qwen3_5Model {
     }
 }
 
-/// Shared dense/MoE NAPI implementation for exact, non-mutating image prompt
-/// planning. Inputs are copied before entering the blocking worker so no JS
-/// backing-store references cross threads.
-pub(crate) async fn qwen35_expanded_prompt_token_count(
-    image_processor: Option<Arc<Qwen35VLImageProcessor>>,
-    spatial_merge_size: i32,
-    prompt_tokens: Uint32Array,
-    messages: Vec<ChatMessage>,
-) -> Result<u32> {
-    let tokens = prompt_tokens.to_vec();
-    let images = extract_images_from_messages(&messages);
-    if images.is_empty() {
-        return u32::try_from(tokens.len())
-            .map_err(|_| Error::from_reason("rendered prompt token count exceeds u32"));
-    }
-    let image_processor = image_processor.ok_or_else(|| {
-        Error::from_reason(
-            "cannot plan expanded image tokens: Qwen3.5 image processor is not loaded",
-        )
-    })?;
-
-    napi::bindgen_prelude::spawn_blocking(move || {
-        let prompt_len =
-            plan_expanded_image_prompt_len(&image_processor, spatial_merge_size, &tokens, &images)?;
-        u32::try_from(prompt_len)
-            .map_err(|_| Error::from_reason("expanded prompt token count exceeds u32"))
-    })
-    .await
-    .map_err(|join_error| {
-        Error::new(
-            Status::GenericFailure,
-            format!("Expanded prompt planning worker failed: {join_error}"),
-        )
-    })?
-}
-
-impl Qwen3_5Model {
-    /// Test-only deterministic teardown for memory-constrained real-weight
-    /// integration tests. Requires exclusive command-sender ownership and
-    /// leaves production NAPI drops non-blocking.
-    #[doc(hidden)]
-    pub fn shutdown_for_test(mut self) -> std::result::Result<(), String> {
-        self.thread.shutdown_and_join()
-    }
-}
-
-crate::models::chat_napi::chat_napi_surface! {
-    class: Qwen3_5Model,
-    thread_cmd: Qwen35Cmd,
-    thread: direct,
-    image_guard: none,
-    ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue_tool: "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined",
-}
-
 /// Default prefill chunk size (tokens per chunk).
 /// Matches Python mlx-lm's `prefill_step_size` default of 2048.
-///
-/// E55: bumped 1024 → 2048 after benching against mlx-lm at 20k prompt:
-/// chunk=1024 incurred 20 chunk boundaries vs mlx-lm's 10 (mlx-lm uses
-/// 2048 by default); the doubled per-chunk overhead cost ~14% at 20k.
-/// At 1024-prompt single-chunk the value is irrelevant — the loop is
-/// guarded by `total_len - offset > PREFILL_STEP_SIZE` so any T < step
-/// goes through the single `remaining` branch unchanged.
 const PREFILL_STEP_SIZE: i64 = 2048;
 
 /// Evaluate all cache arrays across all layers to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
-pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Result<()> {
+pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) {
     if let Some(caches) = caches {
         let mut arrays: Vec<&MxArray> = Vec::new();
         for cache in caches.iter() {
             cache.collect_arrays(&mut arrays);
         }
-        MxArray::eval_arrays(&arrays)?;
-    }
-    Ok(())
-}
-
-/// Async variant of `eval_layer_caches`: kicks GPU on cache materialization
-/// but does NOT block the CPU. Used between prefill chunks so the CPU can
-/// start building the next chunk's graph while the previous chunk's cache
-/// writes are still in flight.
-pub(crate) fn async_eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) {
-    if let Some(caches) = caches {
-        let mut arrays: Vec<&MxArray> = Vec::new();
-        for cache in caches.iter() {
-            cache.collect_arrays(&mut arrays);
-        }
-        MxArray::async_eval_arrays(&arrays);
+        MxArray::eval_arrays(&arrays);
     }
 }
 
@@ -10173,444 +5430,808 @@ fn chunked_prefill(
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
+    lm_head: &Option<Linear>,
     embedding_weight_t: Option<&MxArray>,
     generation_stream: crate::stream::Stream,
-) -> Result<MxArray> {
-    chunked_prefill_with_size(
-        prompt,
-        embedding_weight,
-        layers,
-        caches,
-        final_norm,
-        lm_head,
-        embedding_weight_t,
-        generation_stream,
-        PREFILL_STEP_SIZE,
-    )
-}
-
-fn chunked_prefill_with_size(
-    prompt: &MxArray,
-    embedding_weight: &MxArray,
-    layers: &mut [DecoderLayer],
-    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
-    embedding_weight_t: Option<&MxArray>,
-    generation_stream: crate::stream::Stream,
-    chunk_size: i64,
 ) -> Result<MxArray> {
     let total_len = prompt.shape_at(1)?;
-    if total_len <= 0 {
-        return Err(Error::from_reason("chunked_prefill: empty prompt"));
-    }
-    let chunk_size = if chunk_size <= 0 {
-        total_len
-    } else {
-        chunk_size
-    };
     let mut offset: i64 = 0;
 
-    // E28: env-var toggle for A/B. Default: async between chunks. When set,
-    // falls back to synchronous eval_layer_caches (the prior behavior).
-    let chunk_async = std::env::var("MLX_PREFILL_SYNC_BETWEEN_CHUNKS").is_err();
-    while total_len - offset > chunk_size {
-        let chunk = prompt.slice_axis(1, offset, offset + chunk_size)?;
+    while total_len - offset > PREFILL_STEP_SIZE {
+        let chunk = prompt.slice_axis(1, offset, offset + PREFILL_STEP_SIZE)?;
         {
             let _stream_ctx = StreamContext::new(generation_stream);
-            let _hidden = forward_pre_norm_inner(&chunk, embedding_weight, layers, caches)?;
+            let _logits = forward_inner(
+                &chunk,
+                embedding_weight,
+                layers,
+                caches,
+                final_norm,
+                lm_head,
+                embedding_weight_t,
+            )?;
         }
-        if chunk_async {
-            async_eval_layer_caches(caches);
-        } else {
-            eval_layer_caches(caches)?;
-        }
+        eval_layer_caches(caches);
         crate::array::clear_cache();
-        offset += chunk_size;
+        offset += PREFILL_STEP_SIZE;
     }
 
     let remaining = prompt.slice_axis(1, offset, total_len)?;
-    let last_logits = {
+    let logits = {
         let _stream_ctx = StreamContext::new(generation_stream);
-        let hidden = forward_pre_norm_inner(&remaining, embedding_weight, layers, caches)?;
-        project_last_logits_from_pre_norm_hidden(
-            &hidden,
+        forward_inner(
+            &remaining,
+            embedding_weight,
+            layers,
+            caches,
             final_norm,
             lm_head,
-            embedding_weight,
             embedding_weight_t,
         )?
     };
-    Ok(last_logits)
-}
-
-/// `chunked_prefill` variant that ALSO returns the post-final-norm hidden
-/// state for the prompt tail needed by MTP, concatenated along the time axis
-/// -> `[1, kept_len, hidden]`.
-///
-/// Used only when MTP is active for the turn: the prompt hiddens flow
-/// through `ChatDecodeInputs::prompt_hidden` into `begin_mtp_decode`'s
-/// prompt-prefix seed, which commits the prompt prefix into the MTP
-/// committed-history caches. Logits-only callers keep the cheaper
-/// `chunked_prefill`. The per-chunk forward op sequence is identical for
-/// chunks whose hidden is kept; chunks before the requested tail use the
-/// logits-only path and discard hidden to avoid materializing prompt history
-/// MTPLX would not seed.
-fn chunked_prefill_with_hidden(
-    prompt: &MxArray,
-    embedding_weight: &MxArray,
-    layers: &mut [DecoderLayer],
-    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
-    embedding_weight_t: Option<&MxArray>,
-    generation_stream: crate::stream::Stream,
-    keep_last_hidden: Option<usize>,
-) -> Result<(MxArray, MxArray)> {
-    chunked_prefill_with_hidden_with_size(
-        prompt,
-        embedding_weight,
-        layers,
-        caches,
-        final_norm,
-        lm_head,
-        embedding_weight_t,
-        generation_stream,
-        keep_last_hidden,
-        PREFILL_STEP_SIZE,
-    )
-}
-
-fn chunked_prefill_with_hidden_with_size(
-    prompt: &MxArray,
-    embedding_weight: &MxArray,
-    layers: &mut [DecoderLayer],
-    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
-    embedding_weight_t: Option<&MxArray>,
-    generation_stream: crate::stream::Stream,
-    keep_last_hidden: Option<usize>,
-    chunk_size: i64,
-) -> Result<(MxArray, MxArray)> {
-    let total_len = prompt.shape_at(1)?;
-    if total_len <= 0 {
-        return Err(Error::from_reason(
-            "chunked_prefill_with_hidden: empty prompt",
-        ));
-    }
-    let chunk_size = if chunk_size <= 0 {
-        total_len
-    } else {
-        chunk_size
-    };
-    let mut offset: i64 = 0;
-    let mut hidden_chunks: Vec<MxArray> = Vec::new();
-    let keep_start = keep_last_hidden
-        .map(|keep| total_len.saturating_sub(keep.max(1) as i64))
-        .unwrap_or(0);
-
-    while total_len - offset > chunk_size {
-        let end = offset + chunk_size;
-        let chunk = prompt.slice_axis(1, offset, end)?;
-        let overlaps_kept_tail = end > keep_start;
-        let kept_hidden = if overlaps_kept_tail {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            let hidden = forward_pre_norm_inner(&chunk, embedding_weight, layers, caches)?;
-            let keep_from = keep_start.max(offset);
-            let hidden = if keep_from > offset {
-                hidden.slice_axis(1, keep_from - offset, end - offset)?
-            } else {
-                hidden
-            };
-            Some(final_norm.forward(&hidden)?)
-        } else {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            let _hidden = forward_pre_norm_inner(&chunk, embedding_weight, layers, caches)?;
-            None
-        };
-        eval_layer_caches(caches)?;
-        if let Some(kept_hidden) = kept_hidden {
-            // Materialize the kept hidden before clearing the MLX cache — it
-            // is a lazy handle referencing graph nodes that `clear_cache`
-            // would otherwise free.
-            kept_hidden.eval();
-            hidden_chunks.push(kept_hidden);
-        }
-        crate::array::clear_cache();
-        offset = end;
-    }
-
-    let remaining = prompt.slice_axis(1, offset, total_len)?;
-    let (last_logits, last_hidden) = {
-        let _stream_ctx = StreamContext::new(generation_stream);
-        let hidden = forward_pre_norm_inner(&remaining, embedding_weight, layers, caches)?;
-        let logits = project_last_logits_from_pre_norm_hidden(
-            &hidden,
-            final_norm,
-            lm_head,
-            embedding_weight,
-            embedding_weight_t,
-        )?;
-        let keep_from = keep_start.max(offset);
-        let hidden = if keep_from > offset {
-            hidden.slice_axis(1, keep_from - offset, total_len - offset)?
-        } else {
-            hidden
-        };
-        (logits, final_norm.forward(&hidden)?)
-    };
-    hidden_chunks.push(last_hidden);
-
-    // Concatenate every kept `[1, chunk, hidden]` along axis 1 →
-    // `[1, kept_len, hidden]`.
-    let prompt_hidden = if hidden_chunks.len() == 1 {
-        hidden_chunks
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::from_reason("chunked_prefill_with_hidden: empty hidden chunks"))?
-    } else {
-        let mut acc = hidden_chunks[0].clone();
-        for chunk in &hidden_chunks[1..] {
-            acc = MxArray::concatenate(&acc, chunk, 1)?;
-        }
-        acc
-    };
-    Ok((last_logits, prompt_hidden))
+    Ok(logits)
 }
 
 /// Lock-free forward pass through all layers.
 /// Attention layer handles causal masking internally via "causal" SDPA mode.
-/// Format an `MxArray`'s shape for logging. Returns `[d0, d1, ...]`
-/// or `"<unavailable>"` if `ndim()` fails.
-fn shape_dbg(arr: &MxArray) -> String {
-    let ndim = match arr.ndim() {
-        Ok(n) => n,
-        Err(_) => return "<unavailable>".to_string(),
-    };
-    let mut dims: Vec<i64> = Vec::with_capacity(ndim as usize);
-    for axis in 0..ndim {
-        match arr.shape_at(axis) {
-            Ok(d) => dims.push(d),
-            Err(_) => return "<unavailable>".to_string(),
-        }
-    }
-    format!("{:?}", dims)
-}
-
 fn forward_inner(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
+    lm_head: &Option<Linear>,
     embedding_weight_t: Option<&MxArray>,
-) -> Result<MxArray> {
-    let hidden = forward_pre_norm_inner(input_ids, embedding_weight, layers, caches)?;
-    let hidden = final_norm.forward(&hidden)?;
-    project_logits_from_hidden(&hidden, lm_head, embedding_weight, embedding_weight_t)
-}
-
-fn forward_pre_norm_inner(
-    input_ids: &MxArray,
-    embedding_weight: &MxArray,
-    layers: &mut [DecoderLayer],
-    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
 ) -> Result<MxArray> {
     let embedding = Embedding::from_weight(embedding_weight)?;
     let hidden_states = embedding.forward(input_ids)?;
     let mut h = hidden_states.clone();
 
-    debug!(
-        "Qwen3.5 forward_inner: input_ids_shape={} post_embed_shape={}",
-        shape_dbg(input_ids),
-        shape_dbg(&h),
-    );
-
     let num_layers = layers.len();
-    // Plain layer loop. In-loop async_eval was tested (every 8 layers,
-    // including h + all cache arrays) and found neutral-to-negative at
-    // single-chunk prefill on M3 (back-to-back A/B in the same binary
-    // showed deltas inside the run-to-run noise band). The CPU/GPU
-    // overlap benefit only materializes across the inter-chunk barrier
-    // in chunked_prefill, which now uses async_eval_layer_caches.
-    //
-    // This is the SHARED pre-norm primitive: it MUST return the full
-    // per-position hidden. The MTP prompt-hidden path
-    // (`chunked_prefill_with_hidden_with_size`) keeps the result and
-    // re-slices it by chunk length, so a last-token slice here would
-    // corrupt it. The logits-only callers get the equivalent of the
-    // upstream E37 last-token optimization from
-    // `project_last_logits_from_pre_norm_hidden` (which slices before
-    // `final_norm` + `lm_head`), so the slice deliberately does NOT
-    // live in this loop.
     for i in 0..num_layers {
         let cache = caches.as_mut().map(|c| &mut c[i]);
         h = layers[i].forward(&h, None, cache, None, true)?;
-        if i == 0 || i + 1 == num_layers {
-            debug!(
-                "Qwen3.5 forward_inner: post_layer[{}/{}] shape={}",
-                i,
-                num_layers,
-                shape_dbg(&h),
-            );
-        }
     }
 
-    Ok(h)
-}
-
-/// Tape-recording variant of [`forward_pre_norm_inner`] for the eager MTP
-/// verify forward.
-///
-/// Identical to `forward_pre_norm_inner` except it records a per-layer
-/// [`GdnLayerTape`] for every GDN (`Linear`) layer into `tape`, indexed by
-/// ABSOLUTE layer index (`tape[i]` is `Some` for GDN layers, stays `None` for
-/// full-attention layers). `tape` is pre-sized to `layers.len()` by the caller.
-/// Recording is by lazy `.clone()` (no eval), so it stays inside the fused MLX
-/// graph that `eval_step`/`async_eval_layer_caches` materializes.
-fn forward_pre_norm_inner_with_tape(
-    input_ids: &MxArray,
-    embedding_weight: &MxArray,
-    layers: &mut [DecoderLayer],
-    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
-    tape: &mut [Option<super::gated_delta_net::GdnLayerTape>],
-) -> Result<MxArray> {
-    let embedding = Embedding::from_weight(embedding_weight)?;
-    let hidden_states = embedding.forward(input_ids)?;
-    let mut h = hidden_states.clone();
-
-    let num_layers = layers.len();
-    debug_assert_eq!(
-        tape.len(),
-        num_layers,
-        "forward_pre_norm_inner_with_tape: tape length must equal layer count"
-    );
-    for i in 0..num_layers {
-        let cache = caches.as_mut().map(|c| &mut c[i]);
-        let mut slot: Option<super::gated_delta_net::GdnLayerTape> = None;
-        h = layers[i].forward_with_tape(&h, None, cache, None, true, Some(&mut slot))?;
-        tape[i] = slot;
-    }
-
-    Ok(h)
-}
-
-fn project_logits_from_hidden(
-    hidden: &MxArray,
-    lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
-    embedding_weight_t: Option<&MxArray>,
-) -> Result<MxArray> {
+    let h = final_norm.forward(&h)?;
     match lm_head {
-        Some(head) => head.forward(hidden),
+        Some(head) => head.forward(&h),
         None => match embedding_weight_t {
-            Some(wt) => hidden.matmul(wt),
+            Some(wt) => h.matmul(wt),
             None => {
                 let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-                hidden.matmul(&wt)
+                h.matmul(&wt)
             }
         },
     }
 }
 
-/// Eager (pure-Rust) MTP verify step.
+/// Compiled single-token decode step using mlx::core::compile().
 ///
-/// Translation of the deleted compiled `forward_mtp_verify_compiled_with_hidden`
-/// FFI: runs the `verify_ids` (`[1, K+1]` int32) through the SAME main-model
-/// stack the AR path uses (`forward_pre_norm_inner` + `final_norm` +
-/// `project_logits_from_hidden`), advancing `inner.caches` by `K+1` positions.
+/// On the first call, MLX traces the 64-layer forward pass and caches the graph.
+/// All subsequent calls reuse the cached graph via compile_replace — no re-tracing.
+/// This eliminates per-step graph reconstruction overhead (~5358 nodes).
 ///
-/// Returns `MtpVerifyOutput::logits_only(logits, hiddens)` where:
-///   * `logits` is `[1, K+1, vocab]` (the verifier target distribution at
-///     every verify position),
-///   * `hiddens` is `[1, K+1, hidden]` — the post-final-norm hidden at every
-///     verify position (the chained-seed and commit context).
+/// State is held in C++ globals (g_compiled_caches, g_compiled_offset).
+/// Must call `mlx_qwen35_compiled_init_from_prefill` before the decode loop.
+fn forward_compiled(input_ids: &MxArray, embedding_weight: &MxArray) -> Result<MxArray> {
+    use mlx_sys as sys;
+
+    let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_qwen35_forward_compiled(
+            input_ids.as_raw_ptr(),
+            embedding_weight.as_raw_ptr(),
+            &mut output_ptr,
+            std::ptr::null_mut(),
+        );
+    }
+
+    if output_ptr.is_null() {
+        return Err(Error::from_reason(
+            "C++ compiled forward step returned null — check stderr for exception details",
+        ));
+    }
+
+    MxArray::from_handle(output_ptr, "compiled_forward_logits")
+}
+
+/// Evaluate next_token and all compiled cache arrays to prevent graph accumulation.
 ///
-/// `emb` is the embedding table; `emb_t` is its precomputed transpose for the
-/// tied-embedding projection (passed straight through to
-/// `project_logits_from_hidden`).
-#[allow(clippy::too_many_arguments)]
-fn eager_verify_step(
-    layers: &mut [DecoderLayer],
-    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
-    verify_ids: &MxArray,
-    emb: &MxArray,
-    emb_t: Option<&MxArray>,
-    tape: Option<&mut Vec<Option<super::gated_delta_net::GdnLayerTape>>>,
-) -> Result<mtp_decode::MtpVerifyOutput> {
-    let pre = match tape {
-        Some(tape) => {
-            // Record a per-layer GDN tape during the verify forward so the
-            // rollback replay can reconstruct the AR-exact carried state.
-            tape.clear();
-            tape.resize(layers.len(), None);
-            forward_pre_norm_inner_with_tape(verify_ids, emb, layers, caches, tape)?
+/// Called after each compiled decode step. mlx::core::compile reuses the graph
+/// structure across steps, but we still need to eval to materialize output arrays
+/// and break lazy dependency chains (preventing O(N²) graph growth).
+fn eval_token_and_compiled_caches(next_token: &MxArray) {
+    unsafe {
+        mlx_sys::mlx_qwen35_eval_token_and_compiled_caches(next_token.as_raw_ptr());
+    }
+}
+
+/// Evaluate the sampled token AND all cache arrays together in a single async_eval call.
+///
+/// This is the key fix for performance: without evaluating the cache arrays, they remain
+/// as lazy computation nodes. Each decode step's graph then includes the entire lazy chain
+/// from all previous steps (O(N^2) graph growth), causing GPU execution time to grow
+/// linearly with the number of decode steps.
+///
+/// By evaluating cache arrays here (alongside next_token), MLX materializes them and
+/// breaks the dependency chain (via arr.detach() internally). The next step then starts
+/// with a clean graph bounded to exactly one decode step.
+///
+/// This matches Python mlx-lm's behavior: async_eval(y, logprobs) evaluates y (the token)
+/// whose graph transitively causes all cache state INPUTS to be detached/materialized.
+// Internal methods (not NAPI-exported)
+impl Qwen3_5Model {
+    /// Forward pass from embeddings through all layers (internal, acquires locks).
+    fn forward_from_embeddings(&self, hidden_states: &MxArray) -> Result<MxArray> {
+        let mut h = hidden_states.clone();
+
+        // Acquire write locks for layers and caches (forward mutates caches)
+        let mut layers_guard = self
+            .layers
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+
+        // Forward through layers — attention handles causal masking internally
+        let num_layers = layers_guard.len();
+        for i in 0..num_layers {
+            let cache = caches_guard.as_mut().map(|c| &mut c[i]);
+            h = layers_guard[i].forward(&h, None, cache, None, true)?;
         }
-        None => forward_pre_norm_inner(verify_ids, emb, layers, caches)?,
-    };
-    let hiddens = final_norm.forward(&pre)?;
-    let logits = project_logits_from_hidden(&hiddens, lm_head, emb, emb_t)?;
-    Ok(mtp_decode::MtpVerifyOutput::logits_only(logits, hiddens))
+
+        drop(layers_guard);
+        drop(caches_guard);
+
+        let final_norm_guard = self
+            .final_norm
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
+        let h = final_norm_guard.forward(&h)?;
+        drop(final_norm_guard);
+
+        // LM head
+        let lm_head_guard = self
+            .lm_head
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+        match &*lm_head_guard {
+            Some(head) => head.forward(&h),
+            None => {
+                // tie_word_embeddings: use embedding weight as linear
+                let weight = self.embedding.get_weight();
+                let weight_t = weight.transpose(Some(&[1, 0]))?;
+                h.matmul(&weight_t)
+            }
+        }
+    }
+
+    /// Forward pass from pre-computed embeddings with M-RoPE position IDs (VLM mode).
+    ///
+    /// Used by `Qwen3_5VLModel` to inject vision features into the text stream.
+    pub fn forward_from_embeddings_with_positions(
+        &self,
+        hidden_states: &MxArray,
+        position_ids: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let mut h = hidden_states.clone();
+
+        let mut layers_guard = self
+            .layers
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+
+        let num_layers = layers_guard.len();
+        for i in 0..num_layers {
+            let cache = caches_guard.as_mut().map(|c| &mut c[i]);
+            let layer_pos = if layers_guard[i].is_linear() {
+                None
+            } else {
+                position_ids
+            };
+            h = layers_guard[i].forward(&h, None, cache, layer_pos, true)?;
+        }
+
+        drop(layers_guard);
+        drop(caches_guard);
+
+        let final_norm_guard = self
+            .final_norm
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
+        let h = final_norm_guard.forward(&h)?;
+        drop(final_norm_guard);
+
+        let lm_head_guard = self
+            .lm_head
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+        match &*lm_head_guard {
+            Some(head) => head.forward(&h),
+            None => {
+                let weight = self.embedding.get_weight();
+                let weight_t = weight.transpose(Some(&[1, 0]))?;
+                h.matmul(&weight_t)
+            }
+        }
+    }
+
+    /// Get embeddings for input IDs (used by VLModel).
+    pub fn get_embeddings(&self, input_ids: &MxArray) -> Result<MxArray> {
+        self.embedding.forward(input_ids)
+    }
+
+    /// Set the vision encoder (wraps in Arc).
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) {
+        self.vision_encoder = Some(Arc::new(enc));
+    }
+
+    /// Set the image processor.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn set_image_processor(&mut self, proc: Qwen35VLImageProcessor) {
+        self.image_processor = Some(Arc::new(proc));
+    }
+
+    /// Set the spatial merge size.
+    pub(crate) fn set_spatial_merge_size(&mut self, size: i32) {
+        self.spatial_merge_size = Some(size);
+    }
+
+    /// Initialize M-RoPE on all full attention layers (VLM mode).
+    pub fn init_mrope_layers(
+        &self,
+        mrope_section: Vec<i32>,
+        rope_theta: f64,
+        max_position_embeddings: i32,
+    ) -> Result<()> {
+        let rope_dims = self.config.rope_dims();
+        let mut layers_guard = self
+            .layers
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+        for layer in layers_guard.iter_mut() {
+            if let super::decoder_layer::AttentionType::Full(ref mut attn) = layer.attn {
+                attn.init_mrope(
+                    mrope_section.clone(),
+                    rope_theta,
+                    max_position_embeddings,
+                    rope_dims,
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
-fn project_last_logits_from_pre_norm_hidden(
-    hidden: &MxArray,
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
-    embedding_weight_t: Option<&MxArray>,
-) -> Result<MxArray> {
-    let seq_len = hidden.shape_at(1)?;
-    let last_hidden = hidden.slice_axis(1, seq_len - 1, seq_len)?;
-    let last_hidden = final_norm.forward(&last_hidden)?;
-    let logits =
-        project_logits_from_hidden(&last_hidden, lm_head, embedding_weight, embedding_weight_t)?;
-    logits.squeeze(Some(&[1]))
-}
+// ========== Training Support Methods ==========
+// These methods are Rust-internal only (not exposed via NAPI).
+// They implement the TrainableModel trait interface.
 
-/// Partition `total` committed tokens into chunk sizes all within the
-/// commit graph's `M in [1, 7]` window.
-///
-/// Strategy: greedily take size-6 chunks. The final remainder `r` is
-/// `total % 6`:
-///   - `r == 0`           → all chunks are size 6.
-///   - `r >= 2`           → append one chunk of size `r`.
-///   - `r == 1`           -> append one chunk of size 1.
-///
-/// Precondition: `total >= 1`. For `total in {1..7}` the single chunk is
-/// `total` itself.
-///
-/// `pub(crate)`: also used by `MoeMtpStepper::begin_mtp_decode`'s
-/// committed-history v2 prompt-prefix seed
-/// (`crate::models::qwen3_5_moe::model`), which mirrors this dense chunking.
-pub(crate) fn partition_prefill_chunks(total: usize) -> Vec<usize> {
-    debug_assert!(total >= 1, "partition_prefill_chunks: total must be >= 1");
-    const CHUNK: usize = 6;
-    if total == 1 {
-        return vec![1];
+impl Qwen3_5Model {
+    /// Get model configuration.
+    pub(crate) fn get_config(&self) -> Qwen3_5Config {
+        self.config.clone()
     }
-    if total <= 7 {
-        // A single chunk in [1, 7] covers it directly.
-        return vec![total];
+
+    /// Create a cheap clone for training sessions.
+    /// Arc-clones all shared components, no deep copy.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn clone_for_training(&self) -> Result<Self> {
+        Ok(Self {
+            config: self.config.clone(),
+            embedding: Embedding::from_weight(&self.embedding.get_weight())?,
+            layers: Arc::clone(&self.layers),
+            final_norm: Arc::clone(&self.final_norm),
+            lm_head: Arc::clone(&self.lm_head),
+            caches: Arc::new(RwLock::new(None)), // Fresh empty caches
+            tokenizer: self.tokenizer.clone(),
+            fa_idx: self.fa_idx,
+            vision_encoder: None, // Not needed for training
+            image_processor: None,
+            spatial_merge_size: None,
+            vision_cache: Arc::new(Mutex::new(VisionCacheInner {
+                entries: HashMap::new(),
+                generation: 0,
+            })),
+            cached_token_history: Arc::new(RwLock::new(Vec::new())),
+            cached_image_key: Arc::new(RwLock::new(None)),
+            cached_rope_deltas: Arc::new(RwLock::new(None)),
+            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            generation_lock: Arc::new(TokioMutex::new(())),
+        })
     }
-    let mut chunks: Vec<usize> = Vec::new();
-    let mut remaining = total;
-    while remaining > 7 {
-        chunks.push(CHUNK);
-        remaining -= CHUNK;
+
+    /// Extract all trainable parameters as a name→array map.
+    ///
+    /// Parameter naming convention matches HuggingFace format:
+    /// - `embedding.weight`
+    /// - Linear attention layers: `layers.{i}.linear_attn.{in_proj_qkvz,in_proj_ba,conv1d,norm,out_proj}.weight`
+    /// - Linear attention learnable: `layers.{i}.linear_attn.{a_log,dt_bias}`
+    /// - Full attention layers: `layers.{i}.self_attn.{q_proj,k_proj,v_proj,o_proj}.weight`
+    /// - Full attention norms: `layers.{i}.self_attn.{q_norm,k_norm}.weight`
+    /// - All layers: `layers.{i}.mlp.{gate_proj,up_proj,down_proj}.weight`
+    /// - All layers: `layers.{i}.{input_layernorm,post_attention_layernorm}.weight`
+    /// - `final_norm.weight`
+    /// - `lm_head.weight` (if not tied)
+    pub(crate) fn get_parameters_for_training(&self) -> Result<HashMap<String, MxArray>> {
+        use super::decoder_layer::AttentionType;
+
+        let mut params = HashMap::new();
+
+        let layers_guard = self
+            .layers
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire layers read lock"))?;
+        let final_norm_guard = self
+            .final_norm
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
+        let lm_head_guard = self
+            .lm_head
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+
+        // Embedding
+        params.insert("embedding.weight".to_string(), self.embedding.get_weight());
+
+        // Transformer layers
+        for (i, layer) in layers_guard.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+
+            match &layer.attn {
+                AttentionType::Linear(gdn) => {
+                    params.insert(
+                        format!("{}.linear_attn.in_proj_qkvz.weight", prefix),
+                        gdn.get_in_proj_qkvz_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.in_proj_ba.weight", prefix),
+                        gdn.get_in_proj_ba_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.conv1d.weight", prefix),
+                        gdn.get_conv1d_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.norm.weight", prefix),
+                        gdn.get_norm_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.out_proj.weight", prefix),
+                        gdn.get_out_proj_weight(),
+                    );
+                    params.insert(format!("{}.linear_attn.dt_bias", prefix), gdn.get_dt_bias());
+                    params.insert(format!("{}.linear_attn.a_log", prefix), gdn.get_a_log());
+                }
+                AttentionType::Full(attn) => {
+                    params.insert(
+                        format!("{}.self_attn.q_proj.weight", prefix),
+                        attn.get_q_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.k_proj.weight", prefix),
+                        attn.get_k_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.v_proj.weight", prefix),
+                        attn.get_v_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.o_proj.weight", prefix),
+                        attn.get_o_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.q_norm.weight", prefix),
+                        attn.get_q_norm_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.k_norm.weight", prefix),
+                        attn.get_k_norm_weight(),
+                    );
+                }
+            }
+
+            // MLP (all layers have dense MLP)
+            params.insert(
+                format!("{}.mlp.gate_proj.weight", prefix),
+                layer.mlp.get_gate_proj_weight(),
+            );
+            params.insert(
+                format!("{}.mlp.up_proj.weight", prefix),
+                layer.mlp.get_up_proj_weight(),
+            );
+            params.insert(
+                format!("{}.mlp.down_proj.weight", prefix),
+                layer.mlp.get_down_proj_weight(),
+            );
+
+            // Layer norms
+            params.insert(
+                format!("{}.input_layernorm.weight", prefix),
+                layer.get_input_layernorm_weight(),
+            );
+            params.insert(
+                format!("{}.post_attention_layernorm.weight", prefix),
+                layer.get_post_attention_layernorm_weight(),
+            );
+        }
+
+        // Final norm
+        params.insert(
+            "final_norm.weight".to_string(),
+            final_norm_guard.get_weight(),
+        );
+
+        // LM head (only if not tied)
+        if !self.config.tie_word_embeddings
+            && let Some(ref lm_head) = *lm_head_guard
+        {
+            params.insert("lm_head.weight".to_string(), lm_head.get_weight());
+        }
+
+        Ok(params)
     }
-    // `remaining` is now in [1, 7]. Push it directly.
-    debug_assert!(
-        (1..=7).contains(&remaining),
-        "partition_prefill_chunks: remainder {remaining} out of [1, 7]"
-    );
-    chunks.push(remaining);
-    chunks
+
+    /// Apply gradients to model parameters using pre-fetched params.
+    /// SGD update: param = param - lr * grad.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn apply_gradients_with_params(
+        &mut self,
+        gradients: HashMap<String, &MxArray>,
+        learning_rate: f64,
+        current_params: &HashMap<String, MxArray>,
+    ) -> Result<()> {
+        use crate::training_model::compute_sgd_updates;
+
+        // Compute updated parameters using shared SGD helper
+        let updated_params = compute_sgd_updates(&gradients, learning_rate, current_params)?;
+
+        // Acquire write locks
+        let mut layers = self.layers.write().map_err(|_| {
+            Error::new(
+                Status::GenericFailure,
+                "Failed to acquire layers write lock",
+            )
+        })?;
+        let mut final_norm = self.final_norm.write().map_err(|_| {
+            Error::new(
+                Status::GenericFailure,
+                "Failed to acquire final_norm write lock",
+            )
+        })?;
+        let mut lm_head = self.lm_head.write().map_err(|_| {
+            Error::new(
+                Status::GenericFailure,
+                "Failed to acquire lm_head write lock",
+            )
+        })?;
+
+        // Apply updates
+        for (name, updated_param) in updated_params.iter() {
+            if name == "lm_head.weight" {
+                if let Some(ref mut lm) = *lm_head {
+                    lm.set_weight(updated_param)?;
+                }
+            } else if name == "final_norm.weight" {
+                final_norm.set_weight(updated_param)?;
+            } else if name == "embedding.weight" {
+                self.embedding.set_weight(updated_param)?;
+            } else if name.starts_with("layers.") {
+                let parts: Vec<&str> = name.split('.').collect();
+                if parts.len() >= 3
+                    && let Ok(layer_idx) = parts[1].parse::<usize>()
+                    && layer_idx < layers.len()
+                {
+                    let layer = &mut layers[layer_idx];
+                    self.apply_layer_gradient(layer, name, updated_param)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_layer_gradient(
+        &self,
+        layer: &mut super::decoder_layer::DecoderLayer,
+        name: &str,
+        updated_param: &MxArray,
+    ) -> Result<()> {
+        use super::decoder_layer::AttentionType;
+
+        if name.contains(".linear_attn.") {
+            if let AttentionType::Linear(ref mut gdn) = layer.attn {
+                if name.ends_with(".in_proj_qkvz.weight") {
+                    gdn.set_in_proj_qkvz_weight(updated_param)?;
+                } else if name.ends_with(".in_proj_ba.weight") {
+                    gdn.set_in_proj_ba_weight(updated_param)?;
+                } else if name.ends_with(".conv1d.weight") {
+                    gdn.set_conv1d_weight(updated_param)?;
+                } else if name.ends_with(".norm.weight") {
+                    gdn.set_norm_weight(updated_param)?;
+                } else if name.ends_with(".out_proj.weight") {
+                    gdn.set_out_proj_weight(updated_param)?;
+                } else if name.ends_with(".dt_bias") {
+                    gdn.set_dt_bias(updated_param);
+                } else if name.ends_with(".a_log") {
+                    gdn.set_a_log(updated_param)?;
+                }
+            }
+        } else if name.contains(".self_attn.") {
+            if let AttentionType::Full(ref mut attn) = layer.attn {
+                if name.ends_with(".q_proj.weight") {
+                    attn.set_q_proj_weight(updated_param)?;
+                } else if name.ends_with(".k_proj.weight") {
+                    attn.set_k_proj_weight(updated_param)?;
+                } else if name.ends_with(".v_proj.weight") {
+                    attn.set_v_proj_weight(updated_param)?;
+                } else if name.ends_with(".o_proj.weight") {
+                    attn.set_o_proj_weight(updated_param)?;
+                } else if name.ends_with(".q_norm.weight") {
+                    attn.set_q_norm_weight(updated_param)?;
+                } else if name.ends_with(".k_norm.weight") {
+                    attn.set_k_norm_weight(updated_param)?;
+                }
+            }
+        } else if name.contains(".mlp.") {
+            if name.ends_with(".gate_proj.weight") {
+                layer.mlp.set_gate_proj_weight(updated_param)?;
+            } else if name.ends_with(".up_proj.weight") {
+                layer.mlp.set_up_proj_weight(updated_param)?;
+            } else if name.ends_with(".down_proj.weight") {
+                layer.mlp.set_down_proj_weight(updated_param)?;
+            }
+        } else if name.ends_with(".input_layernorm.weight") {
+            layer.set_input_layernorm_weight(updated_param)?;
+        } else if name.ends_with(".post_attention_layernorm.weight") {
+            layer.set_post_attention_layernorm_weight(updated_param)?;
+        } else {
+            tracing::warn!(
+                "Unrecognized parameter name in apply_layer_gradient: {}",
+                name
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Tokenize messages using the model's chat template.
+    pub(crate) fn apply_chat_template_sync(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: Option<bool>,
+        tools: Option<&[ToolDefinition]>,
+        enable_thinking: Option<bool>,
+    ) -> Result<Vec<u32>> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded - call load() first"))?;
+        tokenizer.apply_chat_template_sync(messages, add_generation_prompt, tools, enable_thinking)
+    }
+
+    /// Generate a single completion with logprob tracking (for GRPO training).
+    ///
+    /// Uses the compiled C++ forward path when available (~10x faster than Rust).
+    /// Generation does NOT need differentiability — gradients are computed separately
+    /// via the functional forward path in autograd Phase 2.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn generate_for_training_sync(
+        &self,
+        input_ids: &MxArray,
+        config: Option<GenerationConfig>,
+    ) -> Result<GenerationResult> {
+        let config = config.unwrap_or_default();
+        let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
+        let model_id = self.model_id;
+
+        // Hold generation lock (blocking — called from spawn_blocking context).
+        let _gen_guard = self.generation_lock.blocking_lock();
+
+        // Check if compiled path is available (C++ weights belong to this model)
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+
+        // Try to acquire compiled mutex (non-blocking, safe from sync context).
+        // If locked (concurrent generate() call), fall back to Rust path.
+        let compiled_lock = if use_compiled {
+            DENSE_COMPILED_MUTEX.try_lock().ok()
+        } else {
+            None
+        };
+        let use_compiled = compiled_lock.is_some();
+
+        let _weight_guard = if use_compiled {
+            acquire_compiled_weight_guard(model_id)
+        } else {
+            None
+        };
+        let use_compiled = _weight_guard.is_some();
+
+        self.init_caches_inner()?;
+
+        // Acquire locks
+        let embedding_weight = self.embedding.get_weight();
+        let mut layers_guard = self
+            .layers
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
+        let final_norm_guard = self
+            .final_norm
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
+        let lm_head_guard = self
+            .lm_head
+            .read()
+            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
+        let mut caches_guard = self
+            .caches
+            .write()
+            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
+
+        // === Prefill (always uses Rust forward — runs once) ===
+        let logits = forward_inner(
+            input_ids,
+            &embedding_weight,
+            &mut layers_guard,
+            &mut caches_guard,
+            &final_norm_guard,
+            &lm_head_guard,
+            None,
+        )?;
+        let seq_len = logits.shape_at(1)?;
+        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+        let last_logits = last_logits.squeeze(Some(&[1]))?;
+        let input_tokens = input_ids.to_uint32()?;
+
+        let result = if use_compiled {
+            // === Compiled C++ decode path ===
+            let _compiled_guard = CompiledResetGuard;
+            let max_new_tokens = config.max_new_tokens.unwrap_or(100);
+            let prefill_len = seq_len as i32;
+            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+            let num_layers = self.config.num_layers as usize;
+            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                vec![std::ptr::null_mut(); num_layers * 2];
+            if let Some(ref caches) = *caches_guard {
+                for (i, cache) in caches.iter().enumerate() {
+                    let (p0, p1) = cache.export_ptrs();
+                    cache_ptrs[i * 2] = p0;
+                    cache_ptrs[i * 2 + 1] = p1;
+                }
+            }
+            // Drop locks not needed during compiled decode
+            drop(layers_guard);
+            drop(final_norm_guard);
+            drop(lm_head_guard);
+            // Keep caches_guard alive through init_from_prefill so cache_ptrs remain valid
+            unsafe {
+                mlx_sys::mlx_qwen35_compiled_init_from_prefill(
+                    self.config.num_layers,
+                    self.config.hidden_size,
+                    self.config.num_heads,
+                    self.config.num_kv_heads,
+                    self.config.head_dim,
+                    self.config.rope_theta as f32,
+                    self.config.rope_dims(),
+                    self.config.rms_norm_eps as f32,
+                    self.config.full_attention_interval,
+                    self.config.linear_num_key_heads,
+                    self.config.linear_num_value_heads,
+                    self.config.linear_key_head_dim,
+                    self.config.linear_value_head_dim,
+                    self.config.linear_conv_kernel_dim,
+                    if self.config.tie_word_embeddings {
+                        1
+                    } else {
+                        0
+                    },
+                    max_kv_len,
+                    1, // batch_size
+                    cache_ptrs.as_mut_ptr(),
+                    prefill_len,
+                );
+            }
+            // C++ has copied arrays into g_compiled_caches — safe to release
+            drop(caches_guard);
+
+            // Decode using compiled forward with synchronous cache eval.
+            // Caches are eval'd BEFORE each forward call to ensure the previous step's
+            // caches are materialized, breaking lazy dependency chains that would otherwise
+            // cause O(N²) graph growth and 100+GB memory.
+            let mut forward_fn = |ids: &MxArray| -> Result<MxArray> {
+                // Sync-eval compiled caches from the previous step before building new graph.
+                // Uses synchronous eval (not async_eval) to avoid interaction issues with
+                // the training loop's own synchronous eval calls.
+                unsafe { mlx_sys::mlx_qwen35_sync_eval_compiled_caches() };
+                let logits = forward_compiled(ids, &embedding_weight)?;
+                // forward_compiled returns [1, vocab] but training loop expects [1, 1, vocab]
+                let logits = logits.reshape(&[1, 1, -1])?;
+                Ok(logits)
+            };
+
+            crate::models::training_generate::generate_decode_loop_for_training(
+                &last_logits,
+                &input_tokens,
+                &config,
+                eos_token_id,
+                &mut forward_fn,
+            )?
+            // _compiled_guard dropped here → mlx_qwen35_compiled_reset()
+        } else {
+            // === Rust fallback decode path ===
+            let mut forward_fn = |ids: &MxArray| -> Result<MxArray> {
+                forward_inner(
+                    ids,
+                    &embedding_weight,
+                    &mut layers_guard,
+                    &mut caches_guard,
+                    &final_norm_guard,
+                    &lm_head_guard,
+                    None,
+                )
+            };
+
+            let result = crate::models::training_generate::generate_decode_loop_for_training(
+                &last_logits,
+                &input_tokens,
+                &config,
+                eos_token_id,
+                &mut forward_fn,
+            )?;
+
+            drop(layers_guard);
+            drop(final_norm_guard);
+            drop(lm_head_guard);
+            drop(caches_guard);
+
+            result
+        };
+
+        drop(compiled_lock);
+        // Use inner variant — we already hold the generation lock
+        self.reset_caches_inner()?;
+
+        Ok(result)
+    }
+
+    /// Generate a batch of completions for GRPO training.
+    pub(crate) fn generate_batch_for_training_sync(
+        &self,
+        prompt_arrays: &[MxArray],
+        group_size: usize,
+        config: Option<GenerationConfig>,
+    ) -> Result<BatchGenerationResult> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+
+        crate::models::training_generate::generate_batch_for_training_loop(
+            prompt_arrays,
+            group_size,
+            config,
+            tokenizer,
+            |prompt, cfg| self.generate_for_training_sync(prompt, cfg),
+        )
+    }
+
+    /// Decode token IDs to text.
+    pub(crate) fn decode_tokens_sync(&self, tokens: &MxArray) -> Result<String> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+        let token_ids = tokens.to_uint32()?;
+        tokenizer.decode_sync(&token_ids, true)
+    }
 }
 
 // ============================================================================
@@ -10643,63 +6264,15 @@ pub(crate) fn compute_image_token_counts_per_image(
 ) -> Result<Vec<usize>> {
     grid.eval();
     let grid_data = grid.to_int32()?;
+    let merge_factor = spatial_merge_size * spatial_merge_size;
     let mut counts = Vec::with_capacity(grid_data.len() / 3);
     for i in 0..(grid_data.len() / 3) {
         let t = grid_data[i * 3];
         let h = grid_data[i * 3 + 1];
         let w = grid_data[i * 3 + 2];
-        counts.push(merged_image_token_count(t, h, w, spatial_merge_size)?);
+        counts.push(((t * h * w) / merge_factor) as usize);
     }
     Ok(counts)
-}
-
-/// Return the exact length produced by [`inject_image_placeholders`] without
-/// allocating the expanded token vector.
-pub(crate) fn expanded_image_prompt_len(
-    tokens: &[u32],
-    per_image_token_counts: &[usize],
-) -> Result<usize> {
-    let total = per_image_token_counts
-        .iter()
-        .try_fold(0usize, |sum, count| {
-            sum.checked_add(*count)
-                .ok_or_else(|| Error::from_reason("expanded image prompt length overflow"))
-        })?;
-    if total == 0 {
-        return Ok(tokens.len());
-    }
-
-    let existing = tokens
-        .iter()
-        .filter(|&&token| token == IMAGE_TOKEN_ID as u32)
-        .count();
-    if existing == 0 || existing == per_image_token_counts.len() {
-        return tokens
-            .len()
-            .checked_add(total)
-            .and_then(|len| len.checked_sub(existing))
-            .ok_or_else(|| Error::from_reason("expanded image prompt length overflow"));
-    }
-
-    // Already-expanded or malformed/unknown placeholder shapes are passed
-    // through unchanged by `inject_image_placeholders`.
-    Ok(tokens.len())
-}
-
-/// CPU-only prompt planner shared by the dense and MoE NAPI wrappers.
-///
-/// It reads encoded image dimensions and applies the loaded Qwen processor's
-/// smart-resize geometry, but never creates normalized pixel tensors, MLX
-/// arrays, vision features, or KV state.
-pub(crate) fn plan_expanded_image_prompt_len(
-    image_processor: &Qwen35VLImageProcessor,
-    spatial_merge_size: i32,
-    tokens: &[u32],
-    images: &[Vec<u8>],
-) -> Result<usize> {
-    let image_refs: Vec<&[u8]> = images.iter().map(Vec::as_slice).collect();
-    let counts = image_processor.plan_merged_token_counts(&image_refs, spatial_merge_size)?;
-    expanded_image_prompt_len(tokens, &counts)
 }
 
 /// Ensure the tokenized prompt contains the right number of
@@ -11021,16 +6594,7 @@ pub(crate) fn get_rope_index(
 
     let position_ids = MxArray::stack(vec![&t_arr, &h_arr, &w_arr], Some(0))?;
 
-    // Decode offset must reference the GLOBAL max M-RoPE position, i.e. the max
-    // over all three (t, h, w) axes — matching mlx-vlm's `llm_positions.max()`.
-    // For an image the spatial (h, w) axes exceed the temporal one, so an
-    // image-final prompt (no trailing text) would get a too-small delta if only
-    // axis 0 were considered.
-    let max_position = all_position_ids
-        .iter()
-        .flat_map(|axis| axis.iter().copied())
-        .max()
-        .unwrap_or(0);
+    let max_position = *all_position_ids[0].iter().max().unwrap_or(&0);
     let rope_deltas = max_position + 1 - seq_len;
 
     Ok((position_ids, rope_deltas))
@@ -11099,610 +6663,277 @@ pub(crate) fn merge_input_ids_with_image_features(
     MxArray::stack(refs, Some(0))
 }
 
-#[derive(Debug, Clone, Copy)]
-struct VisionImageRequest {
-    key: VisionFeatureCacheKey,
-    patch_start: i64,
-    patch_count: i64,
-    feature_count: i64,
-}
-
-#[derive(Debug)]
-struct VisionCacheMiss {
-    request: VisionImageRequest,
-    request_indices: Vec<usize>,
-}
-
-fn plan_vision_image_requests(
-    grid_data: &[i32],
-    per_image_hashes: &[u64],
-    total_patches: i64,
+/// VLM prefill: processes images through vision encoder, merges with text embeddings,
+/// and runs the prefill forward pass with M-RoPE position IDs.
+///
+/// Returns (first_logits [1, vocab], rope_deltas).
+///
+/// This is a free function (not a method) since it needs mutable lock guards passed in,
+/// matching the pattern of `forward_inner()`.
+#[allow(clippy::too_many_arguments)]
+fn vlm_prefill(
+    input_ids: &MxArray,
+    image_cache_key: u64,
+    pre_processed: &ProcessedImages,
+    vision_encoder: &Qwen3_5VisionEncoder,
     spatial_merge_size: i32,
-) -> Result<Vec<VisionImageRequest>> {
-    if spatial_merge_size <= 0 {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!("spatial_merge_size must be positive, got {spatial_merge_size}"),
-        ));
-    }
-    if grid_data.len() != per_image_hashes.len().saturating_mul(3) {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!(
-                "vision grid/hash cardinality mismatch: {} grid values for {} image hashes",
-                grid_data.len(),
-                per_image_hashes.len()
-            ),
-        ));
-    }
+    text_model_embedding: &MxArray,
+    layers_guard: &mut [DecoderLayer],
+    caches_guard: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm_guard: &RMSNorm,
+    lm_head_guard: &Option<Linear>,
+    model_config: &Qwen3_5Config,
+    max_new_tokens: i32,
+    generation_stream: Stream,
+    vision_cache: &VisionCache,
+    model_id: u64,
+) -> Result<(MxArray, i64, bool)> {
+    use crate::array::clear_cache;
 
-    let merge = i64::from(spatial_merge_size);
-    let merge_area = merge
-        .checked_mul(merge)
-        .ok_or_else(|| Error::from_reason("vision spatial merge area overflow"))?;
-    let mut patch_start = 0i64;
-    let mut requests = Vec::with_capacity(per_image_hashes.len());
-    for (image_index, image_hash) in per_image_hashes.iter().copied().enumerate() {
-        let grid = [
-            grid_data[image_index * 3],
-            grid_data[image_index * 3 + 1],
-            grid_data[image_index * 3 + 2],
-        ];
-        let [t, h, w] = grid.map(i64::from);
-        if t <= 0 || h <= 0 || w <= 0 {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!("vision grid {image_index} must be positive, got {grid:?}"),
+    let (inputs_embeds, position_ids, rope_deltas) = vlm_prepare_vision_features(
+        input_ids,
+        image_cache_key,
+        pre_processed,
+        vision_encoder,
+        spatial_merge_size,
+        text_model_embedding,
+        generation_stream,
+        vision_cache,
+    )?;
+
+    // === STEP 4: Prefill with M-RoPE ===
+    let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+
+    let (last_logits, _seq_len, compiled_init_done) = if use_compiled {
+        // C++ VLM prefill: runs all layers in one FFI call with M-RoPE
+        use mlx_sys as sys;
+
+        let seq_len_i32 = inputs_embeds.shape_at(1)? as i32;
+        let max_kv_len = ((seq_len_i32 + max_new_tokens + 255) / 256) * 256;
+        let mrope_section: [i32; 3] = [11, 11, 10]; // Qwen3.5-VL
+
+        let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+        unsafe {
+            sys::mlx_qwen35_vlm_prefill(
+                inputs_embeds.as_raw_ptr(),
+                position_ids.as_raw_ptr(),
+                model_config.num_layers,
+                model_config.hidden_size,
+                model_config.num_heads,
+                model_config.num_kv_heads,
+                model_config.head_dim,
+                model_config.rope_theta as f32,
+                model_config.rope_dims(),
+                model_config.rms_norm_eps as f32,
+                model_config.full_attention_interval,
+                model_config.linear_num_key_heads,
+                model_config.linear_num_value_heads,
+                model_config.linear_key_head_dim,
+                model_config.linear_value_head_dim,
+                model_config.linear_conv_kernel_dim,
+                if model_config.tie_word_embeddings {
+                    1
+                } else {
+                    0
+                },
+                max_kv_len,
+                1, // batch_size
+                mrope_section.as_ptr(),
+                rope_deltas as i32,
+                &mut output_ptr,
+            );
+        }
+
+        if output_ptr.is_null() {
+            return Err(Error::from_reason(
+                "C++ VLM prefill returned null — check stderr for details",
             ));
         }
-        if h % merge != 0 || w % merge != 0 {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "vision grid {image_index} {grid:?} is not divisible by spatial merge size {spatial_merge_size}"
-                ),
-            ));
+
+        // Transfer VLM caches to compiled decode path
+        // vlm_get_cache returns heap-allocated copies — we must delete them after use
+        let num_caches = unsafe { sys::mlx_qwen35_vlm_cache_count() };
+        let mut cache_ptrs: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_caches as usize);
+        for idx in 0..num_caches {
+            cache_ptrs.push(unsafe { sys::mlx_qwen35_vlm_get_cache(idx) });
         }
-        let patch_count = t
-            .checked_mul(h)
-            .and_then(|value| value.checked_mul(w))
-            .ok_or_else(|| Error::from_reason("vision patch count overflow"))?;
-        let feature_count = patch_count / merge_area;
-        requests.push(VisionImageRequest {
-            key: VisionFeatureCacheKey {
-                image_hash,
-                grid_thw: grid,
-            },
-            patch_start,
-            patch_count,
-            feature_count,
-        });
-        patch_start = patch_start
-            .checked_add(patch_count)
-            .ok_or_else(|| Error::from_reason("vision cumulative patch count overflow"))?;
-    }
-    if patch_start != total_patches {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!(
-                "vision grids cover {patch_start} patches but processed pixels contain {total_patches}"
-            ),
-        ));
-    }
-    Ok(requests)
-}
 
-fn partition_vision_cache_misses(
-    misses: &[VisionCacheMiss],
-    max_batch_patches: i64,
-) -> Vec<std::ops::Range<usize>> {
-    let mut batches = Vec::new();
-    let mut batch_start = 0usize;
-    let mut batch_patches = 0i64;
-    for (index, miss) in misses.iter().enumerate() {
-        if index > batch_start
-            && batch_patches.saturating_add(miss.request.patch_count) > max_batch_patches
-        {
-            batches.push(batch_start..index);
-            batch_start = index;
-            batch_patches = 0;
+        unsafe {
+            sys::mlx_qwen35_compiled_init_from_prefill(
+                model_config.num_layers,
+                model_config.hidden_size,
+                model_config.num_heads,
+                model_config.num_kv_heads,
+                model_config.head_dim,
+                model_config.rope_theta as f32,
+                model_config.rope_dims(),
+                model_config.rms_norm_eps as f32,
+                model_config.full_attention_interval,
+                model_config.linear_num_key_heads,
+                model_config.linear_num_value_heads,
+                model_config.linear_key_head_dim,
+                model_config.linear_value_head_dim,
+                model_config.linear_conv_kernel_dim,
+                if model_config.tie_word_embeddings {
+                    1
+                } else {
+                    0
+                },
+                max_kv_len,
+                1,
+                cache_ptrs.as_mut_ptr(),
+                seq_len_i32,
+            );
+
+            // Adjust offset for rope_deltas (VLM positions differ from sequential)
+            if rope_deltas != 0 {
+                sys::mlx_qwen35_compiled_adjust_offset(rope_deltas as i32);
+            }
+
+            // Clean up heap-allocated cache copies from vlm_get_cache
+            for ptr in &cache_ptrs {
+                if !ptr.is_null() {
+                    sys::mlx_array_delete(*ptr);
+                }
+            }
+
+            // Clean up VLM prefill state (caches now owned by compiled decode)
+            sys::mlx_qwen35_vlm_reset();
         }
-        batch_patches = batch_patches.saturating_add(miss.request.patch_count);
-    }
-    if batch_start < misses.len() {
-        batches.push(batch_start..misses.len());
-    }
-    batches
-}
 
-fn lookup_vision_feature_cache(
-    cache: &mut VisionCacheInner,
-    requests: &[VisionImageRequest],
-) -> (Vec<Option<MxArray>>, Vec<VisionCacheMiss>, usize) {
-    let mut ordered_features = vec![None; requests.len()];
-    let mut misses: Vec<VisionCacheMiss> = Vec::new();
-    let mut miss_by_key: HashMap<VisionFeatureCacheKey, usize> = HashMap::new();
-    let mut cache_hits = 0usize;
-    for (request_index, request) in requests.iter().copied().enumerate() {
-        if let Some(features) = cache.get(&request.key) {
-            ordered_features[request_index] = Some(features);
-            cache_hits += 1;
-        } else if let Some(&miss_index) = miss_by_key.get(&request.key) {
-            misses[miss_index].request_indices.push(request_index);
-        } else {
-            miss_by_key.insert(request.key, misses.len());
-            misses.push(VisionCacheMiss {
-                request,
-                request_indices: vec![request_index],
-            });
-        }
-    }
-    (ordered_features, misses, cache_hits)
-}
+        let logits = MxArray::from_handle(output_ptr, "vlm_cpp_prefill")?;
+        // logits is already [1, vocab] from C++ prefill
+        (logits, seq_len_i32 as i64, true) // compiled init done
+    } else {
+        // Rust fallback prefill (when C++ weights not loaded, e.g. test models)
+        // Init fresh caches
+        *caches_guard = Some(
+            (0..model_config.num_layers as usize)
+                .map(|i| {
+                    if model_config.is_linear_layer(i) {
+                        super::layer_cache::Qwen3_5LayerCache::new_linear()
+                    } else {
+                        super::layer_cache::Qwen3_5LayerCache::new_full_attention()
+                    }
+                })
+                .collect(),
+        );
 
-fn vision_array_bytes(array: &MxArray) -> Result<usize> {
-    let elements = array.shape()?.iter().try_fold(1usize, |product, &dim| {
-        let dim = usize::try_from(dim).map_err(|_| {
-            Error::from_reason("vision feature shape contains a negative dimension")
-        })?;
-        product
-            .checked_mul(dim)
-            .ok_or_else(|| Error::from_reason("vision feature element count overflow"))
-    })?;
-    elements
-        .checked_mul(array.dtype()?.byte_size())
-        .ok_or_else(|| Error::from_reason("vision feature byte count overflow"))
-}
+        let logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
 
-fn projected_vision_feature_bytes(
-    requests: &[VisionImageRequest],
-    output_size: u64,
-    dtype_bytes: u64,
-) -> (u64, u64) {
-    let bytes_for = |request: &VisionImageRequest| {
-        u64::try_from(request.feature_count)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(output_size)
-            .saturating_mul(dtype_bytes)
+            let mut h = inputs_embeds.clone();
+
+            // No explicit mask — Qwen3_5Attention uses "causal" SDPA mode
+            let num_layers = layers_guard.len();
+            for i in 0..num_layers {
+                let cache = caches_guard.as_mut().map(|c| &mut c[i]);
+                let layer_pos = if layers_guard[i].is_linear() {
+                    None
+                } else {
+                    Some(&position_ids)
+                };
+                h = layers_guard[i].forward(&h, None, cache, layer_pos, true)?;
+            }
+
+            let h = final_norm_guard.forward(&h)?;
+            let logits = match lm_head_guard {
+                Some(head) => head.forward(&h)?,
+                None => {
+                    let weight_t = text_model_embedding.transpose(Some(&[1, 0]))?;
+                    h.matmul(&weight_t)?
+                }
+            };
+
+            if let Some(ref caches) = *caches_guard {
+                let mut cache_arrays: Vec<&MxArray> = Vec::new();
+                for cache in caches.iter() {
+                    cache.collect_arrays(&mut cache_arrays);
+                }
+                if !cache_arrays.is_empty() {
+                    MxArray::async_eval_arrays(&cache_arrays);
+                }
+            }
+            clear_cache();
+
+            logits
+        };
+
+        let seq_len = logits.shape_at(1)?;
+        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+        let last_logits = last_logits.squeeze(Some(&[1]))?;
+        (last_logits, seq_len, false) // compiled init NOT done
     };
-    let request_bytes = requests.iter().fold(0u64, |bytes, request| {
-        bytes.saturating_add(bytes_for(request))
-    });
-    let mut accounted_keys = HashSet::with_capacity(requests.len());
-    let protected_bytes = requests
-        .iter()
-        .filter(|request| accounted_keys.insert(request.key))
-        .fold(0u64, |bytes, request| {
-            bytes.saturating_add(bytes_for(request))
-        });
-    (request_bytes, protected_bytes)
+
+    Ok((last_logits, rope_deltas, compiled_init_done))
 }
 
-/// Shared VLM prefill steps 1-3: per-image vision cache lookup, bounded vision
-/// encoder miss batches, embedding merge, and M-RoPE position computation.
+/// Shared VLM prefill steps 1-3: vision cache lookup, vision encoder,
+/// embedding merge, and M-RoPE position computation.
 ///
 /// Returns (inputs_embeds, position_ids, rope_deltas) ready for the
 /// language model forward pass. Used by both dense and MoE VLM prefill.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn vlm_prepare_vision_features(
     input_ids: &MxArray,
-    per_image_hashes: &[u64],
+    image_cache_key: u64,
     pre_processed: &ProcessedImages,
     vision_encoder: &Qwen3_5VisionEncoder,
     spatial_merge_size: i32,
     text_model_embedding: &MxArray,
     generation_stream: Stream,
     vision_cache: &VisionCache,
-) -> Result<VisionMerge> {
-    // === STEP 1: Compute vision features with per-image reuse ===
-    let grid = pre_processed.grid_thw();
-    let grid_data = grid.to_int32()?;
-    let pv = pre_processed.pixel_values();
-    let pv_shape = pv.shape()?;
-    if pv_shape.len() != 4 {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!(
-                "processed vision pixels must have rank 4 [patches,C,H,W], got {:?}",
-                pv_shape.as_ref()
-            ),
-        ));
-    }
-    // MLX's allocator cache is reclaimable, unlike active arrays. Drain it
-    // before taking the live snapshot and do not double-count any reported
-    // residue against headroom.
-    crate::array::clear_cache();
-    let memory_snapshot = probe_vision_memory();
-    let (vision_hidden_size, vision_intermediate_size, vision_output_size) =
-        vision_encoder.memory_widths();
-    let activation_dtype_bytes = u64::try_from(pv.dtype()?.byte_size()).unwrap_or(u64::MAX);
-    let cache_feature_dtype = text_model_embedding.dtype()?;
-    let cache_feature_dtype_bytes =
-        u64::try_from(cache_feature_dtype.byte_size()).unwrap_or(u64::MAX);
-    let raw_pixel_bytes_per_patch = pv_shape[1..]
-        .iter()
-        .fold(activation_dtype_bytes, |bytes, &dimension| {
-            bytes.saturating_mul(u64::try_from(dimension).unwrap_or(u64::MAX))
-        });
-    let processed_pixel_bytes = vision_array_bytes(&pv)?;
-    let requests = plan_vision_image_requests(
-        &grid_data,
-        per_image_hashes,
-        pv_shape[0],
-        spatial_merge_size,
-    )?;
-    let protected_keys: HashSet<VisionFeatureCacheKey> =
-        requests.iter().map(|request| request.key).collect();
-    let (
-        mut ordered_features,
-        misses,
-        cache_hits,
-        cache_entries_before,
-        cache_bytes_before,
-        cache_entries_after_prune,
-        cache_bytes_after_prune,
-        initial_eviction,
-        memory_budget,
-    ) = {
+) -> Result<(MxArray, MxArray, i64)> {
+    // === STEP 1: Compute vision features (with hash cache) ===
+    let combined_hash = image_cache_key;
+
+    let cached = {
         let mut cache = vision_cache
             .lock()
             .map_err(|_| Error::from_reason("Vision cache mutex poisoned"))?;
-        let (ordered_features, misses, cache_hits) =
-            lookup_vision_feature_cache(&mut cache, &requests);
-        let cache_entries_before = cache.entries.len();
-        let cache_bytes_before = cache.retained_bytes;
-        let (request_feature_bytes, protected_feature_bytes) = projected_vision_feature_bytes(
-            &requests,
-            vision_output_size,
-            cache_feature_dtype_bytes,
-        );
-        let projected_miss_output_bytes = misses.iter().fold(0u64, |bytes, miss| {
-            let feature_count = u64::try_from(miss.request.feature_count).unwrap_or(u64::MAX);
-            bytes.saturating_add(
-                feature_count
-                    .saturating_mul(vision_output_size)
-                    .saturating_mul(cache_feature_dtype_bytes),
-            )
-        });
-        let projected_concat_output_bytes = if requests.len() > 1 {
-            request_feature_bytes
+        cache.generation += 1;
+        let lru_gen = cache.generation;
+        if let Some((features, grid, lru)) = cache.entries.get_mut(&combined_hash) {
+            *lru = lru_gen;
+            tracing::debug!("Vision cache HIT for hash {:016x}", combined_hash);
+            Some((features.clone(), grid.clone()))
         } else {
-            0
-        };
-        let projected_output_bytes =
-            projected_miss_output_bytes.saturating_add(projected_concat_output_bytes);
-        let memory_budget = resolve_vision_memory_budget(
-            memory_snapshot,
-            u64::try_from(cache.retained_bytes).unwrap_or(u64::MAX),
-            protected_feature_bytes,
-            vision_hidden_size,
-            vision_intermediate_size,
-            activation_dtype_bytes,
-            raw_pixel_bytes_per_patch,
-            projected_output_bytes,
-        );
-        // Prune after touches even when every request image is a cache hit. A
-        // previous oversized protected request is allowed to exceed the floor;
-        // once entries are no longer active they must become evictable.
-        let initial_eviction = cache.evict_to_limits(
-            &protected_keys,
-            VISION_CACHE_MAX_ENTRIES,
-            usize::try_from(memory_budget.cache_budget_bytes).unwrap_or(usize::MAX),
-        );
-        (
-            ordered_features,
-            misses,
-            cache_hits,
-            cache_entries_before,
-            cache_bytes_before,
-            cache.entries.len(),
-            cache.retained_bytes,
-            initial_eviction,
-            memory_budget,
-        )
+            None
+        }
     };
-    if initial_eviction.entries > 0 {
-        // Dropping MLX arrays moves their buffers into the allocator cache.
-        // Release those buffers only after the mutex guard has been dropped.
-        crate::array::clear_cache();
-    }
 
-    // This applies even when every image is a cache hit: joining multiple
-    // cached feature arrays still allocates a request-sized output. Without an
-    // explicit fit check, saturating the transient headroom to zero would only
-    // reject cache misses and an all-hit request could overcommit unified
-    // memory during the final concatenate.
-    if !memory_budget.projected_output_fits {
-        tracing::error!(
-            target: "mlx_core::inference",
-            event = "vision_output_headroom_insufficient",
-            projected_output_bytes = memory_budget.projected_output_bytes,
-            output_headroom_bytes = memory_budget.output_headroom_bytes,
-            effective_cap_bytes = memory_budget.effective_cap_bytes,
-            allocator_active_bytes = memory_snapshot.allocator_active_bytes,
-            metal_current_allocated_bytes = memory_snapshot.metal_current_allocated_bytes,
-            metal_nonreclaimable_bytes = memory_budget.metal_nonreclaimable_bytes,
-            usage_probe_available = memory_budget.usage_probe_available,
-            used_memory_bytes = memory_budget.used_memory_bytes,
-            safety_reserve_bytes = memory_budget.safety_reserve_bytes,
-            "Qwen3.5 vision request outputs cannot fit in the available memory budget"
-        );
-        return Err(Error::from_reason(format!(
-            "insufficient MLX memory headroom for Qwen3.5 vision outputs: the request needs {} bytes for new/collated features, but only {} bytes remain after live allocations and the safety reserve",
-            memory_budget.projected_output_bytes, memory_budget.output_headroom_bytes
-        )));
-    }
+    let (vision_features, grid) = if let Some((features, grid)) = cached {
+        (features, grid)
+    } else {
+        let grid = pre_processed.grid_thw();
+        let pv = pre_processed.pixel_values();
+        let pv_shape = pv.shape()?;
+        let pv_5d = pv.reshape(&[1, pv_shape[0], pv_shape[1], pv_shape[2], pv_shape[3]])?;
 
-    let largest_miss_patches = misses
-        .iter()
-        .map(|miss| miss.request.patch_count)
-        .max()
-        .unwrap_or(0);
-    let largest_miss_peak_bytes = u64::try_from(largest_miss_patches)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(memory_budget.peak_bytes_per_patch);
-    let largest_miss_exceeds_patch_budget =
-        largest_miss_patches > memory_budget.miss_batch_patch_budget;
-    if !misses.is_empty()
-        && (largest_miss_peak_bytes > memory_budget.transient_budget_bytes
-            || largest_miss_exceeds_patch_budget)
-    {
-        tracing::error!(
-            target: "mlx_core::inference",
-            event = "vision_memory_headroom_insufficient",
-            largest_image_patches = largest_miss_patches,
-            dynamic_patch_budget = memory_budget.miss_batch_patch_budget,
-            exceeds_dynamic_patch_budget = largest_miss_exceeds_patch_budget,
-            estimated_peak_bytes = largest_miss_peak_bytes,
-            transient_budget_bytes = memory_budget.transient_budget_bytes,
-            effective_cap_bytes = memory_budget.effective_cap_bytes,
-            allocator_active_bytes = memory_snapshot.allocator_active_bytes,
-            metal_current_allocated_bytes = memory_snapshot.metal_current_allocated_bytes,
-            metal_nonreclaimable_bytes = memory_budget.metal_nonreclaimable_bytes,
-            usage_probe_available = memory_budget.usage_probe_available,
-            used_memory_bytes = memory_budget.used_memory_bytes,
-            safety_reserve_bytes = memory_budget.safety_reserve_bytes,
-            "Qwen3.5 vision image cannot fit in the available transient memory budget"
-        );
-        return Err(Error::from_reason(format!(
-            "insufficient MLX memory headroom for Qwen3.5 vision image: largest miss has {largest_miss_patches} patches with an estimated {}-byte layer peak, but the safe batch limit is {} patches / {} bytes after the safety reserve",
-            largest_miss_peak_bytes,
-            memory_budget.miss_batch_patch_budget,
-            memory_budget.transient_budget_bytes
-        )));
-    }
-    // Self-attention cannot split one image across batches, so the check above
-    // rejects any image above the dynamic/hard limit rather than silently
-    // raising it and overcommitting memory.
-    let resolved_miss_batch_patch_budget = memory_budget.miss_batch_patch_budget.max(1);
-    let miss_batches = partition_vision_cache_misses(&misses, resolved_miss_batch_patch_budget);
-    tracing::info!(
-        target: "mlx_core::inference",
-        event = "vision_feature_cache_plan",
-        image_count = requests.len(),
-        cache_hits,
-        cache_misses = requests.len().saturating_sub(cache_hits),
-        unique_cache_misses = misses.len(),
-        miss_batches = miss_batches.len(),
-        patch_count = pv_shape[0],
-        processed_pixel_bytes,
-        cache_entries_before,
-        cache_bytes_before,
-        cache_entries_after_prune,
-        cache_bytes_after_prune,
-        evicted_entries = initial_eviction.entries,
-        evicted_bytes = initial_eviction.bytes,
-        total_system_memory_bytes = memory_snapshot.total_system_memory_bytes,
-        mlx_memory_limit_bytes = memory_snapshot.mlx_memory_limit_bytes,
-        metal_working_set_bytes = memory_snapshot.metal_working_set_bytes,
-        effective_cap_bytes = memory_budget.effective_cap_bytes,
-        cap_source = memory_budget.cap_source.as_str(),
-        allocator_active_bytes = memory_snapshot.allocator_active_bytes,
-        allocator_active_probe_ok = memory_snapshot.allocator_active_probe_ok,
-        metal_current_allocated_bytes = memory_snapshot.metal_current_allocated_bytes,
-        metal_current_probe_ok = memory_snapshot.metal_current_probe_ok,
-        metal_nonreclaimable_bytes = memory_budget.metal_nonreclaimable_bytes,
-        usage_probe_available = memory_budget.usage_probe_available,
-        used_memory_bytes = memory_budget.used_memory_bytes,
-        allocator_cache_bytes = memory_snapshot.allocator_cache_bytes,
-        allocator_cache_counted = false,
-        safety_reserve_bytes = memory_budget.safety_reserve_bytes,
-        output_headroom_bytes = memory_budget.output_headroom_bytes,
-        projected_output_fits = memory_budget.projected_output_fits,
-        headroom_bytes = memory_budget.headroom_bytes,
-        projected_output_bytes = memory_budget.projected_output_bytes,
-        transient_budget_bytes = memory_budget.transient_budget_bytes,
-        cache_budget_bytes = memory_budget.cache_budget_bytes,
-        peak_bytes_per_patch = memory_budget.peak_bytes_per_patch,
-        dynamic_miss_batch_patch_budget = memory_budget.miss_batch_patch_budget,
-        resolved_miss_batch_patch_budget,
-        largest_miss_patches,
-        vision_hidden_size,
-        vision_intermediate_size,
-        vision_output_size,
-        activation_dtype_bytes,
-        cache_feature_dtype_bytes,
-        raw_pixel_bytes_per_patch,
-        "Qwen3.5 per-image vision feature cache planned"
-    );
-
-    for (batch_index, miss_range) in miss_batches.into_iter().enumerate() {
-        let batch_misses = &misses[miss_range];
-        let batch_patch_count = batch_misses
-            .iter()
-            .try_fold(0i64, |sum, miss| sum.checked_add(miss.request.patch_count))
-            .ok_or_else(|| Error::from_reason("vision miss-batch patch count overflow"))?;
-        let batch_feature_count = batch_misses
-            .iter()
-            .try_fold(0i64, |sum, miss| {
-                sum.checked_add(miss.request.feature_count)
-            })
-            .ok_or_else(|| Error::from_reason("vision miss-batch feature count overflow"))?;
-
-        let materialize_start = std::time::Instant::now();
-        tracing::info!(
-            target: "mlx_core::inference",
-            event = "vision_feature_miss_batch_start",
-            batch_index,
-            image_count = batch_misses.len(),
-            patch_count = batch_patch_count,
-            "Qwen3.5 vision cache-miss batch started"
-        );
-        let independent_features = {
-            let mut pixel_parts = Vec::with_capacity(batch_misses.len());
-            let mut batch_grid_data = Vec::with_capacity(batch_misses.len() * 3);
-            for miss in batch_misses {
-                pixel_parts.push(pv.slice_axis(
-                    0,
-                    miss.request.patch_start,
-                    miss.request.patch_start + miss.request.patch_count,
-                )?);
-                batch_grid_data.extend_from_slice(&miss.request.key.grid_thw);
-            }
-            let batch_pixels = if pixel_parts.len() == 1 {
-                pixel_parts.remove(0)
-            } else {
-                let refs: Vec<&MxArray> = pixel_parts.iter().collect();
-                MxArray::concatenate_many(refs, Some(0))?
-            };
-            let batch_grid =
-                MxArray::from_int32(&batch_grid_data, &[batch_misses.len() as i64, 3])?;
-            let batch_pixels = batch_pixels.reshape(&[
-                1,
-                batch_patch_count,
-                pv_shape[1],
-                pv_shape[2],
-                pv_shape[3],
-            ])?;
-            let batch_features = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                vision_encoder.forward(&batch_pixels, &batch_grid)?
-            };
-            let materialize_context = format!("qwen3_5_vision_miss_batch_{batch_index}");
-            if let Err(error) =
-                MxArray::eval_arrays_with_context(&[&batch_features], &materialize_context)
-            {
-                tracing::error!(
-                    target: "mlx_core::inference",
-                    event = "vision_feature_miss_batch_failed",
-                    batch_index,
-                    image_count = batch_misses.len(),
-                    patch_count = batch_patch_count,
-                    elapsed_ms = elapsed_ms(materialize_start),
-                    error = %error,
-                    "Qwen3.5 vision cache-miss batch failed"
-                );
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 vision miss batch {batch_index} materialization failed: {error}"
-                )));
-            }
-            if batch_features.shape_at(0)? != batch_feature_count {
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 vision miss batch {batch_index} produced {} features, expected {batch_feature_count}",
-                    batch_features.shape_at(0)?
-                )));
-            }
-            // The merge path casts vision output to the text embedding dtype
-            // on every turn. Do that elementwise cast once before splitting so
-            // retained cache entries use the same values at half the storage
-            // when f32 vision activations feed bf16 text embeddings.
-            let cacheable_batch_features = if batch_features.dtype()? != cache_feature_dtype {
-                let cast = batch_features.astype(cache_feature_dtype)?;
-                let cast_context = format!("qwen3_5_vision_miss_batch_{batch_index}_cache_cast");
-                MxArray::eval_arrays_with_context(&[&cast], &cast_context).map_err(|error| {
-                    Error::from_reason(format!(
-                        "Qwen3.5 vision miss batch {batch_index} cache cast failed: {error}"
-                    ))
-                })?;
-                cast
-            } else {
-                batch_features.clone()
-            };
-
-            // Deep-copy each image slice before caching it. MLX's ordinary
-            // `copy()` shares storage; retaining that view would pin the whole
-            // microbatch allocation and invalidate byte accounting.
-            let mut independent_features = Vec::with_capacity(batch_misses.len());
-            let mut feature_start = 0i64;
-            for miss in batch_misses {
-                let feature_end = feature_start + miss.request.feature_count;
-                independent_features.push(
-                    cacheable_batch_features
-                        .slice_axis(0, feature_start, feature_end)?
-                        .deep_copy()?,
-                );
-                feature_start = feature_end;
-            }
-            let independent_refs: Vec<&MxArray> = independent_features.iter().collect();
-            let split_context = format!("qwen3_5_vision_miss_batch_{batch_index}_split");
-            MxArray::eval_arrays_with_context(&independent_refs, &split_context).map_err(
-                |error| {
-                    Error::from_reason(format!(
-                        "Qwen3.5 vision miss batch {batch_index} split materialization failed: {error}"
-                    ))
-                },
-            )?;
-            independent_features
-            // `batch_features`, `batch_pixels`, grids, and slice views all drop
-            // here, before the allocator cache is drained below.
+        let features = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            vision_encoder.forward(&pv_5d, &grid)?
         };
-        crate::array::clear_cache();
 
-        let (cache_entries, cache_bytes, batch_eviction) = {
+        {
             let mut cache = vision_cache
                 .lock()
                 .map_err(|_| Error::from_reason("Vision cache mutex poisoned"))?;
-            let mut batch_eviction = VisionCacheEviction::default();
-            for (miss, features) in batch_misses.iter().zip(independent_features) {
-                let bytes = vision_array_bytes(&features)?;
-                batch_eviction.merge(cache.insert(
-                    miss.request.key,
-                    features.clone(),
-                    bytes,
-                    &protected_keys,
-                    usize::try_from(memory_budget.cache_budget_bytes).unwrap_or(usize::MAX),
-                ));
-                for &request_index in &miss.request_indices {
-                    ordered_features[request_index] = Some(features.clone());
-                }
+            if cache.entries.len() >= VISION_CACHE_MAX_ENTRIES
+                && let Some((&oldest_key, _)) =
+                    cache.entries.iter().min_by_key(|(_, (_, _, lru))| *lru)
+            {
+                cache.entries.remove(&oldest_key);
             }
-            (cache.entries.len(), cache.retained_bytes, batch_eviction)
-        };
-        // Insertion may evict inactive arrays. Their buffers enter MLX's free
-        // pool when the mutex scope drops, so drain once more outside the lock.
-        crate::array::clear_cache();
-        tracing::info!(
-            target: "mlx_core::inference",
-            event = "vision_feature_miss_batch_done",
-            batch_index,
-            image_count = batch_misses.len(),
-            patch_count = batch_patch_count,
-            feature_tokens = batch_feature_count,
-            cache_entries,
-            cache_bytes,
-            evicted_entries = batch_eviction.entries,
-            evicted_bytes = batch_eviction.bytes,
-            elapsed_ms = elapsed_ms(materialize_start),
-            "Qwen3.5 vision cache-miss batch completed"
-        );
-    }
+            cache.generation += 1;
+            let lru_gen = cache.generation;
+            cache
+                .entries
+                .insert(combined_hash, (features.clone(), grid.clone(), lru_gen));
+        }
+        tracing::debug!("Vision cache MISS for hash {:016x}", combined_hash);
 
-    let mut ordered_features: Vec<MxArray> = ordered_features
-        .into_iter()
-        .enumerate()
-        .map(|(image_index, features)| {
-            features.ok_or_else(|| {
-                Error::from_reason(format!(
-                    "Qwen3.5 vision feature missing for request image {image_index}"
-                ))
-            })
-        })
-        .collect::<Result<_>>()?;
-    let vision_features = if ordered_features.len() == 1 {
-        ordered_features.remove(0)
-    } else {
-        let refs: Vec<&MxArray> = ordered_features.iter().collect();
-        MxArray::concatenate_many(refs, Some(0))?
+        (features, grid)
     };
 
     // === STEP 2: Get text embeddings and merge with vision features ===
@@ -11733,365 +6964,7 @@ pub(crate) fn vlm_prepare_vision_features(
         rope_deltas
     );
 
-    Ok(VisionMerge {
-        inputs_embeds,
-        position_ids,
-        rope_deltas,
-    })
-}
-
-#[cfg(test)]
-mod vision_feature_cache_tests {
-    use super::*;
-
-    fn key(image_hash: u64, grid_thw: [i32; 3]) -> VisionFeatureCacheKey {
-        VisionFeatureCacheKey {
-            image_hash,
-            grid_thw,
-        }
-    }
-
-    fn request(
-        key: VisionFeatureCacheKey,
-        patch_start: i64,
-        patch_count: i64,
-    ) -> VisionImageRequest {
-        VisionImageRequest {
-            key,
-            patch_start,
-            patch_count,
-            feature_count: patch_count,
-        }
-    }
-
-    fn feature(value: f32) -> MxArray {
-        let array = MxArray::from_float32(&[value], &[1]).unwrap();
-        array.eval();
-        array
-    }
-
-    fn snapshot(
-        total: u64,
-        mlx_limit: u64,
-        metal_limit: u64,
-        active: u64,
-        metal_current: u64,
-        allocator_cache: u64,
-    ) -> VisionMemorySnapshot {
-        VisionMemorySnapshot {
-            total_system_memory_bytes: total,
-            mlx_memory_limit_bytes: mlx_limit,
-            metal_working_set_bytes: metal_limit,
-            allocator_active_bytes: active,
-            allocator_active_probe_ok: active > 0,
-            metal_current_allocated_bytes: metal_current,
-            metal_current_probe_ok: metal_current > 0,
-            allocator_cache_bytes: allocator_cache,
-        }
-    }
-
-    fn miss(key: VisionFeatureCacheKey, patch_count: i64) -> VisionCacheMiss {
-        VisionCacheMiss {
-            request: request(key, 0, patch_count),
-            request_indices: vec![0],
-        }
-    }
-
-    #[test]
-    fn plans_per_image_ranges_and_rejects_invalid_geometry() {
-        let planned = plan_vision_image_requests(&[1, 4, 4, 2, 2, 4], &[10, 20], 32, 2)
-            .expect("valid image geometry");
-        assert_eq!(planned[0].patch_start, 0);
-        assert_eq!(planned[0].patch_count, 16);
-        assert_eq!(planned[0].feature_count, 4);
-        assert_eq!(planned[1].patch_start, 16);
-        assert_eq!(planned[1].patch_count, 16);
-        assert_eq!(planned[1].feature_count, 4);
-
-        assert!(plan_vision_image_requests(&[1, 4, 4], &[1, 2], 16, 2).is_err());
-        assert!(plan_vision_image_requests(&[1, 3, 4], &[1], 12, 2).is_err());
-        assert!(plan_vision_image_requests(&[1, 4, 4], &[1], 15, 2).is_err());
-        assert!(plan_vision_image_requests(&[0, 4, 4], &[1], 0, 2).is_err());
-    }
-
-    #[test]
-    fn partitions_at_boundary_over_boundary_and_single_oversize_image() {
-        let a = key(1, [1, 1, 1]);
-        let b = key(2, [1, 1, 1]);
-        let exact = vec![miss(a, 16_000), miss(b, 16_768)];
-        assert_eq!(partition_vision_cache_misses(&exact, 32_768), vec![0..2]);
-
-        let over = vec![miss(a, 16_000), miss(b, 16_769)];
-        assert_eq!(
-            partition_vision_cache_misses(&over, 32_768),
-            vec![0..1, 1..2]
-        );
-
-        let oversize = vec![miss(a, 40_000)];
-        assert_eq!(partition_vision_cache_misses(&oversize, 32_768), vec![0..1]);
-    }
-
-    #[test]
-    fn cache_reuses_appended_images_preserves_order_and_deduplicates_misses() {
-        let a = key(10, [1, 2, 2]);
-        let b = key(20, [1, 2, 2]);
-        let c = key(30, [1, 2, 2]);
-        let mut cache = VisionCacheInner::new();
-        let no_protection = HashSet::new();
-        cache.insert(a, feature(1.0), 4, &no_protection, usize::MAX);
-        cache.insert(b, feature(2.0), 4, &no_protection, usize::MAX);
-
-        let appended = [request(a, 0, 4), request(b, 4, 4), request(c, 8, 4)];
-        let (_, misses, hits) = lookup_vision_feature_cache(&mut cache, &appended);
-        assert_eq!(hits, 2);
-        assert_eq!(misses.len(), 1);
-        assert_eq!(misses[0].request.key, c);
-
-        let reordered = [request(b, 0, 4), request(a, 4, 4)];
-        let (ordered, misses, hits) = lookup_vision_feature_cache(&mut cache, &reordered);
-        assert_eq!(hits, 2);
-        assert!(misses.is_empty());
-        assert_eq!(
-            ordered[0].as_ref().unwrap().to_float32().unwrap().to_vec(),
-            [2.0]
-        );
-        assert_eq!(
-            ordered[1].as_ref().unwrap().to_float32().unwrap().to_vec(),
-            [1.0]
-        );
-
-        let mut duplicate_cache = VisionCacheInner::new();
-        duplicate_cache.insert(b, feature(2.0), 4, &no_protection, usize::MAX);
-        let duplicated = [request(a, 0, 4), request(a, 4, 4), request(b, 8, 4)];
-        let (_, misses, hits) = lookup_vision_feature_cache(&mut duplicate_cache, &duplicated);
-        assert_eq!(hits, 1);
-        assert_eq!(misses.len(), 1, "duplicate A should be encoded once");
-        assert_eq!(misses[0].request_indices, vec![0, 1]);
-    }
-
-    #[test]
-    fn cache_key_includes_grid_for_identical_content_hash() {
-        let requests = [
-            request(key(42, [1, 2, 2]), 0, 4),
-            request(key(42, [1, 4, 4]), 4, 16),
-        ];
-        let mut cache = VisionCacheInner::new();
-        let (_, misses, hits) = lookup_vision_feature_cache(&mut cache, &requests);
-        assert_eq!(hits, 0);
-        assert_eq!(misses.len(), 2);
-        assert_ne!(misses[0].request.key, misses[1].request.key);
-    }
-
-    #[test]
-    fn mixed_hits_and_duplicate_miss_fill_exact_request_order() {
-        let a = key(10, [1, 1, 1]);
-        let b = key(20, [1, 1, 1]);
-        let c = key(30, [1, 1, 1]);
-        let mut cache = VisionCacheInner::new();
-        let no_protection = HashSet::new();
-        cache.insert(b, feature(2.0), 4, &no_protection, usize::MAX);
-        cache.insert(c, feature(3.0), 4, &no_protection, usize::MAX);
-
-        let requests = [
-            request(b, 0, 1),
-            request(a, 1, 1),
-            request(a, 2, 1),
-            request(c, 3, 1),
-        ];
-        let (mut ordered, misses, hits) = lookup_vision_feature_cache(&mut cache, &requests);
-        assert_eq!(hits, 2);
-        assert_eq!(misses.len(), 1);
-        assert_eq!(misses[0].request_indices, vec![1, 2]);
-        let encoded_a = feature(1.0);
-        for &request_index in &misses[0].request_indices {
-            ordered[request_index] = Some(encoded_a.clone());
-        }
-        let ordered: Vec<MxArray> = ordered.into_iter().map(Option::unwrap).collect();
-        let refs: Vec<&MxArray> = ordered.iter().collect();
-        let concatenated = MxArray::concatenate_many(refs, Some(0)).unwrap();
-        assert_eq!(
-            concatenated.to_float32().unwrap().to_vec(),
-            [2.0, 1.0, 1.0, 3.0]
-        );
-    }
-
-    #[test]
-    fn duplicate_images_count_once_for_cache_floor_but_once_per_request_for_concat() {
-        let a = key(10, [1, 1, 1]);
-        let b = key(20, [1, 1, 1]);
-        let requests = [request(a, 0, 1), request(a, 1, 1), request(b, 2, 1)];
-        let (request_bytes, protected_bytes) = projected_vision_feature_bytes(&requests, 8, 2);
-        assert_eq!(request_bytes, 48, "concat contains A, A, and B");
-        assert_eq!(protected_bytes, 32, "cache stores only unique A and B");
-    }
-
-    #[test]
-    fn replacing_cache_key_updates_retained_byte_accounting() {
-        let a = key(1, [1, 1, 1]);
-        let no_protection = HashSet::new();
-        let mut cache = VisionCacheInner::new();
-        cache.insert(a, feature(1.0), 4, &no_protection, usize::MAX);
-        cache.insert(a, feature(2.0), 12, &no_protection, usize::MAX);
-        assert_eq!(cache.entries.len(), 1);
-        assert_eq!(cache.retained_bytes, 12);
-        assert_eq!(cache.get(&a).unwrap().to_float32().unwrap().to_vec(), [2.0]);
-    }
-
-    #[test]
-    fn later_all_hit_subset_prunes_inactive_oversized_floor() {
-        let a = key(1, [1, 1, 1]);
-        let b = key(2, [1, 1, 1]);
-        let c = key(3, [1, 1, 1]);
-        let all_protected: HashSet<_> = [a, b, c].into_iter().collect();
-        let mut cache = VisionCacheInner::new();
-        cache.insert(a, feature(1.0), 4, &all_protected, 4);
-        cache.insert(b, feature(2.0), 4, &all_protected, 4);
-        cache.insert(c, feature(3.0), 4, &all_protected, 4);
-        assert_eq!(cache.entries.len(), 3, "active request is the floor");
-        assert_eq!(cache.retained_bytes, 12);
-
-        let current = [request(a, 0, 1)];
-        let (_, misses, hits) = lookup_vision_feature_cache(&mut cache, &current);
-        assert_eq!(hits, 1);
-        assert!(misses.is_empty());
-        let current_protected: HashSet<_> = [a].into_iter().collect();
-        let eviction = cache.evict_to_limits(&current_protected, 1, 4);
-        assert_eq!(eviction.entries, 2);
-        assert_eq!(eviction.bytes, 8);
-        assert_eq!(cache.entries.len(), 1);
-        assert_eq!(cache.retained_bytes, 4);
-        assert!(cache.entries.contains_key(&a));
-    }
-
-    #[test]
-    fn memory_budget_scales_across_16_32_and_128_gib_caps() {
-        let b16 = resolve_vision_memory_budget(
-            snapshot(16 * VISION_GIB, 0, 0, 8 * VISION_GIB, 8 * VISION_GIB, 0),
-            0,
-            0,
-            1152,
-            4304,
-            4,
-            3_072,
-            0,
-        );
-        let b32 = resolve_vision_memory_budget(
-            snapshot(32 * VISION_GIB, 0, 0, 10 * VISION_GIB, 10 * VISION_GIB, 0),
-            0,
-            0,
-            1152,
-            4304,
-            4,
-            3_072,
-            0,
-        );
-        let b128 = resolve_vision_memory_budget(
-            snapshot(128 * VISION_GIB, 0, 0, 40 * VISION_GIB, 40 * VISION_GIB, 0),
-            0,
-            0,
-            1152,
-            4304,
-            4,
-            3_072,
-            0,
-        );
-        assert!(b16.effective_cap_bytes < b32.effective_cap_bytes);
-        assert!(b32.effective_cap_bytes < b128.effective_cap_bytes);
-        assert!(b16.miss_batch_patch_budget < b32.miss_batch_patch_budget);
-        assert!(b32.miss_batch_patch_budget <= b128.miss_batch_patch_budget);
-        assert_eq!(b128.miss_batch_patch_budget, 32_768);
-        assert!(b16.cache_budget_bytes <= b32.cache_budget_bytes);
-        assert!(b32.cache_budget_bytes <= b128.cache_budget_bytes);
-        assert_eq!(b128.cache_budget_bytes, VISION_CACHE_MAX_BYTES);
-    }
-
-    #[test]
-    fn memory_budget_uses_lower_haircut_cap_and_external_metal_usage() {
-        let budget = resolve_vision_memory_budget(
-            snapshot(
-                128 * VISION_GIB,
-                64 * VISION_GIB,
-                96 * VISION_GIB,
-                10 * VISION_GIB,
-                18 * VISION_GIB,
-                VISION_GIB,
-            ),
-            0,
-            0,
-            1152,
-            4304,
-            2,
-            1_536,
-            0,
-        );
-        assert_eq!(budget.effective_cap_bytes, 64 * VISION_GIB);
-        assert_eq!(budget.cap_source, VisionMemoryCapSource::MlxMemoryLimit);
-        assert_eq!(budget.metal_nonreclaimable_bytes, 17 * VISION_GIB);
-        assert_eq!(budget.used_memory_bytes, 17 * VISION_GIB);
-    }
-
-    #[test]
-    fn memory_budget_fails_closed_for_missing_usage_and_near_cap() {
-        let missing =
-            resolve_vision_memory_budget(snapshot(0, 0, 0, 0, 0, 0), 0, 0, 1152, 4304, 4, 3_072, 0);
-        assert_eq!(
-            missing.cap_source,
-            VisionMemoryCapSource::ConservativeFallback
-        );
-        assert!(!missing.usage_probe_available);
-        assert_eq!(missing.headroom_bytes, 0);
-        assert_eq!(missing.cache_budget_bytes, 0);
-        assert_eq!(missing.miss_batch_patch_budget, 0);
-
-        let near_cap = resolve_vision_memory_budget(
-            snapshot(0, 16 * VISION_GIB, 0, 15 * VISION_GIB, 15 * VISION_GIB, 0),
-            0,
-            0,
-            1152,
-            4304,
-            4,
-            3_072,
-            0,
-        );
-        assert!(near_cap.usage_probe_available);
-        assert_eq!(near_cap.headroom_bytes, 0);
-        assert_eq!(near_cap.miss_batch_patch_budget, 0);
-    }
-
-    #[test]
-    fn memory_budget_rejects_outputs_larger_than_post_reserve_headroom() {
-        let budget = resolve_vision_memory_budget(
-            snapshot(0, 16 * VISION_GIB, 0, 12 * VISION_GIB, 12 * VISION_GIB, 0),
-            0,
-            0,
-            1152,
-            4304,
-            4,
-            3_072,
-            3 * VISION_GIB,
-        );
-        assert_eq!(budget.output_headroom_bytes, 2 * VISION_GIB);
-        assert!(!budget.projected_output_fits);
-        assert_eq!(budget.headroom_bytes, 0);
-        assert_eq!(budget.miss_batch_patch_budget, 0);
-    }
-
-    #[test]
-    fn memory_budget_saturates_extreme_geometry_without_overflow() {
-        let budget = resolve_vision_memory_budget(
-            snapshot(u64::MAX, u64::MAX, u64::MAX, 1, 1, 0),
-            0,
-            0,
-            u64::MAX,
-            u64::MAX,
-            u64::MAX,
-            u64::MAX,
-            u64::MAX,
-        );
-        assert_eq!(budget.peak_bytes_per_patch, u64::MAX);
-        assert_eq!(budget.miss_batch_patch_budget, 0);
-        assert!(budget.cache_budget_bytes <= VISION_CACHE_MAX_BYTES);
-    }
+    Ok((inputs_embeds, position_ids, rope_deltas))
 }
 
 #[cfg(test)]
@@ -12156,29 +7029,6 @@ mod image_placeholder_tests {
         let tokens = vec![BOS, USER, 10, 11, IMG, 12, 13];
         let out = inject_image_placeholders(&tokens, &[4]);
         assert_eq!(out, vec![BOS, USER, 10, 11, IMG, IMG, IMG, IMG, 12, 13]);
-    }
-
-    #[test]
-    fn non_allocating_length_plan_matches_placeholder_injection() {
-        let cases = [
-            (vec![BOS, USER, IMG, TEXT], vec![5]),
-            (vec![BOS, IMG, TEXT, IMG], vec![2, 3]),
-            (vec![BOS, USER, TEXT], Vec::new()),
-            (vec![BOS, USER, TEXT], vec![3]),
-            (vec![BOS, USER, IMG, IMG, IMG, IMG, IMG, TEXT], vec![5]),
-            // Unknown placeholder shape is deliberately passed through.
-            (vec![BOS, IMG, IMG, TEXT], vec![3]),
-        ];
-
-        for (tokens, counts) in cases {
-            let planned = expanded_image_prompt_len(&tokens, &counts).expect("plan prompt length");
-            let expanded = inject_image_placeholders(&tokens, &counts);
-            assert_eq!(
-                planned,
-                expanded.len(),
-                "tokens={tokens:?}, counts={counts:?}"
-            );
-        }
     }
 }
 
@@ -12264,7 +7114,7 @@ mod rope_index_tests {
             .copied()
             .collect();
         let (ids, grid) = mk_inputs(&tokens, &[(2, 4, 4)]);
-        let (pos, rope_deltas) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
+        let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
         let (t, h, w) = extract_positions(&pos);
         // Leading text
         assert_eq!(&t[..2], &[0, 1]);
@@ -12275,68 +7125,12 @@ mod rope_index_tests {
         assert_eq!(&t[10..], &[4, 5]);
         assert_eq!(&h[10..], &[4, 5]);
         assert_eq!(&w[10..], &[4, 5]);
-
-        // The image run compresses 8 placeholder tokens into 4 distinct
-        // temporal positions, so the running M-RoPE counter lags the physical
-        // sequence length: `rope_deltas = max_position + 1 - seq_len` MUST be
-        // negative. This is the per-session delta the paged decode/warm-
-        // continuation path adds to the physical KV slot to recover the
-        // compressed rotation position; previously it was dropped, leaving
-        // image-turn decode rotating ~|delta| positions too far ahead.
-        let max_position = *t.iter().max().unwrap() as i64; // temporal axis (axis 0)
-        let seq_len = tokens.len() as i64;
-        assert_eq!(rope_deltas, max_position + 1 - seq_len);
-        assert!(
-            rope_deltas < 0,
-            "image prefill must compress positions (rope_deltas={rope_deltas})"
-        );
-        // 2 text + 8 image (compressed to positions 2..=3) + 2 text → max
-        // temporal position 5 over 12 tokens → delta = 5 + 1 - 12 = -6.
-        assert_eq!(rope_deltas, -6);
-    }
-
-    #[test]
-    fn image_final_prompt_delta_uses_global_max_axis() {
-        // An image-FINAL prompt (no trailing text) exposes which axis feeds the
-        // decode delta: the spatial (h, w) axes outrun the temporal one, so the
-        // global max M-RoPE position lives on a spatial axis. The delta must use
-        // that global max (mlx-vlm `llm_positions.max()`), NOT the temporal axis
-        // alone — otherwise the first generated token rotates at a position
-        // INSIDE the image's spatial range instead of at global_max + 1.
-        let _g = mlx_lock().lock().unwrap();
-        // 1 text + (grid 1x4x4, spatial_merge=2 → llm grid t=1,h=2,w=2 = 4 image
-        // tokens) and NOTHING after the image.
-        let tokens: Vec<i32> = std::iter::once(TEXT_A)
-            .chain(std::iter::repeat_n(IMG, 4))
-            .collect();
-        let (ids, grid) = mk_inputs(&tokens, &[(1, 4, 4)]);
-        let (pos, rope_deltas) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
-        let (t, h, w) = extract_positions(&pos);
-
-        let t_max = *t.iter().max().unwrap() as i64;
-        let global_max = *t.iter().chain(&h).chain(&w).max().unwrap() as i64;
-        let seq_len = tokens.len() as i64;
-
-        // The spatial axes must outrun the temporal one here, else the test
-        // would not distinguish the global-max fix from the axis-0 regression.
-        assert!(
-            global_max > t_max,
-            "test grid is not asymmetric: global_max={global_max} t_max={t_max}"
-        );
-        // The delta references the GLOBAL max, not the temporal-axis max.
-        assert_eq!(rope_deltas, global_max + 1 - seq_len);
-        assert_ne!(
-            rope_deltas,
-            t_max + 1 - seq_len,
-            "delta must not use the temporal axis alone (axis-0 regression)"
-        );
     }
 
     #[test]
     fn two_image_runs_separated_by_text_emits_every_position() {
-        // Two image runs separated by interior text must emit a position for
-        // EVERY token; a dropped interior-text position makes the downstream
-        // reshape in get_rope_index fail with a length mismatch.
+        // THE regression test for the P2 bug — pre-fix this crashed the
+        // downstream reshape with a length mismatch.
         let _g = mlx_lock().lock().unwrap();
         let mut tokens: Vec<i32> = Vec::new();
         tokens.push(TEXT_A); // position 0
@@ -12350,9 +7144,9 @@ mod rope_index_tests {
         let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
         let (t, _h, _w) = extract_positions(&pos);
 
-        // seq_len == tokens.len() — every token must have a position;
-        // dropping the interior text entries fails the reshape at the end
-        // of get_rope_index.
+        // seq_len == tokens.len() — every token must have a position
+        // (the old single-span path dropped the interior text entries,
+        // which then failed the reshape at the end of get_rope_index).
         assert_eq!(
             t.len(),
             tokens.len(),
@@ -12442,10 +7236,12 @@ mod rope_index_tests {
         // markers and `inject_image_placeholders` crams every image's
         // tokens into a single splice after BOS. For N images with
         // distinct grids, the prompt carries ONE big contiguous run of
-        // `sum(per_image_counts)` image tokens. This is a legitimate
-        // fallback layout: the path synthesises per-image sub-run offsets
-        // from the shared span and emits correct M-RoPE positions for each
-        // image (rather than rejecting it as a "run layout mismatch").
+        // `sum(per_image_counts)` image tokens. The old strict guard
+        // rejected this as "run layout mismatch" even though it was
+        // the legitimate fallback layout that previously worked via
+        // the old single-span position walk. The new path synthesises
+        // per-image sub-run offsets from the shared span and emits
+        // correct M-RoPE positions for each image.
         let _g = mlx_lock().lock().unwrap();
         // Two 1×2×2 grids → 4 image tokens each, 8 total.
         let mut tokens = vec![TEXT_A];
@@ -12507,8 +7303,9 @@ mod prefix_cache_reuse_integration_tests {
     //!
     //! The test bodies are intentionally skeletal — they document what
     //! needs to hold rather than wiring up the full model-loading
-    //! boilerplate. Flesh them out alongside the end-to-end harness in
-    //! `serve.ts`.
+    //! boilerplate. Flesh them out alongside the upcoming end-to-end
+    //! harness in `serve.ts` / the pi-mono vitest-migration smoke test
+    //! (plan doc §Verification).
 
     /// Append hit: two back-to-back session-start calls where the second's
     /// token sequence is `first_tokens + extra_tokens`. The result of the
@@ -12554,1293 +7351,5 @@ mod prefix_cache_reuse_integration_tests {
         //   assert_eq!(r2.cached_tokens, 0);
         //   // And the second call must have done a full prefill, not
         //   // attempted to decode from stale caches.
-    }
-}
-
-#[cfg(test)]
-mod paged_construction_tests {
-    //! Smoke tests for the block-paged adapter construction on Qwen3.5
-    //! dense. The forward dispatch lives in `paged_turn_sync_core`
-    //! / `paged_turn_stream_core`; these tests cover the
-    //! Inner-construction surface in isolation.
-    //!
-    //! Tests that allocate a `LayerKVPool` require Metal. Construction-only
-    //! cases are `#[ignore]`-marked behind `MLX_TEST_PAGED=1`; forward-path
-    //! checks are also ignored because no-Metal hosts can abort inside MLX
-    //! before Rust receives an `Err`.
-
-    use super::*;
-    use crate::array::DType;
-    use crate::models::qwen3_5::config::Qwen3_5Config;
-    use crate::models::qwen3_5::decoder_layer::{self, AttentionType};
-    use crate::models::qwen3_5::quantized_linear::{
-        MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE, QuantizedLinear,
-    };
-
-    fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
-        Qwen3_5Config {
-            vocab_size: 1024,
-            hidden_size: 64,
-            num_layers: 8,
-            num_heads: 4,
-            num_kv_heads: 2,
-            intermediate_size: 128,
-            rms_norm_eps: 1e-6,
-            head_dim: 16,
-            tie_word_embeddings: true,
-            attention_bias: false,
-            max_position_embeddings: 1024,
-            pad_token_id: 0,
-            eos_token_id: 0,
-            bos_token_id: 0,
-            linear_num_value_heads: 4,
-            linear_num_key_heads: 2,
-            linear_key_head_dim: 16,
-            linear_value_head_dim: 16,
-            linear_conv_kernel_dim: 4,
-            full_attention_interval: 4,
-            partial_rotary_factor: 0.25,
-            rope_theta: 100_000.0,
-            paged_cache_memory_mb: Some(64),
-            paged_block_size: Some(16),
-            use_block_paged_cache: if use_block_paged { Some(true) } else { None },
-            n_mtp_layers: 0,
-        }
-    }
-
-    fn tiny_paged_forward_cfg() -> Qwen3_5Config {
-        let mut cfg = tiny_cfg(true);
-        // Paged attention's Metal kernels require head_dim=32+; keep the
-        // production-forward tests on a separate shape so construction tests
-        // preserve their smaller historical config.
-        cfg.hidden_size = 128;
-        cfg.intermediate_size = 256;
-        cfg.head_dim = 32;
-        cfg.linear_key_head_dim = 32;
-        cfg.linear_value_head_dim = 32;
-        cfg.paged_cache_memory_mb = Some(256);
-        cfg
-    }
-
-    #[test]
-    fn save_model_rejects_quantized_dense_projection_before_creating_destination() {
-        let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
-        let weight = MxArray::zeros(&[128, 16], Some(DType::Uint32)).unwrap();
-        let scales = MxArray::zeros(&[128, 2], Some(DType::Uint8)).unwrap();
-        let quantized = QuantizedLinear::new(
-            weight,
-            scales,
-            None,
-            None,
-            MXFP8_GROUP_SIZE,
-            MXFP8_BITS,
-            MXFP8_MODE.to_string(),
-        );
-        match &mut inner.layers[3].attn {
-            AttentionType::Full(attn) => attn.set_quantized_q_proj(quantized),
-            AttentionType::Linear(_) => panic!("layer 3 must be full attention"),
-        }
-
-        let destination = std::env::temp_dir().join(format!(
-            "mlx_node_dense_quant_save_reject_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        assert!(!destination.exists());
-        let err = inner
-            .save_model_sync(destination.to_str().unwrap())
-            .expect_err("quantized main-model projection must reject dense-only save");
-        let message = err.reason.to_string();
-        assert!(message.contains("dense/BF16-only"), "{message}");
-        assert!(message.contains("layers.3"), "{message}");
-        assert!(message.contains("before creating"), "{message}");
-        assert!(
-            !destination.exists(),
-            "rejected save must not create its destination directory"
-        );
-    }
-
-    fn paged_inner_or_skip(test_name: &str) -> Option<(Qwen35Inner, Qwen3_5Config)> {
-        let cfg = tiny_paged_forward_cfg();
-        match Qwen35Inner::new(cfg.clone()) {
-            Ok(mut inner) => match inner.initialize_paged_adapter() {
-                Ok(()) => Some((inner, cfg)),
-                Err(err) => {
-                    let msg = err.reason.to_string();
-                    if msg.contains("Metal")
-                        || msg.contains("device")
-                        || msg.contains("LayerKVPool")
-                    {
-                        eprintln!("skipping {test_name} (paged adapter unavailable): {msg}");
-                        None
-                    } else {
-                        panic!("unexpected paged init failure in {test_name}: {msg}");
-                    }
-                }
-            },
-            Err(err) => {
-                let msg = err.reason.to_string();
-                if msg.contains("Metal") || msg.contains("device") || msg.contains("LayerKVPool") {
-                    eprintln!("skipping {test_name} (paged adapter unavailable): {msg}");
-                    None
-                } else {
-                    panic!("unexpected Qwen35Inner::new failure in {test_name}: {msg}");
-                }
-            }
-        }
-    }
-
-    fn cast_qwen35_inner_weights_bf16(inner: &mut Qwen35Inner) {
-        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype bf16") };
-
-        let w = inner.embedding.get_weight();
-        inner.embedding.set_weight(&cast(&w)).expect("set embed");
-
-        let w = inner.final_norm.get_weight();
-        inner
-            .final_norm
-            .set_weight(&cast(&w))
-            .expect("set final_norm");
-
-        if let Some(head) = inner.lm_head.as_mut() {
-            let w = head.get_weight();
-            head.set_weight(&cast(&w), "lm_head").expect("set lm_head");
-        }
-
-        for layer in inner.layers.iter_mut() {
-            let w = layer.get_input_layernorm_weight();
-            layer
-                .set_input_layernorm_weight(&cast(&w))
-                .expect("set input_layernorm");
-            let w = layer.get_post_attention_layernorm_weight();
-            layer
-                .set_post_attention_layernorm_weight(&cast(&w))
-                .expect("set post_attention_layernorm");
-
-            match &mut layer.attn {
-                AttentionType::Linear(gdn) => {
-                    let w = gdn.get_dt_bias();
-                    gdn.set_dt_bias(&cast(&w));
-                    let w = gdn.get_a_log();
-                    gdn.set_a_log(&cast(&w)).expect("set a_log");
-                    let w = gdn.get_in_proj_qkvz_weight();
-                    gdn.set_in_proj_qkvz_weight(&cast(&w))
-                        .expect("set in_proj_qkvz");
-                    let w = gdn.get_in_proj_ba_weight();
-                    gdn.set_in_proj_ba_weight(&cast(&w))
-                        .expect("set in_proj_ba");
-                    let w = gdn.get_conv1d_weight();
-                    gdn.set_conv1d_weight(&cast(&w)).expect("set conv1d");
-                    let w = gdn.get_norm_weight();
-                    gdn.set_norm_weight(&cast(&w)).expect("set gdn norm");
-                    let w = gdn.get_out_proj_weight();
-                    gdn.set_out_proj_weight(&cast(&w)).expect("set out_proj");
-                }
-                AttentionType::Full(attn) => {
-                    let w = attn.get_q_proj_weight();
-                    attn.set_q_proj_weight(&cast(&w)).expect("set q_proj");
-                    let w = attn.get_k_proj_weight();
-                    attn.set_k_proj_weight(&cast(&w)).expect("set k_proj");
-                    let w = attn.get_v_proj_weight();
-                    attn.set_v_proj_weight(&cast(&w)).expect("set v_proj");
-                    let w = attn.get_o_proj_weight();
-                    attn.set_o_proj_weight(&cast(&w)).expect("set o_proj");
-                    let w = attn.get_q_norm_weight();
-                    attn.set_q_norm_weight(&cast(&w)).expect("set q_norm");
-                    let w = attn.get_k_norm_weight();
-                    attn.set_k_norm_weight(&cast(&w)).expect("set k_norm");
-                }
-            }
-
-            let w = layer.mlp.get_gate_proj_weight();
-            layer
-                .mlp
-                .set_gate_proj_weight(&cast(&w))
-                .expect("set gate_proj");
-            let w = layer.mlp.get_up_proj_weight();
-            layer
-                .mlp
-                .set_up_proj_weight(&cast(&w))
-                .expect("set up_proj");
-            let w = layer.mlp.get_down_proj_weight();
-            layer
-                .mlp
-                .set_down_proj_weight(&cast(&w))
-                .expect("set down_proj");
-        }
-    }
-
-    fn reset_paged_request(inner: &mut Qwen35Inner, prompt: &[u32]) {
-        inner.caches = Some(
-            (0..inner.config.num_layers as usize)
-                .map(|i| {
-                    if inner.config.is_linear_layer(i) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect(),
-        );
-
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        if adapter.block_table().is_some() {
-            adapter.release_request().expect("release_request");
-        }
-        adapter.reset_for_new_request(0).expect("reset request");
-        let prefix = adapter
-            .find_cached_prefix(prompt, &[], 0, false)
-            .expect("find_cached_prefix");
-        assert_eq!(
-            prefix.cached_token_count, 0,
-            "dense chunking tests must start from a cold adapter prefix"
-        );
-        adapter
-            .allocate_suffix_blocks(prompt.len() as u32)
-            .expect("allocate suffix blocks");
-    }
-
-    fn run_dense_paged_prefill_with_size(
-        inner: &mut Qwen35Inner,
-        full_tokens: &[u32],
-        suffix_tokens: &[u32],
-        cached_prefix_len: u32,
-        chunk_size: i32,
-    ) -> Result<MxArray> {
-        run_dense_paged_prefill_with_size_and_checkpoint(
-            inner,
-            full_tokens,
-            suffix_tokens,
-            cached_prefix_len,
-            chunk_size,
-        )
-        .map(|(logits, _checkpoint)| logits)
-    }
-
-    fn run_dense_paged_prefill_with_size_and_checkpoint(
-        inner: &mut Qwen35Inner,
-        full_tokens: &[u32],
-        suffix_tokens: &[u32],
-        cached_prefix_len: u32,
-        chunk_size: i32,
-    ) -> Result<(
-        MxArray,
-        Option<super::super::paged_forward::MaterializedGdnPrefixCheckpoint>,
-    )> {
-        let layer_kinds =
-            decoder_layer::compute_layer_kinds(inner.config.num_layers as usize, |i| {
-                inner.config.is_linear_layer(i)
-            });
-        let embed = inner.embedding.clone();
-        let embedding_weight = embed.get_weight();
-        let caches = inner.caches.as_mut().expect("qwen35 caches initialized");
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-
-        super::super::paged_forward::run_paged_prefill_chunk_with_size(
-            full_tokens,
-            suffix_tokens,
-            cached_prefix_len,
-            false,
-            &embed,
-            &mut inner.layers,
-            caches,
-            &inner.final_norm,
-            &inner.lm_head,
-            &embedding_weight,
-            &layer_kinds,
-            adapter,
-            chunk_size,
-            /* cached_rope_deltas */ 0,
-        )
-    }
-
-    fn logits_to_f32_vec(logits: &MxArray) -> Vec<f32> {
-        let f32_arr = logits.astype(DType::Float32).expect("astype f32");
-        f32_arr.eval();
-        let n = f32_arr.shape_at(0).expect("shape_at(0)") as usize;
-        (0..n)
-            .map(|i| f32_arr.item_at_float32(i).expect("item_at_float32"))
-            .collect()
-    }
-
-    fn batch_vocab_logits_to_f32_vec(logits: &MxArray) -> Vec<f32> {
-        assert_eq!(logits.ndim().expect("ndim"), 2, "batch logits ndim");
-        assert_eq!(logits.shape_at(0).expect("shape_at(0)"), 1);
-        let squeezed = logits.squeeze(Some(&[0])).expect("squeeze batch");
-        logits_to_f32_vec(&squeezed)
-    }
-
-    fn assert_finite_vocab_logits(logits: &MxArray, vocab_size: i32, context: &str) {
-        assert_eq!(logits.ndim().expect("ndim"), 1, "{context}: logits ndim");
-        assert_eq!(
-            logits.shape_at(0).expect("shape_at(0)"),
-            vocab_size as i64,
-            "{context}: logits shape"
-        );
-        let values = logits_to_f32_vec(logits);
-        for (i, v) in values.iter().enumerate() {
-            assert!(v.is_finite(), "{context}: logits[{i}] is not finite: {v}");
-        }
-    }
-
-    fn assert_finite_batch_vocab_logits(logits: &MxArray, vocab_size: i32, context: &str) {
-        assert_eq!(logits.ndim().expect("ndim"), 2, "{context}: logits ndim");
-        assert_eq!(
-            logits.shape_at(0).expect("shape_at(0)"),
-            1,
-            "{context}: logits batch"
-        );
-        assert_eq!(
-            logits.shape_at(1).expect("shape_at(1)"),
-            vocab_size as i64,
-            "{context}: logits vocab"
-        );
-        let values = batch_vocab_logits_to_f32_vec(logits);
-        for (i, v) in values.iter().enumerate() {
-            assert!(v.is_finite(), "{context}: logits[{i}] is not finite: {v}");
-        }
-    }
-
-    fn assert_close_batch_vocab_logits(
-        left: &MxArray,
-        right: &MxArray,
-        abs_tol: f32,
-        context: &str,
-    ) {
-        let left = batch_vocab_logits_to_f32_vec(left);
-        let right = batch_vocab_logits_to_f32_vec(right);
-        assert_eq!(left.len(), right.len(), "{context}: logits len");
-        for (i, (a, b)) in left.iter().zip(right.iter()).enumerate() {
-            let diff = (a - b).abs();
-            assert!(
-                diff <= abs_tol,
-                "{context}: logits[{i}] differ: left={a}, right={b}, abs_diff={diff}, tol={abs_tol}"
-            );
-        }
-    }
-
-    fn assert_finite_hidden(hidden: &MxArray, context: &str) {
-        let f32_arr = hidden.astype(DType::Float32).expect("astype hidden f32");
-        f32_arr.eval();
-        let total = (0..f32_arr.ndim().expect("hidden ndim"))
-            .map(|axis| f32_arr.shape_at(axis).expect("hidden shape") as usize)
-            .product::<usize>();
-        for i in 0..total {
-            let value = f32_arr.item_at_float32(i).expect("hidden item");
-            assert!(
-                value.is_finite(),
-                "{context}: hidden[{i}] is not finite: {value}"
-            );
-        }
-    }
-
-    fn reset_dense_caches(inner: &mut Qwen35Inner) {
-        inner.caches = Some(fresh_dense_layer_caches(&inner.config));
-    }
-
-    fn run_dense_final_logits_legacy_chunked_projection(
-        inner: &mut Qwen35Inner,
-        prompt: &MxArray,
-        embedding_weight: &MxArray,
-        embedding_weight_t: &MxArray,
-        chunk_size: i64,
-    ) -> Result<MxArray> {
-        reset_dense_caches(inner);
-        let total_len = prompt.shape_at(1)?;
-        let chunk_size = if chunk_size <= 0 {
-            total_len
-        } else {
-            chunk_size
-        };
-        let generation_stream = Stream::new(DeviceType::Gpu);
-        let mut offset = 0;
-        while total_len - offset > chunk_size {
-            let chunk = prompt.slice_axis(1, offset, offset + chunk_size)?;
-            {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                let _logits = forward_inner(
-                    &chunk,
-                    embedding_weight,
-                    &mut inner.layers,
-                    &mut inner.caches,
-                    &inner.final_norm,
-                    &inner.lm_head,
-                    Some(embedding_weight_t),
-                )?;
-            }
-            eval_layer_caches(&inner.caches)?;
-            crate::array::clear_cache();
-            offset += chunk_size;
-        }
-
-        let remaining = prompt.slice_axis(1, offset, total_len)?;
-        let logits = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            forward_inner(
-                &remaining,
-                embedding_weight,
-                &mut inner.layers,
-                &mut inner.caches,
-                &inner.final_norm,
-                &inner.lm_head,
-                Some(embedding_weight_t),
-            )?
-        };
-        let seq_len = logits.shape_at(1)?;
-        logits
-            .slice_axis(1, seq_len - 1, seq_len)?
-            .squeeze(Some(&[1]))
-    }
-
-    fn run_dense_final_logits_chunked(
-        inner: &mut Qwen35Inner,
-        prompt: &MxArray,
-        embedding_weight: &MxArray,
-        embedding_weight_t: &MxArray,
-        chunk_size: i64,
-    ) -> Result<MxArray> {
-        reset_dense_caches(inner);
-        chunked_prefill_with_size(
-            prompt,
-            embedding_weight,
-            &mut inner.layers,
-            &mut inner.caches,
-            &inner.final_norm,
-            &inner.lm_head,
-            Some(embedding_weight_t),
-            Stream::new(DeviceType::Gpu),
-            chunk_size,
-        )
-    }
-
-    /// `use_block_paged_cache` defaults to `None` and round-trips
-    /// through serde.
-    #[test]
-    fn test_use_block_paged_cache_serde_default_none() {
-        let json = serde_json::json!({
-            "vocab_size": 1024,
-            "hidden_size": 64,
-            "num_layers": 8,
-            "num_heads": 4,
-            "num_kv_heads": 2,
-            "intermediate_size": 128,
-            "rms_norm_eps": 1e-6,
-            "head_dim": 16,
-            "tie_word_embeddings": true,
-            "max_position_embeddings": 1024,
-            "pad_token_id": 0,
-            "eos_token_id": 0,
-            "bos_token_id": 0,
-        });
-        let cfg: Qwen3_5Config = serde_json::from_value(json).unwrap();
-        assert_eq!(
-            cfg.use_block_paged_cache, None,
-            "use_block_paged_cache must default to None on JSON without the key"
-        );
-        assert_eq!(cfg.paged_block_size, None);
-        assert_eq!(cfg.paged_cache_memory_mb, None);
-    }
-
-    #[test]
-    fn test_use_block_paged_cache_serde_true_round_trip() {
-        let json = serde_json::json!({
-            "vocab_size": 1024,
-            "hidden_size": 64,
-            "num_layers": 8,
-            "num_heads": 4,
-            "num_kv_heads": 2,
-            "intermediate_size": 128,
-            "rms_norm_eps": 1e-6,
-            "head_dim": 16,
-            "tie_word_embeddings": true,
-            "max_position_embeddings": 1024,
-            "pad_token_id": 0,
-            "eos_token_id": 0,
-            "bos_token_id": 0,
-            "use_block_paged_cache": true,
-            "paged_block_size": 16,
-            "paged_cache_memory_mb": 256,
-        });
-        let cfg: Qwen3_5Config = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.use_block_paged_cache, Some(true));
-        assert_eq!(cfg.paged_block_size, Some(16));
-        assert_eq!(cfg.paged_cache_memory_mb, Some(256));
-    }
-
-    #[test]
-    fn test_full_attention_layer_count() {
-        let cfg = tiny_cfg(false);
-        // 8 layers, full_attention_interval=4 → layers 3 and 7 are
-        // full-attention (2 layers).
-        assert_eq!(cfg.full_attention_layer_count(), 2);
-    }
-
-    #[test]
-    fn test_dense_gdn_root_rotation_and_legacy_retention_policy() {
-        fn push_checkpoint(
-            inner: &mut Qwen35Inner,
-            owner_id: &str,
-            root_owner_id: Option<&str>,
-            marker: u32,
-        ) {
-            crate::engine::backend::ChatBackend::set_cache_owner_id(inner, owner_id, root_owner_id);
-            let tokens: Vec<u32> = (0..16).map(|offset| marker * 100 + offset).collect();
-            inner
-                .gdn_prefix_checkpoints
-                .push_back(DenseGdnPrefixCheckpoint {
-                    owner_id: inner.active_cache_owner_id.clone(),
-                    prefix_len: 16,
-                    block_size: 16,
-                    final_block_hash: marker as u64,
-                    block_hashes: vec![marker as u64],
-                    tokens,
-                    caches: Vec::new(),
-                });
-            inner.prune_dense_gdn_prefix_checkpoints();
-        }
-
-        let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
-        push_checkpoint(&mut inner, "root-0", Some("root-0"), 1);
-        push_checkpoint(&mut inner, "root-1", Some("root-1"), 2);
-        for (index, owner) in ["child-0", "child-1", "child-2", "child-3"]
-            .into_iter()
-            .enumerate()
-        {
-            push_checkpoint(&mut inner, owner, Some("root-1"), 10 + index as u32);
-        }
-        assert_eq!(inner.gdn_root_cache_owner_id.as_deref(), Some("root-1"));
-        assert!(inner.gdn_root_cache_owner_is_explicit);
-        assert_eq!(inner.gdn_prefix_checkpoints.len(), 5);
-        assert!(
-            !inner
-                .gdn_prefix_checkpoints
-                .iter()
-                .any(|checkpoint| checkpoint.owner_id == "root-0")
-        );
-        assert!(
-            inner
-                .gdn_prefix_checkpoints
-                .iter()
-                .any(|checkpoint| checkpoint.owner_id == "root-1")
-        );
-
-        let mut legacy = Qwen35Inner::new(tiny_cfg(false)).expect("construct legacy dense model");
-        for marker in 1..=3 {
-            push_checkpoint(&mut legacy, "", None, marker);
-        }
-        assert!(!legacy.gdn_root_cache_owner_is_explicit);
-        assert_eq!(legacy.gdn_prefix_checkpoints.len(), 2);
-    }
-
-    #[test]
-    fn test_qwen35_media_plan_requires_complete_paged_vision_stack() {
-        for has_encoder in [false, true] {
-            for has_processor in [false, true] {
-                for has_paged in [false, true] {
-                    let plan = qwen35_dense_media_plan(has_encoder, has_processor, has_paged);
-                    let available = has_encoder && has_processor && has_paged;
-                    assert_eq!(plan.available.images, available);
-                    assert!(!plan.available.audio);
-                    assert_eq!(plan.backend_validated.images, !available);
-                    assert!(!plan.backend_validated.audio);
-                    assert!(plan.admitted().images);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_qwen35_session_media_survives_paged_image_key_clear() {
-        assert_eq!(
-            qwen35_dense_session_media(true, false),
-            MediaCapabilities::IMAGES
-        );
-        assert_eq!(
-            qwen35_dense_session_media(false, true),
-            MediaCapabilities::IMAGES,
-            "a retained M-RoPE delta proves successive paged text turns still extend image KV"
-        );
-        assert_eq!(
-            qwen35_dense_session_media(false, false),
-            MediaCapabilities::NONE
-        );
-    }
-
-    #[test]
-    fn test_dense_paged_finalize_failure_cannot_republish_image_session() {
-        let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
-        inner.caches = Some(fresh_dense_layer_caches(&inner.config));
-        inner.cached_token_history = vec![7, 248_056, 248_056, 8];
-        inner.cached_image_key = Some(0xD35E);
-        inner.cached_paged_image_token_positions = vec![(1, 0xA11C), (2, 0xA11C)];
-        inner.cached_rope_deltas = Some(-2);
-
-        // A missing adapter exercises the same infallible-hook downgrade used
-        // for registration/evaluation/release failures without allocating a
-        // Metal LayerKVPool in this unit test.
-        <Qwen35Inner as crate::engine::backend::PagedBackend>::finalize_paged_turn(
-            &mut inner, true,
-        );
-        assert!(inner.paged_finalize_failed);
-        assert!(inner.caches.is_none());
-        assert!(inner.cached_token_history.is_empty());
-        assert!(inner.cached_image_key.is_none());
-        assert!(inner.cached_paged_image_token_positions.is_empty());
-        assert!(inner.cached_rope_deltas.is_none());
-
-        // The engine always calls save after the infallible finalize hook. It
-        // must consume the failure latch rather than reviving the session from
-        // expanded image-placeholder ids.
-        <Qwen35Inner as crate::engine::backend::PagedBackend>::save_paged_history(
-            &mut inner,
-            &[7, 248_056, 248_056, 8],
-            &[9],
-            false,
-            true,
-        )
-        .expect("failed finalization must downgrade history save");
-        assert!(!inner.paged_finalize_failed);
-        assert!(inner.cached_token_history.is_empty());
-        assert!(!crate::engine::backend::ChatBackend::has_live_session(
-            &inner
-        ));
-        assert_eq!(
-            crate::engine::backend::ChatBackend::session_media(&inner),
-            MediaCapabilities::NONE
-        );
-    }
-
-    fn seed_dense_paged_image_session(inner: &mut Qwen35Inner) {
-        inner.caches = Some(fresh_dense_layer_caches(&inner.config));
-        inner.cached_token_history = vec![7, 248_056, 248_056, 8];
-        inner.cached_image_key = Some(0xD35E);
-        inner.cached_paged_image_token_positions = vec![(1, 0xA11C), (2, 0xA11C)];
-        inner.cached_rope_deltas = Some(-2);
-        inner.paged_full_attn_caches_dirty = true;
-        inner.flat_mtp_caches_desynced = true;
-    }
-
-    #[test]
-    fn test_dense_manual_paged_finalize_failure_invalidates_session() {
-        let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
-        seed_dense_paged_image_session(&mut inner);
-
-        let error = inner
-            .finalize_dense_manual_paged_turn(&[(1, 0xA11C), (2, 0xA11C)])
-            .expect_err("missing adapter must fail manual finalization");
-        assert!(error.to_string().contains("paged finalization failed"));
-        assert!(inner.caches.is_none());
-        assert!(inner.cached_token_history.is_empty());
-        assert!(inner.cached_image_key.is_none());
-        assert!(inner.cached_paged_image_token_positions.is_empty());
-        assert!(inner.cached_rope_deltas.is_none());
-        assert!(!inner.paged_full_attn_caches_dirty);
-        assert!(!inner.flat_mtp_caches_desynced);
-    }
-
-    #[test]
-    fn test_dense_vlm_prefix_prepare_failure_invalidates_session() {
-        let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
-        seed_dense_paged_image_session(&mut inner);
-
-        inner
-            .prepare_dense_vlm_paged_prefix(
-                &[7, 248_056, 248_056, 8],
-                4,
-                16,
-                &[vec![0xA11C]],
-                true,
-                true,
-                0xD35E,
-            )
-            .expect_err("missing adapter must fail VLM prefix preparation");
-        assert!(inner.caches.is_none());
-        assert!(inner.cached_token_history.is_empty());
-        assert!(inner.cached_image_key.is_none());
-        assert!(inner.cached_paged_image_token_positions.is_empty());
-        assert!(inner.cached_rope_deltas.is_none());
-        assert!(!inner.paged_full_attn_caches_dirty);
-        assert!(!crate::engine::backend::ChatBackend::has_live_session(
-            &inner
-        ));
-    }
-
-    #[test]
-    fn test_dense_generic_paged_abort_invalidates_session() {
-        let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
-        seed_dense_paged_image_session(&mut inner);
-
-        <Qwen35Inner as crate::engine::backend::PagedBackend>::abort_paged_turn(&mut inner);
-        assert!(inner.caches.is_none());
-        assert!(inner.cached_token_history.is_empty());
-        assert!(inner.cached_image_key.is_none());
-        assert!(inner.cached_paged_image_token_positions.is_empty());
-        assert!(inner.cached_rope_deltas.is_none());
-        assert!(!inner.paged_full_attn_caches_dirty);
-        assert!(!inner.flat_mtp_caches_desynced);
-    }
-
-    #[test]
-    fn test_qwen35_planned_decoder_overrides_raw_mtp_flag() {
-        let mut config = ChatConfig {
-            cache_owner_id: None,
-            cache_root_owner_id: None,
-            enable_mtp: Some(true),
-            ..ChatConfig::default()
-        };
-        assert!(!apply_qwen35_dense_planned_decoder(
-            &mut config,
-            DecoderPlan::Autoregressive
-        ));
-        assert_eq!(config.enable_mtp, Some(false));
-
-        assert!(apply_qwen35_dense_planned_decoder(
-            &mut config,
-            DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
-        ));
-        assert_eq!(config.enable_mtp, Some(true));
-
-        assert!(!apply_qwen35_dense_planned_decoder(
-            &mut config,
-            DecoderPlan::Speculative(SpeculativeKind::DraftModel)
-        ));
-        assert_eq!(config.enable_mtp, Some(false));
-    }
-
-    /// When `use_block_paged_cache` is `None`, `paged_adapter` is None.
-    #[test]
-    fn test_inner_no_paged_adapter_when_flag_is_none() {
-        let cfg = tiny_cfg(false);
-        let inner =
-            Qwen35Inner::new(cfg).expect("Qwen35Inner::new must succeed without paged adapter");
-        assert!(
-            inner.paged_adapter.is_none(),
-            "paged_adapter must be None when use_block_paged_cache is None"
-        );
-    }
-
-    #[test]
-    fn test_fresh_dense_layer_caches_are_not_gdn_reuse_ready() {
-        let cfg = tiny_cfg(true);
-        let caches = fresh_dense_layer_caches(&cfg);
-        assert_eq!(caches.len(), cfg.num_layers as usize);
-        assert!(
-            !dense_paged_linear_caches_ready(&cfg, Some(&caches)),
-            "fresh linear caches have empty conv/recurrent slots, so a live continuation must replay GDN"
-        );
-        assert!(matches!(caches[0], Qwen3_5LayerCache::Linear(_)));
-        assert!(matches!(caches[3], Qwen3_5LayerCache::FullAttention(_)));
-    }
-
-    fn run_dense_chunked_prefill_final_logits_only_matches_legacy_chunking() -> Result<()> {
-        let mut inner = Qwen35Inner::new(tiny_cfg(false))?;
-        cast_qwen35_inner_weights_bf16(&mut inner);
-
-        let prompt_tokens: Vec<u32> = (0u32..33).map(|i| (i * 17 + 5) % 997).collect();
-        let prompt = MxArray::from_uint32(&prompt_tokens, &[1, prompt_tokens.len() as i64])?;
-        let embedding_weight = inner.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-
-        let expected = run_dense_final_logits_legacy_chunked_projection(
-            &mut inner,
-            &prompt,
-            &embedding_weight,
-            &embedding_weight_t,
-            16,
-        )?;
-        assert_finite_batch_vocab_logits(
-            &expected,
-            inner.config.vocab_size,
-            "legacy chunked final logits",
-        );
-
-        let chunked = run_dense_final_logits_chunked(
-            &mut inner,
-            &prompt,
-            &embedding_weight,
-            &embedding_weight_t,
-            16,
-        )?;
-        assert_finite_batch_vocab_logits(&chunked, inner.config.vocab_size, "chunked final logits");
-        assert_close_batch_vocab_logits(
-            &expected,
-            &chunked,
-            1e-6,
-            "chunked final logits vs legacy chunking",
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_dense_chunked_prefill_final_logits_only_matches_legacy_chunking() {
-        if let Err(err) = run_dense_chunked_prefill_final_logits_only_matches_legacy_chunking() {
-            let msg = err.reason.to_string();
-            if msg.contains("Metal") || msg.contains("device") {
-                eprintln!(
-                    "skipping test_dense_chunked_prefill_final_logits_only_matches_legacy_chunking: {msg}"
-                );
-                return;
-            }
-            panic!("unexpected dense chunked prefill failure: {msg}");
-        }
-    }
-
-    fn run_dense_chunked_prefill_with_hidden_keeps_tail_contract() -> Result<()> {
-        let mut inner = Qwen35Inner::new(tiny_cfg(false))?;
-        cast_qwen35_inner_weights_bf16(&mut inner);
-
-        let prompt_tokens: Vec<u32> = (0u32..35).map(|i| (i * 23 + 3) % 997).collect();
-        let prompt = MxArray::from_uint32(&prompt_tokens, &[1, prompt_tokens.len() as i64])?;
-        let embedding_weight = inner.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-
-        reset_dense_caches(&mut inner);
-        let (logits, hidden) = chunked_prefill_with_hidden_with_size(
-            &prompt,
-            &embedding_weight,
-            &mut inner.layers,
-            &mut inner.caches,
-            &inner.final_norm,
-            &inner.lm_head,
-            Some(&embedding_weight_t),
-            Stream::new(DeviceType::Gpu),
-            Some(5),
-            16,
-        )?;
-        assert_finite_batch_vocab_logits(
-            &logits,
-            inner.config.vocab_size,
-            "chunked hidden final logits",
-        );
-        assert_eq!(hidden.ndim()?, 3, "prompt hidden ndim");
-        assert_eq!(hidden.shape_at(0)?, 1, "prompt hidden batch");
-        assert_eq!(hidden.shape_at(1)?, 5, "prompt hidden tail len");
-        assert_eq!(
-            hidden.shape_at(2)?,
-            inner.config.hidden_size as i64,
-            "prompt hidden width"
-        );
-        assert_finite_hidden(&hidden, "chunked hidden tail");
-
-        let logits_without_hidden = run_dense_final_logits_chunked(
-            &mut inner,
-            &prompt,
-            &embedding_weight,
-            &embedding_weight_t,
-            16,
-        )?;
-        assert_close_batch_vocab_logits(
-            &logits,
-            &logits_without_hidden,
-            1e-6,
-            "hidden and logits-only chunked final logits",
-        );
-
-        reset_dense_caches(&mut inner);
-        let (_logits, full_tail_hidden) = chunked_prefill_with_hidden_with_size(
-            &prompt,
-            &embedding_weight,
-            &mut inner.layers,
-            &mut inner.caches,
-            &inner.final_norm,
-            &inner.lm_head,
-            Some(&embedding_weight_t),
-            Stream::new(DeviceType::Gpu),
-            Some(100),
-            16,
-        )?;
-        assert_eq!(
-            full_tail_hidden.shape_at(1)?,
-            prompt_tokens.len() as i64,
-            "oversized keep window keeps the whole prompt"
-        );
-        assert_finite_hidden(&full_tail_hidden, "chunked full prompt hidden");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_dense_chunked_prefill_with_hidden_keeps_tail_contract() {
-        if let Err(err) = run_dense_chunked_prefill_with_hidden_keeps_tail_contract() {
-            let msg = err.reason.to_string();
-            if msg.contains("Metal") || msg.contains("device") {
-                eprintln!(
-                    "skipping test_dense_chunked_prefill_with_hidden_keeps_tail_contract: {msg}"
-                );
-                return;
-            }
-            panic!("unexpected dense chunked prefill hidden failure: {msg}");
-        }
-    }
-
-    #[test]
-    fn test_dense_paged_prefix_block_hash_matches_allocator_chain() {
-        let tokens: Vec<u32> = (1..=12).collect();
-        let per_block = vec![vec![11], vec![], vec![33, 44]];
-
-        let h0 = mlx_paged_attn::hash_tokens(&tokens[0..4], 0, &per_block[0]);
-        let h1 = mlx_paged_attn::hash_tokens(&tokens[4..8], h0, &per_block[1]);
-        let h2 = mlx_paged_attn::hash_tokens(&tokens[8..12], h1, &per_block[2]);
-
-        assert_eq!(
-            compute_paged_prefix_block_hash(&tokens, 12, 4, &per_block, 0),
-            Some(h2)
-        );
-    }
-
-    #[test]
-    fn test_dense_paged_prefix_block_hash_applies_salt_to_first_block_only() {
-        let tokens: Vec<u32> = (1..=8).collect();
-        let per_block = vec![vec![11], vec![22]];
-        let salt = 99;
-
-        let mut first_block_keys = per_block[0].clone();
-        first_block_keys.push(salt);
-        let h0 = mlx_paged_attn::hash_tokens(&tokens[0..4], 0, &first_block_keys);
-        let h1 = mlx_paged_attn::hash_tokens(&tokens[4..8], h0, &per_block[1]);
-
-        assert_eq!(
-            compute_paged_prefix_block_hash(&tokens, 8, 4, &per_block, salt),
-            Some(h1)
-        );
-    }
-
-    #[test]
-    fn test_dense_paged_prefix_block_hash_rejects_non_full_or_unkeyed_prefix() {
-        let tokens: Vec<u32> = (1..=8).collect();
-        let per_block = vec![vec![]];
-
-        assert_eq!(
-            compute_paged_prefix_block_hash(&tokens, 6, 4, &per_block, 0),
-            None
-        );
-        assert_eq!(
-            compute_paged_prefix_block_hash(&tokens, 8, 4, &per_block, 0),
-            None
-        );
-    }
-
-    /// Allocates a `LayerKVPool`. Requires Metal; gate on
-    /// `MLX_TEST_PAGED=1`.
-    #[test]
-    #[ignore = "Allocates Metal LayerKVPool; gate on MLX_TEST_PAGED=1"]
-    fn test_inner_constructs_paged_adapter_when_flag_is_true() {
-        if std::env::var_os("MLX_TEST_PAGED").is_none() {
-            return;
-        }
-        let cfg = tiny_cfg(true);
-        let mut inner = Qwen35Inner::new(cfg).expect(
-            "Qwen35Inner::new with use_block_paged_cache=true must succeed on Metal-capable host",
-        );
-        inner
-            .initialize_paged_adapter()
-            .expect("post-load paged adapter initialization must succeed");
-        assert!(
-            inner.paged_adapter.is_some(),
-            "paged_adapter must be Some when use_block_paged_cache = Some(true)"
-        );
-    }
-
-    /// VLM checkpoints are accepted under paged dispatch. The media plan is
-    /// not executable with only an encoder; it becomes available only after
-    /// the processor completes the paged vision stack.
-    #[test]
-    #[ignore = "Allocates Metal LayerKVPool; gate on MLX_TEST_PAGED=1"]
-    fn test_vlm_loads_when_paged_enabled() {
-        if std::env::var_os("MLX_TEST_PAGED").is_none() {
-            return;
-        }
-        use crate::models::qwen3_5::vision::Qwen3_5VisionConfig;
-        use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
-
-        let cfg = tiny_cfg(true);
-        let mut inner = Qwen35Inner::new(cfg).unwrap();
-        inner
-            .initialize_paged_adapter()
-            .expect("post-load paged adapter initialization");
-        let vision_cfg = Qwen3_5VisionConfig {
-            hidden_size: 64,
-            intermediate_size: 256,
-            num_heads: 4,
-            num_layers: 2,
-            patch_size: 16,
-            spatial_merge_size: 2,
-            image_size: 256,
-            out_hidden_size: 64,
-        };
-        let vision_enc =
-            Qwen3_5VisionEncoder::new(vision_cfg).expect("vision encoder construction");
-        let result = inner.set_vision_encoder(vision_enc);
-        assert!(
-            result.is_ok(),
-            "set_vision_encoder must succeed when paged_adapter is Some so VLM \
-             checkpoints can complete their paged media stack; got {result:?}"
-        );
-        assert!(
-            inner.vision_encoder.is_some(),
-            "vision_encoder field must be populated after a successful set"
-        );
-        let incomplete = inner.execution_plan().media;
-        assert_eq!(incomplete.available, MediaCapabilities::NONE);
-        assert_eq!(incomplete.backend_validated, MediaCapabilities::IMAGES);
-
-        inner.set_image_processor(Qwen35VLImageProcessor::new(None));
-        let complete = inner.execution_plan().media;
-        assert_eq!(complete.available, MediaCapabilities::IMAGES);
-        assert_eq!(complete.backend_validated, MediaCapabilities::NONE);
-    }
-
-    /// Dense Qwen3.5 paged-prefill chunking state test. This drives the
-    /// production chunk-size worker once and asserts the adapter cursor,
-    /// request token log, and block table cover the whole prompt after all
-    /// chunks have been recorded.
-    #[test]
-    #[ignore = "requires Metal GPU; run with --ignored"]
-    fn test_dense_paged_prefill_chunks_advance_adapter_state() {
-        let Some((mut inner, cfg)) =
-            paged_inner_or_skip("test_dense_paged_prefill_chunks_advance_adapter_state")
-        else {
-            return;
-        };
-        cast_qwen35_inner_weights_bf16(&mut inner);
-
-        let prompt: Vec<u32> = (0u32..64).map(|i| (i * 5 + 7) % 257).collect();
-        reset_paged_request(&mut inner, &prompt);
-
-        let logits = match run_dense_paged_prefill_with_size(
-            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 16,
-        ) {
-            Ok(logits) => logits,
-            Err(err) => {
-                let msg = err.reason.to_string();
-                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
-                    eprintln!(
-                        "skipping test_dense_paged_prefill_chunks_advance_adapter_state: {msg}"
-                    );
-                    return;
-                }
-                panic!("unexpected dense paged chunk failure: {msg}");
-            }
-        };
-
-        let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
-        assert_eq!(
-            adapter.current_token_count() as usize,
-            prompt.len(),
-            "adapter cursor after chunked prefill"
-        );
-        assert_eq!(
-            adapter.request_tokens(),
-            prompt.as_slice(),
-            "request token log after chunked prefill"
-        );
-        let block_table = adapter.block_table().expect("block_table");
-        let expected_min_blocks = prompt.len().div_ceil(adapter.block_size() as usize);
-        assert!(
-            block_table.num_blocks() >= expected_min_blocks,
-            "block table has {} blocks, expected at least {expected_min_blocks}",
-            block_table.num_blocks()
-        );
-        assert_finite_vocab_logits(&logits, cfg.vocab_size, "final dense paged chunk prefill");
-
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
-        adapter.release_request().expect("release_request");
-    }
-
-    /// Uneven-tail coverage for dense Qwen3.5 paged prefill: a 33-token
-    /// prompt with chunk_size=16 must record two full chunks plus a
-    /// one-token tail and return valid logits for the tail chunk.
-    #[test]
-    #[ignore = "requires Metal GPU; run with --ignored"]
-    fn test_dense_paged_prefill_chunks_handle_uneven_tail() {
-        let Some((mut inner, cfg)) =
-            paged_inner_or_skip("test_dense_paged_prefill_chunks_handle_uneven_tail")
-        else {
-            return;
-        };
-        cast_qwen35_inner_weights_bf16(&mut inner);
-
-        let prompt: Vec<u32> = (0u32..33).map(|i| (i * 11 + 3) % 257).collect();
-        reset_paged_request(&mut inner, &prompt);
-
-        let final_logits = run_dense_paged_prefill_with_size(
-            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 16,
-        )
-        .expect("dense paged uneven-tail chunked prefill");
-
-        assert_eq!(
-            prompt.len(),
-            33,
-            "test setup must exercise a one-token tail"
-        );
-        let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
-        assert_eq!(
-            adapter.current_token_count(),
-            33,
-            "adapter cursor must include the uneven tail"
-        );
-        assert_eq!(
-            adapter.request_tokens(),
-            prompt.as_slice(),
-            "request token log must include the uneven tail"
-        );
-        assert_finite_vocab_logits(
-            &final_logits,
-            cfg.vocab_size,
-            "uneven-tail dense paged chunk prefill",
-        );
-
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
-        adapter.release_request().expect("release_request");
-    }
-
-    /// Regression coverage for Pi-style agent turns: a block-aligned prefill
-    /// must retain GDN state at the largest reusable paged-block boundary (16
-    /// of 32 tokens here). A one-block rollback restores exactly, while a
-    /// full-boundary hit replays only one GDN block.
-    #[test]
-    #[ignore = "requires Metal GPU; run with --ignored"]
-    fn test_dense_paged_prefill_captures_exact_gdn_block_checkpoint() {
-        let Some((mut inner, cfg)) =
-            paged_inner_or_skip("test_dense_paged_prefill_captures_exact_gdn_block_checkpoint")
-        else {
-            return;
-        };
-        cast_qwen35_inner_weights_bf16(&mut inner);
-
-        let prompt: Vec<u32> = (0u32..32).map(|i| (i * 13 + 9) % 257).collect();
-        reset_paged_request(&mut inner, &prompt);
-
-        let (logits, checkpoint) = run_dense_paged_prefill_with_size_and_checkpoint(
-            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 16,
-        )
-        .expect("dense paged checkpoint prefill");
-        assert_finite_vocab_logits(&logits, cfg.vocab_size, "checkpoint prefill logits");
-
-        let checkpoint = checkpoint.expect("stable reusable-block GDN checkpoint");
-        assert_eq!(checkpoint.prefix_len, 16);
-        assert!(dense_paged_linear_caches_ready(
-            &inner.config,
-            Some(&checkpoint.caches)
-        ));
-
-        let block_size = inner
-            .paged_adapter
-            .as_ref()
-            .expect("paged_adapter")
-            .block_size();
-        let extra_keys = engine::build_paged_extra_keys(prompt.len(), block_size, &[]);
-        assert!(inner.remember_dense_gdn_materialized_prefix_checkpoint(
-            &prompt,
-            block_size,
-            &extra_keys,
-            0,
-            checkpoint,
-        ));
-        inner.active_cache_owner_id = "child-session".to_owned();
-        assert!(
-            inner
-                .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, 0)
-                .is_none(),
-            "an exact token/hash checkpoint owned by another session must not restore"
-        );
-        inner.active_cache_owner_id.clear();
-        let restored = inner
-            .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, 0)
-            .expect("exact checkpoint restore");
-        assert_eq!(restored.0, 16);
-        assert!(dense_paged_linear_caches_ready(
-            &inner.config,
-            Some(&restored.1)
-        ));
-        let prepared = inner
-            .prepare_dense_gdn_prefix_state(&prompt, 16, block_size, &extra_keys, 0, false)
-            .expect("prepare one-block rollback checkpoint");
-        assert_eq!(prepared.state, "checkpoint");
-        assert!(prepared.already_primed);
-        assert_eq!(prepared.restored_prefix_tokens, 16);
-        assert_eq!(prepared.replayed_prefix_tokens, 0);
-
-        let prepared = inner
-            .prepare_dense_gdn_prefix_state(&prompt, 32, block_size, &extra_keys, 0, false)
-            .expect("prepare full-boundary hit from stable checkpoint");
-        assert_eq!(prepared.state, "checkpoint_replay_materialized");
-        assert!(prepared.already_primed);
-        assert_eq!(prepared.restored_prefix_tokens, 16);
-        assert_eq!(prepared.replayed_prefix_tokens, 16);
-
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
-        adapter.release_request().expect("release_request");
-    }
-
-    /// Compatibility guard for the current/default dense Qwen3.5 paged
-    /// prefill behavior: a full suffix passed in one call remains a valid
-    /// single-shot prefill and is stable across a fresh adapter reset.
-    #[test]
-    #[ignore = "requires Metal GPU; run with --ignored"]
-    fn test_dense_paged_prefill_single_shot_default_still_works() {
-        let Some((mut inner, cfg)) =
-            paged_inner_or_skip("test_dense_paged_prefill_single_shot_default_still_works")
-        else {
-            return;
-        };
-        cast_qwen35_inner_weights_bf16(&mut inner);
-
-        // Longer than two 16-token blocks: if chunk_size=0 accidentally starts
-        // splitting at checkpoint boundaries, this test observes a sidecar.
-        let prompt: Vec<u32> = (0u32..33).map(|i| (i * 17 + 5) % 257).collect();
-
-        reset_paged_request(&mut inner, &prompt);
-        let (logits_a, checkpoint_a) = run_dense_paged_prefill_with_size_and_checkpoint(
-            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 0,
-        )
-        .expect("single-shot A");
-        assert!(
-            checkpoint_a.is_none(),
-            "chunk_size=0 must not split to capture a GDN checkpoint"
-        );
-        assert_finite_vocab_logits(&logits_a, cfg.vocab_size, "single-shot A");
-        {
-            let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
-            assert_eq!(
-                adapter.current_token_count() as usize,
-                prompt.len(),
-                "single-shot cursor"
-            );
-            assert_eq!(adapter.request_tokens(), prompt.as_slice());
-        }
-
-        reset_paged_request(&mut inner, &prompt);
-        let (logits_b, checkpoint_b) = run_dense_paged_prefill_with_size_and_checkpoint(
-            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 0,
-        )
-        .expect("single-shot B");
-        assert!(
-            checkpoint_b.is_none(),
-            "chunk_size=0 must stay single-shot after adapter reset"
-        );
-        let a = logits_to_f32_vec(&logits_a);
-        let b = logits_to_f32_vec(&logits_b);
-        assert_eq!(a.len(), cfg.vocab_size as usize);
-        assert_eq!(b.len(), cfg.vocab_size as usize);
-        for (i, (left, right)) in a.iter().zip(b.iter()).enumerate() {
-            let abs_diff = (left - right).abs();
-            assert!(
-                abs_diff <= 1e-6,
-                "single-shot dense paged prefill changed after fresh reset at index {i}: \
-                 first={left}, second={right}, abs_diff={abs_diff}"
-            );
-        }
-
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
-        adapter.release_request().expect("release_request");
     }
 }
