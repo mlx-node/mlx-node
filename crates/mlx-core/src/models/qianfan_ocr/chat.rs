@@ -194,13 +194,10 @@ pub(crate) fn format_qianfan_chat(
             }
 
             "system" => {
-                // Non-first system messages
+                // Non-first system messages (upstream never appends <think> here)
                 prompt.push_str(IM_START);
                 prompt.push_str("system\n");
                 prompt.push_str(&msg.content);
-                if enable_thinking && i == last_query_index {
-                    prompt.push_str("\n<think>");
-                }
                 prompt.push_str(IM_END);
                 prompt.push('\n');
             }
@@ -403,8 +400,8 @@ fn find_last_query_index(messages: &[ChatMessage]) -> usize {
             return i;
         }
     }
-    // Fallback: last message
-    len.saturating_sub(1)
+    // No real user message found — return sentinel so nothing matches
+    usize::MAX
 }
 
 /// Count total number of images across all messages.
@@ -566,6 +563,20 @@ mod tests {
         // <think> only on the LAST user message
         assert!(result.contains("First<|im_end|>\n")); // no <think> on first
         assert!(result.contains("Second\n<think><|im_end|>\n")); // <think> on second
+    }
+
+    #[test]
+    fn test_think_not_injected_without_user_message() {
+        // No user message at all — <think> must NOT be injected anywhere
+        let messages = vec![
+            text_msg("system", "System A"),
+            text_msg("system", "System B"),
+        ];
+        let result = format_qianfan_chat(&messages, &[], 256, true, None).unwrap();
+        assert!(
+            !result.contains("<think>"),
+            "No <think> without a user message. Got: {result}"
+        );
     }
 
     #[test]
