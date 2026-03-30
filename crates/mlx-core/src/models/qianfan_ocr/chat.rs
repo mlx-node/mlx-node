@@ -136,9 +136,19 @@ pub(crate) fn format_qianfan_chat(
                 let (reasoning, content) =
                     extract_reasoning_and_content(msg, i, last_query_index);
 
-                if let Some(ref r) = reasoning {
+                // Upstream Jinja emits <think> block for assistant turns after
+                // last_query_index when: loop.last OR reasoning is non-empty.
+                // Even empty reasoning gets <think>\n\n</think> on the last msg.
+                let is_after_last_query = i > last_query_index;
+                let is_last_msg = i == msg_count - 1;
+                let emit_think = reasoning.is_some()
+                    || (is_after_last_query && is_last_msg);
+
+                if emit_think {
                     prompt.push_str("<think>\n");
-                    prompt.push_str(r.trim());
+                    if let Some(ref r) = reasoning {
+                        prompt.push_str(r.trim());
+                    }
                     prompt.push_str("\n</think>\n\n");
                     prompt.push_str(content.trim_start_matches('\n'));
                 } else {
@@ -672,6 +682,36 @@ mod tests {
         let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
         // last_query_index=0, assistant at index 1 > 0 → reasoning included
         assert!(result.contains("<think>\nLet me think step by step...\n</think>\n\nThe answer is 42."));
+    }
+
+    #[test]
+    fn test_last_assistant_after_query_emits_empty_think() {
+        // Upstream Jinja: when assistant is the last message AND after
+        // last_query_index, always emit <think> block even if empty.
+        let messages = vec![
+            text_msg("user", "Hello"),
+            assistant_msg("The answer."),
+        ];
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
+        // Should have empty <think> block wrapping the content
+        assert!(
+            result.contains("<|im_start|>assistant\n<think>\n\n</think>\n\nThe answer.<|im_end|>"),
+            "Last assistant after query must emit empty <think> block. Got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_non_last_assistant_after_query_no_empty_think() {
+        // Non-last assistant after last query with no reasoning: no <think>
+        let messages = vec![
+            text_msg("user", "Q1"),
+            assistant_msg("A1"), // after last_query_index=0, but NOT last message
+            text_msg("user", "Q2"),
+        ];
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
+        // A1 is at index 1, last_query_index=2, so 1 <= 2 → no reasoning
+        assert!(result.contains("<|im_start|>assistant\nA1<|im_end|>"));
+        assert!(!result.contains("<think>\n\n</think>"));
     }
 
     #[test]
