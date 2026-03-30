@@ -207,15 +207,12 @@ impl QianfanImageProcessor {
 
         for tile in &tiles {
             let rgb = tile.to_rgb8();
-            for y in 0..h {
-                for x in 0..w {
-                    let pixel = rgb.get_pixel(x as u32, y as u32);
-                    for c in 0..channels {
-                        // Rescale to [0, 1] then normalize with ImageNet stats
-                        let value = pixel[c] as f32 / 255.0;
-                        let normalized = (value - self.mean[c]) / self.std[c];
-                        pixel_data.push(normalized);
-                    }
+            for chunk in rgb.as_raw().chunks_exact(channels) {
+                for (c, &byte) in chunk.iter().enumerate() {
+                    // Rescale to [0, 1] then normalize with ImageNet stats
+                    let value = byte as f32 / 255.0;
+                    let normalized = (value - self.mean[c]) / self.std[c];
+                    pixel_data.push(normalized);
                 }
             }
         }

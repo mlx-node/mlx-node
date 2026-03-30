@@ -84,9 +84,8 @@ pub(crate) fn format_qianfan_chat(
 
     // Step 2: Build ChatML formatted string
     let mut prompt = String::new();
-    let last_idx = messages.len().saturating_sub(1);
 
-    for (i, (role, content)) in messages.iter().enumerate() {
+    for (role, content) in &messages {
         // Skip empty system messages
         if role == "system" && content.is_empty() {
             continue;
@@ -102,14 +101,7 @@ pub(crate) fn format_qianfan_chat(
         // Otherwise, close every message normally.
         prompt.push_str(IM_END);
         prompt.push('\n');
-
-        // If this is the last message, do NOT add generation prompt here
-        // (we add it after the loop). But if there are more messages, continue.
-        let _ = i; // suppress unused warning, used for clarity
     }
-
-    // Omit generation prompt if there are no messages
-    let _ = last_idx;
 
     // Add the final generation prompt: <|im_start|>assistant\n
     prompt.push_str(IM_START);
@@ -117,7 +109,9 @@ pub(crate) fn format_qianfan_chat(
 
     // Step 3: Replace <image> placeholders with visual tokens
     let mut patch_idx = 0;
-    while let Some(pos) = prompt.find(IMAGE_PLACEHOLDER) {
+    let mut search_start = 0;
+    while let Some(rel_pos) = prompt[search_start..].find(IMAGE_PLACEHOLDER) {
+        let pos = search_start + rel_pos;
         if patch_idx >= num_patches_list.len() {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -143,6 +137,7 @@ pub(crate) fn format_qianfan_chat(
 
         // Replace this one occurrence
         prompt.replace_range(pos..pos + IMAGE_PLACEHOLDER.len(), &replacement);
+        search_start = pos + replacement_len;
         patch_idx += 1;
     }
 
@@ -166,23 +161,6 @@ pub(crate) fn count_images_in_messages(messages: &[ChatMessage]) -> u32 {
         .iter()
         .map(|m| m.images.as_ref().map_or(0, |imgs| imgs.len() as u32))
         .sum()
-}
-
-// ---------------------------------------------------------------------------
-// extract_images_from_messages
-// ---------------------------------------------------------------------------
-
-/// Extract all image bytes from messages in order.
-pub(crate) fn extract_images_from_messages(messages: &[ChatMessage]) -> Vec<Vec<u8>> {
-    let mut all_images: Vec<Vec<u8>> = Vec::new();
-    for msg in messages {
-        if let Some(ref images) = msg.images {
-            for img in images {
-                all_images.push(img.to_vec());
-            }
-        }
-    }
-    all_images
 }
 
 // ===========================================================================
@@ -394,44 +372,6 @@ mod tests {
             image_msg("user", "Second", vec![vec![2], vec![3]]),
         ];
         assert_eq!(count_images_in_messages(&messages), 3);
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_images_from_messages tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_extract_images_empty() {
-        let messages = vec![text_msg("user", "Hello")];
-        let images = extract_images_from_messages(&messages);
-        assert!(images.is_empty());
-    }
-
-    #[test]
-    fn test_extract_images_preserves_order() {
-        let messages = vec![
-            image_msg("user", "First", vec![vec![10, 20], vec![30, 40]]),
-            text_msg("assistant", "Ok"),
-            image_msg("user", "Second", vec![vec![50, 60]]),
-        ];
-        let images = extract_images_from_messages(&messages);
-
-        assert_eq!(images.len(), 3);
-        assert_eq!(images[0], vec![10, 20]);
-        assert_eq!(images[1], vec![30, 40]);
-        assert_eq!(images[2], vec![50, 60]);
-    }
-
-    #[test]
-    fn test_extract_images_skips_empty_option() {
-        let messages = vec![
-            text_msg("user", "No images here"),
-            image_msg("user", "One image", vec![vec![99]]),
-        ];
-        let images = extract_images_from_messages(&messages);
-
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0], vec![99]);
     }
 
     // -----------------------------------------------------------------------

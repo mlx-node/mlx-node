@@ -11,7 +11,7 @@ use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 use crate::models::qianfan_ocr::config::Qwen3LMConfig;
-use crate::models::qianfan_ocr::vision::get_weight;
+use crate::models::pp_doclayout_v3::persistence::get_tensor;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::transformer::TransformerBlock;
 use crate::transformer::kv_cache::KVCache;
@@ -50,7 +50,7 @@ impl InternVLLanguageModel {
         let num_layers = config.num_hidden_layers as usize;
 
         // Load embedding
-        let embed_weight = get_weight(weights, &format!("{prefix}.embedding.weight"))?;
+        let embed_weight = get_tensor(weights, &format!("{prefix}.embedding.weight"))?;
         let embedding = Embedding::from_weight(&embed_weight)?;
 
         // Build transformer layers
@@ -71,30 +71,30 @@ impl InternVLLanguageModel {
 
             // Load attention weights
             let attn = &mut block.self_attn;
-            attn.set_q_proj_weight(&get_weight(
+            attn.set_q_proj_weight(&get_tensor(
                 weights,
                 &format!("{layer_prefix}.self_attn.q_proj.weight"),
             )?)?;
-            attn.set_k_proj_weight(&get_weight(
+            attn.set_k_proj_weight(&get_tensor(
                 weights,
                 &format!("{layer_prefix}.self_attn.k_proj.weight"),
             )?)?;
-            attn.set_v_proj_weight(&get_weight(
+            attn.set_v_proj_weight(&get_tensor(
                 weights,
                 &format!("{layer_prefix}.self_attn.v_proj.weight"),
             )?)?;
-            attn.set_o_proj_weight(&get_weight(
+            attn.set_o_proj_weight(&get_tensor(
                 weights,
                 &format!("{layer_prefix}.self_attn.o_proj.weight"),
             )?)?;
 
             // QK norm weights (if enabled)
             if config.use_qk_norm {
-                attn.set_q_norm_weight(&get_weight(
+                attn.set_q_norm_weight(&get_tensor(
                     weights,
                     &format!("{layer_prefix}.self_attn.q_norm.weight"),
                 )?)?;
-                attn.set_k_norm_weight(&get_weight(
+                attn.set_k_norm_weight(&get_tensor(
                     weights,
                     &format!("{layer_prefix}.self_attn.k_norm.weight"),
                 )?)?;
@@ -102,25 +102,25 @@ impl InternVLLanguageModel {
 
             // Load MLP weights
             let mlp = &mut block.mlp;
-            mlp.set_gate_proj_weight(&get_weight(
+            mlp.set_gate_proj_weight(&get_tensor(
                 weights,
                 &format!("{layer_prefix}.mlp.gate_proj.weight"),
             )?)?;
-            mlp.set_up_proj_weight(&get_weight(
+            mlp.set_up_proj_weight(&get_tensor(
                 weights,
                 &format!("{layer_prefix}.mlp.up_proj.weight"),
             )?)?;
-            mlp.set_down_proj_weight(&get_weight(
+            mlp.set_down_proj_weight(&get_tensor(
                 weights,
                 &format!("{layer_prefix}.mlp.down_proj.weight"),
             )?)?;
 
             // Load layer norm weights
-            block.set_input_layernorm_weight(&get_weight(
+            block.set_input_layernorm_weight(&get_tensor(
                 weights,
                 &format!("{layer_prefix}.input_layernorm.weight"),
             )?)?;
-            block.set_post_attention_layernorm_weight(&get_weight(
+            block.set_post_attention_layernorm_weight(&get_tensor(
                 weights,
                 &format!("{layer_prefix}.post_attention_layernorm.weight"),
             )?)?;
@@ -129,7 +129,7 @@ impl InternVLLanguageModel {
         }
 
         // Load final norm
-        let final_norm_weight = get_weight(weights, &format!("{prefix}.final_norm.weight"))?;
+        let final_norm_weight = get_tensor(weights, &format!("{prefix}.final_norm.weight"))?;
         let final_norm = RMSNorm::from_weight(&final_norm_weight, Some(config.rms_norm_eps))?;
 
         // Load lm_head (if not tied)
@@ -137,7 +137,7 @@ impl InternVLLanguageModel {
         let lm_head = if tie_word_embeddings {
             None
         } else {
-            let lm_head_weight = get_weight(weights, &format!("{prefix}.lm_head.weight"))?;
+            let lm_head_weight = get_tensor(weights, &format!("{prefix}.lm_head.weight"))?;
             Some(Linear::from_weights(&lm_head_weight, None)?)
         };
 

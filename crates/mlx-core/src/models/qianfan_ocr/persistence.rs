@@ -29,7 +29,7 @@ pub(crate) fn transform_key(key: &str) -> String {
                 let layer_num = &rest[..dot_pos];
                 let suffix = &rest[dot_pos + 1..];
 
-                let new_suffix = transform_vision_layer_suffix(suffix);
+                let new_suffix = suffix;
                 return format!("vision.layers.{layer_num}.{new_suffix}");
             }
         }
@@ -75,14 +75,6 @@ pub(crate) fn transform_key(key: &str) -> String {
 
     // Fallback: return key unchanged
     key.to_string()
-}
-
-/// Transform suffixes within a vision encoder layer.
-///
-/// Vision layer sub-keys pass through unchanged since InternViTModel::build
-/// expects the original HuggingFace names (attn.proj, norm1, ls1, etc.).
-fn transform_vision_layer_suffix(suffix: &str) -> &str {
-    suffix
 }
 
 /// Check if a weight needs Conv2d NCHW→NHWC transposition.

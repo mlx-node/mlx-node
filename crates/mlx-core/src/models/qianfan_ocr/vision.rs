@@ -14,23 +14,12 @@ use std::collections::HashMap;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
+use crate::models::pp_doclayout_v3::persistence::get_tensor;
 use crate::models::qianfan_ocr::config::InternVisionConfig;
 use crate::nn::activations::Activations;
 use crate::nn::{LayerNorm, Linear};
 use crate::vision::conv2d::Conv2d;
 use crate::vision::interpolate::bilinear_interpolate;
-
-// ============================================================================
-// Helper
-// ============================================================================
-
-/// Look up a weight by key, returning a clear error if missing.
-pub(crate) fn get_weight(weights: &HashMap<String, MxArray>, key: &str) -> Result<MxArray> {
-    weights
-        .get(key)
-        .cloned()
-        .ok_or_else(|| Error::from_reason(format!("Missing weight: {key}")))
-}
 
 // ============================================================================
 // InternVisionEmbeddings
@@ -57,8 +46,8 @@ impl InternVisionEmbeddings {
         config: &InternVisionConfig,
     ) -> Result<Self> {
         // Conv2d weight: [out_channels, kernel_h, kernel_w, in_channels]  (MLX OHWI)
-        let conv_weight = get_weight(weights, &format!("{prefix}.patch_embedding.weight"))?;
-        let conv_bias = get_weight(weights, &format!("{prefix}.patch_embedding.bias"))?;
+        let conv_weight = get_tensor(weights, &format!("{prefix}.patch_embedding.weight"))?;
+        let conv_bias = get_tensor(weights, &format!("{prefix}.patch_embedding.bias"))?;
         let patch_size = config.patch_size as u32;
         let patch_conv = Conv2d::new(
             &conv_weight,
@@ -69,8 +58,8 @@ impl InternVisionEmbeddings {
             None,
         )?;
 
-        let cls_token = get_weight(weights, &format!("{prefix}.class_embedding"))?;
-        let position_embedding = get_weight(weights, &format!("{prefix}.position_embedding"))?;
+        let cls_token = get_tensor(weights, &format!("{prefix}.class_embedding"))?;
+        let position_embedding = get_tensor(weights, &format!("{prefix}.position_embedding"))?;
 
         let default_grid_size = config.image_size as u32 / patch_size;
 
@@ -186,16 +175,16 @@ impl InternVisionAttention {
         prefix: &str,
         config: &InternVisionConfig,
     ) -> Result<Self> {
-        let qkv_weight = get_weight(weights, &format!("{prefix}.attn.qkv.weight"))?;
+        let qkv_weight = get_tensor(weights, &format!("{prefix}.attn.qkv.weight"))?;
         let qkv_bias = if config.qkv_bias {
-            Some(get_weight(weights, &format!("{prefix}.attn.qkv.bias"))?)
+            Some(get_tensor(weights, &format!("{prefix}.attn.qkv.bias"))?)
         } else {
             None
         };
         let qkv = Linear::from_weights(&qkv_weight, qkv_bias.as_ref())?;
 
-        let proj_weight = get_weight(weights, &format!("{prefix}.attn.proj.weight"))?;
-        let proj_bias = get_weight(weights, &format!("{prefix}.attn.proj.bias"))?;
+        let proj_weight = get_tensor(weights, &format!("{prefix}.attn.proj.weight"))?;
+        let proj_bias = get_tensor(weights, &format!("{prefix}.attn.proj.bias"))?;
         let out_proj = Linear::from_weights(&proj_weight, Some(&proj_bias))?;
 
         let num_heads = config.num_attention_heads as u32;
@@ -276,12 +265,12 @@ pub(crate) struct InternVisionMLP {
 impl InternVisionMLP {
     pub fn build(weights: &HashMap<String, MxArray>, prefix: &str) -> Result<Self> {
         let fc1 = Linear::from_weights(
-            &get_weight(weights, &format!("{prefix}.mlp.fc1.weight"))?,
-            Some(&get_weight(weights, &format!("{prefix}.mlp.fc1.bias"))?),
+            &get_tensor(weights, &format!("{prefix}.mlp.fc1.weight"))?,
+            Some(&get_tensor(weights, &format!("{prefix}.mlp.fc1.bias"))?),
         )?;
         let fc2 = Linear::from_weights(
-            &get_weight(weights, &format!("{prefix}.mlp.fc2.weight"))?,
-            Some(&get_weight(weights, &format!("{prefix}.mlp.fc2.bias"))?),
+            &get_tensor(weights, &format!("{prefix}.mlp.fc2.weight"))?,
+            Some(&get_tensor(weights, &format!("{prefix}.mlp.fc2.bias"))?),
         )?;
 
         Ok(Self { fc1, fc2 })
@@ -333,21 +322,21 @@ impl InternVisionEncoderLayer {
         let eps = Some(config.layer_norm_eps);
 
         let layer_norm1 = LayerNorm::from_weights(
-            &get_weight(weights, &format!("{prefix}.norm1.weight"))?,
-            Some(&get_weight(weights, &format!("{prefix}.norm1.bias"))?),
+            &get_tensor(weights, &format!("{prefix}.norm1.weight"))?,
+            Some(&get_tensor(weights, &format!("{prefix}.norm1.bias"))?),
             eps,
         )?;
         let layer_norm2 = LayerNorm::from_weights(
-            &get_weight(weights, &format!("{prefix}.norm2.weight"))?,
-            Some(&get_weight(weights, &format!("{prefix}.norm2.bias"))?),
+            &get_tensor(weights, &format!("{prefix}.norm2.weight"))?,
+            Some(&get_tensor(weights, &format!("{prefix}.norm2.bias"))?),
             eps,
         )?;
 
         let attn = InternVisionAttention::build(weights, prefix, config)?;
         let mlp = InternVisionMLP::build(weights, prefix)?;
 
-        let layer_scale_1 = get_weight(weights, &format!("{prefix}.ls1"))?;
-        let layer_scale_2 = get_weight(weights, &format!("{prefix}.ls2"))?;
+        let layer_scale_1 = get_tensor(weights, &format!("{prefix}.ls1"))?;
+        let layer_scale_2 = get_tensor(weights, &format!("{prefix}.ls2"))?;
 
         Ok(Self {
             layer_norm1,

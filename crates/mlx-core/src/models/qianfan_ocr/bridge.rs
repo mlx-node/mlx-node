@@ -17,7 +17,7 @@ use crate::array::MxArray;
 use crate::nn::activations::Activations;
 use crate::nn::{LayerNorm, Linear};
 
-use super::vision::get_weight;
+use crate::models::pp_doclayout_v3::persistence::get_tensor;
 
 // ============================================================================
 // Pixel Shuffle v2
@@ -95,19 +95,19 @@ impl InternVLBridge {
         downsample_ratio: f64,
     ) -> Result<Self> {
         let ln = LayerNorm::from_weights(
-            &get_weight(weights, &format!("{prefix}.ln.weight"))?,
-            Some(&get_weight(weights, &format!("{prefix}.ln.bias"))?),
+            &get_tensor(weights, &format!("{prefix}.ln.weight"))?,
+            Some(&get_tensor(weights, &format!("{prefix}.ln.bias"))?),
             None,
         )?;
 
         let linear1 = Linear::from_weights(
-            &get_weight(weights, &format!("{prefix}.linear1.weight"))?,
-            Some(&get_weight(weights, &format!("{prefix}.linear1.bias"))?),
+            &get_tensor(weights, &format!("{prefix}.linear1.weight"))?,
+            Some(&get_tensor(weights, &format!("{prefix}.linear1.bias"))?),
         )?;
 
         let linear2 = Linear::from_weights(
-            &get_weight(weights, &format!("{prefix}.linear2.weight"))?,
-            Some(&get_weight(weights, &format!("{prefix}.linear2.bias"))?),
+            &get_tensor(weights, &format!("{prefix}.linear2.weight"))?,
+            Some(&get_tensor(weights, &format!("{prefix}.linear2.bias"))?),
         )?;
 
         Ok(Self {

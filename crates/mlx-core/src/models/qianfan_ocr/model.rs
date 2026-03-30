@@ -18,9 +18,10 @@ use napi_derive::napi;
 use serde_json::Value;
 use tracing::info;
 
-use crate::array::{MxArray, clear_cache};
+use crate::array::{MxArray, synchronize_and_clear_cache};
 use crate::models::qianfan_ocr::bridge::InternVLBridge;
-use crate::models::qianfan_ocr::chat::{extract_images_from_messages, format_qianfan_chat};
+use crate::models::qianfan_ocr::chat::format_qianfan_chat;
+use crate::models::qwen3_5::model::extract_images_from_messages;
 use crate::models::qianfan_ocr::config::{InternVisionConfig, QianfanOCRConfig, Qwen3LMConfig};
 use crate::models::qianfan_ocr::language::InternVLLanguageModel;
 use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
@@ -53,7 +54,7 @@ pub struct QianfanChatResult {
     pub thinking: Option<String>,
     /// Number of generated tokens
     pub num_tokens: u32,
-    /// Why generation stopped: "eos", "length", or "repetition"
+    /// Why generation stopped: "stop", "length", or "repetition"
     pub finish_reason: String,
     /// Raw generated text before parsing
     pub raw_text: String,
@@ -345,7 +346,7 @@ impl QianfanOCRModel {
 
             // Eval prefill logits -- caches materialize through dependency graph
             prefill_logits.eval();
-            clear_cache();
+            synchronize_and_clear_cache();
 
             // Get last logits for first token sampling
             let prefill_seq = prefill_logits.shape()?[1];
@@ -392,7 +393,6 @@ impl QianfanOCRModel {
 
             // Sample first token
             let mut token = sample(&last_logits, Some(sampling_config))?;
-            token.eval();
 
             let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
             let mut finish_reason = "length".to_string();
@@ -406,7 +406,7 @@ impl QianfanOCRModel {
 
                 // Check EOS
                 if token_value == eos_token_id as u32 {
-                    finish_reason = "eos".to_string();
+                    finish_reason = "stop".to_string();
                     break;
                 }
 
@@ -453,7 +453,7 @@ impl QianfanOCRModel {
 
                 // Periodic cache clearing to prevent memory accumulation
                 if (_step + 1) % 256 == 0 {
-                    clear_cache();
+                    synchronize_and_clear_cache();
                 }
             }
 
@@ -648,7 +648,7 @@ impl QianfanOCRModel {
 
                 // Eval prefill logits -- caches materialize through dependency graph
                 prefill_logits.eval();
-                clear_cache();
+                synchronize_and_clear_cache();
 
                 let seq_len = prefill_logits.shape()?[1];
                 let mut last_logits = prefill_logits
@@ -672,9 +672,24 @@ impl QianfanOCRModel {
                         Some(repetition_context_size),
                     )?;
                 }
+                if presence_penalty != 0.0 {
+                    last_logits = apply_presence_penalty(
+                        &last_logits,
+                        &all_tokens,
+                        presence_penalty,
+                        Some(presence_context_size),
+                    )?;
+                }
+                if frequency_penalty != 0.0 {
+                    last_logits = apply_frequency_penalty(
+                        &last_logits,
+                        &all_tokens,
+                        frequency_penalty,
+                        Some(frequency_context_size),
+                    )?;
+                }
 
                 let mut token = sample(&last_logits, Some(sampling_config))?;
-                token.eval();
 
                 let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
                 let mut finish_reason = "length".to_string();
@@ -692,7 +707,7 @@ impl QianfanOCRModel {
                     all_tokens.push(token_value);
 
                     if token_value == eos_token_id as u32 {
-                        finish_reason = "eos".to_string();
+                        finish_reason = "stop".to_string();
                         break;
                     }
 
@@ -752,7 +767,7 @@ impl QianfanOCRModel {
                     token.eval();
 
                     if (step + 1) % 256 == 0 {
-                        clear_cache();
+                        synchronize_and_clear_cache();
                     }
                 }
 
@@ -840,7 +855,7 @@ impl QianfanOCRModel {
 
             // Eval prefill logits -- caches materialize through dependency graph
             logits.eval();
-            clear_cache();
+            synchronize_and_clear_cache();
 
             let seq_len = logits.shape()?[1];
             let last_logits = logits
@@ -848,7 +863,6 @@ impl QianfanOCRModel {
                 .squeeze(Some(&[0, 1]))?;
 
             let mut token = sample(&last_logits, Some(sampling_config))?;
-            token.eval();
 
             let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
 
@@ -874,7 +888,7 @@ impl QianfanOCRModel {
                 token.eval();
 
                 if (step + 1) % 256 == 0 {
-                    clear_cache();
+                    synchronize_and_clear_cache();
                 }
             }
 
@@ -1046,7 +1060,9 @@ fn build_qianfan_ocr_from_weights(
     let tokenizer = if tokenizer_path.exists() {
         info!("  Loading tokenizer from {}", tokenizer_path.display());
         Some(Arc::new(Qwen3Tokenizer::load_from_file_sync(
-            tokenizer_path.to_str().unwrap_or("tokenizer.json"),
+            tokenizer_path
+                .to_str()
+                .ok_or_else(|| Error::from_reason("Non-UTF-8 tokenizer path"))?,
         )?))
     } else {
         info!("  No tokenizer.json found, tokenizer not loaded");
@@ -1193,12 +1209,12 @@ mod tests {
             tool_calls: vec![],
             thinking: None,
             num_tokens: 1,
-            finish_reason: "eos".to_string(),
+            finish_reason: "stop".to_string(),
             raw_text: "Hello".to_string(),
         };
         assert_eq!(result.text, "Hello");
         assert_eq!(result.num_tokens, 1);
-        assert_eq!(result.finish_reason, "eos");
+        assert_eq!(result.finish_reason, "stop");
         assert!(result.thinking.is_none());
         assert!(result.tool_calls.is_empty());
     }
