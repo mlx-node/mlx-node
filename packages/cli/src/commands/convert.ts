@@ -19,7 +19,7 @@ Optional Arguments:
   --dtype, -d <type>    Target dtype (default: bfloat16)
                         Options: float32, float16, bfloat16
   --model-type, -m      Model type (auto-detected if not specified)
-                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_5, qwen3_5_moe
+                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_5, qwen3_5_moe, qianfan-ocr
   --verbose, -v         Enable verbose logging
   --help, -h            Show this help message
 
@@ -48,6 +48,7 @@ Model Types:
   qwen3_5_moe           Qwen3.5 MoE model (FP8 dequant, expert stacking)
   pp-lcnet-ori          PP-LCNet orientation classifier (Paddle -> SafeTensors)
   uvdoc                 UVDoc unwarping model (Paddle/PyTorch -> SafeTensors)
+  qianfan-ocr           Qianfan-OCR InternVL model (key renaming, conv2d transposition)
 
 GGUF Support:
   When --input points to a .gguf file, the converter automatically parses the

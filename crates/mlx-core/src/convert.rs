@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::models::paddleocr_vl::persistence::load_paddleocr_vl_weights;
+use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
 use crate::utils::safetensors::{load_safetensors_lazy, save_safetensors};
 
 /// Structure for parsing model.safetensors.index.json
@@ -408,9 +409,15 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
             );
             sanitize_qwen35_moe(converted_tensors, &config, &target_dtype)?
         }
+        Some("qianfan-ocr") => {
+            info!(
+                "Applying Qianfan-OCR weight sanitization (key renaming, conv2d transposition)..."
+            );
+            load_qianfan_ocr_weights(converted_tensors)?
+        }
         Some(other) => {
             return Err(Error::from_reason(format!(
-                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5",
+                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5, qianfan-ocr",
                 other
             )));
         }

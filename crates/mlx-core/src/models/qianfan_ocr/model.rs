@@ -146,9 +146,15 @@ impl QianfanOCRModel {
                     let all_weights = load_safetensors_weights(path)?;
                     info!("  Loaded {} total tensors", all_weights.len());
 
-                    // Transform keys to internal format
-                    let weights = load_qianfan_ocr_weights(all_weights)?;
-                    info!("  After transformation: {} tensors", weights.len());
+                    // Transform keys if still in HuggingFace format (has vision_model. prefix)
+                    let needs_transform = all_weights.keys().any(|k| k.starts_with("vision_model."));
+                    let weights = if needs_transform {
+                        info!("  Transforming HuggingFace keys to internal format...");
+                        load_qianfan_ocr_weights(all_weights)?
+                    } else {
+                        info!("  Keys already in MLX format, skipping transformation");
+                        all_weights
+                    };
 
                     Ok::<_, Error>((config, weights, model_path))
                 })
