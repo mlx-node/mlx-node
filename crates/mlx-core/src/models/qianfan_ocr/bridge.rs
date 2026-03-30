@@ -25,18 +25,20 @@ use crate::models::pp_doclayout_v3::persistence::get_tensor;
 
 /// Pixel shuffle (v2) downsampling that merges 2x2 spatial blocks into channels.
 ///
+/// Matches the Python InternVL implementation exactly (all 4D operations):
+///   1. reshape [N,W,H,C] -> [N, W, H*s, C/s]   (merge trailing H into C)
+///   2. permute(0,2,1,3)                          (swap spatial axes)
+///   3. reshape [N, H*s, W*s, C/s²]              (merge trailing W into C)
+///   4. permute(0,2,1,3)                          (v2: spatial transpose)
+///
 /// Input:  `[B, seq_len, hidden_size]` where `seq_len = H*W` (e.g. 1024 = 32x32)
 /// Output: `[B, new_h * new_w, new_c]` where spatial dims are halved and channels 4x
-///
-/// For the default case (scale_factor=0.5, input [B, 1024, 1024]):
-///   H=W=32, new_h=new_w=16, new_c=4096 -> output [B, 256, 4096]
 pub fn pixel_shuffle_v2(x: &MxArray, scale_factor: f64) -> Result<MxArray> {
     let shape = x.shape()?;
     let n = shape[0];
     let seq_len = shape[1];
     let c = shape[2];
 
-    // Derive spatial dimensions: seq_len = H * W, assume square
     let hw = (seq_len as f64).sqrt() as i64;
     let h = hw;
     let w = hw;
@@ -45,28 +47,26 @@ pub fn pixel_shuffle_v2(x: &MxArray, scale_factor: f64) -> Result<MxArray> {
     let new_w = (w as f64 * scale_factor) as i64;
     let new_c = (c as f64 / (scale_factor * scale_factor)) as i64;
 
-    // Reshape to spatial grid: [B, W, H, C]
+    // Python: n, w, h, c = x.size()  -- names axis-1 as W, axis-2 as H
+    // Reshape to spatial grid: [N, W, H, C]
     let x = x.reshape(&[n, w, h, c])?;
 
-    // Step 1: split H into (new_h, H/new_h)
-    // [B, W, H, C] -> [B, W, new_h, H/new_h, C]
-    let x = x.reshape(&[n, w, new_h, h / new_h, c])?;
-    // Permute: swap W and new_h -> [B, new_h, W, H/new_h, C]
-    let x = x.transpose(Some(&[0, 2, 1, 3, 4]))?;
+    // Step 1: N,W,H,C -> N, W, H*scale, C/scale
+    // Merges trailing H into C (contiguous last two dims)
+    let x = x.reshape(&[n, w, new_h, (c as f64 / scale_factor) as i64])?;
 
-    // Step 2: split W into (new_w, W/new_w)
-    // [B, new_h, W, H/new_h, C] -> [B, new_h, new_w, W/new_w, H/new_h, C]
-    let x = x.reshape(&[n, new_h, new_w, w / new_w, h / new_h, c])?;
+    // Step 2: permute(0,2,1,3) -- swap W and new_h
+    let x = x.transpose(Some(&[0, 2, 1, 3]))?;
+    // [N, new_h, W, C/scale]
 
-    // v2 permute: swap dims 2,3 (new_w <-> W/new_w)
-    // [B, new_h, new_w, W/new_w, H/new_h, C] -> [B, new_h, W/new_w, new_w, H/new_h, C]
-    let x = x.transpose(Some(&[0, 1, 3, 2, 4, 5]))?;
-
-    // Final reshape: merge all extra dims into channel dimension
-    // [B, new_h, W/new_w, new_w, H/new_h, C] -> [B, new_h, new_w, new_c]
+    // Step 3: N, new_h, W, C/scale -> N, new_h, new_w, C/scale^2
+    // Merges trailing W into C (contiguous last two dims)
     let x = x.reshape(&[n, new_h, new_w, new_c])?;
 
-    // Flatten spatial to sequence: [B, new_h * new_w, new_c]
+    // Step 4: v2 permute(0,2,1,3) -- swap the two spatial axes
+    let x = x.transpose(Some(&[0, 2, 1, 3]))?;
+
+    // Flatten spatial to sequence: [N, new_h*new_w, new_c]
     x.reshape(&[n, new_h * new_w, new_c])
 }
 
