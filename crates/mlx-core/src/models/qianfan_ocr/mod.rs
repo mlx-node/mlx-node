@@ -7,6 +7,7 @@
 pub mod bridge;
 pub mod config;
 pub mod language;
+pub mod persistence;
 pub mod processing;
 pub mod vision;
 
@@ -16,3 +17,5 @@ pub(crate) use bridge::InternVLBridge;
 pub use config::{
     InternVisionConfig, Qwen3LMConfig, QianfanOCRConfig, create_qianfan_ocr_config,
 };
+#[allow(unused_imports)]
+pub(crate) use persistence::load_qianfan_ocr_weights;
