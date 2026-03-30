@@ -141,7 +141,8 @@ pub(crate) fn format_qianfan_chat(
                 // Even empty reasoning gets <think>\n\n</think> on the last msg.
                 let is_after_last_query = i > last_query_index;
                 let is_last_msg = i == msg_count - 1;
-                let emit_think = reasoning.is_some()
+                let has_reasoning = reasoning.as_ref().is_some_and(|r| !r.is_empty());
+                let emit_think = has_reasoning
                     || (is_after_last_query && is_last_msg);
 
                 if emit_think {
@@ -373,7 +374,12 @@ fn extract_reasoning_and_content(
             before // no opening tag — use everything before </think>
         };
 
-        reasoning = Some(extracted.trim_matches('\n').to_string());
+        let trimmed = extracted.trim_matches('\n');
+        reasoning = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
         content = after.trim_start_matches('\n').to_string();
     }
 
@@ -697,6 +703,24 @@ mod tests {
         assert!(
             result.contains("<|im_start|>assistant\n<think>\n\n</think>\n\nThe answer.<|im_end|>"),
             "Last assistant after query must emit empty <think> block. Got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_non_last_assistant_empty_extracted_reasoning_no_think() {
+        // "<think></think>\nA" extracts empty reasoning → should NOT emit <think>
+        // on a non-last assistant turn (upstream: reasoning_content is falsy)
+        let messages = vec![
+            text_msg("user", "Q"),
+            assistant_msg("<think></think>\nA"),
+            assistant_msg("B"),
+        ];
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
+        // Assistant "A" at index 1: last_query_index=0, 1 > 0 but NOT last (index 2 is)
+        // Empty extracted reasoning → no <think> block for this turn
+        assert!(
+            result.contains("<|im_start|>assistant\nA<|im_end|>"),
+            "Non-last assistant with empty extracted reasoning must not emit <think>. Got: {result}"
         );
     }
 
