@@ -1,359 +1,189 @@
+#!/usr/bin/env node
 /**
- * Document Layout Analysis + OCR Pipeline
+ * VLM Inference — Chat with images using Qianfan-OCR or PaddleOCR-VL
  *
- * Combines PP-DocLayoutV3 (layout detection) with PaddleOCR-VL-1.5 (OCR)
- * to extract structured markdown from document images.
- *
- * Pipeline:
- *   0. (Optional) Preprocessing: orientation correction + unwarping
- *   1. DocLayoutModel detects layout elements (titles, text, tables, figures...)
- *   2. Each element is cropped from the source image
- *   3. VLModel OCRs each cropped region with type-appropriate prompts
- *   4. Results are assembled into formatted markdown following reading order
+ * Supports multi-turn conversation with image input and streaming output.
  *
  * Usage:
- *   oxnode examples/vlm-inference.ts <image_path> [--threshold 0.5] [--vlm-only] [--layout-only]
+ *   oxnode examples/vlm-inference.ts [model-path] [--image <path>] [--prompt <text>]
  *
  * Examples:
- *   oxnode examples/vlm-inference.ts ./examples/ocr.png                # Full pipeline
- *   oxnode examples/vlm-inference.ts ./examples/ocr.png --vlm-only     # VLM OCR only
- *   oxnode examples/vlm-inference.ts ./examples/ocr.png --layout-only  # Layout detection only
- *   oxnode examples/vlm-inference.ts ./examples/ocr.png --threshold 0.3
- *   oxnode examples/vlm-inference.ts ./examples/ocr.png --orient       # With orientation correction
- *   oxnode examples/vlm-inference.ts ./examples/ocr.png --unwarp       # With document unwarping
+ *   oxnode examples/vlm-inference.ts .cache/models/qianfan-ocr --image doc.png
+ *   oxnode examples/vlm-inference.ts .cache/models/qianfan-ocr --image doc.png --prompt "Extract all text"
+ *   oxnode examples/vlm-inference.ts .cache/models/qianfan-ocr --image doc.png --stream
+ *   oxnode examples/vlm-inference.ts .cache/models/qianfan-ocr                  # text-only chat
  */
-import { readFileSync, existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 
-import { ChatRole, DocOrientationModel, DocUnwarpModel, type LayoutElement } from '@mlx-node/core';
-import { DocLayoutModel, VLModel, parsePaddleResponse, OutputFormat } from '@mlx-node/vlm';
-import { Transformer } from '@napi-rs/image';
+import type { ChatMessage, ChatConfig } from '@mlx-node/core';
+import { QianfanOCRModel } from '@mlx-node/vlm';
 
-// --- CLI args ---
-const args = process.argv.slice(2);
-const imagePath = args.find((a) => !a.startsWith('--'));
-const vlmOnly = args.includes('--vlm-only');
-const layoutOnly = args.includes('--layout-only');
-const useOrient = args.includes('--orient');
-const useUnwarp = args.includes('--unwarp');
-const thresholdIdx = args.indexOf('--threshold');
-const threshold =
-  thresholdIdx !== -1 && !isNaN(parseFloat(args[thresholdIdx + 1])) ? parseFloat(args[thresholdIdx + 1]) : 0.5;
+// Manual arg parsing — oxnode doesn't preserve shell quoting for multi-word values
+const rawArgs = process.argv.slice(2);
 
-const vlmModelPath = '.cache/models/PaddleOCR-VL-1.5-mlx';
-// Clone from HuggingFace: PaddlePaddle/PP-DocLayoutV3_safetensors (NOT PaddlePaddle/PP-DocLayoutV3)
-const layoutModelPath = '.cache/models/PP-DocLayoutV3';
-const orientModelPath = '.cache/models/PP-LCNet_x1_0_doc_ori-mlx';
-const unwarpModelPath = '.cache/models/UVDoc-mlx';
-
-function tryLoadOrient(): DocOrientationModel | null {
-  if (!useOrient) return null;
-  if (!existsSync(orientModelPath)) {
-    console.error(`Error: Orientation model not found at ${orientModelPath}`);
-    console.error('  Download and convert it first:');
-    console.error(
-      '    mlx download model -m PaddlePaddle/PP-LCNet_x1_0_doc_ori -o .cache/models/PP-LCNet_x1_0_doc_ori',
-    );
-    console.error(
-      '    mlx convert -m pp-lcnet-ori -i .cache/models/PP-LCNet_x1_0_doc_ori -o .cache/models/PP-LCNet_x1_0_doc_ori-mlx',
-    );
-    process.exit(1);
-  }
-  return DocOrientationModel.load(orientModelPath);
+function getFlag(name: string): string | undefined {
+  const idx = rawArgs.indexOf(`--${name}`);
+  if (idx === -1) return undefined;
+  return rawArgs[idx + 1];
+}
+function hasFlag(name: string): boolean {
+  return rawArgs.includes(`--${name}`);
 }
 
-function tryLoadUnwarp(): DocUnwarpModel | null {
-  if (!useUnwarp) return null;
-  if (!existsSync(unwarpModelPath)) {
-    console.error(`Error: Unwarp model not found at ${unwarpModelPath}`);
-    console.error('  Download and convert it first:');
-    console.error('    mlx download model -m PaddlePaddle/UVDoc -o .cache/models/UVDoc');
-    console.error('    mlx convert -m uvdoc -i .cache/models/UVDoc -o .cache/models/UVDoc-mlx');
-    process.exit(1);
+// Collect positionals (args not starting with --)
+const positionals: string[] = [];
+for (let i = 0; i < rawArgs.length; i++) {
+  if (rawArgs[i].startsWith('--')) {
+    // Skip flags that take a value
+    if (['--image', '--prompt', '--max-tokens', '--temperature', '-i', '-p'].includes(rawArgs[i])) i++;
+    continue;
   }
-  return DocUnwarpModel.load(unwarpModelPath);
+  positionals.push(rawArgs[i]);
 }
 
-if (!imagePath) {
-  console.log('Usage: oxnode examples/vlm-inference.ts <image_path> [options]');
-  console.log('Options:');
-  console.log('  --vlm-only       VLM OCR only (no layout detection)');
-  console.log('  --layout-only    Layout detection only (no OCR)');
-  console.log('  --orient         Enable document orientation correction (0/90/180/270)');
-  console.log('  --unwarp         Enable document unwarping (curved/distorted pages)');
-  console.log('  --threshold N    Detection confidence threshold (default: 0.5)');
+// --prompt collects everything between --prompt and the next -- flag
+function getPromptArg(): string | undefined {
+  const idx = rawArgs.indexOf('--prompt');
+  const idx2 = rawArgs.indexOf('-p');
+  const start = Math.max(idx, idx2);
+  if (start === -1) return undefined;
+  const parts: string[] = [];
+  for (let i = start + 1; i < rawArgs.length; i++) {
+    if (rawArgs[i].startsWith('--')) break;
+    parts.push(rawArgs[i]);
+  }
+  return parts.join(' ') || undefined;
+}
+
+const modelPath = positionals[0];
+const imagePath = getFlag('image') || getFlag('i');
+const stream = hasFlag('stream');
+const maxTokens = getFlag('max-tokens') ? parseInt(getFlag('max-tokens')!, 10) : 2048;
+const temperature = getFlag('temperature') ? parseFloat(getFlag('temperature')!) : undefined;
+const enableThinking = hasFlag('thinking');
+const promptArg = getPromptArg();
+
+if (!modelPath) {
+  console.log(`VLM Inference — Chat with images using Qianfan-OCR
+
+Usage:
+  oxnode examples/vlm-inference.ts <model-path> [options]
+
+Options:
+  --image <path>       Image file to process (PNG/JPEG)
+  --prompt <text>      Custom prompt (default: auto-selected based on mode)
+  --stream             Stream output token-by-token
+  --max-tokens <n>     Max tokens to generate (default: 2048)
+  --temperature <f>    Sampling temperature
+  --thinking           Enable Layout-as-Thought mode
+
+Examples:
+  oxnode examples/vlm-inference.ts .cache/models/qianfan-ocr --image doc.png
+  oxnode examples/vlm-inference.ts .cache/models/qianfan-ocr --image doc.png --prompt "Parse to markdown"
+  oxnode examples/vlm-inference.ts .cache/models/qianfan-ocr --image doc.png --stream --thinking
+  oxnode examples/vlm-inference.ts .cache/models/qianfan-ocr  # text-only`);
   process.exit(1);
 }
 
-// --- VLM-only mode (original behavior) ---
-if (vlmOnly) {
-  console.log('Loading VLM...');
-  console.time('VLM load');
-  const vlm = await VLModel.load(vlmModelPath);
-  console.timeEnd('VLM load');
+const resolvedModelPath = resolve(process.cwd(), modelPath);
 
-  console.log(`\n--- OCR: ${imagePath} ---`);
-  console.time('OCR');
-  const imageBuffer = readFileSync(imagePath);
-  const result = await vlm.chat([{ role: ChatRole.User, content: 'Extract the text in this image' }], {
-    images: [imageBuffer],
-  });
-  console.timeEnd('OCR');
+// --- Load model ---
+console.log(`Loading model from: ${resolvedModelPath}`);
+console.time('Load');
+const model = await QianfanOCRModel.load(resolvedModelPath);
+console.timeEnd('Load');
+console.log();
 
-  const formatted = parsePaddleResponse(result.text, { format: OutputFormat.Markdown });
-  console.log(`\n${formatted}`);
-  process.exit(0);
-}
+// --- Build messages ---
+const config: ChatConfig = {
+  maxNewTokens: maxTokens,
+  ...(temperature != null && { temperature }),
+  ...(enableThinking && { enableThinking }),
+};
 
-// --- Layout-only mode ---
-if (layoutOnly) {
-  console.log('Loading models...');
-  console.time('Models load');
-  const layout = DocLayoutModel.load(layoutModelPath);
-  const orientModel = tryLoadOrient();
-  const unwarpModel = tryLoadUnwarp();
-  console.timeEnd('Models load');
+if (imagePath) {
+  const imageBuffer = await readFile(resolve(process.cwd(), imagePath));
+  const imageBytes = new Uint8Array(imageBuffer.buffer, imageBuffer.byteOffset, imageBuffer.byteLength);
+  console.log(`Image: ${imagePath} (${imageBytes.length} bytes)`);
 
-  let imageData: Buffer = readFileSync(imagePath);
+  const defaultPrompt = 'Extract all text from this image.';
+  const prompt = promptArg || defaultPrompt;
 
-  if (orientModel) {
-    console.log('\n--- Orientation Classification ---');
-    const rotateResult = orientModel.classifyAndRotate(imageData);
-    console.log(`  Detected: ${rotateResult.angle}° (score: ${rotateResult.score.toFixed(3)})`);
-    if (rotateResult.angle !== 0) {
-      imageData = Buffer.from(rotateResult.image);
-      console.log(`  Corrected to upright`);
+  const messages: ChatMessage[] = [{ role: 'user', content: prompt, images: [imageBytes] }];
+
+  if (stream) {
+    // --- Streaming mode ---
+    console.log(`Prompt: ${prompt}\n`);
+    const t0 = Date.now();
+    let tokens = 0;
+    for await (const event of model.chatStream(messages, config)) {
+      if (!event.done) {
+        process.stdout.write(event.text);
+      } else {
+        tokens = event.numTokens;
+        console.log();
+        console.log('-'.repeat(80));
+        console.log(`${tokens} tokens | ${Date.now() - t0}ms | finish: ${event.finishReason}`);
+        if (event.thinking) {
+          console.log(`\nThinking:\n${event.thinking}`);
+        }
+      }
     }
-  }
-
-  if (unwarpModel) {
-    console.log('\n--- Document Unwarping ---');
-    const unwarpResult = unwarpModel.unwarp(imageData);
-    imageData = Buffer.from(unwarpResult.image);
-    console.log(`  Unwarped`);
-  }
-
-  console.log(`\n--- Layout Detection: ${imagePath} (threshold=${threshold}) ---`);
-  console.time('Detection');
-  const elements = layout.detect(imageData, threshold);
-  console.timeEnd('Detection');
-
-  console.log(`\nDetected ${elements.length} elements:\n`);
-  for (const el of elements) {
-    const [x1, y1, x2, y2] = el.bbox;
-    console.log(
-      `  [${el.order}] ${el.labelName} (${el.label}) - score: ${el.score.toFixed(3)} ` +
-        `bbox: [${x1.toFixed(0)}, ${y1.toFixed(0)}, ${x2.toFixed(0)}, ${y2.toFixed(0)}]`,
-    );
-  }
-
-  process.exit(0);
-}
-
-// --- Full pipeline: Layout + OCR → Markdown ---
-console.log('Loading models...');
-console.time('Models load');
-const layout = DocLayoutModel.load(layoutModelPath);
-const vlm = await VLModel.load(vlmModelPath);
-const orientModel = tryLoadOrient();
-const unwarpModel = tryLoadUnwarp();
-console.timeEnd('Models load');
-
-// Step 0: Preprocessing (orientation correction + unwarping)
-let processedImage: Buffer = readFileSync(imagePath);
-
-if (orientModel) {
-  console.log('\n--- Orientation Classification ---');
-  console.time('Orientation');
-  const rotateResult = orientModel.classifyAndRotate(processedImage);
-  console.timeEnd('Orientation');
-  console.log(`  Detected: ${rotateResult.angle}° (score: ${rotateResult.score.toFixed(3)})`);
-
-  if (rotateResult.angle !== 0) {
-    processedImage = Buffer.from(rotateResult.image);
-    console.log(`  Corrected to upright`);
-  }
-}
-
-if (unwarpModel) {
-  console.log('\n--- Document Unwarping ---');
-  console.time('Unwarp');
-  const unwarpResult = unwarpModel.unwarp(processedImage);
-  processedImage = Buffer.from(unwarpResult.image);
-  console.timeEnd('Unwarp');
-  console.log(`  Unwarped`);
-}
-
-// Step 1: Detect layout
-console.log(`\n--- Layout Detection (threshold=${threshold}) ---`);
-console.time('Detection');
-const elements = layout.detect(processedImage, threshold);
-console.timeEnd('Detection');
-console.log(`Detected ${elements.length} elements`);
-
-if (elements.length === 0) {
-  console.log('No elements detected. Try lowering the threshold with --threshold 0.3');
-  process.exit(0);
-}
-
-// Step 2: Crop regions and OCR each element
-async function cropElement(el: LayoutElement): Promise<Buffer> {
-  const [x1, y1, x2, y2] = el.bbox;
-  const x = Math.max(0, Math.round(x1));
-  const y = Math.max(0, Math.round(y1));
-  const w = Math.max(1, Math.round(x2 - x1));
-  const h = Math.max(1, Math.round(y2 - y1));
-
-  return Buffer.from(await new Transformer(processedImage).crop(x, y, w, h).png());
-}
-
-/** Get OCR prompt based on element type */
-function getPrompt(labelName: string): string {
-  switch (labelName) {
-    case 'table':
-      return 'Extract this table as a markdown table. Preserve all rows and columns.';
-    case 'isolate_formula':
-      return 'Extract this mathematical formula in LaTeX notation.';
-    case 'code_txt':
-      return 'Extract this code exactly as shown, preserving indentation.';
-    case 'chart':
-    case 'figure':
-      return 'Describe what is shown in this image briefly.';
-    default:
-      return 'Extract the text in this image exactly as shown.';
-  }
-}
-
-/** Elements that should be OCR'd */
-const ocrLabels = new Set([
-  'title',
-  'doc_title',
-  'paragraph_title',
-  'text',
-  'abstract',
-  'list',
-  'table',
-  'table_caption',
-  'table_footnote',
-  'figure_caption',
-  'chart_caption',
-  'isolate_formula',
-  'formula_caption',
-  'code_txt',
-  'header',
-  'footer',
-  'footnote',
-  'margin_note',
-  'reference',
-  'content',
-  'index',
-  'handwriting',
-]);
-
-/** Format OCR text based on element type */
-function formatElement(labelName: string, text: string, order: number): string {
-  const trimmed = text.trim();
-  if (!trimmed) return '';
-
-  switch (labelName) {
-    case 'doc_title':
-      return `# ${trimmed}\n`;
-    case 'title':
-      return `## ${trimmed}\n`;
-    case 'paragraph_title':
-      return `### ${trimmed}\n`;
-    case 'abstract':
-      return `> ${trimmed}\n`;
-    case 'table':
-      return `${trimmed}\n`;
-    case 'table_caption':
-    case 'figure_caption':
-    case 'chart_caption':
-    case 'formula_caption':
-      return `*${trimmed}*\n`;
-    case 'isolate_formula':
-      return `$$\n${trimmed}\n$$\n`;
-    case 'code_txt':
-      return `\`\`\`\n${trimmed}\n\`\`\`\n`;
-    case 'figure':
-    case 'chart':
-      return `[${labelName}: ${trimmed}]\n`;
-    case 'header':
-    case 'footer':
-      return `<!-- ${labelName}: ${trimmed} -->\n`;
-    case 'footnote':
-    case 'table_footnote':
-      return `[^note-${order}]: ${trimmed}\n`;
-    case 'list':
-      return `${trimmed}\n`;
-    default:
-      return `${trimmed}\n`;
-  }
-}
-
-// Step 3: Crop all elements and prepare batch OCR items
-type OcrItem = { index: number; label: string; cropBuffer: Buffer; prompt: string; order: number };
-const ocrItems: OcrItem[] = [];
-const nonOcrParts: Map<number, string> = new Map(); // index -> markdown for non-OCR elements
-
-let idx = 0;
-for (const el of elements) {
-  const label = el.labelName;
-
-  // Skip non-content elements
-  if (label === 'abandon' || label === 'seal') {
-    continue;
-  }
-
-  // For figures/charts without text, just note their position
-  if (label === 'figure' || label === 'chart') {
-    nonOcrParts.set(idx, `[${label}]\n`);
-    idx++;
-    continue;
-  }
-
-  if (!ocrLabels.has(label)) {
-    continue;
-  }
-
-  const cropBuffer = await cropElement(el);
-  const prompt = getPrompt(label);
-  console.log(`  [${el.order}] ${label} (${el.score.toFixed(2)})`);
-  ocrItems.push({ index: idx, label, cropBuffer, prompt, order: el.order });
-  idx++;
-}
-
-// Step 4: Batch OCR all cropped elements
-console.log(`\n--- Batch OCR (${ocrItems.length} elements) ---`);
-console.time('Batch OCR');
-
-const batchItems = ocrItems.map((item) => ({
-  messages: [{ role: ChatRole.User as const, content: item.prompt }],
-  images: [item.cropBuffer],
-}));
-const batchResults = await vlm.batch(batchItems);
-
-console.timeEnd('Batch OCR');
-
-// Step 5: Assemble markdown in reading order
-const markdownParts: string[] = [];
-let ocrResultIdx = 0;
-
-for (let i = 0; i < idx; i++) {
-  if (nonOcrParts.has(i)) {
-    markdownParts.push(nonOcrParts.get(i)!);
   } else {
-    const item = ocrItems[ocrResultIdx];
-    const result = batchResults[ocrResultIdx];
-    const text = parsePaddleResponse(result.text, { format: OutputFormat.Markdown });
-    const formatted = formatElement(item.label, text, item.order);
-    if (formatted) {
-      markdownParts.push(formatted);
+    // --- Non-streaming mode ---
+    console.log(`Prompt: ${prompt}\n`);
+    console.time('Generate');
+    const result = await model.chat(messages, config);
+    console.timeEnd('Generate');
+    console.log();
+    console.log(result.text);
+    console.log('-'.repeat(80));
+    console.log(`${result.numTokens} tokens | finish: ${result.finishReason}`);
+    if (result.thinking) {
+      console.log(`\nThinking:\n${result.thinking}`);
     }
-    ocrResultIdx++;
+
+    // --- Multi-turn follow-up ---
+    const followUp = 'Now format the extracted text as a markdown table if there are any tables.';
+    messages.push({ role: 'assistant', content: result.rawText });
+    messages.push({ role: 'user', content: followUp });
+
+    console.log(`\n── Turn 2 (cache reuse) ──`);
+    console.log(`User: ${followUp}\n`);
+    console.time('Generate (turn 2)');
+    const r2 = await model.chat(messages, config);
+    console.timeEnd('Generate (turn 2)');
+    console.log();
+    console.log(r2.text);
+    console.log('-'.repeat(80));
+    console.log(`${r2.numTokens} tokens | finish: ${r2.finishReason}`);
+  }
+} else {
+  // --- Text-only multi-turn chat ---
+  const messages: ChatMessage[] = [
+    { role: 'user', content: promptArg || 'What can you do? Answer briefly.' },
+  ];
+
+  console.log(`Prompt: ${messages[0].content}\n`);
+
+  if (stream) {
+    for await (const event of model.chatStream(messages, config)) {
+      if (!event.done) {
+        process.stdout.write(event.text);
+      } else {
+        console.log();
+        console.log('-'.repeat(80));
+        console.log(`${event.numTokens} tokens | finish: ${event.finishReason}`);
+      }
+    }
+  } else {
+    console.time('Generate');
+    const result = await model.chat(messages, config);
+    console.timeEnd('Generate');
+    console.log();
+    console.log(result.text);
+    console.log('-'.repeat(80));
+    console.log(`${result.numTokens} tokens | finish: ${result.finishReason}`);
   }
 }
-
-// Output
-const markdown = markdownParts.join('\n');
-console.log('\n--- Result ---\n');
-console.log(markdown);
