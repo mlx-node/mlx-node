@@ -58,6 +58,8 @@ pub struct QianfanChatResult {
     pub finish_reason: String,
     /// Raw generated text before parsing
     pub raw_text: String,
+    /// Performance metrics (only present when `reportPerformance: true`)
+    pub performance: Option<crate::profiling::PerformanceMetrics>,
 }
 
 // ============================================================================
@@ -216,6 +218,13 @@ impl QianfanOCRModel {
         let frequency_context_size = config.frequency_context_size.unwrap_or(20);
         let enable_thinking = config.enable_thinking.unwrap_or(false);
         let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let report_perf = config.report_performance.unwrap_or(false);
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let tokenizer = self
             .tokenizer
@@ -399,13 +408,16 @@ impl QianfanOCRModel {
 
             // Sample first token
             let mut token = sample(&last_logits, Some(sampling_config))?;
+            token.eval();
+
+            let first_token_instant = generation_start.map(|_| std::time::Instant::now());
+            let prefill_token_count = token_ids.len();
 
             let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
             let mut finish_reason = "length".to_string();
 
             // --- Step 8: Decode loop ---
             for _step in 0..max_new_tokens {
-                token.eval();
                 let token_value = token.item_at_int32(0)? as u32;
                 generated_tokens.push(token_value);
                 all_tokens.push(token_value);
@@ -479,6 +491,31 @@ impl QianfanOCRModel {
             let (text_after_thinking, thinking) = tools::parse_thinking(&raw_text);
             let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
 
+            let performance = if let (Some(gen_start), Some(first_tok)) =
+                (generation_start, first_token_instant)
+            {
+                let generation_end = std::time::Instant::now();
+                let prefill_toks = prefill_token_count as f64;
+                let gen_toks = generated_tokens.len() as f64;
+                let ttft_ms = first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
+                let decode_ms = generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
+                Some(crate::profiling::PerformanceMetrics {
+                    ttft_ms,
+                    prefill_tokens_per_second: if ttft_ms > 0.0 {
+                        prefill_toks / (ttft_ms / 1000.0)
+                    } else {
+                        0.0
+                    },
+                    decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                        (gen_toks - 1.0) / (decode_ms / 1000.0)
+                    } else {
+                        0.0
+                    },
+                })
+            } else {
+                None
+            };
+
             Ok(QianfanChatResult {
                 text: text.trim().to_string(),
                 tool_calls,
@@ -486,6 +523,7 @@ impl QianfanOCRModel {
                 num_tokens: generated_tokens.len() as u32,
                 finish_reason,
                 raw_text,
+                performance,
             })
         })
         .await
@@ -545,6 +583,13 @@ impl QianfanOCRModel {
         let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
         let frequency_context_size = config.frequency_context_size.unwrap_or(20);
         let enable_thinking = config.enable_thinking.unwrap_or(false);
+        let report_perf = config.report_performance.unwrap_or(false);
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let tokenizer = self
             .tokenizer
@@ -696,6 +741,10 @@ impl QianfanOCRModel {
                 }
 
                 let mut token = sample(&last_logits, Some(sampling_config))?;
+                token.eval();
+
+                let first_token_instant = generation_start.map(|_| std::time::Instant::now());
+                let prefill_token_count = all_tokens.len();
 
                 let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
                 let mut finish_reason = "length".to_string();
@@ -706,8 +755,6 @@ impl QianfanOCRModel {
                         finish_reason = "cancelled".to_string();
                         break;
                     }
-
-                    token.eval();
                     let token_value = token.item_at_int32(0)? as u32;
                     generated_tokens.push(token_value);
                     all_tokens.push(token_value);
@@ -783,6 +830,33 @@ impl QianfanOCRModel {
                 let (text_after_thinking, thinking) = tools::parse_thinking(&raw_text);
                 let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
 
+                let performance = if let (Some(gen_start), Some(first_tok)) =
+                    (generation_start, first_token_instant)
+                {
+                    let generation_end = std::time::Instant::now();
+                    let prefill_toks = prefill_token_count as f64;
+                    let gen_toks = generated_tokens.len() as f64;
+                    let ttft_ms =
+                        first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
+                    let decode_ms =
+                        generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
+                    Some(crate::profiling::PerformanceMetrics {
+                        ttft_ms,
+                        prefill_tokens_per_second: if ttft_ms > 0.0 {
+                            prefill_toks / (ttft_ms / 1000.0)
+                        } else {
+                            0.0
+                        },
+                        decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                            (gen_toks - 1.0) / (decode_ms / 1000.0)
+                        } else {
+                            0.0
+                        },
+                    })
+                } else {
+                    None
+                };
+
                 emit(ChatStreamChunk {
                     text: String::new(),
                     done: true,
@@ -791,7 +865,7 @@ impl QianfanOCRModel {
                     thinking,
                     num_tokens: Some(generated_tokens.len() as u32),
                     raw_text: Some(text.trim().to_string()),
-                    performance: None,
+                    performance,
                 });
 
                 Ok(())
@@ -1217,6 +1291,7 @@ mod tests {
             num_tokens: 1,
             finish_reason: "stop".to_string(),
             raw_text: "Hello".to_string(),
+            performance: None,
         };
         assert_eq!(result.text, "Hello");
         assert_eq!(result.num_tokens, 1);
