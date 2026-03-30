@@ -4,10 +4,13 @@
 //! Based on the InternVL2.5 architecture with InternViT vision encoder
 //! and Qwen3 language model.
 
+pub mod bridge;
 pub mod config;
 pub mod vision;
 
 // Re-export public items
+#[allow(unused_imports)]
+pub(crate) use bridge::InternVLBridge;
 pub use config::{
     InternVisionConfig, Qwen3LMConfig, QianfanOCRConfig, create_qianfan_ocr_config,
 };

@@ -29,7 +29,7 @@ use crate::vision::interpolate::bilinear_interpolate;
 // ============================================================================
 
 /// Look up a weight by key, returning a clear error if missing.
-fn get_weight(weights: &HashMap<String, MxArray>, key: &str) -> Result<MxArray> {
+pub(crate) fn get_weight(weights: &HashMap<String, MxArray>, key: &str) -> Result<MxArray> {
     weights.get(key).cloned().ok_or_else(|| {
         Error::from_reason(format!("Missing weight: {key}"))
     })
