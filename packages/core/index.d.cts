@@ -659,6 +659,54 @@ export declare class PromptCache {
 }
 
 /**
+ * Qianfan-OCR Vision-Language Model (InternVL architecture).
+ *
+ * Combines InternViT vision encoder, MLP bridge with pixel shuffle,
+ * and Qwen3 language model for OCR and document understanding.
+ */
+export declare class QianfanOCRModel {
+  /** Create a new QianfanOCRModel from config (uninitialized, no weights). */
+  constructor(config: QianfanOcrConfig);
+  /** Returns true if weights have been loaded. */
+  get isInitialized(): boolean;
+  /**
+   * Load a QianfanOCRModel from a directory.
+   *
+   * Reads config.json, loads SafeTensors weights (single or sharded),
+   * builds vision encoder, bridge, and language model, and loads tokenizer.
+   */
+  static load(modelPath: string): Promise<QianfanOCRModel>;
+  /**
+   * Chat with the model.
+   *
+   * High-level API: processes images, formats prompt, generates, and decodes.
+   */
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<QianfanChatResult>;
+  /**
+   * Streaming chat with the model.
+   *
+   * Same as chat() but emits tokens incrementally via callback.
+   */
+  chatStream(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /**
+   * Generate text tokens given pre-tokenized input.
+   *
+   * Lower-level API — prefer chat() for typical usage.
+   */
+  generate(
+    inputIds: MxArray,
+    maxNewTokens?: number | undefined | null,
+    temperature?: number | undefined | null,
+  ): Promise<Array<number>>;
+  /** Reset KV caches and token history. */
+  resetCaches(): void;
+}
+
+/**
  * Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
  *
  * Uses interior mutability (RwLock) for layers, final_norm, lm_head, and caches
@@ -2188,6 +2236,9 @@ export declare function convertParquetToJsonl(inputPath: string, outputPath: str
 /** Create a default PaddleOCR-VL 1.5 configuration (JS factory function) */
 export declare function createPaddleocrVlConfig(): ModelConfig;
 
+/** Create a default Qianfan-OCR configuration (JS factory function) */
+export declare function createQianfanOcrConfig(): QianfanOcrConfig;
+
 /** Document element - either a table or paragraph */
 export interface DocumentElement {
   elementType: ElementType;
@@ -2697,6 +2748,21 @@ export interface GrpoLossConfig {
   vocabChunkSize?: number;
 }
 
+/** InternViT vision encoder configuration */
+export interface InternVisionConfig {
+  hiddenSize: number;
+  intermediateSize: number;
+  numHiddenLayers: number;
+  numAttentionHeads: number;
+  numChannels: number;
+  imageSize: number;
+  patchSize: number;
+  layerNormEps: number;
+  qkvBias: boolean;
+  /** Drop path rate (inference only, always 0) */
+  dropPathRate: number;
+}
+
 /** Check whether profiling is currently enabled. */
 export declare function isProfilingEnabled(): boolean;
 
@@ -2934,6 +3000,45 @@ export interface ProfilingSummary {
   avgPrefillMs: number;
 }
 
+/** Result from a Qianfan-OCR chat() call. */
+export interface QianfanChatResult {
+  /** Generated text (with thinking/tool_call tags stripped) */
+  text: string;
+  /** Parsed tool calls (if any) */
+  toolCalls: Array<ToolCallResult>;
+  /** Thinking content (text inside <think>...</think> tags) */
+  thinking?: string;
+  /** Number of generated tokens */
+  numTokens: number;
+  /** Why generation stopped: "eos", "length", or "repetition" */
+  finishReason: string;
+  /** Raw generated text before parsing */
+  rawText: string;
+}
+
+/** Full Qianfan-OCR model configuration */
+export interface QianfanOcrConfig {
+  visionConfig: InternVisionConfig;
+  llmConfig: Qwen3LmConfig;
+  modelType: string;
+  imgContextTokenId: number;
+  /** `<img>` token ID */
+  imgStartTokenId: number;
+  /** `</img>` token ID */
+  imgEndTokenId: number;
+  /** `<|im_end|>` token ID */
+  eosTokenId: number;
+  /** Which vision encoder layer to extract features from */
+  selectLayer: number;
+  /** Pixel shuffle version */
+  psVersion: string;
+  downsampleRatio: number;
+  dynamicImageSize: boolean;
+  useThumbnail: boolean;
+  maxDynamicPatch: number;
+  minDynamicPatch: number;
+}
+
 /**
  * Qwen3.5 model configuration (dense variant).
  *
@@ -3075,6 +3180,22 @@ export interface Qwen3Config {
    * Default: false
    */
   useFp8Cache?: boolean | undefined;
+}
+
+/** Qwen3 language model configuration */
+export interface Qwen3LmConfig {
+  hiddenSize: number;
+  numHiddenLayers: number;
+  intermediateSize: number;
+  numAttentionHeads: number;
+  numKeyValueHeads: number;
+  headDim: number;
+  rmsNormEps: number;
+  vocabSize: number;
+  maxPositionEmbeddings: number;
+  ropeTheta: number;
+  useQkNorm: boolean;
+  tieWordEmbeddings: boolean;
 }
 
 /** Result of text recognition. */
