@@ -259,6 +259,10 @@ pub(crate) fn format_qianfan_chat(
 }
 
 /// Format the tool definitions block per the upstream Jinja template.
+///
+/// Mirrors the tokenizer's `tools_value` construction (tokenizer.rs:836)
+/// to properly serialize `FunctionParameters.properties` (stored as a JSON
+/// string) into an actual JSON object rather than an escaped string.
 fn format_tools_block(prompt: &mut String, tools: &[ToolDefinition]) {
     prompt.push_str("# Tools\n\n");
     prompt.push_str(
@@ -267,7 +271,9 @@ fn format_tools_block(prompt: &mut String, tools: &[ToolDefinition]) {
          <tools>",
     );
     for tool in tools {
-        if let Ok(json) = serde_json::to_string(tool) {
+        // Build a proper JSON value — parsing properties from string to object
+        let json_value = tool_to_json_value(tool);
+        if let Ok(json) = serde_json::to_string(&json_value) {
             prompt.push('\n');
             prompt.push_str(&json);
         }
@@ -282,24 +288,58 @@ fn format_tools_block(prompt: &mut String, tools: &[ToolDefinition]) {
     );
 }
 
+/// Convert a ToolDefinition to a serde_json::Value, parsing the `properties`
+/// string field into a proper JSON object (same as tokenizer.rs:836).
+fn tool_to_json_value(tool: &ToolDefinition) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".to_string(), serde_json::json!(tool.r#type));
+
+    let mut func = serde_json::Map::new();
+    func.insert(
+        "name".to_string(),
+        serde_json::json!(tool.function.name),
+    );
+    if let Some(desc) = &tool.function.description {
+        func.insert("description".to_string(), serde_json::json!(desc));
+    }
+    if let Some(params) = &tool.function.parameters {
+        let mut params_obj = serde_json::Map::new();
+        params_obj.insert("type".to_string(), serde_json::json!(params.r#type));
+        if let Some(props_str) = &params.properties {
+            // Parse JSON string → Value (not double-escaped string)
+            if let Ok(props_val) = serde_json::from_str::<serde_json::Value>(props_str) {
+                params_obj.insert("properties".to_string(), props_val);
+            } else {
+                // Fallback: include as raw string if parse fails
+                params_obj.insert("properties".to_string(), serde_json::json!(props_str));
+            }
+        }
+        if let Some(required) = &params.required {
+            params_obj.insert("required".to_string(), serde_json::json!(required));
+        }
+        func.insert(
+            "parameters".to_string(),
+            serde_json::Value::Object(params_obj),
+        );
+    }
+    obj.insert("function".to_string(), serde_json::Value::Object(func));
+    serde_json::Value::Object(obj)
+}
+
 /// Extract reasoning and content from an assistant message.
 ///
-/// Per upstream Jinja:
-/// - Only serialize reasoning for assistant turns AFTER `last_query_index`
-/// - Fallback: if content starts with `<think>`, extract reasoning from it
-/// - For turns before last_query_index, strip reasoning entirely
+/// Per upstream Jinja (always extracts first, then gates on position):
+/// 1. Get reasoning from `reasoning_content` field, OR
+///    fallback: extract embedded `<think>...</think>` from content
+/// 2. Only RE-INSERT reasoning for assistant turns AFTER `last_query_index`
+/// 3. For turns before/at last_query_index, return clean content (no reasoning)
 fn extract_reasoning_and_content(
     msg: &ChatMessage,
     msg_index: usize,
     last_query_index: usize,
 ) -> (Option<String>, String) {
-    if msg_index <= last_query_index {
-        // Before or at the last user query — no reasoning in prompt
-        return (None, msg.content.clone());
-    }
-
-    // After last_query_index — include reasoning
-    let reasoning = msg
+    // Step 1: Always extract reasoning and clean content
+    let mut reasoning = msg
         .reasoning_content
         .as_ref()
         .filter(|r| !r.is_empty())
@@ -311,12 +351,16 @@ fn extract_reasoning_and_content(
         && content.starts_with("<think>")
         && let Some(end_pos) = content.find("</think>")
     {
-        let extracted = content[7..end_pos].to_string(); // skip "<think>"
-        content = content[end_pos + 8..].to_string(); // skip "</think>"
-        return (Some(extracted), content);
+        reasoning = Some(content[7..end_pos].to_string());
+        content = content[end_pos + 8..].to_string();
     }
 
-    (reasoning, content)
+    // Step 2: Only re-insert reasoning for turns AFTER last_query_index
+    if msg_index <= last_query_index {
+        (None, content)
+    } else {
+        (reasoning, content)
+    }
 }
 
 /// Find the index of the last real user query (not a tool_response).
@@ -619,15 +663,31 @@ mod tests {
     }
 
     #[test]
-    fn test_reasoning_extracted_from_content() {
-        // Fallback: extract <think>...</think> embedded in content
+    fn test_reasoning_extracted_from_content_after_last_query() {
+        // Fallback: extract <think>...</think> from content, rehydrate after last query
         let messages = vec![
             text_msg("user", "Think."),
             assistant_msg("<think>\nStep 1\n</think>\nResult"),
         ];
         let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
-        // Should be rehydrated as proper reasoning format
+        // Should be rehydrated (assistant at index 1 > last_query_index 0)
         assert!(result.contains("<think>\nStep 1\n</think>\n\nResult"));
+    }
+
+    #[test]
+    fn test_embedded_think_stripped_before_last_query() {
+        // Embedded <think> on older assistant turns must be stripped
+        let messages = vec![
+            text_msg("user", "Think."),
+            assistant_msg("<think>\nOld reasoning\n</think>\nOld answer"),
+            text_msg("user", "Follow up"),
+        ];
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
+        // Reasoning stripped (assistant at index 1, last_query_index=2)
+        assert!(!result.contains("<think>"));
+        assert!(!result.contains("Old reasoning"));
+        // Clean content preserved
+        assert!(result.contains("\nOld answer"));
     }
 
     #[test]
@@ -669,6 +729,14 @@ mod tests {
         assert!(result.contains("get_weather"));
         assert!(result.contains("<tools>"));
         assert!(result.contains("</tools>"));
+        // properties must be a JSON object, not an escaped string
+        assert!(
+            result.contains(r#""properties":{"city":{"type":"string"}}"#),
+            "properties should be a JSON object, not an escaped string. Got: {}",
+            &result[result.find("<tools>").unwrap()..result.find("</tools>").unwrap() + 8]
+        );
+        // Must NOT contain double-escaped properties
+        assert!(!result.contains(r#""properties":"{"#));
     }
 
     #[test]
