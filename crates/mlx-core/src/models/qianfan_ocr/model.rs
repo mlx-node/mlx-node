@@ -328,6 +328,17 @@ impl QianfanOCRModel {
                 // Full reset for fresh generation
                 lm_guard.reset_kv_caches();
                 lm_guard.init_kv_caches();
+            } else {
+                // Reusing prefix — trim caches to prefix_len to discard stale
+                // suffix tokens from the previous generation
+                let cache_offset = lm_guard.get_cache_offset();
+                if cache_offset > prefix_len as i32
+                    && let Some(caches) = lm_guard.kv_caches_mut()
+                {
+                    for c in caches.iter_mut() {
+                        c.trim(prefix_len as i32);
+                    }
+                }
             }
 
             // --- Step 6: Prefill ---
@@ -498,12 +509,17 @@ impl QianfanOCRModel {
                 }
             }
 
-            // --- Step 9: Store token history for cache reuse ---
+            // --- Step 9: Sync token history with cache state ---
             if reuse_cache {
                 let mut full_history = token_ids.clone();
                 full_history.extend_from_slice(&generated_tokens);
                 if let Ok(mut history) = cached_token_history_arc.write() {
                     *history = full_history;
+                }
+            } else {
+                // Not reusing — clear metadata to prevent stale prefix matches
+                if let Ok(mut history) = cached_token_history_arc.write() {
+                    history.clear();
                 }
             }
 
@@ -513,6 +529,11 @@ impl QianfanOCRModel {
 
             let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
             let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
+
+            // Promote finish_reason to "tool_calls" when valid tool calls are parsed
+            if tool_calls.iter().any(|tc| tc.status == "ok") {
+                finish_reason = "tool_calls".to_string();
+            }
 
             let performance = if let (Some(gen_start), Some(first_tok)) =
                 (generation_start, first_token_instant)
@@ -634,6 +655,7 @@ impl QianfanOCRModel {
             .clone()
             .ok_or_else(|| Error::from_reason("Language model not loaded"))?;
         let model_config = self.config.clone();
+        let cached_token_history_arc = self.cached_token_history.clone();
 
         let image_bytes = extract_images_from_messages(&messages);
 
@@ -703,6 +725,11 @@ impl QianfanOCRModel {
 
                 lm_guard.reset_kv_caches();
                 lm_guard.init_kv_caches();
+
+                // Clear cached history — streaming always does a fresh generation
+                if let Ok(mut history) = cached_token_history_arc.write() {
+                    history.clear();
+                }
 
                 let eos_token_id = model_config.eos_token_id;
 
@@ -877,6 +904,11 @@ impl QianfanOCRModel {
                 let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
                 let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
 
+                // Promote finish_reason to "tool_calls" when valid tool calls parsed
+                if tool_calls.iter().any(|tc| tc.status == "ok") {
+                    finish_reason = "tool_calls".to_string();
+                }
+
                 let performance = if let (Some(gen_start), Some(first_tok)) =
                     (generation_start, first_token_instant)
                 {
@@ -974,6 +1006,7 @@ impl QianfanOCRModel {
             .language_model
             .clone()
             .ok_or_else(|| Error::from_reason("Language model not loaded"))?;
+        let cached_token_history_arc = self.cached_token_history.clone();
         let eos_token_id = self.config.eos_token_id;
         let input_ids = input_ids.clone();
 
@@ -993,6 +1026,11 @@ impl QianfanOCRModel {
 
             lm_guard.reset_kv_caches();
             lm_guard.init_kv_caches();
+
+            // Clear cached history — generate() always does fresh generation
+            if let Ok(mut history) = cached_token_history_arc.write() {
+                history.clear();
+            }
 
             // Prefill
             let mut cache = lm_guard.kv_caches_mut().take();
