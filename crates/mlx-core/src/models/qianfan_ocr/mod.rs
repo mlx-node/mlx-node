@@ -6,6 +6,7 @@
 
 pub mod bridge;
 pub mod config;
+pub mod language;
 pub mod vision;
 
 // Re-export public items
