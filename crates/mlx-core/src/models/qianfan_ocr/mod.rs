@@ -5,6 +5,7 @@
 //! and Qwen3 language model.
 
 pub mod config;
+pub mod vision;
 
 // Re-export public items
 pub use config::{
