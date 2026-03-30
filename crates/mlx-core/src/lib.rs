@@ -35,51 +35,49 @@ pub mod vision;
 // Modules excluded from WASM browser builds (training, profiling, DB)
 #[cfg(not(target_family = "wasm"))]
 pub mod autograd;
-#[cfg(not(target_family = "wasm"))]
+pub mod compat;
 pub mod convert;
 #[cfg(not(target_family = "wasm"))]
 pub mod dataset;
 #[cfg(not(target_family = "wasm"))]
 pub mod decode_profiler;
-#[cfg(target_family = "wasm")]
-pub use compat::decode_profiler;
-#[cfg(not(target_family = "wasm"))]
 pub mod gradients;
-#[cfg(not(target_family = "wasm"))]
-pub mod grpo;
-#[cfg(not(target_family = "wasm"))]
+pub mod models;
+pub mod nn;
 pub mod optimizers;
+pub mod param_manager;
+pub mod sampling;
+pub mod stream;
+pub mod tensor;
+pub mod tokenizer;
+pub mod tools;
+#[cfg(not(target_family = "wasm"))]
+pub mod tracing;
+pub mod transformer;
+pub mod utils;
+pub mod vision;
+
+// Modules disabled on WASM (depend on native-only features)
+#[cfg(not(target_family = "wasm"))]
+pub mod profiling;
+#[cfg(not(target_family = "wasm"))]
+pub mod training_model;
 #[cfg(not(target_family = "wasm"))]
 pub mod output_store;
 #[cfg(not(target_family = "wasm"))]
-pub mod param_manager;
-#[cfg(not(target_family = "wasm"))]
-pub mod profiling;
-#[cfg(target_family = "wasm")]
-pub use compat::profiling;
-#[cfg(not(target_family = "wasm"))]
 pub mod sft;
 #[cfg(not(target_family = "wasm"))]
-pub mod tracing;
+pub mod grpo;
+
 #[cfg(not(target_family = "wasm"))]
-pub mod training_model;
-
-use std::sync::LazyLock;
-use stream::{DeviceType, Stream};
-
-#[cfg(all(not(target_family = "wasm"), feature = "mimalloc-safe"))]
 #[global_allocator]
 static GLOBAL: mimalloc_safe::MiMalloc = mimalloc_safe::MiMalloc;
 
 /// Global generation stream, created once at module load (matches mlx-lm)
-/// This is like Python's: generation_stream = mx.new_stream(mx.default_device())
-pub(crate) static GENERATION_STREAM: LazyLock<Stream> = LazyLock::new(|| {
-    // Create a dedicated stream for generation on the default device (GPU if available)
-    Stream::new(DeviceType::Gpu)
-});
+pub(crate) static GENERATION_STREAM: std::sync::LazyLock<stream::Stream> =
+    std::sync::LazyLock::new(|| stream::Stream::new(stream::DeviceType::Gpu));
 
 #[napi_derive::napi(module_exports)]
 pub fn init() {
-    // Initialize the generation stream
     let _ = &*GENERATION_STREAM;
 }
