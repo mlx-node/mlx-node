@@ -5,6 +5,7 @@
 //! and Qwen3 language model.
 
 pub mod bridge;
+pub mod chat;
 pub mod config;
 pub mod language;
 pub mod persistence;
@@ -14,6 +15,8 @@ pub mod vision;
 // Re-export public items
 #[allow(unused_imports)]
 pub(crate) use bridge::InternVLBridge;
+#[allow(unused_imports)]
+pub(crate) use chat::{count_images_in_messages, extract_images_from_messages, format_qianfan_chat};
 pub use config::{
     InternVisionConfig, Qwen3LMConfig, QianfanOCRConfig, create_qianfan_ocr_config,
 };
