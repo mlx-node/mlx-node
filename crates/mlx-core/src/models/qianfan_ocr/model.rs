@@ -510,9 +510,18 @@ impl QianfanOCRModel {
             }
 
             // --- Step 9: Sync token history with cache state ---
+            // On "stop"/"repetition" exits, the terminal token was sampled and
+            // pushed to generated_tokens but never forwarded into the KV cache.
+            // Only include tokens that were actually forwarded so prefix matching
+            // stays aligned with the live cache.
             if reuse_cache {
+                let forwarded = if finish_reason == "length" {
+                    generated_tokens.len()
+                } else {
+                    generated_tokens.len().saturating_sub(1)
+                };
                 let mut full_history = token_ids.clone();
-                full_history.extend_from_slice(&generated_tokens);
+                full_history.extend_from_slice(&generated_tokens[..forwarded]);
                 if let Ok(mut history) = cached_token_history_arc.write() {
                     *history = full_history;
                 }

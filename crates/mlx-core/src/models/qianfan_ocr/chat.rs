@@ -346,13 +346,25 @@ fn extract_reasoning_and_content(
         .cloned();
     let mut content = msg.content.clone();
 
-    // Fallback: extract embedded <think>...</think> from content
+    // Fallback: extract embedded reasoning from content.
+    // Matches upstream Jinja which splits on </think> anywhere in content,
+    // not just when content starts with <think>. Also handles the
+    // "missing opening tag" form (bare reasoning...</think>).
     if reasoning.is_none()
-        && content.starts_with("<think>")
         && let Some(end_pos) = content.find("</think>")
     {
-        reasoning = Some(content[7..end_pos].to_string());
-        content = content[end_pos + 8..].to_string();
+        let before = &content[..end_pos];
+        let after = &content[end_pos + 8..]; // 8 = "</think>".len()
+
+        // Extract reasoning: split before at last <think>, take what follows
+        let extracted = if let Some(think_pos) = before.rfind("<think>") {
+            &before[think_pos + 7..] // 7 = "<think>".len()
+        } else {
+            before // no opening tag — use everything before </think>
+        };
+
+        reasoning = Some(extracted.trim_matches('\n').to_string());
+        content = after.trim_start_matches('\n').to_string();
     }
 
     // Step 2: Only re-insert reasoning for turns AFTER last_query_index
@@ -687,7 +699,51 @@ mod tests {
         assert!(!result.contains("<think>"));
         assert!(!result.contains("Old reasoning"));
         // Clean content preserved
-        assert!(result.contains("\nOld answer"));
+        assert!(result.contains("Old answer"));
+    }
+
+    #[test]
+    fn test_embedded_think_with_leading_whitespace() {
+        // Leading whitespace before <think> should still be extracted
+        let messages = vec![
+            text_msg("user", "Think."),
+            assistant_msg("  <think>\nReasoning\n</think>\nResult"),
+        ];
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
+        // After last query (index 0), so reasoning IS included
+        assert!(result.contains("<think>\nReasoning\n</think>\n\nResult"));
+    }
+
+    #[test]
+    fn test_embedded_think_missing_opening_tag() {
+        // Bare reasoning...</think> should still be extracted
+        let messages = vec![
+            text_msg("user", "Think."),
+            assistant_msg("Some reasoning</think>\nResult"),
+        ];
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
+        assert!(result.contains("<think>\nSome reasoning\n</think>\n\nResult"));
+    }
+
+    #[test]
+    fn test_embedded_think_stripped_all_forms_before_last_query() {
+        // All forms of embedded reasoning are stripped on older turns
+        for content in [
+            "<think>R</think>\nA",       // standard
+            "  <think>R</think>\nA",      // leading whitespace
+            "R</think>\nA",               // missing opening tag
+        ] {
+            let messages = vec![
+                text_msg("user", "Q1"),
+                assistant_msg(content),
+                text_msg("user", "Q2"),
+            ];
+            let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
+            assert!(
+                !result.contains("<think>"),
+                "Reasoning should be stripped for: {content}"
+            );
+        }
     }
 
     #[test]
