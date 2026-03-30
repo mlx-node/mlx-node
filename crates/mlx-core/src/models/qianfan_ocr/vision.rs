@@ -69,7 +69,7 @@ impl InternVisionEmbeddings {
             None,
         )?;
 
-        let cls_token = get_weight(weights, &format!("{prefix}.cls_token"))?;
+        let cls_token = get_weight(weights, &format!("{prefix}.class_embedding"))?;
         let position_embedding = get_weight(weights, &format!("{prefix}.position_embedding"))?;
 
         let default_grid_size = config.image_size as u32 / patch_size;
@@ -421,7 +421,7 @@ impl InternViTModel {
         for i in 0..num_layers {
             let layer = InternVisionEncoderLayer::build(
                 weights,
-                &format!("{prefix}.encoder.layers.{i}"),
+                &format!("{prefix}.layers.{i}"),
                 config,
             )?;
             layers.push(layer);
@@ -505,7 +505,7 @@ mod tests {
             MxArray::zeros(&[d], None).unwrap(),
         );
         w.insert(
-            format!("{ep}.cls_token"),
+            format!("{ep}.class_embedding"),
             MxArray::random_normal(&[1, 1, d], 0.0, 0.02, None).unwrap(),
         );
         w.insert(
@@ -515,7 +515,7 @@ mod tests {
 
         // Encoder layers
         for i in 0..config.num_hidden_layers {
-            let lp = format!("{prefix}.encoder.layers.{i}");
+            let lp = format!("{prefix}.layers.{i}");
             // LayerNorm
             w.insert(
                 format!("{lp}.norm1.weight"),
@@ -597,7 +597,7 @@ mod tests {
         let prefix = "vision_model";
         let weights = make_test_weights(&config, prefix);
 
-        let layer_prefix = format!("{prefix}.encoder.layers.0");
+        let layer_prefix = format!("{prefix}.layers.0");
         let attn = InternVisionAttention::build(&weights, &layer_prefix, &config).unwrap();
 
         let d = config.hidden_size as i64;
@@ -617,7 +617,7 @@ mod tests {
         let prefix = "vision_model";
         let weights = make_test_weights(&config, prefix);
 
-        let layer_prefix = format!("{prefix}.encoder.layers.0");
+        let layer_prefix = format!("{prefix}.layers.0");
         let mlp = InternVisionMLP::build(&weights, &layer_prefix).unwrap();
 
         let d = config.hidden_size as i64;
@@ -641,7 +641,7 @@ mod tests {
         let prefix = "vision_model";
         let weights = make_test_weights(&config, prefix);
 
-        let layer_prefix = format!("{prefix}.encoder.layers.0");
+        let layer_prefix = format!("{prefix}.layers.0");
         let layer = InternVisionEncoderLayer::build(&weights, &layer_prefix, &config).unwrap();
 
         let d = config.hidden_size as i64;
@@ -749,7 +749,7 @@ mod tests {
         let prefix = "vision_model";
         let weights = make_test_weights(&config, prefix);
 
-        let layer_prefix = format!("{prefix}.encoder.layers.0");
+        let layer_prefix = format!("{prefix}.layers.0");
         let attn = InternVisionAttention::build(&weights, &layer_prefix, &config).unwrap();
 
         let d = config.hidden_size as i64;

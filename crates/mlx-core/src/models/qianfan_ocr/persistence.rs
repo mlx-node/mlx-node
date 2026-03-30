@@ -18,15 +18,8 @@ pub(crate) fn transform_key(key: &str) -> String {
     if let Some(rest) = key.strip_prefix("vision_model.") {
         // Embeddings
         if let Some(rest) = rest.strip_prefix("embeddings.") {
-            if rest == "cls_token" {
-                return "vision.cls_token".to_string();
-            }
-            if rest == "position_embedding" {
-                return "vision.position_embedding".to_string();
-            }
-            if let Some(suffix) = rest.strip_prefix("patch_embedding.") {
-                return format!("vision.embeddings.patch_conv.{suffix}");
-            }
+            // All embedding keys keep the vision.embeddings prefix
+            return format!("vision.embeddings.{rest}");
         }
         // Encoder layers
         if let Some(rest) = rest.strip_prefix("encoder.layers.") {
@@ -86,36 +79,10 @@ pub(crate) fn transform_key(key: &str) -> String {
 
 /// Transform suffixes within a vision encoder layer.
 ///
-/// Maps HuggingFace attention/norm/layer-scale names to internal names.
-fn transform_vision_layer_suffix(suffix: &str) -> String {
-    // Attention projections
-    if let Some(rest) = suffix.strip_prefix("attn.") {
-        if let Some(rest) = rest.strip_prefix("proj.") {
-            // attn.proj.{weight,bias} → attn.out_proj.{weight,bias}
-            return format!("attn.out_proj.{rest}");
-        }
-        // attn.qkv.{weight,bias} stays as-is
-        return format!("attn.{rest}");
-    }
-
-    // Layer scale parameters
-    if suffix == "ls1" {
-        return "layer_scale_1".to_string();
-    }
-    if suffix == "ls2" {
-        return "layer_scale_2".to_string();
-    }
-
-    // Layer norms
-    if let Some(rest) = suffix.strip_prefix("norm1.") {
-        return format!("layer_norm1.{rest}");
-    }
-    if let Some(rest) = suffix.strip_prefix("norm2.") {
-        return format!("layer_norm2.{rest}");
-    }
-
-    // MLP (fc1, fc2) passes through unchanged
-    suffix.to_string()
+/// Vision layer sub-keys pass through unchanged since InternViTModel::build
+/// expects the original HuggingFace names (attn.proj, norm1, ls1, etc.).
+fn transform_vision_layer_suffix(suffix: &str) -> &str {
+    suffix
 }
 
 /// Check if a weight needs Conv2d NCHW→NHWC transposition.
@@ -124,7 +91,7 @@ fn transform_vision_layer_suffix(suffix: &str) -> String {
 /// PyTorch stores Conv2d as [out_channels, in_channels, kH, kW] (NCHW),
 /// but MLX expects [out_channels, kH, kW, in_channels] (NHWC).
 fn needs_conv2d_transpose(key: &str, weight: &MxArray) -> bool {
-    key.contains("patch_conv.weight") && weight.ndim().unwrap_or(0) == 4
+    key.contains("patch_embedding.weight") && weight.ndim().unwrap_or(0) == 4
 }
 
 /// Transpose a Conv2d weight from PyTorch NCHW to MLX NHWC format.
@@ -165,7 +132,7 @@ mod tests {
     fn test_transform_key_vision_patch_embedding_weight() {
         assert_eq!(
             transform_key("vision_model.embeddings.patch_embedding.weight"),
-            "vision.embeddings.patch_conv.weight"
+            "vision.embeddings.patch_embedding.weight"
         );
     }
 
@@ -173,7 +140,7 @@ mod tests {
     fn test_transform_key_vision_patch_embedding_bias() {
         assert_eq!(
             transform_key("vision_model.embeddings.patch_embedding.bias"),
-            "vision.embeddings.patch_conv.bias"
+            "vision.embeddings.patch_embedding.bias"
         );
     }
 
@@ -181,7 +148,7 @@ mod tests {
     fn test_transform_key_vision_cls_token() {
         assert_eq!(
             transform_key("vision_model.embeddings.cls_token"),
-            "vision.cls_token"
+            "vision.embeddings.cls_token"
         );
     }
 
@@ -189,7 +156,7 @@ mod tests {
     fn test_transform_key_vision_position_embedding() {
         assert_eq!(
             transform_key("vision_model.embeddings.position_embedding"),
-            "vision.position_embedding"
+            "vision.embeddings.position_embedding"
         );
     }
 
@@ -213,11 +180,11 @@ mod tests {
     fn test_transform_key_vision_attn_proj() {
         assert_eq!(
             transform_key("vision_model.encoder.layers.5.attn.proj.weight"),
-            "vision.layers.5.attn.out_proj.weight"
+            "vision.layers.5.attn.proj.weight"
         );
         assert_eq!(
             transform_key("vision_model.encoder.layers.5.attn.proj.bias"),
-            "vision.layers.5.attn.out_proj.bias"
+            "vision.layers.5.attn.proj.bias"
         );
     }
 
@@ -245,11 +212,11 @@ mod tests {
     fn test_transform_key_vision_layer_scale() {
         assert_eq!(
             transform_key("vision_model.encoder.layers.3.ls1"),
-            "vision.layers.3.layer_scale_1"
+            "vision.layers.3.ls1"
         );
         assert_eq!(
             transform_key("vision_model.encoder.layers.3.ls2"),
-            "vision.layers.3.layer_scale_2"
+            "vision.layers.3.ls2"
         );
     }
 
@@ -257,19 +224,19 @@ mod tests {
     fn test_transform_key_vision_layer_norm() {
         assert_eq!(
             transform_key("vision_model.encoder.layers.7.norm1.weight"),
-            "vision.layers.7.layer_norm1.weight"
+            "vision.layers.7.norm1.weight"
         );
         assert_eq!(
             transform_key("vision_model.encoder.layers.7.norm1.bias"),
-            "vision.layers.7.layer_norm1.bias"
+            "vision.layers.7.norm1.bias"
         );
         assert_eq!(
             transform_key("vision_model.encoder.layers.7.norm2.weight"),
-            "vision.layers.7.layer_norm2.weight"
+            "vision.layers.7.norm2.weight"
         );
         assert_eq!(
             transform_key("vision_model.encoder.layers.7.norm2.bias"),
-            "vision.layers.7.layer_norm2.bias"
+            "vision.layers.7.norm2.bias"
         );
     }
 
@@ -411,12 +378,12 @@ mod tests {
     // ========================================
 
     #[test]
-    fn test_needs_conv2d_transpose_patch_conv() {
+    fn test_needs_conv2d_transpose_patch_embedding() {
         // 4D patch conv weight should be transposed
         let weight = MxArray::from_float32(&[0.0; 1024 * 3 * 14 * 14], &[1024, 3, 14, 14])
             .expect("create array");
         assert!(needs_conv2d_transpose(
-            "vision.embeddings.patch_conv.weight",
+            "vision.embeddings.patch_embedding.weight",
             &weight
         ));
     }
@@ -433,10 +400,10 @@ mod tests {
 
     #[test]
     fn test_needs_conv2d_transpose_non_4d() {
-        // 2D weight with patch_conv name should not be transposed
+        // 2D weight with patch_embedding name should not be transposed
         let weight = MxArray::from_float32(&[0.0; 4], &[2, 2]).expect("create array");
         assert!(!needs_conv2d_transpose(
-            "vision.embeddings.patch_conv.weight",
+            "vision.embeddings.patch_embedding.weight",
             &weight
         ));
     }
@@ -487,7 +454,7 @@ mod tests {
         assert!(result.contains_key("lm.embedding.weight"));
         assert!(result.contains_key("bridge.ln.weight"));
         assert!(result.contains_key("vision.layers.0.attn.qkv.weight"));
-        assert!(result.contains_key("vision.cls_token"));
+        assert!(result.contains_key("vision.embeddings.cls_token"));
         assert!(result.contains_key("lm.lm_head.weight"));
         assert_eq!(result.len(), 5);
     }
@@ -507,7 +474,7 @@ mod tests {
 
         let result = load_qianfan_ocr_weights(weights).expect("load weights");
         let transposed = result
-            .get("vision.embeddings.patch_conv.weight")
+            .get("vision.embeddings.patch_embedding.weight")
             .expect("patch conv weight present");
 
         // Should be transposed to NHWC: [2, 4, 4, 3]
