@@ -19,7 +19,7 @@
 
 use napi::bindgen_prelude::*;
 
-use crate::tokenizer::ChatMessage;
+use crate::tokenizer::{ChatMessage, ToolDefinition};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -51,6 +51,7 @@ pub(crate) fn format_qianfan_chat(
     num_patches_list: &[u32],
     num_image_token: u32,
     enable_thinking: bool,
+    tools: Option<&[ToolDefinition]>,
 ) -> Result<String> {
     if messages.is_empty() {
         return Ok(format!("{IM_START}assistant\n"));
@@ -63,8 +64,24 @@ pub(crate) fn format_qianfan_chat(
     let mut prompt = String::new();
     let msg_count = messages.len();
 
-    // Handle system message (first message only, when role==system)
-    let start_idx = if messages[0].role == "system" {
+    // Handle system message + optional tool definitions
+    // When tools are present, the system block includes tool schemas per the Jinja template.
+    let has_tools = tools.is_some_and(|t| !t.is_empty());
+    let first_is_system = messages[0].role == "system";
+
+    let start_idx = if has_tools {
+        // Tools block replaces/augments the system message
+        prompt.push_str(IM_START);
+        prompt.push_str("system\n");
+        if first_is_system {
+            prompt.push_str(&messages[0].content);
+            prompt.push_str("\n\n");
+        }
+        format_tools_block(&mut prompt, tools.unwrap());
+        prompt.push_str(IM_END);
+        prompt.push('\n');
+        if first_is_system { 1 } else { 0 }
+    } else if first_is_system {
         if !messages[0].content.is_empty() {
             prompt.push_str(IM_START);
             prompt.push_str("system\n");
@@ -112,23 +129,26 @@ pub(crate) fn format_qianfan_chat(
                 prompt.push_str(IM_START);
                 prompt.push_str("assistant\n");
 
-                // Handle reasoning_content (thinking)
-                if let Some(reasoning) = msg
-                    .reasoning_content
-                    .as_ref()
-                    .filter(|r| !r.is_empty())
-                {
-                    prompt.push_str("<think>\n");
-                    prompt.push_str(reasoning.trim());
-                    prompt.push_str("\n</think>\n\n");
-                }
+                // Extract reasoning and content per upstream Jinja logic:
+                // - reasoning_content is only serialized for assistant turns
+                //   AFTER last_query_index
+                // - Fallback: extract embedded <think>...</think> from content
+                let (reasoning, content) =
+                    extract_reasoning_and_content(msg, i, last_query_index);
 
-                prompt.push_str(&msg.content);
+                if let Some(ref r) = reasoning {
+                    prompt.push_str("<think>\n");
+                    prompt.push_str(r.trim());
+                    prompt.push_str("\n</think>\n\n");
+                    prompt.push_str(content.trim_start_matches('\n'));
+                } else {
+                    prompt.push_str(&content);
+                }
 
                 // Handle tool_calls
                 if let Some(ref tool_calls) = msg.tool_calls {
                     for (j, tc) in tool_calls.iter().enumerate() {
-                        if (j == 0 && !msg.content.is_empty()) || j > 0 {
+                        if (j == 0 && !content.is_empty()) || j > 0 {
                             prompt.push('\n');
                         }
                         prompt.push_str("<tool_call>\n{\"name\": \"");
@@ -145,8 +165,7 @@ pub(crate) fn format_qianfan_chat(
 
             "tool" => {
                 // Group consecutive tool messages under one <|im_start|>user
-                let is_first_tool =
-                    i == start_idx || messages[i - 1].role != "tool";
+                let is_first_tool = i == start_idx || messages[i - 1].role != "tool";
                 let is_last_tool =
                     i == msg_count - 1 || messages[i + 1].role != "tool";
 
@@ -176,7 +195,6 @@ pub(crate) fn format_qianfan_chat(
             }
 
             _ => {
-                // Unknown role — pass through
                 prompt.push_str(IM_START);
                 prompt.push_str(&msg.role);
                 prompt.push('\n');
@@ -238,6 +256,67 @@ pub(crate) fn format_qianfan_chat(
     }
 
     Ok(prompt)
+}
+
+/// Format the tool definitions block per the upstream Jinja template.
+fn format_tools_block(prompt: &mut String, tools: &[ToolDefinition]) {
+    prompt.push_str("# Tools\n\n");
+    prompt.push_str(
+        "You may call one or more functions to assist with the user query.\n\n\
+         You are provided with function signatures within <tools></tools> XML tags:\n\
+         <tools>",
+    );
+    for tool in tools {
+        if let Ok(json) = serde_json::to_string(tool) {
+            prompt.push('\n');
+            prompt.push_str(&json);
+        }
+    }
+    prompt.push_str(
+        "\n</tools>\n\n\
+         For each function call, return a json object with function name and arguments \
+         within <tool_call></tool_call> XML tags:\n\
+         <tool_call>\n\
+         {\"name\": <function-name>, \"arguments\": <args-json-object>}\n\
+         </tool_call>",
+    );
+}
+
+/// Extract reasoning and content from an assistant message.
+///
+/// Per upstream Jinja:
+/// - Only serialize reasoning for assistant turns AFTER `last_query_index`
+/// - Fallback: if content starts with `<think>`, extract reasoning from it
+/// - For turns before last_query_index, strip reasoning entirely
+fn extract_reasoning_and_content(
+    msg: &ChatMessage,
+    msg_index: usize,
+    last_query_index: usize,
+) -> (Option<String>, String) {
+    if msg_index <= last_query_index {
+        // Before or at the last user query — no reasoning in prompt
+        return (None, msg.content.clone());
+    }
+
+    // After last_query_index — include reasoning
+    let reasoning = msg
+        .reasoning_content
+        .as_ref()
+        .filter(|r| !r.is_empty())
+        .cloned();
+    let mut content = msg.content.clone();
+
+    // Fallback: extract embedded <think>...</think> from content
+    if reasoning.is_none()
+        && content.starts_with("<think>")
+        && let Some(end_pos) = content.find("</think>")
+    {
+        let extracted = content[7..end_pos].to_string(); // skip "<think>"
+        content = content[end_pos + 8..].to_string(); // skip "</think>"
+        return (Some(extracted), content);
+    }
+
+    (reasoning, content)
 }
 
 /// Find the index of the last real user query (not a tool_response).
@@ -348,7 +427,7 @@ mod tests {
     #[test]
     fn test_simple_text_only() {
         let messages = vec![text_msg("user", "Hello!")];
-        let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
         assert_eq!(
             result,
             "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
@@ -361,7 +440,7 @@ mod tests {
             text_msg("system", "You are an OCR assistant."),
             text_msg("user", "Read this."),
         ];
-        let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
         assert!(result.starts_with("<|im_start|>system\nYou are an OCR assistant.<|im_end|>\n"));
         assert!(result.contains("<|im_start|>user\nRead this.<|im_end|>\n"));
         assert!(result.ends_with("<|im_start|>assistant\n"));
@@ -370,7 +449,7 @@ mod tests {
     #[test]
     fn test_empty_system_omitted() {
         let messages = vec![text_msg("system", ""), text_msg("user", "Hello")];
-        let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
         assert!(!result.contains("system"));
     }
 
@@ -381,7 +460,7 @@ mod tests {
             assistant_msg("Hi!"),
             text_msg("user", "How are you?"),
         ];
-        let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
         let expected = concat!(
             "<|im_start|>user\nHello<|im_end|>\n",
             "<|im_start|>assistant\nHi!<|im_end|>\n",
@@ -396,7 +475,7 @@ mod tests {
     #[test]
     fn test_think_appended_to_last_user_message() {
         let messages = vec![text_msg("user", "Analyze this.")];
-        let result = format_qianfan_chat(&messages, &[], 256, true).unwrap();
+        let result = format_qianfan_chat(&messages, &[], 256, true, None).unwrap();
         // <think> goes INSIDE the user message, before <|im_end|>
         assert!(result.contains("Analyze this.\n<think><|im_end|>\n"));
         assert!(result.ends_with("<|im_start|>assistant\n"));
@@ -411,7 +490,7 @@ mod tests {
             assistant_msg("Ok"),
             text_msg("user", "Second"),
         ];
-        let result = format_qianfan_chat(&messages, &[], 256, true).unwrap();
+        let result = format_qianfan_chat(&messages, &[], 256, true, None).unwrap();
         // <think> only on the LAST user message
         assert!(result.contains("First<|im_end|>\n")); // no <think> on first
         assert!(result.contains("Second\n<think><|im_end|>\n")); // <think> on second
@@ -420,7 +499,7 @@ mod tests {
     #[test]
     fn test_think_with_image() {
         let messages = vec![text_msg("user", "Analyze <image>")];
-        let result = format_qianfan_chat(&messages, &[1], 256, true).unwrap();
+        let result = format_qianfan_chat(&messages, &[1], 256, true, None).unwrap();
         assert!(result.contains("<img>"));
         assert!(result.contains("</img>"));
         // <think> is inside the user message
@@ -433,7 +512,7 @@ mod tests {
     #[test]
     fn test_single_image_auto_prepend() {
         let messages = vec![image_msg("user", "What is this?", 1)];
-        let result = format_qianfan_chat(&messages, &[3], 256, false).unwrap();
+        let result = format_qianfan_chat(&messages, &[3], 256, false, None).unwrap();
         let ctx: String = std::iter::repeat(IMG_CONTEXT).take(256 * 3).collect();
         assert!(result.contains(&format!("<img>{ctx}</img>\nWhat is this?")));
     }
@@ -441,7 +520,7 @@ mod tests {
     #[test]
     fn test_multi_image_auto_prepend() {
         let messages = vec![image_msg("user", "Compare", 3)];
-        let result = format_qianfan_chat(&messages, &[2, 3, 1], 256, false).unwrap();
+        let result = format_qianfan_chat(&messages, &[2, 3, 1], 256, false, None).unwrap();
         assert_eq!(result.matches("<img>").count(), 3);
         assert_eq!(result.matches("</img>").count(), 3);
         assert_eq!(result.matches(IMG_CONTEXT).count(), (2 + 3 + 1) * 256);
@@ -450,7 +529,7 @@ mod tests {
     #[test]
     fn test_manual_placeholder_no_auto_prepend() {
         let messages = vec![text_msg("user", "Look at <image> please")];
-        let result = format_qianfan_chat(&messages, &[2], 256, false).unwrap();
+        let result = format_qianfan_chat(&messages, &[2], 256, false, None).unwrap();
         assert_eq!(result.matches("<img>").count(), 1);
     }
 
@@ -463,7 +542,7 @@ mod tests {
             image_msg("user", "What about image B?", 1),
         ];
         // Image A gets 2 tiles, image B gets 3 tiles
-        let result = format_qianfan_chat(&messages, &[2, 3], 256, false).unwrap();
+        let result = format_qianfan_chat(&messages, &[2, 3], 256, false, None).unwrap();
 
         // Both messages should have their own <img> block
         assert_eq!(result.matches("<img>").count(), 2);
@@ -480,20 +559,20 @@ mod tests {
     #[test]
     fn test_error_more_placeholders_than_images() {
         let messages = vec![text_msg("user", "<image> and <image>")];
-        assert!(format_qianfan_chat(&messages, &[2], 256, false).is_err());
+        assert!(format_qianfan_chat(&messages, &[2], 256, false, None).is_err());
     }
 
     #[test]
     fn test_error_unused_images() {
         // 2 images but only 1 <image> placeholder (explicit)
         let messages = vec![text_msg("user", "Look: <image>")];
-        assert!(format_qianfan_chat(&messages, &[2, 3], 256, false).is_err());
+        assert!(format_qianfan_chat(&messages, &[2, 3], 256, false, None).is_err());
     }
 
     #[test]
     fn test_img_context_count() {
         let messages = vec![text_msg("user", "<image>")];
-        let result = format_qianfan_chat(&messages, &[4], 256, false).unwrap();
+        let result = format_qianfan_chat(&messages, &[4], 256, false, None).unwrap();
         assert_eq!(result.matches(IMG_CONTEXT).count(), 256 * 4);
     }
 
@@ -507,21 +586,48 @@ mod tests {
             tool_msg(r#"{"temp": 72}"#),
             assistant_msg("It's 72F in NYC."),
         ];
-        let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
 
         assert!(result.contains("<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"NYC\"}}\n</tool_call>"));
         assert!(result.contains("<|im_start|>user\n<tool_response>\n{\"temp\": 72}\n</tool_response><|im_end|>"));
     }
 
     #[test]
-    fn test_reasoning_content_formatting() {
+    fn test_reasoning_stripped_before_last_query() {
+        // Reasoning on assistant BEFORE the last user query is stripped
         let messages = vec![
             text_msg("user", "Think about this."),
             assistant_with_reasoning("The answer is 42.", "Let me think step by step..."),
             text_msg("user", "Thanks"),
         ];
-        let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
+        // Reasoning is stripped (assistant is before last_query_index=2)
+        assert!(!result.contains("<think>"));
+        assert!(result.contains("The answer is 42."));
+    }
+
+    #[test]
+    fn test_reasoning_included_after_last_query() {
+        // Reasoning on assistant AFTER the last user query is included
+        let messages = vec![
+            text_msg("user", "Think about this."),
+            assistant_with_reasoning("The answer is 42.", "Let me think step by step..."),
+        ];
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
+        // last_query_index=0, assistant at index 1 > 0 → reasoning included
         assert!(result.contains("<think>\nLet me think step by step...\n</think>\n\nThe answer is 42."));
+    }
+
+    #[test]
+    fn test_reasoning_extracted_from_content() {
+        // Fallback: extract <think>...</think> embedded in content
+        let messages = vec![
+            text_msg("user", "Think."),
+            assistant_msg("<think>\nStep 1\n</think>\nResult"),
+        ];
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
+        // Should be rehydrated as proper reasoning format
+        assert!(result.contains("<think>\nStep 1\n</think>\n\nResult"));
     }
 
     #[test]
@@ -533,11 +639,58 @@ mod tests {
             tool_msg("result2"),
             assistant_msg("Done."),
         ];
-        let result = format_qianfan_chat(&messages, &[], 256, false).unwrap();
+        let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
 
         // Two tool messages grouped under one <|im_start|>user
         let tool_section = "<|im_start|>user\n<tool_response>\nresult1\n</tool_response>\n<tool_response>\nresult2\n</tool_response><|im_end|>\n";
         assert!(result.contains(tool_section));
+    }
+
+    // --- Tools ---
+
+    #[test]
+    fn test_tools_formatting() {
+        use crate::tokenizer::{FunctionDefinition, FunctionParameters, ToolDefinition};
+        let tools = vec![ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "get_weather".to_string(),
+                description: Some("Get weather for a city".to_string()),
+                parameters: Some(FunctionParameters {
+                    r#type: "object".to_string(),
+                    properties: Some(r#"{"city": {"type": "string"}}"#.to_string()),
+                    required: None,
+                }),
+            },
+        }];
+        let messages = vec![text_msg("user", "What's the weather?")];
+        let result = format_qianfan_chat(&messages, &[], 256, false, Some(&tools)).unwrap();
+        assert!(result.contains("<|im_start|>system\n# Tools"));
+        assert!(result.contains("get_weather"));
+        assert!(result.contains("<tools>"));
+        assert!(result.contains("</tools>"));
+    }
+
+    #[test]
+    fn test_tools_with_system_message() {
+        use crate::tokenizer::{FunctionDefinition, ToolDefinition};
+        let tools = vec![ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "calc".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }];
+        let messages = vec![
+            text_msg("system", "You are helpful."),
+            text_msg("user", "Compute X"),
+        ];
+        let result = format_qianfan_chat(&messages, &[], 256, false, Some(&tools)).unwrap();
+        // System message is prepended to the tools block
+        assert!(result.contains("<|im_start|>system\nYou are helpful.\n\n# Tools"));
+        // Only one system block
+        assert_eq!(result.matches("<|im_start|>system").count(), 1);
     }
 
     // --- count_images_in_messages ---

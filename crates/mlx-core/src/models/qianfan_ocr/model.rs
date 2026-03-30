@@ -30,7 +30,7 @@ use crate::models::qianfan_ocr::vision::InternViTModel;
 use crate::models::qwen3_5::model::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
 use crate::sampling::{
     SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
-    sample,
+    check_repetition_cutoff, sample,
 };
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
@@ -222,6 +222,9 @@ impl QianfanOCRModel {
         let presence_context_size = config.presence_context_size.unwrap_or(20);
         let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
         let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
         let enable_thinking = config.enable_thinking.unwrap_or(false);
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -263,6 +266,7 @@ impl QianfanOCRModel {
                 &num_patches_list,
                 num_image_token,
                 enable_thinking,
+                config.tools.as_deref(),
             )?;
 
             // --- Step 3: Tokenize ---
@@ -436,6 +440,17 @@ impl QianfanOCRModel {
                     break;
                 }
 
+                // Check repetition cutoff
+                if let Some(reason) = check_repetition_cutoff(
+                    &generated_tokens,
+                    max_consecutive_tokens,
+                    max_ngram_repeats,
+                    ngram_size,
+                ) {
+                    finish_reason = reason.to_string();
+                    break;
+                }
+
                 // Forward single token
                 let token_2d = token.reshape(&[1, 1])?;
                 let mut cache = lm_guard.kv_caches_mut().take();
@@ -596,6 +611,9 @@ impl QianfanOCRModel {
         let presence_context_size = config.presence_context_size.unwrap_or(20);
         let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
         let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
         let enable_thinking = config.enable_thinking.unwrap_or(false);
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -645,6 +663,7 @@ impl QianfanOCRModel {
                     &num_patches_list,
                     num_image_token,
                     enable_thinking,
+                    config.tools.as_deref(),
                 )?;
                 let token_ids = tokenizer.encode_sync(&prompt, None)?;
                 let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
@@ -780,6 +799,17 @@ impl QianfanOCRModel {
 
                     if token_value == eos_token_id as u32 {
                         finish_reason = "stop".to_string();
+                        break;
+                    }
+
+                    // Check repetition cutoff
+                    if let Some(reason) = check_repetition_cutoff(
+                        &generated_tokens,
+                        max_consecutive_tokens,
+                        max_ngram_repeats,
+                        ngram_size,
+                    ) {
+                        finish_reason = reason.to_string();
                         break;
                     }
 
