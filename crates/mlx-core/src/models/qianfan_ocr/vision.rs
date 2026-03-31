@@ -408,11 +408,8 @@ impl InternViTModel {
         let num_layers = config.num_hidden_layers as usize;
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            let layer = InternVisionEncoderLayer::build(
-                weights,
-                &format!("{prefix}.layers.{i}"),
-                config,
-            )?;
+            let layer =
+                InternVisionEncoderLayer::build(weights, &format!("{prefix}.layers.{i}"), config)?;
             layers.push(layer);
         }
 

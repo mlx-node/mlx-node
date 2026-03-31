@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::models::qianfan_ocr::config::Qwen3LMConfig;
 use crate::models::pp_doclayout_v3::persistence::get_tensor;
+use crate::models::qianfan_ocr::config::Qwen3LMConfig;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::transformer::TransformerBlock;
 use crate::transformer::kv_cache::KVCache;

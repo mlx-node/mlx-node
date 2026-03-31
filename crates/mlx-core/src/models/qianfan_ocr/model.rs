@@ -21,12 +21,12 @@ use tracing::info;
 use crate::array::{MxArray, synchronize_and_clear_cache};
 use crate::models::qianfan_ocr::bridge::InternVLBridge;
 use crate::models::qianfan_ocr::chat::format_qianfan_chat;
-use crate::models::qwen3_5::model::extract_images_from_messages;
 use crate::models::qianfan_ocr::config::{InternVisionConfig, QianfanOCRConfig, Qwen3LMConfig};
 use crate::models::qianfan_ocr::language::InternVLLanguageModel;
 use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
 use crate::models::qianfan_ocr::processing::QianfanImageProcessor;
 use crate::models::qianfan_ocr::vision::InternViTModel;
+use crate::models::qwen3_5::model::extract_images_from_messages;
 use crate::models::qwen3_5::model::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
 use crate::sampling::{
     SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
@@ -149,7 +149,8 @@ impl QianfanOCRModel {
                     info!("  Loaded {} total tensors", all_weights.len());
 
                     // Transform keys if still in HuggingFace format (has vision_model. prefix)
-                    let needs_transform = all_weights.keys().any(|k| k.starts_with("vision_model."));
+                    let needs_transform =
+                        all_weights.keys().any(|k| k.starts_with("vision_model."));
                     let weights = if needs_transform {
                         info!("  Transforming HuggingFace keys to internal format...");
                         load_qianfan_ocr_weights(all_weights)?
@@ -674,305 +675,308 @@ impl QianfanOCRModel {
             let callback_err = callback.clone();
             let result =
                 napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
-                let emit = |chunk: ChatStreamChunk| {
-                    callback.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
-                };
-
-                let result: Result<()> = (|| {
-                // --- Process images ---
-                let processor = QianfanImageProcessor::new(&model_config);
-                let image_refs: Vec<&[u8]> = image_bytes.iter().map(|b| &b[..]).collect();
-                let processed_images = processor.process_many(&image_refs)?;
-
-                let num_patches_list: Vec<u32> =
-                    processed_images.iter().map(|p| p.num_tiles).collect();
-                let num_image_token = model_config.num_image_token() as u32;
-
-                // --- Format and tokenize ---
-                let prompt = format_qianfan_chat(
-                    &messages,
-                    &num_patches_list,
-                    num_image_token,
-                    enable_thinking,
-                    config.tools.as_deref(),
-                )?;
-                let token_ids = tokenizer.encode_sync(&prompt, None)?;
-                let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
-
-                // --- Vision encoding ---
-                let generation_stream = Stream::new(DeviceType::Gpu);
-                let vision_features = if !processed_images.is_empty() {
-                    let vision = vision_arc
-                        .as_ref()
-                        .ok_or_else(|| Error::from_reason("Vision model not loaded"))?;
-                    let bridge = bridge_arc
-                        .as_ref()
-                        .ok_or_else(|| Error::from_reason("Bridge not loaded"))?;
-
-                    let all_pixels = stack_processed_images(&processed_images)?;
-                    let vit_out = {
-                        let _ctx = StreamContext::new(generation_stream);
-                        vision.forward(&all_pixels)?
+                    let emit = |chunk: ChatStreamChunk| {
+                        callback.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
                     };
-                    let bridge_out = {
-                        let _ctx = StreamContext::new(generation_stream);
-                        bridge.forward(&vit_out)?
-                    };
-                    let bridge_shape = bridge_out.shape()?;
-                    let total_tiles = bridge_shape[0];
-                    let tokens_per_tile = bridge_shape[1];
-                    let hidden = bridge_shape[2];
-                    Some(bridge_out.reshape(&[total_tiles * tokens_per_tile, hidden])?)
-                } else {
-                    None
-                };
 
-                // --- Prefill ---
-                let mut lm_guard = lm_arc.write().map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
-                })?;
+                    let result: Result<()> = (|| {
+                        // --- Process images ---
+                        let processor = QianfanImageProcessor::new(&model_config);
+                        let image_refs: Vec<&[u8]> = image_bytes.iter().map(|b| &b[..]).collect();
+                        let processed_images = processor.process_many(&image_refs)?;
 
-                lm_guard.reset_kv_caches();
-                lm_guard.init_kv_caches();
+                        let num_patches_list: Vec<u32> =
+                            processed_images.iter().map(|p| p.num_tiles).collect();
+                        let num_image_token = model_config.num_image_token() as u32;
 
-                // Clear cached history — streaming always does a fresh generation
-                if let Ok(mut history) = cached_token_history_arc.write() {
-                    history.clear();
-                }
-
-                let eos_token_id = model_config.eos_token_id;
-
-                let merged_embeds = if let Some(ref vf) = vision_features {
-                    let text_embeds = {
-                        let _ctx = StreamContext::new(generation_stream);
-                        lm_guard.get_embeddings(&input_ids)?
-                    };
-                    let embed_dtype = text_embeds.dtype()?;
-                    let vf_cast = if vf.dtype()? != embed_dtype {
-                        vf.astype(embed_dtype)?
-                    } else {
-                        vf.clone()
-                    };
-                    merge_vision_features(
-                        &input_ids,
-                        &text_embeds,
-                        &vf_cast,
-                        model_config.img_context_token_id,
-                    )?
-                } else {
-                    let _ctx = StreamContext::new(generation_stream);
-                    lm_guard.get_embeddings(&input_ids)?
-                };
-
-                let mut cache = lm_guard.kv_caches_mut().take();
-                let prefill_logits = {
-                    let _ctx = StreamContext::new(generation_stream);
-                    lm_guard.forward_from_embeddings(&merged_embeds, &mut cache)?
-                };
-                *lm_guard.kv_caches_mut() = cache;
-
-                // Eval prefill logits -- caches materialize through dependency graph
-                prefill_logits.eval();
-                synchronize_and_clear_cache();
-
-                let seq_len = prefill_logits.shape()?[1];
-                let mut last_logits = prefill_logits
-                    .slice_axis(1, seq_len - 1, seq_len)?
-                    .squeeze(Some(&[0, 1]))?;
-
-                let sampling_config = SamplingConfig {
-                    temperature: Some(temperature),
-                    top_k: Some(top_k),
-                    top_p: Some(top_p),
-                    min_p: Some(min_p),
-                };
-
-                let mut all_tokens: Vec<u32> = token_ids;
-
-                if repetition_penalty != 1.0 {
-                    last_logits = apply_repetition_penalty(
-                        &last_logits,
-                        &all_tokens,
-                        repetition_penalty,
-                        Some(repetition_context_size),
-                    )?;
-                }
-                if presence_penalty != 0.0 {
-                    last_logits = apply_presence_penalty(
-                        &last_logits,
-                        &all_tokens,
-                        presence_penalty,
-                        Some(presence_context_size),
-                    )?;
-                }
-                if frequency_penalty != 0.0 {
-                    last_logits = apply_frequency_penalty(
-                        &last_logits,
-                        &all_tokens,
-                        frequency_penalty,
-                        Some(frequency_context_size),
-                    )?;
-                }
-
-                let mut token = sample(&last_logits, Some(sampling_config))?;
-                token.eval();
-
-                let first_token_instant = generation_start.map(|_| std::time::Instant::now());
-                let prefill_token_count = all_tokens.len();
-
-                let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
-                let mut finish_reason = "length".to_string();
-
-                // --- Streaming decode loop ---
-                for step in 0..max_new_tokens {
-                    if cancelled_clone.load(Ordering::Relaxed) {
-                        finish_reason = "cancelled".to_string();
-                        break;
-                    }
-                    let token_value = token.item_at_int32(0)? as u32;
-                    generated_tokens.push(token_value);
-                    all_tokens.push(token_value);
-
-                    if token_value == eos_token_id as u32 {
-                        finish_reason = "stop".to_string();
-                        break;
-                    }
-
-                    // Check repetition cutoff
-                    if let Some(reason) = check_repetition_cutoff(
-                        &generated_tokens,
-                        max_consecutive_tokens,
-                        max_ngram_repeats,
-                        ngram_size,
-                    ) {
-                        finish_reason = reason.to_string();
-                        break;
-                    }
-
-                    // Decode this single token for streaming
-                    let token_text = tokenizer.decode_sync(&[token_value], true)?;
-
-                    emit(ChatStreamChunk {
-                        text: token_text,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        raw_text: None,
-                        performance: None,
-                    });
-
-                    // Forward single token
-                    let token_2d = token.reshape(&[1, 1])?;
-                    let mut cache = lm_guard.kv_caches_mut().take();
-                    let logits = {
-                        let _ctx = StreamContext::new(generation_stream);
-                        lm_guard.forward(&token_2d, &mut cache)?
-                    };
-                    *lm_guard.kv_caches_mut() = cache;
-
-                    let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
-
-                    if repetition_penalty != 1.0 {
-                        next_logits = apply_repetition_penalty(
-                            &next_logits,
-                            &all_tokens,
-                            repetition_penalty,
-                            Some(repetition_context_size),
+                        // --- Format and tokenize ---
+                        let prompt = format_qianfan_chat(
+                            &messages,
+                            &num_patches_list,
+                            num_image_token,
+                            enable_thinking,
+                            config.tools.as_deref(),
                         )?;
-                    }
-                    if presence_penalty != 0.0 {
-                        next_logits = apply_presence_penalty(
-                            &next_logits,
-                            &all_tokens,
-                            presence_penalty,
-                            Some(presence_context_size),
-                        )?;
-                    }
-                    if frequency_penalty != 0.0 {
-                        next_logits = apply_frequency_penalty(
-                            &next_logits,
-                            &all_tokens,
-                            frequency_penalty,
-                            Some(frequency_context_size),
-                        )?;
-                    }
+                        let token_ids = tokenizer.encode_sync(&prompt, None)?;
+                        let input_ids =
+                            MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
-                    token = sample(&next_logits, Some(sampling_config))?;
-                    token.eval();
+                        // --- Vision encoding ---
+                        let generation_stream = Stream::new(DeviceType::Gpu);
+                        let vision_features = if !processed_images.is_empty() {
+                            let vision = vision_arc
+                                .as_ref()
+                                .ok_or_else(|| Error::from_reason("Vision model not loaded"))?;
+                            let bridge = bridge_arc
+                                .as_ref()
+                                .ok_or_else(|| Error::from_reason("Bridge not loaded"))?;
 
-                    if (step + 1) % 256 == 0 {
+                            let all_pixels = stack_processed_images(&processed_images)?;
+                            let vit_out = {
+                                let _ctx = StreamContext::new(generation_stream);
+                                vision.forward(&all_pixels)?
+                            };
+                            let bridge_out = {
+                                let _ctx = StreamContext::new(generation_stream);
+                                bridge.forward(&vit_out)?
+                            };
+                            let bridge_shape = bridge_out.shape()?;
+                            let total_tiles = bridge_shape[0];
+                            let tokens_per_tile = bridge_shape[1];
+                            let hidden = bridge_shape[2];
+                            Some(bridge_out.reshape(&[total_tiles * tokens_per_tile, hidden])?)
+                        } else {
+                            None
+                        };
+
+                        // --- Prefill ---
+                        let mut lm_guard = lm_arc.write().map_err(|_| {
+                            Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
+                        })?;
+
+                        lm_guard.reset_kv_caches();
+                        lm_guard.init_kv_caches();
+
+                        // Clear cached history — streaming always does a fresh generation
+                        if let Ok(mut history) = cached_token_history_arc.write() {
+                            history.clear();
+                        }
+
+                        let eos_token_id = model_config.eos_token_id;
+
+                        let merged_embeds = if let Some(ref vf) = vision_features {
+                            let text_embeds = {
+                                let _ctx = StreamContext::new(generation_stream);
+                                lm_guard.get_embeddings(&input_ids)?
+                            };
+                            let embed_dtype = text_embeds.dtype()?;
+                            let vf_cast = if vf.dtype()? != embed_dtype {
+                                vf.astype(embed_dtype)?
+                            } else {
+                                vf.clone()
+                            };
+                            merge_vision_features(
+                                &input_ids,
+                                &text_embeds,
+                                &vf_cast,
+                                model_config.img_context_token_id,
+                            )?
+                        } else {
+                            let _ctx = StreamContext::new(generation_stream);
+                            lm_guard.get_embeddings(&input_ids)?
+                        };
+
+                        let mut cache = lm_guard.kv_caches_mut().take();
+                        let prefill_logits = {
+                            let _ctx = StreamContext::new(generation_stream);
+                            lm_guard.forward_from_embeddings(&merged_embeds, &mut cache)?
+                        };
+                        *lm_guard.kv_caches_mut() = cache;
+
+                        // Eval prefill logits -- caches materialize through dependency graph
+                        prefill_logits.eval();
                         synchronize_and_clear_cache();
+
+                        let seq_len = prefill_logits.shape()?[1];
+                        let mut last_logits = prefill_logits
+                            .slice_axis(1, seq_len - 1, seq_len)?
+                            .squeeze(Some(&[0, 1]))?;
+
+                        let sampling_config = SamplingConfig {
+                            temperature: Some(temperature),
+                            top_k: Some(top_k),
+                            top_p: Some(top_p),
+                            min_p: Some(min_p),
+                        };
+
+                        let mut all_tokens: Vec<u32> = token_ids;
+
+                        if repetition_penalty != 1.0 {
+                            last_logits = apply_repetition_penalty(
+                                &last_logits,
+                                &all_tokens,
+                                repetition_penalty,
+                                Some(repetition_context_size),
+                            )?;
+                        }
+                        if presence_penalty != 0.0 {
+                            last_logits = apply_presence_penalty(
+                                &last_logits,
+                                &all_tokens,
+                                presence_penalty,
+                                Some(presence_context_size),
+                            )?;
+                        }
+                        if frequency_penalty != 0.0 {
+                            last_logits = apply_frequency_penalty(
+                                &last_logits,
+                                &all_tokens,
+                                frequency_penalty,
+                                Some(frequency_context_size),
+                            )?;
+                        }
+
+                        let mut token = sample(&last_logits, Some(sampling_config))?;
+                        token.eval();
+
+                        let first_token_instant =
+                            generation_start.map(|_| std::time::Instant::now());
+                        let prefill_token_count = all_tokens.len();
+
+                        let mut generated_tokens: Vec<u32> =
+                            Vec::with_capacity(max_new_tokens as usize);
+                        let mut finish_reason = "length".to_string();
+
+                        // --- Streaming decode loop ---
+                        for step in 0..max_new_tokens {
+                            if cancelled_clone.load(Ordering::Relaxed) {
+                                finish_reason = "cancelled".to_string();
+                                break;
+                            }
+                            let token_value = token.item_at_int32(0)? as u32;
+                            generated_tokens.push(token_value);
+                            all_tokens.push(token_value);
+
+                            if token_value == eos_token_id as u32 {
+                                finish_reason = "stop".to_string();
+                                break;
+                            }
+
+                            // Check repetition cutoff
+                            if let Some(reason) = check_repetition_cutoff(
+                                &generated_tokens,
+                                max_consecutive_tokens,
+                                max_ngram_repeats,
+                                ngram_size,
+                            ) {
+                                finish_reason = reason.to_string();
+                                break;
+                            }
+
+                            // Decode this single token for streaming
+                            let token_text = tokenizer.decode_sync(&[token_value], true)?;
+
+                            emit(ChatStreamChunk {
+                                text: token_text,
+                                done: false,
+                                finish_reason: None,
+                                tool_calls: None,
+                                thinking: None,
+                                num_tokens: None,
+                                raw_text: None,
+                                performance: None,
+                            });
+
+                            // Forward single token
+                            let token_2d = token.reshape(&[1, 1])?;
+                            let mut cache = lm_guard.kv_caches_mut().take();
+                            let logits = {
+                                let _ctx = StreamContext::new(generation_stream);
+                                lm_guard.forward(&token_2d, &mut cache)?
+                            };
+                            *lm_guard.kv_caches_mut() = cache;
+
+                            let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
+
+                            if repetition_penalty != 1.0 {
+                                next_logits = apply_repetition_penalty(
+                                    &next_logits,
+                                    &all_tokens,
+                                    repetition_penalty,
+                                    Some(repetition_context_size),
+                                )?;
+                            }
+                            if presence_penalty != 0.0 {
+                                next_logits = apply_presence_penalty(
+                                    &next_logits,
+                                    &all_tokens,
+                                    presence_penalty,
+                                    Some(presence_context_size),
+                                )?;
+                            }
+                            if frequency_penalty != 0.0 {
+                                next_logits = apply_frequency_penalty(
+                                    &next_logits,
+                                    &all_tokens,
+                                    frequency_penalty,
+                                    Some(frequency_context_size),
+                                )?;
+                            }
+
+                            token = sample(&next_logits, Some(sampling_config))?;
+                            token.eval();
+
+                            if (step + 1) % 256 == 0 {
+                                synchronize_and_clear_cache();
+                            }
+                        }
+
+                        // Final chunk
+                        let raw_decoded = tokenizer.decode_sync(&generated_tokens, true)?;
+                        let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
+                        let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
+                        let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
+
+                        // Promote finish_reason to "tool_calls" when valid tool calls parsed
+                        if tool_calls.iter().any(|tc| tc.status == "ok") {
+                            finish_reason = "tool_calls".to_string();
+                        }
+
+                        let performance = if let (Some(gen_start), Some(first_tok)) =
+                            (generation_start, first_token_instant)
+                        {
+                            let generation_end = std::time::Instant::now();
+                            let prefill_toks = prefill_token_count as f64;
+                            let gen_toks = generated_tokens.len() as f64;
+                            let ttft_ms =
+                                first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
+                            let decode_ms =
+                                generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
+                            Some(crate::profiling::PerformanceMetrics {
+                                ttft_ms,
+                                prefill_tokens_per_second: if ttft_ms > 0.0 {
+                                    prefill_toks / (ttft_ms / 1000.0)
+                                } else {
+                                    0.0
+                                },
+                                decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                                    (gen_toks - 1.0) / (decode_ms / 1000.0)
+                                } else {
+                                    0.0
+                                },
+                            })
+                        } else {
+                            None
+                        };
+
+                        emit(ChatStreamChunk {
+                            text: text.trim().to_string(),
+                            done: true,
+                            finish_reason: Some(finish_reason),
+                            tool_calls: Some(tool_calls),
+                            thinking,
+                            num_tokens: Some(generated_tokens.len() as u32),
+                            raw_text: Some(raw_decoded),
+                            performance,
+                        });
+
+                        Ok(())
+                    })();
+
+                    if let Err(e) = result {
+                        emit(ChatStreamChunk {
+                            text: String::new(),
+                            done: true,
+                            finish_reason: Some("error".to_string()),
+                            tool_calls: None,
+                            thinking: None,
+                            num_tokens: None,
+                            raw_text: Some(format!("Error: {e}")),
+                            performance: None,
+                        });
                     }
-                }
 
-                // Final chunk
-                let raw_decoded = tokenizer.decode_sync(&generated_tokens, true)?;
-                let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
-                let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
-                let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
-
-                // Promote finish_reason to "tool_calls" when valid tool calls parsed
-                if tool_calls.iter().any(|tc| tc.status == "ok") {
-                    finish_reason = "tool_calls".to_string();
-                }
-
-                let performance = if let (Some(gen_start), Some(first_tok)) =
-                    (generation_start, first_token_instant)
-                {
-                    let generation_end = std::time::Instant::now();
-                    let prefill_toks = prefill_token_count as f64;
-                    let gen_toks = generated_tokens.len() as f64;
-                    let ttft_ms =
-                        first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
-                    let decode_ms =
-                        generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
-                    Some(crate::profiling::PerformanceMetrics {
-                        ttft_ms,
-                        prefill_tokens_per_second: if ttft_ms > 0.0 {
-                            prefill_toks / (ttft_ms / 1000.0)
-                        } else {
-                            0.0
-                        },
-                        decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
-                            (gen_toks - 1.0) / (decode_ms / 1000.0)
-                        } else {
-                            0.0
-                        },
-                    })
-                } else {
-                    None
-                };
-
-                emit(ChatStreamChunk {
-                    text: text.trim().to_string(),
-                    done: true,
-                    finish_reason: Some(finish_reason),
-                    tool_calls: Some(tool_calls),
-                    thinking,
-                    num_tokens: Some(generated_tokens.len() as u32),
-                    raw_text: Some(raw_decoded),
-                    performance,
-                });
-
-                Ok(())
-            })();
-
-            if let Err(e) = result {
-                emit(ChatStreamChunk {
-                    text: String::new(),
-                    done: true,
-                    finish_reason: Some("error".to_string()),
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    raw_text: Some(format!("Error: {e}")),
-                    performance: None,
-                });
-            }
-
-            Ok(())
+                    Ok(())
                 })
                 .await;
 

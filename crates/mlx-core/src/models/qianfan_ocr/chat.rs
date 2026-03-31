@@ -133,8 +133,7 @@ pub(crate) fn format_qianfan_chat(
                 // - reasoning_content is only serialized for assistant turns
                 //   AFTER last_query_index
                 // - Fallback: extract embedded <think>...</think> from content
-                let (reasoning, content) =
-                    extract_reasoning_and_content(msg, i, last_query_index);
+                let (reasoning, content) = extract_reasoning_and_content(msg, i, last_query_index);
 
                 // Upstream Jinja emits <think> block for assistant turns after
                 // last_query_index when: loop.last OR reasoning is non-empty.
@@ -142,8 +141,7 @@ pub(crate) fn format_qianfan_chat(
                 let is_after_last_query = i > last_query_index;
                 let is_last_msg = i == msg_count - 1;
                 let has_reasoning = reasoning.as_ref().is_some_and(|r| !r.is_empty());
-                let emit_think = has_reasoning
-                    || (is_after_last_query && is_last_msg);
+                let emit_think = has_reasoning || (is_after_last_query && is_last_msg);
 
                 if emit_think {
                     prompt.push_str("<think>\n");
@@ -177,8 +175,7 @@ pub(crate) fn format_qianfan_chat(
             "tool" => {
                 // Group consecutive tool messages under one <|im_start|>user
                 let is_first_tool = i == start_idx || messages[i - 1].role != "tool";
-                let is_last_tool =
-                    i == msg_count - 1 || messages[i + 1].role != "tool";
+                let is_last_tool = i == msg_count - 1 || messages[i + 1].role != "tool";
 
                 if is_first_tool {
                     prompt.push_str(IM_START);
@@ -303,10 +300,7 @@ fn tool_to_json_value(tool: &ToolDefinition) -> serde_json::Value {
     obj.insert("type".to_string(), serde_json::json!(tool.r#type));
 
     let mut func = serde_json::Map::new();
-    func.insert(
-        "name".to_string(),
-        serde_json::json!(tool.function.name),
-    );
+    func.insert("name".to_string(), serde_json::json!(tool.function.name));
     if let Some(desc) = &tool.function.description {
         func.insert("description".to_string(), serde_json::json!(desc));
     }
@@ -672,7 +666,9 @@ mod tests {
         let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
 
         assert!(result.contains("<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"NYC\"}}\n</tool_call>"));
-        assert!(result.contains("<|im_start|>user\n<tool_response>\n{\"temp\": 72}\n</tool_response><|im_end|>"));
+        assert!(result.contains(
+            "<|im_start|>user\n<tool_response>\n{\"temp\": 72}\n</tool_response><|im_end|>"
+        ));
     }
 
     #[test]
@@ -698,17 +694,16 @@ mod tests {
         ];
         let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
         // last_query_index=0, assistant at index 1 > 0 → reasoning included
-        assert!(result.contains("<think>\nLet me think step by step...\n</think>\n\nThe answer is 42."));
+        assert!(
+            result.contains("<think>\nLet me think step by step...\n</think>\n\nThe answer is 42.")
+        );
     }
 
     #[test]
     fn test_last_assistant_after_query_emits_empty_think() {
         // Upstream Jinja: when assistant is the last message AND after
         // last_query_index, always emit <think> block even if empty.
-        let messages = vec![
-            text_msg("user", "Hello"),
-            assistant_msg("The answer."),
-        ];
+        let messages = vec![text_msg("user", "Hello"), assistant_msg("The answer.")];
         let result = format_qianfan_chat(&messages, &[], 256, false, None).unwrap();
         // Should have empty <think> block wrapping the content
         assert!(
@@ -804,9 +799,9 @@ mod tests {
     fn test_embedded_think_stripped_all_forms_before_last_query() {
         // All forms of embedded reasoning are stripped on older turns
         for content in [
-            "<think>R</think>\nA",       // standard
-            "  <think>R</think>\nA",      // leading whitespace
-            "R</think>\nA",               // missing opening tag
+            "<think>R</think>\nA",   // standard
+            "  <think>R</think>\nA", // leading whitespace
+            "R</think>\nA",          // missing opening tag
         ] {
             let messages = vec![
                 text_msg("user", "Q1"),
