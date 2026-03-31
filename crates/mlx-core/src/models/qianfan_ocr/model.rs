@@ -522,12 +522,11 @@ impl QianfanOCRModel {
             // Only include tokens that were actually forwarded so prefix matching
             // stays aligned with the live cache.
             if reuse_cache {
-                let forwarded =
-                    if finish_reason == "stop" || finish_reason == "repetition" {
-                        generated_tokens.len().saturating_sub(1)
-                    } else {
-                        generated_tokens.len()
-                    };
+                let forwarded = if finish_reason == "stop" || finish_reason == "repetition" {
+                    generated_tokens.len().saturating_sub(1)
+                } else {
+                    generated_tokens.len()
+                };
                 let mut full_history = token_ids.clone();
                 full_history.extend_from_slice(&generated_tokens[..forwarded]);
                 if let Ok(mut history) = cached_token_history_arc.write() {
