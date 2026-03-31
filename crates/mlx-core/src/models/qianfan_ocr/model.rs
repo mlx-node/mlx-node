@@ -1028,20 +1028,10 @@ impl QianfanOCRModel {
                         Ok(())
                     })();
 
-                    if let Err(e) = result {
-                        emit(ChatStreamChunk {
-                            text: String::new(),
-                            done: true,
-                            finish_reason: Some("error".to_string()),
-                            tool_calls: None,
-                            thinking: None,
-                            num_tokens: None,
-                            raw_text: Some(format!("Error: {e}")),
-                            performance: None,
-                        });
-                    }
-
-                    Ok(())
+                    // Propagate errors to the outer handler which sends them
+                    // via callback_err.call(Err(...)) — the TS error channel
+                    // that _createChatStream surfaces as thrown exceptions.
+                    result
                 })
                 .await;
 

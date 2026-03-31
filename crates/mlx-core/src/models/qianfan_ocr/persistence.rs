@@ -83,7 +83,19 @@ pub(crate) fn transform_key(key: &str) -> String {
 /// PyTorch stores Conv2d as [out_channels, in_channels, kH, kW] (NCHW),
 /// but MLX expects [out_channels, kH, kW, in_channels] (NHWC).
 fn needs_conv2d_transpose(key: &str, weight: &MxArray) -> bool {
-    key.contains("patch_embedding.weight") && weight.ndim().unwrap_or(0) == 4
+    if !key.contains("patch_embedding.weight") || weight.ndim().unwrap_or(0) != 4 {
+        return false;
+    }
+    // Detect PyTorch OIHW vs MLX OHWI by checking dim layout.
+    // PyTorch: [O, I, H, W] — for RGB input, dim[1]=3, dim[2]=kernel
+    // MLX:     [O, H, W, I] — for RGB input, dim[1]=kernel, dim[3]=3
+    // Only transpose if it looks like OIHW (dim[1] < dim[2]).
+    if let Ok(shape) = weight.shape()
+        && shape.len() == 4
+    {
+        return shape[1] < shape[2]; // OIHW: in_channels < kernel_h
+    }
+    false
 }
 
 /// Transpose a Conv2d weight from PyTorch NCHW to MLX NHWC format.
