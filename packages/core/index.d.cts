@@ -283,11 +283,13 @@ export declare class HarrierModel {
    * Encode a single text into a normalized embedding vector.
    *
    * Tokenizes the text, runs the forward pass, applies last-token pooling,
-   * and L2-normalizes the result.
+   * and L2-normalizes the result. Truncates to `max_position_embeddings`.
    *
    * # Arguments
    * * `text` - Input text to encode
-   * * `instruction` - Optional task instruction to prepend (for queries)
+   * * `instruction` - Optional task instruction prefix or preset name
+   *   (e.g. `"web_search_query"` resolves to the full Harrier prompt).
+   *   Pass `null` for documents/passages that need no instruction.
    *
    * # Returns
    * * Embedding vector, shape: [hidden_size]
@@ -297,11 +299,14 @@ export declare class HarrierModel {
    * Encode a batch of texts into normalized embedding vectors.
    *
    * Each text is independently tokenized and encoded (no padding needed
-   * since each goes through its own forward pass).
+   * since each goes through its own forward pass). Truncates each text
+   * to `max_position_embeddings`.
    *
    * # Arguments
    * * `texts` - Input texts to encode
-   * * `instruction` - Optional task instruction to prepend to each text
+   * * `instruction` - Optional task instruction prefix or preset name
+   *   (e.g. `"web_search_query"` resolves to the full Harrier prompt).
+   *   Pass `null` for documents/passages that need no instruction.
    *
    * # Returns
    * * Embedding matrix, shape: [batch_size, hidden_size]
@@ -309,6 +314,14 @@ export declare class HarrierModel {
   encodeBatch(texts: Array<string>, instruction?: string | undefined | null): Promise<MxArray>;
   /** Get the model configuration. */
   getConfig(): HarrierConfig;
+  /**
+   * Get available prompt presets loaded from config_sentence_transformers.json.
+   *
+   * Returns a map of task name -> full instruction prefix.
+   * Pass a task name to `encode()`/`encodeBatch()` as the `instruction` parameter
+   * to use a preset instead of a raw prefix string.
+   */
+  getPrompts(): Record<string, string>;
   /** Get the total number of model parameters. */
   numParameters(): number;
   /**
@@ -318,6 +331,7 @@ export declare class HarrierModel {
    * - config.json (model configuration)
    * - model.safetensors or weights.safetensors (weights)
    * - tokenizer.json (tokenizer)
+   * - config_sentence_transformers.json (optional, prompt presets)
    */
   static load(modelPath: string): Promise<HarrierModel>;
 }

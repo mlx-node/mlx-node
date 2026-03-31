@@ -104,9 +104,7 @@ impl HarrierModel {
             };
 
             let mut token_ids = tokenizer.encode_sync(&full_text, Some(true))?;
-            if token_ids.len() > max_tokens {
-                token_ids.truncate(max_tokens);
-            }
+            truncate_preserving_tail(&mut token_ids, max_tokens);
             let seq_len = token_ids.len();
             let input = MxArray::from_uint32(&token_ids, &[1, seq_len as i64])?;
 
@@ -162,9 +160,7 @@ impl HarrierModel {
                 };
 
                 let mut token_ids = tokenizer.encode_sync(&full_text, Some(true))?;
-                if token_ids.len() > max_tokens {
-                    token_ids.truncate(max_tokens);
-                }
+                truncate_preserving_tail(&mut token_ids, max_tokens);
                 let seq_len = token_ids.len();
                 let input = MxArray::from_uint32(&token_ids, &[1, seq_len as i64])?;
 
@@ -355,6 +351,20 @@ fn last_token_pool(hidden_states: &MxArray, seq_len: usize, hidden_size: i32) ->
     )
 }
 
+/// Truncate token sequence to `max_len` while preserving the trailing token.
+///
+/// Harrier pools the final token, which is the special end-of-sequence token
+/// added by `add_special_tokens=true`. Naive truncation would drop it, causing
+/// the model to pool a content token instead — deviating from the training recipe.
+/// This keeps the first `max_len - 1` tokens plus the original tail token.
+fn truncate_preserving_tail(token_ids: &mut Vec<u32>, max_len: usize) {
+    if token_ids.len() > max_len && max_len > 0 {
+        let tail = *token_ids.last().unwrap();
+        token_ids.truncate(max_len);
+        *token_ids.last_mut().unwrap() = tail;
+    }
+}
+
 /// L2-normalize an array along the last axis.
 fn l2_normalize(x: &MxArray) -> Result<MxArray> {
     let norm = x.square()?.sum(Some(&[-1]), Some(true))?.sqrt()?;
@@ -449,6 +459,45 @@ mod tests {
 
         assert_eq!(get_shape(&pooled), vec![1, 1, 2]);
         assert_eq!(get_values(&pooled), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_truncate_preserving_tail_keeps_special_token() {
+        // Reproduces the reviewer's scenario: content tokens + trailing EOS (151643)
+        let mut ids = vec![14990, 23811, 23811, 23811, 151643];
+        truncate_preserving_tail(&mut ids, 3);
+        // First 2 content tokens + EOS preserved at end
+        assert_eq!(ids, vec![14990, 23811, 151643]);
+    }
+
+    #[test]
+    fn test_truncate_preserving_tail_noop_under_limit() {
+        let mut ids = vec![1, 2, 3];
+        truncate_preserving_tail(&mut ids, 5);
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_truncate_preserving_tail_noop_at_exact_limit() {
+        let mut ids = vec![1, 2, 3];
+        truncate_preserving_tail(&mut ids, 3);
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_truncate_preserving_tail_to_single_token() {
+        // Even truncating to 1 should preserve the tail special token
+        let mut ids = vec![1, 2, 3, 151643];
+        truncate_preserving_tail(&mut ids, 1);
+        assert_eq!(ids, vec![151643]);
+    }
+
+    #[test]
+    fn test_truncate_preserving_tail_to_two_tokens() {
+        let mut ids = vec![100, 200, 300, 400, 151643];
+        truncate_preserving_tail(&mut ids, 2);
+        // First content token + tail special token
+        assert_eq!(ids, vec![100, 151643]);
     }
 
     #[test]
