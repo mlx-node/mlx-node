@@ -57,14 +57,15 @@ describe.sequential('HarrierModel', () => {
       expect(numParams).toBe(620288);
     });
 
-    it('should default useQkNorm to true (Qwen3 architectural requirement)', () => {
-      // When useQkNorm is not explicitly set, it should default to true
-      // because the underlying Qwen3 backbone always uses QK normalization
-      const config = {
-        ...TINY_CONFIG,
-        useQkNorm: true, // Qwen3 default
-      };
-      const model = new HarrierModel(config);
+    it('should default useQkNorm to true when omitted', () => {
+      // useQkNorm is optional — Qwen3 always uses QK normalization
+      const { useQkNorm: _, ...configWithoutQkNorm } = TINY_CONFIG;
+      const model = new HarrierModel(configWithoutQkNorm as any);
+      expect(model.getConfig().useQkNorm).toBe(true);
+    });
+
+    it('should accept explicit useQkNorm value', () => {
+      const model = new HarrierModel({ ...TINY_CONFIG, useQkNorm: true });
       expect(model.getConfig().useQkNorm).toBe(true);
     });
 

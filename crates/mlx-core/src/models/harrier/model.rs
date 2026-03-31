@@ -31,7 +31,11 @@ pub struct HarrierModel {
 #[napi]
 impl HarrierModel {
     #[napi(constructor)]
-    pub fn new(config: HarrierConfig) -> Result<Self> {
+    pub fn new(mut config: HarrierConfig) -> Result<Self> {
+        // Resolve use_qk_norm default — Qwen3 always uses QK normalization
+        let use_qk_norm = config.use_qk_norm.unwrap_or(true);
+        config.use_qk_norm = Some(use_qk_norm);
+
         let embedding = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)?;
 
         let layers = (0..config.num_layers)
@@ -43,7 +47,7 @@ impl HarrierModel {
                     config.intermediate_size as u32,
                     config.rms_norm_eps,
                     Some(config.rope_theta),
-                    Some(config.use_qk_norm),
+                    Some(use_qk_norm),
                     Some(config.head_dim as u32),
                 )
             })
@@ -221,7 +225,7 @@ impl HarrierModel {
             + (hidden * heads * head_dim);
         let mlp_params = inter * hidden * 3;
         let norm_params = hidden * 2;
-        let qk_norm_params = if self.config.use_qk_norm {
+        let qk_norm_params = if self.config.use_qk_norm.unwrap_or(true) {
             head_dim * 2
         } else {
             0
@@ -264,7 +268,7 @@ impl HarrierModel {
                 |w| attn.set_o_proj_weight(w),
             )?;
 
-            if self.config.use_qk_norm {
+            if self.config.use_qk_norm.unwrap_or(true) {
                 set_required(
                     params,
                     &format!("{}.self_attn.q_norm.weight", prefix),
@@ -518,7 +522,7 @@ mod tests {
             rope_theta: 1_000_000.0,
             max_position_embeddings: 512,
             head_dim: 32,
-            use_qk_norm: false,
+            use_qk_norm: None,
             vocab_size: 100,
         };
 

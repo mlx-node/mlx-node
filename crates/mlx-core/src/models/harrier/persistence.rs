@@ -136,10 +136,12 @@ fn parse_config(raw: &Value) -> Result<HarrierConfig> {
             .or_else(|| raw["maxPositionEmbeddings"].as_i64())
             .unwrap_or(32768) as i32,
         head_dim,
-        use_qk_norm: raw["use_qk_norm"]
-            .as_bool()
-            .or_else(|| raw["useQkNorm"].as_bool())
-            .unwrap_or(true),
+        use_qk_norm: Some(
+            raw["use_qk_norm"]
+                .as_bool()
+                .or_else(|| raw["useQkNorm"].as_bool())
+                .unwrap_or(true),
+        ),
         vocab_size: get_i32(raw, &["vocab_size", "vocabSize"])?,
     })
 }

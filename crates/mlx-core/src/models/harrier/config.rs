@@ -12,9 +12,8 @@ fn default_max_position_embeddings() -> i32 {
     32768
 }
 
-/// Qwen3 always uses QK normalization.
-fn default_use_qk_norm() -> bool {
-    true
+fn default_use_qk_norm() -> Option<bool> {
+    Some(true)
 }
 
 /// Configuration for Harrier embedding model (Qwen3 backbone).
@@ -38,7 +37,10 @@ pub struct HarrierConfig {
     #[serde(default = "default_max_position_embeddings")]
     pub max_position_embeddings: i32,
     pub head_dim: i32,
+    /// Qwen3 always uses QK normalization. Omit or pass null to use the
+    /// default (true). Explicitly passing false is allowed but produces
+    /// a model incompatible with published Harrier weights.
     #[serde(default = "default_use_qk_norm")]
-    pub use_qk_norm: bool,
+    pub use_qk_norm: Option<bool>,
     pub vocab_size: i32,
 }
