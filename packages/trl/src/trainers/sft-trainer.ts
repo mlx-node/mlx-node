@@ -308,6 +308,7 @@ export class SFTTrainer {
     logger.status('loading', `${modelName} loaded (${model.constructor.name})`);
 
     // Create trainer
+    // @ts-expect-error
     const trainer = new SFTTrainer(model, tokenizer, config, logger);
     trainer.originalModelPath = config.modelName;
 

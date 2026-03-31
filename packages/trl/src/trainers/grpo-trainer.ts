@@ -1024,6 +1024,7 @@ export class GRPOTrainer<T = unknown> {
     logger.status('loading', `${modelName} loaded (${model.constructor.name})`);
 
     // Create trainer with the pre-created logger
+    // @ts-expect-error
     const trainer = new GRPOTrainer(model, config, logger);
 
     // Always store the original model path (for tokenizer files when saving checkpoints)
