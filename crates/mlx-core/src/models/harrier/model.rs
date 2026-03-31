@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
@@ -22,6 +23,9 @@ pub struct HarrierModel {
     pub(crate) layers: Vec<TransformerBlock>,
     pub(crate) final_norm: RMSNorm,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    /// Named prompt presets loaded from config_sentence_transformers.json.
+    /// Keys are task names (e.g. "web_search_query"), values are full prefix strings.
+    pub(crate) prompts: HashMap<String, String>,
 }
 
 #[napi]
@@ -53,6 +57,7 @@ impl HarrierModel {
             layers,
             final_norm,
             tokenizer: None,
+            prompts: HashMap::new(),
         })
     }
 
@@ -71,17 +76,21 @@ impl HarrierModel {
     /// Encode a single text into a normalized embedding vector.
     ///
     /// Tokenizes the text, runs the forward pass, applies last-token pooling,
-    /// and L2-normalizes the result.
+    /// and L2-normalizes the result. Truncates to `max_position_embeddings`.
     ///
     /// # Arguments
     /// * `text` - Input text to encode
-    /// * `instruction` - Optional task instruction to prepend (for queries)
+    /// * `instruction` - Optional task instruction prefix or preset name
+    ///   (e.g. `"web_search_query"` resolves to the full Harrier prompt).
+    ///   Pass `null` for documents/passages that need no instruction.
     ///
     /// # Returns
     /// * Embedding vector, shape: [hidden_size]
     #[napi]
     pub async fn encode(&self, text: String, instruction: Option<String>) -> Result<MxArray> {
         let tokenizer = self.require_tokenizer()?.clone();
+        let instruction = instruction.map(|i| self.resolve_instruction(i));
+        let max_tokens = self.config.max_position_embeddings as usize;
         let config_hidden = self.config.hidden_size;
 
         let embedding = self.embedding.clone();
@@ -94,7 +103,10 @@ impl HarrierModel {
                 None => text,
             };
 
-            let token_ids = tokenizer.encode_sync(&full_text, Some(true))?;
+            let mut token_ids = tokenizer.encode_sync(&full_text, Some(true))?;
+            if token_ids.len() > max_tokens {
+                token_ids.truncate(max_tokens);
+            }
             let seq_len = token_ids.len();
             let input = MxArray::from_uint32(&token_ids, &[1, seq_len as i64])?;
 
@@ -114,11 +126,14 @@ impl HarrierModel {
     /// Encode a batch of texts into normalized embedding vectors.
     ///
     /// Each text is independently tokenized and encoded (no padding needed
-    /// since each goes through its own forward pass).
+    /// since each goes through its own forward pass). Truncates each text
+    /// to `max_position_embeddings`.
     ///
     /// # Arguments
     /// * `texts` - Input texts to encode
-    /// * `instruction` - Optional task instruction to prepend to each text
+    /// * `instruction` - Optional task instruction prefix or preset name
+    ///   (e.g. `"web_search_query"` resolves to the full Harrier prompt).
+    ///   Pass `null` for documents/passages that need no instruction.
     ///
     /// # Returns
     /// * Embedding matrix, shape: [batch_size, hidden_size]
@@ -129,6 +144,8 @@ impl HarrierModel {
         instruction: Option<String>,
     ) -> Result<MxArray> {
         let tokenizer = self.require_tokenizer()?.clone();
+        let instruction = instruction.map(|i| self.resolve_instruction(i));
+        let max_tokens = self.config.max_position_embeddings as usize;
         let config_hidden = self.config.hidden_size;
 
         let embedding = self.embedding.clone();
@@ -144,7 +161,10 @@ impl HarrierModel {
                     None => text,
                 };
 
-                let token_ids = tokenizer.encode_sync(&full_text, Some(true))?;
+                let mut token_ids = tokenizer.encode_sync(&full_text, Some(true))?;
+                if token_ids.len() > max_tokens {
+                    token_ids.truncate(max_tokens);
+                }
                 let seq_len = token_ids.len();
                 let input = MxArray::from_uint32(&token_ids, &[1, seq_len as i64])?;
 
@@ -173,6 +193,16 @@ impl HarrierModel {
     #[napi]
     pub fn get_config(&self) -> HarrierConfig {
         self.config.clone()
+    }
+
+    /// Get available prompt presets loaded from config_sentence_transformers.json.
+    ///
+    /// Returns a map of task name -> full instruction prefix.
+    /// Pass a task name to `encode()`/`encodeBatch()` as the `instruction` parameter
+    /// to use a preset instead of a raw prefix string.
+    #[napi]
+    pub fn get_prompts(&self) -> HashMap<String, String> {
+        self.prompts.clone()
     }
 
     /// Get the total number of model parameters.
@@ -206,10 +236,7 @@ impl HarrierModel {
     }
 
     /// Apply loaded parameters to the model.
-    pub(crate) fn load_parameters(
-        &mut self,
-        params: &std::collections::HashMap<String, MxArray>,
-    ) -> Result<()> {
+    pub(crate) fn load_parameters(&mut self, params: &HashMap<String, MxArray>) -> Result<()> {
         if let Some(w) = params.get("embedding.weight") {
             self.embedding.set_weight(w)?;
         } else {
@@ -295,6 +322,15 @@ impl HarrierModel {
             )
         })
     }
+
+    /// If `instruction` matches a loaded prompt name, return the full prefix.
+    /// Otherwise return it as-is (the caller passed a raw prefix string).
+    fn resolve_instruction(&self, instruction: String) -> String {
+        self.prompts
+            .get(&instruction)
+            .cloned()
+            .unwrap_or(instruction)
+    }
 }
 
 /// Shared forward pass: embedding -> transformer layers -> final norm.
@@ -327,12 +363,128 @@ fn l2_normalize(x: &MxArray) -> Result<MxArray> {
 }
 
 fn set_required(
-    params: &std::collections::HashMap<String, MxArray>,
+    params: &HashMap<String, MxArray>,
     name: &str,
     setter: impl FnOnce(&MxArray) -> Result<()>,
 ) -> Result<()> {
     match params.get(name) {
         Some(w) => setter(w),
         None => Err(Error::from_reason(format!("{} not found", name))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn get_values(arr: &MxArray) -> Vec<f32> {
+        arr.eval();
+        arr.to_float32().unwrap().to_vec()
+    }
+
+    fn get_shape(arr: &MxArray) -> Vec<i64> {
+        arr.shape().unwrap().to_vec()
+    }
+
+    #[test]
+    fn test_l2_normalize_produces_unit_vector() {
+        // [3, 4, 0] has L2 norm = 5, so normalized = [0.6, 0.8, 0.0]
+        let x = MxArray::from_float32(&[3.0, 4.0, 0.0], &[3]).unwrap();
+        let normed = l2_normalize(&x).unwrap();
+        let vals = get_values(&normed);
+
+        assert!((vals[0] - 0.6).abs() < 1e-5);
+        assert!((vals[1] - 0.8).abs() < 1e-5);
+        assert!(vals[2].abs() < 1e-5);
+
+        // Check the result actually has unit norm
+        let norm_sq: f32 = vals.iter().map(|v| v * v).sum();
+        assert!((norm_sq - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_l2_normalize_handles_zero_vector() {
+        // Zero vector should not produce NaN (clip(1e-12) prevents div-by-zero)
+        let x = MxArray::from_float32(&[0.0, 0.0, 0.0], &[3]).unwrap();
+        let normed = l2_normalize(&x).unwrap();
+        let vals = get_values(&normed);
+
+        for v in &vals {
+            assert!(!v.is_nan(), "L2 normalize of zero vector produced NaN");
+        }
+    }
+
+    #[test]
+    fn test_l2_normalize_2d_normalizes_per_row() {
+        // Two rows: [3,4] (norm=5) and [0,1] (norm=1)
+        let x = MxArray::from_float32(&[3.0, 4.0, 0.0, 1.0], &[2, 2]).unwrap();
+        let normed = l2_normalize(&x).unwrap();
+        let vals = get_values(&normed);
+
+        // Row 0: [0.6, 0.8]
+        assert!((vals[0] - 0.6).abs() < 1e-5);
+        assert!((vals[1] - 0.8).abs() < 1e-5);
+        // Row 1: [0.0, 1.0]
+        assert!(vals[2].abs() < 1e-5);
+        assert!((vals[3] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_last_token_pool_extracts_final_position() {
+        // [1, 3, 4] tensor: 3 tokens, 4-dim hidden states
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let x = MxArray::from_float32(&data, &[1, 3, 4]).unwrap();
+        let pooled = last_token_pool(&x, 3, 4).unwrap();
+
+        assert_eq!(get_shape(&pooled), vec![1, 1, 4]);
+        // Last token (index 2): values [8, 9, 10, 11]
+        let vals = get_values(&pooled);
+        assert_eq!(vals, vec![8.0, 9.0, 10.0, 11.0]);
+    }
+
+    #[test]
+    fn test_last_token_pool_single_token() {
+        let x = MxArray::from_float32(&[1.0, 2.0], &[1, 1, 2]).unwrap();
+        let pooled = last_token_pool(&x, 1, 2).unwrap();
+
+        assert_eq!(get_shape(&pooled), vec![1, 1, 2]);
+        assert_eq!(get_values(&pooled), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_resolve_instruction_with_known_prompt() {
+        let mut prompts = HashMap::new();
+        prompts.insert(
+            "web_search_query".to_string(),
+            "Instruct: search\nQuery: ".to_string(),
+        );
+
+        let config = HarrierConfig {
+            hidden_size: 64,
+            num_layers: 1,
+            num_heads: 2,
+            num_key_value_heads: 1,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            max_position_embeddings: 512,
+            head_dim: 32,
+            use_qk_norm: false,
+            vocab_size: 100,
+        };
+
+        let mut model = HarrierModel::new(config).unwrap();
+        model.prompts = prompts;
+
+        // Named prompt resolves to full prefix
+        assert_eq!(
+            model.resolve_instruction("web_search_query".to_string()),
+            "Instruct: search\nQuery: "
+        );
+        // Unknown name passes through as-is
+        assert_eq!(
+            model.resolve_instruction("Instruct: custom\nQuery: ".to_string()),
+            "Instruct: custom\nQuery: "
+        );
     }
 }

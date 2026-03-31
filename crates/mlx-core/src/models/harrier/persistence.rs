@@ -22,6 +22,7 @@ impl HarrierModel {
     /// - config.json (model configuration)
     /// - model.safetensors or weights.safetensors (weights)
     /// - tokenizer.json (tokenizer)
+    /// - config_sentence_transformers.json (optional, prompt presets)
     #[napi]
     pub fn load<'env>(
         env: &'env Env,
@@ -48,7 +49,6 @@ fn load_impl(model_path: &str) -> Result<HarrierModel> {
         )));
     }
 
-    // Parse config
     let config_path = path.join("config.json");
     if !config_path.exists() {
         return Err(Error::from_reason(format!(
@@ -66,15 +66,12 @@ fn load_impl(model_path: &str) -> Result<HarrierModel> {
         config.num_layers, config.hidden_size, config.num_heads
     );
 
-    // Load weights
     let mut param_map = load_all_safetensors(path, false)?;
     info!("Loaded {} tensors from SafeTensors", param_map.len());
 
-    // Map HuggingFace names to internal names
     let mapped_params = map_hf_names(&mut param_map);
     info!("Mapped {} parameters", mapped_params.len());
 
-    // Load tokenizer
     let tokenizer_path = path.join("tokenizer.json");
     if !tokenizer_path.exists() {
         return Err(Error::from_reason(format!(
@@ -84,12 +81,20 @@ fn load_impl(model_path: &str) -> Result<HarrierModel> {
     }
     let tokenizer = Qwen3Tokenizer::load_from_file_sync(tokenizer_path.to_str().unwrap())?;
 
-    // Create model and apply weights
+    let prompts = load_prompts(path);
+    if !prompts.is_empty() {
+        info!(
+            "Loaded {} prompt presets: {:?}",
+            prompts.len(),
+            prompts.keys().collect::<Vec<_>>()
+        );
+    }
+
     let mut model = HarrierModel::new(config)?;
     model.load_parameters(&mapped_params)?;
     model.tokenizer = Some(Arc::new(tokenizer));
+    model.prompts = prompts;
 
-    // Materialize all mmap-backed arrays
     for array in mapped_params.values() {
         array.eval();
     }
@@ -139,10 +144,32 @@ fn parse_config(raw: &Value) -> Result<HarrierConfig> {
     })
 }
 
+/// Load prompt presets from config_sentence_transformers.json if present.
+///
+/// Format: `{ "prompts": { "task_name": "Instruct: ...\nQuery: " } }`
+fn load_prompts(model_dir: &Path) -> HashMap<String, String> {
+    let prompts_path = model_dir.join("config_sentence_transformers.json");
+    let data = match fs::read_to_string(&prompts_path) {
+        Ok(d) => d,
+        Err(_) => return HashMap::new(),
+    };
+    let json: Value = match serde_json::from_str(&data) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut prompts = HashMap::new();
+    if let Some(obj) = json["prompts"].as_object() {
+        for (key, val) in obj {
+            if let Some(s) = val.as_str() {
+                prompts.insert(key.clone(), s.to_string());
+            }
+        }
+    }
+    prompts
+}
+
 /// Map HuggingFace parameter names to internal names.
-/// model.embed_tokens.weight -> embedding.weight
-/// model.layers.N.* -> layers.N.*
-/// model.norm.weight -> final_norm.weight
 fn map_hf_names(params: &mut HashMap<String, MxArray>) -> HashMap<String, MxArray> {
     let mut mapped = HashMap::new();
 

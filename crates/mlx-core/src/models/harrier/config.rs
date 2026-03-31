@@ -12,6 +12,11 @@ fn default_max_position_embeddings() -> i32 {
     32768
 }
 
+/// Qwen3 always uses QK normalization.
+fn default_use_qk_norm() -> bool {
+    true
+}
+
 /// Configuration for Harrier embedding model (Qwen3 backbone).
 ///
 /// Only includes backbone dimensions needed for encoding.
@@ -33,7 +38,7 @@ pub struct HarrierConfig {
     #[serde(default = "default_max_position_embeddings")]
     pub max_position_embeddings: i32,
     pub head_dim: i32,
-    #[serde(default)]
+    #[serde(default = "default_use_qk_norm")]
     pub use_qk_norm: bool,
     pub vocab_size: i32,
 }
