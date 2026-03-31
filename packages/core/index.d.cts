@@ -2840,9 +2840,9 @@ export interface HarrierConfig {
   maxPositionEmbeddings: number;
   headDim: number;
   /**
-   * Qwen3 always uses QK normalization. Omit or pass null to use the
-   * default (true). Explicitly passing false is allowed but produces
-   * a model incompatible with published Harrier weights.
+   * Qwen3 always uses QK normalization. Omit to use the default (true).
+   * Explicitly passing false is allowed but produces a model incompatible
+   * with published Harrier weights.
    */
   useQkNorm?: boolean;
   vocabSize: number;
