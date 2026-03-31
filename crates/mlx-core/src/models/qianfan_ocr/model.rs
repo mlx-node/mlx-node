@@ -879,18 +879,8 @@ impl QianfanOCRModel {
                                 break;
                             }
 
-                            // Check repetition cutoff
-                            if let Some(reason) = check_repetition_cutoff(
-                                &generated_tokens,
-                                max_consecutive_tokens,
-                                max_ngram_repeats,
-                                ngram_size,
-                            ) {
-                                finish_reason = reason.to_string();
-                                break;
-                            }
-
-                            // Decode with stateful stream (handles multi-byte boundaries)
+                            // Decode and emit BEFORE repetition check so the
+                            // triggering token is streamed to clients
                             let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
                                 &mut decode_stream,
                                 tokenizer.inner(),
@@ -910,6 +900,17 @@ impl QianfanOCRModel {
                                 raw_text: None,
                                 performance: None,
                             });
+
+                            // Check repetition cutoff (after emit so token is streamed)
+                            if let Some(reason) = check_repetition_cutoff(
+                                &generated_tokens,
+                                max_consecutive_tokens,
+                                max_ngram_repeats,
+                                ngram_size,
+                            ) {
+                                finish_reason = reason.to_string();
+                                break;
+                            }
 
                             // Forward single token
                             let token_2d = token.reshape(&[1, 1])?;
