@@ -1,5 +1,6 @@
 pub mod arrays_cache;
 pub mod attention;
+pub(crate) mod chat_common;
 pub mod config;
 pub mod decoder_layer;
 pub mod gated_delta;
@@ -7,6 +8,7 @@ pub mod gated_delta_net;
 pub mod layer_cache;
 pub mod model;
 pub mod persistence;
+pub(crate) mod persistence_common;
 pub mod processing;
 pub mod prompt_cache;
 pub mod quantized_linear;

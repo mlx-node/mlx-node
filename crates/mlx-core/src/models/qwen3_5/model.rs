@@ -22,6 +22,10 @@ use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools;
 use crate::tools::ToolCallResult;
 
+use super::chat_common::{
+    self, ChatParams, apply_all_penalties, compute_performance_metrics, extract_chat_params,
+    finalize_chat_result, save_cache_state, verify_cache_prefix,
+};
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
@@ -1014,22 +1018,8 @@ impl Qwen3_5Model {
                 enable_thinking,
             )?;
 
-            let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
-            let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-            let repetition_context_size = config.repetition_context_size.unwrap_or(256);
-            let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-            let presence_context_size = config.presence_context_size.unwrap_or(20);
-            let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-            let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-            let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-            let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-            let ngram_size = config.ngram_size.unwrap_or(64);
-            let sampling_config = Some(SamplingConfig {
-                temperature: config.temperature,
-                top_k: config.top_k,
-                top_p: config.top_p,
-                min_p: config.min_p,
-            });
+            let p = extract_chat_params(&config);
+            let max_new_tokens = p.max_new_tokens;
 
             let mut layers_guard = layers_arc
                 .write()
@@ -1270,32 +1260,9 @@ impl Qwen3_5Model {
             let mut token_history: Vec<u32> = tokens.clone();
 
             // Apply repetition penalty to prefill logits
-            if repetition_penalty != 1.0 && !token_history.is_empty() {
-                last_logits = apply_repetition_penalty(
-                    &last_logits,
-                    &token_history,
-                    repetition_penalty,
-                    Some(repetition_context_size),
-                )?;
-            }
-            if presence_penalty != 0.0 {
-                last_logits = apply_presence_penalty(
-                    &last_logits,
-                    &token_history,
-                    presence_penalty,
-                    Some(presence_context_size),
-                )?;
-            }
-            if frequency_penalty != 0.0 {
-                last_logits = apply_frequency_penalty(
-                    &last_logits,
-                    &token_history,
-                    frequency_penalty,
-                    Some(frequency_context_size),
-                )?;
-            }
+            last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
 
-            let mut y = sample(&last_logits, sampling_config)?;
+            let mut y = sample(&last_logits, p.sampling_config)?;
             MxArray::async_eval_arrays(&[&y]);
 
             let _compiled_guard = if use_compiled {
@@ -1394,34 +1361,11 @@ impl Qwen3_5Model {
                         profiler.end();
 
                         profiler.begin("rep_penalty");
-                        if repetition_penalty != 1.0 {
-                            logits = apply_repetition_penalty(
-                                &logits,
-                                &token_history,
-                                repetition_penalty,
-                                Some(repetition_context_size),
-                            )?;
-                        }
-                        if presence_penalty != 0.0 {
-                            logits = apply_presence_penalty(
-                                &logits,
-                                &token_history,
-                                presence_penalty,
-                                Some(presence_context_size),
-                            )?;
-                        }
-                        if frequency_penalty != 0.0 {
-                            logits = apply_frequency_penalty(
-                                &logits,
-                                &token_history,
-                                frequency_penalty,
-                                Some(frequency_context_size),
-                            )?;
-                        }
+                        logits = apply_all_penalties(logits, &token_history, &p)?;
                         profiler.end();
 
                         profiler.begin("sample");
-                        let next_token = sample(&logits, sampling_config)?;
+                        let next_token = sample(&logits, p.sampling_config)?;
                         profiler.end();
 
                         profiler.begin("eval_caches");
@@ -1442,7 +1386,7 @@ impl Qwen3_5Model {
                     let token_id = y.item_at_int32(0)? as u32;
                     profiler.end();
                     profiler.mark_first_token();
-                    if report_perf && first_token_instant.is_none() {
+                    if p.report_performance && first_token_instant.is_none() {
                         first_token_instant = Some(std::time::Instant::now());
                     }
 
@@ -1456,9 +1400,9 @@ impl Qwen3_5Model {
 
                     if let Some(reason) = check_repetition_cutoff(
                         &generated_tokens,
-                        max_consecutive_tokens,
-                        max_ngram_repeats,
-                        ngram_size,
+                        p.max_consecutive_tokens,
+                        p.max_ngram_repeats,
+                        p.ngram_size,
                     ) {
                         finish_reason = reason.to_string();
                         break;
@@ -1539,34 +1483,11 @@ impl Qwen3_5Model {
                         profiler.end();
 
                         profiler.begin("rep_penalty");
-                        if repetition_penalty != 1.0 {
-                            logits = apply_repetition_penalty(
-                                &logits,
-                                &token_history,
-                                repetition_penalty,
-                                Some(repetition_context_size),
-                            )?;
-                        }
-                        if presence_penalty != 0.0 {
-                            logits = apply_presence_penalty(
-                                &logits,
-                                &token_history,
-                                presence_penalty,
-                                Some(presence_context_size),
-                            )?;
-                        }
-                        if frequency_penalty != 0.0 {
-                            logits = apply_frequency_penalty(
-                                &logits,
-                                &token_history,
-                                frequency_penalty,
-                                Some(frequency_context_size),
-                            )?;
-                        }
+                        logits = apply_all_penalties(logits, &token_history, &p)?;
                         profiler.end();
 
                         profiler.begin("sample");
-                        let next_token = sample(&logits, sampling_config)?;
+                        let next_token = sample(&logits, p.sampling_config)?;
                         profiler.end();
 
                         profiler.begin("async_eval");
@@ -1585,7 +1506,7 @@ impl Qwen3_5Model {
                     let token_id = y.item_at_int32(0)? as u32;
                     profiler.end();
                     profiler.mark_first_token();
-                    if report_perf && first_token_instant.is_none() {
+                    if p.report_performance && first_token_instant.is_none() {
                         first_token_instant = Some(std::time::Instant::now());
                     }
 
@@ -1599,9 +1520,9 @@ impl Qwen3_5Model {
 
                     if let Some(reason) = check_repetition_cutoff(
                         &generated_tokens,
-                        max_consecutive_tokens,
-                        max_ngram_repeats,
-                        ngram_size,
+                        p.max_consecutive_tokens,
+                        p.max_ngram_repeats,
+                        p.ngram_size,
                     ) {
                         finish_reason = reason.to_string();
                         break;
@@ -1627,106 +1548,39 @@ impl Qwen3_5Model {
             // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
 
             // === Save token history and image key for cache reuse on next call ===
-            if reuse_cache {
-                let mut full_history = if has_images {
-                    expanded_tokens.clone()
-                } else {
-                    tokens.clone()
-                };
-                // Only include tokens that were actually forwarded through the model.
-                // When stopped at max_tokens ("length"), the last token was never forwarded
-                // (the pipelined loop skips forward on the final step).
-                let history_tokens = if finish_reason == "length" && !generated_tokens.is_empty() {
-                    &generated_tokens[..generated_tokens.len() - 1]
-                } else {
-                    &generated_tokens
-                };
-                full_history.extend_from_slice(history_tokens);
-                if let Ok(mut th) = cached_token_history_arc.write() {
-                    *th = full_history;
-                }
-                if let Ok(mut ik) = cached_image_key_arc.write() {
-                    *ik = if has_images {
-                        Some(current_image_cache_key)
-                    } else {
-                        None
-                    };
-                }
-            } else {
-                // reuseCache: false — clear all cache state to free GPU memory
-                if let Ok(mut cg) = caches_arc.write() {
-                    *cg = None;
-                }
-                if let Ok(mut th) = cached_token_history_arc.write() {
-                    th.clear();
-                }
-                if let Ok(mut ik) = cached_image_key_arc.write() {
-                    *ik = None;
-                }
-                if let Ok(mut rd) = cached_rope_deltas_arc.write() {
-                    *rd = None;
-                }
-            }
+            save_cache_state(
+                p.reuse_cache,
+                has_images,
+                &generated_tokens,
+                &finish_reason,
+                &tokens,
+                Some(&expanded_tokens),
+                current_image_cache_key,
+                &cached_token_history_arc,
+                &cached_image_key_arc,
+                &cached_rope_deltas_arc,
+                &caches_arc,
+            )?;
 
-            // Decode text
-            let text = tokenizer_for_decode
-                .decode_sync(&generated_tokens, true)
-                .unwrap_or_else(|e| {
-                    warn!("Failed to decode generated tokens: {}", e);
-                    String::new()
-                });
+            // Compute performance metrics
+            let performance = compute_performance_metrics(
+                generation_start,
+                first_token_instant,
+                prefill_tokens.len(),
+                generated_tokens.len(),
+            );
 
-            let num_tokens = generated_tokens.len() as u32;
-
-            let think_tag = if tools::has_think_end_token(&generated_tokens, think_end_id) {
-                think_end_str.as_deref()
-            } else {
-                None
-            };
-            let (clean_text, tool_calls, thinking) = tools::split_at_think_end(&text, think_tag);
-
-            // If we have valid tool calls, override finish reason
-            let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
-                "tool_calls".to_string()
-            } else {
-                finish_reason
-            };
-
-            // Compute performance metrics if requested
-            let performance = if let (Some(gen_start), Some(first_tok)) =
-                (generation_start, first_token_instant)
-            {
-                let generation_end = std::time::Instant::now();
-                let actual_prefill_toks = prefill_tokens.len() as f64;
-                let gen_toks = generated_tokens.len() as f64;
-                let ttft_ms = first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
-                let decode_ms = generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
-                Some(crate::profiling::PerformanceMetrics {
-                    ttft_ms,
-                    prefill_tokens_per_second: if ttft_ms > 0.0 {
-                        actual_prefill_toks / (ttft_ms / 1000.0)
-                    } else {
-                        0.0
-                    },
-                    decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
-                        (gen_toks - 1.0) / (decode_ms / 1000.0)
-                    } else {
-                        0.0
-                    },
-                })
-            } else {
-                None
-            };
-
-            Ok(ChatResult {
-                text: clean_text,
-                tool_calls,
-                thinking,
-                num_tokens,
+            finalize_chat_result(
+                &tokenizer_for_decode,
+                &generated_tokens,
+                &tokens,
+                Some(&expanded_tokens),
+                has_images,
                 finish_reason,
-                raw_text: text,
+                think_end_id,
+                think_end_str.as_deref(),
                 performance,
-            })
+            )
         })
         .await
         .map_err(|e| Error::from_reason(format!("Chat task failed: {}", e)))?

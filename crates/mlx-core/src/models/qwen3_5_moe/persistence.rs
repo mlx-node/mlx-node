@@ -9,10 +9,12 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::models::qwen3_5::persistence::{load_vision_weights, parse_vision_config};
+use crate::models::qwen3_5::persistence_common::{
+    dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
+};
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 use crate::tokenizer::Qwen3Tokenizer;
-use crate::utils::safetensors::load_safetensors_lazy;
 
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
@@ -24,150 +26,6 @@ use super::quantized_linear::{
     try_build_quantized_linear,
 };
 use super::switch_glu::SwitchGLU;
-
-/// Load all safetensors files from a directory.
-/// Uses MLX's native mmap-backed lazy loader for near-instant loading.
-fn load_all_safetensors(dir: &Path) -> Result<HashMap<String, MxArray>> {
-    let single_path = if dir.join("weights.safetensors").exists() {
-        Some(dir.join("weights.safetensors"))
-    } else if dir.join("model.safetensors").exists() {
-        Some(dir.join("model.safetensors"))
-    } else {
-        None
-    };
-
-    if let Some(path) = single_path {
-        info!("Loading weights from: {} (mmap)", path.display());
-        return load_safetensors_lazy(&path);
-    }
-
-    let mut shard_files: Vec<std::path::PathBuf> = Vec::new();
-    let entries = fs::read_dir(dir)
-        .map_err(|e| Error::from_reason(format!("Failed to read model directory: {}", e)))?;
-
-    for entry in entries {
-        let entry = entry
-            .map_err(|e| Error::from_reason(format!("Failed to read directory entry: {}", e)))?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        let is_shard = (name.starts_with("model-") || name.starts_with("model.safetensors-"))
-            && name.ends_with(".safetensors")
-            && name.contains("-of-");
-        if is_shard {
-            shard_files.push(entry.path());
-        }
-    }
-
-    if shard_files.is_empty() {
-        return Err(Error::from_reason(format!(
-            "No safetensors files found in {}",
-            dir.display()
-        )));
-    }
-
-    shard_files.sort();
-    info!(
-        "Loading {} sharded safetensors files (mmap)",
-        shard_files.len()
-    );
-
-    let mut all_params: HashMap<String, MxArray> = HashMap::new();
-    for shard_path in &shard_files {
-        info!("  Loading shard: {} (mmap)", shard_path.display());
-        let shard_params = load_safetensors_lazy(shard_path)?;
-        all_params.extend(shard_params);
-    }
-
-    Ok(all_params)
-}
-
-/// FP8 E4M3 block-wise dequantization: weight * scale_inv with block_size=128
-///
-/// Handles both 2D [out, in] and 1D [n] weights.
-/// 1. from_fp8(weight) → target dtype
-/// 2. Pad to 128-block alignment
-/// 3. Reshape into blocks, multiply by scale_inv
-/// 4. Unpad and return as target dtype
-fn dequant_fp8(weight: &MxArray, scale_inv: &MxArray, target_dtype: DType) -> Result<MxArray> {
-    let weight = weight.from_fp8(target_dtype)?;
-
-    let shape = weight.shape()?;
-    let shape_ref = shape.as_ref();
-
-    if shape_ref.len() < 2 {
-        // 1D weight (e.g. bias): just scale directly
-        return weight.mul(scale_inv)?.astype(target_dtype);
-    }
-
-    let m = shape_ref[0] as usize;
-    let n = shape_ref[1] as usize;
-    let bs: usize = 128;
-
-    let pad_bottom = (bs - (m % bs)) % bs;
-    let pad_side = (bs - (n % bs)) % bs;
-
-    let weight = if pad_bottom > 0 || pad_side > 0 {
-        weight.pad(&[0, pad_bottom as i32, 0, pad_side as i32], 0.0)?
-    } else {
-        weight
-    };
-
-    let m_padded = m + pad_bottom;
-    let n_padded = n + pad_side;
-    let weight = weight.reshape(&[
-        (m_padded / bs) as i64,
-        bs as i64,
-        (n_padded / bs) as i64,
-        bs as i64,
-    ])?;
-
-    let scale = scale_inv.expand_dims(1)?.expand_dims(3)?;
-    let weight = weight.mul(&scale)?;
-
-    let weight = weight.reshape(&[m_padded as i64, n_padded as i64])?;
-    let weight = if pad_bottom > 0 || pad_side > 0 {
-        weight.slice(&[0, 0], &[m as i64, n as i64])?
-    } else {
-        weight
-    };
-
-    weight.astype(target_dtype)
-}
-
-/// Dequantize all FP8 weight pairs in-place.
-/// Finds all `*weight_scale_inv` keys, dequantizes the corresponding weight,
-/// removes scale_inv keys, and replaces weights with dequantized versions.
-fn dequant_fp8_weights(params: &mut HashMap<String, MxArray>, target_dtype: DType) -> Result<()> {
-    let scale_keys: Vec<String> = params
-        .keys()
-        .filter(|k| k.ends_with("weight_scale_inv"))
-        .cloned()
-        .collect();
-
-    if scale_keys.is_empty() {
-        return Ok(());
-    }
-
-    info!(
-        "Dequantizing {} FP8 weight pairs to {:?}",
-        scale_keys.len(),
-        target_dtype
-    );
-
-    for scale_key in scale_keys {
-        let weight_key = scale_key.replace("_scale_inv", "");
-        let scale_inv = params
-            .remove(&scale_key)
-            .expect("scale_key must exist in params");
-        if let Some(weight) = params.remove(&weight_key) {
-            let dequantized = dequant_fp8(&weight, &scale_inv, target_dtype)?;
-            // Eval immediately to prevent lazy chain accumulation (OOM with ~31K FP8 pairs)
-            dequantized.eval();
-            params.insert(weight_key, dequantized);
-        }
-    }
-
-    Ok(())
-}
 
 /// Sanitize weights from HuggingFace format.
 fn sanitize_weights(
@@ -971,7 +829,7 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5MoeModel> {
             config.num_layers, config.hidden_size, config.num_experts, config.num_experts_per_tok
         );
 
-        let raw_params = load_all_safetensors(path)?;
+        let raw_params = load_all_safetensors(path, false)?;
         info!("Loaded {} raw tensors", raw_params.len());
 
         // Check for vision weights and split if present
@@ -1138,50 +996,12 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5MoeModel> {
 fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
     let text_cfg = raw.get("text_config");
 
-    let get_i32 = |keys: &[&str], default: i32| -> i32 {
-        for key in keys {
-            if let Some(tc) = text_cfg
-                && let Some(v) = tc[key].as_i64()
-            {
-                return v as i32;
-            }
-            if let Some(v) = raw[key].as_i64() {
-                return v as i32;
-            }
-        }
-        default
-    };
+    let gi = |keys: &[&str], default: i32| get_config_i32(raw, text_cfg, keys, default);
+    let gf = |keys: &[&str], default: f64| get_config_f64(raw, text_cfg, keys, default);
+    let gb = |keys: &[&str], default: bool| get_config_bool(raw, text_cfg, keys, default);
 
-    let get_f64 = |keys: &[&str], default: f64| -> f64 {
-        for key in keys {
-            if let Some(tc) = text_cfg
-                && let Some(v) = tc[key].as_f64()
-            {
-                return v;
-            }
-            if let Some(v) = raw[key].as_f64() {
-                return v;
-            }
-        }
-        default
-    };
-
-    let get_bool = |keys: &[&str], default: bool| -> bool {
-        for key in keys {
-            if let Some(tc) = text_cfg
-                && let Some(v) = tc[key].as_bool()
-            {
-                return v;
-            }
-            if let Some(v) = raw[key].as_bool() {
-                return v;
-            }
-        }
-        default
-    };
-
-    let hidden_size = get_i32(&["hidden_size"], 0);
-    let num_heads = get_i32(&["num_attention_heads", "num_heads"], 0);
+    let hidden_size = gi(&["hidden_size"], 0);
+    let num_heads = gi(&["num_attention_heads", "num_heads"], 0);
 
     let head_dim = text_cfg
         .and_then(|tc| tc["head_dim"].as_i64())
@@ -1201,21 +1021,21 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
 
     let partial_rotary_factor = rope_obj
         .and_then(|rp| rp["partial_rotary_factor"].as_f64())
-        .unwrap_or_else(|| get_f64(&["partial_rotary_factor"], 0.25));
+        .unwrap_or_else(|| gf(&["partial_rotary_factor"], 0.25));
 
     let rope_theta = rope_obj
         .and_then(|rp| rp["rope_theta"].as_f64())
-        .unwrap_or_else(|| get_f64(&["rope_theta"], 100_000.0));
+        .unwrap_or_else(|| gf(&["rope_theta"], 100_000.0));
 
-    let bos_token_id = get_i32(&["bos_token_id"], 151643);
-    let num_layers = get_i32(&["num_hidden_layers", "num_layers"], 0);
-    let intermediate_size = get_i32(&["intermediate_size"], 0);
-    let num_kv_heads = get_i32(&["num_key_value_heads", "num_kv_heads"], 8);
-    let vocab_size = get_i32(&["vocab_size"], 151936);
+    let bos_token_id = gi(&["bos_token_id"], 151643);
+    let num_layers = gi(&["num_hidden_layers", "num_layers"], 0);
+    let intermediate_size = gi(&["intermediate_size"], 0);
+    let num_kv_heads = gi(&["num_key_value_heads", "num_kv_heads"], 8);
+    let vocab_size = gi(&["vocab_size"], 151936);
 
-    let num_experts = get_i32(&["num_experts"], 0);
-    let num_experts_per_tok = get_i32(&["num_experts_per_tok"], 1);
-    let moe_i = get_i32(&["moe_intermediate_size"], 0);
+    let num_experts = gi(&["num_experts"], 0);
+    let num_experts_per_tok = gi(&["num_experts_per_tok"], 1);
+    let moe_i = gi(&["moe_intermediate_size"], 0);
 
     if hidden_size <= 0 {
         return Err(Error::from_reason(format!(
@@ -1249,33 +1069,33 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
         num_heads,
         num_kv_heads,
         intermediate_size,
-        rms_norm_eps: get_f64(&["rms_norm_eps"], 1e-6),
+        rms_norm_eps: gf(&["rms_norm_eps"], 1e-6),
         head_dim,
-        tie_word_embeddings: get_bool(&["tie_word_embeddings"], false),
-        attention_bias: get_bool(&["attention_bias"], false),
-        max_position_embeddings: get_i32(&["max_position_embeddings"], 131072),
-        pad_token_id: get_i32(&["pad_token_id"], bos_token_id),
-        eos_token_id: get_i32(&["eos_token_id"], 151645),
+        tie_word_embeddings: gb(&["tie_word_embeddings"], false),
+        attention_bias: gb(&["attention_bias"], false),
+        max_position_embeddings: gi(&["max_position_embeddings"], 131072),
+        pad_token_id: gi(&["pad_token_id"], bos_token_id),
+        eos_token_id: gi(&["eos_token_id"], 151645),
         bos_token_id,
 
-        linear_num_value_heads: get_i32(&["linear_num_value_heads"], 64),
-        linear_num_key_heads: get_i32(&["linear_num_key_heads"], 16),
-        linear_key_head_dim: get_i32(&["linear_key_head_dim"], 192),
-        linear_value_head_dim: get_i32(&["linear_value_head_dim"], 128),
-        linear_conv_kernel_dim: get_i32(&["linear_conv_kernel_dim"], 4),
-        full_attention_interval: get_i32(&["full_attention_interval"], 4),
+        linear_num_value_heads: gi(&["linear_num_value_heads"], 64),
+        linear_num_key_heads: gi(&["linear_num_key_heads"], 16),
+        linear_key_head_dim: gi(&["linear_key_head_dim"], 192),
+        linear_value_head_dim: gi(&["linear_value_head_dim"], 128),
+        linear_conv_kernel_dim: gi(&["linear_conv_kernel_dim"], 4),
+        full_attention_interval: gi(&["full_attention_interval"], 4),
         partial_rotary_factor,
         rope_theta,
 
         num_experts,
         num_experts_per_tok,
-        decoder_sparse_step: get_i32(&["decoder_sparse_step"], 1),
+        decoder_sparse_step: gi(&["decoder_sparse_step"], 1),
         shared_expert_intermediate_size: {
-            let v = get_i32(&["shared_expert_intermediate_size"], 0);
+            let v = gi(&["shared_expert_intermediate_size"], 0);
             if v > 0 { Some(v) } else { None }
         },
         moe_intermediate_size: { if moe_i > 0 { Some(moe_i) } else { None } },
-        norm_topk_prob: get_bool(&["norm_topk_prob"], true),
+        norm_topk_prob: gb(&["norm_topk_prob"], true),
         mlp_only_layers: text_cfg
             .and_then(|tc| tc["mlp_only_layers"].as_array())
             .or_else(|| raw["mlp_only_layers"].as_array())
