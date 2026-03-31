@@ -158,6 +158,7 @@ pub(crate) struct QianfanImageProcessor {
     image_size: u32,
     min_dynamic_patch: u32,
     max_dynamic_patch: u32,
+    dynamic_image_size: bool,
     use_thumbnail: bool,
     mean: [f32; 3],
     std: [f32; 3],
@@ -170,6 +171,7 @@ impl QianfanImageProcessor {
             image_size: config.vision_config.image_size as u32,
             min_dynamic_patch: config.min_dynamic_patch as u32,
             max_dynamic_patch: config.max_dynamic_patch as u32,
+            dynamic_image_size: config.dynamic_image_size,
             use_thumbnail: config.use_thumbnail,
             // ImageNet normalization constants
             mean: [0.485, 0.456, 0.406],
@@ -189,13 +191,22 @@ impl QianfanImageProcessor {
             )
         })?;
 
-        let tiles = dynamic_preprocess(
-            &img,
-            self.min_dynamic_patch,
-            self.max_dynamic_patch,
-            self.image_size,
-            self.use_thumbnail,
-        );
+        let tiles = if self.dynamic_image_size {
+            dynamic_preprocess(
+                &img,
+                self.min_dynamic_patch,
+                self.max_dynamic_patch,
+                self.image_size,
+                self.use_thumbnail,
+            )
+        } else {
+            // Static: single tile resized to image_size x image_size
+            vec![img.resize_exact(
+                self.image_size,
+                self.image_size,
+                image::imageops::FilterType::CatmullRom,
+            )]
+        };
 
         let num_tiles = tiles.len() as u32;
         let h = self.image_size as usize;

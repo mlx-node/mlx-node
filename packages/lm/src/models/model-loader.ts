@@ -12,9 +12,15 @@ import { Qwen3Model, QianfanOCRModel } from '@mlx-node/core';
 import type { LoadableModel, TrainableModel } from '../interfaces.js';
 import { Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
-export type ModelType = 'qwen3' | 'qwen3_5' | 'qwen3_5_moe' | 'internvl_chat';
+export type ModelType = 'qwen3' | 'qwen3_5' | 'qwen3_5_moe' | 'internvl_chat' | 'qianfan-ocr';
 
-const SUPPORTED_MODEL_TYPES = new Set<ModelType>(['qwen3', 'qwen3_5', 'qwen3_5_moe', 'internvl_chat']);
+const SUPPORTED_MODEL_TYPES = new Set<ModelType>([
+  'qwen3',
+  'qwen3_5',
+  'qwen3_5_moe',
+  'internvl_chat',
+  'qianfan-ocr',
+]);
 
 /**
  * Load a model from disk, auto-detecting architecture from config.json.
@@ -33,6 +39,7 @@ export async function loadModel(modelPath: string): Promise<LoadableModel> {
     case 'qwen3':
       return Qwen3Model.load(modelPath);
     case 'internvl_chat':
+    case 'qianfan-ocr':
       return QianfanOCRModel.load(modelPath) as unknown as Promise<LoadableModel>;
   }
 }
