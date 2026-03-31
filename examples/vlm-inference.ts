@@ -140,7 +140,9 @@ if (imagePath) {
     console.log();
     console.log(result.text);
     console.log('-'.repeat(80));
-    console.log(`${result.performance?.ttftMs}ms | ${result.performance?.prefillTokensPerSecond} tok/s | ${result.performance?.decodeTokensPerSecond} tok/s | ${result.numTokens} tokens | finish: ${result.finishReason}`);
+    console.log(
+      `${result.performance?.ttftMs}ms | ${result.performance?.prefillTokensPerSecond} tok/s | ${result.performance?.decodeTokensPerSecond} tok/s | ${result.numTokens} tokens | finish: ${result.finishReason}`,
+    );
     if (result.thinking) {
       console.log(`\nThinking:\n${result.thinking}`);
     }
@@ -158,13 +160,13 @@ if (imagePath) {
     console.log();
     console.log(r2.text);
     console.log('-'.repeat(80));
-    console.log(`${r2.performance?.ttftMs}ms | ${r2.performance?.prefillTokensPerSecond} tok/s | ${r2.performance?.decodeTokensPerSecond} tok/s | ${r2.numTokens} tokens | finish: ${r2.finishReason}`);
+    console.log(
+      `${r2.performance?.ttftMs}ms | ${r2.performance?.prefillTokensPerSecond} tok/s | ${r2.performance?.decodeTokensPerSecond} tok/s | ${r2.numTokens} tokens | finish: ${r2.finishReason}`,
+    );
   }
 } else {
   // --- Text-only multi-turn chat ---
-  const messages: ChatMessage[] = [
-    { role: 'user', content: promptArg || 'What can you do? Answer briefly.' },
-  ];
+  const messages: ChatMessage[] = [{ role: 'user', content: promptArg || 'What can you do? Answer briefly.' }];
 
   console.log(`Prompt: ${messages[0].content}\n`);
 
@@ -175,7 +177,9 @@ if (imagePath) {
       } else {
         console.log();
         console.log('-'.repeat(80));
-        console.log(`${event.performance?.ttftMs}ms | ${event.performance?.prefillTokensPerSecond} tok/s | ${event.performance?.decodeTokensPerSecond} tok/s | ${event.numTokens} tokens | finish: ${event.finishReason}`);
+        console.log(
+          `${event.performance?.ttftMs}ms | ${event.performance?.prefillTokensPerSecond} tok/s | ${event.performance?.decodeTokensPerSecond} tok/s | ${event.numTokens} tokens | finish: ${event.finishReason}`,
+        );
       }
     }
   } else {
@@ -185,6 +189,8 @@ if (imagePath) {
     console.log();
     console.log(result.text);
     console.log('-'.repeat(80));
-    console.log(`${result.performance?.ttftMs}ms | ${result.performance?.prefillTokensPerSecond} tok/s | ${result.performance?.decodeTokensPerSecond} tok/s | ${result.numTokens} tokens | finish: ${result.finishReason}`);
+    console.log(
+      `${result.performance?.ttftMs}ms | ${result.performance?.prefillTokensPerSecond} tok/s | ${result.performance?.decodeTokensPerSecond} tok/s | ${result.numTokens} tokens | finish: ${result.finishReason}`,
+    );
   }
 }

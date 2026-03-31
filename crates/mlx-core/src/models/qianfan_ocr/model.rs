@@ -329,18 +329,8 @@ impl QianfanOCRModel {
                 // Full reset for fresh generation
                 lm_guard.reset_kv_caches();
                 lm_guard.init_kv_caches();
-            } else {
-                // Reusing prefix — trim caches to prefix_len to discard stale
-                // suffix tokens from the previous generation
-                let cache_offset = lm_guard.get_cache_offset();
-                if cache_offset > prefix_len as i32
-                    && let Some(caches) = lm_guard.kv_caches_mut()
-                {
-                    for c in caches.iter_mut() {
-                        c.trim(prefix_len as i32);
-                    }
-                }
             }
+            // Trim happens below after we know seq_len — see clamped_prefix
 
             // --- Step 6: Prefill ---
             let eos_token_id = model_config.eos_token_id;
@@ -367,10 +357,26 @@ impl QianfanOCRModel {
                 lm_guard.get_embeddings(&input_ids)?
             };
 
-            // Run prefill from prefix_len onwards
+            // Clamp prefix to seq_len-1 so there's always at least 1 token to
+            // forward for logits. Handles the full-prefix-hit case where
+            // prefix_len == seq_len (identical prompt resent).
             let seq_len = merged_embeds.shape()?[1];
-            let prefill_embeds = if prefix_len > 0 && prefix_len < seq_len as usize {
-                merged_embeds.slice_axis(1, prefix_len as i64, seq_len)?
+            let clamped_prefix = prefix_len.min(seq_len.saturating_sub(1) as usize);
+
+            // Trim KV cache to clamped_prefix to discard stale suffix tokens
+            if clamped_prefix > 0 && reuse_cache {
+                let cache_offset = lm_guard.get_cache_offset();
+                if cache_offset > clamped_prefix as i32
+                    && let Some(caches) = lm_guard.kv_caches_mut()
+                {
+                    for c in caches.iter_mut() {
+                        c.trim(clamped_prefix as i32);
+                    }
+                }
+            }
+
+            let prefill_embeds = if clamped_prefix > 0 {
+                merged_embeds.slice_axis(1, clamped_prefix as i64, seq_len)?
             } else {
                 merged_embeds
             };
