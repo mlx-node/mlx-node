@@ -590,7 +590,7 @@ mod tests {
     fn test_single_image_auto_prepend() {
         let messages = vec![image_msg("user", "What is this?", 1)];
         let result = format_qianfan_chat(&messages, &[3], 256, false, None).unwrap();
-        let ctx: String = std::iter::repeat(IMG_CONTEXT).take(256 * 3).collect();
+        let ctx: String = IMG_CONTEXT.repeat(256 * 3);
         assert!(result.contains(&format!("<img>{ctx}</img>\nWhat is this?")));
     }
 
@@ -625,11 +625,11 @@ mod tests {
         assert_eq!(result.matches("<img>").count(), 2);
 
         // Image A (2 tiles = 512 tokens) is in turn 1
-        let ctx_a: String = std::iter::repeat(IMG_CONTEXT).take(256 * 2).collect();
+        let ctx_a: String = IMG_CONTEXT.repeat(256 * 2);
         assert!(result.contains(&format!("<img>{ctx_a}</img>\nWhat is image A?")));
 
         // Image B (3 tiles = 768 tokens) is in turn 3
-        let ctx_b: String = std::iter::repeat(IMG_CONTEXT).take(256 * 3).collect();
+        let ctx_b: String = IMG_CONTEXT.repeat(256 * 3);
         assert!(result.contains(&format!("<img>{ctx_b}</img>\nWhat about image B?")));
     }
 

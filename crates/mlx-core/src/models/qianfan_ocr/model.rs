@@ -742,8 +742,9 @@ impl QianfanOCRModel {
                         })?;
 
                         let prefix_len = if reuse_cache && image_bytes.is_empty() {
-                            let history = cached_token_history_arc.read()
-                                .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
+                            let history = cached_token_history_arc.read().map_err(|_| {
+                                Error::from_reason("Failed to read cached token history")
+                            })?;
                             compute_prefix_match(&token_ids, &history)
                         } else {
                             0
