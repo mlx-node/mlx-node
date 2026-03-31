@@ -14,7 +14,6 @@ use crate::sampling::{
 };
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::tools;
-use crate::tools::ToolCallResult;
 
 use super::layer_cache::Qwen3_5LayerCache;
 use super::model::{ChatConfig, ChatResult};
@@ -128,9 +127,6 @@ pub(crate) fn compute_performance_metrics(
 pub(crate) fn finalize_chat_result(
     tokenizer: &Qwen3Tokenizer,
     generated_tokens: &[u32],
-    tokens: &[u32],
-    _expanded_tokens: Option<&[u32]>,
-    _has_images: bool,
     finish_reason: String,
     think_end_id: Option<u32>,
     think_end_str: Option<&str>,

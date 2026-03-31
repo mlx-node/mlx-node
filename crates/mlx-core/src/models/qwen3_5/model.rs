@@ -23,8 +23,8 @@ use crate::tools;
 use crate::tools::ToolCallResult;
 
 use super::chat_common::{
-    self, ChatParams, apply_all_penalties, compute_performance_metrics, extract_chat_params,
-    finalize_chat_result, save_cache_state, verify_cache_prefix,
+    apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
+    save_cache_state, verify_cache_prefix,
 };
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
@@ -1060,42 +1060,16 @@ impl Qwen3_5Model {
             let cached_token_history_guard = cached_token_history_arc
                 .read()
                 .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
-            let cached_prefix_len = if reuse_cache {
-                let cached = &*cached_token_history_guard;
-                if has_images {
-                    // VLM: check image_cache_key matches AND expanded token prefix matches
-                    let cached_img_key = cached_image_key_arc
-                        .read()
-                        .map_err(|_| Error::from_reason("Failed to read cached image key"))?;
-                    if let Some(cached_key) = *cached_img_key {
-                        if cached_key == current_image_cache_key
-                            && !cached.is_empty()
-                            && expanded_tokens.len() >= cached.len()
-                            && expanded_tokens[..cached.len()] == cached[..]
-                            && caches_guard.is_some()
-                        {
-                            cached.len()
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    }
-                } else {
-                    // Text-only: existing logic unchanged
-                    if !cached.is_empty()
-                        && tokens.len() >= cached.len()
-                        && tokens[..cached.len()] == cached[..]
-                        && caches_guard.is_some()
-                    {
-                        cached.len()
-                    } else {
-                        0
-                    }
-                }
-            } else {
-                0
-            };
+            let cached_prefix_len = verify_cache_prefix(
+                reuse_cache,
+                has_images,
+                &tokens,
+                &expanded_tokens,
+                current_image_cache_key,
+                &cached_token_history_guard,
+                &cached_image_key_arc,
+                caches_guard.is_some(),
+            );
             drop(cached_token_history_guard);
 
             let prefill_tokens = if cached_prefix_len > 0 {
@@ -1573,9 +1547,6 @@ impl Qwen3_5Model {
             finalize_chat_result(
                 &tokenizer_for_decode,
                 &generated_tokens,
-                &tokens,
-                Some(&expanded_tokens),
-                has_images,
                 finish_reason,
                 think_end_id,
                 think_end_str.as_deref(),

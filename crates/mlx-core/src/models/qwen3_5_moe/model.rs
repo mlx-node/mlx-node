@@ -24,7 +24,7 @@ use crate::array::mask::create_causal_mask;
 use crate::models::qwen3::{BatchGenerationResult, GenerationConfig, GenerationResult};
 use crate::models::qwen3_5::chat_common::{
     apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
-    save_cache_state,
+    save_cache_state, verify_cache_prefix,
 };
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{
@@ -856,42 +856,16 @@ impl Qwen3_5MoeModel {
             let cached_token_history_guard = cached_token_history_arc
                 .read()
                 .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
-            let cached_prefix_len = if reuse_cache {
-                let cached = &*cached_token_history_guard;
-                if has_images {
-                    // VLM: also check that image_cache_key matches
-                    let cached_img_key = cached_image_key_arc
-                        .read()
-                        .map_err(|_| Error::from_reason("Failed to read cached image key"))?;
-                    if let Some(cached_key) = *cached_img_key {
-                        if cached_key == image_cache_key
-                            && !cached.is_empty()
-                            && tokens_for_matching.len() >= cached.len()
-                            && tokens_for_matching[..cached.len()] == cached[..]
-                            && caches_guard.is_some()
-                        {
-                            cached.len()
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    }
-                } else {
-                    // Text-only: existing logic
-                    if !cached.is_empty()
-                        && tokens.len() >= cached.len()
-                        && tokens[..cached.len()] == cached[..]
-                        && caches_guard.is_some()
-                    {
-                        cached.len()
-                    } else {
-                        0
-                    }
-                }
-            } else {
-                0
-            };
+            let cached_prefix_len = verify_cache_prefix(
+                reuse_cache,
+                has_images,
+                &tokens,
+                tokens_for_matching,
+                image_cache_key,
+                &cached_token_history_guard,
+                &cached_image_key_arc,
+                caches_guard.is_some(),
+            );
             drop(cached_token_history_guard);
 
             let prefill_tokens = if cached_prefix_len > 0 {
@@ -1379,9 +1353,6 @@ impl Qwen3_5MoeModel {
             finalize_chat_result(
                 &tokenizer_for_decode,
                 &generated_tokens,
-                &tokens,
-                expanded_tokens.as_deref(),
-                has_images,
                 finish_reason,
                 think_end_id,
                 think_end_str.as_deref(),
