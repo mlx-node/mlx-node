@@ -234,32 +234,32 @@ pub(crate) fn verify_cache_prefix(
     cached_token_history: &[u32],
     cached_image_key: &Arc<RwLock<Option<u64>>>,
     has_caches: bool,
-) -> usize {
+) -> Result<usize> {
     if !reuse_cache {
-        return 0;
+        return Ok(0);
     }
     let cached = cached_token_history;
     if has_images {
-        let cached_img_key = cached_image_key.read().ok().and_then(|guard| *guard);
-        if let Some(cached_key) = cached_img_key
+        let cached_img_key_guard = cached_image_key
+            .read()
+            .map_err(|_| Error::from_reason("Failed to read cached image key"))?;
+        if let Some(cached_key) = *cached_img_key_guard
             && cached_key == image_cache_key
             && !cached.is_empty()
             && tokens_for_matching.len() >= cached.len()
             && tokens_for_matching[..cached.len()] == cached[..]
             && has_caches
         {
-            return cached.len();
+            return Ok(cached.len());
         }
-        0
+        Ok(0)
+    } else if !cached.is_empty()
+        && tokens.len() >= cached.len()
+        && tokens[..cached.len()] == cached[..]
+        && has_caches
+    {
+        Ok(cached.len())
     } else {
-        if !cached.is_empty()
-            && tokens.len() >= cached.len()
-            && tokens[..cached.len()] == cached[..]
-            && has_caches
-        {
-            cached.len()
-        } else {
-            0
-        }
+        Ok(0)
     }
 }

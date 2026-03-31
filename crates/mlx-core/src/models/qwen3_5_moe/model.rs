@@ -865,7 +865,7 @@ impl Qwen3_5MoeModel {
                 &cached_token_history_guard,
                 &cached_image_key_arc,
                 caches_guard.is_some(),
-            );
+            )?;
             drop(cached_token_history_guard);
 
             let prefill_tokens = if cached_prefix_len > 0 {
