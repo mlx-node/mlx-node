@@ -58,7 +58,14 @@ impl InternVisionEmbeddings {
             None,
         )?;
 
-        let cls_token = get_tensor(weights, &format!("{prefix}.class_embedding"))?;
+        // Accept both key names: HuggingFace uses "class_embedding",
+        // some checkpoints/docs may use "cls_token"
+        let cls_key = format!("{prefix}.class_embedding");
+        let cls_token = weights
+            .get(&cls_key)
+            .or_else(|| weights.get(&format!("{prefix}.cls_token")))
+            .cloned()
+            .ok_or_else(|| Error::from_reason(format!("Missing weight: {cls_key} (or cls_token)")))?;
         let position_embedding = get_tensor(weights, &format!("{prefix}.position_embedding"))?;
 
         let default_grid_size = config.image_size as u32 / patch_size;

@@ -652,6 +652,7 @@ impl QianfanOCRModel {
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
         let enable_thinking = config.enable_thinking.unwrap_or(false);
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
         let generation_start = if report_perf {
@@ -735,17 +736,22 @@ impl QianfanOCRModel {
                             None
                         };
 
-                        // --- Prefill ---
+                        // --- Prefill (with cache reuse support) ---
                         let mut lm_guard = lm_arc.write().map_err(|_| {
                             Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
                         })?;
 
-                        lm_guard.reset_kv_caches();
-                        lm_guard.init_kv_caches();
+                        let prefix_len = if reuse_cache && image_bytes.is_empty() {
+                            let history = cached_token_history_arc.read()
+                                .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
+                            compute_prefix_match(&token_ids, &history)
+                        } else {
+                            0
+                        };
 
-                        // Clear cached history — streaming always does a fresh generation
-                        if let Ok(mut history) = cached_token_history_arc.write() {
-                            history.clear();
+                        if prefix_len == 0 || !reuse_cache {
+                            lm_guard.reset_kv_caches();
+                            lm_guard.init_kv_caches();
                         }
 
                         let eos_token_id = model_config.eos_token_id;
@@ -772,14 +778,33 @@ impl QianfanOCRModel {
                             lm_guard.get_embeddings(&input_ids)?
                         };
 
+                        let seq_len = merged_embeds.shape()?[1];
+                        let clamped_prefix = prefix_len.min(seq_len.saturating_sub(1) as usize);
+
+                        if clamped_prefix > 0 && reuse_cache {
+                            let cache_offset = lm_guard.get_cache_offset();
+                            if cache_offset > clamped_prefix as i32
+                                && let Some(caches) = lm_guard.kv_caches_mut()
+                            {
+                                for c in caches.iter_mut() {
+                                    c.trim(clamped_prefix as i32);
+                                }
+                            }
+                        }
+
+                        let prefill_embeds = if clamped_prefix > 0 {
+                            merged_embeds.slice_axis(1, clamped_prefix as i64, seq_len)?
+                        } else {
+                            merged_embeds
+                        };
+
                         let mut cache = lm_guard.kv_caches_mut().take();
                         let prefill_logits = {
                             let _ctx = StreamContext::new(generation_stream);
-                            lm_guard.forward_from_embeddings(&merged_embeds, &mut cache)?
+                            lm_guard.forward_from_embeddings(&prefill_embeds, &mut cache)?
                         };
                         *lm_guard.kv_caches_mut() = cache;
 
-                        // Eval prefill logits -- caches materialize through dependency graph
                         prefill_logits.eval();
                         synchronize_and_clear_cache();
 
@@ -795,6 +820,7 @@ impl QianfanOCRModel {
                             min_p: Some(min_p),
                         };
 
+                        let prompt_token_ids = token_ids.clone();
                         let mut all_tokens: Vec<u32> = token_ids;
 
                         if repetition_penalty != 1.0 {
@@ -915,6 +941,22 @@ impl QianfanOCRModel {
                             if (step + 1) % 256 == 0 {
                                 synchronize_and_clear_cache();
                             }
+                        }
+
+                        // Sync token history with cache state
+                        if reuse_cache {
+                            let forwarded = if finish_reason == "length" {
+                                generated_tokens.len()
+                            } else {
+                                generated_tokens.len().saturating_sub(1)
+                            };
+                            let mut full_history = prompt_token_ids;
+                            full_history.extend_from_slice(&generated_tokens[..forwarded]);
+                            if let Ok(mut history) = cached_token_history_arc.write() {
+                                *history = full_history;
+                            }
+                        } else if let Ok(mut history) = cached_token_history_arc.write() {
+                            history.clear();
                         }
 
                         // Final chunk

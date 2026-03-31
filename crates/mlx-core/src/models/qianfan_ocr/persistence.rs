@@ -137,10 +137,10 @@ mod tests {
     }
 
     #[test]
-    fn test_transform_key_vision_cls_token() {
+    fn test_transform_key_vision_class_embedding() {
         assert_eq!(
-            transform_key("vision_model.embeddings.cls_token"),
-            "vision.embeddings.cls_token"
+            transform_key("vision_model.embeddings.class_embedding"),
+            "vision.embeddings.class_embedding"
         );
     }
 
@@ -436,7 +436,7 @@ mod tests {
             small.clone(),
         );
         weights.insert(
-            "vision_model.embeddings.cls_token".to_string(),
+            "vision_model.embeddings.class_embedding".to_string(),
             small.clone(),
         );
         weights.insert("language_model.lm_head.weight".to_string(), small.clone());
@@ -446,7 +446,7 @@ mod tests {
         assert!(result.contains_key("lm.embedding.weight"));
         assert!(result.contains_key("bridge.ln.weight"));
         assert!(result.contains_key("vision.layers.0.attn.qkv.weight"));
-        assert!(result.contains_key("vision.embeddings.cls_token"));
+        assert!(result.contains_key("vision.embeddings.class_embedding"));
         assert!(result.contains_key("lm.lm_head.weight"));
         assert_eq!(result.len(), 5);
     }
