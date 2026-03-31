@@ -271,7 +271,7 @@ impl QianfanOCRModel {
             )?;
 
             // --- Step 3: Tokenize ---
-            let token_ids = tokenizer.encode_sync(&prompt, None)?;
+            let token_ids = tokenizer.encode_sync(&prompt, Some(false))?;
             let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
             // --- Step 4: Vision encoding ---
@@ -704,7 +704,7 @@ impl QianfanOCRModel {
                             enable_thinking,
                             config.tools.as_deref(),
                         )?;
-                        let token_ids = tokenizer.encode_sync(&prompt, None)?;
+                        let token_ids = tokenizer.encode_sync(&prompt, Some(false))?;
                         let input_ids =
                             MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
