@@ -65,13 +65,7 @@ impl HarrierModel {
     /// * Hidden states, shape: [batch_size, seq_len, hidden_size]
     #[napi]
     pub fn forward(&self, input_ids: &MxArray) -> Result<MxArray> {
-        let mut hidden_states = self.embedding.forward(input_ids)?;
-
-        for layer in &self.layers {
-            hidden_states = layer.forward(&hidden_states, None, None)?;
-        }
-
-        self.final_norm.forward(&hidden_states)
+        forward_inner(&self.embedding, &self.layers, &self.final_norm, input_ids)
     }
 
     /// Encode a single text into a normalized embedding vector.
@@ -87,18 +81,9 @@ impl HarrierModel {
     /// * Embedding vector, shape: [hidden_size]
     #[napi]
     pub async fn encode(&self, text: String, instruction: Option<String>) -> Result<MxArray> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| {
-                Error::from_reason(
-                    "Tokenizer not loaded. Use HarrierModel.load() to load a model with tokenizer.",
-                )
-            })?
-            .clone();
+        let tokenizer = self.require_tokenizer()?.clone();
         let config_hidden = self.config.hidden_size;
 
-        // Collect model references for spawn_blocking
         let embedding = self.embedding.clone();
         let layers: Vec<_> = self.layers.iter().cloned().collect();
         let final_norm = self.final_norm.clone();
@@ -113,22 +98,14 @@ impl HarrierModel {
             let seq_len = token_ids.len();
             let input = MxArray::from_uint32(&token_ids, &[1, seq_len as i64])?;
 
-            // Forward pass
-            let mut hidden_states = embedding.forward(&input)?;
-            for layer in &layers {
-                hidden_states = layer.forward(&hidden_states, None, None)?;
-            }
-            hidden_states = final_norm.forward(&hidden_states)?;
+            let hidden_states = forward_inner(&embedding, &layers, &final_norm, &input)?;
 
-            // Last-token pooling: take the last token's hidden state
-            let pooled = hidden_states.slice(
-                &[0, seq_len as i64 - 1, 0],
-                &[1, seq_len as i64, config_hidden as i64],
-            )?;
+            let pooled = last_token_pool(&hidden_states, seq_len, config_hidden)?;
             let pooled = pooled.reshape(&[config_hidden as i64])?;
 
-            // L2 normalization
-            l2_normalize(&pooled)
+            let result = l2_normalize(&pooled)?;
+            result.eval();
+            Ok(result)
         })
         .await
         .map_err(|e| Error::from_reason(format!("encode failed: {}", e)))?
@@ -151,15 +128,7 @@ impl HarrierModel {
         texts: Vec<String>,
         instruction: Option<String>,
     ) -> Result<MxArray> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| {
-                Error::from_reason(
-                    "Tokenizer not loaded. Use HarrierModel.load() to load a model with tokenizer.",
-                )
-            })?
-            .clone();
+        let tokenizer = self.require_tokenizer()?.clone();
         let config_hidden = self.config.hidden_size;
 
         let embedding = self.embedding.clone();
@@ -179,34 +148,20 @@ impl HarrierModel {
                 let seq_len = token_ids.len();
                 let input = MxArray::from_uint32(&token_ids, &[1, seq_len as i64])?;
 
-                // Forward pass
-                let mut hidden_states = embedding.forward(&input)?;
-                for layer in &layers {
-                    hidden_states = layer.forward(&hidden_states, None, None)?;
-                }
-                hidden_states = final_norm.forward(&hidden_states)?;
+                let hidden_states = forward_inner(&embedding, &layers, &final_norm, &input)?;
 
-                // Last-token pooling
-                let pooled = hidden_states.slice(
-                    &[0, seq_len as i64 - 1, 0],
-                    &[1, seq_len as i64, config_hidden as i64],
-                )?;
+                let pooled = last_token_pool(&hidden_states, seq_len, config_hidden)?;
                 let pooled = pooled.reshape(&[1, config_hidden as i64])?;
 
-                // L2 normalize
-                let normalized = l2_normalize(&pooled)?;
-                all_embeddings.push(normalized);
+                all_embeddings.push(l2_normalize(&pooled)?);
             }
 
-            // Stack: concatenate along dim 0
             if all_embeddings.is_empty() {
                 return Err(Error::from_reason("Cannot encode empty batch"));
             }
 
-            let mut result = all_embeddings.remove(0);
-            for emb in all_embeddings {
-                result = MxArray::concatenate(&result, &emb, 0)?;
-            }
+            let refs: Vec<&MxArray> = all_embeddings.iter().collect();
+            let result = MxArray::concatenate_many(refs, Some(0))?;
             result.eval();
             Ok(result)
         })
@@ -234,13 +189,12 @@ impl HarrierModel {
         let embedding_params = vocab * hidden;
         let final_norm_params = hidden;
 
-        // Per layer: q_proj + k_proj + v_proj + o_proj + gate + up + down + 2 norms
-        let attn_params = (heads * head_dim * hidden) // q_proj
-            + (kv_heads * head_dim * hidden)           // k_proj
-            + (kv_heads * head_dim * hidden)           // v_proj
-            + (hidden * heads * head_dim); // o_proj
-        let mlp_params = inter * hidden * 3; // gate + up + down
-        let norm_params = hidden * 2; // input_layernorm + post_attention_layernorm
+        let attn_params = (heads * head_dim * hidden)
+            + (kv_heads * head_dim * hidden)
+            + (kv_heads * head_dim * hidden)
+            + (hidden * heads * head_dim);
+        let mlp_params = inter * hidden * 3;
+        let norm_params = hidden * 2;
         let qk_norm_params = if self.config.use_qk_norm {
             head_dim * 2
         } else {
@@ -256,14 +210,12 @@ impl HarrierModel {
         &mut self,
         params: &std::collections::HashMap<String, MxArray>,
     ) -> Result<()> {
-        // Embedding
         if let Some(w) = params.get("embedding.weight") {
             self.embedding.set_weight(w)?;
         } else {
             return Err(Error::from_reason("embedding.weight not found"));
         }
 
-        // Transformer layers
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let prefix = format!("layers.{}", i);
 
@@ -323,7 +275,6 @@ impl HarrierModel {
             )?;
         }
 
-        // Final norm
         if let Some(w) = params.get("final_norm.weight") {
             self.final_norm.set_weight(w)?;
         } else {
@@ -336,6 +287,36 @@ impl HarrierModel {
         );
         Ok(())
     }
+
+    fn require_tokenizer(&self) -> Result<&Arc<Qwen3Tokenizer>> {
+        self.tokenizer.as_ref().ok_or_else(|| {
+            Error::from_reason(
+                "Tokenizer not loaded. Use HarrierModel.load() to load a model with tokenizer.",
+            )
+        })
+    }
+}
+
+/// Shared forward pass: embedding -> transformer layers -> final norm.
+fn forward_inner(
+    embedding: &Embedding,
+    layers: &[TransformerBlock],
+    final_norm: &RMSNorm,
+    input_ids: &MxArray,
+) -> Result<MxArray> {
+    let mut hidden_states = embedding.forward(input_ids)?;
+    for layer in layers {
+        hidden_states = layer.forward(&hidden_states, None, None)?;
+    }
+    final_norm.forward(&hidden_states)
+}
+
+/// Extract the last token's hidden state from the full sequence output.
+fn last_token_pool(hidden_states: &MxArray, seq_len: usize, hidden_size: i32) -> Result<MxArray> {
+    hidden_states.slice(
+        &[0, seq_len as i64 - 1, 0],
+        &[1, seq_len as i64, hidden_size as i64],
+    )
 }
 
 /// L2-normalize an array along the last axis.
@@ -345,7 +326,6 @@ fn l2_normalize(x: &MxArray) -> Result<MxArray> {
     x.div(&norm)
 }
 
-/// Helper to set a required parameter or return an error.
 fn set_required(
     params: &std::collections::HashMap<String, MxArray>,
     name: &str,
