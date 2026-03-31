@@ -49,7 +49,7 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
         "{wasm_target} {sysroot_flag} -pthread -fPIC -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL"
     );
     let c_flags = common_flags.clone();
-    let cxx_flags = format!("{common_flags} -fexceptions");
+    let cxx_flags = format!("{common_flags} -fwasm-exceptions");
 
     let status = Command::new("cmake")
         .current_dir(&build_dir)
@@ -65,7 +65,7 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
         .arg("-DCMAKE_CROSSCOMPILING=ON")
         .arg(format!("-DCMAKE_C_FLAGS={c_flags}"))
         .arg(format!("-DCMAKE_CXX_FLAGS={cxx_flags}"))
-        .arg(format!("-DCMAKE_EXE_LINKER_FLAGS={wasm_target} {sysroot_flag} -pthread"))
+        .arg(format!("-DCMAKE_EXE_LINKER_FLAGS={wasm_target} {sysroot_flag} -pthread -Wl,--allow-undefined"))
         .arg("-DCMAKE_C_COMPILER_WORKS=ON")
         .arg("-DCMAKE_CXX_COMPILER_WORKS=ON")
         .arg("-DMLX_BUILD_TESTS=OFF")
@@ -138,6 +138,7 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
         .include(mlx_dir)
         .flag("-pthread")
         .flag("-fexceptions")
+        .flag("-fwasm-exceptions")
         .flag("-D_WASI_EMULATED_MMAN")
         .flag("-D_WASI_EMULATED_SIGNAL");
 

@@ -60,14 +60,11 @@ export async function initMLX(options: MLXBrowserOptions) {
 
   const wasmFile = await fetch(options.wasmUrl).then((res) => res.arrayBuffer());
 
-  // C++ exception stubs (libc++abi leaves 3 symbols as imports)
+  // WASM exception tag for C++ exceptions (used by -fwasm-exceptions)
+  const cppExceptionTag = new WebAssembly.Tag({ parameters: ['i32'] });
+
   const cxxStubs = {
-    __cxa_allocate_exception: (size: number) =>
-      (wasmExports?.malloc as Function)?.(size) ?? 0,
-    __cxa_throw: () => {
-      throw new Error('C++ exception thrown in WASM');
-    },
-    __cxa_init_primary_exception: (ptr: number) => ptr,
+    __cpp_exception: cppExceptionTag,
     // mlx::core::gpu::init() — GPU is pre-initialized via bridge
     _ZN3mlx4core3gpu4initEv: () => {},
   };

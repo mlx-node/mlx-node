@@ -74,9 +74,7 @@ const handler = new MessageHandler({
           ...importObject.napi,
           ...importObject.emnapi,
           memory: wasmMemory,
-          __cxa_allocate_exception: () => 0,
-          __cxa_throw: () => { throw new Error('C++ exception in worker'); },
-          __cxa_init_primary_exception: (ptr) => ptr,
+          __cpp_exception: new WebAssembly.Tag({ parameters: ['i32'] }),
           _ZN3mlx4core3gpu4initEv: () => {},
           ...(bridge ? bridge.imports : WEBGPU_NOOP),
         };

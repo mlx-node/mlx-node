@@ -24,7 +24,10 @@ echo ""
 # Step 1: Build with NAPI-RS targeting wasm32-wasip1-threads
 echo "--- Step 1: Building WASM via NAPI-RS ---"
 cd "$ROOT_DIR"
+# -fwasm-exceptions enables native WASM EH (try/catch/throw instructions).
+# Set globally so ALL cc-rs crates (esaxx-rs, etc.) compile with EH support.
 WASI_SDK_PATH="$WASI_SDK_PATH" \
+CXXFLAGS="-fexceptions -fwasm-exceptions" \
   npx @napi-rs/cli build \
     --manifest-path crates/mlx-core/Cargo.toml \
     --target wasm32-wasip1-threads \
@@ -44,9 +47,14 @@ if [ -f "$WASM_FILE" ]; then
   wasm-opt \
     --asyncify \
     --pass-arg=asyncify-imports@env.mlx_webgpu_poll \
+    --enable-exception-handling \
     --enable-threads \
     --enable-bulk-memory \
     --enable-mutable-globals \
+    --enable-reference-types \
+    --enable-multivalue \
+    --enable-sign-ext \
+    --enable-nontrapping-float-to-int \
     "$WASM_FILE" \
     -o "$WASM_FILE"
   echo "Asyncify applied to $WASM_FILE"

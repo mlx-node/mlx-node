@@ -93,6 +93,9 @@ export function createWebGPUBridge(
   let wasmMalloc: (size: number) => number;
   let wasmFree: (ptr: number) => void;
 
+  // Track pending async GPU callbacks so poll can skip yields when idle
+  let pendingCallbacks = 0;
+
   // Track mapped buffer ranges for the WASM memory shadow pattern
   interface MappedRange {
     wasmPtr: number;
@@ -265,9 +268,46 @@ export function createWebGPUBridge(
     },
 
     wgpuDeviceGetLimits(_device: number, limitsPtr: number): number {
-      // WGPUSupportedLimits: nextInChain (ptr4) + WGPULimits struct
-      // For now write zeros — MLX reads limits during init but handles defaults
-      new Uint8Array(wasmMemory.buffer).fill(0, limitsPtr, limitsPtr + 256);
+      // WGPUSupportedLimits (WASM32): nextInChain (ptr4) + WGPULimits
+      // WGPULimits starts at offset 4 (after nextInChain pointer)
+      const view = new DataView(wasmMemory.buffer);
+      const L = device.limits;
+      const base = limitsPtr + 4; // skip nextInChain
+      let off = 0;
+      const w32 = (v: number) => { view.setUint32(base + off, v, true); off += 4; };
+      const w64 = (v: number) => { view.setUint32(base + off, v, true); view.setUint32(base + off + 4, 0, true); off += 8; };
+      w32(L.maxTextureDimension1D);             // +0
+      w32(L.maxTextureDimension2D);             // +4
+      w32(L.maxTextureDimension3D);             // +8
+      w32(L.maxTextureArrayLayers);             // +12
+      w32(L.maxBindGroups);                     // +16
+      w32(L.maxBindGroupsPlusVertexBuffers ?? 0); // +20
+      w32(L.maxBindingsPerBindGroup);           // +24
+      w32(L.maxDynamicUniformBuffersPerPipelineLayout); // +28
+      w32(L.maxDynamicStorageBuffersPerPipelineLayout); // +32
+      w32(L.maxSampledTexturesPerShaderStage);  // +36
+      w32(L.maxSamplersPerShaderStage);         // +40
+      w32(L.maxStorageBuffersPerShaderStage);   // +44
+      w32(L.maxStorageTexturesPerShaderStage);  // +48
+      w32(L.maxUniformBuffersPerShaderStage);   // +52
+      w64(L.maxUniformBufferBindingSize);       // +56
+      w64(L.maxStorageBufferBindingSize);       // +64
+      w32(L.minUniformBufferOffsetAlignment);   // +72
+      w32(L.minStorageBufferOffsetAlignment);   // +76
+      w32(L.maxVertexBuffers);                  // +80
+      w64(L.maxBufferSize);                     // +84
+      w32(L.maxVertexAttributes);               // +92
+      w32(L.maxVertexBufferArrayStride);        // +96
+      w32(L.maxInterStageShaderComponents);     // +100
+      w32(L.maxInterStageShaderVariables);      // +104
+      w32(L.maxColorAttachments);               // +108
+      w32(L.maxColorAttachmentBytesPerSample ?? 0); // +112
+      w32(L.maxComputeWorkgroupStorageSize);    // +116
+      w32(L.maxComputeInvocationsPerWorkgroup); // +120
+      w32(L.maxComputeWorkgroupSizeX);          // +124
+      w32(L.maxComputeWorkgroupSizeY);          // +128
+      w32(L.maxComputeWorkgroupSizeZ);          // +132
+      w32(L.maxComputeWorkgroupsPerDimension);  // +136
       return 1;
     },
 
@@ -299,7 +339,9 @@ export function createWebGPUBridge(
     wgpuQueueOnSubmittedWorkDone(
       _queue: number, callbackPtr: number, userdataPtr: number,
     ): void {
+      pendingCallbacks++;
       queue.onSubmittedWorkDone().then(() => {
+        pendingCallbacks--;
         callCallback(callbackPtr, 0, userdataPtr);
       });
     },
@@ -441,9 +483,11 @@ export function createWebGPUBridge(
     ): void {
       const buffer = getHandle<GPUBuffer>(bufferHandle);
       const gpuMode = mode === 1 ? GPUMapMode.READ : GPUMapMode.WRITE;
+      pendingCallbacks++;
       buffer.mapAsync(gpuMode, offset, size).then(
-        () => { callCallback(callbackPtr, 0, userdataPtr); },
+        () => { pendingCallbacks--; callCallback(callbackPtr, 0, userdataPtr); },
         (err: unknown) => {
+          pendingCallbacks--;
           console.error('[WebGPU Bridge] mapAsync failed:', err);
           callCallback(callbackPtr, 1, userdataPtr);
         },
@@ -470,13 +514,14 @@ export function createWebGPUBridge(
     wgpuShaderModuleRelease(handle: number): void { releaseHandle(handle); },
 
     // ===== Polling =====
-    // On worker threads (spawn_blocking), this is a no-op — the tight poll loop
-    // works because WebGPU callbacks fire on the worker's microtask queue between
-    // wasi_thread_spawn yields.
     mlx_webgpu_poll() {
       // Asyncify yield: suspends WASM, yields to the event loop so WebGPU
       // callbacks (onSubmittedWorkDone, mapAsync) can fire, then resumes.
-      return new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (pendingCallbacks > 0) {
+        return new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      // No pending async work — resolve immediately via microtask (no 4ms delay)
+      return Promise.resolve();
     },
   };
 

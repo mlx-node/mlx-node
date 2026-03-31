@@ -51,10 +51,8 @@ if (!target) {
 // Extra WASM imports needed by MLX that emnapi/WASI don't provide.
 // Injected into both the browser entry and worker entry files.
 const MLX_EXTRA_IMPORTS = `
-      // C++ exception stubs (libc++abi leaves these as imports)
-      __cxa_allocate_exception: () => 0,
-      __cxa_throw: () => { throw new Error('C++ exception thrown in WASM'); },
-      __cxa_init_primary_exception: (ptr) => ptr,
+      // WASM exception tag for C++ exceptions (used by -fwasm-exceptions)
+      __cpp_exception: new WebAssembly.Tag({ parameters: ['i32'] }),
       // MLX GPU init — no-op (GPU initialized lazily via WebGPU bridge)
       _ZN3mlx4core3gpu4initEv: () => {},
       // WebGPU stubs (real bridge injected by consumer via overwriteImports)
@@ -88,7 +86,7 @@ async function patchWasmEntries() {
     try {
       let code = await readFile(filePath, 'utf-8');
       // Inject extra imports after the "memory: ..." line in overwriteImports
-      if (!code.includes('__cxa_allocate_exception')) {
+      if (!code.includes('__cpp_exception')) {
         code = code.replace(
           /memory:\s*(?:__sharedMemory|wasmMemory),?\n/,
           (match) => match + MLX_EXTRA_IMPORTS + '\n',

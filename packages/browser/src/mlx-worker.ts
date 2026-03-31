@@ -59,14 +59,12 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
 
     const wasmFile = await fetch(data.wasmUrl).then((r) => r.arrayBuffer());
 
+    // WASM exception tag for C++ exceptions (used by -fwasm-exceptions)
+    const cppExceptionTag = new WebAssembly.Tag({ parameters: ['i32'] });
+
     const cxxStubs = {
-      __cxa_allocate_exception: (size: number) =>
-        (wasmInstance?.exports.malloc as Function)?.(size) ?? 0,
-      __cxa_throw: (ptr: number, typeInfo: number) => {
-        console.error('[MLX Worker] C++ exception thrown, ptr=', ptr, 'typeInfo=', typeInfo);
-        throw new Error('C++ exception in WASM (ptr=' + ptr + ')');
-      },
-      __cxa_init_primary_exception: (ptr: number) => ptr,
+      __cpp_exception: cppExceptionTag,
+      // MLX GPU init — no-op (GPU pre-initialized via bridge)
       _ZN3mlx4core3gpu4initEv: () => {},
     };
 
@@ -76,8 +74,11 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
       context,
       asyncWorkPoolSize: 4,
       onCreateWorker() {
+        // Child workers need the real WebGPU bridge (not stubs) because
+        // NAPI-RS async functions dispatch through emnapi's worker pool,
+        // and MLX GPU ops execute on those workers.
         return new Worker(
-          new URL('../../core/wasi-worker-browser.mjs', import.meta.url),
+          new URL('./webgpu-worker.mjs', import.meta.url),
           { type: 'module' },
         );
       },
@@ -192,7 +193,10 @@ async function handleChat(data: { messages: any[]; config?: any }) {
     const Qwen35Model = mlxExports.Qwen35Model || mlxExports.Qwen3_5Model;
     post({ type: 'progress', step: 'chat', message: 'Tokenizer test OK, calling model.chat...' });
 
-    const result = await model.chat(data.messages, data.config ?? {
+    // Use chatSync (synchronous) to avoid emnapi async worker thread dispatch
+    // which deadlocks because asyncify can't yield on child worker threads.
+    const chatFn = model.chatSync || model.chat;
+    const result = chatFn.call(model, data.messages, data.config ?? {
       maxNewTokens: 512,
       temperature: 0.7,
       reportPerformance: true,
@@ -213,9 +217,25 @@ async function handleChat(data: { messages: any[]; config?: any }) {
       } : null,
     });
   } catch (e) {
-    post({ type: 'error', message: String(e), stack: (e instanceof Error) ? e.stack : undefined });
+    let message = String(e);
+    let stack: string | undefined;
+    if (e instanceof Error) {
+      message = e.message;
+      stack = e.stack;
+    } else if (e instanceof WebAssembly.Exception) {
+      message = `WebAssembly.Exception (C++ exception escaped to JS — likely an unimplemented op or runtime error in MLX)`;
+    }
+    post({ type: 'error', message, stack });
   }
 }
+
+// Catch unhandled errors/rejections on this worker
+self.addEventListener('error', (e) => {
+  post({ type: 'error', message: `Worker error: ${e.message}`, stack: (e as ErrorEvent).filename });
+});
+self.addEventListener('unhandledrejection', (e: PromiseRejectionEvent) => {
+  post({ type: 'error', message: `Unhandled rejection: ${String(e.reason)}` });
+});
 
 self.onmessage = (e: MessageEvent) => {
   switch (e.data.type) {

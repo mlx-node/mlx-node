@@ -19,10 +19,8 @@ const handler = new MessageHandler({
           ...importObject.napi,
           ...importObject.emnapi,
           memory: wasmMemory,
-          // C++ exception stubs (same as main thread)
-          __cxa_allocate_exception: (size) => importObject.env.malloc?.(size) ?? 0,
-          __cxa_throw: () => { throw new Error('C++ exception in worker'); },
-          __cxa_init_primary_exception: (ptr) => ptr,
+          // WASM exception tag for C++ exceptions (used by -fwasm-exceptions)
+          __cpp_exception: new WebAssembly.Tag({ parameters: ['i32'] }),
           // MLX GPU init — no-op (GPU pre-initialized on main thread)
           _ZN3mlx4core3gpu4initEv: () => {},
           // WebGPU stubs for worker threads (GPU ops dispatch from main thread)

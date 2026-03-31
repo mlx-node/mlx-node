@@ -90,7 +90,13 @@ worker.onmessage = (e) => {
 worker.onerror = (e) => {
   log(`Worker error: ${e.message || e}`);
   if (e instanceof ErrorEvent) {
-    log(`  filename: ${e.filename}:${e.lineno}:${e.colno}`);
+    log(`  file: ${e.filename}`);
+    log(`  line: ${e.lineno}, col: ${e.colno}`);
+    if (e.error) {
+      log(`  error type: ${e.error?.constructor?.name}`);
+      log(`  error: ${String(e.error)}`);
+      if (e.error.stack) log(`  stack: ${e.error.stack}`);
+    }
   }
   setStatus('Worker error', 'error');
 };
