@@ -14,13 +14,7 @@ import { Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
 export type ModelType = 'qwen3' | 'qwen3_5' | 'qwen3_5_moe' | 'internvl_chat' | 'qianfan-ocr';
 
-const SUPPORTED_MODEL_TYPES = new Set<ModelType>([
-  'qwen3',
-  'qwen3_5',
-  'qwen3_5_moe',
-  'internvl_chat',
-  'qianfan-ocr',
-]);
+const SUPPORTED_MODEL_TYPES = new Set<ModelType>(['qwen3', 'qwen3_5', 'qwen3_5_moe', 'internvl_chat', 'qianfan-ocr']);
 
 /**
  * Load a model from disk, auto-detecting architecture from config.json.
