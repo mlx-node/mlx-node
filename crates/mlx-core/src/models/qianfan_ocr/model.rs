@@ -522,11 +522,12 @@ impl QianfanOCRModel {
             // Only include tokens that were actually forwarded so prefix matching
             // stays aligned with the live cache.
             if reuse_cache {
-                let forwarded = if finish_reason == "length" {
-                    generated_tokens.len()
-                } else {
-                    generated_tokens.len().saturating_sub(1)
-                };
+                let forwarded =
+                    if finish_reason == "stop" || finish_reason == "repetition" {
+                        generated_tokens.len().saturating_sub(1)
+                    } else {
+                        generated_tokens.len()
+                    };
                 let mut full_history = token_ids.clone();
                 full_history.extend_from_slice(&generated_tokens[..forwarded]);
                 if let Ok(mut history) = cached_token_history_arc.write() {
@@ -860,6 +861,10 @@ impl QianfanOCRModel {
                             Vec::with_capacity(max_new_tokens as usize);
                         let mut finish_reason = "length".to_string();
 
+                        // Stateful decoder for correct multi-byte/CJK streaming
+                        let mut decode_stream = tokenizer.inner().decode_stream(true);
+                        let mut streamed_text_len: usize = 0;
+
                         // --- Streaming decode loop ---
                         for step in 0..max_new_tokens {
                             if cancelled_clone.load(Ordering::Relaxed) {
@@ -886,8 +891,15 @@ impl QianfanOCRModel {
                                 break;
                             }
 
-                            // Decode this single token for streaming
-                            let token_text = tokenizer.decode_sync(&[token_value], true)?;
+                            // Decode with stateful stream (handles multi-byte boundaries)
+                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                                &mut decode_stream,
+                                tokenizer.inner(),
+                                token_value,
+                                &generated_tokens,
+                                streamed_text_len,
+                            );
+                            streamed_text_len += token_text.len();
 
                             emit(ChatStreamChunk {
                                 text: token_text,
@@ -944,13 +956,18 @@ impl QianfanOCRModel {
                             }
                         }
 
-                        // Sync token history with cache state
+                        // Sync token history with cache state.
+                        // "length" and "cancelled" break before/at the loop boundary
+                        // so all tokens in generated_tokens were forwarded.
+                        // "stop" and "repetition" push then break before forward,
+                        // so the last token was NOT forwarded.
                         if reuse_cache {
-                            let forwarded = if finish_reason == "length" {
-                                generated_tokens.len()
-                            } else {
-                                generated_tokens.len().saturating_sub(1)
-                            };
+                            let forwarded =
+                                if finish_reason == "stop" || finish_reason == "repetition" {
+                                    generated_tokens.len().saturating_sub(1)
+                                } else {
+                                    generated_tokens.len()
+                                };
                             let mut full_history = prompt_token_ids;
                             full_history.extend_from_slice(&generated_tokens[..forwarded]);
                             if let Ok(mut history) = cached_token_history_arc.write() {
