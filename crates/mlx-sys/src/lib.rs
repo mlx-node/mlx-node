@@ -1775,6 +1775,29 @@ unsafe extern "C-unwind" {
         ),
         ctx: *mut std::os::raw::c_void,
     ) -> i32;
+
+    /// Create an MLX array wrapping an existing WGPUBuffer (zero-copy).
+    /// The array takes ownership and will destroy/release the buffer when freed.
+    pub fn mlx_array_from_gpu_buffer(
+        wgpu_buffer_handle: *mut std::os::raw::c_void,
+        byte_size: usize,
+        shape: *const i64,
+        ndim: usize,
+        dtype_code: i32,
+    ) -> *mut mlx_array;
+
+    /// Load safetensors from a memory buffer (no filesystem needed).
+    pub fn mlx_load_safetensors_from_buffer(
+        data: *const u8,
+        data_len: usize,
+        callback: unsafe extern "C-unwind" fn(
+            name: *const std::os::raw::c_char,
+            name_len: usize,
+            handle: *mut mlx_array,
+            ctx: *mut std::os::raw::c_void,
+        ),
+        ctx: *mut std::os::raw::c_void,
+    ) -> i32;
 }
 
 // Gradient computation types

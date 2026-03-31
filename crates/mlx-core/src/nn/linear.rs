@@ -27,6 +27,20 @@ pub struct Linear {
 }
 
 impl Linear {
+    /// Create without allocating weight data (for loadFromMemory where weights
+    /// are replaced immediately by apply_weights).
+    /// Create without random weight init (lazy zeros — no GPU allocation).
+    /// Used by loadFromMemory where apply_weights replaces all weights immediately.
+    pub fn new_empty(in_features: u32, out_features: u32, use_bias: Option<bool>) -> Result<Self> {
+        let weight = MxArray::zeros(&[out_features as i64, in_features as i64], None)?;
+        let bias = if use_bias.unwrap_or(true) {
+            Some(MxArray::zeros(&[out_features as i64], None)?)
+        } else {
+            None
+        };
+        Ok(Self { weight, bias, in_features, out_features, quantized: None })
+    }
+
     /// Create a new Linear layer
     pub fn new(in_features: u32, out_features: u32, use_bias: Option<bool>) -> Result<Self> {
         // Initialize weight with Xavier/Glorot uniform initialization
@@ -34,6 +48,11 @@ impl Linear {
 
         // Create weight matrix [out_features, in_features]
         let weight_shape = [out_features as i64, in_features as i64];
+        // On WASM, use lazy zeros instead of random init to avoid GPU allocation.
+        // Weights are always replaced by apply_weights before first use.
+        #[cfg(target_family = "wasm")]
+        let weight = MxArray::zeros(&weight_shape, None)?;
+        #[cfg(not(target_family = "wasm"))]
         let weight = MxArray::random_uniform(&weight_shape, -scale, scale, None)?;
         let weight_t = weight.transpose(Some(&[1, 0]))?;
 

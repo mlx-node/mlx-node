@@ -1108,6 +1108,84 @@ pub fn load_safetensors_lazy<P: AsRef<std::path::Path>>(
     Ok(ctx.tensors)
 }
 
+/// Load safetensors from a memory buffer (works in both Node.js and browser).
+pub fn load_safetensors_from_buffer(
+    data: &[u8],
+) -> Result<HashMap<String, crate::array::MxArray>> {
+    use mlx_sys as sys;
+
+    struct LoadCtx {
+        tensors: HashMap<String, crate::array::MxArray>,
+    }
+
+    unsafe extern "C-unwind" fn on_tensor(
+        name: *const std::os::raw::c_char,
+        name_len: usize,
+        handle: *mut sys::mlx_array,
+        ctx: *mut std::os::raw::c_void,
+    ) {
+        unsafe {
+            let ctx = &mut *(ctx as *mut LoadCtx);
+            let name_bytes = std::slice::from_raw_parts(name as *const u8, name_len);
+            let name = String::from_utf8_lossy(name_bytes).to_string();
+            if let Ok(arr) = crate::array::MxArray::from_handle(handle, "buffer_load") {
+                ctx.tensors.insert(name, arr);
+            }
+        }
+    }
+
+    let mut ctx = LoadCtx {
+        tensors: HashMap::new(),
+    };
+
+    let count = unsafe {
+        sys::mlx_load_safetensors_from_buffer(
+            data.as_ptr(),
+            data.len(),
+            on_tensor,
+            &mut ctx as *mut LoadCtx as *mut std::os::raw::c_void,
+        )
+    };
+
+    if count < 0 {
+        return Err(Error::from_reason("Failed to load safetensors from buffer"));
+    }
+
+    Ok(ctx.tensors)
+}
+
+/// Create an MLX array wrapping an existing WGPUBuffer handle (zero-copy).
+/// The handle is an integer representing the GPU buffer created by the JS WebGPU bridge.
+/// The array takes ownership of the buffer.
+pub fn array_from_gpu_buffer(
+    gpu_handle: u32,
+    byte_size: usize,
+    shape: &[i64],
+    dtype: crate::array::DType,
+) -> Result<crate::array::MxArray> {
+    // Map Rust DType to C++ dtype_code used by mlx_array_from_gpu_buffer
+    let dtype_code = match dtype {
+        crate::array::DType::Float32 => 0,  // float32
+        crate::array::DType::Float16 => 1,  // float16
+        crate::array::DType::BFloat16 => 2, // bfloat16
+        crate::array::DType::Int32 => 3,    // int32
+        crate::array::DType::Uint32 => 4,   // uint32
+        crate::array::DType::Uint8 => 6,    // uint8
+    };
+
+    let handle = unsafe {
+        mlx_sys::mlx_array_from_gpu_buffer(
+            gpu_handle as *mut std::os::raw::c_void,
+            byte_size,
+            shape.as_ptr(),
+            shape.len(),
+            dtype_code,
+        )
+    };
+
+    crate::array::MxArray::from_handle(handle, "array_from_gpu_buffer")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

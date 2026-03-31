@@ -72,10 +72,19 @@ pub struct Embedding {
 }
 
 impl Embedding {
+    /// Create without random init (lazy zeros).
+    pub fn new_empty(num_embeddings: u32, embedding_dim: u32) -> Result<Self> {
+        let weight = MxArray::zeros(&[num_embeddings as i64, embedding_dim as i64], None)?;
+        Ok(Self { weight, num_embeddings, embedding_dim, is_quantized_flag: false })
+    }
+
     /// Create a new Embedding layer
     pub fn new(num_embeddings: u32, embedding_dim: u32) -> Result<Self> {
         // Initialize with normal distribution
         let shape = [num_embeddings as i64, embedding_dim as i64];
+        #[cfg(target_family = "wasm")]
+        let weight = MxArray::zeros(&shape, None)?;
+        #[cfg(not(target_family = "wasm"))]
         let weight = MxArray::random_normal(&shape, 0.0, 0.02, None)?;
 
         Ok(Self {

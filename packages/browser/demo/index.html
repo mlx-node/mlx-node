@@ -3,100 +3,50 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MLX Browser — Qwen 3.5 0.6B</title>
+  <title>MLX Browser — Qwen 3.5 0.8B</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: system-ui, -apple-system, sans-serif; background: #0a0a0a; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
-    header { padding: 16px 24px; border-bottom: 1px solid #222; display: flex; align-items: center; gap: 12px; }
-    header h1 { font-size: 18px; font-weight: 600; }
-    #status { font-size: 13px; color: #888; }
-    #status.ready { color: #4ade80; }
-    #status.error { color: #f87171; }
-    #chat { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
-    .message { max-width: 720px; padding: 12px 16px; border-radius: 12px; line-height: 1.5; white-space: pre-wrap; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0a0a0a; color: #d4d4d4; height: 100vh; display: flex; flex-direction: column; }
+    header { padding: 12px 24px; border-bottom: 1px solid #222; display: flex; align-items: center; gap: 12px; }
+    header h1 { font-size: 16px; font-weight: 600; }
+    #status { font-size: 13px; padding: 4px 10px; border-radius: 4px; }
+    #status.info { background: #1e293b; color: #93c5fd; }
+    #status.ready { background: #14532d; color: #4ade80; }
+    #status.error { background: #450a0a; color: #fca5a5; }
+    #main { flex: 1; display: flex; overflow: hidden; }
+    #chat { flex: 2; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+    .message { max-width: 720px; padding: 10px 14px; border-radius: 10px; line-height: 1.5; white-space: pre-wrap; font-size: 14px; }
     .message.user { background: #1e3a5f; align-self: flex-end; }
     .message.assistant { background: #1a1a1a; border: 1px solid #333; align-self: flex-start; }
-    #input-area { padding: 16px 24px; border-top: 1px solid #222; display: flex; gap: 12px; }
-    #prompt { flex: 1; padding: 12px 16px; border-radius: 8px; border: 1px solid #333; background: #111; color: #e0e0e0; font-size: 14px; resize: none; }
+    #log { flex: 1; border-left: 1px solid #222; overflow-y: auto; padding: 12px; font-family: 'SF Mono', Menlo, monospace; font-size: 11px; line-height: 1.5; background: #080808; min-width: 300px; }
+    #log div { padding: 1px 0; }
+    #input-area { padding: 12px 24px; border-top: 1px solid #222; display: flex; gap: 8px; align-items: flex-end; }
+    #prompt { flex: 1; padding: 10px 14px; border-radius: 8px; border: 1px solid #333; background: #111; color: #e0e0e0; font-size: 14px; resize: none; min-height: 42px; max-height: 120px; }
     #prompt:focus { outline: none; border-color: #555; }
-    button { padding: 12px 24px; border-radius: 8px; border: none; background: #2563eb; color: white; font-size: 14px; font-weight: 500; cursor: pointer; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-    button:hover:not(:disabled) { background: #1d4ed8; }
-    #progress { padding: 8px 24px; font-size: 12px; color: #666; }
+    button { padding: 10px 16px; border-radius: 8px; border: none; color: white; font-size: 14px; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #send { background: #2563eb; }
+    #send:hover:not(:disabled) { background: #1d4ed8; }
+    #image-btn { background: #374151; font-size: 16px; padding: 8px 12px; }
+    #image-btn:hover:not(:disabled) { background: #4b5563; }
+    #image-input { display: none; }
   </style>
 </head>
 <body>
   <header>
     <h1>MLX Browser</h1>
-    <span id="status">Checking WebGPU...</span>
+    <span id="status" class="info">Initializing...</span>
   </header>
-  <div id="progress"></div>
-  <div id="chat"></div>
+  <div id="main">
+    <div id="chat"></div>
+    <div id="log"></div>
+  </div>
   <div id="input-area">
+    <button id="image-btn" disabled title="Attach image (or paste)">+</button>
+    <input id="image-input" type="file" accept="image/*">
     <textarea id="prompt" rows="1" placeholder="Type a message..." disabled></textarea>
     <button id="send" disabled>Send</button>
   </div>
-
-  <script type="module">
-    const statusEl = document.getElementById('status');
-    const progressEl = document.getElementById('progress');
-    const chatEl = document.getElementById('chat');
-    const promptEl = document.getElementById('prompt');
-    const sendBtn = document.getElementById('send');
-
-    function setStatus(text, className = '') {
-      statusEl.textContent = text;
-      statusEl.className = className;
-    }
-
-    function addMessage(role, text) {
-      const div = document.createElement('div');
-      div.className = `message ${role}`;
-      div.textContent = text;
-      chatEl.appendChild(div);
-      chatEl.scrollTop = chatEl.scrollHeight;
-      return div;
-    }
-
-    async function main() {
-      // Check WebGPU
-      if (!navigator.gpu) {
-        setStatus('WebGPU not available — use Chrome 121+ or Firefox 141+', 'error');
-        return;
-      }
-
-      // Check Cross-Origin-Isolated (required for SharedArrayBuffer)
-      if (!crossOriginIsolated) {
-        setStatus('Missing Cross-Origin-Isolated headers (COOP/COEP)', 'error');
-        progressEl.textContent = 'Server must send: Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp';
-        return;
-      }
-
-      setStatus('WebGPU available — ready to load model');
-      progressEl.textContent = 'Click Send to start (model loading will begin on first message)';
-
-      promptEl.disabled = false;
-      sendBtn.disabled = false;
-      setStatus('Qwen 3.5 0.6B — Ready', 'ready');
-
-      // TODO: Implement model loading and inference when WASM build is ready
-      sendBtn.addEventListener('click', () => {
-        const text = promptEl.value.trim();
-        if (!text) return;
-        addMessage('user', text);
-        promptEl.value = '';
-        addMessage('assistant', '[Model inference not yet connected — WASM build in progress]');
-      });
-
-      promptEl.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-          e.preventDefault();
-          sendBtn.click();
-        }
-      });
-    }
-
-    main();
-  </script>
+  <script type="module" src="./app.ts"></script>
 </body>
 </html>

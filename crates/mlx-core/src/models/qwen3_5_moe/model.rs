@@ -5351,7 +5351,7 @@ impl Qwen3_5MoeModel {
 
             let callback_err = callback.clone();
             let result =
-                run_blocking(move || -> std::result::Result<(), Error> {
+                napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
                     let _weight_guard = if use_cpp {
                         acquire_compiled_weight_guard(model_id)
                     } else {
@@ -6461,22 +6461,77 @@ impl Qwen3_5MoeModel {
     ///
     /// Dispatches to model thread.
     #[napi]
-    #[cfg(not(target_family = "wasm"))]
     pub fn save_model<'env>(
         &self,
         env: &'env Env,
         save_path: String,
     ) -> Result<PromiseRaw<'env, ()>> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.thread.send(Qwen35MoeCmd::SaveModel {
-            save_path,
-            reply: tx,
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (env, save_path);
+            return Err(Error::from_reason("Model saving is not supported in browser"));
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+        let mut params = self.get_parameters_for_training()?;
+
+        // Include vision encoder weights when present (VLM models)
+        if let Some(ref vision_enc) = self.vision_encoder {
+            let vision_params = vision_enc.get_parameters();
+            params.extend(vision_params);
+        }
+
+        // Validate all parameters for NaN/Inf before saving
+        for (name, param) in params.iter() {
+            let data = param.to_float32()?;
+            let invalid_count = data
+                .iter()
+                .filter(|v| v.is_nan() || v.is_infinite())
+                .count();
+            if invalid_count > 0 {
+                return Err(napi::Error::new(
+                    Status::GenericFailure,
+                    format!(
+                        "Cannot save model: parameter '{}' contains {} NaN/Inf values. \
+                        Model weights are corrupted, likely due to training instability. \
+                        Consider reducing learning rate or using an earlier checkpoint.",
+                        name, invalid_count
+                    ),
+                ));
+            }
+        }
+
+        let params_clone: HashMap<String, MxArray> =
+            params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        // Create weights metadata (for reference)
+        let mut weights_metadata = serde_json::Map::new();
+        for (key, array) in params.iter() {
+            let shape_data = array.shape()?;
+            let shape: Vec<i64> = shape_data.as_ref().to_vec();
+            let dtype = array.dtype()?;
+
+            let mut param_info = serde_json::Map::new();
+            param_info.insert("shape".to_string(), serde_json::json!(shape));
+            param_info.insert("dtype".to_string(), serde_json::json!(dtype as i32));
+
+            weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
+        }
+
+        // Serialize config and inject model_type for detectModelType
+        let config = self.get_config();
+        let mut config_value = serde_json::to_value(&config).map_err(|e| {
+            napi::Error::new(
+                Status::GenericFailure,
+                format!("Failed to serialize config: {e}"),
+            )
         })?;
         let promise = env.spawn_future(async move {
             rx.await
                 .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
         })?;
         Ok(promise)
+        }
     }
 }
 

@@ -46,7 +46,7 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
     let wasm_target = "--target=wasm32-wasip1-threads";
     let sysroot_flag = format!("--sysroot={}", sysroot.display());
     let common_flags = format!(
-        "{wasm_target} {sysroot_flag} -pthread -fPIC -mllvm -wasm-enable-sjlj -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL"
+        "{wasm_target} {sysroot_flag} -pthread -fPIC -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL"
     );
     let c_flags = common_flags.clone();
     let cxx_flags = format!("{common_flags} -fexceptions");
@@ -138,8 +138,6 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
         .include(mlx_dir)
         .flag("-pthread")
         .flag("-fexceptions")
-        .flag("-mllvm")
-        .flag("-wasm-enable-sjlj")
         .flag("-D_WASI_EMULATED_MMAN")
         .flag("-D_WASI_EMULATED_SIGNAL");
 
@@ -159,6 +157,14 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
     bridge.compile("mlx_ffi");
 
     println!("cargo:rustc-link-lib=static=mlx_ffi");
+
+    // Link C++ standard library and ABI for WASI (provides operator new/delete,
+    // exception handling, and RTTI — these are left as imports without this).
+    let sysroot_lib = wasi_sdk
+        .join("share/wasi-sysroot/lib/wasm32-wasip1-threads");
+    println!("cargo:rustc-link-search=native={}", sysroot_lib.display());
+    println!("cargo:rustc-link-lib=static=c++");
+    println!("cargo:rustc-link-lib=static=c++abi");
 }
 
 fn build_native(manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {

@@ -27,7 +27,6 @@ use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::SafeTensorsFile;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
 use napi::{Env, Status, bindgen_prelude::*, tokio};
-use napi::{Env, Status, bindgen_prelude::*};
 use napi_derive::napi;
 use serde_json::Value;
 use std::collections::HashMap;

@@ -16,6 +16,8 @@ full = [
   "dep:mimalloc-safe",
   "dep:rust_xlsxwriter",
   "dep:tracing-subscriber",
+  "napi/tokio_fs",
+  "tokio/rt-multi-thread",
 ]
 # Minimal feature set for browser/WASM builds (inference only)
 browser = []

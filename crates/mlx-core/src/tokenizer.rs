@@ -660,36 +660,18 @@ impl Qwen3Tokenizer {
         })
     }
 
-    /// Resolve special token IDs from tokenizer_config.json.
-    /// Returns (pad_token_id, eos_token_id, bos_token_id).
-    fn resolve_special_tokens(
-        tokenizer: &Tokenizer,
-        tokenizer_path: &Path,
-    ) -> (u32, u32, Option<u32>) {
-        let config_path = tokenizer_path
-            .parent()
-            .map(|p| p.join("tokenizer_config.json"));
-
-        let config: Option<serde_json::Value> = config_path
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok());
-
-        let resolve = |key: &str| -> Option<u32> {
-            config
-                .as_ref()
-                .and_then(|c| c.get(key))
-                .and_then(|v| {
-                    v.as_str()
-                        .or_else(|| v.get("content").and_then(|c| c.as_str()))
-                })
-                .and_then(|token_str| tokenizer.token_to_id(token_str))
-        };
-
-        let pad = resolve("pad_token").unwrap_or(ENDOFTEXT_TOKEN_ID);
-        let eos = resolve("eos_token").unwrap_or(IM_END_TOKEN_ID);
-        let bos = resolve("bos_token");
-
-        (pad, eos, bos)
+    /// Create from an already-parsed Tokenizer instance (for loading from memory).
+    pub fn from_tokenizer(tokenizer: Tokenizer) -> Self {
+        let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
+        Self {
+            tokenizer: Arc::new(tokenizer),
+            pad_token_id: ENDOFTEXT_TOKEN_ID,
+            eos_token_id: IM_END_TOKEN_ID,
+            bos_token_id: None,
+            chat_template: None,
+            think_end_id,
+            think_end_str,
+        }
     }
 
     /// Validates a chat template for suspicious patterns that could indicate

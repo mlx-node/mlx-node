@@ -20,7 +20,7 @@ rand = "0.10"
 serde_json = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1.48", features = ["rt", "macros", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = [
   "std",
@@ -38,7 +38,7 @@ image = { version = "0.25", default-features = false, features = ["gif", "jpeg",
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # NAPI-RS
-napi = { version = "3", features = ["napi10", "async", "tokio_fs", "serde-json"] }
+napi = { version = "3", features = ["napi10", "async", "serde-json"] }
 napi-derive = "3"
 napi-build = "2"
 

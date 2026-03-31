@@ -30,6 +30,7 @@ use crate::training_model::ModelType;
 use crate::transformer::{
     KVCache, TransformerBlock,
 };
+#[cfg(not(target_family = "wasm"))]
 use crate::transformer::{
     ContinuousBatchingScheduler, PagedAttentionConfig, PagedKVCache, PendingRequest,
     SchedulerConfig,
@@ -659,6 +660,7 @@ impl Qwen3Inner {
         )?;
 
         // Initialize paged attention if enabled
+        #[cfg(not(target_family = "wasm"))]
         let (paged_cache, scheduler) = if config.use_paged_attention.unwrap_or(false) {
             let paged_config = PagedAttentionConfig {
                 block_size: config.paged_block_size.unwrap_or(16),
@@ -713,7 +715,9 @@ impl Qwen3Inner {
             lm_head,
             kv_caches: None,
             tokenizer: None,
+            #[cfg(not(target_family = "wasm"))]
             paged_cache,
+            #[cfg(not(target_family = "wasm"))]
             scheduler,
             cached_kv_keys: Vec::new(),
             cached_kv_values: Vec::new(),
@@ -5256,7 +5260,9 @@ impl Qwen3Model {
     /// Check if paged attention is enabled for this model
     #[napi]
     pub fn has_paged_attention(&self) -> bool {
+        #[cfg(not(target_family = "wasm"))]
         { self.paged_cache.is_some() }
+        #[cfg(target_family = "wasm")]
         { false }
     }
 
@@ -5265,7 +5271,31 @@ impl Qwen3Model {
     /// Returns memory usage statistics for the paged KV cache.
     #[napi]
     pub fn paged_cache_stats(&self) -> Result<Option<PagedCacheStats>> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::PagedCacheStats { reply })
+        #[cfg(target_family = "wasm")]
+        { return Ok(None); }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            match &self.paged_cache {
+                Some(cache) => {
+                    let cache_guard = cache.read().map_err(|_| {
+                        Error::new(
+                            napi::Status::GenericFailure,
+                            "Failed to acquire paged cache read lock",
+                        )
+                    })?;
+                    let stats = cache_guard.get_memory_stats();
+                    Ok(Some(PagedCacheStats {
+                        total_blocks: stats.total_blocks,
+                        free_blocks: stats.free_blocks,
+                        allocated_blocks: stats.allocated_blocks,
+                        total_memory_mb: stats.total_memory_mb,
+                        used_memory_mb: stats.used_memory_mb,
+                        utilization_percent: stats.utilization_percent,
+                    }))
+                }
+                None => Ok(None),
+            }
+        }
     }
 
     /// Get scheduler statistics (if paged attention is enabled)
@@ -5273,7 +5303,92 @@ impl Qwen3Model {
     /// Returns the number of waiting, running, and completed sequences.
     #[napi]
     pub fn scheduler_stats(&self) -> Result<Option<SchedulerStatsNapi>> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::SchedulerStats { reply })
+        #[cfg(target_family = "wasm")]
+        { return Ok(None); }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            match &self.scheduler {
+                Some(scheduler) => {
+                    let sched_guard = scheduler.read().map_err(|_| {
+                        Error::new(
+                            napi::Status::GenericFailure,
+                            "Failed to acquire scheduler read lock",
+                        )
+                    })?;
+                    let stats = sched_guard.get_stats();
+                    Ok(Some(SchedulerStatsNapi {
+                        num_waiting: stats.num_waiting,
+                        num_running: stats.num_running,
+                        num_completed: stats.num_completed,
+                        num_prefill: stats.num_prefill,
+                        num_decode: stats.num_decode,
+                        total_running_tokens: stats.total_running_tokens,
+                    }))
+                }
+                None => Ok(None),
+            }
+        }
+    }
+
+    /// Forward pass with KV caching for incremental generation
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs, shape: [batch_size, seq_len]
+    /// * `use_cache` - Whether to use KV caching (must call init_kv_caches() first)
+    ///
+    /// # Returns
+    /// * Logits, shape: [batch_size, seq_len, vocab_size]
+    #[napi]
+    pub fn forward_with_cache(&self, input_ids: &MxArray, use_cache: bool) -> Result<MxArray> {
+        // Acquire read locks for model components
+        let layers_guard = self.layers.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire layers read lock",
+            )
+        })?;
+        let final_norm_guard = self.final_norm.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire final_norm read lock",
+            )
+        })?;
+        let lm_head_guard = self.lm_head.read().map_err(|_| {
+            Error::new(
+                napi::Status::GenericFailure,
+                "Failed to acquire lm_head read lock",
+            )
+        })?;
+
+        if use_cache {
+            // Acquire lock for public API (used in training, batch generation, etc.)
+            let mut caches_borrowed = self.kv_caches.write().map_err(|_| {
+                Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire kv caches write lock",
+                )
+            })?;
+
+            Self::forward_with_cache_direct(
+                input_ids,
+                caches_borrowed.as_mut(),
+                &self.embedding.get_weight(),
+                &layers_guard,
+                self.config.tie_word_embeddings,
+                &final_norm_guard,
+                &lm_head_guard,
+            )
+        } else {
+            Self::forward_with_cache_direct(
+                input_ids,
+                None,
+                &self.embedding.get_weight(),
+                &layers_guard,
+                self.config.tie_word_embeddings,
+                &final_norm_guard,
+                &lm_head_guard,
+            )
+        }
     }
 
     /// Forward pass with paged attention for memory-efficient inference.
@@ -5299,18 +5414,42 @@ impl Qwen3Model {
         seq_ids: Vec<u32>,
         positions: &MxArray, // [num_seqs] - per-sequence RoPE positions
     ) -> Result<MxArray> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::ForwardPaged {
-            input_ids: input_ids.clone(),
-            slot_mapping: slot_mapping.clone(),
-            seq_ids,
-            positions,
-            &paged_cache_guard,
-        )
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (input_ids, slot_mapping, seq_ids, positions);
+            return Err(napi::Error::from_reason("Paged attention not supported in browser"));
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            // Ensure paged attention is enabled
+            let paged_cache = self.paged_cache.as_ref().ok_or_else(|| {
+                napi::Error::from_reason(
+                    "Paged attention not enabled. Set use_paged_attention: true in config.",
+                )
+            })?;
+
+            // Acquire read lock for paged cache
+            let paged_cache_guard = paged_cache.read().map_err(|_| {
+                Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire paged cache read lock",
+                )
+            })?;
+
+            self.forward_paged_with_cache(
+                input_ids,
+                slot_mapping,
+                seq_ids,
+                positions,
+                &paged_cache_guard,
+            )
+        }
     }
 
     /// Internal paged forward pass that accepts an already-locked cache reference.
     /// This avoids deadlock when called from step_paged_generation() which already
     /// holds a write lock on the same paged_cache RwLock.
+    #[cfg(not(target_family = "wasm"))]
     fn forward_paged_with_cache(
         &self,
         input_ids: &MxArray,
@@ -5391,11 +5530,113 @@ impl Qwen3Model {
     /// * Logits for the last token, shape: [1, vocab_size]
     #[napi]
     pub fn prefill_paged(&self, prompt_tokens: Vec<u32>, seq_id: u32) -> Result<MxArray> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::PrefillPaged {
-            prompt_tokens,
-            seq_id,
-            reply,
-        })
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (prompt_tokens, seq_id);
+            return Err(napi::Error::from_reason("Paged attention not supported in browser"));
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let paged_cache = self
+                .paged_cache
+                .as_ref()
+                .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
+
+            let prompt_len = prompt_tokens.len();
+            if prompt_len == 0 {
+                return Err(napi::Error::from_reason("Empty prompt"));
+            }
+
+            // Create input tensor: [1, prompt_len]
+            let input_ids = MxArray::from_uint32(&prompt_tokens, &[1, prompt_len as i64])?;
+
+            // Embedding lookup: [1, prompt_len] -> [1, prompt_len, hidden_dim]
+            let mut hidden_states = self.embedding.forward(&input_ids)?;
+
+            // Get slot mapping for prefill (positions 0..prompt_len)
+            let cache_guard = paged_cache
+                .read()
+                .map_err(|_| napi::Error::from_reason("Failed to acquire paged cache read lock"))?;
+            let slot_mapping = cache_guard
+                .get_slot_mapping(seq_id, 0, prompt_len as u32)
+                .map_err(napi::Error::from_reason)?;
+            drop(cache_guard);
+
+            let slot_mapping_arr = MxArray::from_int64(&slot_mapping, &[slot_mapping.len() as i64])?;
+
+            // Acquire read locks for model components
+            let layers_guard = self.layers.read().map_err(|_| {
+                Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire layers read lock",
+                )
+            })?;
+            let final_norm_guard = self.final_norm.read().map_err(|_| {
+                Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire final_norm read lock",
+                )
+            })?;
+            let lm_head_guard = self.lm_head.read().map_err(|_| {
+                Error::new(
+                    napi::Status::GenericFailure,
+                    "Failed to acquire lm_head read lock",
+                )
+            })?;
+
+            // Acquire read lock for paged cache
+            let paged_cache_guard = paged_cache
+                .read()
+                .map_err(|_| napi::Error::from_reason("Failed to acquire paged cache read lock"))?;
+
+            // Process each layer with forward_for_prefill
+            for (layer_idx, layer) in layers_guard.iter().enumerate() {
+                let (output, keys, values) = layer.forward_for_prefill(&hidden_states)?;
+
+                // Write K/V to paged cache using Metal kernel directly
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    paged_cache_guard
+                        .update(
+                            layer_idx as u32,
+                            keys.handle.0,
+                            values.handle.0,
+                            slot_mapping_arr.handle.0,
+                        )
+                        .map_err(napi::Error::from_reason)?;
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return Err(napi::Error::from_reason(
+                        "Paged attention Metal kernels are only available on macOS",
+                    ));
+                }
+
+                hidden_states = output;
+            }
+
+            // Final layer norm
+            hidden_states = final_norm_guard.forward(&hidden_states)?;
+
+            // LM head to get logits
+            let logits = if self.config.tie_word_embeddings {
+                let embedding_weight = self.embedding.get_weight();
+                hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
+            } else {
+                lm_head_guard.forward(&hidden_states)?
+            };
+
+            // Return only the last token's logits: [1, vocab_size]
+            let vocab_size = logits.shape_at(2)?;
+            let last_logits = logits.slice(
+                &[0, prompt_len as i64 - 1, 0],
+                &[1, prompt_len as i64, vocab_size],
+            )?;
+            let last_logits = last_logits.reshape(&[1, vocab_size])?;
+
+            Ok(last_logits)
+        }
     }
 
     /// Add a request to the paged attention scheduler.
@@ -5423,13 +5664,44 @@ impl Qwen3Model {
         max_new_tokens: u32,
         priority: Option<i32>,
     ) -> Result<u32> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::AddPagedRequest {
-            request_id,
-            prompt_tokens,
-            max_new_tokens,
-            priority,
-            reply,
-        })
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (request_id, prompt_tokens, max_new_tokens, priority);
+            return Err(napi::Error::from_reason("Paged attention not supported in browser"));
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            if max_new_tokens == 0 {
+                return Err(napi::Error::from_reason(
+                    "max_new_tokens must be > 0 for paged generation",
+                ));
+            }
+            if prompt_tokens.is_empty() {
+                return Err(napi::Error::from_reason(
+                    "prompt_tokens must not be empty for paged generation",
+                ));
+            }
+            let scheduler = self
+                .scheduler
+                .as_ref()
+                .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
+
+            let mut scheduler_guard = scheduler
+                .write()
+                .map_err(|_| napi::Error::from_reason("Failed to acquire scheduler write lock"))?;
+
+            let request = PendingRequest {
+                request_id,
+                prompt_tokens,
+                max_new_tokens,
+                priority,
+            };
+
+            scheduler_guard.add_request(request);
+
+            // Return the number of pending requests
+            Ok(scheduler_guard.num_waiting())
+        }
     }
 
     /// Schedule and execute one step of paged generation.
@@ -5450,10 +5722,462 @@ impl Qwen3Model {
         &self,
         config: Option<GenerationConfig>,
     ) -> Result<Option<PagedGenerationStep>> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::StepPagedGeneration {
-            config,
-            reply,
-        })
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = config;
+            return Err(napi::Error::from_reason("Paged attention not supported in browser"));
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+        use crate::sampling::SamplingConfig;
+
+        let scheduler = self
+            .scheduler
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
+        let paged_cache = self
+            .paged_cache
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
+
+        let config = config.unwrap_or_default();
+
+        let mut scheduler_guard = scheduler
+            .write()
+            .map_err(|_| napi::Error::from_reason("Failed to acquire scheduler write lock"))?;
+        let mut cache_guard = paged_cache
+            .write()
+            .map_err(|_| napi::Error::from_reason("Failed to acquire paged cache write lock"))?;
+
+        // Schedule next batch
+        let batch = match scheduler_guard.schedule_step(&mut cache_guard) {
+            Some(b) => b,
+            None => return Ok(None), // No work to do
+        };
+
+        if batch.seq_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let sampling_config = SamplingConfig {
+            temperature: config.temperature,
+            top_k: config.top_k,
+            top_p: config.top_p,
+            min_p: config.min_p,
+        };
+        let eos_token_id = config.eos_token_id.unwrap_or(self.config.eos_token_id);
+
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
+
+        let mut finish_reason_overrides: HashMap<u32, &'static str> = HashMap::new();
+
+        // Separate batch into prefill and decode sequences
+        let mut prefill_indices: Vec<usize> = Vec::new();
+        let mut decode_indices: Vec<usize> = Vec::new();
+
+        for (i, &is_prefill) in batch.is_prefill.iter().enumerate() {
+            if is_prefill {
+                prefill_indices.push(i);
+            } else {
+                decode_indices.push(i);
+            }
+        }
+
+        let mut outputs = Vec::with_capacity(batch.seq_ids.len());
+
+        // ========================================
+        // PREFILL PATH: Use standard attention
+        // ========================================
+        for &idx in &prefill_indices {
+            let seq_id = batch.seq_ids[idx];
+            let request_id = &batch.request_ids[idx];
+            let prompt_tokens = &batch.input_tokens[idx];
+            let prompt_len = prompt_tokens.len();
+
+            if prompt_len == 0 {
+                return Err(napi::Error::from_reason(format!(
+                    "Empty prompt for sequence {}",
+                    seq_id
+                )));
+            }
+
+            // Create input tensor: [1, prompt_len]
+            let input_ids = MxArray::from_uint32(prompt_tokens, &[1, prompt_len as i64])?;
+
+            // Embedding lookup
+            let mut hidden_states = self.embedding.forward(&input_ids)?;
+
+            // Get slot mapping for prefill (positions 0..prompt_len)
+            let slot_mapping = cache_guard
+                .get_slot_mapping(seq_id, 0, prompt_len as u32)
+                .map_err(napi::Error::from_reason)?;
+            let slot_mapping_arr =
+                MxArray::from_int64(&slot_mapping, &[slot_mapping.len() as i64])?;
+
+            // Acquire read locks for this prefill sequence
+            let layers_guard = self
+                .layers
+                .read()
+                .map_err(|_| napi::Error::from_reason("Failed to acquire layers read lock"))?;
+            let final_norm_guard = self
+                .final_norm
+                .read()
+                .map_err(|_| napi::Error::from_reason("Failed to acquire final_norm read lock"))?;
+            let lm_head_guard = self
+                .lm_head
+                .read()
+                .map_err(|_| napi::Error::from_reason("Failed to acquire lm_head read lock"))?;
+
+            // Process each layer with forward_for_prefill
+            for (layer_idx, layer) in layers_guard.iter().enumerate() {
+                let (output, keys, values) = layer.forward_for_prefill(&hidden_states)?;
+
+                // Write K/V to paged cache using Metal kernel directly
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    cache_guard
+                        .update(
+                            layer_idx as u32,
+                            keys.handle.0,
+                            values.handle.0,
+                            slot_mapping_arr.handle.0,
+                        )
+                        .map_err(napi::Error::from_reason)?;
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return Err(napi::Error::from_reason(
+                        "Paged attention Metal kernels are only available on macOS",
+                    ));
+                }
+
+                hidden_states = output;
+            }
+
+            // Final layer norm
+            hidden_states = final_norm_guard.forward(&hidden_states)?;
+
+            // LM head to get logits
+            let logits = if self.config.tie_word_embeddings {
+                let embedding_weight = self.embedding.get_weight();
+                hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
+            } else {
+                lm_head_guard.forward(&hidden_states)?
+            };
+
+            // Get last token's logits: [vocab_size]
+            let vocab_size = logits.shape_at(2)?;
+            logits.eval();
+            let logits_data = logits.to_float32()?;
+            let start = (prompt_len - 1) * vocab_size as usize;
+            let end = start + vocab_size as usize;
+
+            if end > logits_data.len() {
+                return Err(napi::Error::from_reason(format!(
+                    "Logits buffer size mismatch in prefill: expected {} elements (end), got {}",
+                    end,
+                    logits_data.len()
+                )));
+            }
+
+            let logit_slice = &logits_data[start..end];
+            let mut logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
+
+            if let Some((prompt, generated)) = scheduler_guard.get_penalty_context(seq_id) {
+                // Build penalty context from the tail of prompt+generated,
+                // bounded by the largest context_size to cap allocation.
+                let max_ctx = repetition_context_size
+                    .max(presence_context_size)
+                    .max(frequency_context_size) as usize;
+                let total = prompt.len() + generated.len();
+                let skip = total.saturating_sub(max_ctx);
+                let prompt_skip = skip.min(prompt.len());
+                let ctx: Vec<u32> = prompt[prompt_skip..]
+                    .iter()
+                    .chain(generated.iter())
+                    .copied()
+                    .collect();
+                if !ctx.is_empty() {
+                    if repetition_penalty != 1.0 {
+                        logit_arr = crate::sampling::apply_repetition_penalty(
+                            &logit_arr,
+                            &ctx,
+                            repetition_penalty,
+                            Some(repetition_context_size),
+                        )?;
+                    }
+                    if presence_penalty != 0.0 {
+                        logit_arr = crate::sampling::apply_presence_penalty(
+                            &logit_arr,
+                            &ctx,
+                            presence_penalty,
+                            Some(presence_context_size),
+                        )?;
+                    }
+                    if frequency_penalty != 0.0 {
+                        logit_arr = crate::sampling::apply_frequency_penalty(
+                            &logit_arr,
+                            &ctx,
+                            frequency_penalty,
+                            Some(frequency_context_size),
+                        )?;
+                    }
+                }
+            }
+
+            let (next_token_arr, logprobs_arr) =
+                crate::sampling::sample_and_logprobs(&logit_arr, Some(sampling_config))?;
+
+            next_token_arr.eval();
+            logprobs_arr.eval();
+            let next_token = next_token_arr.item_at_int32(0)? as u32;
+            let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
+            let is_eos = next_token == eos_token_id as u32;
+            let mut finish_reason_override: Option<&'static str> = None;
+
+            if !is_eos && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
+                let mut history = gen_tokens.to_vec();
+                history.push(next_token);
+                if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                    &history,
+                    max_consecutive_tokens,
+                    max_ngram_repeats,
+                    ngram_size,
+                ) {
+                    finish_reason_override = Some(reason);
+                }
+            }
+
+            // Check if this token hits the length limit
+            if finish_reason_override.is_none()
+                && !is_eos
+                && scheduler_guard.would_hit_length_limit(seq_id)
+            {
+                finish_reason_override = Some("length");
+            }
+
+            let is_finished = is_eos || finish_reason_override.is_some();
+            if let Some(reason) = finish_reason_override {
+                finish_reason_overrides.insert(seq_id, reason);
+            }
+
+            outputs.push(PagedTokenOutput {
+                seq_id,
+                request_id: request_id.clone(),
+                token: next_token,
+                logprob,
+                is_finished,
+            });
+        }
+
+        // ========================================
+        // DECODE PATH: Use paged attention kernel
+        // ========================================
+        if !decode_indices.is_empty() {
+            let num_decode_seqs = decode_indices.len();
+
+            // Extract decode-only data
+            let decode_seq_ids: Vec<u32> =
+                decode_indices.iter().map(|&i| batch.seq_ids[i]).collect();
+            let decode_input_tokens: Vec<u32> = decode_indices
+                .iter()
+                .map(|&i| batch.input_tokens[i].first().copied().unwrap_or(0))
+                .collect();
+            let decode_context_lens: Vec<u32> = decode_indices
+                .iter()
+                .map(|&i| batch.context_lens[i])
+                .collect();
+
+            // Validate: decode sequences must have context_len > 0 (prefill must complete first)
+            for (i, &ctx_len) in decode_context_lens.iter().enumerate() {
+                if ctx_len == 0 {
+                    return Err(napi::Error::from_reason(format!(
+                        "Decode sequence {} (seq_id={}) has context_len=0. \
+                        Prefill must complete before decode.",
+                        i, decode_seq_ids[i]
+                    )));
+                }
+            }
+
+            // Build input tensor: [num_decode_seqs, 1]
+            let input_ids =
+                MxArray::from_uint32(&decode_input_tokens, &[num_decode_seqs as i64, 1])?;
+
+            // Build per-sequence positions for RoPE
+            // Guard against context_len == 0 (shouldn't happen for decode, but be safe)
+            let positions_vec: Vec<i32> = decode_context_lens
+                .iter()
+                .map(|&ctx| if ctx > 0 { ctx as i32 - 1 } else { 0 })
+                .collect();
+            let positions_arr = MxArray::from_int32(&positions_vec, &[num_decode_seqs as i64])?;
+
+            // Get slot mapping for decode (single token at context_len - 1)
+            let input_lens: Vec<u32> = vec![1; num_decode_seqs];
+            let is_prefill_flags: Vec<bool> = vec![false; num_decode_seqs];
+            let slot_mapping = cache_guard
+                .get_slot_mapping_batch(
+                    &decode_seq_ids,
+                    &decode_context_lens,
+                    &is_prefill_flags,
+                    &input_lens,
+                )
+                .map_err(napi::Error::from_reason)?;
+            let slot_mapping_arr =
+                MxArray::from_int64(&slot_mapping, &[slot_mapping.len() as i64])?;
+
+            // Run paged attention forward pass using the already-held write guard
+            // (avoids deadlock — forward_paged() would try to read-lock the same RwLock)
+            let logits = self.forward_paged_with_cache(
+                &input_ids,
+                &slot_mapping_arr,
+                decode_seq_ids.clone(),
+                &positions_arr,
+                &cache_guard,
+            )?;
+
+            // Sample from logits
+            let vocab_size = logits.shape_at(2)?;
+            logits.eval();
+            let logits_data = logits.to_float32()?;
+
+            for (i, &idx) in decode_indices.iter().enumerate() {
+                let seq_id = batch.seq_ids[idx];
+                let request_id = &batch.request_ids[idx];
+
+                let start = i * vocab_size as usize;
+                let end = start + vocab_size as usize;
+
+                if end > logits_data.len() {
+                    return Err(napi::Error::from_reason(format!(
+                        "Logits buffer size mismatch in decode: expected {} elements (end), got {}",
+                        end,
+                        logits_data.len()
+                    )));
+                }
+
+                let logit_slice = &logits_data[start..end];
+                let mut logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
+
+                if let Some((prompt, generated)) = scheduler_guard.get_penalty_context(seq_id) {
+                    let max_ctx = repetition_context_size
+                        .max(presence_context_size)
+                        .max(frequency_context_size) as usize;
+                    let total = prompt.len() + generated.len();
+                    let skip = total.saturating_sub(max_ctx);
+                    let prompt_skip = skip.min(prompt.len());
+                    let gen_skip = skip.saturating_sub(prompt.len());
+                    let ctx: Vec<u32> = prompt[prompt_skip..]
+                        .iter()
+                        .chain(generated[gen_skip..].iter())
+                        .copied()
+                        .collect();
+                    if !ctx.is_empty() {
+                        if repetition_penalty != 1.0 {
+                            logit_arr = crate::sampling::apply_repetition_penalty(
+                                &logit_arr,
+                                &ctx,
+                                repetition_penalty,
+                                Some(repetition_context_size),
+                            )?;
+                        }
+                        if presence_penalty != 0.0 {
+                            logit_arr = crate::sampling::apply_presence_penalty(
+                                &logit_arr,
+                                &ctx,
+                                presence_penalty,
+                                Some(presence_context_size),
+                            )?;
+                        }
+                        if frequency_penalty != 0.0 {
+                            logit_arr = crate::sampling::apply_frequency_penalty(
+                                &logit_arr,
+                                &ctx,
+                                frequency_penalty,
+                                Some(frequency_context_size),
+                            )?;
+                        }
+                    }
+                }
+
+                let (next_token_arr, logprobs_arr) =
+                    crate::sampling::sample_and_logprobs(&logit_arr, Some(sampling_config))?;
+
+                next_token_arr.eval();
+                logprobs_arr.eval();
+                let next_token = next_token_arr.item_at_int32(0)? as u32;
+                let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
+                let is_eos = next_token == eos_token_id as u32;
+                let mut finish_reason_override: Option<&'static str> = None;
+
+                if !is_eos && let Some(gen_tokens) = scheduler_guard.get_generated_tokens(seq_id) {
+                    let mut history = gen_tokens.to_vec();
+                    history.push(next_token);
+                    if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                        &history,
+                        max_consecutive_tokens,
+                        max_ngram_repeats,
+                        ngram_size,
+                    ) {
+                        finish_reason_override = Some(reason);
+                    }
+                }
+
+                // Check if this token hits the length limit
+                if finish_reason_override.is_none()
+                    && !is_eos
+                    && scheduler_guard.would_hit_length_limit(seq_id)
+                {
+                    finish_reason_override = Some("length");
+                }
+
+                let is_finished = is_eos || finish_reason_override.is_some();
+                if let Some(reason) = finish_reason_override {
+                    finish_reason_overrides.insert(seq_id, reason);
+                }
+
+                outputs.push(PagedTokenOutput {
+                    seq_id,
+                    request_id: request_id.clone(),
+                    token: next_token,
+                    logprob,
+                    is_finished,
+                });
+            }
+        }
+
+        let token_outputs: Vec<_> = outputs
+            .iter()
+            .map(|o| {
+                let override_reason = finish_reason_overrides.get(&o.seq_id).copied();
+                crate::transformer::TokenOutput {
+                    seq_id: o.seq_id,
+                    token: o.token,
+                    // is_eos should only be true for actual EOS tokens, not for
+                    // length/repetition stops — those flow through finish_reason_override.
+                    is_eos: o.is_finished && override_reason.is_none(),
+                    finish_reason_override: override_reason,
+                }
+            })
+            .collect();
+        scheduler_guard
+            .process_outputs(token_outputs, &mut cache_guard)
+            .map_err(napi::Error::from_reason)?;
+
+        Ok(Some(PagedGenerationStep {
+            outputs,
+            num_prefill: batch.num_prefill,
+            num_decode: batch.num_decode,
+        }))
+        } // cfg(not(target_family = "wasm"))
     }
 
     /// Get completed sequences from the scheduler.
@@ -5461,15 +6185,90 @@ impl Qwen3Model {
     /// Call this after `step_paged_generation()` returns outputs with `is_finished: true`.
     #[napi]
     pub fn get_completed_sequences(&self) -> Result<Vec<PagedCompletedSequence>> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::GetCompletedSequences {
-            reply,
-        })
+        #[cfg(target_family = "wasm")]
+        { return Ok(Vec::new()); }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let scheduler = self
+                .scheduler
+                .as_ref()
+                .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
+
+            let mut scheduler_guard = scheduler
+                .write()
+                .map_err(|_| napi::Error::from_reason("Failed to acquire scheduler write lock"))?;
+
+            let completed = scheduler_guard.get_completed();
+            Ok(completed
+                .into_iter()
+                .map(|c| PagedCompletedSequence {
+                    request_id: c.request_id,
+                    tokens: c.generated_tokens,
+                    finish_reason: c.finish_reason,
+                })
+                .collect())
+        }
     }
 
     /// Check if the scheduler has pending work.
     #[napi]
     pub fn has_paged_work(&self) -> Result<bool> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::HasPagedWork { reply })
+        #[cfg(target_family = "wasm")]
+        { return Ok(false); }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let scheduler = self
+                .scheduler
+                .as_ref()
+                .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
+
+            let scheduler_guard = scheduler
+                .read()
+                .map_err(|_| napi::Error::from_reason("Failed to acquire scheduler read lock"))?;
+
+            Ok(!scheduler_guard.is_empty())
+        }
+    }
+
+    // Lock-free forward pass for hot path (generation loop)
+    // Takes direct mutable reference to caches, avoiding RwLock overhead
+    fn forward_with_cache_direct(
+        input_ids: &MxArray,
+        kv_caches: Option<&mut Vec<KVCache>>,
+        embedding_weight: &MxArray,
+        layers: &[TransformerBlock],
+        tie_word_embeddings: bool,
+        final_norm: &RMSNorm,
+        lm_head: &Linear,
+    ) -> Result<MxArray> {
+        // Embedding lookup
+        let mut hidden_states = embedding_weight.take(input_ids, 0)?;
+
+        // Pass through transformer layers with optional caching
+        // Note: We pass mask=None and let the Attention layer automatically use
+        // the optimized "causal" mode during prefill (seq_len > 1).
+        // During generation (seq_len == 1), no mask is needed due to KV cache.
+        if let Some(caches) = kv_caches {
+            for (i, layer) in layers.iter().enumerate() {
+                hidden_states = layer.forward(&hidden_states, None, Some(&mut caches[i]))?;
+            }
+        } else {
+            for layer in layers.iter() {
+                hidden_states = layer.forward(&hidden_states, None, None)?;
+            }
+        }
+
+        // Final layer norm
+        hidden_states = final_norm.forward(&hidden_states)?;
+
+        // LM head to get logits
+        let logits = if tie_word_embeddings {
+            hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
+        } else {
+            lm_head.forward(&hidden_states)?
+        };
+
+        Ok(logits)
     }
 
     /// Fused forward pass using C++ implementation for maximum performance.
@@ -5654,7 +6453,9 @@ impl Qwen3Model {
             kv_caches: Arc::new(RwLock::new(None)), // Fresh KV caches for session
             tokenizer: self.tokenizer.clone(),
             // Don't clone paged attention for training - use standard KVCache
+            #[cfg(not(target_family = "wasm"))]
             paged_cache: None,
+            #[cfg(not(target_family = "wasm"))]
             scheduler: None,
             cached_kv_keys: Arc::new(RwLock::new(Vec::new())),
             cached_kv_values: Arc::new(RwLock::new(Vec::new())),
@@ -8617,7 +9418,11 @@ impl Qwen3Model {
 
         Ok((loss, gradients))
     }
+} // end main #[napi] impl Qwen3Model (before training methods with GRPOLossConfig)
 
+#[cfg(not(target_family = "wasm"))]
+#[napi]
+impl Qwen3Model {
     /// Complete GRPO training step using MLX Autograd (RECOMMENDED)
     ///
     /// This method uses automatic differentiation to compute gradients, eliminating
@@ -8773,7 +9578,10 @@ impl Qwen3Model {
 
         Ok((loss_value, gradients, metrics))
     }
+} // end #[cfg(not(target_family = "wasm"))] impl (train_step_grpo_autograd, compute_gradients_only_grpo_autograd)
 
+#[napi]
+impl Qwen3Model {
     /// Accumulate gradients into existing gradient dictionary
     ///
     /// This is a helper method for gradient accumulation. It adds new_gradients
@@ -8813,7 +9621,11 @@ impl Qwen3Model {
 
         Ok(result)
     }
+} // end #[napi] impl Qwen3Model (accumulate_gradients)
 
+#[cfg(not(target_family = "wasm"))]
+#[napi]
+impl Qwen3Model {
     /// Complete GRPO training step using manual gradients (Legacy)
     ///
     /// This method performs a full GRPO training iteration:
@@ -8964,7 +9776,10 @@ impl Qwen3Model {
 
         Ok((loss_value, metrics))
     }
+} // end #[cfg(not(target_family = "wasm"))] impl (train_step_grpo)
 
+#[napi]
+impl Qwen3Model {
     /// Apply gradients to model parameters
     ///
     /// # Arguments

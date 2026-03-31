@@ -143,101 +143,90 @@ export declare class Gemma4Model {
    * to keep `ChatSession.reset()` idempotent across both runnable
    * and stub instances.
    *
-   * A runnable model requires `await Gemma4Model.load(path)`. The
-   * constructor signature is fixed by NAPI-RS; the stub-only behavior is
-   * covered by the regression tests in
+   * Callers relying on the pre-round-2 behavior where `new(config)`
+   * returned a runnable model MUST migrate to `await
+   * Gemma4Model.load(path)`. The constructor signature is unchanged
+   * on purpose (NAPI-RS pins it), so this is a deliberate runtime
+   * behavior break covered by the regression tests in
    * `__test__/models/model-loader-gemma4.test.ts`.
    */
   constructor(config: Gemma4Config);
   /** Returns true if weights have been loaded via `load()`. */
   get isInitialized(): boolean;
-  /**
-   * Whether the block-paged KV cache adapter is active on this model
-   * instance.
-   *
-   * `true` iff `Gemma4Inner::paged_adapter` was successfully
-   * constructed at load time (driven by
-   * `Gemma4Config::use_block_paged_cache`). The
-   * `gemma4_paged_vs_flat_parity` integration test pins greedy
-   * byte-equal at BF16 against real Gemma-4-E2B-IT weights. Stubs
-   * constructed via `new(config)` always return `false`. Surfaced
-   * through this NAPI method so server endpoints can branch on it
-   * without a model-thread roundtrip.
-   */
-  hasBlockPagedCache(): boolean;
-  /**
-   * Whether this loaded instance can execute image-bearing chat turns.
-   * Config-only stubs and incomplete/non-paged physical paths return false.
-   */
-  supportsImages(): boolean;
   modelId(): number;
-  /**
-   * Whether a draft model — DSpark or Google assistant — is loaded on
-   * this instance (via `Gemma4LoadOptions::draft_model_path`), enabling
-   * the speculative-decode whole-turn path.
-   *
-   * Note: this only reports draft availability. Whether speculative
-   * decoding actually runs on a given call also requires the per-request
-   * `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
-   * surface, but it reports an external draft model (either variant),
-   * not in-checkpoint MTP heads. Stubs from `new(config)` always return
-   * `false`.
-   */
-  hasMtpWeights(): boolean;
   /** Load a Gemma4 model from a directory. */
-  static load(modelPath: string, options?: Gemma4LoadOptions | undefined | null): Promise<Gemma4Model>;
+  static load(modelPath: string): Promise<Gemma4Model>;
   /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
+   * Reset all caches and clear cached token history. Exposed so
+   * tests and session-management code can start from a known clean
+   * state between turns.
+   *
+   * Synchronous on the NAPI boundary — every other `SessionCapableModel`
+   * exposes `resetCaches(): void` and the `ChatSession<M>` cross-model
+   * wrapper calls this inline during the image-change restart and
+   * `reset()` flows. Running it as an async NAPI method would break
+   * that contract and silently drop reset failures because
+   * `ChatSession.reset()` and the session-start restart path invoke
+   * `model.resetCaches()` without awaiting.
    */
   resetCaches(): void;
   /**
    * Start a new chat session.
    *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
+   * Runs the full jinja chat template once, decodes until Gemma4's
+   * `<turn|>` delimiter, and leaves the KV caches on a clean turn
+   * boundary so subsequent `chatSessionContinue` /
+   * `chatSessionContinueTool` calls can append a raw delta on top
+   * without re-rendering the chat template.
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Continue an existing chat session with a new user message.
    *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
+   * Appends a raw Gemma4 user/model delta to the session's cached KV
+   * state, then decodes the model reply. Stops on `<turn|>` so the
+   * cache remains on a clean turn boundary for the next turn.
    *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
+   * Requires a live session started via `chatSessionStart`. Errors
+   * if the session is empty, carries image state, or if
+   * `config.reuse_cache` is explicitly set to `false`.
+   *
+   * `images` is an opt-in guard parameter: when non-empty the native
+   * side returns an error whose message begins with
    * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
+   * `ChatSession` layer can catch the prefix and route image-changes
+   * back through a fresh `chatSessionStart` uniformly across all
+   * model backends.
    */
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
    * Continue an existing chat session with a tool-result turn.
    *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
+   * Builds a Gemma4-format tool delta
+   * (`
+  <|turn>tool
+  {content}<turn|>
+  <|turn>model
+  `) from
+   * `content` and prefills it on top of the live session caches,
+   * then decodes the model reply. Stops on `<turn|>` so the cache
+   * stays on a clean turn boundary for the next turn.
    *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
+   * The `tool_call_id` is currently dropped by the wire format —
+   * Gemma4's chat template identifies tool responses positionally,
+   * not via an explicit id. Callers may still log it for their own
+   * bookkeeping.
+   *
+   * Requires a live session started via `chatSessionStart`.
    */
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
     config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
   ): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
@@ -249,24 +238,15 @@ export declare class Gemma4Model {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 
@@ -524,78 +504,68 @@ export declare class Lfm2Model {
   /** Load an LFM2 model from a directory containing safetensors and config.json. */
   static load(modelPath: string): Promise<Lfm2Model>;
   /**
-   * Whether the block-paged KV cache adapter is active on this model
-   * instance.
-   *
-   * `true` iff `Lfm2Inner::paged_adapter` was successfully constructed
-   * at load time (driven by `Lfm2Config::use_block_paged_cache`,
-   * defaulting to `true` after paged-vs-flat parity verification).
-   * LFM2 is hybrid (10 conv + 6 full-attention layers); only the
-   * full-attention layers route through the adapter, conv layers stay
-   * on flat `Lfm2LayerCache::Conv` regardless. When `true`, the native
-   * cache reuses SYS blocks across `chatSessionStart` calls via
-   * content-addressing, so the JS-side warm slot in
-   * `SessionRegistry.getOrCreateWarmAny` is redundant and the
-   * `/v1/messages` server endpoint allocates a fresh `ChatSession` per
-   * request.
-   */
-  hasBlockPagedCache(): boolean;
-  /** Get the model configuration. */
-  getConfig(): Lfm2Config;
-  /** Estimated number of model parameters. */
-  numParameters(): number;
-  /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
+   * Reset all caches and clear cached token history. Exposed so
+   * tests and session-management code can start from a known clean
+   * state between turns.
    */
   resetCaches(): void;
   /**
    * Start a new chat session.
    *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
+   * Runs the full jinja chat template once, decodes until
+   * `<|im_end|>`, and leaves the KV/conv caches on a clean ChatML
+   * boundary so subsequent `chatSessionContinue` /
+   * `chatSessionContinueTool` calls can append a raw delta on top
+   * without re-rendering the chat template.
+   *
+   * Requires `config.reuse_cache` to be enabled (the default).
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Continue an existing chat session with a new user message.
    *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
+   * Appends a raw ChatML user/assistant delta to the session's
+   * cached KV/conv state, then decodes the assistant reply. Stops
+   * on `<|im_end|>` so the cache remains on a clean boundary for
+   * the next turn.
    *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
+   * Requires a live session started via `chatSessionStart`. Errors
+   * if the session is empty, carries image state, or if
+   * `config.reuse_cache` is explicitly set to `false`.
+   *
+   * LFM2 is text-only; `images` is an opt-in guard parameter: when
+   * non-empty the native side returns an error whose message begins
+   * with `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+   * `ChatSession` layer can catch the prefix and route
+   * image-changes back through a fresh `chatSessionStart`
+   * uniformly across all model backends.
    */
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
    * Continue an existing chat session with a tool-result turn.
    *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
-   */
+   * Builds an LFM2-format tool delta (`<|im_start|>tool
+{content}
+ * <|im_end|>`) from `content` and prefills it on top of the live
+ * session caches, then decodes the assistant reply. Stops on
+ * `<|im_end|>` so the cache stays on a clean boundary for the
+ * next turn.
+ *
+ * The `tool_call_id` is currently dropped by the wire format —
+ * LFM2's chat template identifies tool responses positionally,
+ * not via an explicit id. Callers may still log it for their own
+ * bookkeeping.
+ *
+ * Requires a live session started via `chatSessionStart`.
+ */
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
     config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
   ): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
@@ -607,25 +577,20 @@ export declare class Lfm2Model {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
+  /** Get the model configuration. */
+  getConfig(): Lfm2Config;
+  /** Estimated number of model parameters. */
+  numParameters(): number;
 }
 
 export declare class MxArray {
@@ -749,20 +714,9 @@ export declare class MxArray {
   divScalar(value: number): MxArray;
   matmul(other: MxArray): MxArray;
   /**
-   * Matrix multiply-add: D = beta * C + alpha * (self @ B), where self is A.
-   * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B).
-   *
-   * Computed explicitly (matmul, optional alpha scale, then add beta*C)
-   * rather than via the fused `mlx::core::addmm` primitive. The fused
-   * primitive is correct on a well-formed metallib, but this project's local
-   * release build is known to non-deterministically miscompile fused GEMM
-   * kernels (see the metallib-corruption notes), which manifested as the
-   * fused addmm dropping `beta*C` and corrupting every biased linear — most
-   * visibly the vision tower (`qkv`, `proj`, `fc1`, `fc2`, merger all carry a
-   * bias; bias-free LM/MoE linears pass a zero `C` and were unaffected). The
-   * explicit form keeps the `C` term robust to that build hazard; the
-   * `nn::linear` unit tests assert it applies a non-zero `C`, so they double
-   * as a canary if a future build corrupts the matmul kernel too.
+   * Fused matrix multiply-add: D = beta * C + alpha * (self @ B)
+   * where self is A. More efficient than separate matmul and add operations.
+   * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
    */
   addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray;
   abs(): MxArray;
@@ -877,186 +831,24 @@ export declare class MxArray {
   broadcastTo(shape: BigInt64Array): MxArray;
 }
 
-/** NAPI-exported reward registry wrapper */
-export declare class NativeRewardRegistry {
-  /** Create a new reward registry */
-  constructor();
-  /** Register a built-in reward function */
-  register(config: BuiltinRewardConfig): void;
-  /** Score a single completion */
-  score(prompt: string, completion: string): number;
-  /** Score a batch of completions */
-  scoreBatch(prompts: Array<string>, completions: Array<string>): Array<number>;
-  /** Check if registry is empty */
+/**
+ * Opaque handle to KV cache state from a chat-session turn.
+ *
+ * Pass this back via `model.setCache(cache)` before the next
+ * chat-session call to enable incremental prefill — only new tokens
+ * since the last turn are processed, avoiding redundant computation.
+ *
+ * Created internally by the model during chat-session turns.
+ * Extract via `model.takeCache()`, restore via `model.setCache(cache)`.
+ */
+export declare class PromptCache {
+  /** Number of tokens stored in this cache. */
+  get tokenCount(): number;
+  /** Whether this cache has been consumed (caches moved out). */
   get isEmpty(): boolean;
-  /** Get registered reward names */
-  get names(): Array<string>;
-  /** Set whether to normalize scores */
-  setNormalize(normalize: boolean): void;
+  /** Release GPU memory held by this cache. */
+  dispose(): void;
 }
-
-/**
- * OutputStore - Persistence layer for training outputs
- *
- * Stores all model outputs during GRPO training for debugging and research.
- * Supports local SQLite files.
- */
-export declare class OutputStore {
-  /** Create a new output store with local SQLite file */
-  static local(path: string): Promise<OutputStore>;
-  /** Create from config object */
-  static fromConfig(config: OutputStoreConfig): Promise<OutputStore>;
-  /** Start a new training run */
-  startRun(modelName: string, modelPath: string | undefined | null, config: string): Promise<string>;
-  /** Start a new training run with a name */
-  startRunWithName(
-    name: string | undefined | null,
-    modelName: string,
-    modelPath: string | undefined | null,
-    config: string,
-  ): Promise<string>;
-  /** End the current training run */
-  endRun(status: string): Promise<void>;
-  /** Get current run ID */
-  currentRunId(): Promise<string | null>;
-  /** Find a run by name */
-  findRunByName(name: string): Promise<TrainingRunRecord | null>;
-  /** Resume an existing run (sets status to running and makes it current) */
-  resumeRun(runId: string): Promise<void>;
-  /** Delete all steps after a given step number (for resume cleanup) */
-  deleteStepsAfter(runId: string, afterStep: number): Promise<number>;
-  /**
-   * Delete all records after a given step (for checkpoint resume)
-   *
-   * Cascades through: training_steps → generations → tool_calls, and logs.
-   * Use this when resuming from checkpoint to ensure clean database state.
-   */
-  deleteAllAfterStep(runId: string, afterStep: number): Promise<CleanupStats>;
-  /**
-   * Get recent step metrics for TUI sparkline restoration
-   *
-   * Returns metrics ordered by step (oldest first) for easy insertion into VecDeque.
-   */
-  getRecentStepMetrics(runId: string, limit: number): Promise<Array<StepMetricSummary>>;
-  /**
-   * Get aggregate statistics for a training run
-   *
-   * Returns pre-computed aggregates for restoring TUI state on resume.
-   */
-  getRunAggregates(runId: string): Promise<RunAggregates>;
-  /**
-   * Get recent generations for sample panel restoration
-   *
-   * Returns generations ordered by step DESC, reward DESC (most recent high-reward first).
-   */
-  getRecentGenerations(runId: string, limit: number): Promise<Array<GenerationRecord>>;
-  /** Get store configuration */
-  get config(): OutputStoreConfig;
-  /** Record from RewardOutput JSON (direct integration with training engine) */
-  recordStepFromOutputs(
-    step: number,
-    metrics: EngineStepMetrics,
-    outputsJson: string,
-    rewards: Array<number>,
-    groupSize: number,
-  ): Promise<number>;
-  /**
-   * Record a complete training step with all generations and tool calls
-   *
-   * Lower-level API for direct control over step recording.
-   */
-  recordStep(
-    step: StepRecord,
-    generations: Array<GenerationRecord>,
-    toolCalls: Array<Array<ToolCallRecord>>,
-  ): Promise<number>;
-  /** Flush any pending writes */
-  flush(): Promise<void>;
-  /** List all training runs */
-  listRuns(limit?: number | undefined | null, status?: string | undefined | null): Promise<Array<TrainingRunRecord>>;
-  /** Get a specific run */
-  getRun(runId: string): Promise<TrainingRunRecord | null>;
-  /** Get step summaries for a run */
-  getStepSummaries(
-    runId: string,
-    startStep?: number | undefined | null,
-    endStep?: number | undefined | null,
-  ): Promise<Array<StepSummary>>;
-  /** Get all generations for a step */
-  getGenerations(runId: string, step: number): Promise<Array<GenerationWithToolCalls>>;
-  /** Get top/bottom generations by reward */
-  getGenerationsByReward(
-    runId: string,
-    topN?: number | undefined | null,
-    bottomN?: number | undefined | null,
-    stepRange?: Array<number> | undefined | null,
-  ): Promise<Array<GenerationWithToolCalls>>;
-  /** Get generations with specific finish reason */
-  getGenerationsByFinishReason(
-    runId: string,
-    finishReason: string,
-    limit?: number | undefined | null,
-  ): Promise<Array<GenerationWithToolCalls>>;
-  /** Get generations containing tool calls */
-  getGenerationsWithToolCalls(
-    runId: string,
-    toolName?: string | undefined | null,
-    status?: string | undefined | null,
-    limit?: number | undefined | null,
-  ): Promise<Array<GenerationWithToolCalls>>;
-  /** Search generations by text content */
-  searchGenerations(
-    runId: string,
-    query: string,
-    searchIn?: string | undefined | null,
-    limit?: number | undefined | null,
-  ): Promise<Array<GenerationWithToolCalls>>;
-  /** Get reward distribution statistics */
-  getRewardStats(runId: string, stepRange?: Array<number> | undefined | null): Promise<RewardStats>;
-  /** Export to JSONL file */
-  exportJsonl(runId: string, outputPath: string, includeToolCalls?: boolean | undefined | null): Promise<number>;
-  /** Execute raw SQL query (for advanced users) */
-  queryRaw(sql: string): Promise<string>;
-}
-
-/**
- * NAPI-exported view of [`PrivacyFilterModel`].
- *
- * Construct via [`PrivacyFilterModelJs::load`] and run end-to-end
- * classification via [`PrivacyFilterModelJs::classify`].
- */
-export declare class PrivacyFilterModel {
-  /**
-   * Load a privacy-filter checkpoint from a directory.
-   *
-   * The directory must contain `config.json`, `model.safetensors`,
-   * `tokenizer.json`, and optionally `viterbi_calibration.json` and
-   * `tokenizer_config.json`. Synchronous to match the loader pattern
-   * used by every other model in this crate (e.g. `TextDetModel`).
-   */
-  static load(modelPath: string): PrivacyFilterModel;
-  /**
-   * Classify `text` and return detected PII entities (and optionally
-   * per-token tags).
-   *
-   * Pipeline:
-   * 1. Tokenize the text with byte offsets, no special tokens.
-   * 2. Run the forward pass to get `[1, T, 33]` logits.
-   * 3. Compute softmax (for per-tag confidences) and log-softmax (for
-   *    Viterbi emissions) over the class axis.
-   * 4. Build the transition matrix from the default calibration
-   *    merged with any per-call overrides.
-   * 5. Viterbi-decode using log-softmax emissions to get the BIOES
-   *    tag sequence.
-   * 6. For each token, take the softmax probability of the
-   *    Viterbi-emitted tag (so per-token `tag` and `score` share
-   *    decoders), then walk the tags + offsets + those probabilities
-   *    to extract coherent spans whose mean probability clears
-   *    `threshold`.
-   */
-  classify(text: string, opts?: PrivacyClassifyOptions | undefined | null): PrivacyClassifyResult;
-}
-export type PrivacyFilterModelJs = PrivacyFilterModel;
 
 /**
  * Qianfan-OCR Vision-Language Model (InternVL architecture).
@@ -1072,13 +864,8 @@ export declare class QianfanOCRModel {
    * Create a new QianfanOCRModel from config (uninitialized, no weights).
    *
    * This constructor path does not spawn a model thread — the returned
-   * instance is only useful for `is_initialized` queries until
-   * [`QianfanOCRModel::load`] is called to actually run inference. The
-   * `config` argument is accepted to preserve the `new
-   * QianfanOCRModel(config)` JS surface; the value is discarded because
-   * nothing on the uninitialized path consults it (any future config
-   * getter would forward to the inner thread state populated by
-   * `load()`).
+   * instance is only useful for config inspection. Call
+   * [`QianfanOCRModel::load`] to actually run inference.
    */
   constructor(config: QianfanOcrConfig);
   /** Returns true if weights have been loaded via `load()`. */
@@ -1138,19 +925,10 @@ export declare class QianfanOCRModel {
    * model backends. Qianfan-OCR is a VLM but the continue path cannot
    * splice new vision features into a live KV cache — image changes
    * always require a fresh session start.
-   *
-   * `audio` exists only to keep this method's positional ABI aligned
-   * with the shared chat surface every other family exposes (the
-   * `chat_napi_surface!` macro inserts `audio` between `images` and
-   * `config`). Qianfan-OCR has no audio support, so a non-empty
-   * `audio` is rejected at the boundary with the shared no-audio
-   * error; `None` / empty is a complete no-op and audio is never
-   * threaded into the model thread.
    */
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -1161,20 +939,12 @@ export declare class QianfanOCRModel {
    * decodes the model reply. Stops on `<|im_end|>` so the cache stays
    * on a clean turn boundary for the next turn.
    *
-   * `is_error` is the structured tool-error signal. When `Some(true)`,
-   * the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * `<tool_response>` wrapper so the model receives a clear text-level
-   * cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
-   * pre-feature output.
-   *
    * Requires a live session started via `chatSessionStart`.
    */
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
     config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
   ): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
@@ -1182,35 +952,19 @@ export declare class QianfanOCRModel {
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinue`.
-   *
-   * `audio` mirrors the non-streaming entry point: it exists only to
-   * keep the positional ABI aligned with the shared chat surface, and
-   * a non-empty value is rejected at the boundary with the shared
-   * no-audio error. `None` / empty is a complete no-op.
-   */
+  /** Streaming variant of `chatSessionContinue`. */
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * `<tool_response>` wrapper.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 
@@ -1222,55 +976,27 @@ export declare class QianfanOCRModel {
  * routed through `TrainingDispatch` to the model thread.
  */
 export declare class Qwen35Model {
+  /** Initialize caches for incremental generation. */
+  initCaches(): void;
+  /** Reset all caches. */
+  resetCaches(): void;
   /**
-   * Whether the block-paged KV cache adapter is active on this model
-   * instance.
+   * Take the KV cache from the model, returning a `PromptCache` handle.
    *
-   * `true` iff `Qwen35Inner::paged_adapter` was successfully
-   * constructed at load time (driven by
-   * `Qwen3_5Config::use_block_paged_cache`, default-OFF for text-only
-   * checkpoints because parity is pending real-weights validation, and
-   * default-ON for VLM checkpoints). On VLM checkpoints dense image turns
-   * ONLY run on the paged-vision core; a vision turn that reaches a None
-   * adapter errors at dispatch. Surfaced through this NAPI method so
-   * server endpoints can branch on it without round-tripping through
-   * the model thread.
+   * The cache is moved out of the model — calling `takeCache()` twice
+   * returns `null` the second time. Pass the cache back via `setCache()`
+   * before the next `chatSessionStart` / `chatSessionContinue` call for
+   * incremental prefill.
    */
-  hasBlockPagedCache(): boolean;
+  takeCache(): PromptCache | null;
   /**
-   * Whether this checkpoint shipped an MTP head (module loaded by
-   * `persistence::apply_weights_inner`). Snapshotted at load time from
-   * `Qwen35Inner::has_mtp_weights()` so the TS `ChatSession` can
-   * auto-default `enableMtp = true` for MTP-capable checkpoints without
-   * dispatching a command into the model thread.
+   * Restore a previously taken `PromptCache` into the model.
    *
-   * Note: this only reports weight availability. Whether the
-   * speculative-decode path actually runs on a given call also requires the
-   * per-request `enableMtp` flag.
+   * On the next `chatSessionStart` / `chatSessionContinue` call with
+   * `reuseCache: true`, the model will prefix-match the new tokens against
+   * the cache and only prefill the delta.
    */
-  hasMtpWeights(): boolean;
-  /**
-   * Whether this loaded model instance can execute image-bearing turns.
-   *
-   * This is an authoritative load-time snapshot, not a `config.json`
-   * family guess: it requires a loaded vision encoder, image processor,
-   * and the block-paged KV adapter used by the dense vision path.
-   */
-  supportsImages(): boolean;
-  /**
-   * Synchronous snapshot used by higher layers to preflight rendered
-   * prompts and clamp output before native cache allocation.
-   */
-  contextLimits(): Qwen35ContextLimits;
-  /**
-   * Compute the exact prompt length after Qwen image-placeholder expansion
-   * without running the vision encoder or touching inference caches.
-   *
-   * `prompt_tokens` is the already-rendered chat-template output. `messages`
-   * supplies the complete image history so both fresh and leased-session
-   * preflights account for every image in template order.
-   */
-  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
+  setCache(cache: PromptCache): void;
   /**
    * Load a pretrained model from a directory.
    *
@@ -1280,8 +1006,144 @@ export declare class Qwen35Model {
    * - tokenizer.json + tokenizer_config.json
    */
   static load(path: string): Promise<Qwen35Model>;
-  /** Generate text from a prompt token sequence. */
+  /**
+   * Load a model from in-memory buffers (works in both Node.js and browser).
+   *
+   * # Arguments
+   * * `config_json` - Contents of config.json as a string
+   * * `weight_buffers` - SafeTensors file contents as Buffers
+   * * `tokenizer_json` - Contents of tokenizer.json as a string
+   * Load a model from in-memory buffers (works in both Node.js and browser).
+   */
+  static loadFromMemory(configJson: string, weightBuffers: Array<Buffer>, tokenizerJson: string): Qwen35Model;
+  /**
+   * Load a model from pre-created GPU buffers (zero-copy, for browser WebGPU).
+   *
+   * The JS side parses SafeTensors headers, creates GPU buffers directly from the
+   * fetch ArrayBuffer, and passes the buffer handles here. No weight data touches
+   * WASM linear memory.
+   */
+  static loadFromGpuBuffers(configJson: string, gpuTensors: Array<any>, tokenizerJson: string): Qwen35Model;
+  /**
+   * Generate text from a prompt token sequence.
+   *
+   * Runs generation on a worker thread via spawn_blocking to avoid
+   * blocking the Node.js event loop.
+   */
   generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
+  /**
+   * Start a new chat session.
+   *
+   * Runs the full jinja chat template once and uses `<|im_end|>` as
+   * its stop token so the cached KV state ends on a clean ChatML
+   * boundary. Image support is conditional on the loaded
+   * checkpoint: a Qwen3.5-VL dense model loaded with vision weights
+   * accepts images in `messages` (the vision encoder handles
+   * prefill), while a plain text Qwen3.5 checkpoint rejects them
+   * with a runtime error. Subsequent turns in the same session MUST
+   * go through `chatSessionContinue` so the caller appends raw
+   * ChatML deltas on top of the live caches without rerunning the
+   * jinja template; a mid-session image change requires a fresh
+   * `chatSessionStart` call. The session is owned end-to-end by
+   * the `chatSession*` surface.
+   *
+   * This method is the production entry point used by the TypeScript
+   * `ChatSession` wrapper for turn 1 of a multi-round conversation.
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a new user message.
+   *
+   * Appends a raw ChatML user/assistant delta to the session's cached
+   * KV state, then decodes the assistant reply. Stops on `<|im_end|>`
+   * so the cache remains on a clean boundary for the next turn.
+   *
+   * Requires a live session started via `chatSessionStart`. Errors
+   * if the session is empty, carries image state, or if
+   * `config.reuse_cache` is explicitly set to `false`.
+   *
+   * `images` is an opt-in guard parameter: when non-empty, the native
+   * side returns an error whose message begins with
+   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+   * `ChatSession` layer can catch the prefix and route image-changes
+   * back through a fresh `chatSessionStart`.
+   */
+  chatSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null | undefined,
+    config: ChatConfig | null | undefined,
+  ): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a tool-result turn.
+   *
+   * Builds a ChatML `<tool_response>`-wrapped delta from `content` and
+   * prefills it on top of the live session caches, then decodes the
+   * assistant reply. Stops on `<|im_end|>` so the cache stays on a
+   * clean boundary for the next turn.
+   *
+   * The `tool_call_id` is currently dropped by the wire format —
+   * Qwen3.5's chat template identifies tool responses by position +
+   * wrapper tags, not an explicit id. Callers may still log it for
+   * their own bookkeeping.
+   *
+   * Requires a live session started via `chatSessionStart`.
+   */
+  chatSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatResult>;
+  /**
+   * Streaming variant of `chatSessionStart`.
+   *
+   * Dispatches to the dedicated model thread. Behaviourally identical
+   * to `chatSessionStart` (resets caches, uses `<|im_end|>` as
+   * eos, inherits the same VLM-vs-text image-support contract) but
+   * streams token deltas through the JS callback instead of
+   * returning a `ChatResult`. Used by the TypeScript
+   * `ChatSession.sendStream()` for turn 1 of a multi-round streaming
+   * conversation.
+   */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /**
+   * Streaming variant of `chatSessionContinue`.
+   *
+   * Appends a ChatML user/assistant delta on top of the live session
+   * caches and streams the decoded reply. Requires a live session
+   * started via `chatStreamSessionStart` (or the non-streaming
+   * `chatSessionStart`). Used by the TypeScript
+   * `ChatSession.sendStream()` for turns 2..N of a multi-round
+   * streaming conversation.
+   *
+   * `images` is an opt-in guard parameter: when non-empty, the
+   * streaming path emits an error chunk whose message begins with
+   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+   * `ChatSession` layer can route image-changes through a fresh
+   * session start.
+   */
+  chatStreamSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null | undefined,
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /**
+   * Streaming variant of `chatSessionContinueTool`.
+   *
+   * Builds a ChatML tool-response delta on top of the live session
+   * caches and streams the decoded reply. Requires a live session
+   * started via `chatSessionStart` / `chatStreamSessionStart`.
+   */
+  chatStreamSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
   /**
    * Get the number of parameters in the model.
    *
@@ -1294,88 +1156,6 @@ export declare class Qwen35Model {
    * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
-  /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
-   */
-  resetCaches(): void;
-  /**
-   * Start a new chat session.
-   *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
-   */
-  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
-  /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
-   */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
-  /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
-   */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
-  /** Streaming variant of `chatSessionStart`. */
-  chatStreamSessionStart(
-    messages: ChatMessage[],
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
-  /** Streaming variant of `chatSessionContinue`. */
-  chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
-  chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
-  ): Promise<ChatStreamHandle>;
 }
 export type Qwen3_5Model = Qwen35Model;
 
@@ -1387,53 +1167,130 @@ export type Qwen3_5Model = Qwen35Model;
  * routed through `TrainingDispatch` to the model thread.
  */
 export declare class Qwen35MoeModel {
-  /**
-   * Whether the block-paged KV cache adapter is active on this model
-   * instance.
-   *
-   * `true` iff `Qwen35MoeInner::paged_adapter` was successfully
-   * constructed at load time (driven by
-   * `Qwen3_5MoeConfig::use_block_paged_cache`, currently default-OFF
-   * because parity is pending real-weights validation). On VLM
-   * checkpoints the adapter can still be active for text-only
-   * inference; image-bearing chat turns are rejected at runtime by
-   * the chat-entry sites. Surfaced through this NAPI method so
-   * server endpoints can branch on it without round-tripping through
-   * the model thread.
-   */
-  hasBlockPagedCache(): boolean;
-  /**
-   * Whether this checkpoint shipped an MTP head (module loaded by
-   * `persistence::apply_weights_moe_inner`). Snapshotted at load time from
-   * `Qwen35MoeInner::has_mtp_weights()` so the TS `ChatSession` can
-   * auto-default `enableMtp = true` for MTP-capable checkpoints without
-   * dispatching a command into the model thread. Mirrors
-   * `Qwen3_5Model::has_mtp_weights`.
-   *
-   * Note: this only reports weight availability. Whether the
-   * speculative-decode path actually runs on a given call also requires
-   * the per-request `enableMtp` flag.
-   */
-  hasMtpWeights(): boolean;
-  /**
-   * Whether this loaded model instance can execute image-bearing turns.
-   *
-   * This is an authoritative load-time snapshot, not a model-family guess:
-   * it requires the loaded vision encoder, image processor, and block-paged
-   * KV adapter used by the MoE vision path.
-   */
-  supportsImages(): boolean;
-  /** Synchronous active-context snapshot shared with the dense wrapper. */
-  contextLimits(): Qwen35ContextLimits;
-  /**
-   * Exact, non-mutating Qwen image-placeholder expansion count for a fully
-   * rendered prompt and complete message history.
-   */
-  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
+  /** Initialize caches for incremental generation. */
+  initCaches(): void;
+  /** Reset all caches. */
+  resetCaches(): void;
+  /** Take the KV cache from the model, returning a `PromptCache` handle. */
+  takeCache(): PromptCache | null;
+  /** Restore a previously taken `PromptCache` into the model. */
+  setCache(cache: PromptCache): void;
   /** Load a pretrained model from a directory. */
   static load(path: string): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
+  /**
+   * Start a new chat session.
+   *
+   * Runs the full jinja chat template once, decodes until `<|im_end|>`,
+   * and leaves the KV caches on a clean ChatML boundary so subsequent
+   * `chatSessionContinue` / `chatSessionContinueTool` calls can
+   * append a raw delta on top without re-rendering the chat
+   * template.
+   *
+   * Image support is conditional on the loaded checkpoint: a
+   * Qwen3.5-VL MoE model loaded with vision weights accepts images
+   * in `messages` (the vision encoder handles prefill), while a
+   * plain text Qwen3.5 MoE checkpoint rejects them with a runtime
+   * error. A mid-session image change requires a fresh
+   * `chatSessionStart` call.
+   *
+   * Requires `config.reuse_cache` to be enabled (the default).
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a new user message.
+   *
+   * Appends a raw ChatML user/assistant delta to the session's cached
+   * KV state, then decodes the assistant reply. Stops on `<|im_end|>`
+   * so the cache remains on a clean boundary for the next turn.
+   *
+   * Requires a live session started via `chatSessionStart`.
+   * Errors if the session is empty, carries image state, or if
+   * `config.reuse_cache` is explicitly set to `false`.
+   *
+   * `images` is an opt-in guard parameter: when non-empty, the native
+   * side returns an error whose message begins with
+   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+   * `ChatSession` layer can catch the prefix and route image-changes
+   * back through a fresh `chatSessionStart`.
+   */
+  chatSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null | undefined,
+    config: ChatConfig | null | undefined,
+  ): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a tool-result turn.
+   *
+   * Builds a ChatML `<tool_response>`-wrapped delta from `content` and
+   * prefills it on top of the live session caches, then decodes the
+   * assistant reply. Stops on `<|im_end|>` so the cache stays on a
+   * clean boundary for the next turn.
+   *
+   * The `tool_call_id` is currently dropped by the wire format —
+   * Qwen3.5's chat template identifies tool responses by position +
+   * wrapper tags, not an explicit id. Callers may still log it for
+   * their own bookkeeping.
+   *
+   * Requires a live session started via `chatSessionStart`.
+   */
+  chatSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatResult>;
+  /**
+   * Streaming variant of `chatSessionStart`.
+   *
+   * Dispatches to the dedicated model thread. Behaviourally identical
+   * to `chatSessionStart` (resets caches, uses `<|im_end|>` as
+   * eos, inherits the same VLM-vs-text image-support contract) but
+   * streams token deltas through the JS callback instead of
+   * returning a `ChatResult`. Used by the TypeScript
+   * `ChatSession.sendStream()` for turn 1 of a multi-round streaming
+   * conversation.
+   */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /**
+   * Streaming variant of `chatSessionContinue`.
+   *
+   * Appends a ChatML user/assistant delta on top of the live session
+   * caches and streams the decoded reply. Requires a live session
+   * started via `chatStreamSessionStart` (or the non-streaming
+   * `chatSessionStart`). Used by the TypeScript
+   * `ChatSession.sendStream()` for turns 2..N of a multi-round
+   * streaming conversation.
+   *
+   * `images` is an opt-in guard parameter: when non-empty, the
+   * streaming path emits an error chunk whose message begins with
+   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+   * `ChatSession` layer can route image-changes through a fresh
+   * session start.
+   */
+  chatStreamSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null | undefined,
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /**
+   * Streaming variant of `chatSessionContinueTool`.
+   *
+   * Builds a ChatML tool-response delta on top of the live session
+   * caches and streams the decoded reply. Requires a live session
+   * started via `chatSessionStart` / `chatStreamSessionStart`.
+   */
+  chatStreamSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
   /**
    * Get the number of parameters in the model.
    *
@@ -1446,88 +1303,6 @@ export declare class Qwen35MoeModel {
    * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
-  /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
-   */
-  resetCaches(): void;
-  /**
-   * Start a new chat session.
-   *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
-   */
-  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
-  /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
-   */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
-  /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
-   */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
-  /** Streaming variant of `chatSessionStart`. */
-  chatStreamSessionStart(
-    messages: ChatMessage[],
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
-  /** Streaming variant of `chatSessionContinue`. */
-  chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
-  chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
-  ): Promise<ChatStreamHandle>;
 }
 export type Qwen3_5MoeModel = Qwen35MoeModel;
 
@@ -1539,23 +1314,233 @@ export type Qwen3_5MoeModel = Qwen35MoeModel;
  */
 export declare class Qwen3Model {
   /**
-   * Whether the block-paged KV cache adapter is active on this model
-   * instance.
-   *
-   * `true` iff `Qwen3Inner::paged_adapter` was successfully constructed
-   * at load time (driven by `Qwen3Config::use_block_paged_cache`,
-   * defaulting to `true` for Qwen3 since paged-vs-flat parity has been
-   * verified). When `true`, the native cache reuses SYS blocks across
-   * `chatSessionStart` calls via content-addressing in
-   * `BlockAllocator`'s prefix-hash table — the JS-side warm slot in
-   * `SessionRegistry.getOrCreateWarmAny` becomes redundant and the
-   * `/v1/messages` server endpoint allocates a fresh `ChatSession` per
-   * request. See `packages/server/src/endpoints/messages.ts` for the
-   * runtime-routing decision.
+   * Reset the KV cache used for cache reuse across chat-session turns.
+   * Call this when starting a new conversation to ensure a full prefill.
    */
-  hasBlockPagedCache(): boolean;
+  resetCache(): void;
+  /**
+   * Initialize KV caches for incremental generation
+   *
+   * Creates one KV cache per transformer layer. Call this before starting generation.
+   */
+  initKvCaches(): void;
+  /**
+   * Reset all KV caches
+   *
+   * Clears cached key-value states. Call this between different generation sequences.
+   */
+  resetKvCaches(): void;
+  /**
+   * Get paged attention memory statistics (if enabled)
+   *
+   * Returns memory usage statistics for the paged KV cache.
+   */
+  pagedCacheStats(): PagedCacheStats | null;
+  /**
+   * Get scheduler statistics (if paged attention is enabled)
+   *
+   * Returns the number of waiting, running, and completed sequences.
+   */
+  schedulerStats(): SchedulerStatsNapi | null;
+  /**
+   * Forward pass with paged attention for memory-efficient inference.
+   *
+   * This method uses block-based KV cache management via Metal kernels for:
+   * - Variable-length sequences with efficient memory usage
+   * - Continuous batching with dynamic batch composition
+   * - Long context support beyond GPU memory limits
+   *
+   * # Arguments
+   * * `input_ids` - Token IDs, shape: [num_seqs, 1] for decode
+   * * `slot_mapping` - Slot indices for cache updates, shape: [num_seqs]
+   * * `seq_ids` - Sequence IDs in the batch (for looking up block tables/context lens)
+   * * `positions` - Token positions for RoPE, shape: [num_seqs] (per-sequence positions)
+   *
+   * # Returns
+   * * Logits, shape: [num_seqs, 1, vocab_size] for decode
+   */
+  forwardPaged(inputIds: MxArray, slotMapping: MxArray, seqIds: Array<number>, positions: MxArray): MxArray;
+  /**
+   * Prefill a sequence using standard attention and write K/V to paged cache.
+   *
+   * This method should be called before `step_paged_generation()` for each
+   * new prompt. It runs the full forward pass using standard attention
+   * (which is faster for long sequences), then writes the K/V cache to
+   * the paged cache for subsequent decode steps.
+   *
+   * # Arguments
+   * * `prompt_tokens` - Token IDs for the prompt (as u32 array)
+   * * `seq_id` - Sequence ID (obtained from scheduler)
+   *
+   * # Returns
+   * * Logits for the last token, shape: [1, vocab_size]
+   */
+  prefillPaged(promptTokens: Array<number>, seqId: number): MxArray;
+  /**
+   * Add a request to the paged attention scheduler.
+   *
+   * The scheduler queues requests and allocates blocks for KV cache.
+   * Use `step_paged_generation()` to process the scheduled batch.
+   *
+   * Note: The actual sequence ID is assigned during scheduling, not when the
+   * request is added. Use the `request_id` to track your requests through
+   * the generation process.
+   *
+   * # Arguments
+   * * `request_id` - Unique identifier for the request (returned in outputs)
+   * * `prompt_tokens` - Token IDs for the prompt
+   * * `max_new_tokens` - Maximum new tokens to generate
+   * * `priority` - Optional priority (higher = scheduled first)
+   *
+   * # Returns
+   * * Number of pending requests in the queue
+   */
+  addPagedRequest(
+    requestId: string,
+    promptTokens: Array<number>,
+    maxNewTokens: number,
+    priority?: number | undefined | null,
+  ): number;
+  /**
+   * Schedule and execute one step of paged generation.
+   *
+   * This method:
+   * 1. Schedules the next batch of sequences
+   * 2. Runs forward pass with paged attention
+   * 3. Samples next tokens
+   * 4. Returns the generated tokens for each sequence
+   *
+   * # Arguments
+   * * `config` - Generation configuration (temperature, top_k, etc.)
+   *
+   * # Returns
+   * * `PagedGenerationStep` with token outputs for each sequence
+   */
+  stepPagedGeneration(config?: GenerationConfig | undefined | null): PagedGenerationStep | null;
+  /**
+   * Get completed sequences from the scheduler.
+   *
+   * Call this after `step_paged_generation()` returns outputs with `is_finished: true`.
+   */
+  getCompletedSequences(): Array<PagedCompletedSequence>;
+  /** Check if the scheduler has pending work. */
+  hasPagedWork(): boolean;
   /** Get model configuration */
   getConfig(): Qwen3Config;
+  /**
+   * Generate tokens using speculative decoding with a draft model.
+   *
+   * Speculative decoding uses a smaller draft model to generate tokens speculatively,
+   * then verifies them with the target model in a single forward pass. This can achieve
+   * 2-3x speedup when the draft model has high acceptance rate.
+   *
+   * # Algorithm
+   * 1. Draft model generates N tokens speculatively (cheap forward passes)
+   * 2. Target model (self) verifies all N tokens in one forward pass
+   * 3. Accept/reject using rejection sampling
+   * 4. On rejection, resample from adjusted distribution
+   * 5. Rewind caches and continue
+   *
+   * # Arguments
+   * * `draft_model` - Smaller model for speculative generation (should share tokenizer)
+   * * `input_ids` - Input token IDs [1, seq_len]
+   * * `config` - Generation configuration (includes num_draft_tokens)
+   *
+   * # Returns
+   * GenerationResult with tokens, logprobs, and speculative stats in finish_reason
+   *
+   * # Example (TypeScript)
+   * ```typescript
+   * const targetModel = await loadModel('qwen3-7b');
+   * const draftModel = await loadModel('qwen3-0.5b');
+   *
+   * const result = targetModel.generateSpeculativeSync(draftModel, inputIds, {
+   *   numDraftTokens: 5,
+   *   maxNewTokens: 100,
+   *   temperature: 0.7,
+   * });
+   * ```
+   */
+  generateSpeculativeSync(
+    draftModel: Qwen3Model,
+    inputIds: MxArray,
+    config?: GenerationConfig | undefined | null,
+  ): GenerationResult;
+  /** Count total number of parameters in the model */
+  numParameters(): number;
+  /**
+   * Get all model parameters as a dictionary mapping names to arrays
+   *
+   * This matches the TypeScript API for compatibility
+   */
+  getParameters(): Record<string, MxArray>;
+  /** Load parameters from a dictionary */
+  loadParameters(params: Record<string, MxArray>): void;
+  /**
+   * Compute forward pass and loss (for evaluation)
+   *
+   * # Arguments
+   * * `input_ids` - Input token IDs, shape: [batch_size, seq_len]
+   * * `labels` - Target token IDs, shape: [batch_size, seq_len]
+   *
+   * # Returns
+   * * Scalar loss value
+   */
+  computeLoss(inputIds: MxArray, labels: MxArray): MxArray;
+  /**
+   * Compute loss and gradients using a hybrid approach
+   *
+   * This implementation computes gradients for the output layers and uses
+   * numerical approximations for other parameters. This is sufficient to
+   * demonstrate that training works while we build out full MLX autograd integration.
+   *
+   * # Arguments
+   * * `input_ids` - Input token IDs, shape: [batch_size, seq_len]
+   * * `labels` - Target token IDs, shape: [batch_size, seq_len]
+   *
+   * # Returns
+   * * A tuple of (loss, gradients_dict) where gradients_dict maps parameter names to gradient arrays
+   *
+   * # Phase 6A Status
+   * Current implementation computes:
+   * - ✅ Exact gradients for LM head (output layer)
+   * - ⚠吅 Numerical approximations for other layers
+   *
+   * Future: Full MLX autograd will compute exact gradients for all 250+ parameters
+   */
+  computeLossAndGradients(inputIds: MxArray, labels: MxArray): [MxArray, Record<string, MxArray>];
+  /**
+   * Accumulate gradients into existing gradient dictionary
+   *
+   * This is a helper method for gradient accumulation. It adds new_gradients
+   * to accumulated_gradients element-wise.
+   *
+   * # Arguments
+   * * `accumulated_gradients` - Existing accumulated gradients (will be modified in-place conceptually, but returns new dict)
+   * * `new_gradients` - New gradients to add
+   *
+   * # Returns
+   * * Updated gradient dictionary with accumulated values
+   */
+  static accumulateGradients(
+    accumulatedGradients: Record<string, MxArray>,
+    newGradients: Record<string, MxArray>,
+  ): Record<string, MxArray>;
+  /**
+   * Apply gradients to model parameters
+   *
+   * # Arguments
+   * * `gradients` - Dictionary mapping parameter names to gradient arrays
+   * * `learning_rate` - Learning rate for gradient descent
+   *
+   * This performs a simple SGD update: param = param - lr * grad
+   * Only updates parameters that have gradients; others remain unchanged.
+   *
+   * IMPORTANT: This function preserves the original dtype of parameters.
+   * The learning rate scalar is cast to match param dtype to prevent
+   * promotion to float32 during arithmetic operations.
+   */
+  applyGradients(gradients: Record<string, MxArray>, learningRate: number): void;
   /**
    * Text-to-text generation with integrated tokenization
    *
@@ -1587,6 +1572,83 @@ export declare class Qwen3Model {
    * ```
    */
   generate(messages: Array<ChatMessage>, config?: GenerationConfig | undefined | null): Promise<GenerationResult>;
+  /**
+   * Reset all caches and clear cached token history. Exposed so
+   * tests and session-management code can start from a known clean
+   * state between turns.
+   */
+  resetCaches(): void;
+  /**
+   * Start a new chat session.
+   *
+   * Runs the full jinja chat template once, decodes until `<|im_end|>`,
+   * and leaves the KV caches on a clean ChatML boundary so subsequent
+   * `chatSessionContinue` / `chatSessionContinueTool` calls can
+   * append a raw delta on top without re-rendering the chat
+   * template.
+   *
+   * Requires `config.reuse_cache` to be enabled (the default).
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a new user message.
+   *
+   * Appends a raw ChatML user/assistant delta to the session's
+   * cached KV state, then decodes the assistant reply. Stops on
+   * `<|im_end|>` so the cache remains on a clean boundary for the
+   * next turn.
+   *
+   * Requires a live session started via `chatSessionStart`. Errors
+   * if the session is empty, carries image state, or if
+   * `config.reuse_cache` is explicitly set to `false`.
+   *
+   * Qwen3 legacy is text-only; `images` is an opt-in guard parameter:
+   * when non-empty the native side returns an error whose message
+   * begins with `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the
+   * TypeScript `ChatSession` layer can catch the prefix and route
+   * image-changes back through a fresh `chatSessionStart` uniformly
+   * across all model backends.
+   */
+  chatSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null | undefined,
+    config: ChatConfig | null | undefined,
+  ): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a tool-result turn.
+   *
+   * Builds a Qwen3.5-style `<tool_response>`-wrapped user-role delta
+   * from `content` and prefills it on top of the live session
+   * caches, then decodes the assistant reply. Stops on `<|im_end|>`
+   * so the cache stays on a clean boundary for the next turn.
+   *
+   * Requires a live session started via `chatSessionStart`.
+   */
+  chatSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatResult>;
+  /** Streaming variant of `chatSessionStart`. */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinue`. */
+  chatStreamSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null | undefined,
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinueTool`. */
+  chatStreamSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
   /**
    * Generate multiple completions for multiple prompts in batch
    *
@@ -1627,6 +1689,20 @@ export declare class Qwen3Model {
     config?: GenerationConfig | undefined | null,
   ): Promise<BatchGenerationResult>;
   /**
+   * Decode token IDs to text using the internal tokenizer
+   *
+   * Helper method for decoding generated tokens. The model must have been loaded
+   * via load() to have a tokenizer available.
+   *
+   * # Arguments
+   * * `token_ids` - Token IDs to decode as Uint32Array
+   * * `skip_special_tokens` - Whether to skip special tokens (default: true)
+   *
+   * # Returns
+   * * Decoded text string
+   */
+  decode(tokenIds: Uint32Array, skipSpecialTokens?: boolean | undefined | null): Promise<string>;
+  /**
    * Apply chat template and encode to token IDs
    *
    * Formats messages using ChatML format (or Jinja2 template with tools) and encodes to tokens.
@@ -1647,133 +1723,6 @@ export declare class Qwen3Model {
     tools?: Array<ToolDefinition> | undefined | null,
     enableThinking?: boolean | undefined | null,
   ): Promise<Uint32Array>;
-  /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
-   */
-  resetCaches(): void;
-  /**
-   * Start a new chat session.
-   *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
-   */
-  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
-  /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
-   */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
-  /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
-   */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
-  /** Streaming variant of `chatSessionStart`. */
-  chatStreamSessionStart(
-    messages: ChatMessage[],
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
-  /** Streaming variant of `chatSessionContinue`. */
-  chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
-  chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
-  ): Promise<ChatStreamHandle>;
-  /**
-   * Load a pretrained model from disk
-   *
-   * This loads a model from a directory containing:
-   * - config.json: Model configuration
-   * - weights.mlx (optional): MLX format weights with data arrays
-   * - weights.safetensors (optional): SafeTensors format (not yet supported)
-   *
-   * # Arguments
-   * * `model_path` - Path to the model directory
-   *
-   * # Returns
-   * * A fully initialized Qwen3Model with loaded weights
-   */
-  static load(modelPath: string): Promise<Qwen3Model>;
-  /**
-   * Save model configuration and weights to disk
-   *
-   * This saves:
-   * - config.json: Model configuration
-   * - weights.safetensors: Full model weights in SafeTensors format
-   * - weights.mlx: Parameter metadata (for reference)
-   *
-   * Dispatches to the dedicated model thread — all MxArray reads must
-   * happen on the thread that owns them to avoid the MLX cross-thread
-   * `CommandEncoder` crash.
-   *
-   * # Arguments
-   * * `save_path` - Directory to save the model
-   */
-  saveModel(savePath: string): Promise<undefined>;
-  /**
-   * Validate that a set of parameters has all required weights with correct shapes
-   *
-   * This is useful for validating parameters before loading them into a model,
-   * or for checking that saved weights are valid before training.
-   *
-   * # Arguments
-   * * `params` - HashMap of parameter names to MxArray values
-   *
-   * # Returns
-   * * Ok(()) if all validations pass
-   * * Err with descriptive message if validation fails
-   */
-  validateParameters(params: Record<string, MxArray>): void;
 }
 
 /** Qwen3 Tokenizer class with NAPI bindings */
@@ -2201,6 +2150,10 @@ export declare class VLModel {
    * for loading a model from disk.
    */
   constructor(config: ModelConfig);
+  /** Set the tokenizer */
+  setTokenizer(tokenizer: Qwen3Tokenizer): void;
+  /** Check if tokenizer is available */
+  get hasTokenizer(): boolean;
   /**
    * Chat with the VLM model
    *
@@ -2242,6 +2195,80 @@ export declare class VLModel {
    */
   ocr(imageData: Buffer, prompt?: string | undefined | null): Promise<string>;
   /**
+   * Get input embeddings with vision features merged
+   *
+   * # Arguments
+   * * `input_ids` - Token IDs [batch, seq_len]
+   * * `pixel_values` - Optional image patches [batch, seq, channels, patch_h, patch_w]
+   * * `image_grid_thw` - Optional grid dimensions [num_images, 3]
+   *
+   * # Returns
+   * * Input embeddings with vision features inserted at image token positions
+   */
+  getInputEmbeddings(
+    inputIds: MxArray,
+    pixelValues?: MxArray | undefined | null,
+    imageGridThw?: MxArray | undefined | null,
+  ): MxArray;
+  /**
+   * Forward pass
+   *
+   * # Arguments
+   * * `input_ids` - Token IDs [batch, seq_len]
+   * * `pixel_values` - Optional image patches
+   * * `image_grid_thw` - Optional grid dimensions
+   * * `mask` - Optional attention mask
+   *
+   * # Returns
+   * * Logits [batch, seq_len, vocab_size]
+   */
+  forward(
+    inputIds: MxArray,
+    pixelValues?: MxArray | undefined | null,
+    imageGridThw?: MxArray | undefined | null,
+    mask?: MxArray | undefined | null,
+  ): MxArray;
+  /**
+   * Generate text tokens given input tokens and optional image
+   *
+   * Uses KV caching for efficient generation.
+   *
+   * # Arguments
+   * * `input_ids` - Input token IDs [1, seq_len]
+   * * `pixel_values` - Optional image patches [1, num_patches, C, H, W]
+   * * `image_grid_thw` - Optional grid dimensions [1, 3]
+   * * `config` - Generation configuration
+   *
+   * # Returns
+   * * GenerationResult with tokens, logprobs, and finish reason
+   */
+  generate(
+    inputIds: MxArray,
+    pixelValues?: MxArray | undefined | null,
+    imageGridThw?: MxArray | undefined | null,
+    config?: GenerationConfig | undefined | null,
+  ): Promise<GenerationResult>;
+  /**
+   * Batch OCR: extract text from multiple images simultaneously
+   *
+   * Processes N images with sequential prefill + batched decode for ~N× decode throughput.
+   *
+   * # Arguments
+   * * `images` - Encoded image buffers
+   * * `config` - Optional chat configuration (shared across all items)
+   *
+   * # Returns
+   * * Vec of extracted text strings, one per image
+   *
+   * # Example
+   * ```typescript
+   * import { readFileSync } from 'fs';
+   * const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
+   * const texts = await model.ocrBatch(images);
+   * ```
+   */
+  ocrBatch(images: Array<Buffer>, config?: VlmChatConfig | undefined | null): Promise<Array<string>>;
+  /**
    * Batch chat: process multiple items simultaneously
    *
    * Sequential prefill + batched decode. Each item can have different images/prompts.
@@ -2279,6 +2306,25 @@ export declare class VLModel {
    * ```
    */
   static load(modelPath: string): Promise<VLModel>;
+  /**
+   * Load model configuration from disk without loading weights
+   *
+   * This is useful for inspecting model configuration before loading the full model.
+   *
+   * # Arguments
+   * * `model_path` - Path to the model directory containing config.json
+   *
+   * # Returns
+   * * ModelConfig with vision and text configuration
+   *
+   * # Example
+   * ```typescript
+   * import { VLModel } from '@mlx-node/vlm';
+   * const config = await VLModel.loadConfig('./models/paddleocr-vl');
+   * console.log(config.visionConfig.hiddenSize);
+   * ```
+   */
+  static loadConfig(modelPath: string): Promise<ModelConfig>;
 }
 
 /**
@@ -2295,102 +2341,8 @@ export declare function buildRewardOutputs(
   groupSize: number,
 ): Array<RewardOutput>;
 
-/** Configuration for built-in rewards */
-export interface BuiltinRewardConfig {
-  /** Type of reward function */
-  rewardType: BuiltinRewardType;
-  /** Weight for this reward (default 1.0) */
-  weight?: number;
-  /** Allowed tool names (for ToolUse) */
-  allowedTools?: Array<string>;
-  /** Required tags (for XmlFormat) */
-  requiredTags?: Array<string>;
-  /** Minimum length (for Length) */
-  minLength?: number;
-  /** Maximum length (for Length) */
-  maxLength?: number;
-  /** Use character count vs word count (for Length) */
-  useChars?: boolean;
-  /** Required JSON fields (for JsonSchema) */
-  requiredFields?: Array<string>;
-  /** Whether tool call is required (for ToolUse) */
-  required?: boolean;
-}
-
-/** Built-in reward function types */
-export declare const enum BuiltinRewardType {
-  /** Tool use validation */
-  ToolUse = 'ToolUse',
-  /** XML format validation */
-  XmlFormat = 'XmlFormat',
-  /** Length-based scoring */
-  Length = 'Length',
-  /** JSON format validation (brace matching + field name check, not full JSON parsing) */
-  JsonSchema = 'JsonSchema',
-}
-
-/**
- * Data-free static FP8 activation-amax calibration over RAW-text PREFILL
- * (NVIDIA modelopt `MaxCalibrator` parity), end to end in native code.
- *
- * The nvidia recipe covers BOTH `qwen3_5` (dense) and `qwen3_5_moe` (MoE), so
- * this reads `<model_path>/config.json`'s `model_type` and dispatches to the
- * matching loader + `CalibratePrefillRaw` command (any other `model_type` is a
- * clear error). Both loaders are the SAME ones the inference session uses
- * ([`persistence::load_with_thread`]) — the model is only usable on its
- * dedicated model thread. Then:
- *   1. dispatches `{Qwen35Cmd,Qwen35MoeCmd}::CalibratePrefillRaw`, which on the
- *      model thread SELF-ARMS that thread's thread-local
- *      [`ActivationAmaxCollector`] flag (RAII, AFTER load so no load-time eval
- *      is recorded), tokenizes each `text` WITHOUT the chat template, truncates
- *      to `calib_seq` tokens, and runs PREFILL ONLY (no generation) so every
- *      mxfp8 attn/GDN projection's activation tap fires over realistic raw-text
- *      activations, resetting caches between rows, then disarms on exit;
- *   2. ONLY if the full loop succeeded — drains the per-tensor amax and
- *      ATOMICALLY writes it into `<model_path>/config.json` (temp file +
- *      `rename`).
- *
- * CONCURRENCY: the whole clear→prefill→take→write section is serialized by
- * [`calib_guard`] (a process-wide `try_lock`); a second concurrent calibration
- * fails fast with "another calibration is in progress". The arm flag is
- * thread-local (so a concurrent inference model can't contaminate the run), but
- * the running-max MAP is process-global, so serializing RUNS keeps two
- * calibrations from interleaving `record`/`take` on it. The map is CLEARED at
- * the very start so stale amax from a prior PANICKED run cannot leak into this
- * write.
- *
- * On ANY error before the final write, the partial amax is discarded and
- * `config.json` is left UNTOUCHED (a failed calibration must not mutate the
- * live model in place). A run that prefilled ZERO rows (empty dataset, or every
- * row tokenized to nothing) is likewise an ERROR that leaves `config.json`
- * untouched — a no-op calibration must not report a silent success. Returns the
- * number of projections calibrated (the count of collected amax entries); 0
- * means a real prefill ran but the model exercised no activation-fp8 sites (not
- * an nvidia-recipe checkpoint), and in that case `config.json` is left
- * UNCHANGED (no rewrite).
- */
-export declare function calibrateActivationAmaxRaw(
-  modelPath: string,
-  texts: Array<string>,
-  calibSeq: number,
-): Promise<number>;
-
 /** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
-  /**
-   * Internal logical cache owner. The agent provider forwards Pi's stable
-   * session id so model-global GDN sidecars can retain parent and child
-   * branches independently. This does not namespace the physical paged KV
-   * cache; exact token/extra-key hashes remain shareable across owners.
-   */
-  cacheOwnerId?: string | undefined;
-  /**
-   * Internal top-level owner for the bounded Qwen3.5 GDN sidecar store.
-   * `cache_owner_id` may identify a child Pi session; this separately
-   * identifies the current interactive root so /new and /resume can rotate
-   * the protected branch without changing PagedAttention cache identity.
-   */
-  cacheRootOwnerId?: string | undefined;
   maxNewTokens?: number | undefined;
   temperature?: number | undefined;
   topK?: number | undefined;
@@ -2414,11 +2366,11 @@ export interface ChatConfig {
   frequencyPenalty?: number | undefined;
   /** Number of recent tokens to consider for frequency penalty (default: 20) */
   frequencyContextSize?: number | undefined;
-  /** Max consecutive identical tokens before stopping (default: 0 = disabled; opt in with a positive value) */
+  /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
   maxConsecutiveTokens?: number | undefined;
-  /** Max n-gram repetitions before stopping (default: 0 = disabled; opt in with a positive value) */
+  /** Max n-gram repetitions before stopping (default: 3, 0 = disabled) */
   maxNgramRepeats?: number | undefined;
-  /** Max pattern size for n-gram repetition detection (default: 0 = disabled; opt in with a positive value) */
+  /** Max pattern size for n-gram repetition detection (default: 64) */
   ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
   /**
@@ -2451,56 +2403,6 @@ export interface ChatConfig {
    * avoiding redundant computation for multi-turn conversations.
    */
   reuseCache?: boolean | undefined;
-  /**
-   * MTP: opt-in flag enabling the Multi-Token Prediction speculative decode
-   * loop (pure-Rust eager; qwen3.5 dense and MoE). Requires the model
-   * checkpoint to carry an MTP head (otherwise silently ignored). Default:
-   * `false`.
-   */
-  enableMtp?: boolean | undefined;
-  /**
-   * MTP: number of draft tokens per speculative cycle.
-   *
-   * On Qwen3.5 native MTP heads it is clamped to `[1, 5]` by the verify
-   * FFI contract, and when unset native code currently pins depth 1.
-   * When `mtpAdaptiveDepth` is `true`, this value is used as the
-   * throughput-policy seed and the expected-value policy's max depth.
-   * Adaptive depth is opt-in; set `mtpAdaptiveDepth: true` explicitly to
-   * enable it.
-   *
-   * Gemma4 external drafts (`draftModelPath`) resolve the field per draft
-   * variant instead (`gemma4/model.rs` `resolve_params`, always from the
-   * RAW config value — the engine's central `[1, 5]` clamp is an MTP-head
-   * contract that does not apply to external drafts):
-   * - DSpark: with both knobs unset, full draft blocks (the checkpoint's
-   *   block size — 7 tokens on `dspark_gemma4_12b_block7`) run behind a
-   *   short target-AR/DSpark break-even calibration. A short generation
-   *   budget that cannot finish calibration retains the fixed-block
-   *   schedule. An explicit
-   *   `mtpDepth` caps and pins the block unless `mtpAdaptiveDepth: true`
-   *   opts the guard back in; explicit `false` disables it.
-   * - Assistant (Google `gemma-4-*-it-assistant`): an unset `mtpDepth`
-   *   drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`), and an
-   *   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
-   *
-   * `mtpAdaptiveDepth` is ignored for the Gemma4 assistant variant.
-   */
-  mtpDepth?: number | undefined;
-  /**
-   * MTP: when true, the decode loop runs the adaptive
-   * depth policy. Default mode is a per-depth EMA hill-climb plus
-   * DFlash-style 3-state machine `full | reduced | probe`.
-   * `MLX_MTP_ADAPTIVE_DEPTH_MODE=expected-value` instead uses the
-   * MTPLX-style intra-cycle expected-value gate, which deepens toward
-   * `mtpDepth` by default (T=0 byte-parity verified); set
-   * `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
-   * When false, the loop pins `mtpDepth` for every cycle.
-   *
-   * Default: false, except Gemma4 DSpark enables its measured break-even
-   * guard when both this field and `mtpDepth` are unset. An explicit value
-   * always wins over the family default.
-   */
-  mtpAdaptiveDepth?: boolean | undefined;
 }
 
 /** Chat message with tool calling support */
@@ -2513,40 +2415,10 @@ export interface ChatMessage {
   toolCalls?: Array<ToolCall>;
   /** Tool call ID this message is responding to (for tool messages) */
   toolCallId?: string;
-  /**
-   * Whether this tool-role message represents an errored tool result.
-   *
-   * Authoritative, structured signal of tool-call failure. Set to
-   * `Some(true)` when the caller (e.g. the Anthropic
-   * `tool_result.is_error === true` translator) wants the model to
-   * treat the tool output as an error. The renderer prepends a short
-   * `[tool error]` prefix to `content` when emitting the wire-format
-   * tool response so the model receives a clear text-level cue, but
-   * the original `content` stays byte-for-byte intact in the
-   * structured form — no JSON wrapping, no in-band marker that could
-   * collide with a successful tool result whose literal content
-   * happens to start with the same prefix.
-   *
-   * `None` / `Some(false)` produce the unmarked wire format.
-   */
-  isError?: boolean;
   /** Reasoning content for thinking mode (used with <think> tags) */
   reasoningContent?: string;
-  /**
-   * Thinking mode used when this assistant message was generated.
-   *
-   * This is replay provenance, not a request override. Gemma4's disabled-
-   * thinking generation prefix contains an explicit empty thought channel,
-   * while an enabled-thinking turn that emitted no reasoning contains no
-   * such channel. Keeping the historical mode on the message lets the chat
-   * template reproduce either byte sequence even when a later request
-   * changes its current thinking setting.
-   */
-  thinkingEnabled?: boolean;
   /** Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer) */
   images?: Array<Uint8Array> | undefined;
-  /** Audio data for unified Gemma 4 (encoded audio bytes: WAV, passed as Uint8Array/Buffer) */
-  audio?: Array<Uint8Array> | undefined;
 }
 
 /** Unified chat result shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
@@ -2577,13 +2449,13 @@ export interface ChatResult {
 /** Chat message role (lowercase values matching standard convention) */
 export declare const enum ChatRole {
   /** User message */
-  User = 'user',
+  User = 'User',
   /** Assistant response */
-  Assistant = 'assistant',
+  Assistant = 'Assistant',
   /** System prompt */
-  System = 'system',
+  System = 'System',
   /** Tool response */
-  Tool = 'tool',
+  Tool = 'Tool',
 }
 
 /** A single chunk emitted during streaming chat generation. */
@@ -2632,18 +2504,6 @@ export interface ClassifyRotateResult {
   image: Uint8Array;
 }
 
-/** Statistics about cleanup operations (NAPI wrapper) */
-export interface CleanupStats {
-  /** Number of training steps deleted */
-  stepsDeleted: number;
-  /** Number of generations deleted */
-  generationsDeleted: number;
-  /** Number of tool calls deleted */
-  toolCallsDeleted: number;
-  /** Number of logs deleted */
-  logsDeleted: number;
-}
-
 /**
  * Structured completion information aligned with ChatResult.
  * Contains pre-parsed tool calls, thinking, and clean text.
@@ -2680,11 +2540,7 @@ export interface ConversionOptions {
   quantBits?: number;
   /** Quantization group size (default: 64 for affine, 32 for mxfp8) */
   quantGroupSize?: number;
-  /**
-   * Quantization mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or
-   * "sym8" (per-output-channel symmetric int8; qwen3_5 + qwen3_5_moe + lfm2/lfm2_moe + gemma4,
-   * implies bits=8, no group_size — consciously NOT mlx-lm-loadable)
-   */
+  /** Quantization mode: "affine" (default) or "mxfp8" */
   quantMode?: string;
   /**
    * Quantization recipe for per-layer mixed-bit quantization.
@@ -2696,35 +2552,6 @@ export interface ConversionOptions {
    * Improves quantization quality by amplifying important weight channels.
    */
   imatrixPath?: string;
-  /**
-   * Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-   * When true, applies after the recipe predicate: eligible 8-bit affine
-   * decisions become mxfp8 and 4-bit become mxfp4. Kept affine (not upgraded):
-   * affine-only loaders (lm_head, embed_tokens, router.proj,
-   * embedding_projection) at their recipe bits, MoE router gates (8-bit affine),
-   * and the recipe-pinned attention/GDN projections (o_proj / out_proj /
-   * in_proj_a / in_proj_b, 8-bit affine). Requires `quant_mode = "affine"`.
-   * Forces `group_size = 32` for upgraded layers.
-   */
-  quantMxfp?: boolean;
-  /**
-   * Optional Qwen MTP quantization policy: "off" (default), "cyankiwi", "all",
-   * or "split" (alias "drafter").
-   * "cyankiwi" keeps mtp.fc dense and quantizes only the MTP layer linears as
-   * 4-bit affine group_size=32. For dense `qwen3_5` the quantized linears are
-   * emitted into an MTPLX-compatible mtp.safetensors sidecar; for MoE
-   * (`qwen3_5_moe`) there is no sidecar — they are quantized in place and stored
-   * inline in the main safetensors shards.
-   * "all" additionally quantizes mtp.fc. For dense `qwen3_5` the quantized MTP
-   * linears land in the mtp.safetensors sidecar; for MoE (`qwen3_5_moe`) there
-   * is no sidecar — they are quantized in place and stored inline in the main
-   * safetensors shards.
-   * "split"/"drafter" emits a body checkpoint with NO mtp.* tensors plus a
-   * separate `mtp-drafter/` directory in mlx-vlm's `qwen3_5_mtp` format
-   * (bare-keyed MTP head, format:mlx). It does NOT require --quantize/--q-recipe;
-   * the body may be bf16 or already-quantized and the MTP head stays bf16.
-   */
-  quantMtp?: string;
 }
 
 export interface ConversionResult {
@@ -2739,8 +2566,6 @@ export interface ConversionResult {
 }
 
 export declare function convertForeignWeights(options: ForeignConversionOptions): ForeignConversionResult;
-
-export declare function convertGgufToSafetensors(options: GgufConversionOptions): Promise<GgufConversionResult>;
 
 /**
  * Convert a HuggingFace SafeTensors model to MLX format
@@ -2773,8 +2598,6 @@ export declare function convertGgufToSafetensors(options: GgufConversionOptions)
  */
 export declare function convertModel(options: ConversionOptions): Promise<ConversionResult>;
 
-export declare function convertParquetToJsonl(inputPath: string, outputPath: string): void;
-
 /** Create a default PaddleOCR-VL 1.5 configuration (JS factory function) */
 export declare function createPaddleocrVlConfig(): ModelConfig;
 
@@ -2796,11 +2619,11 @@ export declare function createRandomQwen35Checkpoint(config: Qwen35Config, saveP
 /**
  * Create a random-init Qwen3.5 MoE model and save it to disk.
  *
- * Spawns a dedicated model thread whose init runs
- * [`create_random_qwen35_moe_checkpoint_sync`] (random-init inner + save);
- * the thread holds no state and is dropped once the promise resolves, so
- * the in-memory model is released as soon as the checkpoint has been
- * written. Used by TypeScript test fixtures that need an on-disk
+ * Spawns a dedicated `ModelThread<Qwen35MoeCmd>` whose init builds a fresh
+ * random-weight `Qwen35MoeInner` directly, then dispatches
+ * `Qwen35MoeCmd::SaveModel` on that thread. The thread is dropped at the end
+ * of the promise, so the in-memory model is released once the checkpoint has
+ * been written. Used by TypeScript test fixtures that need an on-disk
  * checkpoint without keeping a NAPI model instance alive.
  */
 export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig, savePath: string): Promise<undefined>;
@@ -2826,24 +2649,6 @@ export interface DocumentElement {
   paragraph?: Paragraph;
 }
 
-/**
- * Convert a ParsedDocument to an XLSX buffer.
- *
- * Each Table element becomes a separate worksheet with bold headers.
- * Paragraph elements are collected into a "Text" worksheet.
- *
- * # Example
- * ```typescript
- * import { parseVlmOutput, documentToXlsx } from '@mlx-node/core';
- * import { writeFileSync } from 'fs';
- *
- * const doc = parseVlmOutput(vlmResult.text);
- * const buffer = documentToXlsx(doc);
- * writeFileSync('output.xlsx', buffer);
- * ```
- */
-export declare function documentToXlsx(doc: ParsedDocument): Buffer;
-
 export declare const enum DType {
   Float32 = 0,
   Int32 = 1,
@@ -2851,58 +2656,12 @@ export declare const enum DType {
   BFloat16 = 3,
   Uint32 = 4,
   Uint8 = 5,
-  /** Signed int8 — sym8 per-output-channel symmetric quantized weights. */
-  Int8 = 6,
 }
 
 /** Document element type */
 export declare const enum ElementType {
   Table = 'Table',
   Paragraph = 'Paragraph',
-}
-
-/** Metrics from a training epoch */
-export interface EngineEpochMetrics {
-  /** Epoch number */
-  epoch: number;
-  /** Average loss for the epoch */
-  avgLoss: number;
-  /** Average reward for the epoch */
-  avgReward: number;
-  /** Total steps in the epoch */
-  totalSteps: number;
-  /** Total tokens processed */
-  totalTokens: number;
-  /** Time for the epoch (seconds) */
-  epochTimeSecs: number;
-}
-
-/** Metrics from a single training step */
-export interface EngineStepMetrics {
-  /** Current step number */
-  step: number;
-  /** GRPO loss value */
-  loss: number;
-  /** Mean reward across completions */
-  meanReward: number;
-  /** Standard deviation of rewards */
-  stdReward: number;
-  /** Mean advantage value */
-  meanAdvantage: number;
-  /** Standard deviation of advantages */
-  stdAdvantage: number;
-  /** Total tokens generated this step */
-  totalTokens: number;
-  /** Whether gradients were applied */
-  gradientsApplied: boolean;
-  /** Time for generation (ms) */
-  generationTimeMs: number;
-  /** Time for training (ms) */
-  trainingTimeMs: number;
-  /** Peak memory usage this step (MB) */
-  peakMemoryMb: number;
-  /** Active memory at end of step (MB) */
-  activeMemoryMb: number;
 }
 
 export interface ForeignConversionOptions {
@@ -2979,20 +2738,6 @@ export interface Gemma4Config {
   /** Head dimension for global layers. If None, uses head_dim. */
   globalHeadDim?: number;
   attentionKEqV: boolean;
-  /**
-   * True for the unified multimodal Gemma 4 checkpoint
-   * (`model_type == "gemma4_unified"` or
-   * `architectures[0] == "Gemma4UnifiedForConditionalGeneration"`).
-   * The text decoder is shared, but the unified checkpoint carries
-   * vision/audio embedder weights that must be dropped in a text-only load.
-   */
-  isUnified: boolean;
-  /**
-   * `text_config.use_bidirectional_attention` from the unified checkpoint
-   * (e.g. `"vision"`). Parsed for a stable struct surface; the text-only
-   * decode path does not consume it.
-   */
-  useBidirectionalAttention?: string;
   finalLogitSoftcapping?: number;
   perLayerInputEmbeds: boolean;
   hiddenSizePerLayerInput?: number;
@@ -3011,88 +2756,10 @@ export interface Gemma4Config {
   topKExperts?: number;
   moeIntermediateSize?: number;
   visionConfig?: Gemma4VisionConfig;
-  /**
-   * Encoder-free vision config for the unified multimodal checkpoint.
-   * `Some` only when `is_unified` and the checkpoint carries a
-   * `vision_config` sub-dict. Disjoint from `vision_config` (the SigLIP
-   * path) — the unified vision embedder is built from this instead.
-   */
-  unifiedVisionConfig?: UnifiedVisionConfig;
   imageTokenId?: number;
   boiTokenId?: number;
   eoiTokenId?: number;
   visionSoftTokensPerImage?: number;
-  /**
-   * True when the checkpoint declares an `audio_config` sub-dict. Parallels
-   * `unified_vision_config.is_some()`; gates the un-drop + load of
-   * `embed_audio` weights and the audio merge path.
-   */
-  hasAudio: boolean;
-  /**
-   * Audio placeholder token id (258881). Each `<audio>` placeholder expands to
-   * `boa + audio_token × n_frames + eoa`.
-   */
-  audioTokenId?: number;
-  /** Begin-of-audio token id (256000), emitted before the audio token run. */
-  boaTokenId?: number;
-  /**
-   * End-of-audio token id, parsed from the config's `eoa_token_index` (258883).
-   * A real appended token (like `eoi`), despite the "index" name.
-   */
-  eoaTokenId?: number;
-  /**
-   * Raw audio samples per audio token (640 = 40 ms @ 16 kHz), from
-   * `audio_config.audio_samples_per_token`. Frame size for the encoder-free
-   * pad+reshape feature extractor.
-   */
-  audioSamplesPerToken?: number;
-  /**
-   * GPU memory budget for paged KV cache in megabytes.
-   * Only used when `use_block_paged_cache` is true.
-   * Default: auto-sized to cover `max_position_embeddings` for the
-   * physical full-attention layers.
-   */
-  pagedCacheMemoryMb?: number | undefined;
-  /**
-   * Block size for paged attention (tokens per block).
-   * Only used when `use_block_paged_cache` is true.
-   * Default: 16.
-   */
-  pagedBlockSize?: number | undefined;
-  /**
-   * Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
-   *
-   * When `Some(true)` or unset (the default), `Gemma4Inner` builds
-   * model-independent KV-cache specs, groups them, and allocates a
-   * `BlockAllocator` + `LayerKVPool` pair for physical full-attention
-   * layers. Sliding-window layers still use `RotatingKVCache` until
-   * true paged sliding-window groups are wired. KV-shared layers are
-   * aliases: they reuse their anchor's cache slot and do not allocate
-   * separate physical storage.
-   *
-   * Default: `true` (paged adapter on; opt-out via
-   * `use_block_paged_cache: false` in `config.json` to use the flat
-   * (non-paged) all-`Gemma4LayerCache` path instead). Parity between
-   * the two paths is verified by
-   * `crates/mlx-core/tests/gemma4_paged_vs_flat_parity.rs` against
-   * real Gemma-4-E2B weights.
-   */
-  useBlockPagedCache?: boolean | undefined;
-}
-
-/** Optional load-time settings for [`Gemma4Model::load`]. */
-export interface Gemma4LoadOptions {
-  /**
-   * Directory of a draft checkpoint (config.json + safetensors) to load
-   * alongside the target model for speculative decoding — either a
-   * DSpark draft or a Google assistant draft; the kind is probed from
-   * the draft config.json. When omitted, `<model_path>/draft/` is loaded
-   * automatically when present. Draft decoding runs only on the flat
-   * KV-cache path: setting this while the model config explicitly enables
-   * `use_block_paged_cache` is a hard load error, and an unset
-   * `use_block_paged_cache` is forced to `false`.
-   */
-  draftModelPath?: string;
 }
 
 /**
@@ -3165,19 +2832,19 @@ export interface GenerationConfig {
   /** Number of recent tokens to consider for frequency penalty (default: 20) */
   frequencyContextSize?: number;
   /**
-   * Stop if same token repeats this many times consecutively (default: 0 = disabled).
-   * Opt in by setting a positive value to guard against degenerate repetitive generation.
+   * Stop if same token repeats this many times consecutively (default: 16)
+   * Set to 0 to disable. Prevents OOM from degenerate repetitive generation.
    */
   maxConsecutiveTokens?: number;
   /**
-   * Stop if a pattern repeats this many times consecutively (default: 0 = disabled).
-   * Opt in with a positive value to detect patterns like "A B A B A B".
+   * Stop if a pattern repeats this many times consecutively (default: 3)
+   * Set to 0 to disable. Detects patterns like "A B A B A B".
    * Uses range-based detection: checks all pattern sizes from 2 to ngram_size.
    */
   maxNgramRepeats?: number;
   /**
-   * Maximum pattern size for repetition detection (default: 0 = disabled).
-   * When enabled, all pattern sizes from 2 up to this value are checked each decode step.
+   * Maximum pattern size for repetition detection (default: 64)
+   * All pattern sizes from 2 up to this value are checked each decode step.
    * Larger values catch long phrase-level repetition common in small models.
    */
   ngramSize?: number;
@@ -3192,91 +2859,39 @@ export interface GenerationConfig {
    * Set to 0 to disable chunking and process the entire prompt at once.
    */
   prefillStepSize?: number;
-}
-
-export interface GenerationProfile {
-  /** Label identifying the decode loop variant. */
-  label: string;
-  /** Model type (e.g. "qwen3_5", "qwen3_5_moe", "qwen3"). */
-  modelType: string;
-  /** Number of tokens generated. */
-  numTokens: number;
-  /** Number of prompt tokens. */
-  promptTokens: number;
-  /** Prefill wall-clock time (ms). */
-  prefillMs: number;
-  /** Decode wall-clock time (ms). */
-  decodeMs: number;
-  /** Total wall-clock time (prefill + decode) (ms). */
-  totalMs: number;
-  /** Tokens per second (decode only). */
-  tokensPerSecond: number;
-  /** Time to first token (ms) — from decode loop start to first token extracted. */
-  timeToFirstTokenMs: number;
-  /** Per-phase breakdown. */
-  phases: Array<PhaseProfile>;
   /**
-   * MTP speculative decode: mean accepted *draft* tokens per cycle
-   * (excludes the always-verified token). Historical drafts-only metric.
+   * KV cache quantization bits (default: 16 = no quantization)
+   * - 16: Full precision (bfloat16/float16), no quantization
+   * - 8: 8-bit quantization, ~2x memory savings, minimal quality loss
+   * - 4: 4-bit quantization, ~4x memory savings, some quality degradation
+   *
+   * Quantized KV cache is useful for long sequences where memory becomes a bottleneck.
+   * Note: Adds dequantization overhead per forward pass.
    */
-  mtpMeanAcceptedTokens?: number;
+  kvCacheBits?: number;
   /**
-   * MTP speculative decode: mean *committed* tokens per cycle, INCLUDING
-   * the always-verified token (`mtp_accepted_drafts_total / mtp_cycles
-   * + 1.0`). mlx-vlm-comparable headline; equals mlx-vlm's
-   * `(accepted_drafts + rounds) / rounds` (`common.py:247`).
+   * KV cache quantization group size (default: 64)
+   * Number of elements per quantization group. Smaller groups = better accuracy
+   * but more overhead from storing scales/biases.
+   * Only used when kv_cache_bits is 4 or 8.
    */
-  mtpMeanAcceptedTokensTotal?: number;
-  /** MTP speculative decode: per-draft-position acceptance rate. */
-  mtpAcceptanceByPosition?: Array<number>;
-  /** MTP speculative decode: number of draft+verify cycles executed. */
-  mtpCycles?: number;
-  /** MTP speculative decode: mean attempted draft depth per cycle. */
-  mtpMeanDepth?: number;
-  /** Memory snapshot before generation. */
-  memoryBefore?: MemorySnapshot;
-  /** Memory snapshot after generation. */
-  memoryAfter?: MemorySnapshot;
+  kvCacheGroupSize?: number;
+  /**
+   * Number of draft tokens to generate speculatively (default: 5)
+   * Only used when a draft model is provided for speculative decoding.
+   * Higher values can increase throughput but may reduce acceptance rate.
+   */
+  numDraftTokens?: number;
 }
 
-/** A generation record (NAPI wrapper) */
-export interface GenerationRecord {
-  batchIndex: number;
-  groupIndex: number;
-  prompt: string;
-  expectedAnswer?: string;
-  completionText: string;
-  completionRaw: string;
-  thinking?: string;
-  numTokens: number;
-  finishReason: string;
-  reward: number;
-}
-
-/** A generation with its associated tool calls (NAPI wrapper) */
-export interface GenerationWithToolCalls {
-  generation: GenerationRecord;
-  toolCalls: Array<ToolCallRecord>;
-}
-
-/** Sample MLX's GPU memory counters. See [`GpuMemorySnapshot`]. */
-export declare function getMemorySnapshot(): GpuMemorySnapshot;
-
-/** Retrieve all collected profiling data as a `ProfilingSession`. */
-export declare function getProfilingData(): ProfilingSession;
+/** Get expected weight keys for PaddleOCR-VL model */
+export declare function getExpectedWeightKeys(): Array<string>;
 
 export interface GgufConversionOptions {
   /** Path to the GGUF file */
   inputPath: string;
   /** Output directory for converted SafeTensors model */
   outputDir: string;
-  /**
-   * Optional directory containing the authoritative HuggingFace config and
-   * tokenizer/processor assets. GGUF metadata is not rich enough to recreate
-   * unified Gemma4 config fields such as head_dim, layer_types, vision, and
-   * audio configuration exactly.
-   */
-  configSourceDir?: string;
   /** Target dtype: "float32", "float16", "bfloat16" (default: keep original) */
   dtype?: string;
   /** Enable verbose logging */
@@ -3310,17 +2925,6 @@ export interface GgufConversionOptions {
    * This makes the safetensors compatible with mlx-vlm.
    */
   vlmKeyPrefix?: boolean;
-  /**
-   * Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-   * When true, applies after the recipe predicate: eligible 8-bit affine
-   * decisions become mxfp8 and 4-bit become mxfp4. Kept affine (not upgraded):
-   * affine-only loaders (lm_head, embed_tokens, router.proj,
-   * embedding_projection) at their recipe bits, MoE router gates (8-bit affine),
-   * and the recipe-pinned attention/GDN projections (o_proj / out_proj /
-   * in_proj_a / in_proj_b, 8-bit affine). Requires `quant_mode = "affine"`.
-   * Forces `group_size = 32` for upgraded layers.
-   */
-  quantMxfp?: boolean;
 }
 
 export interface GgufConversionResult {
@@ -3329,240 +2933,6 @@ export interface GgufConversionResult {
   outputPath: string;
   tensorNames: Array<string>;
   sourceFormat: string;
-}
-
-export interface GpuInfo {
-  /** GPU architecture generation (M1=13, M2=14, M3=15, M4=16, M5=17). */
-  architectureGen: number;
-}
-
-/**
- * Snapshot of MLX's GPU memory counters at this instant. All values
- * are in bytes. On Apple Silicon, GPU and CPU share unified memory,
- * so these are NOT a separate "VRAM" pool — they reflect MLX's own
- * tracking of `StorageModePrivate` Metal buffers (model weights,
- * `LayerKVPool`, transient intermediate tensors) attributed to the
- * MLX runtime in this process.
- *
- * Useful for live observability during long-running sessions:
- *
- * ```js
- * const { getMemorySnapshot } = require('@mlx-node/core');
- * setInterval(() => {
- *   const m = getMemorySnapshot();
- *   console.log(`active=${(m.activeBytes/1e9).toFixed(2)}GB peak=${(m.peakBytes/1e9).toFixed(2)}GB cache=${(m.cacheBytes/1e9).toFixed(2)}GB`);
- * }, 1000);
- * ```
- */
-export interface GpuMemorySnapshot {
-  /** Current actively-used GPU buffer bytes (excludes cache pool). */
-  activeBytes: number;
-  /** Peak GPU buffer bytes since the last `resetPeakMemory()` call. */
-  peakBytes: number;
-  /** Bytes held in MLX's caching allocator (released by `clearCache`). */
-  cacheBytes: number;
-}
-
-/** Configuration for the GRPO training engine */
-export interface GrpoEngineConfig {
-  /** Learning rate (default: 1e-6) */
-  learningRate?: number;
-  /** Gradient accumulation steps (default: 1) */
-  gradientAccumulationSteps?: number;
-  /** Maximum gradient norm for clipping (default: 1.0) */
-  gradientClipNorm?: number;
-  /**
-   * Maximum gradient value for element-wise clipping (default: 1.0)
-   * This clamps individual gradient elements to [-value, value]
-   */
-  gradientClipValue?: number;
-  /** Number of completions per prompt (default: 4) */
-  groupSize?: number;
-  /** PPO clipping epsilon (default: 0.2) */
-  clipEpsilon?: number;
-  /** KL divergence coefficient (default: 0.0) */
-  klCoef?: number;
-  /** Loss type: "grpo", "dapo", "dr_grpo", "bnpo" (default: "grpo") */
-  lossType?: string;
-  /**
-   * Maximum completion length for both generation and training (default: 256)
-   * Matches Python TRL's max_completion_length config.
-   */
-  maxCompletionLength?: number;
-  /** Sampling temperature (default: 0.8) */
-  temperature?: number;
-  /** Top-p (nucleus) sampling (default: 0.95) */
-  topP?: number;
-  /** Top-k sampling (optional) */
-  topK?: number;
-  /** Repetition penalty (default: 1.1) */
-  repetitionPenalty?: number;
-  /**
-   * Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
-   * token that appeared at least once in context.
-   */
-  presencePenalty?: number;
-  /**
-   * Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
-   * logits of each token in context.
-   */
-  frequencyPenalty?: number;
-  /**
-   * Maximum allowed NaN gradient occurrences before stopping training (default: 100)
-   * When exceeded, training will stop with an error to prevent model corruption.
-   */
-  maxNanGradients?: number;
-  /**
-   * Consecutive NaN gradients that trigger emergency checkpoint (default: 5)
-   * When reached, the needs_emergency_save flag is set for the TypeScript layer.
-   */
-  emergencySaveThreshold?: number;
-  /**
-   * Enable detailed NaN/Inf detection with per-element counts (default: false)
-   * When false (default), uses GPU-native has_nan_or_inf() which only transfers a single
-   * boolean to CPU. When true, transfers the entire gradient tensor to CPU for detailed
-   * per-element analysis - useful for debugging but has significant performance overhead
-   * for large models (e.g., 2.4GB for Qwen3-0.6B).
-   */
-  verboseNanDetection?: boolean;
-  /**
-   * Enable thinking mode for Qwen3 models (default: true)
-   * When false, adds empty <think></think> tags to disable model thinking.
-   * This is useful for tool-use training where you want direct outputs.
-   */
-  enableThinking?: boolean;
-  /**
-   * Tool definitions for function calling
-   * When provided, tools are included in the chat template so the model
-   * can generate tool calls. This is essential for tool-use training.
-   */
-  tools?: Array<ToolDefinition>;
-  /**
-   * Batch chunk size for LM head computation (memory optimization).
-   * When set, the LM head (hidden_states -> logits) is computed in chunks
-   * of this size to reduce peak memory usage.
-   * Default: None (no chunking, full batch at once)
-   * Recommended: 2 for batch_size >= 4 with large vocabularies (e.g., 151936)
-   * This reduces peak memory from ~1.2GB to ~300MB for Qwen3 (vocab=151936).
-   */
-  lmHeadChunkSize?: number;
-  /**
-   * Batch chunk size for transformer forward pass (memory optimization).
-   * When set, the transformer layers process the batch in chunks of this size,
-   * reducing peak memory from O(batch × heads × seq²) for attention.
-   * Default: None (no chunking, full batch at once)
-   * Recommended: 4 for batch_size >= 4 with groupSize >= 4
-   * Memory savings: ~70-80% for batch=4, groupSize=4 (16 sequences → 4 at a time)
-   */
-  forwardChunkSize?: number;
-  /**
-   * Chunk size for vocabulary dimension in cross-entropy computation.
-   * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
-   * the computation is split into chunks of this size to reduce peak memory usage.
-   * Default: 65536 (2^16)
-   * Recommended: 65536 for Qwen3 (vocab=151936) splits into 3 chunks
-   * Set to a larger value to reduce chunking overhead or smaller for tighter memory constraints.
-   */
-  vocabChunkSize?: number;
-  /**
-   * Enable true parallel batch generation (default: false).
-   * When true, all N*G sequences are processed in parallel using batched FFI
-   * with per-sequence RoPE offsets. This provides 2-4x speedup for GRPO training.
-   * When false, uses the sequential generation (process one prompt at a time,
-   * then expand KV cache for G completions).
-   */
-  useParallelBatchGeneration?: boolean;
-  /**
-   * Enable gradient checkpointing (default: true).
-   * When true, each transformer layer's activations are discarded during the forward
-   * pass and recomputed during backward, reducing peak memory from O(num_layers) to O(1)
-   * for intermediate states. For Qwen3.5 0.8B, this reduces autograd peak from ~105GB to ~11GB.
-   * The trade-off is ~30% more compute (one extra forward pass per layer during backward).
-   */
-  gradientCheckpointing?: boolean;
-  /** Optimizer type: "sgd" or "adamw" (default: "adamw") */
-  optimizerType?: string;
-  /** AdamW beta1 (default: 0.9) */
-  adamwBeta1?: number;
-  /** AdamW beta2 (default: 0.999) */
-  adamwBeta2?: number;
-  /** AdamW epsilon (default: 1e-8) */
-  adamwEps?: number;
-  /** Weight decay for AdamW (default: 0.01) */
-  weightDecay?: number;
-}
-
-/** Configuration for GRPO loss computation */
-export interface GrpoLossConfig {
-  /** Lower clipping bound (default: 0.2, means clip to [1-0.2, 1+epsilon_high]) */
-  epsilonLow: number;
-  /** Upper clipping bound (default: same as epsilon_low) */
-  epsilonHigh?: number;
-  /** KL divergence penalty coefficient (default: 0.0, no penalty) */
-  beta: number;
-  /** Loss aggregation type: "grpo", "bnpo", "dr_grpo", or "dapo" */
-  lossType: string;
-  /** Importance sampling level: "token" or "sequence" */
-  importanceSamplingLevel: string;
-  /**
-   * Maximum completion length (legacy, no longer used by dr_grpo)
-   * Kept for backwards compatibility but ignored in current implementation.
-   */
-  maxCompletionLength?: number;
-  /** Total number of items in batch across all processes (needed for dapo) */
-  numItemsInBatch?: number;
-  /** Current gradient accumulation step (for loss scaling) */
-  gradientAccumulationSteps: number;
-  /**
-   * Batch chunk size for LM head computation (memory optimization).
-   * When set, the LM head (hidden_states -> logits) is computed in chunks
-   * of this size to reduce peak memory usage.
-   * Default: None (no chunking, full batch at once)
-   * Recommended: 2 for batch_size >= 4 with large vocabularies (e.g., 151936)
-   */
-  lmHeadChunkSize?: number;
-  /**
-   * Batch chunk size for transformer forward pass (memory optimization).
-   * When set, the transformer layers process the batch in chunks of this size,
-   * reducing peak memory from O(batch × heads × seq²) for attention.
-   * Default: None (no chunking, full batch at once)
-   * Recommended: 4 for batch_size >= 4 with groupSize >= 4
-   * Memory savings: ~70-80% for batch=4, groupSize=4 (16 sequences → 4 at a time)
-   */
-  forwardChunkSize?: number;
-  /**
-   * Chunk size for vocabulary dimension in cross-entropy computation.
-   * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
-   * the computation is split into chunks of this size to reduce peak memory usage.
-   * Default: 65536 (2^16)
-   * Recommended: 65536 for Qwen3 (vocab=151936) splits into 3 chunks
-   */
-  vocabChunkSize?: number;
-}
-
-/**
- * Configuration for Harrier embedding model (Qwen3 backbone).
- *
- * Only includes backbone dimensions needed for encoding.
- * No generation fields (token IDs, paged attention, etc.).
- */
-export interface HarrierConfig {
-  hiddenSize: number;
-  numLayers: number;
-  numHeads: number;
-  numKeyValueHeads: number;
-  intermediateSize: number;
-  rmsNormEps: number;
-  ropeTheta: number;
-  maxPositionEmbeddings: number;
-  headDim: number;
-  /**
-   * Qwen3 always uses QK normalization. Omit to use the default (true).
-   * Explicitly passing false is allowed but produces a model incompatible
-   * with published Harrier weights.
-   */
-  useQkNorm?: boolean;
-  vocabSize: number;
 }
 
 /** InternViT vision encoder configuration */
@@ -3579,9 +2949,6 @@ export interface InternVisionConfig {
   /** Drop path rate (inference only, always 0) */
   dropPathRate: number;
 }
-
-/** Check whether profiling is currently enabled. */
-export declare function isProfilingEnabled(): boolean;
 
 /** A single detected layout element. */
 export interface LayoutElement {
@@ -3624,69 +2991,6 @@ export interface Lfm2Config {
   eosTokenId: number;
   bosTokenId: number;
   padTokenId: number;
-  /**
-   * GPU memory budget for paged KV cache in megabytes.
-   * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
-   */
-  pagedCacheMemoryMb?: number | undefined;
-  /**
-   * Block size for paged attention (tokens per block).
-   * Only used when `use_block_paged_cache` is true.
-   * Default: 16.
-   */
-  pagedBlockSize?: number | undefined;
-  /**
-   * Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
-   *
-   * Default: `true` since 2026-04-28 (parity-verified via
-   * `crates/mlx-core/tests/lfm2_paged_vs_flat_parity.rs` against real
-   * LFM2.5-1.2B weights: byte-equal greedy decode + prefix-reuse
-   * byte-equal at BF16). Wired through
-   * `Lfm2DecoderLayer::forward_paged_or_flat`.
-   *
-   * Per-layer routing: LFM2's hybrid architecture means only
-   * `full_attention` layers go through the paged adapter; conv layers
-   * stay on the existing flat `Lfm2LayerCache::Conv(ArraysCache)`
-   * storage regardless of this flag. The `LayerKVPool` is sized to
-   * the count of `full_attention` layers and indexed by
-   * attention-ordinal (via `config.full_attn_idxs()`), not by absolute
-   * layer index.
-   *
-   * Opt out with `use_block_paged_cache: Some(false)` to revert to the
-   * fully flat `Lfm2LayerCache` path on all layers.
-   */
-  useBlockPagedCache?: boolean | undefined;
-  /**
-   * MLP intermediate size for the DENSE-in-MoE layers (`layer_idx <
-   * num_dense_layers`). Used DIRECTLY (no 2/3 `computed_ff_dim()` shrink).
-   * Only present on MoE checkpoints.
-   */
-  intermediateSize?: number | undefined;
-  /** Per-expert MLP intermediate size for the sparse MoE layers. */
-  moeIntermediateSize?: number | undefined;
-  /** Total number of routed experts. */
-  numExperts?: number | undefined;
-  /** Top-k experts selected per token. */
-  numExpertsPerTok?: number | undefined;
-  /** Number of leading DENSE layers before MoE layers begin. */
-  numDenseLayers?: number | undefined;
-  /**
-   * Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-20)`).
-   *
-   * `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
-   * required). Absent (None) is read as `true` everywhere via
-   * `.unwrap_or(true)`, matching the prior `default = "default_true"`.
-   */
-  normTopkProb?: boolean | undefined;
-  /**
-   * Add the learned per-expert bias to the post-softmax gates BEFORE top-k.
-   *
-   * `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
-   * required). Absent (None) is read as `true` everywhere via
-   * `.unwrap_or(true)`, matching the prior `default = "default_true"`.
-   */
-  useExpertBias?: boolean | undefined;
 }
 
 export interface MemorySnapshot {
@@ -3757,10 +3061,54 @@ export enum OutputFormat {
   Json = 'Json',
 }
 
-/** Configuration for creating an OutputStore connection */
-export interface OutputStoreConfig {
-  /** Local SQLite file path (e.g., "training_outputs.db") */
-  localPath: string;
+/** Paged attention memory statistics (NAPI-compatible) */
+export interface PagedCacheStats {
+  /** Total number of blocks in the pool */
+  totalBlocks: number;
+  /** Number of free blocks */
+  freeBlocks: number;
+  /** Number of allocated blocks */
+  allocatedBlocks: number;
+  /** Total memory in MB */
+  totalMemoryMb: number;
+  /** Used memory in MB */
+  usedMemoryMb: number;
+  /** Utilization percentage */
+  utilizationPercent: number;
+}
+
+/** A completed sequence from paged generation */
+export interface PagedCompletedSequence {
+  /** Original request ID */
+  requestId: string;
+  /** All generated tokens (excluding prompt) */
+  tokens: Array<number>;
+  /** Reason for completion ("stop", "length", "repetition", "tool_calls") */
+  finishReason: string;
+}
+
+/** Result of a paged generation step */
+export interface PagedGenerationStep {
+  /** Token outputs for each sequence in the batch */
+  outputs: Array<PagedTokenOutput>;
+  /** Number of sequences that were in prefill phase */
+  numPrefill: number;
+  /** Number of sequences that were in decode phase */
+  numDecode: number;
+}
+
+/** Output from a single token generation step in paged attention */
+export interface PagedTokenOutput {
+  /** Sequence ID in the scheduler */
+  seqId: number;
+  /** Request ID for this sequence */
+  requestId: string;
+  /** Generated token ID */
+  token: number;
+  /** Log probability of the token (f64 for NAPI compatibility) */
+  logprob: number;
+  /** Whether this sequence has finished */
+  isFinished: boolean;
 }
 
 /** A text paragraph */
@@ -3826,70 +3174,10 @@ export interface ParseToolCallsResult {
 /** Parse VLM output into structured document */
 export declare function parseVlmOutput(text: string): ParsedDocument;
 
-/**
- * Lightweight performance metrics returned by chat/chatStream when
- * `reportPerformance: true` is set in the config.
- */
 export interface PerformanceMetrics {
-  /**
-   * Time to first token (ms) — wall-clock from generation start to
-   * first token extracted. Includes tokenization, prefill (lazy graph
-   * construction + first GPU eval), and first sample.
-   */
   ttftMs: number;
-  /** Prefill throughput: prompt_tokens / (ttft_ms / 1000). */
   prefillTokensPerSecond: number;
-  /**
-   * Decode throughput: (generated_tokens - 1) / decode_time.
-   * Excludes the first token (counted as prefill).
-   */
   decodeTokensPerSecond: number;
-  /**
-   * MTP speculative decode: mean accepted *draft* tokens per cycle
-   * (range `[0, depth]`). EXCLUDES the always-verified token each cycle
-   * commits. `None` on plain autoregressive runs where no MTP cycle
-   * executed. This is the historical drafts-only metric; for the
-   * mlx-vlm-comparable headline see [`Self::mtp_mean_accepted_tokens_total`].
-   */
-  mtpMeanAcceptedTokens?: number;
-  /**
-   * MTP speculative decode: mean *committed* tokens per cycle, INCLUDING
-   * the single always-verified token each cycle emits — i.e.
-   * `mtp_accepted_drafts_total / mtp_cycles + 1.0`. This is the
-   * mlx-vlm-comparable headline accept rate: it equals mlx-vlm's
-   * `mean_accepted_tokens = (accepted_drafts + rounds) / rounds`
-   * (`mlx-vlm/mlx_vlm/speculative/common.py:247`), where our
-   * `mtp_cycles` is the 1:1 analog of mlx-vlm's `rounds` (one
-   * draft+verify iteration; `record_mtp_cycle` is called exactly once
-   * per cycle). The per-cycle `+1.0` matches mlx-vlm's `+rounds`
-   * assumption — every round commits exactly one verified token
-   * (the residual on partial-accept, the bonus on full-accept), even
-   * when the final cycle's tail is EOS/length-truncated downstream
-   * (mlx-vlm makes the same assumption: it appends to `accept_lens`
-   * once per round regardless of truncation). `None` on plain
-   * autoregressive runs.
-   */
-  mtpMeanAcceptedTokensTotal?: number;
-  /**
-   * MTP speculative decode: per-draft-position acceptance rate
-   * (index = draft position). `None` on plain autoregressive runs.
-   */
-  mtpAcceptanceByPosition?: Array<number>;
-  /**
-   * MTP speculative decode: number of draft+verify cycles executed.
-   * `None` on plain autoregressive runs.
-   */
-  mtpCycles?: number;
-  /**
-   * MTP speculative decode: mean attempted draft depth per cycle.
-   * `None` on plain autoregressive runs.
-   */
-  mtpMeanDepth?: number;
-  /**
-   * Optional decode phase breakdown. Present when decode profiling
-   * is enabled via `MLX_PROFILE_DECODE=1` or `setProfilingEnabled(true)`.
-   */
-  profilePhases?: Array<PhaseProfile>;
 }
 
 export interface PhaseProfile {
@@ -3901,76 +3189,6 @@ export interface PhaseProfile {
   avgUsPerToken: number;
   /** Number of invocations. */
   count: number;
-}
-
-/**
- * Per-call Viterbi calibration overrides.
- *
- * Any field set to `Some(_)` overrides the corresponding bias from the
- * model's default calibration (loaded from `viterbi_calibration.json`
- * at load time). Missing fields fall back to the default.
- */
-export interface PrivacyCalibration {
-  transitionBiasBackgroundStay?: number;
-  transitionBiasBackgroundToStart?: number;
-  transitionBiasEndToBackground?: number;
-  transitionBiasEndToStart?: number;
-  transitionBiasInsideToContinue?: number;
-  transitionBiasInsideToEnd?: number;
-}
-
-/**
- * Options for [`PrivacyFilterModelJs::classify`].
- *
- * - `threshold` (default `0.5`): minimum mean per-token probability for
- *   an extracted span to be returned.
- * - `calibration`: per-call overrides on top of the checkpoint default.
- * - `return_tokens` (default `false`): when `true`, the result includes
- *   a `tokens` array with one entry per input token.
- */
-export interface PrivacyClassifyOptions {
-  threshold?: number;
-  calibration?: PrivacyCalibration;
-  returnTokens?: boolean;
-}
-
-/** Result of [`PrivacyFilterModelJs::classify`]. */
-export interface PrivacyClassifyResult {
-  entities: Array<PrivacyEntity>;
-  tokens?: Array<PrivacyToken>;
-}
-
-/**
- * A privacy entity detected by [`PrivacyFilterModelJs::classify`].
- *
- * `start`/`end` are byte offsets into the input string (Hugging Face
- * `tokenizers` convention). `label` is the privacy class without the
- * BIOES prefix (e.g. `"private_email"`). `score` is the mean — across
- * the span's tokens — of the softmax probability of the Viterbi-emitted
- * tag at each token.
- */
-export interface PrivacyEntity {
-  label: string;
-  start: number;
-  end: number;
-  score: number;
-  text: string;
-}
-
-/**
- * Per-token output emitted when [`PrivacyClassifyOptions::return_tokens`]
- * is `true`. `tag` is the full BIOES tag (`"O"` or `"B-..."`/`"I-..."`/
- * `"E-..."`/`"S-..."`) chosen by the Viterbi decoder. `score` is the
- * softmax probability of that emitted tag at this token, so `tag` and
- * `score` always share decoders (at boundary tokens the Viterbi tag can
- * differ from the local argmax).
- */
-export interface PrivacyToken {
-  text: string;
-  tag: string;
-  score: number;
-  start: number;
-  end: number;
 }
 
 export interface ProfilingSession {
@@ -4020,32 +3238,6 @@ export interface QianfanOcrConfig {
   minDynamicPatch: number;
 }
 
-/** Microbench result for the production quantized qmv dispatch path. */
-export interface QmvQuantizedMicrobenchResult {
-  /** Median `quantized_matmul` wall-clock per call, in nanoseconds. */
-  medianNs: number;
-  /** A tiny materialized checksum of the final output, used to keep the call live. */
-  checksum: number;
-}
-
-/**
- * Run the production quantized-qmv microbench in the current process.
- *
- * To compare `MLX_MTP_SMALL_M_QMV=0` versus `1`, call this from separate
- * processes. MLX caches the env-backed dispatch predicate statically.
- */
-export declare function quantizedQmvMicrobench(
-  k: number,
-  n: number,
-  m: number,
-  groupSize: number,
-  bits: number,
-  mode: string,
-  dtype: DType,
-  warmup?: number | undefined | null,
-  iters?: number | undefined | null,
-): QmvQuantizedMicrobenchResult;
-
 /**
  * Qwen3.5 model configuration (dense variant).
  *
@@ -4074,72 +3266,6 @@ export interface Qwen35Config {
   fullAttentionInterval: number;
   partialRotaryFactor: number;
   ropeTheta: number;
-  /**
-   * GPU memory budget for paged KV cache in megabytes.
-   * Only used when `use_block_paged_cache` is true.
-   * Default: automatically sized for one full-context sequence.
-   */
-  pagedCacheMemoryMb?: number | undefined;
-  /**
-   * Block size for paged attention (tokens per block).
-   * Only used when `use_block_paged_cache` is true.
-   * Default: 16.
-   */
-  pagedBlockSize?: number | undefined;
-  /**
-   * Use the block-paged KV cache adapter (`PagedKVCacheAdapter`) for
-   * full-attention layers.
-   *
-   * **OPT-IN — experimental.** When `Some(true)`, `Qwen35Inner`
-   * allocates a `BlockAllocator` + `LayerKVPool` pair sized for the
-   * model's full-attention layer count and constructs a
-   * `PagedKVCacheAdapter`. The chat-session forward dispatch routes
-   * full-attention layers through this adapter while linear-attention
-   * (GatedDeltaNet / GDN) layers continue to use the existing
-   * `Qwen3_5LayerCache::Linear(ArraysCache)` path with no
-   * cross-request prefix reuse — vLLM's `MambaManager`-style "no
-   * prefix reuse for recurrent layers" stance.
-   *
-   * **Paged vs flat eager**: this flag selects the eager paged decode
-   * over the eager flat decode. When `Some(true)`, full-attention
-   * layers run through the paged adapter (cross-request prefix reuse);
-   * when unset, they run the eager flat decode. Either way the forward
-   * is pure-Rust eager.
-   *
-   * **VLM under paged**: a VLM checkpoint defaults this flag ON at load, so
-   * dense image turns ONLY run on the paged-vision core. A fresh single-turn
-   * image-bearing prompt prefills through the paged adapter (M-RoPE positions
-   * feed the rotary; the merged vision embeddings feed the forward) and
-   * decodes plain AR — MTP weights are ignored on image turns. Warm
-   * image-bearing session continues / cache-hit reuse are still rejected at
-   * runtime (the GDN two-pass warm prefix is not byte-exact). A vision turn
-   * that reaches a None adapter (explicit `Some(false)`, non-Metal build, or
-   * a sym8 checkpoint) errors at dispatch.
-   *
-   * Default: `None` for text-only checkpoints (eager flat decode);
-   * `Some(true)` for VLM checkpoints (block-paged, set in `parse_config`).
-   */
-  useBlockPagedCache?: boolean | undefined;
-  /**
-   * Number of MTP (Multi-Token Prediction) head layers shipped with the
-   * checkpoint. Populated from `mtp_num_hidden_layers` /
-   * `num_nextn_predict_layers` in `config.json`. `0` means the
-   * checkpoint has no MTP heads and the speculative-decode path is
-   * unavailable.
-   */
-  nMtpLayers: number;
-}
-
-/**
- * Trained and physically available active-context limits for one loaded
- * Qwen3.5 model. Values are snapshots because the physical pool is fixed for
- * the lifetime of the resident model.
- */
-export interface Qwen35ContextLimits {
-  trainedWindowTokens: number;
-  effectiveWindowTokens: number;
-  pagedBlockCapacity: number;
-  pagedBlockSize: number;
 }
 
 /** Generation configuration for Qwen3.5 */
@@ -4194,47 +3320,6 @@ export interface Qwen35MoeConfig {
   moeIntermediateSize?: number | undefined;
   normTopkProb: boolean;
   mlpOnlyLayers?: number[] | undefined;
-  /**
-   * GPU memory budget for paged KV cache in megabytes.
-   * Only used when `use_block_paged_cache` is true.
-   * Default: automatically sized for one full-context sequence.
-   */
-  pagedCacheMemoryMb?: number | undefined;
-  /**
-   * Block size for paged attention (tokens per block).
-   * Only used when `use_block_paged_cache` is true.
-   * Default: 16.
-   */
-  pagedBlockSize?: number | undefined;
-  /**
-   * Use the block-paged KV cache adapter for full-attention layers.
-   *
-   * **OPT-IN — experimental.** Same semantics as the dense
-   * `Qwen3_5Config::use_block_paged_cache` field. Selects the eager
-   * paged decode over the eager flat decode: routes full-attention
-   * layers through `PagedKVCacheAdapter` (cross-request prefix reuse);
-   * GDN linear-attention layers stay on `Qwen3_5LayerCache::Linear`
-   * either way. When disabled, full-attention layers run the eager flat
-   * decode instead.
-   *
-   * **VLM under paged**: a VLM checkpoint loads with this flag set, and a
-   * fresh single-turn image-bearing prompt prefills through the paged
-   * adapter (M-RoPE positions feed the rotary; the merged vision embeddings
-   * feed the forward). Image-bearing MTP turns are still rejected at
-   * runtime; warm image-bearing session continues / cache-hit reuse are
-   * cold-started (no warm GDN two-pass prefix).
-   *
-   * Default: `None` / `false`.
-   */
-  useBlockPagedCache?: boolean | undefined;
-  /**
-   * Number of MTP (Multi-Token Prediction) head layers shipped with
-   * the checkpoint. Populated from `mtp_num_hidden_layers` /
-   * `num_nextn_predict_layers` in `config.json`. `0` means the
-   * checkpoint has no MTP heads and the speculative-decode path is
-   * unavailable.
-   */
-  nMtpLayers: number;
 }
 
 /** Generation configuration for Qwen3.5 MoE */
@@ -4272,28 +3357,28 @@ export interface Qwen3Config {
   eosTokenId: number;
   bosTokenId: number;
   /**
+   * Enable paged attention for memory-efficient inference.
+   * Default: false (use standard KVCache)
+   */
+  usePagedAttention?: boolean | undefined;
+  /**
    * GPU memory budget for paged KV cache in megabytes.
+   * Only used when use_paged_attention is true.
    * Default: 2048 (2GB)
    */
   pagedCacheMemoryMb?: number | undefined;
   /**
    * Block size for paged attention (tokens per block).
+   * Only used when use_paged_attention is true.
    * Default: 16
    */
   pagedBlockSize?: number | undefined;
   /**
-   * Use the block-paged KV cache adapter (`PagedKVCacheAdapter`).
-   *
-   * When `Some(true)` (the default for Qwen3), `Qwen3Inner` allocates a
-   * `BlockAllocator` + `LayerKVPool` pair and constructs a
-   * `PagedKVCacheAdapter` for cross-request KV prefix reuse (vLLM-style
-   * block-paged storage with refcounted prefix caching). When
-   * `Some(false)`, the flat (non-paged) `Vec<KVCache>` cache path is
-   * used instead.
-   *
-   * Default: true.
+   * Use FP8 cache for 2x memory reduction (experimental).
+   * Only used when use_paged_attention is true.
+   * Default: false
    */
-  useBlockPagedCache?: boolean | undefined;
+  useFp8Cache?: boolean | undefined;
 }
 
 /** Qwen3 language model configuration */
@@ -4321,27 +3406,6 @@ export interface RecResult {
 }
 
 /**
- * Reset MLX's peak-memory counter to the current active level.
- * Useful for measuring per-request peak memory in a long-running
- * process — call before a request, sample
- * `getMemorySnapshot().peakBytes` after.
- */
-export declare function resetPeakMemory(): void;
-
-/** Clear all collected profiling data and reset session timer. */
-export declare function resetProfilingData(): void;
-
-/** Result of resume position computation */
-export interface ResumePosition {
-  /** Epoch to start from (0-indexed) */
-  startEpoch: number;
-  /** Batch index within epoch to start from */
-  startBatchIdx: number;
-  /** Whether we're at an epoch boundary */
-  isEpochBoundary: boolean;
-}
-
-/**
  * Reward function input for a single completion.
  * Provides all context needed to compute a reward score.
  */
@@ -4350,42 +3414,6 @@ export interface RewardOutput {
   prompt: string;
   /** Structured completion data aligned with ChatResult */
   completion: CompletionInfo;
-}
-
-/** Reward distribution statistics (NAPI wrapper) */
-export interface RewardStats {
-  count: number;
-  mean: number;
-  std: number;
-  min: number;
-  max: number;
-  median: number;
-  p25: number;
-  p75: number;
-}
-
-/** Aggregate statistics for a training run for resume state (NAPI wrapper) */
-export interface RunAggregates {
-  /** Best (highest) reward seen */
-  bestReward: number;
-  /** Average reward */
-  avgReward: number;
-  /** Total reward count */
-  rewardCount: number;
-  /** Best (lowest) loss seen */
-  bestLoss: number;
-  /** Average loss */
-  avgLoss: number;
-  /** Total loss count */
-  lossCount: number;
-  /** Total tokens generated */
-  totalTokens: number;
-  /** Current step number */
-  currentStep: number;
-  /** Average generation time (milliseconds) */
-  avgGenerationTimeMs: number;
-  /** Average training time (milliseconds) */
-  avgTrainingTimeMs: number;
 }
 
 /**
@@ -4403,19 +3431,21 @@ export interface SamplingConfig {
   minP?: number;
 }
 
-/**
- * Parse VLM output and save directly as XLSX file.
- *
- * Convenience function that parses VLM output and writes it to an XLSX file.
- *
- * # Example
- * ```typescript
- * import { saveToXlsx } from '@mlx-node/core';
- *
- * saveToXlsx(vlmResult.text, 'output.xlsx');
- * ```
- */
-export declare function saveToXlsx(text: string, filePath: string): void;
+/** Scheduler statistics (NAPI-compatible) */
+export interface SchedulerStatsNapi {
+  /** Number of requests waiting to be scheduled */
+  numWaiting: number;
+  /** Number of sequences currently running */
+  numRunning: number;
+  /** Number of completed sequences */
+  numCompleted: number;
+  /** Number of sequences in prefill phase */
+  numPrefill: number;
+  /** Number of sequences in decode phase */
+  numDecode: number;
+  /** Total tokens across all running sequences */
+  totalRunningTokens: number;
+}
 
 /** Enable or disable profiling globally. */
 export declare function setProfilingEnabled(enabled: boolean): void;
@@ -4609,16 +3639,6 @@ export interface ToolCall {
   arguments: string;
 }
 
-/** A tool call record (NAPI wrapper) */
-export interface ToolCallRecord {
-  callIndex: number;
-  status: string;
-  toolName?: string;
-  arguments?: string;
-  rawContent: string;
-  errorMessage?: string;
-}
-
 /** Structured tool call with parsed arguments */
 export interface ToolCallResult {
   /** Unique identifier for this tool call (format: call_<uuid>) */
@@ -4657,75 +3677,6 @@ export interface ToolDefinition {
   type: string;
   /** Function definition */
   function: FunctionDefinition;
-}
-
-/** A training run record (NAPI wrapper) */
-export interface TrainingRunRecord {
-  id: string;
-  name?: string;
-  modelName: string;
-  modelPath?: string;
-  config: string;
-  startedAt: number;
-  endedAt?: number;
-  totalSteps: number;
-  status: string;
-}
-
-/** Result from train_step_auto including metrics, completions, and rewards */
-export interface TrainStepResult {
-  /** Training metrics */
-  metrics: EngineStepMetrics;
-  /** Generated completion texts (for TUI logging) */
-  completions: Array<string>;
-  /** Computed reward values (for TUI logging) */
-  rewards: Array<number>;
-}
-
-/** Result from train_step_auto_with_recording including optional full RewardOutput data */
-export interface TrainStepResultWithOutputs {
-  /** Training metrics */
-  metrics: EngineStepMetrics;
-  /** Generated completion texts (for TUI logging) */
-  completions: Array<string>;
-  /** Computed reward values (for TUI logging) */
-  rewards: Array<number>;
-  /**
-   * Full RewardOutput data as JSON (only populated when record_outputs is true)
-   * This enables zero-copy persistence of training outputs
-   */
-  outputsJson?: string;
-  /** Actual token counts for each completion (for accurate TUI display) */
-  completionLengths: Array<number>;
-}
-
-/**
- * Encoder-free vision configuration for the Gemma 4 unified multimodal model.
- *
- * Parsed from the `vision_config` sub-dict of a `gemma4_unified` checkpoint
- * (`model_type == "gemma4_unified_vision"`). This is a different shape from the
- * SigLIP-style [`super::vision_config::Gemma4VisionConfig`] used by the dense
- * gemma4 family: the unified vision path has no transformer encoder, only a
- * patch embedder (LayerNorm + Linear + 2D positional embedding) feeding the
- * multimodal projection.
- */
-export interface UnifiedVisionConfig {
-  /** Pixel side length of a single image patch (48 = patch_size 16 × pooling 3). */
-  modelPatchSize: number;
-  /** Embedding width inside the vision embedder (3840, == text hidden_size). */
-  mmEmbedDim: number;
-  /** Number of rows in the 2D positional-embedding table (1120). */
-  mmPosembSize: number;
-  /** Maximum soft tokens (patches) per image after resize (280). */
-  numSoftTokens: number;
-  /** Output projection width of `embed_vision` (3840, == text hidden_size). */
-  outputProjDims: number;
-  /** Pixel-grid patch size used by the resize math (16). */
-  patchSize: number;
-  /** Pooling kernel size used by the resize math (3). */
-  poolingKernelSize: number;
-  /** Epsilon for the embedder LayerNorms and the projection RMSNorm. */
-  rmsNormEps: number;
 }
 
 /** Result from document unwarping. */

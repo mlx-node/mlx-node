@@ -83,5 +83,11 @@ pub(crate) static GENERATION_STREAM: std::sync::LazyLock<stream::Stream> =
 
 #[napi_derive::napi(module_exports)]
 pub fn init() {
-    let _ = &*GENERATION_STREAM;
+    // On WASM, defer stream init to first use — during module_exports the main
+    // thread is blocked so wasi_thread_spawn messages can't be processed,
+    // causing tokio's multi-thread runtime to fail spawning worker threads.
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let _ = &*GENERATION_STREAM;
+    }
 }

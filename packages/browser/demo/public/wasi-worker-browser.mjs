@@ -1,0 +1,1 @@
+../../../../packages/core/wasi-worker-browser.mjs

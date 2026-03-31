@@ -1,6 +1,26 @@
 #include "mlx_common.h"
+#ifdef MLX_USE_WEBGPU
+// Forward-declare the WebGPU types we need (avoids webgpu.h include path issues)
+typedef struct WGPUBufferImpl* WGPUBuffer;
+extern "C" void wgpuBufferDestroy(WGPUBuffer buffer);
+extern "C" void wgpuBufferRelease(WGPUBuffer buffer);
+namespace mlx::core::wgpu {
+struct WebGPUBuffer {
+  WGPUBuffer buffer;
+  size_t size;
+  void* cpu_ptr;
+};
+}
+#endif
 
 extern "C" {
+
+// Export computation graph to DOT file for debugging
+void mlx_export_to_dot(const char* path, mlx_array* handle) {
+    auto& arr = *reinterpret_cast<array*>(handle);
+    std::ofstream ofs(path);
+    mlx::core::export_to_dot(ofs, arr);
+}
 
 mlx_array* mlx_array_transpose(mlx_array* handle,
                                const int32_t* axes,
@@ -22,9 +42,9 @@ void mlx_array_eval(mlx_array* handle) {
       arr->eval();
     }
   } catch (const std::exception& e) {
-    mlx_trace_native_error("array_eval", e.what());
+    std::cerr << "[MLX] Exception in array_eval: " << e.what() << std::endl;
   } catch (...) {
-    mlx_trace_native_error("array_eval", "unknown exception");
+    std::cerr << "[MLX] Unknown exception in array_eval" << std::endl;
   }
 }
 
@@ -39,64 +59,23 @@ void mlx_async_eval(mlx_array** handles, size_t count) {
     }
     mlx::core::async_eval(std::move(arrays));
   } catch (const std::exception& e) {
-    mlx_trace_native_error("async_eval", e.what());
+    std::cerr << "[MLX] Exception in async_eval: " << e.what() << std::endl;
   } catch (...) {
-    mlx_trace_native_error("async_eval", "unknown exception");
+    std::cerr << "[MLX] Unknown exception in async_eval" << std::endl;
   }
 }
-
-namespace {
-
-void mlx_copy_error(char* error_out,
-                    size_t error_capacity,
-                    const char* detail) {
-  if (!error_out || error_capacity == 0) {
-    return;
-  }
-  const char* message = detail ? detail : "unknown exception";
-  const size_t length = std::min(std::strlen(message), error_capacity - 1);
-  std::memcpy(error_out, message, length);
-  error_out[length] = '\0';
-}
-
-}  // namespace
 
 // Synchronous eval — matches Python's mx.eval(arrays).
-// Unlike async_eval, this blocks until all arrays are materialized. The
-// caller-owned error buffer carries the native exception across the C ABI so
-// Rust can report it through the configured tracing subscriber.
-bool mlx_eval_with_error(mlx_array** handles,
-                         size_t count,
-                         char* error_out,
-                         size_t error_capacity) {
-  if (error_out && error_capacity > 0) {
-    error_out[0] = '\0';
-  }
-  try {
-    std::vector<array> arrays;
-    arrays.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-      if (handles[i]) {
-        arrays.push_back(*reinterpret_cast<array*>(handles[i]));
-      }
+// Unlike async_eval, this blocks until all arrays are materialized.
+void mlx_eval(mlx_array** handles, size_t count) {
+  std::vector<array> arrays;
+  arrays.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    if (handles[i]) {
+      arrays.push_back(*reinterpret_cast<array*>(handles[i]));
     }
-    mlx::core::eval(std::move(arrays));
-    return true;
-  } catch (const std::exception& e) {
-    mlx_copy_error(error_out, error_capacity, e.what());
-    mlx_trace_native_error("eval", e.what());
-    return false;
-  } catch (...) {
-    mlx_copy_error(error_out, error_capacity, "unknown exception");
-    mlx_trace_native_error("eval", "unknown exception");
-    return false;
   }
-}
-
-// Compatibility wrapper for existing native callers that do not need the
-// exception detail.
-bool mlx_eval(mlx_array** handles, size_t count) {
-  return mlx_eval_with_error(handles, count, nullptr, 0);
+  mlx::core::eval(std::move(arrays));
 }
 
 size_t mlx_array_size(mlx_array* handle) {
@@ -281,6 +260,17 @@ bool mlx_array_to_float32(mlx_array* handle, float* out, size_t len) {
   return copy_to_buffer(*arr, out, len);
 }
 
+bool mlx_array_to_float32_noeval(mlx_array* handle, float* out, size_t len) {
+  if (!out) {
+    return false;
+  }
+  auto arr = reinterpret_cast<array*>(handle);
+  if (!arr) {
+    return false;
+  }
+  return copy_to_buffer_noeval(*arr, out, len);
+}
+
 bool mlx_array_to_int32(mlx_array* handle, int32_t* out, size_t len) {
   if (!out) {
     return false;
@@ -290,6 +280,17 @@ bool mlx_array_to_int32(mlx_array* handle, int32_t* out, size_t len) {
     return false;
   }
   return copy_to_buffer(*arr, out, len);
+}
+
+bool mlx_array_to_int32_noeval(mlx_array* handle, int32_t* out, size_t len) {
+  if (!out) {
+    return false;
+  }
+  auto arr = reinterpret_cast<array*>(handle);
+  if (!arr) {
+    return false;
+  }
+  return copy_to_buffer_noeval(*arr, out, len);
 }
 
 bool mlx_array_to_uint32(mlx_array* handle, uint32_t* out, size_t len) {
@@ -1056,17 +1057,9 @@ mlx_array* mlx_fast_scaled_dot_product_attention(mlx_array* queries,
     }
   }
 
-  try {
-    array result = fast::scaled_dot_product_attention(
-        *q, *k, *v, scale, mask_mode, mask_arr, std::nullopt);
-    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-  } catch (const std::exception& e) {
-    mlx_trace_native_error("fast_scaled_dot_product_attention", e.what());
-    return nullptr;
-  } catch (...) {
-    mlx_trace_native_error("fast_scaled_dot_product_attention", "unknown exception");
-    return nullptr;
-  }
+  array result = fast::scaled_dot_product_attention(
+      *q, *k, *v, scale, mask_mode, mask_arr, std::nullopt);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
 mlx_array* mlx_fast_rms_norm(mlx_array* x,
@@ -1118,5 +1111,120 @@ int32_t mlx_load_safetensors(
         return -1;
     }
 }
+
+/// Load safetensors from a memory buffer (for browser/WASM where there's no filesystem).
+/// Works the same as mlx_load_safetensors but reads from a byte buffer instead of a file.
+int32_t mlx_load_safetensors_from_buffer(
+    const uint8_t* data,
+    size_t data_len,
+    void (*callback)(const char* name, size_t name_len, mlx_array* handle, void* ctx),
+    void* ctx
+) {
+    try {
+        // Create a MemoryReader that wraps the buffer
+        class MemoryReader : public mlx::core::io::Reader {
+        public:
+            MemoryReader(const uint8_t* data, size_t len)
+                : data_(data), len_(len), pos_(0) {}
+            bool is_open() const override { return data_ != nullptr; }
+            bool good() const override { return pos_ <= len_; }
+            size_t tell() override { return pos_; }
+            void seek(int64_t off, std::ios_base::seekdir way) override {
+                if (way == std::ios_base::beg) pos_ = off;
+                else if (way == std::ios_base::cur) pos_ += off;
+                else if (way == std::ios_base::end) pos_ = len_ + off;
+            }
+            void read(char* dst, size_t n) override {
+                if (pos_ + n > len_) n = len_ - pos_;
+                std::memcpy(dst, data_ + pos_, n);
+                pos_ += n;
+            }
+            void read(char* dst, size_t n, size_t offset) override {
+                if (offset + n > len_) n = len_ - offset;
+                std::memcpy(dst, data_ + offset, n);
+            }
+            std::string label() const override { return "<memory>"; }
+        private:
+            const uint8_t* data_;
+            size_t len_;
+            size_t pos_;
+        };
+
+        auto reader = std::make_shared<MemoryReader>(data, data_len);
+        auto [tensors, metadata] = mlx::core::load_safetensors(reader);
+        int32_t count = 0;
+        for (auto& [name, arr] : tensors) {
+            auto* handle = reinterpret_cast<mlx_array*>(new array(std::move(arr)));
+            callback(name.c_str(), name.size(), handle, ctx);
+            count++;
+        }
+        return count;
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_load_safetensors_from_buffer error: " << e.what() << std::endl;
+        return -1;
+    }
+}
+
+#ifdef MLX_USE_WEBGPU
+/// Create an MLX array wrapping an existing WGPUBuffer (zero-copy).
+/// The caller is responsible for ensuring the buffer has Storage|CopySrc|CopyDst usage
+/// and contains valid data of the specified dtype and shape.
+/// The array takes ownership of the buffer (it will be destroyed when the array is freed).
+mlx_array* mlx_array_from_gpu_buffer(
+    void* wgpu_buffer_handle,
+    size_t byte_size,
+    const int64_t* shape,
+    size_t ndim,
+    int32_t dtype_code
+) {
+    try {
+        using namespace mlx::core;
+
+        // Create a WebGPUBuffer struct wrapping the existing handle
+        auto* wbuf = new wgpu::WebGPUBuffer{
+            static_cast<WGPUBuffer>(wgpu_buffer_handle),
+            byte_size,
+            nullptr  // no CPU mirror
+        };
+
+        allocator::Buffer buf{static_cast<void*>(wbuf)};
+        Shape arr_shape(shape, shape + ndim);
+
+        // Deleter: destroy the GPU buffer and free the wrapper
+        auto deleter = [](allocator::Buffer buffer) {
+            auto* wb = static_cast<wgpu::WebGPUBuffer*>(buffer.ptr());
+            if (wb->buffer) {
+                wgpuBufferDestroy(wb->buffer);
+                wgpuBufferRelease(wb->buffer);
+            }
+            delete wb;
+        };
+
+        auto dt_from_code = [](int32_t code) -> Dtype {
+            switch (code) {
+                case 0: return float32;
+                case 1: return float16;
+                case 2: return bfloat16;
+                case 3: return int32;
+                case 4: return uint32;
+                case 5: return int8;
+                case 6: return uint8;
+                case 7: return int16;
+                case 8: return uint16;
+                case 9: return int64;
+                case 10: return bool_;
+                default: return float32;
+            }
+        };
+        Dtype dt = dt_from_code(dtype_code);
+
+        auto* arr = new array(buf, std::move(arr_shape), dt, deleter);
+        return reinterpret_cast<mlx_array*>(arr);
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_array_from_gpu_buffer error: " << e.what() << std::endl;
+        return nullptr;
+    }
+}
+#endif // MLX_USE_WEBGPU
 
 }  // extern "C"

@@ -4842,6 +4842,115 @@ impl Qwen3_5Model {
         persistence::load_with_thread(&path).await
     }
 
+    /// Load a model from in-memory buffers (works in both Node.js and browser).
+    ///
+    /// # Arguments
+    /// * `config_json` - Contents of config.json as a string
+    /// * `weight_buffers` - SafeTensors file contents as Buffers
+    /// * `tokenizer_json` - Contents of tokenizer.json as a string
+    /// Load a model from in-memory buffers (works in both Node.js and browser).
+    #[napi]
+    pub fn load_from_memory(
+        config_json: String,
+        weight_buffers: Vec<Buffer>,
+        tokenizer_json: String,
+    ) -> Result<Qwen3_5Model> {
+        use crate::utils::safetensors::load_safetensors_from_buffer;
+
+        let raw: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|e| Error::from_reason(format!("Failed to parse config: {e}")))?;
+        let config = persistence::parse_config(&raw)?;
+
+        let mut all_params = std::collections::HashMap::new();
+        for buf in &weight_buffers {
+            let params = load_safetensors_from_buffer(buf)?;
+            all_params.extend(params);
+        }
+
+        let params = persistence::sanitize_weights(all_params, &config)?;
+
+        let quant_cfg = raw.get("quantization").or_else(|| raw.get("quantization_config"));
+        let quant_bits = quant_cfg.and_then(|q| q["bits"].as_i64()).unwrap_or(4) as i32;
+        let quant_group_size = quant_cfg.and_then(|q| q["group_size"].as_i64()).unwrap_or(64) as i32;
+        let per_layer_quant = std::collections::HashMap::new();
+
+        let mut model = Qwen3_5Model::new(config.clone())?;
+        persistence::apply_weights(&mut model, &params, &config, quant_bits, quant_group_size, &per_layer_quant)?;
+
+        let inner_tokenizer = tokenizers::Tokenizer::from_bytes(tokenizer_json.as_bytes())
+            .map_err(|e| Error::from_reason(format!("Failed to parse tokenizer: {e}")))?;
+        let tokenizer = crate::tokenizer::Qwen3Tokenizer::from_tokenizer(inner_tokenizer);
+        model.tokenizer = Some(std::sync::Arc::new(tokenizer));
+
+        Ok(model)
+    }
+
+    /// Load a model from pre-created GPU buffers (zero-copy, for browser WebGPU).
+    ///
+    /// The JS side parses SafeTensors headers, creates GPU buffers directly from the
+    /// fetch ArrayBuffer, and passes the buffer handles here. No weight data touches
+    /// WASM linear memory.
+    #[napi]
+    pub fn load_from_gpu_buffers(
+        config_json: String,
+        gpu_tensors: Vec<serde_json::Value>,
+        tokenizer_json: String,
+    ) -> Result<Qwen3_5Model> {
+        use crate::utils::safetensors::array_from_gpu_buffer;
+
+        let raw: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|e| Error::from_reason(format!("Failed to parse config: {e}")))?;
+        let config = persistence::parse_config(&raw)?;
+
+        // Convert GPU buffer handles to MxArray tensors
+        let mut params = std::collections::HashMap::new();
+        for tensor in &gpu_tensors {
+            let name = tensor["name"].as_str()
+                .ok_or_else(|| Error::from_reason("Missing tensor name"))?;
+            let handle = tensor["handle"].as_u64()
+                .ok_or_else(|| Error::from_reason("Missing tensor handle"))? as u32;
+            let dtype_code = tensor["dtypeCode"].as_i64()
+                .ok_or_else(|| Error::from_reason("Missing tensor dtypeCode"))? as i32;
+            let byte_size = tensor["byteSize"].as_u64()
+                .ok_or_else(|| Error::from_reason("Missing tensor byteSize"))? as usize;
+            let shape: Vec<i64> = tensor["shape"].as_array()
+                .ok_or_else(|| Error::from_reason("Missing tensor shape"))?
+                .iter()
+                .filter_map(|v| v.as_i64())
+                .collect();
+
+            let dtype = match dtype_code {
+                0 => crate::array::DType::Float32,
+                1 => crate::array::DType::Float16,
+                2 => crate::array::DType::BFloat16,
+                3 => crate::array::DType::Int32,
+                4 => crate::array::DType::Uint32,
+                6 => crate::array::DType::Uint8,
+                _ => crate::array::DType::Float32,
+            };
+
+            let arr = array_from_gpu_buffer(handle, byte_size, &shape, dtype)?;
+            params.insert(name.to_string(), arr);
+        }
+
+        let params = persistence::sanitize_weights(params, &config)?;
+
+        let quant_cfg = raw.get("quantization").or_else(|| raw.get("quantization_config"));
+        let quant_bits = quant_cfg.and_then(|q| q["bits"].as_i64()).unwrap_or(4) as i32;
+        let quant_group_size = quant_cfg.and_then(|q| q["group_size"].as_i64()).unwrap_or(64) as i32;
+        let per_layer_quant = std::collections::HashMap::new();
+
+        let mut model = Qwen3_5Model::new(config.clone())?;
+        persistence::apply_weights(&mut model, &params, &config, quant_bits, quant_group_size, &per_layer_quant)?;
+
+        let inner_tokenizer = tokenizers::Tokenizer::from_bytes(tokenizer_json.as_bytes())
+            .map_err(|e| Error::from_reason(format!("Failed to parse tokenizer: {e}")))?;
+        let tokenizer = crate::tokenizer::Qwen3Tokenizer::from_tokenizer(inner_tokenizer);
+        model.tokenizer = Some(std::sync::Arc::new(tokenizer));
+
+        Ok(model)
+    }
+
     /// Generate text from a prompt token sequence.
     ///
     /// Runs generation on a worker thread via spawn_blocking to avoid
@@ -4893,12 +5002,8 @@ impl Qwen3_5Model {
             None
         };
 
-        napi::bindgen_prelude::spawn_blocking(move || {
-            let _weight_guard = if use_compiled {
-                acquire_compiled_weight_guard(model_id)
-            } else {
-                None
-            };
+        let gen_closure = move || {
+            let _weight_guard = if use_compiled { acquire_compiled_weight_guard(model_id) } else { None };
             let use_compiled = _weight_guard.is_some();
 
             // Acquire all locks ONCE for the entire prefill+decode sequence
@@ -5185,8 +5290,17 @@ impl Qwen3_5Model {
                 num_tokens,
                 finish_reason,
             })
-        })
-        .await
+        };
+
+        // On WASM, run directly (worker can block). On native, dispatch to thread pool.
+        #[cfg(target_family = "wasm")]
+        { gen_closure() }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            napi::bindgen_prelude::spawn_blocking(gen_closure)
+                .await
+                .map_err(|e| Error::from_reason(format!("Generation task failed: {}", e)))?
+        }
     }
 
     /// Start a new chat session.
@@ -6494,22 +6608,77 @@ impl Qwen3_5Model {
     /// # Arguments
     /// * `save_path` - Directory to save the model
     #[napi]
-    #[cfg(not(target_family = "wasm"))]
     pub fn save_model<'env>(
         &self,
         env: &'env Env,
         save_path: String,
     ) -> Result<PromiseRaw<'env, ()>> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.thread.send(Qwen35Cmd::SaveModel {
-            save_path,
-            reply: tx,
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (env, save_path);
+            return Err(Error::from_reason("Model saving is not supported in browser"));
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+        let mut params = self.get_parameters_for_training()?;
+
+        // Include vision encoder weights when present (VLM models)
+        if let Some(ref vision_enc) = self.vision_encoder {
+            let vision_params = vision_enc.get_parameters();
+            params.extend(vision_params);
+        }
+
+        // Validate all parameters for NaN/Inf before saving
+        for (name, param) in params.iter() {
+            let data = param.to_float32()?;
+            let invalid_count = data
+                .iter()
+                .filter(|v| v.is_nan() || v.is_infinite())
+                .count();
+            if invalid_count > 0 {
+                return Err(napi::Error::new(
+                    Status::GenericFailure,
+                    format!(
+                        "Cannot save model: parameter '{}' contains {} NaN/Inf values. \
+                        Model weights are corrupted, likely due to training instability. \
+                        Consider reducing learning rate or using an earlier checkpoint.",
+                        name, invalid_count
+                    ),
+                ));
+            }
+        }
+
+        let params_clone: HashMap<String, MxArray> =
+            params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        // Create weights metadata (for reference)
+        let mut weights_metadata = serde_json::Map::new();
+        for (key, array) in params.iter() {
+            let shape_data = array.shape()?;
+            let shape: Vec<i64> = shape_data.as_ref().to_vec();
+            let dtype = array.dtype()?;
+
+            let mut param_info = serde_json::Map::new();
+            param_info.insert("shape".to_string(), serde_json::json!(shape));
+            param_info.insert("dtype".to_string(), serde_json::json!(dtype as i32));
+
+            weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
+        }
+
+        // Serialize config and inject model_type for detectModelType
+        let config = self.get_config();
+        let mut config_value = serde_json::to_value(&config).map_err(|e| {
+            napi::Error::new(
+                Status::GenericFailure,
+                format!("Failed to serialize config: {e}"),
+            )
         })?;
         let promise = env.spawn_future(async move {
             rx.await
                 .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
         })?;
         Ok(promise)
+        }
     }
 }
 
@@ -6823,6 +6992,7 @@ impl Qwen3_5Model {
 // These methods are Rust-internal only (not exposed via NAPI).
 // They implement the TrainableModel trait interface.
 
+#[cfg(not(target_family = "wasm"))]
 impl Qwen3_5Model {
     /// Get model configuration.
     pub(crate) fn get_config(&self) -> Qwen3_5Config {
