@@ -1,4 +1,4 @@
-import type { Qwen3Model, Qwen35Model, Qwen35MoeModel, QianfanOCRModel } from '@mlx-node/core';
+import type { HarrierModel, Qwen3Model, Qwen35Model, Qwen35MoeModel, QianfanOCRModel } from '@mlx-node/core';
 
 /**
  * Union of all model classes that can be used with training engines.
@@ -8,7 +8,13 @@ import type { Qwen3Model, Qwen35Model, Qwen35MoeModel, QianfanOCRModel } from '@
 export type TrainableModel = Qwen3Model | Qwen35Model | Qwen35MoeModel;
 
 /**
- * Union of all model classes that loadModel can return.
- * Includes both trainable models and inference-only models (e.g. VLMs).
+ * Union of all embedding model classes.
+ * These models encode text into fixed-size embedding vectors.
  */
-export type LoadableModel = TrainableModel | QianfanOCRModel;
+export type EmbeddingModel = HarrierModel;
+
+/**
+ * Union of all model classes that loadModel can return.
+ * Includes trainable models, inference-only models, and embedding models.
+ */
+export type LoadableModel = TrainableModel | QianfanOCRModel | EmbeddingModel;

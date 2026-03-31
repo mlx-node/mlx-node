@@ -14,7 +14,7 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { QianfanOCRModel } from '@mlx-node/core';
+import { HarrierModel, QianfanOCRModel } from '@mlx-node/core';
 import type { ChatResult } from '@mlx-node/lm';
 import { loadModel, Qwen3Model } from '@mlx-node/lm';
 
@@ -34,7 +34,12 @@ const MODEL_PATH = resolve(process.cwd(), '.cache', 'models', modelName);
 console.log(`Loading model from: ${MODEL_PATH}`);
 if (imagePath) console.log(`Image: ${imagePath}`);
 
-const model = await loadModel(MODEL_PATH);
+const loadedModel = await loadModel(MODEL_PATH);
+if (loadedModel instanceof HarrierModel) {
+  console.error('This example is for generative models, not embedding models.');
+  process.exit(1);
+}
+const model = loadedModel;
 const isQwen3 = model instanceof Qwen3Model;
 const isQianfan = model instanceof QianfanOCRModel;
 const modelArch = isQianfan ? 'Qianfan-OCR' : isQwen3 ? 'Qwen3' : 'Qwen3.5';

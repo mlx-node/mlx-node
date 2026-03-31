@@ -261,6 +261,67 @@ export declare class GrpoTrainingEngine {
 }
 export type GRPOTrainingEngine = GrpoTrainingEngine;
 
+/**
+ * Harrier embedding model (Qwen3 backbone for text embeddings).
+ *
+ * Uses last-token pooling and L2 normalization to produce fixed-size
+ * embedding vectors from variable-length text inputs.
+ */
+export declare class HarrierModel {
+  constructor(config: HarrierConfig);
+  /**
+   * Forward pass returning hidden states (no lm_head projection).
+   *
+   * # Arguments
+   * * `input_ids` - Token IDs, shape: [batch_size, seq_len]
+   *
+   * # Returns
+   * * Hidden states, shape: [batch_size, seq_len, hidden_size]
+   */
+  forward(inputIds: MxArray): MxArray;
+  /**
+   * Encode a single text into a normalized embedding vector.
+   *
+   * Tokenizes the text, runs the forward pass, applies last-token pooling,
+   * and L2-normalizes the result.
+   *
+   * # Arguments
+   * * `text` - Input text to encode
+   * * `instruction` - Optional task instruction to prepend (for queries)
+   *
+   * # Returns
+   * * Embedding vector, shape: [hidden_size]
+   */
+  encode(text: string, instruction?: string | undefined | null): Promise<MxArray>;
+  /**
+   * Encode a batch of texts into normalized embedding vectors.
+   *
+   * Each text is independently tokenized and encoded (no padding needed
+   * since each goes through its own forward pass).
+   *
+   * # Arguments
+   * * `texts` - Input texts to encode
+   * * `instruction` - Optional task instruction to prepend to each text
+   *
+   * # Returns
+   * * Embedding matrix, shape: [batch_size, hidden_size]
+   */
+  encodeBatch(texts: Array<string>, instruction?: string | undefined | null): Promise<MxArray>;
+  /** Get the model configuration. */
+  getConfig(): HarrierConfig;
+  /** Get the total number of model parameters. */
+  numParameters(): number;
+  /**
+   * Load a Harrier embedding model from a directory.
+   *
+   * Expects the standard HuggingFace layout:
+   * - config.json (model configuration)
+   * - model.safetensors or weights.safetensors (weights)
+   * - tokenizer.json (tokenizer)
+   */
+  static load(modelPath: string): Promise<HarrierModel>;
+}
+
 export declare class MxArray {
   equal(other: MxArray): MxArray;
   notEqual(other: MxArray): MxArray;
@@ -2746,6 +2807,26 @@ export interface GrpoLossConfig {
    * Recommended: 65536 for Qwen3 (vocab=151936) splits into 3 chunks
    */
   vocabChunkSize?: number;
+}
+
+/**
+ * Configuration for Harrier embedding model (Qwen3 backbone).
+ *
+ * Only includes backbone dimensions needed for encoding.
+ * No generation fields (token IDs, paged attention, etc.).
+ */
+export interface HarrierConfig {
+  hiddenSize: number;
+  numLayers: number;
+  numHeads: number;
+  numKeyValueHeads: number;
+  intermediateSize: number;
+  rmsNormEps: number;
+  ropeTheta: number;
+  maxPositionEmbeddings: number;
+  headDim: number;
+  useQkNorm: boolean;
+  vocabSize: number;
 }
 
 /** InternViT vision encoder configuration */

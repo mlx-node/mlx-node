@@ -15,6 +15,10 @@
 
 // Model classes (for inference)
 export { Qwen3Model, Qwen3Tokenizer } from '@mlx-node/core';
+
+// Embedding models
+export { HarrierModel } from '@mlx-node/core';
+export type { HarrierConfig } from '@mlx-node/core';
 export { Qwen35Model, Qwen35Model as Qwen3_5Model } from './stream.js';
 export type { Qwen35Config, Qwen35GenerationConfig, Qwen35GenerationResult } from '@mlx-node/core';
 
@@ -51,7 +55,7 @@ export {
 export { loadModel, detectModelType, type ModelType } from './models/model-loader.js';
 
 // Interfaces
-export type { TrainableModel, LoadableModel } from './interfaces.js';
+export type { TrainableModel, LoadableModel, EmbeddingModel } from './interfaces.js';
 
 export { QWEN35_CONFIGS, getQwen35Config } from './models/qwen3_5-configs.js';
 
