@@ -51,7 +51,7 @@ export {
 export { loadModel, detectModelType, type ModelType } from './models/model-loader.js';
 
 // Interfaces
-export type { TrainableModel } from './interfaces.js';
+export type { TrainableModel, LoadableModel } from './interfaces.js';
 
 export { QWEN35_CONFIGS, getQwen35Config } from './models/qwen3_5-configs.js';
 

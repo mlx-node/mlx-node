@@ -15,6 +15,7 @@ import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import type { ChatResult } from '@mlx-node/lm';
+import { QianfanOCRModel } from '@mlx-node/core';
 import { loadModel, Qwen3Model } from '@mlx-node/lm';
 
 const { values, positionals } = parseArgs({
@@ -35,9 +36,11 @@ if (imagePath) console.log(`Image: ${imagePath}`);
 
 const model = await loadModel(MODEL_PATH);
 const isQwen3 = model instanceof Qwen3Model;
-console.log(`Model loaded (${isQwen3 ? 'Qwen3' : 'Qwen3.5'})\n`);
+const isQianfan = model instanceof QianfanOCRModel;
+const modelArch = isQianfan ? 'Qianfan-OCR' : isQwen3 ? 'Qwen3' : 'Qwen3.5';
+console.log(`Model loaded (${modelArch})\n`);
 
-function printPerf(result: ChatResult) {
+function printPerf(result: { finishReason: string; numTokens: number; performance?: ChatResult['performance'] }) {
   const p = result.performance;
   if (!p) return;
   console.log('-'.repeat(80));
