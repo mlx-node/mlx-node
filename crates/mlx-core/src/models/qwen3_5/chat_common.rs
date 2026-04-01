@@ -235,10 +235,9 @@ pub(crate) fn finalize_chat_result(
     let num_tokens = generated_tokens.len() as u32;
 
     let (clean_text, tool_calls, thinking) = if !starts_in_thinking {
-        // No-thinking mode: all text is content. Strip think markup for
-        // old-template compatibility, but treat content as normal text.
-        let stripped = tools::strip_think_markup(&text);
-        let (clean, calls) = tools::parse_tool_calls(&stripped);
+        // No-thinking mode: all text is content, passed through verbatim.
+        // Any literal <think> tags are normal model output, not markup.
+        let (clean, calls) = tools::parse_tool_calls(&text);
         (clean, calls, None)
     } else if tools::has_think_end_token(generated_tokens, think_end_id) {
         // Thinking mode with confirmed </think>: split at token boundary.

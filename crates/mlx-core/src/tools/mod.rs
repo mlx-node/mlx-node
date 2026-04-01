@@ -496,15 +496,6 @@ pub fn has_thinking(text: &str) -> bool {
     text.contains("<think>") || text.contains("<longcat_think>")
 }
 
-/// Strip think/longcat_think markup tags from text, keeping inner content.
-/// Used in no-thinking mode for old-template compatibility: tags are removed
-/// but their content is treated as normal text, not reasoning.
-pub fn strip_think_markup(text: &str) -> String {
-    text.replace("<think>", "")
-        .replace("</think>", "")
-        .replace("<longcat_think>", "")
-        .replace("</longcat_think>", "")
-}
 
 /// Result of parsing tool calls from text
 #[napi(object)]

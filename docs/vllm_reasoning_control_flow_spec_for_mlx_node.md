@@ -27,7 +27,7 @@ A vLLM-compatible `mlx-node` implementation should expose the following request-
 - `chat_template_kwargs`
 - `include_reasoning`
 - `thinking_token_budget`
-- `reasoning_effort`  
+- `reasoning_effort`
   plus normal generation parameters such as max tokens, temperature, top-p, stop sequences, and tool-calling options. ([docs.vllm.ai](https://docs.vllm.ai/en/latest/api/vllm/entrypoints/openai/chat_completion/protocol/))
 
 ### 2.1 `chat_template_kwargs`
