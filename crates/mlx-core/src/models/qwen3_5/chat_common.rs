@@ -147,13 +147,15 @@ impl ReasoningTracker {
             return true; // </think> itself is part of reasoning
         }
 
-        self.thinking_token_count += 1;
+        // Check budget BEFORE incrementing so budget=0 triggers on the
+        // very first thinking token (distinct from budget=1).
         if let Some(budget) = self.budget
             && self.thinking_token_count >= budget
             && !self.end_scheduled
         {
             self.force_think_end = true;
         }
+        self.thinking_token_count += 1;
         true
     }
 
@@ -441,34 +443,54 @@ mod tests {
 
     #[test]
     fn test_tracker_budget_enforcement() {
+        // Budget=3: allows exactly 3 thinking tokens before triggering.
+        // Budget is checked BEFORE incrementing count.
         let mut tracker = ReasoningTracker::new(true, Some(3), Some(THINK_END_ID));
-        assert!(tracker.observe_token(100)); // count=1
+        assert!(tracker.observe_token(100)); // check 0<3, count→1
         assert!(!tracker.should_force_think_end());
-        assert!(tracker.observe_token(200)); // count=2
+        assert!(tracker.observe_token(200)); // check 1<3, count→2
         assert!(!tracker.should_force_think_end());
-        assert!(tracker.observe_token(300)); // count=3 >= budget
+        assert!(tracker.observe_token(300)); // check 2<3, count→3
+        assert!(!tracker.should_force_think_end());
+        assert!(tracker.observe_token(400)); // check 3>=3 → force! count→4
         assert!(tracker.should_force_think_end());
         assert_eq!(tracker.forced_token_id(), THINK_END_ID);
     }
 
     #[test]
     fn test_tracker_budget_zero() {
+        // Budget=0: triggers on the very first thinking token (before incrementing).
         let mut tracker = ReasoningTracker::new(true, Some(0), Some(THINK_END_ID));
-        // First token pushes count to 1, which >= 0
-        assert!(tracker.observe_token(100));
+        assert!(tracker.observe_token(100)); // check 0>=0 → force!
         assert!(tracker.should_force_think_end());
+    }
+
+    #[test]
+    fn test_tracker_budget_zero_vs_one() {
+        // Budget=0 and budget=1 must produce different behavior.
+        let mut t0 = ReasoningTracker::new(true, Some(0), Some(THINK_END_ID));
+        assert!(t0.observe_token(100));
+        assert!(t0.should_force_think_end()); // triggers after 1st token
+
+        let mut t1 = ReasoningTracker::new(true, Some(1), Some(THINK_END_ID));
+        assert!(t1.observe_token(100));
+        assert!(!t1.should_force_think_end()); // NOT yet after 1st token
+        assert!(t1.observe_token(200));
+        assert!(t1.should_force_think_end()); // triggers after 2nd token
     }
 
     #[test]
     fn test_tracker_budget_clears_on_think_end() {
         let mut tracker = ReasoningTracker::new(true, Some(2), Some(THINK_END_ID));
-        assert!(tracker.observe_token(100)); // count=1
-        assert!(tracker.observe_token(200)); // count=2 >= budget
+        assert!(tracker.observe_token(100)); // count→1
+        assert!(tracker.observe_token(200)); // check 1<2, count→2
+        assert!(!tracker.should_force_think_end());
+        assert!(tracker.observe_token(300)); // check 2>=2 → force! count→3
         assert!(tracker.should_force_think_end());
         // When the forced think_end token is generated:
         assert!(tracker.observe_token(THINK_END_ID)); // transitions to content
         assert!(!tracker.should_force_think_end()); // force cleared
-        assert!(!tracker.observe_token(300)); // now content
+        assert!(!tracker.observe_token(400)); // now content
     }
 
     #[test]
@@ -477,17 +499,18 @@ mod tests {
         // the pipeline extracts an over-budget token before the forced </think>
         // arrives. The tracker must NOT re-trigger forcing.
         let mut tracker = ReasoningTracker::new(true, Some(3), Some(THINK_END_ID));
-        tracker.observe_token(100); // count=1
-        tracker.observe_token(200); // count=2
-        tracker.observe_token(300); // count=3 >= budget → force=true
+        tracker.observe_token(100); // count→1
+        tracker.observe_token(200); // count→2
+        tracker.observe_token(300); // count→3
+        tracker.observe_token(400); // check 3>=3 → force=true, count→4
 
         // Phase A of step N+1: consume the force flag
         assert!(tracker.should_force_think_end()); // returns true, sets end_scheduled
         assert!(!tracker.should_force_think_end()); // already consumed — must be false
 
         // Phase B of step N+1: the pipeline extracts the over-budget token (not </think>)
-        assert!(tracker.observe_token(400)); // still reasoning, count=4
-        // Must NOT re-trigger forcing despite count(4) >= budget(3)
+        assert!(tracker.observe_token(500)); // still reasoning, count→5
+        // Must NOT re-trigger forcing despite count(5) >= budget(3)
         assert!(!tracker.should_force_think_end());
 
         // Phase B of step N+2: the forced </think> token is finally extracted
@@ -495,7 +518,7 @@ mod tests {
         assert!(!tracker.should_force_think_end());
 
         // Phase B of step N+3: normal content token
-        assert!(!tracker.observe_token(500)); // content
+        assert!(!tracker.observe_token(600)); // content
     }
 
     #[test]
