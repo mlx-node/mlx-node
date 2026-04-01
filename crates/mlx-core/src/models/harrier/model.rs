@@ -98,7 +98,7 @@ impl HarrierModel {
         let config_hidden = self.config.hidden_size;
 
         let embedding = self.embedding.clone();
-        let layers: Vec<_> = self.layers.iter().cloned().collect();
+        let layers: Vec<_> = self.layers.to_vec();
         let final_norm = self.final_norm.clone();
 
         napi::bindgen_prelude::spawn_blocking(move || {
@@ -151,7 +151,7 @@ impl HarrierModel {
         let config_hidden = self.config.hidden_size;
 
         let embedding = self.embedding.clone();
-        let layers: Vec<_> = self.layers.iter().cloned().collect();
+        let layers: Vec<_> = self.layers.to_vec();
         let final_norm = self.final_norm.clone();
 
         napi::bindgen_prelude::spawn_blocking(move || {
