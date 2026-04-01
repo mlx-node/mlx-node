@@ -1154,34 +1154,37 @@ impl Qwen3_5MoeModel {
                 );
 
                 for step in 0..max_new_tokens {
-                    // Build and submit graph for step N+1 before waiting for N
+                    // Build and submit graph for step N+1 before waiting for N.
+                    // forward() always runs to keep KV caches consistent;
+                    // budget enforcement only overrides the sampling step.
                     let next_y = if step + 1 < max_new_tokens {
-                        if reasoning_tracker.should_force_think_end() {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+
+                        profiler.begin("forward");
+                        let next_ids = y.reshape(&[1, 1])?;
+                        let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
+                        profiler.end();
+
+                        let next_token = if reasoning_tracker.should_force_think_end() {
                             // Budget exhausted — force </think> token
                             let forced_id = reasoning_tracker.forced_token_id() as i32;
-                            let forced = MxArray::from_int32(&[forced_id], &[1])?;
-                            eval_token_and_moe_caches(&forced);
-                            Some(forced)
+                            MxArray::from_int32(&[forced_id], &[1])?
                         } else {
-                            profiler.begin("forward");
-                            let next_ids = y.reshape(&[1, 1])?;
-                            let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
-                            profiler.end();
-
                             profiler.begin("rep_penalty");
                             logits = apply_all_penalties(logits, &token_history, &p)?;
                             profiler.end();
 
                             profiler.begin("sample");
-                            let next_token = sample(&logits, p.sampling_config)?;
+                            let t = sample(&logits, p.sampling_config)?;
                             profiler.end();
+                            t
+                        };
 
-                            profiler.begin("eval_caches");
-                            eval_token_and_moe_caches(&next_token);
-                            profiler.end();
+                        profiler.begin("eval_caches");
+                        eval_token_and_moe_caches(&next_token);
+                        profiler.end();
 
-                            Some(next_token)
-                        }
+                        Some(next_token)
                     } else {
                         None
                     };
@@ -1278,43 +1281,46 @@ impl Qwen3_5MoeModel {
                 );
 
                 for step in 0..max_new_tokens {
-                    // Build and submit graph for step N+1 before waiting for N
+                    // Build and submit graph for step N+1 before waiting for N.
+                    // forward() always runs to keep KV caches consistent;
+                    // budget enforcement only overrides the sampling step.
                     let next_y = if step + 1 < max_new_tokens {
-                        if reasoning_tracker.should_force_think_end() {
-                            let forced_id = reasoning_tracker.forced_token_id() as i32;
-                            let forced = MxArray::from_int32(&[forced_id], &[1])?;
-                            MxArray::async_eval_arrays(&[&forced]);
-                            Some(forced)
-                        } else {
-                            profiler.begin("forward");
-                            let next_ids = y.reshape(&[1, 1])?;
-                            let logits = forward_inner(
-                                &next_ids,
-                                &embedding_weight,
-                                &mut layers_guard,
-                                &mut caches_guard,
-                                &final_norm_guard,
-                                &lm_head_guard,
-                                fa_idx,
-                                Some(&embedding_weight_t),
-                            )?;
-                            let mut logits = logits.squeeze(Some(&[1]))?;
-                            profiler.end();
+                        profiler.begin("forward");
+                        let next_ids = y.reshape(&[1, 1])?;
+                        let logits = forward_inner(
+                            &next_ids,
+                            &embedding_weight,
+                            &mut layers_guard,
+                            &mut caches_guard,
+                            &final_norm_guard,
+                            &lm_head_guard,
+                            fa_idx,
+                            Some(&embedding_weight_t),
+                        )?;
+                        let mut logits = logits.squeeze(Some(&[1]))?;
+                        profiler.end();
 
+                        let next_token = if reasoning_tracker.should_force_think_end() {
+                            let forced_id = reasoning_tracker.forced_token_id() as i32;
+                            MxArray::from_int32(&[forced_id], &[1])?
+                        } else {
                             profiler.begin("rep_penalty");
                             logits = apply_all_penalties(logits, &token_history, &p)?;
                             profiler.end();
 
                             profiler.begin("sample");
-                            let next_token = sample(&logits, p.sampling_config)?;
+                            let t = sample(&logits, p.sampling_config)?;
                             profiler.end();
+                            t
+                        };
 
-                            profiler.begin("async_eval");
-                            MxArray::async_eval_arrays(&[&next_token]);
-                            profiler.end();
+                        profiler.begin("async_eval");
+                        // Eval both next_token and logits to ensure forward graph
+                        // (including KV cache updates) is materialized.
+                        MxArray::async_eval_arrays(&[&next_token, &logits]);
+                        profiler.end();
 
-                            Some(next_token)
-                        }
+                        Some(next_token)
                     } else {
                         None
                     };
@@ -1847,6 +1853,9 @@ impl Qwen3_5MoeModel {
                     let mut y = sample(&last_logits, sampling_config)?;
                     MxArray::async_eval_arrays(&[&y]);
 
+                    let mut last_is_reasoning =
+                        enable_thinking.unwrap_or(true) && think_end_id_stream.is_some();
+
                     if use_cpp {
                         // Guard ensures mlx_qwen35_moe_reset() is called even if `?` returns early.
                         let _moe_guard = MoeResetGuard;
@@ -1940,48 +1949,51 @@ impl Qwen3_5MoeModel {
                             thinking_token_budget,
                             think_end_id_stream,
                         );
+                        // Use outer last_is_reasoning (shared with residual flush)
+                        last_is_reasoning = starts_in_thinking;
 
                         for step in 0..max_new_tokens {
-                            // Build and submit graph for step N+1
+                            // Build and submit graph for step N+1.
+                            // forward() always runs to keep KV caches consistent.
                             let next_y = if step + 1 < max_new_tokens {
-                                if reasoning_tracker.should_force_think_end() {
-                                    let forced_id =
-                                        reasoning_tracker.forced_token_id() as i32;
-                                    let forced =
-                                        MxArray::from_int32(&[forced_id], &[1])?;
-                                    eval_token_and_moe_caches(&forced);
-                                    Some(forced)
-                                } else {
-                                    let next_ids = y.reshape(&[1, 1])?;
-                                    let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
-                                    if repetition_penalty != 1.0 {
-                                        logits = apply_repetition_penalty(
-                                            &logits,
-                                            &token_history,
-                                            repetition_penalty,
-                                            Some(repetition_context_size),
-                                        )?;
-                                    }
-                                    if presence_penalty != 0.0 {
-                                        logits = apply_presence_penalty(
-                                            &logits,
-                                            &token_history,
-                                            presence_penalty,
-                                            Some(presence_context_size),
-                                        )?;
-                                    }
-                                    if frequency_penalty != 0.0 {
-                                        logits = apply_frequency_penalty(
-                                            &logits,
-                                            &token_history,
-                                            frequency_penalty,
-                                            Some(frequency_context_size),
-                                        )?;
-                                    }
-                                    let next_token = sample(&logits, sampling_config)?;
-                                    eval_token_and_moe_caches(&next_token);
-                                    Some(next_token)
-                                }
+                                let next_ids = y.reshape(&[1, 1])?;
+                                let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
+
+                                let next_token =
+                                    if reasoning_tracker.should_force_think_end() {
+                                        let forced_id =
+                                            reasoning_tracker.forced_token_id() as i32;
+                                        MxArray::from_int32(&[forced_id], &[1])?
+                                    } else {
+                                        if repetition_penalty != 1.0 {
+                                            logits = apply_repetition_penalty(
+                                                &logits,
+                                                &token_history,
+                                                repetition_penalty,
+                                                Some(repetition_context_size),
+                                            )?;
+                                        }
+                                        if presence_penalty != 0.0 {
+                                            logits = apply_presence_penalty(
+                                                &logits,
+                                                &token_history,
+                                                presence_penalty,
+                                                Some(presence_context_size),
+                                            )?;
+                                        }
+                                        if frequency_penalty != 0.0 {
+                                            logits = apply_frequency_penalty(
+                                                &logits,
+                                                &token_history,
+                                                frequency_penalty,
+                                                Some(frequency_context_size),
+                                            )?;
+                                        }
+                                        sample(&logits, sampling_config)?
+                                    };
+
+                                eval_token_and_moe_caches(&next_token);
+                                Some(next_token)
                             } else {
                                 None
                             };
@@ -2002,6 +2014,7 @@ impl Qwen3_5MoeModel {
                             }
 
                             let is_reasoning = reasoning_tracker.observe_token(token_id);
+                            last_is_reasoning = is_reasoning;
 
                             let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
                                 &mut decode_stream,
@@ -2101,58 +2114,63 @@ impl Qwen3_5MoeModel {
                             thinking_token_budget,
                             think_end_id_stream,
                         );
+                        // Use outer last_is_reasoning (shared with residual flush)
+                        last_is_reasoning = starts_in_thinking;
 
                         for step in 0..max_new_tokens {
-                            // Build and submit graph for step N+1
+                            // Build and submit graph for step N+1.
+                            // forward() always runs to keep KV caches consistent.
                             let next_y = if step + 1 < max_new_tokens {
-                                if reasoning_tracker.should_force_think_end() {
-                                    let forced_id =
-                                        reasoning_tracker.forced_token_id() as i32;
-                                    let forced =
-                                        MxArray::from_int32(&[forced_id], &[1])?;
-                                    MxArray::async_eval_arrays(&[&forced]);
-                                    Some(forced)
-                                } else {
-                                    let next_ids = y.reshape(&[1, 1])?;
-                                    let logits = forward_inner(
-                                        &next_ids,
-                                        &embedding_weight,
-                                        &mut layers_guard,
-                                        &mut caches_guard,
-                                        &final_norm_guard,
-                                        &lm_head_guard,
-                                        fa_idx,
-                                        Some(&embedding_weight_t),
-                                    )?;
-                                    let mut logits = logits.squeeze(Some(&[1]))?;
-                                    if repetition_penalty != 1.0 {
-                                        logits = apply_repetition_penalty(
-                                            &logits,
-                                            &token_history,
-                                            repetition_penalty,
-                                            Some(repetition_context_size),
-                                        )?;
-                                    }
-                                    if presence_penalty != 0.0 {
-                                        logits = apply_presence_penalty(
-                                            &logits,
-                                            &token_history,
-                                            presence_penalty,
-                                            Some(presence_context_size),
-                                        )?;
-                                    }
-                                    if frequency_penalty != 0.0 {
-                                        logits = apply_frequency_penalty(
-                                            &logits,
-                                            &token_history,
-                                            frequency_penalty,
-                                            Some(frequency_context_size),
-                                        )?;
-                                    }
-                                    let next_token = sample(&logits, sampling_config)?;
-                                    MxArray::async_eval_arrays(&[&next_token]);
-                                    Some(next_token)
-                                }
+                                let next_ids = y.reshape(&[1, 1])?;
+                                let logits = forward_inner(
+                                    &next_ids,
+                                    &embedding_weight,
+                                    &mut layers_guard,
+                                    &mut caches_guard,
+                                    &final_norm_guard,
+                                    &lm_head_guard,
+                                    fa_idx,
+                                    Some(&embedding_weight_t),
+                                )?;
+                                let mut logits = logits.squeeze(Some(&[1]))?;
+
+                                let next_token =
+                                    if reasoning_tracker.should_force_think_end() {
+                                        let forced_id =
+                                            reasoning_tracker.forced_token_id() as i32;
+                                        MxArray::from_int32(&[forced_id], &[1])?
+                                    } else {
+                                        if repetition_penalty != 1.0 {
+                                            logits = apply_repetition_penalty(
+                                                &logits,
+                                                &token_history,
+                                                repetition_penalty,
+                                                Some(repetition_context_size),
+                                            )?;
+                                        }
+                                        if presence_penalty != 0.0 {
+                                            logits = apply_presence_penalty(
+                                                &logits,
+                                                &token_history,
+                                                presence_penalty,
+                                                Some(presence_context_size),
+                                            )?;
+                                        }
+                                        if frequency_penalty != 0.0 {
+                                            logits = apply_frequency_penalty(
+                                                &logits,
+                                                &token_history,
+                                                frequency_penalty,
+                                                Some(frequency_context_size),
+                                            )?;
+                                        }
+                                        sample(&logits, sampling_config)?
+                                    };
+
+                                // Eval both next_token and logits to ensure forward graph
+                                // (including KV cache updates) is materialized.
+                                MxArray::async_eval_arrays(&[&next_token, &logits]);
+                                Some(next_token)
                             } else {
                                 None
                             };
@@ -2173,6 +2191,7 @@ impl Qwen3_5MoeModel {
                             }
 
                             let is_reasoning = reasoning_tracker.observe_token(token_id);
+                            last_is_reasoning = is_reasoning;
 
                             let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
                                 &mut decode_stream,
@@ -2324,7 +2343,7 @@ impl Qwen3_5MoeModel {
                                 num_tokens: None,
                                 raw_text: None,
                                 performance: None,
-                                is_reasoning: None,
+                                is_reasoning: Some(last_is_reasoning),
                             }),
                             ThreadsafeFunctionCallMode::NonBlocking,
                         );

@@ -108,6 +108,9 @@ pub(crate) struct ReasoningTracker {
     budget: Option<i32>,
     think_end_id: Option<u32>,
     force_think_end: bool,
+    /// Set after `should_force_think_end` is consumed, prevents re-triggering
+    /// from subsequent `observe_token` calls before the forced token is extracted.
+    end_scheduled: bool,
 }
 
 impl ReasoningTracker {
@@ -123,6 +126,7 @@ impl ReasoningTracker {
             budget,
             think_end_id,
             force_think_end: false,
+            end_scheduled: false,
         }
     }
 
@@ -137,12 +141,13 @@ impl ReasoningTracker {
         if self.think_end_id == Some(token_id) {
             self.in_thinking = false;
             self.force_think_end = false;
+            self.end_scheduled = false;
             return true; // </think> itself is part of reasoning
         }
 
         self.thinking_token_count += 1;
         if let Some(budget) = self.budget {
-            if self.thinking_token_count >= budget {
+            if self.thinking_token_count >= budget && !self.end_scheduled {
                 self.force_think_end = true;
             }
         }
@@ -150,13 +155,20 @@ impl ReasoningTracker {
     }
 
     /// Whether the next token should be forced to think_end_id.
+    /// Consumes the flag — returns true at most once per budget trigger.
     ///
     /// Check this BEFORE building the next decode step's graph.
-    pub fn should_force_think_end(&self) -> bool {
-        self.force_think_end && self.think_end_id.is_some()
+    pub fn should_force_think_end(&mut self) -> bool {
+        if self.force_think_end && self.think_end_id.is_some() {
+            self.force_think_end = false;
+            self.end_scheduled = true;
+            true
+        } else {
+            false
+        }
     }
 
-    /// The think_end token ID to force. Only valid when `should_force_think_end()` is true.
+    /// The think_end token ID to force. Only valid when `should_force_think_end()` returned true.
     pub fn forced_token_id(&self) -> u32 {
         self.think_end_id
             .expect("should_force_think_end was true but think_end_id is None")
@@ -400,6 +412,33 @@ mod tests {
         assert!(tracker.observe_token(THINK_END_ID)); // transitions to content
         assert!(!tracker.should_force_think_end()); // force cleared
         assert!(!tracker.observe_token(300)); // now content
+    }
+
+    #[test]
+    fn test_tracker_no_double_force_with_pipeline_lag() {
+        // Simulates pipelined decode: after should_force_think_end() is consumed,
+        // the pipeline extracts an over-budget token before the forced </think>
+        // arrives. The tracker must NOT re-trigger forcing.
+        let mut tracker = ReasoningTracker::new(true, Some(3), Some(THINK_END_ID));
+        tracker.observe_token(100); // count=1
+        tracker.observe_token(200); // count=2
+        tracker.observe_token(300); // count=3 >= budget → force=true
+
+        // Phase A of step N+1: consume the force flag
+        assert!(tracker.should_force_think_end()); // returns true, sets end_scheduled
+        assert!(!tracker.should_force_think_end()); // already consumed — must be false
+
+        // Phase B of step N+1: the pipeline extracts the over-budget token (not </think>)
+        assert!(tracker.observe_token(400)); // still reasoning, count=4
+        // Must NOT re-trigger forcing despite count(4) >= budget(3)
+        assert!(!tracker.should_force_think_end());
+
+        // Phase B of step N+2: the forced </think> token is finally extracted
+        assert!(tracker.observe_token(THINK_END_ID)); // transitions to content
+        assert!(!tracker.should_force_think_end());
+
+        // Phase B of step N+3: normal content token
+        assert!(!tracker.observe_token(500)); // content
     }
 
     #[test]
