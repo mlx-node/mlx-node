@@ -1959,6 +1959,7 @@ impl Qwen3_5MoeModel {
                             // Build and submit graph for step N+1.
                             // forward() always runs to keep KV caches consistent.
                             let next_y = if step + 1 < max_new_tokens {
+                                let _stream_ctx = StreamContext::new(generation_stream);
                                 let next_ids = y.reshape(&[1, 1])?;
                                 let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
 
