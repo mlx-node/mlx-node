@@ -207,7 +207,6 @@ impl QianfanOCRModel {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
-            enable_thinking: None,
             thinking_token_budget: None,
             include_reasoning: None,
             reasoning_effort: None,
@@ -229,7 +228,10 @@ impl QianfanOCRModel {
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
-        let enable_thinking = config.enable_thinking.unwrap_or(false);
+        let enable_thinking = config
+            .reasoning_effort
+            .as_deref()
+            .is_some_and(|e| !matches!(e, "none" | "low"));
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -635,7 +637,6 @@ impl QianfanOCRModel {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
-            enable_thinking: None,
             thinking_token_budget: None,
             include_reasoning: None,
             reasoning_effort: None,
@@ -657,7 +658,10 @@ impl QianfanOCRModel {
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
-        let enable_thinking = config.enable_thinking.unwrap_or(false);
+        let enable_thinking = config
+            .reasoning_effort
+            .as_deref()
+            .is_some_and(|e| !matches!(e, "none" | "low"));
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 

@@ -2117,11 +2117,6 @@ export interface ChatConfig {
   ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
   /**
-   * Enable thinking mode (Qwen3's <think> tags). Default: true (model thinks naturally).
-   * Set to false to suppress thinking by injecting empty <think></think> tags.
-   */
-  enableThinking?: boolean | undefined;
-  /**
    * Maximum number of thinking tokens before forcing </think>.
    * When the model has generated this many tokens while in thinking mode,
    * the next token is forced to be the think_end token. None = unlimited.
@@ -2134,8 +2129,9 @@ export interface ChatConfig {
    */
   includeReasoning?: boolean | undefined;
   /**
-   * Reasoning effort level. Overrides `enableThinking` when set:
-   * "low"/"none" → enableThinking=false, "medium"/"high" → enableThinking=true.
+   * Reasoning effort level. Controls whether the model thinks before answering:
+   * "low"/"none" → thinking disabled, "medium"/"high" → thinking enabled.
+   * Not set → thinking enabled (model thinks naturally).
    */
   reasoningEffort?: string | undefined;
   /** When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result */

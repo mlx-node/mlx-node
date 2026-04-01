@@ -37,6 +37,19 @@ pub(crate) struct ChatParams {
     pub include_reasoning: bool,
 }
 
+/// Resolve the effective `enable_thinking` value from `reasoning_effort`.
+///
+/// In vLLM, `enable_thinking` is a low-level template kwarg nested inside
+/// `chat_template_kwargs`. `reasoning_effort` is the user-facing control that
+/// drives it. This function maps the user-facing API to the template parameter.
+pub(crate) fn resolve_enable_thinking(config: &ChatConfig) -> Option<bool> {
+    match config.reasoning_effort.as_deref() {
+        Some("none") | Some("low") => Some(false),
+        Some("medium") | Some("high") => Some(true),
+        _ => None, // not set → default (template decides, typically true)
+    }
+}
+
 /// Extract ChatConfig fields into flat variables with defaults.
 pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
     ChatParams {

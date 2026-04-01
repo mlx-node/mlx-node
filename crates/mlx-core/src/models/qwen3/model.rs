@@ -5680,7 +5680,9 @@ impl Qwen3Model {
 
         // Extract tools, enable_thinking, report_performance, and reuse_cache from config
         let tools = config.as_ref().and_then(|c| c.tools.clone());
-        let enable_thinking = config.as_ref().and_then(|c| c.enable_thinking);
+        let enable_thinking = config
+            .as_ref()
+            .and_then(crate::models::qwen3_5::chat_common::resolve_enable_thinking);
         let report_perf = config
             .as_ref()
             .and_then(|c| c.report_performance)

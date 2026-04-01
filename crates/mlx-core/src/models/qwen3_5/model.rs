@@ -190,10 +190,13 @@ pub struct ChatConfig {
     pub ngram_size: Option<i32>,
     #[napi(ts_type = "Array<ToolDefinition>")]
     pub tools: Option<Vec<ToolDefinition>>,
-    /// Enable thinking mode (Qwen3's <think> tags). Default: true (model thinks naturally).
-    /// Set to false to suppress thinking by injecting empty <think></think> tags.
-    #[napi(ts_type = "boolean | undefined")]
-    pub enable_thinking: Option<bool>,
+    /// Reasoning effort level. Controls whether the model thinks before answering.
+    /// - "none" / "low": thinking disabled (template injects closed think block).
+    ///   "none" also sets includeReasoning to false by default.
+    /// - "medium" / "high": thinking enabled (default behavior).
+    /// - Not set: thinking enabled (model thinks naturally).
+    #[napi(ts_type = "string | undefined")]
+    pub reasoning_effort: Option<String>,
     /// Maximum number of thinking tokens before forcing </think>.
     /// When the model has generated this many tokens while in thinking mode,
     /// the next token is forced to be the think_end token. None = unlimited.
@@ -201,13 +204,9 @@ pub struct ChatConfig {
     pub thinking_token_budget: Option<i32>,
     /// Whether to include reasoning/thinking content in the output.
     /// When false, the `thinking` field of ChatResult/ChatStreamChunk will always be None.
-    /// Default: true (reasoning is included).
+    /// Default: true (false when reasoningEffort is "none").
     #[napi(ts_type = "boolean | undefined")]
     pub include_reasoning: Option<bool>,
-    /// Reasoning effort level. Overrides `enableThinking` when set:
-    /// "low"/"none" → enableThinking=false, "medium"/"high" → enableThinking=true.
-    #[napi(ts_type = "string | undefined")]
-    pub reasoning_effort: Option<String>,
     /// When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result
     #[napi(ts_type = "boolean | undefined")]
     pub report_performance: Option<bool>,
@@ -941,7 +940,6 @@ impl Qwen3_5Model {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
-            enable_thinking: None,
             thinking_token_budget: None,
             include_reasoning: None,
             reasoning_effort: None,
@@ -1032,11 +1030,7 @@ impl Qwen3_5Model {
             let mut first_token_instant: Option<std::time::Instant> = None;
 
             let tool_defs = config.tools.as_deref();
-            let enable_thinking = match config.reasoning_effort.as_deref() {
-                Some("low") | Some("none") => Some(false),
-                Some("medium") | Some("high") => Some(true),
-                _ => config.enable_thinking,
-            };
+            let enable_thinking = chat_common::resolve_enable_thinking(&config);
             let tokens = tokenizer.apply_chat_template_sync(
                 &messages,
                 Some(true),
@@ -1655,7 +1649,6 @@ impl Qwen3_5Model {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
-            enable_thinking: None,
             thinking_token_budget: None,
             include_reasoning: None,
             reasoning_effort: None,
@@ -1754,11 +1747,7 @@ impl Qwen3_5Model {
                     };
 
                     let tool_defs = config.tools.as_deref();
-                    let enable_thinking = match config.reasoning_effort.as_deref() {
-                        Some("low") | Some("none") => Some(false),
-                        Some("medium") | Some("high") => Some(true),
-                        _ => config.enable_thinking,
-                    };
+                    let enable_thinking = chat_common::resolve_enable_thinking(&config);
                     let tokens = tokenizer.apply_chat_template_sync(
                         &messages,
                         Some(true),

@@ -729,7 +729,6 @@ impl Qwen3_5MoeModel {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
-            enable_thinking: None,
             thinking_token_budget: None,
             include_reasoning: None,
             reasoning_effort: None,
@@ -808,11 +807,7 @@ impl Qwen3_5MoeModel {
             let use_cpp = _weight_guard.is_some();
 
             let tool_defs = config.tools.as_deref();
-            let enable_thinking = match config.reasoning_effort.as_deref() {
-                Some("low") | Some("none") => Some(false),
-                Some("medium") | Some("high") => Some(true),
-                _ => config.enable_thinking,
-            };
+            let enable_thinking = chat_common::resolve_enable_thinking(&config);
             let tokens = tokenizer.apply_chat_template_sync(
                 &messages,
                 Some(true),
@@ -1446,7 +1441,6 @@ impl Qwen3_5MoeModel {
             max_ngram_repeats: None,
             ngram_size: None,
             tools: None,
-            enable_thinking: None,
             thinking_token_budget: None,
             include_reasoning: None,
             reasoning_effort: None,
@@ -1536,11 +1530,7 @@ impl Qwen3_5MoeModel {
                     let use_cpp = _weight_guard.is_some();
 
                     let tool_defs = config.tools.as_deref();
-                    let enable_thinking = match config.reasoning_effort.as_deref() {
-                        Some("low") | Some("none") => Some(false),
-                        Some("medium") | Some("high") => Some(true),
-                        _ => config.enable_thinking,
-                    };
+                    let enable_thinking = chat_common::resolve_enable_thinking(&config);
                     let tokens = tokenizer.apply_chat_template_sync(
                         &messages,
                         Some(true),
