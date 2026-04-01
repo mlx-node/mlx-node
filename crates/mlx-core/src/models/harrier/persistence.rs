@@ -121,7 +121,15 @@ fn parse_config(raw: &Value) -> Result<HarrierConfig> {
         hidden_size,
         num_layers: get_i32(raw, &["num_hidden_layers", "num_layers", "numLayers"])?,
         num_heads,
-        num_key_value_heads: get_i32(raw, &["num_key_value_heads", "num_kv_heads", "numKvHeads"])?,
+        num_key_value_heads: get_i32(
+            raw,
+            &[
+                "num_key_value_heads",
+                "numKeyValueHeads",
+                "num_kv_heads",
+                "numKvHeads",
+            ],
+        )?,
         intermediate_size: get_i32(raw, &["intermediate_size", "intermediateSize"])?,
         rms_norm_eps: raw["rms_norm_eps"]
             .as_f64()
