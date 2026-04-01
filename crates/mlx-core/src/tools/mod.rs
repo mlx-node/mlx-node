@@ -579,10 +579,11 @@ pub fn split_at_think_end(
     // Token-level split: authoritative when think_end_tag is confirmed.
     // Always takes priority — even when <think> appears in the text (old templates).
     // Tool calls are parsed only from content after the boundary.
-    // Uses rfind (last occurrence) so that a literal </think> mentioned earlier
-    // in reasoning text (e.g., explaining XML) doesn't cause a premature split.
+    // Uses find (first occurrence): </think> is a special token, so the first
+    // text match is the real boundary. Content after the boundary may mention
+    // </think> literally; rfind would incorrectly split at that later occurrence.
     if let Some(tag) = think_end_tag
-        && let Some(close_pos) = raw_text.rfind(tag)
+        && let Some(close_pos) = raw_text.find(tag)
     {
         let thinking_text = raw_text[..close_pos].trim();
         // Strip opening think tag from old-style templates that emit it
@@ -1335,18 +1336,16 @@ The weather in Tokyo is sunny."#;
     }
 
     #[test]
-    fn test_split_at_think_end_literal_close_tag_in_reasoning() {
-        // Reasoning text mentions </think> literally before the actual boundary.
-        // rfind ensures we split at the LAST occurrence (the real boundary).
-        let text =
-            "The model emits </think> to end reasoning. Let me continue.</think>\nactual content";
+    fn test_split_at_think_end_close_tag_in_content() {
+        // Content after the real boundary mentions </think> literally.
+        // find (first occurrence) splits at the real boundary, not the literal.
+        let text = "reasoning here</think>\nThe </think> tag ends reasoning.";
         let (clean, tools, thinking) = split_at_think_end(text, Some("</think>"));
-        assert_eq!(clean, "actual content");
+        assert_eq!(thinking.unwrap(), "reasoning here");
         assert!(tools.is_empty());
-        let t = thinking.unwrap();
         assert!(
-            t.contains("</think> to end reasoning"),
-            "literal </think> should be preserved in thinking, got: {t}"
+            clean.contains("</think> tag ends reasoning"),
+            "literal </think> in content should be preserved, got: {clean}"
         );
     }
 }

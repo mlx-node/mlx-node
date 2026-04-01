@@ -1369,23 +1369,30 @@ impl Qwen3_5Model {
                         let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
                         profiler.end();
 
-                        let next_token = if reasoning_tracker.should_force_think_end() {
-                            let forced_id = reasoning_tracker.forced_token_id() as i32;
-                            MxArray::from_int32(&[forced_id], &[1])?
-                        } else {
-                            profiler.begin("rep_penalty");
-                            logits = apply_all_penalties(logits, &token_history, &p)?;
-                            profiler.end();
+                        let (next_token, budget_forced) =
+                            if reasoning_tracker.should_force_think_end() {
+                                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                                (MxArray::from_int32(&[forced_id], &[1])?, true)
+                            } else {
+                                profiler.begin("rep_penalty");
+                                logits = apply_all_penalties(logits, &token_history, &p)?;
+                                profiler.end();
 
-                            profiler.begin("sample");
-                            let t = sample(&logits, p.sampling_config)?;
-                            profiler.end();
-                            t
-                        };
+                                profiler.begin("sample");
+                                let t = sample(&logits, p.sampling_config)?;
+                                profiler.end();
+                                (t, false)
+                            };
 
                         profiler.begin("eval_caches");
                         eval_token_and_compiled_caches(&next_token);
                         profiler.end();
+                        if budget_forced {
+                            // next_token is a constant with no graph dependency on
+                            // forward_compiled. Eval logits to ensure the forward
+                            // graph and KV cache updates are materialized.
+                            logits.eval();
+                        }
 
                         Some(next_token)
                     } else {
@@ -2159,38 +2166,42 @@ impl Qwen3_5Model {
                                 let next_ids = y.reshape(&[1, 1])?;
                                 let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
 
-                                let next_token = if reasoning_tracker.should_force_think_end() {
-                                    let forced_id = reasoning_tracker.forced_token_id() as i32;
-                                    MxArray::from_int32(&[forced_id], &[1])?
-                                } else {
-                                    if repetition_penalty != 1.0 {
-                                        logits = apply_repetition_penalty(
-                                            &logits,
-                                            &token_history,
-                                            repetition_penalty,
-                                            Some(repetition_context_size),
-                                        )?;
-                                    }
-                                    if presence_penalty != 0.0 {
-                                        logits = apply_presence_penalty(
-                                            &logits,
-                                            &token_history,
-                                            presence_penalty,
-                                            Some(presence_context_size),
-                                        )?;
-                                    }
-                                    if frequency_penalty != 0.0 {
-                                        logits = apply_frequency_penalty(
-                                            &logits,
-                                            &token_history,
-                                            frequency_penalty,
-                                            Some(frequency_context_size),
-                                        )?;
-                                    }
-                                    sample(&logits, sampling_config)?
-                                };
+                                let (next_token, budget_forced) =
+                                    if reasoning_tracker.should_force_think_end() {
+                                        let forced_id = reasoning_tracker.forced_token_id() as i32;
+                                        (MxArray::from_int32(&[forced_id], &[1])?, true)
+                                    } else {
+                                        if repetition_penalty != 1.0 {
+                                            logits = apply_repetition_penalty(
+                                                &logits,
+                                                &token_history,
+                                                repetition_penalty,
+                                                Some(repetition_context_size),
+                                            )?;
+                                        }
+                                        if presence_penalty != 0.0 {
+                                            logits = apply_presence_penalty(
+                                                &logits,
+                                                &token_history,
+                                                presence_penalty,
+                                                Some(presence_context_size),
+                                            )?;
+                                        }
+                                        if frequency_penalty != 0.0 {
+                                            logits = apply_frequency_penalty(
+                                                &logits,
+                                                &token_history,
+                                                frequency_penalty,
+                                                Some(frequency_context_size),
+                                            )?;
+                                        }
+                                        (sample(&logits, sampling_config)?, false)
+                                    };
 
                                 eval_token_and_compiled_caches(&next_token);
+                                if budget_forced {
+                                    logits.eval();
+                                }
                                 Some(next_token)
                             } else {
                                 None
