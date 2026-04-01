@@ -2531,15 +2531,22 @@ impl Qwen3_5Model {
 
                     let num_tokens = generated_tokens.len() as u32;
 
-                    let think_tag = if starts_in_thinking
-                        && tools::has_think_end_token(&generated_tokens, think_end_id)
+                    let (clean_text, tool_calls, thinking) = if !starts_in_thinking {
+                        let (clean, calls) = tools::parse_tool_calls(&text);
+                        (clean, calls, None)
+                    } else if tools::has_think_end_token(&generated_tokens, think_end_id)
                     {
-                        think_end_str.as_deref()
+                        tools::split_at_think_end(&text, think_end_str.as_deref())
                     } else {
-                        None
+                        let t = text.trim();
+                        let t = t.strip_prefix("<think>").unwrap_or(t).trim();
+                        let thinking = if t.is_empty() {
+                            None
+                        } else {
+                            Some(t.to_string())
+                        };
+                        (String::new(), vec![], thinking)
                     };
-                    let (clean_text, tool_calls, thinking) =
-                        tools::split_at_think_end(&text, think_tag);
                     let thinking = if include_reasoning { thinking } else { None };
 
                     // If we have valid tool calls, override finish reason

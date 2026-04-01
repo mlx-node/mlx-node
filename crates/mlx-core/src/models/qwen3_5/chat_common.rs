@@ -234,17 +234,31 @@ pub(crate) fn finalize_chat_result(
 
     let num_tokens = generated_tokens.len() as u32;
 
-    // Only attempt think splitting when generation started inside a reasoning
-    // block. In no-thinking mode the prompt already closed the think block,
-    // so any literal </think> in the output is normal content.
-    let think_tag = if starts_in_thinking
-        && tools::has_think_end_token(generated_tokens, think_end_id)
-    {
-        think_end_str
+    let (clean_text, tool_calls, thinking) = if !starts_in_thinking {
+        // No-thinking mode: all text is content. Any literal <think> tags
+        // are normal model output, not reasoning boundaries.
+        let (clean, calls) = tools::parse_tool_calls(&text);
+        (clean, calls, None)
+    } else if tools::has_think_end_token(generated_tokens, think_end_id) {
+        // Thinking mode with confirmed </think>: split at token boundary.
+        tools::split_at_think_end(&text, think_end_str)
     } else {
-        None
+        // Thinking mode, truncated (no </think> before EOS/max_tokens):
+        // entire output is reasoning, no content.
+        let thinking_text = text.trim();
+        // Strip leading <think> from old-style templates that emit it
+        // in the generated text (newer templates inject it in the prompt).
+        let thinking_text = thinking_text
+            .strip_prefix("<think>")
+            .unwrap_or(thinking_text)
+            .trim();
+        let thinking = if thinking_text.is_empty() {
+            None
+        } else {
+            Some(thinking_text.to_string())
+        };
+        (String::new(), vec![], thinking)
     };
-    let (clean_text, tool_calls, thinking) = tools::split_at_think_end(&text, think_tag);
 
     // Suppress reasoning if not requested
     let thinking = if include_reasoning { thinking } else { None };
