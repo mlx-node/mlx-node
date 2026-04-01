@@ -18,6 +18,10 @@ use crate::models::qwen3_5::model::{
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 
+use super::config::Qwen3_5MoeConfig;
+use super::decoder_layer::DecoderLayer;
+use super::layer_cache::Qwen3_5LayerCache;
+use super::persistence;
 use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
@@ -34,12 +38,6 @@ use crate::sampling::{
 };
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
-use crate::tools;
-
-use super::config::Qwen3_5MoeConfig;
-use super::decoder_layer::DecoderLayer;
-use super::layer_cache::Qwen3_5LayerCache;
-use super::persistence;
 
 // Import the shared model ID counter from the dense module — dense and MoE
 // share the same C++ weight map, so IDs must be globally unique.
@@ -1164,23 +1162,29 @@ impl Qwen3_5MoeModel {
                         let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
                         profiler.end();
 
-                        let next_token = if reasoning_tracker.should_force_think_end() {
-                            // Budget exhausted — force </think> token
-                            let forced_id = reasoning_tracker.forced_token_id() as i32;
-                            MxArray::from_int32(&[forced_id], &[1])?
-                        } else {
-                            profiler.begin("rep_penalty");
-                            logits = apply_all_penalties(logits, &token_history, &p)?;
-                            profiler.end();
+                        let (next_token, budget_forced) =
+                            if reasoning_tracker.should_force_think_end() {
+                                // Budget exhausted — force </think> token
+                                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                                (MxArray::from_int32(&[forced_id], &[1])?, true)
+                            } else {
+                                profiler.begin("rep_penalty");
+                                logits = apply_all_penalties(logits, &token_history, &p)?;
+                                profiler.end();
 
-                            profiler.begin("sample");
-                            let t = sample(&logits, p.sampling_config)?;
-                            profiler.end();
-                            t
-                        };
+                                profiler.begin("sample");
+                                let t = sample(&logits, p.sampling_config)?;
+                                profiler.end();
+                                (t, false)
+                            };
 
                         profiler.begin("eval_caches");
                         eval_token_and_moe_caches(&next_token);
+                        if budget_forced {
+                            // When budget-forced, next_token is a constant that doesn't
+                            // pull the forward graph. Eval logits to materialize cache updates.
+                            logits.eval();
+                        }
                         profiler.end();
 
                         Some(next_token)
@@ -1397,7 +1401,6 @@ impl Qwen3_5MoeModel {
                 generated_tokens.len(),
             );
 
-            let starts_in_thinking = enable_thinking.unwrap_or(true) && think_end_id.is_some();
             finalize_chat_result(
                 &tokenizer_for_decode,
                 &generated_tokens,
@@ -1406,7 +1409,7 @@ impl Qwen3_5MoeModel {
                 think_end_str.as_deref(),
                 performance,
                 p.include_reasoning,
-                starts_in_thinking,
+                enable_thinking.unwrap_or(true),
             )
         })
         .await
@@ -1959,38 +1962,44 @@ impl Qwen3_5MoeModel {
                                 let next_ids = y.reshape(&[1, 1])?;
                                 let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
 
-                                let next_token = if reasoning_tracker.should_force_think_end() {
-                                    let forced_id = reasoning_tracker.forced_token_id() as i32;
-                                    MxArray::from_int32(&[forced_id], &[1])?
-                                } else {
-                                    if repetition_penalty != 1.0 {
-                                        logits = apply_repetition_penalty(
-                                            &logits,
-                                            &token_history,
-                                            repetition_penalty,
-                                            Some(repetition_context_size),
-                                        )?;
-                                    }
-                                    if presence_penalty != 0.0 {
-                                        logits = apply_presence_penalty(
-                                            &logits,
-                                            &token_history,
-                                            presence_penalty,
-                                            Some(presence_context_size),
-                                        )?;
-                                    }
-                                    if frequency_penalty != 0.0 {
-                                        logits = apply_frequency_penalty(
-                                            &logits,
-                                            &token_history,
-                                            frequency_penalty,
-                                            Some(frequency_context_size),
-                                        )?;
-                                    }
-                                    sample(&logits, sampling_config)?
-                                };
+                                let (next_token, budget_forced) =
+                                    if reasoning_tracker.should_force_think_end() {
+                                        let forced_id = reasoning_tracker.forced_token_id() as i32;
+                                        (MxArray::from_int32(&[forced_id], &[1])?, true)
+                                    } else {
+                                        if repetition_penalty != 1.0 {
+                                            logits = apply_repetition_penalty(
+                                                &logits,
+                                                &token_history,
+                                                repetition_penalty,
+                                                Some(repetition_context_size),
+                                            )?;
+                                        }
+                                        if presence_penalty != 0.0 {
+                                            logits = apply_presence_penalty(
+                                                &logits,
+                                                &token_history,
+                                                presence_penalty,
+                                                Some(presence_context_size),
+                                            )?;
+                                        }
+                                        if frequency_penalty != 0.0 {
+                                            logits = apply_frequency_penalty(
+                                                &logits,
+                                                &token_history,
+                                                frequency_penalty,
+                                                Some(frequency_context_size),
+                                            )?;
+                                        }
+                                        (sample(&logits, sampling_config)?, false)
+                                    };
 
                                 eval_token_and_moe_caches(&next_token);
+                                if budget_forced {
+                                    // When budget-forced, next_token is a constant that doesn't
+                                    // pull the forward graph. Eval logits to materialize cache updates.
+                                    logits.eval();
+                                }
                                 Some(next_token)
                             } else {
                                 None
@@ -2344,26 +2353,14 @@ impl Qwen3_5MoeModel {
 
                     let num_tokens = generated_tokens.len() as u32;
 
-                    let (clean_text, tool_calls, thinking) = if !starts_in_thinking {
-                        let (clean, calls) = tools::parse_tool_calls(&text);
-                        (clean, calls, None)
-                    } else if tools::has_think_end_token(&generated_tokens, think_end_id_stream) {
-                        tools::split_at_think_end(&text, think_end_str_stream.as_deref())
-                    } else {
-                        let t = text.trim();
-                        let t = t
-                            .strip_prefix("<think>")
-                            .or_else(|| t.strip_prefix("<longcat_think>"))
-                            .unwrap_or(t)
-                            .trim();
-                        let thinking = if t.is_empty() {
-                            None
-                        } else {
-                            Some(t.to_string())
-                        };
-                        (String::new(), vec![], thinking)
-                    };
-                    let thinking = if include_reasoning { thinking } else { None };
+                    let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
+                        &text,
+                        &generated_tokens,
+                        enable_thinking.unwrap_or(true),
+                        think_end_id_stream,
+                        think_end_str_stream.as_deref(),
+                        include_reasoning,
+                    );
 
                     // If we have valid tool calls, override finish reason
                     let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {

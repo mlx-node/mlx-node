@@ -19,7 +19,6 @@ use crate::sampling::{
 };
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
-use crate::tools;
 use crate::tools::ToolCallResult;
 
 use super::chat_common;
@@ -1604,7 +1603,6 @@ impl Qwen3_5Model {
                 generated_tokens.len(),
             );
 
-            let starts_in_thinking = enable_thinking.unwrap_or(true) && think_end_id.is_some();
             finalize_chat_result(
                 &tokenizer_for_decode,
                 &generated_tokens,
@@ -1613,7 +1611,7 @@ impl Qwen3_5Model {
                 think_end_str.as_deref(),
                 performance,
                 p.include_reasoning,
-                starts_in_thinking,
+                enable_thinking.unwrap_or(true),
             )
         })
         .await
@@ -2513,26 +2511,14 @@ impl Qwen3_5Model {
 
                     let num_tokens = generated_tokens.len() as u32;
 
-                    let (clean_text, tool_calls, thinking) = if !starts_in_thinking {
-                        let (clean, calls) = tools::parse_tool_calls(&text);
-                        (clean, calls, None)
-                    } else if tools::has_think_end_token(&generated_tokens, think_end_id) {
-                        tools::split_at_think_end(&text, think_end_str.as_deref())
-                    } else {
-                        let t = text.trim();
-                        let t = t
-                            .strip_prefix("<think>")
-                            .or_else(|| t.strip_prefix("<longcat_think>"))
-                            .unwrap_or(t)
-                            .trim();
-                        let thinking = if t.is_empty() {
-                            None
-                        } else {
-                            Some(t.to_string())
-                        };
-                        (String::new(), vec![], thinking)
-                    };
-                    let thinking = if include_reasoning { thinking } else { None };
+                    let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
+                        &text,
+                        &generated_tokens,
+                        enable_thinking.unwrap_or(true),
+                        think_end_id,
+                        think_end_str.as_deref(),
+                        include_reasoning,
+                    );
 
                     // If we have valid tool calls, override finish reason
                     let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {

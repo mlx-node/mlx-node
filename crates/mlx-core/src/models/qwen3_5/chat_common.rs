@@ -209,39 +209,32 @@ pub(crate) fn compute_performance_metrics(
     })
 }
 
-/// Decode tokens, parse thinking/tool_calls, build ChatResult.
+/// Shared finalization: parse thinking + tool calls from decoded text.
 ///
-/// `starts_in_thinking`: whether generation began inside a reasoning block.
-/// When false (no-thinking mode), all text is treated as content regardless of
-/// any literal `</think>` tokens that may appear.
-pub(crate) fn finalize_chat_result(
-    tokenizer: &Qwen3Tokenizer,
+/// Three-way branching based on the request's reasoning state:
+/// 1. `!thinking_enabled`: no-thinking mode — all text is content, no reasoning parsing.
+/// 2. `thinking_enabled` + `</think>` token confirmed: split at token-confirmed boundary.
+/// 3. `thinking_enabled` + no `</think>` token + `think_end_id` exists: truncated generation.
+/// 4. `thinking_enabled` + no `think_end_id` in vocab: text-level fallback via `split_at_think_end`.
+///
+/// `include_reasoning`: when false, thinking field is suppressed (set to None).
+pub(crate) fn parse_thinking_and_tools(
+    text: &str,
     generated_tokens: &[u32],
-    finish_reason: String,
+    thinking_enabled: bool,
     think_end_id: Option<u32>,
     think_end_str: Option<&str>,
-    performance: Option<crate::profiling::PerformanceMetrics>,
     include_reasoning: bool,
-    starts_in_thinking: bool,
-) -> Result<ChatResult> {
-    let text = tokenizer
-        .decode_sync(generated_tokens, true)
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to decode generated tokens: {}", e);
-            String::new()
-        });
-
-    let num_tokens = generated_tokens.len() as u32;
-
-    let (clean_text, tool_calls, thinking) = if !starts_in_thinking {
+) -> (String, Vec<tools::ToolCallResult>, Option<String>) {
+    let (clean_text, tool_calls, thinking) = if !thinking_enabled {
         // No-thinking mode: all text is content, passed through verbatim.
         // Any literal <think> tags are normal model output, not markup.
-        let (clean, calls) = tools::parse_tool_calls(&text);
+        let (clean, calls) = tools::parse_tool_calls(text);
         (clean, calls, None)
     } else if tools::has_think_end_token(generated_tokens, think_end_id) {
         // Thinking mode with confirmed </think>: split at token boundary.
-        tools::split_at_think_end(&text, think_end_str)
-    } else {
+        tools::split_at_think_end(text, think_end_str)
+    } else if think_end_id.is_some() {
         // Thinking mode, truncated (no </think> before EOS/max_tokens):
         // entire output is reasoning, no content.
         let thinking_text = text.trim();
@@ -258,10 +251,46 @@ pub(crate) fn finalize_chat_result(
             Some(thinking_text.to_string())
         };
         (String::new(), vec![], thinking)
+    } else {
+        // No think_end_id in vocab — cannot do token-level detection.
+        // Fall back to text-level parsing via split_at_think_end(None).
+        tools::split_at_think_end(text, None)
     };
 
     // Suppress reasoning if not requested
     let thinking = if include_reasoning { thinking } else { None };
+
+    (clean_text, tool_calls, thinking)
+}
+
+/// Decode tokens, parse thinking/tool_calls, build ChatResult.
+pub(crate) fn finalize_chat_result(
+    tokenizer: &Qwen3Tokenizer,
+    generated_tokens: &[u32],
+    finish_reason: String,
+    think_end_id: Option<u32>,
+    think_end_str: Option<&str>,
+    performance: Option<crate::profiling::PerformanceMetrics>,
+    include_reasoning: bool,
+    thinking_enabled: bool,
+) -> Result<ChatResult> {
+    let text = tokenizer
+        .decode_sync(generated_tokens, true)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to decode generated tokens: {}", e);
+            String::new()
+        });
+
+    let num_tokens = generated_tokens.len() as u32;
+
+    let (clean_text, tool_calls, thinking) = parse_thinking_and_tools(
+        &text,
+        generated_tokens,
+        thinking_enabled,
+        think_end_id,
+        think_end_str,
+        include_reasoning,
+    );
 
     // If we have valid tool calls, override finish reason
     let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
