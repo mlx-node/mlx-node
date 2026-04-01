@@ -496,7 +496,6 @@ pub fn has_thinking(text: &str) -> bool {
     text.contains("<think>") || text.contains("<longcat_think>")
 }
 
-
 /// Result of parsing tool calls from text
 #[napi(object)]
 pub struct ParseToolCallsResult {
@@ -1269,10 +1268,19 @@ The weather in Tokyo is sunny."#;
         let text = "<think>Let me call <tool_call>{\"name\":\"search\",\"arguments\":{\"q\":\"test\"}}</tool_call> to help</think>\nThe answer is 42";
         let (clean, tools, thinking) = split_at_think_end(text, Some("</think>"));
         assert_eq!(clean, "The answer is 42");
-        assert!(tools.is_empty(), "tool_call inside reasoning must not be extracted");
+        assert!(
+            tools.is_empty(),
+            "tool_call inside reasoning must not be extracted"
+        );
         let t = thinking.unwrap();
-        assert!(t.contains("tool_call"), "tool_call text should remain in thinking");
-        assert!(t.starts_with("Let me call"), "<think> prefix should be stripped");
+        assert!(
+            t.contains("tool_call"),
+            "tool_call text should remain in thinking"
+        );
+        assert!(
+            t.starts_with("Let me call"),
+            "<think> prefix should be stripped"
+        );
     }
 
     #[test]
@@ -1295,7 +1303,10 @@ The weather in Tokyo is sunny."#;
         assert_eq!(clean, "content here");
         assert!(tools.is_empty());
         let t = thinking.unwrap();
-        assert!(t.contains("<think>"), "literal <think> preserved in thinking");
+        assert!(
+            t.contains("<think>"),
+            "literal <think> preserved in thinking"
+        );
     }
 
     #[test]
@@ -1304,7 +1315,10 @@ The weather in Tokyo is sunny."#;
         let text = "<longcat_think>reasoning <tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call></longcat_think>\nanswer";
         let (clean, tools, thinking) = split_at_think_end(text, Some("</longcat_think>"));
         assert_eq!(clean, "answer");
-        assert!(tools.is_empty(), "tool_call inside longcat reasoning must not be extracted");
+        assert!(
+            tools.is_empty(),
+            "tool_call inside longcat reasoning must not be extracted"
+        );
         assert!(thinking.unwrap().contains("tool_call"));
     }
 

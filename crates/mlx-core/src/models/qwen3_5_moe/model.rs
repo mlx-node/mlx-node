@@ -1145,8 +1145,7 @@ impl Qwen3_5MoeModel {
                 // token behind), matching Python mlx-lm's pipelining behavior.
                 profiler.set_label("moe_chat_compiled");
 
-                let starts_in_thinking =
-                    enable_thinking.unwrap_or(true) && think_end_id.is_some();
+                let starts_in_thinking = enable_thinking.unwrap_or(true) && think_end_id.is_some();
                 let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                     starts_in_thinking,
                     p.thinking_token_budget,
@@ -1272,8 +1271,7 @@ impl Qwen3_5MoeModel {
                 // Rust fallback decode loop (pipelined)
                 profiler.set_label("moe_chat_rust");
 
-                let starts_in_thinking =
-                    enable_thinking.unwrap_or(true) && think_end_id.is_some();
+                let starts_in_thinking = enable_thinking.unwrap_or(true) && think_end_id.is_some();
                 let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                     starts_in_thinking,
                     p.thinking_token_budget,
@@ -1399,8 +1397,7 @@ impl Qwen3_5MoeModel {
                 generated_tokens.len(),
             );
 
-            let starts_in_thinking =
-                enable_thinking.unwrap_or(true) && think_end_id.is_some();
+            let starts_in_thinking = enable_thinking.unwrap_or(true) && think_end_id.is_some();
             finalize_chat_result(
                 &tokenizer_for_decode,
                 &generated_tokens,
@@ -1537,10 +1534,10 @@ impl Qwen3_5MoeModel {
 
                     let tool_defs = config.tools.as_deref();
                     let enable_thinking = match config.reasoning_effort.as_deref() {
-                Some("low") | Some("none") => Some(false),
-                Some("medium") | Some("high") => Some(true),
-                _ => config.enable_thinking,
-            };
+                        Some("low") | Some("none") => Some(false),
+                        Some("medium") | Some("high") => Some(true),
+                        _ => config.enable_thinking,
+                    };
                     let tokens = tokenizer.apply_chat_template_sync(
                         &messages,
                         Some(true),
@@ -1565,9 +1562,9 @@ impl Qwen3_5MoeModel {
                         min_p: config.min_p,
                     });
                     let thinking_token_budget = config.thinking_token_budget;
-                    let include_reasoning = config.include_reasoning.unwrap_or_else(|| {
-                        !matches!(config.reasoning_effort.as_deref(), Some("none"))
-                    });
+                    let include_reasoning = config
+                        .include_reasoning
+                        .unwrap_or(!matches!(config.reasoning_effort.as_deref(), Some("none")));
 
                     let mut layers_guard = layers_arc
                         .write()
@@ -1955,9 +1952,6 @@ impl Qwen3_5MoeModel {
                             thinking_token_budget,
                             think_end_id_stream,
                         );
-                        // Use outer last_is_reasoning (shared with residual flush)
-                        last_is_reasoning = starts_in_thinking;
-
                         for step in 0..max_new_tokens {
                             // Build and submit graph for step N+1.
                             // forward() always runs to keep KV caches consistent.
@@ -1965,38 +1959,36 @@ impl Qwen3_5MoeModel {
                                 let next_ids = y.reshape(&[1, 1])?;
                                 let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
 
-                                let next_token =
-                                    if reasoning_tracker.should_force_think_end() {
-                                        let forced_id =
-                                            reasoning_tracker.forced_token_id() as i32;
-                                        MxArray::from_int32(&[forced_id], &[1])?
-                                    } else {
-                                        if repetition_penalty != 1.0 {
-                                            logits = apply_repetition_penalty(
-                                                &logits,
-                                                &token_history,
-                                                repetition_penalty,
-                                                Some(repetition_context_size),
-                                            )?;
-                                        }
-                                        if presence_penalty != 0.0 {
-                                            logits = apply_presence_penalty(
-                                                &logits,
-                                                &token_history,
-                                                presence_penalty,
-                                                Some(presence_context_size),
-                                            )?;
-                                        }
-                                        if frequency_penalty != 0.0 {
-                                            logits = apply_frequency_penalty(
-                                                &logits,
-                                                &token_history,
-                                                frequency_penalty,
-                                                Some(frequency_context_size),
-                                            )?;
-                                        }
-                                        sample(&logits, sampling_config)?
-                                    };
+                                let next_token = if reasoning_tracker.should_force_think_end() {
+                                    let forced_id = reasoning_tracker.forced_token_id() as i32;
+                                    MxArray::from_int32(&[forced_id], &[1])?
+                                } else {
+                                    if repetition_penalty != 1.0 {
+                                        logits = apply_repetition_penalty(
+                                            &logits,
+                                            &token_history,
+                                            repetition_penalty,
+                                            Some(repetition_context_size),
+                                        )?;
+                                    }
+                                    if presence_penalty != 0.0 {
+                                        logits = apply_presence_penalty(
+                                            &logits,
+                                            &token_history,
+                                            presence_penalty,
+                                            Some(presence_context_size),
+                                        )?;
+                                    }
+                                    if frequency_penalty != 0.0 {
+                                        logits = apply_frequency_penalty(
+                                            &logits,
+                                            &token_history,
+                                            frequency_penalty,
+                                            Some(frequency_context_size),
+                                        )?;
+                                    }
+                                    sample(&logits, sampling_config)?
+                                };
 
                                 eval_token_and_moe_caches(&next_token);
                                 Some(next_token)
@@ -2120,9 +2112,6 @@ impl Qwen3_5MoeModel {
                             thinking_token_budget,
                             think_end_id_stream,
                         );
-                        // Use outer last_is_reasoning (shared with residual flush)
-                        last_is_reasoning = starts_in_thinking;
-
                         for step in 0..max_new_tokens {
                             // Build and submit graph for step N+1.
                             // forward() always runs to keep KV caches consistent.
@@ -2140,38 +2129,36 @@ impl Qwen3_5MoeModel {
                                 )?;
                                 let mut logits = logits.squeeze(Some(&[1]))?;
 
-                                let next_token =
-                                    if reasoning_tracker.should_force_think_end() {
-                                        let forced_id =
-                                            reasoning_tracker.forced_token_id() as i32;
-                                        MxArray::from_int32(&[forced_id], &[1])?
-                                    } else {
-                                        if repetition_penalty != 1.0 {
-                                            logits = apply_repetition_penalty(
-                                                &logits,
-                                                &token_history,
-                                                repetition_penalty,
-                                                Some(repetition_context_size),
-                                            )?;
-                                        }
-                                        if presence_penalty != 0.0 {
-                                            logits = apply_presence_penalty(
-                                                &logits,
-                                                &token_history,
-                                                presence_penalty,
-                                                Some(presence_context_size),
-                                            )?;
-                                        }
-                                        if frequency_penalty != 0.0 {
-                                            logits = apply_frequency_penalty(
-                                                &logits,
-                                                &token_history,
-                                                frequency_penalty,
-                                                Some(frequency_context_size),
-                                            )?;
-                                        }
-                                        sample(&logits, sampling_config)?
-                                    };
+                                let next_token = if reasoning_tracker.should_force_think_end() {
+                                    let forced_id = reasoning_tracker.forced_token_id() as i32;
+                                    MxArray::from_int32(&[forced_id], &[1])?
+                                } else {
+                                    if repetition_penalty != 1.0 {
+                                        logits = apply_repetition_penalty(
+                                            &logits,
+                                            &token_history,
+                                            repetition_penalty,
+                                            Some(repetition_context_size),
+                                        )?;
+                                    }
+                                    if presence_penalty != 0.0 {
+                                        logits = apply_presence_penalty(
+                                            &logits,
+                                            &token_history,
+                                            presence_penalty,
+                                            Some(presence_context_size),
+                                        )?;
+                                    }
+                                    if frequency_penalty != 0.0 {
+                                        logits = apply_frequency_penalty(
+                                            &logits,
+                                            &token_history,
+                                            frequency_penalty,
+                                            Some(frequency_context_size),
+                                        )?;
+                                    }
+                                    sample(&logits, sampling_config)?
+                                };
 
                                 // Eval both next_token and logits to ensure forward graph
                                 // (including KV cache updates) is materialized.
@@ -2360,14 +2347,8 @@ impl Qwen3_5MoeModel {
                     let (clean_text, tool_calls, thinking) = if !starts_in_thinking {
                         let (clean, calls) = tools::parse_tool_calls(&text);
                         (clean, calls, None)
-                    } else if tools::has_think_end_token(
-                        &generated_tokens,
-                        think_end_id_stream,
-                    ) {
-                        tools::split_at_think_end(
-                            &text,
-                            think_end_str_stream.as_deref(),
-                        )
+                    } else if tools::has_think_end_token(&generated_tokens, think_end_id_stream) {
+                        tools::split_at_think_end(&text, think_end_str_stream.as_deref())
                     } else {
                         let t = text.trim();
                         let t = t
