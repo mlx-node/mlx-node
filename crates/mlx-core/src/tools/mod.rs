@@ -572,15 +572,16 @@ pub fn split_at_think_end(
     }
     // Token-level split: the template injected <think>\n as a prefix, so the
     // generated text starts with thinking content followed by </think>.
+    // When think_end_tag is Some, we have token-level confirmation that the
+    // think-end token was generated, so we always split at its position
+    // regardless of what follows (the newline heuristic is only needed for
+    // the text-level guess path in parse_thinking).
     if let Some(tag) = think_end_tag
         && let Some(close_pos) = raw_text.find(tag)
     {
-        let after_tag = &raw_text[close_pos + tag.len()..];
-        if !after_tag.is_empty() && !after_tag.starts_with('\n') {
-            return parse_generation_output(raw_text);
-        }
         let thinking_text = raw_text[..close_pos].trim();
-        let response_text = after_tag.trim();
+        let after_tag = &raw_text[close_pos + tag.len()..];
+        let response_text = after_tag.trim_start_matches('\n').trim_start();
         let thinking = if thinking_text.is_empty() {
             None
         } else {

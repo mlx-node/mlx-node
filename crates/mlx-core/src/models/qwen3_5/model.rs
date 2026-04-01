@@ -1608,6 +1608,8 @@ impl Qwen3_5Model {
                 generated_tokens.len(),
             );
 
+            let starts_in_thinking =
+                enable_thinking.unwrap_or(true) && think_end_id.is_some();
             finalize_chat_result(
                 &tokenizer_for_decode,
                 &generated_tokens,
@@ -1616,6 +1618,7 @@ impl Qwen3_5Model {
                 think_end_str.as_deref(),
                 performance,
                 p.include_reasoning,
+                starts_in_thinking,
             )
         })
         .await
@@ -2065,8 +2068,9 @@ impl Qwen3_5Model {
                         None
                     };
 
-                    let mut last_is_reasoning =
+                    let starts_in_thinking =
                         enable_thinking.unwrap_or(true) && think_end_id.is_some();
+                    let mut last_is_reasoning = starts_in_thinking;
 
                     if use_compiled {
                         if vlm_compiled_init_done {
@@ -2527,7 +2531,9 @@ impl Qwen3_5Model {
 
                     let num_tokens = generated_tokens.len() as u32;
 
-                    let think_tag = if tools::has_think_end_token(&generated_tokens, think_end_id) {
+                    let think_tag = if starts_in_thinking
+                        && tools::has_think_end_token(&generated_tokens, think_end_id)
+                    {
                         think_end_str.as_deref()
                     } else {
                         None

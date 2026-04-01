@@ -211,6 +211,10 @@ pub(crate) fn compute_performance_metrics(
 }
 
 /// Decode tokens, parse thinking/tool_calls, build ChatResult.
+///
+/// `starts_in_thinking`: whether generation began inside a reasoning block.
+/// When false (no-thinking mode), all text is treated as content regardless of
+/// any literal `</think>` tokens that may appear.
 pub(crate) fn finalize_chat_result(
     tokenizer: &Qwen3Tokenizer,
     generated_tokens: &[u32],
@@ -219,6 +223,7 @@ pub(crate) fn finalize_chat_result(
     think_end_str: Option<&str>,
     performance: Option<crate::profiling::PerformanceMetrics>,
     include_reasoning: bool,
+    starts_in_thinking: bool,
 ) -> Result<ChatResult> {
     let text = tokenizer
         .decode_sync(generated_tokens, true)
@@ -229,7 +234,12 @@ pub(crate) fn finalize_chat_result(
 
     let num_tokens = generated_tokens.len() as u32;
 
-    let think_tag = if tools::has_think_end_token(generated_tokens, think_end_id) {
+    // Only attempt think splitting when generation started inside a reasoning
+    // block. In no-thinking mode the prompt already closed the think block,
+    // so any literal </think> in the output is normal content.
+    let think_tag = if starts_in_thinking
+        && tools::has_think_end_token(generated_tokens, think_end_id)
+    {
         think_end_str
     } else {
         None

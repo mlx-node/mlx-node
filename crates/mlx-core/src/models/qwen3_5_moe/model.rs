@@ -1399,6 +1399,8 @@ impl Qwen3_5MoeModel {
                 generated_tokens.len(),
             );
 
+            let starts_in_thinking =
+                enable_thinking.unwrap_or(true) && think_end_id.is_some();
             finalize_chat_result(
                 &tokenizer_for_decode,
                 &generated_tokens,
@@ -1407,6 +1409,7 @@ impl Qwen3_5MoeModel {
                 think_end_str.as_deref(),
                 performance,
                 p.include_reasoning,
+                starts_in_thinking,
             )
         })
         .await
@@ -1855,8 +1858,9 @@ impl Qwen3_5MoeModel {
                     let mut y = sample(&last_logits, sampling_config)?;
                     MxArray::async_eval_arrays(&[&y]);
 
-                    let mut last_is_reasoning =
+                    let starts_in_thinking =
                         enable_thinking.unwrap_or(true) && think_end_id_stream.is_some();
+                    let mut last_is_reasoning = starts_in_thinking;
 
                     if use_cpp {
                         // Guard ensures mlx_qwen35_moe_reset() is called even if `?` returns early.
@@ -2353,12 +2357,13 @@ impl Qwen3_5MoeModel {
 
                     let num_tokens = generated_tokens.len() as u32;
 
-                    let think_tag =
-                        if tools::has_think_end_token(&generated_tokens, think_end_id_stream) {
-                            think_end_str_stream.as_deref()
-                        } else {
-                            None
-                        };
+                    let think_tag = if starts_in_thinking
+                        && tools::has_think_end_token(&generated_tokens, think_end_id_stream)
+                    {
+                        think_end_str_stream.as_deref()
+                    } else {
+                        None
+                    };
                     let (clean_text, tool_calls, thinking) =
                         tools::split_at_think_end(&text, think_tag);
                     let thinking = if include_reasoning { thinking } else { None };
