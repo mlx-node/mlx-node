@@ -59,7 +59,11 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         report_performance: config.report_performance.unwrap_or(false),
         reuse_cache: config.reuse_cache.unwrap_or(true),
         thinking_token_budget: config.thinking_token_budget,
-        include_reasoning: config.include_reasoning.unwrap_or(true),
+        include_reasoning: config.include_reasoning.unwrap_or_else(|| {
+            // reasoning_effort == "none" implies include_reasoning = false
+            // unless explicitly overridden by the include_reasoning field
+            !matches!(config.reasoning_effort.as_deref(), Some("none"))
+        }),
     }
 }
 

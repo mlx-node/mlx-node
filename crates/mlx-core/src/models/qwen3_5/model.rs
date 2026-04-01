@@ -1782,7 +1782,9 @@ impl Qwen3_5Model {
                         min_p: config.min_p,
                     });
                     let thinking_token_budget = config.thinking_token_budget;
-                    let include_reasoning = config.include_reasoning.unwrap_or(true);
+                    let include_reasoning = config.include_reasoning.unwrap_or_else(|| {
+                        !matches!(config.reasoning_effort.as_deref(), Some("none"))
+                    });
 
                     let mut layers_guard = layers_arc
                         .write()
@@ -2214,13 +2216,13 @@ impl Qwen3_5Model {
                             generated_tokens.push(token_id);
                             token_history.push(token_id);
 
+                            let is_reasoning = reasoning_tracker.observe_token(token_id);
+                            last_is_reasoning = is_reasoning;
+
                             if cancelled_inner.load(Ordering::Relaxed) {
                                 finish_reason = String::from("cancelled");
                                 break;
                             }
-
-                            let is_reasoning = reasoning_tracker.observe_token(token_id);
-                            last_is_reasoning = is_reasoning;
 
                             let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
                                 &mut decode_stream,
@@ -2391,13 +2393,13 @@ impl Qwen3_5Model {
                             generated_tokens.push(token_id);
                             token_history.push(token_id);
 
+                            let is_reasoning = reasoning_tracker.observe_token(token_id);
+                            last_is_reasoning = is_reasoning;
+
                             if cancelled_inner.load(Ordering::Relaxed) {
                                 finish_reason = String::from("cancelled");
                                 break;
                             }
-
-                            let is_reasoning = reasoning_tracker.observe_token(token_id);
-                            last_is_reasoning = is_reasoning;
 
                             let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
                                 &mut decode_stream,
