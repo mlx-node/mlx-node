@@ -1138,7 +1138,7 @@ impl Qwen3_5MoeModel {
                 // token behind), matching Python mlx-lm's pipelining behavior.
                 profiler.set_label("moe_chat_compiled");
 
-                let starts_in_thinking = enable_thinking.unwrap_or(true) && think_end_id.is_some();
+                let starts_in_thinking = enable_thinking.unwrap_or(true);
                 let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                     starts_in_thinking,
                     p.thinking_token_budget,
@@ -1270,7 +1270,7 @@ impl Qwen3_5MoeModel {
                 // Rust fallback decode loop (pipelined)
                 profiler.set_label("moe_chat_rust");
 
-                let starts_in_thinking = enable_thinking.unwrap_or(true) && think_end_id.is_some();
+                let starts_in_thinking = enable_thinking.unwrap_or(true);
                 let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                     starts_in_thinking,
                     p.thinking_token_budget,

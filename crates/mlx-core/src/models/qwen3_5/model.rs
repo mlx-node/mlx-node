@@ -1344,7 +1344,7 @@ impl Qwen3_5Model {
                 // Compiled C++ decode loop (pipelined — submit N+1 before eval N)
                 profiler.set_label("chat_compiled");
 
-                let starts_in_thinking = enable_thinking.unwrap_or(true) && think_end_id.is_some();
+                let starts_in_thinking = enable_thinking.unwrap_or(true);
                 let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                     starts_in_thinking,
                     p.thinking_token_budget,
@@ -1476,7 +1476,7 @@ impl Qwen3_5Model {
                 // Build next step's graph before blocking on current token.
                 profiler.set_label("chat_rust");
 
-                let starts_in_thinking = enable_thinking.unwrap_or(true) && think_end_id.is_some();
+                let starts_in_thinking = enable_thinking.unwrap_or(true);
                 let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                     starts_in_thinking,
                     p.thinking_token_budget,
@@ -2057,8 +2057,7 @@ impl Qwen3_5Model {
                         None
                     };
 
-                    let starts_in_thinking =
-                        enable_thinking.unwrap_or(true) && think_end_id.is_some();
+                    let starts_in_thinking = enable_thinking.unwrap_or(true);
                     let mut last_is_reasoning = starts_in_thinking;
 
                     if use_compiled {
@@ -2140,8 +2139,7 @@ impl Qwen3_5Model {
                         // Compiled C++ decode loop (pipelined — submit N+1 before eval N)
                         profiler.set_label("chat_stream_compiled");
 
-                        let starts_in_thinking =
-                            enable_thinking.unwrap_or(true) && think_end_id.is_some();
+                        let starts_in_thinking = enable_thinking.unwrap_or(true);
                         let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                             starts_in_thinking,
                             thinking_token_budget,
@@ -2304,8 +2302,7 @@ impl Qwen3_5Model {
                         // Rust fallback decode loop (pipelined)
                         profiler.set_label("chat_stream_rust");
 
-                        let starts_in_thinking =
-                            enable_thinking.unwrap_or(true) && think_end_id.is_some();
+                        let starts_in_thinking = enable_thinking.unwrap_or(true);
                         let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                             starts_in_thinking,
                             thinking_token_budget,

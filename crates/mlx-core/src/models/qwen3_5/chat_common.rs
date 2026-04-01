@@ -546,4 +546,18 @@ mod tests {
             assert!(!tracker.should_force_think_end());
         }
     }
+
+    #[test]
+    fn test_tracker_no_think_end_id_labels_as_reasoning() {
+        // When thinking is enabled but think_end_id is missing (tokenizer
+        // renders </think> as multiple tokens), observe_token should still
+        // return true (reasoning) for every token — consistent with the
+        // text-level finalization that will find reasoning via parsing.
+        let mut tracker = ReasoningTracker::new(true, None, None);
+        assert!(tracker.observe_token(100)); // reasoning
+        assert!(tracker.observe_token(200)); // reasoning
+        assert!(tracker.observe_token(300)); // reasoning
+        // Never transitions — no think_end_id to match
+        assert!(!tracker.should_force_think_end()); // budget disabled
+    }
 }
