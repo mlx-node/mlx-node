@@ -22,6 +22,7 @@ use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
 use crate::models::qwen3::{BatchGenerationResult, GenerationConfig, GenerationResult};
+use crate::models::qwen3_5::chat_common;
 use crate::models::qwen3_5::chat_common::{
     apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
     save_cache_state, verify_cache_prefix,
@@ -731,6 +732,9 @@ impl Qwen3_5MoeModel {
             ngram_size: None,
             tools: None,
             enable_thinking: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
         });
@@ -806,7 +810,11 @@ impl Qwen3_5MoeModel {
             let use_cpp = _weight_guard.is_some();
 
             let tool_defs = config.tools.as_deref();
-            let enable_thinking = config.enable_thinking;
+            let enable_thinking = match config.reasoning_effort.as_deref() {
+                Some("low") | Some("none") => Some(false),
+                Some("medium") | Some("high") => Some(true),
+                _ => config.enable_thinking,
+            };
             let tokens = tokenizer.apply_chat_template_sync(
                 &messages,
                 Some(true),
@@ -1136,27 +1144,44 @@ impl Qwen3_5MoeModel {
                 // Rep penalty uses token_history as-of graph build time (one
                 // token behind), matching Python mlx-lm's pipelining behavior.
                 profiler.set_label("moe_chat_compiled");
+
+                let starts_in_thinking =
+                    enable_thinking.unwrap_or(true) && think_end_id.is_some();
+                let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+                    starts_in_thinking,
+                    p.thinking_token_budget,
+                    think_end_id,
+                );
+
                 for step in 0..max_new_tokens {
                     // Build and submit graph for step N+1 before waiting for N
                     let next_y = if step + 1 < max_new_tokens {
-                        profiler.begin("forward");
-                        let next_ids = y.reshape(&[1, 1])?;
-                        let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
-                        profiler.end();
+                        if reasoning_tracker.should_force_think_end() {
+                            // Budget exhausted — force </think> token
+                            let forced_id = reasoning_tracker.forced_token_id() as i32;
+                            let forced = MxArray::from_int32(&[forced_id], &[1])?;
+                            eval_token_and_moe_caches(&forced);
+                            Some(forced)
+                        } else {
+                            profiler.begin("forward");
+                            let next_ids = y.reshape(&[1, 1])?;
+                            let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
+                            profiler.end();
 
-                        profiler.begin("rep_penalty");
-                        logits = apply_all_penalties(logits, &token_history, &p)?;
-                        profiler.end();
+                            profiler.begin("rep_penalty");
+                            logits = apply_all_penalties(logits, &token_history, &p)?;
+                            profiler.end();
 
-                        profiler.begin("sample");
-                        let next_token = sample(&logits, p.sampling_config)?;
-                        profiler.end();
+                            profiler.begin("sample");
+                            let next_token = sample(&logits, p.sampling_config)?;
+                            profiler.end();
 
-                        profiler.begin("eval_caches");
-                        eval_token_and_moe_caches(&next_token);
-                        profiler.end();
+                            profiler.begin("eval_caches");
+                            eval_token_and_moe_caches(&next_token);
+                            profiler.end();
 
-                        Some(next_token)
+                            Some(next_token)
+                        }
                     } else {
                         None
                     };
@@ -1176,6 +1201,7 @@ impl Qwen3_5MoeModel {
 
                     generated_tokens.push(token_id);
                     token_history.push(token_id);
+                    reasoning_tracker.observe_token(token_id);
 
                     if token_id == eos_id {
                         finish_reason = String::from("stop");
@@ -1242,37 +1268,53 @@ impl Qwen3_5MoeModel {
             } else {
                 // Rust fallback decode loop (pipelined)
                 profiler.set_label("moe_chat_rust");
+
+                let starts_in_thinking =
+                    enable_thinking.unwrap_or(true) && think_end_id.is_some();
+                let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+                    starts_in_thinking,
+                    p.thinking_token_budget,
+                    think_end_id,
+                );
+
                 for step in 0..max_new_tokens {
                     // Build and submit graph for step N+1 before waiting for N
                     let next_y = if step + 1 < max_new_tokens {
-                        profiler.begin("forward");
-                        let next_ids = y.reshape(&[1, 1])?;
-                        let logits = forward_inner(
-                            &next_ids,
-                            &embedding_weight,
-                            &mut layers_guard,
-                            &mut caches_guard,
-                            &final_norm_guard,
-                            &lm_head_guard,
-                            fa_idx,
-                            Some(&embedding_weight_t),
-                        )?;
-                        let mut logits = logits.squeeze(Some(&[1]))?;
-                        profiler.end();
+                        if reasoning_tracker.should_force_think_end() {
+                            let forced_id = reasoning_tracker.forced_token_id() as i32;
+                            let forced = MxArray::from_int32(&[forced_id], &[1])?;
+                            MxArray::async_eval_arrays(&[&forced]);
+                            Some(forced)
+                        } else {
+                            profiler.begin("forward");
+                            let next_ids = y.reshape(&[1, 1])?;
+                            let logits = forward_inner(
+                                &next_ids,
+                                &embedding_weight,
+                                &mut layers_guard,
+                                &mut caches_guard,
+                                &final_norm_guard,
+                                &lm_head_guard,
+                                fa_idx,
+                                Some(&embedding_weight_t),
+                            )?;
+                            let mut logits = logits.squeeze(Some(&[1]))?;
+                            profiler.end();
 
-                        profiler.begin("rep_penalty");
-                        logits = apply_all_penalties(logits, &token_history, &p)?;
-                        profiler.end();
+                            profiler.begin("rep_penalty");
+                            logits = apply_all_penalties(logits, &token_history, &p)?;
+                            profiler.end();
 
-                        profiler.begin("sample");
-                        let next_token = sample(&logits, p.sampling_config)?;
-                        profiler.end();
+                            profiler.begin("sample");
+                            let next_token = sample(&logits, p.sampling_config)?;
+                            profiler.end();
 
-                        profiler.begin("async_eval");
-                        MxArray::async_eval_arrays(&[&next_token]);
-                        profiler.end();
+                            profiler.begin("async_eval");
+                            MxArray::async_eval_arrays(&[&next_token]);
+                            profiler.end();
 
-                        Some(next_token)
+                            Some(next_token)
+                        }
                     } else {
                         None
                     };
@@ -1292,6 +1334,7 @@ impl Qwen3_5MoeModel {
 
                     generated_tokens.push(token_id);
                     token_history.push(token_id);
+                    reasoning_tracker.observe_token(token_id);
 
                     if token_id == eos_id {
                         finish_reason = String::from("stop");
@@ -1357,6 +1400,7 @@ impl Qwen3_5MoeModel {
                 think_end_id,
                 think_end_str.as_deref(),
                 performance,
+                p.include_reasoning,
             )
         })
         .await
@@ -1394,6 +1438,9 @@ impl Qwen3_5MoeModel {
             ngram_size: None,
             tools: None,
             enable_thinking: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
         });
@@ -1480,7 +1527,11 @@ impl Qwen3_5MoeModel {
                     let use_cpp = _weight_guard.is_some();
 
                     let tool_defs = config.tools.as_deref();
-                    let enable_thinking = config.enable_thinking;
+                    let enable_thinking = match config.reasoning_effort.as_deref() {
+                Some("low") | Some("none") => Some(false),
+                Some("medium") | Some("high") => Some(true),
+                _ => config.enable_thinking,
+            };
                     let tokens = tokenizer.apply_chat_template_sync(
                         &messages,
                         Some(true),
@@ -1504,6 +1555,8 @@ impl Qwen3_5MoeModel {
                         top_p: config.top_p,
                         min_p: config.min_p,
                     });
+                    let thinking_token_budget = config.thinking_token_budget;
+                    let include_reasoning = config.include_reasoning.unwrap_or(true);
 
                     let mut layers_guard = layers_arc
                         .write()
@@ -1879,38 +1932,56 @@ impl Qwen3_5MoeModel {
 
                         // C++ decode loop (pipelined — submit N+1 before eval N)
                         profiler.set_label("moe_chat_stream_compiled");
+
+                        let starts_in_thinking =
+                            enable_thinking.unwrap_or(true) && think_end_id_stream.is_some();
+                        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+                            starts_in_thinking,
+                            thinking_token_budget,
+                            think_end_id_stream,
+                        );
+
                         for step in 0..max_new_tokens {
                             // Build and submit graph for step N+1
                             let next_y = if step + 1 < max_new_tokens {
-                                let next_ids = y.reshape(&[1, 1])?;
-                                let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
-                                if repetition_penalty != 1.0 {
-                                    logits = apply_repetition_penalty(
-                                        &logits,
-                                        &token_history,
-                                        repetition_penalty,
-                                        Some(repetition_context_size),
-                                    )?;
+                                if reasoning_tracker.should_force_think_end() {
+                                    let forced_id =
+                                        reasoning_tracker.forced_token_id() as i32;
+                                    let forced =
+                                        MxArray::from_int32(&[forced_id], &[1])?;
+                                    eval_token_and_moe_caches(&forced);
+                                    Some(forced)
+                                } else {
+                                    let next_ids = y.reshape(&[1, 1])?;
+                                    let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
+                                    if repetition_penalty != 1.0 {
+                                        logits = apply_repetition_penalty(
+                                            &logits,
+                                            &token_history,
+                                            repetition_penalty,
+                                            Some(repetition_context_size),
+                                        )?;
+                                    }
+                                    if presence_penalty != 0.0 {
+                                        logits = apply_presence_penalty(
+                                            &logits,
+                                            &token_history,
+                                            presence_penalty,
+                                            Some(presence_context_size),
+                                        )?;
+                                    }
+                                    if frequency_penalty != 0.0 {
+                                        logits = apply_frequency_penalty(
+                                            &logits,
+                                            &token_history,
+                                            frequency_penalty,
+                                            Some(frequency_context_size),
+                                        )?;
+                                    }
+                                    let next_token = sample(&logits, sampling_config)?;
+                                    eval_token_and_moe_caches(&next_token);
+                                    Some(next_token)
                                 }
-                                if presence_penalty != 0.0 {
-                                    logits = apply_presence_penalty(
-                                        &logits,
-                                        &token_history,
-                                        presence_penalty,
-                                        Some(presence_context_size),
-                                    )?;
-                                }
-                                if frequency_penalty != 0.0 {
-                                    logits = apply_frequency_penalty(
-                                        &logits,
-                                        &token_history,
-                                        frequency_penalty,
-                                        Some(frequency_context_size),
-                                    )?;
-                                }
-                                let next_token = sample(&logits, sampling_config)?;
-                                eval_token_and_moe_caches(&next_token);
-                                Some(next_token)
                             } else {
                                 None
                             };
@@ -1930,6 +2001,8 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
+                            let is_reasoning = reasoning_tracker.observe_token(token_id);
+
                             let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
                                 &mut decode_stream,
                                 tokenizer_for_decode.inner(),
@@ -1948,6 +2021,7 @@ impl Qwen3_5MoeModel {
                                     num_tokens: None,
                                     raw_text: None,
                                     performance: None,
+                                    is_reasoning: Some(is_reasoning),
                                 }),
                                 ThreadsafeFunctionCallMode::NonBlocking,
                             );
@@ -2019,48 +2093,66 @@ impl Qwen3_5MoeModel {
                     } else {
                         // Rust fallback decode loop (pipelined)
                         profiler.set_label("moe_chat_stream_rust");
+
+                        let starts_in_thinking =
+                            enable_thinking.unwrap_or(true) && think_end_id_stream.is_some();
+                        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+                            starts_in_thinking,
+                            thinking_token_budget,
+                            think_end_id_stream,
+                        );
+
                         for step in 0..max_new_tokens {
                             // Build and submit graph for step N+1
                             let next_y = if step + 1 < max_new_tokens {
-                                let next_ids = y.reshape(&[1, 1])?;
-                                let logits = forward_inner(
-                                    &next_ids,
-                                    &embedding_weight,
-                                    &mut layers_guard,
-                                    &mut caches_guard,
-                                    &final_norm_guard,
-                                    &lm_head_guard,
-                                    fa_idx,
-                                    Some(&embedding_weight_t),
-                                )?;
-                                let mut logits = logits.squeeze(Some(&[1]))?;
-                                if repetition_penalty != 1.0 {
-                                    logits = apply_repetition_penalty(
-                                        &logits,
-                                        &token_history,
-                                        repetition_penalty,
-                                        Some(repetition_context_size),
+                                if reasoning_tracker.should_force_think_end() {
+                                    let forced_id =
+                                        reasoning_tracker.forced_token_id() as i32;
+                                    let forced =
+                                        MxArray::from_int32(&[forced_id], &[1])?;
+                                    MxArray::async_eval_arrays(&[&forced]);
+                                    Some(forced)
+                                } else {
+                                    let next_ids = y.reshape(&[1, 1])?;
+                                    let logits = forward_inner(
+                                        &next_ids,
+                                        &embedding_weight,
+                                        &mut layers_guard,
+                                        &mut caches_guard,
+                                        &final_norm_guard,
+                                        &lm_head_guard,
+                                        fa_idx,
+                                        Some(&embedding_weight_t),
                                     )?;
+                                    let mut logits = logits.squeeze(Some(&[1]))?;
+                                    if repetition_penalty != 1.0 {
+                                        logits = apply_repetition_penalty(
+                                            &logits,
+                                            &token_history,
+                                            repetition_penalty,
+                                            Some(repetition_context_size),
+                                        )?;
+                                    }
+                                    if presence_penalty != 0.0 {
+                                        logits = apply_presence_penalty(
+                                            &logits,
+                                            &token_history,
+                                            presence_penalty,
+                                            Some(presence_context_size),
+                                        )?;
+                                    }
+                                    if frequency_penalty != 0.0 {
+                                        logits = apply_frequency_penalty(
+                                            &logits,
+                                            &token_history,
+                                            frequency_penalty,
+                                            Some(frequency_context_size),
+                                        )?;
+                                    }
+                                    let next_token = sample(&logits, sampling_config)?;
+                                    MxArray::async_eval_arrays(&[&next_token]);
+                                    Some(next_token)
                                 }
-                                if presence_penalty != 0.0 {
-                                    logits = apply_presence_penalty(
-                                        &logits,
-                                        &token_history,
-                                        presence_penalty,
-                                        Some(presence_context_size),
-                                    )?;
-                                }
-                                if frequency_penalty != 0.0 {
-                                    logits = apply_frequency_penalty(
-                                        &logits,
-                                        &token_history,
-                                        frequency_penalty,
-                                        Some(frequency_context_size),
-                                    )?;
-                                }
-                                let next_token = sample(&logits, sampling_config)?;
-                                MxArray::async_eval_arrays(&[&next_token]);
-                                Some(next_token)
                             } else {
                                 None
                             };
@@ -2080,6 +2172,8 @@ impl Qwen3_5MoeModel {
                                 break;
                             }
 
+                            let is_reasoning = reasoning_tracker.observe_token(token_id);
+
                             let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
                                 &mut decode_stream,
                                 tokenizer_for_decode.inner(),
@@ -2098,6 +2192,7 @@ impl Qwen3_5MoeModel {
                                     num_tokens: None,
                                     raw_text: None,
                                     performance: None,
+                                    is_reasoning: Some(is_reasoning),
                                 }),
                                 ThreadsafeFunctionCallMode::NonBlocking,
                             );
@@ -2229,6 +2324,7 @@ impl Qwen3_5MoeModel {
                                 num_tokens: None,
                                 raw_text: None,
                                 performance: None,
+                                is_reasoning: None,
                             }),
                             ThreadsafeFunctionCallMode::NonBlocking,
                         );
@@ -2244,6 +2340,7 @@ impl Qwen3_5MoeModel {
                         };
                     let (clean_text, tool_calls, thinking) =
                         tools::split_at_think_end(&text, think_tag);
+                    let thinking = if include_reasoning { thinking } else { None };
 
                     // If we have valid tool calls, override finish reason
                     let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -2263,6 +2360,7 @@ impl Qwen3_5MoeModel {
                             num_tokens: Some(num_tokens),
                             raw_text: Some(text),
                             performance,
+                            is_reasoning: None,
                         }),
                         ThreadsafeFunctionCallMode::NonBlocking,
                     );

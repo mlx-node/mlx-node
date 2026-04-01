@@ -33,6 +33,8 @@ pub(crate) struct ChatParams {
     pub sampling_config: Option<SamplingConfig>,
     pub report_performance: bool,
     pub reuse_cache: bool,
+    pub thinking_token_budget: Option<i32>,
+    pub include_reasoning: bool,
 }
 
 /// Extract ChatConfig fields into flat variables with defaults.
@@ -56,6 +58,8 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         }),
         report_performance: config.report_performance.unwrap_or(false),
         reuse_cache: config.reuse_cache.unwrap_or(true),
+        thinking_token_budget: config.thinking_token_budget,
+        include_reasoning: config.include_reasoning.unwrap_or(true),
     }
 }
 
@@ -90,6 +94,73 @@ pub(crate) fn apply_all_penalties(
         )?;
     }
     Ok(logits)
+}
+
+/// Tracks reasoning vs content state during token-by-token generation.
+///
+/// For Qwen3.5: the template injects `<think>\n` when thinking is enabled.
+/// The model generates thinking tokens, then emits `</think>` (think_end_id),
+/// then generates content. This tracker detects the transition at the TOKEN
+/// level — no text parsing needed during decoding.
+pub(crate) struct ReasoningTracker {
+    in_thinking: bool,
+    thinking_token_count: i32,
+    budget: Option<i32>,
+    think_end_id: Option<u32>,
+    force_think_end: bool,
+}
+
+impl ReasoningTracker {
+    /// Create a new tracker.
+    ///
+    /// `starts_in_thinking`: true when the template injected `<think>\n` (thinking enabled).
+    /// `budget`: maximum thinking tokens before forcing `</think>`. None = unlimited.
+    /// `think_end_id`: token ID for `</think>` from the tokenizer vocabulary.
+    pub fn new(starts_in_thinking: bool, budget: Option<i32>, think_end_id: Option<u32>) -> Self {
+        Self {
+            in_thinking: starts_in_thinking,
+            thinking_token_count: 0,
+            budget,
+            think_end_id,
+            force_think_end: false,
+        }
+    }
+
+    /// Process a generated token. Returns whether this token is reasoning content.
+    ///
+    /// Call AFTER extracting the token ID from the GPU each decode step.
+    pub fn observe_token(&mut self, token_id: u32) -> bool {
+        if !self.in_thinking {
+            return false;
+        }
+
+        if self.think_end_id == Some(token_id) {
+            self.in_thinking = false;
+            self.force_think_end = false;
+            return true; // </think> itself is part of reasoning
+        }
+
+        self.thinking_token_count += 1;
+        if let Some(budget) = self.budget {
+            if self.thinking_token_count >= budget {
+                self.force_think_end = true;
+            }
+        }
+        true
+    }
+
+    /// Whether the next token should be forced to think_end_id.
+    ///
+    /// Check this BEFORE building the next decode step's graph.
+    pub fn should_force_think_end(&self) -> bool {
+        self.force_think_end && self.think_end_id.is_some()
+    }
+
+    /// The think_end token ID to force. Only valid when `should_force_think_end()` is true.
+    pub fn forced_token_id(&self) -> u32 {
+        self.think_end_id
+            .expect("should_force_think_end was true but think_end_id is None")
+    }
 }
 
 /// Compute TTFT / prefill tok/s / decode tok/s performance metrics.
@@ -131,6 +202,7 @@ pub(crate) fn finalize_chat_result(
     think_end_id: Option<u32>,
     think_end_str: Option<&str>,
     performance: Option<crate::profiling::PerformanceMetrics>,
+    include_reasoning: bool,
 ) -> Result<ChatResult> {
     let text = tokenizer
         .decode_sync(generated_tokens, true)
@@ -147,6 +219,9 @@ pub(crate) fn finalize_chat_result(
         None
     };
     let (clean_text, tool_calls, thinking) = tools::split_at_think_end(&text, think_tag);
+
+    // Suppress reasoning if not requested
+    let thinking = if include_reasoning { thinking } else { None };
 
     // If we have valid tool calls, override finish reason
     let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -261,5 +336,88 @@ pub(crate) fn verify_cache_prefix(
         Ok(cached.len())
     } else {
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const THINK_END_ID: u32 = 151668; // example </think> token ID
+
+    #[test]
+    fn test_tracker_starts_in_thinking() {
+        let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END_ID));
+        assert!(tracker.observe_token(100)); // reasoning
+        assert!(tracker.observe_token(200)); // reasoning
+        assert!(!tracker.should_force_think_end());
+    }
+
+    #[test]
+    fn test_tracker_transitions_on_think_end() {
+        let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END_ID));
+        assert!(tracker.observe_token(100)); // reasoning
+        assert!(tracker.observe_token(THINK_END_ID)); // </think> is still reasoning
+        assert!(!tracker.observe_token(300)); // now content
+        assert!(!tracker.observe_token(400)); // still content
+    }
+
+    #[test]
+    fn test_tracker_starts_in_content() {
+        let mut tracker = ReasoningTracker::new(false, None, Some(THINK_END_ID));
+        assert!(!tracker.observe_token(100));
+        assert!(!tracker.observe_token(200));
+        assert!(!tracker.should_force_think_end());
+    }
+
+    #[test]
+    fn test_tracker_budget_enforcement() {
+        let mut tracker = ReasoningTracker::new(true, Some(3), Some(THINK_END_ID));
+        assert!(tracker.observe_token(100)); // count=1
+        assert!(!tracker.should_force_think_end());
+        assert!(tracker.observe_token(200)); // count=2
+        assert!(!tracker.should_force_think_end());
+        assert!(tracker.observe_token(300)); // count=3 >= budget
+        assert!(tracker.should_force_think_end());
+        assert_eq!(tracker.forced_token_id(), THINK_END_ID);
+    }
+
+    #[test]
+    fn test_tracker_budget_zero() {
+        let mut tracker = ReasoningTracker::new(true, Some(0), Some(THINK_END_ID));
+        // First token pushes count to 1, which >= 0
+        assert!(tracker.observe_token(100));
+        assert!(tracker.should_force_think_end());
+    }
+
+    #[test]
+    fn test_tracker_budget_clears_on_think_end() {
+        let mut tracker = ReasoningTracker::new(true, Some(2), Some(THINK_END_ID));
+        assert!(tracker.observe_token(100)); // count=1
+        assert!(tracker.observe_token(200)); // count=2 >= budget
+        assert!(tracker.should_force_think_end());
+        // When the forced think_end token is generated:
+        assert!(tracker.observe_token(THINK_END_ID)); // transitions to content
+        assert!(!tracker.should_force_think_end()); // force cleared
+        assert!(!tracker.observe_token(300)); // now content
+    }
+
+    #[test]
+    fn test_tracker_no_budget() {
+        let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END_ID));
+        for i in 0..1000 {
+            assert!(tracker.observe_token(i));
+            assert!(!tracker.should_force_think_end());
+        }
+    }
+
+    #[test]
+    fn test_tracker_no_think_end_id() {
+        let mut tracker = ReasoningTracker::new(true, Some(5), None);
+        // Without think_end_id, should_force_think_end is always false
+        for i in 0..100 {
+            tracker.observe_token(i);
+            assert!(!tracker.should_force_think_end());
+        }
     }
 }

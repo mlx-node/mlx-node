@@ -2121,6 +2121,23 @@ export interface ChatConfig {
    * Set to false to suppress thinking by injecting empty <think></think> tags.
    */
   enableThinking?: boolean | undefined;
+  /**
+   * Maximum number of thinking tokens before forcing </think>.
+   * When the model has generated this many tokens while in thinking mode,
+   * the next token is forced to be the think_end token. None = unlimited.
+   */
+  thinkingTokenBudget?: number | undefined;
+  /**
+   * Whether to include reasoning/thinking content in the output.
+   * When false, the `thinking` field of ChatResult/ChatStreamChunk will always be null.
+   * Default: true (reasoning is included).
+   */
+  includeReasoning?: boolean | undefined;
+  /**
+   * Reasoning effort level. Overrides `enableThinking` when set:
+   * "low"/"none" → enableThinking=false, "medium"/"high" → enableThinking=true.
+   */
+  reasoningEffort?: string | undefined;
   /** When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result */
   reportPerformance?: boolean | undefined;
   /**
@@ -2184,6 +2201,12 @@ export interface ChatStreamChunk {
   rawText?: string;
   /** Performance metrics (only present in the final chunk when `reportPerformance: true`) */
   performance?: PerformanceMetrics;
+  /**
+   * Whether this delta chunk contains reasoning/thinking content.
+   * true = reasoning (inside <think>...</think>), false = content (after </think>).
+   * Only present on intermediate (non-final) chunks.
+   */
+  isReasoning?: boolean;
 }
 
 /** Result from classify_and_rotate: orientation info + corrected image bytes. */

@@ -11,6 +11,7 @@ import type {
 export interface ChatStreamDelta {
   text: string;
   done: false;
+  isReasoning?: boolean;
 }
 
 export interface ChatStreamFinal {
@@ -95,7 +96,7 @@ export async function* _createChatStream(
           } as ChatStreamFinal;
           return;
         }
-        yield { text: chunk.text, done: false } as ChatStreamDelta;
+        yield { text: chunk.text, done: false, isReasoning: chunk.isReasoning ?? undefined } as ChatStreamDelta;
       }
     }
   } finally {

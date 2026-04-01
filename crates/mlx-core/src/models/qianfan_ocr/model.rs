@@ -208,6 +208,9 @@ impl QianfanOCRModel {
             ngram_size: None,
             tools: None,
             enable_thinking: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
         });
@@ -633,6 +636,9 @@ impl QianfanOCRModel {
             ngram_size: None,
             tools: None,
             enable_thinking: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
         });
@@ -899,6 +905,7 @@ impl QianfanOCRModel {
                                 num_tokens: None,
                                 raw_text: None,
                                 performance: None,
+                                is_reasoning: None,
                             });
 
                             // Check repetition cutoff (after emit so token is streamed)
@@ -1024,6 +1031,7 @@ impl QianfanOCRModel {
                             num_tokens: Some(generated_tokens.len() as u32),
                             raw_text: Some(raw_decoded),
                             performance,
+                            is_reasoning: None,
                         });
 
                         Ok(())
