@@ -2532,14 +2532,19 @@ impl Qwen3_5Model {
                     let num_tokens = generated_tokens.len() as u32;
 
                     let (clean_text, tool_calls, thinking) = if !starts_in_thinking {
-                        let (clean, calls) = tools::parse_tool_calls(&text);
+                        let stripped = tools::strip_think_markup(&text);
+                        let (clean, calls) = tools::parse_tool_calls(&stripped);
                         (clean, calls, None)
                     } else if tools::has_think_end_token(&generated_tokens, think_end_id)
                     {
                         tools::split_at_think_end(&text, think_end_str.as_deref())
                     } else {
                         let t = text.trim();
-                        let t = t.strip_prefix("<think>").unwrap_or(t).trim();
+                        let t = t
+                            .strip_prefix("<think>")
+                            .or_else(|| t.strip_prefix("<longcat_think>"))
+                            .unwrap_or(t)
+                            .trim();
                         let thinking = if t.is_empty() {
                             None
                         } else {

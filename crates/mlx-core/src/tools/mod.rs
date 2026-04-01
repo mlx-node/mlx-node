@@ -442,43 +442,49 @@ pub fn has_tool_calls(text: &str) -> bool {
 /// explaining XML tags), the fallback only applies when `</think>` is followed by
 /// a newline or end-of-text — not when it's embedded mid-sentence.
 pub fn parse_thinking(text: &str) -> (String, Option<String>) {
-    let blocks = extract_tag_blocks(text, "<think>", "</think>");
+    // Check both <think> and <longcat_think> paired blocks.
+    for (open, close) in [
+        ("<think>", "</think>"),
+        ("<longcat_think>", "</longcat_think>"),
+    ] {
+        let blocks = extract_tag_blocks(text, open, close);
+        if !blocks.is_empty() {
+            let thinking_parts: Vec<&str> = blocks
+                .iter()
+                .map(|(_, _, inner)| inner.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
 
-    if !blocks.is_empty() {
-        let thinking_parts: Vec<&str> = blocks
-            .iter()
-            .map(|(_, _, inner)| inner.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let thinking = if thinking_parts.is_empty() {
-            None
-        } else {
-            Some(thinking_parts.join("\n\n"))
-        };
-
-        let cleaned_text = strip_tag_blocks(text, "<think>", "</think>");
-        return (cleaned_text, thinking);
-    }
-
-    // Handle missing opening <think> tag (template already added it as prefix).
-    // The template adds `<think>\n` as the assistant generation prompt, so the
-    // model's output starts with thinking content + `</think>`.
-    //
-    // To distinguish from literal `</think>` in content (e.g., "Use </think> to
-    // close the tag"), only apply when `</think>` is followed by a newline or
-    // end-of-text — the model always generates `</think>\n\n` before the response.
-    if let Some(close_pos) = text.find("</think>") {
-        let after_tag = &text[close_pos + "</think>".len()..];
-        if after_tag.is_empty() || after_tag.starts_with('\n') {
-            let thinking_content = text[..close_pos].trim();
-            let after = after_tag.trim();
-            let thinking = if thinking_content.is_empty() {
+            let thinking = if thinking_parts.is_empty() {
                 None
             } else {
-                Some(thinking_content.to_string())
+                Some(thinking_parts.join("\n\n"))
             };
-            return (after.to_string(), thinking);
+
+            let cleaned_text = strip_tag_blocks(text, open, close);
+            return (cleaned_text, thinking);
+        }
+    }
+
+    // Handle missing opening tag (template already added it as prefix).
+    // The template adds `<think>\n` (or `<longcat_think>\n`) as the assistant
+    // generation prompt, so the model's output starts with thinking + close tag.
+    //
+    // To distinguish from literal close tags in content, only apply when the
+    // close tag is followed by a newline or end-of-text.
+    for close_tag in ["</think>", "</longcat_think>"] {
+        if let Some(close_pos) = text.find(close_tag) {
+            let after_tag = &text[close_pos + close_tag.len()..];
+            if after_tag.is_empty() || after_tag.starts_with('\n') {
+                let thinking_content = text[..close_pos].trim();
+                let after = after_tag.trim();
+                let thinking = if thinking_content.is_empty() {
+                    None
+                } else {
+                    Some(thinking_content.to_string())
+                };
+                return (after.to_string(), thinking);
+            }
         }
     }
 
@@ -487,7 +493,17 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
 
 /// Check if text contains any thinking tags
 pub fn has_thinking(text: &str) -> bool {
-    text.contains("<think>")
+    text.contains("<think>") || text.contains("<longcat_think>")
+}
+
+/// Strip think/longcat_think markup tags from text, keeping inner content.
+/// Used in no-thinking mode for old-template compatibility: tags are removed
+/// but their content is treated as normal text, not reasoning.
+pub fn strip_think_markup(text: &str) -> String {
+    text.replace("<think>", "")
+        .replace("</think>", "")
+        .replace("<longcat_think>", "")
+        .replace("</longcat_think>", "")
 }
 
 /// Result of parsing tool calls from text

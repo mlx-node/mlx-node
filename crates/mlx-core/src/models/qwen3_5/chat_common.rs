@@ -235,9 +235,10 @@ pub(crate) fn finalize_chat_result(
     let num_tokens = generated_tokens.len() as u32;
 
     let (clean_text, tool_calls, thinking) = if !starts_in_thinking {
-        // No-thinking mode: all text is content. Any literal <think> tags
-        // are normal model output, not reasoning boundaries.
-        let (clean, calls) = tools::parse_tool_calls(&text);
+        // No-thinking mode: all text is content. Strip think markup for
+        // old-template compatibility, but treat content as normal text.
+        let stripped = tools::strip_think_markup(&text);
+        let (clean, calls) = tools::parse_tool_calls(&stripped);
         (clean, calls, None)
     } else if tools::has_think_end_token(generated_tokens, think_end_id) {
         // Thinking mode with confirmed </think>: split at token boundary.
@@ -246,10 +247,11 @@ pub(crate) fn finalize_chat_result(
         // Thinking mode, truncated (no </think> before EOS/max_tokens):
         // entire output is reasoning, no content.
         let thinking_text = text.trim();
-        // Strip leading <think> from old-style templates that emit it
-        // in the generated text (newer templates inject it in the prompt).
+        // Strip leading <think>/<longcat_think> from old-style templates
+        // that emit it in the generated text.
         let thinking_text = thinking_text
             .strip_prefix("<think>")
+            .or_else(|| thinking_text.strip_prefix("<longcat_think>"))
             .unwrap_or(thinking_text)
             .trim();
         let thinking = if thinking_text.is_empty() {
