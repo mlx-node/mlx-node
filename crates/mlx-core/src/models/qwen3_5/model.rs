@@ -2104,30 +2104,47 @@ impl Qwen3_5Model {
                             // forward() always runs to keep KV caches consistent.
                             let next_y = if step + 1 < p.max_new_tokens {
                                 let _stream_ctx = StreamContext::new(generation_stream);
+
+                                profiler.begin("forward");
                                 let next_ids = y.reshape(&[1, 1])?;
                                 let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
+                                profiler.end();
 
                                 let (next_token, budget_forced) =
                                     if reasoning_tracker.should_force_think_end() {
                                         let forced_id = reasoning_tracker.forced_token_id() as i32;
                                         (MxArray::from_int32(&[forced_id], &[1])?, true)
                                     } else {
+                                        profiler.begin("rep_penalty");
                                         logits = apply_all_penalties(logits, &token_history, &p)?;
-                                        (sample(&logits, p.sampling_config)?, false)
+                                        profiler.end();
+
+                                        profiler.begin("sample");
+                                        let t = sample(&logits, p.sampling_config)?;
+                                        profiler.end();
+                                        (t, false)
                                     };
 
+                                profiler.begin("eval_caches");
                                 eval_token_and_compiled_caches(&next_token);
                                 if budget_forced {
                                     logits.eval();
                                 }
+                                profiler.end();
+
                                 Some(next_token)
                             } else {
                                 None
                             };
 
                             // Wait for step N (GPU already computing N+1)
+                            profiler.begin("eval_token");
                             y.eval();
+                            profiler.end();
+
+                            profiler.begin("extract");
                             let token_id = y.item_at_int32(0)? as u32;
+                            profiler.end();
                             profiler.mark_first_token();
                             if p.report_performance && first_token_instant.is_none() {
                                 first_token_instant = Some(std::time::Instant::now());
@@ -2243,6 +2260,8 @@ impl Qwen3_5Model {
                             // forward() always runs to keep KV caches consistent.
                             let next_y = if step + 1 < p.max_new_tokens {
                                 let _stream_ctx = StreamContext::new(generation_stream);
+
+                                profiler.begin("forward");
                                 let next_ids = y.reshape(&[1, 1])?;
                                 let logits = forward_inner(
                                     &next_ids,
@@ -2254,26 +2273,41 @@ impl Qwen3_5Model {
                                     Some(&embedding_weight_t),
                                 )?;
                                 let mut logits = logits.squeeze(Some(&[1]))?;
+                                profiler.end();
 
                                 let next_token = if reasoning_tracker.should_force_think_end() {
                                     let forced_id = reasoning_tracker.forced_token_id() as i32;
                                     MxArray::from_int32(&[forced_id], &[1])?
                                 } else {
+                                    profiler.begin("rep_penalty");
                                     logits = apply_all_penalties(logits, &token_history, &p)?;
-                                    sample(&logits, p.sampling_config)?
+                                    profiler.end();
+
+                                    profiler.begin("sample");
+                                    let t = sample(&logits, p.sampling_config)?;
+                                    profiler.end();
+                                    t
                                 };
 
+                                profiler.begin("eval_caches");
                                 // Eval next_token and logits to ensure the forward
                                 // graph (including KV cache updates) is materialized.
                                 MxArray::async_eval_arrays(&[&next_token, &logits]);
+                                profiler.end();
+
                                 Some(next_token)
                             } else {
                                 None
                             };
 
                             // Wait for step N (GPU already computing N+1)
+                            profiler.begin("eval_token");
                             y.eval();
+                            profiler.end();
+
+                            profiler.begin("extract");
                             let token_id = y.item_at_int32(0)? as u32;
+                            profiler.end();
                             profiler.mark_first_token();
                             if p.report_performance && first_token_instant.is_none() {
                                 first_token_instant = Some(std::time::Instant::now());
