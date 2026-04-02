@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use crate::array::MxArray;
 use crate::models::qwen3::{BatchGenerationResult, GenerationConfig, GenerationResult};
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::sampling::{SamplingConfig, check_repetition_cutoff, sample};
+use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools::ToolCallResult;
@@ -1980,118 +1980,42 @@ impl Qwen3_5Model {
                             p.thinking_token_budget,
                             think_end_id,
                         );
-                        for step in 0..p.max_new_tokens {
-                            // Build and submit graph for step N+1.
-                            // forward() always runs to keep KV caches consistent.
-                            let next_y = if step + 1 < p.max_new_tokens {
-                                let _stream_ctx = StreamContext::new(generation_stream);
 
-                                profiler.begin("forward");
-                                let next_ids = y.reshape(&[1, 1])?;
-                                let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
-                                profiler.end();
-
-                                let (next_token, budget_forced) =
-                                    if reasoning_tracker.should_force_think_end() {
-                                        let forced_id = reasoning_tracker.forced_token_id() as i32;
-                                        (MxArray::from_int32(&[forced_id], &[1])?, true)
-                                    } else {
-                                        profiler.begin("rep_penalty");
-                                        logits = apply_all_penalties(logits, &token_history, &p)?;
-                                        profiler.end();
-
-                                        profiler.begin("sample");
-                                        let t = sample(&logits, p.sampling_config)?;
-                                        profiler.end();
-                                        (t, false)
-                                    };
-
-                                profiler.begin("eval_caches");
-                                eval_token_and_compiled_caches(&next_token);
+                        let mut ops = chat_common::DecodeOps {
+                            forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                                Ok((forward_compiled(ids, emb)?, false))
+                            },
+                            eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                                eval_token_and_compiled_caches(token);
                                 if budget_forced {
                                     logits.eval();
                                 }
-                                profiler.end();
-
-                                Some(next_token)
-                            } else {
-                                None
-                            };
-
-                            // Wait for step N (GPU already computing N+1)
-                            profiler.begin("eval_token");
-                            y.eval();
-                            profiler.end();
-
-                            profiler.begin("extract");
-                            let token_id = y.item_at_int32(0)? as u32;
-                            profiler.end();
-                            profiler.mark_first_token();
-                            if p.report_performance && first_token_instant.is_none() {
-                                first_token_instant = Some(std::time::Instant::now());
+                            },
+                        };
+                        chat_common::decode_loop!(
+                            ops: ops,
+                            y: y,
+                            embedding_weight: embedding_weight,
+                            params: p,
+                            reasoning_tracker: reasoning_tracker,
+                            profiler: profiler,
+                            max_new_tokens: p.max_new_tokens,
+                            eos_id: eos_id,
+                            generated_tokens: generated_tokens,
+                            token_history: token_history,
+                            finish_reason: finish_reason,
+                            first_token_instant: first_token_instant,
+                            report_perf: p.report_performance,
+                            generation_stream: generation_stream,
+                            streaming: {
+                                callback: callback,
+                                cancelled: cancelled_inner,
+                                decode_stream: decode_stream,
+                                tokenizer: tokenizer_for_decode,
+                                streamed_text_len: streamed_text_len,
+                                last_is_reasoning: last_is_reasoning
                             }
-                            generated_tokens.push(token_id);
-                            token_history.push(token_id);
-
-                            let is_reasoning = reasoning_tracker.observe_token(token_id);
-                            last_is_reasoning = is_reasoning;
-
-                            if cancelled_inner.load(Ordering::Relaxed) {
-                                finish_reason = String::from("cancelled");
-                                break;
-                            }
-
-                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
-                                &mut decode_stream,
-                                tokenizer_for_decode.inner(),
-                                token_id,
-                                &generated_tokens,
-                                streamed_text_len,
-                            );
-                            streamed_text_len += token_text.len();
-                            callback.call(
-                                Ok(ChatStreamChunk {
-                                    text: token_text,
-                                    done: false,
-                                    finish_reason: None,
-                                    tool_calls: None,
-                                    thinking: None,
-                                    num_tokens: None,
-                                    raw_text: None,
-                                    performance: None,
-                                    is_reasoning: Some(is_reasoning),
-                                }),
-                                ThreadsafeFunctionCallMode::NonBlocking,
-                            );
-
-                            if token_id == eos_id {
-                                finish_reason = String::from("stop");
-                                break;
-                            }
-
-                            if let Some(reason) = check_repetition_cutoff(
-                                &generated_tokens,
-                                p.max_consecutive_tokens,
-                                p.max_ngram_repeats,
-                                p.ngram_size,
-                            ) {
-                                finish_reason = reason.to_string();
-                                break;
-                            }
-
-                            match next_y {
-                                Some(next) => y = next,
-                                None => break,
-                            }
-
-                            profiler.step();
-
-                            if (step + 1) % 256 == 0 {
-                                crate::array::synchronize_and_clear_cache();
-                            }
-                        }
-                        profiler.snapshot_memory_after();
-                        profiler.report();
+                        );
 
                         // === Export caches from C++ before CompiledResetGuard drops ===
                         if reuse_cache {
@@ -2136,125 +2060,48 @@ impl Qwen3_5Model {
                             p.thinking_token_budget,
                             think_end_id,
                         );
-                        for step in 0..p.max_new_tokens {
-                            // Build and submit graph for step N+1.
-                            // forward() always runs to keep KV caches consistent.
-                            let next_y = if step + 1 < p.max_new_tokens {
-                                let _stream_ctx = StreamContext::new(generation_stream);
 
-                                profiler.begin("forward");
-                                let next_ids = y.reshape(&[1, 1])?;
+                        let mut ops = chat_common::DecodeOps {
+                            forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                                 let logits = forward_inner(
-                                    &next_ids,
-                                    &embedding_weight,
+                                    ids,
+                                    emb,
                                     &mut layers_guard,
                                     &mut caches_guard,
                                     &final_norm_guard,
                                     &lm_head_guard,
                                     Some(&embedding_weight_t),
                                 )?;
-                                let mut logits = logits.squeeze(Some(&[1]))?;
-                                profiler.end();
-
-                                let next_token = if reasoning_tracker.should_force_think_end() {
-                                    let forced_id = reasoning_tracker.forced_token_id() as i32;
-                                    MxArray::from_int32(&[forced_id], &[1])?
-                                } else {
-                                    profiler.begin("rep_penalty");
-                                    logits = apply_all_penalties(logits, &token_history, &p)?;
-                                    profiler.end();
-
-                                    profiler.begin("sample");
-                                    let t = sample(&logits, p.sampling_config)?;
-                                    profiler.end();
-                                    t
-                                };
-
-                                profiler.begin("eval_caches");
-                                // Eval next_token and logits to ensure the forward
-                                // graph (including KV cache updates) is materialized.
-                                MxArray::async_eval_arrays(&[&next_token, &logits]);
-                                profiler.end();
-
-                                Some(next_token)
-                            } else {
-                                None
-                            };
-
-                            // Wait for step N (GPU already computing N+1)
-                            profiler.begin("eval_token");
-                            y.eval();
-                            profiler.end();
-
-                            profiler.begin("extract");
-                            let token_id = y.item_at_int32(0)? as u32;
-                            profiler.end();
-                            profiler.mark_first_token();
-                            if p.report_performance && first_token_instant.is_none() {
-                                first_token_instant = Some(std::time::Instant::now());
+                                Ok((logits, true))
+                            },
+                            eval_step: |token: &MxArray, logits: &MxArray, _budget_forced: bool| {
+                                MxArray::async_eval_arrays(&[token, logits]);
+                            },
+                        };
+                        chat_common::decode_loop!(
+                            ops: ops,
+                            y: y,
+                            embedding_weight: embedding_weight,
+                            params: p,
+                            reasoning_tracker: reasoning_tracker,
+                            profiler: profiler,
+                            max_new_tokens: p.max_new_tokens,
+                            eos_id: eos_id,
+                            generated_tokens: generated_tokens,
+                            token_history: token_history,
+                            finish_reason: finish_reason,
+                            first_token_instant: first_token_instant,
+                            report_perf: p.report_performance,
+                            generation_stream: generation_stream,
+                            streaming: {
+                                callback: callback,
+                                cancelled: cancelled_inner,
+                                decode_stream: decode_stream,
+                                tokenizer: tokenizer_for_decode,
+                                streamed_text_len: streamed_text_len,
+                                last_is_reasoning: last_is_reasoning
                             }
-                            generated_tokens.push(token_id);
-                            token_history.push(token_id);
-
-                            let is_reasoning = reasoning_tracker.observe_token(token_id);
-                            last_is_reasoning = is_reasoning;
-
-                            if cancelled_inner.load(Ordering::Relaxed) {
-                                finish_reason = String::from("cancelled");
-                                break;
-                            }
-
-                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
-                                &mut decode_stream,
-                                tokenizer_for_decode.inner(),
-                                token_id,
-                                &generated_tokens,
-                                streamed_text_len,
-                            );
-                            streamed_text_len += token_text.len();
-                            callback.call(
-                                Ok(ChatStreamChunk {
-                                    text: token_text,
-                                    done: false,
-                                    finish_reason: None,
-                                    tool_calls: None,
-                                    thinking: None,
-                                    num_tokens: None,
-                                    raw_text: None,
-                                    performance: None,
-                                    is_reasoning: Some(is_reasoning),
-                                }),
-                                ThreadsafeFunctionCallMode::NonBlocking,
-                            );
-
-                            if token_id == eos_id {
-                                finish_reason = String::from("stop");
-                                break;
-                            }
-
-                            if let Some(reason) = check_repetition_cutoff(
-                                &generated_tokens,
-                                p.max_consecutive_tokens,
-                                p.max_ngram_repeats,
-                                p.ngram_size,
-                            ) {
-                                finish_reason = reason.to_string();
-                                break;
-                            }
-
-                            match next_y {
-                                Some(next) => y = next,
-                                None => break,
-                            }
-
-                            profiler.step();
-
-                            if (step + 1) % 256 == 0 {
-                                crate::array::synchronize_and_clear_cache();
-                            }
-                        }
-                        profiler.snapshot_memory_after();
-                        profiler.report();
+                        );
                     }
 
                     // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
