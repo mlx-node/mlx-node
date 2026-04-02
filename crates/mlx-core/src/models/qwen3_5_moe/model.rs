@@ -1848,8 +1848,7 @@ impl Qwen3_5MoeModel {
                     let mut y = sample(&last_logits, sampling_config)?;
                     MxArray::async_eval_arrays(&[&y]);
 
-                    let starts_in_thinking =
-                        enable_thinking.unwrap_or(true) && think_end_id_stream.is_some();
+                    let starts_in_thinking = enable_thinking.unwrap_or(true);
                     let mut last_is_reasoning = starts_in_thinking;
 
                     if use_cpp {
@@ -1938,8 +1937,7 @@ impl Qwen3_5MoeModel {
                         // C++ decode loop (pipelined — submit N+1 before eval N)
                         profiler.set_label("moe_chat_stream_compiled");
 
-                        let starts_in_thinking =
-                            enable_thinking.unwrap_or(true) && think_end_id_stream.is_some();
+                        let starts_in_thinking = enable_thinking.unwrap_or(true);
                         let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                             starts_in_thinking,
                             thinking_token_budget,
@@ -2105,8 +2103,7 @@ impl Qwen3_5MoeModel {
                         // Rust fallback decode loop (pipelined)
                         profiler.set_label("moe_chat_stream_rust");
 
-                        let starts_in_thinking =
-                            enable_thinking.unwrap_or(true) && think_end_id_stream.is_some();
+                        let starts_in_thinking = enable_thinking.unwrap_or(true);
                         let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                             starts_in_thinking,
                             thinking_token_budget,
