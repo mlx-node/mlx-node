@@ -429,6 +429,180 @@ pub(crate) fn verify_cache_prefix(
     }
 }
 
+/// Closures for model-specific operations in the decode loop.
+///
+/// `F`: forward pass — takes (input_ids [1,1], embedding_weight) → Result<(logits, needs_squeeze)>.
+/// `E`: eval step — takes (next_token, logits, budget_forced) → schedules async eval.
+#[allow(dead_code)]
+pub(crate) struct DecodeOps<F, E>
+where
+    F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, bool)>,
+    E: Fn(&MxArray, &MxArray, bool),
+{
+    pub forward: F,
+    pub eval_step: E,
+}
+
+/// Pipelined decode loop shared across all Qwen3.5 model variants.
+///
+/// Generates the token-by-token decode loop with:
+/// - Pipelining: builds step N+1's graph before blocking on step N
+/// - Budget enforcement via ReasoningTracker
+/// - Penalty application via apply_all_penalties
+/// - Stop conditions: EOS, repetition cutoff
+/// - Every-256-step synchronize_and_clear_cache
+/// - Profiler instrumentation
+///
+/// The optional `streaming:` block adds callback emission, cancellation,
+/// incremental detokenization, and is_reasoning tagging.
+#[allow(unused_macros)]
+macro_rules! decode_loop {
+    (
+        ops: $ops:expr,
+        y: $y:expr,
+        embedding_weight: $emb:expr,
+        params: $p:expr,
+        reasoning_tracker: $tracker:expr,
+        profiler: $profiler:expr,
+        max_new_tokens: $max:expr,
+        eos_id: $eos:expr,
+        generated_tokens: $gen:expr,
+        token_history: $hist:expr,
+        finish_reason: $reason:expr,
+        first_token_instant: $first_tok:expr,
+        report_perf: $report:expr,
+        generation_stream: $stream:expr
+        $(, streaming: {
+            callback: $cb:expr,
+            cancelled: $cancelled:expr,
+            decode_stream: $ds:expr,
+            tokenizer: $tok:expr,
+            streamed_text_len: $slen:expr,
+            last_is_reasoning: $last_r:expr
+        })?
+    ) => {{
+        for step in 0..$max {
+            let next_y = if step + 1 < $max {
+                let _stream_ctx = $crate::stream::StreamContext::new($stream);
+
+                $profiler.begin("forward");
+                let next_ids = $y.reshape(&[1, 1])?;
+                let (mut logits, needs_squeeze) = ($ops.forward)(&next_ids, &$emb)?;
+                if needs_squeeze {
+                    logits = logits.squeeze(Some(&[1]))?;
+                }
+                $profiler.end();
+
+                let (next_token, budget_forced) =
+                    if $tracker.should_force_think_end() {
+                        let forced_id = $tracker.forced_token_id() as i32;
+                        ($crate::array::MxArray::from_int32(&[forced_id], &[1])?, true)
+                    } else {
+                        $profiler.begin("rep_penalty");
+                        logits = $crate::models::qwen3_5::chat_common::apply_all_penalties(
+                            logits, &$hist, &$p,
+                        )?;
+                        $profiler.end();
+
+                        $profiler.begin("sample");
+                        let t = $crate::sampling::sample(&logits, $p.sampling_config)?;
+                        $profiler.end();
+                        (t, false)
+                    };
+
+                $profiler.begin("eval_caches");
+                ($ops.eval_step)(&next_token, &logits, budget_forced);
+                $profiler.end();
+
+                Some(next_token)
+            } else {
+                None
+            };
+
+            $profiler.begin("eval_token");
+            $y.eval();
+            $profiler.end();
+
+            $profiler.begin("extract");
+            let token_id = $y.item_at_int32(0)? as u32;
+            $profiler.end();
+            $profiler.mark_first_token();
+            if $report && $first_tok.is_none() {
+                $first_tok = Some(std::time::Instant::now());
+            }
+
+            $gen.push(token_id);
+            $hist.push(token_id);
+            let _is_reasoning = $tracker.observe_token(token_id);
+
+            // Streaming-only block (conditionally compiled via macro repetition)
+            $(
+                $last_r = _is_reasoning;
+
+                if $cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    $reason = String::from("cancelled");
+                    break;
+                }
+
+                let token_text = $crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                    &mut $ds,
+                    $tok.inner(),
+                    token_id,
+                    &$gen,
+                    $slen,
+                );
+                $slen += token_text.len();
+                $cb.call(
+                    Ok($crate::models::qwen3_5::model::ChatStreamChunk {
+                        text: token_text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        raw_text: None,
+                        performance: None,
+                        is_reasoning: Some(_is_reasoning),
+                    }),
+                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            )?
+
+            if token_id == $eos {
+                $reason = String::from("stop");
+                break;
+            }
+
+            if let Some(reason) = $crate::sampling::check_repetition_cutoff(
+                &$gen,
+                $p.max_consecutive_tokens,
+                $p.max_ngram_repeats,
+                $p.ngram_size,
+            ) {
+                $reason = reason.to_string();
+                break;
+            }
+
+            match next_y {
+                Some(next) => $y = next,
+                None => break,
+            }
+
+            $profiler.step();
+
+            if (step + 1) % 256 == 0 {
+                $crate::array::synchronize_and_clear_cache();
+            }
+        }
+
+        $profiler.snapshot_memory_after();
+        $profiler.report();
+    }};
+}
+
+#[allow(unused_imports)]
+pub(crate) use decode_loop;
+
 #[cfg(test)]
 mod tests {
     use super::*;
