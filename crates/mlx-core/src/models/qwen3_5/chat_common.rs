@@ -232,7 +232,7 @@ pub(crate) fn compute_performance_metrics(
 
 /// Shared finalization: parse thinking + tool calls from decoded text.
 ///
-/// Three-way branching based on the request's reasoning state:
+/// Four-way branching based on the request's reasoning state:
 /// 1. `!thinking_enabled`: no-thinking mode — all text is content, no reasoning parsing.
 /// 2. `thinking_enabled` + `</think>` token confirmed: split at token-confirmed boundary.
 /// 3. `thinking_enabled` + no `</think>` token + `think_end_id` exists: truncated generation.

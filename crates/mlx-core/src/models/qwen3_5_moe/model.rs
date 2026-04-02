@@ -1935,7 +1935,6 @@ impl Qwen3_5MoeModel {
                         // C++ decode loop (pipelined — submit N+1 before eval N)
                         profiler.set_label("moe_chat_stream_compiled");
 
-                        let starts_in_thinking = enable_thinking.unwrap_or(true);
                         let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                             starts_in_thinking,
                             thinking_token_budget,
@@ -2101,7 +2100,6 @@ impl Qwen3_5MoeModel {
                         // Rust fallback decode loop (pipelined)
                         profiler.set_label("moe_chat_stream_rust");
 
-                        let starts_in_thinking = enable_thinking.unwrap_or(true);
                         let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                             starts_in_thinking,
                             thinking_token_budget,

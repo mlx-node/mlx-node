@@ -228,10 +228,8 @@ impl QianfanOCRModel {
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
-        let enable_thinking = config
-            .reasoning_effort
-            .as_deref()
-            .is_some_and(|e| !matches!(e, "none" | "low"));
+        let enable_thinking =
+            crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config).unwrap_or(false);
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -658,10 +656,8 @@ impl QianfanOCRModel {
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
-        let enable_thinking = config
-            .reasoning_effort
-            .as_deref()
-            .is_some_and(|e| !matches!(e, "none" | "low"));
+        let enable_thinking =
+            crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config).unwrap_or(false);
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
