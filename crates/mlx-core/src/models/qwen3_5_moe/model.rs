@@ -1142,94 +1142,33 @@ impl Qwen3_5MoeModel {
                     think_end_id,
                 );
 
-                for step in 0..max_new_tokens {
-                    // Build and submit graph for step N+1 before waiting for N.
-                    // forward() always runs to keep KV caches consistent;
-                    // budget enforcement only overrides the sampling step.
-                    let next_y = if step + 1 < max_new_tokens {
-                        let _stream_ctx = StreamContext::new(generation_stream);
-
-                        profiler.begin("forward");
-                        let next_ids = y.reshape(&[1, 1])?;
-                        let mut logits = forward_moe_cpp(&next_ids, &embedding_weight)?;
-                        profiler.end();
-
-                        let (next_token, budget_forced) =
-                            if reasoning_tracker.should_force_think_end() {
-                                // Budget exhausted — force </think> token
-                                let forced_id = reasoning_tracker.forced_token_id() as i32;
-                                (MxArray::from_int32(&[forced_id], &[1])?, true)
-                            } else {
-                                profiler.begin("rep_penalty");
-                                logits = apply_all_penalties(logits, &token_history, &p)?;
-                                profiler.end();
-
-                                profiler.begin("sample");
-                                let t = sample(&logits, p.sampling_config)?;
-                                profiler.end();
-                                (t, false)
-                            };
-
-                        profiler.begin("eval_caches");
-                        eval_token_and_moe_caches(&next_token);
+                let mut ops = chat_common::DecodeOps {
+                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                        Ok((forward_moe_cpp(ids, emb)?, false))
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_moe_caches(token);
                         if budget_forced {
-                            // When budget-forced, next_token is a constant that doesn't
-                            // pull the forward graph. Eval logits to materialize cache updates.
                             logits.eval();
                         }
-                        profiler.end();
-
-                        Some(next_token)
-                    } else {
-                        None
-                    };
-
-                    // Wait for step N (GPU already computing N+1)
-                    profiler.begin("eval_token");
-                    y.eval();
-                    profiler.end();
-
-                    profiler.begin("extract");
-                    let token_id = y.item_at_int32(0)? as u32;
-                    profiler.end();
-                    profiler.mark_first_token();
-                    if p.report_performance && first_token_instant.is_none() {
-                        first_token_instant = Some(std::time::Instant::now());
-                    }
-
-                    generated_tokens.push(token_id);
-                    token_history.push(token_id);
-                    reasoning_tracker.observe_token(token_id);
-
-                    if token_id == eos_id {
-                        finish_reason = String::from("stop");
-                        break;
-                    }
-
-                    if let Some(reason) = check_repetition_cutoff(
-                        &generated_tokens,
-                        p.max_consecutive_tokens,
-                        p.max_ngram_repeats,
-                        p.ngram_size,
-                    ) {
-                        finish_reason = reason.to_string();
-                        break;
-                    }
-
-                    match next_y {
-                        Some(next) => y = next,
-                        None => break,
-                    }
-
-                    profiler.step();
-
-                    if (step + 1) % 256 == 0 {
-                        crate::array::synchronize_and_clear_cache();
-                    }
-                }
-
-                profiler.snapshot_memory_after();
-                profiler.report();
+                    },
+                };
+                chat_common::decode_loop!(
+                    ops: ops,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream
+                );
 
                 // === Export caches from C++ before MoeResetGuard drops ===
                 if reuse_cache {
@@ -1274,16 +1213,11 @@ impl Qwen3_5MoeModel {
                     think_end_id,
                 );
 
-                for step in 0..max_new_tokens {
-                    // Build and submit graph for step N+1 before waiting for N.
-                    // forward() always runs to keep KV caches consistent;
-                    // budget enforcement only overrides the sampling step.
-                    let next_y = if step + 1 < max_new_tokens {
-                        profiler.begin("forward");
-                        let next_ids = y.reshape(&[1, 1])?;
+                let mut ops = chat_common::DecodeOps {
+                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                         let logits = forward_inner(
-                            &next_ids,
-                            &embedding_weight,
+                            ids,
+                            emb,
                             &mut layers_guard,
                             &mut caches_guard,
                             &final_norm_guard,
@@ -1291,80 +1225,28 @@ impl Qwen3_5MoeModel {
                             fa_idx,
                             Some(&embedding_weight_t),
                         )?;
-                        let mut logits = logits.squeeze(Some(&[1]))?;
-                        profiler.end();
-
-                        let next_token = if reasoning_tracker.should_force_think_end() {
-                            let forced_id = reasoning_tracker.forced_token_id() as i32;
-                            MxArray::from_int32(&[forced_id], &[1])?
-                        } else {
-                            profiler.begin("rep_penalty");
-                            logits = apply_all_penalties(logits, &token_history, &p)?;
-                            profiler.end();
-
-                            profiler.begin("sample");
-                            let t = sample(&logits, p.sampling_config)?;
-                            profiler.end();
-                            t
-                        };
-
-                        profiler.begin("async_eval");
-                        // Eval both next_token and logits to ensure forward graph
-                        // (including KV cache updates) is materialized.
-                        MxArray::async_eval_arrays(&[&next_token, &logits]);
-                        profiler.end();
-
-                        Some(next_token)
-                    } else {
-                        None
-                    };
-
-                    // Wait for step N (GPU already computing N+1)
-                    profiler.begin("eval_token");
-                    y.eval();
-                    profiler.end();
-
-                    profiler.begin("extract");
-                    let token_id = y.item_at_int32(0)? as u32;
-                    profiler.end();
-                    profiler.mark_first_token();
-                    if p.report_performance && first_token_instant.is_none() {
-                        first_token_instant = Some(std::time::Instant::now());
-                    }
-
-                    generated_tokens.push(token_id);
-                    token_history.push(token_id);
-                    reasoning_tracker.observe_token(token_id);
-
-                    if token_id == eos_id {
-                        finish_reason = String::from("stop");
-                        break;
-                    }
-
-                    if let Some(reason) = check_repetition_cutoff(
-                        &generated_tokens,
-                        p.max_consecutive_tokens,
-                        p.max_ngram_repeats,
-                        p.ngram_size,
-                    ) {
-                        finish_reason = reason.to_string();
-                        break;
-                    }
-
-                    match next_y {
-                        Some(next) => y = next,
-                        None => break,
-                    }
-
-                    profiler.step();
-
-                    if (step + 1) % 256 == 0 {
-                        crate::array::synchronize_and_clear_cache();
-                    }
-                }
-
-                profiler.snapshot_memory_after();
-                profiler.report();
+                        Ok((logits, true)) // needs squeeze
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, _budget_forced: bool| {
+                        MxArray::async_eval_arrays(&[token, logits]);
+                    },
+                };
+                chat_common::decode_loop!(
+                    ops: ops,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream
+                );
 
                 drop(layers_guard);
                 drop(caches_guard);
