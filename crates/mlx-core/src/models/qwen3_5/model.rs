@@ -13,10 +13,7 @@ use tracing::{info, warn};
 use crate::array::MxArray;
 use crate::models::qwen3::{BatchGenerationResult, GenerationConfig, GenerationResult};
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::sampling::{
-    SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
-    check_repetition_cutoff, sample,
-};
+use crate::sampling::{SamplingConfig, check_repetition_cutoff, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools::ToolCallResult;
@@ -1757,24 +1754,7 @@ impl Qwen3_5Model {
 
                     let mut first_token_instant: Option<std::time::Instant> = None;
 
-                    let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
-                    let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-                    let repetition_context_size = config.repetition_context_size.unwrap_or(256);
-                    let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-                    let presence_context_size = config.presence_context_size.unwrap_or(20);
-                    let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-                    let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-                    let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-                    let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-                    let ngram_size = config.ngram_size.unwrap_or(64);
-                    let sampling_config = Some(SamplingConfig {
-                        temperature: config.temperature,
-                        top_k: config.top_k,
-                        top_p: config.top_p,
-                        min_p: config.min_p,
-                    });
-                    let thinking_token_budget = config.thinking_token_budget;
-                    let include_reasoning = chat_common::resolve_include_reasoning(&config);
+                    let p = chat_common::extract_chat_params(&config);
 
                     let mut layers_guard = layers_arc
                         .write()
@@ -1968,7 +1948,7 @@ impl Qwen3_5Model {
                                     &final_norm_guard,
                                     &lm_head_guard,
                                     &model_config,
-                                    max_new_tokens,
+                                    p.max_new_tokens,
                                     generation_stream,
                                     &vision_cache_stream,
                                     model_id,
@@ -2020,33 +2000,10 @@ impl Qwen3_5Model {
                     // Track token history for repetition penalty
                     let mut token_history: Vec<u32> = tokens.clone();
 
-                    // Apply repetition penalty to prefill logits
-                    if repetition_penalty != 1.0 && !token_history.is_empty() {
-                        last_logits = apply_repetition_penalty(
-                            &last_logits,
-                            &token_history,
-                            repetition_penalty,
-                            Some(repetition_context_size),
-                        )?;
-                    }
-                    if presence_penalty != 0.0 {
-                        last_logits = apply_presence_penalty(
-                            &last_logits,
-                            &token_history,
-                            presence_penalty,
-                            Some(presence_context_size),
-                        )?;
-                    }
-                    if frequency_penalty != 0.0 {
-                        last_logits = apply_frequency_penalty(
-                            &last_logits,
-                            &token_history,
-                            frequency_penalty,
-                            Some(frequency_context_size),
-                        )?;
-                    }
+                    // Apply penalties to prefill logits
+                    last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
 
-                    let mut y = sample(&last_logits, sampling_config)?;
+                    let mut y = sample(&last_logits, p.sampling_config)?;
                     MxArray::async_eval_arrays(&[&y]);
 
                     let _compiled_guard = if use_compiled {
@@ -2069,7 +2026,7 @@ impl Qwen3_5Model {
                         } else {
                             use mlx_sys as sys;
                             let prefill_len = seq_len as i32;
-                            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+                            let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
                             let num_layers = model_config.num_layers as usize;
                             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -2139,13 +2096,13 @@ impl Qwen3_5Model {
 
                         let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                             starts_in_thinking,
-                            thinking_token_budget,
+                            p.thinking_token_budget,
                             think_end_id,
                         );
-                        for step in 0..max_new_tokens {
+                        for step in 0..p.max_new_tokens {
                             // Build and submit graph for step N+1.
                             // forward() always runs to keep KV caches consistent.
-                            let next_y = if step + 1 < max_new_tokens {
+                            let next_y = if step + 1 < p.max_new_tokens {
                                 let _stream_ctx = StreamContext::new(generation_stream);
                                 let next_ids = y.reshape(&[1, 1])?;
                                 let mut logits = forward_compiled(&next_ids, &embedding_weight)?;
@@ -2155,31 +2112,8 @@ impl Qwen3_5Model {
                                         let forced_id = reasoning_tracker.forced_token_id() as i32;
                                         (MxArray::from_int32(&[forced_id], &[1])?, true)
                                     } else {
-                                        if repetition_penalty != 1.0 {
-                                            logits = apply_repetition_penalty(
-                                                &logits,
-                                                &token_history,
-                                                repetition_penalty,
-                                                Some(repetition_context_size),
-                                            )?;
-                                        }
-                                        if presence_penalty != 0.0 {
-                                            logits = apply_presence_penalty(
-                                                &logits,
-                                                &token_history,
-                                                presence_penalty,
-                                                Some(presence_context_size),
-                                            )?;
-                                        }
-                                        if frequency_penalty != 0.0 {
-                                            logits = apply_frequency_penalty(
-                                                &logits,
-                                                &token_history,
-                                                frequency_penalty,
-                                                Some(frequency_context_size),
-                                            )?;
-                                        }
-                                        (sample(&logits, sampling_config)?, false)
+                                        logits = apply_all_penalties(logits, &token_history, &p)?;
+                                        (sample(&logits, p.sampling_config)?, false)
                                     };
 
                                 eval_token_and_compiled_caches(&next_token);
@@ -2195,7 +2129,7 @@ impl Qwen3_5Model {
                             y.eval();
                             let token_id = y.item_at_int32(0)? as u32;
                             profiler.mark_first_token();
-                            if report_perf && first_token_instant.is_none() {
+                            if p.report_performance && first_token_instant.is_none() {
                                 first_token_instant = Some(std::time::Instant::now());
                             }
                             generated_tokens.push(token_id);
@@ -2239,9 +2173,9 @@ impl Qwen3_5Model {
 
                             if let Some(reason) = check_repetition_cutoff(
                                 &generated_tokens,
-                                max_consecutive_tokens,
-                                max_ngram_repeats,
-                                ngram_size,
+                                p.max_consecutive_tokens,
+                                p.max_ngram_repeats,
+                                p.ngram_size,
                             ) {
                                 finish_reason = reason.to_string();
                                 break;
@@ -2301,13 +2235,13 @@ impl Qwen3_5Model {
 
                         let mut reasoning_tracker = chat_common::ReasoningTracker::new(
                             starts_in_thinking,
-                            thinking_token_budget,
+                            p.thinking_token_budget,
                             think_end_id,
                         );
-                        for step in 0..max_new_tokens {
+                        for step in 0..p.max_new_tokens {
                             // Build and submit graph for step N+1.
                             // forward() always runs to keep KV caches consistent.
-                            let next_y = if step + 1 < max_new_tokens {
+                            let next_y = if step + 1 < p.max_new_tokens {
                                 let _stream_ctx = StreamContext::new(generation_stream);
                                 let next_ids = y.reshape(&[1, 1])?;
                                 let logits = forward_inner(
@@ -2325,31 +2259,8 @@ impl Qwen3_5Model {
                                     let forced_id = reasoning_tracker.forced_token_id() as i32;
                                     MxArray::from_int32(&[forced_id], &[1])?
                                 } else {
-                                    if repetition_penalty != 1.0 {
-                                        logits = apply_repetition_penalty(
-                                            &logits,
-                                            &token_history,
-                                            repetition_penalty,
-                                            Some(repetition_context_size),
-                                        )?;
-                                    }
-                                    if presence_penalty != 0.0 {
-                                        logits = apply_presence_penalty(
-                                            &logits,
-                                            &token_history,
-                                            presence_penalty,
-                                            Some(presence_context_size),
-                                        )?;
-                                    }
-                                    if frequency_penalty != 0.0 {
-                                        logits = apply_frequency_penalty(
-                                            &logits,
-                                            &token_history,
-                                            frequency_penalty,
-                                            Some(frequency_context_size),
-                                        )?;
-                                    }
-                                    sample(&logits, sampling_config)?
+                                    logits = apply_all_penalties(logits, &token_history, &p)?;
+                                    sample(&logits, p.sampling_config)?
                                 };
 
                                 // Eval next_token and logits to ensure the forward
@@ -2364,7 +2275,7 @@ impl Qwen3_5Model {
                             y.eval();
                             let token_id = y.item_at_int32(0)? as u32;
                             profiler.mark_first_token();
-                            if report_perf && first_token_instant.is_none() {
+                            if p.report_performance && first_token_instant.is_none() {
                                 first_token_instant = Some(std::time::Instant::now());
                             }
                             generated_tokens.push(token_id);
@@ -2408,9 +2319,9 @@ impl Qwen3_5Model {
 
                             if let Some(reason) = check_repetition_cutoff(
                                 &generated_tokens,
-                                max_consecutive_tokens,
-                                max_ngram_repeats,
-                                ngram_size,
+                                p.max_consecutive_tokens,
+                                p.max_ngram_repeats,
+                                p.ngram_size,
                             ) {
                                 finish_reason = reason.to_string();
                                 break;
@@ -2510,7 +2421,7 @@ impl Qwen3_5Model {
                         enable_thinking.unwrap_or(true),
                         think_end_id,
                         think_end_str.as_deref(),
-                        include_reasoning,
+                        p.include_reasoning,
                     );
 
                     // If we have valid tool calls, override finish reason
