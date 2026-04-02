@@ -433,7 +433,6 @@ pub(crate) fn verify_cache_prefix(
 ///
 /// `F`: forward pass — takes (input_ids [1,1], embedding_weight) → Result<(logits, needs_squeeze)>.
 /// `E`: eval step — takes (next_token, logits, budget_forced) → schedules async eval.
-#[allow(dead_code)]
 pub(crate) struct DecodeOps<F, E>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, bool)>,
@@ -455,7 +454,6 @@ where
 ///
 /// The optional `streaming:` block adds callback emission, cancellation,
 /// incremental detokenization, and is_reasoning tagging.
-#[allow(unused_macros)]
 macro_rules! decode_loop {
     (
         ops: $ops:expr,
@@ -600,7 +598,6 @@ macro_rules! decode_loop {
     }};
 }
 
-#[allow(unused_imports)]
 pub(crate) use decode_loop;
 
 #[cfg(test)]
