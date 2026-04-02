@@ -50,6 +50,13 @@ pub(crate) fn resolve_enable_thinking(config: &ChatConfig) -> Option<bool> {
     }
 }
 
+/// Resolve `include_reasoning` from config, with `reasoning_effort: "none"` default.
+pub(crate) fn resolve_include_reasoning(config: &ChatConfig) -> bool {
+    config
+        .include_reasoning
+        .unwrap_or(!matches!(config.reasoning_effort.as_deref(), Some("none")))
+}
+
 /// Extract ChatConfig fields into flat variables with defaults.
 pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
     ChatParams {
@@ -72,9 +79,7 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         report_performance: config.report_performance.unwrap_or(false),
         reuse_cache: config.reuse_cache.unwrap_or(true),
         thinking_token_budget: config.thinking_token_budget,
-        include_reasoning: config
-            .include_reasoning
-            .unwrap_or(!matches!(config.reasoning_effort.as_deref(), Some("none"))),
+        include_reasoning: resolve_include_reasoning(config),
     }
 }
 

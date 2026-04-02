@@ -1774,9 +1774,7 @@ impl Qwen3_5Model {
                         min_p: config.min_p,
                     });
                     let thinking_token_budget = config.thinking_token_budget;
-                    let include_reasoning = config
-                        .include_reasoning
-                        .unwrap_or(!matches!(config.reasoning_effort.as_deref(), Some("none")));
+                    let include_reasoning = chat_common::resolve_include_reasoning(&config);
 
                     let mut layers_guard = layers_arc
                         .write()
