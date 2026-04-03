@@ -248,7 +248,7 @@ impl Gemma4Model {
         let ple = self.ple.clone();
         let model_config = self.config.clone();
 
-        let sampling_config = make_sampling_config(&config);
+        let sampling_config = make_sampling_config(&config, &model_config);
         let enable_thinking = config.enable_thinking;
         let eos_ids = model_config.eos_token_ids.clone();
 
@@ -264,6 +264,12 @@ impl Gemma4Model {
                     enable_thinking, // None = template default
                 )?
             } else {
+                // Manual fallback: thinking control requires a chat template
+                if enable_thinking == Some(true) {
+                    return Err(Error::from_reason(
+                        "enable_thinking=true requires a chat template (not found in tokenizer_config.json or chat_template.jinja)",
+                    ));
+                }
                 // Manual Gemma4 format matching the canonical template.
                 // Role mapping: "assistant" → "model", "developer" → "system".
                 // Tool calls serialized as <|tool_call>call:name{args}<tool_call|>.
@@ -409,8 +415,14 @@ fn init_caches_for_config(config: &Gemma4Config) -> Vec<Gemma4LayerCache> {
     caches
 }
 
-fn make_sampling_config(config: &Gemma4ChatConfig) -> Option<SamplingConfig> {
-    let temp = config.temperature.unwrap_or(0.0);
+fn make_sampling_config(
+    config: &Gemma4ChatConfig,
+    model_config: &Gemma4Config,
+) -> Option<SamplingConfig> {
+    let temp = config
+        .temperature
+        .or(model_config.default_temperature)
+        .unwrap_or(0.0);
     if temp <= 0.0 {
         // Greedy: use a near-zero temperature for argmax-like behavior.
         // Cannot pass None because sample() defaults to temperature=1.0.
@@ -423,8 +435,8 @@ fn make_sampling_config(config: &Gemma4ChatConfig) -> Option<SamplingConfig> {
     }
     Some(SamplingConfig {
         temperature: Some(temp),
-        top_k: config.top_k,
-        top_p: config.top_p,
+        top_k: config.top_k.or(model_config.default_top_k),
+        top_p: config.top_p.or(model_config.default_top_p),
         min_p: config.min_p,
     })
 }

@@ -2544,6 +2544,9 @@ export interface Gemma4Config {
   attentionBias: boolean;
   useDoubleWideMlp: boolean;
   numKvSharedLayers?: number;
+  defaultTemperature?: number;
+  defaultTopK?: number;
+  defaultTopP?: number;
   enableMoeBlock: boolean;
   numExperts?: number;
   topKExperts?: number;

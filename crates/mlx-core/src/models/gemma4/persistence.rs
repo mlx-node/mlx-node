@@ -121,6 +121,11 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             let v = get_config_i32(&raw, text_cfg, &["num_kv_shared_layers"], -1);
             if v > 0 { Some(v) } else { None }
         },
+        // Sampling defaults (populated from generation_config.json in load_from_dir)
+        default_temperature: None,
+        default_top_k: None,
+        default_top_p: None,
+
         // MoE fields
         enable_moe_block: get_config_bool(&raw, text_cfg, &["enable_moe_block"], false),
         num_experts: {
@@ -245,7 +250,7 @@ fn validate_required_weights(
         params.contains_key(key)
             || key
                 .strip_suffix(".weight")
-                .map(|prefix| params.contains_key(&format!("{}.scales", prefix)))
+                .map(|p| params.contains_key(&format!("{}.scales", p)))
                 .unwrap_or(false)
     };
 
@@ -292,20 +297,38 @@ fn validate_required_weights(
             }
         }
 
-        // MLP projections (dense path; skipped for pure-MoE layers)
-        if !config.enable_moe_block {
-            let mlp_keys = [
-                format!("{}.gate_proj.weight", mlp),
-                format!("{}.up_proj.weight", mlp),
-                format!("{}.down_proj.weight", mlp),
-            ];
-            for key in &mlp_keys {
-                if !has(key) {
-                    return Err(Error::from_reason(format!(
-                        "Missing required weight: {}",
-                        key
-                    )));
-                }
+        // Q/K norms (always required)
+        for norm in &["q_norm.weight", "k_norm.weight"] {
+            let key = format!("{}.{}", attn, norm);
+            if !has(&key) {
+                return Err(Error::from_reason(format!(
+                    "Missing required weight: {}",
+                    key
+                )));
+            }
+        }
+
+        // layer_scalar (buffer — no .weight suffix)
+        let scalar_key = format!("{}.layer_scalar", prefix);
+        if !params.contains_key(&scalar_key) {
+            return Err(Error::from_reason(format!(
+                "Missing required weight: {}",
+                scalar_key
+            )));
+        }
+
+        // Dense MLP always required (even with MoE, runs in parallel)
+        let mlp_keys = [
+            format!("{}.gate_proj.weight", mlp),
+            format!("{}.up_proj.weight", mlp),
+            format!("{}.down_proj.weight", mlp),
+        ];
+        for key in &mlp_keys {
+            if !has(key) {
+                return Err(Error::from_reason(format!(
+                    "Missing required weight: {}",
+                    key
+                )));
             }
         }
 
@@ -339,6 +362,14 @@ fn validate_required_weights(
                         key
                     )));
                 }
+            }
+            // router.scale (buffer — no .weight suffix)
+            let router_scale_key = format!("{}.router.scale", prefix);
+            if !params.contains_key(&router_scale_key) {
+                return Err(Error::from_reason(format!(
+                    "Missing required weight: {}",
+                    router_scale_key
+                )));
             }
         }
     }
@@ -661,31 +692,41 @@ impl Gemma4Model {
             // Parse config
             let mut config = parse_config(path)?;
 
-            // Merge stop tokens from generation_config.json (e.g. <turn|> = 106)
+            // Merge stop tokens and sampling defaults from generation_config.json
             let gen_config_path = path.join("generation_config.json");
             if let Ok(gen_str) = fs::read_to_string(&gen_config_path)
                 && let Ok(gen_val) = serde_json::from_str::<Value>(&gen_str)
-                && let Some(eos) = gen_val.get("eos_token_id")
             {
-                let mut ids: std::collections::HashSet<i32> =
-                    config.eos_token_ids.iter().copied().collect();
-                match eos {
-                    Value::Array(arr) => {
-                        for v in arr {
-                            if let Some(i) = v.as_i64() {
+                // Merge EOS token IDs (e.g. <turn|> = 106)
+                if let Some(eos) = gen_val.get("eos_token_id") {
+                    let mut ids: std::collections::HashSet<i32> =
+                        config.eos_token_ids.iter().copied().collect();
+                    match eos {
+                        Value::Array(arr) => {
+                            for v in arr {
+                                if let Some(i) = v.as_i64() {
+                                    ids.insert(i as i32);
+                                }
+                            }
+                        }
+                        Value::Number(n) => {
+                            if let Some(i) = n.as_i64() {
                                 ids.insert(i as i32);
                             }
                         }
+                        _ => {}
                     }
-                    Value::Number(n) => {
-                        if let Some(i) = n.as_i64() {
-                            ids.insert(i as i32);
-                        }
-                    }
-                    _ => {}
+                    config.eos_token_ids = ids.into_iter().collect();
+                    config.eos_token_ids.sort();
                 }
-                config.eos_token_ids = ids.into_iter().collect();
-                config.eos_token_ids.sort();
+                // Read sampling defaults
+                config.default_temperature =
+                    gen_val.get("temperature").and_then(|v| v.as_f64());
+                config.default_top_k = gen_val
+                    .get("top_k")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32);
+                config.default_top_p = gen_val.get("top_p").and_then(|v| v.as_f64());
             }
             let num_global = config
                 .layer_types

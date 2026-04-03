@@ -78,6 +78,14 @@ pub struct Gemma4Config {
     #[serde(default)]
     pub num_kv_shared_layers: Option<i32>,
 
+    // Sampling defaults (from generation_config.json)
+    #[serde(default)]
+    pub default_temperature: Option<f64>,
+    #[serde(default)]
+    pub default_top_k: Option<i32>,
+    #[serde(default)]
+    pub default_top_p: Option<f64>,
+
     // MoE (Mixture of Experts) — used by 26B-A4B model.
     // When enable_moe_block=true, ALL layers have MoE parallel to the dense MLP.
     #[serde(default)]
