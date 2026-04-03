@@ -57,7 +57,7 @@ const IM_START_TOKEN_ID: u32 = 151644;
 const IM_END_TOKEN_ID: u32 = 151645;
 
 /// Valid roles for ChatML format (prevents role injection attacks)
-const VALID_CHATML_ROLES: &[&str] = &["system", "user", "assistant", "tool"];
+const VALID_CHATML_ROLES: &[&str] = &["system", "user", "assistant", "tool", "developer"];
 
 /// Tool call made by an assistant
 #[napi(object)]
@@ -548,6 +548,14 @@ impl Qwen3Tokenizer {
         let add_prompt = add_generation_prompt.unwrap_or(true);
         let tokenizer = self.tokenizer.clone();
         let chat_template = self.chat_template.clone();
+        let bos_str = self
+            .bos_token_id
+            .and_then(|id| self.tokenizer.id_to_token(id))
+            .unwrap_or_default();
+        let eos_str = self
+            .tokenizer
+            .id_to_token(self.eos_token_id)
+            .unwrap_or_default();
 
         env.spawn_future_with_callback(
             async move {
@@ -563,6 +571,8 @@ impl Qwen3Tokenizer {
                             tools.as_deref(),
                             add_prompt,
                             enable_thinking,
+                            &bos_str,
+                            &eos_str,
                         )
                         .map_err(Error::from_reason)?
                     } else {
@@ -719,6 +729,8 @@ impl Qwen3Tokenizer {
         tools: Option<&[ToolDefinition]>,
         add_generation_prompt: bool,
         enable_thinking: Option<bool>,
+        bos_token: &str,
+        eos_token: &str,
     ) -> std::result::Result<String, String> {
         let mut env = Environment::new();
 
@@ -929,11 +941,14 @@ impl Qwen3Tokenizer {
         // Build context for Jinja2 template
         // Note: enable_thinking defaults to true to allow model to think naturally.
         // Setting to false adds empty <think></think> tags which DISABLES thinking.
+        // bos_token/eos_token: used by Gemma4 and other templates ({{ bos_token }}).
         let ctx = context! {
             messages => messages_value,
             tools => tools_value,
             add_generation_prompt => add_generation_prompt,
             enable_thinking => enable_thinking.unwrap_or(true),
+            bos_token => bos_token,
+            eos_token => eos_token,
         };
 
         tmpl.render(ctx)
@@ -1106,6 +1121,14 @@ impl Qwen3Tokenizer {
         let sanitized: Vec<ChatMessage> = Self::sanitize_messages(messages);
 
         // Use Jinja2 rendering if template exists, fallback to ChatML otherwise
+        let bos_str = self
+            .bos_token_id
+            .and_then(|id| self.tokenizer.id_to_token(id))
+            .unwrap_or_default();
+        let eos_str = self
+            .tokenizer
+            .id_to_token(self.eos_token_id)
+            .unwrap_or_default();
         let formatted = if let Some(chat_template) = &self.chat_template {
             Self::render_chat_template_jinja2(
                 chat_template,
@@ -1113,6 +1136,8 @@ impl Qwen3Tokenizer {
                 tools,
                 add_prompt,
                 enable_thinking,
+                &bos_str,
+                &eos_str,
             )
             .map_err(Error::from_reason)?
         } else {

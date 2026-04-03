@@ -254,25 +254,9 @@ impl Gemma4Model {
                         other => other,
                     };
 
-                    if role == "tool" {
-                        // Format tool response content in Gemma4 DSL
-                        let response_body =
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg.content)
-                            {
-                                format_gemma4_value(&val)
-                            } else {
-                                format!("value:<|\"|>{}<|\"|>", msg.content)
-                            };
-                        // Strip outer braces if it's already an object
-                        let inner = response_body
-                            .strip_prefix('{')
-                            .and_then(|s| s.strip_suffix('}'))
-                            .unwrap_or(&response_body);
-                        prompt_text.push_str(&format!(
-                            "<|turn>user\n<|tool_response>response:unknown{{{}}}<tool_response|><turn|>\n",
-                            inner
-                        ));
-                    } else {
+                    // All roles (including "tool") use the same <|turn>role\n...<turn|>\n format.
+                    // This matches the canonical tokenizer behavior verified against HF.
+                    {
                         prompt_text.push_str(&format!("<|turn>{}\n", role));
 
                         // Emit tool calls for assistant/model messages
@@ -788,53 +772,33 @@ mod tests {
             "numbers and bools should be bare (no <|\"|> wrapping), keys sorted alphabetically"
         );
 
-        // Verify tool response uses response:unknown{...} format
-        let response_json = r#"{"temp": 20}"#;
-        let response_val: serde_json::Value = serde_json::from_str(response_json).unwrap();
-        let response_body = format_gemma4_value(&response_val);
-        let inner = response_body
-            .strip_prefix('{')
-            .and_then(|s| s.strip_suffix('}'))
-            .unwrap_or(&response_body);
-        let tool_response_fragment = format!(
-            "<|tool_response>response:unknown{{{}}}<tool_response|>",
-            inner
-        );
-        assert_eq!(
-            tool_response_fragment, "<|tool_response>response:unknown{temp:20}<tool_response|>",
-            "tool response should use response:unknown{{...}} format with bare numbers"
-        );
+        // Verify format_gemma4_value handles nested JSON objects correctly
+        let nested_json = r#"{"temp": 20}"#;
+        let nested_val: serde_json::Value = serde_json::from_str(nested_json).unwrap();
+        let dsl3 = format_gemma4_value(&nested_val);
+        assert_eq!(dsl3, "{temp:20}", "object with bare number value");
 
-        // Build a full prompt to verify end-to-end integration
+        // Build a full prompt matching the manual fallback path
         let mut prompt = String::from("<bos>");
 
         // user turn
         prompt.push_str("<|turn>user\nWhat's the weather?<turn|>\n");
 
-        // model tool-call turn
+        // model tool-call turn (assistant → model)
         let tc_dsl = json_args_to_gemma4_dsl(r#"{"location": "Paris", "units": "celsius"}"#);
         prompt.push_str(&format!(
             "<|turn>model\n<|tool_call>call:get_weather{{{}}}<tool_call|><turn|>\n",
             tc_dsl
         ));
 
-        // tool response turn
-        let resp_val: serde_json::Value = serde_json::from_str(r#"{"temp": 20}"#).unwrap();
-        let resp_body = format_gemma4_value(&resp_val);
-        let resp_inner = resp_body
-            .strip_prefix('{')
-            .and_then(|s| s.strip_suffix('}'))
-            .unwrap_or(&resp_body);
-        prompt.push_str(&format!(
-            "<|turn>user\n<|tool_response>response:unknown{{{}}}<tool_response|><turn|>\n",
-            resp_inner
-        ));
+        // tool response turn — plain <|turn>tool format (matches HF tokenizer behavior)
+        prompt.push_str("<|turn>tool\n{\"temp\": 20}<turn|>\n");
 
-        // final model turn
+        // final model answer
         prompt.push_str("<|turn>model\nIt's 20 degrees in Paris.<turn|>\n");
         prompt.push_str("<|turn>model\n");
 
-        // Verify DSL format (no raw JSON quotes in tool call)
+        // Verify DSL format in tool call (no raw JSON quotes)
         assert!(
             prompt.contains(r#"<|tool_call>call:get_weather{location:<|"|>Paris<|"|>,units:<|"|>celsius<|"|>}<tool_call|>"#),
             "tool call args should use Gemma4 DSL with <|\"|> string delimiters"
@@ -844,15 +808,18 @@ mod tests {
             "tool call should NOT contain raw JSON quoted keys"
         );
 
-        // Verify tool response DSL format
+        // Verify tool response uses simple <|turn>tool format (not rewritten)
         assert!(
-            prompt.contains("<|tool_response>response:unknown{temp:20}<tool_response|>"),
-            "tool response should use response:unknown{{...}} format"
+            prompt.contains("<|turn>tool\n"),
+            "tool response should use plain <|turn>tool format"
+        );
+        assert!(
+            !prompt.contains("<|tool_response>"),
+            "tool response should NOT use <|tool_response> rewriting"
         );
 
-        // Verify no raw "assistant" or "tool" role in turns
+        // Verify assistant→model mapping
         assert!(!prompt.contains("<|turn>assistant"));
-        assert!(!prompt.contains("<|turn>tool"));
     }
 
     #[test]
