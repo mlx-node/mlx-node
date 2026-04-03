@@ -227,3 +227,32 @@ impl Gemma4Config {
         !(layer_idx + 1..first_shared).any(|i| self.layer_types[i] == *my_type)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_default_layer_types_synthesis() {
+        // 35 layers: every 6th is full_attention, last forced to full
+        let mut types: Vec<String> = (0..35)
+            .map(|i| {
+                if (i + 1) % 6 == 0 {
+                    "full_attention".to_string()
+                } else {
+                    "sliding_attention".to_string()
+                }
+            })
+            .collect();
+        *types.last_mut().unwrap() = "full_attention".to_string();
+
+        // Indices 5,11,17,23,29 are full (every 6th)
+        // Index 34 (last) is also full (forced)
+        assert_eq!(types[5], "full_attention");
+        assert_eq!(types[11], "full_attention");
+        assert_eq!(types[34], "full_attention");
+        assert_eq!(types[0], "sliding_attention");
+        assert_eq!(types[33], "sliding_attention");
+
+        let full_count = types.iter().filter(|t| *t == "full_attention").count();
+        assert_eq!(full_count, 6); // 5 periodic + 1 forced last
+    }
+}

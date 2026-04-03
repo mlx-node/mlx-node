@@ -1007,6 +1007,14 @@ impl Qwen3Tokenizer {
         })
     }
 
+    /// Returns true if the tokenizer has a chat template loaded.
+    ///
+    /// Used by models (e.g. Gemma4) to decide whether to use the template or
+    /// fall back to a model-specific manual prompt format.
+    pub(crate) fn has_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
     /// Encode text synchronously (for internal use by generate())
     pub(crate) fn encode_sync(
         &self,

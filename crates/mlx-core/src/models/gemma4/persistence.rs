@@ -43,7 +43,11 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
     };
 
     // Parse layer_types array from text_config
-    let layer_types = parse_layer_types(&raw, text_cfg);
+    let layer_types = parse_layer_types(
+        &raw,
+        text_cfg,
+        get_config_i32(&raw, text_cfg, &["num_hidden_layers"], 35),
+    );
 
     // Parse RoPE parameters from nested `rope_parameters` structure.
     // Structure: text_config.rope_parameters.full_attention.{rope_theta, partial_rotary_factor}
@@ -136,18 +140,38 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
 
 /// Parse `layer_types` array from config.
 /// Returns a Vec of "sliding_attention" or "full_attention" strings.
-fn parse_layer_types(raw: &Value, text_cfg: Option<&Value>) -> Vec<String> {
+///
+/// If `layer_types` is absent or empty, synthesizes the HuggingFace default pattern:
+/// every 6th layer (1-indexed) is "full_attention", and the last layer is always forced
+/// to "full_attention". This matches `transformers/models/gemma4/configuration_gemma4.py:181-188`.
+fn parse_layer_types(raw: &Value, text_cfg: Option<&Value>, num_layers: i32) -> Vec<String> {
     let arr = text_cfg
         .and_then(|tc| tc.get("layer_types"))
         .or_else(|| raw.get("layer_types"));
     if let Some(Value::Array(items)) = arr {
-        items
+        let types: Vec<String> = items
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
-            .collect()
-    } else {
-        Vec::new()
+            .collect();
+        if !types.is_empty() {
+            return types;
+        }
     }
+    // Synthesize HF default: every 6th layer is full_attention, last layer forced to full.
+    // Matches transformers/models/gemma4/configuration_gemma4.py:181-188
+    let mut types: Vec<String> = (0..num_layers as usize)
+        .map(|i| {
+            if (i + 1) % 6 == 0 {
+                "full_attention".to_string()
+            } else {
+                "sliding_attention".to_string()
+            }
+        })
+        .collect();
+    if let Some(last) = types.last_mut() {
+        *last = "full_attention".to_string();
+    }
+    types
 }
 
 /// Parse nested RoPE parameters from `rope_parameters` object.

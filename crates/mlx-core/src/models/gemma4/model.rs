@@ -186,25 +186,30 @@ impl Gemma4Model {
         let eos_ids = model_config.eos_token_ids.clone();
 
         tokio::task::spawn_blocking(move || {
-            // Construct Gemma 4 chat format manually:
-            //   <bos><|turn>user\n{content}<turn|>\n<|turn>model\n
-            // No Jinja2 template needed — Gemma 4 tokenizer doesn't include one.
-            // Note: Gemma4 uses "model" (not "assistant") for the model's role.
-            // Map "assistant" → "model" so multi-turn chats produce correct tokens.
-            let mut prompt_text = String::new();
-            for msg in &messages {
-                let role = match msg.role.as_str() {
-                    "assistant" => "model",
-                    other => other,
-                };
-                let content = &msg.content;
-                prompt_text.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, content));
-            }
-            // Add generation prompt for the model's response
-            prompt_text.push_str("<|turn>model\n");
-
-            // Encode with BOS token
-            let tokens = tokenizer.encode_sync(&prompt_text, Some(true))?;
+            // Try the tokenizer's chat template if available (handles role mapping,
+            // special tokens, and variant-specific formatting automatically).
+            // Fall back to manual Gemma4 format if no template was loaded.
+            let tokens = if tokenizer.has_chat_template() {
+                tokenizer.apply_chat_template_sync(
+                    &messages,
+                    Some(true),  // add_generation_prompt
+                    None,        // no tools
+                    Some(false), // no thinking
+                )?
+            } else {
+                // Manual Gemma4 format: <|turn>role\ncontent<turn|>\n
+                // Gemma4 uses "model" (not "assistant") for the model's role.
+                let mut prompt_text = String::new();
+                for msg in &messages {
+                    let role = match msg.role.as_str() {
+                        "assistant" => "model",
+                        other => other,
+                    };
+                    prompt_text.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, &msg.content));
+                }
+                prompt_text.push_str("<|turn>model\n");
+                tokenizer.encode_sync(&prompt_text, Some(true))?
+            };
 
             // Create prompt tensor
             let token_arr: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
@@ -589,6 +594,31 @@ fn create_sliding_mask(seq_len: i64, offset: i32, window_size: i64) -> Result<Mx
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_gemma4_chat_manual_fallback_format() {
+        // When no chat template exists, manual format maps roles correctly
+        let messages = vec![
+            ("system", "You are helpful."),
+            ("user", "Hi"),
+            ("assistant", "Hello!"),
+            ("user", "Bye"),
+        ];
+        let mut prompt = String::new();
+        for (role, content) in &messages {
+            let mapped = match *role {
+                "assistant" => "model",
+                other => other,
+            };
+            prompt.push_str(&format!("<|turn>{}\n{}<turn|>\n", mapped, content));
+        }
+        prompt.push_str("<|turn>model\n");
+
+        assert!(prompt.contains("<|turn>system\nYou are helpful.<turn|>"));
+        assert!(prompt.contains("<|turn>model\nHello!<turn|>"));
+        assert!(!prompt.contains("<|turn>assistant"));
+        assert!(prompt.ends_with("<|turn>model\n"));
+    }
 
     #[test]
     fn test_gemma4_chat_role_mapping() {
