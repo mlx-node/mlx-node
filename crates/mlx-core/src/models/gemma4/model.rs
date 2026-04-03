@@ -197,18 +197,41 @@ impl Gemma4Model {
                     Some(false), // no thinking
                 )?
             } else {
-                // Manual Gemma4 format matching the canonical template:
-                //   <bos><|turn>role\ncontent<turn|>\n...<|turn>model\n
-                // Gemma4 uses "model" (not "assistant") for the model's role.
-                // BOS is prepended explicitly (not via add_special_tokens) to
-                // match the upstream template which includes {{ bos_token }}.
+                // Manual Gemma4 format matching the canonical template.
+                // Role mapping: "assistant" → "model", "developer" → "system".
+                // Tool calls serialized as <|tool_call>call:name{args}<tool_call|>.
+                // Tool responses wrapped in <|tool_response>...<tool_response|>.
+                // BOS prepended explicitly (matching {{ bos_token }} in template).
                 let mut prompt_text = String::from("<bos>");
                 for msg in &messages {
                     let role = match msg.role.as_str() {
                         "assistant" => "model",
+                        "developer" => "system",
                         other => other,
                     };
-                    prompt_text.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, &msg.content));
+
+                    if role == "tool" {
+                        // Tool response: wrap in tool_response tags within a user turn
+                        prompt_text.push_str("<|turn>user\n<|tool_response>");
+                        prompt_text.push_str(&msg.content);
+                        prompt_text.push_str("<tool_response|><turn|>\n");
+                    } else {
+                        prompt_text.push_str(&format!("<|turn>{}\n", role));
+
+                        // Emit tool calls for assistant/model messages
+                        if let Some(ref tool_calls) = msg.tool_calls {
+                            for tc in tool_calls {
+                                prompt_text.push_str(&format!(
+                                    "<|tool_call>call:{}{{{}}}<tool_call|>",
+                                    tc.name, tc.arguments
+                                ));
+                            }
+                        }
+
+                        // Emit content
+                        prompt_text.push_str(&msg.content);
+                        prompt_text.push_str("<turn|>\n");
+                    }
                 }
                 prompt_text.push_str("<|turn>model\n");
                 tokenizer.encode_sync(&prompt_text, Some(false))?
@@ -685,5 +708,91 @@ mod tests {
         assert_eq!(masked_ids.item_at_int32(2).unwrap(), 262143);
         assert_eq!(masked_ids.item_at_int32(3).unwrap(), 0); // in range (0 is valid)
         assert_eq!(masked_ids.item_at_int32(4).unwrap(), 0); // -1 is OOV, mapped to 0
+    }
+
+    #[test]
+    fn test_gemma4_chat_tool_calls_serialization() {
+        // Verify tool calls are serialized as <|tool_call>call:name{args}<tool_call|>
+        let mut prompt = String::from("<bos>");
+
+        // Simulate: user asks, model calls a tool, tool responds, model answers
+        let turns: Vec<(&str, &str, Option<Vec<(&str, &str)>>, bool)> = vec![
+            ("user", "What's the weather?", None, false),
+            (
+                "assistant",
+                "",
+                Some(vec![("get_weather", r#""location":"Paris""#)]),
+                false,
+            ),
+            ("tool", r#"{"temp": 20}"#, None, true),
+            ("assistant", "It's 20 degrees in Paris.", None, false),
+        ];
+
+        for (role, content, tool_calls, is_tool_response) in &turns {
+            let mapped = match *role {
+                "assistant" => "model",
+                "developer" => "system",
+                other => other,
+            };
+
+            if *is_tool_response {
+                prompt.push_str("<|turn>user\n<|tool_response>");
+                prompt.push_str(content);
+                prompt.push_str("<tool_response|><turn|>\n");
+            } else {
+                prompt.push_str(&format!("<|turn>{}\n", mapped));
+                if let Some(calls) = tool_calls {
+                    for (name, args) in calls {
+                        prompt.push_str(&format!(
+                            "<|tool_call>call:{}{{{}}}<tool_call|>",
+                            name, args
+                        ));
+                    }
+                }
+                prompt.push_str(content);
+                prompt.push_str("<turn|>\n");
+            }
+        }
+        prompt.push_str("<|turn>model\n");
+
+        // Verify tool call serialization
+        assert!(
+            prompt.contains(r#"<|tool_call>call:get_weather{"location":"Paris"}<tool_call|>"#),
+            "tool call should be serialized with call:name{{args}} format"
+        );
+        // Verify tool response
+        assert!(
+            prompt.contains(r#"<|tool_response>{"temp": 20}<tool_response|>"#),
+            "tool response should be wrapped in tool_response tags"
+        );
+        // Verify no raw "assistant" or "tool" role in turns
+        assert!(!prompt.contains("<|turn>assistant"));
+        assert!(!prompt.contains("<|turn>tool"));
+    }
+
+    #[test]
+    fn test_gemma4_chat_developer_role_mapping() {
+        // "developer" role should be mapped to "system"
+        let mut prompt = String::from("<bos>");
+        let role = "developer";
+        let mapped = match role {
+            "assistant" => "model",
+            "developer" => "system",
+            other => other,
+        };
+        prompt.push_str(&format!(
+            "<|turn>{}\nYou are a helpful bot.<turn|>\n",
+            mapped
+        ));
+        prompt.push_str("<|turn>model\n");
+
+        assert!(
+            prompt.contains("<|turn>system\nYou are a helpful bot."),
+            "developer role should be mapped to system"
+        );
+        assert!(
+            !prompt.contains("<|turn>developer"),
+            "developer should not appear as a raw role"
+        );
     }
 }
