@@ -355,13 +355,18 @@ fn forward_inner(
         let ple_dim = ple.ple_dim as i64;
         let num_layers = ple.num_layers as i64;
 
-        // Clamp token IDs to PLE vocab range (may be smaller than main vocab)
-        let max_valid = MxArray::scalar_int(ple.vocab_size_per_layer_input - 1)?;
+        // Mask OOV token IDs to 0 for PLE embedding (matches vLLM behavior).
+        // IDs outside [0, vocab_size_per_layer_input) are mapped to index 0
+        // (a neutral fallback), rather than clamped to the last valid index.
+        let ple_vocab = MxArray::scalar_int(ple.vocab_size_per_layer_input)?;
         let zero = MxArray::scalar_int(0)?;
-        let clamped_ids = input_ids.maximum(&zero)?.minimum(&max_valid)?;
+        let valid_mask = input_ids
+            .greater_equal(&zero)?
+            .logical_and(&input_ids.less(&ple_vocab)?)?;
+        let masked_ids = valid_mask.where_(input_ids, &zero)?;
 
         // per_layer_embeds: [B, T, num_layers * ple_dim]
-        let per_layer_embeds = ple.embed_tokens_per_layer.forward(&clamped_ids)?;
+        let per_layer_embeds = ple.embed_tokens_per_layer.forward(&masked_ids)?;
         // HF's Gemma4TextScaledWordEmbedding scales by sqrt(ple_dim)
         let embed_scale = MxArray::scalar_float((ple.ple_dim as f64).sqrt())?;
         let embed_scale = embed_scale.astype(per_layer_embeds.dtype()?)?;
@@ -503,7 +508,7 @@ fn forward_inner(
 
             if has_kv_sharing
                 && config.should_store_shared_kv(i)
-                && let Some((keys, values)) = caches[i].get_cached_kv()
+                && let Some((keys, values)) = caches[i].take_stashed_kv()
             {
                 shared_kv.insert(i, (keys, values));
             }
@@ -574,4 +579,34 @@ fn create_sliding_mask(seq_len: i64, offset: i32, window_size: i64) -> Result<Mx
     let zero_f = MxArray::full(&[1], Either::A(0.0), Some(crate::array::DType::Float32))?;
     let mask = valid.where_(&zero_f, &neg_inf)?;
     mask.reshape(&[1, 1, seq_len, total_len])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ple_oov_masking() {
+        // Simulate token IDs where some exceed PLE vocab or are negative
+        let input_ids = MxArray::from_int32(&[5, 100, 262143, 0, -1], &[1, 5]).unwrap();
+        let ple_vocab = 262144i32; // PLE vocab size
+
+        let ple_vocab_arr = MxArray::scalar_int(ple_vocab).unwrap();
+        let zero = MxArray::scalar_int(0).unwrap();
+        let valid_mask = input_ids
+            .greater_equal(&zero)
+            .unwrap()
+            .logical_and(&input_ids.less(&ple_vocab_arr).unwrap())
+            .unwrap();
+        let masked_ids = valid_mask.where_(&input_ids, &zero).unwrap();
+
+        masked_ids.eval();
+        // IDs within range: unchanged. IDs out of range (negative): mapped to 0.
+        assert_eq!(masked_ids.item_at_int32(0).unwrap(), 5); // in range
+        assert_eq!(masked_ids.item_at_int32(1).unwrap(), 100); // in range
+        // 262143 < 262144, so it's valid
+        assert_eq!(masked_ids.item_at_int32(2).unwrap(), 262143);
+        assert_eq!(masked_ids.item_at_int32(3).unwrap(), 0); // in range (0 is valid)
+        assert_eq!(masked_ids.item_at_int32(4).unwrap(), 0); // -1 is OOV, mapped to 0
+    }
 }

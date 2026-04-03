@@ -298,15 +298,9 @@ impl Gemma4Attention {
         let queries = self.rope.forward(&queries, offset)?;
         let keys = self.rope.forward(&keys, offset)?;
 
-        // Update cache and get full K/V sequence
+        // Update cache, get full K/V sequence, and stash for KV sharing
         let (keys, values) = if let Some(c) = cache {
-            match c {
-                Gemma4LayerCache::Global(kvc) => kvc.update_and_fetch(&keys, &values)?,
-                Gemma4LayerCache::Sliding(rkvc) => {
-                    let kv = rkvc.update_and_fetch(&keys, &values)?;
-                    (kv[0].clone(), kv[1].clone())
-                }
-            }
+            c.update_and_fetch_stash(&keys, &values)?
         } else {
             (keys, values)
         };
