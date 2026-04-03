@@ -231,6 +231,54 @@ fn parse_eos_token_ids(value: &Value) -> Vec<i32> {
     }
 }
 
+/// Validate that critical weights are present after sanitization.
+///
+/// Checks embed_tokens, final norm, and per-layer attention + MLP weights.
+/// Allows for quantized variants (`.scales` suffix instead of `.weight`).
+fn validate_required_weights(
+    params: &HashMap<String, MxArray>,
+    config: &Gemma4Config,
+) -> Result<()> {
+    let has = |key: &str| -> bool {
+        params.contains_key(key)
+            || key
+                .strip_suffix(".weight")
+                .map(|prefix| params.contains_key(&format!("{}.scales", prefix)))
+                .unwrap_or(false)
+    };
+
+    // Model-level weights
+    if !has("embed_tokens.weight") {
+        return Err(Error::from_reason(
+            "Missing required weight: embed_tokens.weight",
+        ));
+    }
+    if !has("norm.weight") {
+        return Err(Error::from_reason("Missing required weight: norm.weight"));
+    }
+
+    // Per-layer required weights
+    for i in 0..config.num_hidden_layers as usize {
+        let prefix = format!("layers.{}", i);
+        let layer_keys = [
+            format!("{}.self_attn.q_proj.weight", prefix),
+            format!("{}.self_attn.k_proj.weight", prefix),
+            format!("{}.input_layernorm.weight", prefix),
+            format!("{}.mlp.gate_proj.weight", prefix),
+        ];
+        for key in &layer_keys {
+            if !has(key) {
+                return Err(Error::from_reason(format!(
+                    "Missing required weight: {}",
+                    key
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Sanitize HuggingFace weight keys to internal format.
 ///
 /// Handles:
@@ -544,7 +592,34 @@ impl Gemma4Model {
             let path = Path::new(&model_path);
 
             // Parse config
-            let config = parse_config(path)?;
+            let mut config = parse_config(path)?;
+
+            // Merge stop tokens from generation_config.json (e.g. <turn|> = 106)
+            let gen_config_path = path.join("generation_config.json");
+            if let Ok(gen_str) = fs::read_to_string(&gen_config_path)
+                && let Ok(gen_val) = serde_json::from_str::<Value>(&gen_str)
+                && let Some(eos) = gen_val.get("eos_token_id")
+            {
+                let mut ids: std::collections::HashSet<i32> =
+                    config.eos_token_ids.iter().copied().collect();
+                match eos {
+                    Value::Array(arr) => {
+                        for v in arr {
+                            if let Some(i) = v.as_i64() {
+                                ids.insert(i as i32);
+                            }
+                        }
+                    }
+                    Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            ids.insert(i as i32);
+                        }
+                    }
+                    _ => {}
+                }
+                config.eos_token_ids = ids.into_iter().collect();
+                config.eos_token_ids.sort();
+            }
             let num_global = config
                 .layer_types
                 .iter()
@@ -592,6 +667,9 @@ impl Gemma4Model {
             // Sanitize weights
             let params = sanitize_weights(&mut params, &config)?;
             info!("Sanitized to {} tensors", params.len());
+
+            // Validate required weights are present
+            validate_required_weights(&params, &config)?;
 
             // Create model
             let mut model = Gemma4Model::new(config.clone())?;

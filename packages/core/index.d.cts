@@ -2486,6 +2486,11 @@ export interface Gemma4ChatConfig {
   topK?: number;
   topP?: number;
   minP?: number;
+  /**
+   * Enable thinking mode. `None` = let the template decide,
+   * `Some(false)` = disabled, `Some(true)` = enabled.
+   */
+  enableThinking?: boolean;
 }
 
 /** Gemma4 chat result. */

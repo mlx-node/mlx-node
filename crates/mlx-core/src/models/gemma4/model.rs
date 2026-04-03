@@ -67,6 +67,9 @@ pub struct Gemma4ChatConfig {
     pub top_k: Option<i32>,
     pub top_p: Option<f64>,
     pub min_p: Option<f64>,
+    /// Enable thinking mode. `None` = let the template decide,
+    /// `Some(false)` = disabled, `Some(true)` = enabled.
+    pub enable_thinking: Option<bool>,
 }
 
 /// Gemma4 chat result.
@@ -209,6 +212,7 @@ impl Gemma4Model {
             top_k: None,
             top_p: None,
             min_p: None,
+            enable_thinking: None,
         });
 
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
@@ -227,6 +231,7 @@ impl Gemma4Model {
         let model_config = self.config.clone();
 
         let sampling_config = make_sampling_config(&config);
+        let enable_thinking = config.enable_thinking;
         let eos_ids = model_config.eos_token_ids.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -236,9 +241,9 @@ impl Gemma4Model {
             let tokens = if tokenizer.has_chat_template() {
                 tokenizer.apply_chat_template_sync(
                     &messages,
-                    Some(true),  // add_generation_prompt
-                    None,        // no tools
-                    Some(false), // no thinking
+                    Some(true),      // add_generation_prompt
+                    None,            // no tools
+                    enable_thinking, // None = template default
                 )?
             } else {
                 // Manual Gemma4 format matching the canonical template.
