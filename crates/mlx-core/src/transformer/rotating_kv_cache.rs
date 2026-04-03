@@ -94,10 +94,39 @@ impl RotatingKVCache {
 
         if self.keys.is_none() {
             let zero_scalar = MxArray::full(&[1], Either::A(0.0), None)?;
-            self.keys = Some(keys.add(&zero_scalar)?);
-            self.values = Some(values.add(&zero_scalar)?);
-            self.offset = seq_len;
-            self.idx = seq_len;
+
+            // If initial sequence exceeds max_size, trim to keep only the tail
+            // (plus the first `keep` tokens if set). This prevents O(prompt_len)
+            // memory for sliding-window layers on long prefills.
+            let (stored_keys, stored_values, stored_idx) = if seq_len > self.max_size {
+                if self.keep > 0 {
+                    // Preserve first `keep` tokens + last `max_size - keep` tokens.
+                    let kept_keys = keys.slice_axis(2, 0, self.keep as i64)?;
+                    let kept_values = values.slice_axis(2, 0, self.keep as i64)?;
+                    let tail_len = self.max_size - self.keep;
+                    let tail_start = (seq_len - tail_len) as i64;
+                    let tail_keys = keys.slice_axis(2, tail_start, seq_len as i64)?;
+                    let tail_values = values.slice_axis(2, tail_start, seq_len as i64)?;
+                    let trimmed_keys = MxArray::concatenate(&kept_keys, &tail_keys, 2)?;
+                    let trimmed_values = MxArray::concatenate(&kept_values, &tail_values, 2)?;
+                    (trimmed_keys, trimmed_values, self.max_size)
+                } else {
+                    let start = (seq_len - self.max_size) as i64;
+                    let trimmed_keys = keys.slice_axis(2, start, seq_len as i64)?;
+                    let trimmed_values = values.slice_axis(2, start, seq_len as i64)?;
+                    (trimmed_keys, trimmed_values, self.max_size)
+                }
+            } else {
+                (keys.add(&zero_scalar)?, values.add(&zero_scalar)?, seq_len)
+            };
+
+            self.keys = Some(stored_keys.add(&zero_scalar)?);
+            self.values = Some(stored_values.add(&zero_scalar)?);
+            self.offset = seq_len; // offset tracks TOTAL tokens seen, not stored
+            self.idx = stored_idx;
+
+            // Return the FULL (untrimmed) keys/values for prefill attention.
+            // The caller needs to attend over the complete sequence during prefill.
             return Ok(vec![keys.add(&zero_scalar)?, values.add(&zero_scalar)?]);
         }
 
@@ -273,6 +302,24 @@ impl RotatingKVCache {
     /// Returns the current write index.
     pub fn get_idx(&self) -> i32 {
         self.idx
+    }
+
+    /// Get the current cached K/V in temporal order.
+    ///
+    /// Returns the valid portion of the cache rearranged into temporal order.
+    /// This is useful for KV cache sharing where another layer needs to read
+    /// this cache's contents without modifying it.
+    ///
+    /// Returns None if the cache is empty.
+    pub fn fetch_current_kv(&self) -> Option<(MxArray, MxArray)> {
+        if self.offset == 0 {
+            return None;
+        }
+        let keys = self.keys.as_ref()?;
+        let values = self.values.as_ref()?;
+        let ordered_keys = self.temporal_order(keys).ok()?;
+        let ordered_values = self.temporal_order(values).ok()?;
+        Some((ordered_keys, ordered_values))
     }
 }
 

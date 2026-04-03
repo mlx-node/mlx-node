@@ -7,12 +7,12 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { HarrierModel, Qwen3Model, QianfanOCRModel } from '@mlx-node/core';
+import { Gemma4Model, HarrierModel, Qwen3Model, QianfanOCRModel } from '@mlx-node/core';
 
 import type { LoadableModel, TrainableModel } from '../interfaces.js';
 import { Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
-export type ModelType = 'qwen3' | 'qwen3_5' | 'qwen3_5_moe' | 'internvl_chat' | 'qianfan-ocr' | 'harrier';
+export type ModelType = 'qwen3' | 'qwen3_5' | 'qwen3_5_moe' | 'internvl_chat' | 'qianfan-ocr' | 'harrier' | 'gemma4';
 
 const SUPPORTED_MODEL_TYPES = new Set<ModelType>([
   'qwen3',
@@ -21,6 +21,7 @@ const SUPPORTED_MODEL_TYPES = new Set<ModelType>([
   'internvl_chat',
   'qianfan-ocr',
   'harrier',
+  'gemma4',
 ]);
 
 /**
@@ -44,6 +45,8 @@ export async function loadModel(modelPath: string): Promise<LoadableModel> {
     case 'internvl_chat':
     case 'qianfan-ocr':
       return QianfanOCRModel.load(modelPath) as unknown as Promise<LoadableModel>;
+    case 'gemma4':
+      return Gemma4Model.load(modelPath) as unknown as Promise<LoadableModel>;
   }
 }
 
@@ -51,7 +54,10 @@ export async function detectModelType(modelPath: string): Promise<ModelType> {
   try {
     const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
     const config = JSON.parse(raw);
-    let modelType: ModelType = config.model_type ?? 'qwen3';
+    const rawModelType: string = config.model_type ?? 'qwen3';
+
+    // Normalize model_type: gemma4_text → gemma4
+    let modelType: ModelType = (rawModelType === 'gemma4_text' ? 'gemma4' : rawModelType) as ModelType;
 
     // Detect embedding models: Qwen3 backbone with base architecture (no ForCausalLM)
     if (modelType === 'qwen3') {

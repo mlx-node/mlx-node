@@ -103,6 +103,22 @@ export declare class DocUnwarpModel {
   unwarp(imageData: Uint8Array): UnwarpResult;
 }
 
+/**
+ * Gemma 4 dense language model.
+ *
+ * Supports E2B (2.3B), E4B (4.5B), and 31B variants.
+ * Features: hybrid attention (sliding + global), GeGLU MLP, logit softcapping,
+ * embedding scaling, and optional per-layer embeddings.
+ */
+export declare class Gemma4Model {
+  constructor(config: Gemma4Config);
+  modelId(): number;
+  /** Load a Gemma4 model from a directory. */
+  static load(modelPath: string): Promise<Gemma4Model>;
+  /** Chat with the model using a list of messages. */
+  chat(messages: Array<ChatMessage>, config?: Gemma4ChatConfig | undefined | null): Promise<Gemma4ChatResult>;
+}
+
 /** Result from text generation with detailed metadata */
 export declare class GenerationResult {
   /** Get the decoded text */
@@ -474,6 +490,8 @@ export declare class MxArray {
   sinh(): MxArray;
   cosh(): MxArray;
   tanh(): MxArray;
+  /** Error function: erf(x) = (2/sqrt(pi)) * integral(0..x, exp(-t^2) dt) */
+  erf(): MxArray;
   floor(): MxArray;
   ceil(): MxArray;
   round(): MxArray;
@@ -2117,6 +2135,14 @@ export interface ChatConfig {
   ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
   /**
+   * Reasoning effort level. Controls whether the model thinks before answering.
+   * - "none" / "low": thinking disabled (template injects closed think block).
+   *   "none" also sets includeReasoning to false by default.
+   * - "medium" / "high": thinking enabled (default behavior).
+   * - Not set: thinking enabled (model thinks naturally).
+   */
+  reasoningEffort?: string | undefined;
+  /**
    * Maximum number of thinking tokens before forcing </think>.
    * When the model has generated this many tokens while in thinking mode,
    * the next token is forced to be the think_end token. None = unlimited.
@@ -2124,16 +2150,10 @@ export interface ChatConfig {
   thinkingTokenBudget?: number | undefined;
   /**
    * Whether to include reasoning/thinking content in the output.
-   * When false, the `thinking` field of ChatResult/ChatStreamChunk will always be null.
-   * Default: true (reasoning is included).
+   * When false, the `thinking` field of ChatResult/ChatStreamChunk will always be None.
+   * Default: true (false when reasoningEffort is "none").
    */
   includeReasoning?: boolean | undefined;
-  /**
-   * Reasoning effort level. Controls whether the model thinks before answering:
-   * "low"/"none" → thinking disabled, "medium"/"high" → thinking enabled.
-   * Not set → thinking enabled (model thinks naturally).
-   */
-  reasoningEffort?: string | undefined;
   /** When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result */
   reportPerformance?: boolean | undefined;
   /**
@@ -2202,7 +2222,7 @@ export interface ChatStreamChunk {
    * true = reasoning (inside <think>...</think>), false = content (after </think>).
    * Only present on intermediate (non-final) chunks.
    */
-  isReasoning?: boolean;
+  isReasoning?: boolean | undefined;
 }
 
 /** Result from classify_and_rotate: orientation info + corrected image bytes. */
@@ -2457,6 +2477,72 @@ export interface FunctionParameters {
   properties?: string;
   /** List of required parameter names */
   required?: Array<string>;
+}
+
+/** Gemma4 generation configuration. */
+export interface Gemma4ChatConfig {
+  maxNewTokens?: number;
+  temperature?: number;
+  topK?: number;
+  topP?: number;
+  minP?: number;
+}
+
+/** Gemma4 chat result. */
+export interface Gemma4ChatResult {
+  text: string;
+  numTokens: number;
+  finishReason: string;
+}
+
+/**
+ * Gemma 4 model configuration (dense variant).
+ *
+ * Supports E2B (2.3B), E4B (4.5B), and 31B dense models.
+ * For MoE models (26B-A4B), use `Gemma4MoeConfig` from `gemma4_moe`.
+ */
+export interface Gemma4Config {
+  vocabSize: number;
+  hiddenSize: number;
+  numHiddenLayers: number;
+  numAttentionHeads: number;
+  numKeyValueHeads: number;
+  headDim: number;
+  intermediateSize: number;
+  rmsNormEps: number;
+  tieWordEmbeddings: boolean;
+  maxPositionEmbeddings: number;
+  slidingWindow: number;
+  /**
+   * Explicit per-layer attention type: "sliding_attention" or "full_attention".
+   * Parsed from `text_config.layer_types` in the HuggingFace config.
+   */
+  layerTypes: Array<string>;
+  /** RoPE theta for global (full) attention layers. */
+  ropeTheta: number;
+  /** RoPE theta for sliding (local) attention layers. */
+  ropeLocalBaseFreq: number;
+  /** Fraction of head_dim to rotate for global attention (0.25 = 25%). */
+  partialRotaryFactor: number;
+  /** KV heads for global layers. If None, uses num_key_value_heads. */
+  globalNumKeyValueHeads?: number;
+  /** Head dimension for global layers. If None, uses head_dim. */
+  globalHeadDim?: number;
+  attentionKEqV: boolean;
+  finalLogitSoftcapping?: number;
+  perLayerInputEmbeds: boolean;
+  hiddenSizePerLayerInput?: number;
+  vocabSizePerLayerInput?: number;
+  padTokenId: number;
+  eosTokenIds: Array<number>;
+  bosTokenId: number;
+  attentionBias: boolean;
+  useDoubleWideMlp: boolean;
+  numKvSharedLayers?: number;
+  enableMoeBlock: boolean;
+  numExperts?: number;
+  topKExperts?: number;
+  moeIntermediateSize?: number;
 }
 
 /** Result from generate_batch_for_training with all data needed for training */

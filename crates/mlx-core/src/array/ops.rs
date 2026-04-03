@@ -217,6 +217,13 @@ impl MxArray {
         MxArray::from_handle(handle, "tanh")
     }
 
+    /// Error function: erf(x) = (2/sqrt(pi)) * integral(0..x, exp(-t^2) dt)
+    #[napi]
+    pub fn erf(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_erf(self.handle.0) };
+        MxArray::from_handle(handle, "erf")
+    }
+
     // Rounding operations
 
     #[napi]

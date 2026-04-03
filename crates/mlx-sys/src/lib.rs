@@ -544,6 +544,7 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_sinh(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_cosh(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_tanh(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_erf(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_floor(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_ceil(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_round(handle: *mut mlx_array) -> *mut mlx_array;

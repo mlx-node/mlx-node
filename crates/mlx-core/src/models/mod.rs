@@ -3,6 +3,7 @@
  *
  * Contains all model implementations.
  */
+pub mod gemma4;
 pub mod harrier;
 pub mod paddleocr_vl;
 pub mod pp_doc_ori;

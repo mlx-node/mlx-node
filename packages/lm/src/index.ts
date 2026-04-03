@@ -16,6 +16,10 @@
 // Model classes (for inference)
 export { Qwen3Model, Qwen3Tokenizer } from '@mlx-node/core';
 
+// Gemma4 models
+export { Gemma4Model } from '@mlx-node/core';
+export type { Gemma4Config, Gemma4ChatConfig, Gemma4ChatResult } from '@mlx-node/core';
+
 // Embedding models
 export { HarrierModel } from '@mlx-node/core';
 export type { HarrierConfig } from '@mlx-node/core';

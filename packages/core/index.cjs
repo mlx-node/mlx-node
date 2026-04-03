@@ -741,6 +741,7 @@ module.exports.DocLayoutModel = nativeBinding.DocLayoutModel;
 module.exports.PPDocLayoutV3Model = nativeBinding.PPDocLayoutV3Model;
 module.exports.DocOrientationModel = nativeBinding.DocOrientationModel;
 module.exports.DocUnwarpModel = nativeBinding.DocUnwarpModel;
+module.exports.Gemma4Model = nativeBinding.Gemma4Model;
 module.exports.GenerationResult = nativeBinding.GenerationResult;
 module.exports.GrpoTrainingEngine = nativeBinding.GrpoTrainingEngine;
 module.exports.GRPOTrainingEngine = nativeBinding.GRPOTrainingEngine;

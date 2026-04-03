@@ -1,4 +1,4 @@
-import type { HarrierModel, Qwen3Model, Qwen35Model, Qwen35MoeModel, QianfanOCRModel } from '@mlx-node/core';
+import type { Gemma4Model, HarrierModel, Qwen3Model, Qwen35Model, Qwen35MoeModel, QianfanOCRModel } from '@mlx-node/core';
 
 /**
  * Union of all model classes that can be used with training engines.
@@ -17,4 +17,4 @@ export type EmbeddingModel = HarrierModel;
  * Union of all model classes that loadModel can return.
  * Includes trainable models, inference-only models, and embedding models.
  */
-export type LoadableModel = TrainableModel | QianfanOCRModel | EmbeddingModel;
+export type LoadableModel = TrainableModel | QianfanOCRModel | EmbeddingModel | Gemma4Model;

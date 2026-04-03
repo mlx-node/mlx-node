@@ -696,6 +696,12 @@ mlx_array* mlx_array_tanh(mlx_array* handle) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
+mlx_array* mlx_array_erf(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  array result = mlx::core::erf(*arr);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
 mlx_array* mlx_array_floor(mlx_array* handle) {
   auto arr = reinterpret_cast<array*>(handle);
   array result = mlx::core::floor(*arr);

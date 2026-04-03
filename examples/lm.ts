@@ -14,7 +14,7 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { HarrierModel, QianfanOCRModel } from '@mlx-node/core';
+import { Gemma4Model, HarrierModel, QianfanOCRModel } from '@mlx-node/core';
 import type { ChatResult } from '@mlx-node/lm';
 import { loadModel, Qwen3Model } from '@mlx-node/lm';
 
@@ -37,6 +37,10 @@ if (imagePath) console.log(`Image: ${imagePath}`);
 const loadedModel = await loadModel(MODEL_PATH);
 if (loadedModel instanceof HarrierModel) {
   console.error('This example is for generative models, not embedding models.');
+  process.exit(1);
+}
+if (loadedModel instanceof Gemma4Model) {
+  console.error('Use examples/gemma4.ts for Gemma4 models.');
   process.exit(1);
 }
 const model = loadedModel;

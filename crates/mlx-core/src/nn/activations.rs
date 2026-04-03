@@ -67,8 +67,11 @@ impl Activations {
         input.mul(&sigmoid)
     }
 
-    /// Gaussian Error Linear Unit (GELU)
+    /// Gaussian Error Linear Unit (GELU) — tanh approximation.
     /// Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    ///
+    /// This matches PyTorch's `F.gelu(x, approximate="tanh")` and HuggingFace's
+    /// `gelu_pytorch_tanh`. Used by Gemma4 dense MLP and most vision models.
     pub fn gelu(input: &MxArray) -> Result<MxArray> {
         let handle = unsafe {
             // Constants
@@ -119,6 +122,46 @@ impl Activations {
             result
         };
         MxArray::from_handle(handle, "gelu")
+    }
+
+    /// Gaussian Error Linear Unit — exact (non-approximate) variant.
+    /// GELU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+    ///
+    /// This matches PyTorch's `F.gelu(x, approximate="none")`.
+    /// Used by Gemma4 MoE experts (vLLM's `activation="gelu"` defaults to exact).
+    pub fn gelu_exact(input: &MxArray) -> Result<MxArray> {
+        let handle = unsafe {
+            let half = sys::mlx_array_scalar_float(0.5);
+            let one = sys::mlx_array_scalar_float(1.0);
+            let inv_sqrt2 = sys::mlx_array_scalar_float(std::f64::consts::FRAC_1_SQRT_2);
+
+            // x / sqrt(2)
+            let x_scaled = sys::mlx_array_mul(input.handle.0, inv_sqrt2);
+
+            // erf(x / sqrt(2))
+            let erf_result = sys::mlx_array_erf(x_scaled);
+
+            // 1 + erf(x / sqrt(2))
+            let one_plus_erf = sys::mlx_array_add(one, erf_result);
+
+            // x * (1 + erf(x / sqrt(2)))
+            let x_times_bracket = sys::mlx_array_mul(input.handle.0, one_plus_erf);
+
+            // 0.5 * x * (1 + erf(x / sqrt(2)))
+            let result = sys::mlx_array_mul(half, x_times_bracket);
+
+            // Clean up
+            sys::mlx_array_delete(half);
+            sys::mlx_array_delete(one);
+            sys::mlx_array_delete(inv_sqrt2);
+            sys::mlx_array_delete(x_scaled);
+            sys::mlx_array_delete(erf_result);
+            sys::mlx_array_delete(one_plus_erf);
+            sys::mlx_array_delete(x_times_bracket);
+
+            result
+        };
+        MxArray::from_handle(handle, "gelu_exact")
     }
 
     /// ReLU: max(0, x)
