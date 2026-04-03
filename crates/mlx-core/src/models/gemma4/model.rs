@@ -197,9 +197,12 @@ impl Gemma4Model {
                     Some(false), // no thinking
                 )?
             } else {
-                // Manual Gemma4 format: <|turn>role\ncontent<turn|>\n
+                // Manual Gemma4 format matching the canonical template:
+                //   <bos><|turn>role\ncontent<turn|>\n...<|turn>model\n
                 // Gemma4 uses "model" (not "assistant") for the model's role.
-                let mut prompt_text = String::new();
+                // BOS is prepended explicitly (not via add_special_tokens) to
+                // match the upstream template which includes {{ bos_token }}.
+                let mut prompt_text = String::from("<bos>");
                 for msg in &messages {
                     let role = match msg.role.as_str() {
                         "assistant" => "model",
@@ -208,7 +211,7 @@ impl Gemma4Model {
                     prompt_text.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, &msg.content));
                 }
                 prompt_text.push_str("<|turn>model\n");
-                tokenizer.encode_sync(&prompt_text, Some(true))?
+                tokenizer.encode_sync(&prompt_text, Some(false))?
             };
 
             // Create prompt tensor
@@ -597,14 +600,17 @@ mod tests {
 
     #[test]
     fn test_gemma4_chat_manual_fallback_format() {
-        // When no chat template exists, manual format maps roles correctly
+        // When no chat template exists, manual format should:
+        // 1. Start with <bos>
+        // 2. Map "assistant" → "model"
+        // 3. End with <|turn>model\n
         let messages = vec![
             ("system", "You are helpful."),
             ("user", "Hi"),
             ("assistant", "Hello!"),
             ("user", "Bye"),
         ];
-        let mut prompt = String::new();
+        let mut prompt = String::from("<bos>");
         for (role, content) in &messages {
             let mapped = match *role {
                 "assistant" => "model",
@@ -614,6 +620,7 @@ mod tests {
         }
         prompt.push_str("<|turn>model\n");
 
+        assert!(prompt.starts_with("<bos><|turn>"), "must start with <bos>");
         assert!(prompt.contains("<|turn>system\nYou are helpful.<turn|>"));
         assert!(prompt.contains("<|turn>model\nHello!<turn|>"));
         assert!(!prompt.contains("<|turn>assistant"));
@@ -629,7 +636,7 @@ mod tests {
             ("user", "How are you?"),
         ];
 
-        let mut prompt_text = String::new();
+        let mut prompt_text = String::from("<bos>");
         for (role, content) in &messages {
             let mapped_role = match *role {
                 "assistant" => "model",
@@ -639,7 +646,8 @@ mod tests {
         }
         prompt_text.push_str("<|turn>model\n");
 
-        // Verify "assistant" was mapped to "model"
+        // Verify BOS is present and "assistant" was mapped to "model"
+        assert!(prompt_text.starts_with("<bos>"), "must start with <bos>");
         assert!(
             !prompt_text.contains("<|turn>assistant"),
             "assistant role should be mapped to model"
@@ -649,8 +657,8 @@ mod tests {
             "assistant message should use model role"
         );
 
-        // Verify the full format
-        let expected = "<|turn>user\nHi<turn|>\n<|turn>model\nHello!<turn|>\n<|turn>user\nHow are you?<turn|>\n<|turn>model\n";
+        // Verify the full format (with <bos> prefix)
+        let expected = "<bos><|turn>user\nHi<turn|>\n<|turn>model\nHello!<turn|>\n<|turn>user\nHow are you?<turn|>\n<|turn>model\n";
         assert_eq!(prompt_text, expected);
     }
 
