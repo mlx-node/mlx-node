@@ -890,11 +890,21 @@ impl Qwen3Tokenizer {
                             if let Some(id) = &tc.id {
                                 call_obj.insert("id".to_string(), serde_json::json!(id));
                             }
+                            // Flat format (backward compat with some templates)
                             call_obj.insert("name".to_string(), serde_json::json!(tc.name));
+                            // Parse arguments
                             let args_value =
                                 serde_json::from_str::<serde_json::Value>(&tc.arguments)
                                     .unwrap_or_else(|_| serde_json::json!(tc.arguments));
-                            call_obj.insert("arguments".to_string(), args_value);
+                            call_obj.insert("arguments".to_string(), args_value.clone());
+                            // Wrapped format (Gemma4/OpenAI standard: tool_call.function.name)
+                            call_obj.insert(
+                                "function".to_string(),
+                                serde_json::json!({
+                                    "name": tc.name,
+                                    "arguments": args_value,
+                                }),
+                            );
                             serde_json::Value::Object(call_obj)
                         })
                         .collect();

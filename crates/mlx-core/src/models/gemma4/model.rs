@@ -11,6 +11,50 @@ use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 
+/// Convert a JSON value to Gemma4's tool-call DSL format.
+/// Strings → <|"|>str<|"|>, numbers/bools → bare, objects/arrays → recursive.
+fn format_gemma4_value(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::String(s) => format!("<|\"|>{}<|\"|>", s),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(format_gemma4_value).collect();
+            format!("[{}]", items.join(","))
+        }
+        serde_json::Value::Object(map) => {
+            let mut pairs: Vec<(String, String)> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), format_gemma4_value(v)))
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            let inner: Vec<String> = pairs.iter().map(|(k, v)| format!("{}:{}", k, v)).collect();
+            format!("{{{}}}", inner.join(","))
+        }
+    }
+}
+
+/// Convert JSON arguments string to Gemma4 tool-call DSL.
+/// Returns the inner key:value pairs (without outer braces).
+fn json_args_to_gemma4_dsl(json_str: &str) -> String {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(json_str) {
+        let mut pairs: Vec<(String, String)> = map
+            .iter()
+            .map(|(k, v)| (k.clone(), format_gemma4_value(v)))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
+            .iter()
+            .map(|(k, v)| format!("{}:{}", k, v))
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        // If not valid JSON object, pass through as-is
+        json_str.to_string()
+    }
+}
+
 use super::config::Gemma4Config;
 use super::decoder_layer::Gemma4DecoderLayer;
 use super::layer_cache::Gemma4LayerCache;
@@ -211,10 +255,23 @@ impl Gemma4Model {
                     };
 
                     if role == "tool" {
-                        // Tool response: wrap in tool_response tags within a user turn
-                        prompt_text.push_str("<|turn>user\n<|tool_response>");
-                        prompt_text.push_str(&msg.content);
-                        prompt_text.push_str("<tool_response|><turn|>\n");
+                        // Format tool response content in Gemma4 DSL
+                        let response_body =
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg.content)
+                            {
+                                format_gemma4_value(&val)
+                            } else {
+                                format!("value:<|\"|>{}<|\"|>", msg.content)
+                            };
+                        // Strip outer braces if it's already an object
+                        let inner = response_body
+                            .strip_prefix('{')
+                            .and_then(|s| s.strip_suffix('}'))
+                            .unwrap_or(&response_body);
+                        prompt_text.push_str(&format!(
+                            "<|turn>user\n<|tool_response>response:unknown{{{}}}<tool_response|><turn|>\n",
+                            inner
+                        ));
                     } else {
                         prompt_text.push_str(&format!("<|turn>{}\n", role));
 
@@ -223,7 +280,8 @@ impl Gemma4Model {
                             for tc in tool_calls {
                                 prompt_text.push_str(&format!(
                                     "<|tool_call>call:{}{{{}}}<tool_call|>",
-                                    tc.name, tc.arguments
+                                    tc.name,
+                                    json_args_to_gemma4_dsl(&tc.arguments)
                                 ));
                             }
                         }
@@ -712,59 +770,86 @@ mod tests {
 
     #[test]
     fn test_gemma4_chat_tool_calls_serialization() {
-        // Verify tool calls are serialized as <|tool_call>call:name{args}<tool_call|>
+        // Verify tool call args use Gemma4 DSL format (not raw JSON)
+        // JSON: {"location": "Paris", "units": "celsius"}
+        // DSL:  location:<|"|>Paris<|"|>,units:<|"|>celsius<|"|>  (keys sorted alphabetically)
+        let args_json = r#"{"location": "Paris", "units": "celsius"}"#;
+        let dsl = json_args_to_gemma4_dsl(args_json);
+        assert_eq!(
+            dsl, r#"location:<|"|>Paris<|"|>,units:<|"|>celsius<|"|>"#,
+            "string values should be wrapped in <|\"|> delimiters, keys sorted alphabetically"
+        );
+
+        // Verify numeric and bool values are bare (no quotes)
+        let args_with_number = r#"{"count": 5, "active": true}"#;
+        let dsl2 = json_args_to_gemma4_dsl(args_with_number);
+        assert_eq!(
+            dsl2, "active:true,count:5",
+            "numbers and bools should be bare (no <|\"|> wrapping), keys sorted alphabetically"
+        );
+
+        // Verify tool response uses response:unknown{...} format
+        let response_json = r#"{"temp": 20}"#;
+        let response_val: serde_json::Value = serde_json::from_str(response_json).unwrap();
+        let response_body = format_gemma4_value(&response_val);
+        let inner = response_body
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or(&response_body);
+        let tool_response_fragment = format!(
+            "<|tool_response>response:unknown{{{}}}<tool_response|>",
+            inner
+        );
+        assert_eq!(
+            tool_response_fragment, "<|tool_response>response:unknown{temp:20}<tool_response|>",
+            "tool response should use response:unknown{{...}} format with bare numbers"
+        );
+
+        // Build a full prompt to verify end-to-end integration
         let mut prompt = String::from("<bos>");
 
-        // Simulate: user asks, model calls a tool, tool responds, model answers
-        let turns: Vec<(&str, &str, Option<Vec<(&str, &str)>>, bool)> = vec![
-            ("user", "What's the weather?", None, false),
-            (
-                "assistant",
-                "",
-                Some(vec![("get_weather", r#""location":"Paris""#)]),
-                false,
-            ),
-            ("tool", r#"{"temp": 20}"#, None, true),
-            ("assistant", "It's 20 degrees in Paris.", None, false),
-        ];
+        // user turn
+        prompt.push_str("<|turn>user\nWhat's the weather?<turn|>\n");
 
-        for (role, content, tool_calls, is_tool_response) in &turns {
-            let mapped = match *role {
-                "assistant" => "model",
-                "developer" => "system",
-                other => other,
-            };
+        // model tool-call turn
+        let tc_dsl = json_args_to_gemma4_dsl(r#"{"location": "Paris", "units": "celsius"}"#);
+        prompt.push_str(&format!(
+            "<|turn>model\n<|tool_call>call:get_weather{{{}}}<tool_call|><turn|>\n",
+            tc_dsl
+        ));
 
-            if *is_tool_response {
-                prompt.push_str("<|turn>user\n<|tool_response>");
-                prompt.push_str(content);
-                prompt.push_str("<tool_response|><turn|>\n");
-            } else {
-                prompt.push_str(&format!("<|turn>{}\n", mapped));
-                if let Some(calls) = tool_calls {
-                    for (name, args) in calls {
-                        prompt.push_str(&format!(
-                            "<|tool_call>call:{}{{{}}}<tool_call|>",
-                            name, args
-                        ));
-                    }
-                }
-                prompt.push_str(content);
-                prompt.push_str("<turn|>\n");
-            }
-        }
+        // tool response turn
+        let resp_val: serde_json::Value = serde_json::from_str(r#"{"temp": 20}"#).unwrap();
+        let resp_body = format_gemma4_value(&resp_val);
+        let resp_inner = resp_body
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or(&resp_body);
+        prompt.push_str(&format!(
+            "<|turn>user\n<|tool_response>response:unknown{{{}}}<tool_response|><turn|>\n",
+            resp_inner
+        ));
+
+        // final model turn
+        prompt.push_str("<|turn>model\nIt's 20 degrees in Paris.<turn|>\n");
         prompt.push_str("<|turn>model\n");
 
-        // Verify tool call serialization
+        // Verify DSL format (no raw JSON quotes in tool call)
         assert!(
-            prompt.contains(r#"<|tool_call>call:get_weather{"location":"Paris"}<tool_call|>"#),
-            "tool call should be serialized with call:name{{args}} format"
+            prompt.contains(r#"<|tool_call>call:get_weather{location:<|"|>Paris<|"|>,units:<|"|>celsius<|"|>}<tool_call|>"#),
+            "tool call args should use Gemma4 DSL with <|\"|> string delimiters"
         );
-        // Verify tool response
         assert!(
-            prompt.contains(r#"<|tool_response>{"temp": 20}<tool_response|>"#),
-            "tool response should be wrapped in tool_response tags"
+            !prompt.contains(r#""location""#),
+            "tool call should NOT contain raw JSON quoted keys"
         );
+
+        // Verify tool response DSL format
+        assert!(
+            prompt.contains("<|tool_response>response:unknown{temp:20}<tool_response|>"),
+            "tool response should use response:unknown{{...}} format"
+        );
+
         // Verify no raw "assistant" or "tool" role in turns
         assert!(!prompt.contains("<|turn>assistant"));
         assert!(!prompt.contains("<|turn>tool"));
