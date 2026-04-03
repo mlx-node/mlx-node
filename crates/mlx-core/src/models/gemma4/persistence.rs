@@ -233,7 +233,9 @@ fn parse_eos_token_ids(value: &Value) -> Vec<i32> {
 
 /// Validate that critical weights are present after sanitization.
 ///
-/// Checks embed_tokens, final norm, and per-layer attention + MLP weights.
+/// Exhaustively checks embed_tokens, final norm, and per-layer attention + MLP weights,
+/// including o_proj, up_proj, down_proj, all 4 norms, v_proj (when !k_eq_v),
+/// and MoE weights (when enabled).
 /// Allows for quantized variants (`.scales` suffix instead of `.weight`).
 fn validate_required_weights(
     params: &HashMap<String, MxArray>,
@@ -260,18 +262,83 @@ fn validate_required_weights(
     // Per-layer required weights
     for i in 0..config.num_hidden_layers as usize {
         let prefix = format!("layers.{}", i);
-        let layer_keys = [
-            format!("{}.self_attn.q_proj.weight", prefix),
-            format!("{}.self_attn.k_proj.weight", prefix),
-            format!("{}.input_layernorm.weight", prefix),
-            format!("{}.mlp.gate_proj.weight", prefix),
+        let attn = format!("{}.self_attn", prefix);
+        let mlp = format!("{}.mlp", prefix);
+
+        // Attention projections always required
+        let attn_keys = [
+            format!("{}.q_proj.weight", attn),
+            format!("{}.k_proj.weight", attn),
+            format!("{}.o_proj.weight", attn),
         ];
-        for key in &layer_keys {
+        for key in &attn_keys {
             if !has(key) {
                 return Err(Error::from_reason(format!(
                     "Missing required weight: {}",
                     key
                 )));
+            }
+        }
+
+        // v_proj required when this layer does not use k_eq_v
+        let layer_k_eq_v = config.attention_k_eq_v && config.is_global_layer(i);
+        if !layer_k_eq_v {
+            let key = format!("{}.v_proj.weight", attn);
+            if !has(&key) {
+                return Err(Error::from_reason(format!(
+                    "Missing required weight: {}",
+                    key
+                )));
+            }
+        }
+
+        // MLP projections (dense path; skipped for pure-MoE layers)
+        if !config.enable_moe_block {
+            let mlp_keys = [
+                format!("{}.gate_proj.weight", mlp),
+                format!("{}.up_proj.weight", mlp),
+                format!("{}.down_proj.weight", mlp),
+            ];
+            for key in &mlp_keys {
+                if !has(key) {
+                    return Err(Error::from_reason(format!(
+                        "Missing required weight: {}",
+                        key
+                    )));
+                }
+            }
+        }
+
+        // All 4 layer norms
+        let norm_keys = [
+            format!("{}.input_layernorm.weight", prefix),
+            format!("{}.post_attention_layernorm.weight", prefix),
+            format!("{}.pre_feedforward_layernorm.weight", prefix),
+            format!("{}.post_feedforward_layernorm.weight", prefix),
+        ];
+        for key in &norm_keys {
+            if !has(key) {
+                return Err(Error::from_reason(format!(
+                    "Missing required weight: {}",
+                    key
+                )));
+            }
+        }
+
+        // MoE weights when enabled
+        if config.enable_moe_block {
+            let moe_keys = [
+                format!("{}.router.proj.weight", prefix),
+                format!("{}.experts.gate_up_proj", prefix),
+                format!("{}.experts.down_proj", prefix),
+            ];
+            for key in &moe_keys {
+                if !has(key) {
+                    return Err(Error::from_reason(format!(
+                        "Missing required weight: {}",
+                        key
+                    )));
+                }
             }
         }
     }

@@ -55,6 +55,24 @@ fn json_args_to_gemma4_dsl(json_str: &str) -> String {
     }
 }
 
+/// Strip Gemma4 control tokens from user-supplied content to prevent prompt injection.
+///
+/// Removes all Gemma4 delimiter tokens that could allow a malicious message to
+/// hijack the turn structure or inject synthetic tool calls/responses.
+fn escape_gemma4_content(s: &str) -> String {
+    s.replace("<|turn>", "")
+        .replace("<turn|>", "")
+        .replace("<|tool_call>", "")
+        .replace("<tool_call|>", "")
+        .replace("<|tool_response>", "")
+        .replace("<tool_response|>", "")
+        .replace("<|tool>", "")
+        .replace("<tool|>", "")
+        .replace("<|channel>", "")
+        .replace("<channel|>", "")
+        .replace("<|think|>", "")
+}
+
 use super::config::Gemma4Config;
 use super::decoder_layer::Gemma4DecoderLayer;
 use super::layer_cache::Gemma4LayerCache;
@@ -270,13 +288,13 @@ impl Gemma4Model {
                                 prompt_text.push_str(&format!(
                                     "<|tool_call>call:{}{{{}}}<tool_call|>",
                                     tc.name,
-                                    json_args_to_gemma4_dsl(&tc.arguments)
+                                    json_args_to_gemma4_dsl(&escape_gemma4_content(&tc.arguments))
                                 ));
                             }
                         }
 
-                        // Emit content
-                        prompt_text.push_str(&msg.content);
+                        // Emit content (sanitized to prevent control-token injection)
+                        prompt_text.push_str(&escape_gemma4_content(&msg.content));
                         prompt_text.push_str("<turn|>\n");
                     }
                 }

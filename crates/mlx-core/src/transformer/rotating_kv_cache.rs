@@ -136,7 +136,12 @@ impl RotatingKVCache {
         let current_len = ordered_keys.shape_at(2)? as i32;
         self.idx = current_len;
 
-        let trim_size = current_len - self.max_size + 1;
+        let total = current_len + seq_len;
+        let trim_size = if total > self.max_size {
+            total - self.max_size
+        } else {
+            0
+        };
 
         let new_keys = self.trim(trim_size, &ordered_keys, Some(keys))?;
         let new_values = self.trim(trim_size, &ordered_values, Some(values))?;
@@ -532,5 +537,26 @@ mod tests {
         }
 
         assert_eq!(cache.get_offset(), 25);
+    }
+
+    #[test]
+    fn test_multi_chunk_stays_within_window() {
+        let mut cache = RotatingKVCache::new(8, None);
+        let k1 = MxArray::ones(&[1, 1, 6, 4], None).unwrap();
+        let v1 = k1.clone();
+        cache.update_and_fetch(&k1, &v1).unwrap();
+
+        let k2 = MxArray::ones(&[1, 1, 6, 4], None).unwrap();
+        let v2 = k2.clone();
+        cache.update_and_fetch(&k2, &v2).unwrap();
+
+        // Single token after should yield window-bounded cache
+        let k3 = MxArray::ones(&[1, 1, 1, 4], None).unwrap();
+        let v3 = k3.clone();
+        let r = cache.update_and_fetch(&k3, &v3).unwrap();
+        assert!(
+            r[0].shape_at(2).unwrap() <= 8,
+            "cache must not exceed window"
+        );
     }
 }
