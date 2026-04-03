@@ -20,9 +20,9 @@ use super::quantized_linear::{Gemma4MLPVariant, QuantizedLinear};
 ///
 /// Forward:
 ///   r = self_attn(input_layernorm(x))
-///   h = clip_residual(x, post_attention_layernorm(r))
+///   h = x + post_attention_layernorm(r)
 ///   r = mlp(pre_feedforward_layernorm(h))
-///   out = clip_residual(h, post_feedforward_layernorm(r))
+///   out = h + post_feedforward_layernorm(r)
 ///   out = out * layer_scalar
 ///   out = out + ple_projection(gelu(ple_gate(out)) * per_layer_input)  (if PLE)
 pub struct Gemma4DecoderLayer {
@@ -53,25 +53,6 @@ pub struct Gemma4DecoderLayer {
     pre_feedforward_layernorm_2: Option<RMSNorm>,
     post_feedforward_layernorm_1: Option<RMSNorm>,
     post_feedforward_layernorm_2: Option<RMSNorm>,
-}
-
-/// FP16 overflow-safe residual addition.
-///
-/// For fp16 inputs, clamps values to [-65504, 65504] before adding to prevent overflow.
-/// For bf16/f32, performs standard addition (bf16 range is ±3.4e38, same as f32).
-fn clip_residual(x: &MxArray, y: &MxArray) -> Result<MxArray> {
-    let dtype = x.dtype()?;
-    if matches!(dtype, crate::array::DType::Float16) {
-        // Cast to f32, add, clamp back to fp16 range to prevent overflow
-        let x_f32 = x.astype(crate::array::DType::Float32)?;
-        let y_f32 = y.astype(crate::array::DType::Float32)?;
-        let sum = x_f32.add(&y_f32)?;
-        let bound = 65504.0_f64;
-        let clamped = sum.clip(Some(-bound), Some(bound))?;
-        clamped.astype(dtype)
-    } else {
-        x.add(y)
-    }
 }
 
 impl Gemma4DecoderLayer {
@@ -206,7 +187,7 @@ impl Gemma4DecoderLayer {
     ) -> Result<MxArray> {
         // Post-attention norm + residual
         let attn_normed = self.post_attention_layernorm.forward(attn_out)?;
-        let h = clip_residual(x, &attn_normed)?;
+        let h = x.add(&attn_normed)?;
 
         // Pre-FFN norm + MLP
         let ffn_normed = self.pre_feedforward_layernorm.forward(&h)?;
@@ -237,7 +218,7 @@ impl Gemma4DecoderLayer {
 
         // Post-FFN norm + residual
         let mlp_normed = self.post_feedforward_layernorm.forward(&combined_mlp_out)?;
-        let mut out = clip_residual(&h, &mlp_normed)?;
+        let mut out = h.add(&mlp_normed)?;
 
         // Apply PLE (per-layer embeddings) BEFORE layer_scalar (matches HF order)
         if let (Some(gate_proj), Some(proj), Some(norm), Some(ple_input)) = (

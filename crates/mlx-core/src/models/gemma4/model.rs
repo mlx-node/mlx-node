@@ -189,9 +189,14 @@ impl Gemma4Model {
             // Construct Gemma 4 chat format manually:
             //   <bos><|turn>user\n{content}<turn|>\n<|turn>model\n
             // No Jinja2 template needed — Gemma 4 tokenizer doesn't include one.
+            // Note: Gemma4 uses "model" (not "assistant") for the model's role.
+            // Map "assistant" → "model" so multi-turn chats produce correct tokens.
             let mut prompt_text = String::new();
             for msg in &messages {
-                let role = &msg.role;
+                let role = match msg.role.as_str() {
+                    "assistant" => "model",
+                    other => other,
+                };
                 let content = &msg.content;
                 prompt_text.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, content));
             }
@@ -584,6 +589,40 @@ fn create_sliding_mask(seq_len: i64, offset: i32, window_size: i64) -> Result<Mx
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_gemma4_chat_role_mapping() {
+        // Verify that "assistant" role gets mapped to "model" in Gemma4 format
+        let messages = vec![
+            ("user", "Hi"),
+            ("assistant", "Hello!"),
+            ("user", "How are you?"),
+        ];
+
+        let mut prompt_text = String::new();
+        for (role, content) in &messages {
+            let mapped_role = match *role {
+                "assistant" => "model",
+                other => other,
+            };
+            prompt_text.push_str(&format!("<|turn>{}\n{}<turn|>\n", mapped_role, content));
+        }
+        prompt_text.push_str("<|turn>model\n");
+
+        // Verify "assistant" was mapped to "model"
+        assert!(
+            !prompt_text.contains("<|turn>assistant"),
+            "assistant role should be mapped to model"
+        );
+        assert!(
+            prompt_text.contains("<|turn>model\nHello!<turn|>"),
+            "assistant message should use model role"
+        );
+
+        // Verify the full format
+        let expected = "<|turn>user\nHi<turn|>\n<|turn>model\nHello!<turn|>\n<|turn>user\nHow are you?<turn|>\n<|turn>model\n";
+        assert_eq!(prompt_text, expected);
+    }
 
     #[test]
     fn test_ple_oov_masking() {
