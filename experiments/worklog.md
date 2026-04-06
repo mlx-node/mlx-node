@@ -37,9 +37,31 @@
 - GPU readback of full vocab (248K * 4 = ~1MB) works fine via SharedArrayBuffer readback buffer (4MB limit)
 - `RandomBits`, `Sort`, `Scan` have NO WebGPU implementation (NO_GPU in primitives.cpp)
 
+### Run 4: Batch size 64→512 + setPipeline dedup — decode_tok_s=2.8 (KEEP)
+- Timestamp: 2026-04-07 00:09
+- What changed: Increased max_ops_per_commit from 64 to 512 in C++ device.cpp. Added pipeline/bindgroup dedup to skip redundant RPC calls when same pipeline is used consecutively.
+- Result: 2.8 tok/s (+12% from 2.5), TTFT 2739ms
+- Insight: Batch size increase helps but isn't the main bottleneck. The RPC overhead per individual call dominates.
+
+### Run 5: Fused dispatch RPC — decode_tok_s=4.1 (KEEP)
+- Timestamp: 2026-04-07 00:20
+- What changed: In webgpu-bridge-stub.ts, buffer setPipeline and setBindGroup(0) calls locally. When dispatch is called, send all three as a single FUSED_DISPATCH RPC via Atomics.wait. Reduces from 3 separate roundtrips to 1 per dispatch.
+- Result: **4.1 tok/s (+46%)**, TTFT 1585ms (-42%)
+- Insight: RPC roundtrip batching is the single highest-impact optimization. Each Atomics.wait roundtrip costs ~100µs. With ~120 dispatches per token, saving 2 RPCs each = ~24ms saved per token (from ~36ms to ~12ms dispatch overhead).
+
+### Key Insights
+- MLX's categorical() on WASM exhausts heap via cumsum+random::uniform (248K temp arrays per token)
+- WASM incremental builds can be stale — `cargo clean -p mlx-core` forces proper recompilation
+- `to_float32()` returns napi::Float32Array which is NOT iterable in Rust — need internal `to_float32_vec()` returning Vec<f32>
+- GPU readback of full vocab (248K * 4 = ~1MB) works fine via SharedArrayBuffer readback buffer (4MB limit)
+- `RandomBits`, `Sort`, `Scan` have NO WebGPU implementation (NO_GPU in primitives.cpp)
+- **RPC batching is the #1 perf lever**: each Atomics.wait/notify roundtrip costs ~100µs
+- cmake for WASM doesn't handle WASI_IMPORT backend properly — can't easily modify C++ code without fixing cmake
+
 ### Next Ideas
-1. Performance: optimize WebGPU kernel dispatch (reduce RPC overhead)
-2. Architecture: bf16→f32 early conversion at weight load time  
-3. Architecture: reduce WebGPU RPC round-trips during inference
-4. Test infra: migrate browser tests to Vitest browser mode
-5. Code quality: add proper error handling and types to worker communication
+1. Fuse createBuffer+getMappedRange+unmap for uniform buffers (3→1 RPC, needs C++ or complex JS interception)
+2. Cache bind group layouts per pipeline (avoid recreation)
+3. Use queueWriteBuffer instead of mappedAtCreation for small uniforms (1 RPC instead of 3)
+4. Architecture: bf16→f32 early conversion at weight load time  
+5. Test infra: migrate browser tests to Vitest browser mode
+6. Code quality: add proper error handling and types to worker communication
