@@ -86,6 +86,10 @@ export function createBridgeStub(
   let activeComputePass = -1;
   let activeComputePassEncoder = -1;
 
+  // Buffer size cache: use plain object (faster than Map for integer keys)
+  // Caches buffer sizes to avoid BUFFER_GET_SIZE RPCs (~2.5x per dispatch)
+  const bufSizes: Record<number, number> = {};
+
   function flushPendingCompute() {
     if (pendingPipeline >= 0) {
       rpcCall(RpcFn.COMPUTE_PASS_SET_PIPELINE, pendingPass, pendingPipeline);
@@ -471,12 +475,15 @@ export function createBridgeStub(
 
     // ===== Buffer =====
     wgpuBufferGetSize(bufferHandle: number): bigint {
-      // Returns u64 via RESULT + RESULT_HI
+      // Fast path: return cached size (no RPC)
+      const cached = bufSizes[bufferHandle];
+      if (cached !== undefined) return BigInt(cached);
+      // Slow path: RPC to gpu-worker
       rpcCall(RpcFn.BUFFER_GET_SIZE, bufferHandle);
-      // Safe to read after rpcCall: gpu-worker won't touch the buffer until
-      // next PENDING, and wasm-worker is single-threaded.
       const lo = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);
       const hi = cmdDataView.getUint32(CMD_OFFSET.RESULT_HI, true);
+      // Cache (assume sizes < 2^32 for typical buffers)
+      bufSizes[bufferHandle] = lo;
       return BigInt(lo) | (BigInt(hi) << 32n);
     },
 
