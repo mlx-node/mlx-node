@@ -82,6 +82,10 @@ export function createBridgeStub(
   let pendingPipeline = -1;
   let pendingBindGroup = -1;
 
+  // Active compute pass caching (avoid begin/end per dispatch)
+  let activeComputePass = -1;
+  let activeComputePassEncoder = -1;
+
   function flushPendingCompute() {
     if (pendingPipeline >= 0) {
       rpcCall(RpcFn.COMPUTE_PASS_SET_PIPELINE, pendingPass, pendingPipeline);
@@ -347,8 +351,23 @@ export function createBridgeStub(
     },
 
     // ===== Command Encoder =====
+    // Cache active compute pass to avoid begin/end per dispatch.
+    // C++ creates a new pass for each eval, but we reuse the existing one.
     wgpuCommandEncoderBeginComputePass(encoderHandle: number, _descPtr: number): number {
-      return rpcCall(RpcFn.CMD_ENCODER_BEGIN_COMPUTE_PASS, encoderHandle);
+      if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
+        // Reuse existing pass
+        return activeComputePass;
+      }
+      // End previous pass if it was for a different encoder
+      if (activeComputePass >= 0 && activeComputePassEncoder !== encoderHandle) {
+        rpcCall(RpcFn.COMPUTE_PASS_END, activeComputePass);
+        rpcCall(RpcFn.COMPUTE_PASS_RELEASE, activeComputePass);
+        activeComputePass = -1;
+      }
+      const handle = rpcCall(RpcFn.CMD_ENCODER_BEGIN_COMPUTE_PASS, encoderHandle);
+      activeComputePass = handle;
+      activeComputePassEncoder = encoderHandle;
+      return handle;
     },
 
     wgpuCommandEncoderCopyBufferToBuffer(
@@ -357,6 +376,14 @@ export function createBridgeStub(
       dstHandle: number, dstOffset: bigint,
       size: bigint,
     ): void {
+      // End compute pass before copy — WebGPU doesn't allow mixing
+      if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
+        flushPendingCompute();
+        rpcCall(RpcFn.COMPUTE_PASS_END, activeComputePass);
+        rpcCall(RpcFn.COMPUTE_PASS_RELEASE, activeComputePass);
+        activeComputePass = -1;
+        activeComputePassEncoder = -1;
+      }
       // 7 u32 args + 1 high-bits word = uses ARG0..ARG7 + ARG0_HI
       const srcOffsetLo = Number(srcOffset & 0xFFFFFFFFn);
       const srcOffsetHi = Number(srcOffset >> 32n);
@@ -372,6 +399,14 @@ export function createBridgeStub(
     },
 
     wgpuCommandEncoderFinish(encoderHandle: number, _descPtr: number): number {
+      // End the cached compute pass before finishing the encoder
+      if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
+        flushPendingCompute();
+        rpcCall(RpcFn.COMPUTE_PASS_END, activeComputePass);
+        rpcCall(RpcFn.COMPUTE_PASS_RELEASE, activeComputePass);
+        activeComputePass = -1;
+        activeComputePassEncoder = -1;
+      }
       return rpcCall(RpcFn.CMD_ENCODER_FINISH, encoderHandle);
     },
 
@@ -423,12 +458,15 @@ export function createBridgeStub(
     },
 
     wgpuComputePassEncoderEnd(passHandle: number): void {
-      flushPendingCompute(); // Flush any buffered setPipeline/setBindGroup
-      rpcCall(RpcFn.COMPUTE_PASS_END, passHandle);
+      flushPendingCompute();
+      // Don't actually end the pass — keep it alive for reuse.
+      // It will be ended when a different encoder creates a pass,
+      // or when the encoder is finished.
     },
 
     wgpuComputePassEncoderRelease(handle: number): void {
-      rpcCall(RpcFn.COMPUTE_PASS_RELEASE, handle);
+      // Don't release — the pass is being reused.
+      // It will be released when the encoder finishes.
     },
 
     // ===== Buffer =====

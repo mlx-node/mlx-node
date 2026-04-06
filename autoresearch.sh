@@ -135,7 +135,7 @@ const { chromium } = require('playwright');
   }
 
   // Send a test message with temp=0
-  await page.fill('#prompt', 'What is 2+2? Answer in one word.');
+  await page.fill('#prompt', 'Write a haiku about coding.');
   await page.click('#send');
 
   // Wait for response
