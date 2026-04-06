@@ -588,15 +588,84 @@ pub fn sample(logits: &MxArray, config: Option<SamplingConfig>) -> Result<MxArra
     { sample_compiled(logits, config) }
 }
 
-/// Sample using non-compiled operations (fallback for WASM)
+/// Sample using non-compiled operations (fallback for WASM).
+///
+/// For temperature > 0, reads logits to CPU and does the entire sampling pipeline
+/// in pure Rust (temperature, softmax, categorical) to avoid creating intermediate
+/// MLX arrays that exhaust the ~1.9GB WASM heap during the decode loop.
 pub fn sample_uncompiled(logits: &MxArray, config: Option<SamplingConfig>) -> Result<MxArray> {
-    let temp = config.as_ref().and_then(|c| c.temperature).unwrap_or(1.0);
+    let cfg = config.unwrap_or_default();
+    let temp = cfg.temperature.unwrap_or(1.0);
     // Greedy: use argmax when temperature ≤ 0
     if temp <= 0.0 {
         return logits.argmax(-1, None);
     }
-    let filtered = apply_sampling(logits, config)?;
-    filtered.categorical(Some(-1))
+    // Pure Rust categorical: read logits to CPU, apply temperature + sampling there.
+    // Avoids MLX array ops (categorical/cumsum/random) that exhaust WASM heap.
+    cpu_categorical_sample(logits, temp)
+}
+
+/// Categorical sampling in pure Rust — no MLX array ops for intermediates.
+/// Reads logits to CPU, applies temperature, computes softmax + cumsum in Rust,
+/// samples with thread-local RNG, returns a scalar MxArray.
+/// Memory: one Vec<f32> for logits + one Vec<f64> for cumulative probs.
+fn cpu_categorical_sample(logits: &MxArray, temperature: f64) -> Result<MxArray> {
+    // Force evaluation so we can read the data
+    logits.eval();
+
+    // Read logits to CPU as Vec<f32> (avoids NAPI Float32Array wrapper)
+    let data = logits.to_float32_vec()?;
+    if data.is_empty() {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "Empty logits for sampling",
+        ));
+    }
+
+    // Apply temperature and find max for numerical stability in one pass
+    let inv_temp = 1.0 / temperature;
+    let max_val = data.iter().copied().fold(f32::NEG_INFINITY, |m, v| {
+        m.max(v * inv_temp as f32)
+    });
+
+    // Compute softmax(logits/temperature) and cumulative sum in one pass
+    let mut cumsum = 0.0f64;
+    let mut probs: Vec<f64> = Vec::with_capacity(data.len());
+    for &logit in &data {
+        let scaled = (logit as f64) * inv_temp;
+        let p = (scaled - max_val as f64).exp();
+        cumsum += p;
+        probs.push(cumsum);
+    }
+
+    let total = cumsum;
+
+    // Generate random threshold using xorshift64 (thread-local state).
+    // We avoid std::rand and MLX random::uniform to prevent WASM heap pressure.
+    use std::cell::Cell;
+    thread_local! {
+        static RNG_STATE: Cell<u64> = Cell::new(0xDEAD_BEEF_CAFE_BABEu64);
+    }
+    let r: f64 = RNG_STATE.with(|state| {
+        let mut s = state.get();
+        // xorshift64
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        state.set(s);
+        // Convert to (0, 1) — avoid exactly 0 or 1
+        ((s >> 11) as f64 + 0.5) / ((1u64 << 53) as f64)
+    });
+
+    // Find first token where cumsum/total > r
+    let threshold = r * total;
+    let token_id = probs
+        .iter()
+        .position(|&cs| cs > threshold)
+        .unwrap_or(data.len() - 1);
+
+    // Return as scalar u32 MxArray (matching argmax return type)
+    MxArray::from_uint32(&[token_id as u32], &[1])
 }
 
 /// Sample using optimized path - fully compiled C++ implementation.

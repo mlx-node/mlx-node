@@ -330,11 +330,17 @@ impl MxArray {
     /// - Final output extraction
     #[napi]
     pub fn to_float32(&self) -> Result<Float32Array> {
+        let buffer = self.to_float32_vec()?;
+        Ok(buffer.into())
+    }
+
+    /// Copy entire array from GPU to CPU as Vec<f32> (internal use).
+    pub(crate) fn to_float32_vec(&self) -> Result<Vec<f32>> {
         let len = unsafe { sys::mlx_array_size(self.handle.0) };
         let mut buffer = vec![0f32; len];
         let ok = unsafe { sys::mlx_array_to_float32(self.handle.0, buffer.as_mut_ptr(), len) };
         if ok {
-            Ok(buffer.into())
+            Ok(buffer)
         } else {
             Err(Error::from_reason("Failed to copy array to float32 buffer"))
         }
