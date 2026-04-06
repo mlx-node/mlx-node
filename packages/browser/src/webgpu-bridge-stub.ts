@@ -101,39 +101,29 @@ export function createBridgeStub(
     }
   }
 
+  // Pre-allocated DataView offsets for faster argument writing
+  const ARG_BASE = CMD_OFFSET.ARG0;
+
   function rpcCall(fnId: number, ...args: number[]): number {
-    rpcCount++;
-    // Keep last 32 calls in ring buffer
-    if (rpcHistory.length >= RPC_HISTORY_SIZE) rpcHistory.shift();
-    rpcHistory.push({ n: rpcCount, fn: fnId });
-
-    // Write function ID
+    // Write function ID + arguments in one block
     cmdDataView.setUint32(CMD_OFFSET.FN_ID, fnId, true);
-
-    // Write arguments (up to 8 u32 values in ARG0..ARG7)
-    for (let i = 0; i < args.length && i < 8; i++) {
-      cmdDataView.setUint32(CMD_OFFSET.ARG0 + i * 4, args[i] >>> 0, true);
+    for (let i = 0; i < args.length; i++) {
+      cmdDataView.setUint32(ARG_BASE + (i << 2), args[i] >>> 0, true);
     }
-
-    // Clear callback count from previous call
     cmdDataView.setUint32(CMD_OFFSET.CALLBACK_COUNT, 0, true);
 
-    // Signal gpu-worker: set PENDING and notify
+    // Signal gpu-worker and block
     Atomics.store(cmdView, STATUS_INDEX, STATUS.PENDING);
     Atomics.notify(cmdView, STATUS_INDEX);
-
-    // Block until gpu-worker sets DONE, with 10s timeout for deadlock detection
     const waitResult = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 10_000);
     if (waitResult === 'timed-out') {
+      rpcCount++;
+      if (rpcHistory.length >= RPC_HISTORY_SIZE) rpcHistory.shift();
+      rpcHistory.push({ n: rpcCount, fn: fnId });
       console.error(`[RPC TIMEOUT] fn=${fnId} (#${rpcCount}) timed out after 10s!`);
-      console.error(`[RPC TIMEOUT] Last ${rpcHistory.length} calls:`,
-        rpcHistory.map(h => `#${h.n}:fn=${h.fn}`).join(', '));
-      console.error(`[RPC TIMEOUT] Status word:`, Atomics.load(cmdView, STATUS_INDEX));
-      // Wait indefinitely for recovery (don't break the protocol)
       Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING);
     }
 
-    // Read result
     const result = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);
 
     // Process pending callbacks (critical for init: adapter/device callbacks)
@@ -143,9 +133,7 @@ export function createBridgeStub(
       console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e);
     }
 
-    // Reset status for next call
     Atomics.store(cmdView, STATUS_INDEX, STATUS.IDLE);
-
     return result;
   }
 
