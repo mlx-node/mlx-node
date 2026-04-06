@@ -6,6 +6,7 @@ use napi::bindgen_prelude::*;
 
 use super::attention::Qwen3_5Attention;
 use super::config::Qwen3_5Config;
+use super::debug::log_tensor_stats;
 use super::gated_delta_net::GatedDeltaNet;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::quantized_linear::{MLPVariant, QuantizedLinear};
@@ -72,6 +73,7 @@ pub struct DecoderLayer {
     pub mlp: MLPVariant,
     input_layernorm: RMSNorm,
     post_attention_layernorm: RMSNorm,
+    layer_idx: usize,
 }
 
 impl DecoderLayer {
@@ -84,7 +86,7 @@ impl DecoderLayer {
         let is_linear = config.is_linear_layer(layer_idx);
 
         let attn = if is_linear {
-            AttentionType::Linear(GatedDeltaNet::new(config)?)
+            AttentionType::Linear(GatedDeltaNet::new(config, layer_idx)?)
         } else {
             AttentionType::Full(Qwen3_5Attention::new(config)?)
         };
@@ -103,6 +105,7 @@ impl DecoderLayer {
             mlp,
             input_layernorm,
             post_attention_layernorm,
+            layer_idx,
         })
     }
 
@@ -213,9 +216,16 @@ impl DecoderLayer {
                 attn.forward(&normed, mask, kvc, position_ids)?
             }
         };
-
+        log_tensor_stats(
+            &format!("layer.{:02}.decoder.attn_out", self.layer_idx),
+            &attn_out,
+        );
         // Residual connection
         let h = x.add(&attn_out)?;
+        log_tensor_stats(
+            &format!("layer.{:02}.decoder.post_attn_residual", self.layer_idx),
+            &h,
+        );
 
         // E38: slice h to last token before MLP if asked (last-layer prefill
         // optimization). Saves ~120 GFLOPs of MLP work at T=860.
@@ -229,9 +239,18 @@ impl DecoderLayer {
         // Pre-norm + MLP
         let normed = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = self.mlp.forward(&normed)?;
+        log_tensor_stats(
+            &format!("layer.{:02}.decoder.mlp_out", self.layer_idx),
+            &mlp_out,
+        );
 
         // Residual connection
-        h.add(&mlp_out)
+        let out = h.add(&mlp_out)?;
+        log_tensor_stats(
+            &format!("layer.{:02}.decoder.out", self.layer_idx),
+            &out,
+        );
+        Ok(out)
     }
 
     /// Forward pass with paged-or-flat dispatch for Qwen3.5.

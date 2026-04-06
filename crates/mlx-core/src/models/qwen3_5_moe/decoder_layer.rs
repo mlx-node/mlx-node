@@ -56,7 +56,7 @@ impl DecoderLayer {
         let dense_config = config.to_dense_config();
 
         let attn = if is_linear {
-            AttentionType::Linear(GatedDeltaNet::new(&dense_config)?)
+            AttentionType::Linear(GatedDeltaNet::new(&dense_config, layer_idx)?)
         } else {
             AttentionType::Full(Qwen3_5Attention::new(&dense_config)?)
         };

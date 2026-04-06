@@ -51,3 +51,10 @@ mlx-db = { path = "crates/mlx-db" }
 [profile.release]
 lto = true
 codegen-units = 1
+
+[profile.wasi]
+inherits = "release"
+lto = false
+codegen-units = 16
+# NOTE: wasi profile not used yet due to WASM vtable corruption bug.
+# Using --release (lto=true, codegen-units=1) until root cause is fixed.

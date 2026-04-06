@@ -631,6 +631,45 @@ export declare class MxArray {
     step?: number | undefined | null,
     dtype?: DType | undefined | null,
   ): MxArray;
+  static testCompileBasic(): boolean;
+  static testCompileMatmul(): boolean;
+  static testCompileRepeated(): boolean;
+  static testGpuBufferArrays(): boolean;
+  /** Run single layer forward using model weights, return first 5 values */
+  static testSingleLayerForward(): Array<number>;
+  /** Read first N float values from a C++ weight map entry */
+  static readCppWeight(name: string, count: number): Array<number>;
+  /**
+   * Step-by-step GDN test: returns intermediate values at the given checkpoint.
+   * checkpoint 0-8: various stages of GDN pipeline. 9: conv1d weight info.
+   */
+  static testGdnStep(checkpoint: number, maxCount: number): Array<number>;
+  /**
+   * Isolated GDN recurrence test with small known inputs (2x2 dims).
+   * Returns y_out values followed by state_out values.
+   */
+  static testGdnRecurrenceSmall(): Array<number>;
+  /**
+   * Run full-attention layer 0 forward using model weights, return first N values.
+   * Exercises: RMSNorm + Q/K/V proj + QK norm + RoPE + SDPA + gate + output proj.
+   */
+  static testSdpaCausal(maxCount?: number | undefined | null): Array<number>;
+  static testSdpaGqa(maxCount?: number | undefined | null): Array<number>;
+  static testAttentionLayerForward(maxCount?: number | undefined | null): Array<number>;
+  static testRopeBf16(maxCount?: number | undefined | null): Array<number>;
+  static testQkNormRope(maxCount?: number | undefined | null): Array<number>;
+  static testSdpaAdditiveMask(maxCount?: number | undefined | null): Array<number>;
+  static testSdpaDecodeGqa(maxCount?: number | undefined | null): Array<number>;
+  static testFullAttnLayerBf16(maxCount?: number | undefined | null): Array<number>;
+  static testRmsNormBf16(maxCount?: number | undefined | null): Array<number>;
+  static testSwigluMlpBf16(maxCount?: number | undefined | null): Array<number>;
+  static testDecodeStepWithCache(maxCount?: number | undefined | null): Array<number>;
+  static testAttnLayerBf16(maxCount?: number | undefined | null): Array<number>;
+  static testFirst4LayersBf16(maxCount?: number | undefined | null): Array<number>;
+  static testGdnFullBf16(maxCount?: number | undefined | null): Array<number>;
+  static testGdnMultiStepBf16(maxCount?: number | undefined | null): Array<number>;
+  static testCategoricalSamplingBf16(maxCount?: number | undefined | null): Array<number>;
+  static testGdnLayerBf16(maxCount?: number | undefined | null): Array<number>;
   astype(dtype: DType): MxArray;
   /**
    * Create a copy of this array with a new handle.
@@ -831,6 +870,148 @@ export declare class MxArray {
   broadcastTo(shape: BigInt64Array): MxArray;
 }
 
+/** NAPI-exported reward registry wrapper */
+export declare class NativeRewardRegistry {
+  /** Create a new reward registry */
+  constructor();
+  /** Register a built-in reward function */
+  register(config: BuiltinRewardConfig): void;
+  /** Score a single completion */
+  score(prompt: string, completion: string): number;
+  /** Score a batch of completions */
+  scoreBatch(prompts: Array<string>, completions: Array<string>): Array<number>;
+  /** Check if registry is empty */
+  get isEmpty(): boolean;
+  /** Get registered reward names */
+  get names(): Array<string>;
+  /** Set whether to normalize scores */
+  setNormalize(normalize: boolean): void;
+}
+
+/**
+ * OutputStore - Persistence layer for training outputs
+ *
+ * Stores all model outputs during GRPO training for debugging and research.
+ * Supports local SQLite files.
+ */
+export declare class OutputStore {
+  /** Create a new output store with local SQLite file */
+  static local(path: string): Promise<OutputStore>;
+  /** Create from config object */
+  static fromConfig(config: OutputStoreConfig): Promise<OutputStore>;
+  /** Start a new training run */
+  startRun(modelName: string, modelPath: string | undefined | null, config: string): Promise<string>;
+  /** Start a new training run with a name */
+  startRunWithName(
+    name: string | undefined | null,
+    modelName: string,
+    modelPath: string | undefined | null,
+    config: string,
+  ): Promise<string>;
+  /** End the current training run */
+  endRun(status: string): Promise<void>;
+  /** Get current run ID */
+  currentRunId(): Promise<string | null>;
+  /** Find a run by name */
+  findRunByName(name: string): Promise<TrainingRunRecord | null>;
+  /** Resume an existing run (sets status to running and makes it current) */
+  resumeRun(runId: string): Promise<void>;
+  /** Delete all steps after a given step number (for resume cleanup) */
+  deleteStepsAfter(runId: string, afterStep: number): Promise<number>;
+  /**
+   * Delete all records after a given step (for checkpoint resume)
+   *
+   * Cascades through: training_steps → generations → tool_calls, and logs.
+   * Use this when resuming from checkpoint to ensure clean database state.
+   */
+  deleteAllAfterStep(runId: string, afterStep: number): Promise<CleanupStats>;
+  /**
+   * Get recent step metrics for TUI sparkline restoration
+   *
+   * Returns metrics ordered by step (oldest first) for easy insertion into VecDeque.
+   */
+  getRecentStepMetrics(runId: string, limit: number): Promise<Array<StepMetricSummary>>;
+  /**
+   * Get aggregate statistics for a training run
+   *
+   * Returns pre-computed aggregates for restoring TUI state on resume.
+   */
+  getRunAggregates(runId: string): Promise<RunAggregates>;
+  /**
+   * Get recent generations for sample panel restoration
+   *
+   * Returns generations ordered by step DESC, reward DESC (most recent high-reward first).
+   */
+  getRecentGenerations(runId: string, limit: number): Promise<Array<GenerationRecord>>;
+  /** Get store configuration */
+  get config(): OutputStoreConfig;
+  /** Record from RewardOutput JSON (direct integration with training engine) */
+  recordStepFromOutputs(
+    step: number,
+    metrics: EngineStepMetrics,
+    outputsJson: string,
+    rewards: Array<number>,
+    groupSize: number,
+  ): Promise<number>;
+  /**
+   * Record a complete training step with all generations and tool calls
+   *
+   * Lower-level API for direct control over step recording.
+   */
+  recordStep(
+    step: StepRecord,
+    generations: Array<GenerationRecord>,
+    toolCalls: Array<Array<ToolCallRecord>>,
+  ): Promise<number>;
+  /** Flush any pending writes */
+  flush(): Promise<void>;
+  /** List all training runs */
+  listRuns(limit?: number | undefined | null, status?: string | undefined | null): Promise<Array<TrainingRunRecord>>;
+  /** Get a specific run */
+  getRun(runId: string): Promise<TrainingRunRecord | null>;
+  /** Get step summaries for a run */
+  getStepSummaries(
+    runId: string,
+    startStep?: number | undefined | null,
+    endStep?: number | undefined | null,
+  ): Promise<Array<StepSummary>>;
+  /** Get all generations for a step */
+  getGenerations(runId: string, step: number): Promise<Array<GenerationWithToolCalls>>;
+  /** Get top/bottom generations by reward */
+  getGenerationsByReward(
+    runId: string,
+    topN?: number | undefined | null,
+    bottomN?: number | undefined | null,
+    stepRange?: Array<number> | undefined | null,
+  ): Promise<Array<GenerationWithToolCalls>>;
+  /** Get generations with specific finish reason */
+  getGenerationsByFinishReason(
+    runId: string,
+    finishReason: string,
+    limit?: number | undefined | null,
+  ): Promise<Array<GenerationWithToolCalls>>;
+  /** Get generations containing tool calls */
+  getGenerationsWithToolCalls(
+    runId: string,
+    toolName?: string | undefined | null,
+    status?: string | undefined | null,
+    limit?: number | undefined | null,
+  ): Promise<Array<GenerationWithToolCalls>>;
+  /** Search generations by text content */
+  searchGenerations(
+    runId: string,
+    query: string,
+    searchIn?: string | undefined | null,
+    limit?: number | undefined | null,
+  ): Promise<Array<GenerationWithToolCalls>>;
+  /** Get reward distribution statistics */
+  getRewardStats(runId: string, stepRange?: Array<number> | undefined | null): Promise<RewardStats>;
+  /** Export to JSONL file */
+  exportJsonl(runId: string, outputPath: string, includeToolCalls?: boolean | undefined | null): Promise<number>;
+  /** Execute raw SQL query (for advanced users) */
+  queryRaw(sql: string): Promise<string>;
+}
+
 /**
  * Opaque handle to KV cache state from a chat-session turn.
  *
@@ -1023,7 +1204,12 @@ export declare class Qwen35Model {
    * fetch ArrayBuffer, and passes the buffer handles here. No weight data touches
    * WASM linear memory.
    */
-  static loadFromGpuBuffers(configJson: string, gpuTensors: Array<any>, tokenizerJson: string): Qwen35Model;
+  static loadFromGpuBuffers(
+    configJson: string,
+    gpuTensors: Array<any>,
+    tokenizerJson: string,
+    tokenizerConfigJson?: string | undefined | null,
+  ): Qwen35Model;
   /**
    * Generate text from a prompt token sequence.
    *
@@ -1510,6 +1696,59 @@ export declare class Qwen3Model {
    */
   computeLossAndGradients(inputIds: MxArray, labels: MxArray): [MxArray, Record<string, MxArray>];
   /**
+   * Complete GRPO training step using MLX Autograd (RECOMMENDED)
+   *
+   * This method uses automatic differentiation to compute gradients, eliminating
+   * the need for manual backward pass implementation. This is the preferred approach.
+   *
+   * # Arguments
+   * * `prompt_tokens` - Prompt token sequences [batch_size, seq_len] (1D arrays)
+   * * `completion_tokens` - Completion sequences [batch*G, completion_len] (1D arrays)
+   * * `completion_logprobs` - Logprobs from generation [batch*G, completion_len] (1D arrays)
+   * * `rewards` - Reward scores for each completion [batch*G]
+   * * `group_size` - Number of completions per prompt (G)
+   * * `config` - GRPO loss configuration
+   * * `learning_rate` - Learning rate for parameter updates
+   *
+   * # Returns
+   * * Tuple of (loss_value, metrics_dict)
+   */
+  trainStepGrpoAutograd(
+    promptTokens: Array<MxArray>,
+    completionTokens: Array<MxArray>,
+    completionLogprobs: Array<MxArray>,
+    rewards: Float64Array,
+    groupSize: number,
+    config: GRPOLossConfig,
+    learningRate: number,
+  ): [number, Record<string, number>];
+  /**
+   * Compute gradients only without applying them (for gradient accumulation)
+   *
+   * This method computes GRPO loss and gradients but does NOT update parameters.
+   * Used for gradient accumulation where gradients are summed across multiple
+   * micro-batches before applying them.
+   *
+   * # Arguments
+   * * `prompt_tokens` - Prompt token sequences [batch_size, seq_len] (1D arrays)
+   * * `completion_tokens` - Completion sequences [batch*G, completion_len] (1D arrays)
+   * * `completion_logprobs` - Logprobs from generation [batch*G, completion_len] (1D arrays)
+   * * `rewards` - Reward scores for each completion [batch*G]
+   * * `group_size` - Number of completions per prompt (G)
+   * * `config` - GRPO loss configuration
+   *
+   * # Returns
+   * * Tuple of (loss_value, gradients_dict, metrics_dict)
+   */
+  computeGradientsOnlyGrpoAutograd(
+    promptTokens: Array<MxArray>,
+    completionTokens: Array<MxArray>,
+    completionLogprobs: Array<MxArray>,
+    rewards: Float64Array,
+    groupSize: number,
+    config: GRPOLossConfig,
+  ): [number, Record<string, MxArray>, Record<string, number>];
+  /**
    * Accumulate gradients into existing gradient dictionary
    *
    * This is a helper method for gradient accumulation. It adds new_gradients
@@ -1526,6 +1765,38 @@ export declare class Qwen3Model {
     accumulatedGradients: Record<string, MxArray>,
     newGradients: Record<string, MxArray>,
   ): Record<string, MxArray>;
+  /**
+   * Complete GRPO training step using manual gradients (Legacy)
+   *
+   * This method performs a full GRPO training iteration:
+   * 1. Takes completions (already generated) with their logprobs and rewards
+   * 2. Computes advantages
+   * 3. Computes GRPO loss and gradients
+   * 4. Updates model parameters
+   *
+   * NOTE: Use train_step_grpo_autograd instead for automatic differentiation.
+   *
+   * # Arguments
+   * * `prompt_tokens` - Prompt token sequences [batch_size, seq_len] (1D arrays)
+   * * `completion_tokens` - Completion sequences [batch*G, completion_len] (1D arrays)
+   * * `completion_logprobs` - Logprobs from generation [batch*G, completion_len] (1D arrays)
+   * * `rewards` - Reward scores for each completion [batch*G]
+   * * `group_size` - Number of completions per prompt (G)
+   * * `config` - GRPO loss configuration
+   * * `learning_rate` - Learning rate for parameter updates
+   *
+   * # Returns
+   * * Tuple of (loss_value, metrics_dict)
+   */
+  trainStepGrpo(
+    promptTokens: Array<MxArray>,
+    completionTokens: Array<MxArray>,
+    completionLogprobs: Array<MxArray>,
+    rewards: Float64Array,
+    groupSize: number,
+    config: GRPOLossConfig,
+    learningRate: number,
+  ): [number, Record<string, number>];
   /**
    * Apply gradients to model parameters
    *
@@ -1723,6 +1994,47 @@ export declare class Qwen3Model {
     tools?: Array<ToolDefinition> | undefined | null,
     enableThinking?: boolean | undefined | null,
   ): Promise<Uint32Array>;
+  /**
+   * Load a pretrained model from disk
+   *
+   * This loads a model from a directory containing:
+   * - config.json: Model configuration
+   * - weights.mlx (optional): MLX format weights with data arrays
+   * - weights.safetensors (optional): SafeTensors format (not yet supported)
+   *
+   * # Arguments
+   * * `model_path` - Path to the model directory
+   *
+   * # Returns
+   * * A fully initialized Qwen3Model with loaded weights
+   */
+  static load(modelPath: string): Promise<Qwen3Model>;
+  /**
+   * Save model configuration and weights to disk
+   *
+   * This saves:
+   * - config.json: Model configuration
+   * - weights.safetensors: Full model weights in SafeTensors format
+   * - weights.mlx: Parameter metadata (for reference)
+   *
+   * # Arguments
+   * * `save_path` - Directory to save the model
+   */
+  saveModel(savePath: string): Promise<undefined>;
+  /**
+   * Validate that a set of parameters has all required weights with correct shapes
+   *
+   * This is useful for validating parameters before loading them into a model,
+   * or for checking that saved weights are valid before training.
+   *
+   * # Arguments
+   * * `params` - HashMap of parameter names to MxArray values
+   *
+   * # Returns
+   * * Ok(()) if all validations pass
+   * * Err with descriptive message if validation fails
+   */
+  validateParameters(params: Record<string, MxArray>): void;
 }
 
 /** Qwen3 Tokenizer class with NAPI bindings */
@@ -1855,6 +2167,60 @@ export declare class Qwen3Tokenizer {
   getImEndToken(): string;
   /** Get the special token for ENDOFTEXT (used as PAD) */
   getEndoftextToken(): string;
+}
+
+/** SFT Training Engine */
+export declare class SftTrainingEngine {
+  /** Create a new SFT training engine from a Qwen3 model */
+  constructor(model: Qwen3Model, config: SftEngineConfig);
+  /** Create a new SFT training engine from a Qwen3.5 dense model */
+  static fromQwen35(model: Qwen35Model, config: SftEngineConfig): SftTrainingEngine;
+  /** Create a new SFT training engine from a Qwen3.5 MoE model */
+  static fromQwen35Moe(model: Qwen35MoeModel, config: SftEngineConfig): SftTrainingEngine;
+  /** Run a single training step */
+  trainStep(inputIds: MxArray, labels: MxArray): Promise<SftStepMetrics>;
+  /** Get current step number */
+  getStep(): number;
+  /** Get current epoch */
+  getEpoch(): number;
+  /**
+   * Flush any accumulated gradients at epoch end
+   *
+   * When stepsPerEpoch % gradient_accumulation_steps != 0, there may be
+   * leftover gradients from the final micro-batches. This method applies
+   * them with proper averaging, matching TRL behavior.
+   */
+  flushGradients(): boolean;
+  /**
+   * Compute the resume position given current state and dataset info
+   *
+   * This centralizes all resume logic in Rust for correctness.
+   * Uses i64 math internally to avoid overflow on long runs.
+   */
+  computeResumePosition(stepsPerEpoch: number): ResumePosition;
+  /** Check if emergency save is needed */
+  needsEmergencySave(): boolean;
+  /** Clear emergency save flag */
+  clearEmergencySave(): void;
+  /**
+   * Signal start of a new epoch
+   *
+   * Takes the epoch number directly from TypeScript to ensure synchronization.
+   * The epoch is 0-indexed to match the TypeScript training loop.
+   */
+  startEpoch(epoch: number): void;
+  /** End current epoch and return metrics */
+  endEpoch(epochTimeSecs: number): SftEpochMetrics;
+  /** Reset training state (for new training run) */
+  reset(): void;
+  /** Restore training state (for resuming from checkpoint) */
+  restoreState(step: number, epoch: number): void;
+  /** Get the underlying Qwen3 model for checkpointing */
+  getModel(): Qwen3Model;
+  /** Get the underlying Qwen3.5 dense model for checkpointing */
+  getQwen35Model(): Qwen35Model;
+  /** Get the underlying Qwen3.5 MoE model for checkpointing */
+  getQwen35MoeModel(): Qwen35MoeModel;
 }
 
 /**
@@ -2341,6 +2707,40 @@ export declare function buildRewardOutputs(
   groupSize: number,
 ): Array<RewardOutput>;
 
+/** Configuration for built-in rewards */
+export interface BuiltinRewardConfig {
+  /** Type of reward function */
+  rewardType: BuiltinRewardType;
+  /** Weight for this reward (default 1.0) */
+  weight?: number;
+  /** Allowed tool names (for ToolUse) */
+  allowedTools?: Array<string>;
+  /** Required tags (for XmlFormat) */
+  requiredTags?: Array<string>;
+  /** Minimum length (for Length) */
+  minLength?: number;
+  /** Maximum length (for Length) */
+  maxLength?: number;
+  /** Use character count vs word count (for Length) */
+  useChars?: boolean;
+  /** Required JSON fields (for JsonSchema) */
+  requiredFields?: Array<string>;
+  /** Whether tool call is required (for ToolUse) */
+  required?: boolean;
+}
+
+/** Built-in reward function types */
+export declare const enum BuiltinRewardType {
+  /** Tool use validation */
+  ToolUse = 'ToolUse',
+  /** XML format validation */
+  XmlFormat = 'XmlFormat',
+  /** Length-based scoring */
+  Length = 'Length',
+  /** JSON format validation (brace matching + field name check, not full JSON parsing) */
+  JsonSchema = 'JsonSchema',
+}
+
 /** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
   maxNewTokens?: number | undefined;
@@ -2504,6 +2904,18 @@ export interface ClassifyRotateResult {
   image: Uint8Array;
 }
 
+/** Statistics about cleanup operations (NAPI wrapper) */
+export interface CleanupStats {
+  /** Number of training steps deleted */
+  stepsDeleted: number;
+  /** Number of generations deleted */
+  generationsDeleted: number;
+  /** Number of tool calls deleted */
+  toolCallsDeleted: number;
+  /** Number of logs deleted */
+  logsDeleted: number;
+}
+
 /**
  * Structured completion information aligned with ChatResult.
  * Contains pre-parsed tool calls, thinking, and clean text.
@@ -2567,6 +2979,8 @@ export interface ConversionResult {
 
 export declare function convertForeignWeights(options: ForeignConversionOptions): ForeignConversionResult;
 
+export declare function convertGgufToSafetensors(options: GgufConversionOptions): Promise<GgufConversionResult>;
+
 /**
  * Convert a HuggingFace SafeTensors model to MLX format
  *
@@ -2597,6 +3011,8 @@ export declare function convertForeignWeights(options: ForeignConversionOptions)
  * ```
  */
 export declare function convertModel(options: ConversionOptions): Promise<ConversionResult>;
+
+export declare function convertParquetToJsonl(inputPath: string, outputPath: string): void;
 
 /** Create a default PaddleOCR-VL 1.5 configuration (JS factory function) */
 export declare function createPaddleocrVlConfig(): ModelConfig;
@@ -2662,6 +3078,50 @@ export declare const enum DType {
 export declare const enum ElementType {
   Table = 'Table',
   Paragraph = 'Paragraph',
+}
+
+/** Metrics from a training epoch */
+export interface EngineEpochMetrics {
+  /** Epoch number */
+  epoch: number;
+  /** Average loss for the epoch */
+  avgLoss: number;
+  /** Average reward for the epoch */
+  avgReward: number;
+  /** Total steps in the epoch */
+  totalSteps: number;
+  /** Total tokens processed */
+  totalTokens: number;
+  /** Time for the epoch (seconds) */
+  epochTimeSecs: number;
+}
+
+/** Metrics from a single training step */
+export interface EngineStepMetrics {
+  /** Current step number */
+  step: number;
+  /** GRPO loss value */
+  loss: number;
+  /** Mean reward across completions */
+  meanReward: number;
+  /** Standard deviation of rewards */
+  stdReward: number;
+  /** Mean advantage value */
+  meanAdvantage: number;
+  /** Standard deviation of advantages */
+  stdAdvantage: number;
+  /** Total tokens generated this step */
+  totalTokens: number;
+  /** Whether gradients were applied */
+  gradientsApplied: boolean;
+  /** Time for generation (ms) */
+  generationTimeMs: number;
+  /** Time for training (ms) */
+  trainingTimeMs: number;
+  /** Peak memory usage this step (MB) */
+  peakMemoryMb: number;
+  /** Active memory at end of step (MB) */
+  activeMemoryMb: number;
 }
 
 export interface ForeignConversionOptions {
@@ -2884,8 +3344,58 @@ export interface GenerationConfig {
   numDraftTokens?: number;
 }
 
+export interface GenerationProfile {
+  /** Label identifying the decode loop variant. */
+  label: string;
+  /** Model type (e.g. "qwen3_5", "qwen3_5_moe", "qwen3"). */
+  modelType: string;
+  /** Number of tokens generated. */
+  numTokens: number;
+  /** Number of prompt tokens. */
+  promptTokens: number;
+  /** Prefill wall-clock time (ms). */
+  prefillMs: number;
+  /** Decode wall-clock time (ms). */
+  decodeMs: number;
+  /** Total wall-clock time (prefill + decode) (ms). */
+  totalMs: number;
+  /** Tokens per second (decode only). */
+  tokensPerSecond: number;
+  /** Time to first token (ms) — from decode loop start to first token extracted. */
+  timeToFirstTokenMs: number;
+  /** Per-phase breakdown. */
+  phases: Array<PhaseProfile>;
+  /** Memory snapshot before generation. */
+  memoryBefore?: MemorySnapshot;
+  /** Memory snapshot after generation. */
+  memoryAfter?: MemorySnapshot;
+}
+
+/** A generation record (NAPI wrapper) */
+export interface GenerationRecord {
+  batchIndex: number;
+  groupIndex: number;
+  prompt: string;
+  expectedAnswer?: string;
+  completionText: string;
+  completionRaw: string;
+  thinking?: string;
+  numTokens: number;
+  finishReason: string;
+  reward: number;
+}
+
+/** A generation with its associated tool calls (NAPI wrapper) */
+export interface GenerationWithToolCalls {
+  generation: GenerationRecord;
+  toolCalls: Array<ToolCallRecord>;
+}
+
 /** Get expected weight keys for PaddleOCR-VL model */
 export declare function getExpectedWeightKeys(): Array<string>;
+
+/** Retrieve all collected profiling data as a `ProfilingSession`. */
+export declare function getProfilingData(): ProfilingSession;
 
 export interface GgufConversionOptions {
   /** Path to the GGUF file */
@@ -2935,6 +3445,188 @@ export interface GgufConversionResult {
   sourceFormat: string;
 }
 
+export interface GpuInfo {
+  /** GPU architecture generation (M1=13, M2=14, M3=15, M4=16, M5=17). */
+  architectureGen: number;
+}
+
+/** Configuration for the GRPO training engine */
+export interface GrpoEngineConfig {
+  /** Learning rate (default: 1e-6) */
+  learningRate?: number;
+  /** Gradient accumulation steps (default: 1) */
+  gradientAccumulationSteps?: number;
+  /** Maximum gradient norm for clipping (default: 1.0) */
+  gradientClipNorm?: number;
+  /**
+   * Maximum gradient value for element-wise clipping (default: 1.0)
+   * This clamps individual gradient elements to [-value, value]
+   */
+  gradientClipValue?: number;
+  /** Number of completions per prompt (default: 4) */
+  groupSize?: number;
+  /** PPO clipping epsilon (default: 0.2) */
+  clipEpsilon?: number;
+  /** KL divergence coefficient (default: 0.0) */
+  klCoef?: number;
+  /** Loss type: "grpo", "dapo", "dr_grpo", "bnpo" (default: "grpo") */
+  lossType?: string;
+  /**
+   * Maximum completion length for both generation and training (default: 256)
+   * Matches Python TRL's max_completion_length config.
+   */
+  maxCompletionLength?: number;
+  /** Sampling temperature (default: 0.8) */
+  temperature?: number;
+  /** Top-p (nucleus) sampling (default: 0.95) */
+  topP?: number;
+  /** Top-k sampling (optional) */
+  topK?: number;
+  /** Repetition penalty (default: 1.1) */
+  repetitionPenalty?: number;
+  /**
+   * Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
+   * token that appeared at least once in context.
+   */
+  presencePenalty?: number;
+  /**
+   * Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
+   * logits of each token in context.
+   */
+  frequencyPenalty?: number;
+  /**
+   * Maximum allowed NaN gradient occurrences before stopping training (default: 100)
+   * When exceeded, training will stop with an error to prevent model corruption.
+   */
+  maxNanGradients?: number;
+  /**
+   * Consecutive NaN gradients that trigger emergency checkpoint (default: 5)
+   * When reached, the needs_emergency_save flag is set for the TypeScript layer.
+   */
+  emergencySaveThreshold?: number;
+  /**
+   * Enable detailed NaN/Inf detection with per-element counts (default: false)
+   * When false (default), uses GPU-native has_nan_or_inf() which only transfers a single
+   * boolean to CPU. When true, transfers the entire gradient tensor to CPU for detailed
+   * per-element analysis - useful for debugging but has significant performance overhead
+   * for large models (e.g., 2.4GB for Qwen3-0.6B).
+   */
+  verboseNanDetection?: boolean;
+  /**
+   * Enable thinking mode for Qwen3 models (default: true)
+   * When false, adds empty <think></think> tags to disable model thinking.
+   * This is useful for tool-use training where you want direct outputs.
+   */
+  enableThinking?: boolean;
+  /**
+   * Tool definitions for function calling
+   * When provided, tools are included in the chat template so the model
+   * can generate tool calls. This is essential for tool-use training.
+   */
+  tools?: Array<ToolDefinition>;
+  /**
+   * Batch chunk size for LM head computation (memory optimization).
+   * When set, the LM head (hidden_states -> logits) is computed in chunks
+   * of this size to reduce peak memory usage.
+   * Default: None (no chunking, full batch at once)
+   * Recommended: 2 for batch_size >= 4 with large vocabularies (e.g., 151936)
+   * This reduces peak memory from ~1.2GB to ~300MB for Qwen3 (vocab=151936).
+   */
+  lmHeadChunkSize?: number;
+  /**
+   * Batch chunk size for transformer forward pass (memory optimization).
+   * When set, the transformer layers process the batch in chunks of this size,
+   * reducing peak memory from O(batch × heads × seq²) for attention.
+   * Default: None (no chunking, full batch at once)
+   * Recommended: 4 for batch_size >= 4 with groupSize >= 4
+   * Memory savings: ~70-80% for batch=4, groupSize=4 (16 sequences → 4 at a time)
+   */
+  forwardChunkSize?: number;
+  /**
+   * Chunk size for vocabulary dimension in cross-entropy computation.
+   * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
+   * the computation is split into chunks of this size to reduce peak memory usage.
+   * Default: 65536 (2^16)
+   * Recommended: 65536 for Qwen3 (vocab=151936) splits into 3 chunks
+   * Set to a larger value to reduce chunking overhead or smaller for tighter memory constraints.
+   */
+  vocabChunkSize?: number;
+  /**
+   * Enable true parallel batch generation (default: false).
+   * When true, all N*G sequences are processed in parallel using batched FFI
+   * with per-sequence RoPE offsets. This provides 2-4x speedup for GRPO training.
+   * When false, uses the sequential generation (process one prompt at a time,
+   * then expand KV cache for G completions).
+   */
+  useParallelBatchGeneration?: boolean;
+  /**
+   * Enable gradient checkpointing (default: true).
+   * When true, each transformer layer's activations are discarded during the forward
+   * pass and recomputed during backward, reducing peak memory from O(num_layers) to O(1)
+   * for intermediate states. For Qwen3.5 0.8B, this reduces autograd peak from ~105GB to ~11GB.
+   * The trade-off is ~30% more compute (one extra forward pass per layer during backward).
+   */
+  gradientCheckpointing?: boolean;
+  /** Optimizer type: "sgd" or "adamw" (default: "adamw") */
+  optimizerType?: string;
+  /** AdamW beta1 (default: 0.9) */
+  adamwBeta1?: number;
+  /** AdamW beta2 (default: 0.999) */
+  adamwBeta2?: number;
+  /** AdamW epsilon (default: 1e-8) */
+  adamwEps?: number;
+  /** Weight decay for AdamW (default: 0.01) */
+  weightDecay?: number;
+}
+
+/** Configuration for GRPO loss computation */
+export interface GrpoLossConfig {
+  /** Lower clipping bound (default: 0.2, means clip to [1-0.2, 1+epsilon_high]) */
+  epsilonLow: number;
+  /** Upper clipping bound (default: same as epsilon_low) */
+  epsilonHigh?: number;
+  /** KL divergence penalty coefficient (default: 0.0, no penalty) */
+  beta: number;
+  /** Loss aggregation type: "grpo", "bnpo", "dr_grpo", or "dapo" */
+  lossType: string;
+  /** Importance sampling level: "token" or "sequence" */
+  importanceSamplingLevel: string;
+  /**
+   * Maximum completion length (legacy, no longer used by dr_grpo)
+   * Kept for backwards compatibility but ignored in current implementation.
+   */
+  maxCompletionLength?: number;
+  /** Total number of items in batch across all processes (needed for dapo) */
+  numItemsInBatch?: number;
+  /** Current gradient accumulation step (for loss scaling) */
+  gradientAccumulationSteps: number;
+  /**
+   * Batch chunk size for LM head computation (memory optimization).
+   * When set, the LM head (hidden_states -> logits) is computed in chunks
+   * of this size to reduce peak memory usage.
+   * Default: None (no chunking, full batch at once)
+   * Recommended: 2 for batch_size >= 4 with large vocabularies (e.g., 151936)
+   */
+  lmHeadChunkSize?: number;
+  /**
+   * Batch chunk size for transformer forward pass (memory optimization).
+   * When set, the transformer layers process the batch in chunks of this size,
+   * reducing peak memory from O(batch × heads × seq²) for attention.
+   * Default: None (no chunking, full batch at once)
+   * Recommended: 4 for batch_size >= 4 with groupSize >= 4
+   * Memory savings: ~70-80% for batch=4, groupSize=4 (16 sequences → 4 at a time)
+   */
+  forwardChunkSize?: number;
+  /**
+   * Chunk size for vocabulary dimension in cross-entropy computation.
+   * When computing logsumexp over large vocabularies (e.g., Qwen3's 151,936 tokens),
+   * the computation is split into chunks of this size to reduce peak memory usage.
+   * Default: 65536 (2^16)
+   * Recommended: 65536 for Qwen3 (vocab=151936) splits into 3 chunks
+   */
+  vocabChunkSize?: number;
+}
+
 /** InternViT vision encoder configuration */
 export interface InternVisionConfig {
   hiddenSize: number;
@@ -2949,6 +3641,9 @@ export interface InternVisionConfig {
   /** Drop path rate (inference only, always 0) */
   dropPathRate: number;
 }
+
+/** Check whether profiling is currently enabled. */
+export declare function isProfilingEnabled(): boolean;
 
 /** A single detected layout element. */
 export interface LayoutElement {
@@ -3059,6 +3754,12 @@ export enum OutputFormat {
   Html = 'Html',
   /** JSON structured output */
   Json = 'Json',
+}
+
+/** Configuration for creating an OutputStore connection */
+export interface OutputStoreConfig {
+  /** Local SQLite file path (e.g., "training_outputs.db") */
+  localPath: string;
 }
 
 /** Paged attention memory statistics (NAPI-compatible) */
@@ -3174,9 +3875,23 @@ export interface ParseToolCallsResult {
 /** Parse VLM output into structured document */
 export declare function parseVlmOutput(text: string): ParsedDocument;
 
+/**
+ * Lightweight performance metrics returned by chat/chatStream when
+ * `reportPerformance: true` is set in the config.
+ */
 export interface PerformanceMetrics {
+  /**
+   * Time to first token (ms) — wall-clock from generation start to
+   * first token extracted. Includes tokenization, prefill (lazy graph
+   * construction + first GPU eval), and first sample.
+   */
   ttftMs: number;
+  /** Prefill throughput: prompt_tokens / (ttft_ms / 1000). */
   prefillTokensPerSecond: number;
+  /**
+   * Decode throughput: (generated_tokens - 1) / decode_time.
+   * Excludes the first token (counted as prefill).
+   */
   decodeTokensPerSecond: number;
 }
 
@@ -3405,6 +4120,19 @@ export interface RecResult {
   score: number;
 }
 
+/** Clear all collected profiling data and reset session timer. */
+export declare function resetProfilingData(): void;
+
+/** Result of resume position computation */
+export interface ResumePosition {
+  /** Epoch to start from (0-indexed) */
+  startEpoch: number;
+  /** Batch index within epoch to start from */
+  startBatchIdx: number;
+  /** Whether we're at an epoch boundary */
+  isEpochBoundary: boolean;
+}
+
 /**
  * Reward function input for a single completion.
  * Provides all context needed to compute a reward score.
@@ -3414,6 +4142,42 @@ export interface RewardOutput {
   prompt: string;
   /** Structured completion data aligned with ChatResult */
   completion: CompletionInfo;
+}
+
+/** Reward distribution statistics (NAPI wrapper) */
+export interface RewardStats {
+  count: number;
+  mean: number;
+  std: number;
+  min: number;
+  max: number;
+  median: number;
+  p25: number;
+  p75: number;
+}
+
+/** Aggregate statistics for a training run for resume state (NAPI wrapper) */
+export interface RunAggregates {
+  /** Best (highest) reward seen */
+  bestReward: number;
+  /** Average reward */
+  avgReward: number;
+  /** Total reward count */
+  rewardCount: number;
+  /** Best (lowest) loss seen */
+  bestLoss: number;
+  /** Average loss */
+  avgLoss: number;
+  /** Total loss count */
+  lossCount: number;
+  /** Total tokens generated */
+  totalTokens: number;
+  /** Current step number */
+  currentStep: number;
+  /** Average generation time (milliseconds) */
+  avgGenerationTimeMs: number;
+  /** Average training time (milliseconds) */
+  avgTrainingTimeMs: number;
 }
 
 /**
@@ -3639,6 +4403,16 @@ export interface ToolCall {
   arguments: string;
 }
 
+/** A tool call record (NAPI wrapper) */
+export interface ToolCallRecord {
+  callIndex: number;
+  status: string;
+  toolName?: string;
+  arguments?: string;
+  rawContent: string;
+  errorMessage?: string;
+}
+
 /** Structured tool call with parsed arguments */
 export interface ToolCallResult {
   /** Unique identifier for this tool call (format: call_<uuid>) */
@@ -3677,6 +4451,46 @@ export interface ToolDefinition {
   type: string;
   /** Function definition */
   function: FunctionDefinition;
+}
+
+/** A training run record (NAPI wrapper) */
+export interface TrainingRunRecord {
+  id: string;
+  name?: string;
+  modelName: string;
+  modelPath?: string;
+  config: string;
+  startedAt: number;
+  endedAt?: number;
+  totalSteps: number;
+  status: string;
+}
+
+/** Result from train_step_auto including metrics, completions, and rewards */
+export interface TrainStepResult {
+  /** Training metrics */
+  metrics: EngineStepMetrics;
+  /** Generated completion texts (for TUI logging) */
+  completions: Array<string>;
+  /** Computed reward values (for TUI logging) */
+  rewards: Array<number>;
+}
+
+/** Result from train_step_auto_with_recording including optional full RewardOutput data */
+export interface TrainStepResultWithOutputs {
+  /** Training metrics */
+  metrics: EngineStepMetrics;
+  /** Generated completion texts (for TUI logging) */
+  completions: Array<string>;
+  /** Computed reward values (for TUI logging) */
+  rewards: Array<number>;
+  /**
+   * Full RewardOutput data as JSON (only populated when record_outputs is true)
+   * This enables zero-copy persistence of training outputs
+   */
+  outputsJson?: string;
+  /** Actual token counts for each completion (for accurate TUI display) */
+  completionLengths: Array<number>;
 }
 
 /** Result from document unwarping. */

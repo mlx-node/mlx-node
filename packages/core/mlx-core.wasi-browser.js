@@ -9,7 +9,7 @@ const __wasi = new __WASI({
   version: 'preview1',
 });
 
-const __wasmUrl = new URL('./mlx-core.wasm32-wasi.debug.wasm', import.meta.url).href;
+const __wasmUrl = new URL('./mlx-core.wasm32-wasi.wasm', import.meta.url).href;
 const __emnapiContext = __emnapiGetDefaultContext();
 
 const __sharedMemory = new WebAssembly.Memory({
@@ -41,7 +41,6 @@ const {
       ...importObject.napi,
       ...importObject.emnapi,
       memory: __sharedMemory,
-      __cpp_exception: new WebAssembly.Tag({ parameters: ['i32'] }), _ZN3mlx4core3gpu4initEv: () => {}, wgpuCreateInstance: () => 0, wgpuInstanceRequestAdapter: () => {}, wgpuInstanceRelease: () => {}, wgpuAdapterRequestDevice: () => {}, wgpuAdapterRelease: () => {}, wgpuDeviceSetUncapturedErrorCallback: () => {}, wgpuDeviceSetDeviceLostCallback: () => {}, wgpuDeviceGetQueue: () => 0, mlx_webgpu_poll: () => {}, wgpuDeviceCreateComputePipeline: () => 0, wgpuComputePipelineGetBindGroupLayout: () => 0, wgpuDeviceCreateShaderModule: () => 0, wgpuQueueOnSubmittedWorkDone: () => {}, wgpuAdapterGetProperties: () => {}, wgpuDeviceGetLimits: () => 0, wgpuCommandEncoderRelease: () => {}, wgpuComputePassEncoderEnd: () => {}, wgpuComputePassEncoderRelease: () => {}, wgpuDeviceCreateCommandEncoder: () => 0, wgpuCommandEncoderBeginComputePass: () => 0, wgpuComputePassEncoderSetPipeline: () => {}, wgpuComputePassEncoderSetBindGroup: () => {}, wgpuComputePassEncoderDispatchWorkgroups: () => {}, wgpuCommandEncoderFinish: () => 0, wgpuQueueSubmit: () => {}, wgpuCommandBufferRelease: () => {}, wgpuDeviceCreateBuffer: () => 0, wgpuBufferDestroy: () => {}, wgpuBufferRelease: () => {}, wgpuCommandEncoderCopyBufferToBuffer: () => {}, wgpuBufferMapAsync: () => {}, wgpuBufferGetConstMappedRange: () => 0, wgpuBufferUnmap: () => {}, wgpuBufferGetSize: () => 0n, wgpuBindGroupRelease: () => {}, wgpuDeviceCreateBindGroup: () => 0, wgpuBufferGetMappedRange: () => 0,
     };
     return importObject;
   },
@@ -61,7 +60,11 @@ export const PPDocLayoutV3Model = __napiModule.exports.PPDocLayoutV3Model;
 export const DocOrientationModel = __napiModule.exports.DocOrientationModel;
 export const DocUnwarpModel = __napiModule.exports.DocUnwarpModel;
 export const GenerationResult = __napiModule.exports.GenerationResult;
+export const GrpoTrainingEngine = __napiModule.exports.GrpoTrainingEngine;
+export const GRPOTrainingEngine = __napiModule.exports.GRPOTrainingEngine;
 export const MxArray = __napiModule.exports.MxArray;
+export const NativeRewardRegistry = __napiModule.exports.NativeRewardRegistry;
+export const OutputStore = __napiModule.exports.OutputStore;
 export const PromptCache = __napiModule.exports.PromptCache;
 export const QianfanOCRModel = __napiModule.exports.QianfanOCRModel;
 export const Qwen35Model = __napiModule.exports.Qwen35Model;
@@ -70,6 +73,7 @@ export const Qwen35MoeModel = __napiModule.exports.Qwen35MoeModel;
 export const Qwen3_5MoeModel = __napiModule.exports.Qwen3_5MoeModel;
 export const Qwen3Model = __napiModule.exports.Qwen3Model;
 export const Qwen3Tokenizer = __napiModule.exports.Qwen3Tokenizer;
+export const SftTrainingEngine = __napiModule.exports.SftTrainingEngine;
 export const Tensor = __napiModule.exports.Tensor;
 export const TextDetModel = __napiModule.exports.TextDetModel;
 export const TextRecModel = __napiModule.exports.TextRecModel;
@@ -77,16 +81,23 @@ export const VlmChatResult = __napiModule.exports.VlmChatResult;
 export const VLMChatResult = __napiModule.exports.VLMChatResult;
 export const VLModel = __napiModule.exports.VLModel;
 export const buildRewardOutputs = __napiModule.exports.buildRewardOutputs;
+export const BuiltinRewardType = __napiModule.exports.BuiltinRewardType;
 export const ChatRole = __napiModule.exports.ChatRole;
 export const convertForeignWeights = __napiModule.exports.convertForeignWeights;
+export const convertGgufToSafetensors = __napiModule.exports.convertGgufToSafetensors;
 export const convertModel = __napiModule.exports.convertModel;
+export const convertParquetToJsonl = __napiModule.exports.convertParquetToJsonl;
 export const createPaddleocrVlConfig = __napiModule.exports.createPaddleocrVlConfig;
 export const createQianfanOcrConfig = __napiModule.exports.createQianfanOcrConfig;
 export const DType = __napiModule.exports.DType;
 export const ElementType = __napiModule.exports.ElementType;
 export const formatDocument = __napiModule.exports.formatDocument;
 export const getExpectedWeightKeys = __napiModule.exports.getExpectedWeightKeys;
+export const getProfilingData = __napiModule.exports.getProfilingData;
+export const isProfilingEnabled = __napiModule.exports.isProfilingEnabled;
 export const OutputFormat = __napiModule.exports.OutputFormat;
 export const parsePaddleResponse = __napiModule.exports.parsePaddleResponse;
 export const parseToolCallsFromText = __napiModule.exports.parseToolCallsFromText;
 export const parseVlmOutput = __napiModule.exports.parseVlmOutput;
+export const resetProfilingData = __napiModule.exports.resetProfilingData;
+export const setProfilingEnabled = __napiModule.exports.setProfilingEnabled;

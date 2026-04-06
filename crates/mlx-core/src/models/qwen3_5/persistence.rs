@@ -854,6 +854,10 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
 /// Register all sanitized weights with the C++ fused forward pass.
 /// Sets model_id AFTER all weights are stored — ensures no inference sees
 /// a partially-populated weight map with the new model's ID.
+pub(crate) fn register_weights_with_cpp_public(params: &HashMap<String, MxArray>, model_id: u64) {
+    register_weights_with_cpp(params, model_id);
+}
+
 fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
     use mlx_sys as sys;
 

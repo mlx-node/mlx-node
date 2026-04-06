@@ -13,15 +13,28 @@
 #endif
 #include "mlx/backend/gpu/device_info.h"
 
+// Forward-declare gpu::synchronize for the WASM eval helper
+namespace mlx::core::gpu { void synchronize(Stream s); }
+
+// WASM-safe eval: uses async_eval + gpu::synchronize instead of
+// mlx::core::eval which deadlocks due to Event::wait/cv.wait.
+inline void eval_safe(mlx::core::array& arr) {
+  mlx::core::async_eval({arr});
+  mlx::core::gpu::synchronize(
+      mlx::core::default_stream(mlx::core::Device::gpu));
+}
+
+inline void eval_safe(std::vector<mlx::core::array> arrays) {
+  mlx::core::async_eval(std::move(arrays));
+  mlx::core::gpu::synchronize(
+      mlx::core::default_stream(mlx::core::Device::gpu));
+}
+
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstdint>
-#include <cctype>
 #include <cstring>
-#include <fstream>
 #include <optional>
-#include <string>
 #include <utility>
 #include <vector>
 #include <iostream>
@@ -36,96 +49,6 @@ struct mlx_stream {
   int32_t index;
   int32_t device_type;  // 0 = CPU, 1 = GPU
 };
-
-namespace mlx::core::fast::paged {
-
-// Standardized metadata that EVERY paged-attention model's compiled forward
-// receives. Shapes are FIXED at compile time (sentinel-padded contents); only
-// contents change per request — that's what keeps the compile cache hitting
-// across calls instead of re-tracing on every shape change.
-//
-// The struct is a thin POD-style aggregator — it does NOT own the arrays.
-// Callers (the Rust adapter) materialize the arrays once per request,
-// hand the struct into the compiled graph, and the arrays die with the
-// caller's stack frame. No copies, no ref counting beyond MLX's own
-// `array` machinery.
-struct PagedAttentionInputs {
-  // Global token position of the first new token in this request, broadcast
-  // as a `[1]` int32 array so the compile cache treats it as a tracer rather
-  // than a fixed scalar (matches the per-request `offset` array threaded
-  // through `mlx_qwen35.cpp` today).
-  array offset_arr;
-
-  // Per-request block table, sentinel-padded with -1 to a fixed
-  // `[1, max_blocks_per_seq]` int32 shape. The kernel reads
-  // `block_table[seq_idx, block_idx]` and uses -1 entries as a dispatch-time
-  // skip signal (validated by `paged_attention` factory).
-  array block_table;
-
-  // Per-token slot mapping for the current write chunk, sentinel-padded with
-  // -1 to a fixed `[chunk_size_max]` int64 shape. The kernel reads
-  // `slot_mapping[token_idx]` and computes `block_id = slot / block_size`
-  // for the K/V write target. Sentinel slots are skipped on dispatch
-  // (validated factory-side).
-  array slot_mapping;
-
-  // Valid prefix length of `slot_mapping` (so the write kernel knows how
-  // many tokens of the padded chunk are real). `[1]` int32.
-  array num_valid_tokens;
-
-  // Valid prefix length of `block_table` (so the gather kernel knows how
-  // many blocks of the padded table are real). `[1]` int32.
-  array num_valid_blocks;
-
-  // Total context length so far for this single-request adapter (= number of
-  // tokens already recorded after the chunk being written), threaded as a
-  // `[1]` int32 array so the kernel reads `context_lens[seq_idx=0]` from
-  // the right place. Mirrors vLLM's `seq_lens` argument to the
-  // `paged_attention` kernel (one entry per dispatched sequence).
-  array seq_lens;
-};
-
-}  // namespace mlx::core::fast::paged
-
-// =============================================================================
-// NA int8 W8A8 lazy graph builders (defined in mlx_na_int8.cpp).
-//
-// External-linkage C++ entry points for the sym8 (per-output-channel symmetric
-// int8) linear path. The eager Rust `QuantizedLinear::forward_sym8` emits
-// these graphs via the `mlx_w8a8_linear` / `mlx_int8_qmv` FFI wrappers, which
-// delegate to these builders. Keeping the math in ONE definition means every
-// consumer emits byte-identical graph nodes for the same inputs.
-//
-// Contract (both):
-//   x    : [M,K] activations (bf16; non-bf16 defensively cast)
-//   w_kn : [K,N] CONTIGUOUS int8 kernel operand, pre-transposed at load/
-//          registration time (NOT the checkpoint [N,K] tensor)
-//   s_w  : [N] f32 per-output-channel weight scale
-//   returns LAZY bf16 [M,N] = x @ w^T (composes into the surrounding graph)
-//
-// All THROW std::runtime_error on contract violations (caller-visible
-// fail-loud; the extern "C" wrappers translate to cerr + false for Rust).
-// Dispatch rule mirrors Rust: M <= 2 -> qmv_w8a16 (decode matvec, bf16
-// activations read directly — NO act quant), M >= 3 -> the W8A8 prefill GEMM.
-// qmv_lazy is the OLD W8A8 decode matvec, kept for A/B (qmv_w8a16_lazy falls
-// back to it under INT8_QMV_W8A16=0) and microbenches.
-// qmv_w8a16_lazy takes BOTH weight orientations: w_kn [K,N] (the GEMM operand,
-// consumed by the 2D-block fallback under INT8_QMV16_SG=0 and the W8A8
-// reroute) and w_nk [N,K] (the CHECKPOINT orientation, consumed by the default
-// simd_sum-style kernel — buffer-shared with the params tensor).
-// =============================================================================
-namespace na_int8 {
-mlx::core::array w8a8_linear_lazy(const mlx::core::array& x,
-                                  const mlx::core::array& w_kn,
-                                  const mlx::core::array& s_w);
-mlx::core::array qmv_lazy(const mlx::core::array& x,
-                          const mlx::core::array& w_kn,
-                          const mlx::core::array& s_w);
-mlx::core::array qmv_w8a16_lazy(const mlx::core::array& x,
-                                const mlx::core::array& w_kn,
-                                const mlx::core::array& w_nk,
-                                const mlx::core::array& s_w);
-}  // namespace na_int8
 
 namespace {
 using mlx::core::add;
@@ -156,31 +79,6 @@ using mlx::core::sum;
 using mlx::core::take;
 using mlx::core::transpose;
 using mlx::core::zeros;
-
-inline bool mlx_env_flag_enabled(const char* value) {
-  if (!value) return false;
-  std::string v(value);
-  std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  return v == "1" || v == "true" || v == "yes" || v == "on";
-}
-
-inline void mlx_trace_native_error(const char* context, const char* detail) {
-  if (!mlx_env_flag_enabled(std::getenv("MLX_INFERENCE_TRACE"))) return;
-  const char* path = std::getenv("MLX_INFERENCE_TRACE_FILE");
-  if (!path || !*path) return;
-  std::ofstream out(path, std::ios::app);
-  if (!out) return;
-  out << "native_error context=" << (context ? context : "unknown") << " detail=\"";
-  if (detail) {
-    for (const char* p = detail; *p; ++p) {
-      char c = *p;
-      out << ((c == '\n' || c == '\r' || c == '"') ? ' ' : c);
-    }
-  }
-  out << "\"\n";
-}
 
 // Comparison operations
 using mlx::core::equal;
@@ -279,7 +177,6 @@ enum BridgeDType : int32_t {
   BFLOAT16 = 3,
   UINT32 = 4,
   UINT8 = 5,
-  INT8 = 6,  // sym8 per-channel symmetric int8 checkpoint weights
 };
 
 mlx::core::Dtype to_mlx_dtype(int32_t code) {
@@ -296,8 +193,6 @@ mlx::core::Dtype to_mlx_dtype(int32_t code) {
       return mlx::core::uint32;
     case UINT8:
       return mlx::core::uint8;
-    case INT8:
-      return mlx::core::int8;
     default:
       return mlx::core::float32;
   }
@@ -317,31 +212,31 @@ int32_t from_mlx_dtype(mlx::core::Dtype dtype) {
       return UINT32;
     case mlx::core::uint8:
       return UINT8;
-    case mlx::core::int8:
-      return INT8;
     default:
       return -1;
   }
 }
 
 bool copy_to_buffer(const array& arr, float* out, size_t len) {
-  // Force materialization by adding zeros - this ensures broadcast values are
-  // expanded
-  auto zeros_arr = zeros(arr.shape(), arr.dtype());
-  auto materialized = add(arr, zeros_arr);
-  materialized.eval();
+  // Materialize the array as contiguous f32 for readback.
+  // We use add(zeros) to force broadcast expansion, then astype to f32.
+  // For bf16 on WebGPU: convert to f32 BEFORE the add(zeros) to avoid a
+  // bf16 raw_ptr() readback → re-upload cycle that corrupts data.
+  array src = arr;
+  if (src.dtype() != mlx::core::float32) {
+    src = astype(src, mlx::core::float32);
+  }
+  auto zeros_arr = zeros(src.shape(), mlx::core::float32);
+  auto materialized = add(src, zeros_arr);
+  eval_safe(materialized);
 
-  // Now flatten and copy
   auto flat = flatten(materialized);
-  auto host = (flat.dtype() == mlx::core::float32)
-                  ? flat
-                  : astype(flat, mlx::core::float32);
-  host.eval();
+  eval_safe(flat);
 
-  if (host.size() != len) {
+  if (flat.size() != len) {
     return false;
   }
-  const float* data = host.data<float>();
+  const float* data = flat.data<float>();
   std::copy(data, data + len, out);
   return true;
 }
@@ -351,14 +246,14 @@ bool copy_to_buffer(const array& arr, int32_t* out, size_t len) {
   // expanded
   auto zeros_arr = zeros(arr.shape(), arr.dtype());
   auto materialized = add(arr, zeros_arr);
-  materialized.eval();
+  eval_safe(materialized);
 
   // Now flatten and copy
   auto flat = flatten(materialized);
   auto host = (flat.dtype() == mlx::core::int32)
                   ? flat
                   : astype(flat, mlx::core::int32);
-  host.eval();
+  eval_safe(host);
 
   if (host.size() != len) {
     return false;
@@ -373,19 +268,55 @@ bool copy_to_buffer(const array& arr, uint32_t* out, size_t len) {
   // expanded
   auto zeros_arr = zeros(arr.shape(), arr.dtype());
   auto materialized = add(arr, zeros_arr);
-  materialized.eval();
+  eval_safe(materialized);
 
   // Now flatten and copy
   auto flat = flatten(materialized);
   auto host = (flat.dtype() == mlx::core::uint32)
                   ? flat
                   : astype(flat, mlx::core::uint32);
-  host.eval();
+  eval_safe(host);
 
   if (host.size() != len) {
     return false;
   }
   const uint32_t* data = host.data<uint32_t>();
+  std::copy(data, data + len, out);
+  return true;
+}
+
+// NO-EVAL versions: assume input array is already evaluated (for async pipeline)
+// Skips the add(zeros) materialization step, only evals transformations
+bool copy_to_buffer_noeval(const array& arr, float* out, size_t len) {
+  // Input arr is already evaluated by async_eval
+  // Skip the add(zeros) step - assume no broadcast expansion needed
+  auto flat = flatten(arr);
+  auto host = (flat.dtype() == mlx::core::float32)
+                  ? flat
+                  : astype(flat, mlx::core::float32);
+  eval_safe(host);  // Only eval the transformation (flatten/astype)
+
+  if (host.size() != len) {
+    return false;
+  }
+  const float* data = host.data<float>();
+  std::copy(data, data + len, out);
+  return true;
+}
+
+bool copy_to_buffer_noeval(const array& arr, int32_t* out, size_t len) {
+  // Input arr is already evaluated by async_eval
+  // Skip the add(zeros) step - assume no broadcast expansion needed
+  auto flat = flatten(arr);
+  auto host = (flat.dtype() == mlx::core::int32)
+                  ? flat
+                  : astype(flat, mlx::core::int32);
+  eval_safe(host);  // Only eval the transformation (flatten/astype)
+
+  if (host.size() != len) {
+    return false;
+  }
+  const int32_t* data = host.data<int32_t>();
   std::copy(data, data + len, out);
   return true;
 }

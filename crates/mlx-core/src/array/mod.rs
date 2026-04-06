@@ -114,8 +114,17 @@ impl MxArray {
 
 impl Clone for MxArray {
     fn clone(&self) -> Self {
+        // CRITICAL: Must create a new C++ array object (shared_ptr copy) rather
+        // than just cloning the Rust Arc. Without this, multiple Rust handles
+        // share one C++ pointer, so the C++ shared_ptr refcount doesn't reflect
+        // all live Rust references. When eval detaches graph nodes, the C++ refcount
+        // can hit 0 while Rust clones still exist → use-after-free.
+        let cloned = unsafe { sys::mlx_array_shallow_clone(self.handle.0) };
+        if cloned.is_null() {
+            panic!("mlx_array_shallow_clone returned null — possible heap corruption");
+        }
         Self {
-            handle: Arc::clone(&self.handle),
+            handle: Arc::new(MxHandle(cloned)),
         }
     }
 }

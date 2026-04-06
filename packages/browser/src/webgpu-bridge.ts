@@ -93,8 +93,57 @@ export function createWebGPUBridge(
   let wasmMalloc: (size: number) => number;
   let wasmFree: (ptr: number) => void;
 
-  // Track pending async GPU callbacks so poll can skip yields when idle
+  // GPU synchronization via Atomics.wait (no asyncify needed).
+  //
+  // Instead of returning Promises from mlx_webgpu_poll (which requires asyncify
+  // to yield the WASM thread), we block synchronously via Atomics.wait.
+  // A helper worker handles GPU completion callbacks and notifies us.
+  //
+  // Signal layout in SharedArrayBuffer (4 bytes each):
+  //   [0] = done signal: 0 = waiting, 1 = GPU work complete
+  //   [1] = submit signal: 0 = idle, 1 = main thread waiting for GPU
+  const signalBuffer = new SharedArrayBuffer(8);
+  const signalView = new Int32Array(signalBuffer);
+  const DONE_IDX = 0;
+  const SUBMIT_IDX = 1;
+
+  // Spawn a lightweight helper worker for GPU completion callbacks.
+  // It shares the GPUDevice and uses Atomics.notify to wake the main worker.
+  const helperCode = `
+    let queue = null;
+    const DONE_IDX = 0;
+    const SUBMIT_IDX = 1;
+
+    self.onmessage = async (e) => {
+      if (e.data.type === 'init') {
+        queue = e.data.queue;
+        pollLoop(new Int32Array(e.data.signalBuffer));
+      }
+    };
+
+    async function pollLoop(signal) {
+      while (true) {
+        // Wait for main thread to signal that GPU work was submitted
+        const result = Atomics.waitAsync(signal, SUBMIT_IDX, 0);
+        if (result.async) await result.value;
+
+        // Reset submit signal
+        Atomics.store(signal, SUBMIT_IDX, 0);
+
+        // Wait for all submitted GPU work to complete
+        await queue.onSubmittedWorkDone();
+
+        // Signal the main thread that GPU work is done
+        Atomics.store(signal, DONE_IDX, 1);
+        Atomics.notify(signal, DONE_IDX);
+      }
+    }
+  `;
+  const helperBlob = new Blob([helperCode], { type: 'application/javascript' });
+  const helperWorker = new Worker(URL.createObjectURL(helperBlob));
+
   let pendingCallbacks = 0;
+  let pollCount = 0;
 
   // Track mapped buffer ranges for the WASM memory shadow pattern
   interface MappedRange {
@@ -334,6 +383,20 @@ export function createWebGPUBridge(
         commandBuffers.push(getHandle<GPUCommandBuffer>(handle));
       }
       queue.submit(commandBuffers);
+      console.log(`[WebGPU Bridge] queue.submit(${count} cmd bufs), handles=${handles.size}`);
+    },
+
+    wgpuQueueWriteBuffer(
+      _queue: number, bufferHandle: number, bufferOffset: bigint,
+      dataPtr: number, size: number,
+    ): void {
+      const buffer = getHandle<GPUBuffer>(bufferHandle);
+      if (!buffer) {
+        console.error(`[WebGPU Bridge] writeBuffer: invalid handle ${bufferHandle}`);
+        return;
+      }
+      const data = new Uint8Array(wasmMemory.buffer, dataPtr, size);
+      queue.writeBuffer(buffer, Number(bufferOffset), data);
     },
 
     wgpuQueueOnSubmittedWorkDone(
@@ -343,6 +406,12 @@ export function createWebGPUBridge(
       queue.onSubmittedWorkDone().then(() => {
         pendingCallbacks--;
         callCallback(callbackPtr, 0, userdataPtr);
+        // Wake any waiting poll — GPU work is done
+        if (pendingCallbacks === 0) {
+          const resolvers = pendingResolvers;
+          pendingResolvers = [];
+          for (const resolve of resolvers) resolve();
+        }
       });
     },
 
@@ -485,11 +554,24 @@ export function createWebGPUBridge(
       const gpuMode = mode === 1 ? GPUMapMode.READ : GPUMapMode.WRITE;
       pendingCallbacks++;
       buffer.mapAsync(gpuMode, offset, size).then(
-        () => { pendingCallbacks--; callCallback(callbackPtr, 0, userdataPtr); },
+        () => {
+          pendingCallbacks--;
+          callCallback(callbackPtr, 0, userdataPtr);
+          if (pendingCallbacks === 0) {
+            const resolvers = pendingResolvers;
+            pendingResolvers = [];
+            for (const resolve of resolvers) resolve();
+          }
+        },
         (err: unknown) => {
           pendingCallbacks--;
           console.error('[WebGPU Bridge] mapAsync failed:', err);
           callCallback(callbackPtr, 1, userdataPtr);
+          if (pendingCallbacks === 0) {
+            const resolvers = pendingResolvers;
+            pendingResolvers = [];
+            for (const resolve of resolvers) resolve();
+          }
         },
       );
     },
@@ -515,12 +597,15 @@ export function createWebGPUBridge(
 
     // ===== Polling =====
     mlx_webgpu_poll() {
-      // Asyncify yield: suspends WASM, yields to the event loop so WebGPU
-      // callbacks (onSubmittedWorkDone, mapAsync) can fire, then resumes.
+      // Returns a Promise when GPU work is pending → triggers asyncify yield.
+      // With synchronize() removed from the WASI path, this is only called
+      // from raw_ptr()'s mapAsync poll loop (once per token readback).
+      pollCount++;
       if (pendingCallbacks > 0) {
-        return new Promise<void>((resolve) => setTimeout(resolve, 0));
+        return new Promise<void>((resolve) => {
+          pendingResolvers.push(resolve);
+        });
       }
-      // No pending async work — resolve immediately via microtask (no 4ms delay)
       return Promise.resolve();
     },
   };

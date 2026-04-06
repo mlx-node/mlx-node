@@ -2,6 +2,24 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+// WASM streaming channel — write decoded text to SharedArrayBuffer for real-time rendering
+#[cfg(target_family = "wasm")]
+#[link(wasm_import_module = "env")]
+unsafe extern "C" {
+    safe fn mlx_stream_write(ptr: *const u8, len: u32);
+    safe fn mlx_stream_reset();
+}
+
+/// Test that mlx_stream_write WASM import works — call from JS to verify
+#[cfg(target_family = "wasm")]
+#[napi]
+pub fn test_stream_channel() -> bool {
+    let msg = b"hello from WASM stream";
+    mlx_stream_reset();
+    mlx_stream_write(msg.as_ptr(), msg.len() as u32);
+    true
+}
+
 use futures::TryFutureExt;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -27,6 +45,7 @@ use super::chat_common::{
 };
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
+use super::debug::{log_logits, log_tensor_stats};
 use super::layer_cache::Qwen3_5LayerCache;
 use super::persistence;
 use super::processing::Qwen35VLImageProcessor;
@@ -4895,6 +4914,7 @@ impl Qwen3_5Model {
         config_json: String,
         gpu_tensors: Vec<serde_json::Value>,
         tokenizer_json: String,
+        #[napi(ts_arg_type = "string | undefined | null")] tokenizer_config_json: Option<String>,
     ) -> Result<Qwen3_5Model> {
         use crate::utils::safetensors::array_from_gpu_buffer;
 
@@ -4943,9 +4963,35 @@ impl Qwen3_5Model {
         let mut model = Qwen3_5Model::new(config.clone())?;
         persistence::apply_weights(&mut model, &params, &config, quant_bits, quant_group_size, &per_layer_quant)?;
 
+        // Force-register weights with C++ compiled forward on WASM.
+        // Must use register_weights_with_cpp (not raw store) because it handles
+        // weight merging (in_proj_qkv+z → in_proj_qkvz, etc.) that the C++ forward expects.
+        // Always register for C++ tests (was WASM-only)
+        persistence::register_weights_with_cpp_public(&params, model.model_id);
+
         let inner_tokenizer = tokenizers::Tokenizer::from_bytes(tokenizer_json.as_bytes())
             .map_err(|e| Error::from_reason(format!("Failed to parse tokenizer: {e}")))?;
-        let tokenizer = crate::tokenizer::Qwen3Tokenizer::from_tokenizer(inner_tokenizer);
+        let mut tokenizer = crate::tokenizer::Qwen3Tokenizer::from_tokenizer(inner_tokenizer);
+
+        // Extract chat_template from tokenizer_config.json if provided
+        if let Some(tc_json) = tokenizer_config_json {
+            if let Ok(tc_val) = serde_json::from_str::<serde_json::Value>(&tc_json) {
+                // Try chat_template as array of templates (Qwen3.5 format)
+                if let Some(templates) = tc_val.get("chat_template").and_then(|v| v.as_array()) {
+                    for tmpl in templates {
+                        if tmpl.get("name").and_then(|n| n.as_str()) == Some("default") {
+                            if let Some(template_str) = tmpl.get("template").and_then(|t| t.as_str()) {
+                                tokenizer.set_chat_template(Some(template_str.to_string()));
+                                break;
+                            }
+                        }
+                    }
+                } else if let Some(template_str) = tc_val.get("chat_template").and_then(|v| v.as_str()) {
+                    tokenizer.set_chat_template(Some(template_str.to_string()));
+                }
+            }
+        }
+
         model.tokenizer = Some(std::sync::Arc::new(tokenizer));
 
         Ok(model)
@@ -6764,16 +6810,56 @@ fn forward_inner(
 ) -> Result<MxArray> {
     let embedding = Embedding::from_weight(embedding_weight)?;
     let hidden_states = embedding.forward(input_ids)?;
+    log_tensor_stats("qwen35.forward.hidden_states", &hidden_states);
     let mut h = hidden_states.clone();
 
-    let num_layers = layers.len();
-    for i in 0..num_layers {
+    let max_layers = layers.len();
+    // Layer-by-layer debug: log mean/std of hidden states after each layer
+    let log_layer_stats = std::env::var("MLX_LOG_LAYERS").is_ok();
+    for i in 0..max_layers {
         let cache = caches.as_mut().map(|c| &mut c[i]);
         h = layers[i].forward(&h, None, cache, None, true)?;
+
+        // On WASM, eval after each layer to keep the graph bounded.
+        // forward_inner is only used for prefill (compiled path handles decode).
+        #[cfg(target_family = "wasm")]
+        {
+            let mut eval_targets: Vec<&MxArray> = vec![&h];
+            if let Some(caches_vec) = &caches {
+                caches_vec[i].collect_arrays(&mut eval_targets);
+            }
+            MxArray::eval_arrays(&eval_targets);
+        }
+
+        if log_layer_stats && (i == 2 || i == 3) {
+            // Extra detailed check for L02→L03 transition
+            h.eval();
+            if let Ok(shape) = h.shape() {
+                if let Ok(dtype) = h.dtype() {
+                    eprintln!("[LAYER_DETAIL] L{:02} shape={:?} dtype={:?}", i, shape.as_ref(), dtype);
+                }
+            }
+        }
+        if log_layer_stats && i < 6 {
+            // Only log first 6 layers to avoid overwhelming output
+            // Eval to get values (on native this forces materialization)
+            h.eval();
+            if let Ok(vals) = h.to_float32() {
+                let vals = vals.to_vec();
+                let n = vals.len() as f64;
+                let mean: f64 = vals.iter().map(|v| *v as f64).sum::<f64>() / n;
+                let std: f64 = (vals.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / n).sqrt();
+                let first5: Vec<String> = vals.iter().take(5).map(|v| format!("{:.6}", v)).collect();
+                let last5: Vec<String> = vals.iter().rev().take(5).rev().map(|v| format!("{:.6}", v)).collect();
+                eprintln!("[LAYER_STATS] L{:02} mean={:.6} std={:.6} first=[{}] last=[{}]",
+                    i, mean, std, first5.join(","), last5.join(","));
+            }
+        }
     }
 
     let h = final_norm.forward(&h)?;
-    match lm_head {
+    log_tensor_stats("qwen35.forward.final_norm", &h);
+    let logits = match lm_head {
         Some(head) => head.forward(&h),
         None => match embedding_weight_t {
             Some(wt) => h.matmul(wt),
@@ -6782,7 +6868,9 @@ fn forward_inner(
                 h.matmul(&wt)
             }
         },
-    }
+    }?;
+    log_logits("qwen35.forward.logits", &logits);
+    Ok(logits)
 }
 
 /// Compiled single-token decode step using mlx::core::compile().

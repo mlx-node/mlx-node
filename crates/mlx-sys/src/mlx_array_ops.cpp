@@ -112,23 +112,6 @@ mlx_array* mlx_from_fp8(mlx_array* handle, int32_t target_dtype) {
   }
 }
 
-// Convert a float array to FP8 E4M3 using MLX's to_fp8 (no scale applied).
-// Output is a uint8 array containing raw FP8 E4M3 encoded bytes.
-mlx_array* mlx_to_fp8(mlx_array* handle) {
-  if (!handle) {
-    std::cerr << "[MLX] mlx_to_fp8: null handle" << std::endl;
-    return nullptr;
-  }
-  try {
-    auto& arr = *reinterpret_cast<array*>(handle);
-    auto result = mlx::core::to_fp8(arr);
-    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-  } catch (const std::exception& e) {
-    std::cerr << "[MLX] mlx_to_fp8: " << e.what() << std::endl;
-    return nullptr;
-  }
-}
-
 mlx_array* mlx_array_scalar_float(double value) {
   auto arr = new array(static_cast<float>(value));
   return reinterpret_cast<mlx_array*>(arr);
@@ -193,15 +176,13 @@ mlx_array* mlx_array_copy(mlx_array* handle) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
-mlx_array* mlx_array_deep_copy(mlx_array* handle) {
+// Shallow clone: creates a new heap-allocated array object that shares the same
+// ArrayDesc (via shared_ptr copy). This increments the C++ refcount, which is
+// critical for Rust MxArray::clone() — without this, multiple Rust handles
+// share one C++ pointer and the C++ refcount doesn't reflect all live references.
+mlx_array* mlx_array_shallow_clone(mlx_array* handle) {
   auto arr = reinterpret_cast<array*>(handle);
-  // `copy()` creates a distinct MLX array handle but its Copy primitive shares
-  // the input buffer after evaluation. Force an AsType primitive even though
-  // the dtype is unchanged: both the CPU and GPU implementations allocate and
-  // populate independent storage. This is required when retaining a slice
-  // without pinning the much larger source allocation.
-  array result = astype(*arr, arr->dtype(), /* copy = */ true);
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  return reinterpret_cast<mlx_array*>(new array(*arr));
 }
 
 mlx_array* mlx_array_log_softmax(mlx_array* handle, int32_t axis) {

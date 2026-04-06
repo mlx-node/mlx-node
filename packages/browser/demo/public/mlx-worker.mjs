@@ -61,6 +61,7 @@ const handler = new MessageHandler({
           wgpuBindGroupRelease: () => {},
           wgpuDeviceCreateBindGroup: () => 0,
           wgpuBufferGetMappedRange: () => 0,
+          wgpuQueueWriteBuffer: () => {},
         };
       },
     });

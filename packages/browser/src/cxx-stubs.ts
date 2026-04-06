@@ -117,6 +117,14 @@ export function createCxxStubs(memory: WebAssembly.Memory) {
     // ── MLX GPU Init ───────────────────────────────────────────────────
     // mlx::core::gpu::init() — GPU is pre-initialized via WebGPU bridge
     '_ZN3mlx4core3gpu4initEv': () => {},
+
+    // ── POSIX Dynamic Linking Stubs ──────────────────────────────────
+    // Used by MLX distributed module to load MPI/ring plugins at runtime.
+    // In WASM, dynamic linking is not available — return failure.
+    dlopen: (_filename: number, _flags: number) => 0, // NULL = failure
+    dlclose: (_handle: number) => -1, // -1 = failure
+    dlsym: (_handle: number, _symbol: number) => 0, // NULL = not found
+    dlerror: () => 0, // NULL = no error string
   };
 
   return { stubs, captureExports };

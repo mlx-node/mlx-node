@@ -42,7 +42,6 @@ unsafe extern "C-unwind" {
         ndim: usize,
     ) -> *mut mlx_array;
     pub fn mlx_from_fp8(handle: *mut mlx_array, target_dtype: i32) -> *mut mlx_array;
-    pub fn mlx_to_fp8(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_scalar_float(value: f64) -> *mut mlx_array;
     pub fn mlx_array_scalar_int(value: i32) -> *mut mlx_array;
     pub fn mlx_array_zeros(shape: *const i64, ndim: usize, dtype: i32) -> *mut mlx_array;
@@ -61,7 +60,7 @@ unsafe extern "C-unwind" {
     ) -> *mut mlx_array;
     pub fn mlx_array_astype(handle: *mut mlx_array, dtype: i32) -> *mut mlx_array;
     pub fn mlx_array_copy(handle: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_array_deep_copy(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_shallow_clone(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log_softmax(handle: *mut mlx_array, axis: i32) -> *mut mlx_array;
     pub fn mlx_array_logsumexp(
         handle: *mut mlx_array,
@@ -265,12 +264,6 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_eval(handle: *mut mlx_array);
     pub fn mlx_async_eval(handles: *mut *mut mlx_array, count: usize);
     pub fn mlx_eval(handles: *mut *mut mlx_array, count: usize) -> bool;
-    pub fn mlx_eval_with_error(
-        handles: *mut *mut mlx_array,
-        count: usize,
-        error_out: *mut std::ffi::c_char,
-        error_capacity: usize,
-    ) -> bool;
     pub fn mlx_array_size(handle: *mut mlx_array) -> usize;
     pub fn mlx_array_ndim(handle: *mut mlx_array) -> usize;
     pub fn mlx_array_shape(handle: *mut mlx_array, out: *mut i64);
@@ -308,7 +301,6 @@ unsafe extern "C-unwind" {
         out_len: usize,
     ) -> bool;
     pub fn mlx_array_delete(arr: *mut mlx_array);
-
     pub fn mlx_synchronize();
     pub fn mlx_clear_cache();
     pub fn mlx_compile_clear_cache() -> bool;
@@ -600,29 +592,6 @@ unsafe extern "C-unwind" {
     // the FFI boundary and aborts the process). Pass null `out_*` to
     // ignore the value.
     pub fn mlx_metal_is_available() -> bool;
-    pub fn mlx_metal_is_nax_available() -> bool;
-    /// Probe whether MLX can dispatch the fused D=256 full-SDPA kernel for the
-    /// effective input dtype. Returns 0 on success and writes a conservative
-    /// result to `out_available`; returns -1 on invalid output or a caught C++
-    /// exception. Non-Metal builds return success with `false`.
-    pub fn mlx_metal_d256_full_sdpa_available(
-        effective_dtype_is_float32: bool,
-        out_available: *mut bool,
-    ) -> i32;
-    /// Evaluate the D=256-specific eligibility predicate shared with MLX's
-    /// Metal dispatcher, without adding hot-path logging or counters. The
-    /// caller still owns the dispatcher's outer inference/stream gates.
-    /// Uses the same 0/-1 fallible-output contract as the capability probe.
-    pub fn mlx_metal_d256_full_sdpa_would_use(
-        effective_dtype_is_float32: bool,
-        query_head_dim: i32,
-        value_head_dim: i32,
-        query_length: i32,
-        key_length: i32,
-        do_causal: bool,
-        has_array_mask: bool,
-        out_would_use: *mut bool,
-    ) -> i32;
     pub fn mlx_metal_device_info() -> *const std::os::raw::c_char;
     pub fn mlx_set_wired_limit(limit: u64, out_old_limit: *mut u64) -> i32;
     pub fn mlx_get_peak_memory(out_value: *mut u64) -> i32;
@@ -762,31 +731,6 @@ unsafe extern "C-unwind" {
         v_pool: *mut mlx_array,
         block_table: *mut mlx_array,
         seq_lens: *mut mlx_array,
-        k_scale: *mut mlx_array,
-        v_scale: *mut mlx_array,
-        scale: f32,
-        softcap: f32,
-        sliding_window: i32,
-        block_size: i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_size: i32,
-        kv_dtype: u8,
-    ) -> *mut mlx_array;
-
-    /// Emit the MLX C++ `paged_attention_varlen(...)` Custom primitive and
-    /// return its lazy on-device output. `q` is flat over all query tokens;
-    /// `cu_seqlens_q` maps those rows to the compact per-sequence rows in
-    /// `block_table` and `seq_lens`. Returns null for bridge/factory validation
-    /// errors; GPU dispatch errors surface when MLX evaluates the output.
-    #[allow(clippy::too_many_arguments)]
-    pub fn mlx_paged_attention_varlen_forward(
-        q: *mut mlx_array,
-        k_pool: *mut mlx_array,
-        v_pool: *mut mlx_array,
-        block_table: *mut mlx_array,
-        seq_lens: *mut mlx_array,
-        cu_seqlens_q: *mut mlx_array,
         k_scale: *mut mlx_array,
         v_scale: *mut mlx_array,
         scale: f32,
@@ -1019,8 +963,8 @@ unsafe extern "C-unwind" {
 
     /// block_size = 0 must be rejected. Without this check the pool
     /// shape equality accepts a zero-sized pool block dim when
-    /// block_size=0, and `eval_gpu`'s bounds check then divides the
-    /// sequence length by zero in host code.
+    /// block_size=0, and `eval_gpu`'s bounds check then divides by
+    /// zero in host code (`(s + block_size - 1) / block_size`).
     pub fn mlx_paged_attention_factory_rejects_zero_block_size() -> i32;
 
     /// head_size = 0 must be rejected. The Metal kernel uses head_size
@@ -1285,15 +1229,6 @@ unsafe extern "C-unwind" {
     /// the expected shape. -1 on shape mismatch, 0 on factory exception.
     pub fn mlx_paged_attention_varlen_factory_accepts_wellformed() -> i32;
 
-    /// Returns 1 iff the public varlen C ABI rejects an unsupported
-    /// `kv_dtype_raw` wire value before casting it to the native enum.
-    pub fn mlx_paged_attention_varlen_forward_rejects_invalid_kv_dtype() -> i32;
-
-    /// Returns 1 iff `PagedAttentionVarlen::eval_gpu` rejects a per-sequence
-    /// query span larger than the matching `seq_lens` context. Returns -3 when
-    /// Metal is unavailable and -1 on test setup errors.
-    pub fn mlx_paged_attention_varlen_eval_gpu_rejects_query_span_exceeds_seq_len() -> i32;
-
     /// Returns 1 iff the factory rejects a `cu_seqlens_q` array whose
     /// length is not `num_seqs + 1`.
     pub fn mlx_paged_attention_varlen_factory_rejects_cu_seqlens_len() -> i32;
@@ -1306,49 +1241,6 @@ unsafe extern "C-unwind" {
     /// `mlx::core::compile(...)` and returns an output of the expected
     /// shape. -1 on any thrown exception or shape mismatch.
     pub fn mlx_paged_attention_varlen_compile_trace_smoke() -> i32;
-
-    /// Model-free exact-shape graph-native numerical parity probe for the
-    /// grouped Qwen3.5/3.6 paged decode kernel. Pass 1 for normal decode or 2
-    /// for the varlen MTP verifier, plus 24/4 or 16/2 for the head shape.
-    /// Returns 1 on success, -3 without Metal.
-    pub fn mlx_paged_grouped_qwen35_graph_parity(
-        query_rows: i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-    ) -> i32;
-
-    /// Reset/read the environment-gated grouped-route test probe. Production
-    /// dispatch only touches its atomic counter when
-    /// `MLX_PAGED_GROUPED_QWEN35_TEST_PROBE=1` was set before first use.
-    pub fn mlx_paged_grouped_qwen35_test_probe_reset();
-    pub fn mlx_paged_grouped_qwen35_test_probe_count() -> u64;
-
-    /// Pure shape/threshold guard used to pin the grouped Qwen3.5/3.6 route.
-    /// This bypasses the environment escape hatch and GPU capability check.
-    pub fn mlx_paged_grouped_qwen35_shape_guard_for_test(
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        query_rows: i32,
-        max_context_len: i32,
-    ) -> i32;
-
-    /// Reset/read the environment-gated experimental Gemma 4 grouped-route
-    /// test probe.
-    pub fn mlx_paged_grouped_gemma4_test_probe_reset();
-    pub fn mlx_paged_grouped_gemma4_test_probe_count() -> u64;
-
-    /// Pure selector guard for the BF16 D512/BS16/16Q/1KV Gemma 4 route.
-    /// selector_mode: 0=disabled, 1=auto, 2=force.
-    pub fn mlx_paged_grouped_gemma4_shape_guard_for_test(
-        selector_mode: i32,
-        query_rows: i32,
-        max_context_len: i32,
-    ) -> i32;
-
-    /// Model-free graph-native numerical parity for the staged Gemma 4
-    /// D512/BS16/16Q/1KV kernel at the requested partial/boundary context.
-    /// Returns 1 on success and -3 without Metal.
-    pub fn mlx_paged_grouped_gemma4_graph_parity(context_len: i32) -> i32;
 }
 
 // ================================================================================
@@ -1798,6 +1690,44 @@ unsafe extern "C-unwind" {
         ),
         ctx: *mut std::os::raw::c_void,
     ) -> i32;
+
+    /// Exercise the WASM heap allocator with a few small malloc/free/new/delete
+    /// operations. Useful for localizing heap corruption during browser builds.
+    pub fn mlx_heap_probe() -> bool;
+
+    // Compile tests — exercise mlx::core::compile on WebGPU
+    pub fn mlx_test_compile_basic() -> bool;
+    pub fn mlx_test_compile_matmul() -> bool;
+    pub fn mlx_test_compile_repeated() -> bool;
+
+    // GPU buffer array test — exercises mlx_array_from_gpu_buffer code path
+    pub fn mlx_test_gpu_buffer_arrays() -> bool;
+
+    // Diagnostic
+    pub fn mlx_qwen35_get_weight_count() -> i32;
+    pub fn mlx_qwen35_check_weight(name: *const std::os::raw::c_char) -> i32;
+    pub fn mlx_qwen35_read_weight(name: *const std::os::raw::c_char, out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_single_layer_forward(out: *mut f32, max_count: i32) -> bool;
+    pub fn mlx_test_gdn_step_by_step(checkpoint: i32, out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_gdn_recurrence_small(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_attention_layer_forward(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_causal(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_gqa(out: *mut f32, max_count: i32) -> i32;
+    // Phase 1+2 inference step tests
+    pub fn mlx_test_rope_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_qk_norm_rope(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_additive_mask(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_decode_gqa(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_full_attn_layer_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_rms_norm_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_swiglu_mlp_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_decode_step_with_cache(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_attn_layer_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_first_4_layers_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_gdn_full_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_gdn_multi_step_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_gdn_layer_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_categorical_sampling_bf16(out: *mut f32, max_count: i32) -> i32;
 }
 
 // Gradient computation types

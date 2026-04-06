@@ -170,6 +170,7 @@ impl Qwen3_5Attention {
             (queries, keys)
         };
 
+
         // Transpose to [B, H, T, D] for KVCache and SDPA
         let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
         let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
@@ -182,20 +183,83 @@ impl Qwen3_5Attention {
             (keys, values)
         };
 
-        // Scaled dot-product attention using fast kernel.
+        // Scaled dot-product attention.
         // When no explicit mask is provided:
         //   - seq_len > 1 (prefill): use "causal" mode — MLX's fused Metal kernel handles
         //     causal masking internally without materializing an O(N²) mask array.
         //     This matches Python mlx-lm's `create_attention_mask` returning "causal".
         //   - seq_len == 1 (decode): no mask needed (single token only attends to past).
         // When an explicit mask is provided (e.g., sliding window): use it directly.
-        let output = if let Some(m) = mask {
-            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, Some(m))?
-        } else if seq_len > 1 {
-            scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?
-        } else {
-            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, None)?
+        // Manual SDPA implementation to bypass the fast::sdpa fallback
+        // for debugging WebGPU divergence
+        let output = {
+            use crate::array::MxArray;
+            // Cast scale to bf16 to maintain dtype throughout
+            let scale_scalar = MxArray::scalar_float(self.scale as f64)?
+                .astype(queries.dtype()?)?;
+            let q_scaled = queries.mul(&scale_scalar)?;
+
+            // GQA: expand q heads to match kv heads
+            let n_rep = self.num_heads / self.num_kv_heads;
+            // For GQA: repeat K/V heads to match Q heads count
+            // This avoids 5D broadcast matmul which WebGPU doesn't handle correctly
+            let (q_for_attn, k_for_attn, v_for_attn) = if n_rep > 1 {
+                // Repeat K: [B, Hkv, T, D] → [B, Hkv, 1, T, D] → tile → [B, Hkv, n_rep, T, D] → reshape [B, Hq, T, D]
+                let kv_len = keys.shape_at(2)?;
+                let k_expanded = keys.reshape(&[
+                    batch, self.num_kv_heads as i64, 1, kv_len, self.head_dim as i64
+                ])?;
+                let k_tiled = k_expanded.tile(&[1, 1, n_rep as i32, 1, 1])?;
+                let k_flat = k_tiled.reshape(&[
+                    batch, self.num_heads as i64, kv_len, self.head_dim as i64
+                ])?;
+
+                let v_expanded = values.reshape(&[
+                    batch, self.num_kv_heads as i64, 1, kv_len, self.head_dim as i64
+                ])?;
+                let v_tiled = v_expanded.tile(&[1, 1, n_rep as i32, 1, 1])?;
+                let v_flat = v_tiled.reshape(&[
+                    batch, self.num_heads as i64, kv_len, self.head_dim as i64
+                ])?;
+
+                (q_scaled, k_flat, v_flat)
+            } else {
+                (q_scaled, keys.clone(), values.clone())
+            };
+
+            // scores = q @ k^T  (swap last 2 axes of k)
+            let k_ndim = k_for_attn.ndim()? as i64;
+            let mut perm: Vec<i32> = (0..k_ndim as i32).collect();
+            let n = perm.len();
+            perm.swap(n - 1, n - 2);
+            let k_t = k_for_attn.transpose(Some(&perm))?;
+            let mut scores = q_for_attn.matmul(&k_t)?;
+
+            // Causal mask for prefill
+            if seq_len > 1 {
+                let kv_len = scores.shape_at(scores.ndim()? - 1)?;
+                let q_len = scores.shape_at(scores.ndim()? - 2)?;
+                let offset_val = kv_len - q_len;
+                let q_idx = MxArray::arange(offset_val as f64, (q_len + offset_val) as f64, None, None)?;
+                let k_idx = MxArray::arange(0.0, kv_len as f64, None, None)?;
+                let q_idx_2d = q_idx.reshape(&[q_len, 1])?;
+                let k_idx_2d = k_idx.reshape(&[1, kv_len])?;
+                let mask_bool = q_idx_2d.greater_equal(&k_idx_2d)?;
+                let neg_inf = MxArray::scalar_float(f64::NEG_INFINITY)?
+                    .astype(scores.dtype()?)?;
+                scores = mask_bool.where_(&scores, &neg_inf)?;
+            }
+
+            // softmax
+            let attn_weights = crate::nn::Activations::softmax(&scores, Some(-1))?;
+
+            // output = weights @ v
+            let mut attn_out = attn_weights.matmul(&v_for_attn)?;
+
+            // Already [B, Hq, T, D] — no reshape needed
+            attn_out
         };
+
 
         // Transpose back: [B, H, T, D] → [B, T, H, D] → flatten to [B, T, H*D]
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;
@@ -206,8 +270,10 @@ impl Qwen3_5Attention {
         let gate_sigmoid = Activations::sigmoid(&gate)?;
         let gated_output = output.mul(&gate_sigmoid)?;
 
+
         // Output projection
-        self.o_proj.forward(&gated_output)
+        let result = self.o_proj.forward(&gated_output)?;
+        Ok(result)
     }
 
     /// Initialize M-RoPE for VLM mode.

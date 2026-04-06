@@ -674,6 +674,12 @@ impl Qwen3Tokenizer {
         }
     }
 
+    /// Set the chat template (Jinja2 template string from tokenizer_config.json).
+    /// Used when loading from WASM where tokenizer_config.json is fetched separately.
+    pub fn set_chat_template(&mut self, template: Option<String>) {
+        self.chat_template = template;
+    }
+
     /// Validates a chat template for suspicious patterns that could indicate
     /// denial of service risks.
     ///

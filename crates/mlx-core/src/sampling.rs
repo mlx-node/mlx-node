@@ -582,12 +582,19 @@ pub fn apply_sampling(logits: &MxArray, config: Option<SamplingConfig>) -> Resul
 /// # Returns
 /// Sampled token indices [1] or [batch]
 pub fn sample(logits: &MxArray, config: Option<SamplingConfig>) -> Result<MxArray> {
-    // Use optimized compiled path for better performance
-    sample_compiled(logits, config)
+    #[cfg(target_os = "wasi")]
+    { return sample_uncompiled(logits, config); }
+    #[cfg(not(target_os = "wasi"))]
+    { sample_compiled(logits, config) }
 }
 
-/// Sample using non-compiled operations (fallback)
+/// Sample using non-compiled operations (fallback for WASM)
 pub fn sample_uncompiled(logits: &MxArray, config: Option<SamplingConfig>) -> Result<MxArray> {
+    let temp = config.as_ref().and_then(|c| c.temperature).unwrap_or(1.0);
+    // Greedy: use argmax when temperature ≤ 0
+    if temp <= 0.0 {
+        return logits.argmax(-1, None);
+    }
     let filtered = apply_sampling(logits, config)?;
     filtered.categorical(Some(-1))
 }

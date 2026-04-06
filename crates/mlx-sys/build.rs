@@ -49,6 +49,14 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
         "{wasm_target} {sysroot_flag} -pthread -fPIC -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL"
     );
     let c_flags = common_flags.clone();
+    // -fno-inline: prevent ALL inlining so that inline virtual methods
+    // (DEFINE_NAME, UnaryPrimitive forwarders, etc.) are emitted as
+    // standalone functions. Without this, wasm-ld GC discards inlined
+    // virtual methods, leaving vtable entries pointing to garbage.
+    // -femit-all-decls: force emission of ALL inline virtual methods.
+    // Without this, Clang's Itanium ABI marks inline virtuals as
+    // 'available_externally' in the key function's TU, causing vtable
+    // entries to reference undefined symbols that wasm-ld resolves incorrectly.
     let cxx_flags = format!("{common_flags} -fwasm-exceptions");
 
     let status = Command::new("cmake")
@@ -63,6 +71,8 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
         .arg("-DCMAKE_SYSTEM_NAME=WASI")
         .arg("-DCMAKE_SYSTEM_PROCESSOR=wasm32")
         .arg("-DCMAKE_CROSSCOMPILING=ON")
+        .arg("-DCMAKE_BUILD_TYPE=Release")
+        .arg("-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG")
         .arg(format!("-DCMAKE_C_FLAGS={c_flags}"))
         .arg(format!("-DCMAKE_CXX_FLAGS={cxx_flags}"))
         .arg(format!("-DCMAKE_EXE_LINKER_FLAGS={wasm_target} {sysroot_flag} -pthread -Wl,--allow-undefined"))
@@ -115,6 +125,12 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
     // Also search the build dir itself
     add_link_search(&build_dir);
 
+    // whole-archive: force wasm-ld to include ALL object files from libmlx.a.
+    // Without this, virtual method implementations (referenced only via vtable
+    // data relocations in the WASM data section) get discarded during archive
+    // scanning, causing "function signature mismatch" at runtime.
+    // Distributed is excluded from the CMake build (WASI_SDK flag) to avoid
+    // pulling in ring/MPI/NCCL stubs that don't exist in WASM.
     println!("cargo:rustc-link-lib=static=mlx");
 
     // No framework linking for WASI
@@ -140,7 +156,14 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
         .flag("-fexceptions")
         .flag("-fwasm-exceptions")
         .flag("-D_WASI_EMULATED_MMAN")
-        .flag("-D_WASI_EMULATED_SIGNAL");
+        .flag("-D_WASI_EMULATED_SIGNAL")
+        // Match CMake's visibility flags to prevent vtable corruption.
+        // Without these, inline virtual overrides in UnaryPrimitive get
+        // different visibility between libmlx.a and libmlx_ffi.a, causing
+        // wasm-ld to pick inconsistent vtable thunks → call_indirect mismatch.
+        .flag("-fvisibility=hidden")
+        .flag("-fvisibility-inlines-hidden")
+        ;
 
     if include_generated.exists() {
         bridge.include(&include_generated);
@@ -166,6 +189,9 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
     println!("cargo:rustc-link-search=native={}", sysroot_lib.display());
     println!("cargo:rustc-link-lib=static=c++");
     println!("cargo:rustc-link-lib=static=c++abi");
+    // Increase WASM stack size to 8MB (default is 64KB-1MB, too small for deep
+    // model call stacks: chat_sync → forward → 24 layers → matmul → ...)
+    println!("cargo:rustc-link-arg=-Wl,-z,stack-size=8388608");
 }
 
 fn build_native(manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {

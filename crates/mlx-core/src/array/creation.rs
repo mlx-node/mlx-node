@@ -246,6 +246,228 @@ impl MxArray {
         let handle = unsafe { sys::mlx_array_arange(start, stop, step.unwrap_or(1.0), dt.code()) };
         MxArray::from_handle(handle, "array_arange")
     }
+
+    // --- Compile tests (exercise mlx::core::compile on WebGPU) ---
+
+    #[napi]
+    pub fn test_compile_basic() -> bool {
+        unsafe { sys::mlx_test_compile_basic() }
+    }
+
+    #[napi]
+    pub fn test_compile_matmul() -> bool {
+        unsafe { sys::mlx_test_compile_matmul() }
+    }
+
+    #[napi]
+    pub fn test_compile_repeated() -> bool {
+        unsafe { sys::mlx_test_compile_repeated() }
+    }
+
+    #[napi]
+    pub fn test_gpu_buffer_arrays() -> bool {
+        unsafe { sys::mlx_test_gpu_buffer_arrays() }
+    }
+
+    /// Run single layer forward using model weights, return first 5 values
+    #[napi]
+    pub fn test_single_layer_forward() -> Vec<f64> {
+        let mut buf = [0f32; 5];
+        let ok = unsafe { sys::mlx_test_single_layer_forward(buf.as_mut_ptr(), 5) };
+        if !ok { return vec![-999.0]; }
+        buf.iter().map(|v| *v as f64).collect()
+    }
+
+    /// Read first N float values from a C++ weight map entry
+    #[napi]
+    pub fn read_cpp_weight(name: String, count: i32) -> Vec<f64> {
+        if count <= 0 { return vec![-999.0]; }
+        let c_name = match std::ffi::CString::new(name) {
+            Ok(s) => s,
+            Err(_) => return vec![-999.0],
+        };
+        let mut buf = vec![0f32; count as usize];
+        let n = unsafe { sys::mlx_qwen35_read_weight(c_name.as_ptr(), buf.as_mut_ptr(), count) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    /// Step-by-step GDN test: returns intermediate values at the given checkpoint.
+    /// checkpoint 0-8: various stages of GDN pipeline. 9: conv1d weight info.
+    #[napi]
+    pub fn test_gdn_step(checkpoint: i32, max_count: i32) -> Vec<f64> {
+        let mut buf = vec![0f32; max_count as usize];
+        let n = unsafe { sys::mlx_test_gdn_step_by_step(checkpoint, buf.as_mut_ptr(), max_count) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    /// Isolated GDN recurrence test with small known inputs (2x2 dims).
+    /// Returns y_out values followed by state_out values.
+    #[napi]
+    pub fn test_gdn_recurrence_small() -> Vec<f64> {
+        let mut buf = vec![0f32; 20];
+        let n = unsafe { sys::mlx_test_gdn_recurrence_small(buf.as_mut_ptr(), 20) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    /// Run full-attention layer 0 forward using model weights, return first N values.
+    /// Exercises: RMSNorm + Q/K/V proj + QK norm + RoPE + SDPA + gate + output proj.
+    #[napi]
+    pub fn test_sdpa_causal(max_count: Option<i32>) -> Vec<f64> {
+        let count = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; count];
+        let n = unsafe { sys::mlx_test_sdpa_causal(buf.as_mut_ptr(), count as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_sdpa_gqa(max_count: Option<i32>) -> Vec<f64> {
+        let count = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; count];
+        let n = unsafe { sys::mlx_test_sdpa_gqa(buf.as_mut_ptr(), count as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_attention_layer_forward(max_count: Option<i32>) -> Vec<f64> {
+        let count = max_count.unwrap_or(10) as usize;
+        let mut buf = vec![0f32; count];
+        let n = unsafe { sys::mlx_test_attention_layer_forward(buf.as_mut_ptr(), count as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    // ===== Phase 1+2 inference step tests =====
+
+    #[napi]
+    pub fn test_rope_bf16(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_rope_bf16(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_qk_norm_rope(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_qk_norm_rope(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_sdpa_additive_mask(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_sdpa_additive_mask(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_sdpa_decode_gqa(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_sdpa_decode_gqa(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_full_attn_layer_bf16(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_full_attn_layer_bf16(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_rms_norm_bf16(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_rms_norm_bf16(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_swiglu_mlp_bf16(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_swiglu_mlp_bf16(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_decode_step_with_cache(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_decode_step_with_cache(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_attn_layer_bf16(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_attn_layer_bf16(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_first_4_layers_bf16(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_first_4_layers_bf16(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_gdn_full_bf16(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_gdn_full_bf16(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_gdn_multi_step_bf16(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_gdn_multi_step_bf16(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_categorical_sampling_bf16(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(10) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_categorical_sampling_bf16(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    #[napi]
+    pub fn test_gdn_layer_bf16(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(20) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_gdn_layer_bf16(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
 }
 
 #[cfg(test)]
