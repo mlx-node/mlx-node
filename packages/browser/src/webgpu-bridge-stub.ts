@@ -553,8 +553,8 @@ export function createBridgeStub(
       rpcCall(RpcFn.BUFFER_MAP_ASYNC, bufferHandle, mode, offset, size, callbackPtr, userdataPtr);
     },
 
-    wgpuBufferDestroy(bufferHandle: number): void {
-      rpcCall(RpcFn.BUFFER_DESTROY, bufferHandle);
+    wgpuBufferDestroy(_bufferHandle: number): void {
+      // No-op: gpu-worker already skips buffer destroy to avoid "destroyed in submit" errors
     },
 
     wgpuBufferRelease(handle: number): void {
