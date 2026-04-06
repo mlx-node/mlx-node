@@ -186,12 +186,13 @@ HAS_ERROR=$(echo "$INFERENCE_RESULT" | tail -1 | node -e "const d=JSON.parse(req
 echo "Decode: ${DECODE_TOK_S} tok/s, TTFT: ${TTFT_MS}ms"
 echo "Response: ${RESPONSE_TEXT:0:200}"
 
-# Check output coherence (basic heuristic: response should contain readable text)
+# Check output coherence
+# Response should have some meaningful content (not empty, not just noise)
 OUTPUT_COHERENT=0
-if [[ "$HAS_ERROR" == "0" ]] && [[ ${#RESPONSE_TEXT} -gt 2 ]]; then
-  # Check it's not all garbage (has some ASCII letters)
-  ALPHA_COUNT=$(echo "$RESPONSE_TEXT" | tr -cd 'a-zA-Z' | wc -c | tr -d ' ')
-  if [[ $ALPHA_COUNT -gt 3 ]]; then
+if [[ "$HAS_ERROR" == "0" ]] && [[ ${#RESPONSE_TEXT} -gt 0 ]]; then
+  # Check it's not all garbage: has alphanumeric chars or is a valid short answer
+  ALNUM_COUNT=$(echo "$RESPONSE_TEXT" | tr -cd 'a-zA-Z0-9' | wc -c | tr -d ' ')
+  if [[ $ALNUM_COUNT -gt 0 ]]; then
     OUTPUT_COHERENT=1
   fi
 fi

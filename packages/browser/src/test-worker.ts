@@ -81,6 +81,8 @@ async function initAndRun(wasmUrl: string) {
         ...bridge.imports,
         __cpp_exception: tag,
         _ZN3mlx4core3gpu4initEv: () => {},
+        mlx_stream_write: () => {},
+        mlx_stream_reset: () => {},
       };
       return importObject;
     },
