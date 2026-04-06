@@ -16,9 +16,30 @@
 - Diagnostics code (~130 lines) runs on first chat — significant code quality issue
 - LTO must stay disabled (compiler bug corrupts C++ vtables)
 
+### Run 2: Remove diagnostics from mlx-worker.ts — decode_tok_s=2.4 (KEEP)
+- Timestamp: 2026-04-06 23:40
+- What changed: Removed ~130 lines of debug diagnostics (GDN checkpoints, weight verification, layer forward tests, bf16 verify) from handleChat in mlx-worker.ts
+- Result: 2.4 tok/s (same as baseline), code quality improvement
+- Insight: Diagnostics only ran on first chat. Equal perf → keep (simpler is better)
+- Next: Fix temperature > 0 sampling
+
+### Run 3: Fix temperature > 0 sampling — decode_tok_s=2.5, temp_gt0_works=1 (KEEP)
+- Timestamp: 2026-04-07 00:00
+- What changed: Implemented cpu_categorical_sample() in sampling.rs. Reads logits to CPU via to_float32_vec(), applies temperature/softmax/cumsum in Rust, samples with xorshift64 RNG. Also added to_float32_vec() internal method and fixed test-worker.ts missing mlx_stream_write/reset stubs.
+- Result: 2.5 tok/s, TTFT 2796ms, temp>0 NOW WORKS
+- Insight: Previous temp>0 crash was from MLX's categorical() using cumsum+random::uniform which create 248K-element temp arrays, exhausting the ~1.9GB WASM heap. Pure Rust sampling avoids all MLX array ops for intermediates. Also discovered WASM incremental builds were STALE — need to force recompilation when changing Rust sampling code.
+- Next: Performance optimization, architecture improvements
+
+### Key Insights
+- MLX's categorical() on WASM exhausts heap via cumsum+random::uniform (248K temp arrays per token)
+- WASM incremental builds can be stale — `cargo clean -p mlx-core` forces proper recompilation
+- `to_float32()` returns napi::Float32Array which is NOT iterable in Rust — need internal `to_float32_vec()` returning Vec<f32>
+- GPU readback of full vocab (248K * 4 = ~1MB) works fine via SharedArrayBuffer readback buffer (4MB limit)
+- `RandomBits`, `Sort`, `Scan` have NO WebGPU implementation (NO_GPU in primitives.cpp)
+
 ### Next Ideas
-1. Remove diagnostics from mlx-worker.ts (code quality, may slightly improve first-chat perf)
-2. Implement Gumbel-max trick for temp>0 sampling (avoids categorical/cumsum)
-3. Early bf16→f32 conversion at weight load time
-4. Optimize matmul kernel tile sizes for WebGPU
-5. Migrate browser tests to Vitest browser mode
+1. Performance: optimize WebGPU kernel dispatch (reduce RPC overhead)
+2. Architecture: bf16→f32 early conversion at weight load time  
+3. Architecture: reduce WebGPU RPC round-trips during inference
+4. Test infra: migrate browser tests to Vitest browser mode
+5. Code quality: add proper error handling and types to worker communication

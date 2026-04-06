@@ -1,3 +1,4 @@
 {"type":"config","name":"webgpu-production","metricName":"decode_tok_s","metricUnit":"tok/s","bestDirection":"higher"}
 {"run":1,"commit":"a8a9007","metric":2.4,"metrics":{"browser_tests_passed":162,"output_coherent":1,"temp_gt0_works":0,"ttft_ms":2793},"status":"keep","description":"baseline: 2.4 tok/s, 162 tests pass, temp>0 untested (demo hardcodes temp=0)","timestamp":1775490288,"segment":0}
 {"run":2,"commit":"4eb7c53","metric":2.4,"metrics":{"browser_tests_passed":162,"output_coherent":1,"temp_gt0_works":0,"ttft_ms":2834},"status":"keep","description":"remove ~130 lines diagnostics from mlx-worker.ts (code quality, equal perf)","timestamp":1775490399,"segment":0}
+{"run":3,"commit":"253869d","metric":2.5,"metrics":{"browser_tests_passed":162,"output_coherent":1,"temp_gt0_works":1,"ttft_ms":2796},"status":"keep","description":"fix temp>0: pure Rust categorical sampling avoids WASM heap exhaustion","timestamp":1775491602,"segment":0}
