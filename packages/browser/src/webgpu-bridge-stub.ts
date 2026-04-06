@@ -77,6 +77,22 @@ export function createBridgeStub(
   const RPC_HISTORY_SIZE = 32;
   const rpcHistory: Array<{ n: number; fn: number }> = [];
 
+  // Pending compute pass state for fusion (setPipeline + setBindGroup → single dispatch RPC)
+  let pendingPass = -1;
+  let pendingPipeline = -1;
+  let pendingBindGroup = -1;
+
+  function flushPendingCompute() {
+    if (pendingPipeline >= 0) {
+      rpcCall(RpcFn.COMPUTE_PASS_SET_PIPELINE, pendingPass, pendingPipeline);
+      pendingPipeline = -1;
+    }
+    if (pendingBindGroup >= 0) {
+      rpcCall(RpcFn.COMPUTE_PASS_SET_BIND_GROUP, pendingPass, 0, pendingBindGroup, 0, 0);
+      pendingBindGroup = -1;
+    }
+  }
+
   function rpcCall(fnId: number, ...args: number[]): number {
     rpcCount++;
     // Keep last 32 calls in ring buffer
@@ -368,42 +384,46 @@ export function createBridgeStub(
       rpcCall(RpcFn.CMD_BUFFER_RELEASE, handle);
     },
 
-    // ===== Compute Pass Encoder =====
+    // ===== Compute Pass Encoder (with auto-fusion) =====
+    // Buffer setPipeline + setBindGroup calls, flush them in a single fused RPC
+    // when dispatch is called. This reduces 3+ RPC roundtrips to 1.
     wgpuComputePassEncoderSetPipeline(passHandle: number, pipelineHandle: number): void {
-      rpcCall(RpcFn.COMPUTE_PASS_SET_PIPELINE, passHandle, pipelineHandle);
+      pendingPass = passHandle;
+      pendingPipeline = pipelineHandle;
+      pendingBindGroup = -1; // Reset bind group — new pipeline needs new bind group
     },
 
     wgpuComputePassEncoderSetBindGroup(
       passHandle: number, groupIndex: number, bgHandle: number,
       dynamicOffsetCount: number, dynamicOffsetsPtr: number,
     ): void {
-      rpcCall(RpcFn.COMPUTE_PASS_SET_BIND_GROUP, passHandle, groupIndex, bgHandle, dynamicOffsetCount, dynamicOffsetsPtr);
+      if (groupIndex === 0 && dynamicOffsetCount === 0 && pendingPipeline >= 0) {
+        // Buffer for fusion with upcoming dispatch
+        pendingBindGroup = bgHandle;
+      } else {
+        // Non-fusable: flush pending and do individual RPC
+        flushPendingCompute();
+        rpcCall(RpcFn.COMPUTE_PASS_SET_BIND_GROUP, passHandle, groupIndex, bgHandle, dynamicOffsetCount, dynamicOffsetsPtr);
+      }
     },
 
     wgpuComputePassEncoderDispatchWorkgroups(
       passHandle: number, x: number, y: number, z: number,
     ): void {
-      rpcCall(RpcFn.COMPUTE_PASS_DISPATCH, passHandle, x, y, z);
-    },
-
-    // Fused dispatch: setPipeline + setBindGroup(0) + dispatch in one RPC
-    mlx_wgpu_fused_dispatch(
-      passHandle: number, pipelineHandle: number, bgHandle: number,
-      x: number, y: number, z: number,
-    ): void {
-      rpcCall(RpcFn.FUSED_DISPATCH, passHandle, pipelineHandle, bgHandle, x, y, z);
-    },
-
-    // Fused dispatch with 2 bind groups
-    mlx_wgpu_fused_dispatch_2bg(
-      passHandle: number, pipelineHandle: number,
-      bg0Handle: number, bg1Handle: number,
-      x: number, y: number,
-    ): void {
-      rpcCall(RpcFn.FUSED_DISPATCH_2BG, passHandle, pipelineHandle, bg0Handle, bg1Handle, x, y);
+      if (pendingPipeline >= 0 && pendingBindGroup >= 0) {
+        // Fused: setPipeline + setBindGroup(0) + dispatch in 1 RPC
+        rpcCall(RpcFn.FUSED_DISPATCH, pendingPass, pendingPipeline, pendingBindGroup, x, y, z);
+        pendingPipeline = -1;
+        pendingBindGroup = -1;
+      } else {
+        // No pending state or incomplete — flush and dispatch separately
+        flushPendingCompute();
+        rpcCall(RpcFn.COMPUTE_PASS_DISPATCH, passHandle, x, y, z);
+      }
     },
 
     wgpuComputePassEncoderEnd(passHandle: number): void {
+      flushPendingCompute(); // Flush any buffered setPipeline/setBindGroup
       rpcCall(RpcFn.COMPUTE_PASS_END, passHandle);
     },
 
