@@ -386,6 +386,23 @@ export function createBridgeStub(
       rpcCall(RpcFn.COMPUTE_PASS_DISPATCH, passHandle, x, y, z);
     },
 
+    // Fused dispatch: setPipeline + setBindGroup(0) + dispatch in one RPC
+    mlx_wgpu_fused_dispatch(
+      passHandle: number, pipelineHandle: number, bgHandle: number,
+      x: number, y: number, z: number,
+    ): void {
+      rpcCall(RpcFn.FUSED_DISPATCH, passHandle, pipelineHandle, bgHandle, x, y, z);
+    },
+
+    // Fused dispatch with 2 bind groups
+    mlx_wgpu_fused_dispatch_2bg(
+      passHandle: number, pipelineHandle: number,
+      bg0Handle: number, bg1Handle: number,
+      x: number, y: number,
+    ): void {
+      rpcCall(RpcFn.FUSED_DISPATCH_2BG, passHandle, pipelineHandle, bg0Handle, bg1Handle, x, y);
+    },
+
     wgpuComputePassEncoderEnd(passHandle: number): void {
       rpcCall(RpcFn.COMPUTE_PASS_END, passHandle);
     },

@@ -80,6 +80,12 @@ export const enum RpcFn {
   POLL = 80,
   // Special: register externally-created GPU buffer (for weight upload)
   ADD_GPU_BUFFER = 90,
+  // Fused compute dispatch: setPipeline + setBindGroup(0) + dispatch in one RPC
+  // Args: passHandle, pipelineHandle, bindGroupHandle, dispatchX, dispatchY, dispatchZ
+  FUSED_DISPATCH = 91,
+  // Fused compute dispatch with 2 bind groups
+  // Args: passHandle, pipelineHandle, bg0Handle, bg1Handle, dispatchX, dispatchY
+  FUSED_DISPATCH_2BG = 92,
 }
 
 // ---- Command Buffer Layout (SharedArrayBuffer) ----

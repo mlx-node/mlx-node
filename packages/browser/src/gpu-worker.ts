@@ -981,6 +981,41 @@ async function processCommand(fnId: number): Promise<void> {
     // ================================================================
     // Special: register externally-created GPU buffer
     // ================================================================
+    case RpcFn.FUSED_DISPATCH: {
+      // Fused: setPipeline + setBindGroup(0) + dispatch in one RPC call
+      // Args: passHandle, pipelineHandle, bindGroupHandle, x, y, z
+      const passHandle = arg0();
+      const pipelineHandle = arg1();
+      const bgHandle = arg2();
+      const x = arg3();
+      const y = arg4();
+      const z = arg5();
+      const pass = getHandle<GPUComputePassEncoder>(passHandle);
+      pass.setPipeline(getHandle<GPUComputePipeline>(pipelineHandle));
+      pass.setBindGroup(0, getHandle<GPUBindGroup>(bgHandle));
+      pass.dispatchWorkgroups(x, y, z);
+      setResult(0);
+      break;
+    }
+
+    case RpcFn.FUSED_DISPATCH_2BG: {
+      // Fused: setPipeline + setBindGroup(0,1) + dispatch in one RPC call
+      // Args: passHandle, pipelineHandle, bg0Handle, bg1Handle, x, y
+      const passHandle = arg0();
+      const pipelineHandle = arg1();
+      const bg0Handle = arg2();
+      const bg1Handle = arg3();
+      const x = arg4();
+      const y = arg5();
+      const pass = getHandle<GPUComputePassEncoder>(passHandle);
+      pass.setPipeline(getHandle<GPUComputePipeline>(pipelineHandle));
+      pass.setBindGroup(0, getHandle<GPUBindGroup>(bg0Handle));
+      pass.setBindGroup(1, getHandle<GPUBindGroup>(bg1Handle));
+      pass.dispatchWorkgroups(x, y, 1);
+      setResult(0);
+      break;
+    }
+
     case RpcFn.ADD_GPU_BUFFER: {
       // This is handled via postMessage, not RPC, because the GPU buffer
       // object can't be serialized through SharedArrayBuffer.
