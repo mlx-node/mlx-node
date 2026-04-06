@@ -1,0 +1,1 @@
+{"type":"config","name":"webgpu-production","metricName":"decode_tok_s","metricUnit":"tok/s","bestDirection":"higher"}
