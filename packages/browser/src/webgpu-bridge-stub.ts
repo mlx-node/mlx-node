@@ -39,6 +39,8 @@ export function createBridgeStub(
   },
   /** Dedicated readback buffer for GPU→CPU data */
   readbackBuffer?: SharedArrayBuffer,
+  /** GPU feature flags for local resolution (no RPC needed) */
+  gpuFeatures?: { shaderF16?: boolean; subgroups?: boolean; timestampQuery?: boolean },
 ): BridgeStub {
   const cmdView = new Int32Array(cmdBuffer);
   const cmdDataView = new DataView(cmdBuffer);
@@ -81,6 +83,7 @@ export function createBridgeStub(
   let pendingPass = -1;
   let pendingPipeline = -1;
   let pendingBindGroup = -1;
+  let pendingBindGroup1 = -1;
 
   // Active compute pass caching (avoid begin/end per dispatch)
   let activeComputePass = -1;
@@ -90,6 +93,9 @@ export function createBridgeStub(
   // Caches buffer sizes to avoid BUFFER_GET_SIZE RPCs (~2.5x per dispatch)
   const bufSizes: Record<number, number> = {};
 
+  // Pipeline bind group layout cache: layouts are lightweight and never released
+  const layoutCache: Record<number, number> = {};
+
   function flushPendingCompute() {
     if (pendingPipeline >= 0) {
       rpcCall(RpcFn.COMPUTE_PASS_SET_PIPELINE, pendingPass, pendingPipeline);
@@ -98,6 +104,10 @@ export function createBridgeStub(
     if (pendingBindGroup >= 0) {
       rpcCall(RpcFn.COMPUTE_PASS_SET_BIND_GROUP, pendingPass, 0, pendingBindGroup, 0, 0);
       pendingBindGroup = -1;
+    }
+    if (pendingBindGroup1 >= 0) {
+      rpcCall(RpcFn.COMPUTE_PASS_SET_BIND_GROUP, pendingPass, 1, pendingBindGroup1, 0, 0);
+      pendingBindGroup1 = -1;
     }
   }
 
@@ -126,11 +136,10 @@ export function createBridgeStub(
 
     const result = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);
 
-    // Process pending callbacks (critical for init: adapter/device callbacks)
-    try {
-      drainCallbacks(fnId);
-    } catch (e) {
-      console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e);
+    // Process pending callbacks only when present (95%+ of calls have 0)
+    const cbCount = cmdDataView.getUint32(CMD_OFFSET.CALLBACK_COUNT, true);
+    if (cbCount > 0) {
+      try { drainCallbacks(fnId); } catch (e) { console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e); }
     }
 
     Atomics.store(cmdView, STATUS_INDEX, STATUS.IDLE);
@@ -146,10 +155,6 @@ export function createBridgeStub(
     args: number[],
     hiArgs: Record<number, number>,
   ): number {
-    rpcCount++;
-    if (rpcHistory.length >= RPC_HISTORY_SIZE) rpcHistory.shift();
-    rpcHistory.push({ n: rpcCount, fn: fnId });
-
     cmdDataView.setUint32(CMD_OFFSET.FN_ID, fnId, true);
 
     for (let i = 0; i < args.length && i < 8; i++) {
@@ -169,6 +174,9 @@ export function createBridgeStub(
 
     const waitResult = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 10_000);
     if (waitResult === 'timed-out') {
+      rpcCount++;
+      if (rpcHistory.length >= RPC_HISTORY_SIZE) rpcHistory.shift();
+      rpcHistory.push({ n: rpcCount, fn: fnId });
       console.error(`[RPC TIMEOUT] fn=${fnId} (#${rpcCount}) timed out after 10s! (rpcCallWithHi)`);
       console.error(`[RPC TIMEOUT] Last ${rpcHistory.length} calls:`,
         rpcHistory.map(h => `#${h.n}:fn=${h.fn}`).join(', '));
@@ -177,10 +185,9 @@ export function createBridgeStub(
     }
 
     const result = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);
-    try {
-      drainCallbacks(fnId);
-    } catch (e) {
-      console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e);
+    const cbCount = cmdDataView.getUint32(CMD_OFFSET.CALLBACK_COUNT, true);
+    if (cbCount > 0) {
+      try { drainCallbacks(fnId); } catch (e) { console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e); }
     }
     Atomics.store(cmdView, STATUS_INDEX, STATUS.IDLE);
 
@@ -263,6 +270,12 @@ export function createBridgeStub(
       _adapter: number, _descPtr: number, callbackPtr: number, userdataPtr: number,
     ): void {
       rpcCall(RpcFn.ADAPTER_REQUEST_DEVICE, 0, 0, callbackPtr, userdataPtr);
+    },
+
+    wgpuAdapterHasFeature(_adapter: number, feature: number): number {
+      if (feature === 14 && gpuFeatures?.shaderF16) return 1;  // WGPUFeatureName_ShaderF16
+      if (feature === 0x3F1 && gpuFeatures?.subgroups) return 1;  // WGPUFeatureName_Subgroups
+      return 0;
     },
 
     wgpuAdapterRelease(): void {
@@ -418,6 +431,7 @@ export function createBridgeStub(
       pendingPass = passHandle;
       pendingPipeline = pipelineHandle;
       pendingBindGroup = -1; // Reset bind group — new pipeline needs new bind group
+      pendingBindGroup1 = -1;
     },
 
     wgpuComputePassEncoderSetBindGroup(
@@ -427,6 +441,9 @@ export function createBridgeStub(
       if (groupIndex === 0 && dynamicOffsetCount === 0 && pendingPipeline >= 0) {
         // Buffer for fusion with upcoming dispatch
         pendingBindGroup = bgHandle;
+      } else if (groupIndex === 1 && dynamicOffsetCount === 0 && pendingPipeline >= 0) {
+        // Buffer bind group 1 for FUSED_DISPATCH_2BG
+        pendingBindGroup1 = bgHandle;
       } else {
         // Non-fusable: flush pending and do individual RPC
         flushPendingCompute();
@@ -437,7 +454,13 @@ export function createBridgeStub(
     wgpuComputePassEncoderDispatchWorkgroups(
       passHandle: number, x: number, y: number, z: number,
     ): void {
-      if (pendingPipeline >= 0 && pendingBindGroup >= 0) {
+      if (pendingPipeline >= 0 && pendingBindGroup >= 0 && pendingBindGroup1 >= 0) {
+        // Fused: setPipeline + setBindGroup(0) + setBindGroup(1) + dispatch in 1 RPC
+        rpcCall(RpcFn.FUSED_DISPATCH_2BG, pendingPass, pendingPipeline, pendingBindGroup, pendingBindGroup1, x, y, z);
+        pendingPipeline = -1;
+        pendingBindGroup = -1;
+        pendingBindGroup1 = -1;
+      } else if (pendingPipeline >= 0 && pendingBindGroup >= 0) {
         // Fused: setPipeline + setBindGroup(0) + dispatch in 1 RPC
         rpcCall(RpcFn.FUSED_DISPATCH, pendingPass, pendingPipeline, pendingBindGroup, x, y, z);
         pendingPipeline = -1;
@@ -558,7 +581,12 @@ export function createBridgeStub(
 
     // ===== Pipeline =====
     wgpuComputePipelineGetBindGroupLayout(pipelineHandle: number, index: number): number {
-      return rpcCall(RpcFn.PIPELINE_GET_BIND_GROUP_LAYOUT, pipelineHandle, index);
+      const key = pipelineHandle * 4 + index;
+      const cached = layoutCache[key];
+      if (cached !== undefined) return cached;
+      const handle = rpcCall(RpcFn.PIPELINE_GET_BIND_GROUP_LAYOUT, pipelineHandle, index);
+      layoutCache[key] = handle;
+      return handle;
     },
 
     wgpuComputePipelineRelease(handle: number): void {

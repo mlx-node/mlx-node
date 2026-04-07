@@ -1047,18 +1047,19 @@ async function processCommand(fnId: number): Promise<void> {
 
     case RpcFn.FUSED_DISPATCH_2BG: {
       // Fused: setPipeline + setBindGroup(0,1) + dispatch in one RPC call
-      // Args: passHandle, pipelineHandle, bg0Handle, bg1Handle, x, y
+      // Args: passHandle, pipelineHandle, bg0Handle, bg1Handle, x, y, z
       const passHandle = arg0();
       const pipelineHandle = arg1();
       const bg0Handle = arg2();
       const bg1Handle = arg3();
       const x = arg4();
       const y = arg5();
+      const z = arg6();
       const pass = getHandle<GPUComputePassEncoder>(passHandle);
       pass.setPipeline(getHandle<GPUComputePipeline>(pipelineHandle));
       pass.setBindGroup(0, getHandle<GPUBindGroup>(bg0Handle));
       pass.setBindGroup(1, getHandle<GPUBindGroup>(bg1Handle));
-      pass.dispatchWorkgroups(x, y, 1);
+      pass.dispatchWorkgroups(x, y, z);
       setResult(0);
       break;
     }
