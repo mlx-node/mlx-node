@@ -83,7 +83,7 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
       adapterHandle: gpuReady.adapterHandle,
       deviceHandle: gpuReady.deviceHandle,
       queueHandle: gpuReady.queueHandle,
-    }, readbackBuffer);
+    }, readbackBuffer, gpuReady.features);
 
     // 3. Load WASM with bridge stub
     post({ type: 'progress', step: 'wasm', message: 'Loading WASM module...' });
