@@ -272,6 +272,13 @@ export function createBridgeStub(
       rpcCall(RpcFn.ADAPTER_REQUEST_DEVICE, 0, 0, callbackPtr, userdataPtr);
     },
 
+    wgpuAdapterGetLimits(_adapterHandle: number, limitsPtr: number): number {
+      // The GPU worker already requested the device with adapter limits.
+      // For WASM, we write adapter limits to the provided pointer.
+      // Use the same RPC as device limits (they're the same in practice for our usage).
+      return rpcCall(RpcFn.DEVICE_GET_LIMITS, limitsPtr);
+    },
+
     wgpuAdapterHasFeature(_adapter: number, feature: number): number {
       if (feature === 14 && gpuFeatures?.shaderF16) return 1;  // WGPUFeatureName_ShaderF16
       if (feature === 0x3F1 && gpuFeatures?.subgroups) return 1;  // WGPUFeatureName_Subgroups
