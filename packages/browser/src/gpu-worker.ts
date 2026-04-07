@@ -24,35 +24,58 @@ import {
   CALLBACK_ENTRY_SIZE,
 } from './rpc-protocol.js';
 
-// ---------- Handle Table ----------
+// ---------- Handle Table (1H: sparse array for O(1) index lookup) ----------
 
-const handles = new Map<number, any>();
-const bufferSizes = new Map<number, number>();
+const handles: any[] = [null]; // index 0 unused — handles start at 1
+const bufferSizesArr: (number | undefined)[] = [undefined];
 let nextHandle = 1;
 
 function addHandle(obj: any): number {
   const id = nextHandle++;
-  handles.set(id, obj);
+  handles[id] = obj;
   return id;
 }
 
 function getHandle<T>(id: number): T {
-  const obj = handles.get(id);
+  const obj = handles[id];
   if (!obj) throw new Error(`[GPU Worker] Invalid handle: ${id}`);
   return obj as T;
 }
 
 function releaseHandle(id: number): void {
-  handles.delete(id);
-  bufferSizes.delete(id);
+  handles[id] = undefined;
+  bufferSizesArr[id] = undefined;
 }
 
-// ---------- Memory Helpers ----------
+// ---------- Memory Helpers (1J: cached WASM DataView) ----------
+
+let cachedWasmBuffer: ArrayBuffer | null = null;
+let cachedWasmView: DataView | null = null;
+let cachedWasmU8: Uint8Array | null = null;
+
+function getWasmView(): DataView {
+  const buf = wasmMemoryObj.buffer;
+  if (buf !== cachedWasmBuffer) {
+    cachedWasmBuffer = buf;
+    cachedWasmView = new DataView(buf);
+    cachedWasmU8 = new Uint8Array(buf);
+  }
+  return cachedWasmView!;
+}
+
+function getWasmBytes(): Uint8Array {
+  const buf = wasmMemoryObj.buffer;
+  if (buf !== cachedWasmBuffer) {
+    cachedWasmBuffer = buf;
+    cachedWasmView = new DataView(buf);
+    cachedWasmU8 = new Uint8Array(buf);
+  }
+  return cachedWasmU8!;
+}
 
 function readString(ptr: number): string {
   if (ptr === 0) return '';
-  // Read from wasmMemoryObj.buffer — always returns current byteLength after grow()
-  const bytes = new Uint8Array(wasmMemoryObj.buffer);
+  const bytes = getWasmBytes();
   let end = ptr;
   const maxLen = bytes.byteLength;
   while (end < maxLen && bytes[end] !== 0) end++;
@@ -64,6 +87,7 @@ function readString(ptr: number): string {
 let device: GPUDevice;
 let queue: GPUQueue;
 let adapter: GPUAdapter;
+let hasShaderF16 = false;
 
 // Pre-registered handles (set during init)
 let instanceHandle: number;
@@ -85,7 +109,11 @@ interface PendingCallback {
   status: number;
   userdataPtr: number;
 }
-const pendingCallbacks: PendingCallback[] = [];
+// 1I: Ring buffer for pending callbacks — avoids splice(0, count) overhead
+const cbRing: PendingCallback[] = [];
+let cbHead = 0;
+let cbTail = 0;
+function pushCallback(cb: PendingCallback): void { cbRing[cbTail++] = cb; }
 
 // GPU-done callbacks: accumulated from QUEUE_ON_SUBMITTED_WORK_DONE (fn=22).
 // These must NOT fire until GPU work actually completes. They are moved to
@@ -128,7 +156,18 @@ self.onmessage = async (e: MessageEvent) => {
     }
     adapter = _adapter;
 
+    // 1A: Runtime feature detection
+    hasShaderF16 = adapter.features.has('shader-f16');
+    const hasSubgroups = adapter.features.has('subgroups');
+    const hasTimestampQuery = adapter.features.has('timestamp-query');
+    const requiredFeatures: GPUFeatureName[] = [];
+    if (hasShaderF16) requiredFeatures.push('shader-f16');
+    if (hasSubgroups) requiredFeatures.push('subgroups');
+    if (hasTimestampQuery) requiredFeatures.push('timestamp-query');
+    console.log(`[GPU Worker] Detected features: shader-f16=${hasShaderF16}, subgroups=${hasSubgroups}, timestamp-query=${hasTimestampQuery}`);
+
     device = await adapter.requestDevice({
+      requiredFeatures,
       requiredLimits: {
         maxStorageBuffersPerShaderStage: Math.min(adapter.limits.maxStorageBuffersPerShaderStage, 16),
         maxBufferSize: Math.min(adapter.limits.maxBufferSize, 1 << 30),
@@ -161,6 +200,7 @@ self.onmessage = async (e: MessageEvent) => {
       adapterHandle,
       deviceHandle,
       queueHandle,
+      features: { shaderF16: hasShaderF16, subgroups: hasSubgroups, timestampQuery: hasTimestampQuery },
     });
 
     // Start command processing loop
@@ -181,9 +221,10 @@ self.onmessage = async (e: MessageEvent) => {
     for (const tensor of tensors) {
       const isBf16 = tensor.dtype === 'BF16';
       const isF16 = tensor.dtype === 'F16';
-      // bf16/f16 must be expanded to f32 for WebGPU — WGSL has no bf16 type,
-      // and f16 support is optional. Store as f32 on GPU.
-      const needsExpand = isBf16 || isF16;
+      // bf16 always expands to f32 — WGSL has no bf16 type.
+      // f16 stays native when shader-f16 is available (halves upload bandwidth);
+      // otherwise expands to f32.
+      const needsExpand = isBf16 || (isF16 && !hasShaderF16);
       const numElements = tensor.byteSize / (isBf16 || isF16 ? 2 : 4);
       const gpuByteSize = needsExpand ? numElements * 4 : tensor.byteSize;
       const alignedSize = Math.max(4, Math.ceil(gpuByteSize / 4) * 4);
@@ -234,7 +275,7 @@ self.onmessage = async (e: MessageEvent) => {
       gpuBuffer.unmap();
 
       const handle = addHandle(gpuBuffer);
-      bufferSizes.set(handle, alignedSize);
+      bufferSizesArr[handle] = alignedSize;
       handles.push(handle);
     }
 
@@ -287,11 +328,12 @@ async function commandLoop(): Promise<void> {
 }
 
 function flushCallbacks(): void {
-  const count = Math.min(pendingCallbacks.length, MAX_CALLBACKS_PER_CALL);
+  const pending = cbTail - cbHead;
+  const count = Math.min(pending, MAX_CALLBACKS_PER_CALL);
   cmdDataView.setUint32(CMD_OFFSET.CALLBACK_COUNT, count, true);
 
   for (let i = 0; i < count; i++) {
-    const cb = pendingCallbacks[i];
+    const cb = cbRing[cbHead + i];
     const base = CMD_OFFSET.CALLBACK_BASE + i * CALLBACK_ENTRY_SIZE;
     cmdDataView.setUint32(base, cb.fnPtr, true);
     cmdDataView.setUint32(base + 4, cb.status, true);
@@ -299,9 +341,14 @@ function flushCallbacks(): void {
     cmdDataView.setUint32(base + 12, 0, true); // pad
   }
 
-  // Remove flushed callbacks (keep overflow for next call)
+  // Advance head; compact when fully drained
   if (count > 0) {
-    pendingCallbacks.splice(0, count);
+    cbHead += count;
+    if (cbHead === cbTail) {
+      cbHead = 0;
+      cbTail = 0;
+      cbRing.length = 0;
+    }
   }
 }
 
@@ -327,12 +374,10 @@ async function processCommand(fnId: number): Promise<void> {
     cmdDataView.setUint32(CMD_OFFSET.RESULT_HI, hi, true);
   };
 
-  // Fresh DataView over WASM memory for reading struct descriptors.
-  // Must be created on each call since the underlying SAB can grow.
-  // Always read wasmMemoryObj.buffer (not a cached SAB) — .buffer getter returns
-  // a fresh SAB with the current byteLength after any memory.grow() on the wasm-worker.
-  const wasm = () => new DataView(wasmMemoryObj.buffer);
-  const wasmBytes = () => new Uint8Array(wasmMemoryObj.buffer);
+  // 1J: Use cached DataView/Uint8Array over WASM memory.
+  // Cache invalidates automatically when buffer identity changes (memory.grow).
+  const wasm = getWasmView;
+  const wasmBytes = getWasmBytes;
 
   switch (fnId) {
     // ================================================================
@@ -357,7 +402,7 @@ async function processCommand(fnId: number): Promise<void> {
       // The callback ring has fnPtr + status + userdata. For request-adapter, "status" is
       // the WGPURequestAdapterStatus (0 = success). The wasm-worker needs the adapter handle.
       // We return adapterHandle as the RESULT so the wasm-worker can read it.
-      pendingCallbacks.push({ fnPtr: callbackPtr, status: 0, userdataPtr });
+      pushCallback({ fnPtr: callbackPtr, status: 0, userdataPtr });
       setResult(adapterHandle);
       break;
     }
@@ -375,7 +420,7 @@ async function processCommand(fnId: number): Promise<void> {
       // Args: _adapter, _descPtr, callbackPtr, userdataPtr
       const callbackPtr = arg2();
       const userdataPtr = arg3();
-      pendingCallbacks.push({ fnPtr: callbackPtr, status: 0, userdataPtr });
+      pushCallback({ fnPtr: callbackPtr, status: 0, userdataPtr });
       setResult(deviceHandle);
       break;
     }
@@ -417,7 +462,7 @@ async function processCommand(fnId: number): Promise<void> {
       try {
         const buffer = device.createBuffer({ size, usage, mappedAtCreation });
         const handle = addHandle(buffer);
-        bufferSizes.set(handle, size);
+        bufferSizesArr[handle] = size;
         setResult(handle);
       } catch (e) {
         console.error(`[GPU Worker] createBuffer failed: size=${size} usage=0x${usage.toString(16)} mapped=${mappedAtCreation}`, e);
@@ -796,7 +841,7 @@ async function processCommand(fnId: number): Promise<void> {
       // Args: bufferHandle
       // Returns: u64 size via RESULT + RESULT_HI
       const bufferHandle = arg0();
-      const size = bufferSizes.get(bufferHandle) ?? 0;
+      const size = bufferSizesArr[bufferHandle] ?? 0;
       setResultBig(size & 0xFFFFFFFF, Math.floor(size / 0x100000000));
       break;
     }
@@ -816,7 +861,7 @@ async function processCommand(fnId: number): Promise<void> {
       const wasmPtr = arg3();
 
       const buffer = getHandle<GPUBuffer>(bufferHandle);
-      if (size === 0) size = (bufferSizes.get(bufferHandle) ?? 0) - offset;
+      if (size === 0) size = (bufferSizesArr[bufferHandle] ?? 0) - offset;
 
       const jsRange = buffer.getMappedRange(offset, size);
       activeMappings.set(bufferHandle, { jsRange, wasmPtr, size, writeBack: true });
@@ -835,7 +880,7 @@ async function processCommand(fnId: number): Promise<void> {
       const wasmPtr = arg3();
 
       const buffer = getHandle<GPUBuffer>(bufferHandle);
-      if (size === 0) size = (bufferSizes.get(bufferHandle) ?? 0) - offset;
+      if (size === 0) size = (bufferSizesArr[bufferHandle] ?? 0) - offset;
 
       const jsRange = buffer.getMappedRange(offset, size);
 
@@ -891,10 +936,10 @@ async function processCommand(fnId: number): Promise<void> {
 
       try {
         await buffer.mapAsync(gpuMode, offset, size);
-        pendingCallbacks.push({ fnPtr: callbackPtr, status: 0, userdataPtr });
+        pushCallback({ fnPtr: callbackPtr, status: 0, userdataPtr });
       } catch (err) {
         console.error('[GPU Worker] mapAsync failed:', err);
-        pendingCallbacks.push({ fnPtr: callbackPtr, status: 1, userdataPtr });
+        pushCallback({ fnPtr: callbackPtr, status: 1, userdataPtr });
       }
       setResult(0);
       break;
@@ -968,13 +1013,15 @@ async function processCommand(fnId: number): Promise<void> {
       // This is the whole reason for the two-worker architecture:
       // the event loop is free here, so onSubmittedWorkDone() resolves.
       await queue.onSubmittedWorkDone();
-      // NOW it's safe to fire GPU-done callbacks. Move them to pendingCallbacks
+      // NOW it's safe to fire GPU-done callbacks. Move them to the ring
       // so flushCallbacks() writes them to the callback ring for the wasm-worker.
       if (gpuDoneCallbacks.length > 0) {
-        pendingCallbacks.push(...gpuDoneCallbacks);
+        for (let i = 0; i < gpuDoneCallbacks.length; i++) {
+          pushCallback(gpuDoneCallbacks[i]);
+        }
         gpuDoneCallbacks.length = 0;
       }
-      setResult(pendingCallbacks.length);
+      setResult(cbTail - cbHead);
       break;
     }
 
