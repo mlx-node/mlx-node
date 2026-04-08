@@ -14,7 +14,7 @@ use crate::models::qwen3_5::persistence_common::{
 use crate::tokenizer::Qwen3Tokenizer;
 
 use super::config::Gemma4Config;
-use super::model::Gemma4Model;
+use super::model::{Gemma4Model, warmup_forward};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, is_mxfp8_checkpoint, is_quantized_checkpoint,
     try_build_mxfp8_quantized_linear, try_build_quantized_linear,
@@ -866,11 +866,45 @@ impl Gemma4Model {
             dequant_fp8_weights(&mut params, DType::BFloat16)?;
 
             // Sanitize weights
-            let params = sanitize_weights(&mut params, &config)?;
+            let mut params = sanitize_weights(&mut params, &config)?;
             info!("Sanitized to {} tensors", params.len());
 
             // Validate required weights are present
             validate_required_weights(&params, &config)?;
+
+            // Fuse split MoE expert weights: replace separate gate_proj + up_proj
+            // with a single gate_up_proj BEFORE apply_weights. This ensures:
+            // 1. The model and params share the same fused MxArray (no duplication)
+            // 2. g_weights (C++ global) stores the fused version, not the splits
+            // 3. Saves ~30 GB that would otherwise be held by redundant split arrays
+            if config.enable_moe_block {
+                for i in 0..config.num_hidden_layers as usize {
+                    let prefix = format!("layers.{}", i);
+                    let gate_key =
+                        format!("{}.experts.switch_glu.gate_proj.weight", prefix);
+                    let up_key =
+                        format!("{}.experts.switch_glu.up_proj.weight", prefix);
+                    if let (Some(gate), Some(up)) = (
+                        params.remove(&gate_key),
+                        params.remove(&up_key),
+                    ) {
+                        let fused = MxArray::concatenate(&gate, &up, 1)?;
+                        params.insert(
+                            format!("{}.experts.gate_up_proj", prefix),
+                            fused,
+                        );
+                    }
+                    // Remap split down_proj key so apply_weights and C++ path both find it
+                    let down_split =
+                        format!("{}.experts.switch_glu.down_proj.weight", prefix);
+                    let down_fused = format!("{}.experts.down_proj", prefix);
+                    if !params.contains_key(&down_fused)
+                        && let Some(w) = params.remove(&down_split)
+                    {
+                        params.insert(down_fused, w);
+                    }
+                }
+            }
 
             // Create model
             let mut model = Gemma4Model::new(config.clone())?;
@@ -878,19 +912,12 @@ impl Gemma4Model {
             // Apply weights (uses blocking_write on Arc<RwLock<>>)
             apply_weights(&mut model, &params, &config)?;
 
-            // Evaluate all weights to materialize them on GPU.
-            // Without this, weights remain as lazy mmap references and every
-            // decode step would re-read ~48GB from disk. This matches Python
-            // mlx-vlm's `mx.eval(model.parameters())` after load.
+            // Materialize weights in chunked evals to avoid Metal command buffer
+            // timeouts on large models. Without this, weights remain as lazy mmap
+            // references and every decode step re-reads ~48GB from disk.
             {
                 let weight_refs: Vec<&MxArray> = params.values().collect();
-                MxArray::eval_arrays(&weight_refs);
-                let mem_bytes = crate::array::get_active_memory();
-                eprintln!(
-                    "[gemma4] Evaluated {} weight tensors onto GPU ({:.2} GB active)",
-                    weight_refs.len(),
-                    mem_bytes / 1e9
-                );
+                crate::array::memory::materialize_weights(&weight_refs);
             }
 
             // Register weights with C++ compiled forward pass
@@ -903,6 +930,21 @@ impl Gemma4Model {
                     .map_err(|e| Error::from_reason(format!("Failed to load tokenizer: {}", e)))?;
                 model.set_tokenizer(Arc::new(tokenizer));
                 info!("Tokenizer loaded");
+            }
+
+            // Warmup: run dummy tokens through the full model to trigger
+            // Metal shader compilation at load time rather than on the first real
+            // inference call. Without this, the first chat() call is ~100x slower
+            // than subsequent calls due to JIT shader compilation.
+            if std::env::var("GEMMA4_NO_WARMUP").is_err() {
+                let warmup_start = std::time::Instant::now();
+                warmup_forward(&model, &config)?;
+                let active_after = crate::array::get_active_memory();
+                info!(
+                    "[gemma4] Warmup forward pass: {:.1}ms ({:.2} GB active)",
+                    warmup_start.elapsed().as_secs_f64() * 1000.0,
+                    active_after / 1e9,
+                );
             }
 
             Ok(model)

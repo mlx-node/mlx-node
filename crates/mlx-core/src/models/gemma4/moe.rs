@@ -115,16 +115,20 @@ impl Gemma4Router {
 
 /// Gemma4 MoE Experts block.
 ///
-/// Uses fused gate_up_proj weights [num_experts, 2*moe_inter, hidden] and
-/// down_proj weights [num_experts, hidden, moe_inter].
+/// Weights are stored in their ORIGINAL layout (no pre-transpose):
+///   gate_up_proj: [num_experts, 2*moe_inter, hidden]
+///   down_proj:    [num_experts, hidden, moe_inter]
 ///
-/// Receives pre-computed (top_k_indices, top_k_weights) from the Router.
-/// Dispatches tokens to experts via gather_mm and computes weighted sum.
+/// The transpose to [E, in, out] happens lazily inside gather_mm via
+/// `swapaxes(-1, -2)`, matching Python's SwitchLinear which does:
+///   `mx.gather_mm(x, self["weight"].swapaxes(-1, -2), ...)`
+///
+/// This avoids materializing a ~30GB transposed copy of the expert weights.
 pub struct Gemma4MoE {
-    /// Fused gate+up projection, stored TRANSPOSED: [num_experts, hidden, 2*moe_inter]
-    gate_up_proj_t: MxArray,
-    /// Down projection, stored TRANSPOSED: [num_experts, moe_inter, hidden]
-    down_proj_t: MxArray,
+    /// Fused gate+up projection: [num_experts, 2*moe_inter, hidden]
+    gate_up_proj: MxArray,
+    /// Down projection: [num_experts, hidden, moe_inter]
+    down_proj: MxArray,
     /// Pre-created scalar of top_k for floor_divide.
     k_scalar: MxArray,
     /// Pre-computed token indices for single-token decode: [K] zeros.
@@ -142,13 +146,13 @@ impl Gemma4MoE {
         moe_intermediate_size: u32,
     ) -> Result<Self> {
         let fused_inter = (2 * moe_intermediate_size) as i64;
-        let gate_up_proj_t =
-            MxArray::zeros(&[num_experts as i64, hidden_size as i64, fused_inter], None)?;
-        let down_proj_t = MxArray::zeros(
+        let gate_up_proj =
+            MxArray::zeros(&[num_experts as i64, fused_inter, hidden_size as i64], None)?;
+        let down_proj = MxArray::zeros(
             &[
                 num_experts as i64,
-                moe_intermediate_size as i64,
                 hidden_size as i64,
+                moe_intermediate_size as i64,
             ],
             None,
         )?;
@@ -158,8 +162,8 @@ impl Gemma4MoE {
             MxArray::from_int32(&vec![0i32; top_k as usize], &[top_k as i64])?;
 
         Ok(Self {
-            gate_up_proj_t,
-            down_proj_t,
+            gate_up_proj,
+            down_proj,
             k_scalar,
             single_token_indices,
             top_k: top_k as i32,
@@ -219,8 +223,9 @@ impl Gemma4MoE {
             (x_rep, flat_indices, None)
         };
 
-        // gate_up = gather_mm(x, gate_up_proj_t, idx) -> [ne*k, 1, 2*moe_inter]
-        let gate_up = x_for_gather.gather_mm(&self.gate_up_proj_t, &idx_for_gather, do_sort)?;
+        // Lazy transpose matching Python SwitchLinear (zero-copy view, no memory duplication)
+        let gate_up_proj_t = self.gate_up_proj.transpose(Some(&[0, 2, 1]))?;
+        let gate_up = x_for_gather.gather_mm(&gate_up_proj_t, &idx_for_gather, do_sort)?;
 
         let gate = gate_up.slice_axis(2, 0, moe_inter)?;
         let up = gate_up.slice_axis(2, moe_inter, 2 * moe_inter)?;
@@ -231,8 +236,8 @@ impl Gemma4MoE {
             MxArray::from_handle(handle, "moe_geglu")?
         };
 
-        // down = gather_mm(hidden, down_proj_t, idx) -> [ne*k, 1, hidden]
-        let down = hidden.gather_mm(&self.down_proj_t, &idx_for_gather, do_sort)?;
+        let down_proj_t = self.down_proj.transpose(Some(&[0, 2, 1]))?;
+        let down = hidden.gather_mm(&down_proj_t, &idx_for_gather, do_sort)?;
 
         let down_final = if let Some(inv_order) = needs_unsort {
             down.take(&inv_order, 0)?
@@ -255,12 +260,12 @@ impl Gemma4MoE {
     // ========== Weight setters ==========
 
     pub fn set_gate_up_proj(&mut self, w: &MxArray) -> Result<()> {
-        self.gate_up_proj_t = w.transpose(Some(&[0, 2, 1]))?;
+        self.gate_up_proj = w.clone();
         Ok(())
     }
 
     pub fn set_down_proj(&mut self, w: &MxArray) -> Result<()> {
-        self.down_proj_t = w.transpose(Some(&[0, 2, 1]))?;
+        self.down_proj = w.clone();
         Ok(())
     }
 }

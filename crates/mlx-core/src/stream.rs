@@ -134,40 +134,8 @@ impl WiredLimitContext {
     /// * `model_size_bytes` - Total size of model parameters in bytes
     /// * `streams` - Streams to synchronize before restoring limit (usually `vec![generation_stream]`)
     pub fn new(model_size_bytes: usize, streams: Vec<Stream>) -> Self {
-        // Check if Metal is available (only active on Apple Silicon with Metal backend)
-        let metal_available = unsafe { sys::mlx_metal_is_available() };
-
-        if !metal_available {
-            // Not on Metal, return no-op context
-            return Self {
-                old_limit: 0,
-                streams: Vec::new(),
-            };
-        }
-
-        // Get Metal device info
-        let device_info_ptr = unsafe { sys::mlx_metal_device_info() };
-
-        // Check for null pointer before converting to CStr
-        // This can happen if Metal initialization failed or device info is unavailable
-        if device_info_ptr.is_null() {
-            return Self {
-                old_limit: 0,
-                streams: Vec::new(),
-            };
-        }
-
-        let device_info_str = unsafe {
-            std::ffi::CStr::from_ptr(device_info_ptr)
-                .to_string_lossy()
-                .into_owned()
-        };
-
-        // Parse JSON to get max_recommended_working_set_size
-        let max_rec_size = Self::parse_max_working_set_size(&device_info_str);
-
+        let max_rec_size = Self::get_max_working_set_size();
         if max_rec_size == 0 {
-            // Failed to get max size, return no-op context
             return Self {
                 old_limit: 0,
                 streams: Vec::new(),
@@ -191,6 +159,17 @@ impl WiredLimitContext {
         let old_limit = unsafe { sys::mlx_set_wired_limit(max_rec_size) };
 
         Self { old_limit, streams }
+    }
+
+    /// Query GPU's `max_recommended_working_set_size` in bytes.
+    /// Returns 0 if Metal is unavailable or device info can't be read.
+    pub(crate) fn get_max_working_set_size() -> usize {
+        let ptr = unsafe { sys::mlx_metal_device_info() };
+        if ptr.is_null() {
+            return 0;
+        }
+        let json = unsafe { std::ffi::CStr::from_ptr(ptr).to_string_lossy() };
+        Self::parse_max_working_set_size(&json)
     }
 
     /// Parse max_recommended_working_set_size from JSON device info

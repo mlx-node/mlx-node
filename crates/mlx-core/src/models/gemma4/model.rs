@@ -77,6 +77,7 @@ fn escape_gemma4_content(s: &str) -> String {
 use super::config::Gemma4Config;
 use super::decoder_layer::Gemma4DecoderLayer;
 use super::layer_cache::Gemma4LayerCache;
+use tracing::{debug, info};
 
 /// Gemma4 generation configuration.
 #[napi(object)]
@@ -390,15 +391,10 @@ impl Gemma4Model {
             // Mark first token time (TTFT = time to first token)
             let first_token_instant = std::time::Instant::now();
 
-            // Decode loop — matches mlx-vlm generate_step pattern:
-            // 1. Build lazy graph per step via forward_inner (no compile())
-            // 2. async_eval the output token + cache arrays
-            // 3. Double-buffer: build step N+1 while extracting step N
-            //
-            // mlx-vlm achieves ~30 tok/s without compile() by relying on:
-            // - MLX lazy evaluation building optimized computation graphs
-            // - Metal shader cache reusing compiled GPU kernels across steps
-            // - In-place cache mutation as side-effects (not return values)
+            // Decode loop — matches mlx-lm generate.py pattern:
+            // 1. Build lazy graph per step via forward_inner
+            // 2. async_eval the output token (caches materialize through dependency graph)
+            // 3. Double-buffer: build step N+1 while GPU executes step N
             //
             // Set GEMMA4_USE_COMPILE=1 to use the old compiled C++ path for A/B testing.
             let mut generated_tokens: Vec<u32> = Vec::new();
@@ -496,14 +492,16 @@ impl Gemma4Model {
                 }
                 unsafe { mlx_sys::mlx_gemma4_reset(); }
             } else {
-                // Default: lazy eval decode (matches mlx-vlm pattern)
+                // Default: lazy eval decode (matches mlx-lm pattern)
                 //
-                // Each step builds a lazy computation graph via forward_inner.
-                // Cache mutations (slice_assign_axis_inplace) happen as side effects.
-                // We eval both the token AND cache arrays each step to ensure
-                // cache state is materialized before the next step reads it.
-                // MLX's Metal shader cache reuses compiled kernels since shapes
-                // are identical across decode steps.
+                // Double-buffered: build step N+1's graph while GPU executes step N.
+                // Cache mutations (slice_assign_axis_inplace) are lazy side effects
+                // in the computation graph — evaluating the token implicitly
+                // materializes caches (no explicit cache eval needed during decode).
+                //
+                // Pattern from mlx-lm generate.py:
+                //   mx.async_eval(next_y)   # fire and forget
+                //   if n == 0: mx.eval(y)   # sync only for TTFT
                 let mut current_y = y;
                 for step in 0..max_new_tokens {
                     let next_y = if step + 1 < max_new_tokens {
@@ -523,8 +521,7 @@ impl Gemma4Model {
                         )?;
                         let logits = logits.squeeze(Some(&[1]))?;
                         let next_token = sample_next_token(&logits, sampling_config)?;
-                        next_token.eval();
-                        eval_gemma4_caches(&caches);
+                        MxArray::async_eval_arrays(&[&next_token]);
                         Some(next_token)
                     } else {
                         None
@@ -563,6 +560,8 @@ impl Gemma4Model {
                 .as_secs_f64()
                 * 1000.0;
             let gen_toks = generated_tokens.len() as f64;
+            let mem_after = crate::array::get_active_memory();
+            debug!("[gemma4-chat] after generate: {:.2} GB active", mem_after / 1e9);
 
             let performance = Some(crate::profiling::PerformanceMetrics {
                 ttft_ms,
@@ -594,6 +593,80 @@ impl Gemma4Model {
     pub fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
         self.tokenizer = Some(tokenizer);
     }
+}
+
+/// How many layers to batch per eval during warmup.
+///
+/// Larger GPUs can handle bigger Metal command buffers before timing out,
+/// but the timeout is nondeterministic (thermal state, system load).
+/// Uses `max_recommended_working_set_size` (GPU memory) as proxy:
+///   ≤128 GB → 1  (base / Pro / Max)
+///   ≤384 GB → 2  (Ultra variants)
+///   >384 GB → 4  (future hardware)
+fn warmup_layer_batch_size() -> usize {
+    let gb = crate::stream::WiredLimitContext::get_max_working_set_size() / (1 << 30);
+    match gb {
+        0..=128 => 1,
+        129..=384 => 2,
+        _ => 4,
+    }
+}
+
+/// Single-token forward pass to trigger Metal shader compilation at load time.
+/// Layers are eval'd in batches (sized by GPU capability) to keep Metal
+/// command buffers under the timeout limit on cold shader cache.
+pub fn warmup_forward(model: &Gemma4Model, config: &Gemma4Config) -> Result<()> {
+    let embed_guard = model.embed_tokens.blocking_read();
+    let layers_guard = model.layers.blocking_read();
+    let norm_guard = model.final_norm.blocking_read();
+    let lm_head_guard = model.lm_head.blocking_read();
+    let embed_weight_t_guard = model.embed_weight_t.blocking_read();
+
+    let batch = warmup_layer_batch_size();
+    let mem_before = crate::array::get_active_memory();
+    info!(
+        "[warmup] layer batch size: {} (GPU mem: query complete)",
+        batch
+    );
+
+    {
+        let mut caches = init_caches_for_config(config);
+        let dummy = MxArray::from_int32(&[1i32], &[1, 1])?;
+
+        let mut h = embed_guard.forward(&dummy)?;
+        h = h.mul_scalar((config.hidden_size as f64).sqrt())?;
+        h.eval();
+
+        for (i, layer) in layers_guard.iter().enumerate() {
+            h = layer.forward(&h, None, Some(&mut caches[i]), None, false)?;
+            if (i + 1) % batch == 0 || i + 1 == layers_guard.len() {
+                h.eval();
+            }
+        }
+
+        h = norm_guard.forward(&h)?;
+        let logits = if let Some(head) = &*lm_head_guard {
+            head.forward(&h)?
+        } else if let Some(w_t) = embed_weight_t_guard.as_ref() {
+            h.matmul(w_t)?
+        } else {
+            let weight = embed_guard.get_weight();
+            let weight_t = weight.transpose(Some(&[1, 0]))?;
+            h.matmul(&weight_t)?
+        };
+        logits.eval();
+    }
+
+    crate::array::synchronize_and_clear_cache();
+    let mem_after = crate::array::get_active_memory();
+    info!(
+        "[warmup] memory: {:.2} GB → {:.2} GB (delta: {:.2} GB)",
+        mem_before / 1e9,
+        mem_after / 1e9,
+        (mem_after - mem_before) / 1e9
+    );
+
+    Ok(())
 }
 
 fn init_caches_for_config(config: &Gemma4Config) -> Vec<Gemma4LayerCache> {
@@ -943,8 +1016,9 @@ fn project_per_layer_inputs(
 }
 
 /// Default prefill chunk size (tokens per chunk).
-/// Smaller than Qwen3.5's 2048 because the 128-expert MoE dispatch creates
-/// substantial intermediate tensors per layer per token.
+/// Note: mlx-lm uses 2048 but the first eval triggers Metal shader compilation
+/// which can GPU-timeout with very large graphs. Using 512 keeps individual
+/// command buffers under Metal's timeout limit.
 const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
 
 /// Evaluate all Gemma4 cache arrays to materialize them on GPU.

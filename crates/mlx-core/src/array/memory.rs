@@ -115,18 +115,7 @@ pub fn materialize_weights(arrays: &[&super::MxArray]) {
     let start = std::time::Instant::now();
     let total = arrays.len();
 
-    // Query GPU memory to determine chunk budget
-    let device_info_ptr = unsafe { sys::mlx_metal_device_info() };
-    let max_working_set = if !device_info_ptr.is_null() {
-        let info_str = unsafe {
-            std::ffi::CStr::from_ptr(device_info_ptr)
-                .to_string_lossy()
-                .into_owned()
-        };
-        crate::stream::WiredLimitContext::parse_max_working_set_size(&info_str)
-    } else {
-        0
-    };
+    let max_working_set = crate::stream::WiredLimitContext::get_max_working_set_size();
 
     // Budget per chunk: 1/4 of max working set, clamped to [512MB, 4GB]
     let budget = if max_working_set > 0 {
