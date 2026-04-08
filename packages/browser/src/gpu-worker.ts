@@ -1172,6 +1172,40 @@ async function processCommand(fnId: number): Promise<void> {
       break;
     }
 
+    case RpcFn.FUSED_COPY_BUFFER: {
+      // Fused: end compute pass (if active) + copyBufferToBuffer + begin new compute pass
+      // This saves 2-3 RPC round-trips per buffer copy during decode.
+      // Args: encoderHandle, passHandle (0=no pass), srcHandle, srcOffset, dstHandle, dstOffset, size
+      // Returns: new compute pass handle
+      const encoderHandle = arg0();
+      const passHandle = arg1();
+      const srcHandle = arg2();
+      const srcOffset = arg3();
+      const dstHandle = arg4();
+      const dstOffset = arg5();
+      const size = arg6();
+
+      const encoder = getHandle<GPUCommandEncoder>(encoderHandle);
+
+      // End active compute pass if provided
+      if (passHandle !== 0) {
+        const pass = getHandle<GPUComputePassEncoder>(passHandle);
+        pass.end();
+        releaseHandle(passHandle);
+      }
+
+      // Perform the copy
+      const src = getHandle<GPUBuffer>(srcHandle);
+      const dst = getHandle<GPUBuffer>(dstHandle);
+      encoder.copyBufferToBuffer(src, srcOffset, dst, dstOffset, size);
+
+      // Begin new compute pass for subsequent dispatches
+      const newPass = encoder.beginComputePass();
+      const newPassHandle = addHandle(newPass);
+      setResult(newPassHandle);
+      break;
+    }
+
     case RpcFn.ADD_GPU_BUFFER: {
       // This is handled via postMessage, not RPC, because the GPU buffer
       // object can't be serialized through SharedArrayBuffer.

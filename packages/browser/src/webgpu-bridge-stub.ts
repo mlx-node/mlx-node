@@ -611,29 +611,44 @@ export function createBridgeStub(
       dstHandle: number, dstOffset: bigint,
       size: bigint,
     ): void {
-      // End compute pass before copy — WebGPU doesn't allow mixing
-      if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
-        flushPendingCompute();
-        rpcCall(RpcFn.COMPUTE_PASS_END, activeComputePass);
-        rpcCall(RpcFn.COMPUTE_PASS_RELEASE, activeComputePass);
-        activeComputePass = -1;
-        activeComputePassEncoder = -1;
-      }
-      // Resolve deferred buffer handles
+      flushPendingCompute();
       const resolvedSrc = resolveBufferHandle(srcHandle);
       const resolvedDst = resolveBufferHandle(dstHandle);
-      // 7 u32 args + 1 high-bits word = uses ARG0..ARG7 + ARG0_HI
-      const srcOffsetLo = Number(srcOffset & 0xFFFFFFFFn);
-      const srcOffsetHi = Number(srcOffset >> 32n);
-      const dstOffsetLo = Number(dstOffset & 0xFFFFFFFFn);
-      const dstOffsetHi = Number(dstOffset >> 32n);
-      const sizeLo = Number(size & 0xFFFFFFFFn);
-      const sizeHi = Number(size >> 32n);
-      rpcCallWithHi(
-        RpcFn.CMD_ENCODER_COPY_BUFFER,
-        [encoderHandle, resolvedSrc, srcOffsetLo, srcOffsetHi, resolvedDst, dstOffsetLo, dstOffsetHi, sizeLo],
-        { 0: sizeHi }, // ARG0_HI = sizeHi (maps to gpu-worker's arg0Hi)
-      );
+
+      // For 32-bit offsets/sizes (common in WASM), use fused RPC
+      const srcOff32 = Number(srcOffset);
+      const dstOff32 = Number(dstOffset);
+      const size32 = Number(size);
+
+      if (srcOffset <= 0xFFFFFFFF && dstOffset <= 0xFFFFFFFF && size <= 0xFFFFFFFF
+          && activeComputePassEncoder === encoderHandle) {
+        // FUSED: end pass (if active) + copy + begin new pass = 1 RPC instead of 3-4
+        const passHandle = activeComputePass >= 0 ? activeComputePass : 0;
+        const newPassHandle = rpcCall(
+          RpcFn.FUSED_COPY_BUFFER,
+          encoderHandle, passHandle, resolvedSrc, srcOff32, resolvedDst, dstOff32, size32,
+        );
+        activeComputePass = newPassHandle;
+        activeComputePassEncoder = encoderHandle;
+      } else {
+        // Fallback: 64-bit offsets or different encoder — use separate RPCs
+        if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
+          rpcCall(RpcFn.COMPUTE_PASS_END, activeComputePass);
+          activeComputePass = -1;
+          activeComputePassEncoder = -1;
+        }
+        const srcOffsetLo = Number(srcOffset & 0xFFFFFFFFn);
+        const srcOffsetHi = Number(srcOffset >> 32n);
+        const dstOffsetLo = Number(dstOffset & 0xFFFFFFFFn);
+        const dstOffsetHi = Number(dstOffset >> 32n);
+        const sizeLo = Number(size & 0xFFFFFFFFn);
+        const sizeHi = Number(size >> 32n);
+        rpcCallWithHi(
+          RpcFn.CMD_ENCODER_COPY_BUFFER,
+          [encoderHandle, resolvedSrc, srcOffsetLo, srcOffsetHi, resolvedDst, dstOffsetLo, dstOffsetHi, sizeLo],
+          { 0: sizeHi },
+        );
+      }
     },
 
     wgpuCommandEncoderFinish(encoderHandle: number, _descPtr: number): number {

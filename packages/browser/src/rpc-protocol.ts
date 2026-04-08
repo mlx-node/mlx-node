@@ -107,6 +107,11 @@ export const enum RpcFn {
   // UNIFORM_DATA_SIZE (offset 188): u32 size of inline uniform data
   // UNIFORM_DATA (offset 192+): the uniform data bytes (up to 256 bytes)
   FUSED_DISPATCH_WITH_UNIFORM = 97,
+  // Fused: end compute pass (if active) + copyBufferToBuffer + begin new compute pass
+  // ARG0: encoderHandle, ARG1: passHandle (0 = no active pass to end)
+  // ARG2: srcHandle, ARG3: srcOffset (u32), ARG4: dstHandle, ARG5: dstOffset (u32), ARG6: size (u32)
+  // Returns: new compute pass handle
+  FUSED_COPY_BUFFER = 98,
 }
 
 // ---- Command Buffer Layout (SharedArrayBuffer) ----
