@@ -1108,7 +1108,7 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
 }
 
 /// Register all sanitized weights with the C++ MoE forward pass.
-/// Uses the same shared g_weights map as the dense path (mlx_qwen35_store_weight).
+/// Uses the same shared g_weights map as the dense path (mlx_store_weight).
 /// Sets model_id AFTER all weights are stored.
 fn register_moe_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
     use mlx_sys as sys;
@@ -1120,12 +1120,12 @@ fn register_moe_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u6
         .unwrap();
 
     // Clear weights (shared map)
-    unsafe { sys::mlx_qwen35_clear_weights() };
+    unsafe { sys::mlx_clear_weights() };
 
     let store = |name: &str, array: &MxArray| {
         let c_name = CString::new(name).expect("Weight name contains null byte");
         unsafe {
-            sys::mlx_qwen35_store_weight(c_name.as_ptr(), array.as_raw_ptr());
+            sys::mlx_store_weight(c_name.as_ptr(), array.as_raw_ptr());
         }
     };
 
@@ -1136,9 +1136,9 @@ fn register_moe_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u6
         store(name, array);
     }
 
-    let count = unsafe { sys::mlx_qwen35_weight_count() };
+    let count = unsafe { sys::mlx_weight_count() };
     info!("Registered {} weights with C++ MoE forward pass", count);
 
     // Set model ID AFTER all weights are stored.
-    unsafe { sys::mlx_qwen35_set_model_id(model_id) };
+    unsafe { sys::mlx_set_model_id(model_id) };
 }

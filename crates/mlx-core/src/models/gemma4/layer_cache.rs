@@ -103,6 +103,22 @@ impl Gemma4LayerCache {
         Ok((k, v))
     }
 
+    /// Update the cache and return K/V without stashing.
+    /// Use this when KV sharing is disabled (num_kv_shared_layers=0).
+    pub fn update_and_fetch(
+        &mut self,
+        keys: &MxArray,
+        values: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        match &mut self.inner {
+            CacheType::Global(kvc) => kvc.update_and_fetch(keys, values),
+            CacheType::Sliding(rkvc) => {
+                let kv = rkvc.update_and_fetch(keys, values)?;
+                Ok((kv[0].clone(), kv[1].clone()))
+            }
+        }
+    }
+
     /// Save K/V into the stash (replaces any previous stash).
     pub fn stash_kv(&mut self, keys: MxArray, values: MxArray) {
         self.stashed_kv = Some((keys, values));
@@ -115,6 +131,29 @@ impl Gemma4LayerCache {
     /// never populated).
     pub fn take_stashed_kv(&mut self) -> Option<(MxArray, MxArray)> {
         self.stashed_kv.take()
+    }
+
+    /// Collect references to the raw internal K/V arrays for eval between
+    /// chunked prefill steps. Matches Qwen3.5's `collect_arrays` pattern.
+    pub fn collect_cache_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {
+        match &self.inner {
+            CacheType::Global(c) => {
+                if let Some(k) = c.keys_ref() {
+                    out.push(k);
+                }
+                if let Some(v) = c.values_ref() {
+                    out.push(v);
+                }
+            }
+            CacheType::Sliding(c) => {
+                if let Some(k) = c.keys_ref() {
+                    out.push(k);
+                }
+                if let Some(v) = c.values_ref() {
+                    out.push(v);
+                }
+            }
+        }
     }
 }
 

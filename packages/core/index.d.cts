@@ -2498,6 +2498,8 @@ export interface Gemma4ChatResult {
   text: string;
   numTokens: number;
   finishReason: string;
+  /** Performance metrics (always present). */
+  performance?: PerformanceMetrics;
 }
 
 /**

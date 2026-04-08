@@ -112,38 +112,9 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
 
 extern "C" {
 
-void mlx_qwen35_store_weight(const char* name, mlx_array* weight) {
-  std::unique_lock<std::shared_mutex> lock(g_weights_mutex());
-  auto& arr = *reinterpret_cast<array*>(weight);
-  std::string key(name);
-  g_weights().insert_or_assign(key, arr);
-  // Pre-compute 2D transpose only for weights consumed via get_weight_t() / linear_proj().
-  // Match: any key containing "_proj" (covers q_proj, k_proj, v_proj, o_proj, out_proj,
-  // gate_proj, up_proj, down_proj, in_proj_qkvz, in_proj_ba, etc.), plus embedding/lm_head.
-  // Excludes vision encoder weights, norm weights, A_log, dt_bias, scales, biases.
-  if (arr.ndim() == 2 && (
-      key.find("_proj") != std::string::npos ||
-      key == "embedding.weight" ||
-      key == "lm_head.weight")) {
-    g_weight_transposes().insert_or_assign(key, transpose(arr));
-  }
-}
-
-void mlx_qwen35_clear_weights() {
-  std::unique_lock<std::shared_mutex> lock(g_weights_mutex());
-  g_weights().clear();
-  g_weight_transposes().clear();
-  g_active_model_id().store(0, std::memory_order_release);
-}
-
-size_t mlx_qwen35_weight_count() {
-  std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
-  return g_weights().size();
-}
-
-void mlx_qwen35_set_model_id(uint64_t id) {
-  g_active_model_id().store(id, std::memory_order_release);
-}
+// Weight storage FFI (mlx_store_weight, mlx_clear_weights,
+// mlx_weight_count, mlx_set_model_id) moved to
+// mlx_common_weights.cpp — shared by all compiled model forward passes.
 
 uint64_t mlx_qwen35_get_model_id() {
   return g_active_model_id().load(std::memory_order_acquire);

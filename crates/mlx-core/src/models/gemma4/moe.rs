@@ -1,53 +1,99 @@
 use crate::array::MxArray;
-use crate::nn::{Activations, Linear, RMSNorm};
+use crate::nn::{Activations, Linear};
+use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
 /// Gemma4 MoE Router.
 ///
-/// Computes expert routing logits from hidden states.
-/// Forward: `proj(norm(x, no_weight) * root_size * scale)`
+/// Matches mlx-lm gemma4_text.py Router:
+/// Forward: `proj(rms_norm(x, scale * root_size, eps))` → argpartition top-k → softmax(top-k scores) → per_expert_scale
 ///
-/// The norm is a scale-free RMSNorm (weight stays at ones, never loaded from checkpoint).
+/// Key: softmax is applied to the TOP-K scores ONLY, not all experts.
 /// `scale` is a learnable vector [hidden_size] loaded from `router.scale`.
-/// `root_size` = hidden_size^(-0.5), a constant scaling factor.
+/// `root_size` = hidden_size^(-0.5), fused into the rms_norm weight.
 pub struct Gemma4Router {
-    /// Scale-free RMSNorm (weight=ones, never loaded). Normalizes input before routing.
-    norm: RMSNorm,
     /// Learnable scale vector [hidden_size], loaded from checkpoint.
+    /// Fused with root_size as the rms_norm weight: `weight = scale * root_size`.
     scale: MxArray,
-    /// Pre-created scalar: hidden_size^(-0.5).
-    root_size: MxArray,
+    /// Pre-computed scalar: hidden_size^(-0.5).
+    root_size: f64,
+    /// RMSNorm epsilon.
+    eps: f64,
     /// Projects to [num_experts] logits.
     proj: Linear,
+    /// Per-expert scaling factors: [num_experts]
+    per_expert_scale: MxArray,
+    /// Number of experts to route to.
+    top_k: i32,
 }
 
 impl Gemma4Router {
-    pub fn new(hidden_size: u32, num_experts: u32, eps: f64) -> Result<Self> {
-        let norm = RMSNorm::new(hidden_size, Some(eps))?;
+    pub fn new(hidden_size: u32, num_experts: u32, top_k: u32, eps: f64) -> Result<Self> {
         // Scale initialized to ones; will be loaded from checkpoint
         let scale = MxArray::ones(&[hidden_size as i64], None)?;
-        let root_size = MxArray::scalar_float((hidden_size as f64).powf(-0.5))?;
+        let root_size = (hidden_size as f64).powf(-0.5);
         let proj = Linear::new(hidden_size, num_experts, Some(false))?;
+        let per_expert_scale = MxArray::ones(&[num_experts as i64], None)?;
 
         Ok(Self {
-            norm,
             scale,
             root_size,
+            eps,
             proj,
+            per_expert_scale,
+            top_k: top_k as i32,
         })
     }
 
-    /// Compute router logits.
+    /// Compute top-k expert indices and weights.
     ///
-    /// Input: `x` [B*T, hidden_size] or [B, T, hidden_size]
-    /// Output: logits [B*T, num_experts] or [B, T, num_experts]
-    pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
-        let normed = self.norm.forward(x)?;
-        let root = self.root_size.astype(normed.dtype()?)?;
-        let scaled = normed.mul(&root)?.mul(&self.scale)?;
-        let logits = self.proj.forward(&scaled)?;
-        // Cast to f32 for stable routing (matches vLLM's GateLinear out_dtype=f32)
-        logits.astype(crate::array::DType::Float32)
+    /// Matches mlx-lm Router.__call__:
+    /// 1. rms_norm(x, scale * root_size, eps)
+    /// 2. proj → expert_scores
+    /// 3. argpartition → top-k indices
+    /// 4. softmax over TOP-K scores only (NOT all experts)
+    /// 5. Multiply by per_expert_scale
+    ///
+    /// Returns: (top_k_indices [B, T, K], top_k_weights [B, T, K])
+    pub fn forward(&self, x: &MxArray) -> Result<(MxArray, MxArray)> {
+        // Fused norm: rms_norm(x, scale * root_size, eps)
+        // Matches mlx-lm: mx.fast.rms_norm(x, self.scale * self._root_size, self.eps)
+        let fused_weight = self.scale.mul_scalar(self.root_size)?;
+        let normed = {
+            let handle = unsafe {
+                sys::mlx_fast_rms_norm(x.handle.0, fused_weight.handle.0, self.eps as f32)
+            };
+            MxArray::from_handle(handle, "router_rms_norm")?
+        };
+
+        let expert_scores = self.proj.forward(&normed)?;
+
+        // Top-k via argpartition (matches mlx-lm: kth=-top_k, axis=-1)
+        let ndim = expert_scores.ndim()? as usize;
+        let last_axis = ndim - 1;
+        let num_experts = expert_scores.shape_at(last_axis as u32)?;
+        let top_k_indices_full = expert_scores.argpartition(-self.top_k, Some(-1))?;
+        let top_k_indices = top_k_indices_full.slice_axis(
+            last_axis,
+            num_experts - self.top_k as i64,
+            num_experts,
+        )?;
+
+        // Extract top-k scores and softmax over them ONLY (not all experts)
+        // This is the key difference from the old implementation which did softmax over ALL experts
+        let top_k_scores = expert_scores.take_along_axis(&top_k_indices, -1)?;
+        let top_k_weights = Activations::softmax_precise(&top_k_scores, Some(-1))?;
+
+        // Apply per-expert scaling: per_expert_scale[top_k_indices]
+        // per_expert_scale is [num_experts], top_k_indices is [B, T, K] or [B*T, K]
+        // Use take on flattened indices, then reshape back
+        let idx_shape = top_k_indices.shape()?;
+        let flat_idx = top_k_indices.reshape(&[-1])?;
+        let top_k_scales = self.per_expert_scale.take(&flat_idx, 0)?;
+        let top_k_scales = top_k_scales.reshape(&idx_shape)?;
+        let top_k_weights = top_k_weights.mul(&top_k_scales)?;
+
+        Ok((top_k_indices, top_k_weights))
     }
 
     // ========== Weight setters ==========
@@ -60,6 +106,11 @@ impl Gemma4Router {
     pub fn set_proj_weight(&mut self, w: &MxArray) -> Result<()> {
         self.proj.set_weight(w)
     }
+
+    pub fn set_per_expert_scale(&mut self, w: &MxArray) -> Result<()> {
+        self.per_expert_scale = w.clone();
+        Ok(())
+    }
 }
 
 /// Gemma4 MoE Experts block.
@@ -67,24 +118,18 @@ impl Gemma4Router {
 /// Uses fused gate_up_proj weights [num_experts, 2*moe_inter, hidden] and
 /// down_proj weights [num_experts, hidden, moe_inter].
 ///
-/// Routing uses a custom scheme different from standard top-k:
-/// 1. topk_ids = topk(logits, k)
-/// 2. probs = softmax(logits) over ALL experts
-/// 3. indicator = one_hot(topk_ids, E).sum(dim=-2)  (binary mask)
-/// 4. gate_weights = indicator * probs  (masked probabilities)
-/// 5. gate_weights = gate_weights / sum(gate_weights)  (renormalize)
-/// 6. topk_weights = gather(gate_weights, topk_ids)
-/// 7. topk_weights *= per_expert_scale[topk_ids]
+/// Receives pre-computed (top_k_indices, top_k_weights) from the Router.
+/// Dispatches tokens to experts via gather_mm and computes weighted sum.
 pub struct Gemma4MoE {
     /// Fused gate+up projection, stored TRANSPOSED: [num_experts, hidden, 2*moe_inter]
     gate_up_proj_t: MxArray,
     /// Down projection, stored TRANSPOSED: [num_experts, moe_inter, hidden]
     down_proj_t: MxArray,
-    /// Per-expert scaling factors: [num_experts]
-    per_expert_scale: MxArray,
     /// Pre-created scalar of top_k for floor_divide.
     k_scalar: MxArray,
-    num_experts: i32,
+    /// Pre-computed token indices for single-token decode: [K] zeros.
+    /// Avoids arange allocation on every forward call in the hot path.
+    single_token_indices: MxArray,
     top_k: i32,
     moe_intermediate_size: i32,
 }
@@ -97,7 +142,6 @@ impl Gemma4MoE {
         moe_intermediate_size: u32,
     ) -> Result<Self> {
         let fused_inter = (2 * moe_intermediate_size) as i64;
-        // Store in transposed form: [E, hidden, 2*moe_inter] and [E, moe_inter, hidden]
         let gate_up_proj_t =
             MxArray::zeros(&[num_experts as i64, hidden_size as i64, fused_inter], None)?;
         let down_proj_t = MxArray::zeros(
@@ -108,122 +152,115 @@ impl Gemma4MoE {
             ],
             None,
         )?;
-        let per_expert_scale = MxArray::ones(&[num_experts as i64], None)?;
         let k_scalar = MxArray::scalar_int(top_k as i32)?;
+        // Pre-compute token indices for single-token unsorted path: all zeros
+        let single_token_indices =
+            MxArray::from_int32(&vec![0i32; top_k as usize], &[top_k as i64])?;
 
         Ok(Self {
             gate_up_proj_t,
             down_proj_t,
-            per_expert_scale,
             k_scalar,
-            num_experts: num_experts as i32,
+            single_token_indices,
             top_k: top_k as i32,
             moe_intermediate_size: moe_intermediate_size as i32,
         })
     }
 
-    /// Forward pass: route tokens to top-k experts and compute weighted expert outputs.
+    /// Forward pass: dispatch tokens to experts via pre-computed routing.
     ///
     /// # Arguments
     /// * `x` - Input hidden states [B, T, hidden_size]
-    /// * `router_logits` - Router output [B, T, num_experts]
-    pub fn forward(&self, x: &MxArray, router_logits: &MxArray) -> Result<MxArray> {
+    /// * `top_k_indices` - Expert indices from Router [B, T, K]
+    /// * `top_k_weights` - Expert weights from Router [B, T, K]
+    pub fn forward(
+        &self,
+        x: &MxArray,
+        top_k_indices: &MxArray,
+        top_k_weights: &MxArray,
+    ) -> Result<MxArray> {
         let shape = x.shape()?;
         let batch = shape[0];
         let seq_len = shape[1];
         let hidden_size = shape[2];
         let ne = batch * seq_len;
         let k = self.top_k as i64;
-        let num_exp = self.num_experts as i64;
         let moe_inter = self.moe_intermediate_size as i64;
         let x_dtype = x.dtype()?;
 
-        // Flatten to [ne, hidden_size] and [ne, num_experts]
         let x_flat = x.reshape(&[ne, hidden_size])?;
-        let logits_flat = router_logits.reshape(&[ne, num_exp])?;
 
-        // Step 1: Find top-k expert indices using argpartition
-        // argpartition with kth=-k puts the k largest in the last k positions
-        let top_indices_full = logits_flat.argpartition(-(k as i32), Some(-1))?;
-        let top_indices = top_indices_full.slice_axis(1, num_exp - k, num_exp)?;
+        // Sort by expert index for gather_mm efficiency.
+        // Skip sorting when indices.size < 64 (single-token decode).
+        let flat_indices = top_k_indices.reshape(&[-1])?;
+        let do_sort = ne * k >= 64;
 
-        // Step 2: Softmax over ALL experts (not just top-k)
-        let probs = Activations::softmax_precise(&logits_flat, Some(-1))?;
+        let (x_for_gather, idx_for_gather, needs_unsort) = if do_sort {
+            let order = flat_indices.argsort(Some(-1))?;
+            let inv_order_arr = order.argsort(Some(-1))?;
+            let idx_sorted = flat_indices.take(&order, 0)?;
+            let x_expanded = x_flat.reshape(&[ne, 1, hidden_size])?;
+            let token_indices = order.floor_divide(&self.k_scalar)?;
+            let x_sorted = x_expanded.take(&token_indices, 0)?;
+            (x_sorted, idx_sorted, Some(inv_order_arr))
+        } else {
+            let x_expanded = x_flat.reshape(&[ne, 1, hidden_size])?;
+            // Positional indices (arange // k), NOT expert indices — expert IDs are
+            // arbitrary (e.g. [81, 7, 38, ...]) and would index out-of-bounds.
+            let token_indices = if ne == 1 {
+                // Single-token decode hot path: reuse pre-computed zeros
+                self.single_token_indices.clone()
+            } else {
+                let positions =
+                    MxArray::arange(0.0, (ne * k) as f64, None, Some(crate::array::DType::Int32))?;
+                positions.floor_divide(&self.k_scalar)?
+            };
+            let x_rep = x_expanded.take(&token_indices, 0)?;
+            (x_rep, flat_indices, None)
+        };
 
-        // Fused equivalent of one_hot->indicator->gather: directly select top-k probabilities.
-        let top_weights = probs.take_along_axis(&top_indices, -1)?;
-        // Renormalize with zero-division guard (matches vLLM: torch.where(renorm_factor > 0.0, renorm_factor, 1.0))
-        let weight_sum = top_weights.sum(Some(&[-1]), Some(true))?;
-        let eps = MxArray::full(&[1], Either::A(1e-9), Some(weight_sum.dtype()?))?;
-        let weight_sum = weight_sum.maximum(&eps)?;
-        let top_weights = top_weights.div(&weight_sum)?;
+        // gate_up = gather_mm(x, gate_up_proj_t, idx) -> [ne*k, 1, 2*moe_inter]
+        let gate_up = x_for_gather.gather_mm(&self.gate_up_proj_t, &idx_for_gather, do_sort)?;
 
-        // Step 7: Apply per-expert scaling
-        let expert_scales = self
-            .per_expert_scale
-            .take(&top_indices.reshape(&[-1])?, 0)?;
-        let expert_scales = expert_scales.reshape(&[ne, k])?;
-        let top_weights = top_weights.mul(&expert_scales)?;
-
-        // Sort by expert index for gather_mm efficiency
-        let flat_indices = top_indices.reshape(&[-1])?;
-        let order = flat_indices.argsort(Some(-1))?;
-        let inv_order = order.argsort(Some(-1))?;
-        let idx_sorted = flat_indices.take(&order, 0)?;
-
-        // Expand x for expert selection: [ne, hidden] -> [ne, 1, hidden] (3D for gather_mm)
-        let x_expanded = x_flat.reshape(&[ne, 1, hidden_size])?;
-        let token_indices = order.floor_divide(&self.k_scalar)?;
-        let x_sorted = x_expanded.take(&token_indices, 0)?;
-
-        // gate_up = gather_mm(x_sorted, gate_up_proj_t, idx_sorted) -> [ne*k, 1, 2*moe_inter]
-        let gate_up = x_sorted.gather_mm(&self.gate_up_proj_t, &idx_sorted, true)?;
-
-        // Split gate and up along last axis (axis=2): each [ne*k, 1, moe_inter]
         let gate = gate_up.slice_axis(2, 0, moe_inter)?;
         let up = gate_up.slice_axis(2, moe_inter, 2 * moe_inter)?;
 
-        // Apply exact GELU activation (vLLM uses activation="gelu" which maps to
-        // F.gelu(x, approximate="none"), not the tanh approximation used by the dense MLP)
-        let activated = Activations::gelu_exact(&gate)?;
-        let hidden = activated.mul(&up)?;
+        // Fused geglu: gelu_approx(gate) * up in one compiled kernel
+        let hidden = {
+            let handle = unsafe { sys::mlx_geglu(gate.handle.0, up.handle.0) };
+            MxArray::from_handle(handle, "moe_geglu")?
+        };
 
-        // down = gather_mm(hidden, down_proj_t, idx_sorted) -> [ne*k, 1, hidden]
-        let down = hidden.gather_mm(&self.down_proj_t, &idx_sorted, true)?;
+        // down = gather_mm(hidden, down_proj_t, idx) -> [ne*k, 1, hidden]
+        let down = hidden.gather_mm(&self.down_proj_t, &idx_for_gather, do_sort)?;
 
-        // Unsort back to original order
-        let down_unsorted = down.take(&inv_order, 0)?;
-        // Reshape to [ne, k, hidden]
-        let expert_out = down_unsorted.reshape(&[ne, k, hidden_size])?;
+        let down_final = if let Some(inv_order) = needs_unsort {
+            down.take(&inv_order, 0)?
+        } else {
+            down
+        };
+        let expert_out = down_final.reshape(&[ne, k, hidden_size])?;
 
         // Apply routing weights: [ne, k, 1] * [ne, k, hidden]
-        let weights_expanded = top_weights.reshape(&[ne, k, 1])?;
-        let weights_expanded = weights_expanded.astype(x_dtype)?;
-        let weighted = expert_out.mul(&weights_expanded)?;
+        let weights_flat = top_k_weights.reshape(&[ne, k, 1])?;
+        let weights_flat = weights_flat.astype(x_dtype)?;
+        let weighted = expert_out.mul(&weights_flat)?;
 
         // Sum over experts: [ne, hidden]
         let output = weighted.sum(Some(&[1]), None)?;
 
-        // Reshape back to [B, T, hidden]
         output.reshape(&[batch, seq_len, hidden_size])
     }
 
     // ========== Weight setters ==========
 
     pub fn set_gate_up_proj(&mut self, w: &MxArray) -> Result<()> {
-        // Store transposed: [E, 2*moe_inter, hidden] -> [E, hidden, 2*moe_inter]
         self.gate_up_proj_t = w.transpose(Some(&[0, 2, 1]))?;
         Ok(())
     }
 
     pub fn set_down_proj(&mut self, w: &MxArray) -> Result<()> {
-        // Store transposed: [E, hidden, moe_inter] -> [E, moe_inter, hidden]
         self.down_proj_t = w.transpose(Some(&[0, 2, 1]))?;
-        Ok(())
-    }
-
-    pub fn set_per_expert_scale(&mut self, w: &MxArray) -> Result<()> {
-        self.per_expert_scale = w.clone();
         Ok(())
     }
 }

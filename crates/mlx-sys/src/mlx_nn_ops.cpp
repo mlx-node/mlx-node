@@ -1,6 +1,15 @@
 #include "mlx_common.h"
+#include <fstream>
+#include <mlx/graph_utils.h>
 
 extern "C" {
+
+// Export computation graph to DOT file for debugging
+void mlx_export_to_dot(const char* path, mlx_array* handle) {
+    auto& arr = *reinterpret_cast<array*>(handle);
+    std::ofstream ofs(path);
+    mlx::core::export_to_dot(ofs, arr);
+}
 
 mlx_array* mlx_array_transpose(mlx_array* handle,
                                const int32_t* axes,
@@ -799,6 +808,71 @@ mlx_array* mlx_array_isfinite(mlx_array* handle) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
+// Compiled GELU approximate — matches Python nn.gelu_approx with mx.compile.
+// Uses compile(shapeless=True) to fuse into a single Metal kernel.
+// Formula: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+//
+// Constants use input dtype — matches Python where `to_array(float, x.dtype)`
+// converts Python floats to the array's dtype in __rmul__ etc.
+static auto compiled_gelu_approx = mlx::core::compile(
+    [](const std::vector<array>& inputs) -> std::vector<array> {
+        const auto& x = inputs[0];
+        auto c = array(0.7978845608028654f, x.dtype());  // sqrt(2/pi)
+        auto inner = c * (x + array(0.044715f, x.dtype()) * x * x * x);
+        return {array(0.5f, x.dtype()) * x * (array(1.0f, x.dtype()) + mlx::core::tanh(inner))};
+    },
+    /* shapeless */ true
+);
+
+mlx_array* mlx_gelu_approx(mlx_array* handle) {
+    auto& x = *reinterpret_cast<array*>(handle);
+    auto result = compiled_gelu_approx({x})[0];
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+// Compiled GeGLU — matches Python's @partial(mx.compile, shapeless=True) geglu.
+// Fuses gelu_approx(gate) * up into a single Metal kernel.
+// Called once per decoder layer per step (30+ times per decode step).
+//
+// Constants use input dtype — matches Python where `to_array(float, x.dtype)`
+// converts Python floats to the array's dtype in binary operations.
+static auto compiled_geglu = mlx::core::compile(
+    [](const std::vector<array>& inputs) -> std::vector<array> {
+        const auto& gate = inputs[0];
+        const auto& up = inputs[1];
+        auto c = array(0.7978845608028654f, gate.dtype());
+        auto inner = c * (gate + array(0.044715f, gate.dtype()) * gate * gate * gate);
+        auto activated = array(0.5f, gate.dtype()) * gate * (array(1.0f, gate.dtype()) + mlx::core::tanh(inner));
+        return {activated * up};
+    },
+    /* shapeless */ true
+);
+
+mlx_array* mlx_geglu(mlx_array* gate_handle, mlx_array* up_handle) {
+    auto& gate = *reinterpret_cast<array*>(gate_handle);
+    auto& up = *reinterpret_cast<array*>(up_handle);
+    auto result = compiled_geglu({gate, up})[0];
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+// Compiled logit softcap — matches Python's @partial(mx.compile, shapeless=True) logit_softcap.
+// Fuses tanh(x / softcap) * softcap into a single Metal kernel.
+static auto compiled_logit_softcap = mlx::core::compile(
+    [](const std::vector<array>& inputs) -> std::vector<array> {
+        const auto& x = inputs[0];
+        const auto& softcap = inputs[1];
+        return {mlx::core::tanh(x / softcap) * softcap};
+    },
+    /* shapeless */ true
+);
+
+mlx_array* mlx_logit_softcap(mlx_array* x_handle, mlx_array* softcap_handle) {
+    auto& x = *reinterpret_cast<array*>(x_handle);
+    auto& softcap = *reinterpret_cast<array*>(softcap_handle);
+    auto result = compiled_logit_softcap({x, softcap})[0];
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
 // Fast operations
 mlx_array* mlx_fast_rope(mlx_array* handle,
                          int32_t dims,
@@ -809,6 +883,27 @@ mlx_array* mlx_fast_rope(mlx_array* handle,
   auto arr = reinterpret_cast<array*>(handle);
   array result = fast::rope(*arr, dims, traditional, std::optional<float>(base),
                             scale, offset, std::nullopt);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+// fast::rope with array offset (for compile compatibility) and optional
+// precomputed freqs.  When freqs_arr is non-null, base is ignored.
+// freqs must be 1-D with shape [dims/2].
+mlx_array* mlx_fast_rope_with_freqs(mlx_array* handle,
+                                    int32_t dims,
+                                    bool traditional,
+                                    float base,
+                                    float scale,
+                                    mlx_array* offset_arr,
+                                    mlx_array* freqs_arr) {
+  auto& x = *reinterpret_cast<array*>(handle);
+  auto& off = *reinterpret_cast<array*>(offset_arr);
+  std::optional<float> base_opt =
+      (freqs_arr == nullptr && base > 0.0f) ? std::optional<float>(base) : std::nullopt;
+  std::optional<array> freqs_opt =
+      freqs_arr ? std::optional<array>(*reinterpret_cast<array*>(freqs_arr))
+                : std::nullopt;
+  array result = fast::rope(x, dims, traditional, base_opt, scale, off, freqs_opt);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 

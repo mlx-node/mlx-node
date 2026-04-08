@@ -1,11 +1,27 @@
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::nn::{Linear, RMSNorm, RoPE};
+use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
 use super::config::Gemma4Config;
 use super::layer_cache::Gemma4LayerCache;
 use super::quantized_linear::{LinearProj, QuantizedLinear};
+
+/// Trim mask to match K/V sequence length (e.g. after RotatingKVCache eviction).
+fn trim_mask(mask: Option<&MxArray>, kv_len: i64) -> Result<Option<MxArray>> {
+    match mask {
+        Some(m) => {
+            let mask_len = m.shape_at(3)?;
+            if mask_len != kv_len {
+                Ok(Some(m.slice_axis(3, mask_len - kv_len, mask_len)?))
+            } else {
+                Ok(Some(m.clone()))
+            }
+        }
+        None => Ok(None),
+    }
+}
 
 // ============================================
 // Gemma4 Proportional RoPE (global layers)
@@ -13,92 +29,69 @@ use super::quantized_linear::{LinearProj, QuantizedLinear};
 
 /// Gemma4 proportional RoPE for global attention layers.
 ///
-/// Different from standard RoPE: frequency exponent denominator = head_size (not rotary_dim).
-/// Non-rotated dims get identity rotation (cos=1, sin=0 via zero-padded inv_freq).
+/// 1:1 port of mlx-lm `ProportionalRoPE` (rope_utils.py).
+/// Uses inf-padded frequencies with a SINGLE `mx.fast.rope` call.
+/// Non-rotated dimensions get `inf` frequency → no rotation (identity).
 ///
-/// Matches HF `_compute_proportional_rope_parameters` and vLLM `Gemma4RotaryEmbedding`.
-/// Uses neox-style `rotate_half`: `[-x2, x1]`.
+/// Key insight: exponent denominator = full `dims` (head_size), not `rotated_dims`.
+/// Only `partial_rotary_factor` fraction of dims are actually rotated.
 struct Gemma4ProportionalRoPE {
-    /// Pre-computed inverse frequencies [1, head_size/2], zero-padded for non-rotated dims.
-    inv_freq: MxArray,
-    half_dim: i64,
+    /// Pre-computed frequencies for `mx.fast.rope`, shape [dims/2].
+    /// First rotated_dims/2 entries: factor * base^(2i / dims)
+    /// Remaining entries: inf (causes no rotation in mx.fast.rope)
+    freqs: MxArray,
+    /// Full head dimension (e.g. 512)
+    dims: i32,
 }
 
 impl Gemma4ProportionalRoPE {
     /// Create proportional RoPE for global attention.
     ///
+    /// Matches mlx-lm rope_utils.py:ProportionalRoPE.__init__
+    ///
     /// # Arguments
-    /// * `head_size` - Full head dimension for global layers (e.g. 512)
-    /// * `rotary_dim` - Number of dims actually rotated (e.g. 64 = head_dim * partial_rotary_factor)
+    /// * `dims` - Full head dimension (e.g. 512)
+    /// * `partial_rotary_factor` - Fraction of dims to rotate (e.g. 0.25)
     /// * `base` - RoPE theta (e.g. 1_000_000.0)
-    fn new(head_size: i32, rotary_dim: i32, base: f64) -> Result<Self> {
-        let rope_angles = rotary_dim / 2; // rotation pairs
-        let nope_angles = (head_size / 2) - rope_angles; // non-rotated pairs
-        let half_dim = (head_size / 2) as i64;
+    fn new(dims: i32, partial_rotary_factor: f64, base: f64) -> Result<Self> {
+        // rotated_dims = int(dims * partial_rotary_factor)
+        let rotated_dims = (dims as f64 * partial_rotary_factor) as i32;
+        let half_rotated = (rotated_dims / 2) as usize;
+        let half_dims = (dims / 2) as usize;
+        let nope_dims = half_dims - half_rotated;
 
-        // Compute inv_freq with head_size as denominator (NOT rotary_dim).
-        // Formula: inv_freq[i] = 1 / (base ^ (2i / head_size))  for i < rope_angles
-        //          inv_freq[i] = 0                                for i >= rope_angles
-        let total = (rope_angles + nope_angles) as usize;
-        let mut inv_freq_data: Vec<f32> = Vec::with_capacity(total);
-        for i in 0..rope_angles {
-            let exponent = (2 * i) as f64 / head_size as f64;
-            inv_freq_data.push((1.0 / base.powf(exponent)) as f32);
+        // freqs = concat([base^(arange(0,rotated_dims,2)/dims), full(inf, nope_dims)])
+        let mut freqs_data: Vec<f32> = Vec::with_capacity(half_dims);
+        for i in 0..half_rotated {
+            let exponent = (2 * i) as f64 / dims as f64;
+            freqs_data.push(base.powf(exponent) as f32);
         }
-        // Zero-pad for non-rotated dims (identity rotation: cos=1, sin=0)
-        inv_freq_data.extend(std::iter::repeat_n(0.0f32, nope_angles as usize));
+        // Pad with inf for non-rotated dimensions (identity rotation)
+        freqs_data.extend(std::iter::repeat_n(f32::INFINITY, nope_dims));
 
-        let inv_freq = MxArray::from_float32(&inv_freq_data, &[1, half_dim])?;
+        let freqs = MxArray::from_float32(&freqs_data, &[half_dims as i64])?;
 
-        Ok(Self { inv_freq, half_dim })
+        Ok(Self { freqs, dims })
     }
 
     /// Apply proportional RoPE to tensor in [B, H, T, D] format.
     ///
-    /// Computes neox-style rotation: `x * cos + rotate_half(x) * sin`
-    /// where `rotate_half(x) = [-x2, x1]` (x split at D/2).
+    /// Single fused `mx.fast.rope` call with inf-padded frequencies.
+    /// No split/scatter needed — the kernel handles everything.
     fn forward(&self, x: &MxArray, offset: i32) -> Result<MxArray> {
-        let seq_len = x.shape_at(2)?; // T dimension in [B, H, T, D]
-
-        // Position indices: [offset, offset+1, ..., offset+seq_len-1]
-        let positions = MxArray::arange(
-            offset as f64,
-            (offset as i64 + seq_len) as f64,
-            Some(1.0),
-            None,
-        )?;
-
-        // freqs = positions[:, None] * inv_freq[None, :]  -> [T, half_dim]
-        let positions = positions.reshape(&[seq_len, 1])?;
-        let freqs = positions.mul(&self.inv_freq)?;
-
-        // cos/sin: [T, half_dim]
-        let cos_cache = freqs.cos()?;
-        let sin_cache = freqs.sin()?;
-
-        // Tile to full dim: [T, half_dim] -> [T, head_size] by repeating each value for both halves
-        // neox-style needs [cos, cos] along last dim
-        let cos_full = MxArray::concatenate(&cos_cache, &cos_cache, -1)?;
-        let sin_full = MxArray::concatenate(&sin_cache, &sin_cache, -1)?;
-
-        // Reshape for broadcasting: [1, 1, T, head_size]
-        let head_size = self.half_dim * 2;
-        let cos_b = cos_full.reshape(&[1, 1, seq_len, head_size])?;
-        let sin_b = sin_full.reshape(&[1, 1, seq_len, head_size])?;
-
-        // Cast to input dtype to avoid f32 promotion
-        let x_dtype = x.dtype()?;
-        let cos_b = cos_b.astype(x_dtype)?;
-        let sin_b = sin_b.astype(x_dtype)?;
-
-        // rotate_half: split x into [x1, x2] at D/2, return [-x2, x1]
-        let x1 = x.slice_axis(3, 0, self.half_dim)?;
-        let x2 = x.slice_axis(3, self.half_dim, head_size)?;
-        let neg_x2 = x2.mul_scalar(-1.0)?;
-        let rotated = MxArray::concatenate_many(vec![&neg_x2, &x1], Some(-1))?;
-
-        // Apply rotation: x * cos + rotate_half(x) * sin
-        x.mul(&cos_b)?.add(&rotated.mul(&sin_b)?)
+        let offset_arr = MxArray::from_int32(&[offset], &[1])?;
+        let handle = unsafe {
+            sys::mlx_fast_rope_with_freqs(
+                x.handle.0,
+                self.dims, // full head dimension
+                false,     // traditional=False (neox-style)
+                0.0,       // base ignored when freqs provided
+                1.0,       // scale=1.0
+                offset_arr.handle.0,
+                self.freqs.handle.0,
+            )
+        };
+        MxArray::from_handle(handle, "proportional_rope")
     }
 }
 
@@ -112,7 +105,7 @@ enum Gemma4RoPE {
     /// Uses `fast.rope(dims=head_dim, base=10K)` — correct because dims == head_size.
     Standard(RoPE),
     /// Proportional RoPE for global (full) attention layers.
-    /// Frequency exponent denominator = head_size, not rotary_dim.
+    /// Uses mx.fast.rope with precomputed freqs on only the rotated dims.
     Proportional(Gemma4ProportionalRoPE),
 }
 
@@ -147,7 +140,8 @@ pub struct Gemma4Attention {
 
     q_norm: RMSNorm,
     k_norm: RMSNorm,
-    v_norm: RMSNorm, // Scale-free RMSNorm (weight=ones, no learnable params)
+    /// V norm epsilon (scale-free: passes weight=None to rms_norm, matching Python RMSNormNoScale)
+    v_norm_eps: f32,
 
     rope: Gemma4RoPE,
 
@@ -202,12 +196,12 @@ impl Gemma4Attention {
 
         let q_norm = RMSNorm::new(head_dim as u32, Some(config.rms_norm_eps))?;
         let k_norm = RMSNorm::new(head_dim as u32, Some(config.rms_norm_eps))?;
-        // V norm is scale-free: weight stays at ones, no learnable params.
-        // Equivalent to x / sqrt(mean(x^2) + eps).
-        let v_norm = RMSNorm::new(head_dim as u32, Some(config.rms_norm_eps))?;
+        // V norm is scale-free: passes weight=None to rms_norm
+        // Matches Python's RMSNormNoScale: mx.fast.rms_norm(x, None, eps)
+        let v_norm_eps = config.rms_norm_eps as f32;
 
         // RoPE: sliding uses standard RoPE (theta=10K, dims=head_dim).
-        // Global uses proportional RoPE (theta=1M, freq denominator=head_size, zero-padded).
+        // Global uses proportional RoPE (theta=1M, partial rotation via mx.fast.rope).
         let rope = if is_sliding {
             Gemma4RoPE::Standard(RoPE::new(
                 config.rope_dims_sliding(),
@@ -216,11 +210,10 @@ impl Gemma4Attention {
                 None,
             ))
         } else {
-            let rotary_dim = config.rope_dims_global(); // head_dim * partial_rotary_factor (e.g. 64)
             Gemma4RoPE::Proportional(Gemma4ProportionalRoPE::new(
-                head_dim,          // global head_size (e.g. 512)
-                rotary_dim,        // actual rotation dims (e.g. 64)
-                config.rope_theta, // 1M
+                head_dim,                     // full head dimension (e.g. 512)
+                config.partial_rotary_factor, // fraction of dims to rotate (e.g. 0.25)
+                config.rope_theta,            // 1M
             )?)
         };
 
@@ -231,7 +224,7 @@ impl Gemma4Attention {
             o_proj: LinearProj::Standard(o_proj),
             q_norm,
             k_norm,
-            v_norm,
+            v_norm_eps,
             rope,
             num_heads,
             num_kv_heads,
@@ -251,6 +244,7 @@ impl Gemma4Attention {
         x: &MxArray,
         mask: Option<&MxArray>,
         cache: Option<&mut Gemma4LayerCache>,
+        needs_stash: bool,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
@@ -259,7 +253,6 @@ impl Gemma4Attention {
         let queries = self.q_proj.forward(x)?;
         let keys = self.k_proj.forward(x)?;
         let values = if self.k_is_v {
-            // K=V sharing: use key projection output as values too
             keys.clone()
         } else {
             self.v_proj.as_ref().unwrap().forward(x)?
@@ -281,33 +274,42 @@ impl Gemma4Attention {
             self.head_dim as i64,
         ])?;
 
-        // QKV normalization (operates on last dim D, layout-independent)
-        // Q and K norms have learnable weights; V norm is scale-free (weight=ones)
+        // QKV normalization
         let queries = self.q_norm.forward(&queries)?;
         let keys = self.k_norm.forward(&keys)?;
-        let values = self.v_norm.forward(&values)?;
+        // V norm: scale-free (weight=None), matching Python's RMSNormNoScale
+        let values = {
+            let handle = unsafe {
+                sys::mlx_fast_rms_norm(values.handle.0, std::ptr::null_mut(), self.v_norm_eps)
+            };
+            MxArray::from_handle(handle, "v_norm")?
+        };
 
-        // Transpose to [B, H, T, D] BEFORE RoPE.
-        // mx.fast.rope expects penultimate dim to be sequence positions (T).
+        // Transpose to [B, H, T, D] BEFORE RoPE
         let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
         let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
         let values = values.transpose(Some(&[0, 2, 1, 3]))?;
 
-        // Apply RoPE with cache offset (now [B, H, T, D] — T is penultimate)
+        // Apply RoPE with cache offset
         let offset = cache.as_ref().map_or(0, |c| c.get_offset());
         let queries = self.rope.forward(&queries, offset)?;
         let keys = self.rope.forward(&keys, offset)?;
 
-        // Update cache, get full K/V sequence, and stash for KV sharing
+        // Update cache
         let (keys, values) = if let Some(c) = cache {
-            c.update_and_fetch_stash(&keys, &values)?
+            if needs_stash {
+                c.update_and_fetch_stash(&keys, &values)?
+            } else {
+                c.update_and_fetch(&keys, &values)?
+            }
         } else {
             (keys, values)
         };
 
+        let mask = trim_mask(mask, keys.shape_at(2)?)?;
+
         // Scaled dot-product attention with scale=1.0
-        // Gemma4 uses QKV normalization instead of query_pre_attn_scalar scaling.
-        let output = if let Some(m) = mask {
+        let output = if let Some(ref m) = mask {
             scaled_dot_product_attention(&queries, &keys, &values, 1.0, Some(m))?
         } else if seq_len > 1 {
             scaled_dot_product_attention_causal(&queries, &keys, &values, 1.0)?
@@ -357,8 +359,10 @@ impl Gemma4Attention {
         // Apply RoPE to queries using the anchor's cache offset
         let queries = self.rope.forward(&queries, cache_offset)?;
 
+        let mask = trim_mask(mask, shared_keys.shape_at(2)?)?;
+
         // Use shared K/V directly (already [B, H_kv, T, D] with RoPE applied)
-        let output = if let Some(m) = mask {
+        let output = if let Some(ref m) = mask {
             scaled_dot_product_attention(&queries, shared_keys, shared_values, 1.0, Some(m))?
         } else if seq_len > 1 {
             scaled_dot_product_attention_causal(&queries, shared_keys, shared_values, 1.0)?

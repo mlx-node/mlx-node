@@ -111,6 +111,14 @@ impl MxArray {
         MxArray::from_handle(handle, "array_scalar_float")
     }
 
+    /// Create a scalar with a specific dtype (no AsType node in the graph).
+    /// Matches Python's `mx.array(value, dtype=dtype)`.
+    pub(crate) fn scalar_float_like(value: f64, like: &MxArray) -> Result<Self> {
+        let dt = like.dtype()?;
+        let handle = unsafe { sys::mlx_array_scalar_float_dtype(value, dt.code()) };
+        MxArray::from_handle(handle, "array_scalar_float_dtype")
+    }
+
     #[napi]
     pub fn scalar_int(value: i32) -> Result<Self> {
         let handle = unsafe { sys::mlx_array_scalar_int(value) };

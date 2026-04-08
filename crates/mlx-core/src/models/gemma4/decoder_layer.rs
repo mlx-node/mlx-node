@@ -97,7 +97,12 @@ impl Gemma4DecoderLayer {
             let top_k = config.top_k_experts.unwrap_or(8) as u32;
             let moe_inter = config.moe_intermediate_size.unwrap_or(704) as u32;
             (
-                Some(Gemma4Router::new(h, num_experts, config.rms_norm_eps)?),
+                Some(Gemma4Router::new(
+                    h,
+                    num_experts,
+                    top_k,
+                    config.rms_norm_eps,
+                )?),
                 Some(Gemma4MoE::new(h, num_experts, top_k, moe_inter)?),
                 Some(RMSNorm::new(h, eps)?),
                 Some(RMSNorm::new(h, eps)?),
@@ -136,10 +141,11 @@ impl Gemma4DecoderLayer {
         mask: Option<&MxArray>,
         cache: Option<&mut Gemma4LayerCache>,
         per_layer_input: Option<&MxArray>,
+        needs_stash: bool,
     ) -> Result<MxArray> {
         // Pre-norm + attention
         let normed = self.input_layernorm.forward(x)?;
-        let attn_out = self.self_attn.forward(&normed, mask, cache)?;
+        let attn_out = self.self_attn.forward(&normed, mask, cache, needs_stash)?;
 
         self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)
     }
@@ -205,9 +211,9 @@ impl Gemma4DecoderLayer {
             let hidden_states_1 = pf1.forward(&mlp_out)?;
 
             // MoE branch: router and experts see the RESIDUAL (pre-MLP state), not MLP output
-            let router_logits = router.forward(&h)?;
+            let (top_k_indices, top_k_weights) = router.forward(&h)?;
             let hidden_states_2 = pff2.forward(&h)?;
-            let hidden_states_2 = moe.forward(&hidden_states_2, &router_logits)?;
+            let hidden_states_2 = moe.forward(&hidden_states_2, &top_k_indices, &top_k_weights)?;
             let hidden_states_2 = pf2.forward(&hidden_states_2)?;
 
             // Combine dense MLP and MoE outputs
@@ -364,10 +370,12 @@ impl Gemma4DecoderLayer {
     }
 
     pub fn set_moe_per_expert_scale(&mut self, w: &MxArray) -> Result<()> {
-        if let Some(ref mut moe) = self.moe {
-            moe.set_per_expert_scale(w)
+        if let Some(ref mut router) = self.router {
+            router.set_per_expert_scale(w)
         } else {
-            Err(Error::from_reason("MoE not initialized"))
+            Err(Error::from_reason(
+                "Router not initialized (MoE not enabled)",
+            ))
         }
     }
 

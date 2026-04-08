@@ -70,58 +70,12 @@ impl Activations {
     /// Gaussian Error Linear Unit (GELU) — tanh approximation.
     /// Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     ///
-    /// This matches PyTorch's `F.gelu(x, approximate="tanh")` and HuggingFace's
-    /// `gelu_pytorch_tanh`. Used by Gemma4 dense MLP and most vision models.
+    /// Uses a compiled (fused) Metal kernel via `mx.compile(shapeless=True)`,
+    /// matching Python's `nn.gelu_approx`. Operates in native dtype (no f32 upcast)
+    /// for maximum performance — the compile fusion handles numerical stability.
     pub fn gelu(input: &MxArray) -> Result<MxArray> {
-        let handle = unsafe {
-            // Constants
-            let half = sys::mlx_array_scalar_float(0.5);
-            let one = sys::mlx_array_scalar_float(1.0);
-            let sqrt_2_over_pi = sys::mlx_array_scalar_float(0.7978845608);
-            let coeff = sys::mlx_array_scalar_float(0.044715);
-
-            // x^3
-            let x_squared = sys::mlx_array_square(input.handle.0);
-            let x_cubed = sys::mlx_array_mul(x_squared, input.handle.0);
-
-            // 0.044715 * x^3
-            let scaled_x_cubed = sys::mlx_array_mul_scalar(x_cubed, 0.044715);
-
-            // x + 0.044715 * x^3
-            let inner = sys::mlx_array_add(input.handle.0, scaled_x_cubed);
-
-            // sqrt(2/pi) * (x + 0.044715 * x^3)
-            let scaled_inner = sys::mlx_array_mul(inner, sqrt_2_over_pi);
-
-            // tanh(...)
-            let tanh_result = sys::mlx_array_tanh(scaled_inner);
-
-            // 1 + tanh(...)
-            let one_plus_tanh = sys::mlx_array_add(one, tanh_result);
-
-            // x * (1 + tanh(...))
-            let x_times_bracket = sys::mlx_array_mul(input.handle.0, one_plus_tanh);
-
-            // 0.5 * x * (1 + tanh(...))
-            let result = sys::mlx_array_mul(half, x_times_bracket);
-
-            // Clean up
-            sys::mlx_array_delete(half);
-            sys::mlx_array_delete(one);
-            sys::mlx_array_delete(sqrt_2_over_pi);
-            sys::mlx_array_delete(coeff);
-            sys::mlx_array_delete(x_squared);
-            sys::mlx_array_delete(x_cubed);
-            sys::mlx_array_delete(scaled_x_cubed);
-            sys::mlx_array_delete(inner);
-            sys::mlx_array_delete(scaled_inner);
-            sys::mlx_array_delete(tanh_result);
-            sys::mlx_array_delete(one_plus_tanh);
-            sys::mlx_array_delete(x_times_bracket);
-
-            result
-        };
-        MxArray::from_handle(handle, "gelu")
+        let handle = unsafe { sys::mlx_gelu_approx(input.handle.0) };
+        MxArray::from_handle(handle, "gelu_approx")
     }
 
     /// Gaussian Error Linear Unit — exact (non-approximate) variant.

@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use crate::array::MxArray;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
+use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 
 /// Convert a JSON value to Gemma4's tool-call DSL format.
@@ -96,6 +97,8 @@ pub struct Gemma4ChatResult {
     pub text: String,
     pub num_tokens: u32,
     pub finish_reason: String,
+    /// Performance metrics (always present).
+    pub performance: Option<crate::profiling::PerformanceMetrics>,
 }
 
 /// PLE (Per-Layer Embeddings) model-level components.
@@ -133,12 +136,20 @@ pub struct Gemma4Model {
     pub(crate) layers: Arc<RwLock<Vec<Gemma4DecoderLayer>>>,
     pub(crate) final_norm: Arc<RwLock<RMSNorm>>,
     pub(crate) lm_head: Arc<RwLock<Option<Linear>>>,
+    /// Pre-transposed embedding weight for tied lm_head: [hidden_size, vocab_size].
+    /// Only populated when tie_word_embeddings=true.
+    pub(crate) embed_weight_t: Arc<RwLock<Option<MxArray>>>,
     pub(crate) ple: Arc<RwLock<Option<PleComponents>>>,
     tokenizer: Option<Arc<Qwen3Tokenizer>>,
-    model_id: u64,
+    pub(crate) model_id: u64,
 }
 
 static MODEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Mutex to serialize access to the C++ compiled Gemma4 forward pass global state.
+/// Only one chat() call can use the compiled path at a time.
+/// Uses std::sync::Mutex since we're inside spawn_blocking which is synchronous.
+static GEMMA4_COMPILED_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[napi]
 impl Gemma4Model {
@@ -200,6 +211,7 @@ impl Gemma4Model {
             layers: Arc::new(RwLock::new(layers)),
             final_norm: Arc::new(RwLock::new(final_norm)),
             lm_head: Arc::new(RwLock::new(lm_head)),
+            embed_weight_t: Arc::new(RwLock::new(None)),
             ple: Arc::new(RwLock::new(ple)),
             tokenizer: None,
             model_id,
@@ -245,6 +257,7 @@ impl Gemma4Model {
         let layers = self.layers.clone();
         let final_norm = self.final_norm.clone();
         let lm_head = self.lm_head.clone();
+        let embed_weight_t = self.embed_weight_t.clone();
         let ple = self.ple.clone();
         let model_config = self.config.clone();
 
@@ -315,80 +328,261 @@ impl Gemma4Model {
             // Initialize caches
             let mut caches = init_caches_for_config(&model_config);
 
+            // Create dedicated generation stream for GPU scheduling.
+            let generation_stream = Stream::new(DeviceType::Gpu);
+
+            // Wired memory: pin model weights in GPU memory (prevents paging for large models).
+            // Uses usize::MAX to always set limit to max_recommended_working_set_size.
+            let _wired_ctx = crate::stream::WiredLimitContext::new(
+                usize::MAX,
+                vec![generation_stream],
+            );
+
             // Acquire locks
             let embed_guard = embed_tokens.blocking_read();
             let layers_guard = layers.blocking_read();
             let norm_guard = final_norm.blocking_read();
             let lm_head_guard = lm_head.blocking_read();
+            let embed_weight_t_guard = embed_weight_t.blocking_read();
             let ple_guard = ple.blocking_read();
 
-            // Prefill
-            let logits = forward_inner(
-                &prompt,
-                &embed_guard,
-                &layers_guard,
-                &mut caches,
-                &norm_guard,
-                &lm_head_guard,
-                ple_guard.as_ref(),
-                &model_config,
-            )?;
+            let generation_start = std::time::Instant::now();
+            let prompt_token_count = tokens.len();
 
-            // Sample first token from last position
-            let last_logits = logits.slice_axis(1, tokens.len() as i64 - 1, tokens.len() as i64)?;
-            let last_logits = last_logits.squeeze(Some(&[1]))?;
+            // Prefill: process tokens [0:N-1] through body only (no lm_head),
+            // then run last token through full forward to get logits.
+            // Matches mlx-lm generate_step pattern.
+            {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                prefill_body_gemma4(
+                    &prompt,
+                    &embed_guard,
+                    &layers_guard,
+                    &mut caches,
+                    &norm_guard,
+                    ple_guard.as_ref(),
+                    &model_config,
+                )?;
+            }
+            eval_gemma4_caches(&caches);
 
-            let mut y = sample(&last_logits, sampling_config)?;
-            MxArray::async_eval_arrays(&[&y]);
-
-            // Decode loop
-            let mut generated_tokens: Vec<u32> = Vec::new();
-            let mut finish_reason = "length".to_string();
-
-            for step in 0..max_new_tokens {
-                y.eval();
-                let token_id = y.item_at_int32(0)? as u32;
-                generated_tokens.push(token_id);
-
-                // Check EOS
-                if eos_ids.contains(&(token_id as i32)) {
-                    finish_reason = "stop".to_string();
-                    break;
-                }
-
-                // Forward single token
-                let next_ids = y.reshape(&[1, 1])?;
-                let logits = forward_inner(
-                    &next_ids,
+            // Last token → logits
+            let last_token = prompt.slice_axis(1, tokens.len() as i64 - 1, tokens.len() as i64)?;
+            let logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                forward_inner(
+                    &last_token,
                     &embed_guard,
                     &layers_guard,
                     &mut caches,
                     &norm_guard,
                     &lm_head_guard,
+                    embed_weight_t_guard.as_ref(),
                     ple_guard.as_ref(),
                     &model_config,
-                )?;
-                let logits = logits.squeeze(Some(&[1]))?;
+                )?
+            };
+            let logits = logits.squeeze(Some(&[1]))?;
+            let y = sample_next_token(&logits, sampling_config)?;
+            y.eval();
+            eval_gemma4_caches(&caches);
 
-                // Sample next token
-                let next_token = sample(&logits, sampling_config)?;
-                MxArray::async_eval_arrays(&[&next_token]);
+            // Mark first token time (TTFT = time to first token)
+            let first_token_instant = std::time::Instant::now();
 
-                y = next_token;
+            // Decode loop — matches mlx-vlm generate_step pattern:
+            // 1. Build lazy graph per step via forward_inner (no compile())
+            // 2. async_eval the output token + cache arrays
+            // 3. Double-buffer: build step N+1 while extracting step N
+            //
+            // mlx-vlm achieves ~30 tok/s without compile() by relying on:
+            // - MLX lazy evaluation building optimized computation graphs
+            // - Metal shader cache reusing compiled GPU kernels across steps
+            // - In-place cache mutation as side-effects (not return values)
+            //
+            // Set GEMMA4_USE_COMPILE=1 to use the old compiled C++ path for A/B testing.
+            let mut generated_tokens: Vec<u32> = Vec::new();
+            let mut finish_reason = "length".to_string();
 
-                // Periodic cache clear to prevent memory accumulation
-                if (step + 1) % 256 == 0 {
-                    crate::array::synchronize_and_clear_cache();
+            let use_compiled = std::env::var("GEMMA4_USE_COMPILE").is_ok()
+                && model_config.num_kv_shared_layers.is_none_or(|n| n <= 0)
+                && unsafe { mlx_sys::mlx_weight_count() } > 0;
+
+            if use_compiled {
+                // Legacy compiled C++ path (opt-in via GEMMA4_USE_COMPILE=1)
+                let _compiled_guard = GEMMA4_COMPILED_MUTEX.lock().unwrap();
+                let mut cache_arrays_owned: Vec<MxArray> =
+                    Vec::with_capacity(caches.len() * 2);
+                for (layer_idx, cache) in caches.iter().enumerate() {
+                    let (k, v) = cache.get_cached_kv().ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "Compiled Gemma4 decode expected cache for layer {} after prefill",
+                            layer_idx
+                        ))
+                    })?;
+                    cache_arrays_owned.push(k);
+                    cache_arrays_owned.push(v);
+                }
+                let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> = cache_arrays_owned
+                    .iter()
+                    .map(|a| a.as_raw_ptr())
+                    .collect();
+
+                let layer_types_i32: Vec<i32> = (0..model_config.num_hidden_layers as usize)
+                    .map(|i| if model_config.is_global_layer(i) { 1 } else { 0 })
+                    .collect();
+
+                let max_kv_len = (tokens.len() as i32 + max_new_tokens)
+                    .min(model_config.max_position_embeddings);
+
+                unsafe {
+                    mlx_sys::mlx_gemma4_init_from_prefill(
+                        model_config.num_hidden_layers,
+                        model_config.hidden_size,
+                        model_config.num_attention_heads,
+                        model_config.num_key_value_heads,
+                        model_config.head_dim,
+                        model_config.effective_kv_heads(true),
+                        model_config.effective_head_dim(true),
+                        model_config.rope_theta as f32,
+                        model_config.rope_local_base_freq as f32,
+                        model_config.partial_rotary_factor as f32,
+                        model_config.rms_norm_eps as f32,
+                        model_config.sliding_window,
+                        if model_config.tie_word_embeddings { 1 } else { 0 },
+                        max_kv_len,
+                        1,
+                        model_config.num_experts.unwrap_or(0),
+                        model_config.top_k_experts.unwrap_or(0),
+                        model_config.moe_intermediate_size.unwrap_or(0),
+                        model_config.intermediate_size,
+                        model_config.final_logit_softcapping.unwrap_or(0.0) as f32,
+                        layer_types_i32.as_ptr(),
+                        layer_types_i32.len() as i32,
+                        cache_ptrs.as_mut_ptr(),
+                        tokens.len() as i32,
+                    );
+                }
+
+                let embed_weight = embed_guard.get_weight();
+                let mut current_y = y;
+                for step in 0..max_new_tokens {
+                    let next_y = if step + 1 < max_new_tokens {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+                        let next_ids = current_y.reshape(&[1, 1])?;
+                        let logits = forward_gemma4_cpp(&next_ids, &embed_weight)?;
+                        let next_token = sample_next_token(&logits, sampling_config)?;
+                        eval_token_and_gemma4_caches(&next_token);
+                        Some(next_token)
+                    } else {
+                        None
+                    };
+
+                    let token_id = current_y.item_at_int32(0)? as u32;
+                    generated_tokens.push(token_id);
+
+                    if eos_ids.contains(&(token_id as i32)) {
+                        finish_reason = "stop".to_string();
+                        break;
+                    }
+                    if let Some(next_token) = next_y {
+                        current_y = next_token;
+                    } else {
+                        break;
+                    }
+                    if (step + 1) % 256 == 0 {
+                        crate::array::synchronize_and_clear_cache();
+                    }
+                }
+                unsafe { mlx_sys::mlx_gemma4_reset(); }
+            } else {
+                // Default: lazy eval decode (matches mlx-vlm pattern)
+                //
+                // Each step builds a lazy computation graph via forward_inner.
+                // Cache mutations (slice_assign_axis_inplace) happen as side effects.
+                // We eval both the token AND cache arrays each step to ensure
+                // cache state is materialized before the next step reads it.
+                // MLX's Metal shader cache reuses compiled kernels since shapes
+                // are identical across decode steps.
+                let mut current_y = y;
+                for step in 0..max_new_tokens {
+                    let next_y = if step + 1 < max_new_tokens {
+                        let _stream_ctx = StreamContext::new(generation_stream);
+
+                        let next_ids = current_y.reshape(&[1, 1])?;
+                        let logits = forward_inner(
+                            &next_ids,
+                            &embed_guard,
+                            &layers_guard,
+                            &mut caches,
+                            &norm_guard,
+                            &lm_head_guard,
+                            embed_weight_t_guard.as_ref(),
+                            ple_guard.as_ref(),
+                            &model_config,
+                        )?;
+                        let logits = logits.squeeze(Some(&[1]))?;
+                        let next_token = sample_next_token(&logits, sampling_config)?;
+                        next_token.eval();
+                        eval_gemma4_caches(&caches);
+                        Some(next_token)
+                    } else {
+                        None
+                    };
+
+                    let token_id = current_y.item_at_int32(0)? as u32;
+                    generated_tokens.push(token_id);
+
+                    if eos_ids.contains(&(token_id as i32)) {
+                        finish_reason = "stop".to_string();
+                        break;
+                    }
+                    if let Some(next_token) = next_y {
+                        current_y = next_token;
+                    } else {
+                        break;
+                    }
+
+                    if (step + 1) % 256 == 0 {
+                        crate::array::clear_cache();
+                    }
                 }
             }
 
             // Decode text
             let text = tokenizer.decode_sync(&generated_tokens, true)?;
 
+            // Compute performance metrics
+            let generation_end = std::time::Instant::now();
+            let ttft_ms = first_token_instant
+                .duration_since(generation_start)
+                .as_secs_f64()
+                * 1000.0;
+            let decode_ms = generation_end
+                .duration_since(first_token_instant)
+                .as_secs_f64()
+                * 1000.0;
+            let gen_toks = generated_tokens.len() as f64;
+
+            let performance = Some(crate::profiling::PerformanceMetrics {
+                ttft_ms,
+                prefill_tokens_per_second: if ttft_ms > 0.0 {
+                    prompt_token_count as f64 / (ttft_ms / 1000.0)
+                } else {
+                    0.0
+                },
+                decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                    (gen_toks - 1.0) / (decode_ms / 1000.0)
+                } else {
+                    0.0
+                },
+            });
+
             Ok(Gemma4ChatResult {
                 text,
                 num_tokens: generated_tokens.len() as u32,
                 finish_reason,
+                performance,
             })
         })
         .await
@@ -441,136 +635,175 @@ fn make_sampling_config(
     })
 }
 
-/// Synchronous forward pass (used inside spawn_blocking).
-fn forward_inner(
-    input_ids: &MxArray,
+fn sample_next_token(logits: &MxArray, config: Option<SamplingConfig>) -> Result<MxArray> {
+    if is_greedy_sampling(config) {
+        return logits.argmax(-1, Some(false));
+    }
+    sample(logits, config)
+}
+
+fn is_greedy_sampling(config: Option<SamplingConfig>) -> bool {
+    config.is_some_and(|cfg| {
+        cfg.temperature.unwrap_or(1.0) <= 0.0
+            && cfg.top_k.is_none()
+            && cfg.top_p.is_none()
+            && cfg.min_p.is_none()
+    })
+}
+
+/// Call the compiled C++ forward for a single Gemma4 decode step.
+fn forward_gemma4_cpp(input_ids: &MxArray, embedding_weight: &MxArray) -> Result<MxArray> {
+    let mut logits_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+    let mut cache_offset: i32 = 0;
+    unsafe {
+        mlx_sys::mlx_gemma4_forward(
+            input_ids.as_raw_ptr(),
+            embedding_weight.as_raw_ptr(),
+            &mut logits_ptr,
+            &mut cache_offset,
+        );
+    }
+    if logits_ptr.is_null() {
+        return Err(Error::from_reason("Gemma4 compiled forward returned null"));
+    }
+    MxArray::from_handle(logits_ptr, "gemma4_compiled_forward")
+}
+
+fn eval_token_and_gemma4_caches(next_token: &MxArray) {
+    unsafe {
+        mlx_sys::mlx_gemma4_eval_token_and_caches(next_token.as_raw_ptr());
+    }
+}
+
+/// Transformer body: embedding through decoder layers and final norm.
+///
+/// Matches mlx-vlm `Gemma4TextModel.__call__`. Does NOT run lm_head or softcap.
+/// Used by chunked prefill for intermediate chunks and by the full forward.
+///
+/// When `inputs_embeds` is provided, uses it directly (skipping embedding lookup).
+/// When `per_layer_inputs` is provided, uses it directly (skipping PLE computation).
+fn forward_body(
+    input_ids: Option<&MxArray>,
+    inputs_embeds: Option<MxArray>,
     embedding: &Embedding,
     layers: &[Gemma4DecoderLayer],
     caches: &mut [Gemma4LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
     ple: Option<&PleComponents>,
+    per_layer_inputs: Option<&MxArray>,
     config: &Gemma4Config,
 ) -> Result<MxArray> {
-    let mut h = embedding.forward(input_ids)?;
-
-    // Embedding scaling: multiply by sqrt(hidden_size)
-    let scale = (config.hidden_size as f64).sqrt();
-    let scale_arr = MxArray::scalar_float(scale)?;
-    let scale_arr = scale_arr.astype(h.dtype()?)?;
-    h = h.mul(&scale_arr)?;
+    // Step 1: Embedding (or use pre-computed embeddings)
+    let mut h = if let Some(embeds) = inputs_embeds {
+        embeds
+    } else {
+        let ids = input_ids.ok_or_else(|| {
+            Error::from_reason("forward_body: either input_ids or inputs_embeds must be provided")
+        })?;
+        let emb = embedding.forward(ids)?;
+        emb.mul_scalar((config.hidden_size as f64).sqrt())?
+    };
 
     let seq_len = h.shape_at(1)?;
 
-    // Compute PLE (per-layer embeddings) if enabled.
-    // Result: per_layer_inputs[i] = combined[:, :, i, :] for each layer, shape [B, T, ple_dim]
-    let per_layer_inputs: Option<Vec<MxArray>> = if let Some(ple) = ple {
-        let ple_dim = ple.ple_dim as i64;
-        let num_layers = ple.num_layers as i64;
-
-        // Mask OOV token IDs to 0 for PLE embedding (matches vLLM behavior).
-        // IDs outside [0, vocab_size_per_layer_input) are mapped to index 0
-        // (a neutral fallback), rather than clamped to the last valid index.
-        let ple_vocab = MxArray::scalar_int(ple.vocab_size_per_layer_input)?;
-        let zero = MxArray::scalar_int(0)?;
-        let valid_mask = input_ids
-            .greater_equal(&zero)?
-            .logical_and(&input_ids.less(&ple_vocab)?)?;
-        let masked_ids = valid_mask.where_(input_ids, &zero)?;
-
-        // per_layer_embeds: [B, T, num_layers * ple_dim]
-        let per_layer_embeds = ple.embed_tokens_per_layer.forward(&masked_ids)?;
-        // HF's Gemma4TextScaledWordEmbedding scales by sqrt(ple_dim)
-        let embed_scale = MxArray::scalar_float((ple.ple_dim as f64).sqrt())?;
-        let embed_scale = embed_scale.astype(per_layer_embeds.dtype()?)?;
-        let per_layer_embeds = per_layer_embeds.mul(&embed_scale)?;
-        // Reshape to [B, T, num_layers, ple_dim]
-        let batch = per_layer_embeds.shape_at(0)?;
-        let per_layer_embeds = per_layer_embeds.reshape(&[batch, seq_len, num_layers, ple_dim])?;
-
-        // projected: [B, T, num_layers * ple_dim]
-        let projected = ple.per_layer_model_projection.forward(&h)?;
-        let proj_scale = MxArray::scalar_float(ple.per_layer_model_projection_scale)?;
-        let proj_scale = proj_scale.astype(projected.dtype()?)?;
-        let projected = projected.mul(&proj_scale)?;
-        // Reshape to [B, T, num_layers, ple_dim]
-        let projected = projected.reshape(&[batch, seq_len, num_layers, ple_dim])?;
-
-        // Normalize the projection ONLY (before combining with embeds).
-        // vLLM: per_layer_projection_norm(projection), then combine.
-        let projected = ple.per_layer_projection_norm.forward(&projected)?;
-
-        // Combine: (normed_projection + per_layer_embeds) * 1/sqrt(2)
-        let combined = projected.add(&per_layer_embeds)?;
-        let input_scale = MxArray::scalar_float(ple.per_layer_input_scale)?;
-        let input_scale = input_scale.astype(combined.dtype()?)?;
-        let combined = combined.mul(&input_scale)?;
-
-        // Slice per layer: combined[:, :, i, :] -> [B, T, ple_dim]
-        let mut inputs = Vec::with_capacity(num_layers as usize);
-        for i in 0..num_layers {
-            let layer_ple = combined.slice_axis(2, i, i + 1)?;
-            let layer_ple = layer_ple.squeeze(Some(&[2]))?;
-            inputs.push(layer_ple);
+    // Step 2: PLE (per-layer embeddings) — compute or reuse
+    let owned_ple: Option<MxArray>;
+    let effective_ple: Option<&MxArray> = if let Some(ple_inputs) = per_layer_inputs {
+        // Pre-computed: might need to slice for chunked prefill
+        if ple_inputs.shape_at(1)? != seq_len {
+            // Slice to match current chunk (chunked prefill)
+            let cache_offset = caches
+                .iter()
+                .find_map(|c| {
+                    let off = c.get_offset();
+                    if off > 0 { Some(off as i64) } else { None }
+                })
+                .unwrap_or(0);
+            let max_start = ple_inputs.shape_at(1)? - seq_len;
+            let start = cache_offset.min(max_start);
+            owned_ple = Some(ple_inputs.slice_axis(1, start, start + seq_len)?);
+            owned_ple.as_ref()
+        } else {
+            Some(ple_inputs)
         }
-        Some(inputs)
+    } else if let Some(ple) = ple {
+        if let Some(ids) = input_ids {
+            owned_ple = Some(compute_ple(ids, &h, ple, seq_len)?);
+            owned_ple.as_ref()
+        } else {
+            None
+        }
     } else {
         None
     };
 
-    // Build masks for prefill (seq_len > 1) only
-    // During decode (seq_len == 1), pass None to let SDPA handle it optimally
-    let global_mask = if seq_len > 1 {
-        let global_idx = (0..config.num_hidden_layers as usize)
-            .find(|&i| config.is_global_layer(i))
-            .unwrap_or(0);
-        Some(create_causal_mask(
-            seq_len,
-            caches[global_idx].get_offset(),
-        )?)
+    // Step 3: Project PLE if we have per-layer inputs
+    // Matches mlx-vlm project_per_layer_inputs: projects h and combines with token PLEs
+    let projected_ple: Option<MxArray> = if let Some(ple_data) = effective_ple {
+        if let Some(ple) = ple {
+            Some(project_per_layer_inputs(&h, ple_data, ple)?)
+        } else {
+            None
+        }
     } else {
         None
     };
 
-    let sliding_mask = if seq_len > 1 {
+    // Step 4: Build masks
+    // Global layers: None during prefill → triggers fused causal SDPA kernel
+    // Sliding layers: explicit windowed mask during prefill
+    // Decode (seq_len == 1): None for both
+    //
+    // Matches mlx-vlm create_attention_mask behavior:
+    //   global → "causal" string → fused kernel
+    //   sliding → explicit mask with window constraint
+    // Sliding mask: only needed when seq_len > window_size.
+    // Matches Python create_attention_mask: when N <= window_size, returns "causal".
+    // When N > window_size, returns explicit causal+window mask.
+    let sliding_mask = if seq_len > 1 && seq_len > config.sliding_window as i64 {
         let sliding_idx = (0..config.num_hidden_layers as usize)
             .find(|&i| config.is_sliding_layer(i))
             .unwrap_or(0);
+        let offset = if sliding_idx < caches.len() {
+            caches[sliding_idx].get_offset()
+        } else {
+            0
+        };
         Some(create_sliding_mask(
             seq_len,
-            caches[sliding_idx].get_offset(),
+            offset,
             config.sliding_window as i64,
         )?)
     } else {
         None
     };
 
-    // Forward through layers with KV cache sharing.
-    //
-    // Layers are split into two groups:
-    // - Non-shared (0..first_kv_shared): compute Q, K, V normally; update own cache
-    // - Shared (first_kv_shared..num_layers): compute Q only; reuse K/V from anchor cache
-    //
-    // The anchor for a shared layer is the last non-shared layer of the same attention
-    // type (sliding or global). After running the anchor layer, we read its K/V cache
-    // contents and provide them to all shared layers of that type.
+    // Step 5: Forward through layers with KV cache sharing
     let has_kv_sharing = config.num_kv_shared_layers.is_some_and(|n| n > 0);
-
-    // Shared K/V storage: anchor_layer_idx -> (keys, values)
-    // Only populated when KV sharing is active.
     let mut shared_kv: HashMap<usize, (MxArray, MxArray)> = HashMap::new();
 
     for (i, layer) in layers.iter().enumerate() {
         let is_global = config.is_global_layer(i);
-        let mask = if is_global {
-            global_mask.as_ref()
+
+        // Global layers: None mask → attention module uses causal SDPA or no-mask path
+        // Sliding layers: explicit windowed mask
+        let mask: Option<&MxArray> = if is_global {
+            None
         } else {
             sliding_mask.as_ref()
         };
-        let ple_input = per_layer_inputs.as_ref().and_then(|inputs| inputs.get(i));
+
+        let ple_input = projected_ple.as_ref().map(|p| {
+            // projected_ple shape: [B, T, num_layers, ple_dim], extract layer i
+            p.slice_axis(2, i as i64, i as i64 + 1)
+                .and_then(|s| s.squeeze(Some(&[2])))
+        });
+        let ple_input_ref = match &ple_input {
+            Some(Ok(arr)) => Some(arr),
+            _ => None,
+        };
 
         if has_kv_sharing && config.is_kv_shared_layer(i) {
-            // Shared layer: compute Q only, reuse K/V from anchor
             let anchor_idx = config.kv_shared_anchor(i).ok_or_else(|| {
                 Error::from_reason(format!(
                     "Layer {} is shared but has no anchor (missing layer type match)",
@@ -585,39 +818,21 @@ fn forward_inner(
                 ))
             })?;
 
-            // RoPE offset for shared layer queries.
-            // The anchor cache's offset has already been incremented by update_and_fetch
-            // (offset = total tokens in cache AFTER the anchor processed the current input).
-            // Shared layer queries need RoPE at the same positions as the anchor's queries,
-            // which were applied BEFORE update. So subtract seq_len to get the pre-update offset.
+            // Shared layer uses anchor's cache offset.
+            // Subtract seq_len to get pre-update offset (queries need same positions as anchor).
             let cache_offset = caches[anchor_idx].get_offset() - seq_len as i32;
-
-            // For shared layers, the mask may need to match the anchor's K/V length.
-            // The anchor's K/V sequence length may differ from what the original mask
-            // was built for (e.g., sliding anchor has window-sized K/V).
-            let kv_seq_len = shared_keys.shape_at(2)?;
-            let adjusted_mask = if let Some(m) = mask {
-                let mask_kv_len = m.shape_at(3)?;
-                if mask_kv_len > kv_seq_len {
-                    // Narrow the mask's last dim to match shared K/V length
-                    Some(m.slice_axis(3, mask_kv_len - kv_seq_len, mask_kv_len)?)
-                } else {
-                    Some(m.clone())
-                }
-            } else {
-                None
-            };
 
             h = layer.forward_shared(
                 &h,
-                adjusted_mask.as_ref(),
+                mask,
                 shared_keys,
                 shared_values,
                 cache_offset,
-                ple_input,
+                ple_input_ref,
             )?;
         } else {
-            h = layer.forward(&h, mask, Some(&mut caches[i]), ple_input)?;
+            let needs_stash = has_kv_sharing && config.should_store_shared_kv(i);
+            h = layer.forward(&h, mask, Some(&mut caches[i]), ple_input_ref, needs_stash)?;
 
             if has_kv_sharing
                 && config.should_store_shared_kv(i)
@@ -629,45 +844,217 @@ fn forward_inner(
     }
 
     // Final norm
-    h = final_norm.forward(&h)?;
+    final_norm.forward(&h)
+}
+
+/// Full forward pass: transformer body + lm_head + logit softcapping.
+///
+/// Used for the final prefill chunk and for each decode step.
+fn forward_inner(
+    input_ids: &MxArray,
+    embedding: &Embedding,
+    layers: &[Gemma4DecoderLayer],
+    caches: &mut [Gemma4LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embed_weight_t: Option<&MxArray>,
+    ple: Option<&PleComponents>,
+    config: &Gemma4Config,
+) -> Result<MxArray> {
+    let h = forward_body(
+        Some(input_ids),
+        None,
+        embedding,
+        layers,
+        caches,
+        final_norm,
+        ple,
+        None,
+        config,
+    )?;
 
     // LM head or tied embeddings
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
+    } else if let Some(w_t) = embed_weight_t {
+        h.matmul(w_t)?
     } else {
         let weight = embedding.get_weight();
         let weight_t = weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
     };
 
-    // Logit softcapping
+    // Logit softcapping — compiled fused kernel (matches Python's mx.compile logit_softcap)
     if let Some(cap) = config.final_logit_softcapping {
-        let cap_arr = MxArray::scalar_float(cap)?;
-        let cap_arr = cap_arr.astype(logits.dtype()?)?;
-        let scaled = logits.div(&cap_arr)?;
-        let capped = scaled.tanh()?;
-        Ok(capped.mul(&cap_arr)?)
+        let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
+        let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
+        Ok(MxArray::from_handle(handle, "logit_softcap")?)
     } else {
         Ok(logits)
     }
 }
 
-fn create_causal_mask(seq_len: i64, offset: i32) -> Result<MxArray> {
-    let total_len = seq_len + offset as i64;
-    let rows = MxArray::arange(offset as f64, (offset as i64 + seq_len) as f64, None, None)?;
-    let cols = MxArray::arange(0.0, total_len as f64, None, None)?;
-    let rows = rows.reshape(&[seq_len, 1])?;
-    let cols = cols.reshape(&[1, total_len])?;
-    let valid = rows.greater_equal(&cols)?;
+/// Compute PLE (per-layer embeddings) from input_ids.
+/// Returns shape [B, T, num_layers, ple_dim].
+fn compute_ple(
+    input_ids: &MxArray,
+    h: &MxArray,
+    ple: &PleComponents,
+    seq_len: i64,
+) -> Result<MxArray> {
+    let ple_dim = ple.ple_dim as i64;
+    let num_layers = ple.num_layers as i64;
 
-    let neg_inf = MxArray::full(
-        &[1],
-        Either::A(f64::NEG_INFINITY),
-        Some(crate::array::DType::Float32),
-    )?;
-    let zero_f = MxArray::full(&[1], Either::A(0.0), Some(crate::array::DType::Float32))?;
-    let mask = valid.where_(&zero_f, &neg_inf)?;
-    mask.reshape(&[1, 1, seq_len, total_len])
+    // Mask OOV token IDs to 0 for PLE embedding
+    let ple_vocab = MxArray::scalar_int(ple.vocab_size_per_layer_input)?;
+    let zero = MxArray::scalar_int(0)?;
+    let valid_mask = input_ids
+        .greater_equal(&zero)?
+        .logical_and(&input_ids.less(&ple_vocab)?)?;
+    let masked_ids = valid_mask.where_(input_ids, &zero)?;
+
+    // per_layer_embeds: [B, T, num_layers * ple_dim]
+    let per_layer_embeds = ple.embed_tokens_per_layer.forward(&masked_ids)?;
+    let per_layer_embeds = per_layer_embeds.mul_scalar((ple.ple_dim as f64).sqrt())?;
+    let batch = per_layer_embeds.shape_at(0)?;
+    let per_layer_embeds = per_layer_embeds.reshape(&[batch, seq_len, num_layers, ple_dim])?;
+
+    // Project from main hidden state
+    let projected = ple.per_layer_model_projection.forward(h)?;
+    let projected = projected.mul_scalar(ple.per_layer_model_projection_scale)?;
+    let projected = projected.reshape(&[batch, seq_len, num_layers, ple_dim])?;
+
+    let projected = ple.per_layer_projection_norm.forward(&projected)?;
+
+    // Combine: (normed_projection + per_layer_embeds) * 1/sqrt(2)
+    let combined = projected.add(&per_layer_embeds)?;
+    combined.mul_scalar(ple.per_layer_input_scale)
+}
+
+/// Project per-layer inputs: combine PLE data with hidden state projection.
+/// Returns shape [B, T, num_layers, ple_dim].
+fn project_per_layer_inputs(
+    _h: &MxArray,
+    per_layer_data: &MxArray,
+    _ple: &PleComponents,
+) -> Result<MxArray> {
+    // PLE data is already fully computed (combined projection + token embeddings)
+    Ok(per_layer_data.clone())
+}
+
+/// Default prefill chunk size (tokens per chunk).
+/// Smaller than Qwen3.5's 2048 because the 128-expert MoE dispatch creates
+/// substantial intermediate tensors per layer per token.
+const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
+
+/// Evaluate all Gemma4 cache arrays to materialize them on GPU.
+/// Must be called between prefill chunks to break lazy dependency chains.
+fn eval_gemma4_caches(caches: &[Gemma4LayerCache]) {
+    let mut arrays: Vec<&MxArray> = Vec::new();
+    for cache in caches {
+        cache.collect_cache_arrays(&mut arrays);
+    }
+    if !arrays.is_empty() {
+        MxArray::eval_arrays(&arrays);
+    }
+}
+
+/// Chunked prefill: process all tokens EXCEPT the last one.
+///
+/// Matches mlx-lm generate.py generate_step prefill pattern:
+/// - The prefill loop processes tokens [0:N-1] (all but the last)
+/// - The last token is processed by the caller via `forward_inner`, which
+///   also produces the logits used to sample the first output token
+///
+/// This is CRITICAL for correctness: SDPA computes slightly different numerical
+/// results for multi-token causal attention vs single-token attention with cached
+/// K/V. These small differences compound through layers, causing divergent logits
+/// if the last prompt token is processed in the same batch as the rest.
+///
+/// 1. Embed ALL tokens once upfront (including PLE if enabled)
+/// 2. Run only the transformer body for each chunk (no lm_head)
+/// 3. Stop BEFORE the last token — the caller handles it via forward_inner
+fn prefill_body_gemma4(
+    prompt: &MxArray,
+    embedding: &Embedding,
+    layers: &[Gemma4DecoderLayer],
+    caches: &mut [Gemma4LayerCache],
+    final_norm: &RMSNorm,
+    ple: Option<&PleComponents>,
+    config: &Gemma4Config,
+) -> Result<()> {
+    let total_len = prompt.shape_at(1)?;
+
+    // Must have at least 2 tokens (1 for prefill, 1 for caller to process)
+    if total_len <= 1 {
+        return Ok(());
+    }
+
+    // Process tokens [0:N-1] — leave last token for the caller
+    let prefill_len = total_len - 1;
+
+    // Step 1: Embed tokens [0:N-1]
+    let prefill_ids = prompt.slice_axis(1, 0, prefill_len)?;
+    let all_embeds = {
+        let emb = embedding.forward(&prefill_ids)?;
+        emb.mul_scalar((config.hidden_size as f64).sqrt())?
+    };
+
+    // Step 2: Compute PLE for prefill tokens (if enabled)
+    let all_ple: Option<MxArray> = if let Some(ple) = ple {
+        Some(compute_ple(&prefill_ids, &all_embeds, ple, prefill_len)?)
+    } else {
+        None
+    };
+
+    let mut offset: i64 = 0;
+
+    // Process in chunks
+    while prefill_len - offset > GEMMA4_PREFILL_STEP_SIZE {
+        let chunk_embeds = all_embeds.slice_axis(1, offset, offset + GEMMA4_PREFILL_STEP_SIZE)?;
+        let chunk_ple = all_ple
+            .as_ref()
+            .map(|p| p.slice_axis(1, offset, offset + GEMMA4_PREFILL_STEP_SIZE))
+            .transpose()?;
+
+        let _hidden = forward_body(
+            None,
+            Some(chunk_embeds),
+            embedding,
+            layers,
+            caches,
+            final_norm,
+            ple,
+            chunk_ple.as_ref(),
+            config,
+        )?;
+        eval_gemma4_caches(caches);
+        crate::array::clear_cache();
+        offset += GEMMA4_PREFILL_STEP_SIZE;
+    }
+
+    // Final chunk (still body only — no lm_head needed)
+    if offset < prefill_len {
+        let remaining_embeds = all_embeds.slice_axis(1, offset, prefill_len)?;
+        let remaining_ple = all_ple
+            .as_ref()
+            .map(|p| p.slice_axis(1, offset, prefill_len))
+            .transpose()?;
+
+        let _hidden = forward_body(
+            None,
+            Some(remaining_embeds),
+            embedding,
+            layers,
+            caches,
+            final_norm,
+            ple,
+            remaining_ple.as_ref(),
+            config,
+        )?;
+    }
+
+    Ok(())
 }
 
 fn create_sliding_mask(seq_len: i64, offset: i32, window_size: i64) -> Result<MxArray> {

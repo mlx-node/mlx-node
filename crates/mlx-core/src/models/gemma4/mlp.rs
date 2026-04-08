@@ -1,13 +1,14 @@
 use crate::array::MxArray;
-use crate::nn::{Activations, Linear};
+use crate::nn::Linear;
+use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
-/// Gemma4 MLP with GELU activation (GeGLU).
+/// Gemma4 MLP with GeGLU activation.
 ///
-/// output = down_proj(gelu(gate_proj(x)) * up_proj(x))
+/// output = down_proj(geglu(gate_proj(x), up_proj(x)))
 ///
-/// Unlike the standard SwiGLU MLP used by Qwen3.5 (which uses SiLU),
-/// Gemma 4 uses GELU (gelu_pytorch_tanh approximation).
+/// Uses a compiled (fused) `geglu` kernel matching Python's
+/// `@partial(mx.compile, shapeless=True) def geglu(gate, x): return nn.gelu_approx(gate) * x`
 pub struct GemmaMLP {
     gate_proj: Linear,
     up_proj: Linear,
@@ -27,12 +28,14 @@ impl GemmaMLP {
         })
     }
 
-    /// Forward pass: down(gelu(gate(x)) * up(x))
+    /// Forward pass: down(geglu(gate(x), up(x)))
+    /// Uses compiled fused geglu kernel (gelu_approx(gate) * up → single Metal dispatch).
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let activated = Activations::gelu(&gate)?;
-        let gated = activated.mul(&up)?;
+        // Fused geglu: gelu_approx(gate) * up in one compiled kernel
+        let handle = unsafe { sys::mlx_geglu(gate.handle.0, up.handle.0) };
+        let gated = MxArray::from_handle(handle, "geglu")?;
         self.down_proj.forward(&gated)
     }
 

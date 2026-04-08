@@ -60,12 +60,19 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
 
     let head_dim = get_config_i32(&raw, text_cfg, &["head_dim"], 256);
 
-    // Detect PLE from presence of vocab_size_per_layer_input (no explicit boolean in config)
+    // Detect PLE: requires BOTH hidden_size_per_layer_input > 0 AND vocab_size_per_layer_input > 0.
+    // The 26B model has vocab_size_per_layer_input=262144 but hidden_size_per_layer_input=0,
+    // so PLE must NOT be enabled for it.
     let vocab_size_per_layer_input = {
         let v = get_config_i32(&raw, text_cfg, &["vocab_size_per_layer_input"], -1);
         if v > 0 { Some(v) } else { None }
     };
-    let per_layer_input_embeds = vocab_size_per_layer_input.is_some();
+    let hidden_size_per_layer_input = {
+        let v = get_config_i32(&raw, text_cfg, &["hidden_size_per_layer_input"], -1);
+        if v > 0 { Some(v) } else { None }
+    };
+    let per_layer_input_embeds =
+        hidden_size_per_layer_input.is_some() && vocab_size_per_layer_input.is_some();
 
     // num_global_key_value_heads: may be null in config (E2B), meaning global layers
     // use the same num_kv_heads as sliding but with global_head_dim
@@ -107,16 +114,13 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             if v > 0.0 { Some(v) } else { None }
         },
         per_layer_input_embeds,
-        hidden_size_per_layer_input: {
-            let v = get_config_i32(&raw, text_cfg, &["hidden_size_per_layer_input"], -1);
-            if v > 0 { Some(v) } else { None }
-        },
+        hidden_size_per_layer_input,
         vocab_size_per_layer_input,
         pad_token_id: get_config_i32(&raw, text_cfg, &["pad_token_id"], 0),
         eos_token_ids,
         bos_token_id: get_config_i32(&raw, text_cfg, &["bos_token_id"], 2),
         attention_bias: get_config_bool(&raw, text_cfg, &["attention_bias"], false),
-        use_double_wide_mlp: get_config_bool(&raw, text_cfg, &["use_double_wide_mlp"], false),
+        use_double_wide_mlp: get_config_bool(&raw, text_cfg, &["use_double_wide_mlp"], true),
         num_kv_shared_layers: {
             let v = get_config_i32(&raw, text_cfg, &["num_kv_shared_layers"], -1);
             if v > 0 { Some(v) } else { None }
@@ -146,9 +150,10 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
 /// Parse `layer_types` array from config.
 /// Returns a Vec of "sliding_attention" or "full_attention" strings.
 ///
-/// If `layer_types` is absent or empty, synthesizes the HuggingFace default pattern:
-/// every 6th layer (1-indexed) is "full_attention", and the last layer is always forced
-/// to "full_attention". This matches `transformers/models/gemma4/configuration_gemma4.py:181-188`.
+/// If `layer_types` is absent or empty, synthesizes the mlx-lm default pattern:
+/// `(sliding_window_pattern - 1)` sliding layers followed by 1 full attention layer,
+/// repeating to fill `num_hidden_layers`. Default `sliding_window_pattern` = 5,
+/// giving 4 sliding + 1 full per cycle. Matches mlx-lm gemma4_text.py __post_init__.
 fn parse_layer_types(raw: &Value, text_cfg: Option<&Value>, num_layers: i32) -> Vec<String> {
     let arr = text_cfg
         .and_then(|tc| tc.get("layer_types"))
@@ -162,21 +167,18 @@ fn parse_layer_types(raw: &Value, text_cfg: Option<&Value>, num_layers: i32) -> 
             return types;
         }
     }
-    // Synthesize HF default: every 6th layer is full_attention, last layer forced to full.
-    // Matches transformers/models/gemma4/configuration_gemma4.py:181-188
-    let mut types: Vec<String> = (0..num_layers as usize)
-        .map(|i| {
-            if (i + 1) % 6 == 0 {
-                "full_attention".to_string()
-            } else {
-                "sliding_attention".to_string()
-            }
-        })
-        .collect();
-    if let Some(last) = types.last_mut() {
-        *last = "full_attention".to_string();
+    // Synthesize mlx-lm default: sliding_window_pattern controls the cycle length.
+    // Pattern = (swp-1) sliding + 1 full, repeated to fill num_layers.
+    // Matches mlx-lm gemma4_text.py ModelArgs.__post_init__
+    let swp = get_config_i32(raw, text_cfg, &["sliding_window_pattern"], 5) as usize;
+    let n = num_layers as usize;
+    let mut pattern: Vec<String> = Vec::with_capacity(swp);
+    for _ in 0..swp.saturating_sub(1) {
+        pattern.push("sliding_attention".to_string());
     }
-    types
+    pattern.push("full_attention".to_string());
+    // Tile the pattern to cover all layers
+    (0..n).map(|i| pattern[i % pattern.len()].clone()).collect()
 }
 
 /// Parse nested RoPE parameters from `rope_parameters` object.
@@ -348,20 +350,26 @@ fn validate_required_weights(
             }
         }
 
-        // MoE weights when enabled
+        // MoE weights when enabled — accept both HF and mlx-lm key formats
         if config.enable_moe_block {
-            let moe_keys = [
-                format!("{}.router.proj.weight", prefix),
-                format!("{}.experts.gate_up_proj", prefix),
-                format!("{}.experts.down_proj", prefix),
-            ];
-            for key in &moe_keys {
-                if !has(key) {
-                    return Err(Error::from_reason(format!(
-                        "Missing required weight: {}",
-                        key
-                    )));
-                }
+            // Router projection is always the same
+            if !has(&format!("{}.router.proj.weight", prefix)) {
+                return Err(Error::from_reason(format!(
+                    "Missing required weight: {}.router.proj.weight",
+                    prefix
+                )));
+            }
+            // Expert weights: HF fused OR mlx-lm split format
+            let has_fused = has(&format!("{}.experts.gate_up_proj", prefix))
+                && has(&format!("{}.experts.down_proj", prefix));
+            let has_split = has(&format!("{}.experts.switch_glu.gate_proj.weight", prefix))
+                && has(&format!("{}.experts.switch_glu.up_proj.weight", prefix))
+                && has(&format!("{}.experts.switch_glu.down_proj.weight", prefix));
+            if !has_fused && !has_split {
+                return Err(Error::from_reason(format!(
+                    "Missing MoE expert weights for layer {} (expected fused gate_up_proj+down_proj or split switch_glu.{{gate,up,down}}_proj.weight)",
+                    i
+                )));
             }
             // router.scale (buffer — no .weight suffix)
             let router_scale_key = format!("{}.router.scale", prefix);
@@ -394,9 +402,12 @@ pub fn sanitize_weights(
     for key in keys {
         let value = params.remove(&key).unwrap();
 
-        // Strip prefixes — actual HF weights use `model.language_model.` prefix
+        // Strip prefixes — supports both HF format and mlx-lm converted format:
+        // HF: model.language_model.model.layers.* or model.layers.*
+        // mlx-lm converted: language_model.model.layers.*
         let clean_key = key
-            .strip_prefix("model.language_model.")
+            .strip_prefix("model.language_model.model.")
+            .or_else(|| key.strip_prefix("model.language_model."))
             .or_else(|| key.strip_prefix("language_model.model."))
             .or_else(|| key.strip_prefix("language_model."))
             .or_else(|| key.strip_prefix("model."))
@@ -415,6 +426,17 @@ pub fn sanitize_weights(
             continue;
         }
 
+        // Skip non-weight tensors that Python's sanitize() filters out:
+        // rotary embeddings (computed at runtime) and quantization range parameters
+        if clean_key.contains("self_attn.rotary_emb")
+            || clean_key.contains("input_max")
+            || clean_key.contains("input_min")
+            || clean_key.contains("output_max")
+            || clean_key.contains("output_min")
+        {
+            continue;
+        }
+
         // Skip PLE weights when PLE is not enabled for this model.
         if !config.per_layer_input_embeds
             && (clean_key.starts_with("embed_tokens_per_layer.")
@@ -427,10 +449,9 @@ pub fn sanitize_weights(
             continue;
         }
 
-        // NOTE: Gemma 4 stores norm weights as EFFECTIVE values (already includes any offset).
-        // The HF Gemma4RMSNorm multiplies by `self.weight` directly, NOT `(1 + self.weight)`.
-        // This differs from Gemma 3's mlx-lm implementation which added 1.0.
-        // Do NOT add 1.0 to norm weights.
+        // mlx-lm nn.RMSNorm passes weight directly to mx.fast.rms_norm (no +1 offset).
+        // The checkpoint stores full effective values (initialized to ones in mlx-lm).
+        // Our Rust RMSNorm::forward also passes weight directly — no adjustment needed.
 
         sanitized.insert(clean_key, value);
     }
@@ -438,6 +459,21 @@ pub fn sanitize_weights(
     // Handle tie_word_embeddings
     if config.tie_word_embeddings {
         sanitized.remove("lm_head.weight");
+    }
+
+    // Cast all f32 floating-point tensors to bf16 to eliminate AsType graph nodes.
+    // HF checkpoints store some buffers (layer_scalar, router.scale, per_expert_scale)
+    // as f32 while the model operates in bf16. Without this cast, every arithmetic
+    // operation between f32 buffers and bf16 activations creates an AsType node,
+    // adding ~700 extra ops to the decode graph and preventing Metal kernel fusion.
+    // Python's load_weights handles this implicitly via tree_map dtype conversion.
+    use crate::array::DType;
+    for value in sanitized.values_mut() {
+        if value.dtype().is_ok_and(|dt| dt == DType::Float32)
+            && let Ok(casted) = value.astype(DType::BFloat16)
+        {
+            *value = casted;
+        }
     }
 
     Ok(sanitized)
@@ -482,6 +518,11 @@ fn apply_weights(
         let mut embed = model.embed_tokens.blocking_write();
         if let Some(w) = params.get("embed_tokens.weight") {
             embed.load_weight(w)?;
+            // Pre-transpose for tied lm_head: [vocab, hidden] -> [hidden, vocab]
+            if config.tie_word_embeddings {
+                let w_t = w.transpose(Some(&[1, 0]))?;
+                *model.embed_weight_t.blocking_write() = Some(w_t);
+            }
         }
     }
 
@@ -651,11 +692,26 @@ fn apply_weights(
                 layer.set_moe_per_expert_scale(w)?;
             }
 
-            // Expert weights: fused gate_up_proj [E, 2*moe_inter, hidden] and down_proj [E, hidden, moe_inter]
+            // Expert weights: support both fused (HF) and split (mlx-lm) formats.
+            // HF format: experts.gate_up_proj [E, 2*moe_inter, hidden]
+            // mlx-lm format: experts.switch_glu.gate_proj.weight + experts.switch_glu.up_proj.weight
             if let Some(w) = params.get(&format!("{}.experts.gate_up_proj", prefix)) {
                 layer.set_moe_gate_up_proj(w)?;
+            } else if let (Some(gate), Some(up)) = (
+                params.get(&format!("{}.experts.switch_glu.gate_proj.weight", prefix)),
+                params.get(&format!("{}.experts.switch_glu.up_proj.weight", prefix)),
+            ) {
+                // Fuse split gate+up back into [E, 2*moe_inter, hidden]
+                let fused = MxArray::concatenate(gate, up, 1)?;
+                layer.set_moe_gate_up_proj(&fused)?;
             }
+            // HF format: experts.down_proj [E, hidden, moe_inter]
+            // mlx-lm format: experts.switch_glu.down_proj.weight
             if let Some(w) = params.get(&format!("{}.experts.down_proj", prefix)) {
+                layer.set_moe_down_proj(w)?;
+            } else if let Some(w) =
+                params.get(&format!("{}.experts.switch_glu.down_proj.weight", prefix))
+            {
                 layer.set_moe_down_proj(w)?;
             }
 
@@ -676,6 +732,43 @@ fn apply_weights(
 
     info!("All weights applied successfully");
     Ok(())
+}
+
+/// Register all sanitized weights with the C++ compiled forward pass.
+/// Uses the shared g_weights map (same API as Qwen3.5).
+/// Sets model_id AFTER all weights stored.
+fn register_gemma4_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
+    use mlx_sys as sys;
+    use std::ffi::CString;
+
+    let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+        .write()
+        .unwrap();
+
+    unsafe { sys::mlx_clear_weights() };
+
+    let store = |name: &str, array: &MxArray| {
+        let c_name = CString::new(name).expect("Weight name contains null byte");
+        unsafe {
+            sys::mlx_store_weight(c_name.as_ptr(), array.as_raw_ptr());
+        }
+    };
+
+    for (name, array) in params {
+        store(name, array);
+    }
+
+    // Store pre-transposed embedding weight for tied lm_head in C++ path
+    if let Some(w) = params.get("embed_tokens.weight")
+        && let Ok(w_t) = w.transpose(Some(&[1, 0]))
+    {
+        store("embed_tokens.weight_t", &w_t);
+    }
+
+    let count = unsafe { sys::mlx_weight_count() };
+    info!("Registered {} weights with C++ Gemma4 forward pass", count);
+
+    unsafe { sys::mlx_set_model_id(model_id) };
 }
 
 impl Gemma4Model {
@@ -784,6 +877,24 @@ impl Gemma4Model {
 
             // Apply weights (uses blocking_write on Arc<RwLock<>>)
             apply_weights(&mut model, &params, &config)?;
+
+            // Evaluate all weights to materialize them on GPU.
+            // Without this, weights remain as lazy mmap references and every
+            // decode step would re-read ~48GB from disk. This matches Python
+            // mlx-vlm's `mx.eval(model.parameters())` after load.
+            {
+                let weight_refs: Vec<&MxArray> = params.values().collect();
+                MxArray::eval_arrays(&weight_refs);
+                let mem_bytes = crate::array::get_active_memory();
+                eprintln!(
+                    "[gemma4] Evaluated {} weight tensors onto GPU ({:.2} GB active)",
+                    weight_refs.len(),
+                    mem_bytes / 1e9
+                );
+            }
+
+            // Register weights with C++ compiled forward pass
+            register_gemma4_weights_with_cpp(&params, model.model_id);
 
             // Load tokenizer
             let tokenizer_path = path.join("tokenizer.json");

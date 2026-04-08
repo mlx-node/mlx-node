@@ -276,6 +276,9 @@ export async function run(argv: string[]) {
       } else if (config.model_type === 'qwen3_5_moe' || config.model_type === 'qwen3_5') {
         modelType = config.model_type;
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'gemma4') {
+        modelType = 'gemma4';
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       }
     } catch {
       // config.json not found or invalid

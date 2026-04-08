@@ -27,6 +27,14 @@ impl RotatingKVCache {
         }
     }
 
+    pub fn keys_ref(&self) -> Option<&MxArray> {
+        self.keys.as_ref()
+    }
+
+    pub fn values_ref(&self) -> Option<&MxArray> {
+        self.values.as_ref()
+    }
+
     /// Helper: Trim cache by removing middle section
     fn trim(&self, trim_size: i32, v: &MxArray, append: Option<&MxArray>) -> Result<MxArray> {
         let mut to_cat: Vec<MxArray> = Vec::new();
@@ -43,13 +51,11 @@ impl RotatingKVCache {
             let keep_end = v.slice(&starts, &stops)?;
             to_cat.push(keep_end);
         } else {
-            let zero_scalar = MxArray::full(&[1], Either::A(0.0), None)?;
-            to_cat.push(v.add(&zero_scalar)?);
+            to_cat.push(v.clone());
         }
 
         if let Some(append_arr) = append {
-            let zero_scalar = MxArray::full(&[1], Either::A(0.0), None)?;
-            to_cat.push(append_arr.add(&zero_scalar)?);
+            to_cat.push(append_arr.clone());
         }
 
         let refs: Vec<&MxArray> = to_cat.iter().collect();
@@ -62,8 +68,7 @@ impl RotatingKVCache {
         let cache_len = v_shape[2] as i32;
 
         if self.idx == cache_len {
-            let zero_scalar = MxArray::full(&[1], Either::A(0.0), None)?;
-            Ok(v.add(&zero_scalar)?)
+            Ok(v.clone())
         } else if self.idx < self.offset {
             let starts = vec![0, 0, 0, 0];
             let stops = vec![v_shape[0], v_shape[1], self.keep as i64, v_shape[3]];
@@ -93,11 +98,7 @@ impl RotatingKVCache {
         let seq_len = keys.shape_at(2)? as i32;
 
         if self.keys.is_none() {
-            let zero_scalar = MxArray::full(&[1], Either::A(0.0), None)?;
-
             // If initial sequence exceeds max_size, trim to keep only the tail
-            // (plus the first `keep` tokens if set). This prevents O(prompt_len)
-            // memory for sliding-window layers on long prefills.
             let (stored_keys, stored_values, stored_idx) = if seq_len > self.max_size {
                 if self.keep > 0 {
                     // Preserve first `keep` tokens + last `max_size - keep` tokens.
@@ -117,17 +118,21 @@ impl RotatingKVCache {
                     (trimmed_keys, trimmed_values, self.max_size)
                 }
             } else {
-                (keys.add(&zero_scalar)?, values.add(&zero_scalar)?, seq_len)
+                (keys.clone(), values.clone(), seq_len)
             };
 
-            self.keys = Some(stored_keys.add(&zero_scalar)?);
-            self.values = Some(stored_values.add(&zero_scalar)?);
+            self.keys = Some(stored_keys.clone());
+            self.values = Some(stored_values.clone());
             self.offset = seq_len; // offset tracks TOTAL tokens seen, not stored
             self.idx = stored_idx;
 
             // Return the FULL (untrimmed) keys/values for prefill attention.
             // The caller needs to attend over the complete sequence during prefill.
-            return Ok(vec![keys.add(&zero_scalar)?, values.add(&zero_scalar)?]);
+            // Match Python: return self.keys, self.values (same objects)
+            return Ok(vec![
+                self.keys.as_ref().unwrap().clone(),
+                self.values.as_ref().unwrap().clone(),
+            ]);
         }
 
         let ordered_keys = self.temporal_order(self.keys.as_ref().unwrap())?;
@@ -146,9 +151,8 @@ impl RotatingKVCache {
         let new_keys = self.trim(trim_size, &ordered_keys, Some(keys))?;
         let new_values = self.trim(trim_size, &ordered_values, Some(values))?;
 
-        let zero_scalar = MxArray::full(&[1], Either::A(0.0), None)?;
-        self.keys = Some(new_keys.add(&zero_scalar)?);
-        self.values = Some(new_values.add(&zero_scalar)?);
+        self.keys = Some(new_keys.clone());
+        self.values = Some(new_values.clone());
         self.offset += seq_len;
         self.idx = new_keys.shape_at(2)? as i32;
 
@@ -187,8 +191,8 @@ impl RotatingKVCache {
                 v_head_dim as i64,
             ];
 
-            let new_k = MxArray::zeros(&k_shape, None)?;
-            let new_v = MxArray::zeros(&v_shape, None)?;
+            let new_k = MxArray::zeros(&k_shape, Some(keys.dtype()?))?;
+            let new_v = MxArray::zeros(&v_shape, Some(values.dtype()?))?;
 
             if let Some(existing_keys) = &self.keys {
                 self.keys = Some(MxArray::concatenate(existing_keys, &new_k, 2)?);
@@ -264,11 +268,7 @@ impl RotatingKVCache {
             return Ok(vec![keys_result, values_result]);
         }
 
-        let zero_scalar = MxArray::full(&[1], Either::A(0.0), None)?;
-        Ok(vec![
-            self_keys.add(&zero_scalar)?,
-            self_values.add(&zero_scalar)?,
-        ])
+        Ok(vec![self_keys.clone(), self_values.clone()])
     }
 
     /// Updates the cache with new keys and values.

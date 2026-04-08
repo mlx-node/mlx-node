@@ -286,15 +286,15 @@ static auto& compiled_min_p_fn() {
   return fn;
 }
 
-// Compiled categorical sampling with temperature
-static auto& compiled_categorical_fn() {
-  static auto fn = mlx::core::compile([](const std::vector<array>& inputs) {
-    auto logprobs = inputs[0];
-    auto inv_temp = inputs[1];
-    auto scaled = mlx::core::multiply(logprobs, inv_temp);
-    return std::vector<array>{mlx::core::random::categorical(scaled, -1)};
-  });
-  return fn;
+// Categorical sampling with temperature — NOT compiled.
+//
+// The C++ compile() API does not support random state management
+// (inputs/outputs=mx.random.state is a Python-only feature).
+// Compiling random::categorical would capture the random key at trace time
+// and reuse it on every call, corrupting MLX's global random state.
+static array categorical_with_temp(const array& logprobs, const array& inv_temp) {
+  auto scaled = mlx::core::multiply(logprobs, inv_temp);
+  return mlx::core::random::categorical(scaled, -1);
 }
 
 // ============================================================================
@@ -317,11 +317,11 @@ mlx_array* mlx_compiled_sample_full(
 
   bool needs_filters = (top_k > 0) || (top_p > 0.0f && top_p < 1.0f) || (min_p > 0.0f);
 
-  // Fast path: no filters — compiled categorical only
+  // Fast path: no filters — categorical only
   if (!needs_filters) {
     auto inv_temp = mlx::core::array(1.0f / temperature);
-    auto results = compiled_categorical_fn()({logits, inv_temp});
-    return reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
+    auto result = categorical_with_temp(logits, inv_temp);
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
   }
 
   // Convert logits to logprobs: logprobs = logits - logsumexp(logits)
@@ -341,10 +341,10 @@ mlx_array* mlx_compiled_sample_full(
     logprobs = compiled_min_p_fn()({logprobs, mlx::core::array(min_p)})[0];
   }
 
-  // Apply temperature and sample — compiled categorical
+  // Apply temperature and sample — uncompiled categorical
   auto inv_temp = mlx::core::array(1.0f / temperature);
-  auto results = compiled_categorical_fn()({logprobs, inv_temp});
-  return reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
+  auto result = categorical_with_temp(logprobs, inv_temp);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
 // ============================================================================

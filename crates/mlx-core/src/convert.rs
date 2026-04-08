@@ -415,9 +415,15 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
             );
             load_qianfan_ocr_weights(converted_tensors)?
         }
+        Some("gemma4") => {
+            info!(
+                "Applying Gemma4 weight sanitization (prefix stripping, vision/audio removal)..."
+            );
+            sanitize_gemma4_convert(converted_tensors, tie_word_embeddings, verbose)?
+        }
         Some(other) => {
             return Err(Error::from_reason(format!(
-                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5, qianfan-ocr",
+                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5, qianfan-ocr, gemma4",
                 other
             )));
         }
@@ -520,6 +526,20 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
                 per_layer_overrides.len()
             );
         }
+    } else if matches!(model_type.as_deref(), Some("gemma4")) {
+        // Gemma4: clean up config.json to match mlx-lm save_config behavior.
+        // Remove keys that are not needed for text-only inference.
+        let mut output_config = config.clone();
+        if let Some(obj) = output_config.as_object_mut() {
+            obj.remove("_name_or_path");
+            obj.remove("vision_config");
+            obj.remove("audio_config");
+        }
+        let config_str = serde_json::to_string_pretty(&output_config)
+            .map_err(|e| Error::from_reason(format!("Failed to serialize config: {}", e)))?;
+        fs::write(&output_config_path, config_str)
+            .map_err(|e| Error::from_reason(format!("Failed to write config.json: {}", e)))?;
+        info!("Wrote cleaned config.json (removed vision_config, audio_config, _name_or_path)");
     } else {
         info!("Copying config.json to: {}", output_config_path.display());
         fs::copy(&config_path, &output_config_path)
@@ -535,6 +555,8 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         "merges.txt",
         "special_tokens_map.json",
         "added_tokens.json",
+        // Chat template (Gemma4 and other models use external .jinja files)
+        "chat_template.jinja",
         // Generation config
         "generation_config.json",
         // VLM-specific files
@@ -637,6 +659,119 @@ pub(crate) enum QuantDecision {
 }
 
 /// Extract the layer index from a weight key like "model.layers.5.self_attn.q_proj.weight" → Some(5).
+/// Sanitize Gemma4 weights at conversion time.
+///
+/// Produces output compatible with BOTH mlx-lm and our Rust inference.
+/// Matches mlx-lm's gemma4.Model.sanitize() + gemma4_text.Model.sanitize():
+///
+/// 1. Strip HF prefix, remap to mlx-lm attribute tree: `language_model.model.*`
+/// 2. Remove vision/audio/multimodal weights (text-only)
+/// 3. Remove rotary_emb, calibration tensors
+/// 4. Split fused experts.gate_up_proj into switch_glu.gate_proj + switch_glu.up_proj
+/// 5. Rename experts.down_proj to switch_glu.down_proj.weight
+/// 6. Drop lm_head.weight when tie_word_embeddings=true
+fn sanitize_gemma4_convert(
+    weights: HashMap<String, MxArray>,
+    tie_word_embeddings: bool,
+    verbose: bool,
+) -> Result<HashMap<String, MxArray>> {
+    let mut sanitized: HashMap<String, MxArray> = HashMap::new();
+    let mut skipped = 0usize;
+
+    for (key, array) in weights {
+        // Step 1: Strip HF prefix to get the bare key.
+        // HF stores as: model.language_model.model.layers.N.* or model.layers.N.*
+        let stripped = key
+            .strip_prefix("model.language_model.model.")
+            .or_else(|| key.strip_prefix("model.language_model."))
+            .or_else(|| key.strip_prefix("language_model.model."))
+            .or_else(|| key.strip_prefix("language_model."))
+            .or_else(|| key.strip_prefix("model."))
+            .unwrap_or(&key);
+
+        // Skip vision/audio/multimodal encoder weights (text-only conversion)
+        if stripped.starts_with("vision_tower.")
+            || stripped.starts_with("vision_encoder.")
+            || stripped.starts_with("audio_tower.")
+            || stripped.starts_with("audio_encoder.")
+            || stripped.starts_with("embed_audio.")
+            || stripped.starts_with("embed_vision.")
+            || stripped.starts_with("multi_modal_projector.")
+        {
+            skipped += 1;
+            continue;
+        }
+
+        // Skip rotary_emb keys (precomputed inverse frequencies, unused)
+        if stripped.contains("rotary_emb") {
+            skipped += 1;
+            continue;
+        }
+
+        // Skip calibration tensors (clipping params for clippable linears)
+        if stripped.ends_with(".input_max")
+            || stripped.ends_with(".input_min")
+            || stripped.ends_with(".output_max")
+            || stripped.ends_with(".output_min")
+        {
+            skipped += 1;
+            continue;
+        }
+
+        // Skip lm_head.weight when tied embeddings
+        if tie_word_embeddings && stripped == "lm_head.weight" {
+            skipped += 1;
+            continue;
+        }
+
+        // Step 2: Apply mlx-lm gemma4_text sanitize transforms.
+        // Split fused experts.gate_up_proj and rename experts.down_proj.
+        if stripped.ends_with(".experts.gate_up_proj") {
+            // Split [num_experts, 2*moe_inter, hidden] along axis -2 into two halves
+            let base = stripped.strip_suffix(".gate_up_proj").unwrap();
+            let shape = array.shape()?;
+            let mid = shape[1] / 2; // split the output dimension in half
+
+            let gate = array.slice_axis(1, 0, mid)?;
+            let up = array.slice_axis(1, mid, shape[1])?;
+
+            // Ensure contiguous layout for safetensors (matches Python's mx.contiguous)
+            gate.eval();
+            up.eval();
+
+            let gate_key = format!("language_model.model.{base}.switch_glu.gate_proj.weight");
+            let up_key = format!("language_model.model.{base}.switch_glu.up_proj.weight");
+            sanitized.insert(gate_key, gate);
+            sanitized.insert(up_key, up);
+            continue;
+        }
+
+        if stripped.ends_with(".experts.down_proj") {
+            let base = stripped.strip_suffix(".down_proj").unwrap();
+            let out_key = format!("language_model.model.{base}.switch_glu.down_proj.weight");
+            sanitized.insert(out_key, array);
+            continue;
+        }
+
+        // Step 3: Add the mlx-lm attribute tree prefix.
+        // mlx-lm's gemma4.Model has: self.language_model = gemma4_text.Model
+        // gemma4_text.Model has: self.model = Gemma4TextModel
+        // So all weights get prefix: language_model.model.
+        let out_key = format!("language_model.model.{stripped}");
+        sanitized.insert(out_key, array);
+    }
+
+    if verbose || skipped > 0 {
+        info!(
+            "  Gemma4 sanitize: kept {} tensors, skipped {}",
+            sanitized.len(),
+            skipped
+        );
+    }
+
+    Ok(sanitized)
+}
+
 fn extract_layer_index(key: &str) -> Option<usize> {
     // Look for ".layers.N." or "layers.N."
     let idx = key.find("layers.")?;

@@ -563,6 +563,19 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_isinf(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_isfinite(handle: *mut mlx_array) -> *mut mlx_array;
 
+    // Create scalar with specific dtype (no AsType node)
+    pub fn mlx_array_scalar_float_dtype(value: f64, dtype: i32) -> *mut mlx_array;
+
+    // Debug: export computation graph to DOT file
+    pub fn mlx_export_to_dot(path: *const std::os::raw::c_char, handle: *mut mlx_array);
+
+    // Compiled GELU approximate (fused kernel, matches Python nn.gelu_approx)
+    pub fn mlx_gelu_approx(handle: *mut mlx_array) -> *mut mlx_array;
+    // Compiled GeGLU: gelu_approx(gate) * up (fused kernel)
+    pub fn mlx_geglu(gate: *mut mlx_array, up: *mut mlx_array) -> *mut mlx_array;
+    // Compiled logit softcap: tanh(x / softcap) * softcap (fused kernel)
+    pub fn mlx_logit_softcap(x: *mut mlx_array, softcap: *mut mlx_array) -> *mut mlx_array;
+
     // Fast operations (mlx::fast namespace)
     pub fn mlx_fast_rope(
         handle: *mut mlx_array,
@@ -571,6 +584,18 @@ unsafe extern "C-unwind" {
         base: f32,
         scale: f32,
         offset: i32,
+    ) -> *mut mlx_array;
+    /// fast::rope with array offset and optional precomputed freqs.
+    /// When freqs is non-null, base is ignored (pass 0.0).
+    /// freqs must be 1-D with shape [dims/2].
+    pub fn mlx_fast_rope_with_freqs(
+        handle: *mut mlx_array,
+        dims: i32,
+        traditional: bool,
+        base: f32,
+        scale: f32,
+        offset: *mut mlx_array,
+        freqs: *mut mlx_array,
     ) -> *mut mlx_array;
     pub fn mlx_fast_scaled_dot_product_attention(
         queries: *mut mlx_array,
@@ -1004,17 +1029,17 @@ unsafe extern "C-unwind" {
     // ============================================
 
     /// Store a model weight by name (called once per weight during model load)
-    pub fn mlx_qwen35_store_weight(name: *const std::os::raw::c_char, weight: *mut mlx_array);
+    pub fn mlx_store_weight(name: *const std::os::raw::c_char, weight: *mut mlx_array);
 
     /// Clear all stored weights (called on model destruction)
-    pub fn mlx_qwen35_clear_weights();
+    pub fn mlx_clear_weights();
 
     /// Get the number of stored weights (for debugging)
-    pub fn mlx_qwen35_weight_count() -> usize;
+    pub fn mlx_weight_count() -> usize;
 
     /// Set the active model ID (called after all weights are stored).
     /// Inference checks this against its own model_id to avoid cross-model contamination.
-    pub fn mlx_qwen35_set_model_id(id: u64);
+    pub fn mlx_set_model_id(id: u64);
 
     /// Get the active model ID. Returns 0 if no model has registered weights.
     pub fn mlx_qwen35_get_model_id() -> u64;
@@ -1167,6 +1192,89 @@ unsafe extern "C-unwind" {
 
     /// Adjust MoE cache offset by delta (for VLM M-RoPE position correction).
     pub fn mlx_qwen35_moe_adjust_offset(delta: i32);
+
+    // ============================================
+    // Gemma4 Forward Pass (compiled)
+    // ============================================
+
+    /// Initialize Gemma4 forward pass from post-prefill caches.
+    pub fn mlx_gemma4_init_from_prefill(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        global_num_kv_heads: i32,
+        global_head_dim: i32,
+        rope_theta: f32,
+        rope_local_base_freq: f32,
+        partial_rotary_factor: f32,
+        rms_norm_eps: f32,
+        sliding_window: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        num_experts: i32,
+        top_k_experts: i32,
+        moe_intermediate_size: i32,
+        intermediate_size: i32,
+        final_logit_softcapping: f32,
+        layer_types: *const i32,
+        layer_types_len: i32,
+        cache_arrays: *mut *mut mlx_array,
+        prefill_offset: i32,
+    );
+
+    /// Gemma4 single-token decode step.
+    pub fn mlx_gemma4_forward(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        output_logits: *mut *mut mlx_array,
+        cache_offset_out: *mut i32,
+    );
+
+    /// Gemma4 single-token greedy decode step.
+    pub fn mlx_gemma4_forward_greedy(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        output_token: *mut *mut mlx_array,
+        cache_offset_out: *mut i32,
+    );
+
+    /// Eval next_token and all Gemma4 cache arrays to prevent graph accumulation.
+    pub fn mlx_gemma4_eval_token_and_caches(next_token: *mut mlx_array);
+
+    /// Synchronously eval all Gemma4 cache arrays (for periodic memory management).
+    pub fn mlx_gemma4_sync_eval_caches();
+
+    /// Reset Gemma4 state.
+    pub fn mlx_gemma4_reset();
+
+    /// Export Gemma4 caches for PromptCache reuse.
+    /// Copies cache arrays to caller-provided output pointers.
+    /// Returns number of arrays exported, or 0 if not initialized.
+    pub fn mlx_gemma4_export_caches(out_ptrs: *mut *mut mlx_array, max_count: i32) -> i32;
+
+    /// Get current Gemma4 cache offset (tokens processed).
+    pub fn mlx_gemma4_get_cache_offset() -> i32;
+
+    /// Benchmark: run N decode steps entirely in C++ with per-step eval.
+    pub fn mlx_gemma4_benchmark(num_steps: i32) -> f64;
+
+    /// Full decode loop in C++ — no per-step Rust round-trip.
+    /// Returns number of tokens generated. Token IDs written to out_tokens.
+    pub fn mlx_gemma4_generate(
+        first_token: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        max_tokens: i32,
+        temperature: f32,
+        eos_ids: *const i32,
+        num_eos_ids: i32,
+        out_tokens: *mut i32,
+    ) -> i32;
+
+    /// Adjust Gemma4 cache offset by delta (for VLM position correction).
+    pub fn mlx_gemma4_adjust_offset(delta: i32);
 
     /// Load safetensors file using MLX's lazy loading (data read on eval, not upfront).
     /// Calls `callback` for each tensor with (name, name_len, array_handle, ctx).

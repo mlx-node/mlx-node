@@ -240,27 +240,26 @@ impl Gemma4Config {
 mod tests {
     #[test]
     fn test_default_layer_types_synthesis() {
-        // 35 layers: every 6th is full_attention, last forced to full
-        let mut types: Vec<String> = (0..35)
-            .map(|i| {
-                if (i + 1) % 6 == 0 {
-                    "full_attention".to_string()
-                } else {
-                    "sliding_attention".to_string()
-                }
-            })
-            .collect();
-        *types.last_mut().unwrap() = "full_attention".to_string();
+        // mlx-lm default: sliding_window_pattern=5 → 4 sliding + 1 full per cycle
+        // 35 layers = 7 complete cycles: indices 4,9,14,19,24,29,34 are full
+        let swp = 5usize;
+        let n = 35usize;
+        let mut pattern = Vec::with_capacity(swp);
+        for _ in 0..swp - 1 {
+            pattern.push("sliding_attention".to_string());
+        }
+        pattern.push("full_attention".to_string());
+        let types: Vec<String> = (0..n).map(|i| pattern[i % pattern.len()].clone()).collect();
 
-        // Indices 5,11,17,23,29 are full (every 6th)
-        // Index 34 (last) is also full (forced)
-        assert_eq!(types[5], "full_attention");
-        assert_eq!(types[11], "full_attention");
+        assert_eq!(types[4], "full_attention");
+        assert_eq!(types[9], "full_attention");
+        assert_eq!(types[14], "full_attention");
         assert_eq!(types[34], "full_attention");
         assert_eq!(types[0], "sliding_attention");
-        assert_eq!(types[33], "sliding_attention");
+        assert_eq!(types[3], "sliding_attention");
+        assert_eq!(types[5], "sliding_attention");
 
         let full_count = types.iter().filter(|t| *t == "full_attention").count();
-        assert_eq!(full_count, 6); // 5 periodic + 1 forced last
+        assert_eq!(full_count, 7); // 35 / 5 = 7 full layers
     }
 }

@@ -106,6 +106,13 @@ mlx_array* mlx_array_scalar_float(double value) {
   return reinterpret_cast<mlx_array*>(arr);
 }
 
+// Create a scalar with a specific dtype (no AsType node) — matches Python's array(val, dtype)
+mlx_array* mlx_array_scalar_float_dtype(double value, int32_t dtype) {
+  auto dt = to_mlx_dtype(dtype);
+  auto arr = new array(static_cast<float>(value), dt);
+  return reinterpret_cast<mlx_array*>(arr);
+}
+
 mlx_array* mlx_array_scalar_int(int32_t value) {
   auto arr = new array(value);
   return reinterpret_cast<mlx_array*>(arr);
@@ -301,32 +308,33 @@ mlx_array* mlx_array_div(mlx_array* lhs, mlx_array* rhs) {
 
 mlx_array* mlx_array_add_scalar(mlx_array* handle, double value) {
   auto arr = reinterpret_cast<array*>(handle);
-  // Cast scalar to input dtype to avoid f32 promotion with bf16/f16 inputs
-  array scalar = astype(array(static_cast<float>(value)), arr->dtype());
+  // Create scalar directly in target dtype (no AsType node) — matches Python's to_array()
+  auto dt = mlx::core::issubdtype(arr->dtype(), mlx::core::floating) ? arr->dtype() : mlx::core::float32;
+  array scalar(static_cast<float>(value), dt);
   array result = *arr + scalar;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
 mlx_array* mlx_array_mul_scalar(mlx_array* handle, double value) {
   auto arr = reinterpret_cast<array*>(handle);
-  // Cast scalar to input dtype to avoid f32 promotion with bf16/f16 inputs
-  array scalar = astype(array(static_cast<float>(value)), arr->dtype());
+  auto dt = mlx::core::issubdtype(arr->dtype(), mlx::core::floating) ? arr->dtype() : mlx::core::float32;
+  array scalar(static_cast<float>(value), dt);
   array result = *arr * scalar;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
 mlx_array* mlx_array_sub_scalar(mlx_array* handle, double value) {
   auto arr = reinterpret_cast<array*>(handle);
-  // Cast scalar to input dtype to avoid f32 promotion with bf16/f16 inputs
-  array scalar = astype(array(static_cast<float>(value)), arr->dtype());
+  auto dt = mlx::core::issubdtype(arr->dtype(), mlx::core::floating) ? arr->dtype() : mlx::core::float32;
+  array scalar(static_cast<float>(value), dt);
   array result = *arr - scalar;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
 mlx_array* mlx_array_div_scalar(mlx_array* handle, double value) {
   auto arr = reinterpret_cast<array*>(handle);
-  // Cast scalar to input dtype to avoid f32 promotion with bf16/f16 inputs
-  array scalar = astype(array(static_cast<float>(value)), arr->dtype());
+  auto dt = mlx::core::issubdtype(arr->dtype(), mlx::core::floating) ? arr->dtype() : mlx::core::float32;
+  array scalar(static_cast<float>(value), dt);
   array result = *arr / scalar;
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }

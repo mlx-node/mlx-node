@@ -16,6 +16,9 @@ struct QuantizedBackend {
 
 pub struct Linear {
     weight: MxArray,
+    /// Pre-transposed weight [in_features, out_features] for efficient matmul.
+    /// Avoids creating a transpose graph node on every forward() call.
+    weight_t: MxArray,
     bias: Option<MxArray>,
     in_features: u32,
     out_features: u32,
@@ -32,6 +35,7 @@ impl Linear {
         // Create weight matrix [out_features, in_features]
         let weight_shape = [out_features as i64, in_features as i64];
         let weight = MxArray::random_uniform(&weight_shape, -scale, scale, None)?;
+        let weight_t = weight.transpose(Some(&[1, 0]))?;
 
         // Create bias if needed
         let bias = if use_bias.unwrap_or(true) {
@@ -43,6 +47,7 @@ impl Linear {
 
         Ok(Self {
             weight,
+            weight_t,
             bias,
             in_features,
             out_features,
@@ -78,15 +83,10 @@ impl Linear {
                 result = result.add(b)?;
             }
             Ok(result)
+        } else if let Some(ref b) = self.bias {
+            input.addmm(b, &self.weight_t, None, None)
         } else {
-            let axes = [1, 0];
-            let weight_t = self.weight.transpose(Some(&axes))?;
-
-            if let Some(ref b) = self.bias {
-                input.addmm(b, &weight_t, None, None)
-            } else {
-                input.matmul(&weight_t)
-            }
+            input.matmul(&self.weight_t)
         }
     }
 
@@ -104,6 +104,7 @@ impl Linear {
                 weight.shape()?.as_ref()
             )));
         }
+        self.weight_t = weight.transpose(Some(&[1, 0]))?;
         self.weight = weight.clone();
         self.quantized = None;
         Ok(())
@@ -191,6 +192,7 @@ impl Clone for Linear {
     fn clone(&self) -> Self {
         Self {
             weight: self.weight.clone(),
+            weight_t: self.weight_t.clone(),
             bias: self.bias.clone(),
             in_features: self.in_features,
             out_features: self.out_features,
@@ -220,6 +222,7 @@ impl Linear {
         let in_features = shape[1] as u32;
 
         Ok(Self {
+            weight_t: weight.transpose(Some(&[1, 0]))?,
             weight: weight.clone(),
             bias: bias.cloned(),
             in_features,

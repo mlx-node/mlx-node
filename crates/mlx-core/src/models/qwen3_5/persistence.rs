@@ -808,7 +808,7 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
             // Clear stale weights so a previously-loaded non-quantized model's weights
             // don't trick this model into the compiled path via weight_count > 0.
             let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
-            unsafe { mlx_sys::mlx_qwen35_clear_weights() };
+            unsafe { mlx_sys::mlx_clear_weights() };
         }
 
         // Materialize all mmap-backed weight arrays so the first inference
@@ -871,12 +871,12 @@ fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
     // until registration is complete and model_id is set.
     let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
 
-    unsafe { sys::mlx_qwen35_clear_weights() };
+    unsafe { sys::mlx_clear_weights() };
 
     let store = |name: &str, array: &MxArray| {
         let c_name = CString::new(name).expect("Weight name contains null byte");
         unsafe {
-            sys::mlx_qwen35_store_weight(c_name.as_ptr(), array.as_raw_ptr());
+            sys::mlx_store_weight(c_name.as_ptr(), array.as_raw_ptr());
         }
     };
 
@@ -922,12 +922,12 @@ fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
         }
     }
 
-    let count = unsafe { sys::mlx_qwen35_weight_count() };
+    let count = unsafe { sys::mlx_weight_count() };
     info!("Registered {} weights with C++ fused forward pass", count);
 
     // Set model ID AFTER all weights are stored. This ordering ensures no
     // inference sees a partially-populated map with the new model's ID.
-    unsafe { sys::mlx_qwen35_set_model_id(model_id) };
+    unsafe { sys::mlx_set_model_id(model_id) };
 }
 
 /// Parse Qwen3.5 dense config from JSON.
