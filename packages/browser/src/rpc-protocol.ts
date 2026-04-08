@@ -86,6 +86,9 @@ export const enum RpcFn {
   // Fused compute dispatch with 2 bind groups
   // Args: passHandle, pipelineHandle, bg0Handle, bg1Handle, dispatchX, dispatchY
   FUSED_DISPATCH_2BG = 92,
+  // Fused encoder finish + queue submit + release encoder & cmdBuf in one RPC
+  // Args: encoderHandle, passHandle (0 = no pass to end)
+  FUSED_SUBMIT = 93,
 }
 
 // ---- Command Buffer Layout (SharedArrayBuffer) ----

@@ -95,6 +95,13 @@ export function createBridgeStub(
   let activeComputePass = -1;
   let activeComputePassEncoder = -1;
 
+  // Fused submit state: buffer finish → fuse with submit → skip releases
+  let pendingFinishEncoder = -1;
+  let pendingFinishPass = -1; // compute pass to end+release in FUSED_SUBMIT
+  let lastFakeCmdBuf = -1;
+  let lastFusedEncoder = -1;
+  let fakeHandleCounter = 0x7F000000; // high range to avoid collision with real handles
+
   // Buffer size cache: use plain object (faster than Map for integer keys)
   // Caches buffer sizes to avoid BUFFER_GET_SIZE RPCs (~2.5x per dispatch)
   const bufSizes: Record<number, number> = {};
@@ -346,6 +353,15 @@ export function createBridgeStub(
 
     // ===== Queue =====
     wgpuQueueSubmit(_queue: number, count: number, cmdBufArrayPtr: number): void {
+      if (pendingFinishEncoder >= 0) {
+        // FUSED: pass_end + pass_release + finish + submit + release in 1 RPC (saves 5 round-trips)
+        const passHandle = pendingFinishPass >= 0 ? pendingFinishPass : 0;
+        rpcCall(RpcFn.FUSED_SUBMIT, pendingFinishEncoder, passHandle);
+        lastFusedEncoder = pendingFinishEncoder;
+        pendingFinishEncoder = -1;
+        pendingFinishPass = -1;
+        return;
+      }
       rpcCall(RpcFn.QUEUE_SUBMIT, count, cmdBufArrayPtr);
     },
 
@@ -417,23 +433,34 @@ export function createBridgeStub(
     },
 
     wgpuCommandEncoderFinish(encoderHandle: number, _descPtr: number): number {
-      // End the cached compute pass before finishing the encoder
+      // Buffer everything for FUSED_SUBMIT — pass end, finish, submit all in one RPC
+      flushPendingCompute();
       if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
-        flushPendingCompute();
-        rpcCall(RpcFn.COMPUTE_PASS_END, activeComputePass);
-        rpcCall(RpcFn.COMPUTE_PASS_RELEASE, activeComputePass);
+        pendingFinishPass = activeComputePass;
         activeComputePass = -1;
         activeComputePassEncoder = -1;
+      } else {
+        pendingFinishPass = -1;
       }
-      return rpcCall(RpcFn.CMD_ENCODER_FINISH, encoderHandle);
+      pendingFinishEncoder = encoderHandle;
+      lastFakeCmdBuf = fakeHandleCounter++;
+      return lastFakeCmdBuf;
     },
 
     wgpuCommandEncoderRelease(handle: number): void {
+      if (handle === lastFusedEncoder) {
+        lastFusedEncoder = -1;
+        return; // Already released by FUSED_SUBMIT
+      }
       rpcCall(RpcFn.CMD_ENCODER_RELEASE, handle);
     },
 
     // ===== Command Buffer =====
     wgpuCommandBufferRelease(handle: number): void {
+      if (handle === lastFakeCmdBuf) {
+        lastFakeCmdBuf = -1;
+        return; // Already released by FUSED_SUBMIT
+      }
       rpcCall(RpcFn.CMD_BUFFER_RELEASE, handle);
     },
 

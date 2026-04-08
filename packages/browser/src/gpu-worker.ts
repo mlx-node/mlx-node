@@ -1064,6 +1064,23 @@ async function processCommand(fnId: number): Promise<void> {
       break;
     }
 
+    case RpcFn.FUSED_SUBMIT: {
+      // Fused: [pass_end + pass_release +] finish + submit + release
+      // Replaces up to 6 separate RPCs with 1. Args: encoderHandle, passHandle (0=no pass)
+      const encoderHandle = arg0();
+      const passHandle = arg1();
+      if (passHandle > 0) {
+        getHandle<GPUComputePassEncoder>(passHandle).end();
+        releaseHandle(passHandle);
+      }
+      const encoder = getHandle<GPUCommandEncoder>(encoderHandle);
+      const cmdBuf = encoder.finish();
+      queue.submit([cmdBuf]);
+      releaseHandle(encoderHandle);
+      setResult(0);
+      break;
+    }
+
     case RpcFn.ADD_GPU_BUFFER: {
       // This is handled via postMessage, not RPC, because the GPU buffer
       // object can't be serialized through SharedArrayBuffer.
