@@ -415,6 +415,7 @@ pub(crate) fn verify_cache_prefix_direct(
 }
 
 /// Save or clear cache state after generation.
+#[allow(dead_code)] // Kept for future Qwen3 migration or lock-based fallback
 pub(crate) fn save_cache_state(
     reuse_cache: bool,
     has_images: bool,
@@ -473,6 +474,7 @@ pub(crate) fn save_cache_state(
 
 /// Verify cache prefix match for reuse. Returns the number of cached tokens
 /// that match the current input (0 if no match).
+#[allow(dead_code)] // Kept for future Qwen3 migration or lock-based fallback
 pub(crate) fn verify_cache_prefix(
     reuse_cache: bool,
     has_images: bool,

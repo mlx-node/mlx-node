@@ -18,7 +18,7 @@ use crate::tokenizer::Qwen3Tokenizer;
 
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
-use super::model::Qwen3_5MoeModel;
+use super::model::{Qwen3_5MoeModel, Qwen35MoeInner, handle_qwen35_moe_cmd};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
     MLPVariant, QuantizedSwitchLinear, is_mxfp8_checkpoint, is_quantized_checkpoint,
@@ -802,6 +802,517 @@ fn apply_weights(
     Ok(())
 }
 
+/// Apply weights directly to a Qwen35MoeInner (no locks needed).
+///
+/// Same logic as `apply_weights` but accesses inner fields directly instead
+/// of through `Arc<RwLock<>>`. Used by `load_with_thread`.
+fn apply_weights_moe_inner(
+    inner: &mut Qwen35MoeInner,
+    params: &HashMap<String, MxArray>,
+    config: &Qwen3_5MoeConfig,
+    quant_bits: i32,
+    quant_group_size: i32,
+    per_layer_quant: &HashMap<String, (i32, i32)>,
+) -> Result<()> {
+    let is_quantized = is_quantized_checkpoint(params);
+    let is_mxfp8 = is_mxfp8_checkpoint(params);
+
+    // Helper: try MXFP8 builder first (if applicable), then affine builder.
+    let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
+        if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_linear(params, prefix) {
+            return Some(ql);
+        }
+        let (bits, gs) = per_layer_quant
+            .get(prefix)
+            .copied()
+            .or_else(|| {
+                if prefix.ends_with(".in_proj_qkvz") {
+                    let base = prefix.strip_suffix(".in_proj_qkvz").unwrap();
+                    let qkv = per_layer_quant.get(&format!("{}.in_proj_qkv", base));
+                    let z = per_layer_quant.get(&format!("{}.in_proj_z", base));
+                    match (qkv, z) {
+                        (Some(&a), Some(&b)) if a != b => {
+                            warn!(
+                                "Merged in_proj_qkvz has conflicting overrides: \
+                                 qkv={:?}, z={:?}. Using higher precision.",
+                                a, b
+                            );
+                            Some(if a.0 > b.0 { a } else { b })
+                        }
+                        (Some(&a), _) | (_, Some(&a)) => Some(a),
+                        _ => None,
+                    }
+                } else if prefix.ends_with(".in_proj_ba") {
+                    let base = prefix.strip_suffix(".in_proj_ba").unwrap();
+                    let b_val = per_layer_quant.get(&format!("{}.in_proj_b", base));
+                    let a_val = per_layer_quant.get(&format!("{}.in_proj_a", base));
+                    match (b_val, a_val) {
+                        (Some(&x), Some(&y)) if x != y => {
+                            warn!(
+                                "Merged in_proj_ba has conflicting overrides: \
+                                 b={:?}, a={:?}. Using higher precision.",
+                                x, y
+                            );
+                            Some(if x.0 > y.0 { x } else { y })
+                        }
+                        (Some(&x), _) | (_, Some(&x)) => Some(x),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((quant_bits, quant_group_size));
+        try_build_quantized_linear(params, prefix, gs, bits)
+    };
+
+    // Router gates: check per-layer overrides first, fallback to 8-bit affine
+    let try_build_ql_gate = |params: &HashMap<String, MxArray>, prefix: &str| {
+        let (bits, gs) = per_layer_quant
+            .get(prefix)
+            .copied()
+            .unwrap_or((GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE));
+        try_build_quantized_linear(params, prefix, gs, bits)
+    };
+
+    let try_build_qsl = |params: &HashMap<String, MxArray>, prefix: &str| {
+        if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_switch_linear(params, prefix) {
+            return Some(ql);
+        }
+        let (bits, gs) = per_layer_quant
+            .get(prefix)
+            .copied()
+            .unwrap_or((quant_bits, quant_group_size));
+        try_build_quantized_switch_linear(params, prefix, gs, bits)
+    };
+
+    // Embedding — supports both dense and quantized weights
+    if let Some(scales) = params.get("embedding.scales") {
+        let weight = params.get("embedding.weight").ok_or_else(|| {
+            Error::from_reason("Missing embedding.weight for quantized embedding")
+        })?;
+        let biases = params.get("embedding.biases");
+        let (bits, gs) = per_layer_quant
+            .get("embed_tokens")
+            .copied()
+            .unwrap_or((quant_bits, quant_group_size));
+        inner
+            .embedding
+            .load_quantized(weight, scales, biases, gs, bits)?;
+        info!("Loaded quantized embedding ({}-bit)", bits);
+    } else if let Some(w) = params.get("embedding.weight") {
+        inner.embedding.set_weight(w)?;
+    }
+
+    // final_norm — direct access, no lock
+    if let Some(w) = params.get("final_norm.weight") {
+        inner.final_norm.set_weight(w)?;
+    }
+
+    // lm_head — direct access, no lock
+    if is_quantized {
+        if let Some(ql) = try_build_ql(params, "lm_head") {
+            inner.lm_head = Some(super::quantized_linear::LinearProj::Quantized(ql));
+        } else if let Some(ref mut head) = inner.lm_head
+            && let Some(w) = params.get("lm_head.weight")
+        {
+            head.set_weight(w, "lm_head")?;
+        }
+    } else if let Some(ref mut head) = inner.lm_head
+        && let Some(w) = params.get("lm_head.weight")
+    {
+        head.set_weight(w, "lm_head")?;
+    }
+
+    // Layers — direct access, no lock
+    for (i, layer) in inner.layers.iter_mut().enumerate() {
+        let prefix = format!("layers.{}", i);
+
+        // Attention weights
+        match &mut layer.attn {
+            AttentionType::Linear(gdn) => {
+                if is_quantized {
+                    if let Some(ql) =
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))
+                    {
+                        gdn.set_quantized_in_proj_qkvz(ql);
+                    } else if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
+                    {
+                        gdn.set_in_proj_qkvz_weight(w)?;
+                    }
+
+                    if let Some(ql) =
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_ba", prefix))
+                    {
+                        gdn.set_quantized_in_proj_ba(ql);
+                    } else if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix))
+                    {
+                        gdn.set_in_proj_ba_weight(w)?;
+                    }
+
+                    if let Some(ql) =
+                        try_build_ql(params, &format!("{}.linear_attn.out_proj", prefix))
+                    {
+                        gdn.set_quantized_out_proj(ql);
+                    } else if let Some(w) =
+                        params.get(&format!("{}.linear_attn.out_proj.weight", prefix))
+                    {
+                        gdn.set_out_proj_weight(w)?;
+                    }
+                } else {
+                    if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
+                    {
+                        gdn.set_in_proj_qkvz_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))
+                    {
+                        if let Some(z) =
+                            params.get(&format!("{}.linear_attn.in_proj_z.weight", prefix))
+                        {
+                            let combined = MxArray::concatenate(w, z, 0)?;
+                            gdn.set_in_proj_qkvz_weight(&combined)?;
+                        } else {
+                            return Err(Error::from_reason(format!(
+                                "Layer {}: in_proj_qkv found but in_proj_z missing",
+                                i
+                            )));
+                        }
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix))
+                    {
+                        gdn.set_in_proj_ba_weight(w)?;
+                    }
+                    if let Some(b) = params.get(&format!("{}.linear_attn.in_proj_b.weight", prefix))
+                        && let Some(a) =
+                            params.get(&format!("{}.linear_attn.in_proj_a.weight", prefix))
+                    {
+                        let combined = MxArray::concatenate(b, a, 0)?;
+                        gdn.set_in_proj_ba_weight(&combined)?;
+                    }
+                    if let Some(w) = params.get(&format!("{}.linear_attn.out_proj.weight", prefix))
+                    {
+                        gdn.set_out_proj_weight(w)?;
+                    }
+                }
+                if let Some(w) = params.get(&format!("{}.linear_attn.conv1d.weight", prefix)) {
+                    gdn.set_conv1d_weight(w)?;
+                }
+                if let Some(w) = params.get(&format!("{}.linear_attn.dt_bias", prefix)) {
+                    gdn.set_dt_bias(w);
+                }
+                if let Some(w) = params.get(&format!("{}.linear_attn.norm.weight", prefix)) {
+                    gdn.set_norm_weight(w)?;
+                }
+                if let Some(w) = params.get(&format!("{}.linear_attn.A_log", prefix)) {
+                    gdn.set_a_log(w)?;
+                }
+            }
+            AttentionType::Full(attn) => {
+                if is_quantized {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix))
+                    {
+                        attn.set_quantized_q_proj(ql);
+                    } else if let Some(w) =
+                        params.get(&format!("{}.self_attn.q_proj.weight", prefix))
+                    {
+                        attn.set_q_proj_weight(w)?;
+                    }
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix))
+                    {
+                        attn.set_quantized_k_proj(ql);
+                    } else if let Some(w) =
+                        params.get(&format!("{}.self_attn.k_proj.weight", prefix))
+                    {
+                        attn.set_k_proj_weight(w)?;
+                    }
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix))
+                    {
+                        attn.set_quantized_v_proj(ql);
+                    } else if let Some(w) =
+                        params.get(&format!("{}.self_attn.v_proj.weight", prefix))
+                    {
+                        attn.set_v_proj_weight(w)?;
+                    }
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix))
+                    {
+                        attn.set_quantized_o_proj(ql);
+                    } else if let Some(w) =
+                        params.get(&format!("{}.self_attn.o_proj.weight", prefix))
+                    {
+                        attn.set_o_proj_weight(w)?;
+                    }
+                } else {
+                    if let Some(w) = params.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
+                        attn.set_q_proj_weight(w)?;
+                    }
+                    if let Some(w) = params.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
+                        attn.set_k_proj_weight(w)?;
+                    }
+                    if let Some(w) = params.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
+                        attn.set_v_proj_weight(w)?;
+                    }
+                    if let Some(w) = params.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
+                        attn.set_o_proj_weight(w)?;
+                    }
+                }
+                if let Some(w) = params.get(&format!("{}.self_attn.q_norm.weight", prefix)) {
+                    attn.set_q_norm_weight(w)?;
+                }
+                if let Some(w) = params.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
+                    attn.set_k_norm_weight(w)?;
+                }
+                if let Some(w) = params.get(&format!("{}.self_attn.q_proj.bias", prefix)) {
+                    attn.set_q_proj_bias(Some(w))?;
+                }
+                if let Some(w) = params.get(&format!("{}.self_attn.k_proj.bias", prefix)) {
+                    attn.set_k_proj_bias(Some(w))?;
+                }
+                if let Some(w) = params.get(&format!("{}.self_attn.v_proj.bias", prefix)) {
+                    attn.set_v_proj_bias(Some(w))?;
+                }
+                if let Some(w) = params.get(&format!("{}.self_attn.o_proj.bias", prefix)) {
+                    attn.set_o_proj_bias(Some(w))?;
+                }
+            }
+        }
+
+        // MLP weights
+        match &mut layer.mlp {
+            MLPType::Dense(MLPVariant::Standard(mlp)) => {
+                if is_quantized {
+                    let gate_key = format!("{}.mlp.gate_proj", prefix);
+                    let up_key = format!("{}.mlp.up_proj", prefix);
+                    let down_key = format!("{}.mlp.down_proj", prefix);
+
+                    let q_gate = try_build_ql(params, &gate_key);
+                    let q_up = try_build_ql(params, &up_key);
+                    let q_down = try_build_ql(params, &down_key);
+
+                    if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
+                        layer.set_quantized_dense_mlp(qg, qu, qd);
+                    } else {
+                        if let Some(w) = params.get(&format!("{}.weight", gate_key)) {
+                            mlp.set_gate_proj_weight(w)?;
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", up_key)) {
+                            mlp.set_up_proj_weight(w)?;
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", down_key)) {
+                            mlp.set_down_proj_weight(w)?;
+                        }
+                    }
+                } else {
+                    if let Some(w) = params.get(&format!("{}.mlp.gate_proj.weight", prefix)) {
+                        mlp.set_gate_proj_weight(w)?;
+                    }
+                    if let Some(w) = params.get(&format!("{}.mlp.up_proj.weight", prefix)) {
+                        mlp.set_up_proj_weight(w)?;
+                    }
+                    if let Some(w) = params.get(&format!("{}.mlp.down_proj.weight", prefix)) {
+                        mlp.set_down_proj_weight(w)?;
+                    }
+                }
+            }
+            MLPType::Dense(MLPVariant::Quantized { .. }) => {}
+            MLPType::MoE(moe) => {
+                if is_quantized {
+                    if let Some(ql) = try_build_ql_gate(params, &format!("{}.mlp.gate", prefix)) {
+                        moe.set_quantized_gate(ql);
+                    } else if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
+                        moe.set_gate_weight(w)?;
+                    }
+
+                    let gate_proj_key = format!("{}.mlp.switch_mlp.gate_proj", prefix);
+                    let up_proj_key = format!("{}.mlp.switch_mlp.up_proj", prefix);
+                    let down_proj_key = format!("{}.mlp.switch_mlp.down_proj", prefix);
+
+                    let q_gate = try_build_qsl(params, &gate_proj_key);
+                    let q_up = try_build_qsl(params, &up_proj_key);
+                    let q_down = try_build_qsl(params, &down_proj_key);
+
+                    if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
+                        let quantized_switch = SwitchGLU::new_quantized(qg, qu, qd);
+                        moe.set_switch_mlp(quantized_switch);
+                    } else {
+                        if let Some(w) = params.get(&format!("{}.weight", gate_proj_key)) {
+                            moe.set_switch_mlp_gate_proj_weight(w);
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", up_proj_key)) {
+                            moe.set_switch_mlp_up_proj_weight(w);
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", down_proj_key)) {
+                            moe.set_switch_mlp_down_proj_weight(w);
+                        }
+                    }
+
+                    let se_gate_key = format!("{}.mlp.shared_expert.gate_proj", prefix);
+                    let se_up_key = format!("{}.mlp.shared_expert.up_proj", prefix);
+                    let se_down_key = format!("{}.mlp.shared_expert.down_proj", prefix);
+
+                    let q_se_gate = try_build_ql(params, &se_gate_key);
+                    let q_se_up = try_build_ql(params, &se_up_key);
+                    let q_se_down = try_build_ql(params, &se_down_key);
+
+                    if let (Some(qg), Some(qu), Some(qd)) = (q_se_gate, q_se_up, q_se_down) {
+                        moe.set_quantized_shared_expert(qg, qu, qd);
+                    } else {
+                        if let Some(w) = params.get(&format!("{}.weight", se_gate_key)) {
+                            moe.set_shared_expert_gate_proj_weight(w)?;
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", se_up_key)) {
+                            moe.set_shared_expert_up_proj_weight(w)?;
+                        }
+                        if let Some(w) = params.get(&format!("{}.weight", se_down_key)) {
+                            moe.set_shared_expert_down_proj_weight(w)?;
+                        }
+                    }
+
+                    if let Some(ql) =
+                        try_build_ql_gate(params, &format!("{}.mlp.shared_expert_gate", prefix))
+                    {
+                        moe.set_quantized_shared_expert_gate(ql);
+                    } else if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix))
+                    {
+                        moe.set_shared_expert_gate_weight(w)?;
+                    }
+                } else {
+                    if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
+                        moe.set_gate_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix))
+                    {
+                        moe.set_switch_mlp_gate_proj_weight(w);
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.switch_mlp.up_proj.weight", prefix))
+                    {
+                        moe.set_switch_mlp_up_proj_weight(w);
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.switch_mlp.down_proj.weight", prefix))
+                    {
+                        moe.set_switch_mlp_down_proj_weight(w);
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert.gate_proj.weight", prefix))
+                    {
+                        moe.set_shared_expert_gate_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert.up_proj.weight", prefix))
+                    {
+                        moe.set_shared_expert_up_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert.down_proj.weight", prefix))
+                    {
+                        moe.set_shared_expert_down_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix))
+                    {
+                        moe.set_shared_expert_gate_weight(w)?;
+                    }
+                }
+            }
+        }
+
+        // Layer norms
+        if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
+            layer.set_input_layernorm_weight(w)?;
+        }
+        if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
+            layer.set_post_attention_layernorm_weight(w)?;
+        }
+    }
+
+    // Verify mandatory weights
+    let mut missing_mandatory = Vec::new();
+    if !params.contains_key("embedding.weight") {
+        missing_mandatory.push("embedding.weight".to_string());
+    }
+    if !params.contains_key("final_norm.weight") {
+        missing_mandatory.push("final_norm.weight".to_string());
+    }
+    if !config.tie_word_embeddings
+        && !params.contains_key("lm_head.weight")
+        && !params.contains_key("lm_head.scales")
+    {
+        missing_mandatory.push("lm_head.weight".to_string());
+    }
+
+    let num_layers = inner.layers.len();
+    let mut layers_missing_attn: Vec<usize> = Vec::new();
+    let mut layers_missing_mlp: Vec<usize> = Vec::new();
+
+    for i in 0..num_layers {
+        let prefix = format!("layers.{}", i);
+        let has_attn = params.contains_key(&format!("{}.self_attn.q_proj.weight", prefix))
+            || params.contains_key(&format!("{}.self_attn.q_proj.scales", prefix))
+            || params.contains_key(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
+            || params.contains_key(&format!("{}.linear_attn.in_proj_qkvz.scales", prefix))
+            || params.contains_key(&format!("{}.linear_attn.in_proj_qkv.weight", prefix))
+            || params.contains_key(&format!("{}.linear_attn.in_proj_qkv.scales", prefix));
+        if !has_attn {
+            layers_missing_attn.push(i);
+        }
+        let has_mlp = params.contains_key(&format!("{}.mlp.gate_proj.weight", prefix))
+            || params.contains_key(&format!("{}.mlp.gate.weight", prefix))
+            || params.contains_key(&format!("{}.mlp.gate.scales", prefix))
+            || params.contains_key(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix))
+            || params.contains_key(&format!("{}.mlp.switch_mlp.gate_proj.scales", prefix));
+        if !has_mlp {
+            layers_missing_mlp.push(i);
+        }
+    }
+
+    if !layers_missing_attn.is_empty() {
+        if layers_missing_attn.len() == num_layers {
+            missing_mandatory.push("layers.*.attn weights".to_string());
+        } else {
+            missing_mandatory.push(format!(
+                "attention weights for layers {:?} ({}/{})",
+                &layers_missing_attn[..layers_missing_attn.len().min(10)],
+                layers_missing_attn.len(),
+                num_layers
+            ));
+        }
+    }
+    if !layers_missing_mlp.is_empty() {
+        if layers_missing_mlp.len() == num_layers {
+            missing_mandatory.push("layers.*.mlp weights".to_string());
+        } else {
+            missing_mandatory.push(format!(
+                "MLP weights for layers {:?} ({}/{})",
+                &layers_missing_mlp[..layers_missing_mlp.len().min(10)],
+                layers_missing_mlp.len(),
+                num_layers
+            ));
+        }
+    }
+
+    if !missing_mandatory.is_empty() {
+        return Err(Error::from_reason(format!(
+            "Checkpoint missing mandatory weights: {:?}",
+            missing_mandatory
+        )));
+    }
+
+    let total_weights = params.len();
+    info!(
+        "Applied weights to inner from checkpoint: {} total in checkpoint",
+        total_weights
+    );
+    Ok(())
+}
+
 /// Load a pretrained Qwen3.5 MoE model from a directory.
 pub async fn load(model_path: &str) -> Result<Qwen3_5MoeModel> {
     let model_path = model_path.to_string();
@@ -990,6 +1501,252 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5MoeModel> {
     })
     .await
     .map_err(|e| Error::from_reason(format!("Failed to load model: {}", e)))?
+}
+
+/// Load a pretrained Qwen3.5 MoE model into a dedicated model thread.
+///
+/// All model state lives on the spawned thread. Returns a thin NAPI shell
+/// with the thread handle and dummy training fields.
+pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
+    use crate::models::qwen3_5::model::VisionCacheInner;
+    use crate::nn::{Embedding, RMSNorm};
+    use std::collections::HashMap as StdHashMap;
+    use std::sync::{Mutex, RwLock};
+
+    let model_path = model_path.to_string();
+
+    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+        move || {
+            let path = Path::new(&model_path);
+
+            if !path.exists() {
+                return Err(Error::from_reason(format!(
+                    "Model path does not exist: {}",
+                    model_path
+                )));
+            }
+
+            // Load config
+            let config_path = path.join("config.json");
+            let config_data = fs::read_to_string(&config_path)
+                .map_err(|e| Error::from_reason(format!("Failed to read config: {}", e)))?;
+            let raw: Value = serde_json::from_str(&config_data)
+                .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
+
+            let config = parse_config(&raw)?;
+
+            info!(
+                "Qwen3.5 MoE config: {} layers, hidden={}, experts={}x{}",
+                config.num_layers,
+                config.hidden_size,
+                config.num_experts,
+                config.num_experts_per_tok
+            );
+
+            // Load all weights
+            let raw_params = load_all_safetensors(path, false)?;
+            info!("Loaded {} raw tensors", raw_params.len());
+
+            // Split vision/text weights
+            let has_vision = raw_params
+                .keys()
+                .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."));
+
+            let (text_raw_params, vision_params) = if has_vision {
+                let mut vision_params: HashMap<String, MxArray> = HashMap::new();
+                let mut text_params: HashMap<String, MxArray> = HashMap::new();
+                for (name, array) in raw_params {
+                    if name.starts_with("vision_tower.") || name.starts_with("visual.") {
+                        let vkey = name
+                            .strip_prefix("vision_tower.")
+                            .or_else(|| name.strip_prefix("visual."))
+                            .unwrap_or(&name)
+                            .to_string();
+                        vision_params.insert(vkey, array);
+                    } else {
+                        text_params.insert(name, array);
+                    }
+                }
+                info!(
+                    "Split: {} vision tensors, {} text tensors",
+                    vision_params.len(),
+                    text_params.len()
+                );
+                (text_params, Some(vision_params))
+            } else {
+                (raw_params, None)
+            };
+
+            // Sanitize weights
+            let params = sanitize_weights(text_raw_params, &config)?;
+            let quantized = is_quantized_checkpoint(&params);
+            info!(
+                "Sanitized to {} parameters (quantized={})",
+                params.len(),
+                quantized
+            );
+
+            // Parse quantization config
+            let quant_cfg = raw
+                .get("quantization")
+                .or_else(|| raw.get("quantization_config"));
+            let quant_bits = quant_cfg
+                .and_then(|q| q["bits"].as_i64())
+                .unwrap_or(DEFAULT_QUANT_BITS as i64) as i32;
+            let quant_group_size = quant_cfg
+                .and_then(|q| q["group_size"].as_i64())
+                .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64)
+                as i32;
+            let per_layer_quant: HashMap<String, (i32, i32)> = quant_cfg
+                .and_then(|q| q.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .filter(|(_, v)| v.is_object())
+                        .filter_map(|(k, v)| {
+                            let bits = v["bits"].as_i64()? as i32;
+                            let gs =
+                                v["group_size"].as_i64().unwrap_or(quant_group_size as i64) as i32;
+                            let normalized = k
+                                .strip_prefix("model.language_model.")
+                                .or_else(|| k.strip_prefix("language_model.model."))
+                                .or_else(|| k.strip_prefix("language_model."))
+                                .or_else(|| k.strip_prefix("model."))
+                                .unwrap_or(k)
+                                .to_string();
+                            Some((normalized, (bits, gs)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if quant_cfg.is_some() {
+                info!(
+                    "Using quantization config: bits={}, group_size={}, per_layer_overrides={}",
+                    quant_bits,
+                    quant_group_size,
+                    per_layer_quant.len()
+                );
+            }
+
+            // Load tokenizer
+            let tokenizer_path = path.join("tokenizer.json");
+            let tokenizer = if tokenizer_path.exists() {
+                info!("Loading tokenizer from: {}", tokenizer_path.display());
+                Some(Qwen3Tokenizer::load_from_file_sync(
+                    tokenizer_path.to_str().ok_or_else(|| {
+                        Error::from_reason("Tokenizer path contains invalid UTF-8")
+                    })?,
+                )?)
+            } else {
+                None
+            };
+
+            // Create inner model
+            let mut inner = Qwen35MoeInner::new(config.clone())?;
+
+            // Apply weights directly to inner (no locks)
+            apply_weights_moe_inner(
+                &mut inner,
+                &params,
+                &config,
+                quant_bits,
+                quant_group_size,
+                &per_layer_quant,
+            )?;
+
+            // Register weights with C++ MoE forward pass
+            register_moe_weights_with_cpp(&params, inner.model_id);
+
+            // Materialize mmap-backed weights
+            {
+                let arrays: Vec<&MxArray> = params.values().collect();
+                crate::array::memory::materialize_weights(&arrays);
+            }
+
+            // Set tokenizer
+            if let Some(tok) = tokenizer {
+                inner.set_tokenizer(Arc::new(tok));
+            }
+
+            // Load vision encoder if present
+            if let Some(ref vparams) = vision_params {
+                let vision_config = parse_vision_config(&raw);
+                info!(
+                    "Vision config: {} layers, hidden={}, heads={}, patch={}",
+                    vision_config.num_layers,
+                    vision_config.hidden_size,
+                    vision_config.num_heads,
+                    vision_config.patch_size,
+                );
+
+                let mut vision_encoder = Qwen3_5VisionEncoder::new(vision_config.clone())?;
+                load_vision_weights(&mut vision_encoder, vparams, &vision_config)?;
+
+                inner.init_mrope_layers(
+                    vec![11, 11, 10],
+                    config.rope_theta,
+                    config.max_position_embeddings,
+                )?;
+
+                inner.set_vision_encoder(vision_encoder);
+                inner.set_image_processor(Qwen35VLImageProcessor::new(None));
+                inner.set_spatial_merge_size(vision_config.spatial_merge_size);
+
+                info!("Qwen3.5 MoE-VL model loaded successfully (with vision encoder)");
+            } else {
+                info!("Qwen3.5 MoE model loaded successfully");
+            }
+
+            let model_id = inner.model_id;
+            let config_out = inner.config.clone();
+            let image_processor = inner.image_processor.as_ref().map(Arc::clone);
+            let tokenizer_out = inner.tokenizer.clone();
+
+            Ok((
+                inner,
+                (config_out, model_id, image_processor, tokenizer_out),
+            ))
+        },
+        handle_qwen35_moe_cmd,
+    );
+
+    let (config, model_id, image_processor, tokenizer) = init_rx
+        .await
+        .map_err(|_| Error::from_reason("Model thread exited during load"))??;
+
+    // Create dummy training fields (not used by inference models)
+    let fa_idx = (0..config.num_layers as usize)
+        .find(|&i| !config.is_linear_layer(i))
+        .unwrap_or(0);
+    let embedding = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)?;
+
+    Ok(Qwen3_5MoeModel {
+        thread: Some(thread),
+        config: config.clone(),
+        model_id,
+        image_processor,
+        // Training fields (unused for inference)
+        embedding,
+        layers: std::sync::Arc::new(RwLock::new(Vec::new())),
+        final_norm: std::sync::Arc::new(RwLock::new(RMSNorm::new(
+            config.hidden_size as u32,
+            Some(config.rms_norm_eps),
+        )?)),
+        lm_head: std::sync::Arc::new(RwLock::new(None)),
+        caches: std::sync::Arc::new(RwLock::new(None)),
+        tokenizer,
+        fa_idx,
+        vision_encoder: None,
+        spatial_merge_size: None,
+        vision_cache: std::sync::Arc::new(Mutex::new(VisionCacheInner {
+            entries: StdHashMap::new(),
+            generation: 0,
+        })),
+        cached_token_history: std::sync::Arc::new(RwLock::new(Vec::new())),
+        cached_image_key: std::sync::Arc::new(RwLock::new(None)),
+        cached_rope_deltas: std::sync::Arc::new(RwLock::new(None)),
+        generation_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+    })
 }
 
 /// Parse Qwen3.5 MoE config from JSON.
