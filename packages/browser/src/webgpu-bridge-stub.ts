@@ -44,6 +44,7 @@ export function createBridgeStub(
 ): BridgeStub {
   const cmdView = new Int32Array(cmdBuffer);
   const cmdDataView = new DataView(cmdBuffer);
+  const cmdU32 = new Uint32Array(cmdBuffer);  // fast unsigned writes (avoids DataView overhead)
   const readbackView = readbackBuffer ? new Uint8Array(readbackBuffer) : null;
 
   // WASM exports -- set via setInstance() after WASM instantiation
@@ -231,20 +232,28 @@ export function createBridgeStub(
     }
   }
 
-  // Pre-allocated DataView offsets for faster argument writing
-  const ARG_BASE = CMD_OFFSET.ARG0;
+  // Uint32Array indices for direct arg writes (element index = byte offset / 4)
+  const I_FN = CMD_OFFSET.FN_ID >>> 2;          // 0
+  const I_RESULT = CMD_OFFSET.RESULT >>> 2;      // 2
+  const I_ARG0 = CMD_OFFSET.ARG0 >>> 2;         // 4
+  const I_CB_COUNT = CMD_OFFSET.CALLBACK_COUNT >>> 2; // 16
 
-  function rpcCall(fnId: number, ...args: number[]): number {
-    // Write function ID + arguments in one block
-    cmdDataView.setUint32(CMD_OFFSET.FN_ID, fnId, true);
-    for (let i = 0; i < args.length; i++) {
-      cmdDataView.setUint32(ARG_BASE + (i << 2), args[i] >>> 0, true);
-    }
+  function rpcCall(
+    fnId: number, a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0,
+  ): number {
+    // Write function ID + all arguments via Uint32Array (no DataView overhead, no array alloc)
+    cmdU32[I_FN] = fnId;
+    cmdU32[I_ARG0] = a0 >>> 0;
+    cmdU32[I_ARG0 + 1] = a1 >>> 0;
+    cmdU32[I_ARG0 + 2] = a2 >>> 0;
+    cmdU32[I_ARG0 + 3] = a3 >>> 0;
+    cmdU32[I_ARG0 + 4] = a4 >>> 0;
+    cmdU32[I_ARG0 + 5] = a5 >>> 0;
+    cmdU32[I_ARG0 + 6] = a6 >>> 0;
     // Don't clear CALLBACK_COUNT for FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM —
-    // it holds entryCount (written by the caller before rpcCall). The gpu-worker reads it
-    // during processCommand.
+    // it holds entryCount (written by the caller before rpcCall).
     if (fnId !== RpcFn.FUSED_FULL_DISPATCH && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM) {
-      cmdDataView.setUint32(CMD_OFFSET.CALLBACK_COUNT, 0, true);
+      cmdU32[I_CB_COUNT] = 0;
     }
 
     // Signal gpu-worker and block
@@ -259,14 +268,13 @@ export function createBridgeStub(
       Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING);
     }
 
-    const result = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);
+    const result = cmdU32[I_RESULT];
 
     // Process pending callbacks only when present (95%+ of calls have 0).
     // Skip for FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM — CALLBACK_COUNT
     // holds entryCount, not callbacks.
     if (fnId !== RpcFn.FUSED_FULL_DISPATCH && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM) {
-      const cbCount = cmdDataView.getUint32(CMD_OFFSET.CALLBACK_COUNT, true);
-      if (cbCount > 0) {
+      if (cmdU32[I_CB_COUNT] > 0) {
         try { drainCallbacks(fnId); } catch (e) { console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e); }
       }
     }
@@ -744,18 +752,18 @@ export function createBridgeStub(
 
           // Write entry data into the callback ring space BEFORE rpcCall
           // (rpcCall will skip zeroing CALLBACK_COUNT for these fnIds)
-          cmdDataView.setUint32(CMD_OFFSET.CALLBACK_COUNT, entryCount, true);
+          cmdU32[I_CB_COUNT] = entryCount;
           for (let i = 0; i < entryCount; i++) {
             const e = bgDesc.entries[i];
-            const base = CMD_OFFSET.CALLBACK_BASE + i * 12;
-            cmdDataView.setUint32(base, e.bufferHandle, true);
-            cmdDataView.setUint32(base + 4, e.sizeLo, true);
-            cmdDataView.setUint32(base + 8, e.sizeHi, true);
+            const base = (CMD_OFFSET.CALLBACK_BASE + i * 12) >>> 2;
+            cmdU32[base] = e.bufferHandle;
+            cmdU32[base + 1] = e.sizeLo;
+            cmdU32[base + 2] = e.sizeHi;
           }
 
           if (uniformData && uniformData.byteLength <= 256) {
             // FUSED_DISPATCH_WITH_UNIFORM: pack writeBuffer + bind group + dispatch in one RPC
-            cmdDataView.setUint32(CMD_OFFSET.UNIFORM_DATA_SIZE, uniformData.byteLength, true);
+            cmdU32[CMD_OFFSET.UNIFORM_DATA_SIZE >>> 2] = uniformData.byteLength;
             new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformData.byteLength).set(uniformData);
             rpcCall(RpcFn.FUSED_DISPATCH_WITH_UNIFORM, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z, uniformEntryIdx);
           } else {
