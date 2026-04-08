@@ -11,6 +11,7 @@ pub mod dataset;
 pub mod decode_profiler;
 pub mod gradients;
 pub mod grpo;
+pub mod model_thread;
 pub mod models;
 pub mod nn;
 pub mod optimizers;
