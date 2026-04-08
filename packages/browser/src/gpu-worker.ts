@@ -5,7 +5,7 @@
  * async callbacks (onSubmittedWorkDone, mapAsync) resolve naturally.
  *
  * Communication with wasm-worker:
- *   - SharedArrayBuffer command channel (256 bytes, see rpc-protocol.ts)
+ *   - SharedArrayBuffer command channel (512 bytes, see rpc-protocol.ts)
  *   - SharedArrayBuffer WASM memory (for reading struct descriptors + data)
  *   - Atomics.waitAsync / Atomics.notify for synchronization
  *
@@ -97,6 +97,7 @@ let queueHandle: number;
 
 // ---------- Shared Memory ----------
 
+let cmdBuffer: SharedArrayBuffer;  // Raw SharedArrayBuffer for typed array views into command data
 let cmdView: Int32Array;
 let cmdDataView: DataView;
 let wasmMemoryObj: WebAssembly.Memory;  // Memory object — .buffer always reflects current size after grow()
@@ -135,7 +136,7 @@ const activeMappings = new Map<number, MappedRangeInfo>();
 
 self.onmessage = async (e: MessageEvent) => {
   if (e.data.type === 'init') {
-    const cmdBuffer: SharedArrayBuffer = e.data.cmdBuffer;
+    cmdBuffer = e.data.cmdBuffer;
     wasmMemoryObj = e.data.wasmMemory;  // WebAssembly.Memory object
     readbackView = new Uint8Array(e.data.readbackBuffer);
 
@@ -1103,6 +1104,58 @@ async function processCommand(fnId: number): Promise<void> {
         const sizeHi = cmdDataView.getUint32(base + 8, true);
         const size = sizeLo + sizeHi * 0x100000000;
         const buffer = getHandle<GPUBuffer>(bufferHandle);
+        const resource: GPUBufferBinding = { buffer, offset: 0 };
+        if (size !== 0 && size < 2 ** 53) {
+          resource.size = size;
+        }
+        entries.push({ binding: i, resource });
+      }
+
+      const bindGroup = device.createBindGroup({ layout, entries });
+      const pass = getHandle<GPUComputePassEncoder>(passHandle);
+      pass.setPipeline(getHandle<GPUComputePipeline>(pipelineHandle));
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(x, y, z);
+      setResult(0);
+      break;
+    }
+
+    case RpcFn.FUSED_DISPATCH_WITH_UNIFORM: {
+      // Like FUSED_FULL_DISPATCH but also writes inline uniform data to one bind group buffer.
+      // This fuses QUEUE_WRITE_BUFFER + createBindGroup + setPipeline + setBindGroup + dispatch
+      // into a single RPC, eliminating one round-trip per compute dispatch.
+      // ARGs: passHandle, pipelineHandle, layoutHandle, dispatchX, Y, Z, uniformEntryIdx
+      // CALLBACK_COUNT: entryCount
+      // CALLBACK_BASE+: entries (bufHandle:u32, sizeLo:u32, sizeHi:u32) × entryCount
+      // UNIFORM_DATA_SIZE (offset 188): u32 size of inline uniform data
+      // UNIFORM_DATA (offset 192+): the uniform data bytes
+      const passHandle = arg0();
+      const pipelineHandle = arg1();
+      const layoutHandle = arg2();
+      const x = arg3();
+      const y = arg4();
+      const z = arg5();
+      const uniformEntryIdx = arg6();
+
+      const entryCount = cmdDataView.getUint32(CMD_OFFSET.CALLBACK_COUNT, true);
+      const uniformDataSize = cmdDataView.getUint32(CMD_OFFSET.UNIFORM_DATA_SIZE, true);
+
+      const layout = getHandle<GPUBindGroupLayout>(layoutHandle);
+      const entries: GPUBindGroupEntry[] = [];
+      for (let i = 0; i < entryCount; i++) {
+        const base = CMD_OFFSET.CALLBACK_BASE + i * 12;
+        const bufferHandle = cmdDataView.getUint32(base, true);
+        const sizeLo = cmdDataView.getUint32(base + 4, true);
+        const sizeHi = cmdDataView.getUint32(base + 8, true);
+        const size = sizeLo + sizeHi * 0x100000000;
+        const buffer = getHandle<GPUBuffer>(bufferHandle);
+
+        // Write inline uniform data to this buffer before creating the bind group
+        if (i === uniformEntryIdx && uniformDataSize > 0) {
+          const uniformData = new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformDataSize);
+          queue.writeBuffer(buffer, 0, uniformData);
+        }
+
         const resource: GPUBufferBinding = { buffer, offset: 0 };
         if (size !== 0 && size < 2 ** 53) {
           resource.size = size;

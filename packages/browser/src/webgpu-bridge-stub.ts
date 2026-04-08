@@ -150,6 +150,27 @@ export function createBridgeStub(
   // Pipeline bind group layout cache: layouts are lightweight and never released
   const layoutCache: Record<number, number> = {};
 
+  // Deferred small wgpuQueueWriteBuffer: buffer uniform data locally.
+  // When wgpuQueueWriteBuffer is called with <=256 bytes at offset 0,
+  // we defer the write and pack it inline into FUSED_DISPATCH_WITH_UNIFORM.
+  interface PendingWriteBuffer {
+    data: Uint8Array;  // copied from WASM memory (slice, not subarray)
+  }
+  const pendingWriteBuffers = new Map<number, PendingWriteBuffer>();
+
+  /** Flush all deferred writeBuffer calls via individual RPCs. */
+  function flushPendingWrites(): void {
+    if (pendingWriteBuffers.size === 0) return;
+    for (const [handle, pending] of pendingWriteBuffers) {
+      // Allocate temporary WASM memory to pass data through RPC
+      const wasmPtr = wasmMalloc(pending.data.byteLength);
+      heap().set(pending.data, wasmPtr);
+      rpcCall(RpcFn.QUEUE_WRITE_BUFFER, handle, 0, 0, wasmPtr, pending.data.byteLength);
+      wasmFree(wasmPtr);
+    }
+    pendingWriteBuffers.clear();
+  }
+
   /** Materialize a fake bind group handle into a real one via RPC. */
   function materializeBg(handle: number): number {
     const bgDesc = pendingBgData.get(handle);
@@ -192,6 +213,8 @@ export function createBridgeStub(
   }
 
   function flushPendingCompute() {
+    // Flush any deferred writeBuffer calls that weren't inlined into a fused dispatch
+    flushPendingWrites();
     if (pendingPipeline >= 0) {
       rpcCall(RpcFn.COMPUTE_PASS_SET_PIPELINE, pendingPass, pendingPipeline);
       pendingPipeline = -1;
@@ -217,9 +240,10 @@ export function createBridgeStub(
     for (let i = 0; i < args.length; i++) {
       cmdDataView.setUint32(ARG_BASE + (i << 2), args[i] >>> 0, true);
     }
-    // Don't clear CALLBACK_COUNT for FUSED_FULL_DISPATCH — it holds entryCount
-    // (written by the caller before rpcCall). The gpu-worker reads it during processCommand.
-    if (fnId !== RpcFn.FUSED_FULL_DISPATCH) {
+    // Don't clear CALLBACK_COUNT for FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM —
+    // it holds entryCount (written by the caller before rpcCall). The gpu-worker reads it
+    // during processCommand.
+    if (fnId !== RpcFn.FUSED_FULL_DISPATCH && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM) {
       cmdDataView.setUint32(CMD_OFFSET.CALLBACK_COUNT, 0, true);
     }
 
@@ -238,8 +262,9 @@ export function createBridgeStub(
     const result = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);
 
     // Process pending callbacks only when present (95%+ of calls have 0).
-    // Skip for FUSED_FULL_DISPATCH — CALLBACK_COUNT holds entryCount, not callbacks.
-    if (fnId !== RpcFn.FUSED_FULL_DISPATCH) {
+    // Skip for FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM — CALLBACK_COUNT
+    // holds entryCount, not callbacks.
+    if (fnId !== RpcFn.FUSED_FULL_DISPATCH && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM) {
       const cbCount = cmdDataView.getUint32(CMD_OFFSET.CALLBACK_COUNT, true);
       if (cbCount > 0) {
         try { drainCallbacks(fnId); } catch (e) { console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e); }
@@ -518,6 +543,8 @@ export function createBridgeStub(
 
     // ===== Queue =====
     wgpuQueueSubmit(_queue: number, count: number, cmdBufArrayPtr: number): void {
+      // Flush any deferred writeBuffer calls before submitting
+      flushPendingWrites();
       if (pendingFinishEncoder >= 0) {
         // FUSED: pass_end + pass_release + finish + submit + release in 1 RPC (saves 5 round-trips)
         const passHandle = pendingFinishPass >= 0 ? pendingFinishPass : 0;
@@ -535,6 +562,14 @@ export function createBridgeStub(
       dataPtr: number, size: number,
     ): void {
       const resolved = resolveBufferHandle(bufferHandle);
+      // Defer small writes at offset 0 — will be packed into FUSED_DISPATCH_WITH_UNIFORM
+      if (size <= 256 && bufferOffset === 0n) {
+        const h = heap();
+        const data = h.slice(dataPtr, dataPtr + size);
+        pendingWriteBuffers.set(resolved, { data });
+        return;
+      }
+      // Large or offset writes: send immediately
       const offsetLo = Number(bufferOffset & 0xFFFFFFFFn);
       const offsetHi = Number(bufferOffset >> 32n);
       rpcCall(RpcFn.QUEUE_WRITE_BUFFER, resolved, offsetLo, offsetHi, dataPtr, size);
@@ -665,6 +700,7 @@ export function createBridgeStub(
     ): void {
       if (pendingPipeline >= 0 && pendingBindGroup >= 0 && pendingBindGroup1 >= 0) {
         // 2 bind groups: materialize any fake handles and use FUSED_DISPATCH_2BG
+        flushPendingWrites();
         const realBg0 = materializeBg(pendingBindGroup);
         const realBg1 = materializeBg(pendingBindGroup1);
         rpcCall(RpcFn.FUSED_DISPATCH_2BG, pendingPass, pendingPipeline, realBg0, realBg1, x, y, z);
@@ -674,11 +710,25 @@ export function createBridgeStub(
       } else if (pendingPipeline >= 0 && pendingBindGroup >= 0) {
         const bgDesc = pendingBgData.get(pendingBindGroup);
         if (bgDesc) {
-          // FUSED_FULL_DISPATCH: inline bind group creation + dispatch in one RPC
+          // FUSED dispatch: inline bind group creation + dispatch in one RPC
           pendingBgData.delete(pendingBindGroup);
           const entryCount = bgDesc.entries.length;
+
+          // Check if any bind group entry has a pending deferred writeBuffer
+          let uniformEntryIdx = -1;
+          let uniformData: Uint8Array | null = null;
+          for (let i = 0; i < entryCount; i++) {
+            const pending = pendingWriteBuffers.get(bgDesc.entries[i].bufferHandle);
+            if (pending) {
+              uniformEntryIdx = i;
+              uniformData = pending.data;
+              pendingWriteBuffers.delete(bgDesc.entries[i].bufferHandle);
+              break;  // only inline one write per dispatch
+            }
+          }
+
           // Write entry data into the callback ring space BEFORE rpcCall
-          // (rpcCall will skip zeroing CALLBACK_COUNT for this fnId)
+          // (rpcCall will skip zeroing CALLBACK_COUNT for these fnIds)
           cmdDataView.setUint32(CMD_OFFSET.CALLBACK_COUNT, entryCount, true);
           for (let i = 0; i < entryCount; i++) {
             const e = bgDesc.entries[i];
@@ -687,9 +737,20 @@ export function createBridgeStub(
             cmdDataView.setUint32(base + 4, e.sizeLo, true);
             cmdDataView.setUint32(base + 8, e.sizeHi, true);
           }
-          rpcCall(RpcFn.FUSED_FULL_DISPATCH, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z);
+
+          if (uniformData && uniformData.byteLength <= 256) {
+            // FUSED_DISPATCH_WITH_UNIFORM: pack writeBuffer + bind group + dispatch in one RPC
+            cmdDataView.setUint32(CMD_OFFSET.UNIFORM_DATA_SIZE, uniformData.byteLength, true);
+            new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformData.byteLength).set(uniformData);
+            rpcCall(RpcFn.FUSED_DISPATCH_WITH_UNIFORM, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z, uniformEntryIdx);
+          } else {
+            // Flush any remaining pending writes that weren't inlined
+            flushPendingWrites();
+            rpcCall(RpcFn.FUSED_FULL_DISPATCH, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z);
+          }
         } else {
           // Real bind group handle — use existing FUSED_DISPATCH
+          flushPendingWrites();
           rpcCall(RpcFn.FUSED_DISPATCH, pendingPass, pendingPipeline, pendingBindGroup, x, y, z);
         }
         pendingPipeline = -1;

@@ -100,14 +100,23 @@ export const enum RpcFn {
   // CALLBACK_COUNT: entryCount (repurposed — gpu-worker checks fnId to distinguish)
   // CALLBACK_BASE+: entry data (bufHandle:u32, sizeLo:u32, sizeHi:u32) × entryCount
   FUSED_FULL_DISPATCH = 96,
+  // Fused: like FUSED_FULL_DISPATCH but also writes inline uniform data to one buffer
+  // ARG0-5: passHandle, pipelineHandle, layoutHandle, dispatchX, Y, Z
+  // ARG6: uniformEntryIdx (which bind group entry gets the writeBuffer)
+  // CALLBACK_COUNT: entryCount, CALLBACK_BASE+: entries (same as FUSED_FULL_DISPATCH)
+  // UNIFORM_DATA_SIZE (offset 188): u32 size of inline uniform data
+  // UNIFORM_DATA (offset 192+): the uniform data bytes (up to 256 bytes)
+  FUSED_DISPATCH_WITH_UNIFORM = 97,
 }
 
 // ---- Command Buffer Layout (SharedArrayBuffer) ----
 //
-// Fixed-size 256-byte command record. The first 64 bytes hold the function ID,
+// Fixed-size 512-byte command record. The first 64 bytes hold the function ID,
 // status flag, return values, and up to 8 u32 arguments (+ high words for u64).
-// Bytes 64..191 hold the callback ring (up to 8 pending callbacks at 16 bytes each).
-// Bytes 192..255 are reserved.
+// Bytes 64..187 hold the callback ring / bind group entries.
+// Bytes 188..191 hold the inline uniform data size (for FUSED_DISPATCH_WITH_UNIFORM).
+// Bytes 192..447 hold inline uniform data (up to 256 bytes).
+// Bytes 448..511 are reserved.
 //
 // All offsets are byte offsets from the start of the SharedArrayBuffer.
 
@@ -130,16 +139,23 @@ export const CMD_OFFSET = {
   ARG2_HI: 56,    // u32: high bits for u64 arg2
   ARG3_HI: 60,    // u32: high bits for u64 arg3
 
-  // ---- Callback ring (64..191) ----
+  // ---- Callback ring (64..187) ----
   // After POLL or BUFFER_MAP_ASYNC, gpu-worker writes pending callbacks here.
   // Each callback entry is 16 bytes: [fnPtr: u32, status: u32, userdataPtr: u32, _pad: u32]
   // CALLBACK_COUNT tells wasm-worker how many entries to process.
-  CALLBACK_COUNT: 64,  // u32: number of pending callbacks (0..8)
+  // For FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM, this region holds
+  // bind group entries (bufHandle:u32, sizeLo:u32, sizeHi:u32) × entryCount.
+  CALLBACK_COUNT: 64,  // u32: number of pending callbacks (0..8) or entryCount
   CALLBACK_BASE: 68,   // start of callback entries (each 16 bytes)
   // Entry i: fnPtr at 68 + i*16, status at 72 + i*16, userdata at 76 + i*16
 
+  // ---- Inline uniform data (188..447) ----
+  // Used by FUSED_DISPATCH_WITH_UNIFORM to pack writeBuffer data inline.
+  UNIFORM_DATA_SIZE: 188,  // u32: size of inline uniform data (0 = none)
+  UNIFORM_DATA: 192,       // start of inline uniform data (up to 256 bytes)
+
   // ---- Total ----
-  TOTAL: 256,
+  TOTAL: 512,
 } as const;
 
 // Max callbacks per RPC round-trip
