@@ -3,14 +3,13 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use futures::TryFutureExt;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
-use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use crate::array::MxArray;
+use crate::model_thread::{ResponseTx, StreamTx};
 use crate::models::qwen3::{BatchGenerationResult, GenerationConfig, GenerationResult};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
@@ -21,7 +20,7 @@ use crate::tools::ToolCallResult;
 use super::chat_common;
 use super::chat_common::{
     apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
-    save_cache_state, verify_cache_prefix,
+    save_cache_state_direct, verify_cache_prefix_direct,
 };
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
@@ -93,14 +92,1624 @@ pub(crate) fn acquire_compiled_weight_guard(
     }
 }
 
-/// Process-wide mutex serializing the dense compiled forward lifecycle.
+/// Process-wide mutex serializing the dense compiled forward lifecycle across
+/// model instances. Within a single model instance, the dedicated model thread
+/// serializes calls. But with multiple model instances, compiled C++ forward
+/// calls from different model threads can collide on process-wide globals.
+static DENSE_COMPILED_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Internal model state owned exclusively by the dedicated model thread.
 ///
-/// The C++ compiled decode path uses process-wide globals (`g_compiled_caches`,
-/// `g_offset_int`, etc.). Concurrent `generate()`/`chat()` calls via
-/// `Promise.all()` would race on these globals since `spawn_blocking` dispatches
-/// to separate threads. This mutex is acquired in the async context *before*
-/// `spawn_blocking`, ensuring only one compiled lifecycle runs at a time.
-static DENSE_COMPILED_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
+/// No `Arc<RwLock<>>` — the model thread has sole ownership of all inference
+/// state. Training support uses a separate code path via `clone_for_training()`.
+pub(crate) struct Qwen35Inner {
+    pub(crate) config: Qwen3_5Config,
+    pub(crate) embedding: Embedding,
+    pub(crate) layers: Vec<DecoderLayer>,
+    pub(crate) final_norm: RMSNorm,
+    pub(crate) lm_head: Option<Linear>,
+    pub(crate) caches: Option<Vec<Qwen3_5LayerCache>>,
+    pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    #[allow(dead_code)]
+    pub(crate) fa_idx: usize,
+    pub(crate) vision_encoder: Option<Arc<Qwen3_5VisionEncoder>>,
+    pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
+    pub(crate) spatial_merge_size: Option<i32>,
+    pub(crate) vision_cache: VisionCache,
+    pub(crate) cached_token_history: Vec<u32>,
+    pub(crate) cached_image_key: Option<u64>,
+    pub(crate) cached_rope_deltas: Option<i32>,
+    pub(crate) model_id: u64,
+}
+
+/// Commands dispatched from NAPI methods to the dedicated model thread.
+pub(crate) enum Qwen35Cmd {
+    Chat {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    ChatStream {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
+    Generate {
+        prompt_tokens: MxArray,
+        config: Qwen3_5GenerationConfig,
+        reply: ResponseTx<Qwen3_5GenerationResult>,
+    },
+    TakeCache {
+        reply: ResponseTx<Option<crate::models::qwen3_5::prompt_cache::PromptCache>>,
+    },
+    SetCache {
+        cache: crate::models::qwen3_5::prompt_cache::PromptCache,
+        reply: ResponseTx<()>,
+    },
+    InitCaches {
+        reply: ResponseTx<()>,
+    },
+    ResetCaches {
+        reply: ResponseTx<()>,
+    },
+    SaveModel {
+        save_path: String,
+        reply: ResponseTx<()>,
+    },
+}
+
+/// Command handler for the dedicated model thread.
+pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
+    match cmd {
+        Qwen35Cmd::Chat {
+            messages,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.chat_sync(messages, config));
+        }
+        Qwen35Cmd::ChatStream {
+            messages,
+            config,
+            stream_tx,
+            cancelled,
+        } => {
+            inner.chat_stream_sync(messages, config, stream_tx, cancelled);
+        }
+        Qwen35Cmd::Generate {
+            prompt_tokens,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.generate_sync(prompt_tokens, config));
+        }
+        Qwen35Cmd::TakeCache { reply } => {
+            let _ = reply.send(Ok(inner.take_cache_sync()));
+        }
+        Qwen35Cmd::SetCache { cache, reply } => {
+            let _ = reply.send(inner.set_cache_sync(cache));
+        }
+        Qwen35Cmd::InitCaches { reply } => {
+            let _ = reply.send(inner.init_caches_sync());
+        }
+        Qwen35Cmd::ResetCaches { reply } => {
+            let _ = reply.send(inner.reset_caches_sync());
+        }
+        Qwen35Cmd::SaveModel { save_path, reply } => {
+            let _ = reply.send(inner.save_model_sync(&save_path));
+        }
+    }
+}
+
+// ========== Qwen35Inner implementation ==========
+// All these methods run on the dedicated model thread (synchronous, no locks).
+
+impl Qwen35Inner {
+    /// Create a new Qwen35Inner with the given configuration.
+    pub(crate) fn new(config: Qwen3_5Config) -> Result<Self> {
+        let embedding = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)?;
+
+        let layers = (0..config.num_layers as usize)
+            .map(|i| DecoderLayer::new(&config, i))
+            .collect::<Result<Vec<_>>>()?;
+
+        let final_norm = RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps))?;
+
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(Linear::new(
+                config.hidden_size as u32,
+                config.vocab_size as u32,
+                Some(false),
+            )?)
+        };
+
+        let fa_idx = (0..config.num_layers as usize)
+            .find(|&i| !config.is_linear_layer(i))
+            .unwrap_or(0);
+
+        let model_id = QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        Ok(Self {
+            config,
+            embedding,
+            layers,
+            final_norm,
+            lm_head,
+            caches: None,
+            tokenizer: None,
+            fa_idx,
+            vision_encoder: None,
+            image_processor: None,
+            spatial_merge_size: None,
+            vision_cache: Arc::new(Mutex::new(VisionCacheInner {
+                entries: HashMap::new(),
+                generation: 0,
+            })),
+            cached_token_history: Vec::new(),
+            cached_image_key: None,
+            cached_rope_deltas: None,
+            model_id,
+        })
+    }
+
+    /// Initialize KV caches.
+    pub(crate) fn init_caches_sync(&mut self) -> Result<()> {
+        let caches = (0..self.config.num_layers as usize)
+            .map(|i| {
+                if self.config.is_linear_layer(i) {
+                    Qwen3_5LayerCache::new_linear()
+                } else {
+                    Qwen3_5LayerCache::new_full_attention()
+                }
+            })
+            .collect();
+        self.caches = Some(caches);
+        self.clear_reuse_state();
+        Ok(())
+    }
+
+    /// Reset all caches.
+    pub(crate) fn reset_caches_sync(&mut self) -> Result<()> {
+        if let Some(ref mut caches) = self.caches {
+            for cache in caches.iter_mut() {
+                cache.reset();
+            }
+        }
+        self.caches = None;
+        self.clear_reuse_state();
+        Ok(())
+    }
+
+    /// Clear cached token history, image key, and rope deltas.
+    fn clear_reuse_state(&mut self) {
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_rope_deltas = None;
+    }
+
+    /// Take the KV cache from the model, returning a `PromptCache` handle.
+    pub(crate) fn take_cache_sync(
+        &mut self,
+    ) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
+        if self.cached_token_history.is_empty() {
+            return None;
+        }
+        let caches = self.caches.take()?;
+        Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
+            caches,
+            self.cached_token_history.clone(),
+            "qwen3_5",
+            self.config.num_layers as usize,
+            self.cached_image_key,
+            self.cached_rope_deltas,
+            self.model_id,
+        ))
+    }
+
+    /// Restore a previously taken `PromptCache` into the model.
+    pub(crate) fn set_cache_sync(
+        &mut self,
+        mut cache: crate::models::qwen3_5::prompt_cache::PromptCache,
+    ) -> Result<()> {
+        let restored_caches = cache.take_caches().ok_or_else(|| {
+            Error::from_reason("PromptCache is empty (already consumed or disposed)")
+        })?;
+        self.caches = Some(restored_caches);
+        self.cached_token_history = cache.token_history().to_vec();
+        self.cached_image_key = cache.image_cache_key();
+        self.cached_rope_deltas = cache.rope_deltas();
+        Ok(())
+    }
+
+    /// Get the number of parameters in the model.
+    #[allow(dead_code)]
+    pub(crate) fn num_parameters(&self) -> i64 {
+        let h = self.config.hidden_size as i64;
+        let v = self.config.vocab_size as i64;
+        let n = self.config.num_layers as usize;
+        let dense_i = self.config.intermediate_size as i64;
+
+        let mut total = v * h;
+        if !self.config.tie_word_embeddings {
+            total += v * h;
+        }
+
+        let kd = self.config.linear_key_dim() as i64;
+        let vd = self.config.linear_value_dim() as i64;
+
+        for layer_idx in 0..n {
+            let is_linear = self.config.is_linear_layer(layer_idx);
+            if is_linear {
+                let num_vh = self.config.linear_num_value_heads as i64;
+                let vhd = self.config.linear_value_head_dim as i64;
+                total += h * (kd * 2 + vd * 2)
+                    + h * (num_vh * 2)
+                    + (kd * 2 + vd) * self.config.linear_conv_kernel_dim as i64
+                    + vd * h
+                    + num_vh
+                    + num_vh
+                    + vhd;
+            } else {
+                let d = self.config.head_dim as i64;
+                total += h * h * 2 + h * (self.config.num_kv_heads as i64 * d) * 2 + h * h + d * 2;
+            }
+            total += 3 * h * dense_i;
+            total += h * 2;
+        }
+        total += h;
+        total
+    }
+
+    /// Save model weights and configuration to a directory (synchronous).
+    pub(crate) fn save_model_sync(&self, save_path: &str) -> Result<()> {
+        use super::decoder_layer::AttentionType;
+
+        let mut params = HashMap::new();
+
+        // Embedding
+        params.insert("embedding.weight".to_string(), self.embedding.get_weight());
+
+        // Layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+            match &layer.attn {
+                AttentionType::Linear(gdn) => {
+                    params.insert(
+                        format!("{}.linear_attn.in_proj_qkvz.weight", prefix),
+                        gdn.get_in_proj_qkvz_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.in_proj_ba.weight", prefix),
+                        gdn.get_in_proj_ba_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.conv1d.weight", prefix),
+                        gdn.get_conv1d_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.norm.weight", prefix),
+                        gdn.get_norm_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.out_proj.weight", prefix),
+                        gdn.get_out_proj_weight(),
+                    );
+                    params.insert(format!("{}.linear_attn.dt_bias", prefix), gdn.get_dt_bias());
+                    params.insert(format!("{}.linear_attn.a_log", prefix), gdn.get_a_log());
+                }
+                AttentionType::Full(attn) => {
+                    params.insert(
+                        format!("{}.self_attn.q_proj.weight", prefix),
+                        attn.get_q_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.k_proj.weight", prefix),
+                        attn.get_k_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.v_proj.weight", prefix),
+                        attn.get_v_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.o_proj.weight", prefix),
+                        attn.get_o_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.q_norm.weight", prefix),
+                        attn.get_q_norm_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.k_norm.weight", prefix),
+                        attn.get_k_norm_weight(),
+                    );
+                }
+            }
+            params.insert(
+                format!("{}.mlp.gate_proj.weight", prefix),
+                layer.mlp.get_gate_proj_weight(),
+            );
+            params.insert(
+                format!("{}.mlp.up_proj.weight", prefix),
+                layer.mlp.get_up_proj_weight(),
+            );
+            params.insert(
+                format!("{}.mlp.down_proj.weight", prefix),
+                layer.mlp.get_down_proj_weight(),
+            );
+            params.insert(
+                format!("{}.input_layernorm.weight", prefix),
+                layer.get_input_layernorm_weight(),
+            );
+            params.insert(
+                format!("{}.post_attention_layernorm.weight", prefix),
+                layer.get_post_attention_layernorm_weight(),
+            );
+        }
+
+        // Final norm
+        params.insert(
+            "final_norm.weight".to_string(),
+            self.final_norm.get_weight(),
+        );
+
+        // LM head
+        if !self.config.tie_word_embeddings
+            && let Some(ref lm_head) = self.lm_head
+        {
+            params.insert("lm_head.weight".to_string(), lm_head.get_weight());
+        }
+
+        // Include vision encoder weights
+        if let Some(ref vision_enc) = self.vision_encoder {
+            let vision_params = vision_enc.get_parameters();
+            params.extend(vision_params);
+        }
+
+        // Validate for NaN/Inf
+        for (name, param) in params.iter() {
+            let data = param.to_float32()?;
+            let invalid_count = data
+                .iter()
+                .filter(|v| v.is_nan() || v.is_infinite())
+                .count();
+            if invalid_count > 0 {
+                return Err(napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!(
+                        "Cannot save model: parameter '{}' contains {} NaN/Inf values.",
+                        name, invalid_count
+                    ),
+                ));
+            }
+        }
+
+        let params_clone: HashMap<String, MxArray> =
+            params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        // Weights metadata
+        let mut weights_metadata = serde_json::Map::new();
+        for (key, array) in params.iter() {
+            let shape_data = array.shape()?;
+            let shape: Vec<i64> = shape_data.as_ref().to_vec();
+            let dtype = array.dtype()?;
+            let mut param_info = serde_json::Map::new();
+            param_info.insert("shape".to_string(), serde_json::json!(shape));
+            param_info.insert("dtype".to_string(), serde_json::json!(dtype as i32));
+            weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
+        }
+
+        // Config JSON
+        let mut config_value = serde_json::to_value(&self.config).map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Failed to serialize config: {e}"),
+            )
+        })?;
+        if let serde_json::Value::Object(ref mut map) = config_value {
+            map.insert("model_type".to_string(), serde_json::json!("qwen3_5"));
+        }
+
+        let weights_json = serde_json::json!({
+            "version": "1.0",
+            "config": config_value,
+            "weights": weights_metadata,
+            "note": "Full weights are in weights.safetensors"
+        });
+
+        let path = std::path::Path::new(save_path);
+        std::fs::create_dir_all(path)?;
+
+        info!("Saving model to {}", save_path);
+
+        let config_path = path.join("config.json");
+        let config_json = serde_json::to_string_pretty(&config_value)?;
+        std::fs::write(&config_path, config_json)?;
+        info!("Saved config.json");
+
+        let safetensors_path = path.join("weights.safetensors");
+        let metadata = Some(serde_json::json!({
+            "format": "mlx-node",
+            "version": "1.0"
+        }));
+        crate::utils::safetensors::save_safetensors(&safetensors_path, &params_clone, metadata)?;
+        info!("Saved weights.safetensors");
+
+        let weights_str = serde_json::to_string_pretty(&weights_json)?;
+        let weights_path = path.join("weights.mlx");
+        std::fs::write(&weights_path, weights_str)?;
+        info!("Saved weights.mlx metadata");
+
+        Ok(())
+    }
+
+    /// Set the tokenizer.
+    pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
+        self.tokenizer = Some(tokenizer);
+    }
+
+    /// Set the vision encoder.
+    pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) {
+        self.vision_encoder = Some(Arc::new(enc));
+    }
+
+    /// Set the image processor.
+    pub(crate) fn set_image_processor(&mut self, proc: Qwen35VLImageProcessor) {
+        self.image_processor = Some(Arc::new(proc));
+    }
+
+    /// Set spatial merge size.
+    pub(crate) fn set_spatial_merge_size(&mut self, size: i32) {
+        self.spatial_merge_size = Some(size);
+    }
+
+    /// Initialize M-RoPE on all full attention layers (VLM mode).
+    pub(crate) fn init_mrope_layers(
+        &mut self,
+        mrope_section: Vec<i32>,
+        rope_theta: f64,
+        max_position_embeddings: i32,
+    ) -> Result<()> {
+        let rope_dims = self.config.rope_dims();
+        for layer in self.layers.iter_mut() {
+            if let super::decoder_layer::AttentionType::Full(ref mut attn) = layer.attn {
+                attn.init_mrope(
+                    mrope_section.clone(),
+                    rope_theta,
+                    max_position_embeddings,
+                    rope_dims,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Chat synchronous (runs on model thread).
+    pub(crate) fn chat_sync(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let report_perf = config.report_performance.unwrap_or(false);
+
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        let has_images = messages
+            .iter()
+            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
+
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
+
+        let tool_defs = config.tools.as_deref();
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let tokens = tokenizer.apply_chat_template_sync(
+            &messages,
+            Some(true),
+            tool_defs,
+            enable_thinking,
+        )?;
+
+        let p = extract_chat_params(&config);
+        let max_new_tokens = p.max_new_tokens;
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut first_token_instant: Option<std::time::Instant> = None;
+
+        let model_id = self.model_id;
+
+        // Check if compiled path will be used
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+
+        // Serialize compiled lifecycle across model instances
+        let _compiled_lock = if use_compiled {
+            Some(
+                DENSE_COMPILED_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+
+        // Re-validate compiled path under weight lock
+        let mut _weight_guard = None;
+        let use_compiled = if use_compiled {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let embedding_weight = self.embedding.get_weight();
+
+        // === VLM image processing ===
+        let sms = self.spatial_merge_size.unwrap_or(2);
+        let (expanded_tokens, current_image_cache_key, vlm_processed) = if has_images {
+            if let (Some(_vision_enc), Some(img_proc)) =
+                (self.vision_encoder.as_ref(), self.image_processor.as_ref())
+            {
+                let all_images = extract_images_from_messages(&messages);
+                let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
+                let processed_pre = img_proc.process_many(&image_refs)?;
+                let num_image_tokens = compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
+                let expanded = inject_image_placeholders(&tokens, num_image_tokens);
+                let cache_key = compute_image_cache_key(&all_images);
+                (expanded, cache_key, Some(processed_pre))
+            } else {
+                (tokens.clone(), 0u64, None)
+            }
+        } else {
+            (tokens.clone(), 0u64, None)
+        };
+
+        // === Cache reuse: prefix verification ===
+        let cached_prefix_len = verify_cache_prefix_direct(
+            reuse_cache,
+            has_images,
+            &tokens,
+            &expanded_tokens,
+            current_image_cache_key,
+            &self.cached_token_history,
+            &self.cached_image_key,
+            self.caches.is_some(),
+        );
+
+        let prefill_tokens = if cached_prefix_len > 0 {
+            if has_images {
+                info!(
+                    "VLM cache reuse: {} cached tokens, {} new tokens to prefill",
+                    cached_prefix_len,
+                    expanded_tokens.len() - cached_prefix_len
+                );
+                expanded_tokens[cached_prefix_len..].to_vec()
+            } else {
+                info!(
+                    "Cache reuse: {} cached tokens, {} new tokens to prefill",
+                    cached_prefix_len,
+                    tokens.len() - cached_prefix_len
+                );
+                tokens[cached_prefix_len..].to_vec()
+            }
+        } else {
+            // Full reset
+            if let Some(ref mut caches) = self.caches {
+                for cache in caches.iter_mut() {
+                    cache.reset();
+                }
+            }
+            let new_caches = (0..self.config.num_layers as usize)
+                .map(|i| {
+                    if self.config.is_linear_layer(i) {
+                        Qwen3_5LayerCache::new_linear()
+                    } else {
+                        Qwen3_5LayerCache::new_full_attention()
+                    }
+                })
+                .collect();
+            self.caches = Some(new_caches);
+            tokens.clone()
+        };
+
+        // Zero-delta guard
+        let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
+            info!("Zero-delta cache hit: resetting caches for full re-prefill");
+            if let Some(ref mut caches) = self.caches {
+                for cache in caches.iter_mut() {
+                    cache.reset();
+                }
+            }
+            let new_caches = (0..self.config.num_layers as usize)
+                .map(|i| {
+                    if self.config.is_linear_layer(i) {
+                        Qwen3_5LayerCache::new_linear()
+                    } else {
+                        Qwen3_5LayerCache::new_full_attention()
+                    }
+                })
+                .collect();
+            self.caches = Some(new_caches);
+            let tokens = if has_images {
+                expanded_tokens.clone()
+            } else {
+                tokens.clone()
+            };
+            (tokens, 0)
+        } else {
+            (prefill_tokens, cached_prefix_len)
+        };
+
+        let eos_id = self.config.eos_token_id as u32;
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut finish_reason = String::from("length");
+
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
+        let mut profiler = crate::decode_profiler::DecodeProfiler::new("chat", "qwen3_5");
+        profiler.set_prompt_tokens(prefill_tokens.len() as u32);
+        profiler.snapshot_memory_before();
+
+        // === VLM or text prefill branching ===
+        profiler.begin_prefill();
+        let (mut last_logits, seq_len, vlm_compiled_init_done) = if has_images
+            && cached_prefix_len == 0
+        {
+            if let Some(vision_enc) = self.vision_encoder.clone() {
+                let final_tokens = &expanded_tokens;
+                let processed = vlm_processed
+                    .as_ref()
+                    .ok_or_else(|| Error::from_reason("VLM processed images missing"))?;
+
+                let input_ids =
+                    MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
+
+                let (logits, rope_deltas, vlm_compiled) = vlm_prefill(
+                    &input_ids,
+                    current_image_cache_key,
+                    processed,
+                    &vision_enc,
+                    sms,
+                    &embedding_weight,
+                    &mut self.layers,
+                    &mut self.caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &self.config,
+                    max_new_tokens,
+                    generation_stream,
+                    &self.vision_cache,
+                    model_id,
+                )?;
+
+                self.cached_rope_deltas = Some(rope_deltas as i32);
+
+                let vlm_seq_len = final_tokens.len() as i64;
+                (logits, vlm_seq_len, vlm_compiled)
+            } else {
+                return Err(Error::from_reason(
+                    "VLM prefill requested but vision encoder/processor not loaded",
+                ));
+            }
+        } else {
+            let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
+            let logits = chunked_prefill(
+                &prompt,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+                generation_stream,
+            )?;
+
+            let seq_len = logits.shape_at(1)?;
+            let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+            let last_logits = last_logits.squeeze(Some(&[1]))?;
+            let total_seq_len = if has_images {
+                expanded_tokens.len() as i64
+            } else {
+                tokens.len() as i64
+            };
+            (last_logits, total_seq_len, false)
+        };
+        profiler.end_prefill();
+
+        let mut token_history: Vec<u32> = tokens.clone();
+        last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
+        let mut y = sample(&last_logits, p.sampling_config)?;
+        MxArray::async_eval_arrays(&[&y]);
+
+        let _compiled_guard = if use_compiled {
+            Some(CompiledResetGuard)
+        } else {
+            None
+        };
+
+        if use_compiled {
+            if vlm_compiled_init_done {
+                // VLM prefill already initialized compiled state
+            } else {
+                use mlx_sys as sys;
+                let prefill_len = seq_len as i32;
+                let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+                let num_layers = self.config.num_layers as usize;
+                let mut cache_ptrs: Vec<*mut sys::mlx_array> =
+                    vec![std::ptr::null_mut(); num_layers * 2];
+                if let Some(ref caches) = self.caches {
+                    for (i, cache) in caches.iter().enumerate() {
+                        let (p0, p1) = cache.export_ptrs();
+                        cache_ptrs[i * 2] = p0;
+                        cache_ptrs[i * 2 + 1] = p1;
+                    }
+                }
+                unsafe {
+                    sys::mlx_qwen35_compiled_init_from_prefill(
+                        self.config.num_layers,
+                        self.config.hidden_size,
+                        self.config.num_heads,
+                        self.config.num_kv_heads,
+                        self.config.head_dim,
+                        self.config.rope_theta as f32,
+                        self.config.rope_dims(),
+                        self.config.rms_norm_eps as f32,
+                        self.config.full_attention_interval,
+                        self.config.linear_num_key_heads,
+                        self.config.linear_num_value_heads,
+                        self.config.linear_key_head_dim,
+                        self.config.linear_value_head_dim,
+                        self.config.linear_conv_kernel_dim,
+                        if self.config.tie_word_embeddings {
+                            1
+                        } else {
+                            0
+                        },
+                        max_kv_len,
+                        1,
+                        cache_ptrs.as_mut_ptr(),
+                        prefill_len,
+                    );
+                }
+
+                // VLM cache reuse: apply saved rope_deltas
+                if has_images
+                    && cached_prefix_len > 0
+                    && let Some(delta) = self.cached_rope_deltas
+                {
+                    unsafe {
+                        mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
+                    }
+                }
+            }
+
+            // For text-only, clear stale rope deltas
+            if !has_images {
+                self.cached_rope_deltas = None;
+            }
+
+            profiler.set_label("chat_compiled");
+
+            let starts_in_thinking = enable_thinking.unwrap_or(true);
+            let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+                starts_in_thinking,
+                p.thinking_token_budget,
+                think_end_id,
+            );
+
+            let mut ops = chat_common::DecodeOps {
+                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                    Ok((forward_compiled(ids, emb)?, false))
+                },
+                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                    eval_token_and_compiled_caches(token);
+                    if budget_forced {
+                        logits.eval();
+                    }
+                },
+            };
+            chat_common::decode_loop!(
+                ops: ops,
+                y: y,
+                embedding_weight: embedding_weight,
+                params: p,
+                reasoning_tracker: reasoning_tracker,
+                profiler: profiler,
+                max_new_tokens: max_new_tokens,
+                eos_id: eos_id,
+                generated_tokens: generated_tokens,
+                token_history: token_history,
+                finish_reason: finish_reason,
+                first_token_instant: first_token_instant,
+                report_perf: p.report_performance,
+                generation_stream: generation_stream
+            );
+
+            // Export caches from C++ before CompiledResetGuard drops
+            if reuse_cache {
+                let num_layers = self.config.num_layers as usize;
+                let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                    vec![std::ptr::null_mut(); num_layers * 2];
+                let exported = unsafe {
+                    mlx_sys::mlx_qwen35_export_caches(
+                        export_ptrs.as_mut_ptr(),
+                        (num_layers * 2) as i32,
+                    )
+                };
+                if exported > 0 {
+                    let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
+                    let mut new_caches = Vec::with_capacity(num_layers);
+                    for i in 0..num_layers {
+                        let p0 = export_ptrs[i * 2];
+                        let p1 = export_ptrs[i * 2 + 1];
+                        let mut lc = if self.config.is_linear_layer(i) {
+                            Qwen3_5LayerCache::new_linear()
+                        } else {
+                            Qwen3_5LayerCache::new_full_attention()
+                        };
+                        lc.import_ptrs(p0, p1, cache_offset);
+                        new_caches.push(lc);
+                    }
+                    self.caches = Some(new_caches);
+                }
+            }
+        } else {
+            profiler.set_label("chat_rust");
+
+            let starts_in_thinking = enable_thinking.unwrap_or(true);
+            let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+                starts_in_thinking,
+                p.thinking_token_budget,
+                think_end_id,
+            );
+
+            MxArray::async_eval_arrays(&[&y]);
+
+            let mut ops = chat_common::DecodeOps {
+                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                    let logits = forward_inner(
+                        ids,
+                        emb,
+                        &mut self.layers,
+                        &mut self.caches,
+                        &self.final_norm,
+                        &self.lm_head,
+                        Some(&embedding_weight_t),
+                    )?;
+                    Ok((logits, true))
+                },
+                eval_step: |token: &MxArray, logits: &MxArray, _budget_forced: bool| {
+                    MxArray::async_eval_arrays(&[token, logits]);
+                },
+            };
+            chat_common::decode_loop!(
+                ops: ops,
+                y: y,
+                embedding_weight: embedding_weight,
+                params: p,
+                reasoning_tracker: reasoning_tracker,
+                profiler: profiler,
+                max_new_tokens: max_new_tokens,
+                eos_id: eos_id,
+                generated_tokens: generated_tokens,
+                token_history: token_history,
+                finish_reason: finish_reason,
+                first_token_instant: first_token_instant,
+                report_perf: p.report_performance,
+                generation_stream: generation_stream
+            );
+        }
+
+        // Save cache state
+        save_cache_state_direct(
+            p.reuse_cache,
+            has_images,
+            &generated_tokens,
+            &finish_reason,
+            &tokens,
+            Some(&expanded_tokens),
+            current_image_cache_key,
+            &mut self.cached_token_history,
+            &mut self.cached_image_key,
+            &mut self.cached_rope_deltas,
+            &mut self.caches,
+        );
+
+        let performance = compute_performance_metrics(
+            generation_start,
+            first_token_instant,
+            prefill_tokens.len(),
+            generated_tokens.len(),
+        );
+
+        finalize_chat_result(
+            &tokenizer,
+            &generated_tokens,
+            finish_reason,
+            think_end_id,
+            think_end_str.as_deref(),
+            performance,
+            p.include_reasoning,
+            enable_thinking.unwrap_or(true),
+        )
+    }
+
+    /// Streaming chat synchronous (runs on model thread).
+    pub(crate) fn chat_stream_sync(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        let cb = StreamSender(stream_tx.clone());
+        let result = self.chat_stream_sync_inner(messages, config, &cb, &cancelled);
+        if let Err(e) = result {
+            let _ = stream_tx.send(Err(e));
+        }
+    }
+
+    fn chat_stream_sync_inner(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let report_perf = config.report_performance.unwrap_or(false);
+
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        let has_images = messages
+            .iter()
+            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
+
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
+        let tokenizer_for_decode = tokenizer.clone();
+
+        let tool_defs = config.tools.as_deref();
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let tokens = tokenizer.apply_chat_template_sync(
+            &messages,
+            Some(true),
+            tool_defs,
+            enable_thinking,
+        )?;
+
+        let p = chat_common::extract_chat_params(&config);
+        let model_id = self.model_id;
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut first_token_instant: Option<std::time::Instant> = None;
+
+        // Check compiled path
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let _compiled_lock = if use_compiled {
+            Some(
+                DENSE_COMPILED_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+
+        let mut _weight_guard = None;
+        let use_compiled = if use_compiled {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let embedding_weight = self.embedding.get_weight();
+
+        // VLM image processing
+        let sms = self.spatial_merge_size.unwrap_or(2);
+        let (expanded_tokens, current_image_cache_key, vlm_processed) = if has_images {
+            if let (Some(_vision_enc), Some(img_proc)) =
+                (self.vision_encoder.as_ref(), self.image_processor.as_ref())
+            {
+                let all_images = extract_images_from_messages(&messages);
+                let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
+                let processed_pre = img_proc.process_many(&image_refs)?;
+                let num_image_tokens = compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
+                let expanded = inject_image_placeholders(&tokens, num_image_tokens);
+                let cache_key = compute_image_cache_key(&all_images);
+                (expanded, cache_key, Some(processed_pre))
+            } else {
+                (tokens.clone(), 0u64, None)
+            }
+        } else {
+            (tokens.clone(), 0u64, None)
+        };
+
+        // Cache reuse
+        let cached_prefix_len = verify_cache_prefix_direct(
+            reuse_cache,
+            has_images,
+            &tokens,
+            &expanded_tokens,
+            current_image_cache_key,
+            &self.cached_token_history,
+            &self.cached_image_key,
+            self.caches.is_some(),
+        );
+
+        let prefill_tokens = if cached_prefix_len > 0 {
+            if has_images {
+                info!(
+                    "VLM cache reuse: {} cached tokens, {} new tokens to prefill",
+                    cached_prefix_len,
+                    expanded_tokens.len() - cached_prefix_len
+                );
+                expanded_tokens[cached_prefix_len..].to_vec()
+            } else {
+                info!(
+                    "Cache reuse: {} cached tokens, {} new tokens to prefill",
+                    cached_prefix_len,
+                    tokens.len() - cached_prefix_len
+                );
+                tokens[cached_prefix_len..].to_vec()
+            }
+        } else {
+            if let Some(ref mut caches) = self.caches {
+                for cache in caches.iter_mut() {
+                    cache.reset();
+                }
+            }
+            let new_caches = (0..self.config.num_layers as usize)
+                .map(|i| {
+                    if self.config.is_linear_layer(i) {
+                        Qwen3_5LayerCache::new_linear()
+                    } else {
+                        Qwen3_5LayerCache::new_full_attention()
+                    }
+                })
+                .collect();
+            self.caches = Some(new_caches);
+            tokens.clone()
+        };
+
+        // Zero-delta guard
+        let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
+            info!("Zero-delta cache hit: resetting caches for full re-prefill");
+            if let Some(ref mut caches) = self.caches {
+                for cache in caches.iter_mut() {
+                    cache.reset();
+                }
+            }
+            let new_caches = (0..self.config.num_layers as usize)
+                .map(|i| {
+                    if self.config.is_linear_layer(i) {
+                        Qwen3_5LayerCache::new_linear()
+                    } else {
+                        Qwen3_5LayerCache::new_full_attention()
+                    }
+                })
+                .collect();
+            self.caches = Some(new_caches);
+            let tokens = if has_images {
+                expanded_tokens.clone()
+            } else {
+                tokens.clone()
+            };
+            (tokens, 0)
+        } else {
+            (prefill_tokens, cached_prefix_len)
+        };
+
+        let eos_id = self.config.eos_token_id as u32;
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut finish_reason = String::from("length");
+        let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
+        let mut streamed_text_len: usize = 0;
+
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
+        let mut profiler = crate::decode_profiler::DecodeProfiler::new("chat_stream", "qwen3_5");
+        profiler.set_prompt_tokens(prefill_tokens.len() as u32);
+        profiler.snapshot_memory_before();
+
+        // VLM or text prefill
+        profiler.begin_prefill();
+        let (mut last_logits, seq_len, vlm_compiled_init_done) = if has_images
+            && cached_prefix_len == 0
+        {
+            if let Some(vision_enc) = self.vision_encoder.clone() {
+                let final_tokens = &expanded_tokens;
+                let processed = vlm_processed
+                    .as_ref()
+                    .ok_or_else(|| Error::from_reason("VLM processed images missing"))?;
+
+                let input_ids =
+                    MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
+
+                let (logits, rope_deltas, vlm_compiled) = vlm_prefill(
+                    &input_ids,
+                    current_image_cache_key,
+                    processed,
+                    &vision_enc,
+                    sms,
+                    &embedding_weight,
+                    &mut self.layers,
+                    &mut self.caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &self.config,
+                    p.max_new_tokens,
+                    generation_stream,
+                    &self.vision_cache,
+                    model_id,
+                )?;
+
+                self.cached_rope_deltas = Some(rope_deltas as i32);
+                let vlm_seq_len = final_tokens.len() as i64;
+                (logits, vlm_seq_len, vlm_compiled)
+            } else {
+                return Err(Error::from_reason(
+                    "VLM prefill requested but vision encoder/processor not loaded",
+                ));
+            }
+        } else {
+            let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
+            let logits = chunked_prefill(
+                &prompt,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+                generation_stream,
+            )?;
+
+            let seq_len = logits.shape_at(1)?;
+            let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+            let last_logits = last_logits.squeeze(Some(&[1]))?;
+            let total_seq_len = if has_images {
+                expanded_tokens.len() as i64
+            } else {
+                tokens.len() as i64
+            };
+            (last_logits, total_seq_len, false)
+        };
+        profiler.end_prefill();
+
+        let mut token_history: Vec<u32> = tokens.clone();
+        last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
+        let mut y = sample(&last_logits, p.sampling_config)?;
+        MxArray::async_eval_arrays(&[&y]);
+
+        let _compiled_guard = if use_compiled {
+            Some(CompiledResetGuard)
+        } else {
+            None
+        };
+
+        let starts_in_thinking = enable_thinking.unwrap_or(true);
+        let mut last_is_reasoning = starts_in_thinking;
+
+        if use_compiled {
+            if vlm_compiled_init_done {
+                // VLM prefill already initialized compiled state
+            } else {
+                use mlx_sys as sys;
+                let prefill_len = seq_len as i32;
+                let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
+                let num_layers = self.config.num_layers as usize;
+                let mut cache_ptrs: Vec<*mut sys::mlx_array> =
+                    vec![std::ptr::null_mut(); num_layers * 2];
+                if let Some(ref caches) = self.caches {
+                    for (i, cache) in caches.iter().enumerate() {
+                        let (p0, p1) = cache.export_ptrs();
+                        cache_ptrs[i * 2] = p0;
+                        cache_ptrs[i * 2 + 1] = p1;
+                    }
+                }
+                unsafe {
+                    sys::mlx_qwen35_compiled_init_from_prefill(
+                        self.config.num_layers,
+                        self.config.hidden_size,
+                        self.config.num_heads,
+                        self.config.num_kv_heads,
+                        self.config.head_dim,
+                        self.config.rope_theta as f32,
+                        self.config.rope_dims(),
+                        self.config.rms_norm_eps as f32,
+                        self.config.full_attention_interval,
+                        self.config.linear_num_key_heads,
+                        self.config.linear_num_value_heads,
+                        self.config.linear_key_head_dim,
+                        self.config.linear_value_head_dim,
+                        self.config.linear_conv_kernel_dim,
+                        if self.config.tie_word_embeddings {
+                            1
+                        } else {
+                            0
+                        },
+                        max_kv_len,
+                        1,
+                        cache_ptrs.as_mut_ptr(),
+                        prefill_len,
+                    );
+                }
+
+                if has_images
+                    && cached_prefix_len > 0
+                    && let Some(delta) = self.cached_rope_deltas
+                {
+                    unsafe {
+                        mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
+                    }
+                }
+            }
+
+            if !has_images {
+                self.cached_rope_deltas = None;
+            }
+
+            profiler.set_label("chat_stream_compiled");
+
+            let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+                starts_in_thinking,
+                p.thinking_token_budget,
+                think_end_id,
+            );
+
+            let mut ops = chat_common::DecodeOps {
+                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                    Ok((forward_compiled(ids, emb)?, false))
+                },
+                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                    eval_token_and_compiled_caches(token);
+                    if budget_forced {
+                        logits.eval();
+                    }
+                },
+            };
+            chat_common::decode_loop!(
+                ops: ops,
+                y: y,
+                embedding_weight: embedding_weight,
+                params: p,
+                reasoning_tracker: reasoning_tracker,
+                profiler: profiler,
+                max_new_tokens: p.max_new_tokens,
+                eos_id: eos_id,
+                generated_tokens: generated_tokens,
+                token_history: token_history,
+                finish_reason: finish_reason,
+                first_token_instant: first_token_instant,
+                report_perf: p.report_performance,
+                generation_stream: generation_stream,
+                streaming: {
+                    callback: cb,
+                    cancelled: cancelled,
+                    decode_stream: decode_stream,
+                    tokenizer: tokenizer_for_decode,
+                    streamed_text_len: streamed_text_len,
+                    last_is_reasoning: last_is_reasoning
+                }
+            );
+
+            // Export caches
+            if reuse_cache {
+                let num_layers = self.config.num_layers as usize;
+                let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                    vec![std::ptr::null_mut(); num_layers * 2];
+                let exported = unsafe {
+                    mlx_sys::mlx_qwen35_export_caches(
+                        export_ptrs.as_mut_ptr(),
+                        (num_layers * 2) as i32,
+                    )
+                };
+                if exported > 0 {
+                    let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
+                    let mut new_caches = Vec::with_capacity(num_layers);
+                    for i in 0..num_layers {
+                        let p0 = export_ptrs[i * 2];
+                        let p1 = export_ptrs[i * 2 + 1];
+                        let mut lc = if self.config.is_linear_layer(i) {
+                            Qwen3_5LayerCache::new_linear()
+                        } else {
+                            Qwen3_5LayerCache::new_full_attention()
+                        };
+                        lc.import_ptrs(p0, p1, cache_offset);
+                        new_caches.push(lc);
+                    }
+                    self.caches = Some(new_caches);
+                }
+            }
+        } else {
+            profiler.set_label("chat_stream_rust");
+
+            let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+                starts_in_thinking,
+                p.thinking_token_budget,
+                think_end_id,
+            );
+
+            let mut ops = chat_common::DecodeOps {
+                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                    let logits = forward_inner(
+                        ids,
+                        emb,
+                        &mut self.layers,
+                        &mut self.caches,
+                        &self.final_norm,
+                        &self.lm_head,
+                        Some(&embedding_weight_t),
+                    )?;
+                    Ok((logits, true))
+                },
+                eval_step: |token: &MxArray, logits: &MxArray, _budget_forced: bool| {
+                    MxArray::async_eval_arrays(&[token, logits]);
+                },
+            };
+            chat_common::decode_loop!(
+                ops: ops,
+                y: y,
+                embedding_weight: embedding_weight,
+                params: p,
+                reasoning_tracker: reasoning_tracker,
+                profiler: profiler,
+                max_new_tokens: p.max_new_tokens,
+                eos_id: eos_id,
+                generated_tokens: generated_tokens,
+                token_history: token_history,
+                finish_reason: finish_reason,
+                first_token_instant: first_token_instant,
+                report_perf: p.report_performance,
+                generation_stream: generation_stream,
+                streaming: {
+                    callback: cb,
+                    cancelled: cancelled,
+                    decode_stream: decode_stream,
+                    tokenizer: tokenizer_for_decode,
+                    streamed_text_len: streamed_text_len,
+                    last_is_reasoning: last_is_reasoning
+                }
+            );
+        }
+
+        // Save cache state
+        save_cache_state_direct(
+            p.reuse_cache,
+            has_images,
+            &generated_tokens,
+            &finish_reason,
+            &tokens,
+            Some(&expanded_tokens),
+            current_image_cache_key,
+            &mut self.cached_token_history,
+            &mut self.cached_image_key,
+            &mut self.cached_rope_deltas,
+            &mut self.caches,
+        );
+
+        let text = tokenizer_for_decode
+            .decode_sync(&generated_tokens, true)
+            .unwrap_or_else(|e| {
+                warn!("Failed to decode generated tokens: {}", e);
+                String::new()
+            });
+
+        // Flush residual bytes
+        if text.len() > streamed_text_len {
+            let residual = text[streamed_text_len..].to_string();
+            cb.call(
+                Ok(ChatStreamChunk {
+                    text: residual,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    raw_text: None,
+                    performance: None,
+                    is_reasoning: Some(last_is_reasoning),
+                }),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+        }
+
+        let num_tokens = generated_tokens.len() as u32;
+
+        let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
+            &text,
+            &generated_tokens,
+            enable_thinking.unwrap_or(true),
+            think_end_id,
+            think_end_str.as_deref(),
+            p.include_reasoning,
+        );
+
+        let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
+        let perf_metrics = compute_performance_metrics(
+            generation_start,
+            first_token_instant,
+            prefill_tokens.len(),
+            generated_tokens.len(),
+        );
+
+        // Send final done chunk
+        cb.call(
+            Ok(ChatStreamChunk {
+                text: clean_text,
+                done: true,
+                finish_reason: Some(finish_reason),
+                tool_calls: Some(tool_calls),
+                thinking,
+                num_tokens: Some(num_tokens),
+                raw_text: Some(text),
+                performance: perf_metrics,
+                is_reasoning: None,
+            }),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+
+        Ok(())
+    }
+
+    /// Generate text from prompt tokens (synchronous, runs on model thread).
+    pub(crate) fn generate_sync(
+        &mut self,
+        prompt_tokens: MxArray,
+        config: Qwen3_5GenerationConfig,
+    ) -> Result<Qwen3_5GenerationResult> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        // Init caches
+        self.init_caches_sync()?;
+
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        // Prefill
+        let prompt = prompt_tokens.reshape(&[1, -1])?;
+        let logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            forward_inner(
+                &prompt,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+            )?
+        };
+
+        let seq_len = logits.shape_at(1)?;
+        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+        let last_logits = last_logits.squeeze(Some(&[1]))?;
+
+        let sampling_config = Some(SamplingConfig {
+            temperature: config.temperature,
+            top_k: config.top_k,
+            top_p: config.top_p,
+            min_p: config.min_p,
+        });
+
+        let eos_id = self.config.eos_token_id as u32;
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut y = sample(&last_logits, sampling_config)?;
+
+        for _step in 0..config.max_new_tokens {
+            y.eval();
+            let token_id = y.item_at_int32(0)? as u32;
+            generated_tokens.push(token_id);
+
+            if token_id == eos_id {
+                break;
+            }
+
+            let next_ids = y.reshape(&[1, 1])?;
+            let logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                forward_inner(
+                    &next_ids,
+                    &embedding_weight,
+                    &mut self.layers,
+                    &mut self.caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    Some(&embedding_weight_t),
+                )?
+            };
+
+            let logits = logits.squeeze(Some(&[1]))?;
+            y = sample(&logits, sampling_config)?;
+            MxArray::async_eval_arrays(&[&y]);
+
+            if (_step + 1) % 256 == 0 {
+                crate::array::synchronize_and_clear_cache();
+            }
+        }
+
+        self.reset_caches_sync()?;
+
+        let finish_reason = if generated_tokens.last().is_some_and(|&t| t == eos_id) {
+            "stop"
+        } else {
+            "length"
+        };
+
+        let text = tokenizer
+            .decode_sync(&generated_tokens, true)
+            .unwrap_or_default();
+
+        Ok(Qwen3_5GenerationResult {
+            tokens: generated_tokens.clone(),
+            text,
+            num_tokens: generated_tokens.len() as u32,
+            finish_reason: finish_reason.to_string(),
+        })
+    }
+}
+
+/// Wrapper around `StreamTx` that provides a `.call()` method matching the
+/// `ThreadsafeFunction` interface expected by the `decode_loop!` macro.
+///
+/// This allows the macro to work unchanged for both:
+/// - MoE model: passes a real `ThreadsafeFunction` (old path, until Phase 4)
+/// - Dense model: passes this `StreamSender` (new dedicated-thread path)
+struct StreamSender(StreamTx<ChatStreamChunk>);
+
+impl StreamSender {
+    fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
+        let _ = self.0.send(result);
+    }
+}
 
 /// RAII guard that calls `mlx_qwen35_compiled_reset()` on drop.
 ///
@@ -266,49 +1875,37 @@ impl ChatStreamHandle {
 
 /// Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
 ///
-/// Uses interior mutability (RwLock) for layers, final_norm, lm_head, and caches
-/// to allow async generation via spawn_blocking without blocking the Node.js event loop.
-/// This matches the pattern used by Qwen3Model.
+/// All inference state lives on a dedicated OS thread. NAPI methods dispatch
+/// commands via channels and await responses. Training support uses a
+/// separate `Arc<RwLock<>>` path via `clone_for_training()`.
 #[napi]
 pub struct Qwen3_5Model {
+    /// Dedicated model thread for inference. `None` for training clones.
+    pub(crate) thread: Option<crate::model_thread::ModelThread<Qwen35Cmd>>,
+    /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5Config,
+    pub(crate) model_id: u64,
+    pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
+
+    // === Training support fields (Arc<RwLock<>>) ===
+    // These are ONLY used by training clones (thread == None).
+    // For inference models, all state lives on the dedicated model thread.
     pub(crate) embedding: Embedding,
-    /// Decoder layers wrapped in RwLock for interior mutability during generation.
     pub(crate) layers: Arc<RwLock<Vec<DecoderLayer>>>,
-    /// Final layer norm wrapped in RwLock for interior mutability.
     pub(crate) final_norm: Arc<RwLock<RMSNorm>>,
-    /// LM head wrapped in RwLock for interior mutability.
-    pub(crate) lm_head: Arc<RwLock<Option<Linear>>>, // None when tie_word_embeddings
-    /// KV/SSM caches wrapped in RwLock for interior mutability during generation.
+    pub(crate) lm_head: Arc<RwLock<Option<Linear>>>,
     pub(crate) caches: Arc<RwLock<Option<Vec<Qwen3_5LayerCache>>>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
-    pub(crate) fa_idx: usize, // Index of first full attention layer
-    /// Optional vision encoder (set when loading a VLM)
+    #[allow(dead_code)]
+    pub(crate) fa_idx: usize,
     pub(crate) vision_encoder: Option<Arc<Qwen3_5VisionEncoder>>,
-    /// Optional image processor (set when loading a VLM)
-    pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
-    /// Spatial merge size for VLM (typically 2)
     pub(crate) spatial_merge_size: Option<i32>,
-    /// LRU cache for vision encoder embeddings, avoids re-encoding the same
-    /// image in multi-turn VLM conversations.
+    #[allow(dead_code)]
     pub(crate) vision_cache: VisionCache,
-    /// Token history for KV cache reuse across chat() calls.
-    /// Stores the full token sequence (template + generated) from the last call.
-    cached_token_history: Arc<RwLock<Vec<u32>>>,
-    /// Image cache key for VLM cache reuse (None for text-only conversations).
-    cached_image_key: Arc<RwLock<Option<u64>>>,
-    /// Rope deltas from VLM prefill, needed for cache reuse on subsequent turns.
-    /// Without this, the compiled decode path starts with wrong RoPE positions
-    /// when VLM prefill is skipped on Turn 2+.
-    cached_rope_deltas: Arc<RwLock<Option<i32>>>,
-    /// Unique model instance ID for compiled path ownership.
-    /// The C++ global weight map is shared across all models — this ID ensures
-    /// inference only uses the compiled path when the weights belong to this model.
-    pub(crate) model_id: u64,
-    /// Serializes cache state access: held during the entire chat()/chatStream()/generate()
-    /// lifecycle. Cache API methods (reset_caches, take_cache, set_cache) use try_lock
-    /// and return an error if generation is in-flight.
-    generation_lock: Arc<TokioMutex<()>>,
+    pub(crate) cached_token_history: Arc<RwLock<Vec<u32>>>,
+    pub(crate) cached_image_key: Arc<RwLock<Option<u64>>>,
+    pub(crate) cached_rope_deltas: Arc<RwLock<Option<i32>>>,
+    pub(crate) generation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[napi]
@@ -316,45 +1913,48 @@ impl Qwen3_5Model {
     /// Create a new Qwen3.5 model with the given configuration.
     #[napi(constructor)]
     pub fn new(config: Qwen3_5Config) -> Result<Self> {
-        let embedding = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)?;
+        let config_clone = config.clone();
+        let config_for_shell = config.clone();
 
-        let layers = (0..config.num_layers as usize)
-            .map(|i| DecoderLayer::new(&config, i))
-            .collect::<Result<Vec<_>>>()?;
-
-        let final_norm = RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps))?;
-
-        let lm_head = if config.tie_word_embeddings {
-            None
-        } else {
-            Some(Linear::new(
-                config.hidden_size as u32,
-                config.vocab_size as u32,
-                Some(false),
-            )?)
-        };
-
-        // Find first full attention layer index
-        let fa_idx = (0..config.num_layers as usize)
-            .find(|&i| !config.is_linear_layer(i))
-            .unwrap_or(0);
-
-        info!(
-            "Qwen3.5 model created: {} layers, fa_idx={}",
-            config.num_layers, fa_idx,
+        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+            move || {
+                let inner = Qwen35Inner::new(config)?;
+                let model_id = inner.model_id;
+                Ok((inner, model_id))
+            },
+            handle_qwen35_cmd,
         );
 
+        let model_id = init_rx
+            .blocking_recv()
+            .map_err(|_| napi::Error::from_reason("Model thread exited during init"))??;
+
+        // Create dummy training fields (not used for inference-only models)
+        let embedding = Embedding::new(
+            config_for_shell.vocab_size as u32,
+            config_for_shell.hidden_size as u32,
+        )?;
+        let fa_idx = (0..config_for_shell.num_layers as usize)
+            .find(|&i| !config_for_shell.is_linear_layer(i))
+            .unwrap_or(0);
+
         Ok(Self {
-            config,
+            thread: Some(thread),
+            config: config_clone,
+            model_id,
+            image_processor: None,
+            // Training fields (unused for inference models, but needed for type compatibility)
             embedding,
-            layers: Arc::new(RwLock::new(layers)),
-            final_norm: Arc::new(RwLock::new(final_norm)),
-            lm_head: Arc::new(RwLock::new(lm_head)),
+            layers: Arc::new(RwLock::new(Vec::new())),
+            final_norm: Arc::new(RwLock::new(RMSNorm::new(
+                config_for_shell.hidden_size as u32,
+                Some(config_for_shell.rms_norm_eps),
+            )?)),
+            lm_head: Arc::new(RwLock::new(None)),
             caches: Arc::new(RwLock::new(None)),
             tokenizer: None,
             fa_idx,
             vision_encoder: None,
-            image_processor: None,
             spatial_merge_size: None,
             vision_cache: Arc::new(Mutex::new(VisionCacheInner {
                 entries: HashMap::new(),
@@ -363,14 +1963,19 @@ impl Qwen3_5Model {
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
-            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-            generation_lock: Arc::new(TokioMutex::new(())),
+            generation_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
     /// Initialize caches for incremental generation.
     #[napi]
     pub fn init_caches(&self) -> Result<()> {
+        if let Some(ref thread) = self.thread {
+            return crate::model_thread::send_and_block(thread, |reply| Qwen35Cmd::InitCaches {
+                reply,
+            });
+        }
+        // Training clone fallback (no model thread)
         let _guard = self.generation_lock.try_lock().map_err(|_| {
             Error::from_reason("Cannot init caches while generation is in progress")
         })?;
@@ -401,6 +2006,12 @@ impl Qwen3_5Model {
     /// Reset all caches.
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
+        if let Some(ref thread) = self.thread {
+            return crate::model_thread::send_and_block(thread, |reply| Qwen35Cmd::ResetCaches {
+                reply,
+            });
+        }
+        // Training clone fallback
         let _guard = self.generation_lock.try_lock().map_err(|_| {
             Error::from_reason("Cannot reset caches while generation is in progress")
         })?;
@@ -443,12 +2054,18 @@ impl Qwen3_5Model {
     /// before the next `chat()` call for incremental prefill.
     #[napi]
     pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
+        if let Some(ref thread) = self.thread {
+            return crate::model_thread::send_and_block(thread, |reply| Qwen35Cmd::TakeCache {
+                reply,
+            })
+            .ok()?;
+        }
+        // Training clone fallback
         let _guard = self.generation_lock.try_lock().ok()?;
         let mut caches_guard = self.caches.write().ok()?;
         let token_history_guard = self.cached_token_history.read().ok()?;
         let caches = caches_guard.take()?;
         if token_history_guard.is_empty() {
-            // No generation has happened yet — put caches back
             *caches_guard = Some(caches);
             return None;
         }
@@ -474,10 +2091,7 @@ impl Qwen3_5Model {
         &self,
         cache: &mut crate::models::qwen3_5::prompt_cache::PromptCache,
     ) -> Result<()> {
-        let _guard = self
-            .generation_lock
-            .try_lock()
-            .map_err(|_| Error::from_reason("Cannot set cache while generation is in progress"))?;
+        // Validate before sending (these checks don't need model-thread state)
         if cache.model_type() != "qwen3_5" {
             return Err(Error::from_reason(format!(
                 "Cache type '{}' doesn't match model type 'qwen3_5'",
@@ -496,6 +2110,29 @@ impl Qwen3_5Model {
                 "Cache was created by a different model instance (different checkpoint or config)",
             ));
         }
+        if let Some(ref thread) = self.thread {
+            // Extract the cache data to send to model thread
+            let owned_cache = crate::models::qwen3_5::prompt_cache::PromptCache::new(
+                cache.take_caches().ok_or_else(|| {
+                    Error::from_reason("PromptCache is empty (already consumed or disposed)")
+                })?,
+                cache.token_history().to_vec(),
+                "qwen3_5",
+                cache.num_layers(),
+                cache.image_cache_key(),
+                cache.rope_deltas(),
+                cache.model_id(),
+            );
+            return crate::model_thread::send_and_block(thread, |reply| Qwen35Cmd::SetCache {
+                cache: owned_cache,
+                reply,
+            });
+        }
+        // Training clone fallback
+        let _guard = self
+            .generation_lock
+            .try_lock()
+            .map_err(|_| Error::from_reason("Cannot set cache while generation is in progress"))?;
         let restored_caches = cache.take_caches().ok_or_else(|| {
             Error::from_reason("PromptCache is empty (already consumed or disposed)")
         })?;
@@ -518,37 +2155,6 @@ impl Qwen3_5Model {
         Ok(())
     }
 
-    /// Forward pass through the model.
-    ///
-    /// # Arguments
-    /// * `input_ids` - Token IDs [B, T]
-    ///
-    /// # Returns
-    /// Logits [B, T, vocab_size]
-    #[napi]
-    pub fn forward(&self, input_ids: &MxArray) -> Result<MxArray> {
-        let hidden_states = self.embedding.forward(input_ids)?;
-        self.forward_from_embeddings(&hidden_states)
-    }
-
-    /// Forward pass with cache for incremental generation.
-    #[napi]
-    pub fn forward_with_cache(&self, input_ids: &MxArray) -> Result<MxArray> {
-        {
-            let caches_guard = self
-                .caches
-                .read()
-                .map_err(|_| Error::from_reason("Failed to acquire caches read lock"))?;
-            if caches_guard.is_none() {
-                drop(caches_guard);
-                self.init_caches()?;
-            }
-        }
-
-        let hidden_states = self.embedding.forward(input_ids)?;
-        self.forward_from_embeddings(&hidden_states)
-    }
-
     /// Load a pretrained model from a directory.
     ///
     /// Expects the directory to contain:
@@ -557,13 +2163,10 @@ impl Qwen3_5Model {
     /// - tokenizer.json + tokenizer_config.json
     #[napi]
     pub async fn load(path: String) -> Result<Qwen3_5Model> {
-        persistence::load(&path).await
+        persistence::load_with_thread(&path).await
     }
 
     /// Generate text from a prompt token sequence.
-    ///
-    /// Runs generation on a worker thread via spawn_blocking to avoid
-    /// blocking the Node.js event loop.
     #[napi]
     pub async fn generate(
         &self,
@@ -576,9 +2179,6 @@ impl Qwen3_5Model {
                 config.max_new_tokens
             )));
         }
-
-        // generate() assumes batch_size=1 (reshape to [1,1], item_at_int32(0)).
-        // Reject multi-batch prompts early to avoid silently wrong results.
         let batch_size = prompt_tokens.shape_at(0)?;
         if batch_size != 1 {
             return Err(Error::from_reason(format!(
@@ -586,335 +2186,21 @@ impl Qwen3_5Model {
                 batch_size
             )));
         }
-
-        // Hold generation lock for the entire cache-read + generation + cache-write lifecycle.
-        let gen_lock = self.generation_lock.clone();
-        let _gen_guard = gen_lock.lock().await;
-
-        // Clone Arcs and data needed for the closure
-        let embedding_weight = self.embedding.get_weight();
-        let layers_arc = self.layers.clone();
-        let final_norm_arc = self.final_norm.clone();
-        let lm_head_arc = self.lm_head.clone();
-        let caches_arc = self.caches.clone();
-        let model_config = self.config.clone();
-        let tokenizer = self.tokenizer.clone();
-
-        let prompt_tokens = prompt_tokens.clone();
-        let model_id = self.model_id;
-
-        // Check if compiled path will be used (C++ weights belong to this model).
-        // Must be checked before spawn_blocking so we can acquire the mutex in async context.
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
-
-        // Serialize compiled lifecycle — prevents concurrent C++ global corruption
-        let _compiled_lock = if use_compiled {
-            Some(DENSE_COMPILED_MUTEX.lock().await)
-        } else {
-            None
-        };
-
-        napi::bindgen_prelude::spawn_blocking(move || {
-            let _weight_guard = if use_compiled {
-                acquire_compiled_weight_guard(model_id)
-            } else {
-                None
-            };
-            let use_compiled = _weight_guard.is_some();
-
-            // Acquire all locks ONCE for the entire prefill+decode sequence
-            let mut layers_guard = layers_arc
-                .write()
-                .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
-            let mut caches_guard = caches_arc
-                .write()
-                .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
-            let final_norm_guard = final_norm_arc
-                .read()
-                .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
-            let lm_head_guard = lm_head_arc
-                .read()
-                .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
-
-            // Init fresh caches (old ones dropped on overwrite)
-            *caches_guard = Some(
-                (0..model_config.num_layers as usize)
-                    .map(|i| {
-                        if model_config.is_linear_layer(i) {
-                            Qwen3_5LayerCache::new_linear()
-                        } else {
-                            Qwen3_5LayerCache::new_full_attention()
-                        }
-                    })
-                    .collect(),
-            );
-
-            let max_tokens = config.max_new_tokens;
-            let sampling_config = Some(SamplingConfig {
-                temperature: config.temperature,
-                top_k: config.top_k,
-                top_p: config.top_p,
-                min_p: config.min_p,
-            });
-
-            let eos_id = model_config.eos_token_id as u32;
-            let mut generated_tokens: Vec<u32> = Vec::new();
-            let mut finish_reason = String::from("length");
-
-            // Pre-compute embedding weight transpose once (avoids recomputing per step)
-            let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-
-            // Create dedicated generation stream for GPU scheduling
-            let generation_stream = Stream::new(DeviceType::Gpu);
-
-            // Pin model weights in Metal memory for the duration of generation
-            let model_size_bytes = model_config.estimate_memory_bytes() as usize;
-            let _wired_ctx =
-                crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
-
-            // Profiler — covers both compiled and rust decode paths
-            let mut profiler = crate::decode_profiler::DecodeProfiler::new("generate", "qwen3_5");
-            profiler.set_prompt_tokens(prompt_tokens.shape_at(1).unwrap_or(0) as u32);
-            profiler.snapshot_memory_before();
-
-            // Prefill: chunked forward pass on prompt (stays on GPU, no roundtrip)
-            profiler.begin_prefill();
-            let logits = chunked_prefill(
-                &prompt_tokens,
-                &embedding_weight,
-                &mut layers_guard,
-                &mut caches_guard,
-                &final_norm_guard,
-                &lm_head_guard,
-                Some(&embedding_weight_t),
-                generation_stream,
-            )?;
-            profiler.end_prefill();
-
-            // Get last token logits: [1, vocab]
-            let last_chunk_len = logits.shape_at(1)?;
-            let last_logits = logits.slice_axis(1, last_chunk_len - 1, last_chunk_len)?;
-            let last_logits = last_logits.squeeze(Some(&[1]))?; // [1, vocab]
-
-            // Sample first token (lazy — not evaluated yet)
-            let mut y = sample(&last_logits, sampling_config)?;
-            MxArray::async_eval_arrays(&[&y]);
-
-            // Guard ensures mlx_qwen35_compiled_reset() is called even if `?` returns early.
-            let _compiled_guard = if use_compiled {
-                Some(CompiledResetGuard)
-            } else {
-                None
-            };
-
-            if use_compiled {
-                // Initialize compiled forward pass from prefill caches.
-                // Use TOTAL prompt length (not last chunk length) for correct
-                // RoPE offset and KV capacity pre-allocation.
-                use mlx_sys as sys;
-                let prefill_len = prompt_tokens.shape_at(1)? as i32;
-                let max_kv_len = ((prefill_len + max_tokens + 255) / 256) * 256;
-                let num_layers = model_config.num_layers as usize;
-                let mut cache_ptrs: Vec<*mut sys::mlx_array> =
-                    vec![std::ptr::null_mut(); num_layers * 2];
-                if let Some(ref caches) = *caches_guard {
-                    for (i, cache) in caches.iter().enumerate() {
-                        let (p0, p1) = cache.export_ptrs();
-                        cache_ptrs[i * 2] = p0;
-                        cache_ptrs[i * 2 + 1] = p1;
-                    }
-                }
-                // Drop non-cache locks — not needed during compiled decode
-                drop(layers_guard);
-                drop(final_norm_guard);
-                drop(lm_head_guard);
-                // Keep caches_guard alive through init_from_prefill so cache_ptrs
-                // (raw pointers into the cache MxArrays) remain valid.
-                unsafe {
-                    sys::mlx_qwen35_compiled_init_from_prefill(
-                        model_config.num_layers,
-                        model_config.hidden_size,
-                        model_config.num_heads,
-                        model_config.num_kv_heads,
-                        model_config.head_dim,
-                        model_config.rope_theta as f32,
-                        model_config.rope_dims(),
-                        model_config.rms_norm_eps as f32,
-                        model_config.full_attention_interval,
-                        model_config.linear_num_key_heads,
-                        model_config.linear_num_value_heads,
-                        model_config.linear_key_head_dim,
-                        model_config.linear_value_head_dim,
-                        model_config.linear_conv_kernel_dim,
-                        if model_config.tie_word_embeddings {
-                            1
-                        } else {
-                            0
-                        },
-                        max_kv_len,
-                        1, // batch_size
-                        cache_ptrs.as_mut_ptr(),
-                        prefill_len,
-                    );
-                }
-                // C++ has copied arrays into g_compiled_caches — safe to release
-                drop(caches_guard);
-
-                // Compiled C++ decode loop (all locks dropped — C++ owns the state)
-                profiler.set_label("generate_compiled");
-
-                for step in 0..max_tokens {
-                    let next_y = {
-                        let _stream_ctx = StreamContext::new(generation_stream);
-                        if step + 1 < max_tokens {
-                            profiler.begin("forward");
-                            let next_ids = y.reshape(&[1, 1])?;
-                            let logits = forward_compiled(&next_ids, &embedding_weight)?;
-                            profiler.end();
-
-                            profiler.begin("sample");
-                            let next_token = sample(&logits, sampling_config)?;
-                            profiler.end();
-
-                            profiler.begin("eval_caches");
-                            eval_token_and_compiled_caches(&next_token);
-                            profiler.end();
-
-                            Some(next_token)
-                        } else {
-                            None
-                        }
-                    };
-
-                    profiler.begin("eval_token");
-                    y.eval();
-                    profiler.end();
-
-                    profiler.begin("extract");
-                    let token_id = y.item_at_int32(0)? as u32;
-                    profiler.end();
-                    profiler.mark_first_token();
-
-                    generated_tokens.push(token_id);
-
-                    if token_id == eos_id {
-                        finish_reason = String::from("stop");
-                        break;
-                    }
-
-                    match next_y {
-                        Some(next) => y = next,
-                        None => break,
-                    }
-
-                    profiler.step();
-
-                    if (step + 1) % 256 == 0 {
-                        crate::array::synchronize_and_clear_cache();
-                    }
-                }
-
-                profiler.snapshot_memory_after();
-                profiler.report();
-            } else {
-                // Rust fallback decode loop (locks held for entire loop)
-                profiler.set_label("generate_rust");
-
-                for step in 0..max_tokens {
-                    let next_y = {
-                        let _stream_ctx = StreamContext::new(generation_stream);
-                        if step + 1 < max_tokens {
-                            profiler.begin("forward");
-                            let next_ids = y.reshape(&[1, 1])?;
-                            let logits = forward_inner(
-                                &next_ids,
-                                &embedding_weight,
-                                &mut layers_guard,
-                                &mut caches_guard,
-                                &final_norm_guard,
-                                &lm_head_guard,
-                                Some(&embedding_weight_t),
-                            )?;
-                            let logits = logits.squeeze(Some(&[1]))?;
-                            profiler.end();
-
-                            profiler.begin("sample");
-                            let next_token = sample(&logits, sampling_config)?;
-                            profiler.end();
-
-                            profiler.begin("async_eval");
-                            MxArray::async_eval_arrays(&[&next_token]);
-                            profiler.end();
-
-                            Some(next_token)
-                        } else {
-                            None
-                        }
-                    };
-
-                    profiler.begin("eval_token");
-                    y.eval();
-                    profiler.end();
-
-                    profiler.begin("extract");
-                    let token_id = y.item_at_int32(0)? as u32;
-                    profiler.end();
-                    profiler.mark_first_token();
-
-                    generated_tokens.push(token_id);
-
-                    if token_id == eos_id {
-                        finish_reason = String::from("stop");
-                        break;
-                    }
-
-                    match next_y {
-                        Some(next) => y = next,
-                        None => break,
-                    }
-
-                    profiler.step();
-
-                    if (step + 1) % 256 == 0 {
-                        crate::array::synchronize_and_clear_cache();
-                    }
-                }
-
-                profiler.snapshot_memory_after();
-                profiler.report();
-            }
-
-            // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
-
-            // Decode text if tokenizer available
-            let text = if let Some(ref tok) = tokenizer {
-                tok.decode_sync(&generated_tokens, true)
-                    .unwrap_or_else(|e| {
-                        warn!("Failed to decode generated tokens: {}", e);
-                        String::new()
-                    })
-            } else {
-                warn!("No tokenizer loaded - text decoding unavailable, only token IDs returned");
-                String::new()
-            };
-
-            let num_tokens = generated_tokens.len() as u32;
-
-            Ok(Qwen3_5GenerationResult {
-                tokens: generated_tokens,
-                text,
-                num_tokens,
-                finish_reason,
-            })
+        let thread = self
+            .thread
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("generate() not available on training clones"))?;
+        crate::model_thread::send_and_await(thread, |reply| Qwen35Cmd::Generate {
+            prompt_tokens: prompt_tokens.clone(),
+            config,
+            reply,
         })
         .await
-        .map_err(|e| Error::from_reason(format!("Generation task failed: {}", e)))?
     }
 
     /// Chat API with tool calling support.
     ///
-    /// Runs tokenization + generation on a worker thread via spawn_blocking
-    /// to avoid blocking the Node.js event loop.
+    /// Dispatches to the dedicated model thread and awaits the result.
     #[napi]
     pub async fn chat(
         &self,
@@ -944,563 +2230,23 @@ impl Qwen3_5Model {
             reuse_cache: None,
         });
 
-        let reuse_cache = config.reuse_cache.unwrap_or(true);
-
-        let gen_lock = self.generation_lock.clone();
-        let _gen_guard = gen_lock.lock().await;
-
-        let tokenizer = self
-            .tokenizer
-            .clone()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
-
-        // Detect images in messages
-        let has_images = messages
-            .iter()
-            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
-
-        // Clone Arcs and data needed for the closure
-        let embedding_weight = self.embedding.get_weight();
-        let layers_arc = self.layers.clone();
-        let final_norm_arc = self.final_norm.clone();
-        let lm_head_arc = self.lm_head.clone();
-        let caches_arc = self.caches.clone();
-        let cached_token_history_arc = self.cached_token_history.clone();
-        let cached_image_key_arc = self.cached_image_key.clone();
-        let cached_rope_deltas_arc = self.cached_rope_deltas.clone();
-        let model_config = self.config.clone();
-
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        let tokenizer_for_decode = tokenizer.clone();
-
-        // Clone vision fields if images present
-        let vision_encoder_arc = if has_images {
-            self.vision_encoder.clone()
-        } else {
-            None
-        };
-        let image_processor_arc = if has_images {
-            self.image_processor.clone()
-        } else {
-            None
-        };
-        let spatial_merge_size = self.spatial_merge_size;
-        let vision_cache = self.vision_cache.clone();
-        let model_id = self.model_id;
-
-        // Check if compiled path will be used (C++ weights belong to this model).
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
-
-        // Capture start time BEFORE compiled mutex + spawn_blocking so TTFT
-        // reflects the full user-perceived latency (mutex wait + thread dispatch
-        // + tokenization + prefill + first GPU eval).
-        let report_perf = config.report_performance.unwrap_or(false);
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        // Serialize compiled lifecycle — prevents concurrent C++ global corruption
-        let _compiled_lock = if use_compiled {
-            Some(DENSE_COMPILED_MUTEX.lock().await)
-        } else {
-            None
-        };
-
-        napi::bindgen_prelude::spawn_blocking(move || {
-            // Re-validate compiled path under weight lock.
-            let mut _weight_guard = None;
-            let use_compiled = if use_compiled {
-                let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-                if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                    _weight_guard = Some(guard);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            let mut first_token_instant: Option<std::time::Instant> = None;
-
-            let tool_defs = config.tools.as_deref();
-            let enable_thinking = chat_common::resolve_enable_thinking(&config);
-            let tokens = tokenizer.apply_chat_template_sync(
-                &messages,
-                Some(true),
-                tool_defs,
-                enable_thinking,
-            )?;
-
-            let p = extract_chat_params(&config);
-            let max_new_tokens = p.max_new_tokens;
-
-            let mut layers_guard = layers_arc
-                .write()
-                .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
-            let mut caches_guard = caches_arc
-                .write()
-                .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
-            let final_norm_guard = final_norm_arc
-                .read()
-                .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
-            let lm_head_guard = lm_head_arc
-                .read()
-                .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
-
-            // === VLM image processing (before cache check, needed for expanded tokens) ===
-            // Save processed images for reuse in VLM prefill to avoid double processing.
-            let sms = spatial_merge_size.unwrap_or(2);
-            let (expanded_tokens, current_image_cache_key, vlm_processed) = if has_images {
-                if let (Some(_vision_enc), Some(img_proc)) =
-                    (vision_encoder_arc.as_ref(), image_processor_arc.as_ref())
-                {
-                    let all_images = extract_images_from_messages(&messages);
-                    let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
-                    let processed_pre = img_proc.process_many(&image_refs)?;
-                    let num_image_tokens =
-                        compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
-                    let expanded = inject_image_placeholders(&tokens, num_image_tokens);
-                    let cache_key = compute_image_cache_key(&all_images);
-                    (expanded, cache_key, Some(processed_pre))
-                } else {
-                    (tokens.clone(), 0u64, None)
-                }
-            } else {
-                (tokens.clone(), 0u64, None)
-            };
-
-            // === Cache reuse: prefix verification ===
-            let cached_token_history_guard = cached_token_history_arc
-                .read()
-                .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
-            let cached_prefix_len = verify_cache_prefix(
-                reuse_cache,
-                has_images,
-                &tokens,
-                &expanded_tokens,
-                current_image_cache_key,
-                &cached_token_history_guard,
-                &cached_image_key_arc,
-                caches_guard.is_some(),
-            )?;
-            drop(cached_token_history_guard);
-
-            let prefill_tokens = if cached_prefix_len > 0 {
-                if has_images {
-                    info!(
-                        "VLM cache reuse: {} cached tokens, {} new tokens to prefill",
-                        cached_prefix_len,
-                        expanded_tokens.len() - cached_prefix_len
-                    );
-                    expanded_tokens[cached_prefix_len..].to_vec()
-                } else {
-                    info!(
-                        "Cache reuse: {} cached tokens, {} new tokens to prefill",
-                        cached_prefix_len,
-                        tokens.len() - cached_prefix_len
-                    );
-                    tokens[cached_prefix_len..].to_vec()
-                }
-            } else {
-                // Full reset
-                if let Some(ref mut caches) = *caches_guard {
-                    for cache in caches.iter_mut() {
-                        cache.reset();
-                    }
-                }
-                let new_caches = (0..model_config.num_layers as usize)
-                    .map(|i| {
-                        if model_config.is_linear_layer(i) {
-                            Qwen3_5LayerCache::new_linear()
-                        } else {
-                            Qwen3_5LayerCache::new_full_attention()
-                        }
-                    })
-                    .collect();
-                *caches_guard = Some(new_caches);
-                tokens.clone()
-            };
-
-            // Zero-delta guard: if entire prompt was cached (exact same input repeated),
-            // reset caches and do a full re-prefill. GDN recurrence state cannot be
-            // rewound, so full re-prefill is the only correct approach for Qwen3.5.
-            // Also reset cached_prefix_len so VLM routing correctly triggers vlm_prefill.
-            let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
-                info!("Zero-delta cache hit: resetting caches for full re-prefill");
-                if let Some(ref mut caches) = *caches_guard {
-                    for cache in caches.iter_mut() {
-                        cache.reset();
-                    }
-                }
-                let new_caches = (0..model_config.num_layers as usize)
-                    .map(|i| {
-                        if model_config.is_linear_layer(i) {
-                            Qwen3_5LayerCache::new_linear()
-                        } else {
-                            Qwen3_5LayerCache::new_full_attention()
-                        }
-                    })
-                    .collect();
-                *caches_guard = Some(new_caches);
-                let tokens = if has_images {
-                    expanded_tokens.clone()
-                } else {
-                    tokens.clone()
-                };
-                (tokens, 0)
-            } else {
-                (prefill_tokens, cached_prefix_len)
-            };
-
-            let eos_id = model_config.eos_token_id as u32;
-            let mut generated_tokens: Vec<u32> = Vec::new();
-            let mut finish_reason = String::from("length");
-
-            let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-            let generation_stream = Stream::new(DeviceType::Gpu);
-            let model_size_bytes = model_config.estimate_memory_bytes() as usize;
-            let _wired_ctx =
-                crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
-
-            // Profiler — covers both compiled and rust chat decode paths
-            let mut profiler = crate::decode_profiler::DecodeProfiler::new("chat", "qwen3_5");
-            profiler.set_prompt_tokens(prefill_tokens.len() as u32);
-            profiler.snapshot_memory_before();
-
-            // === VLM or text prefill branching ===
-            // vlm_compiled_init_done: true if vlm_prefill already called compiled_init_from_prefill
-            profiler.begin_prefill();
-            let (mut last_logits, seq_len, vlm_compiled_init_done) =
-                if has_images && cached_prefix_len == 0 {
-                    // --- VLM full prefill (first call or different images) ---
-                    // Reuse expanded_tokens and processed images from pre-cache-check step.
-                    if let Some(vision_enc) = vision_encoder_arc.as_ref() {
-                        let final_tokens = &expanded_tokens;
-                        let processed = vlm_processed
-                            .as_ref()
-                            .ok_or_else(|| Error::from_reason("VLM processed images missing"))?;
-                        let image_cache_key = current_image_cache_key;
-
-                        let input_ids =
-                            MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
-
-                        let (logits, rope_deltas, vlm_compiled) = vlm_prefill(
-                            &input_ids,
-                            image_cache_key,
-                            processed,
-                            vision_enc,
-                            sms,
-                            &embedding_weight,
-                            &mut layers_guard,
-                            &mut caches_guard,
-                            &final_norm_guard,
-                            &lm_head_guard,
-                            &model_config,
-                            max_new_tokens,
-                            generation_stream,
-                            &vision_cache,
-                            model_id,
-                        )?;
-
-                        // Save rope_deltas for cache reuse on subsequent turns
-                        if let Ok(mut rd) = cached_rope_deltas_arc.write() {
-                            *rd = Some(rope_deltas as i32);
-                        }
-
-                        let vlm_seq_len = final_tokens.len() as i64;
-                        (logits, vlm_seq_len, vlm_compiled)
-                    } else {
-                        return Err(Error::from_reason(
-                            "VLM prefill requested but vision encoder/processor not loaded",
-                        ));
-                    }
-                } else {
-                    // --- Text prefill path (text-only OR VLM cache reuse with same images) ---
-                    let prompt =
-                        MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-                    let logits = chunked_prefill(
-                        &prompt,
-                        &embedding_weight,
-                        &mut layers_guard,
-                        &mut caches_guard,
-                        &final_norm_guard,
-                        &lm_head_guard,
-                        Some(&embedding_weight_t),
-                        generation_stream,
-                    )?;
-
-                    let seq_len = logits.shape_at(1)?;
-                    let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-                    let last_logits = last_logits.squeeze(Some(&[1]))?;
-                    // seq_len for the C++ init is the TOTAL tokens (cached + new)
-                    // For VLM cache reuse, use expanded_tokens length; for text-only, use tokens length
-                    let total_seq_len = if has_images {
-                        expanded_tokens.len() as i64
-                    } else {
-                        tokens.len() as i64
-                    };
-                    (last_logits, total_seq_len, false)
-                };
-            profiler.end_prefill();
-
-            // Track token history for repetition penalty
-            let mut token_history: Vec<u32> = tokens.clone();
-
-            // Apply repetition penalty to prefill logits
-            last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
-
-            let mut y = sample(&last_logits, p.sampling_config)?;
-            MxArray::async_eval_arrays(&[&y]);
-
-            let _compiled_guard = if use_compiled {
-                Some(CompiledResetGuard)
-            } else {
-                None
-            };
-
-            if use_compiled {
-                if vlm_compiled_init_done {
-                    // VLM prefill already called compiled_init_from_prefill and
-                    // transferred caches — just drop the locks we don't need.
-                    drop(layers_guard);
-                    drop(final_norm_guard);
-                    drop(lm_head_guard);
-                    drop(caches_guard);
-                } else {
-                    use mlx_sys as sys;
-                    let prefill_len = seq_len as i32;
-                    let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
-                    let num_layers = model_config.num_layers as usize;
-                    let mut cache_ptrs: Vec<*mut sys::mlx_array> =
-                        vec![std::ptr::null_mut(); num_layers * 2];
-                    if let Some(ref caches) = *caches_guard {
-                        for (i, cache) in caches.iter().enumerate() {
-                            let (p0, p1) = cache.export_ptrs();
-                            cache_ptrs[i * 2] = p0;
-                            cache_ptrs[i * 2 + 1] = p1;
-                        }
-                    }
-                    // Drop non-cache locks — not needed during compiled decode
-                    drop(layers_guard);
-                    drop(final_norm_guard);
-                    drop(lm_head_guard);
-                    // Keep caches_guard alive through init_from_prefill so cache_ptrs
-                    // (raw pointers into the cache MxArrays) remain valid.
-                    unsafe {
-                        sys::mlx_qwen35_compiled_init_from_prefill(
-                            model_config.num_layers,
-                            model_config.hidden_size,
-                            model_config.num_heads,
-                            model_config.num_kv_heads,
-                            model_config.head_dim,
-                            model_config.rope_theta as f32,
-                            model_config.rope_dims(),
-                            model_config.rms_norm_eps as f32,
-                            model_config.full_attention_interval,
-                            model_config.linear_num_key_heads,
-                            model_config.linear_num_value_heads,
-                            model_config.linear_key_head_dim,
-                            model_config.linear_value_head_dim,
-                            model_config.linear_conv_kernel_dim,
-                            if model_config.tie_word_embeddings {
-                                1
-                            } else {
-                                0
-                            },
-                            max_kv_len,
-                            1,
-                            cache_ptrs.as_mut_ptr(),
-                            prefill_len,
-                        );
-                    }
-                    // C++ has copied arrays into g_compiled_caches — safe to release
-                    drop(caches_guard);
-
-                    // VLM cache reuse: apply saved rope_deltas so compiled decode
-                    // uses correct M-RoPE positions (vlm_prefill was skipped).
-                    if has_images
-                        && cached_prefix_len > 0
-                        && let Ok(rd) = cached_rope_deltas_arc.read()
-                        && let Some(delta) = *rd
-                    {
-                        unsafe {
-                            mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
-                        }
-                    }
-                }
-
-                // For text-only conversations, clear any stale cached rope deltas
-                if !has_images && let Ok(mut rd) = cached_rope_deltas_arc.write() {
-                    *rd = None;
-                }
-
-                // Compiled C++ decode loop (pipelined — submit N+1 before eval N)
-                profiler.set_label("chat_compiled");
-
-                let starts_in_thinking = enable_thinking.unwrap_or(true);
-                let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-                    starts_in_thinking,
-                    p.thinking_token_budget,
-                    think_end_id,
-                );
-
-                let mut ops = chat_common::DecodeOps {
-                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                        Ok((forward_compiled(ids, emb)?, false))
-                    },
-                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                        eval_token_and_compiled_caches(token);
-                        if budget_forced {
-                            logits.eval();
-                        }
-                    },
-                };
-                chat_common::decode_loop!(
-                    ops: ops,
-                    y: y,
-                    embedding_weight: embedding_weight,
-                    params: p,
-                    reasoning_tracker: reasoning_tracker,
-                    profiler: profiler,
-                    max_new_tokens: max_new_tokens,
-                    eos_id: eos_id,
-                    generated_tokens: generated_tokens,
-                    token_history: token_history,
-                    finish_reason: finish_reason,
-                    first_token_instant: first_token_instant,
-                    report_perf: p.report_performance,
-                    generation_stream: generation_stream
-                );
-
-                // === Export caches from C++ before CompiledResetGuard drops ===
-                if reuse_cache {
-                    let num_layers = model_config.num_layers as usize;
-                    let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
-                        vec![std::ptr::null_mut(); num_layers * 2];
-                    let exported = unsafe {
-                        mlx_sys::mlx_qwen35_export_caches(
-                            export_ptrs.as_mut_ptr(),
-                            (num_layers * 2) as i32,
-                        )
-                    };
-                    if exported > 0 {
-                        let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
-                        let mut new_caches = Vec::with_capacity(num_layers);
-                        for i in 0..num_layers {
-                            let p0 = export_ptrs[i * 2];
-                            let p1 = export_ptrs[i * 2 + 1];
-                            let mut lc = if model_config.is_linear_layer(i) {
-                                Qwen3_5LayerCache::new_linear()
-                            } else {
-                                Qwen3_5LayerCache::new_full_attention()
-                            };
-                            lc.import_ptrs(p0, p1, cache_offset);
-                            new_caches.push(lc);
-                        }
-                        let mut cg = caches_arc.write().map_err(|_| {
-                            Error::from_reason("Failed to acquire caches lock for cache export")
-                        })?;
-                        *cg = Some(new_caches);
-                    }
-                }
-            } else {
-                // Rust fallback decode loop — pipelined like mlx-lm:
-                // Build next step's graph before blocking on current token.
-                profiler.set_label("chat_rust");
-
-                let starts_in_thinking = enable_thinking.unwrap_or(true);
-                let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-                    starts_in_thinking,
-                    p.thinking_token_budget,
-                    think_end_id,
-                );
-
-                // Kick off first token's async eval
-                MxArray::async_eval_arrays(&[&y]);
-
-                let mut ops = chat_common::DecodeOps {
-                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                        let logits = forward_inner(
-                            ids,
-                            emb,
-                            &mut layers_guard,
-                            &mut caches_guard,
-                            &final_norm_guard,
-                            &lm_head_guard,
-                            Some(&embedding_weight_t),
-                        )?;
-                        Ok((logits, true)) // needs squeeze
-                    },
-                    eval_step: |token: &MxArray, logits: &MxArray, _budget_forced: bool| {
-                        MxArray::async_eval_arrays(&[token, logits]);
-                    },
-                };
-                chat_common::decode_loop!(
-                    ops: ops,
-                    y: y,
-                    embedding_weight: embedding_weight,
-                    params: p,
-                    reasoning_tracker: reasoning_tracker,
-                    profiler: profiler,
-                    max_new_tokens: max_new_tokens,
-                    eos_id: eos_id,
-                    generated_tokens: generated_tokens,
-                    token_history: token_history,
-                    finish_reason: finish_reason,
-                    first_token_instant: first_token_instant,
-                    report_perf: p.report_performance,
-                    generation_stream: generation_stream
-                );
-            }
-
-            // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
-
-            // === Save token history and image key for cache reuse on next call ===
-            save_cache_state(
-                p.reuse_cache,
-                has_images,
-                &generated_tokens,
-                &finish_reason,
-                &tokens,
-                Some(&expanded_tokens),
-                current_image_cache_key,
-                &cached_token_history_arc,
-                &cached_image_key_arc,
-                &cached_rope_deltas_arc,
-                &caches_arc,
-            )?;
-
-            // Compute performance metrics
-            let performance = compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                prefill_tokens.len(),
-                generated_tokens.len(),
-            );
-
-            finalize_chat_result(
-                &tokenizer_for_decode,
-                &generated_tokens,
-                finish_reason,
-                think_end_id,
-                think_end_str.as_deref(),
-                performance,
-                p.include_reasoning,
-                enable_thinking.unwrap_or(true),
-            )
+        let thread = self
+            .thread
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("chat() not available on training clones"))?;
+        crate::model_thread::send_and_await(thread, |reply| Qwen35Cmd::Chat {
+            messages,
+            config,
+            reply,
         })
         .await
-        .map_err(|e| Error::from_reason(format!("Chat task failed: {}", e)))?
     }
 
     /// Streaming chat API with tool calling support.
     ///
-    /// Same as `chat()` but streams tokens one-by-one via the callback.
-    /// Returns a `ChatStreamHandle` immediately; generation runs in background.
+    /// Dispatches to the dedicated model thread. Tokens stream back via
+    /// an mpsc channel bridged to the JS callback. Returns a `ChatStreamHandle`
+    /// immediately; generation runs on the model thread.
     /// Call `handle.cancel()` to abort generation early.
     #[napi(
         ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
@@ -1534,728 +2280,31 @@ impl Qwen3_5Model {
             reuse_cache: None,
         });
 
-        let reuse_cache = config.reuse_cache.unwrap_or(true);
-        let report_perf = config.report_performance.unwrap_or(false);
-
-        // Use lock_owned() so the guard is 'static and can be moved into tokio::spawn.
-        let gen_guard = Arc::clone(&self.generation_lock).lock_owned().await;
-
-        let tokenizer = self
-            .tokenizer
-            .clone()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
-
-        let has_images = messages
-            .iter()
-            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
-
-        // Clone Arcs and data needed for the closure
-        let embedding_weight = self.embedding.get_weight();
-        let layers_arc = self.layers.clone();
-        let final_norm_arc = self.final_norm.clone();
-        let lm_head_arc = self.lm_head.clone();
-        let caches_arc = self.caches.clone();
-        let cached_token_history_arc = self.cached_token_history.clone();
-        let cached_image_key_arc = self.cached_image_key.clone();
-        let cached_rope_deltas_arc = self.cached_rope_deltas.clone();
-        let model_config = self.config.clone();
-
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        let tokenizer_for_decode = tokenizer.clone();
-
-        // Clone vision fields if images present
-        let vision_encoder_arc = if has_images {
-            self.vision_encoder.clone()
-        } else {
-            None
-        };
-        let image_processor_arc = if has_images {
-            self.image_processor.clone()
-        } else {
-            None
-        };
-        let spatial_merge_size = self.spatial_merge_size;
-        let vision_cache_stream = self.vision_cache.clone();
-        let model_id = self.model_id;
-
-        // Check if compiled path will be used (C++ weights belong to this model).
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
-
-        // Capture start time BEFORE compiled mutex + spawn_blocking so TTFT
-        // reflects the full user-perceived latency.
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        // Serialize compiled lifecycle — prevents concurrent C++ global corruption.
-        // Acquire in async context, move into tokio::spawn so it stays held during generation.
-        let compiled_lock = if use_compiled {
-            Some(DENSE_COMPILED_MUTEX.lock().await)
-        } else {
-            None
-        };
+        let thread = self
+            .thread
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("chat_stream() not available on training clones"))?;
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
 
+        // Create mpsc channel to bridge model thread → tokio task → JS callback
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        // Send streaming command to model thread
+        thread.send(Qwen35Cmd::ChatStream {
+            messages,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+
+        // Spawn tokio task that reads from stream_rx and calls the JS callback
         let callback = Arc::new(callback);
-
         tokio::spawn(async move {
-            let _gen_guard = gen_guard;
-            let _compiled_lock = compiled_lock;
-
-            let callback_err = callback.clone();
-            let result =
-                napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
-                    // Re-validate compiled path under weight lock.
-                    let mut _weight_guard = None;
-                    let use_compiled = if use_compiled {
-                        let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
-                        if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
-                            _weight_guard = Some(guard);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-
-                    let tool_defs = config.tools.as_deref();
-                    let enable_thinking = chat_common::resolve_enable_thinking(&config);
-                    let tokens = tokenizer.apply_chat_template_sync(
-                        &messages,
-                        Some(true),
-                        tool_defs,
-                        enable_thinking,
-                    )?;
-
-                    let mut first_token_instant: Option<std::time::Instant> = None;
-
-                    let p = chat_common::extract_chat_params(&config);
-
-                    let mut layers_guard = layers_arc
-                        .write()
-                        .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
-                    let mut caches_guard = caches_arc
-                        .write()
-                        .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
-                    let final_norm_guard = final_norm_arc.read().map_err(|_| {
-                        Error::from_reason("Failed to acquire final_norm read lock")
-                    })?;
-                    let lm_head_guard = lm_head_arc
-                        .read()
-                        .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
-
-                    // === VLM image processing (before cache check, needed for expanded tokens) ===
-                    let sms = spatial_merge_size.unwrap_or(2);
-                    let (expanded_tokens, current_image_cache_key, vlm_processed) = if has_images {
-                        if let (Some(_vision_enc), Some(img_proc)) =
-                            (vision_encoder_arc.as_ref(), image_processor_arc.as_ref())
-                        {
-                            let all_images = extract_images_from_messages(&messages);
-                            let image_refs: Vec<&[u8]> =
-                                all_images.iter().map(|v| v.as_slice()).collect();
-                            let processed_pre = img_proc.process_many(&image_refs)?;
-                            let num_image_tokens =
-                                compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
-                            let expanded = inject_image_placeholders(&tokens, num_image_tokens);
-                            let cache_key = compute_image_cache_key(&all_images);
-                            (expanded, cache_key, Some(processed_pre))
-                        } else {
-                            (tokens.clone(), 0u64, None)
-                        }
-                    } else {
-                        (tokens.clone(), 0u64, None)
-                    };
-
-                    // === Cache reuse: prefix verification ===
-                    let cached_token_history_guard = cached_token_history_arc
-                        .read()
-                        .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
-                    let cached_prefix_len = if reuse_cache {
-                        let cached = &*cached_token_history_guard;
-                        if has_images {
-                            // VLM: check image_cache_key matches AND expanded token prefix matches
-                            let cached_img_key = cached_image_key_arc.read().map_err(|_| {
-                                Error::from_reason("Failed to read cached image key")
-                            })?;
-                            if let Some(cached_key) = *cached_img_key {
-                                if cached_key == current_image_cache_key
-                                    && !cached.is_empty()
-                                    && expanded_tokens.len() >= cached.len()
-                                    && expanded_tokens[..cached.len()] == cached[..]
-                                    && caches_guard.is_some()
-                                {
-                                    cached.len()
-                                } else {
-                                    0
-                                }
-                            } else {
-                                0
-                            }
-                        } else {
-                            // Text-only: existing logic unchanged
-                            if !cached.is_empty()
-                                && tokens.len() >= cached.len()
-                                && tokens[..cached.len()] == cached[..]
-                                && caches_guard.is_some()
-                            {
-                                cached.len()
-                            } else {
-                                0
-                            }
-                        }
-                    } else {
-                        0
-                    };
-                    drop(cached_token_history_guard);
-
-                    let prefill_tokens = if cached_prefix_len > 0 {
-                        if has_images {
-                            info!(
-                                "VLM cache reuse: {} cached tokens, {} new tokens to prefill",
-                                cached_prefix_len,
-                                expanded_tokens.len() - cached_prefix_len
-                            );
-                            expanded_tokens[cached_prefix_len..].to_vec()
-                        } else {
-                            info!(
-                                "Cache reuse: {} cached tokens, {} new tokens to prefill",
-                                cached_prefix_len,
-                                tokens.len() - cached_prefix_len
-                            );
-                            tokens[cached_prefix_len..].to_vec()
-                        }
-                    } else {
-                        // Full reset
-                        if let Some(ref mut caches) = *caches_guard {
-                            for cache in caches.iter_mut() {
-                                cache.reset();
-                            }
-                        }
-                        let new_caches = (0..model_config.num_layers as usize)
-                            .map(|i| {
-                                if model_config.is_linear_layer(i) {
-                                    Qwen3_5LayerCache::new_linear()
-                                } else {
-                                    Qwen3_5LayerCache::new_full_attention()
-                                }
-                            })
-                            .collect();
-                        *caches_guard = Some(new_caches);
-                        tokens.clone()
-                    };
-
-                    // Zero-delta guard: also reset cached_prefix_len for VLM routing.
-                    let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
-                        info!("Zero-delta cache hit: resetting caches for full re-prefill");
-                        if let Some(ref mut caches) = *caches_guard {
-                            for cache in caches.iter_mut() {
-                                cache.reset();
-                            }
-                        }
-                        let new_caches = (0..model_config.num_layers as usize)
-                            .map(|i| {
-                                if model_config.is_linear_layer(i) {
-                                    Qwen3_5LayerCache::new_linear()
-                                } else {
-                                    Qwen3_5LayerCache::new_full_attention()
-                                }
-                            })
-                            .collect();
-                        *caches_guard = Some(new_caches);
-                        let tokens = if has_images {
-                            expanded_tokens.clone()
-                        } else {
-                            tokens.clone()
-                        };
-                        (tokens, 0)
-                    } else {
-                        (prefill_tokens, cached_prefix_len)
-                    };
-
-                    let eos_id = model_config.eos_token_id as u32;
-                    let mut generated_tokens: Vec<u32> = Vec::new();
-                    let mut finish_reason = String::from("length");
-                    let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
-                    let mut streamed_text_len: usize = 0;
-
-                    let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-                    let generation_stream = Stream::new(DeviceType::Gpu);
-                    let model_size_bytes = model_config.estimate_memory_bytes() as usize;
-                    let _wired_ctx = crate::stream::WiredLimitContext::new(
-                        model_size_bytes,
-                        vec![generation_stream],
-                    );
-
-                    // Profiler — covers both compiled and rust chat_stream decode paths
-                    let mut profiler =
-                        crate::decode_profiler::DecodeProfiler::new("chat_stream", "qwen3_5");
-                    profiler.set_prompt_tokens(prefill_tokens.len() as u32);
-                    profiler.snapshot_memory_before();
-
-                    // === VLM or text prefill branching ===
-                    // vlm_compiled_init_done: true if vlm_prefill already called compiled_init_from_prefill
-                    profiler.begin_prefill();
-                    let (mut last_logits, seq_len, vlm_compiled_init_done) =
-                        if has_images && cached_prefix_len == 0 {
-                            // --- VLM full prefill (first call or different images) ---
-                            // Reuse expanded_tokens and processed images from pre-cache-check step.
-                            if let Some(vision_enc) = vision_encoder_arc.as_ref() {
-                                let final_tokens = &expanded_tokens;
-                                let processed = vlm_processed.as_ref().ok_or_else(|| {
-                                    Error::from_reason("VLM processed images missing")
-                                })?;
-                                let image_cache_key = current_image_cache_key;
-
-                                let input_ids = MxArray::from_uint32(
-                                    final_tokens,
-                                    &[1, final_tokens.len() as i64],
-                                )?;
-
-                                let (logits, rope_deltas, vlm_compiled) = vlm_prefill(
-                                    &input_ids,
-                                    image_cache_key,
-                                    processed,
-                                    vision_enc,
-                                    sms,
-                                    &embedding_weight,
-                                    &mut layers_guard,
-                                    &mut caches_guard,
-                                    &final_norm_guard,
-                                    &lm_head_guard,
-                                    &model_config,
-                                    p.max_new_tokens,
-                                    generation_stream,
-                                    &vision_cache_stream,
-                                    model_id,
-                                )?;
-
-                                // Save rope_deltas for cache reuse on subsequent turns
-                                if let Ok(mut rd) = cached_rope_deltas_arc.write() {
-                                    *rd = Some(rope_deltas as i32);
-                                }
-
-                                let vlm_seq_len = final_tokens.len() as i64;
-                                (logits, vlm_seq_len, vlm_compiled)
-                            } else {
-                                return Err(Error::from_reason(
-                                    "VLM prefill requested but vision encoder/processor not loaded",
-                                ));
-                            }
-                        } else {
-                            // --- Text prefill path (text-only OR VLM cache reuse with same images) ---
-                            let prompt = MxArray::from_uint32(
-                                &prefill_tokens,
-                                &[1, prefill_tokens.len() as i64],
-                            )?;
-                            let logits = chunked_prefill(
-                                &prompt,
-                                &embedding_weight,
-                                &mut layers_guard,
-                                &mut caches_guard,
-                                &final_norm_guard,
-                                &lm_head_guard,
-                                Some(&embedding_weight_t),
-                                generation_stream,
-                            )?;
-
-                            let seq_len = logits.shape_at(1)?;
-                            let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-                            let last_logits = last_logits.squeeze(Some(&[1]))?;
-                            // seq_len for the C++ init is the TOTAL tokens (cached + new)
-                            // For VLM cache reuse, use expanded_tokens length; for text-only, use tokens length
-                            let total_seq_len = if has_images {
-                                expanded_tokens.len() as i64
-                            } else {
-                                tokens.len() as i64
-                            };
-                            (last_logits, total_seq_len, false)
-                        };
-                    profiler.end_prefill();
-
-                    // Track token history for repetition penalty
-                    let mut token_history: Vec<u32> = tokens.clone();
-
-                    // Apply penalties to prefill logits
-                    last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
-
-                    let mut y = sample(&last_logits, p.sampling_config)?;
-                    MxArray::async_eval_arrays(&[&y]);
-
-                    let _compiled_guard = if use_compiled {
-                        Some(CompiledResetGuard)
-                    } else {
-                        None
-                    };
-
-                    let starts_in_thinking = enable_thinking.unwrap_or(true);
-                    let mut last_is_reasoning = starts_in_thinking;
-
-                    if use_compiled {
-                        if vlm_compiled_init_done {
-                            // VLM prefill already called compiled_init_from_prefill and
-                            // transferred caches — just drop the locks we don't need.
-                            drop(layers_guard);
-                            drop(final_norm_guard);
-                            drop(lm_head_guard);
-                            drop(caches_guard);
-                        } else {
-                            use mlx_sys as sys;
-                            let prefill_len = seq_len as i32;
-                            let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
-                            let num_layers = model_config.num_layers as usize;
-                            let mut cache_ptrs: Vec<*mut sys::mlx_array> =
-                                vec![std::ptr::null_mut(); num_layers * 2];
-                            if let Some(ref caches) = *caches_guard {
-                                for (i, cache) in caches.iter().enumerate() {
-                                    let (p0, p1) = cache.export_ptrs();
-                                    cache_ptrs[i * 2] = p0;
-                                    cache_ptrs[i * 2 + 1] = p1;
-                                }
-                            }
-                            // Drop non-cache locks — not needed during compiled decode
-                            drop(layers_guard);
-                            drop(final_norm_guard);
-                            drop(lm_head_guard);
-                            // Keep caches_guard alive through init_from_prefill so cache_ptrs
-                            // (raw pointers into the cache MxArrays) remain valid.
-                            unsafe {
-                                sys::mlx_qwen35_compiled_init_from_prefill(
-                                    model_config.num_layers,
-                                    model_config.hidden_size,
-                                    model_config.num_heads,
-                                    model_config.num_kv_heads,
-                                    model_config.head_dim,
-                                    model_config.rope_theta as f32,
-                                    model_config.rope_dims(),
-                                    model_config.rms_norm_eps as f32,
-                                    model_config.full_attention_interval,
-                                    model_config.linear_num_key_heads,
-                                    model_config.linear_num_value_heads,
-                                    model_config.linear_key_head_dim,
-                                    model_config.linear_value_head_dim,
-                                    model_config.linear_conv_kernel_dim,
-                                    if model_config.tie_word_embeddings {
-                                        1
-                                    } else {
-                                        0
-                                    },
-                                    max_kv_len,
-                                    1,
-                                    cache_ptrs.as_mut_ptr(),
-                                    prefill_len,
-                                );
-                            }
-                            // C++ has copied arrays into g_compiled_caches — safe to release
-                            drop(caches_guard);
-
-                            // VLM cache reuse: apply saved rope_deltas so compiled decode
-                            // uses correct M-RoPE positions (vlm_prefill was skipped).
-                            if has_images
-                                && cached_prefix_len > 0
-                                && let Ok(rd) = cached_rope_deltas_arc.read()
-                                && let Some(delta) = *rd
-                            {
-                                unsafe {
-                                    mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
-                                }
-                            }
-                        }
-
-                        // For text-only conversations, clear any stale cached rope deltas
-                        if !has_images && let Ok(mut rd) = cached_rope_deltas_arc.write() {
-                            *rd = None;
-                        }
-
-                        // Compiled C++ decode loop (pipelined — submit N+1 before eval N)
-                        profiler.set_label("chat_stream_compiled");
-
-                        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-                            starts_in_thinking,
-                            p.thinking_token_budget,
-                            think_end_id,
-                        );
-
-                        let mut ops = chat_common::DecodeOps {
-                            forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                                Ok((forward_compiled(ids, emb)?, false))
-                            },
-                            eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                                eval_token_and_compiled_caches(token);
-                                if budget_forced {
-                                    logits.eval();
-                                }
-                            },
-                        };
-                        chat_common::decode_loop!(
-                            ops: ops,
-                            y: y,
-                            embedding_weight: embedding_weight,
-                            params: p,
-                            reasoning_tracker: reasoning_tracker,
-                            profiler: profiler,
-                            max_new_tokens: p.max_new_tokens,
-                            eos_id: eos_id,
-                            generated_tokens: generated_tokens,
-                            token_history: token_history,
-                            finish_reason: finish_reason,
-                            first_token_instant: first_token_instant,
-                            report_perf: p.report_performance,
-                            generation_stream: generation_stream,
-                            streaming: {
-                                callback: callback,
-                                cancelled: cancelled_inner,
-                                decode_stream: decode_stream,
-                                tokenizer: tokenizer_for_decode,
-                                streamed_text_len: streamed_text_len,
-                                last_is_reasoning: last_is_reasoning
-                            }
-                        );
-
-                        // === Export caches from C++ before CompiledResetGuard drops ===
-                        if reuse_cache {
-                            let num_layers = model_config.num_layers as usize;
-                            let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
-                                vec![std::ptr::null_mut(); num_layers * 2];
-                            let exported = unsafe {
-                                mlx_sys::mlx_qwen35_export_caches(
-                                    export_ptrs.as_mut_ptr(),
-                                    (num_layers * 2) as i32,
-                                )
-                            };
-                            if exported > 0 {
-                                let cache_offset =
-                                    unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
-                                let mut new_caches = Vec::with_capacity(num_layers);
-                                for i in 0..num_layers {
-                                    let p0 = export_ptrs[i * 2];
-                                    let p1 = export_ptrs[i * 2 + 1];
-                                    let mut lc = if model_config.is_linear_layer(i) {
-                                        Qwen3_5LayerCache::new_linear()
-                                    } else {
-                                        Qwen3_5LayerCache::new_full_attention()
-                                    };
-                                    lc.import_ptrs(p0, p1, cache_offset);
-                                    new_caches.push(lc);
-                                }
-                                let mut cg = caches_arc.write().map_err(|_| {
-                                    Error::from_reason(
-                                        "Failed to acquire caches lock for cache export",
-                                    )
-                                })?;
-                                *cg = Some(new_caches);
-                            }
-                        }
-                    } else {
-                        // Rust fallback decode loop (pipelined)
-                        profiler.set_label("chat_stream_rust");
-
-                        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-                            starts_in_thinking,
-                            p.thinking_token_budget,
-                            think_end_id,
-                        );
-
-                        let mut ops = chat_common::DecodeOps {
-                            forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                                let logits = forward_inner(
-                                    ids,
-                                    emb,
-                                    &mut layers_guard,
-                                    &mut caches_guard,
-                                    &final_norm_guard,
-                                    &lm_head_guard,
-                                    Some(&embedding_weight_t),
-                                )?;
-                                Ok((logits, true))
-                            },
-                            eval_step: |token: &MxArray, logits: &MxArray, _budget_forced: bool| {
-                                MxArray::async_eval_arrays(&[token, logits]);
-                            },
-                        };
-                        chat_common::decode_loop!(
-                            ops: ops,
-                            y: y,
-                            embedding_weight: embedding_weight,
-                            params: p,
-                            reasoning_tracker: reasoning_tracker,
-                            profiler: profiler,
-                            max_new_tokens: p.max_new_tokens,
-                            eos_id: eos_id,
-                            generated_tokens: generated_tokens,
-                            token_history: token_history,
-                            finish_reason: finish_reason,
-                            first_token_instant: first_token_instant,
-                            report_perf: p.report_performance,
-                            generation_stream: generation_stream,
-                            streaming: {
-                                callback: callback,
-                                cancelled: cancelled_inner,
-                                decode_stream: decode_stream,
-                                tokenizer: tokenizer_for_decode,
-                                streamed_text_len: streamed_text_len,
-                                last_is_reasoning: last_is_reasoning
-                            }
-                        );
-                    }
-
-                    // _compiled_guard dropped here (if Some), calling mlx_qwen35_compiled_reset()
-
-                    // === Save token history and image key for cache reuse on next call ===
-                    if reuse_cache {
-                        let mut full_history = if has_images {
-                            expanded_tokens.clone()
-                        } else {
-                            tokens.clone()
-                        };
-                        // Only include tokens that were actually forwarded through the model.
-                        // When stopped at max_tokens ("length"), the last token was never forwarded
-                        // (the pipelined loop skips forward on the final step).
-                        let history_tokens =
-                            if finish_reason == "length" && !generated_tokens.is_empty() {
-                                &generated_tokens[..generated_tokens.len() - 1]
-                            } else {
-                                &generated_tokens
-                            };
-                        full_history.extend_from_slice(history_tokens);
-                        if let Ok(mut th) = cached_token_history_arc.write() {
-                            *th = full_history;
-                        }
-                        if let Ok(mut ik) = cached_image_key_arc.write() {
-                            *ik = if has_images {
-                                Some(current_image_cache_key)
-                            } else {
-                                None
-                            };
-                        }
-                    } else {
-                        if let Ok(mut cg) = caches_arc.write() {
-                            *cg = None;
-                        }
-                        if let Ok(mut th) = cached_token_history_arc.write() {
-                            th.clear();
-                        }
-                        if let Ok(mut ik) = cached_image_key_arc.write() {
-                            *ik = None;
-                        }
-                        if let Ok(mut rd) = cached_rope_deltas_arc.write() {
-                            *rd = None;
-                        }
-                    }
-
-                    let text = tokenizer_for_decode
-                        .decode_sync(&generated_tokens, true)
-                        .unwrap_or_else(|e| {
-                            warn!("Failed to decode generated tokens: {}", e);
-                            String::new()
-                        });
-
-                    // Flush any residual bytes buffered by DecodeStream that
-                    // weren't emitted as intermediate chunks.
-                    if text.len() > streamed_text_len {
-                        let residual = text[streamed_text_len..].to_string();
-                        callback.call(
-                            Ok(ChatStreamChunk {
-                                text: residual,
-                                done: false,
-                                finish_reason: None,
-                                tool_calls: None,
-                                thinking: None,
-                                num_tokens: None,
-                                raw_text: None,
-                                performance: None,
-                                is_reasoning: Some(last_is_reasoning),
-                            }),
-                            ThreadsafeFunctionCallMode::NonBlocking,
-                        );
-                    }
-
-                    let num_tokens = generated_tokens.len() as u32;
-
-                    let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
-                        &text,
-                        &generated_tokens,
-                        enable_thinking.unwrap_or(true),
-                        think_end_id,
-                        think_end_str.as_deref(),
-                        p.include_reasoning,
-                    );
-
-                    // If we have valid tool calls, override finish reason
-                    let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
-                        "tool_calls".to_string()
-                    } else {
-                        finish_reason
-                    };
-
-                    // Compute performance metrics if requested
-                    let perf_metrics = if let (Some(gen_start), Some(first_tok)) =
-                        (generation_start, first_token_instant)
-                    {
-                        let generation_end = std::time::Instant::now();
-                        let actual_prefill_toks = prefill_tokens.len() as f64;
-                        let gen_toks = generated_tokens.len() as f64;
-                        let ttft_ms = first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
-                        let decode_ms =
-                            generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
-                        Some(crate::profiling::PerformanceMetrics {
-                            ttft_ms,
-                            prefill_tokens_per_second: if ttft_ms > 0.0 {
-                                actual_prefill_toks / (ttft_ms / 1000.0)
-                            } else {
-                                0.0
-                            },
-                            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
-                                (gen_toks - 1.0) / (decode_ms / 1000.0)
-                            } else {
-                                0.0
-                            },
-                        })
-                    } else {
-                        None
-                    };
-
-                    // Send final done chunk
-                    callback.call(
-                        Ok(ChatStreamChunk {
-                            text: clean_text,
-                            done: true,
-                            finish_reason: Some(finish_reason),
-                            tool_calls: Some(tool_calls),
-                            thinking,
-                            num_tokens: Some(num_tokens),
-                            raw_text: Some(text),
-                            performance: perf_metrics,
-                            is_reasoning: None,
-                        }),
-                        ThreadsafeFunctionCallMode::NonBlocking,
-                    );
-
-                    Ok(())
-                })
-                .await;
-
-            match result {
-                Ok(Ok(())) => {} // Success — final chunk already sent via callback
-                Ok(Err(e)) => {
-                    // Inner closure error (tokenization, lock, array ops, etc.)
-                    callback_err.call(Err(e), ThreadsafeFunctionCallMode::NonBlocking);
-                }
-                Err(e) => {
-                    // JoinError (panic in spawn_blocking)
-                    callback_err.call(
-                        Err(Error::from_reason(format!(
-                            "Chat stream task panicked: {}",
-                            e
-                        ))),
-                        ThreadsafeFunctionCallMode::NonBlocking,
-                    );
-                }
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
             }
         });
 
@@ -2263,6 +2312,8 @@ impl Qwen3_5Model {
     }
 
     /// Get the number of parameters in the model.
+    ///
+    /// Pure config computation — no model-thread dispatch needed.
     #[napi]
     pub fn num_parameters(&self) -> i64 {
         let h = self.config.hidden_size as i64;
@@ -2270,7 +2321,6 @@ impl Qwen3_5Model {
         let n = self.config.num_layers as usize;
         let dense_i = self.config.intermediate_size as i64;
 
-        // Embedding + LM head
         let mut total = v * h;
         if !self.config.tie_word_embeddings {
             total += v * h;
@@ -2281,63 +2331,59 @@ impl Qwen3_5Model {
 
         for layer_idx in 0..n {
             let is_linear = self.config.is_linear_layer(layer_idx);
-
-            // Attention params
             if is_linear {
                 let num_vh = self.config.linear_num_value_heads as i64;
                 let vhd = self.config.linear_value_head_dim as i64;
-                total += h * (kd * 2 + vd * 2) // in_proj_qkvz
-                    + h * (num_vh * 2) // in_proj_ba
-                    + (kd * 2 + vd) * self.config.linear_conv_kernel_dim as i64 // conv1d
-                    + vd * h // out_proj
-                    + num_vh // dt_bias
-                    + num_vh // a_log
-                    + vhd; // norm (RMSNormGated weight)
+                total += h * (kd * 2 + vd * 2)
+                    + h * (num_vh * 2)
+                    + (kd * 2 + vd) * self.config.linear_conv_kernel_dim as i64
+                    + vd * h
+                    + num_vh
+                    + num_vh
+                    + vhd;
             } else {
                 let d = self.config.head_dim as i64;
-                total += h * h * 2 // q_proj (2x for gate)
-                    + h * (self.config.num_kv_heads as i64 * d) * 2 // k, v
-                    + h * h // o_proj
-                    + d * 2; // q_norm + k_norm (each [head_dim])
+                total += h * h * 2 + h * (self.config.num_kv_heads as i64 * d) * 2 + h * h + d * 2;
             }
-
-            // Dense MLP params
             total += 3 * h * dense_i;
-
-            // Norms (2 per layer)
             total += h * 2;
         }
-
-        // Final norm
         total += h;
-
         total
     }
 
     /// Save the model weights and configuration to a directory.
     ///
-    /// This saves:
-    /// - config.json: Model configuration (with model_type for detectModelType)
-    /// - weights.safetensors: Full model weights in SafeTensors format
-    /// - weights.mlx: Parameter metadata (for reference)
-    ///
-    /// # Arguments
-    /// * `save_path` - Directory to save the model
+    /// For inference models: dispatches to model thread.
+    /// For training clones: uses Arc<RwLock<>> training fields directly.
     #[napi]
     pub fn save_model<'env>(
         &self,
         env: &'env Env,
         save_path: String,
     ) -> Result<PromiseRaw<'env, ()>> {
+        if let Some(ref thread) = self.thread {
+            // Inference model: dispatch to model thread
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            thread.send(Qwen35Cmd::SaveModel {
+                save_path,
+                reply: tx,
+            })?;
+            let promise = env.spawn_future(async move {
+                rx.await
+                    .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
+            })?;
+            return Ok(promise);
+        }
+
+        // Training clone: use Arc<RwLock<>> fields directly (existing code path)
         let mut params = self.get_parameters_for_training()?;
 
-        // Include vision encoder weights when present (VLM models)
         if let Some(ref vision_enc) = self.vision_encoder {
             let vision_params = vision_enc.get_parameters();
             params.extend(vision_params);
         }
 
-        // Validate all parameters for NaN/Inf before saving
         for (name, param) in params.iter() {
             let data = param.to_float32()?;
             let invalid_count = data
@@ -2360,21 +2406,17 @@ impl Qwen3_5Model {
         let params_clone: HashMap<String, MxArray> =
             params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
-        // Create weights metadata (for reference)
         let mut weights_metadata = serde_json::Map::new();
         for (key, array) in params.iter() {
             let shape_data = array.shape()?;
             let shape: Vec<i64> = shape_data.as_ref().to_vec();
             let dtype = array.dtype()?;
-
             let mut param_info = serde_json::Map::new();
             param_info.insert("shape".to_string(), serde_json::json!(shape));
             param_info.insert("dtype".to_string(), serde_json::json!(dtype as i32));
-
             weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
         }
 
-        // Serialize config and inject model_type for detectModelType
         let config = self.get_config();
         let mut config_value = serde_json::to_value(&config).map_err(|e| {
             napi::Error::new(
@@ -2394,19 +2436,16 @@ impl Qwen3_5Model {
         });
 
         let promise = env.spawn_future(async move {
-            tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 let path = std::path::Path::new(&save_path);
                 std::fs::create_dir_all(path)?;
-
                 info!("Saving model to {}", save_path);
 
-                // 1. Save configuration as JSON
                 let config_path = path.join("config.json");
                 let config_json = serde_json::to_string_pretty(&config_value)?;
                 std::fs::write(&config_path, config_json)?;
                 info!("Saved config.json");
 
-                // 2. Save full weights in SafeTensors format
                 let safetensors_path = path.join("weights.safetensors");
                 let metadata = Some(serde_json::json!({
                     "format": "mlx-node",
@@ -2419,7 +2458,6 @@ impl Qwen3_5Model {
                 )?;
                 info!("Saved weights.safetensors");
 
-                // 3. Save weights metadata (for reference)
                 let weights_str = serde_json::to_string_pretty(&weights_json)?;
                 let weights_path = path.join("weights.mlx");
                 std::fs::write(&weights_path, weights_str)?;
@@ -2427,14 +2465,14 @@ impl Qwen3_5Model {
 
                 Ok::<_, Error>(())
             })
+            .await
             .map_err(|err| {
                 napi::Error::new(
                     Status::GenericFailure,
                     format!("Failed to save model: {}", err),
                 )
-            })
-            .await
-            .flatten()?;
+            })?;
+            result?;
             Ok(())
         })?;
 
@@ -2602,6 +2640,7 @@ fn eval_token_and_compiled_caches(next_token: &MxArray) {
 // Internal methods (not NAPI-exported)
 impl Qwen3_5Model {
     /// Forward pass from embeddings through all layers (internal, acquires locks).
+    #[allow(dead_code)]
     fn forward_from_embeddings(&self, hidden_states: &MxArray) -> Result<MxArray> {
         let mut h = hidden_states.clone();
 
@@ -2762,7 +2801,10 @@ impl Qwen3_5Model {
     /// Arc-clones all shared components, no deep copy.
     pub(crate) fn clone_for_training(&self) -> Result<Self> {
         Ok(Self {
+            thread: None, // Training clones don't use the model thread
             config: self.config.clone(),
+            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            image_processor: None,
             embedding: Embedding::from_weight(&self.embedding.get_weight())?,
             layers: Arc::clone(&self.layers),
             final_norm: Arc::clone(&self.final_norm),
@@ -2771,7 +2813,6 @@ impl Qwen3_5Model {
             tokenizer: self.tokenizer.clone(),
             fa_idx: self.fa_idx,
             vision_encoder: None, // Not needed for training
-            image_processor: None,
             spatial_merge_size: None,
             vision_cache: Arc::new(Mutex::new(VisionCacheInner {
                 entries: HashMap::new(),
@@ -2780,8 +2821,7 @@ impl Qwen3_5Model {
             cached_token_history: Arc::new(RwLock::new(Vec::new())),
             cached_image_key: Arc::new(RwLock::new(None)),
             cached_rope_deltas: Arc::new(RwLock::new(None)),
-            model_id: QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-            generation_lock: Arc::new(TokioMutex::new(())),
+            generation_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
