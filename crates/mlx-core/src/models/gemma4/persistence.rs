@@ -919,6 +919,14 @@ fn apply_vision_weights(
                 }
             }
         }
+
+        // Standardization parameters (only present when standardize=true)
+        if let Some(w) = params.get("vision_tower.std_bias") {
+            vision_tower.std_bias = Some(w.clone());
+        }
+        if let Some(w) = params.get("vision_tower.std_scale") {
+            vision_tower.std_scale = Some(w.clone());
+        }
     }
     drop(vt_guard);
 

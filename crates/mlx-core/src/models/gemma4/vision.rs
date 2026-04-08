@@ -36,10 +36,10 @@ pub struct VisionRMSNorm {
 }
 
 impl VisionRMSNorm {
-    pub fn new(dim: i32) -> Result<Self> {
+    pub fn new(dim: i32, eps: f64) -> Result<Self> {
         Ok(Self {
             weight: MxArray::ones(&[dim as i64], Some(DType::Float32))?,
-            eps: 1e-6,
+            eps,
         })
     }
 
@@ -143,8 +143,8 @@ impl VisionAttention {
             k_proj: make(h, nkv * hd)?,
             v_proj: make(h, nkv * hd)?,
             o_proj: make(nh * hd, h)?,
-            q_norm: VisionRMSNorm::new(hd)?,
-            k_norm: VisionRMSNorm::new(hd)?,
+            q_norm: VisionRMSNorm::new(hd, config.rms_norm_eps)?,
+            k_norm: VisionRMSNorm::new(hd, config.rms_norm_eps)?,
             v_norm: VisionRMSNormNoScale::new(),
         })
     }
@@ -476,17 +476,20 @@ impl VisionPooler {
 
         let length = output_length.unwrap_or(self.default_output_length);
 
-        let (hidden_states, mask) = if hidden_states.shape_at(1)? == length as i64 {
-            // No pooling needed — mask is the padding_positions (True=padding)
-            (hidden_states, padding_positions.clone())
+        // mask convention: always True=valid, False=padding
+        let (hidden_states, valid_mask) = if hidden_states.shape_at(1)? == length as i64 {
+            // No pooling needed — invert padding_positions (True=padding) to True=valid
+            let valid = padding_positions.logical_not()?;
+            (hidden_states, valid)
         } else {
+            // avg_pool_by_positions already returns True=valid
             self.avg_pool_by_positions(&hidden_states, patch_positions, length)?
         };
 
         // Scale by sqrt(hidden_size) — applied unconditionally after pool/no-pool
         let scale = MxArray::scalar_float(self.root_hidden_size)?;
         let hidden_states = hidden_states.mul(&scale)?;
-        Ok((hidden_states, mask))
+        Ok((hidden_states, valid_mask))
     }
 }
 
@@ -647,14 +650,9 @@ impl Gemma4VisionModel {
             self.pooler
                 .forward(&hidden_states, &patch_positions, &padding_positions, None)?;
 
-        // Determine valid mask: if pooler did avg_pool_by_positions, pool_mask
-        // is True=valid.  If no pooling, pool_mask is padding_positions (True=padding).
+        // pool_mask is always True=valid (normalized in VisionPooler::forward)
         let seq_len = pooled.shape_at(1)?;
-        let valid_mask = if seq_len == self.default_output_length as i64 {
-            pool_mask.clone()
-        } else {
-            pool_mask.logical_not()?
-        };
+        let valid_mask = pool_mask;
 
         // Strip padding: for each batch item, count valid tokens and slice.
         // Pooling produces contiguous valid tokens followed by padding.

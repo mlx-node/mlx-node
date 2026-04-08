@@ -295,18 +295,19 @@ impl Gemma4Model {
         let embed_vision = self.embed_vision.clone();
         let model_config = self.config.clone();
 
-        // Process images before spawn_blocking (image crate is Send-safe but
-        // we need the image_processor ref which is on self)
+        // Process images before spawn_blocking because image_processor
+        // lives on &self and cannot be moved into the closure.
         let processed_images = if has_images {
-            if let Some(ref ip) = self.image_processor {
-                let mut results = Vec::with_capacity(all_images.len());
-                for img_bytes in &all_images {
-                    results.push(ip.process_bytes(img_bytes)?);
-                }
-                results
-            } else {
-                Vec::new()
+            let ip = self.image_processor.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "Images provided but model has no vision support (no vision_config in config.json)",
+                )
+            })?;
+            let mut results = Vec::with_capacity(all_images.len());
+            for img_bytes in &all_images {
+                results.push(ip.process_bytes(img_bytes)?);
             }
+            results
         } else {
             Vec::new()
         };
@@ -459,6 +460,22 @@ impl Gemma4Model {
                 // masked_scatter: replace image_token positions with vision features
                 let image_token = MxArray::scalar_int(image_token_id)?;
                 let image_mask = prompt.equal(&image_token)?;
+
+                // Validate: number of True positions in mask must match vision feature count
+                let mask_count_arr = image_mask.astype(DType::Int32)?.sum(None, None)?;
+                mask_count_arr.eval();
+                let mask_count = mask_count_arr.item_at_int32(0)? as i64;
+                let feature_count = image_features.shape_at(1)?;
+                if mask_count != feature_count {
+                    return Err(Error::new(
+                        Status::GenericFailure,
+                        format!(
+                            "Image token count ({mask_count}) does not match vision feature count ({feature_count}). \
+                             Check that image token expansion produced the correct number of tokens."
+                        ),
+                    ));
+                }
+
                 let image_mask_expanded = image_mask.expand_dims(-1)?;
                 let image_mask_expanded = image_mask_expanded.broadcast_to(
                     &text_embeds.shape()?,
@@ -1327,6 +1344,9 @@ fn expand_image_tokens(
 
     if image_count == 0 && !processed_images.is_empty() {
         // Manual fallback: insert expanded tokens after BOS (position 0)
+        if tokens.is_empty() {
+            return Vec::new();
+        }
         let mut result = Vec::with_capacity(
             tokens.len()
                 + processed_images
@@ -1368,7 +1388,7 @@ fn expand_image_tokens(
 /// masked_scatter: replace positions where mask=true with values from source.
 ///
 /// Matches Python: `mx.where(mask_flat, aligned, input_flat).reshape(input.shape)`
-/// where `aligned = source.flatten()[cumsum(mask_flat) - 1 % source.size]`
+/// where `aligned = source.flatten()[(cumsum(mask_flat) - 1) % source.size]`
 fn masked_scatter(input: &MxArray, mask: &MxArray, source: &MxArray) -> Result<MxArray> {
     let input_shape = input.shape()?;
     let mask_flat = mask.reshape(&[-1])?.astype(DType::Int32)?;
