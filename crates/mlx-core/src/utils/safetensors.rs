@@ -315,6 +315,9 @@ fn bytes_to_u16(bytes: &[u8]) -> Vec<u16> {
 // SafeTensors Writer
 // ============================================================================
 
+/// Maximum shard size in bytes (5 GB), matching mlx-lm and mlx-vlm.
+const MAX_SHARD_SIZE: usize = 5 << 30;
+
 /// Save tensors to SafeTensors format.
 ///
 /// Uses a two-pass streaming approach to avoid materializing all tensor bytes
@@ -322,22 +325,19 @@ fn bytes_to_u16(bytes: &[u8]) -> Vec<u16> {
 ///
 /// Pass 1: Compute byte sizes from array metadata (no evaluation), build header.
 /// Pass 2: Write header, then stream each tensor's bytes to disk one at a time.
-pub fn save_safetensors<P: AsRef<Path>>(
+fn save_safetensors_single<P: AsRef<Path>>(
     path: P,
     tensors: &HashMap<String, MxArray>,
+    names: &[String],
     metadata: Option<serde_json::Value>,
 ) -> Result<()> {
     use std::io::{BufWriter, Write};
-
-    // Sort tensor names for deterministic output
-    let mut tensor_names: Vec<String> = tensors.keys().cloned().collect();
-    tensor_names.sort();
 
     // --- Pass 1: Build header from metadata only (no tensor evaluation) ---
     let mut header = serde_json::Map::new();
     let mut current_offset = 0usize;
 
-    for name in &tensor_names {
+    for name in names {
         let array = tensors.get(name).unwrap();
         let shape = array.shape()?;
         let shape_vec: Vec<usize> = shape.as_ref().iter().map(|&x| x as usize).collect();
@@ -380,9 +380,19 @@ pub fn save_safetensors<P: AsRef<Path>>(
         .map_err(|e| Error::from_reason(format!("Failed to write header: {}", e)))?;
 
     // Stream each tensor: materialize → write → drop
-    for name in &tensor_names {
+    for name in names {
         let array = tensors.get(name).unwrap();
-        let bytes = array_to_bytes(array)?;
+        let bytes = array_to_bytes(array).map_err(|e| {
+            let dtype = array.dtype().ok();
+            let shape = array.shape().ok();
+            Error::from_reason(format!(
+                "Failed to serialize tensor '{}' (dtype={:?}, shape={:?}): {}",
+                name,
+                dtype,
+                shape.as_ref().map(|s| s.as_ref()),
+                e
+            ))
+        })?;
         writer
             .write_all(&bytes)
             .map_err(|e| Error::from_reason(format!("Failed to write tensor {}: {}", name, e)))?;
@@ -392,6 +402,115 @@ pub fn save_safetensors<P: AsRef<Path>>(
     writer
         .flush()
         .map_err(|e| Error::from_reason(format!("Failed to flush file: {}", e)))?;
+
+    Ok(())
+}
+
+/// Save tensors to a single SafeTensors file (legacy API for non-sharded use cases).
+pub fn save_safetensors<P: AsRef<Path>>(
+    path: P,
+    tensors: &HashMap<String, MxArray>,
+    metadata: Option<serde_json::Value>,
+) -> Result<()> {
+    let mut names: Vec<String> = tensors.keys().cloned().collect();
+    names.sort();
+    save_safetensors_single(path, tensors, &names, metadata)
+}
+
+/// Save tensors as sharded SafeTensors files with an index, matching mlx-lm/mlx-vlm output.
+///
+/// - Splits into 5GB shards: `model-00001-of-XXXXX.safetensors`
+/// - If total size ≤ 5GB, writes a single `model.safetensors`
+/// - Always writes `model.safetensors.index.json` with `{metadata: {total_size}, weight_map}`
+/// - SafeTensors metadata is `{"format": "mlx"}` for compatibility
+pub fn save_safetensors_sharded(
+    output_dir: &Path,
+    tensors: &HashMap<String, MxArray>,
+) -> Result<()> {
+    use tracing::info;
+
+    let metadata = serde_json::json!({"format": "mlx"});
+
+    // Sort tensor names for deterministic output
+    let mut all_names: Vec<String> = tensors.keys().cloned().collect();
+    all_names.sort();
+
+    // Compute per-tensor byte sizes
+    let mut tensor_sizes: Vec<(String, usize)> = Vec::with_capacity(all_names.len());
+    let mut total_size: usize = 0;
+    for name in &all_names {
+        let array = tensors.get(name).unwrap();
+        let size = array.size()? as usize;
+        let byte_size = size * array.dtype()?.byte_size();
+        tensor_sizes.push((name.clone(), byte_size));
+        total_size += byte_size;
+    }
+
+    // Split into shards (greedy bin-packing like mlx-lm/mlx-vlm)
+    let mut shards: Vec<Vec<String>> = Vec::new();
+    let mut current_shard: Vec<String> = Vec::new();
+    let mut current_size: usize = 0;
+
+    for (name, byte_size) in &tensor_sizes {
+        if !current_shard.is_empty() && current_size + byte_size > MAX_SHARD_SIZE {
+            shards.push(std::mem::take(&mut current_shard));
+            current_size = 0;
+        }
+        current_shard.push(name.clone());
+        current_size += byte_size;
+    }
+    if !current_shard.is_empty() {
+        shards.push(current_shard);
+    }
+
+    let num_shards = shards.len();
+    info!(
+        "Saving {} tensors ({:.2} GB) in {} shard(s)",
+        all_names.len(),
+        total_size as f64 / (1 << 30) as f64,
+        num_shards
+    );
+
+    // Build weight_map and write each shard
+    let mut weight_map: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+
+    for (i, shard_names) in shards.iter().enumerate() {
+        let shard_filename = if num_shards == 1 {
+            "model.safetensors".to_string()
+        } else {
+            format!("model-{:05}-of-{:05}.safetensors", i + 1, num_shards)
+        };
+
+        let shard_path = output_dir.join(&shard_filename);
+        info!(
+            "  Writing shard: {} ({} tensors)",
+            shard_filename,
+            shard_names.len()
+        );
+
+        save_safetensors_single(&shard_path, tensors, shard_names, Some(metadata.clone()))?;
+
+        for name in shard_names {
+            weight_map.insert(name.clone(), shard_filename.clone());
+        }
+    }
+
+    // Write index file (always, even for single shard — matches mlx-lm behavior)
+    let index = serde_json::json!({
+        "metadata": {
+            "total_size": total_size,
+        },
+        "weight_map": weight_map,
+    });
+
+    let index_path = output_dir.join("model.safetensors.index.json");
+    let index_str = serde_json::to_string_pretty(&index)
+        .map_err(|e| Error::from_reason(format!("Failed to serialize index: {}", e)))?;
+    std::fs::write(&index_path, index_str)
+        .map_err(|e| Error::from_reason(format!("Failed to write index: {}", e)))?;
+
+    info!("  Wrote model.safetensors.index.json");
 
     Ok(())
 }

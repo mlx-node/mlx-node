@@ -18,10 +18,7 @@ async function main() {
   let passed = 0;
   for (const { prompt, expected } of tests) {
     const t1 = Date.now();
-    const r = await model.chat(
-      [{ role: 'user', content: prompt }],
-      { maxNewTokens: 64, temperature: 0.0 },
-    );
+    const r = await model.chat([{ role: 'user', content: prompt }], { maxNewTokens: 64, temperature: 0.0 });
     const elapsed = Date.now() - t1;
     const text = r.text.replace(/\n/g, '\\n').slice(0, 120);
     const ok = expected ? r.text.includes(expected) : true;
@@ -33,4 +30,7 @@ async function main() {
   console.log(`\n${passed}/${tests.length} tests passed`);
   process.exit(passed === tests.length ? 0 : 1);
 }
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

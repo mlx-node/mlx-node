@@ -39,14 +39,10 @@ if (loadedModel instanceof HarrierModel) {
   console.error('This example is for generative models, not embedding models.');
   process.exit(1);
 }
-if (loadedModel instanceof Gemma4Model) {
-  console.error('Use examples/gemma4.ts for Gemma4 models.');
-  process.exit(1);
-}
-const model = loadedModel;
-const isQwen3 = model instanceof Qwen3Model;
-const isQianfan = model instanceof QianfanOCRModel;
-const modelArch = isQianfan ? 'Qianfan-OCR' : isQwen3 ? 'Qwen3' : 'Qwen3.5';
+const isGemma4 = loadedModel instanceof Gemma4Model;
+const isQwen3 = loadedModel instanceof Qwen3Model;
+const isQianfan = loadedModel instanceof QianfanOCRModel;
+const modelArch = isGemma4 ? 'Gemma4' : isQianfan ? 'Qianfan-OCR' : isQwen3 ? 'Qwen3' : 'Qwen3.5';
 console.log(`Model loaded (${modelArch})\n`);
 
 function printPerf(result: { finishReason: string; numTokens: number; performance?: ChatResult['performance'] }) {
@@ -56,6 +52,45 @@ function printPerf(result: { finishReason: string; numTokens: number; performanc
   console.log(
     `Stop reason: ${result.finishReason} | ${result.numTokens} tokens | TTFT ${p.ttftMs.toFixed(0)}ms | Prefill ${p.prefillTokensPerSecond.toFixed(1)} tok/s | Decode ${p.decodeTokensPerSecond.toFixed(1)} tok/s`,
   );
+}
+
+async function chat(
+  messages: { role: string; content: string; images?: Uint8Array[] }[],
+  opts: { maxNewTokens: number; temperature: number },
+): Promise<{
+  text: string;
+  rawText: string;
+  finishReason: string;
+  numTokens: number;
+  performance?: ChatResult['performance'];
+}> {
+  if (isGemma4) {
+    const model = loadedModel as Gemma4Model;
+    const r = await model.chat(messages, {
+      maxNewTokens: opts.maxNewTokens,
+      temperature: opts.temperature,
+    });
+    return {
+      text: r.text,
+      rawText: r.text,
+      finishReason: r.finishReason,
+      numTokens: r.numTokens,
+      performance: r.performance,
+    };
+  }
+  const model = loadedModel as Exclude<typeof loadedModel, HarrierModel | Gemma4Model>;
+  const r = await model.chat(messages, {
+    maxNewTokens: opts.maxNewTokens,
+    temperature: opts.temperature,
+    reportPerformance: true,
+  });
+  return {
+    text: r.text,
+    rawText: r.rawText,
+    finishReason: r.finishReason,
+    numTokens: r.numTokens,
+    performance: r.performance,
+  };
 }
 
 if (imagePath) {
@@ -71,11 +106,7 @@ if (imagePath) {
   // Turn 1: full VLM prefill
   console.log('── Turn 1 (full VLM prefill) ──');
   console.log(`User: ${messages[0].content}`);
-  const r1 = await model.chat(messages, {
-    maxNewTokens: 2048,
-    temperature: 0.6,
-    reportPerformance: true,
-  });
+  const r1 = await chat(messages, { maxNewTokens: 2048, temperature: 0.6 });
   console.log(`Assistant: ${r1.text}`);
   printPerf(r1);
 
@@ -85,11 +116,7 @@ if (imagePath) {
 
   console.log('\n── Turn 2 (cache reuse, same image) ──');
   console.log(`User: ${messages[2].content}`);
-  const r2 = await model.chat(messages, {
-    maxNewTokens: 2048,
-    temperature: 0.6,
-    reportPerformance: true,
-  });
+  const r2 = await chat(messages, { maxNewTokens: 2048, temperature: 0.6 });
   console.log(`Assistant: ${r2.text}`);
   printPerf(r2);
 
@@ -99,11 +126,7 @@ if (imagePath) {
 
   console.log('\n── Turn 3 (cache reuse) ──');
   console.log(`User: ${messages[4].content}`);
-  const r3 = await model.chat(messages, {
-    maxNewTokens: 2048,
-    temperature: 0.6,
-    reportPerformance: true,
-  });
+  const r3 = await chat(messages, { maxNewTokens: 2048, temperature: 0.6 });
   console.log(`Assistant: ${r3.text}`);
   printPerf(r3);
 } else {
@@ -116,11 +139,7 @@ if (imagePath) {
   // Turn 1: full prefill
   console.log('── Turn 1 (full prefill) ──');
   console.log(`User: ${messages[1].content}`);
-  const r1 = await model.chat(messages, {
-    maxNewTokens: 2048,
-    temperature: 0.6,
-    reportPerformance: true,
-  });
+  const r1 = await chat(messages, { maxNewTokens: 2048, temperature: 0.6 });
   console.log(`Assistant: ${r1.text}`);
   printPerf(r1);
 
@@ -130,11 +149,7 @@ if (imagePath) {
 
   console.log('\n── Turn 2 (cache reuse) ──');
   console.log(`User: ${messages[3].content}`);
-  const r2 = await model.chat(messages, {
-    maxNewTokens: 2048,
-    temperature: 0.6,
-    reportPerformance: true,
-  });
+  const r2 = await chat(messages, { maxNewTokens: 2048, temperature: 0.6 });
   console.log(`Assistant: ${r2.text}`);
   printPerf(r2);
 
@@ -144,11 +159,7 @@ if (imagePath) {
 
   console.log('\n── Turn 3 (cache reuse) ──');
   console.log(`User: ${messages[5].content}`);
-  const r3 = await model.chat(messages, {
-    maxNewTokens: 2048,
-    temperature: 0.6,
-    reportPerformance: true,
-  });
+  const r3 = await chat(messages, { maxNewTokens: 2048, temperature: 0.6 });
   console.log(`Assistant: ${r3.text}`);
   printPerf(r3);
 
@@ -158,11 +169,7 @@ if (imagePath) {
 
   console.log('\n── Turn 4 (cache reuse) ──');
   console.log(`User: ${messages[7].content}`);
-  const r4 = await model.chat(messages, {
-    maxNewTokens: 2048,
-    temperature: 0.6,
-    reportPerformance: true,
-  });
+  const r4 = await chat(messages, { maxNewTokens: 2048, temperature: 0.6 });
   console.log(`Assistant: ${r4.text}`);
   printPerf(r4);
 }

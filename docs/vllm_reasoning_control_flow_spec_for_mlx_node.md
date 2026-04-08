@@ -723,14 +723,15 @@ vLLM supports server-level `--default-chat-template-kwargs` and request-level ov
 
 ## 20. Files to modify
 
-| File | Changes |
-|------|---------|
-| `crates/mlx-core/src/models/qwen3_5/model.rs` | `ChatConfig` +3 fields, `ChatStreamChunk` +1 field, `reasoning_effort` resolution (×2), `ReasoningTracker` in 4 decode loops, budget enforcement in 4 loops, `is_reasoning` in 2 streaming loops |
-| `crates/mlx-core/src/models/qwen3_5/chat_common.rs` | `ReasoningTracker` struct + unit tests, `ChatParams` +2 fields, `extract_chat_params()`, `finalize_chat_result()` + `include_reasoning` |
-| `crates/mlx-core/src/models/qwen3_5_moe/model.rs` | Same decode loop changes as dense: `reasoning_effort` (×2), tracker in 4 loops, budget in 4 loops, `is_reasoning` in 2 streaming loops, `finalize_chat_result` call |
-| `packages/lm/src/stream.ts` | `ChatStreamDelta` + `isReasoning`, `_createChatStream()` propagation |
+| File                                                | Changes                                                                                                                                                                                          |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/mlx-core/src/models/qwen3_5/model.rs`       | `ChatConfig` +3 fields, `ChatStreamChunk` +1 field, `reasoning_effort` resolution (×2), `ReasoningTracker` in 4 decode loops, budget enforcement in 4 loops, `is_reasoning` in 2 streaming loops |
+| `crates/mlx-core/src/models/qwen3_5/chat_common.rs` | `ReasoningTracker` struct + unit tests, `ChatParams` +2 fields, `extract_chat_params()`, `finalize_chat_result()` + `include_reasoning`                                                          |
+| `crates/mlx-core/src/models/qwen3_5_moe/model.rs`   | Same decode loop changes as dense: `reasoning_effort` (×2), tracker in 4 loops, budget in 4 loops, `is_reasoning` in 2 streaming loops, `finalize_chat_result` call                              |
+| `packages/lm/src/stream.ts`                         | `ChatStreamDelta` + `isReasoning`, `_createChatStream()` propagation                                                                                                                             |
 
 Files NOT modified (already correct):
+
 - `crates/mlx-core/src/tools/mod.rs` — tool parsing isolation already works
 - `crates/mlx-core/src/tokenizer.rs` — `think_end_id` detection, `enable_thinking` already wired
 - `crates/mlx-core/src/sampling.rs` — no logits processor needed

@@ -263,32 +263,33 @@ bool mlx_array_to_uint16(mlx_array* handle, uint16_t* out, size_t len) {
     return false;
   }
   try {
-    // Force materialization
-    auto zeros_arr = zeros(arr->shape(), arr->dtype());
-    auto materialized = add(*arr, zeros_arr);
-    materialized.eval();
+    arr->eval();
 
-    auto flat = flatten(materialized);
-    flat.eval();
-
-    if (flat.size() != len) {
+    auto dtype = arr->dtype();
+    if (dtype != mlx::core::bfloat16 && dtype != mlx::core::float16) {
+      std::cerr << "[MLX] mlx_array_to_uint16: unsupported dtype " << dtype << std::endl;
       return false;
     }
 
-    // Both bfloat16_t and float16_t are 16-bit types with same memory layout as uint16_t
-    auto dtype = flat.dtype();
+    if (static_cast<size_t>(arr->size()) != len) {
+      std::cerr << "[MLX] mlx_array_to_uint16: size mismatch " << arr->size() << " vs " << len << std::endl;
+      return false;
+    }
+
+    // Use contiguous copy to flatten multi-dim arrays into row-major buffer
+    auto flat = flatten(*arr);
+    flat.eval();
+
     if (dtype == mlx::core::bfloat16) {
       const auto* data = flat.data<mlx::core::bfloat16_t>();
       std::memcpy(out, data, len * sizeof(uint16_t));
-    } else if (dtype == mlx::core::float16) {
+    } else {
       const auto* data = flat.data<mlx::core::float16_t>();
       std::memcpy(out, data, len * sizeof(uint16_t));
-    } else {
-      return false; // Only bf16/f16 supported
     }
     return true;
   } catch (const std::exception& e) {
-    std::cerr << "[MLX] copy_to_buffer(uint16): " << e.what() << std::endl;
+    std::cerr << "[MLX] mlx_array_to_uint16: " << e.what() << std::endl;
     return false;
   }
 }

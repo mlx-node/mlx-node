@@ -1,4 +1,11 @@
-import type { Gemma4Model, HarrierModel, Qwen3Model, Qwen35Model, Qwen35MoeModel, QianfanOCRModel } from '@mlx-node/core';
+import type {
+  Gemma4Model,
+  HarrierModel,
+  Qwen3Model,
+  Qwen35Model,
+  Qwen35MoeModel,
+  QianfanOCRModel,
+} from '@mlx-node/core';
 
 /**
  * Union of all model classes that can be used with training engines.
