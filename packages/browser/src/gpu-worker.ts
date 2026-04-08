@@ -1090,6 +1090,30 @@ async function processCommand(fnId: number): Promise<void> {
       break;
     }
 
+    case RpcFn.CREATE_BUFFER_FROM_DATA: {
+      // Fused: createBuffer + writeBuffer in one RPC (replaces mappedAtCreation pattern).
+      // Args: usage, sizeLo, sizeHi, wasmDataPtr
+      const usage = arg0();
+      const sizeLo = arg1();
+      const sizeHi = arg2();
+      const wasmDataPtr = arg3();
+      const size = sizeLo + sizeHi * 0x100000000;
+
+      try {
+        const buffer = device.createBuffer({ size, usage });
+        // Copy data from WASM memory into the buffer
+        const data = wasmBytes().slice(wasmDataPtr, wasmDataPtr + size);
+        queue.writeBuffer(buffer, 0, data);
+        const handle = addHandle(buffer);
+        bufferSizesArr[handle] = size;
+        setResult(handle);
+      } catch (e) {
+        console.error(`[GPU Worker] CREATE_BUFFER_FROM_DATA failed: size=${size} usage=0x${usage.toString(16)}`, e);
+        setResult(0);
+      }
+      break;
+    }
+
     default: {
       console.warn(`[GPU Worker] Unknown function ID: ${fnId}`);
       setResult(0);

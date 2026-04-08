@@ -108,15 +108,27 @@ export function createBridgeStub(
 
   // Deferred mappedAtCreation buffers: skip getMappedRange + unmap RPCs.
   // Instead of sending 3 RPCs (createBuffer+getMappedRange+unmap), we:
-  //   1. Strip mappedAtCreation from descriptor, send createBuffer RPC (real handle, 1 RPC)
+  //   1. Return a FAKE handle (no RPC at all)
   //   2. Allocate WASM shadow locally; getMappedRange returns it (0 RPCs)
-  //   3. On unmap, write data via QUEUE_WRITE_BUFFER (1 RPC)
-  // Total: 2 RPCs instead of 3 per uniform buffer creation.
+  //   3. On unmap, send single CREATE_BUFFER_FROM_DATA RPC (1 RPC)
+  // Total: 1 RPC instead of 2 per uniform buffer creation.
   interface MappedAtCreationInfo {
     wasmPtr: number; // WASM shadow pointer (allocated by wasmMalloc)
     size: number;    // buffer size in bytes
+    usage: number;   // GPUBufferUsageFlags for deferred creation
   }
   const mappedAtCreationBuffers = new Map<number, MappedAtCreationInfo>();
+
+  // Fake→real handle remapping for deferred buffer creation.
+  // After wgpuBufferUnmap sends CREATE_BUFFER_FROM_DATA, the real handle is stored here.
+  // All subsequent bridge stub functions that take a buffer handle resolve through this map.
+  let fakeBufferCounter = 0x7D000000; // distinct range from fakeHandleCounter (0x7F000000)
+  const deferredBufferRemap = new Map<number, number>(); // fake → real handle
+
+  /** Resolve a buffer handle: if it's a deferred fake handle, return the real one. */
+  function resolveBufferHandle(handle: number): number {
+    return deferredBufferRemap.get(handle) ?? handle;
+  }
 
   // Pipeline bind group layout cache: layouts are lightweight and never released
   const layoutCache: Record<number, number> = {};
@@ -331,25 +343,24 @@ export function createBridgeStub(
       const h = heap();
       if (h[descPtr + 24]) {
         // mappedAtCreation=true: read usage to determine if we can defer.
-        // We can only use QUEUE_WRITE_BUFFER on unmap if the buffer has COPY_DST
+        // We can only use writeBuffer on unmap if the buffer has COPY_DST
         // (WGPUBufferUsage_CopyDst = 0x0008). Buffers with only CopySrc must use
-        // the original 3-RPC approach (createBuffer with mappedAtCreation intact).
+        // the original approach (createBuffer with mappedAtCreation intact).
         const view = new DataView(h.buffer, h.byteOffset, h.byteLength);
         const usage = view.getUint32(descPtr + 8, true);
         const COPY_DST = 0x0008;
         if (usage & COPY_DST) {
-          // Strip mappedAtCreation so GPU buffer is created unmapped (we manage shadow locally).
+          // Fully deferred: return a FAKE handle (0 RPCs).
+          // The real GPU buffer is created during wgpuBufferUnmap via CREATE_BUFFER_FROM_DATA.
           const sizeLo = view.getUint32(descPtr + 16, true);
           const sizeHi = view.getUint32(descPtr + 20, true);
           const size = sizeLo + sizeHi * 0x100000000;
-          h[descPtr + 24] = 0;
-          const handle = rpcCall(RpcFn.DEVICE_CREATE_BUFFER, descPtr);
-          // Restore WASM memory (the descriptor may be reused by C++)
-          heap()[descPtr + 24] = 1;
+          const fakeHandle = fakeBufferCounter++;
           // Allocate WASM shadow for C++ to write into via getMappedRange
           const wasmPtr = wasmMalloc(size);
-          mappedAtCreationBuffers.set(handle, { wasmPtr, size });
-          return handle;
+          mappedAtCreationBuffers.set(fakeHandle, { wasmPtr, size, usage });
+          bufSizes[fakeHandle] = size;
+          return fakeHandle;
         }
         // No COPY_DST: fall through to normal RPC (gpu-worker handles mapping)
       }
@@ -365,6 +376,25 @@ export function createBridgeStub(
     },
 
     wgpuDeviceCreateBindGroup(_device: number, descPtr: number): number {
+      // Patch any deferred (fake) buffer handles in bind group entries before sending RPC.
+      // The gpu-worker reads buffer handles from WASM memory and needs real handles.
+      if (deferredBufferRemap.size > 0) {
+        const view = new DataView(heap().buffer);
+        // WGPUBindGroupDescriptor: +12 entryCount, +16 entriesPtr
+        const entryCount = view.getUint32(descPtr + 12, true);
+        const entriesPtr = view.getUint32(descPtr + 16, true);
+        const ENTRY_SIZE = 40; // WGPUBindGroupEntry is 40 bytes on WASM32
+        for (let i = 0; i < entryCount; i++) {
+          const ePtr = entriesPtr + i * ENTRY_SIZE;
+          const bufferHandle = view.getUint32(ePtr + 8, true);
+          if (bufferHandle !== 0) {
+            const real = deferredBufferRemap.get(bufferHandle);
+            if (real !== undefined) {
+              view.setUint32(ePtr + 8, real, true);
+            }
+          }
+        }
+      }
       return rpcCall(RpcFn.DEVICE_CREATE_BIND_GROUP, descPtr);
     },
 
@@ -414,9 +444,10 @@ export function createBridgeStub(
       _queue: number, bufferHandle: number, bufferOffset: bigint,
       dataPtr: number, size: number,
     ): void {
+      const resolved = resolveBufferHandle(bufferHandle);
       const offsetLo = Number(bufferOffset & 0xFFFFFFFFn);
       const offsetHi = Number(bufferOffset >> 32n);
-      rpcCall(RpcFn.QUEUE_WRITE_BUFFER, bufferHandle, offsetLo, offsetHi, dataPtr, size);
+      rpcCall(RpcFn.QUEUE_WRITE_BUFFER, resolved, offsetLo, offsetHi, dataPtr, size);
     },
 
     wgpuQueueOnSubmittedWorkDone(
@@ -463,6 +494,9 @@ export function createBridgeStub(
         activeComputePass = -1;
         activeComputePassEncoder = -1;
       }
+      // Resolve deferred buffer handles
+      const resolvedSrc = resolveBufferHandle(srcHandle);
+      const resolvedDst = resolveBufferHandle(dstHandle);
       // 7 u32 args + 1 high-bits word = uses ARG0..ARG7 + ARG0_HI
       const srcOffsetLo = Number(srcOffset & 0xFFFFFFFFn);
       const srcOffsetHi = Number(srcOffset >> 32n);
@@ -472,7 +506,7 @@ export function createBridgeStub(
       const sizeHi = Number(size >> 32n);
       rpcCallWithHi(
         RpcFn.CMD_ENCODER_COPY_BUFFER,
-        [encoderHandle, srcHandle, srcOffsetLo, srcOffsetHi, dstHandle, dstOffsetLo, dstOffsetHi, sizeLo],
+        [encoderHandle, resolvedSrc, srcOffsetLo, srcOffsetHi, resolvedDst, dstOffsetLo, dstOffsetHi, sizeLo],
         { 0: sizeHi }, // ARG0_HI = sizeHi (maps to gpu-worker's arg0Hi)
       );
     },
@@ -569,11 +603,12 @@ export function createBridgeStub(
 
     // ===== Buffer =====
     wgpuBufferGetSize(bufferHandle: number): bigint {
-      // Fast path: return cached size (no RPC)
+      // Fast path: return cached size (no RPC) — check both fake and real handle
       const cached = bufSizes[bufferHandle];
       if (cached !== undefined) return BigInt(cached);
-      // Slow path: RPC to gpu-worker
-      rpcCall(RpcFn.BUFFER_GET_SIZE, bufferHandle);
+      // Slow path: RPC to gpu-worker (resolve fake→real first)
+      const resolved = resolveBufferHandle(bufferHandle);
+      rpcCall(RpcFn.BUFFER_GET_SIZE, resolved);
       const lo = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);
       const hi = cmdDataView.getUint32(CMD_OFFSET.RESULT_HI, true);
       // Cache (assume sizes < 2^32 for typical buffers)
@@ -640,18 +675,24 @@ export function createBridgeStub(
     },
 
     wgpuBufferUnmap(bufferHandle: number): void {
-      // Fast path: deferred mappedAtCreation buffer — write data via QUEUE_WRITE_BUFFER (1 RPC)
-      // instead of the original 3-RPC dance (createBuffer + getMappedRange + unmap).
+      // Fast path: deferred mappedAtCreation buffer — create buffer + write data in 1 RPC
+      // via CREATE_BUFFER_FROM_DATA (fused createBuffer + writeBuffer).
       const mapped = mappedAtCreationBuffers.get(bufferHandle);
       if (mapped) {
         mappedAtCreationBuffers.delete(bufferHandle);
-        // QUEUE_WRITE_BUFFER args: bufferHandle, offsetLo, offsetHi, dataPtr, size
-        rpcCall(RpcFn.QUEUE_WRITE_BUFFER, bufferHandle, 0, 0, mapped.wasmPtr, mapped.size);
+        const sizeLo = mapped.size & 0xFFFFFFFF;
+        const sizeHi = Math.floor(mapped.size / 0x100000000);
+        // CREATE_BUFFER_FROM_DATA: args = usage, sizeLo, sizeHi, wasmDataPtr
+        const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, mapped.usage, sizeLo, sizeHi, mapped.wasmPtr);
+        // Store remap so subsequent uses of the fake handle resolve to the real one
+        deferredBufferRemap.set(bufferHandle, realHandle);
+        // Cache size under real handle too (keep fake entry for getSize lookups)
+        bufSizes[realHandle] = mapped.size;
         wasmFree(mapped.wasmPtr);
         unmapPtrs.delete(bufferHandle);
         return;
       }
-      rpcCall(RpcFn.BUFFER_UNMAP, bufferHandle);
+      rpcCall(RpcFn.BUFFER_UNMAP, resolveBufferHandle(bufferHandle));
       // Free the WASM shadow pointer allocated by getMappedRange/getConstMappedRange
       const wasmPtr = unmapPtrs.get(bufferHandle);
       if (wasmPtr !== undefined) {
@@ -665,15 +706,26 @@ export function createBridgeStub(
       offset: number, size: number,
       callbackPtr: number, userdataPtr: number,
     ): void {
-      rpcCall(RpcFn.BUFFER_MAP_ASYNC, bufferHandle, mode, offset, size, callbackPtr, userdataPtr);
+      rpcCall(RpcFn.BUFFER_MAP_ASYNC, resolveBufferHandle(bufferHandle), mode, offset, size, callbackPtr, userdataPtr);
     },
 
-    wgpuBufferDestroy(_bufferHandle: number): void {
-      // No-op: gpu-worker already skips buffer destroy to avoid "destroyed in submit" errors
+    wgpuBufferDestroy(bufferHandle: number): void {
+      // No-op: gpu-worker already skips buffer destroy to avoid "destroyed in submit" errors.
+      // If a deferred buffer was never unmapped (unlikely), clean up the pending state.
+      const mapped = mappedAtCreationBuffers.get(bufferHandle);
+      if (mapped) {
+        mappedAtCreationBuffers.delete(bufferHandle);
+        wasmFree(mapped.wasmPtr);
+      }
     },
 
     wgpuBufferRelease(handle: number): void {
-      rpcCall(RpcFn.BUFFER_RELEASE, handle);
+      const resolved = resolveBufferHandle(handle);
+      if (resolved !== handle) {
+        // Clean up remap entry — buffer is being released
+        deferredBufferRemap.delete(handle);
+      }
+      rpcCall(RpcFn.BUFFER_RELEASE, resolved);
     },
 
     // ===== Pipeline =====

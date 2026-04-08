@@ -92,6 +92,9 @@ export const enum RpcFn {
   // Fused: createBindGroup(from descPtr) + setPipeline + setBindGroup(0) + dispatch
   // Args: passHandle, pipelineHandle, bgDescPtr, dispatchX, dispatchY, dispatchZ
   FUSED_BG_DISPATCH = 94,
+  // Fused: create buffer + write initial data in one RPC (replaces mappedAtCreation pattern)
+  // Args: usage, sizeLo, sizeHi, wasmDataPtr
+  CREATE_BUFFER_FROM_DATA = 95,
 }
 
 // ---- Command Buffer Layout (SharedArrayBuffer) ----
