@@ -14,7 +14,8 @@ use crate::models::qwen3_5::persistence_common::{
 use crate::tokenizer::Qwen3Tokenizer;
 
 use super::config::Gemma4Config;
-use super::model::{Gemma4Model, warmup_forward};
+use super::image_processor::Gemma4ImageProcessor;
+use super::model::{Gemma4Inner, Gemma4Model, warmup_forward};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, is_mxfp8_checkpoint, is_quantized_checkpoint,
     try_build_mxfp8_quantized_linear, try_build_quantized_linear,
@@ -523,9 +524,9 @@ pub fn sanitize_weights(
     Ok(sanitized)
 }
 
-/// Apply sanitized weights to a Gemma4Model.
+/// Apply sanitized weights to a Gemma4Inner.
 fn apply_weights(
-    model: &mut Gemma4Model,
+    inner: &mut Gemma4Inner,
     params: &HashMap<String, MxArray>,
     config: &Gemma4Config,
 ) -> Result<()> {
@@ -558,44 +559,36 @@ fn apply_weights(
     };
 
     // Embedding
-    {
-        let mut embed = model.embed_tokens.blocking_write();
-        if let Some(w) = params.get("embed_tokens.weight") {
-            embed.load_weight(w)?;
-            // Pre-transpose for tied lm_head: [vocab, hidden] -> [hidden, vocab]
-            if config.tie_word_embeddings {
-                let w_t = w.transpose(Some(&[1, 0]))?;
-                *model.embed_weight_t.blocking_write() = Some(w_t);
-            }
+    if let Some(w) = params.get("embed_tokens.weight") {
+        inner.embed_tokens.load_weight(w)?;
+        // Pre-transpose for tied lm_head: [vocab, hidden] -> [hidden, vocab]
+        if config.tie_word_embeddings {
+            let w_t = w.transpose(Some(&[1, 0]))?;
+            inner.embed_weight_t = Some(w_t);
         }
     }
 
     // Final norm
-    {
-        let mut norm = model.final_norm.blocking_write();
-        if let Some(w) = params.get("norm.weight") {
-            norm.set_weight(w)?;
-        }
+    if let Some(w) = params.get("norm.weight") {
+        inner.final_norm.set_weight(w)?;
     }
 
     // LM head (when not tied)
-    if !config.tie_word_embeddings {
-        let mut lm_head = model.lm_head.blocking_write();
-        if let Some(ref mut head) = *lm_head {
-            if let Some(_ql) = try_build_ql("lm_head") {
-                return Err(Error::from_reason(
-                    "Quantized lm_head not yet supported for Gemma4",
-                ));
-            } else if let Some(w) = params.get("lm_head.weight") {
-                head.set_weight(w)?;
-            }
+    if !config.tie_word_embeddings
+        && let Some(ref mut head) = inner.lm_head
+    {
+        if let Some(_ql) = try_build_ql("lm_head") {
+            return Err(Error::from_reason(
+                "Quantized lm_head not yet supported for Gemma4",
+            ));
+        } else if let Some(w) = params.get("lm_head.weight") {
+            head.set_weight(w)?;
         }
     }
 
     // PLE model-level weights
     {
-        let mut ple_guard = model.ple.blocking_write();
-        if let Some(ref mut ple) = *ple_guard {
+        if let Some(ref mut ple) = inner.ple {
             if let Some(w) = params.get("embed_tokens_per_layer.weight") {
                 ple.embed_tokens_per_layer.load_weight(w)?;
                 info!("PLE embed_tokens_per_layer loaded");
@@ -611,8 +604,7 @@ fn apply_weights(
     }
 
     // Per-layer weights
-    let mut layers = model.layers.blocking_write();
-    for (i, layer) in layers.iter_mut().enumerate() {
+    for (i, layer) in inner.layers.iter_mut().enumerate() {
         let prefix = format!("layers.{}", i);
 
         // Attention weights
@@ -778,9 +770,9 @@ fn apply_weights(
     Ok(())
 }
 
-/// Apply vision weights to the model's vision tower and multimodal embedder.
+/// Apply vision weights to the inner model's vision tower and multimodal embedder.
 fn apply_vision_weights(
-    model: &mut Gemma4Model,
+    inner: &mut Gemma4Inner,
     params: &HashMap<String, MxArray>,
     config: &Gemma4Config,
 ) -> Result<()> {
@@ -790,8 +782,7 @@ fn apply_vision_weights(
     };
 
     // --- Vision Tower ---
-    let mut vt_guard = model.vision_tower.blocking_write();
-    if let Some(ref mut vision_tower) = *vt_guard {
+    if let Some(ref mut vision_tower) = inner.vision_tower {
         // Patch embedder
         if let Some(w) = params.get("vision_tower.patch_embedder.input_proj.weight") {
             vision_tower.patch_embedder.input_proj.set_weight(w)?;
@@ -928,16 +919,13 @@ fn apply_vision_weights(
             vision_tower.std_scale = Some(w.clone());
         }
     }
-    drop(vt_guard);
 
     // --- Multimodal Embedder ---
-    let mut ev_guard = model.embed_vision.blocking_write();
-    if let Some(ref mut embedder) = *ev_guard
+    if let Some(ref mut embedder) = inner.embed_vision
         && let Some(w) = params.get("embed_vision.embedding_projection.weight")
     {
         embedder.embedding_projection.set_weight(w)?;
     }
-    drop(ev_guard);
 
     info!("Vision weights applied successfully");
     Ok(())
@@ -980,188 +968,209 @@ fn register_gemma4_weights_with_cpp(params: &HashMap<String, MxArray>, model_id:
     unsafe { sys::mlx_set_model_id(model_id) };
 }
 
-impl Gemma4Model {
-    /// Load a Gemma4 model from a directory containing safetensors and config.json.
+impl Gemma4Inner {
+    /// Load a Gemma4Inner from a directory containing safetensors and config.json.
     ///
-    /// Uses `spawn_blocking` because weight application requires blocking locks
-    /// on the model's interior-mutable fields.
-    pub async fn load_from_dir(model_path: &str) -> Result<Self> {
-        let model_path = model_path.to_string();
+    /// All weight loading happens synchronously (designed to run on the model thread).
+    pub fn load_from_dir(model_path: &str) -> Result<Self> {
+        let path = Path::new(model_path);
 
-        tokio::task::spawn_blocking(move || {
-            let path = Path::new(&model_path);
+        // Parse config
+        let mut config = parse_config(path)?;
 
-            // Parse config
-            let mut config = parse_config(path)?;
-
-            // Merge stop tokens and sampling defaults from generation_config.json
-            let gen_config_path = path.join("generation_config.json");
-            if let Ok(gen_str) = fs::read_to_string(&gen_config_path)
-                && let Ok(gen_val) = serde_json::from_str::<Value>(&gen_str)
-            {
-                // Merge EOS token IDs (e.g. <turn|> = 106)
-                if let Some(eos) = gen_val.get("eos_token_id") {
-                    let mut ids: std::collections::HashSet<i32> =
-                        config.eos_token_ids.iter().copied().collect();
-                    match eos {
-                        Value::Array(arr) => {
-                            for v in arr {
-                                if let Some(i) = v.as_i64() {
-                                    ids.insert(i as i32);
-                                }
-                            }
-                        }
-                        Value::Number(n) => {
-                            if let Some(i) = n.as_i64() {
+        // Merge stop tokens and sampling defaults from generation_config.json
+        let gen_config_path = path.join("generation_config.json");
+        if let Ok(gen_str) = fs::read_to_string(&gen_config_path)
+            && let Ok(gen_val) = serde_json::from_str::<Value>(&gen_str)
+        {
+            // Merge EOS token IDs (e.g. <turn|> = 106)
+            if let Some(eos) = gen_val.get("eos_token_id") {
+                let mut ids: std::collections::HashSet<i32> =
+                    config.eos_token_ids.iter().copied().collect();
+                match eos {
+                    Value::Array(arr) => {
+                        for v in arr {
+                            if let Some(i) = v.as_i64() {
                                 ids.insert(i as i32);
                             }
                         }
-                        _ => {}
                     }
-                    config.eos_token_ids = ids.into_iter().collect();
-                    config.eos_token_ids.sort();
+                    Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            ids.insert(i as i32);
+                        }
+                    }
+                    _ => {}
                 }
-                // Read sampling defaults
-                config.default_temperature =
-                    gen_val.get("temperature").and_then(|v| v.as_f64());
-                config.default_top_k = gen_val
-                    .get("top_k")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as i32);
-                config.default_top_p = gen_val.get("top_p").and_then(|v| v.as_f64());
+                config.eos_token_ids = ids.into_iter().collect();
+                config.eos_token_ids.sort();
             }
-            let num_global = config
-                .layer_types
-                .iter()
-                .filter(|t| t.as_str() == "full_attention")
-                .count();
-            if config.enable_moe_block {
-                info!(
-                    "Gemma4 MoE config: {}L ({}g+{}s), h={}, heads={}, kv_heads={}, head_dim={}/{}, sliding_window={}, experts={}, top_k={}, moe_inter={}, k_eq_v={}",
-                    config.num_hidden_layers,
-                    num_global,
-                    config.num_hidden_layers as usize - num_global,
-                    config.hidden_size,
-                    config.num_attention_heads,
-                    config.num_key_value_heads,
-                    config.head_dim,
-                    config.global_head_dim.unwrap_or(config.head_dim),
-                    config.sliding_window,
-                    config.num_experts.unwrap_or(0),
-                    config.top_k_experts.unwrap_or(0),
-                    config.moe_intermediate_size.unwrap_or(0),
-                    config.attention_k_eq_v,
-                );
-            } else {
-                info!(
-                    "Gemma4 config: {}L ({}g+{}s), h={}, heads={}, kv_heads={}, head_dim={}/{}, sliding_window={}",
-                    config.num_hidden_layers,
-                    num_global,
-                    config.num_hidden_layers as usize - num_global,
-                    config.hidden_size,
-                    config.num_attention_heads,
-                    config.num_key_value_heads,
-                    config.head_dim,
-                    config.global_head_dim.unwrap_or(config.head_dim),
-                    config.sliding_window,
-                );
-            }
+            // Read sampling defaults
+            config.default_temperature = gen_val.get("temperature").and_then(|v| v.as_f64());
+            config.default_top_k = gen_val
+                .get("top_k")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
+            config.default_top_p = gen_val.get("top_p").and_then(|v| v.as_f64());
+        }
+        let num_global = config
+            .layer_types
+            .iter()
+            .filter(|t| t.as_str() == "full_attention")
+            .count();
+        if config.enable_moe_block {
+            info!(
+                "Gemma4 MoE config: {}L ({}g+{}s), h={}, heads={}, kv_heads={}, head_dim={}/{}, sliding_window={}, experts={}, top_k={}, moe_inter={}, k_eq_v={}",
+                config.num_hidden_layers,
+                num_global,
+                config.num_hidden_layers as usize - num_global,
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.global_head_dim.unwrap_or(config.head_dim),
+                config.sliding_window,
+                config.num_experts.unwrap_or(0),
+                config.top_k_experts.unwrap_or(0),
+                config.moe_intermediate_size.unwrap_or(0),
+                config.attention_k_eq_v,
+            );
+        } else {
+            info!(
+                "Gemma4 config: {}L ({}g+{}s), h={}, heads={}, kv_heads={}, head_dim={}/{}, sliding_window={}",
+                config.num_hidden_layers,
+                num_global,
+                config.num_hidden_layers as usize - num_global,
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.global_head_dim.unwrap_or(config.head_dim),
+                config.sliding_window,
+            );
+        }
 
-            // Load safetensors
-            let mut params = load_all_safetensors(path, false)?;
-            info!("Loaded {} tensors from safetensors", params.len());
+        // Load safetensors
+        let mut params = load_all_safetensors(path, false)?;
+        info!("Loaded {} tensors from safetensors", params.len());
 
-            // FP8 dequantization (if applicable)
-            dequant_fp8_weights(&mut params, DType::BFloat16)?;
+        // FP8 dequantization (if applicable)
+        dequant_fp8_weights(&mut params, DType::BFloat16)?;
 
-            // Sanitize weights
-            let mut params = sanitize_weights(&mut params, &config)?;
-            info!("Sanitized to {} tensors", params.len());
+        // Sanitize weights
+        let mut params = sanitize_weights(&mut params, &config)?;
+        info!("Sanitized to {} tensors", params.len());
 
-            // Validate required weights are present
-            validate_required_weights(&params, &config)?;
+        // Validate required weights are present
+        validate_required_weights(&params, &config)?;
 
-            // Fuse split MoE expert weights: replace separate gate_proj + up_proj
-            // with a single gate_up_proj BEFORE apply_weights. This ensures:
-            // 1. The model and params share the same fused MxArray (no duplication)
-            // 2. g_weights (C++ global) stores the fused version, not the splits
-            // 3. Saves ~30 GB that would otherwise be held by redundant split arrays
-            if config.enable_moe_block {
-                for i in 0..config.num_hidden_layers as usize {
-                    let prefix = format!("layers.{}", i);
-                    let gate_key =
-                        format!("{}.experts.switch_glu.gate_proj.weight", prefix);
-                    let up_key =
-                        format!("{}.experts.switch_glu.up_proj.weight", prefix);
-                    if let (Some(gate), Some(up)) = (
-                        params.remove(&gate_key),
-                        params.remove(&up_key),
-                    ) {
-                        let fused = MxArray::concatenate(&gate, &up, 1)?;
-                        params.insert(
-                            format!("{}.experts.gate_up_proj", prefix),
-                            fused,
-                        );
-                    }
-                    // Remap split down_proj key so apply_weights and C++ path both find it
-                    let down_split =
-                        format!("{}.experts.switch_glu.down_proj.weight", prefix);
-                    let down_fused = format!("{}.experts.down_proj", prefix);
-                    if !params.contains_key(&down_fused)
-                        && let Some(w) = params.remove(&down_split)
-                    {
-                        params.insert(down_fused, w);
-                    }
+        // Fuse split MoE expert weights: replace separate gate_proj + up_proj
+        // with a single gate_up_proj BEFORE apply_weights. This ensures:
+        // 1. The model and params share the same fused MxArray (no duplication)
+        // 2. g_weights (C++ global) stores the fused version, not the splits
+        // 3. Saves ~30 GB that would otherwise be held by redundant split arrays
+        if config.enable_moe_block {
+            for i in 0..config.num_hidden_layers as usize {
+                let prefix = format!("layers.{}", i);
+                let gate_key = format!("{}.experts.switch_glu.gate_proj.weight", prefix);
+                let up_key = format!("{}.experts.switch_glu.up_proj.weight", prefix);
+                if let (Some(gate), Some(up)) = (params.remove(&gate_key), params.remove(&up_key)) {
+                    let fused = MxArray::concatenate(&gate, &up, 1)?;
+                    params.insert(format!("{}.experts.gate_up_proj", prefix), fused);
+                }
+                // Remap split down_proj key so apply_weights and C++ path both find it
+                let down_split = format!("{}.experts.switch_glu.down_proj.weight", prefix);
+                let down_fused = format!("{}.experts.down_proj", prefix);
+                if !params.contains_key(&down_fused)
+                    && let Some(w) = params.remove(&down_split)
+                {
+                    params.insert(down_fused, w);
                 }
             }
+        }
 
-            // Create model
-            let mut model = Gemma4Model::new(config.clone())?;
+        // Create inner model
+        let mut inner = Gemma4Inner::new(config.clone())?;
 
-            // Apply weights (uses blocking_write on Arc<RwLock<>>)
-            apply_weights(&mut model, &params, &config)?;
+        // Apply weights
+        apply_weights(&mut inner, &params, &config)?;
 
-            // Apply vision weights (if vision_config present)
-            apply_vision_weights(&mut model, &params, &config)?;
+        // Apply vision weights (if vision_config present)
+        apply_vision_weights(&mut inner, &params, &config)?;
 
-            // Materialize weights in chunked evals to avoid Metal command buffer
-            // timeouts on large models. Without this, weights remain as lazy mmap
-            // references and every decode step re-reads ~48GB from disk.
-            {
-                let weight_refs: Vec<&MxArray> = params.values().collect();
-                crate::array::memory::materialize_weights(&weight_refs);
-            }
+        // Materialize weights in chunked evals to avoid Metal command buffer
+        // timeouts on large models. Without this, weights remain as lazy mmap
+        // references and every decode step re-reads ~48GB from disk.
+        {
+            let weight_refs: Vec<&MxArray> = params.values().collect();
+            crate::array::memory::materialize_weights(&weight_refs);
+        }
 
-            // Register weights with C++ compiled forward pass
-            register_gemma4_weights_with_cpp(&params, model.model_id);
+        // Register weights with C++ compiled forward pass
+        register_gemma4_weights_with_cpp(&params, inner.model_id);
 
-            // Load tokenizer
-            let tokenizer_path = path.join("tokenizer.json");
-            if tokenizer_path.exists() {
-                let tokenizer = Qwen3Tokenizer::from_file(&tokenizer_path)
-                    .map_err(|e| Error::from_reason(format!("Failed to load tokenizer: {}", e)))?;
-                model.set_tokenizer(Arc::new(tokenizer));
-                info!("Tokenizer loaded");
-            }
+        // Load tokenizer
+        let tokenizer_path = path.join("tokenizer.json");
+        if tokenizer_path.exists() {
+            let tokenizer = Qwen3Tokenizer::from_file(&tokenizer_path)
+                .map_err(|e| Error::from_reason(format!("Failed to load tokenizer: {}", e)))?;
+            inner.set_tokenizer(Arc::new(tokenizer));
+            info!("Tokenizer loaded");
+        }
 
-            // Warmup: run dummy tokens through the full model to trigger
-            // Metal shader compilation at load time rather than on the first real
-            // inference call. Without this, the first chat() call is ~100x slower
-            // than subsequent calls due to JIT shader compilation.
-            if std::env::var("GEMMA4_NO_WARMUP").is_err() {
-                let warmup_start = std::time::Instant::now();
-                warmup_forward(&model, &config)?;
-                let active_after = crate::array::get_active_memory();
-                info!(
-                    "[gemma4] Warmup forward pass: {:.1}ms ({:.2} GB active)",
-                    warmup_start.elapsed().as_secs_f64() * 1000.0,
-                    active_after / 1e9,
-                );
-            }
+        // Warmup: run dummy tokens through the full model to trigger
+        // Metal shader compilation at load time rather than on the first real
+        // inference call. Without this, the first chat() call is ~100x slower
+        // than subsequent calls due to JIT shader compilation.
+        if std::env::var("GEMMA4_NO_WARMUP").is_err() {
+            let warmup_start = std::time::Instant::now();
+            warmup_forward(&inner)?;
+            let active_after = crate::array::get_active_memory();
+            info!(
+                "[gemma4] Warmup forward pass: {:.1}ms ({:.2} GB active)",
+                warmup_start.elapsed().as_secs_f64() * 1000.0,
+                active_after / 1e9,
+            );
+        }
 
-            Ok(model)
+        Ok(inner)
+    }
+}
+
+impl Gemma4Model {
+    /// Load a Gemma4 model from a directory containing safetensors and config.json.
+    ///
+    /// Spawns a dedicated model thread. The init_fn runs all weight loading on
+    /// that thread, then the thread enters its command loop.
+    pub async fn load_from_dir(model_path: &str) -> Result<Self> {
+        let model_path = model_path.to_string();
+
+        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+            move || {
+                let inner = Gemma4Inner::load_from_dir(&model_path)?;
+                let config = inner.config.clone();
+                let model_id = inner.model_id;
+                let image_processor = inner.image_processor.as_ref().map(|ip| {
+                    Gemma4ImageProcessor::new(
+                        ip.patch_size,
+                        ip.max_soft_tokens,
+                        ip.pooling_kernel_size,
+                    )
+                });
+                Ok((inner, (config, model_id, image_processor)))
+            },
+            super::model::handle_gemma4_cmd,
+        );
+
+        let (config, model_id, image_processor) = init_rx
+            .await
+            .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
+
+        Ok(Gemma4Model {
+            thread,
+            config,
+            model_id,
+            image_processor,
         })
-        .await
-        .map_err(|e| Error::from_reason(format!("Load task failed: {}", e)))?
     }
 }

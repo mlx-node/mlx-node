@@ -4,15 +4,15 @@ use std::sync::Arc;
 use napi::Either;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use tokio::sync::RwLock;
 
 use crate::array::{DType, MxArray};
+use crate::model_thread::ResponseTx;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 
-use super::image_processor::Gemma4ImageProcessor;
+use super::image_processor::{Gemma4ImageProcessor, ProcessedGemma4Image};
 use super::vision::{Gemma4MultimodalEmbedder, Gemma4VisionModel};
 
 /// Convert a JSON value to Gemma4's tool-call DSL format.
@@ -128,41 +128,64 @@ pub(crate) struct PleComponents {
     pub vocab_size_per_layer_input: i32,
 }
 
+/// Internal model state owned exclusively by the dedicated model thread.
+///
+/// No `Arc<RwLock<>>` — the model thread has sole ownership.
+pub(crate) struct Gemma4Inner {
+    pub(crate) config: Gemma4Config,
+    pub(crate) embed_tokens: Embedding,
+    pub(crate) layers: Vec<Gemma4DecoderLayer>,
+    pub(crate) final_norm: RMSNorm,
+    pub(crate) lm_head: Option<Linear>,
+    /// Pre-transposed embedding weight for tied lm_head: [hidden_size, vocab_size].
+    /// Only populated when tie_word_embeddings=true.
+    pub(crate) embed_weight_t: Option<MxArray>,
+    pub(crate) ple: Option<PleComponents>,
+    // Vision components (None for text-only models)
+    pub(crate) vision_tower: Option<Gemma4VisionModel>,
+    pub(crate) embed_vision: Option<Gemma4MultimodalEmbedder>,
+    pub(crate) image_processor: Option<Gemma4ImageProcessor>,
+    pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    pub(crate) model_id: u64,
+}
+
+/// Commands dispatched from NAPI methods to the dedicated model thread.
+pub(crate) enum Gemma4Cmd {
+    Chat {
+        messages: Vec<ChatMessage>,
+        config: Gemma4ChatConfig,
+        processed_images: Vec<ProcessedGemma4Image>,
+        reply: ResponseTx<Gemma4ChatResult>,
+    },
+}
+
 /// Gemma 4 dense language model.
 ///
 /// Supports E2B (2.3B), E4B (4.5B), and 31B variants.
 /// Features: hybrid attention (sliding + global), GeGLU MLP, logit softcapping,
 /// embedding scaling, and optional per-layer embeddings.
+///
+/// All model state lives on a dedicated OS thread. NAPI methods dispatch
+/// commands via channels and await responses.
 #[napi]
 pub struct Gemma4Model {
-    config: Gemma4Config,
-    pub(crate) embed_tokens: Arc<RwLock<Embedding>>,
-    pub(crate) layers: Arc<RwLock<Vec<Gemma4DecoderLayer>>>,
-    pub(crate) final_norm: Arc<RwLock<RMSNorm>>,
-    pub(crate) lm_head: Arc<RwLock<Option<Linear>>>,
-    /// Pre-transposed embedding weight for tied lm_head: [hidden_size, vocab_size].
-    /// Only populated when tie_word_embeddings=true.
-    pub(crate) embed_weight_t: Arc<RwLock<Option<MxArray>>>,
-    pub(crate) ple: Arc<RwLock<Option<PleComponents>>>,
-    // Vision components (None for text-only models)
-    pub(crate) vision_tower: Arc<RwLock<Option<Gemma4VisionModel>>>,
-    pub(crate) embed_vision: Arc<RwLock<Option<Gemma4MultimodalEmbedder>>>,
-    image_processor: Option<Gemma4ImageProcessor>,
-    tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    pub(crate) thread: crate::model_thread::ModelThread<Gemma4Cmd>,
+    /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
+    #[allow(dead_code)]
+    pub(crate) config: Gemma4Config,
     pub(crate) model_id: u64,
+    pub(crate) image_processor: Option<Gemma4ImageProcessor>,
 }
 
 static MODEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Mutex to serialize access to the C++ compiled Gemma4 forward pass global state.
-/// Only one chat() call can use the compiled path at a time.
-/// Uses std::sync::Mutex since we're inside spawn_blocking which is synchronous.
-static GEMMA4_COMPILED_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Serializes compiled C++ forward calls across model instances.
+/// Only matters if two Gemma4 models are loaded simultaneously (rare).
+static COMPILED_FORWARD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[napi]
-impl Gemma4Model {
-    #[napi(constructor)]
-    pub fn new(config: Gemma4Config) -> Result<Self> {
+impl Gemma4Inner {
+    /// Create a new Gemma4Inner with empty (uninitialized) weights.
+    pub(crate) fn new(config: Gemma4Config) -> Result<Self> {
         let num_layers = config.num_hidden_layers as usize;
         let hidden_size = config.hidden_size as u32;
         let vocab_size = config.vocab_size as u32;
@@ -232,17 +255,497 @@ impl Gemma4Model {
 
         Ok(Self {
             config,
-            embed_tokens: Arc::new(RwLock::new(embed_tokens)),
-            layers: Arc::new(RwLock::new(layers)),
-            final_norm: Arc::new(RwLock::new(final_norm)),
-            lm_head: Arc::new(RwLock::new(lm_head)),
-            embed_weight_t: Arc::new(RwLock::new(None)),
-            ple: Arc::new(RwLock::new(ple)),
-            vision_tower: Arc::new(RwLock::new(vision_tower)),
-            embed_vision: Arc::new(RwLock::new(embed_vision)),
+            embed_tokens,
+            layers,
+            final_norm,
+            lm_head,
+            embed_weight_t: None,
+            ple,
+            vision_tower,
+            embed_vision,
             image_processor,
             tokenizer: None,
             model_id,
+        })
+    }
+
+    pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
+        self.tokenizer = Some(tokenizer);
+    }
+
+    /// Synchronous chat implementation. Runs on the dedicated model thread.
+    fn chat_sync(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: Gemma4ChatConfig,
+        processed_images: Vec<ProcessedGemma4Image>,
+    ) -> Result<Gemma4ChatResult> {
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
+
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+
+        let has_images = !processed_images.is_empty();
+        let sampling_config = make_sampling_config(&config, &self.config);
+        let enable_thinking = config.enable_thinking;
+        let eos_ids = self.config.eos_token_ids.clone();
+
+        // Try the tokenizer's chat template if available (handles role mapping,
+        // special tokens, and variant-specific formatting automatically).
+        // Fall back to manual Gemma4 format if no template was loaded.
+        let tokens = if tokenizer.has_chat_template() {
+            tokenizer.apply_chat_template_sync(
+                &messages,
+                Some(true),      // add_generation_prompt
+                None,            // no tools
+                enable_thinking, // None = template default
+            )?
+        } else {
+            // Manual fallback: thinking control requires a chat template
+            if enable_thinking == Some(true) {
+                return Err(Error::from_reason(
+                    "enable_thinking=true requires a chat template (not found in tokenizer_config.json or chat_template.jinja)",
+                ));
+            }
+            // Manual Gemma4 format matching the canonical template.
+            // Role mapping: "assistant" → "model", "developer" → "system".
+            // Tool calls serialized as <|tool_call>call:name{args}<tool_call|>.
+            // Tool responses wrapped in <|tool_response>...<tool_response|>.
+            // BOS prepended explicitly (matching {{ bos_token }} in template).
+            let mut prompt_text = String::from("<bos>");
+            for msg in &messages {
+                let role = match msg.role.as_str() {
+                    "assistant" => "model",
+                    "developer" => "system",
+                    other => other,
+                };
+
+                // All roles (including "tool") use the same <|turn>role\n...<turn|>\n format.
+                // This matches the canonical tokenizer behavior verified against HF.
+                {
+                    prompt_text.push_str(&format!("<|turn>{}\n", role));
+
+                    // Emit tool calls for assistant/model messages
+                    if let Some(ref tool_calls) = msg.tool_calls {
+                        for tc in tool_calls {
+                            prompt_text.push_str(&format!(
+                                "<|tool_call>call:{}{{{}}}<tool_call|>",
+                                tc.name,
+                                json_args_to_gemma4_dsl(&escape_gemma4_content(&tc.arguments))
+                            ));
+                        }
+                    }
+
+                    // Emit content (sanitized to prevent control-token injection)
+                    prompt_text.push_str(&escape_gemma4_content(&msg.content));
+                    prompt_text.push_str("<turn|>\n");
+                }
+            }
+            prompt_text.push_str("<|turn>model\n");
+            tokenizer.encode_sync(&prompt_text, Some(false))?
+        };
+
+        // Expand image tokens if images are present.
+        // Gemma4 uses: <|image>  (BOI) + <|image|> × num_soft_tokens + <image|> (EOI)
+        // The chat template inserts a single <|image|> per image; we expand it here.
+        let tokens = if has_images && !processed_images.is_empty() {
+            let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
+            let boi_token_id = self.config.boi_token_id.unwrap_or(255999) as u32;
+            let eoi_token_id = self.config.eoi_token_id.unwrap_or(258882) as u32;
+            expand_image_tokens(
+                &tokens,
+                &processed_images,
+                image_token_id,
+                boi_token_id,
+                eoi_token_id,
+            )
+        } else {
+            tokens
+        };
+
+        // Create prompt tensor
+        let token_arr: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let prompt = MxArray::from_int32(&token_arr, &[1, tokens.len() as i64])?;
+
+        // Initialize caches
+        let mut caches = init_caches_for_config(&self.config);
+
+        // Create dedicated generation stream for GPU scheduling.
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        // Wired memory: pin model weights in GPU memory (prevents paging for large models).
+        // Uses usize::MAX to always set limit to max_recommended_working_set_size.
+        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+
+        let generation_start = std::time::Instant::now();
+        let prompt_token_count = tokens.len();
+
+        // Vision prefill: if images present, build merged embeddings
+        // (text embeddings with vision features scattered at image_token positions)
+        let vision_embeds: Option<MxArray> = if has_images
+            && !processed_images.is_empty()
+            && let Some(ref vt) = self.vision_tower
+            && let Some(ref ev) = self.embed_vision
+        {
+            let image_token_id = self.config.image_token_id.unwrap_or(258880);
+
+            // Run vision tower on each image and collect features
+            let mut all_features: Vec<MxArray> = Vec::new();
+            for proc in &processed_images {
+                let features = vt.forward(&proc.pixel_values)?;
+                let projected = ev.forward(&features)?;
+                all_features.push(projected);
+            }
+
+            // Concatenate all image features: [1, total_soft_tokens, hidden_size]
+            let image_features = if all_features.len() == 1 {
+                all_features.remove(0)
+            } else {
+                let refs: Vec<&MxArray> = all_features.iter().collect();
+                MxArray::concatenate_many(refs, Some(1))?
+            };
+
+            // Build text embeddings
+            let text_embeds = self.embed_tokens.forward(&prompt)?;
+            let text_embeds = text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+
+            // Cast image features to text embedding dtype
+            let embed_dtype = text_embeds.dtype()?;
+            let image_features = image_features.astype(embed_dtype)?;
+
+            // masked_scatter: replace image_token positions with vision features
+            let image_token = MxArray::scalar_int(image_token_id)?;
+            let image_mask = prompt.equal(&image_token)?;
+
+            // Validate: number of True positions in mask must match vision feature count
+            let mask_count_arr = image_mask.astype(DType::Int32)?.sum(None, None)?;
+            mask_count_arr.eval();
+            let mask_count = mask_count_arr.item_at_int32(0)? as i64;
+            let feature_count = image_features.shape_at(1)?;
+            if mask_count != feature_count {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    format!(
+                        "Image token count ({mask_count}) does not match vision feature count ({feature_count}). \
+                         Check that image token expansion produced the correct number of tokens."
+                    ),
+                ));
+            }
+
+            let image_mask_expanded = image_mask.expand_dims(-1)?;
+            let image_mask_expanded = image_mask_expanded.broadcast_to(&text_embeds.shape()?)?;
+
+            let merged = masked_scatter(&text_embeds, &image_mask_expanded, &image_features)?;
+            Some(merged)
+        } else {
+            None
+        };
+
+        // Prefill: process tokens [0:N-1] through body only (no lm_head),
+        // then run last token through full forward to get logits.
+        // Matches mlx-lm generate_step pattern.
+        {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            if let Some(ref embeds) = vision_embeds {
+                // Vision path: prefill with merged embeddings
+                prefill_body_gemma4_with_embeds(
+                    &prompt,
+                    embeds,
+                    &self.embed_tokens,
+                    &self.layers,
+                    &mut caches,
+                    &self.final_norm,
+                    self.ple.as_ref(),
+                    &self.config,
+                )?;
+            } else {
+                // Text-only path
+                prefill_body_gemma4(
+                    &prompt,
+                    &self.embed_tokens,
+                    &self.layers,
+                    &mut caches,
+                    &self.final_norm,
+                    self.ple.as_ref(),
+                    &self.config,
+                )?;
+            }
+        }
+        eval_gemma4_caches(&caches);
+
+        // Last token → logits
+        let last_token = prompt.slice_axis(1, tokens.len() as i64 - 1, tokens.len() as i64)?;
+        let logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            forward_inner(
+                &last_token,
+                &self.embed_tokens,
+                &self.layers,
+                &mut caches,
+                &self.final_norm,
+                &self.lm_head,
+                self.embed_weight_t.as_ref(),
+                self.ple.as_ref(),
+                &self.config,
+            )?
+        };
+        let logits = logits.squeeze(Some(&[1]))?;
+        let y = sample_next_token(&logits, sampling_config)?;
+        y.eval();
+        eval_gemma4_caches(&caches);
+
+        // Mark first token time (TTFT = time to first token)
+        let first_token_instant = std::time::Instant::now();
+
+        // Decode loop — matches mlx-lm generate.py pattern:
+        // 1. Build lazy graph per step via forward_inner
+        // 2. async_eval the output token (caches materialize through dependency graph)
+        // 3. Double-buffer: build step N+1 while GPU executes step N
+        //
+        // Set GEMMA4_USE_COMPILE=1 to use the old compiled C++ path for A/B testing.
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut finish_reason = "length".to_string();
+
+        let use_compiled = std::env::var("GEMMA4_USE_COMPILE").is_ok()
+            && self.config.num_kv_shared_layers.is_none_or(|n| n <= 0)
+            && unsafe { mlx_sys::mlx_weight_count() } > 0;
+
+        if use_compiled {
+            // Legacy compiled C++ path (opt-in via GEMMA4_USE_COMPILE=1)
+            let _compiled_guard = COMPILED_FORWARD_MUTEX.lock().unwrap();
+            let mut cache_arrays_owned: Vec<MxArray> = Vec::with_capacity(caches.len() * 2);
+            for (layer_idx, cache) in caches.iter().enumerate() {
+                let (k, v) = cache.get_cached_kv().ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Compiled Gemma4 decode expected cache for layer {} after prefill",
+                        layer_idx
+                    ))
+                })?;
+                cache_arrays_owned.push(k);
+                cache_arrays_owned.push(v);
+            }
+            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                cache_arrays_owned.iter().map(|a| a.as_raw_ptr()).collect();
+
+            let layer_types_i32: Vec<i32> = (0..self.config.num_hidden_layers as usize)
+                .map(|i| if self.config.is_global_layer(i) { 1 } else { 0 })
+                .collect();
+
+            let max_kv_len =
+                (tokens.len() as i32 + max_new_tokens).min(self.config.max_position_embeddings);
+
+            unsafe {
+                mlx_sys::mlx_gemma4_init_from_prefill(
+                    self.config.num_hidden_layers,
+                    self.config.hidden_size,
+                    self.config.num_attention_heads,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                    self.config.effective_kv_heads(true),
+                    self.config.effective_head_dim(true),
+                    self.config.rope_theta as f32,
+                    self.config.rope_local_base_freq as f32,
+                    self.config.partial_rotary_factor as f32,
+                    self.config.rms_norm_eps as f32,
+                    self.config.sliding_window,
+                    if self.config.tie_word_embeddings {
+                        1
+                    } else {
+                        0
+                    },
+                    max_kv_len,
+                    1,
+                    self.config.num_experts.unwrap_or(0),
+                    self.config.top_k_experts.unwrap_or(0),
+                    self.config.moe_intermediate_size.unwrap_or(0),
+                    self.config.intermediate_size,
+                    self.config.final_logit_softcapping.unwrap_or(0.0) as f32,
+                    layer_types_i32.as_ptr(),
+                    layer_types_i32.len() as i32,
+                    cache_ptrs.as_mut_ptr(),
+                    tokens.len() as i32,
+                );
+            }
+
+            let embed_weight = self.embed_tokens.get_weight();
+            let mut current_y = y;
+            for step in 0..max_new_tokens {
+                let next_y = if step + 1 < max_new_tokens {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    let next_ids = current_y.reshape(&[1, 1])?;
+                    let logits = forward_gemma4_cpp(&next_ids, &embed_weight)?;
+                    let next_token = sample_next_token(&logits, sampling_config)?;
+                    eval_token_and_gemma4_caches(&next_token);
+                    Some(next_token)
+                } else {
+                    None
+                };
+
+                let token_id = current_y.item_at_int32(0)? as u32;
+                generated_tokens.push(token_id);
+
+                if eos_ids.contains(&(token_id as i32)) {
+                    finish_reason = "stop".to_string();
+                    break;
+                }
+                if let Some(next_token) = next_y {
+                    current_y = next_token;
+                } else {
+                    break;
+                }
+                if (step + 1) % 256 == 0 {
+                    crate::array::synchronize_and_clear_cache();
+                }
+            }
+            unsafe {
+                mlx_sys::mlx_gemma4_reset();
+            }
+        } else {
+            // Default: lazy eval decode (matches mlx-lm pattern)
+            //
+            // Double-buffered: build step N+1's graph while GPU executes step N.
+            // Cache mutations (slice_assign_axis_inplace) are lazy side effects
+            // in the computation graph — evaluating the token implicitly
+            // materializes caches (no explicit cache eval needed during decode).
+            //
+            // Pattern from mlx-lm generate.py:
+            //   mx.async_eval(next_y)   # fire and forget
+            //   if n == 0: mx.eval(y)   # sync only for TTFT
+            let mut current_y = y;
+            for step in 0..max_new_tokens {
+                let next_y = if step + 1 < max_new_tokens {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+
+                    let next_ids = current_y.reshape(&[1, 1])?;
+                    let logits = forward_inner(
+                        &next_ids,
+                        &self.embed_tokens,
+                        &self.layers,
+                        &mut caches,
+                        &self.final_norm,
+                        &self.lm_head,
+                        self.embed_weight_t.as_ref(),
+                        self.ple.as_ref(),
+                        &self.config,
+                    )?;
+                    let logits = logits.squeeze(Some(&[1]))?;
+                    let next_token = sample_next_token(&logits, sampling_config)?;
+                    MxArray::async_eval_arrays(&[&next_token]);
+                    Some(next_token)
+                } else {
+                    None
+                };
+
+                let token_id = current_y.item_at_int32(0)? as u32;
+                generated_tokens.push(token_id);
+
+                if eos_ids.contains(&(token_id as i32)) {
+                    finish_reason = "stop".to_string();
+                    break;
+                }
+                if let Some(next_token) = next_y {
+                    current_y = next_token;
+                } else {
+                    break;
+                }
+
+                if (step + 1) % 256 == 0 {
+                    crate::array::clear_cache();
+                }
+            }
+        }
+
+        // Decode text
+        let text = tokenizer.decode_sync(&generated_tokens, true)?;
+
+        // Compute performance metrics
+        let generation_end = std::time::Instant::now();
+        let ttft_ms = first_token_instant
+            .duration_since(generation_start)
+            .as_secs_f64()
+            * 1000.0;
+        let decode_ms = generation_end
+            .duration_since(first_token_instant)
+            .as_secs_f64()
+            * 1000.0;
+        let gen_toks = generated_tokens.len() as f64;
+        let mem_after = crate::array::get_active_memory();
+        debug!(
+            "[gemma4-chat] after generate: {:.2} GB active",
+            mem_after / 1e9
+        );
+
+        let performance = Some(crate::profiling::PerformanceMetrics {
+            ttft_ms,
+            prefill_tokens_per_second: if ttft_ms > 0.0 {
+                prompt_token_count as f64 / (ttft_ms / 1000.0)
+            } else {
+                0.0
+            },
+            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                (gen_toks - 1.0) / (decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+
+        Ok(Gemma4ChatResult {
+            text,
+            num_tokens: generated_tokens.len() as u32,
+            finish_reason,
+            performance,
+        })
+    }
+}
+
+/// Command handler for the dedicated model thread.
+pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
+    match cmd {
+        Gemma4Cmd::Chat {
+            messages,
+            config,
+            processed_images,
+            reply,
+        } => {
+            let result = inner.chat_sync(messages, config, processed_images);
+            let _ = reply.send(result);
+        }
+    }
+}
+
+#[napi]
+impl Gemma4Model {
+    #[napi(constructor)]
+    pub fn new(config: Gemma4Config) -> Result<Self> {
+        let config_clone = config.clone();
+        let image_processor = config.vision_config.as_ref().map(|vc| {
+            Gemma4ImageProcessor::new(
+                vc.patch_size,
+                vc.default_output_length,
+                vc.pooling_kernel_size,
+            )
+        });
+
+        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+            move || {
+                let inner = Gemma4Inner::new(config)?;
+                let model_id = inner.model_id;
+                Ok((inner, model_id))
+            },
+            handle_gemma4_cmd,
+        );
+
+        let model_id = init_rx
+            .blocking_recv()
+            .map_err(|_| napi::Error::from_reason("Model thread exited during init"))??;
+
+        Ok(Self {
+            thread,
+            config: config_clone,
+            model_id,
+            image_processor,
         })
     }
 
@@ -273,31 +776,9 @@ impl Gemma4Model {
             enable_thinking: None,
         });
 
-        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
-
-        let tokenizer = self
-            .tokenizer
-            .clone()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
-
-        // Extract image bytes before spawn_blocking (Uint8Array is !Send)
+        // Process images before sending command (Uint8Array is !Send)
         let all_images = extract_images_from_messages(&messages);
-        let has_images = !all_images.is_empty();
-
-        // Clone Arcs for spawn_blocking
-        let embed_tokens = self.embed_tokens.clone();
-        let layers = self.layers.clone();
-        let final_norm = self.final_norm.clone();
-        let lm_head = self.lm_head.clone();
-        let embed_weight_t = self.embed_weight_t.clone();
-        let ple = self.ple.clone();
-        let vision_tower = self.vision_tower.clone();
-        let embed_vision = self.embed_vision.clone();
-        let model_config = self.config.clone();
-
-        // Process images before spawn_blocking because image_processor
-        // lives on &self and cannot be moved into the closure.
-        let processed_images = if has_images {
+        let processed_images = if !all_images.is_empty() {
             let ip = self.image_processor.as_ref().ok_or_else(|| {
                 Error::from_reason(
                     "Images provided but model has no vision support (no vision_config in config.json)",
@@ -312,438 +793,13 @@ impl Gemma4Model {
             Vec::new()
         };
 
-        let sampling_config = make_sampling_config(&config, &model_config);
-        let enable_thinking = config.enable_thinking;
-        let eos_ids = model_config.eos_token_ids.clone();
-
-        tokio::task::spawn_blocking(move || {
-            // Try the tokenizer's chat template if available (handles role mapping,
-            // special tokens, and variant-specific formatting automatically).
-            // Fall back to manual Gemma4 format if no template was loaded.
-            let tokens = if tokenizer.has_chat_template() {
-                tokenizer.apply_chat_template_sync(
-                    &messages,
-                    Some(true),      // add_generation_prompt
-                    None,            // no tools
-                    enable_thinking, // None = template default
-                )?
-            } else {
-                // Manual fallback: thinking control requires a chat template
-                if enable_thinking == Some(true) {
-                    return Err(Error::from_reason(
-                        "enable_thinking=true requires a chat template (not found in tokenizer_config.json or chat_template.jinja)",
-                    ));
-                }
-                // Manual Gemma4 format matching the canonical template.
-                // Role mapping: "assistant" → "model", "developer" → "system".
-                // Tool calls serialized as <|tool_call>call:name{args}<tool_call|>.
-                // Tool responses wrapped in <|tool_response>...<tool_response|>.
-                // BOS prepended explicitly (matching {{ bos_token }} in template).
-                let mut prompt_text = String::from("<bos>");
-                for msg in &messages {
-                    let role = match msg.role.as_str() {
-                        "assistant" => "model",
-                        "developer" => "system",
-                        other => other,
-                    };
-
-                    // All roles (including "tool") use the same <|turn>role\n...<turn|>\n format.
-                    // This matches the canonical tokenizer behavior verified against HF.
-                    {
-                        prompt_text.push_str(&format!("<|turn>{}\n", role));
-
-                        // Emit tool calls for assistant/model messages
-                        if let Some(ref tool_calls) = msg.tool_calls {
-                            for tc in tool_calls {
-                                prompt_text.push_str(&format!(
-                                    "<|tool_call>call:{}{{{}}}<tool_call|>",
-                                    tc.name,
-                                    json_args_to_gemma4_dsl(&escape_gemma4_content(&tc.arguments))
-                                ));
-                            }
-                        }
-
-                        // Emit content (sanitized to prevent control-token injection)
-                        prompt_text.push_str(&escape_gemma4_content(&msg.content));
-                        prompt_text.push_str("<turn|>\n");
-                    }
-                }
-                prompt_text.push_str("<|turn>model\n");
-                tokenizer.encode_sync(&prompt_text, Some(false))?
-            };
-
-            // Expand image tokens if images are present.
-            // Gemma4 uses: <|image>  (BOI) + <|image|> × num_soft_tokens + <image|> (EOI)
-            // The chat template inserts a single <|image|> per image; we expand it here.
-            let tokens = if has_images && !processed_images.is_empty() {
-                let image_token_id = model_config.image_token_id.unwrap_or(258880) as u32;
-                let boi_token_id = model_config.boi_token_id.unwrap_or(255999) as u32;
-                let eoi_token_id = model_config.eoi_token_id.unwrap_or(258882) as u32;
-                expand_image_tokens(
-                    &tokens,
-                    &processed_images,
-                    image_token_id,
-                    boi_token_id,
-                    eoi_token_id,
-                )
-            } else {
-                tokens
-            };
-
-            // Create prompt tensor
-            let token_arr: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-            let prompt = MxArray::from_int32(&token_arr, &[1, tokens.len() as i64])?;
-
-            // Initialize caches
-            let mut caches = init_caches_for_config(&model_config);
-
-            // Create dedicated generation stream for GPU scheduling.
-            let generation_stream = Stream::new(DeviceType::Gpu);
-
-            // Wired memory: pin model weights in GPU memory (prevents paging for large models).
-            // Uses usize::MAX to always set limit to max_recommended_working_set_size.
-            let _wired_ctx = crate::stream::WiredLimitContext::new(
-                usize::MAX,
-                vec![generation_stream],
-            );
-
-            // Acquire locks
-            let embed_guard = embed_tokens.blocking_read();
-            let layers_guard = layers.blocking_read();
-            let norm_guard = final_norm.blocking_read();
-            let lm_head_guard = lm_head.blocking_read();
-            let embed_weight_t_guard = embed_weight_t.blocking_read();
-            let ple_guard = ple.blocking_read();
-            let vision_tower_guard = vision_tower.blocking_read();
-            let embed_vision_guard = embed_vision.blocking_read();
-
-            let generation_start = std::time::Instant::now();
-            let prompt_token_count = tokens.len();
-
-            // Vision prefill: if images present, build merged embeddings
-            // (text embeddings with vision features scattered at image_token positions)
-            let vision_embeds: Option<MxArray> = if has_images
-                && !processed_images.is_empty()
-                && vision_tower_guard.is_some()
-                && embed_vision_guard.is_some()
-            {
-                let vt = vision_tower_guard.as_ref().unwrap();
-                let ev = embed_vision_guard.as_ref().unwrap();
-                let image_token_id =
-                    model_config.image_token_id.unwrap_or(258880);
-
-                // Run vision tower on each image and collect features
-                let mut all_features: Vec<MxArray> = Vec::new();
-                for proc in &processed_images {
-                    let features = vt.forward(&proc.pixel_values)?;
-                    let projected = ev.forward(&features)?;
-                    all_features.push(projected);
-                }
-
-                // Concatenate all image features: [1, total_soft_tokens, hidden_size]
-                let image_features = if all_features.len() == 1 {
-                    all_features.remove(0)
-                } else {
-                    let refs: Vec<&MxArray> = all_features.iter().collect();
-                    MxArray::concatenate_many(refs, Some(1))?
-                };
-
-                // Build text embeddings
-                let text_embeds = embed_guard.forward(&prompt)?;
-                let text_embeds =
-                    text_embeds.mul_scalar((model_config.hidden_size as f64).sqrt())?;
-
-                // Cast image features to text embedding dtype
-                let embed_dtype = text_embeds.dtype()?;
-                let image_features = image_features.astype(embed_dtype)?;
-
-                // masked_scatter: replace image_token positions with vision features
-                let image_token = MxArray::scalar_int(image_token_id)?;
-                let image_mask = prompt.equal(&image_token)?;
-
-                // Validate: number of True positions in mask must match vision feature count
-                let mask_count_arr = image_mask.astype(DType::Int32)?.sum(None, None)?;
-                mask_count_arr.eval();
-                let mask_count = mask_count_arr.item_at_int32(0)? as i64;
-                let feature_count = image_features.shape_at(1)?;
-                if mask_count != feature_count {
-                    return Err(Error::new(
-                        Status::GenericFailure,
-                        format!(
-                            "Image token count ({mask_count}) does not match vision feature count ({feature_count}). \
-                             Check that image token expansion produced the correct number of tokens."
-                        ),
-                    ));
-                }
-
-                let image_mask_expanded = image_mask.expand_dims(-1)?;
-                let image_mask_expanded = image_mask_expanded.broadcast_to(
-                    &text_embeds.shape()?,
-                )?;
-
-                let merged = masked_scatter(&text_embeds, &image_mask_expanded, &image_features)?;
-                Some(merged)
-            } else {
-                None
-            };
-
-            // Prefill: process tokens [0:N-1] through body only (no lm_head),
-            // then run last token through full forward to get logits.
-            // Matches mlx-lm generate_step pattern.
-            {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                if let Some(ref embeds) = vision_embeds {
-                    // Vision path: prefill with merged embeddings
-                    prefill_body_gemma4_with_embeds(
-                        &prompt,
-                        embeds,
-                        &embed_guard,
-                        &layers_guard,
-                        &mut caches,
-                        &norm_guard,
-                        ple_guard.as_ref(),
-                        &model_config,
-                    )?;
-                } else {
-                    // Text-only path
-                    prefill_body_gemma4(
-                        &prompt,
-                        &embed_guard,
-                        &layers_guard,
-                        &mut caches,
-                        &norm_guard,
-                        ple_guard.as_ref(),
-                        &model_config,
-                    )?;
-                }
-            }
-            eval_gemma4_caches(&caches);
-
-            // Last token → logits
-            let last_token = prompt.slice_axis(1, tokens.len() as i64 - 1, tokens.len() as i64)?;
-            let logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                forward_inner(
-                    &last_token,
-                    &embed_guard,
-                    &layers_guard,
-                    &mut caches,
-                    &norm_guard,
-                    &lm_head_guard,
-                    embed_weight_t_guard.as_ref(),
-                    ple_guard.as_ref(),
-                    &model_config,
-                )?
-            };
-            let logits = logits.squeeze(Some(&[1]))?;
-            let y = sample_next_token(&logits, sampling_config)?;
-            y.eval();
-            eval_gemma4_caches(&caches);
-
-            // Mark first token time (TTFT = time to first token)
-            let first_token_instant = std::time::Instant::now();
-
-            // Decode loop — matches mlx-lm generate.py pattern:
-            // 1. Build lazy graph per step via forward_inner
-            // 2. async_eval the output token (caches materialize through dependency graph)
-            // 3. Double-buffer: build step N+1 while GPU executes step N
-            //
-            // Set GEMMA4_USE_COMPILE=1 to use the old compiled C++ path for A/B testing.
-            let mut generated_tokens: Vec<u32> = Vec::new();
-            let mut finish_reason = "length".to_string();
-
-            let use_compiled = std::env::var("GEMMA4_USE_COMPILE").is_ok()
-                && model_config.num_kv_shared_layers.is_none_or(|n| n <= 0)
-                && unsafe { mlx_sys::mlx_weight_count() } > 0;
-
-            if use_compiled {
-                // Legacy compiled C++ path (opt-in via GEMMA4_USE_COMPILE=1)
-                let _compiled_guard = GEMMA4_COMPILED_MUTEX.lock().unwrap();
-                let mut cache_arrays_owned: Vec<MxArray> =
-                    Vec::with_capacity(caches.len() * 2);
-                for (layer_idx, cache) in caches.iter().enumerate() {
-                    let (k, v) = cache.get_cached_kv().ok_or_else(|| {
-                        Error::from_reason(format!(
-                            "Compiled Gemma4 decode expected cache for layer {} after prefill",
-                            layer_idx
-                        ))
-                    })?;
-                    cache_arrays_owned.push(k);
-                    cache_arrays_owned.push(v);
-                }
-                let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> = cache_arrays_owned
-                    .iter()
-                    .map(|a| a.as_raw_ptr())
-                    .collect();
-
-                let layer_types_i32: Vec<i32> = (0..model_config.num_hidden_layers as usize)
-                    .map(|i| if model_config.is_global_layer(i) { 1 } else { 0 })
-                    .collect();
-
-                let max_kv_len = (tokens.len() as i32 + max_new_tokens)
-                    .min(model_config.max_position_embeddings);
-
-                unsafe {
-                    mlx_sys::mlx_gemma4_init_from_prefill(
-                        model_config.num_hidden_layers,
-                        model_config.hidden_size,
-                        model_config.num_attention_heads,
-                        model_config.num_key_value_heads,
-                        model_config.head_dim,
-                        model_config.effective_kv_heads(true),
-                        model_config.effective_head_dim(true),
-                        model_config.rope_theta as f32,
-                        model_config.rope_local_base_freq as f32,
-                        model_config.partial_rotary_factor as f32,
-                        model_config.rms_norm_eps as f32,
-                        model_config.sliding_window,
-                        if model_config.tie_word_embeddings { 1 } else { 0 },
-                        max_kv_len,
-                        1,
-                        model_config.num_experts.unwrap_or(0),
-                        model_config.top_k_experts.unwrap_or(0),
-                        model_config.moe_intermediate_size.unwrap_or(0),
-                        model_config.intermediate_size,
-                        model_config.final_logit_softcapping.unwrap_or(0.0) as f32,
-                        layer_types_i32.as_ptr(),
-                        layer_types_i32.len() as i32,
-                        cache_ptrs.as_mut_ptr(),
-                        tokens.len() as i32,
-                    );
-                }
-
-                let embed_weight = embed_guard.get_weight();
-                let mut current_y = y;
-                for step in 0..max_new_tokens {
-                    let next_y = if step + 1 < max_new_tokens {
-                        let _stream_ctx = StreamContext::new(generation_stream);
-                        let next_ids = current_y.reshape(&[1, 1])?;
-                        let logits = forward_gemma4_cpp(&next_ids, &embed_weight)?;
-                        let next_token = sample_next_token(&logits, sampling_config)?;
-                        eval_token_and_gemma4_caches(&next_token);
-                        Some(next_token)
-                    } else {
-                        None
-                    };
-
-                    let token_id = current_y.item_at_int32(0)? as u32;
-                    generated_tokens.push(token_id);
-
-                    if eos_ids.contains(&(token_id as i32)) {
-                        finish_reason = "stop".to_string();
-                        break;
-                    }
-                    if let Some(next_token) = next_y {
-                        current_y = next_token;
-                    } else {
-                        break;
-                    }
-                    if (step + 1) % 256 == 0 {
-                        crate::array::synchronize_and_clear_cache();
-                    }
-                }
-                unsafe { mlx_sys::mlx_gemma4_reset(); }
-            } else {
-                // Default: lazy eval decode (matches mlx-lm pattern)
-                //
-                // Double-buffered: build step N+1's graph while GPU executes step N.
-                // Cache mutations (slice_assign_axis_inplace) are lazy side effects
-                // in the computation graph — evaluating the token implicitly
-                // materializes caches (no explicit cache eval needed during decode).
-                //
-                // Pattern from mlx-lm generate.py:
-                //   mx.async_eval(next_y)   # fire and forget
-                //   if n == 0: mx.eval(y)   # sync only for TTFT
-                let mut current_y = y;
-                for step in 0..max_new_tokens {
-                    let next_y = if step + 1 < max_new_tokens {
-                        let _stream_ctx = StreamContext::new(generation_stream);
-
-                        let next_ids = current_y.reshape(&[1, 1])?;
-                        let logits = forward_inner(
-                            &next_ids,
-                            &embed_guard,
-                            &layers_guard,
-                            &mut caches,
-                            &norm_guard,
-                            &lm_head_guard,
-                            embed_weight_t_guard.as_ref(),
-                            ple_guard.as_ref(),
-                            &model_config,
-                        )?;
-                        let logits = logits.squeeze(Some(&[1]))?;
-                        let next_token = sample_next_token(&logits, sampling_config)?;
-                        MxArray::async_eval_arrays(&[&next_token]);
-                        Some(next_token)
-                    } else {
-                        None
-                    };
-
-                    let token_id = current_y.item_at_int32(0)? as u32;
-                    generated_tokens.push(token_id);
-
-                    if eos_ids.contains(&(token_id as i32)) {
-                        finish_reason = "stop".to_string();
-                        break;
-                    }
-                    if let Some(next_token) = next_y {
-                        current_y = next_token;
-                    } else {
-                        break;
-                    }
-
-                    if (step + 1) % 256 == 0 {
-                        crate::array::clear_cache();
-                    }
-                }
-            }
-
-            // Decode text
-            let text = tokenizer.decode_sync(&generated_tokens, true)?;
-
-            // Compute performance metrics
-            let generation_end = std::time::Instant::now();
-            let ttft_ms = first_token_instant
-                .duration_since(generation_start)
-                .as_secs_f64()
-                * 1000.0;
-            let decode_ms = generation_end
-                .duration_since(first_token_instant)
-                .as_secs_f64()
-                * 1000.0;
-            let gen_toks = generated_tokens.len() as f64;
-            let mem_after = crate::array::get_active_memory();
-            debug!("[gemma4-chat] after generate: {:.2} GB active", mem_after / 1e9);
-
-            let performance = Some(crate::profiling::PerformanceMetrics {
-                ttft_ms,
-                prefill_tokens_per_second: if ttft_ms > 0.0 {
-                    prompt_token_count as f64 / (ttft_ms / 1000.0)
-                } else {
-                    0.0
-                },
-                decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
-                    (gen_toks - 1.0) / (decode_ms / 1000.0)
-                } else {
-                    0.0
-                },
-            });
-
-            Ok(Gemma4ChatResult {
-                text,
-                num_tokens: generated_tokens.len() as u32,
-                finish_reason,
-                performance,
-            })
+        crate::model_thread::send_and_await(&self.thread, |reply| Gemma4Cmd::Chat {
+            messages,
+            config,
+            processed_images,
+            reply,
         })
         .await
-        .map_err(|e| Error::from_reason(format!("Chat task failed: {}", e)))?
-    }
-}
-
-impl Gemma4Model {
-    pub fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
-        self.tokenizer = Some(tokenizer);
     }
 }
 
@@ -767,13 +823,8 @@ fn warmup_layer_batch_size() -> usize {
 /// Single-token forward pass to trigger Metal shader compilation at load time.
 /// Layers are eval'd in batches (sized by GPU capability) to keep Metal
 /// command buffers under the timeout limit on cold shader cache.
-pub fn warmup_forward(model: &Gemma4Model, config: &Gemma4Config) -> Result<()> {
-    let embed_guard = model.embed_tokens.blocking_read();
-    let layers_guard = model.layers.blocking_read();
-    let norm_guard = model.final_norm.blocking_read();
-    let lm_head_guard = model.lm_head.blocking_read();
-    let embed_weight_t_guard = model.embed_weight_t.blocking_read();
-
+pub(crate) fn warmup_forward(inner: &Gemma4Inner) -> Result<()> {
+    let config = &inner.config;
     let batch = warmup_layer_batch_size();
     let mem_before = crate::array::get_active_memory();
     info!(
@@ -785,24 +836,24 @@ pub fn warmup_forward(model: &Gemma4Model, config: &Gemma4Config) -> Result<()> 
         let mut caches = init_caches_for_config(config);
         let dummy = MxArray::from_int32(&[1i32], &[1, 1])?;
 
-        let mut h = embed_guard.forward(&dummy)?;
+        let mut h = inner.embed_tokens.forward(&dummy)?;
         h = h.mul_scalar((config.hidden_size as f64).sqrt())?;
         h.eval();
 
-        for (i, layer) in layers_guard.iter().enumerate() {
+        for (i, layer) in inner.layers.iter().enumerate() {
             h = layer.forward(&h, None, Some(&mut caches[i]), None, false)?;
-            if (i + 1) % batch == 0 || i + 1 == layers_guard.len() {
+            if (i + 1) % batch == 0 || i + 1 == inner.layers.len() {
                 h.eval();
             }
         }
 
-        h = norm_guard.forward(&h)?;
-        let logits = if let Some(head) = &*lm_head_guard {
+        h = inner.final_norm.forward(&h)?;
+        let logits = if let Some(ref head) = inner.lm_head {
             head.forward(&h)?
-        } else if let Some(w_t) = embed_weight_t_guard.as_ref() {
+        } else if let Some(ref w_t) = inner.embed_weight_t {
             h.matmul(w_t)?
         } else {
-            let weight = embed_guard.get_weight();
+            let weight = inner.embed_tokens.get_weight();
             let weight_t = weight.transpose(Some(&[1, 0]))?;
             h.matmul(&weight_t)?
         };
