@@ -1753,7 +1753,7 @@ pub struct Qwen3_5GenerationResult {
 
 /// Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE).
 #[napi(object)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatConfig {
     #[napi(ts_type = "number | undefined")]
     pub max_new_tokens: Option<i32>,
