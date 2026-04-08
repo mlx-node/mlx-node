@@ -35,6 +35,48 @@ async function initAndRun(wasmUrl: string) {
   const { CMD_OFFSET, READBACK_BUFFER_SIZE } = await import('./rpc-protocol');
   const { createCxxStubs } = await import('./cxx-stubs');
 
+  // Monkey-patch WebAssembly.instantiate to fix WASM32 signed pointer overflow.
+  // When the WASM heap exceeds 2GB, malloc returns addresses >= 0x80000000.
+  // JavaScript coerces the WASM i32 return value to a signed number, making
+  // these addresses negative. Callers that use the pointer as a TypedArray
+  // offset (e.g., emnapi's getArrayBufferPointer) then fail with
+  // "offset is out of bounds". We wrap the exported malloc so it always
+  // returns an unsigned 32-bit value via >>> 0.
+  //
+  // WebAssembly.Instance.exports is frozen, so Proxy get-traps can't return
+  // a different value for non-configurable properties. Instead, we create a
+  // plain-object copy of exports with malloc wrapped, and return a fake
+  // instance object. emnapi's loadNapiModuleImpl copies exports via
+  // Object.assign, so the wrapped malloc propagates to its internal _malloc.
+  const _origInstantiate = WebAssembly.instantiate;
+  (WebAssembly as any).instantiate = async function (...args: any[]) {
+    const result = await _origInstantiate.apply(WebAssembly, args);
+    // WebAssembly.instantiate returns { module, instance } for ArrayBuffer input
+    const inst = result.instance ?? result;
+    const origExports = inst.exports;
+    const origMalloc = origExports.malloc as Function | undefined;
+    if (typeof origMalloc === 'function') {
+      // Build a plain-object copy of exports with malloc wrapped.
+      const wrappedExports: Record<string, WebAssembly.ExportValue> = Object.create(null);
+      for (const key of Object.keys(origExports)) {
+        wrappedExports[key] = origExports[key];
+      }
+      wrappedExports.malloc = function (size: number) {
+        return (origMalloc(size) as number) >>> 0;
+      };
+      // Return a fake instance with the wrapped exports.
+      // The real instance is preserved as __realInstance for callers
+      // (like beforeInit) that need the genuine WebAssembly.Instance.
+      const fakeInstance = { exports: wrappedExports, __realInstance: inst };
+      if (result.instance) {
+        return { module: result.module, instance: fakeInstance };
+      }
+      return fakeInstance;
+    }
+    return result;
+  };
+
+
   post({ type: 'status', message: 'Spawning GPU worker...' });
 
   const cmdBuf = new SharedArrayBuffer(CMD_OFFSET.TOTAL);
@@ -67,33 +109,40 @@ async function initAndRun(wasmUrl: string) {
   const context = getDefaultContext();
 
   let wasmInst: WebAssembly.Instance | null = null;
-  const { napiModule: mod } = await instantiateNapiModule(wasmFile, {
-    context,
-    asyncWorkPoolSize: 0,
-    wasi,
-    overwriteImports(importObject: Record<string, Record<string, unknown>>) {
-      importObject.env = {
-        ...importObject.env,
-        ...importObject.napi,
-        ...importObject.emnapi,
-        memory: wasmMem,
-        ...stubs.stubs,
-        ...bridge.imports,
-        __cpp_exception: tag,
-        _ZN3mlx4core3gpu4initEv: () => {},
-        mlx_stream_write: () => {},
-        mlx_stream_reset: () => {},
-      };
-      return importObject;
-    },
-    beforeInit({ instance }: { instance: WebAssembly.Instance }) {
-      wasmInst = instance;
-      bridge.setInstance(instance);
-      for (const k of Object.keys(instance.exports)) {
-        if (k.startsWith('__napi_register__')) (instance.exports[k] as Function)();
-      }
-    },
-  });
+  let napiModResult: any;
+  try {
+    napiModResult = await instantiateNapiModule(wasmFile, {
+      context,
+      asyncWorkPoolSize: 0,
+      wasi,
+      overwriteImports(importObject: Record<string, Record<string, unknown>>) {
+        importObject.env = {
+          ...importObject.env,
+          ...importObject.napi,
+          ...importObject.emnapi,
+          memory: wasmMem,
+          ...stubs.stubs,
+          ...bridge.imports,
+          __cpp_exception: tag,
+          _ZN3mlx4core3gpu4initEv: () => {},
+          mlx_stream_write: () => {},
+          mlx_stream_reset: () => {},
+        };
+        return importObject;
+      },
+      beforeInit({ instance }: { instance: WebAssembly.Instance }) {
+        wasmInst = instance;
+        bridge.setInstance(instance);
+        for (const k of Object.keys(instance.exports)) {
+          if (k.startsWith('__napi_register__')) (instance.exports[k] as Function)();
+        }
+      },
+    });
+  } finally {
+    // Restore original WebAssembly.instantiate
+    (WebAssembly as any).instantiate = _origInstantiate;
+  }
+  const mod = napiModResult.napiModule;
 
   const mlxExports = (mod as any).exports;
   const MxArray = mlxExports.MxArray;
@@ -1908,7 +1957,6 @@ async function initAndRun(wasmUrl: string) {
       const xData = new Float32Array(20 * D);
       for (let i = 0; i < 100; i++) xData[i] = 0.01;
       const x = MxArray.fromFloat32(xData, new BigInt64Array([20n, BigInt(D)]));
-
       // Matmul [20, 1024] @ [1024, 8192] = [20, 8192]
       const y = x.matmul(w);
       y.eval();

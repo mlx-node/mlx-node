@@ -6814,8 +6814,6 @@ fn forward_inner(
     let mut h = hidden_states.clone();
 
     let max_layers = layers.len();
-    // Layer-by-layer debug: log mean/std of hidden states after each layer
-    let log_layer_stats = std::env::var("MLX_LOG_LAYERS").is_ok();
     for i in 0..max_layers {
         let cache = caches.as_mut().map(|c| &mut c[i]);
         h = layers[i].forward(&h, None, cache, None, true)?;
@@ -6829,31 +6827,6 @@ fn forward_inner(
                 caches_vec[i].collect_arrays(&mut eval_targets);
             }
             MxArray::eval_arrays(&eval_targets);
-        }
-
-        if log_layer_stats && (i == 2 || i == 3) {
-            // Extra detailed check for L02→L03 transition
-            h.eval();
-            if let Ok(shape) = h.shape() {
-                if let Ok(dtype) = h.dtype() {
-                    eprintln!("[LAYER_DETAIL] L{:02} shape={:?} dtype={:?}", i, shape.as_ref(), dtype);
-                }
-            }
-        }
-        if log_layer_stats && i < 6 {
-            // Only log first 6 layers to avoid overwhelming output
-            // Eval to get values (on native this forces materialization)
-            h.eval();
-            if let Ok(vals) = h.to_float32() {
-                let vals = vals.to_vec();
-                let n = vals.len() as f64;
-                let mean: f64 = vals.iter().map(|v| *v as f64).sum::<f64>() / n;
-                let std: f64 = (vals.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / n).sqrt();
-                let first5: Vec<String> = vals.iter().take(5).map(|v| format!("{:.6}", v)).collect();
-                let last5: Vec<String> = vals.iter().rev().take(5).rev().map(|v| format!("{:.6}", v)).collect();
-                eprintln!("[LAYER_STATS] L{:02} mean={:.6} std={:.6} first=[{}] last=[{}]",
-                    i, mean, std, first5.join(","), last5.join(","));
-            }
         }
     }
 

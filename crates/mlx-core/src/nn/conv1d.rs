@@ -93,6 +93,17 @@ impl Conv1d {
     /// Input shape: `[batch, seq_len, in_channels]`
     /// Output shape: `[batch, seq_len_out, out_channels]`
     pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
+        let result = self.forward_conv(input)?;
+
+        if let Some(ref b) = self.bias {
+            result.add(b)
+        } else {
+            Ok(result)
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn forward_conv(&self, input: &MxArray) -> Result<MxArray> {
         let handle = unsafe {
             sys::mlx_conv1d(
                 input.handle.0,
@@ -103,13 +114,68 @@ impl Conv1d {
                 self.groups,
             )
         };
-        let result = MxArray::from_handle(handle, "conv1d")?;
+        MxArray::from_handle(handle, "conv1d")
+    }
 
-        if let Some(ref b) = self.bias {
-            result.add(b)
+    /// Manual depthwise conv1d for WASM/WebGPU where the Convolution primitive
+    /// is not available. Uses only slice + multiply + add ops.
+    ///
+    /// Only supports: stride=1, padding=0, dilation=1, groups=in_channels (depthwise).
+    #[cfg(target_family = "wasm")]
+    fn forward_conv(&self, input: &MxArray) -> Result<MxArray> {
+        let in_channels = input.shape_at(2)?;
+
+        if self.stride == 1
+            && self.padding == 0
+            && self.dilation == 1
+            && self.groups as i64 == in_channels
+        {
+            self.forward_depthwise(input)
         } else {
-            Ok(result)
+            Err(Error::from_reason(format!(
+                "Conv1d on WebGPU only supports depthwise (groups=channels) with stride=1, \
+                 padding=0, dilation=1. Got stride={}, padding={}, dilation={}, groups={}, \
+                 in_channels={}",
+                self.stride, self.padding, self.dilation, self.groups, in_channels
+            )))
         }
+    }
+
+    /// Depthwise conv1d using only elementwise ops.
+    /// Weight: [C, K, 1], Input: [B, T, C] → Output: [B, T-K+1, C]
+    ///
+    /// For each kernel position k:
+    ///   output += input[:, k:T_out+k, :] * weight[:, k, 0]
+    fn forward_depthwise(&self, input: &MxArray) -> Result<MxArray> {
+        let seq_len = input.shape_at(1)?;
+        let kernel_size = self.weight.shape_at(1)?;
+        let t_out = seq_len - kernel_size + 1;
+
+        if t_out <= 0 {
+            return Err(Error::from_reason(format!(
+                "Conv1d: input seq_len ({}) < kernel_size ({})",
+                seq_len, kernel_size
+            )));
+        }
+
+        // weight shape: [C, K, 1] → squeeze to [C, K], then slice per k → [C] → [1, 1, C]
+        let weight_2d = self.weight.squeeze(Some(&[2]))?; // [C, K]
+
+        let mut result: Option<MxArray> = None;
+        for k in 0..kernel_size {
+            // input[:, k:k+t_out, :] → [B, T_out, C]
+            let input_slice = input.slice_axis(1, k, k + t_out)?;
+            // weight_2d[:, k] → [C] → reshape to [1, 1, C] for broadcast
+            let w_k = weight_2d.slice_axis(1, k, k + 1)?; // [C, 1]
+            let w_k = w_k.reshape(&[1, 1, -1])?; // [1, 1, C]
+            let term = input_slice.mul(&w_k)?;
+            result = Some(match result {
+                Some(acc) => acc.add(&term)?,
+                None => term,
+            });
+        }
+
+        result.ok_or_else(|| Error::from_reason("Conv1d: kernel_size is 0".to_string()))
     }
 
     pub fn get_weight(&self) -> MxArray {

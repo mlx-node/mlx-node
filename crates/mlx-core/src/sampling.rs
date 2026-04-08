@@ -598,11 +598,41 @@ pub fn sample_uncompiled(logits: &MxArray, config: Option<SamplingConfig>) -> Re
     let temp = cfg.temperature.unwrap_or(1.0);
     // Greedy: use argmax when temperature ≤ 0
     if temp <= 0.0 {
-        return logits.argmax(-1, None);
+        return argmax_compat(logits, -1);
     }
     // Pure Rust categorical: read logits to CPU, apply temperature + sampling there.
     // Avoids MLX array ops (categorical/cumsum/random) that exhaust WASM heap.
     cpu_categorical_sample(logits, temp)
+}
+
+/// Argmax that works on all backends including WebGPU.
+///
+/// On native builds, delegates to the native ArgReduce primitive.
+/// On WASM/WebGPU (where ArgReduce is not implemented), decomposes into:
+///   max → equal → where → min (all available in WebGPU).
+#[cfg(not(target_family = "wasm"))]
+fn argmax_compat(logits: &MxArray, axis: i32) -> Result<MxArray> {
+    logits.argmax(axis, None)
+}
+
+#[cfg(target_family = "wasm")]
+fn argmax_compat(logits: &MxArray, axis: i32) -> Result<MxArray> {
+    use napi::Either;
+    // 1. max_val = max(logits, axis, keepdims=true) for broadcasting
+    let max_val = logits.max(Some(&[axis]), Some(true))?;
+    // 2. mask = (logits == max_val) — bool array
+    let mask = logits.equal(&max_val)?;
+    // 3. indices = arange(0, dim_size) with shape for broadcasting
+    let dim_size = logits.shape_at(
+        if axis < 0 { (logits.ndim()? as i32 + axis) as u32 } else { axis as u32 }
+    )?;
+    let indices = MxArray::arange(0.0, dim_size as f64, None, Some(crate::array::DType::Int32))?;
+    // 4. big_val = dim_size (any value >= dim_size works as "not a valid index")
+    let big = MxArray::full(&[dim_size], Either::A(dim_size as f64), Some(crate::array::DType::Int32))?;
+    // 5. masked_indices = where(mask, indices, big_val)
+    let masked = mask.where_(&indices, &big)?;
+    // 6. result = min(masked, axis) — first matching index
+    masked.min(Some(&[axis]), None)
 }
 
 /// Categorical sampling in pure Rust — no MLX array ops for intermediates.

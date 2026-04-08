@@ -48,8 +48,14 @@ export function createBridgeStub(
 
   // WASM exports -- set via setInstance() after WASM instantiation
   let wasmTable: WebAssembly.Table;
-  let wasmMalloc: (size: number) => number;
+  let _wasmMalloc: (size: number) => number;
   let wasmFree: (ptr: number) => void;
+  // WASM32 pointers are unsigned 32-bit, but JS coerces WASM i32 returns to
+  // signed. When the WASM heap exceeds 2GB, pointers above 0x80000000 become
+  // negative JS numbers. Use >>> 0 to reinterpret as unsigned.
+  function wasmMalloc(size: number): number {
+    return _wasmMalloc(size) >>> 0;
+  }
   // Get a fresh Uint8Array view of WASM heap. wasmMemory.buffer always reflects
   // current size after memory.grow() (WebAssembly.Memory getter returns fresh SAB).
   function heap(): Uint8Array {
@@ -58,7 +64,7 @@ export function createBridgeStub(
 
   function setInstance(instance: WebAssembly.Instance): void {
     wasmTable = instance.exports.__indirect_function_table as WebAssembly.Table;
-    wasmMalloc = instance.exports.malloc as (size: number) => number;
+    _wasmMalloc = instance.exports.malloc as (size: number) => number;
     wasmFree = instance.exports.free as (ptr: number) => void;
   }
 
@@ -551,10 +557,6 @@ export function createBridgeStub(
       // heap() always reflects the current memory size after growth.
       if (readbackView && actualSize > 0) {
         const h = heap();
-        if (wasmPtr + actualSize > h.byteLength) {
-          console.error(`[Bridge Stub] HEAP OVERFLOW: wasmPtr=${wasmPtr} + size=${actualSize} = ${wasmPtr + actualSize} > heap=${h.byteLength}`);
-          return wasmPtr; // skip copy to avoid crash
-        }
         h.set(readbackView.subarray(0, actualSize), wasmPtr);
       }
       return wasmPtr;
