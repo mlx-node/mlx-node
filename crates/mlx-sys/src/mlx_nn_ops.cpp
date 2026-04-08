@@ -2676,7 +2676,12 @@ int mlx_test_gdn_full_bf16(float* out_vals, int max_count) {
 
         // Beta, g
         auto beta_3d = reshape(sigmoid(b_raw), {B, 1, Hv});
-        auto g_3d = reshape(qwen35_common::fused_compute_g(a_log, a_raw, dt_bias), {B, 1, Hv});
+        // compute_g without mlx::core::compile (WebGPU has no Compiled impl)
+        auto A = exp(a_log);
+        auto sp = qwen35_common::softplus(mlx::core::add(a_raw, dt_bias));
+        auto g_raw = exp(negative(A * sp));
+        g_raw = astype(g_raw, a_raw.dtype());
+        auto g_3d = reshape(g_raw, {B, 1, Hv});
 
         // Recurrence with zero initial state
         auto cur_state = zeros({B, Hv, Dv, Dk}, bfloat16);
@@ -2835,7 +2840,12 @@ int mlx_test_gdn_layer_bf16(float* out_vals, int max_count) {
         k = fast::rms_norm(k, std::nullopt, 1e-6f) * array(inv_s, q_dt);
 
         auto beta_3d = reshape(sigmoid(b_raw), {B, 1, Hv});
-        auto g_3d = reshape(qwen35_common::fused_compute_g(a_log, a_raw, dt_bias), {B, 1, Hv});
+        // compute_g without mlx::core::compile (WebGPU has no Compiled impl)
+        auto A_g = exp(a_log);
+        auto sp_g = qwen35_common::softplus(mlx::core::add(a_raw, dt_bias));
+        auto g_raw_g = exp(negative(A_g * sp_g));
+        g_raw_g = astype(g_raw_g, a_raw.dtype());
+        auto g_3d = reshape(g_raw_g, {B, 1, Hv});
 
         auto cur_state = zeros({B, Hv, Dv, Dk}, bfloat16);
         eval_safe(cur_state);
