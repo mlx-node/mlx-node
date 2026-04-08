@@ -96,6 +96,13 @@ pub struct Gemma4Config {
     pub top_k_experts: Option<i32>,
     #[serde(default)]
     pub moe_intermediate_size: Option<i32>,
+
+    // Vision fields (None when no vision_config in config.json — text-only model)
+    pub vision_config: Option<super::vision_config::Gemma4VisionConfig>,
+    pub image_token_id: Option<i32>,               // 258880
+    pub boi_token_id: Option<i32>,                 // 255999
+    pub eoi_token_id: Option<i32>,                 // 258882
+    pub vision_soft_tokens_per_image: Option<i32>, // 280
 }
 
 fn default_sliding_window() -> i32 {

@@ -144,6 +144,27 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             let v = get_config_i32(&raw, text_cfg, &["moe_intermediate_size"], -1);
             if v > 0 { Some(v) } else { None }
         },
+
+        // Vision fields — only present when config.json contains a vision_config sub-dict
+        vision_config: raw
+            .get("vision_config")
+            .map(super::vision_config::Gemma4VisionConfig::from_json),
+        image_token_id: raw
+            .get("image_token_id")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
+        boi_token_id: raw
+            .get("boi_token_id")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
+        eoi_token_id: raw
+            .get("eoi_token_id")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
+        vision_soft_tokens_per_image: raw
+            .get("vision_soft_tokens_per_image")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
     })
 }
 
@@ -414,25 +435,45 @@ pub fn sanitize_weights(
             .unwrap_or(&key)
             .to_string();
 
-        // Skip vision/audio encoder weights (text-only mode)
-        if clean_key.starts_with("vision_tower.")
-            || clean_key.starts_with("vision_encoder.")
-            || clean_key.starts_with("multi_modal_projector.")
-            || clean_key.starts_with("audio_tower.")
+        // Strip `.linear.` from vision weight keys. ClippableLinear stores weights
+        // as `*.linear.weight` in the checkpoint, but we want `*.weight` for lookup.
+        let clean_key =
+            if clean_key.starts_with("vision_tower.") || clean_key.starts_with("embed_vision.") {
+                clean_key.replace(".linear.weight", ".weight")
+            } else {
+                clean_key
+            };
+
+        // Skip audio encoder weights (always — not supported yet)
+        if clean_key.starts_with("audio_tower.")
             || clean_key.starts_with("audio_encoder.")
             || clean_key.starts_with("embed_audio.")
-            || clean_key.starts_with("embed_vision.")
         {
             continue;
         }
 
-        // Skip non-weight tensors that Python's sanitize() filters out:
-        // rotary embeddings (computed at runtime) and quantization range parameters
-        if clean_key.contains("self_attn.rotary_emb")
-            || clean_key.contains("input_max")
+        // Skip vision weights only when vision_config is absent (text-only mode)
+        if config.vision_config.is_none()
+            && (clean_key.starts_with("vision_tower.")
+                || clean_key.starts_with("vision_encoder.")
+                || clean_key.starts_with("multi_modal_projector.")
+                || clean_key.starts_with("embed_vision."))
+        {
+            continue;
+        }
+
+        // Skip rotary embeddings (computed at runtime)
+        if clean_key.contains("self_attn.rotary_emb") {
+            continue;
+        }
+
+        // Skip clip params for TEXT weights (not used). Keep for VISION weights
+        // (ClippableLinear needs input_min/max, output_min/max).
+        if (clean_key.contains("input_max")
             || clean_key.contains("input_min")
             || clean_key.contains("output_max")
-            || clean_key.contains("output_min")
+            || clean_key.contains("output_min"))
+            && !clean_key.starts_with("vision_tower.")
         {
             continue;
         }
@@ -461,14 +502,17 @@ pub fn sanitize_weights(
         sanitized.remove("lm_head.weight");
     }
 
-    // Cast all f32 floating-point tensors to bf16 to eliminate AsType graph nodes.
+    // Cast all f32 floating-point tensors to bf16 — EXCEPT vision weights
+    // which need f32 precision for clip bounds and position embeddings.
     // HF checkpoints store some buffers (layer_scalar, router.scale, per_expert_scale)
     // as f32 while the model operates in bf16. Without this cast, every arithmetic
     // operation between f32 buffers and bf16 activations creates an AsType node,
     // adding ~700 extra ops to the decode graph and preventing Metal kernel fusion.
     // Python's load_weights handles this implicitly via tree_map dtype conversion.
-    use crate::array::DType;
-    for value in sanitized.values_mut() {
+    for (key, value) in sanitized.iter_mut() {
+        if key.starts_with("vision_tower.") || key.starts_with("embed_vision.") {
+            continue;
+        }
         if value.dtype().is_ok_and(|dt| dt == DType::Float32)
             && let Ok(casted) = value.astype(DType::BFloat16)
         {
@@ -734,6 +778,163 @@ fn apply_weights(
     Ok(())
 }
 
+/// Apply vision weights to the model's vision tower and multimodal embedder.
+fn apply_vision_weights(
+    model: &mut Gemma4Model,
+    params: &HashMap<String, MxArray>,
+    config: &Gemma4Config,
+) -> Result<()> {
+    let vc = match &config.vision_config {
+        Some(c) => c,
+        None => return Ok(()), // No vision — nothing to do
+    };
+
+    // --- Vision Tower ---
+    let mut vt_guard = model.vision_tower.blocking_write();
+    if let Some(ref mut vision_tower) = *vt_guard {
+        // Patch embedder
+        if let Some(w) = params.get("vision_tower.patch_embedder.input_proj.weight") {
+            vision_tower.patch_embedder.input_proj.set_weight(w)?;
+        }
+        if let Some(w) = params.get("vision_tower.patch_embedder.position_embedding_table") {
+            vision_tower.patch_embedder.position_embedding_table = w.clone();
+        }
+
+        // Encoder layers
+        for (i, layer) in vision_tower.encoder_layers.iter_mut().enumerate() {
+            let prefix = format!("vision_tower.encoder.layers.{}", i);
+
+            // Attention projections (ClippableLinear)
+            for proj in &["q_proj", "k_proj", "v_proj", "o_proj"] {
+                let w_key = format!("{}.self_attn.{}.weight", prefix, proj);
+                if let Some(w) = params.get(&w_key) {
+                    let cl = match *proj {
+                        "q_proj" => &mut layer.self_attn.q_proj,
+                        "k_proj" => &mut layer.self_attn.k_proj,
+                        "v_proj" => &mut layer.self_attn.v_proj,
+                        "o_proj" => &mut layer.self_attn.o_proj,
+                        _ => unreachable!(),
+                    };
+                    cl.linear.set_weight(w)?;
+                }
+
+                // Clip bounds (only when use_clipped_linears is true)
+                if vc.use_clipped_linears {
+                    let cl = match *proj {
+                        "q_proj" => &mut layer.self_attn.q_proj,
+                        "k_proj" => &mut layer.self_attn.k_proj,
+                        "v_proj" => &mut layer.self_attn.v_proj,
+                        "o_proj" => &mut layer.self_attn.o_proj,
+                        _ => unreachable!(),
+                    };
+                    let base = format!("{}.self_attn.{}", prefix, proj);
+                    if let (Some(imin), Some(imax), Some(omin), Some(omax)) = (
+                        params.get(&format!("{}.input_min", base)),
+                        params.get(&format!("{}.input_max", base)),
+                        params.get(&format!("{}.output_min", base)),
+                        params.get(&format!("{}.output_max", base)),
+                    ) {
+                        imin.eval();
+                        imax.eval();
+                        omin.eval();
+                        omax.eval();
+                        cl.set_clip_bounds(
+                            imin.item_at_float32(0)? as f64,
+                            imax.item_at_float32(0)? as f64,
+                            omin.item_at_float32(0)? as f64,
+                            omax.item_at_float32(0)? as f64,
+                        );
+                    }
+                }
+            }
+
+            // Q/K norm weights (VisionRMSNorm — has learnable weight)
+            if let Some(w) = params.get(&format!("{}.self_attn.q_norm.weight", prefix)) {
+                layer.self_attn.q_norm.weight = w.clone();
+            }
+            if let Some(w) = params.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
+                layer.self_attn.k_norm.weight = w.clone();
+            }
+            // V norm: VisionRMSNormNoScale — no learnable params, nothing to load
+
+            // MLP projections (ClippableLinear)
+            for proj in &["gate_proj", "up_proj", "down_proj"] {
+                let w_key = format!("{}.mlp.{}.weight", prefix, proj);
+                if let Some(w) = params.get(&w_key) {
+                    let cl = match *proj {
+                        "gate_proj" => &mut layer.mlp.gate_proj,
+                        "up_proj" => &mut layer.mlp.up_proj,
+                        "down_proj" => &mut layer.mlp.down_proj,
+                        _ => unreachable!(),
+                    };
+                    cl.linear.set_weight(w)?;
+                }
+
+                if vc.use_clipped_linears {
+                    let cl = match *proj {
+                        "gate_proj" => &mut layer.mlp.gate_proj,
+                        "up_proj" => &mut layer.mlp.up_proj,
+                        "down_proj" => &mut layer.mlp.down_proj,
+                        _ => unreachable!(),
+                    };
+                    let base = format!("{}.mlp.{}", prefix, proj);
+                    if let (Some(imin), Some(imax), Some(omin), Some(omax)) = (
+                        params.get(&format!("{}.input_min", base)),
+                        params.get(&format!("{}.input_max", base)),
+                        params.get(&format!("{}.output_min", base)),
+                        params.get(&format!("{}.output_max", base)),
+                    ) {
+                        imin.eval();
+                        imax.eval();
+                        omin.eval();
+                        omax.eval();
+                        cl.set_clip_bounds(
+                            imin.item_at_float32(0)? as f64,
+                            imax.item_at_float32(0)? as f64,
+                            omin.item_at_float32(0)? as f64,
+                            omax.item_at_float32(0)? as f64,
+                        );
+                    }
+                }
+            }
+
+            // 4 block norms (standard RMSNorm — has weight)
+            for (norm_name, norm_ref) in [
+                ("input_layernorm", &mut layer.input_layernorm),
+                (
+                    "post_attention_layernorm",
+                    &mut layer.post_attention_layernorm,
+                ),
+                (
+                    "pre_feedforward_layernorm",
+                    &mut layer.pre_feedforward_layernorm,
+                ),
+                (
+                    "post_feedforward_layernorm",
+                    &mut layer.post_feedforward_layernorm,
+                ),
+            ] {
+                if let Some(w) = params.get(&format!("{}.{}.weight", prefix, norm_name)) {
+                    norm_ref.set_weight(w)?;
+                }
+            }
+        }
+    }
+    drop(vt_guard);
+
+    // --- Multimodal Embedder ---
+    let mut ev_guard = model.embed_vision.blocking_write();
+    if let Some(ref mut embedder) = *ev_guard
+        && let Some(w) = params.get("embed_vision.embedding_projection.weight")
+    {
+        embedder.embedding_projection.set_weight(w)?;
+    }
+    drop(ev_guard);
+
+    info!("Vision weights applied successfully");
+    Ok(())
+}
+
 /// Register all sanitized weights with the C++ compiled forward pass.
 /// Uses the shared g_weights map (same API as Qwen3.5).
 /// Sets model_id AFTER all weights stored.
@@ -911,6 +1112,9 @@ impl Gemma4Model {
 
             // Apply weights (uses blocking_write on Arc<RwLock<>>)
             apply_weights(&mut model, &params, &config)?;
+
+            // Apply vision weights (if vision_config present)
+            apply_vision_weights(&mut model, &params, &config)?;
 
             // Materialize weights in chunked evals to avoid Metal command buffer
             // timeouts on large models. Without this, weights remain as lazy mmap

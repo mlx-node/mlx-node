@@ -2553,6 +2553,33 @@ export interface Gemma4Config {
   numExperts?: number;
   topKExperts?: number;
   moeIntermediateSize?: number;
+  visionConfig?: Gemma4VisionConfig;
+  imageTokenId?: number;
+  boiTokenId?: number;
+  eoiTokenId?: number;
+  visionSoftTokensPerImage?: number;
+}
+
+/**
+ * Vision encoder configuration for Gemma4 multimodal models.
+ *
+ * Parsed from the `vision_config` sub-dict in config.json.
+ */
+export interface Gemma4VisionConfig {
+  hiddenSize: number;
+  intermediateSize: number;
+  numHiddenLayers: number;
+  numAttentionHeads: number;
+  numKeyValueHeads: number;
+  headDim: number;
+  rmsNormEps: number;
+  patchSize: number;
+  positionEmbeddingSize: number;
+  defaultOutputLength: number;
+  poolingKernelSize: number;
+  useClippedLinears: boolean;
+  ropeTheta: number;
+  standardize: boolean;
 }
 
 /** Result from generate_batch_for_training with all data needed for training */

@@ -6,11 +6,14 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tokio::sync::RwLock;
 
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+
+use super::image_processor::Gemma4ImageProcessor;
+use super::vision::{Gemma4MultimodalEmbedder, Gemma4VisionModel};
 
 /// Convert a JSON value to Gemma4's tool-call DSL format.
 /// Strings → <|"|>str<|"|>, numbers/bools → bare, objects/arrays → recursive.
@@ -141,6 +144,10 @@ pub struct Gemma4Model {
     /// Only populated when tie_word_embeddings=true.
     pub(crate) embed_weight_t: Arc<RwLock<Option<MxArray>>>,
     pub(crate) ple: Arc<RwLock<Option<PleComponents>>>,
+    // Vision components (None for text-only models)
+    pub(crate) vision_tower: Arc<RwLock<Option<Gemma4VisionModel>>>,
+    pub(crate) embed_vision: Arc<RwLock<Option<Gemma4MultimodalEmbedder>>>,
+    image_processor: Option<Gemma4ImageProcessor>,
     tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) model_id: u64,
 }
@@ -204,6 +211,23 @@ impl Gemma4Model {
             None
         };
 
+        // Initialize vision components if vision_config is present
+        let (vision_tower, embed_vision, image_processor) = if let Some(ref vc) =
+            config.vision_config
+        {
+            let vt = Gemma4VisionModel::new(vc)?;
+            let ev =
+                Gemma4MultimodalEmbedder::new(vc.hidden_size, config.hidden_size, vc.rms_norm_eps)?;
+            let ip = Gemma4ImageProcessor::new(
+                vc.patch_size,
+                vc.default_output_length,
+                vc.pooling_kernel_size,
+            );
+            (Some(vt), Some(ev), Some(ip))
+        } else {
+            (None, None, None)
+        };
+
         let model_id = MODEL_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok(Self {
@@ -214,6 +238,9 @@ impl Gemma4Model {
             lm_head: Arc::new(RwLock::new(lm_head)),
             embed_weight_t: Arc::new(RwLock::new(None)),
             ple: Arc::new(RwLock::new(ple)),
+            vision_tower: Arc::new(RwLock::new(vision_tower)),
+            embed_vision: Arc::new(RwLock::new(embed_vision)),
+            image_processor,
             tokenizer: None,
             model_id,
         })
@@ -253,6 +280,10 @@ impl Gemma4Model {
             .clone()
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
 
+        // Extract image bytes before spawn_blocking (Uint8Array is !Send)
+        let all_images = extract_images_from_messages(&messages);
+        let has_images = !all_images.is_empty();
+
         // Clone Arcs for spawn_blocking
         let embed_tokens = self.embed_tokens.clone();
         let layers = self.layers.clone();
@@ -260,7 +291,25 @@ impl Gemma4Model {
         let lm_head = self.lm_head.clone();
         let embed_weight_t = self.embed_weight_t.clone();
         let ple = self.ple.clone();
+        let vision_tower = self.vision_tower.clone();
+        let embed_vision = self.embed_vision.clone();
         let model_config = self.config.clone();
+
+        // Process images before spawn_blocking (image crate is Send-safe but
+        // we need the image_processor ref which is on self)
+        let processed_images = if has_images {
+            if let Some(ref ip) = self.image_processor {
+                let mut results = Vec::with_capacity(all_images.len());
+                for img_bytes in &all_images {
+                    results.push(ip.process_bytes(img_bytes)?);
+                }
+                results
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
 
         let sampling_config = make_sampling_config(&config, &model_config);
         let enable_thinking = config.enable_thinking;
@@ -322,6 +371,24 @@ impl Gemma4Model {
                 tokenizer.encode_sync(&prompt_text, Some(false))?
             };
 
+            // Expand image tokens if images are present.
+            // Gemma4 uses: <|image>  (BOI) + <|image|> × num_soft_tokens + <image|> (EOI)
+            // The chat template inserts a single <|image|> per image; we expand it here.
+            let tokens = if has_images && !processed_images.is_empty() {
+                let image_token_id = model_config.image_token_id.unwrap_or(258880) as u32;
+                let boi_token_id = model_config.boi_token_id.unwrap_or(255999) as u32;
+                let eoi_token_id = model_config.eoi_token_id.unwrap_or(258882) as u32;
+                expand_image_tokens(
+                    &tokens,
+                    &processed_images,
+                    image_token_id,
+                    boi_token_id,
+                    eoi_token_id,
+                )
+            } else {
+                tokens
+            };
+
             // Create prompt tensor
             let token_arr: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
             let prompt = MxArray::from_int32(&token_arr, &[1, tokens.len() as i64])?;
@@ -346,24 +413,92 @@ impl Gemma4Model {
             let lm_head_guard = lm_head.blocking_read();
             let embed_weight_t_guard = embed_weight_t.blocking_read();
             let ple_guard = ple.blocking_read();
+            let vision_tower_guard = vision_tower.blocking_read();
+            let embed_vision_guard = embed_vision.blocking_read();
 
             let generation_start = std::time::Instant::now();
             let prompt_token_count = tokens.len();
+
+            // Vision prefill: if images present, build merged embeddings
+            // (text embeddings with vision features scattered at image_token positions)
+            let vision_embeds: Option<MxArray> = if has_images
+                && !processed_images.is_empty()
+                && vision_tower_guard.is_some()
+                && embed_vision_guard.is_some()
+            {
+                let vt = vision_tower_guard.as_ref().unwrap();
+                let ev = embed_vision_guard.as_ref().unwrap();
+                let image_token_id =
+                    model_config.image_token_id.unwrap_or(258880);
+
+                // Run vision tower on each image and collect features
+                let mut all_features: Vec<MxArray> = Vec::new();
+                for proc in &processed_images {
+                    let features = vt.forward(&proc.pixel_values)?;
+                    let projected = ev.forward(&features)?;
+                    all_features.push(projected);
+                }
+
+                // Concatenate all image features: [1, total_soft_tokens, hidden_size]
+                let image_features = if all_features.len() == 1 {
+                    all_features.remove(0)
+                } else {
+                    let refs: Vec<&MxArray> = all_features.iter().collect();
+                    MxArray::concatenate_many(refs, Some(1))?
+                };
+
+                // Build text embeddings
+                let text_embeds = embed_guard.forward(&prompt)?;
+                let text_embeds =
+                    text_embeds.mul_scalar((model_config.hidden_size as f64).sqrt())?;
+
+                // Cast image features to text embedding dtype
+                let embed_dtype = text_embeds.dtype()?;
+                let image_features = image_features.astype(embed_dtype)?;
+
+                // masked_scatter: replace image_token positions with vision features
+                let image_token = MxArray::scalar_int(image_token_id)?;
+                let image_mask = prompt.equal(&image_token)?;
+                let image_mask_expanded = image_mask.expand_dims(-1)?;
+                let image_mask_expanded = image_mask_expanded.broadcast_to(
+                    &text_embeds.shape()?,
+                )?;
+
+                let merged = masked_scatter(&text_embeds, &image_mask_expanded, &image_features)?;
+                Some(merged)
+            } else {
+                None
+            };
 
             // Prefill: process tokens [0:N-1] through body only (no lm_head),
             // then run last token through full forward to get logits.
             // Matches mlx-lm generate_step pattern.
             {
                 let _stream_ctx = StreamContext::new(generation_stream);
-                prefill_body_gemma4(
-                    &prompt,
-                    &embed_guard,
-                    &layers_guard,
-                    &mut caches,
-                    &norm_guard,
-                    ple_guard.as_ref(),
-                    &model_config,
-                )?;
+                if let Some(ref embeds) = vision_embeds {
+                    // Vision path: prefill with merged embeddings
+                    prefill_body_gemma4_with_embeds(
+                        &prompt,
+                        embeds,
+                        &embed_guard,
+                        &layers_guard,
+                        &mut caches,
+                        &norm_guard,
+                        ple_guard.as_ref(),
+                        &model_config,
+                    )?;
+                } else {
+                    // Text-only path
+                    prefill_body_gemma4(
+                        &prompt,
+                        &embed_guard,
+                        &layers_guard,
+                        &mut caches,
+                        &norm_guard,
+                        ple_guard.as_ref(),
+                        &model_config,
+                    )?;
+                }
             }
             eval_gemma4_caches(&caches);
 
@@ -1153,6 +1288,191 @@ fn create_sliding_mask(seq_len: i64, offset: i32, window_size: i64) -> Result<Mx
     let zero_f = MxArray::full(&[1], Either::A(0.0), Some(crate::array::DType::Float32))?;
     let mask = valid.where_(&zero_f, &neg_inf)?;
     mask.reshape(&[1, 1, seq_len, total_len])
+}
+
+// ---------------------------------------------------------------------------
+// Vision helpers
+// ---------------------------------------------------------------------------
+
+/// Extract raw image bytes from ChatMessage.images fields.
+fn extract_images_from_messages(messages: &[ChatMessage]) -> Vec<Vec<u8>> {
+    let mut all_images: Vec<Vec<u8>> = Vec::new();
+    for msg in messages {
+        if let Some(ref images) = msg.images {
+            for img in images {
+                all_images.push(img.to_vec());
+            }
+        }
+    }
+    all_images
+}
+
+/// Expand image tokens in a token sequence.
+///
+/// The chat template inserts a single `<|image|>` per image. This function
+/// replaces each occurrence with: `boi_token + image_token × num_soft_tokens + eoi_token`.
+///
+/// If there are fewer `<|image|>` tokens than processed images, the extra images
+/// are ignored (manual fallback may not have inserted tokens).
+/// If there are no `<|image|>` tokens but images exist, we insert the expanded
+/// sequence after the first token (BOS).
+fn expand_image_tokens(
+    tokens: &[u32],
+    processed_images: &[super::image_processor::ProcessedGemma4Image],
+    image_token_id: u32,
+    boi_token_id: u32,
+    eoi_token_id: u32,
+) -> Vec<u32> {
+    let image_count = tokens.iter().filter(|&&t| t == image_token_id).count();
+
+    if image_count == 0 && !processed_images.is_empty() {
+        // Manual fallback: insert expanded tokens after BOS (position 0)
+        let mut result = Vec::with_capacity(
+            tokens.len()
+                + processed_images
+                    .iter()
+                    .map(|p| p.num_soft_tokens as usize + 2)
+                    .sum::<usize>(),
+        );
+        result.push(tokens[0]); // BOS
+        for proc in processed_images {
+            result.push(boi_token_id);
+            for _ in 0..proc.num_soft_tokens {
+                result.push(image_token_id);
+            }
+            result.push(eoi_token_id);
+        }
+        result.extend_from_slice(&tokens[1..]);
+        return result;
+    }
+
+    // Replace each <|image|> with the expanded BOI + N×image_token + EOI sequence
+    let mut result = Vec::with_capacity(tokens.len() * 2);
+    let mut img_idx = 0;
+    for &t in tokens {
+        if t == image_token_id && img_idx < processed_images.len() {
+            let num_soft = processed_images[img_idx].num_soft_tokens;
+            result.push(boi_token_id);
+            for _ in 0..num_soft {
+                result.push(image_token_id);
+            }
+            result.push(eoi_token_id);
+            img_idx += 1;
+        } else {
+            result.push(t);
+        }
+    }
+    result
+}
+
+/// masked_scatter: replace positions where mask=true with values from source.
+///
+/// Matches Python: `mx.where(mask_flat, aligned, input_flat).reshape(input.shape)`
+/// where `aligned = source.flatten()[cumsum(mask_flat) - 1 % source.size]`
+fn masked_scatter(input: &MxArray, mask: &MxArray, source: &MxArray) -> Result<MxArray> {
+    let input_shape = input.shape()?;
+    let mask_flat = mask.reshape(&[-1])?.astype(DType::Int32)?;
+    let input_flat = input.reshape(&[-1])?;
+
+    let source_flat = source.reshape(&[-1])?;
+    let source_size = source_flat.shape_at(0)?;
+
+    // cumsum of mask gives 1-based indices into source; subtract 1 for 0-based
+    let indices = mask_flat.cumsum(0)?.sub(&MxArray::scalar_int(1)?)?;
+    // Modulo source_size to handle wrap-around safely
+    let source_size_arr = MxArray::scalar_int(source_size as i32)?;
+    let safe_indices = indices.remainder(&source_size_arr)?;
+    let aligned = source_flat.take(&safe_indices, 0)?;
+
+    // where mask=1 use aligned (source), else keep input
+    let result = mask_flat.where_(&aligned, &input_flat)?;
+    result.reshape(&input_shape)
+}
+
+/// Chunked prefill with pre-computed embeddings (for vision path).
+///
+/// Same as `prefill_body_gemma4` but uses pre-merged `inputs_embeds` instead
+/// of looking up from the embedding table. PLE tokens at image positions are
+/// zeroed to avoid confusing the per-layer embeddings with vision token IDs.
+fn prefill_body_gemma4_with_embeds(
+    prompt: &MxArray,
+    inputs_embeds: &MxArray,
+    embedding: &Embedding,
+    layers: &[Gemma4DecoderLayer],
+    caches: &mut [Gemma4LayerCache],
+    final_norm: &RMSNorm,
+    ple: Option<&PleComponents>,
+    config: &Gemma4Config,
+) -> Result<()> {
+    let total_len = inputs_embeds.shape_at(1)?;
+
+    if total_len <= 1 {
+        return Ok(());
+    }
+
+    // Process tokens [0:N-1] — leave last token for forward_inner
+    let prefill_len = total_len - 1;
+    let all_embeds = inputs_embeds.slice_axis(1, 0, prefill_len)?;
+
+    // PLE: mask image token positions to 0 before computing per-layer embeddings
+    let all_ple: Option<MxArray> = if let Some(ple) = ple {
+        let prefill_ids = prompt.slice_axis(1, 0, prefill_len)?;
+        let image_token_id = config.image_token_id.unwrap_or(258880);
+        let image_token = MxArray::scalar_int(image_token_id)?;
+        let image_mask = prefill_ids.equal(&image_token)?;
+        let zero = MxArray::scalar_int(0)?;
+        let masked_ids = image_mask.where_(&zero, &prefill_ids)?;
+        Some(compute_ple(&masked_ids, &all_embeds, ple, prefill_len)?)
+    } else {
+        None
+    };
+
+    let mut offset: i64 = 0;
+
+    while prefill_len - offset > GEMMA4_PREFILL_STEP_SIZE {
+        let chunk_embeds = all_embeds.slice_axis(1, offset, offset + GEMMA4_PREFILL_STEP_SIZE)?;
+        let chunk_ple = all_ple
+            .as_ref()
+            .map(|p| p.slice_axis(1, offset, offset + GEMMA4_PREFILL_STEP_SIZE))
+            .transpose()?;
+
+        let _hidden = forward_body(
+            None,
+            Some(chunk_embeds),
+            embedding,
+            layers,
+            caches,
+            final_norm,
+            ple,
+            chunk_ple.as_ref(),
+            config,
+        )?;
+        eval_gemma4_caches(caches);
+        crate::array::clear_cache();
+        offset += GEMMA4_PREFILL_STEP_SIZE;
+    }
+
+    if offset < prefill_len {
+        let remaining_embeds = all_embeds.slice_axis(1, offset, prefill_len)?;
+        let remaining_ple = all_ple
+            .as_ref()
+            .map(|p| p.slice_axis(1, offset, prefill_len))
+            .transpose()?;
+
+        let _hidden = forward_body(
+            None,
+            Some(remaining_embeds),
+            embedding,
+            layers,
+            caches,
+            final_norm,
+            ple,
+            remaining_ple.as_ref(),
+            config,
+        )?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
