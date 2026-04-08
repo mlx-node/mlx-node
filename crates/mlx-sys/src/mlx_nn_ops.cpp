@@ -9,9 +9,9 @@ namespace mlx::core::wgpu {
 struct WebGPUBuffer {
   WGPUBuffer buffer;
   size_t size;
-  size_t host_size;
   void* cpu_ptr{nullptr};
-  bool stores_bfloat16_as_f32{false};
+  bool cpu_dirty{false};
+  bool gpu_has_data{false};
 };
 }
 #endif
@@ -1185,15 +1185,12 @@ mlx_array* mlx_array_from_gpu_buffer(
         // the allocator would cache the external handle on free and later
         // reuse it for unrelated allocations. When the model weight is freed
         // separately, the reused buffer becomes invalid → heap corruption.
-        bool is_bf16 = (dtype_code == 2); // 2 = bfloat16
         auto* wbuf = new wgpu::WebGPUBuffer{};
         wbuf->buffer = static_cast<WGPUBuffer>(wgpu_buffer_handle);
         wbuf->size = byte_size;  // GPU buffer size (f32 for bf16)
-        wbuf->host_size = byte_size;
         wbuf->cpu_ptr = nullptr;
-        // When the GPU buffer stores bf16 data expanded to f32, set this flag
-        // so the WebGPU backend knows the storage layout matches f32.
-        wbuf->stores_bfloat16_as_f32 = is_bf16;
+        wbuf->cpu_dirty = false;
+        wbuf->gpu_has_data = true;  // Data was uploaded by the JS worker
 
         allocator::Buffer buf{static_cast<void*>(wbuf)};
         Shape arr_shape(shape, shape + ndim);
@@ -1397,9 +1394,9 @@ bool mlx_test_gpu_buffer_arrays() {
         auto* wbuf_new = new wgpu::WebGPUBuffer{};
         wbuf_new->buffer = raw_handle;
         wbuf_new->size = byte_size;
-        wbuf_new->host_size = byte_size;
         wbuf_new->cpu_ptr = nullptr;
-        wbuf_new->stores_bfloat16_as_f32 = false;
+        wbuf_new->cpu_dirty = false;
+        wbuf_new->gpu_has_data = true;
 
         allocator::Buffer buf{static_cast<void*>(wbuf_new)};
 
@@ -1457,9 +1454,9 @@ bool mlx_test_gpu_buffer_arrays() {
             auto* wb = new wgpu::WebGPUBuffer{};
             wb->buffer = nullptr;  // not a real GPU buffer
             wb->size = 1024 * (1 + (i % 8));  // varied sizes
-            wb->host_size = wb->size;
             wb->cpu_ptr = nullptr;
-            wb->stores_bfloat16_as_f32 = false;
+            wb->cpu_dirty = false;
+            wb->gpu_has_data = false;
             permanent_bufs.push_back(wb);
         }
         fprintf(stderr, "[gpu_buffer_test] allocated 473 bufs, running 20 eval rounds...\n");

@@ -129,9 +129,7 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
     // Without this, virtual method implementations (referenced only via vtable
     // data relocations in the WASM data section) get discarded during archive
     // scanning, causing "function signature mismatch" at runtime.
-    // Distributed is excluded from the CMake build (WASI_SDK flag) to avoid
-    // pulling in ring/MPI/NCCL stubs that don't exist in WASM.
-    println!("cargo:rustc-link-lib=static=mlx");
+    println!("cargo:rustc-link-lib=static:+whole-archive=mlx");
 
     // No framework linking for WASI
 
