@@ -2,8 +2,12 @@
  * PaddleOCR-VL Full Model
  *
  * Combines vision encoder and language model for vision-language tasks.
+ *
+ * Architecture: dedicated model thread owns all state (weights, KV caches,
+ * tokenizer). NAPI methods dispatch commands via channels and await responses.
  */
 use crate::array::{MxArray, clear_cache};
+use crate::model_thread::ResponseTx;
 use crate::models::paddleocr_vl::chat::{
     ChatRole, VLMBatchItem, VLMChatConfig, VLMChatMessage, VLMChatResult,
 };
@@ -22,87 +26,187 @@ use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::SafeTensorsFile;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
-use napi::{Env, Status, bindgen_prelude::*, tokio};
+use napi::{Env, Status, bindgen_prelude::*};
 use napi_derive::napi;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+// ---------------------------------------------------------------------------
+// Inner model state — owned exclusively by the dedicated model thread
+// ---------------------------------------------------------------------------
+
+/// Internal model state owned exclusively by the dedicated model thread.
+///
+/// No `Arc<RwLock<>>` — the model thread has sole ownership.
+pub(crate) struct VLModelInner {
+    config: ModelConfig,
+    visual: Option<PaddleOCRVisionModel>,
+    language_model: Option<ERNIELanguageModel>,
+    /// Tokenizer for text encoding/decoding (Arc because tokenizer is Clone-expensive)
+    tokenizer: Option<Arc<Qwen3Tokenizer>>,
+}
+
+// ---------------------------------------------------------------------------
+// Command enum — dispatched from NAPI methods to the model thread
+// ---------------------------------------------------------------------------
+
+/// Commands dispatched from NAPI methods to the dedicated model thread.
+pub(crate) enum VLModelCmd {
+    Chat {
+        messages: Vec<VLMChatMessage>,
+        config: Option<VLMChatConfig>,
+        /// Image bytes extracted from Buffer (Buffer is !Send)
+        image_bytes: Option<Vec<Vec<u8>>>,
+        reply: ResponseTx<VLMChatResult>,
+    },
+    Generate {
+        input_ids: MxArray,
+        pixel_values: Option<MxArray>,
+        image_grid_thw: Option<MxArray>,
+        config: Option<GenerationConfig>,
+        reply: ResponseTx<GenerationResult>,
+    },
+    Batch {
+        items: Vec<SendableVLMBatchItem>,
+        config: Option<VLMChatConfig>,
+        reply: ResponseTx<Vec<VLMChatResult>>,
+    },
+    GetInputEmbeddings {
+        input_ids: MxArray,
+        image_features: Option<MxArray>,
+        image_grid_thw: Option<MxArray>,
+        reply: ResponseTx<MxArray>,
+    },
+    Forward {
+        input_ids: MxArray,
+        pixel_values: Option<MxArray>,
+        image_grid_thw: Option<MxArray>,
+        mask: Option<MxArray>,
+        reply: ResponseTx<MxArray>,
+    },
+    SetTokenizer {
+        tokenizer: Arc<Qwen3Tokenizer>,
+        reply: ResponseTx<()>,
+    },
+}
+
+/// A Send-safe version of VLMBatchItem where Buffer → Vec<u8>.
+pub(crate) struct SendableVLMBatchItem {
+    pub messages: Vec<VLMChatMessage>,
+    pub images: Option<Vec<Vec<u8>>>,
+}
+
+// ---------------------------------------------------------------------------
+// NAPI shell — thin wrapper around ModelThread
+// ---------------------------------------------------------------------------
 
 /// Vision-Language Model
 ///
 /// A generic VLM for OCR and document understanding tasks.
 /// Currently supports PaddleOCR-VL architecture (vision encoder + ERNIE language model).
+///
+/// All model state lives on a dedicated OS thread. NAPI methods dispatch
+/// commands via channels and await responses.
 #[napi(js_name = "VLModel")]
 pub struct VLModel {
+    thread: crate::model_thread::ModelThread<VLModelCmd>,
+    /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     config: ModelConfig,
-    visual: Option<Arc<PaddleOCRVisionModel>>,
-    /// Language model wrapped in RwLock for mutable KV cache access
-    language_model: Option<Arc<RwLock<ERNIELanguageModel>>>,
-    /// Tokenizer for text encoding/decoding
-    tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    /// Whether the model has been fully initialized (visual + language model loaded).
+    initialized: bool,
+    /// Whether a tokenizer has been set.
+    has_tokenizer_flag: bool,
 }
 
-#[napi]
-impl VLModel {
-    /// Create a new PaddleOCR-VL model
-    #[napi(constructor)]
-    pub fn new(config: ModelConfig) -> Self {
-        Self {
+// ---------------------------------------------------------------------------
+// Command handler
+// ---------------------------------------------------------------------------
+
+/// Command handler for the dedicated model thread.
+pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
+    match cmd {
+        VLModelCmd::Chat {
+            messages,
             config,
-            visual: None,
-            language_model: None,
-            tokenizer: None,
+            image_bytes,
+            reply,
+        } => {
+            let result = inner.chat_sync(messages, config, image_bytes);
+            let _ = reply.send(result);
+        }
+        VLModelCmd::Generate {
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            config,
+            reply,
+        } => {
+            let result = inner.generate_sync(
+                &input_ids,
+                pixel_values.as_ref(),
+                image_grid_thw.as_ref(),
+                config,
+            );
+            let _ = reply.send(result);
+        }
+        VLModelCmd::Batch {
+            items,
+            config,
+            reply,
+        } => {
+            let result = inner.batch_sync(items, config);
+            let _ = reply.send(result);
+        }
+        VLModelCmd::GetInputEmbeddings {
+            input_ids,
+            image_features,
+            image_grid_thw,
+            reply,
+        } => {
+            let result = inner.get_input_embeddings_sync(
+                &input_ids,
+                image_features.as_ref(),
+                image_grid_thw.as_ref(),
+            );
+            let _ = reply.send(result);
+        }
+        VLModelCmd::Forward {
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            mask,
+            reply,
+        } => {
+            let result = inner.forward_sync(
+                &input_ids,
+                pixel_values.as_ref(),
+                image_grid_thw.as_ref(),
+                mask.as_ref(),
+            );
+            let _ = reply.send(result);
+        }
+        VLModelCmd::SetTokenizer { tokenizer, reply } => {
+            inner.tokenizer = Some(tokenizer);
+            let _ = reply.send(Ok(()));
         }
     }
+}
 
-    /// Set the vision model (internal - used by VLModel::load())
-    pub fn set_visual(&mut self, visual: &PaddleOCRVisionModel) {
-        self.visual = Some(Arc::new(visual.clone()));
-    }
+// ---------------------------------------------------------------------------
+// VLModelInner implementation
+// ---------------------------------------------------------------------------
 
-    /// Set the language model (internal - used by VLModel::load())
-    pub fn set_language_model(&mut self, lm: &ERNIELanguageModel) {
-        self.language_model = Some(Arc::new(RwLock::new(lm.clone())));
-    }
-
-    /// Set the tokenizer
-    #[napi]
-    pub fn set_tokenizer(&mut self, tokenizer: &Qwen3Tokenizer) {
-        self.tokenizer = Some(Arc::new(tokenizer.clone()));
-    }
-
-    /// Check if tokenizer is available
-    #[napi(getter)]
-    pub fn has_tokenizer(&self) -> bool {
-        self.tokenizer.is_some()
-    }
-
-    /// Chat with the VLM model
-    ///
-    /// High-level API for conversational interaction with images.
-    ///
-    /// # Arguments
-    /// * `messages` - Chat messages (role + content)
-    /// * `config` - Chat configuration (including images for automatic processing)
-    ///
-    /// # Returns
-    /// * VLMChatResult with generated text
-    ///
-    /// # Example
-    /// ```typescript
-    /// const result = await model.chat(
-    ///   [{ role: 'user', content: 'Describe this image.' }],
-    ///   { images: [readFileSync('./photo.jpg')], maxNewTokens: 256 }
-    /// );
-    /// ```
-    #[napi]
-    pub async fn chat(
-        &self,
+impl VLModelInner {
+    /// Synchronous chat implementation. Runs on the dedicated model thread.
+    fn chat_sync(
+        &mut self,
         messages: Vec<VLMChatMessage>,
         config: Option<VLMChatConfig>,
+        image_bytes: Option<Vec<Vec<u8>>>,
     ) -> Result<VLMChatResult> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
@@ -111,11 +215,11 @@ impl VLModel {
             )
         })?;
 
-        // Merge passed config with defaults - any None fields use the default values
+        // Merge passed config with defaults
         let default_config = VLMChatConfig::default();
         let config = match config {
             Some(c) => VLMChatConfig {
-                images: c.images,
+                images: None, // already extracted into image_bytes
                 max_new_tokens: c.max_new_tokens.or(default_config.max_new_tokens),
                 temperature: c.temperature.or(default_config.temperature),
                 top_k: c.top_k.or(default_config.top_k),
@@ -134,130 +238,104 @@ impl VLModel {
             None => default_config,
         };
 
-        // spawn_blocking: image processing + tokenization (CPU-bound)
         let vision_config = self.config.vision_config.clone();
         let eos_token_id = self.config.eos_token_id;
-        let tokenizer_clone = tokenizer.clone();
-        let (input_ids, pixel_values, grid_thw, gen_config) =
-            napi::bindgen_prelude::spawn_blocking(move || {
-                // Process images if image buffers provided
-                let (pixel_values, grid_thw) = if let Some(ref images) = config.images {
-                    if images.is_empty() {
-                        (None, None)
-                    } else {
-                        let processor_config = ImageProcessorConfig {
-                            patch_size: vision_config.patch_size,
-                            merge_size: vision_config.spatial_merge_size,
-                            ..ImageProcessorConfig::default()
-                        };
-                        let processor = ImageProcessor::new(Some(processor_config));
-                        let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
-                        let processed = processor.process_many(&image_refs)?;
 
-                        let pv = processed.pixel_values();
-                        let pv_shape = pv.shape()?;
-                        let new_shape = BigInt64Array::from(vec![
-                            1i64,
-                            pv_shape[0],
-                            pv_shape[1],
-                            pv_shape[2],
-                            pv_shape[3],
-                        ]);
-                        let pixel_values = pv.reshape(&new_shape)?;
-                        let grid_thw = processed.grid_thw();
-                        (Some(pixel_values), Some(grid_thw))
-                    }
-                } else {
-                    (None, None)
+        // Process images
+        let (pixel_values, grid_thw) = if let Some(ref images) = image_bytes {
+            if images.is_empty() {
+                (None, None)
+            } else {
+                let processor_config = ImageProcessorConfig {
+                    patch_size: vision_config.patch_size,
+                    merge_size: vision_config.spatial_merge_size,
+                    ..ImageProcessorConfig::default()
                 };
+                let processor = ImageProcessor::new(Some(processor_config));
+                let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
+                let processed = processor.process_many(&image_refs)?;
 
-                // Count image tokens
-                let num_image_tokens = if let Some(ref grid) = grid_thw {
-                    grid.eval();
-                    let grid_data = grid.to_int32()?;
-                    let spatial_merge_size = vision_config.spatial_merge_size;
-                    let merge_factor = spatial_merge_size * spatial_merge_size;
-                    let mut total = 0i32;
-                    for i in 0..(grid_data.len() / 3) {
-                        let t = grid_data[i * 3];
-                        let h = grid_data[i * 3 + 1];
-                        let w = grid_data[i * 3 + 2];
-                        total += (t * h * w) / merge_factor;
-                    }
-                    Some(total as usize)
-                } else {
-                    None
-                };
+                let pv = processed.pixel_values();
+                let pv_shape = pv.shape()?;
+                let new_shape = BigInt64Array::from(vec![
+                    1i64,
+                    pv_shape[0],
+                    pv_shape[1],
+                    pv_shape[2],
+                    pv_shape[3],
+                ]);
+                let pixel_values = pv.reshape(&new_shape)?;
+                let grid_thw = processed.grid_thw();
+                (Some(pixel_values), Some(grid_thw))
+            }
+        } else {
+            (None, None)
+        };
 
-                // Format messages with image placeholders
-                let formatted =
-                    crate::models::paddleocr_vl::chat::format_vlm_chat(&messages, num_image_tokens);
+        // Count image tokens
+        let num_image_tokens = if let Some(ref grid) = grid_thw {
+            grid.eval();
+            let grid_data = grid.to_int32()?;
+            let spatial_merge_size = vision_config.spatial_merge_size;
+            let merge_factor = spatial_merge_size * spatial_merge_size;
+            let mut total = 0i32;
+            for i in 0..(grid_data.len() / 3) {
+                let t = grid_data[i * 3];
+                let h = grid_data[i * 3 + 1];
+                let w = grid_data[i * 3 + 2];
+                total += (t * h * w) / merge_factor;
+            }
+            Some(total as usize)
+        } else {
+            None
+        };
 
-                // Encode the text
-                let token_ids = tokenizer_clone.encode_sync(&formatted, None)?;
-                let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
+        // Format messages with image placeholders
+        let formatted =
+            crate::models::paddleocr_vl::chat::format_vlm_chat(&messages, num_image_tokens);
 
-                // Build generation config
-                let gen_config = GenerationConfig {
-                    max_new_tokens: config.max_new_tokens,
-                    temperature: config.temperature,
-                    top_k: config.top_k,
-                    top_p: config.top_p,
-                    min_p: None,
-                    repetition_penalty: config.repetition_penalty,
-                    repetition_context_size: None,
-                    presence_penalty: config.presence_penalty,
-                    presence_context_size: config.presence_context_size,
-                    frequency_penalty: config.frequency_penalty,
-                    frequency_context_size: config.frequency_context_size,
-                    max_consecutive_tokens: None,
-                    max_ngram_repeats: None,
-                    ngram_size: None,
-                    eos_token_id: Some(eos_token_id),
-                    return_logprobs: config.return_logprobs,
-                    prefill_step_size: None,
-                    kv_cache_bits: None,
-                    kv_cache_group_size: None,
-                    num_draft_tokens: None,
-                    report_performance: None,
-                };
+        // Encode the text
+        let token_ids = tokenizer.encode_sync(&formatted, None)?;
+        let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
-                Ok::<_, Error>((input_ids, pixel_values, grid_thw, gen_config))
-            })
-            .await
-            .map_err(|e| {
-                Error::new(
-                    Status::GenericFailure,
-                    format!("VLM chat preprocessing failed: {}", e),
-                )
-            })??;
+        // Build generation config
+        let gen_config = GenerationConfig {
+            max_new_tokens: config.max_new_tokens,
+            temperature: config.temperature,
+            top_k: config.top_k,
+            top_p: config.top_p,
+            min_p: None,
+            repetition_penalty: config.repetition_penalty,
+            repetition_context_size: None,
+            presence_penalty: config.presence_penalty,
+            presence_context_size: config.presence_context_size,
+            frequency_penalty: config.frequency_penalty,
+            frequency_context_size: config.frequency_context_size,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            eos_token_id: Some(eos_token_id),
+            return_logprobs: config.return_logprobs,
+            prefill_step_size: None,
+            kv_cache_bits: None,
+            kv_cache_group_size: None,
+            num_draft_tokens: None,
+            report_performance: None,
+        };
 
-        // Generate (already async)
-        let result = self
-            .generate(
-                &input_ids,
-                pixel_values.as_ref(),
-                grid_thw.as_ref(),
-                Some(gen_config),
-            )
-            .await?;
+        // Generate
+        let result = self.generate_sync(
+            &input_ids,
+            pixel_values.as_ref(),
+            grid_thw.as_ref(),
+            Some(gen_config),
+        )?;
 
-        // spawn_blocking: decode tokens → text (CPU-bound)
-        let result_tokens = result.tokens.clone();
-        let text = napi::bindgen_prelude::spawn_blocking(move || {
-            result_tokens.eval();
-            let tokens_vec = result_tokens.to_uint32()?;
-            let text = tokenizer.decode_sync(&tokens_vec, true)?;
-            let text = text.replace("<|im_end|>", "").trim().to_string();
-            Ok::<String, Error>(text)
-        })
-        .await
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("VLM chat decoding failed: {}", e),
-            )
-        })??;
+        // Decode tokens → text
+        result.tokens.eval();
+        let tokens_vec = result.tokens.to_uint32()?;
+        let text = tokenizer.decode_sync(&tokens_vec, true)?;
+        let text = text.replace("<|im_end|>", "").trim().to_string();
 
         Ok(VLMChatResult {
             text,
@@ -268,60 +346,8 @@ impl VLModel {
         })
     }
 
-    /// Simple OCR: extract text from encoded image bytes
-    ///
-    /// Convenience method that processes an image and extracts all text.
-    ///
-    /// # Arguments
-    /// * `image_data` - Encoded image bytes (PNG/JPEG)
-    /// * `prompt` - Optional custom prompt (default: "Extract all text from this image.")
-    ///
-    /// # Returns
-    /// * Extracted text as a string
-    ///
-    /// # Example
-    /// ```typescript
-    /// const text = await model.ocr(imageBuffer);
-    /// console.log(text);
-    /// ```
-    #[napi]
-    pub async fn ocr(&self, image_data: Buffer, prompt: Option<String>) -> Result<String> {
-        let prompt = prompt.unwrap_or_else(|| "Extract all text from this image.".to_string());
-
-        let messages = vec![VLMChatMessage {
-            role: ChatRole::User,
-            content: prompt,
-        }];
-
-        let config = VLMChatConfig {
-            images: Some(vec![image_data]),
-            ..Default::default()
-        };
-
-        let result = self.chat(messages, Some(config)).await?;
-
-        // Clean up common LaTeX wrappers from OCR output
-        let text = result.text;
-        let text = text
-            .strip_prefix("\\(\\text{")
-            .and_then(|s| s.strip_suffix("}\\)"))
-            .map(|s| s.to_string())
-            .unwrap_or(text);
-
-        Ok(text)
-    }
-
-    /// Get input embeddings with vision features merged
-    ///
-    /// # Arguments
-    /// * `input_ids` - Token IDs [batch, seq_len]
-    /// * `pixel_values` - Optional image patches [batch, seq, channels, patch_h, patch_w]
-    /// * `image_grid_thw` - Optional grid dimensions [num_images, 3]
-    ///
-    /// # Returns
-    /// * Input embeddings with vision features inserted at image token positions
-    #[napi]
-    pub fn get_input_embeddings(
+    /// Get input embeddings with vision features merged.
+    fn get_input_embeddings_sync(
         &self,
         input_ids: &MxArray,
         pixel_values: Option<&MxArray>,
@@ -331,16 +357,10 @@ impl VLModel {
             .language_model
             .as_ref()
             .ok_or_else(|| Error::new(Status::GenericFailure, "Language model not set"))?;
-        let lm_guard = lm.read().map_err(|_| {
-            Error::new(
-                Status::GenericFailure,
-                "Failed to acquire language model read lock",
-            )
-        })?;
 
         // If no images, just get text embeddings
         if pixel_values.is_none() {
-            return lm_guard.get_embeddings(input_ids);
+            return lm.get_embeddings(input_ids);
         }
 
         let pixel_values = pixel_values.unwrap();
@@ -357,7 +377,7 @@ impl VLModel {
             .ok_or_else(|| Error::new(Status::GenericFailure, "Vision model not set"))?;
 
         // Get text embeddings
-        let inputs_embeds = lm_guard.get_embeddings(input_ids)?;
+        let inputs_embeds = lm.get_embeddings(input_ids)?;
 
         // Get vision features
         let hidden_states = visual.forward(pixel_values, grid_thw)?;
@@ -371,7 +391,7 @@ impl VLModel {
         };
 
         // Merge vision features into text embeddings at image token positions
-        Self::merge_input_ids_with_image_features(
+        merge_input_ids_with_image_features(
             self.config.image_token_id,
             &hidden_states,
             &inputs_embeds,
@@ -379,282 +399,8 @@ impl VLModel {
         )
     }
 
-    /// Compute position IDs for multimodal RoPE
-    ///
-    /// This function computes proper 3D position IDs for image tokens:
-    /// - Text tokens get sequential positions [0, 1, 2, ...]
-    /// - Image tokens get 2D spatial positions based on grid_thw
-    ///
-    /// Returns (position_ids, rope_deltas) where:
-    /// - position_ids: [3, batch, seq_len] position indices for t, h, w
-    /// - rope_deltas: offset to add during decode phase
-    fn get_rope_index(
-        input_ids: &MxArray,
-        image_grid_thw: Option<&MxArray>,
-        spatial_merge_size: i32,
-        image_token_id: i32,
-    ) -> Result<(MxArray, i64)> {
-        let shape = input_ids.shape()?;
-        let batch_size = shape[0];
-        let seq_len = shape[1];
-
-        // If no images, use simple sequential positions
-        if image_grid_thw.is_none() {
-            let pos = MxArray::arange(0.0, seq_len as f64, Some(1.0), None)?;
-            let pos = pos.reshape(&[1, 1, seq_len])?;
-            let position_ids = MxArray::tile(&pos, &[3, batch_size as i32, 1])?;
-            return Ok((position_ids, 0));
-        }
-
-        let grid_thw = image_grid_thw.unwrap();
-
-        // Get input IDs and grid data
-        let input_ids_data = input_ids.to_int32()?;
-        grid_thw.eval();
-        let grid_data = grid_thw.to_int32()?;
-
-        // Process batch (currently supports batch_size=1)
-        // For each batch, we compute position IDs with proper 2D spatial encoding for images
-        let mut all_position_ids: Vec<Vec<i64>> = vec![Vec::new(); 3]; // [t, h, w] components
-
-        for batch_idx in 0..batch_size as usize {
-            let start = batch_idx * seq_len as usize;
-            let end = start + seq_len as usize;
-            let batch_tokens: Vec<i32> = input_ids_data[start..end].to_vec();
-
-            // Find positions of image tokens
-            let mut image_positions: Vec<usize> = Vec::new();
-            for (i, &token) in batch_tokens.iter().enumerate() {
-                if token == image_token_id {
-                    image_positions.push(i);
-                }
-            }
-
-            // If no image tokens, use sequential positions
-            if image_positions.is_empty() {
-                for i in 0..seq_len {
-                    all_position_ids[0].push(i);
-                    all_position_ids[1].push(i);
-                    all_position_ids[2].push(i);
-                }
-                continue;
-            }
-
-            // Get grid dimensions for ALL images
-            let num_images = grid_data.len() / 3;
-            if num_images == 0 || grid_data.len() % 3 != 0 {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    format!(
-                        "grid_data must have 3N elements for N images, got {} elements. \
-                        Ensure image_grid_thw is properly set when image tokens are present in input.",
-                        grid_data.len()
-                    ),
-                ));
-            }
-
-            // Calculate token info for each image
-            let mut total_expected_tokens = 0usize;
-            let mut image_token_info: Vec<(i64, i64, i64, usize)> = Vec::new();
-
-            for img_idx in 0..num_images {
-                let t = grid_data[img_idx * 3] as i64;
-                let h = grid_data[img_idx * 3 + 1] as i64;
-                let w = grid_data[img_idx * 3 + 2] as i64;
-
-                let llm_grid_t = t;
-                let llm_grid_h = h / spatial_merge_size as i64;
-                let llm_grid_w = w / spatial_merge_size as i64;
-                let num_tokens = (llm_grid_t * llm_grid_h * llm_grid_w) as usize;
-
-                image_token_info.push((llm_grid_t, llm_grid_h, llm_grid_w, num_tokens));
-                total_expected_tokens += num_tokens;
-            }
-
-            // Validate total image token count matches expected from grid dimensions
-            if total_expected_tokens != image_positions.len() {
-                return Err(Error::new(
-                    Status::GenericFailure,
-                    format!(
-                        "Image token count mismatch: expected {} tokens from {} images, \
-                        but found {} image tokens in prompt. \
-                        This likely indicates a bug in prompt formatting. Check that: \
-                        1) The image placeholder tokens match the expected count from grid_thw \
-                        2) spatial_merge_size ({}) in config matches the vision encoder output \
-                        3) grid_thw dimensions are computed correctly for the input images",
-                        total_expected_tokens,
-                        num_images,
-                        image_positions.len(),
-                        spatial_merge_size
-                    ),
-                ));
-            }
-
-            // Build position IDs
-            let image_start = image_positions[0];
-            let image_end = image_positions[image_positions.len() - 1] + 1;
-
-            // Text tokens before images: sequential positions
-            for i in 0..image_start {
-                all_position_ids[0].push(i as i64);
-                all_position_ids[1].push(i as i64);
-                all_position_ids[2].push(i as i64);
-            }
-
-            // Each image's 2D spatial positions
-            let mut current_pos = image_start as i64;
-            let mut max_pos = image_start as i64;
-
-            for (llm_grid_t, llm_grid_h, llm_grid_w, _) in &image_token_info {
-                for t_idx in 0..*llm_grid_t {
-                    for h_idx in 0..*llm_grid_h {
-                        for w_idx in 0..*llm_grid_w {
-                            all_position_ids[0].push(current_pos + t_idx);
-                            all_position_ids[1].push(current_pos + h_idx);
-                            all_position_ids[2].push(current_pos + w_idx);
-                        }
-                    }
-                }
-                let img_max = current_pos
-                    + std::cmp::max(
-                        *llm_grid_t - 1,
-                        std::cmp::max(*llm_grid_h - 1, *llm_grid_w - 1),
-                    );
-                max_pos = std::cmp::max(max_pos, img_max);
-                current_pos = img_max + 1;
-            }
-
-            // Text tokens after images: continue from max position
-            let next_pos = max_pos + 1;
-            for i in image_end..seq_len as usize {
-                let pos = next_pos + (i - image_end) as i64;
-                all_position_ids[0].push(pos);
-                all_position_ids[1].push(pos);
-                all_position_ids[2].push(pos);
-            }
-        }
-
-        // Convert to MxArray [3, batch, seq_len]
-        let total_len = all_position_ids[0].len();
-        let expected_len = (3 * batch_size * seq_len) as usize;
-        if total_len * 3 != expected_len {
-            return Err(Error::new(
-                Status::GenericFailure,
-                format!(
-                    "Position ID length mismatch: got {} * 3, expected {}",
-                    total_len, expected_len
-                ),
-            ));
-        }
-
-        // Stack the three components
-        let t_positions: Vec<i32> = all_position_ids[0].iter().map(|&x| x as i32).collect();
-        let h_positions: Vec<i32> = all_position_ids[1].iter().map(|&x| x as i32).collect();
-        let w_positions: Vec<i32> = all_position_ids[2].iter().map(|&x| x as i32).collect();
-
-        let t_arr = MxArray::from_int32(&t_positions, &[batch_size, seq_len])?;
-        let h_arr = MxArray::from_int32(&h_positions, &[batch_size, seq_len])?;
-        let w_arr = MxArray::from_int32(&w_positions, &[batch_size, seq_len])?;
-
-        let position_ids = MxArray::stack(vec![&t_arr, &h_arr, &w_arr], Some(0))?;
-
-        // Compute rope_deltas: max position - seq_len (for decode phase offset)
-        let max_position = *all_position_ids[0].iter().max().unwrap_or(&0);
-        let rope_deltas = max_position + 1 - seq_len;
-
-        Ok((position_ids, rope_deltas))
-    }
-
-    /// Merge image features into input embeddings at image token positions
-    fn merge_input_ids_with_image_features(
-        image_token_id: i32,
-        image_features: &MxArray,
-        inputs_embeds: &MxArray,
-        input_ids: &MxArray,
-    ) -> Result<MxArray> {
-        let input_shape = input_ids.shape()?;
-        let batch_size = input_shape[0];
-        let _seq_len = input_shape[1];
-
-        // Create image token mask
-        let image_token = MxArray::scalar_int(image_token_id)?;
-        let image_positions = input_ids.equal(&image_token)?;
-
-        let inputs_embeds_shape = inputs_embeds.shape()?;
-        let hidden_dim = inputs_embeds_shape[2];
-
-        let mut batch_outputs: Vec<MxArray> = Vec::new();
-        let mut feature_start_idx = 0i64;
-
-        for batch_idx in 0..batch_size {
-            // Get mask for this batch item
-            let batch_mask = image_positions.slice_axis(0, batch_idx, batch_idx + 1)?;
-            let batch_mask = batch_mask.squeeze(Some(&[0]))?;
-
-            // Count image tokens in this batch
-            let mask_sum = batch_mask.sum(None, None)?;
-            let num_positions = mask_sum.to_int32()?[0] as i64;
-
-            if num_positions > 0 {
-                // Extract features for this batch
-                let batch_features = image_features.slice_axis(
-                    0,
-                    feature_start_idx,
-                    feature_start_idx + num_positions,
-                )?;
-
-                // Get embeddings for this batch item
-                let batch_embeds = inputs_embeds.slice_axis(0, batch_idx, batch_idx + 1)?;
-                let batch_embeds = batch_embeds.squeeze(Some(&[0]))?;
-
-                // Create cumsum for feature indexing
-                let mask_int = batch_mask.astype(crate::array::DType::Int32)?;
-                let cumsum = mask_int.cumsum(0)?;
-
-                // Build feature indices: where mask is true, use cumsum-1; else use 0
-                let ones = MxArray::scalar_int(1)?;
-                let feature_indices = cumsum.sub(&ones)?;
-                let zeros =
-                    MxArray::zeros(&feature_indices.shape()?, Some(crate::array::DType::Int32))?;
-                let feature_indices = batch_mask.where_(&feature_indices, &zeros)?;
-
-                // Gather features using indices
-                let gathered_features = batch_features.take(&feature_indices, 0)?;
-
-                // Expand mask for broadcasting
-                let mask_expanded = batch_mask.reshape(&[-1, 1])?;
-                let mask_expanded =
-                    MxArray::broadcast_to(&mask_expanded, &[batch_mask.shape()?[0], hidden_dim])?;
-
-                // Combine: use gathered_features where mask is true, else use original embeds
-                let batch_output = mask_expanded.where_(&gathered_features, &batch_embeds)?;
-
-                batch_outputs.push(batch_output);
-                feature_start_idx += num_positions;
-            } else {
-                // No image tokens in this batch item
-                let batch_embeds = inputs_embeds.slice_axis(0, batch_idx, batch_idx + 1)?;
-                batch_outputs.push(batch_embeds.squeeze(Some(&[0]))?);
-            }
-        }
-
-        // Stack all batch outputs
-        let refs: Vec<&MxArray> = batch_outputs.iter().collect();
-        MxArray::stack(refs, Some(0))
-    }
-
-    /// Forward pass
-    ///
-    /// # Arguments
-    /// * `input_ids` - Token IDs [batch, seq_len]
-    /// * `pixel_values` - Optional image patches
-    /// * `image_grid_thw` - Optional grid dimensions
-    /// * `mask` - Optional attention mask
-    ///
-    /// # Returns
-    /// * Logits [batch, seq_len, vocab_size]
-    #[napi]
-    pub fn forward(
+    /// Forward pass through the full model.
+    fn forward_sync(
         &self,
         input_ids: &MxArray,
         pixel_values: Option<&MxArray>,
@@ -665,467 +411,373 @@ impl VLModel {
             .language_model
             .as_ref()
             .ok_or_else(|| Error::new(Status::GenericFailure, "Language model not set"))?;
-        let lm_guard = lm.read().map_err(|_| {
-            Error::new(
-                Status::GenericFailure,
-                "Failed to acquire language model read lock",
-            )
-        })?;
 
         // Get merged embeddings
-        let inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, image_grid_thw)?;
+        let inputs_embeds =
+            self.get_input_embeddings_sync(input_ids, pixel_values, image_grid_thw)?;
 
         // Forward through language model
-        lm_guard.forward(input_ids, Some(&inputs_embeds), mask, None)
+        lm.forward(input_ids, Some(&inputs_embeds), mask, None)
     }
 
-    /// Generate text tokens given input tokens and optional image
-    ///
-    /// Uses KV caching for efficient generation - each step only processes the
-    /// new token(s) while reusing cached key-value states from previous tokens.
-    /// Vision features are computed once at the start and cached.
-    ///
-    /// # Arguments
-    /// * `input_ids` - Input token IDs [1, seq_len]
-    /// * `pixel_values` - Optional image patches [1, num_patches, C, H, W]
-    /// * `image_grid_thw` - Optional grid dimensions [1, 3]
-    /// * `config` - Generation configuration
-    ///
-    /// # Returns
-    /// * GenerationResult with tokens, logprobs, and finish reason
-    #[napi]
-    pub async fn generate(
-        &self,
+    /// Synchronous generate. Runs on the dedicated model thread.
+    fn generate_sync(
+        &mut self,
         input_ids: &MxArray,
         pixel_values: Option<&MxArray>,
         image_grid_thw: Option<&MxArray>,
         config: Option<GenerationConfig>,
     ) -> Result<GenerationResult> {
         let config = config.unwrap_or_default();
-
-        // Clone Arc fields and input arrays before the closure
-        let visual_arc = self.visual.clone();
-        let lm_arc = self
-            .language_model
-            .clone()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Language model not set"))?;
         let model_config = self.config.clone();
-        let input_ids = input_ids.clone();
-        let pixel_values = pixel_values.cloned();
-        let image_grid_thw = image_grid_thw.cloned();
 
-        napi::bindgen_prelude::spawn_blocking(move || {
-            // Extract config with defaults - aligned with mlx-vlm generate_step defaults
-            let max_new_tokens = config.max_new_tokens.unwrap_or(256); // mlx-vlm DEFAULT_MAX_TOKENS
-            let temperature = config.temperature.unwrap_or(0.0); // mlx-vlm: greedy by default
-            let top_k = config.top_k.unwrap_or(0);
-            let top_p = config.top_p.unwrap_or(1.0);
-            let min_p = config.min_p.unwrap_or(0.0);
-            let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-            let repetition_context_size = config.repetition_context_size.unwrap_or(20);
-            let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-            let presence_context_size = config.presence_context_size.unwrap_or(20);
-            let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-            let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-            let eos_token_id = config.eos_token_id.unwrap_or(model_config.eos_token_id);
-            let return_logprobs = config.return_logprobs.unwrap_or(false);
+        // Extract config with defaults
+        let max_new_tokens = config.max_new_tokens.unwrap_or(256);
+        let temperature = config.temperature.unwrap_or(0.0);
+        let top_k = config.top_k.unwrap_or(0);
+        let top_p = config.top_p.unwrap_or(1.0);
+        let min_p = config.min_p.unwrap_or(0.0);
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(20);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+        let eos_token_id = config.eos_token_id.unwrap_or(model_config.eos_token_id);
+        let return_logprobs = config.return_logprobs.unwrap_or(false);
 
-            debug!(
-                "Starting VLM generation with KV cache: max_tokens={}, temp={}, top_k={}, top_p={}, rep_penalty={}",
-                max_new_tokens, temperature, top_k, top_p, repetition_penalty
-            );
+        debug!(
+            "Starting VLM generation with KV cache: max_tokens={}, temp={}, top_k={}, top_p={}, rep_penalty={}",
+            max_new_tokens, temperature, top_k, top_p, repetition_penalty
+        );
 
-            // Create dedicated generation stream for GPU-CPU pipelining.
-            let generation_stream = Stream::new(DeviceType::Gpu);
+        // Create dedicated generation stream for GPU-CPU pipelining.
+        let generation_stream = Stream::new(DeviceType::Gpu);
 
-            // Prepare sampling config
-            let sampling_config = SamplingConfig {
-                temperature: Some(temperature),
-                top_k: Some(top_k),
-                top_p: Some(top_p),
-                min_p: Some(min_p),
-            };
+        // Prepare sampling config
+        let sampling_config = SamplingConfig {
+            temperature: Some(temperature),
+            top_k: Some(top_k),
+            top_p: Some(top_p),
+            min_p: Some(min_p),
+        };
 
-            // Get language model with write access for KV cache
-            let mut lm_guard = lm_arc.write().map_err(|_| {
-                Error::new(
-                    Status::GenericFailure,
-                    "Failed to acquire language model write lock",
-                )
-            })?;
+        // Get language model with mutable access for KV cache
+        let lm = self
+            .language_model
+            .as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Language model not set"))?;
 
-            // Initialize fused KV caches for this generation (C++ forward pass)
-            lm_guard.init_fused_kv_caches();
+        // Initialize fused KV caches for this generation (C++ forward pass)
+        lm.init_fused_kv_caches();
 
-            // Reset position state for new generation (critical for multimodal)
-            lm_guard.reset_position_state();
+        // Reset position state for new generation (critical for multimodal)
+        lm.reset_position_state();
 
-            // === STEP 1: Compute vision features ONCE ===
-            let vision_features = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                if let (Some(pv), Some(grid)) = (&pixel_values, &image_grid_thw) {
-                    let visual = visual_arc
-                        .as_ref()
-                        .ok_or_else(|| Error::new(Status::GenericFailure, "Vision model not set"))?;
-                    Some(visual.forward(pv, grid)?)
-                } else {
-                    None
-                }
-            };
-
-            // === STEP 2: Compute proper position IDs for mRoPE ===
-            let (position_ids, rope_deltas) = VLModel::get_rope_index(
-                &input_ids,
-                image_grid_thw.as_ref(),
-                model_config.vision_config.spatial_merge_size,
-                model_config.image_token_id,
-            )?;
-            debug!("Computed position_ids with rope_deltas: {}", rope_deltas);
-
-            // Store position state for decode phase
-            lm_guard.set_position_state(position_ids.clone(), rope_deltas);
-
-            // === STEP 3: Prefill - process prompt with vision features ===
-            let inputs_embeds = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                let embeds = lm_guard.get_embeddings(&input_ids)?;
-                if let Some(ref vf) = vision_features {
-                    let embed_dtype = embeds.dtype()?;
-                    let vf_cast = if vf.dtype()? != embed_dtype {
-                        vf.astype(embed_dtype)?
-                    } else {
-                        vf.clone()
-                    };
-                    VLModel::merge_input_ids_with_image_features(
-                        model_config.image_token_id,
-                        &vf_cast,
-                        &embeds,
-                        &input_ids,
-                    )?
-                } else {
-                    embeds
-                }
-            };
-
-            // Chunked prefill
-            let prefill_step_size: i64 = 2048;
-            let seq_len = inputs_embeds.shape_at(1)?;
-
-            let mut last_logits = if seq_len > prefill_step_size {
-                let mut offset: i64 = 0;
-                let mut chunk_logits = None;
-
-                while offset < seq_len {
-                    let chunk_end = std::cmp::min(offset + prefill_step_size, seq_len);
-                    let n_to_process = if chunk_end < seq_len {
-                        chunk_end - offset
-                    } else {
-                        seq_len - offset
-                    };
-
-                    let chunk_embeds = inputs_embeds.slice_axis(1, offset, offset + n_to_process)?;
-                    let chunk_pos = position_ids.slice_axis(2, offset, offset + n_to_process)?;
-
-                    {
-                        let _stream_ctx = StreamContext::new(generation_stream);
-                        chunk_logits = Some(lm_guard.forward_fused(&chunk_embeds, &chunk_pos)?);
-                    }
-
-                    lm_guard.eval_fused_kv_caches();
-                    clear_cache();
-
-                    offset += n_to_process;
-                }
-
-                let logits = chunk_logits.unwrap();
-                let last_seq = logits.shape_at(1)?;
-                logits
-                    .slice_axis(1, last_seq - 1, last_seq)?
-                    .squeeze(Some(&[0, 1]))?
+        // === STEP 1: Compute vision features ONCE ===
+        let vision_features = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            if let (Some(pv), Some(grid)) = (pixel_values, image_grid_thw) {
+                let visual = self
+                    .visual
+                    .as_ref()
+                    .ok_or_else(|| Error::new(Status::GenericFailure, "Vision model not set"))?;
+                Some(visual.forward(pv, grid)?)
             } else {
-                let logits = {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    lm_guard.forward_fused(&inputs_embeds, &position_ids)?
+                None
+            }
+        };
+
+        // === STEP 2: Compute proper position IDs for mRoPE ===
+        let (position_ids, rope_deltas) = get_rope_index(
+            input_ids,
+            image_grid_thw,
+            model_config.vision_config.spatial_merge_size,
+            model_config.image_token_id,
+        )?;
+        debug!("Computed position_ids with rope_deltas: {}", rope_deltas);
+
+        // Store position state for decode phase
+        lm.set_position_state(position_ids.clone(), rope_deltas);
+
+        // === STEP 3: Prefill - process prompt with vision features ===
+        let inputs_embeds = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let embeds = lm.get_embeddings(input_ids)?;
+            if let Some(ref vf) = vision_features {
+                let embed_dtype = embeds.dtype()?;
+                let vf_cast = if vf.dtype()? != embed_dtype {
+                    vf.astype(embed_dtype)?
+                } else {
+                    vf.clone()
                 };
-                lm_guard.eval_fused_kv_caches();
-                clear_cache();
-                logits
-                    .slice_axis(1, seq_len - 1, seq_len)?
-                    .squeeze(Some(&[0, 1]))?
-            };
-
-            // Get input tokens for repetition penalty context
-            let input_tokens = input_ids.to_uint32()?;
-            let mut all_tokens: Vec<u32> = input_tokens.to_vec();
-
-            // Apply repetition penalty to first token if enabled
-            if repetition_penalty != 1.0 {
-                last_logits = apply_repetition_penalty(
-                    &last_logits,
-                    &all_tokens,
-                    repetition_penalty,
-                    Some(repetition_context_size),
-                )?;
-            }
-            if presence_penalty != 0.0 {
-                last_logits = apply_presence_penalty(
-                    &last_logits,
-                    &all_tokens,
-                    presence_penalty,
-                    Some(presence_context_size),
-                )?;
-            }
-            if frequency_penalty != 0.0 {
-                last_logits = apply_frequency_penalty(
-                    &last_logits,
-                    &all_tokens,
-                    frequency_penalty,
-                    Some(frequency_context_size),
-                )?;
-            }
-
-            // Sample first token
-            let (mut token, mut logprobs_arr): (MxArray, Option<MxArray>) = if return_logprobs {
-                let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
-                (tok, Some(lp))
+                merge_input_ids_with_image_features(
+                    model_config.image_token_id,
+                    &vf_cast,
+                    &embeds,
+                    input_ids,
+                )?
             } else {
-                let tok = sample(&last_logits, Some(sampling_config))?;
-                (tok, None)
-            };
+                embeds
+            }
+        };
 
-            // Synchronously evaluate the first token
-            if return_logprobs {
-                if let Some(ref lp) = logprobs_arr {
-                    MxArray::async_eval_arrays(&[&token, lp]);
+        // Chunked prefill
+        let prefill_step_size: i64 = 2048;
+        let seq_len = inputs_embeds.shape_at(1)?;
+
+        let mut last_logits = if seq_len > prefill_step_size {
+            let mut offset: i64 = 0;
+            let mut chunk_logits = None;
+
+            while offset < seq_len {
+                let chunk_end = std::cmp::min(offset + prefill_step_size, seq_len);
+                let n_to_process = if chunk_end < seq_len {
+                    chunk_end - offset
                 } else {
-                    MxArray::async_eval_arrays(&[&token]);
+                    seq_len - offset
+                };
+
+                let chunk_embeds = inputs_embeds.slice_axis(1, offset, offset + n_to_process)?;
+                let chunk_pos = position_ids.slice_axis(2, offset, offset + n_to_process)?;
+
+                {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    chunk_logits = Some(lm.forward_fused(&chunk_embeds, &chunk_pos)?);
                 }
+
+                lm.eval_fused_kv_caches();
+                clear_cache();
+
+                offset += n_to_process;
+            }
+
+            let logits = chunk_logits.unwrap();
+            let last_seq = logits.shape_at(1)?;
+            logits
+                .slice_axis(1, last_seq - 1, last_seq)?
+                .squeeze(Some(&[0, 1]))?
+        } else {
+            let logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                lm.forward_fused(&inputs_embeds, &position_ids)?
+            };
+            lm.eval_fused_kv_caches();
+            clear_cache();
+            logits
+                .slice_axis(1, seq_len - 1, seq_len)?
+                .squeeze(Some(&[0, 1]))?
+        };
+
+        // Get input tokens for repetition penalty context
+        let input_tokens = input_ids.to_uint32()?;
+        let mut all_tokens: Vec<u32> = input_tokens.to_vec();
+
+        // Apply repetition penalty to first token if enabled
+        if repetition_penalty != 1.0 {
+            last_logits = apply_repetition_penalty(
+                &last_logits,
+                &all_tokens,
+                repetition_penalty,
+                Some(repetition_context_size),
+            )?;
+        }
+        if presence_penalty != 0.0 {
+            last_logits = apply_presence_penalty(
+                &last_logits,
+                &all_tokens,
+                presence_penalty,
+                Some(presence_context_size),
+            )?;
+        }
+        if frequency_penalty != 0.0 {
+            last_logits = apply_frequency_penalty(
+                &last_logits,
+                &all_tokens,
+                frequency_penalty,
+                Some(frequency_context_size),
+            )?;
+        }
+
+        // Sample first token
+        let (mut token, mut logprobs_arr): (MxArray, Option<MxArray>) = if return_logprobs {
+            let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
+            (tok, Some(lp))
+        } else {
+            let tok = sample(&last_logits, Some(sampling_config))?;
+            (tok, None)
+        };
+
+        // Synchronously evaluate the first token
+        if return_logprobs {
+            if let Some(ref lp) = logprobs_arr {
+                MxArray::async_eval_arrays(&[&token, lp]);
             } else {
                 MxArray::async_eval_arrays(&[&token]);
             }
-            token.eval();
+        } else {
+            MxArray::async_eval_arrays(&[&token]);
+        }
+        token.eval();
 
-            // Track generated tokens
-            let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
-            let mut generated_logprobs: Vec<f32> = if return_logprobs {
-                Vec::with_capacity(max_new_tokens as usize)
-            } else {
-                Vec::new()
-            };
-            let mut finish_reason = "length";
+        // Track generated tokens
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut generated_logprobs: Vec<f32> = if return_logprobs {
+            Vec::with_capacity(max_new_tokens as usize)
+        } else {
+            Vec::new()
+        };
+        let mut finish_reason = "length";
 
-            let ngram_size = config.ngram_size.unwrap_or(0);
+        let ngram_size = config.ngram_size.unwrap_or(0);
 
-            // === STEP 4: Pipelined decode loop ===
-            #[allow(clippy::needless_range_loop)]
-            for step in 0..max_new_tokens {
-                let (next_tok, next_lp) = {
-                    let _stream_ctx = StreamContext::new(generation_stream);
+        // === STEP 4: Pipelined decode loop ===
+        #[allow(clippy::needless_range_loop)]
+        for step in 0..max_new_tokens {
+            let (next_tok, next_lp) = {
+                let _stream_ctx = StreamContext::new(generation_stream);
 
-                    let token_2d = token.reshape(&[1, 1])?;
-                    let input_embeds = lm_guard.get_embeddings(&token_2d)?;
+                let token_2d = token.reshape(&[1, 1])?;
+                let input_embeds = lm.get_embeddings(&token_2d)?;
 
-                    let rope_deltas = lm_guard.get_rope_deltas().unwrap_or(0);
-                    let cache_offset = lm_guard.get_fused_cache_offset() as i64;
-                    let pos_value = (cache_offset + rope_deltas) as f32;
-                    let decode_pos =
-                        MxArray::from_float32(&[pos_value], &[1, 1, 1])?.broadcast_to(&[3, 1, 1])?;
+                let rope_deltas = lm.get_rope_deltas().unwrap_or(0);
+                let cache_offset = lm.get_fused_cache_offset() as i64;
+                let pos_value = (cache_offset + rope_deltas) as f32;
+                let decode_pos =
+                    MxArray::from_float32(&[pos_value], &[1, 1, 1])?.broadcast_to(&[3, 1, 1])?;
 
-                    let logits = lm_guard.forward_fused(&input_embeds, &decode_pos)?;
-                    let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
+                let logits = lm.forward_fused(&input_embeds, &decode_pos)?;
+                let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
 
-                    // Append the previous token to all_tokens BEFORE applying penalties,
-                    // so the penalty functions see the most recent token.
-                    token.eval();
-                    let token_value = token.item_at_int32(0)? as u32;
-                    generated_tokens.push(token_value);
-                    all_tokens.push(token_value);
+                // Append the previous token to all_tokens BEFORE applying penalties,
+                // so the penalty functions see the most recent token.
+                token.eval();
+                let token_value = token.item_at_int32(0)? as u32;
+                generated_tokens.push(token_value);
+                all_tokens.push(token_value);
 
-                    if return_logprobs && let Some(ref lp) = logprobs_arr {
-                        lp.eval();
-                        let token_logprob = lp.item_at_float32(token_value as usize)?;
-                        generated_logprobs.push(token_logprob);
-                    }
+                if return_logprobs && let Some(ref lp) = logprobs_arr {
+                    lp.eval();
+                    let token_logprob = lp.item_at_float32(token_value as usize)?;
+                    generated_logprobs.push(token_logprob);
+                }
 
-                    if repetition_penalty != 1.0 {
-                        next_logits = apply_repetition_penalty(
-                            &next_logits,
-                            &all_tokens,
-                            repetition_penalty,
-                            Some(repetition_context_size),
-                        )?;
-                    }
-                    if presence_penalty != 0.0 {
-                        next_logits = apply_presence_penalty(
-                            &next_logits,
-                            &all_tokens,
-                            presence_penalty,
-                            Some(presence_context_size),
-                        )?;
-                    }
-                    if frequency_penalty != 0.0 {
-                        next_logits = apply_frequency_penalty(
-                            &next_logits,
-                            &all_tokens,
-                            frequency_penalty,
-                            Some(frequency_context_size),
-                        )?;
-                    }
+                if repetition_penalty != 1.0 {
+                    next_logits = apply_repetition_penalty(
+                        &next_logits,
+                        &all_tokens,
+                        repetition_penalty,
+                        Some(repetition_context_size),
+                    )?;
+                }
+                if presence_penalty != 0.0 {
+                    next_logits = apply_presence_penalty(
+                        &next_logits,
+                        &all_tokens,
+                        presence_penalty,
+                        Some(presence_context_size),
+                    )?;
+                }
+                if frequency_penalty != 0.0 {
+                    next_logits = apply_frequency_penalty(
+                        &next_logits,
+                        &all_tokens,
+                        frequency_penalty,
+                        Some(frequency_context_size),
+                    )?;
+                }
 
-                    let (tok, lp): (MxArray, Option<MxArray>) = if return_logprobs {
-                        let (t, l) = sample_and_logprobs(&next_logits, Some(sampling_config))?;
-                        (t, Some(l))
-                    } else {
-                        (sample(&next_logits, Some(sampling_config))?, None)
-                    };
-
-                    (tok, lp)
+                let (tok, lp): (MxArray, Option<MxArray>) = if return_logprobs {
+                    let (t, l) = sample_and_logprobs(&next_logits, Some(sampling_config))?;
+                    (t, Some(l))
+                } else {
+                    (sample(&next_logits, Some(sampling_config))?, None)
                 };
 
-                if return_logprobs {
-                    if let Some(ref lp) = next_lp {
-                        MxArray::async_eval_arrays(&[&next_tok, lp]);
-                    } else {
-                        MxArray::async_eval_arrays(&[&next_tok]);
-                    }
+                (tok, lp)
+            };
+
+            if return_logprobs {
+                if let Some(ref lp) = next_lp {
+                    MxArray::async_eval_arrays(&[&next_tok, lp]);
                 } else {
                     MxArray::async_eval_arrays(&[&next_tok]);
                 }
+            } else {
+                MxArray::async_eval_arrays(&[&next_tok]);
+            }
 
-                // Token was already evaluated and pushed above (before penalties)
-                let token_value = *all_tokens.last().unwrap();
+            // Token was already evaluated and pushed above (before penalties)
+            let token_value = *all_tokens.last().unwrap();
 
-                if token_value == eos_token_id as u32 {
-                    finish_reason = "stop";
-                    break;
-                }
+            if token_value == eos_token_id as u32 {
+                finish_reason = "stop";
+                break;
+            }
 
-                let min_pattern_len = 8;
-                let max_pattern_len = ngram_size as usize;
-                if ngram_size > 0 && generated_tokens.len() >= (min_pattern_len * 2) {
-                    let len = generated_tokens.len();
+            let min_pattern_len = 8;
+            let max_pattern_len = ngram_size as usize;
+            if ngram_size > 0 && generated_tokens.len() >= (min_pattern_len * 2) {
+                let len = generated_tokens.len();
 
-                    for pattern_len in min_pattern_len..=max_pattern_len.min(len / 2) {
-                        let pattern1_start = len - pattern_len * 2;
-                        let pattern2_start = len - pattern_len;
+                for pattern_len in min_pattern_len..=max_pattern_len.min(len / 2) {
+                    let pattern1_start = len - pattern_len * 2;
+                    let pattern2_start = len - pattern_len;
 
-                        let pattern1 = &generated_tokens[pattern1_start..pattern1_start + pattern_len];
-                        let pattern2 = &generated_tokens[pattern2_start..];
+                    let pattern1 = &generated_tokens[pattern1_start..pattern1_start + pattern_len];
+                    let pattern2 = &generated_tokens[pattern2_start..];
 
-                        if pattern1 == pattern2 {
-                            debug!(
-                                "Detected {}-token pattern repetition, stopping",
-                                pattern_len
-                            );
-                            finish_reason = "repetition";
-                            generated_tokens.truncate(pattern2_start);
-                            generated_logprobs.truncate(pattern2_start);
-                            break;
-                        }
-                    }
-
-                    if finish_reason == "repetition" {
+                    if pattern1 == pattern2 {
+                        debug!(
+                            "Detected {}-token pattern repetition, stopping",
+                            pattern_len
+                        );
+                        finish_reason = "repetition";
+                        generated_tokens.truncate(pattern2_start);
+                        generated_logprobs.truncate(pattern2_start);
                         break;
                     }
                 }
 
-                if step > 0 && step % 256 == 0 {
-                    clear_cache();
+                if finish_reason == "repetition" {
+                    break;
                 }
-
-                token = next_tok;
-                logprobs_arr = next_lp;
             }
 
-            // Reset fused caches after generation
-            lm_guard.reset_fused_kv_caches();
+            if step > 0 && step % 256 == 0 {
+                clear_cache();
+            }
 
-            // Build result
-            let tokens_array =
-                MxArray::from_uint32(&generated_tokens, &[generated_tokens.len() as i64])?;
-            let logprobs_array = if return_logprobs {
-                MxArray::from_float32(&generated_logprobs, &[generated_logprobs.len() as i64])?
-            } else {
-                MxArray::from_float32(&[], &[0])?
-            };
+            token = next_tok;
+            logprobs_arr = next_lp;
+        }
 
-            Ok(GenerationResult {
-                text: String::new(),
-                tokens: tokens_array,
-                logprobs: logprobs_array,
-                finish_reason: finish_reason.to_string(),
-                num_tokens: generated_tokens.len(),
-                first_token_elapsed_ms: None,
-            })
+        // Reset fused caches after generation
+        lm.reset_fused_kv_caches();
+
+        // Build result
+        let tokens_array =
+            MxArray::from_uint32(&generated_tokens, &[generated_tokens.len() as i64])?;
+        let logprobs_array = if return_logprobs {
+            MxArray::from_float32(&generated_logprobs, &[generated_logprobs.len() as i64])?
+        } else {
+            MxArray::from_float32(&[], &[0])?
+        };
+
+        Ok(GenerationResult {
+            text: String::new(),
+            tokens: tokens_array,
+            logprobs: logprobs_array,
+            finish_reason: finish_reason.to_string(),
+            num_tokens: generated_tokens.len(),
+            first_token_elapsed_ms: None,
         })
-        .await
-        .map_err(|e| Error::new(Status::GenericFailure, format!("VLM generation failed: {}", e)))?
     }
 
-    /// Batch OCR: extract text from multiple images simultaneously
-    ///
-    /// Processes N images with sequential prefill + batched decode for ~N× decode throughput.
-    ///
-    /// # Arguments
-    /// * `images` - Encoded image buffers
-    /// * `config` - Optional chat configuration (shared across all items)
-    ///
-    /// # Returns
-    /// * Vec of extracted text strings, one per image
-    ///
-    /// # Example
-    /// ```typescript
-    /// import { readFileSync } from 'fs';
-    /// const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
-    /// const texts = await model.ocrBatch(images);
-    /// ```
-    #[napi]
-    pub async fn ocr_batch(
-        &self,
-        images: Vec<Buffer>,
-        config: Option<VLMChatConfig>,
-    ) -> Result<Vec<String>> {
-        let prompt = "Extract all text from this image.".to_string();
-
-        let batch: Vec<VLMBatchItem> = images
-            .into_iter()
-            .map(|image_data| VLMBatchItem {
-                messages: vec![VLMChatMessage {
-                    role: ChatRole::User,
-                    content: prompt.clone(),
-                }],
-                images: Some(vec![image_data]),
-            })
-            .collect();
-
-        let results = self.batch(batch, config).await?;
-
-        Ok(results
-            .into_iter()
-            .map(|r| {
-                let text = r.text;
-                text.strip_prefix("\\(\\text{")
-                    .and_then(|s| s.strip_suffix("}\\)"))
-                    .map(|s| s.to_string())
-                    .unwrap_or(text)
-            })
-            .collect())
-    }
-
-    /// Batch chat: process multiple items simultaneously
-    ///
-    /// Sequential prefill + batched decode. Each item can have different images/prompts.
-    ///
-    /// # Arguments
-    /// * `batch` - Batch items, each with messages and optional images
-    /// * `config` - Optional shared chat configuration
-    ///
-    /// # Returns
-    /// * Vec of VLMChatResult, one per batch item
-    #[napi]
-    pub async fn batch(
-        &self,
-        batch: Vec<VLMBatchItem>,
+    /// Synchronous batch processing. Runs on the dedicated model thread.
+    fn batch_sync(
+        &mut self,
+        batch: Vec<SendableVLMBatchItem>,
         config: Option<VLMChatConfig>,
     ) -> Result<Vec<VLMChatResult>> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
@@ -1144,11 +796,8 @@ impl VLModel {
             let item = &batch[0];
             let default_cfg = VLMChatConfig::default();
             let base = config.as_ref().unwrap_or(&default_cfg);
-            let c = Some(VLMChatConfig {
-                images: item
-                    .images
-                    .as_ref()
-                    .map(|imgs| imgs.iter().map(|b| Buffer::from(b.to_vec())).collect()),
+            let merged_config = Some(VLMChatConfig {
+                images: None, // already extracted
                 max_new_tokens: base.max_new_tokens,
                 temperature: base.temperature,
                 top_k: base.top_k,
@@ -1160,7 +809,8 @@ impl VLModel {
                 frequency_context_size: base.frequency_context_size,
                 return_logprobs: base.return_logprobs,
             });
-            let result = self.chat(item.messages.clone(), c).await?;
+            let result =
+                self.chat_sync(item.messages.clone(), merged_config, item.images.clone())?;
             return Ok(vec![result]);
         }
 
@@ -1186,159 +836,138 @@ impl VLModel {
             None => default_config,
         };
 
-        // Clone Arc fields for use inside spawn_blocking
-        let visual_arc = self.visual.clone();
-        let lm_arc = self
-            .language_model
-            .clone()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Language model not set"))?;
-        let model_config = self.config.clone();
-        let tokenizer_clone = tokenizer.clone();
+        let model_config = &self.config;
 
-        // spawn_blocking: image processing + tokenization + generate_batch + decoding
-        napi::bindgen_prelude::spawn_blocking(move || {
-            let gen_config = GenerationConfig {
-                max_new_tokens: config.max_new_tokens,
-                temperature: config.temperature,
-                top_k: config.top_k,
-                top_p: config.top_p,
-                min_p: None,
-                repetition_penalty: config.repetition_penalty,
-                repetition_context_size: None,
-                presence_penalty: config.presence_penalty,
-                presence_context_size: config.presence_context_size,
-                frequency_penalty: config.frequency_penalty,
-                frequency_context_size: config.frequency_context_size,
-                max_consecutive_tokens: None,
-                max_ngram_repeats: None,
-                ngram_size: None,
-                eos_token_id: Some(model_config.eos_token_id),
-                return_logprobs: config.return_logprobs,
-                prefill_step_size: None,
-                kv_cache_bits: None,
-                kv_cache_group_size: None,
-                num_draft_tokens: None,
-                report_performance: None,
+        let gen_config = GenerationConfig {
+            max_new_tokens: config.max_new_tokens,
+            temperature: config.temperature,
+            top_k: config.top_k,
+            top_p: config.top_p,
+            min_p: None,
+            repetition_penalty: config.repetition_penalty,
+            repetition_context_size: None,
+            presence_penalty: config.presence_penalty,
+            presence_context_size: config.presence_context_size,
+            frequency_penalty: config.frequency_penalty,
+            frequency_context_size: config.frequency_context_size,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            eos_token_id: Some(model_config.eos_token_id),
+            return_logprobs: config.return_logprobs,
+            prefill_step_size: None,
+            kv_cache_bits: None,
+            kv_cache_group_size: None,
+            num_draft_tokens: None,
+            report_performance: None,
+        };
+
+        // Prepare per-item inputs
+        let batch_size = batch.len();
+        let mut all_input_ids = Vec::with_capacity(batch_size);
+        let mut all_pixel_values = Vec::with_capacity(batch_size);
+        let mut all_grid_thws = Vec::with_capacity(batch_size);
+
+        for item in &batch {
+            let (pixel_values, grid_thw) = if let Some(ref images) = item.images {
+                if images.is_empty() {
+                    (None, None)
+                } else {
+                    let processor_config = ImageProcessorConfig {
+                        patch_size: model_config.vision_config.patch_size,
+                        merge_size: model_config.vision_config.spatial_merge_size,
+                        ..ImageProcessorConfig::default()
+                    };
+                    let processor = ImageProcessor::new(Some(processor_config));
+                    let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
+                    let processed = processor.process_many(&image_refs)?;
+                    let pv = processed.pixel_values();
+                    let pv_shape = pv.shape()?;
+                    let new_shape = BigInt64Array::from(vec![
+                        1i64,
+                        pv_shape[0],
+                        pv_shape[1],
+                        pv_shape[2],
+                        pv_shape[3],
+                    ]);
+                    let pixel_values = pv.reshape(&new_shape)?;
+                    let grid_thw = processed.grid_thw();
+                    (Some(pixel_values), Some(grid_thw))
+                }
+            } else {
+                (None, None)
             };
 
-            // Prepare per-item inputs
-            let batch_size = batch.len();
-            let mut all_input_ids = Vec::with_capacity(batch_size);
-            let mut all_pixel_values = Vec::with_capacity(batch_size);
-            let mut all_grid_thws = Vec::with_capacity(batch_size);
+            let num_image_tokens = if let Some(ref grid) = grid_thw {
+                grid.eval();
+                let grid_data = grid.to_int32()?;
+                let spatial_merge_size = model_config.vision_config.spatial_merge_size;
+                let merge_factor = spatial_merge_size * spatial_merge_size;
+                let mut total = 0i32;
+                for i in 0..(grid_data.len() / 3) {
+                    let t = grid_data[i * 3];
+                    let h = grid_data[i * 3 + 1];
+                    let w = grid_data[i * 3 + 2];
+                    total += (t * h * w) / merge_factor;
+                }
+                Some(total as usize)
+            } else {
+                None
+            };
 
-            for item in &batch {
-                let (pixel_values, grid_thw) = if let Some(ref images) = item.images {
-                    if images.is_empty() {
-                        (None, None)
-                    } else {
-                        let processor_config = ImageProcessorConfig {
-                            patch_size: model_config.vision_config.patch_size,
-                            merge_size: model_config.vision_config.spatial_merge_size,
-                            ..ImageProcessorConfig::default()
-                        };
-                        let processor = ImageProcessor::new(Some(processor_config));
-                        let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
-                        let processed = processor.process_many(&image_refs)?;
-                        let pv = processed.pixel_values();
-                        let pv_shape = pv.shape()?;
-                        let new_shape = BigInt64Array::from(vec![
-                            1i64,
-                            pv_shape[0],
-                            pv_shape[1],
-                            pv_shape[2],
-                            pv_shape[3],
-                        ]);
-                        let pixel_values = pv.reshape(&new_shape)?;
-                        let grid_thw = processed.grid_thw();
-                        (Some(pixel_values), Some(grid_thw))
-                    }
-                } else {
-                    (None, None)
-                };
+            let formatted = crate::models::paddleocr_vl::chat::format_vlm_chat(
+                &item.messages,
+                num_image_tokens,
+            );
+            let token_ids = tokenizer.encode_sync(&formatted, None)?;
+            let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
-                let num_image_tokens = if let Some(ref grid) = grid_thw {
-                    grid.eval();
-                    let grid_data = grid.to_int32()?;
-                    let spatial_merge_size = model_config.vision_config.spatial_merge_size;
-                    let merge_factor = spatial_merge_size * spatial_merge_size;
-                    let mut total = 0i32;
-                    for i in 0..(grid_data.len() / 3) {
-                        let t = grid_data[i * 3];
-                        let h = grid_data[i * 3 + 1];
-                        let w = grid_data[i * 3 + 2];
-                        total += (t * h * w) / merge_factor;
-                    }
-                    Some(total as usize)
-                } else {
-                    None
-                };
+            all_input_ids.push(input_ids);
+            all_pixel_values.push(pixel_values);
+            all_grid_thws.push(grid_thw);
+        }
 
-                let formatted = crate::models::paddleocr_vl::chat::format_vlm_chat(
-                    &item.messages,
-                    num_image_tokens,
-                );
-                let token_ids = tokenizer_clone.encode_sync(&formatted, None)?;
-                let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
+        // Run batch generation
+        let results = self.generate_batch_impl(
+            &all_input_ids,
+            &all_pixel_values,
+            &all_grid_thws,
+            Some(gen_config),
+        )?;
 
-                all_input_ids.push(input_ids);
-                all_pixel_values.push(pixel_values);
-                all_grid_thws.push(grid_thw);
-            }
+        // Decode results
+        let mut chat_results = Vec::with_capacity(batch_size);
+        for result in results {
+            result.tokens.eval();
+            let tokens_vec = result.tokens.to_uint32()?;
+            let text = tokenizer.decode_sync(&tokens_vec, true)?;
+            let text = text.replace("<|im_end|>", "").trim().to_string();
 
-            // Run batch generation (generate_batch is private, stays sync)
-            let results = VLModel::generate_batch_impl(
-                &visual_arc,
-                &lm_arc,
-                &model_config,
-                &all_input_ids,
-                &all_pixel_values,
-                &all_grid_thws,
-                Some(gen_config),
-            )?;
+            chat_results.push(VLMChatResult {
+                text,
+                tokens: result.tokens,
+                logprobs: result.logprobs,
+                finish_reason: result.finish_reason,
+                num_tokens: result.num_tokens,
+            });
+        }
 
-            // Decode results
-            let mut chat_results = Vec::with_capacity(batch_size);
-            for result in results {
-                result.tokens.eval();
-                let tokens_vec = result.tokens.to_uint32()?;
-                let text = tokenizer_clone.decode_sync(&tokens_vec, true)?;
-                let text = text.replace("<|im_end|>", "").trim().to_string();
-
-                chat_results.push(VLMChatResult {
-                    text,
-                    tokens: result.tokens,
-                    logprobs: result.logprobs,
-                    finish_reason: result.finish_reason,
-                    num_tokens: result.num_tokens,
-                });
-            }
-
-            Ok(chat_results)
-        })
-        .await
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("VLM batch processing failed: {}", e),
-            )
-        })?
+        Ok(chat_results)
     }
 
-    /// Batch generate: sequential prefill + batched decode
+    /// Batch generate: sequential prefill + batched decode.
     ///
-    /// Each item is prefilled independently (different image sizes → different vision tokens),
+    /// Each item is prefilled independently (different image sizes -> different vision tokens),
     /// then KV caches are merged and decode runs in batch for ~N× throughput.
     fn generate_batch_impl(
-        visual_arc: &Option<Arc<PaddleOCRVisionModel>>,
-        lm_arc: &Arc<RwLock<ERNIELanguageModel>>,
-        model_config: &ModelConfig,
+        &mut self,
         all_input_ids: &[MxArray],
         all_pixel_values: &[Option<MxArray>],
         all_grid_thws: &[Option<MxArray>],
         config: Option<GenerationConfig>,
     ) -> Result<Vec<GenerationResult>> {
         let config = config.unwrap_or_default();
+        let model_config = self.config.clone();
 
         if all_input_ids.is_empty() {
             return Ok(Vec::new());
@@ -1368,15 +997,12 @@ impl VLModel {
 
         let generation_stream = Stream::new(DeviceType::Gpu);
 
-        let lm = lm_arc;
-        let visual = visual_arc.as_ref();
+        let lm = self
+            .language_model
+            .as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Language model not set"))?;
 
-        let num_layers = {
-            let lm_guard = lm.read().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire LM read lock")
-            })?;
-            lm_guard.num_layers_usize()
-        };
+        let num_layers = lm.num_layers_usize();
 
         // === STEP 1: Sequential per-item prefill ===
         let mut item_kv_keys: Vec<Vec<MxArray>> = Vec::with_capacity(batch_size);
@@ -1392,18 +1018,14 @@ impl VLModel {
             let pixel_values = all_pixel_values[i].as_ref();
             let grid_thw = all_grid_thws[i].as_ref();
 
-            let mut lm_guard = lm.write().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
-            })?;
-
-            lm_guard.init_fused_kv_caches();
-            lm_guard.reset_position_state();
+            lm.init_fused_kv_caches();
+            lm.reset_position_state();
 
             // Vision features
             let vision_features = {
                 let _stream_ctx = StreamContext::new(generation_stream);
                 if let (Some(pv), Some(grid)) = (pixel_values, grid_thw) {
-                    let v = visual.ok_or_else(|| {
+                    let v = self.visual.as_ref().ok_or_else(|| {
                         Error::new(Status::GenericFailure, "Vision model not set")
                     })?;
                     Some(v.forward(pv, grid)?)
@@ -1413,7 +1035,7 @@ impl VLModel {
             };
 
             // Position IDs with mRoPE
-            let (position_ids, rope_deltas) = VLModel::get_rope_index(
+            let (position_ids, rope_deltas) = get_rope_index(
                 input_ids,
                 grid_thw,
                 model_config.vision_config.spatial_merge_size,
@@ -1423,7 +1045,7 @@ impl VLModel {
             // Merge embeddings
             let inputs_embeds = {
                 let _stream_ctx = StreamContext::new(generation_stream);
-                let embeds = lm_guard.get_embeddings(input_ids)?;
+                let embeds = lm.get_embeddings(input_ids)?;
                 if let Some(ref vf) = vision_features {
                     let embed_dtype = embeds.dtype()?;
                     let vf_cast = if vf.dtype()? != embed_dtype {
@@ -1431,7 +1053,7 @@ impl VLModel {
                     } else {
                         vf.clone()
                     };
-                    VLModel::merge_input_ids_with_image_features(
+                    merge_input_ids_with_image_features(
                         model_config.image_token_id,
                         &vf_cast,
                         &embeds,
@@ -1445,7 +1067,7 @@ impl VLModel {
             // Prefill and extract KV
             let (logits, kv_keys, kv_values, cache_idx) = {
                 let _stream_ctx = StreamContext::new(generation_stream);
-                lm_guard.forward_fused_extract_kv(&inputs_embeds, &position_ids)?
+                lm.forward_fused_extract_kv(&inputs_embeds, &position_ids)?
             };
 
             clear_cache();
@@ -1587,11 +1209,7 @@ impl VLModel {
             None
         };
 
-        // Get read lock for batched decode
-        let lm_guard = lm
-            .read()
-            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire LM read lock"))?;
-
+        // Batched decode uses immutable LM access (read-only forward)
         for step in 0..max_new_tokens {
             if active_indices.is_empty() {
                 break;
@@ -1611,7 +1229,7 @@ impl VLModel {
                     .collect()
             };
             let embed_input = MxArray::from_uint32(&embed_tokens, &[active_batch_size, 1])?;
-            let token_embeds = lm_guard.get_embedding_layer().forward(&embed_input)?;
+            let token_embeds = lm.get_embedding_layer().forward(&embed_input)?;
 
             // Build position_ids [3, active_batch, 1] for mRoPE decode
             let mut pos_data: Vec<f32> = Vec::with_capacity(3 * active_indices.len());
@@ -1634,7 +1252,7 @@ impl VLModel {
             // Batched forward
             let (logits, new_kv_keys, new_kv_values, new_cache_idx) = {
                 let _stream_ctx = StreamContext::new(generation_stream);
-                lm_guard.forward_fused_batched(
+                lm.forward_fused_batched(
                     &token_embeds,
                     &position_ids,
                     &left_padding_active,
@@ -1776,8 +1394,6 @@ impl VLModel {
                     }
                 }
                 // Filter next_tokens to match the shrunken active set.
-                // Without this, tok_vals[local_idx] on the next iteration reads
-                // tokens from deactivated items, corrupting remaining outputs.
                 next_tokens = next_tokens.take(&indices_array, 0)?;
                 if let Some(ref lp) = next_logprobs {
                     next_logprobs = Some(lp.take(&indices_array, 0)?);
@@ -1839,6 +1455,316 @@ impl VLModel {
 
         Ok(results)
     }
+}
+
+// ---------------------------------------------------------------------------
+// NAPI impl block
+// ---------------------------------------------------------------------------
+
+#[napi]
+impl VLModel {
+    /// Create a new PaddleOCR-VL model (empty, not loaded).
+    ///
+    /// Creates a model thread with an empty inner. Use `VLModel.load()` instead
+    /// for loading a model from disk.
+    #[napi(constructor)]
+    pub fn new(config: ModelConfig) -> Result<Self> {
+        let config_clone = config.clone();
+
+        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+            move || {
+                let inner = VLModelInner {
+                    config,
+                    visual: None,
+                    language_model: None,
+                    tokenizer: None,
+                };
+                Ok((inner, ()))
+            },
+            handle_vlmodel_cmd,
+        );
+
+        init_rx
+            .blocking_recv()
+            .map_err(|_| napi::Error::from_reason("Model thread exited during init"))??;
+
+        Ok(Self {
+            thread,
+            config: config_clone,
+            initialized: false,
+            has_tokenizer_flag: false,
+        })
+    }
+
+    /// Set the tokenizer
+    #[napi]
+    pub fn set_tokenizer(&mut self, tokenizer: &Qwen3Tokenizer) -> Result<()> {
+        let arc = Arc::new(tokenizer.clone());
+        crate::model_thread::send_and_block(&self.thread, |reply| VLModelCmd::SetTokenizer {
+            tokenizer: arc,
+            reply,
+        })?;
+        self.has_tokenizer_flag = true;
+        Ok(())
+    }
+
+    /// Check if tokenizer is available
+    #[napi(getter)]
+    pub fn has_tokenizer(&self) -> bool {
+        self.has_tokenizer_flag
+    }
+
+    /// Chat with the VLM model
+    ///
+    /// High-level API for conversational interaction with images.
+    ///
+    /// # Arguments
+    /// * `messages` - Chat messages (role + content)
+    /// * `config` - Chat configuration (including images for automatic processing)
+    ///
+    /// # Returns
+    /// * VLMChatResult with generated text
+    ///
+    /// # Example
+    /// ```typescript
+    /// const result = await model.chat(
+    ///   [{ role: 'user', content: 'Describe this image.' }],
+    ///   { images: [readFileSync('./photo.jpg')], maxNewTokens: 256 }
+    /// );
+    /// ```
+    #[napi]
+    pub async fn chat(
+        &self,
+        messages: Vec<VLMChatMessage>,
+        config: Option<VLMChatConfig>,
+    ) -> Result<VLMChatResult> {
+        // Extract image bytes from Buffer (Buffer is !Send) before dispatching
+        let image_bytes = config
+            .as_ref()
+            .and_then(|c| c.images.as_ref())
+            .map(|images| images.iter().map(|b| b.to_vec()).collect::<Vec<Vec<u8>>>());
+
+        crate::model_thread::send_and_await(&self.thread, |reply| VLModelCmd::Chat {
+            messages,
+            config,
+            image_bytes,
+            reply,
+        })
+        .await
+    }
+
+    /// Simple OCR: extract text from encoded image bytes
+    ///
+    /// Convenience method that processes an image and extracts all text.
+    ///
+    /// # Arguments
+    /// * `image_data` - Encoded image bytes (PNG/JPEG)
+    /// * `prompt` - Optional custom prompt (default: "Extract all text from this image.")
+    ///
+    /// # Returns
+    /// * Extracted text as a string
+    ///
+    /// # Example
+    /// ```typescript
+    /// const text = await model.ocr(imageBuffer);
+    /// console.log(text);
+    /// ```
+    #[napi]
+    pub async fn ocr(&self, image_data: Buffer, prompt: Option<String>) -> Result<String> {
+        let prompt = prompt.unwrap_or_else(|| "Extract all text from this image.".to_string());
+
+        let messages = vec![VLMChatMessage {
+            role: ChatRole::User,
+            content: prompt,
+        }];
+
+        let config = VLMChatConfig {
+            images: Some(vec![image_data]),
+            ..Default::default()
+        };
+
+        let result = self.chat(messages, Some(config)).await?;
+
+        // Clean up common LaTeX wrappers from OCR output
+        let text = result.text;
+        let text = text
+            .strip_prefix("\\(\\text{")
+            .and_then(|s| s.strip_suffix("}\\)"))
+            .map(|s| s.to_string())
+            .unwrap_or(text);
+
+        Ok(text)
+    }
+
+    /// Get input embeddings with vision features merged
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `pixel_values` - Optional image patches [batch, seq, channels, patch_h, patch_w]
+    /// * `image_grid_thw` - Optional grid dimensions [num_images, 3]
+    ///
+    /// # Returns
+    /// * Input embeddings with vision features inserted at image token positions
+    #[napi]
+    pub fn get_input_embeddings(
+        &self,
+        input_ids: &MxArray,
+        pixel_values: Option<&MxArray>,
+        image_grid_thw: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        crate::model_thread::send_and_block(&self.thread, |reply| VLModelCmd::GetInputEmbeddings {
+            input_ids: input_ids.clone(),
+            image_features: pixel_values.cloned(),
+            image_grid_thw: image_grid_thw.cloned(),
+            reply,
+        })
+    }
+
+    /// Forward pass
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `pixel_values` - Optional image patches
+    /// * `image_grid_thw` - Optional grid dimensions
+    /// * `mask` - Optional attention mask
+    ///
+    /// # Returns
+    /// * Logits [batch, seq_len, vocab_size]
+    #[napi]
+    pub fn forward(
+        &self,
+        input_ids: &MxArray,
+        pixel_values: Option<&MxArray>,
+        image_grid_thw: Option<&MxArray>,
+        mask: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        crate::model_thread::send_and_block(&self.thread, |reply| VLModelCmd::Forward {
+            input_ids: input_ids.clone(),
+            pixel_values: pixel_values.cloned(),
+            image_grid_thw: image_grid_thw.cloned(),
+            mask: mask.cloned(),
+            reply,
+        })
+    }
+
+    /// Generate text tokens given input tokens and optional image
+    ///
+    /// Uses KV caching for efficient generation.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Input token IDs [1, seq_len]
+    /// * `pixel_values` - Optional image patches [1, num_patches, C, H, W]
+    /// * `image_grid_thw` - Optional grid dimensions [1, 3]
+    /// * `config` - Generation configuration
+    ///
+    /// # Returns
+    /// * GenerationResult with tokens, logprobs, and finish reason
+    #[napi]
+    pub async fn generate(
+        &self,
+        input_ids: &MxArray,
+        pixel_values: Option<&MxArray>,
+        image_grid_thw: Option<&MxArray>,
+        config: Option<GenerationConfig>,
+    ) -> Result<GenerationResult> {
+        let input_ids = input_ids.clone();
+        let pixel_values = pixel_values.cloned();
+        let image_grid_thw = image_grid_thw.cloned();
+
+        crate::model_thread::send_and_await(&self.thread, |reply| VLModelCmd::Generate {
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            config,
+            reply,
+        })
+        .await
+    }
+
+    /// Batch OCR: extract text from multiple images simultaneously
+    ///
+    /// Processes N images with sequential prefill + batched decode for ~N× decode throughput.
+    ///
+    /// # Arguments
+    /// * `images` - Encoded image buffers
+    /// * `config` - Optional chat configuration (shared across all items)
+    ///
+    /// # Returns
+    /// * Vec of extracted text strings, one per image
+    ///
+    /// # Example
+    /// ```typescript
+    /// import { readFileSync } from 'fs';
+    /// const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
+    /// const texts = await model.ocrBatch(images);
+    /// ```
+    #[napi]
+    pub async fn ocr_batch(
+        &self,
+        images: Vec<Buffer>,
+        config: Option<VLMChatConfig>,
+    ) -> Result<Vec<String>> {
+        let prompt = "Extract all text from this image.".to_string();
+
+        let batch: Vec<VLMBatchItem> = images
+            .into_iter()
+            .map(|image_data| VLMBatchItem {
+                messages: vec![VLMChatMessage {
+                    role: ChatRole::User,
+                    content: prompt.clone(),
+                }],
+                images: Some(vec![image_data]),
+            })
+            .collect();
+
+        let results = self.batch(batch, config).await?;
+
+        Ok(results
+            .into_iter()
+            .map(|r| {
+                let text = r.text;
+                text.strip_prefix("\\(\\text{")
+                    .and_then(|s| s.strip_suffix("}\\)"))
+                    .map(|s| s.to_string())
+                    .unwrap_or(text)
+            })
+            .collect())
+    }
+
+    /// Batch chat: process multiple items simultaneously
+    ///
+    /// Sequential prefill + batched decode. Each item can have different images/prompts.
+    ///
+    /// # Arguments
+    /// * `batch` - Batch items, each with messages and optional images
+    /// * `config` - Optional shared chat configuration
+    ///
+    /// # Returns
+    /// * Vec of VLMChatResult, one per batch item
+    #[napi]
+    pub async fn batch(
+        &self,
+        batch: Vec<VLMBatchItem>,
+        config: Option<VLMChatConfig>,
+    ) -> Result<Vec<VLMChatResult>> {
+        // Convert VLMBatchItem (with Buffer) → SendableVLMBatchItem (with Vec<u8>)
+        let sendable_items: Vec<SendableVLMBatchItem> = batch
+            .into_iter()
+            .map(|item| SendableVLMBatchItem {
+                messages: item.messages,
+                images: item
+                    .images
+                    .map(|imgs| imgs.into_iter().map(|b| b.to_vec()).collect()),
+            })
+            .collect();
+
+        crate::model_thread::send_and_await(&self.thread, |reply| VLModelCmd::Batch {
+            items: sendable_items,
+            config,
+            reply,
+        })
+        .await
+    }
 
     /// Get model configuration
     #[napi(getter)]
@@ -1849,7 +1775,7 @@ impl VLModel {
     /// Check if model is fully initialized
     #[napi(getter)]
     pub fn is_initialized(&self) -> bool {
-        self.visual.is_some() && self.language_model.is_some()
+        self.initialized
     }
 
     /// Load a VLM from disk
@@ -1874,232 +1800,29 @@ impl VLModel {
     pub fn load<'env>(env: &'env Env, model_path: String) -> Result<PromiseRaw<'env, VLModel>> {
         env.spawn_future_with_callback(
             async move {
-                tokio::task::spawn_blocking(move || {
-                    let path = Path::new(&model_path);
+                let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+                    move || {
+                        let inner = load_vlmodel_inner_from_dir(&model_path)?;
+                        let config = inner.config.clone();
+                        let has_tokenizer = inner.tokenizer.is_some();
+                        Ok((inner, (config, has_tokenizer)))
+                    },
+                    handle_vlmodel_cmd,
+                );
 
-                    // Check if path exists
-                    if !path.exists() {
-                        return Err(napi::Error::from_reason(format!(
-                            "Model path does not exist: {}",
-                            model_path
-                        )));
-                    }
+                let (config, has_tokenizer) = init_rx
+                    .await
+                    .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
-                    // Load configuration
-                    let config_path = path.join("config.json");
-                    if !config_path.exists() {
-                        return Err(napi::Error::from_reason(format!(
-                            "Config file not found: {}",
-                            config_path.display()
-                        )));
-                    }
-
-                    let config_data = fs::read_to_string(&config_path)?;
-                    let raw_config: Value = serde_json::from_str(&config_data)?;
-
-                    // Parse vision config
-                    let vision_raw = &raw_config["vision_config"];
-                    let vision_config = VisionConfig {
-                        model_type: vision_raw["model_type"]
-                            .as_str()
-                            .unwrap_or("paddleocr_vl")
-                            .to_string(),
-                        hidden_size: vision_raw["hidden_size"].as_i64().unwrap_or_else(|| {
-                            warn!("vision_config.hidden_size not found in config.json, using default 1152");
-                            1152
-                        }) as i32,
-                        intermediate_size: vision_raw["intermediate_size"].as_i64().unwrap_or(4304)
-                            as i32,
-                        num_hidden_layers: vision_raw["num_hidden_layers"].as_i64().unwrap_or_else(|| {
-                            warn!("vision_config.num_hidden_layers not found in config.json, using default 27");
-                            27
-                        }) as i32,
-                        num_attention_heads: vision_raw["num_attention_heads"]
-                            .as_i64()
-                            .unwrap_or_else(|| {
-                                warn!("vision_config.num_attention_heads not found in config.json, using default 16");
-                                16
-                            }) as i32,
-                        num_channels: vision_raw["num_channels"].as_i64().unwrap_or(3) as i32,
-                        image_size: vision_raw["image_size"].as_i64().unwrap_or(384) as i32,
-                        patch_size: vision_raw["patch_size"].as_i64().unwrap_or_else(|| {
-                            warn!("vision_config.patch_size not found in config.json, using default 14");
-                            14
-                        }) as i32,
-                        hidden_act: vision_raw["hidden_act"]
-                            .as_str()
-                            .unwrap_or("gelu_pytorch_tanh")
-                            .to_string(),
-                        layer_norm_eps: vision_raw["layer_norm_eps"].as_f64().unwrap_or(1e-6),
-                        attention_dropout: vision_raw["attention_dropout"].as_f64().unwrap_or(0.0),
-                        spatial_merge_size: vision_raw["spatial_merge_size"].as_i64().unwrap_or_else(|| {
-                            warn!("vision_config.spatial_merge_size not found in config.json, using default 2");
-                            2
-                        }) as i32,
-                    };
-
-                    // Parse text config
-                    let text_raw = &raw_config["text_config"];
-                    let mrope_section: Vec<i32> = text_raw["mrope_section"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_i64().map(|x| x as i32))
-                                .collect()
-                        })
-                        .unwrap_or_else(|| vec![16, 24, 24]);
-
-                    let text_config = TextConfig {
-                        model_type: text_raw["model_type"]
-                            .as_str()
-                            .unwrap_or("paddleocr_vl")
-                            .to_string(),
-                        hidden_size: text_raw["hidden_size"].as_i64().unwrap_or_else(|| {
-                            warn!("text_config.hidden_size not found in config.json, using default 1024");
-                            1024
-                        }) as i32,
-                        num_hidden_layers: text_raw["num_hidden_layers"].as_i64().unwrap_or_else(|| {
-                            warn!("text_config.num_hidden_layers not found in config.json, using default 18");
-                            18
-                        }) as i32,
-                        intermediate_size: text_raw["intermediate_size"].as_i64().unwrap_or(3072)
-                            as i32,
-                        num_attention_heads: text_raw["num_attention_heads"].as_i64().unwrap_or_else(|| {
-                            warn!("text_config.num_attention_heads not found in config.json, using default 16");
-                            16
-                        }) as i32,
-                        rms_norm_eps: text_raw["rms_norm_eps"].as_f64().unwrap_or(1e-5),
-                        vocab_size: text_raw["vocab_size"].as_i64().unwrap_or_else(|| {
-                            warn!("text_config.vocab_size not found in config.json, using default 103424");
-                            103424
-                        }) as i32,
-                        num_key_value_heads: text_raw["num_key_value_heads"].as_i64().unwrap_or(2)
-                            as i32,
-                        max_position_embeddings: text_raw["max_position_embeddings"]
-                            .as_i64()
-                            .unwrap_or(131072)
-                            as i32,
-                        rope_theta: text_raw["rope_theta"].as_f64().unwrap_or(500000.0),
-                        rope_traditional: text_raw["rope_traditional"].as_bool().unwrap_or(false),
-                        use_bias: text_raw["use_bias"].as_bool().unwrap_or(false),
-                        head_dim: text_raw["head_dim"].as_i64().unwrap_or(128) as i32,
-                        mrope_section,
-                    };
-
-                    // Build model config
-                    let config = ModelConfig {
-                        vision_config: vision_config.clone(),
-                        text_config: text_config.clone(),
-                        model_type: raw_config["model_type"]
-                            .as_str()
-                            .unwrap_or("paddleocr_vl")
-                            .to_string(),
-                        ignore_index: raw_config["ignore_index"].as_i64().unwrap_or(-100) as i32,
-                        image_token_id: raw_config["image_token_id"].as_i64().unwrap_or(100295)
-                            as i32,
-                        video_token_id: raw_config["video_token_id"].as_i64().unwrap_or(100296)
-                            as i32,
-                        vision_start_token_id: raw_config["vision_start_token_id"]
-                            .as_i64()
-                            .unwrap_or(101305)
-                            as i32,
-                        vision_end_token_id: raw_config["vision_end_token_id"]
-                            .as_i64()
-                            .unwrap_or(101306) as i32,
-                        eos_token_id: raw_config["eos_token_id"].as_i64().unwrap_or(2) as i32,
-                    };
-
-                    info!("📦 Loading PaddleOCR-VL model from: {}", model_path);
-                    info!(
-                        "   Vision: {} layers, {} hidden, {} heads",
-                        vision_config.num_hidden_layers,
-                        vision_config.hidden_size,
-                        vision_config.num_attention_heads
-                    );
-                    info!(
-                        "   Language: {} layers, {} hidden, {} heads",
-                        text_config.num_hidden_layers,
-                        text_config.hidden_size,
-                        text_config.num_attention_heads
-                    );
-
-                    // Load SafeTensors weights
-                    // Support both single file and sharded format
-                    let safetensors_path = path.join("model.safetensors");
-                    let mut all_weights: HashMap<String, MxArray> = HashMap::new();
-
-                    if safetensors_path.exists() {
-                        let st_file = SafeTensorsFile::load(&safetensors_path)?;
-                        info!(
-                            "  Loading {} tensors from model.safetensors",
-                            st_file.tensor_names().len()
-                        );
-                        all_weights = st_file.load_tensors(&safetensors_path)?;
-                    } else {
-                        // Try sharded format (model-00001-of-00002.safetensors, etc.)
-                        let mut shard_index = 1;
-                        loop {
-                            // Find sharded safetensors file matching pattern model-XXXXX-of-*.safetensors
-                            // Find matching file
-                            let mut found_shard = None;
-                            for entry in fs::read_dir(path)? {
-                                let entry = entry?;
-                                let name = entry.file_name().to_string_lossy().to_string();
-                                if name.starts_with(&format!("model-{:05}-of-", shard_index))
-                                    && name.ends_with(".safetensors")
-                                {
-                                    found_shard = Some(entry.path());
-                                    break;
-                                }
-                            }
-
-                            match found_shard {
-                                Some(shard_path) => {
-                                    info!("  Loading shard: {}", shard_path.display());
-                                    let st_file = SafeTensorsFile::load(&shard_path)?;
-                                    let shard_weights = st_file.load_tensors(&shard_path)?;
-                                    all_weights.extend(shard_weights);
-                                    shard_index += 1;
-                                }
-                                None => {
-                                    if shard_index == 1 {
-                                        return Err(Error::new(
-                                            Status::InvalidArg,
-                                            format!("No SafeTensors files found in {}", model_path),
-                                        ));
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    info!("  Loaded {} total tensors", all_weights.len());
-
-                    // Transform keys for PaddleOCR-VL format
-                    let weights = load_paddleocr_vl_weights(all_weights)?;
-                    info!("  After transformation: {} tensors", weights.len());
-
-                    Ok::<_, Error>((config, weights, vision_config, text_config, model_path))
-                })
-                .await
-                .map_err(|err| {
-                    Error::new(
-                        Status::GenericFailure,
-                        format!("Failed to load model: {err}"),
-                    )
-                })
-                .flatten()
+                Ok((thread, config, has_tokenizer))
             },
-            |_, (config, weights, vision_config, text_config, model_path)| {
-                // Build the model from weights (includes tokenizer loading)
-                build_paddleocr_vl_from_weights(
+            |_, (thread, config, has_tokenizer)| {
+                Ok(VLModel {
+                    thread,
                     config,
-                    weights,
-                    vision_config,
-                    text_config,
-                    &model_path,
-                )
+                    initialized: true,
+                    has_tokenizer_flag: has_tokenizer,
+                })
             },
         )
     }
@@ -2127,7 +1850,7 @@ impl VLModel {
     ) -> Result<PromiseRaw<'env, ModelConfig>> {
         env.spawn_future_with_callback(
             async move {
-                tokio::task::spawn_blocking(move || {
+                napi::tokio::task::spawn_blocking(move || {
                     let path = Path::new(&model_path);
 
                     // Check if path exists
@@ -2276,15 +1999,488 @@ impl VLModel {
     }
 }
 
-/// Build VLModel from loaded weights
-fn build_paddleocr_vl_from_weights(
+// ---------------------------------------------------------------------------
+// Helper: Compute position IDs for multimodal RoPE
+// ---------------------------------------------------------------------------
+
+/// Compute position IDs for multimodal RoPE
+///
+/// This function computes proper 3D position IDs for image tokens:
+/// - Text tokens get sequential positions [0, 1, 2, ...]
+/// - Image tokens get 2D spatial positions based on grid_thw
+///
+/// Returns (position_ids, rope_deltas) where:
+/// - position_ids: [3, batch, seq_len] position indices for t, h, w
+/// - rope_deltas: offset to add during decode phase
+fn get_rope_index(
+    input_ids: &MxArray,
+    image_grid_thw: Option<&MxArray>,
+    spatial_merge_size: i32,
+    image_token_id: i32,
+) -> Result<(MxArray, i64)> {
+    let shape = input_ids.shape()?;
+    let batch_size = shape[0];
+    let seq_len = shape[1];
+
+    // If no images, use simple sequential positions
+    if image_grid_thw.is_none() {
+        let pos = MxArray::arange(0.0, seq_len as f64, Some(1.0), None)?;
+        let pos = pos.reshape(&[1, 1, seq_len])?;
+        let position_ids = MxArray::tile(&pos, &[3, batch_size as i32, 1])?;
+        return Ok((position_ids, 0));
+    }
+
+    let grid_thw = image_grid_thw.unwrap();
+
+    // Get input IDs and grid data
+    let input_ids_data = input_ids.to_int32()?;
+    grid_thw.eval();
+    let grid_data = grid_thw.to_int32()?;
+
+    // Process batch (currently supports batch_size=1)
+    let mut all_position_ids: Vec<Vec<i64>> = vec![Vec::new(); 3]; // [t, h, w] components
+
+    for batch_idx in 0..batch_size as usize {
+        let start = batch_idx * seq_len as usize;
+        let end = start + seq_len as usize;
+        let batch_tokens: Vec<i32> = input_ids_data[start..end].to_vec();
+
+        // Find positions of image tokens
+        let mut image_positions: Vec<usize> = Vec::new();
+        for (i, &token) in batch_tokens.iter().enumerate() {
+            if token == image_token_id {
+                image_positions.push(i);
+            }
+        }
+
+        // If no image tokens, use sequential positions
+        if image_positions.is_empty() {
+            for i in 0..seq_len {
+                all_position_ids[0].push(i);
+                all_position_ids[1].push(i);
+                all_position_ids[2].push(i);
+            }
+            continue;
+        }
+
+        // Get grid dimensions for ALL images
+        let num_images = grid_data.len() / 3;
+        if num_images == 0 || grid_data.len() % 3 != 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "grid_data must have 3N elements for N images, got {} elements. \
+                    Ensure image_grid_thw is properly set when image tokens are present in input.",
+                    grid_data.len()
+                ),
+            ));
+        }
+
+        // Calculate token info for each image
+        let mut total_expected_tokens = 0usize;
+        let mut image_token_info: Vec<(i64, i64, i64, usize)> = Vec::new();
+
+        for img_idx in 0..num_images {
+            let t = grid_data[img_idx * 3] as i64;
+            let h = grid_data[img_idx * 3 + 1] as i64;
+            let w = grid_data[img_idx * 3 + 2] as i64;
+
+            let llm_grid_t = t;
+            let llm_grid_h = h / spatial_merge_size as i64;
+            let llm_grid_w = w / spatial_merge_size as i64;
+            let num_tokens = (llm_grid_t * llm_grid_h * llm_grid_w) as usize;
+
+            image_token_info.push((llm_grid_t, llm_grid_h, llm_grid_w, num_tokens));
+            total_expected_tokens += num_tokens;
+        }
+
+        // Validate total image token count matches expected from grid dimensions
+        if total_expected_tokens != image_positions.len() {
+            return Err(Error::new(
+                Status::GenericFailure,
+                format!(
+                    "Image token count mismatch: expected {} tokens from {} images, \
+                    but found {} image tokens in prompt. \
+                    This likely indicates a bug in prompt formatting. Check that: \
+                    1) The image placeholder tokens match the expected count from grid_thw \
+                    2) spatial_merge_size ({}) in config matches the vision encoder output \
+                    3) grid_thw dimensions are computed correctly for the input images",
+                    total_expected_tokens,
+                    num_images,
+                    image_positions.len(),
+                    spatial_merge_size
+                ),
+            ));
+        }
+
+        // Build position IDs
+        let image_start = image_positions[0];
+        let image_end = image_positions[image_positions.len() - 1] + 1;
+
+        // Text tokens before images: sequential positions
+        for i in 0..image_start {
+            all_position_ids[0].push(i as i64);
+            all_position_ids[1].push(i as i64);
+            all_position_ids[2].push(i as i64);
+        }
+
+        // Each image's 2D spatial positions
+        let mut current_pos = image_start as i64;
+        let mut max_pos = image_start as i64;
+
+        for (llm_grid_t, llm_grid_h, llm_grid_w, _) in &image_token_info {
+            for t_idx in 0..*llm_grid_t {
+                for h_idx in 0..*llm_grid_h {
+                    for w_idx in 0..*llm_grid_w {
+                        all_position_ids[0].push(current_pos + t_idx);
+                        all_position_ids[1].push(current_pos + h_idx);
+                        all_position_ids[2].push(current_pos + w_idx);
+                    }
+                }
+            }
+            let img_max = current_pos
+                + std::cmp::max(
+                    *llm_grid_t - 1,
+                    std::cmp::max(*llm_grid_h - 1, *llm_grid_w - 1),
+                );
+            max_pos = std::cmp::max(max_pos, img_max);
+            current_pos = img_max + 1;
+        }
+
+        // Text tokens after images: continue from max position
+        let next_pos = max_pos + 1;
+        for i in image_end..seq_len as usize {
+            let pos = next_pos + (i - image_end) as i64;
+            all_position_ids[0].push(pos);
+            all_position_ids[1].push(pos);
+            all_position_ids[2].push(pos);
+        }
+    }
+
+    // Convert to MxArray [3, batch, seq_len]
+    let total_len = all_position_ids[0].len();
+    let expected_len = (3 * batch_size * seq_len) as usize;
+    if total_len * 3 != expected_len {
+        return Err(Error::new(
+            Status::GenericFailure,
+            format!(
+                "Position ID length mismatch: got {} * 3, expected {}",
+                total_len, expected_len
+            ),
+        ));
+    }
+
+    // Stack the three components
+    let t_positions: Vec<i32> = all_position_ids[0].iter().map(|&x| x as i32).collect();
+    let h_positions: Vec<i32> = all_position_ids[1].iter().map(|&x| x as i32).collect();
+    let w_positions: Vec<i32> = all_position_ids[2].iter().map(|&x| x as i32).collect();
+
+    let t_arr = MxArray::from_int32(&t_positions, &[batch_size, seq_len])?;
+    let h_arr = MxArray::from_int32(&h_positions, &[batch_size, seq_len])?;
+    let w_arr = MxArray::from_int32(&w_positions, &[batch_size, seq_len])?;
+
+    let position_ids = MxArray::stack(vec![&t_arr, &h_arr, &w_arr], Some(0))?;
+
+    // Compute rope_deltas: max position - seq_len (for decode phase offset)
+    let max_position = *all_position_ids[0].iter().max().unwrap_or(&0);
+    let rope_deltas = max_position + 1 - seq_len;
+
+    Ok((position_ids, rope_deltas))
+}
+
+/// Merge image features into input embeddings at image token positions
+fn merge_input_ids_with_image_features(
+    image_token_id: i32,
+    image_features: &MxArray,
+    inputs_embeds: &MxArray,
+    input_ids: &MxArray,
+) -> Result<MxArray> {
+    let input_shape = input_ids.shape()?;
+    let batch_size = input_shape[0];
+    let _seq_len = input_shape[1];
+
+    // Create image token mask
+    let image_token = MxArray::scalar_int(image_token_id)?;
+    let image_positions = input_ids.equal(&image_token)?;
+
+    let inputs_embeds_shape = inputs_embeds.shape()?;
+    let hidden_dim = inputs_embeds_shape[2];
+
+    let mut batch_outputs: Vec<MxArray> = Vec::new();
+    let mut feature_start_idx = 0i64;
+
+    for batch_idx in 0..batch_size {
+        // Get mask for this batch item
+        let batch_mask = image_positions.slice_axis(0, batch_idx, batch_idx + 1)?;
+        let batch_mask = batch_mask.squeeze(Some(&[0]))?;
+
+        // Count image tokens in this batch
+        let mask_sum = batch_mask.sum(None, None)?;
+        let num_positions = mask_sum.to_int32()?[0] as i64;
+
+        if num_positions > 0 {
+            // Extract features for this batch
+            let batch_features = image_features.slice_axis(
+                0,
+                feature_start_idx,
+                feature_start_idx + num_positions,
+            )?;
+
+            // Get embeddings for this batch item
+            let batch_embeds = inputs_embeds.slice_axis(0, batch_idx, batch_idx + 1)?;
+            let batch_embeds = batch_embeds.squeeze(Some(&[0]))?;
+
+            // Create cumsum for feature indexing
+            let mask_int = batch_mask.astype(crate::array::DType::Int32)?;
+            let cumsum = mask_int.cumsum(0)?;
+
+            // Build feature indices: where mask is true, use cumsum-1; else use 0
+            let ones = MxArray::scalar_int(1)?;
+            let feature_indices = cumsum.sub(&ones)?;
+            let zeros =
+                MxArray::zeros(&feature_indices.shape()?, Some(crate::array::DType::Int32))?;
+            let feature_indices = batch_mask.where_(&feature_indices, &zeros)?;
+
+            // Gather features using indices
+            let gathered_features = batch_features.take(&feature_indices, 0)?;
+
+            // Expand mask for broadcasting
+            let mask_expanded = batch_mask.reshape(&[-1, 1])?;
+            let mask_expanded =
+                MxArray::broadcast_to(&mask_expanded, &[batch_mask.shape()?[0], hidden_dim])?;
+
+            // Combine: use gathered_features where mask is true, else use original embeds
+            let batch_output = mask_expanded.where_(&gathered_features, &batch_embeds)?;
+
+            batch_outputs.push(batch_output);
+            feature_start_idx += num_positions;
+        } else {
+            // No image tokens in this batch item
+            let batch_embeds = inputs_embeds.slice_axis(0, batch_idx, batch_idx + 1)?;
+            batch_outputs.push(batch_embeds.squeeze(Some(&[0]))?);
+        }
+    }
+
+    // Stack all batch outputs
+    let refs: Vec<&MxArray> = batch_outputs.iter().collect();
+    MxArray::stack(refs, Some(0))
+}
+
+// ---------------------------------------------------------------------------
+// Model loading — runs on the model thread
+// ---------------------------------------------------------------------------
+
+/// Load VLModelInner from a model directory.
+///
+/// All weight loading happens synchronously (designed to run on the model thread).
+fn load_vlmodel_inner_from_dir(model_path: &str) -> Result<VLModelInner> {
+    let path = Path::new(model_path);
+
+    // Check if path exists
+    if !path.exists() {
+        return Err(napi::Error::from_reason(format!(
+            "Model path does not exist: {}",
+            model_path
+        )));
+    }
+
+    // Load configuration
+    let config_path = path.join("config.json");
+    if !config_path.exists() {
+        return Err(napi::Error::from_reason(format!(
+            "Config file not found: {}",
+            config_path.display()
+        )));
+    }
+
+    let config_data = fs::read_to_string(&config_path)?;
+    let raw_config: Value = serde_json::from_str(&config_data)?;
+
+    // Parse vision config
+    let vision_raw = &raw_config["vision_config"];
+    let vision_config = VisionConfig {
+        model_type: vision_raw["model_type"]
+            .as_str()
+            .unwrap_or("paddleocr_vl")
+            .to_string(),
+        hidden_size: vision_raw["hidden_size"].as_i64().unwrap_or_else(|| {
+            warn!("vision_config.hidden_size not found in config.json, using default 1152");
+            1152
+        }) as i32,
+        intermediate_size: vision_raw["intermediate_size"].as_i64().unwrap_or(4304) as i32,
+        num_hidden_layers: vision_raw["num_hidden_layers"].as_i64().unwrap_or_else(|| {
+            warn!("vision_config.num_hidden_layers not found in config.json, using default 27");
+            27
+        }) as i32,
+        num_attention_heads: vision_raw["num_attention_heads"]
+            .as_i64()
+            .unwrap_or_else(|| {
+                warn!(
+                    "vision_config.num_attention_heads not found in config.json, using default 16"
+                );
+                16
+            }) as i32,
+        num_channels: vision_raw["num_channels"].as_i64().unwrap_or(3) as i32,
+        image_size: vision_raw["image_size"].as_i64().unwrap_or(384) as i32,
+        patch_size: vision_raw["patch_size"].as_i64().unwrap_or_else(|| {
+            warn!("vision_config.patch_size not found in config.json, using default 14");
+            14
+        }) as i32,
+        hidden_act: vision_raw["hidden_act"]
+            .as_str()
+            .unwrap_or("gelu_pytorch_tanh")
+            .to_string(),
+        layer_norm_eps: vision_raw["layer_norm_eps"].as_f64().unwrap_or(1e-6),
+        attention_dropout: vision_raw["attention_dropout"].as_f64().unwrap_or(0.0),
+        spatial_merge_size: vision_raw["spatial_merge_size"]
+            .as_i64()
+            .unwrap_or_else(|| {
+                warn!("vision_config.spatial_merge_size not found in config.json, using default 2");
+                2
+            }) as i32,
+    };
+
+    // Parse text config
+    let text_raw = &raw_config["text_config"];
+    let mrope_section: Vec<i32> = text_raw["mrope_section"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_i64().map(|x| x as i32))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![16, 24, 24]);
+
+    let text_config = TextConfig {
+        model_type: text_raw["model_type"]
+            .as_str()
+            .unwrap_or("paddleocr_vl")
+            .to_string(),
+        hidden_size: text_raw["hidden_size"].as_i64().unwrap_or_else(|| {
+            warn!("text_config.hidden_size not found in config.json, using default 1024");
+            1024
+        }) as i32,
+        num_hidden_layers: text_raw["num_hidden_layers"].as_i64().unwrap_or_else(|| {
+            warn!("text_config.num_hidden_layers not found in config.json, using default 18");
+            18
+        }) as i32,
+        intermediate_size: text_raw["intermediate_size"].as_i64().unwrap_or(3072) as i32,
+        num_attention_heads: text_raw["num_attention_heads"].as_i64().unwrap_or_else(|| {
+            warn!("text_config.num_attention_heads not found in config.json, using default 16");
+            16
+        }) as i32,
+        rms_norm_eps: text_raw["rms_norm_eps"].as_f64().unwrap_or(1e-5),
+        vocab_size: text_raw["vocab_size"].as_i64().unwrap_or_else(|| {
+            warn!("text_config.vocab_size not found in config.json, using default 103424");
+            103424
+        }) as i32,
+        num_key_value_heads: text_raw["num_key_value_heads"].as_i64().unwrap_or(2) as i32,
+        max_position_embeddings: text_raw["max_position_embeddings"]
+            .as_i64()
+            .unwrap_or(131072) as i32,
+        rope_theta: text_raw["rope_theta"].as_f64().unwrap_or(500000.0),
+        rope_traditional: text_raw["rope_traditional"].as_bool().unwrap_or(false),
+        use_bias: text_raw["use_bias"].as_bool().unwrap_or(false),
+        head_dim: text_raw["head_dim"].as_i64().unwrap_or(128) as i32,
+        mrope_section,
+    };
+
+    // Build model config
+    let config = ModelConfig {
+        vision_config: vision_config.clone(),
+        text_config: text_config.clone(),
+        model_type: raw_config["model_type"]
+            .as_str()
+            .unwrap_or("paddleocr_vl")
+            .to_string(),
+        ignore_index: raw_config["ignore_index"].as_i64().unwrap_or(-100) as i32,
+        image_token_id: raw_config["image_token_id"].as_i64().unwrap_or(100295) as i32,
+        video_token_id: raw_config["video_token_id"].as_i64().unwrap_or(100296) as i32,
+        vision_start_token_id: raw_config["vision_start_token_id"]
+            .as_i64()
+            .unwrap_or(101305) as i32,
+        vision_end_token_id: raw_config["vision_end_token_id"].as_i64().unwrap_or(101306) as i32,
+        eos_token_id: raw_config["eos_token_id"].as_i64().unwrap_or(2) as i32,
+    };
+
+    info!("Loading PaddleOCR-VL model from: {}", model_path);
+    info!(
+        "   Vision: {} layers, {} hidden, {} heads",
+        vision_config.num_hidden_layers,
+        vision_config.hidden_size,
+        vision_config.num_attention_heads
+    );
+    info!(
+        "   Language: {} layers, {} hidden, {} heads",
+        text_config.num_hidden_layers, text_config.hidden_size, text_config.num_attention_heads
+    );
+
+    // Load SafeTensors weights
+    let safetensors_path = path.join("model.safetensors");
+    let mut all_weights: HashMap<String, MxArray> = HashMap::new();
+
+    if safetensors_path.exists() {
+        let st_file = SafeTensorsFile::load(&safetensors_path)?;
+        info!(
+            "  Loading {} tensors from model.safetensors",
+            st_file.tensor_names().len()
+        );
+        all_weights = st_file.load_tensors(&safetensors_path)?;
+    } else {
+        // Try sharded format
+        let mut shard_index = 1;
+        loop {
+            let mut found_shard = None;
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(&format!("model-{:05}-of-", shard_index))
+                    && name.ends_with(".safetensors")
+                {
+                    found_shard = Some(entry.path());
+                    break;
+                }
+            }
+
+            match found_shard {
+                Some(shard_path) => {
+                    info!("  Loading shard: {}", shard_path.display());
+                    let st_file = SafeTensorsFile::load(&shard_path)?;
+                    let shard_weights = st_file.load_tensors(&shard_path)?;
+                    all_weights.extend(shard_weights);
+                    shard_index += 1;
+                }
+                None => {
+                    if shard_index == 1 {
+                        return Err(Error::new(
+                            Status::InvalidArg,
+                            format!("No SafeTensors files found in {}", model_path),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    info!("  Loaded {} total tensors", all_weights.len());
+
+    // Transform keys for PaddleOCR-VL format
+    let weights = load_paddleocr_vl_weights(all_weights)?;
+    info!("  After transformation: {} tensors", weights.len());
+
+    build_vlmodel_inner_from_weights(config, weights, vision_config, text_config, model_path)
+}
+
+/// Build VLModelInner from loaded weights
+fn build_vlmodel_inner_from_weights(
     config: ModelConfig,
     weights: HashMap<String, MxArray>,
     vision_config: VisionConfig,
     text_config: TextConfig,
     model_path: &str,
-) -> Result<VLModel> {
-    info!("🔧 Building PaddleOCR-VL model from weights...");
+) -> Result<VLModelInner> {
+    info!("Building PaddleOCR-VL model from weights...");
 
     // Helper to get weight with nice error message
     let get_weight = |key: &str| -> Result<&MxArray> {
@@ -2417,40 +2613,41 @@ fn build_paddleocr_vl_from_weights(
 
     info!("    Added {} decoder layers", text_config.num_hidden_layers);
 
-    // === Build full model ===
-    let mut model = VLModel::new(config);
-    model.set_visual(&vision_model);
-    model.set_language_model(&language_model);
-
     // === Load tokenizer ===
     let tokenizer_path = Path::new(model_path).join("tokenizer.json");
-    if tokenizer_path.exists() {
+    let tokenizer = if tokenizer_path.exists() {
         info!("  Loading tokenizer from {:?}...", tokenizer_path);
         match crate::tokenizer::Qwen3Tokenizer::from_file(&tokenizer_path) {
             Ok(tokenizer) => {
-                model.tokenizer = Some(Arc::new(tokenizer));
-                info!("    ✅ Tokenizer loaded");
+                info!("    Tokenizer loaded");
+                Some(Arc::new(tokenizer))
             }
             Err(e) => {
-                // Log warning but don't fail - tokenizer can be set manually
                 info!(
-                    "    ⚠️ Could not load tokenizer: {}. Use setTokenizer() to set manually.",
+                    "    Could not load tokenizer: {}. Use setTokenizer() to set manually.",
                     e
                 );
+                None
             }
         }
     } else {
         info!(
-            "    ℹ️ No tokenizer.json found at {:?}. Use setTokenizer() to set manually.",
+            "    No tokenizer.json found at {:?}. Use setTokenizer() to set manually.",
             tokenizer_path
         );
-    }
+        None
+    };
 
-    info!("✅ PaddleOCR-VL model built successfully");
+    info!("PaddleOCR-VL model built successfully");
     info!("   Vision: {} layers loaded", vision_model.num_layers());
     info!("   Language: {} layers loaded", language_model.num_layers());
 
-    Ok(model)
+    Ok(VLModelInner {
+        config,
+        visual: Some(vision_model),
+        language_model: Some(language_model),
+        tokenizer,
+    })
 }
 
 #[cfg(test)]
@@ -2460,7 +2657,7 @@ mod tests {
     #[test]
     fn test_model_creation() {
         let config = ModelConfig::default();
-        let model = VLModel::new(config);
+        let model = VLModel::new(config).unwrap();
 
         assert!(!model.is_initialized());
     }
@@ -2468,7 +2665,7 @@ mod tests {
     #[test]
     fn test_model_not_initialized_by_default() {
         let config = ModelConfig::default();
-        let model = VLModel::new(config);
+        let model = VLModel::new(config).unwrap();
 
         // Model should not be initialized without vision and language models
         assert!(!model.is_initialized());
@@ -2477,7 +2674,7 @@ mod tests {
     #[test]
     fn test_model_config_accessible() {
         let config = ModelConfig::default();
-        let model = VLModel::new(config);
+        let model = VLModel::new(config).unwrap();
 
         // Config should be accessible after creation
         assert_eq!(model.config.image_token_id, 100295);
@@ -2489,7 +2686,7 @@ mod tests {
     #[test]
     fn test_model_config_special_tokens() {
         let config = ModelConfig::default();
-        let model = VLModel::new(config);
+        let model = VLModel::new(config).unwrap();
 
         assert_eq!(model.config.image_token_id, 100295);
         assert_eq!(model.config.video_token_id, 100296);
@@ -2539,7 +2736,7 @@ mod tests {
     ///
     /// This test simulates the exact control flow from generate_batch's decode loop:
     ///   1. Start with 3 active items producing tokens [10, 20, 30]
-    ///   2. Item 1 (middle) hits EOS → deactivated
+    ///   2. Item 1 (middle) hits EOS -> deactivated
     ///   3. Verify remaining items [0, 2] read correct tokens [10, 30] not [10, 20]
     #[test]
     fn test_batch_decode_eos_filter_tokens() {
