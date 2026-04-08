@@ -89,6 +89,9 @@ export const enum RpcFn {
   // Fused encoder finish + queue submit + release encoder & cmdBuf in one RPC
   // Args: encoderHandle, passHandle (0 = no pass to end)
   FUSED_SUBMIT = 93,
+  // Fused: createBindGroup(from descPtr) + setPipeline + setBindGroup(0) + dispatch
+  // Args: passHandle, pipelineHandle, bgDescPtr, dispatchX, dispatchY, dispatchZ
+  FUSED_BG_DISPATCH = 94,
 }
 
 // ---- Command Buffer Layout (SharedArrayBuffer) ----

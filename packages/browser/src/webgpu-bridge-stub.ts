@@ -106,6 +106,18 @@ export function createBridgeStub(
   // Caches buffer sizes to avoid BUFFER_GET_SIZE RPCs (~2.5x per dispatch)
   const bufSizes: Record<number, number> = {};
 
+  // Deferred mappedAtCreation buffers: skip getMappedRange + unmap RPCs.
+  // Instead of sending 3 RPCs (createBuffer+getMappedRange+unmap), we:
+  //   1. Strip mappedAtCreation from descriptor, send createBuffer RPC (real handle, 1 RPC)
+  //   2. Allocate WASM shadow locally; getMappedRange returns it (0 RPCs)
+  //   3. On unmap, write data via QUEUE_WRITE_BUFFER (1 RPC)
+  // Total: 2 RPCs instead of 3 per uniform buffer creation.
+  interface MappedAtCreationInfo {
+    wasmPtr: number; // WASM shadow pointer (allocated by wasmMalloc)
+    size: number;    // buffer size in bytes
+  }
+  const mappedAtCreationBuffers = new Map<number, MappedAtCreationInfo>();
+
   // Pipeline bind group layout cache: layouts are lightweight and never released
   const layoutCache: Record<number, number> = {};
 
@@ -308,6 +320,39 @@ export function createBridgeStub(
 
     // ===== Device =====
     wgpuDeviceCreateBuffer(_device: number, descPtr: number): number {
+      // WGPUBufferDescriptor (WASM32 layout):
+      //   +0  nextInChain (ptr, 4 bytes)
+      //   +4  label (ptr, 4 bytes)
+      //   +8  usage (u32, 4 bytes)
+      //   +12 padding (4 bytes, alignment for u64)
+      //   +16 size lo (u32)
+      //   +20 size hi (u32)
+      //   +24 mappedAtCreation (WGPUBool = u32)
+      const h = heap();
+      if (h[descPtr + 24]) {
+        // mappedAtCreation=true: read usage to determine if we can defer.
+        // We can only use QUEUE_WRITE_BUFFER on unmap if the buffer has COPY_DST
+        // (WGPUBufferUsage_CopyDst = 0x0008). Buffers with only CopySrc must use
+        // the original 3-RPC approach (createBuffer with mappedAtCreation intact).
+        const view = new DataView(h.buffer, h.byteOffset, h.byteLength);
+        const usage = view.getUint32(descPtr + 8, true);
+        const COPY_DST = 0x0008;
+        if (usage & COPY_DST) {
+          // Strip mappedAtCreation so GPU buffer is created unmapped (we manage shadow locally).
+          const sizeLo = view.getUint32(descPtr + 16, true);
+          const sizeHi = view.getUint32(descPtr + 20, true);
+          const size = sizeLo + sizeHi * 0x100000000;
+          h[descPtr + 24] = 0;
+          const handle = rpcCall(RpcFn.DEVICE_CREATE_BUFFER, descPtr);
+          // Restore WASM memory (the descriptor may be reused by C++)
+          heap()[descPtr + 24] = 1;
+          // Allocate WASM shadow for C++ to write into via getMappedRange
+          const wasmPtr = wasmMalloc(size);
+          mappedAtCreationBuffers.set(handle, { wasmPtr, size });
+          return handle;
+        }
+        // No COPY_DST: fall through to normal RPC (gpu-worker handles mapping)
+      }
       return rpcCall(RpcFn.DEVICE_CREATE_BUFFER, descPtr);
     },
 
@@ -495,13 +540,11 @@ export function createBridgeStub(
       passHandle: number, x: number, y: number, z: number,
     ): void {
       if (pendingPipeline >= 0 && pendingBindGroup >= 0 && pendingBindGroup1 >= 0) {
-        // Fused: setPipeline + setBindGroup(0) + setBindGroup(1) + dispatch in 1 RPC
         rpcCall(RpcFn.FUSED_DISPATCH_2BG, pendingPass, pendingPipeline, pendingBindGroup, pendingBindGroup1, x, y, z);
         pendingPipeline = -1;
         pendingBindGroup = -1;
         pendingBindGroup1 = -1;
       } else if (pendingPipeline >= 0 && pendingBindGroup >= 0) {
-        // Fused: setPipeline + setBindGroup(0) + dispatch in 1 RPC
         rpcCall(RpcFn.FUSED_DISPATCH, pendingPass, pendingPipeline, pendingBindGroup, x, y, z);
         pendingPipeline = -1;
         pendingBindGroup = -1;
@@ -539,6 +582,13 @@ export function createBridgeStub(
     },
 
     wgpuBufferGetMappedRange(bufferHandle: number, offset: number, size: number): number {
+      // Fast path: deferred mappedAtCreation buffer — return WASM shadow (no RPC)
+      const mapped = mappedAtCreationBuffers.get(bufferHandle);
+      if (mapped) {
+        unmapPtrs.set(bufferHandle, mapped.wasmPtr);
+        return mapped.wasmPtr + offset;
+      }
+
       // WASM memory shadow pattern: allocate WASM-side buffer, pass pointer to gpu-worker.
       // gpu-worker calls getMappedRange, stores the mapping. On unmap, gpu-worker copies
       // WASM->JS ArrayBuffer (write path for mappedAtCreation).
@@ -590,6 +640,17 @@ export function createBridgeStub(
     },
 
     wgpuBufferUnmap(bufferHandle: number): void {
+      // Fast path: deferred mappedAtCreation buffer — write data via QUEUE_WRITE_BUFFER (1 RPC)
+      // instead of the original 3-RPC dance (createBuffer + getMappedRange + unmap).
+      const mapped = mappedAtCreationBuffers.get(bufferHandle);
+      if (mapped) {
+        mappedAtCreationBuffers.delete(bufferHandle);
+        // QUEUE_WRITE_BUFFER args: bufferHandle, offsetLo, offsetHi, dataPtr, size
+        rpcCall(RpcFn.QUEUE_WRITE_BUFFER, bufferHandle, 0, 0, mapped.wasmPtr, mapped.size);
+        wasmFree(mapped.wasmPtr);
+        unmapPtrs.delete(bufferHandle);
+        return;
+      }
       rpcCall(RpcFn.BUFFER_UNMAP, bufferHandle);
       // Free the WASM shadow pointer allocated by getMappedRange/getConstMappedRange
       const wasmPtr = unmapPtrs.get(bufferHandle);
@@ -630,7 +691,7 @@ export function createBridgeStub(
     },
 
     // ===== Release =====
-    wgpuBindGroupRelease(_handle: number): void {
+    wgpuBindGroupRelease(handle: number): void {
       // No-op: bind groups are lightweight JS objects, no GPU resources to free.
       // Skipping this RPC saves ~28K roundtrips per generation.
     },
