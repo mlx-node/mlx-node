@@ -1081,6 +1081,44 @@ async function processCommand(fnId: number): Promise<void> {
       break;
     }
 
+    case RpcFn.FUSED_FULL_DISPATCH: {
+      // Fused: inline createBindGroup + setPipeline + setBindGroup(0) + dispatch
+      // ARGs: passHandle, pipelineHandle, layoutHandle, dispatchX, Y, Z
+      // CALLBACK_COUNT: entryCount (repurposed — written by bridge-stub before signaling)
+      // CALLBACK_BASE+: entries (bufHandle:u32, sizeLo:u32, sizeHi:u32) × entryCount
+      const passHandle = arg0();
+      const pipelineHandle = arg1();
+      const layoutHandle = arg2();
+      const x = arg3();
+      const y = arg4();
+      const z = arg5();
+
+      const entryCount = cmdDataView.getUint32(CMD_OFFSET.CALLBACK_COUNT, true);
+      const layout = getHandle<GPUBindGroupLayout>(layoutHandle);
+      const entries: GPUBindGroupEntry[] = [];
+      for (let i = 0; i < entryCount; i++) {
+        const base = CMD_OFFSET.CALLBACK_BASE + i * 12;
+        const bufferHandle = cmdDataView.getUint32(base, true);
+        const sizeLo = cmdDataView.getUint32(base + 4, true);
+        const sizeHi = cmdDataView.getUint32(base + 8, true);
+        const size = sizeLo + sizeHi * 0x100000000;
+        const buffer = getHandle<GPUBuffer>(bufferHandle);
+        const resource: GPUBufferBinding = { buffer, offset: 0 };
+        if (size !== 0 && size < 2 ** 53) {
+          resource.size = size;
+        }
+        entries.push({ binding: i, resource });
+      }
+
+      const bindGroup = device.createBindGroup({ layout, entries });
+      const pass = getHandle<GPUComputePassEncoder>(passHandle);
+      pass.setPipeline(getHandle<GPUComputePipeline>(pipelineHandle));
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(x, y, z);
+      setResult(0);
+      break;
+    }
+
     case RpcFn.ADD_GPU_BUFFER: {
       // This is handled via postMessage, not RPC, because the GPU buffer
       // object can't be serialized through SharedArrayBuffer.

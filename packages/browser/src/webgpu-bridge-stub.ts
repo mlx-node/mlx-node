@@ -130,8 +130,66 @@ export function createBridgeStub(
     return deferredBufferRemap.get(handle) ?? handle;
   }
 
+  // Eagerly-parsed bind group descriptors for FUSED_FULL_DISPATCH.
+  // During wgpuDeviceCreateBindGroup, we read the descriptor from WASM memory
+  // (while the C++ stack frame is still valid) and store the parsed entry data.
+  // This avoids a separate DEVICE_CREATE_BIND_GROUP RPC — the bind group is
+  // created inline on the gpu-worker side during dispatch.
+  interface BgEntryData {
+    bufferHandle: number;  // already resolved via resolveBufferHandle
+    sizeLo: number;
+    sizeHi: number;
+  }
+  interface ParsedBgDesc {
+    layoutHandle: number;
+    entries: BgEntryData[];
+  }
+  const pendingBgData = new Map<number, ParsedBgDesc>();
+  let fakeBgCounter = 0x7E000000;
+
   // Pipeline bind group layout cache: layouts are lightweight and never released
   const layoutCache: Record<number, number> = {};
+
+  /** Materialize a fake bind group handle into a real one via RPC. */
+  function materializeBg(handle: number): number {
+    const bgDesc = pendingBgData.get(handle);
+    if (!bgDesc) return handle; // already real
+    pendingBgData.delete(handle);
+    // Reconstruct the descriptor in WASM scratch memory and send CREATE_BIND_GROUP RPC
+    const ENTRY_SIZE = 40; // WGPUBindGroupEntry is 40 bytes on WASM32
+    const descSize = 20;   // WGPUBindGroupDescriptor is 20 bytes on WASM32
+    const entriesSize = bgDesc.entries.length * ENTRY_SIZE;
+    const scratchPtr = wasmMalloc(descSize + entriesSize);
+    const view = new DataView(heap().buffer);
+    const entriesArrPtr = scratchPtr + descSize;
+
+    // Write WGPUBindGroupDescriptor
+    view.setUint32(scratchPtr + 0, 0, true);  // nextInChain
+    view.setUint32(scratchPtr + 4, 0, true);  // label
+    view.setUint32(scratchPtr + 8, bgDesc.layoutHandle, true);
+    view.setUint32(scratchPtr + 12, bgDesc.entries.length, true);
+    view.setUint32(scratchPtr + 16, entriesArrPtr, true);
+
+    // Write WGPUBindGroupEntry array
+    for (let i = 0; i < bgDesc.entries.length; i++) {
+      const e = bgDesc.entries[i];
+      const ePtr = entriesArrPtr + i * ENTRY_SIZE;
+      view.setUint32(ePtr + 0, 0, true);   // nextInChain
+      view.setUint32(ePtr + 4, i, true);   // binding = sequential index
+      view.setUint32(ePtr + 8, e.bufferHandle, true);
+      view.setUint32(ePtr + 12, 0, true);  // padding
+      view.setUint32(ePtr + 16, 0, true);  // offset lo = 0
+      view.setUint32(ePtr + 20, 0, true);  // offset hi = 0
+      view.setUint32(ePtr + 24, e.sizeLo, true);
+      view.setUint32(ePtr + 28, e.sizeHi, true);
+      view.setUint32(ePtr + 32, 0, true);  // sampler
+      view.setUint32(ePtr + 36, 0, true);  // textureView
+    }
+
+    const realHandle = rpcCall(RpcFn.DEVICE_CREATE_BIND_GROUP, scratchPtr);
+    wasmFree(scratchPtr);
+    return realHandle;
+  }
 
   function flushPendingCompute() {
     if (pendingPipeline >= 0) {
@@ -139,11 +197,13 @@ export function createBridgeStub(
       pendingPipeline = -1;
     }
     if (pendingBindGroup >= 0) {
-      rpcCall(RpcFn.COMPUTE_PASS_SET_BIND_GROUP, pendingPass, 0, pendingBindGroup, 0, 0);
+      const realBg = materializeBg(pendingBindGroup);
+      rpcCall(RpcFn.COMPUTE_PASS_SET_BIND_GROUP, pendingPass, 0, realBg, 0, 0);
       pendingBindGroup = -1;
     }
     if (pendingBindGroup1 >= 0) {
-      rpcCall(RpcFn.COMPUTE_PASS_SET_BIND_GROUP, pendingPass, 1, pendingBindGroup1, 0, 0);
+      const realBg1 = materializeBg(pendingBindGroup1);
+      rpcCall(RpcFn.COMPUTE_PASS_SET_BIND_GROUP, pendingPass, 1, realBg1, 0, 0);
       pendingBindGroup1 = -1;
     }
   }
@@ -157,7 +217,11 @@ export function createBridgeStub(
     for (let i = 0; i < args.length; i++) {
       cmdDataView.setUint32(ARG_BASE + (i << 2), args[i] >>> 0, true);
     }
-    cmdDataView.setUint32(CMD_OFFSET.CALLBACK_COUNT, 0, true);
+    // Don't clear CALLBACK_COUNT for FUSED_FULL_DISPATCH — it holds entryCount
+    // (written by the caller before rpcCall). The gpu-worker reads it during processCommand.
+    if (fnId !== RpcFn.FUSED_FULL_DISPATCH) {
+      cmdDataView.setUint32(CMD_OFFSET.CALLBACK_COUNT, 0, true);
+    }
 
     // Signal gpu-worker and block
     Atomics.store(cmdView, STATUS_INDEX, STATUS.PENDING);
@@ -173,10 +237,13 @@ export function createBridgeStub(
 
     const result = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);
 
-    // Process pending callbacks only when present (95%+ of calls have 0)
-    const cbCount = cmdDataView.getUint32(CMD_OFFSET.CALLBACK_COUNT, true);
-    if (cbCount > 0) {
-      try { drainCallbacks(fnId); } catch (e) { console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e); }
+    // Process pending callbacks only when present (95%+ of calls have 0).
+    // Skip for FUSED_FULL_DISPATCH — CALLBACK_COUNT holds entryCount, not callbacks.
+    if (fnId !== RpcFn.FUSED_FULL_DISPATCH) {
+      const cbCount = cmdDataView.getUint32(CMD_OFFSET.CALLBACK_COUNT, true);
+      if (cbCount > 0) {
+        try { drainCallbacks(fnId); } catch (e) { console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e); }
+      }
     }
 
     Atomics.store(cmdView, STATUS_INDEX, STATUS.IDLE);
@@ -376,14 +443,37 @@ export function createBridgeStub(
     },
 
     wgpuDeviceCreateBindGroup(_device: number, descPtr: number): number {
-      // Patch any deferred (fake) buffer handles in bind group entries before sending RPC.
-      // The gpu-worker reads buffer handles from WASM memory and needs real handles.
-      if (deferredBufferRemap.size > 0) {
-        const view = new DataView(heap().buffer);
-        // WGPUBindGroupDescriptor: +12 entryCount, +16 entriesPtr
-        const entryCount = view.getUint32(descPtr + 12, true);
-        const entriesPtr = view.getUint32(descPtr + 16, true);
+      // Eagerly read descriptor from WASM memory (stack is still valid here).
+      // Parse entries and store them for FUSED_FULL_DISPATCH — avoids a separate
+      // DEVICE_CREATE_BIND_GROUP RPC when the bind group is used immediately.
+      const h = heap();
+      const view = new DataView(h.buffer, h.byteOffset, h.byteLength);
+      const layoutHandle = view.getUint32(descPtr + 8, true);
+      const entryCount = view.getUint32(descPtr + 12, true);
+      const entriesPtr = view.getUint32(descPtr + 16, true);
+
+      // Only defer if entry count fits in overflow space (max 10 entries, 12 bytes each)
+      if (entryCount <= 10) {
+        const entries: BgEntryData[] = [];
         const ENTRY_SIZE = 40; // WGPUBindGroupEntry is 40 bytes on WASM32
+        for (let i = 0; i < entryCount; i++) {
+          const ePtr = entriesPtr + i * ENTRY_SIZE;
+          let bufferHandle = view.getUint32(ePtr + 8, true);
+          // Resolve deferred buffer handles immediately (while stack is valid)
+          bufferHandle = resolveBufferHandle(bufferHandle);
+          const sizeLo = view.getUint32(ePtr + 24, true);
+          const sizeHi = view.getUint32(ePtr + 28, true);
+          entries.push({ bufferHandle, sizeLo, sizeHi });
+        }
+        const fake = fakeBgCounter++;
+        pendingBgData.set(fake, { layoutHandle, entries });
+        return fake;
+      }
+
+      // Too many entries — fall through to direct RPC.
+      // Still need to patch fake buffer handles in entries.
+      if (deferredBufferRemap.size > 0) {
+        const ENTRY_SIZE = 40;
         for (let i = 0; i < entryCount; i++) {
           const ePtr = entriesPtr + i * ENTRY_SIZE;
           const bufferHandle = view.getUint32(ePtr + 8, true);
@@ -574,12 +664,34 @@ export function createBridgeStub(
       passHandle: number, x: number, y: number, z: number,
     ): void {
       if (pendingPipeline >= 0 && pendingBindGroup >= 0 && pendingBindGroup1 >= 0) {
-        rpcCall(RpcFn.FUSED_DISPATCH_2BG, pendingPass, pendingPipeline, pendingBindGroup, pendingBindGroup1, x, y, z);
+        // 2 bind groups: materialize any fake handles and use FUSED_DISPATCH_2BG
+        const realBg0 = materializeBg(pendingBindGroup);
+        const realBg1 = materializeBg(pendingBindGroup1);
+        rpcCall(RpcFn.FUSED_DISPATCH_2BG, pendingPass, pendingPipeline, realBg0, realBg1, x, y, z);
         pendingPipeline = -1;
         pendingBindGroup = -1;
         pendingBindGroup1 = -1;
       } else if (pendingPipeline >= 0 && pendingBindGroup >= 0) {
-        rpcCall(RpcFn.FUSED_DISPATCH, pendingPass, pendingPipeline, pendingBindGroup, x, y, z);
+        const bgDesc = pendingBgData.get(pendingBindGroup);
+        if (bgDesc) {
+          // FUSED_FULL_DISPATCH: inline bind group creation + dispatch in one RPC
+          pendingBgData.delete(pendingBindGroup);
+          const entryCount = bgDesc.entries.length;
+          // Write entry data into the callback ring space BEFORE rpcCall
+          // (rpcCall will skip zeroing CALLBACK_COUNT for this fnId)
+          cmdDataView.setUint32(CMD_OFFSET.CALLBACK_COUNT, entryCount, true);
+          for (let i = 0; i < entryCount; i++) {
+            const e = bgDesc.entries[i];
+            const base = CMD_OFFSET.CALLBACK_BASE + i * 12;
+            cmdDataView.setUint32(base, e.bufferHandle, true);
+            cmdDataView.setUint32(base + 4, e.sizeLo, true);
+            cmdDataView.setUint32(base + 8, e.sizeHi, true);
+          }
+          rpcCall(RpcFn.FUSED_FULL_DISPATCH, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z);
+        } else {
+          // Real bind group handle — use existing FUSED_DISPATCH
+          rpcCall(RpcFn.FUSED_DISPATCH, pendingPass, pendingPipeline, pendingBindGroup, x, y, z);
+        }
         pendingPipeline = -1;
         pendingBindGroup = -1;
       } else {
@@ -744,7 +856,9 @@ export function createBridgeStub(
 
     // ===== Release =====
     wgpuBindGroupRelease(handle: number): void {
-      // No-op: bind groups are lightweight JS objects, no GPU resources to free.
+      // Clean up eagerly-parsed bind group data if it was never dispatched
+      pendingBgData.delete(handle);
+      // No RPC: bind groups are lightweight JS objects, no GPU resources to free.
       // Skipping this RPC saves ~28K roundtrips per generation.
     },
 

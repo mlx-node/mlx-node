@@ -95,6 +95,11 @@ export const enum RpcFn {
   // Fused: create buffer + write initial data in one RPC (replaces mappedAtCreation pattern)
   // Args: usage, sizeLo, sizeHi, wasmDataPtr
   CREATE_BUFFER_FROM_DATA = 95,
+  // Fused: inline bind group creation + setPipeline + setBindGroup(0) + dispatch
+  // ARG0-5: passHandle, pipelineHandle, layoutHandle, dispatchX, Y, Z
+  // CALLBACK_COUNT: entryCount (repurposed — gpu-worker checks fnId to distinguish)
+  // CALLBACK_BASE+: entry data (bufHandle:u32, sizeLo:u32, sizeHi:u32) × entryCount
+  FUSED_FULL_DISPATCH = 96,
 }
 
 // ---- Command Buffer Layout (SharedArrayBuffer) ----
