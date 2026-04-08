@@ -121,18 +121,15 @@ impl RotatingKVCache {
                 (keys.clone(), values.clone(), seq_len)
             };
 
-            self.keys = Some(stored_keys.clone());
-            self.values = Some(stored_values.clone());
+            self.keys = Some(stored_keys);
+            self.values = Some(stored_values);
             self.offset = seq_len; // offset tracks TOTAL tokens seen, not stored
             self.idx = stored_idx;
 
             // Return the FULL (untrimmed) keys/values for prefill attention.
-            // The caller needs to attend over the complete sequence during prefill.
-            // Match Python: return self.keys, self.values (same objects)
-            return Ok(vec![
-                self.keys.as_ref().unwrap().clone(),
-                self.values.as_ref().unwrap().clone(),
-            ]);
+            // The caller needs to attend over the complete sequence during prefill,
+            // even though only the window is stored internally.
+            return Ok(vec![keys.clone(), values.clone()]);
         }
 
         let ordered_keys = self.temporal_order(self.keys.as_ref().unwrap())?;
