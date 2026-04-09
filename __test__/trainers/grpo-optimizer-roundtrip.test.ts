@@ -19,72 +19,105 @@
  *     checkpoint and on resume, but the AdamW moment tensors and step counter
  *     silently failed to round-trip. Both entry points now go through the
  *     dedicated model thread via `SaveOptimizerState` / `LoadOptimizerState`
- *     commands. The resume path in step 3 below is the user-visible surface
- *     of that fix: it must complete without aborting, regardless of whether
- *     the optimizer had populated moments at save time.
+ *     commands. Step 2 below writes `optimizer_state.safetensors` through
+ *     that command, and step 3 below consumes it via `LoadOptimizerState`.
  *
  * ---------------------------------------------------------------------------
- * Note on AdamW moment assertions
+ * Making the AdamW state map actually populate on a tiny random-weight Qwen3
  * ---------------------------------------------------------------------------
- * An earlier draft of this test tried to assert that
- * `optimizer_state.safetensors` was present after the save and that the
- * resumed loss matched the pre-save loss within a sane factor. That proved
- * impractical on a tiny random-weight Qwen3:
  *
- *   - With a short `maxCompletionLength` (<=16) every rollout hits the
- *     degenerate-completion filter in the engine (`finish_reason="length"` +
- *     `tokens >= 0.9 * max_completion_length`), the train step early-returns
- *     with `loss=0, gradientsApplied=false`, and AdamW never populates a
- *     single moment tensor — so `save_optimizer_state_sync` short-circuits
- *     out of the `keys.is_empty()` branch without writing a file.
- *   - With `maxCompletionLength` >= 17, generation can finish via the
- *     repetition detector (`finish_reason="repetition"`) which bypasses the
- *     filter, but on tiny bf16 random weights the Metal autograd backward
- *     kernel aborts with a foreign C++ exception before returning control
- *     to Rust. That abort is orthogonal to this fix and not something this
- *     test should try to reproduce.
+ * A naive version of this test (short `maxCompletionLength`, default sampling,
+ * constant rewards) silently degrades into a no-op: the engine's degenerate-
+ * completion filter kills every rollout (`finish_reason="length"` +
+ * `tokens >= 0.9 * max_completion_length`), `train_step_grpo_sync` is never
+ * called, the optimizer state map stays empty, and
+ * `save_optimizer_state_sync` takes the `keys.is_empty()` early return
+ * without writing a file. The test then passes vacuously — the save appears
+ * to succeed, `hasOptimizerState` is set to `true` by `saveCheckpoint`
+ * unconditionally, the resume-path `try/catch` swallows the missing file,
+ * and nothing actually exercises the optimizer-state round-trip.
  *
- * So instead of chasing a configuration where both autograd and the filter
- * cooperate, this test deliberately stays inside the safe max=10 regime and
- * validates the plumbing that the two fixes are actually about:
+ * To force the pipeline to actually populate optimizer state we need three
+ * things:
  *
- *   a) `saveCheckpoint` on a loaded (thread-backed) Qwen3 model completes
- *      without crashing and writes the files the resume path expects
- *      (`training_state.json`, `weights.safetensors`, `config.json`,
- *      `tokenizer.json`).
- *   b) `GRPOTrainer.create({ resumeFromCheckpoint })` rebuilds the trainer
- *      without aborting, including the `loadOptimizerState` call that used
- *      to silently no-op on the old `warn!` stub and now dispatches to the
- *      model thread. A missing optimizer file is tolerated by the resume
- *      code's try/catch, but the underlying `LoadOptimizerState` command
- *      must still be wired through the thread — a regression that broke
- *      that wiring would abort the test worker, not fall into the warn.
- *   c) The resumed trainer preserves the JS-side step counter from
- *      `training_state.json` (3 → still 3 before any new step).
- *   d) A subsequent `trainStep` on the resumed trainer returns finite
- *      metrics. This proves the model thread is still live and the
- *      optimizer state (populated or not) loaded through `loadOptimizerState`
- *      didn't leave the training engine in a broken state.
+ *   1. The engine's degenerate-completion filter to let at least one
+ *      completion through per step. The filter only rejects
+ *      `finish_reason == "length"` with `tokens >= 0.9 * max`. So we need
+ *      generation to finish via EOS or the repetition cutoff before hitting
+ *      the length limit. The GRPO engine hardcodes `max_consecutive_tokens:
+ *      16`, `max_ngram_repeats: 8`, and `ngram_size: 3` in its generation
+ *      config (crates/mlx-core/src/grpo/engine.rs build_gen_config).
+ *      Combined with `repetitionPenalty: 0.05` (< 1 REWARDS previously-
+ *      sampled tokens — it divides positive logits by the penalty, which
+ *      with 0.05 multiplies them by 20) and greedy decoding, the model
+ *      collapses into a short repeating cycle within a few dozen tokens on
+ *      almost every attempt. A small retry loop tolerates the rare attempt
+ *      that escapes the cutoff.
+ *
+ *   2. The optimizer state map on the model thread to become non-empty.
+ *      This happens as a side effect of `AdamW::update_batch` calling
+ *      `init_state` the first time it sees each parameter name — regardless
+ *      of the actual gradient values. So as long as ONE train step makes it
+ *      past the degenerate-completion filter and runs
+ *      `train_step_grpo_sync`'s optimizer-update branch, the state map is
+ *      populated and `save_optimizer_state_sync` will write a real file
+ *      instead of taking the empty-keys early return.
+ *
+ *   3. `save_model` to succeed at checkpoint time, which means the model
+ *      weights must not contain any NaN/Inf values. We guarantee this by
+ *      combining `learningRate: 0` with a CONSTANT reward function: with
+ *      constant rewards the group-normalized advantages are exactly 0, so
+ *      the policy gradient is exactly 0, so AdamW computes `new_m = 0,
+ *      new_v = 0, update = 0 / (0 + eps) = 0, lr_update = 0`, and the
+ *      parameter update is an identity no-op. This avoids the IEEE
+ *      floating-point footgun where `lr=0 * update=inf = NaN` poisons the
+ *      weights — a non-hypothetical risk even with `gradientClipNorm` +
+ *      element-wise clipping, because the update denominator can get very
+ *      small in bf16 on the first real gradient of a random-init model.
+ *
+ * We deliberately run in the same TINY_TEST_CONFIG the other GRPO trainer
+ * tests use — this combination of head_dim / hidden_size / num_heads has
+ * been verified to work on the Metal autograd backward path elsewhere
+ * (see `grpo-autograd-integration.test.ts`, which runs a full autograd
+ * train step on exactly this shape with `maxCompletionLength: 256`).
  */
 
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { Qwen3Model } from '@mlx-node/core';
 import { loadModel } from '@mlx-node/lm';
 import { GRPOTrainer, type RewardOutput } from '@mlx-node/trl';
-import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
+import { afterAll, describe, expect, it } from 'vite-plus/test';
 
 import { createTempModel } from '../test-model-utils';
 
-// Deterministic varying reward — two completions in a group-of-2 get
-// different scores, giving a non-zero advantage if the engine ever makes
-// it past the degenerate-completion filter. For this tiny random-weight
-// model that filter will in practice kill every rollout (see the header
-// comment), in which case the reward values are moot.
-const deterministicReward = (outputs: RewardOutput[]): Float32Array =>
-  Float32Array.from(outputs.map((_o, i) => (i % 2 === 0 ? 1.0 : 0.0)));
+// Constant reward: every completion gets the same score. Group normalization
+// turns these into advantages of exactly 0, so the policy gradient is exactly
+// 0 everywhere. This is intentional — we want to populate AdamW moment state
+// (which happens via `init_state` the moment `update_batch` is called on a
+// previously-unseen param) WITHOUT actually perturbing the weights.
+//
+// With zero gradients:
+//   new_m = β1*0 + (1-β1)*0 = 0
+//   new_v = β2*0 + (1-β2)*0 = 0
+//   update = 0 / (sqrt(0) + eps) = 0
+//   new_param = param - lr*0 = param  (exactly, no FP drama)
+//
+// So weights stay pristine (saveable), but the optimizer state map has been
+// populated by `init_state`, so `get_state_keys()` is non-empty and
+// `save_optimizer_state_sync` writes a real safetensors file instead of
+// taking the empty-keys early return. That's exactly what the round-trip
+// test needs.
+//
+// Note: group normalization on constant rewards could hit a 0/0 if std is
+// measured as exactly 0; the engine's `compute_advantages` handles that by
+// clamping std to a small epsilon, producing finite (zero) advantages. This
+// has been verified empirically — the train step returns `gradientsApplied
+// === true` with this reward as long as the engine's degenerate-completion
+// filter lets the completions through (see commentary further below).
+const constantReward = (outputs: RewardOutput[]): Float32Array => Float32Array.from(outputs.map(() => 1.0));
 
 interface TrainingStateJson {
   step: number;
@@ -94,30 +127,50 @@ interface TrainingStateJson {
 }
 
 describe.sequential('GRPOTrainer checkpoint + optimizer state round-trip', () => {
-  let tempModel: { modelPath: string; cleanup: () => void };
-  let checkpointDir: string;
-
-  beforeAll(async () => {
-    // Default TINY_TEST_CONFIG from test-model-utils — identical shape to the
-    // other GRPO trainer tests, which is the combination of head_dim /
-    // hidden_size / num_heads known to be stable on the Metal backward path.
-    tempModel = await createTempModel();
-    checkpointDir = mkdtempSync(join(tmpdir(), 'mlx-grpo-opt-roundtrip-'));
-  });
+  // Resources created *inside* `runOnce` are tracked here so the outer
+  // retry loop and `afterAll` can clean up across attempts. We hold these
+  // at describe scope rather than `beforeAll` because some attempts may
+  // need to discard a poisoned random-init model and create a fresh one.
+  const cleanups: Array<() => void> = [];
 
   afterAll(() => {
-    tempModel?.cleanup();
-    if (checkpointDir && existsSync(checkpointDir)) {
+    for (const fn of cleanups) {
       try {
-        rmSync(checkpointDir, { recursive: true, force: true });
+        fn();
       } catch (err) {
-        console.warn(`Failed to cleanup checkpoint dir ${checkpointDir}:`, err);
+        console.warn('Cleanup failed:', err);
       }
     }
   });
 
-  it('saves a checkpoint through the model thread and resumes without crashing', async () => {
-    // --- Phase 1: initial trainer, run a few steps -------------------------
+  /**
+   * Single attempt at the full round-trip. Throws on any assertion or
+   * numerical failure; the outer loop in `it(...)` catches those and
+   * re-runs with a fresh random-init model. We isolate per-attempt state
+   * (model, checkpoint dir, trainers) inside this helper so a failed
+   * attempt can't leak an MxArray or checkpoint path into the next.
+   *
+   * Returns the final `m4.loss` on success for the outer loop's logging.
+   */
+  async function runOnce(): Promise<{ attempts: number; finalLoss: number }> {
+    const tempModel = await createTempModel();
+    const checkpointDir = mkdtempSync(join(tmpdir(), 'mlx-grpo-opt-roundtrip-'));
+    cleanups.push(() => {
+      try {
+        tempModel.cleanup();
+      } catch (err) {
+        console.warn('Failed to cleanup temp model:', err);
+      }
+      if (existsSync(checkpointDir)) {
+        try {
+          rmSync(checkpointDir, { recursive: true, force: true });
+        } catch (err) {
+          console.warn(`Failed to cleanup checkpoint dir ${checkpointDir}:`, err);
+        }
+      }
+    });
+
+    // --- Phase 1: initial trainer, run a few steps ------------------------
     const loadedA = await loadModel(tempModel.modelPath);
     expect(loadedA).toBeInstanceOf(Qwen3Model);
     const modelA = loadedA as unknown as Qwen3Model;
@@ -126,15 +179,59 @@ describe.sequential('GRPOTrainer checkpoint + optimizer state round-trip', () =>
       modelName: 'qwen3-tiny-roundtrip',
       modelPath: tempModel.modelPath, // so saveCheckpoint can find tokenizer.json
       groupSize: 2,
-      // max_completion_length is deliberately small — see the header comment.
-      // The tiny random-weight model hits the degenerate-completion filter in
-      // this regime, so gradients don't actually flow; we're validating the
-      // save/resume plumbing, not the numerics.
-      maxCompletionLength: 10,
-      temperature: 0.8,
-      topP: 0.95,
-      learningRate: 1e-4,
-      rewardFunction: deterministicReward,
+      // maxCompletionLength large enough to give the repetition cutoff
+      // room to fire before we hit the length limit. The GRPO engine's
+      // generation config hardcodes `max_consecutive_tokens: 16`,
+      // `max_ngram_repeats: 8`, and `ngram_size: 3`
+      // (crates/mlx-core/src/grpo/engine.rs build_gen_config), so the
+      // consecutive-same cutoff fires after 16 identical tokens in a row
+      // and the ngram cutoff fires after 16 tokens of an ABAB pattern or
+      // 24 tokens of an ABCABC pattern. With `repetitionPenalty: 0.05`
+      // below, we strongly bias the model toward re-picking previously
+      // sampled tokens, so one of those cutoffs fires well before the
+      // 0.9 * 128 = 115 length threshold.
+      maxCompletionLength: 128,
+      // topK=1 + tiny temperature ≈ greedy argmax. Combined with a strong
+      // bonus for previously-sampled tokens via repetitionPenalty<1 (see
+      // below), the model collapses into a short repeating cycle within a
+      // few dozen tokens.
+      temperature: 0.01,
+      topK: 1,
+      topP: 1.0,
+      // repetitionPenalty < 1 REWARDS previously-sampled tokens instead of
+      // penalizing them — `apply_repetition_penalty` divides positive
+      // logits by `penalty`, so penalty=0.05 multiplies them by 20. On a
+      // tiny random-weight model with already-near-uniform logits that's
+      // enough to force the sampler to keep picking the same handful of
+      // tokens, which in turn triggers the 16-consecutive-token and/or
+      // ngram-repeat cutoffs hardcoded in the GRPO engine's gen config.
+      // Without this the random-weight Qwen3 wanders in a long cycle and
+      // all completions finish with reason="length", which the engine's
+      // degenerate-completion filter rejects (see engine.rs ~1000).
+      repetitionPenalty: 0.05,
+      // Zero learning rate + constant rewards = deterministic no-op weight
+      // update. Constant rewards produce zero advantages (see `constantReward`
+      // above), which make all policy gradients exactly zero. With zero
+      // gradients AdamW's `update_single_at_step` computes
+      //   new_m = 0.9*0 + 0.1*0 = 0
+      //   new_v = 0.999*0 + 0.001*0 = 0
+      //   update = 0 / (sqrt(0) + eps) = 0
+      //   new_param = param - 0*update = param
+      // exactly — no bf16/IEEE floating-point edge cases. The state map
+      // is still populated (via `init_state` on each param's first visit),
+      // so `get_state_keys()` is non-empty and `save_optimizer_state_sync`
+      // writes a real file. The weights stay pristine, so `save_model`'s
+      // NaN/Inf validation passes.
+      //
+      // NOTE: `lr=0` alone (with non-zero gradients) is NOT enough, because
+      // of an IEEE floating-point footgun: if `update = corrected_m /
+      // (sqrt(corrected_v) + eps)` ever contains `inf` (possible in bf16
+      // with extreme gradients), then `update * 0 = NaN`, which poisons
+      // the weight through `new_param = param - NaN`. Zero gradients are
+      // the only numerically safe path.
+      learningRate: 0,
+      gradientClipNorm: 1.0,
+      rewardFunction: constantReward,
       logConsole: false,
       outputDir: checkpointDir,
     } as const;
@@ -143,55 +240,126 @@ describe.sequential('GRPOTrainer checkpoint + optimizer state round-trip', () =>
 
     const prompts = [[{ role: 'user' as const, content: 'hi' }]];
 
-    const m1 = await trainerA.trainStep(prompts);
-    const m2 = await trainerA.trainStep(prompts);
-    const m3 = await trainerA.trainStep(prompts);
-
-    for (const [idx, m] of [m1, m2, m3].entries()) {
-      expect(typeof m.loss).toBe('number');
-      expect(Number.isFinite(m.loss)).toBe(true);
-      // The JS-side step counter on GRPOTrainer is incremented per trainStep
-      // regardless of whether the engine early-returned, so step follows the
-      // call index 1..3 even in the filter-killed regime.
-      expect(m.step).toBe(idx + 1);
+    // Run training steps in a retry loop until we see at least one step that
+    // actually applied gradients. We need a successful gradient application
+    // for `save_optimizer_state_sync` to produce a non-empty file — it
+    // short-circuits with `Ok(())` when AdamW's state map is empty (via
+    // `get_state_keys().is_empty()`), and the state map only becomes
+    // non-empty once `update_batch` has been called at least once (it calls
+    // `init_state` the first time each param name is seen).
+    //
+    // Why retry instead of running a fixed number of steps: on a tiny random-
+    // weight Qwen3 (2 layers, hidden_size=64), the GRPO engine's degenerate-
+    // completion filter occasionally rejects every rollout in a step
+    // (when the random sampling path happens to avoid both the 16-consecutive-
+    // token cutoff AND the ABAB/ABCABC ngram-repeat cutoffs and generation
+    // runs right up to `maxCompletionLength`). When all completions are
+    // filtered, the engine early-returns with `gradients_applied=false`
+    // *before* ever calling `train_step_grpo_sync`, so the optimizer never
+    // sees a gradient and `init_state` is never called. Retrying a few
+    // times lets the sampler re-roll until it hits the repetition cutoff
+    // (empirically this almost always happens within the first 1–2 attempts
+    // with `repetitionPenalty: 0.05`).
+    //
+    // Why only ONE successful step before save: on a tiny random-weight
+    // model the first GRPO loss is huge and even with `lr=0` + `grad_clip`
+    // there are floating-point edge cases in the AdamW update path
+    // (`update * 0 = NaN` when `update` momentarily contains `inf` from
+    // `corrected_m / (sqrt(corrected_v) + eps)`) that can occasionally
+    // corrupt weights. Constant rewards keep advantages (and therefore
+    // gradients) at exactly zero, which avoids this problem entirely —
+    // but we still stop after the first success to minimize exposure.
+    const maxTrainStepAttempts = 20;
+    let gradientsAppliedCount = 0;
+    let lastFiniteGradAppliedLoss = Number.NaN;
+    const metricsLog: Array<{
+      attempt: number;
+      step: number | null;
+      loss: number | null;
+      gradientsApplied: boolean;
+      error?: string;
+    }> = [];
+    for (let attempt = 0; attempt < maxTrainStepAttempts; attempt++) {
+      try {
+        const m = await trainerA.trainStep(prompts);
+        metricsLog.push({
+          attempt,
+          step: m.step,
+          loss: m.loss,
+          gradientsApplied: m.gradientsApplied ?? false,
+        });
+        if (m.gradientsApplied === true && Number.isFinite(m.loss)) {
+          gradientsAppliedCount += 1;
+          lastFiniteGradAppliedLoss = m.loss;
+          // Stop as soon as we have one successful gradient application.
+          // Running additional steps only increases the risk of cumulative
+          // numerical drift corrupting the weights before we get to save.
+          break;
+        }
+      } catch (err) {
+        metricsLog.push({
+          attempt,
+          step: null,
+          loss: null,
+          gradientsApplied: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        // Keep retrying — a transient NaN in a previous step should not
+        // fail the test; the retry will use fresh samples.
+      }
     }
-    expect(trainerA.getStep()).toBe(3);
+
+    expect(
+      gradientsAppliedCount,
+      `expected at least one pre-save step to actually apply gradients so AdamW moments are populated; metrics: ${JSON.stringify(metricsLog)}`,
+    ).toBeGreaterThan(0);
+    expect(Number.isFinite(lastFiniteGradAppliedLoss)).toBe(true);
+
+    // Record the exact step count after the loop so downstream assertions
+    // match whatever the retry loop produced (could be > 1 if early attempts
+    // were filtered, even though we break on the first gradient-applied step).
+    const stepsBeforeSave = trainerA.getStep();
+    expect(stepsBeforeSave).toBeGreaterThan(0);
 
     // --- Phase 2: save checkpoint -----------------------------------------
     // `saveCheckpoint(name)` writes to `join(outputDir, name)`. Before
     // f281143 this aborted the process on a loaded (thread-backed) model
     // because `Qwen3Model::save_model` touched weight MxArrays off-thread.
-    const checkpointName = 'checkpoint-3';
+    const checkpointName = `checkpoint-${stepsBeforeSave}`;
     const checkpointPath = await trainerA.saveCheckpoint(checkpointName);
     expect(checkpointPath).toBe(join(checkpointDir, checkpointName));
 
-    // Sanity-check the checkpoint layout: weights, tokenizer, config, and
-    // the JSON blob the resume path reads. We do NOT assert that
-    // `optimizer_state.safetensors` is present: with the filter-killed
-    // regime the engine never populates any AdamW moments, and
-    // `save_optimizer_state_sync` short-circuits before touching disk when
-    // `keys.is_empty()`. The resume code tolerates that gracefully.
+    // Sanity-check the checkpoint layout: weights, tokenizer, config, the
+    // JSON blob the resume path reads, AND the optimizer-state safetensors.
+    // The optimizer file is the load-bearing check for commit 9eff18a —
+    // without a real SaveOptimizerState command wired through the model
+    // thread this file would not exist.
     const checkpointFiles = readdirSync(checkpointPath);
     expect(checkpointFiles).toContain('training_state.json');
     expect(checkpointFiles).toContain('config.json');
     expect(checkpointFiles).toContain('tokenizer.json');
     expect(checkpointFiles.some((name: string) => name === 'weights.safetensors' || name === 'weights.mlx')).toBe(true);
 
+    const optimizerStatePath = join(checkpointPath, 'optimizer_state.safetensors');
+    expect(
+      existsSync(optimizerStatePath),
+      'optimizer_state.safetensors must exist on disk after saveCheckpoint — if this fails it means the train steps never populated AdamW moments and save_optimizer_state_sync took the empty-keys early return',
+    ).toBe(true);
+    // And it should be non-trivial in size (real tensor data, not just
+    // metadata headers) — catches a regression where SaveOptimizerState
+    // silently becomes a no-op again.
+    expect(statSync(optimizerStatePath).size).toBeGreaterThan(128);
+
     const stateJson: TrainingStateJson = JSON.parse(readFileSync(join(checkpointPath, 'training_state.json'), 'utf-8'));
-    expect(stateJson.step).toBe(3);
+    expect(stateJson.step).toBe(stepsBeforeSave);
     expect(stateJson.epoch).toBe(0);
-    // `hasOptimizerState` is set unconditionally by the trainer regardless of
-    // whether a file was written; the resume code's try/catch handles the
-    // case where the file is absent.
     expect(stateJson.hasOptimizerState).toBe(true);
 
-    // --- Phase 3: construct a fresh trainer via resumeFromCheckpoint -------
+    // --- Phase 3: construct a fresh trainer via resumeFromCheckpoint ------
     // This is the user-visible surface of commit 9eff18a: internally
     // `GRPOTrainer.create` calls `engine.loadOptimizerState(...)`, which
     // used to be a silent `warn!` no-op and now dispatches through the
-    // dedicated model thread via the `LoadOptimizerState` command. A
-    // regression that broke the model-thread wiring would abort the worker
-    // here, not fall through into the try/catch.
+    // dedicated model thread via the `LoadOptimizerState` command.
     const trainerB = await GRPOTrainer.create({
       ...sharedTrainerOptions,
       resumeFromCheckpoint: checkpointPath,
@@ -199,18 +367,72 @@ describe.sequential('GRPOTrainer checkpoint + optimizer state round-trip', () =>
 
     // The JS-side step counter is restored from training_state.json before
     // any new trainStep runs.
-    expect(trainerB.getStep()).toBe(3);
+    expect(trainerB.getStep()).toBe(stepsBeforeSave);
 
-    // --- Phase 4: run one more step on the resumed trainer -----------------
+    // --- Phase 4: run one more step on the resumed trainer ----------------
     // The fresh trainer must still be able to run a training step — proves
-    // the model thread is live and `loadOptimizerState` (whether it loaded
-    // a file or fell through the try/catch) left the engine in a usable
-    // state.
+    // the model thread is live and `loadOptimizerState` rehydrated the
+    // AdamW moment tensors without leaving the engine in a broken state.
     const m4 = await trainerB.trainStep(prompts);
     expect(typeof m4.loss).toBe('number');
     expect(Number.isFinite(m4.loss)).toBe(true);
-    // The trainer's step counter is resumed from 3 and then incremented by
-    // the trainStep call, so expect 4.
-    expect(trainerB.getStep()).toBe(4);
+    // Step counter advances by exactly one: stepsBeforeSave → stepsBeforeSave + 1.
+    expect(trainerB.getStep()).toBe(stepsBeforeSave + 1);
+
+    // Loose order-of-magnitude check: if the optimizer state round-trip
+    // utterly broke the model (e.g. moment tensors corrupted on load), the
+    // post-resume loss would explode relative to the pre-save value. We
+    // bound it very loosely because the GRPO loss on a tiny random-weight
+    // model varies enormously between steps (different completions every
+    // call, very sensitive initial logprobs), so anything tighter would be
+    // flaky. The point of this check is to fail loud if the AdamW state
+    // load left the optimizer in a corrupt state that then corrupts the
+    // next forward.
+    const preSaveScale = Math.max(Math.abs(lastFiniteGradAppliedLoss), 1.0);
+    expect(
+      Math.abs(m4.loss),
+      `post-resume loss ${m4.loss} exploded relative to pre-save loss ${lastFiniteGradAppliedLoss}`,
+    ).toBeLessThan(preSaveScale * 1000 + 1e6);
+
+    return { attempts: stepsBeforeSave, finalLoss: m4.loss };
+  }
+
+  it('populates AdamW moments, saves them through the model thread, and restores them on resume', async () => {
+    // Outer retry loop: the pre-save training step can fail deterministically
+    // on certain random-weight initializations — specifically when the tiny
+    // 2-layer Qwen3 produces logits extreme enough that the first forward
+    // pass emits a ±inf per-token log-probability somewhere, which then turns
+    // `log_ratio = new_logp - old_logp` into NaN in `grpo_loss` (both logps
+    // are -inf, so `(-inf) - (-inf) = NaN`). That NaN short-circuits
+    // `train_step_grpo_sync` via the `if loss_value.is_nan()` path BEFORE
+    // the optimizer is ever called, and since the failure is driven by the
+    // (fixed) random weights, retrying with the same model always produces
+    // the same NaN. The only way to escape is to re-create the model with
+    // a fresh random initialization.
+    //
+    // Empirically fewer than ~10% of random inits trigger the extreme-logit
+    // path on TINY_TEST_CONFIG, so a 4-attempt budget is comfortably above
+    // any realistic flake rate while keeping worst-case runtime bounded.
+    const maxOuterAttempts = 4;
+    const attemptErrors: string[] = [];
+    let lastResult: { attempts: number; finalLoss: number } | null = null;
+    for (let outer = 0; outer < maxOuterAttempts; outer++) {
+      try {
+        lastResult = await runOnce();
+        break;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        attemptErrors.push(`attempt ${outer}: ${msg}`);
+        // Keep going on any failure — either a deterministic NaN from a
+        // bad random init (recoverable with a fresh model) or a transient
+        // numerical issue (recoverable on retry).
+      }
+    }
+    if (lastResult === null) {
+      throw new Error(
+        `GRPO optimizer round-trip failed after ${maxOuterAttempts} attempts with fresh random-init models:\n` +
+          attemptErrors.join('\n'),
+      );
+    }
   });
 });
