@@ -656,6 +656,11 @@ impl GRPOTrainingEngine {
         let training_start = std::time::Instant::now();
 
         // === Phase 2: Train via model thread ===
+        // Re-check invalidation after the generate await: a concurrent
+        // `reset()` may have fired during Phase 1, and we must not dispatch
+        // a training step against a newly re-initialized training_state on
+        // behalf of an old handle.
+        self.ensure_valid()?;
         let loss_config = self.build_loss_config(num_prompts, group_size);
         let metrics = self
             .dispatch_train_step(rewards.clone(), group_size as i32, loss_config, None)
@@ -1071,6 +1076,9 @@ impl GRPOTrainingEngine {
                 expected_completions
             );
 
+            // Re-check invalidation after the JS reward callback await —
+            // a concurrent `reset()` may have fired while JS was running.
+            self.ensure_valid()?;
             // Bump ts.step on the model thread (it's the single source of truth)
             // and drop stale MxArrays in the same round-trip. Mirror the result
             // into the engine's read-through cache — gated on generation.
@@ -1126,6 +1134,9 @@ impl GRPOTrainingEngine {
                 filtered_count, num_prompts
             );
 
+            // Re-check invalidation after the JS reward callback await —
+            // a concurrent `reset()` may have fired while JS was running.
+            self.ensure_valid()?;
             // Bump ts.step on the model thread (it's the single source of truth)
             // and drop stale MxArrays in the same round-trip. Mirror the result
             // into the engine's read-through cache — gated on generation.
@@ -1196,6 +1207,10 @@ impl GRPOTrainingEngine {
             vocab_chunk_size: self.config.vocab_chunk_size.map(|n| n as i64),
         };
 
+        // Final re-check before the training dispatch: this is the last
+        // await gap where a concurrent `reset()` could have invalidated
+        // this handle between the reward callback and the training step.
+        self.ensure_valid()?;
         let metrics = self
             .dispatch_train_step(
                 filtered_rewards.clone(),
