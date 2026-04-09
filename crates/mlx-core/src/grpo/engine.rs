@@ -997,23 +997,45 @@ impl GRPOTrainingEngine {
             ));
         }
 
-        // === DEGENERATE OUTPUT FILTERING ===
+        // === DEGENERATE OUTPUT FILTERING (per-prompt balanced) ===
+        //
+        // The autograd / advantages paths require a rectangular layout:
+        // `valid_indices.len() == num_prompts * effective_group_size`.
+        // We therefore filter per prompt and then truncate every prompt to the
+        // minimum survivor count, so uneven drops across prompts can't break
+        // divisibility downstream.
         let max_tokens_threshold =
             (self.config.max_completion_length.unwrap_or(4096) as f64 * 0.9) as u32;
-        let valid_indices: Vec<usize> = all_finish_reasons
-            .iter()
-            .enumerate()
-            .filter(|(i, reason)| {
-                *reason != "length" || all_token_counts[*i] < max_tokens_threshold
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let (valid_indices, balanced_effective_group_size, per_prompt_survivor_counts) =
+            compute_balanced_valid_indices(
+                &all_finish_reasons,
+                &all_token_counts,
+                num_prompts,
+                group_size,
+                max_tokens_threshold,
+            );
 
         let num_filtered = expected_completions - valid_indices.len();
         if num_filtered > 0 {
+            let min_survivors = per_prompt_survivor_counts
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(0);
+            let max_survivors = per_prompt_survivor_counts
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0);
             info!(
-                "Filtered {} degenerate completions (finish_reason='length', tokens >= {})",
-                num_filtered, max_tokens_threshold
+                "Filtered {} degenerate completions (finish_reason='length', tokens >= {}); \
+                 per-prompt survivors: min={} max={} counts={:?}, effective_group_size={}",
+                num_filtered,
+                max_tokens_threshold,
+                min_survivors,
+                max_survivors,
+                per_prompt_survivor_counts,
+                balanced_effective_group_size
             );
         }
 
@@ -1059,11 +1081,14 @@ impl GRPOTrainingEngine {
         }
 
         let filtered_count = valid_indices.len();
-        let effective_group_size = if num_prompts > 0 {
-            filtered_count / num_prompts
-        } else {
-            group_size
-        };
+        // By construction from compute_balanced_valid_indices:
+        // filtered_count == num_prompts * balanced_effective_group_size
+        let effective_group_size = balanced_effective_group_size;
+        debug_assert_eq!(
+            filtered_count,
+            num_prompts * effective_group_size,
+            "balanced filter must produce a rectangular layout"
+        );
 
         if effective_group_size < 1 {
             warn!(
@@ -1649,6 +1674,73 @@ fn compute_reward_stats(rewards: &[f64]) -> (f64, f64) {
     (mean, std)
 }
 
+/// Compute per-prompt balanced valid indices for GRPO degenerate-output filtering.
+///
+/// The cache layout is prompt-major: completion index `c` belongs to prompt
+/// `c / group_size`. After filtering "length"-degenerate completions per-prompt,
+/// we take the FIRST `min_survivor_count` survivors from each prompt so that the
+/// result is rectangular (num_prompts * effective_group_size). This keeps the
+/// divisibility invariant required by advantages.rs (`rewards.len() % group_size == 0`)
+/// and autograd.rs (`num_prompts * group_size` completions).
+///
+/// # Arguments
+/// * `all_finish_reasons` - finish reason per completion (length == num_prompts * group_size)
+/// * `all_token_counts`   - token count per completion (length == num_prompts * group_size)
+/// * `num_prompts`        - number of prompts in this batch
+/// * `group_size`         - original completions-per-prompt before filtering
+/// * `max_tokens_threshold` - drop a completion if finish_reason == "length" and tokens >= this
+///
+/// # Returns
+/// `(balanced_valid_indices, effective_group_size, per_prompt_survivor_counts)`
+/// * `balanced_valid_indices` - rectangular, prompt-major list of kept indices
+/// * `effective_group_size` - min survivors across all prompts (0 if any prompt lost all)
+/// * `per_prompt_survivor_counts` - raw per-prompt survivor counts, pre-balancing (for logging)
+pub(crate) fn compute_balanced_valid_indices(
+    all_finish_reasons: &[String],
+    all_token_counts: &[u32],
+    num_prompts: usize,
+    group_size: usize,
+    max_tokens_threshold: u32,
+) -> (Vec<usize>, usize, Vec<usize>) {
+    if num_prompts == 0 || group_size == 0 {
+        return (Vec::new(), 0, Vec::new());
+    }
+
+    // Collect survivors per prompt, preserving prompt-major order.
+    let mut per_prompt: Vec<Vec<usize>> = (0..num_prompts).map(|_| Vec::new()).collect();
+    for (idx, reason) in all_finish_reasons.iter().enumerate() {
+        let token_count = all_token_counts.get(idx).copied().unwrap_or(0);
+        let is_degenerate = reason == "length" && token_count >= max_tokens_threshold;
+        if is_degenerate {
+            continue;
+        }
+        let prompt_idx = idx / group_size;
+        if prompt_idx < num_prompts {
+            per_prompt[prompt_idx].push(idx);
+        }
+    }
+
+    let per_prompt_counts: Vec<usize> = per_prompt.iter().map(|v| v.len()).collect();
+    let effective_group_size = per_prompt_counts.iter().copied().min().unwrap_or(0);
+
+    // Rebuild valid_indices in prompt-major order, taking the first
+    // `effective_group_size` survivors from each prompt. By construction this
+    // guarantees `valid_indices.len() == num_prompts * effective_group_size`.
+    let mut balanced_valid_indices =
+        Vec::with_capacity(num_prompts.saturating_mul(effective_group_size));
+    for prompt_survivors in &per_prompt {
+        for &idx in prompt_survivors.iter().take(effective_group_size) {
+            balanced_valid_indices.push(idx);
+        }
+    }
+
+    (
+        balanced_valid_indices,
+        effective_group_size,
+        per_prompt_counts,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1668,5 +1760,133 @@ mod tests {
         let (mean, std) = compute_reward_stats(&rewards);
         assert_eq!(mean, 0.0);
         assert_eq!(std, 0.0);
+    }
+
+    fn mk_reasons(len: usize, degenerate_idxs: &[usize]) -> Vec<String> {
+        (0..len)
+            .map(|i| {
+                if degenerate_idxs.contains(&i) {
+                    "length".to_string()
+                } else {
+                    "stop".to_string()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_balanced_filter_no_filtering() {
+        // 3 prompts * 4 completions = 12, none degenerate
+        let reasons = mk_reasons(12, &[]);
+        let tokens = vec![10u32; 12];
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 3, 4, 100);
+        assert_eq!(eff, 4);
+        assert_eq!(valid.len(), 3 * 4);
+        assert_eq!(valid, (0..12).collect::<Vec<_>>());
+        assert_eq!(counts, vec![4, 4, 4]);
+    }
+
+    #[test]
+    fn test_balanced_filter_uniform_drop() {
+        // 3 prompts * 4 = 12, drop 1 from each prompt: indices 0, 4, 8
+        // All those have finish_reason=length AND token_count >= threshold
+        let reasons = mk_reasons(12, &[0, 4, 8]);
+        let mut tokens = vec![10u32; 12];
+        tokens[0] = 200;
+        tokens[4] = 200;
+        tokens[8] = 200;
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 3, 4, 100);
+        assert_eq!(eff, 3);
+        assert_eq!(valid.len(), 3 * 3);
+        // Prompt 0: survivors [1,2,3], prompt 1: [5,6,7], prompt 2: [9,10,11]
+        assert_eq!(valid, vec![1, 2, 3, 5, 6, 7, 9, 10, 11]);
+        assert_eq!(counts, vec![3, 3, 3]);
+    }
+
+    #[test]
+    fn test_balanced_filter_uneven_drop() {
+        // 3 prompts * 4 = 12
+        // Prompt 0 loses 1 (idx 0), prompt 1 loses 3 (idxs 4,5,6), prompt 2 loses 0
+        let reasons = mk_reasons(12, &[0, 4, 5, 6]);
+        let mut tokens = vec![10u32; 12];
+        for &i in &[0usize, 4, 5, 6] {
+            tokens[i] = 200;
+        }
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 3, 4, 100);
+        // min survivors = 1 (prompt 1 kept only idx 7)
+        assert_eq!(eff, 1);
+        assert_eq!(counts, vec![3, 1, 4]);
+        assert_eq!(valid.len(), 3);
+        // prompt 0 first survivor = 1, prompt 1 = 7, prompt 2 = 8
+        assert_eq!(valid, vec![1, 7, 8]);
+    }
+
+    #[test]
+    fn test_balanced_filter_all_from_one_prompt() {
+        // 3 prompts * 4 = 12; prompt 1 loses ALL 4 completions (idxs 4-7)
+        let reasons = mk_reasons(12, &[4, 5, 6, 7]);
+        let mut tokens = vec![10u32; 12];
+        for t in tokens.iter_mut().skip(4).take(4) {
+            *t = 200;
+        }
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 3, 4, 100);
+        assert_eq!(eff, 0);
+        assert_eq!(valid.len(), 0);
+        assert_eq!(counts, vec![4, 0, 4]);
+    }
+
+    #[test]
+    fn test_balanced_filter_asymmetric_whole_loss() {
+        // 2 prompts * 3 = 6; prompt 0 keeps all, prompt 1 loses all
+        let reasons = mk_reasons(6, &[3, 4, 5]);
+        let mut tokens = vec![10u32; 6];
+        for t in tokens.iter_mut().skip(3).take(3) {
+            *t = 200;
+        }
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 2, 3, 100);
+        assert_eq!(eff, 0);
+        assert_eq!(valid.len(), 0);
+        assert_eq!(counts, vec![3, 0]);
+    }
+
+    #[test]
+    fn test_balanced_filter_rectangular_invariant() {
+        // Random-ish but deterministic: 4 prompts * 5 = 20
+        // prompt 0 loses 0, prompt 1 loses 2 (idxs 6, 8), prompt 2 loses 1 (idx 11), prompt 3 loses 4 (15,16,17,18)
+        let degenerate = vec![6usize, 8, 11, 15, 16, 17, 18];
+        let reasons = mk_reasons(20, &degenerate);
+        let mut tokens = vec![10u32; 20];
+        for &i in &degenerate {
+            tokens[i] = 200;
+        }
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 4, 5, 100);
+        // Survivor counts: [5, 3, 4, 1] → min = 1
+        assert_eq!(counts, vec![5, 3, 4, 1]);
+        assert_eq!(eff, 1);
+        // Rectangular: 4 * 1 = 4
+        assert_eq!(valid.len(), 4);
+        // First survivor of each prompt: 0 (p0), 5 (p1 first non-degen), 10 (p2 first non-degen), 19 (p3 only survivor)
+        assert_eq!(valid, vec![0, 5, 10, 19]);
+        // Verify divisibility
+        assert_eq!(valid.len() % 4, 0);
+    }
+
+    #[test]
+    fn test_balanced_filter_length_but_under_threshold() {
+        // finish_reason == "length" but token_count < threshold → NOT degenerate
+        let reasons = mk_reasons(6, &[0, 1, 2, 3, 4, 5]);
+        let tokens = vec![50u32; 6]; // below threshold 100
+        let (valid, eff, counts) = compute_balanced_valid_indices(&reasons, &tokens, 2, 3, 100);
+        assert_eq!(eff, 3);
+        assert_eq!(valid.len(), 6);
+        assert_eq!(counts, vec![3, 3]);
+    }
+
+    #[test]
+    fn test_balanced_filter_empty_inputs() {
+        let (valid, eff, counts) = compute_balanced_valid_indices(&[], &[], 0, 4, 100);
+        assert_eq!(eff, 0);
+        assert!(valid.is_empty());
+        assert!(counts.is_empty());
     }
 }

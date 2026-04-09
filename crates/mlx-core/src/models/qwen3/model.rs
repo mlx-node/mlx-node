@@ -2678,14 +2678,17 @@ impl Qwen3Inner {
         let prompt_refs: Vec<&MxArray> = prompt_tokens.iter().collect();
         let (completion_refs, logprob_refs): (Vec<&MxArray>, Vec<&MxArray>) =
             if let Some(ref indices) = valid_indices {
-                let c: Vec<&MxArray> = indices
-                    .iter()
-                    .filter_map(|&i| completion_tokens.get(i))
-                    .collect();
-                let l: Vec<&MxArray> = indices
-                    .iter()
-                    .filter_map(|&i| completion_logprobs.get(i))
-                    .collect();
+                let n = completion_tokens.len();
+                for &i in indices {
+                    if i >= n {
+                        return Err(napi::Error::from_reason(format!(
+                            "valid_indices contains out-of-range index {} (completion count = {})",
+                            i, n
+                        )));
+                    }
+                }
+                let c: Vec<&MxArray> = indices.iter().map(|&i| &completion_tokens[i]).collect();
+                let l: Vec<&MxArray> = indices.iter().map(|&i| &completion_logprobs[i]).collect();
                 (c, l)
             } else {
                 (
