@@ -392,5 +392,4 @@ describe('Parameter Manager', () => {
       }
     });
   });
-
 });

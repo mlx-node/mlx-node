@@ -1,5 +1,5 @@
 import { Qwen35Model, Qwen35MoeModel } from '@mlx-node/core';
-import type { Qwen35Config, Qwen35MoeConfig } from '@mlx-node/core';
+import type { Qwen35Config } from '@mlx-node/core';
 import { describe, it, expect } from 'vite-plus/test';
 
 describe.sequential('Qwen3.5 MoE', () => {

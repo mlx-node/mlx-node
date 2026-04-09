@@ -8,7 +8,7 @@ import { MxArray, Qwen3Model } from '@mlx-node/core';
 import type { Qwen3Config } from '@mlx-node/lm';
 import { describe, it, expect } from 'vite-plus/test';
 
-import { shape } from '../test-utils.js';
+
 
 // Tiny test configuration for fast testing
 const TEST_CONFIG: Qwen3Config = {
@@ -208,7 +208,6 @@ describe('Qwen3 Parameter Management', () => {
       // Most values should be different (we added noise to all)
       expect(diffCount).toBeGreaterThan(originalQWeight.length * 0.9);
     });
-
   });
 
   describe('Edge Cases', () => {
