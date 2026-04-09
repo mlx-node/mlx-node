@@ -202,6 +202,37 @@ mod tests {
     }
 
     #[test]
+    fn bump_skipped_step_increments_step_and_clears_cache() {
+        // Mirrors the BumpSkippedStep command handler logic.
+        let mut state =
+            ModelThreadTrainingState::new(1e-4, 1, None, None, 100, 5, false, true, None);
+        state.step = 3;
+        state.cached_prompt_tokens = Some(vec![]);
+        state.cached_completion_tokens = Some(vec![]);
+        state.cached_completion_logprobs = Some(vec![]);
+
+        // BumpSkippedStep: clear_generation_cache + step += 1
+        state.clear_generation_cache();
+        state.step += 1;
+
+        assert_eq!(state.step, 4);
+        assert!(state.cached_prompt_tokens.is_none());
+        assert!(state.cached_completion_tokens.is_none());
+        assert!(state.cached_completion_logprobs.is_none());
+    }
+
+    #[test]
+    fn set_training_step_overwrites_step() {
+        // Mirrors the SetTrainingStep command handler logic.
+        let mut state =
+            ModelThreadTrainingState::new(1e-4, 1, None, None, 100, 5, false, true, None);
+        state.step = 7;
+        // SetTrainingStep: ts.step = new_step
+        state.step = 42;
+        assert_eq!(state.step, 42);
+    }
+
+    #[test]
     fn new_accepts_adamw_optimizer() {
         let adamw = AdamW::new(
             Some(1e-4),

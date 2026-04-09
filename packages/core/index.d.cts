@@ -243,7 +243,12 @@ export declare class GrpoTrainingEngine {
   startEpoch(): void;
   /** End the current epoch and get metrics */
   endEpoch(epochTimeSecs: number): EngineEpochMetrics;
-  /** Reset the engine for a fresh training run */
+  /**
+   * Reset the engine for a fresh training run
+   *
+   * Also drops the training state (optimizer, step counter) on the model
+   * thread so `InitTraining` can be called again in the same process.
+   */
   reset(): void;
   /** Check if reward registry has any rewards registered */
   get hasBuiltinRewards(): boolean;
@@ -1667,9 +1672,22 @@ export declare class SftTrainingEngine {
   startEpoch(epoch: number): void;
   /** End current epoch and return metrics */
   endEpoch(epochTimeSecs: number): SftEpochMetrics;
-  /** Reset training state (for new training run) */
+  /**
+   * Reset training state (for new training run)
+   *
+   * Also drops the training state (optimizer, step counter) on the model
+   * thread so a subsequent construction (or a new training session on the
+   * same model) can re-initialize it cleanly.
+   */
   reset(): void;
-  /** Restore training state (for resuming from checkpoint) */
+  /**
+   * Restore training state (for resuming from checkpoint)
+   *
+   * Updates both the engine's read-through cache and the model thread's
+   * authoritative `ts.step`. Does NOT touch optimizer state — that is
+   * loaded via `loadOptimizerState`, which restores the AdamW bias-
+   * correction step separately.
+   */
   restoreState(step: number, epoch: number): void;
   /**
    * Get the underlying Qwen3 model for checkpointing

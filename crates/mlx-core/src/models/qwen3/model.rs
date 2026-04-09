@@ -221,7 +221,22 @@ pub(crate) enum Qwen3Cmd {
         valid_indices: Option<Vec<usize>>,
         reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
     },
-    ClearGenerationCache {
+    /// Bump the training step counter without applying gradients
+    /// (used by engine skip paths that abort before training).
+    /// Also clears cached generation MxArrays.
+    /// Returns the new step.
+    BumpSkippedStep {
+        reply: ResponseTx<i64>,
+    },
+    /// Restore the training step counter (for resume from checkpoint).
+    /// Does not touch optimizer state — that's loaded via LoadOptimizerState.
+    SetTrainingStep {
+        step: i64,
+        reply: ResponseTx<()>,
+    },
+    /// Drop the training state on the model thread.
+    /// After this, InitTraining can be called again. No-op if no training state.
+    ResetTraining {
         reply: ResponseTx<()>,
     },
     TrainStepSFT {
@@ -375,10 +390,31 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
                 valid_indices,
             ));
         }
-        Qwen3Cmd::ClearGenerationCache { reply } => {
-            if let Some(ref mut ts) = inner.training_state {
+        Qwen3Cmd::BumpSkippedStep { reply } => {
+            let result = if let Some(ref mut ts) = inner.training_state {
                 ts.clear_generation_cache();
-            }
+                ts.step += 1;
+                Ok(ts.step)
+            } else {
+                Err(napi::Error::from_reason(
+                    "Training not initialized. Call InitTraining first.",
+                ))
+            };
+            let _ = reply.send(result);
+        }
+        Qwen3Cmd::SetTrainingStep { step, reply } => {
+            let result = if let Some(ref mut ts) = inner.training_state {
+                ts.step = step;
+                Ok(())
+            } else {
+                Err(napi::Error::from_reason(
+                    "Training not initialized. Call InitTraining first.",
+                ))
+            };
+            let _ = reply.send(result);
+        }
+        Qwen3Cmd::ResetTraining { reply } => {
+            inner.training_state = None;
             let _ = reply.send(Ok(()));
         }
         Qwen3Cmd::TrainStepSFT {

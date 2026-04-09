@@ -525,8 +525,15 @@ impl SftTrainingEngine {
     }
 
     /// Reset training state (for new training run)
+    ///
+    /// Also drops the training state (optimizer, step counter) on the model
+    /// thread so a subsequent construction (or a new training session on the
+    /// same model) can re-initialize it cleanly.
     #[napi]
     pub fn reset(&self) -> Result<()> {
+        // Drop model-thread training state first (optimizer + ts.step).
+        self.dispatch_reset_training_blocking()?;
+
         let mut state = self
             .state
             .write()
@@ -537,8 +544,16 @@ impl SftTrainingEngine {
     }
 
     /// Restore training state (for resuming from checkpoint)
+    ///
+    /// Updates both the engine's read-through cache and the model thread's
+    /// authoritative `ts.step`. Does NOT touch optimizer state — that is
+    /// loaded via `loadOptimizerState`, which restores the AdamW bias-
+    /// correction step separately.
     #[napi]
     pub fn restore_state(&self, step: i64, epoch: i32) -> Result<()> {
+        // Update the authoritative ts.step on the model thread first.
+        self.dispatch_set_training_step_blocking(step)?;
+
         let mut state = self
             .state
             .write()
@@ -643,6 +658,63 @@ impl SftTrainingEngine {
             }
         }
         rx.await
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    /// Send ResetTraining command and block until complete.
+    ///
+    /// Drops the training state (optimizer + step counter) on the model
+    /// thread. Blocking because it's invoked from the sync `reset()` NAPI
+    /// method.
+    fn dispatch_reset_training_blocking(&self) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match &self.dispatch {
+            TrainingDispatch::Qwen3(sender) => {
+                sender
+                    .send(Qwen3Cmd::ResetTraining { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Dense(sender) => {
+                sender
+                    .send(Qwen35Cmd::ResetTraining { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Moe(sender) => {
+                sender
+                    .send(Qwen35MoeCmd::ResetTraining { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+        }
+        rx.blocking_recv()
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    /// Send SetTrainingStep command and block until complete.
+    ///
+    /// Plumbs the restored step to the model thread's authoritative
+    /// `ts.step` so subsequent `train_step_sft_sync` increments from the
+    /// correct value. Blocking because it's invoked from the sync
+    /// `restore_state()` NAPI method.
+    fn dispatch_set_training_step_blocking(&self, step: i64) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match &self.dispatch {
+            TrainingDispatch::Qwen3(sender) => {
+                sender
+                    .send(Qwen3Cmd::SetTrainingStep { step, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Dense(sender) => {
+                sender
+                    .send(Qwen35Cmd::SetTrainingStep { step, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Moe(sender) => {
+                sender
+                    .send(Qwen35MoeCmd::SetTrainingStep { step, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+        }
+        rx.blocking_recv()
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }
 

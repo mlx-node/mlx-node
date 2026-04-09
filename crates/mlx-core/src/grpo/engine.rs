@@ -1045,15 +1045,17 @@ impl GRPOTrainingEngine {
                 expected_completions
             );
 
-            // Drop stale MxArrays on the model thread before returning.
-            self.dispatch_clear_generation_cache().await?;
+            // Bump ts.step on the model thread (it's the single source of truth)
+            // and drop stale MxArrays in the same round-trip. Mirror the result
+            // into the engine's read-through cache.
+            let current_step = self.dispatch_bump_skipped_step().await?;
 
-            let mut state = self.state.write().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-            })?;
-            state.step += 1;
-            let current_step = state.step;
-            drop(state);
+            {
+                let mut state = self.state.write().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                })?;
+                state.step = current_step;
+            }
 
             let (mean_reward, std_reward) = compute_reward_stats(&rewards);
             let total_tokens: u32 = all_token_counts.iter().sum();
@@ -1096,15 +1098,17 @@ impl GRPOTrainingEngine {
                 filtered_count, num_prompts
             );
 
-            // Drop stale MxArrays on the model thread before returning.
-            self.dispatch_clear_generation_cache().await?;
+            // Bump ts.step on the model thread (it's the single source of truth)
+            // and drop stale MxArrays in the same round-trip. Mirror the result
+            // into the engine's read-through cache.
+            let current_step = self.dispatch_bump_skipped_step().await?;
 
-            let mut state = self.state.write().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-            })?;
-            state.step += 1;
-            let current_step = state.step;
-            drop(state);
+            {
+                let mut state = self.state.write().map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state write lock")
+                })?;
+                state.step = current_step;
+            }
 
             let (mean_reward, std_reward) = compute_reward_stats(&rewards);
             let total_tokens: u32 = all_token_counts.iter().sum();
@@ -1319,17 +1323,20 @@ impl GRPOTrainingEngine {
     }
 
     /// Reset the engine for a fresh training run
+    ///
+    /// Also drops the training state (optimizer, step counter) on the model
+    /// thread so `InitTraining` can be called again in the same process.
     #[napi]
     pub fn reset(&self) -> Result<()> {
+        // Drop model-thread training state first (optimizer + ts.step).
+        self.dispatch_reset_training_blocking()?;
+
         let mut state = self
             .state
             .write()
             .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?;
 
         *state = EngineState::default();
-
-        // Note: model thread training state (optimizer, gradients) is reset
-        // when InitTraining is called again. For now reset is epoch-boundary only.
 
         info!("Training engine reset");
         Ok(())
@@ -1533,31 +1540,64 @@ impl GRPOTrainingEngine {
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }
 
-    /// Send ClearGenerationCache command and await completion.
+    /// Send BumpSkippedStep command and await the new step.
     ///
     /// Used by `train_step_auto`'s early-return paths (all-filtered and
-    /// no-valid-completions) to drop stale MxArrays on the model thread
-    /// before returning.
-    async fn dispatch_clear_generation_cache(&self) -> Result<()> {
+    /// no-valid-completions). This both drops stale MxArrays on the model
+    /// thread AND increments the model-thread-owned `ts.step`, returning
+    /// it so the engine's read-through cache can track it.
+    ///
+    /// `ts.step` is the single source of truth for the training step; the
+    /// engine's `EngineState.step` is only ever updated FROM the model
+    /// thread (success path uses `metrics.step`, skip path uses this).
+    async fn dispatch_bump_skipped_step(&self) -> Result<i64> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         match &self.dispatch {
             TrainingDispatch::Qwen3(sender) => {
                 sender
-                    .send(Qwen3Cmd::ClearGenerationCache { reply: tx })
+                    .send(Qwen3Cmd::BumpSkippedStep { reply: tx })
                     .map_err(|_| Error::from_reason("Model thread exited"))?;
             }
             TrainingDispatch::Qwen35Dense(sender) => {
                 sender
-                    .send(Qwen35Cmd::ClearGenerationCache { reply: tx })
+                    .send(Qwen35Cmd::BumpSkippedStep { reply: tx })
                     .map_err(|_| Error::from_reason("Model thread exited"))?;
             }
             TrainingDispatch::Qwen35Moe(sender) => {
                 sender
-                    .send(Qwen35MoeCmd::ClearGenerationCache { reply: tx })
+                    .send(Qwen35MoeCmd::BumpSkippedStep { reply: tx })
                     .map_err(|_| Error::from_reason("Model thread exited"))?;
             }
         }
         rx.await
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    /// Send ResetTraining command and block until complete.
+    ///
+    /// Drops the training state (optimizer + step counter) on the model
+    /// thread so `InitTraining` can be called again. Blocking because it's
+    /// invoked from the sync `reset()` NAPI method.
+    fn dispatch_reset_training_blocking(&self) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match &self.dispatch {
+            TrainingDispatch::Qwen3(sender) => {
+                sender
+                    .send(Qwen3Cmd::ResetTraining { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Dense(sender) => {
+                sender
+                    .send(Qwen35Cmd::ResetTraining { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Moe(sender) => {
+                sender
+                    .send(Qwen35MoeCmd::ResetTraining { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+        }
+        rx.blocking_recv()
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }
 
