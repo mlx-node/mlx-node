@@ -20,7 +20,7 @@ import { loadModel } from '@mlx-node/lm';
 
 const model = await loadModel('./models/Qwen3-0.6B');
 
-const result = model.chat([{ role: 'user', content: 'What is the capital of France?' }]);
+const result = await model.chat([{ role: 'user', content: 'What is the capital of France?' }]);
 
 console.log(result.text);
 ```
