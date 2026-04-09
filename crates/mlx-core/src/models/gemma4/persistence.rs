@@ -1148,7 +1148,6 @@ impl Gemma4Model {
         let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
             move || {
                 let inner = Gemma4Inner::load_from_dir(&model_path)?;
-                let config = inner.config.clone();
                 let model_id = inner.model_id;
                 let image_processor = inner.image_processor.as_ref().map(|ip| {
                     Gemma4ImageProcessor::new(
@@ -1157,18 +1156,17 @@ impl Gemma4Model {
                         ip.pooling_kernel_size,
                     )
                 });
-                Ok((inner, (config, model_id, image_processor)))
+                Ok((inner, (model_id, image_processor)))
             },
             super::model::handle_gemma4_cmd,
         );
 
-        let (config, model_id, image_processor) = init_rx
+        let (model_id, image_processor) = init_rx
             .await
             .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
         Ok(Gemma4Model {
             thread,
-            config,
             model_id,
             image_processor,
         })

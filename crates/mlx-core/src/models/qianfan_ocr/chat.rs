@@ -399,7 +399,7 @@ fn find_last_query_index(messages: &[ChatMessage]) -> usize {
 }
 
 /// Count total number of images across all messages.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn count_images_in_messages(messages: &[ChatMessage]) -> u32 {
     messages
         .iter()

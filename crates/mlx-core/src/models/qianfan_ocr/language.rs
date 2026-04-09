@@ -246,13 +246,12 @@ impl InternVLLanguageModel {
     }
 
     /// Get the number of transformer layers.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
     /// Get the current cache offset (number of cached tokens).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get_cache_offset(&self) -> i32 {
         self.kv_caches
             .as_ref()

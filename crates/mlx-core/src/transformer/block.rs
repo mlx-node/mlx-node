@@ -26,7 +26,6 @@ pub struct TransformerBlock {
     rope_base: f32,
     rope_dims: i32,
     norm_eps: f32,
-    #[allow(dead_code)] // Stored for future use in fused forward path
     use_qk_norm: bool,
 }
 

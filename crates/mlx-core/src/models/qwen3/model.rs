@@ -113,7 +113,7 @@ pub struct PagedCompletedSequence {
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
 /// No `Arc<RwLock<>>` — the model thread has sole ownership of all inference
-/// state. Training support uses a separate code path via `clone_for_session()`.
+/// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen3Inner {
     pub(crate) config: Qwen3Config,
     pub(crate) embedding: Embedding,
@@ -134,7 +134,6 @@ pub(crate) struct Qwen3Inner {
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
-#[allow(dead_code)] // Training variants used in Phase 3+
 pub(crate) enum Qwen3Cmd {
     Chat {
         messages: Vec<ChatMessage>,
@@ -221,16 +220,13 @@ pub(crate) enum Qwen3Cmd {
         loss_config: crate::grpo::loss::GRPOLossConfig,
         reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
     },
-    GetParameters {
-        reply: ResponseTx<std::collections::HashMap<String, crate::array::MxArray>>,
-    },
-    LoadParameters {
-        params: std::collections::HashMap<String, crate::array::MxArray>,
-        reply: ResponseTx<()>,
-    },
-    SaveCheckpoint {
-        path: String,
-        reply: ResponseTx<()>,
+    TrainStepSFT {
+        input_ids: Vec<i32>,
+        input_shape: Vec<i64>,
+        labels: Vec<i32>,
+        labels_shape: Vec<i64>,
+        config: crate::sft::engine::SftEngineConfig,
+        reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
     },
 }
 
@@ -357,14 +353,21 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
         } => {
             let _ = reply.send(inner.train_step_grpo_sync(rewards, group_size, loss_config));
         }
-        Qwen3Cmd::GetParameters { reply } => {
-            let _ = reply.send(inner.get_parameters_sync());
-        }
-        Qwen3Cmd::LoadParameters { params, reply } => {
-            let _ = reply.send(inner.load_parameters_sync(params));
-        }
-        Qwen3Cmd::SaveCheckpoint { path, reply } => {
-            let _ = reply.send(inner.save_checkpoint_sync(&path));
+        Qwen3Cmd::TrainStepSFT {
+            input_ids,
+            input_shape,
+            labels,
+            labels_shape,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.train_step_sft_sync(
+                input_ids,
+                input_shape,
+                labels,
+                labels_shape,
+                config,
+            ));
         }
     }
 }
@@ -1990,7 +1993,6 @@ impl Qwen3Inner {
     // ========== Training methods (run on model thread) ==========
 
     /// Initialize training state with optimizer and configuration.
-    #[allow(dead_code)]
     fn init_training_sync(
         &mut self,
         config: crate::grpo::engine::GRPOEngineConfig,
@@ -2018,7 +2020,6 @@ impl Qwen3Inner {
             config.emergency_save_threshold.unwrap_or(5),
             config.verbose_nan_detection.unwrap_or(false),
             config.gradient_checkpointing.unwrap_or(true),
-            config.weight_decay.unwrap_or(0.01),
             optimizer,
         ));
         info!("Training state initialized on model thread");
@@ -2030,7 +2031,6 @@ impl Qwen3Inner {
     /// Tokenizes prompts using Jinja2 chat template, generates completions,
     /// caches MxArray results in training_state for the subsequent training step,
     /// and returns plain data across the thread boundary.
-    #[allow(dead_code)]
     fn generate_for_training_thread_sync(
         &mut self,
         prompts: Vec<ChatMessage>,
@@ -2404,7 +2404,6 @@ impl Qwen3Inner {
     /// Consumes cached MxArrays from the generation phase, computes loss and
     /// gradients via autograd, validates and clips gradients, accumulates them,
     /// and applies the optimizer step when accumulation is complete.
-    #[allow(dead_code)]
     fn train_step_grpo_sync(
         &mut self,
         rewards: Vec<f64>,
@@ -2691,6 +2690,310 @@ impl Qwen3Inner {
         })
     }
 
+    /// SFT training step: compute loss, gradients, and apply optimizer.
+    ///
+    /// Receives plain data (Vec<i32> + shape) from the SFT engine, reconstructs
+    /// MxArrays on the model thread, computes SFT loss + gradients, validates,
+    /// clips, accumulates, and applies optimizer step when accumulation is complete.
+    fn train_step_sft_sync(
+        &mut self,
+        input_ids: Vec<i32>,
+        input_shape: Vec<i64>,
+        labels: Vec<i32>,
+        labels_shape: Vec<i64>,
+        config: crate::sft::engine::SftEngineConfig,
+    ) -> Result<crate::training_model::TrainStepPlainMetrics> {
+        use crate::array::memory::{get_active_memory, get_peak_memory, reset_peak_memory};
+        use crate::optimizers::GradientUtils;
+
+        reset_peak_memory();
+
+        // Ensure training state is initialized
+        let ts = self.training_state.as_ref().ok_or_else(|| {
+            napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
+        })?;
+        let _ = ts; // just validating it exists
+
+        // Reconstruct MxArrays from plain data
+        let input_ids_arr = MxArray::from_int32(&input_ids, &input_shape)?;
+        let labels_arr = MxArray::from_int32(&labels, &labels_shape)?;
+
+        // Get model parameters
+        let params = self.get_parameters_sync()?;
+        let model_type = crate::training_model::ModelType::Qwen3(self.config.clone());
+
+        // Build loss config from SftEngineConfig
+        let loss_config = crate::sft::SftLossConfig {
+            ignore_index: Some(-100),
+            label_smoothing: config.label_smoothing,
+        };
+
+        let use_checkpointing = config.gradient_checkpointing.unwrap_or(true);
+        let verbose_nan = config.verbose_nan_detection.unwrap_or(false);
+        let max_nan_gradients = config.max_nan_gradients.unwrap_or(100);
+        let emergency_save_threshold = config.emergency_save_threshold.unwrap_or(5);
+
+        // Compute loss and gradients
+        let (loss_value, gradients) = crate::sft::autograd::compute_sft_loss_and_gradients(
+            &model_type,
+            &params,
+            &input_ids_arr,
+            &labels_arr,
+            loss_config,
+            use_checkpointing,
+        )?;
+
+        // Check for NaN/Inf loss
+        if loss_value.is_nan() || loss_value.is_infinite() {
+            warn!("SFT: Skipping step due to invalid loss: {}", loss_value);
+            synchronize_and_clear_cache();
+            let ts = self.training_state.as_mut().unwrap();
+            ts.nan_gradient_count += 1;
+            ts.consecutive_nan_count += 1;
+
+            if ts.nan_gradient_count >= max_nan_gradients as u64 {
+                return Err(napi::Error::from_reason(format!(
+                    "Training stopped: exceeded max NaN gradient count ({}/{})",
+                    ts.nan_gradient_count, max_nan_gradients
+                )));
+            }
+
+            if ts.consecutive_nan_count >= emergency_save_threshold as u32 {
+                warn!(
+                    "Emergency save triggered: {} consecutive NaN losses",
+                    ts.consecutive_nan_count
+                );
+            }
+
+            return Ok(crate::training_model::TrainStepPlainMetrics {
+                loss: 0.0,
+                gradients_applied: false,
+                mean_advantage: 0.0,
+                std_advantage: 0.0,
+                nan_gradient_count: ts.nan_gradient_count,
+                peak_memory_mb: get_peak_memory() / 1e6,
+                active_memory_mb: get_active_memory() / 1e6,
+                total_tokens: 0,
+                step: ts.step,
+            });
+        }
+
+        // Validate ALL gradients — skip entire step if ANY has NaN/Inf
+        for (name, grad) in gradients.iter() {
+            grad.eval();
+            let has_invalid = grad.has_nan_or_inf()?;
+            if has_invalid {
+                if verbose_nan {
+                    let data = grad.to_float32()?;
+                    let invalid_count = data
+                        .iter()
+                        .filter(|v| v.is_nan() || v.is_infinite())
+                        .count();
+                    warn!(
+                        "SFT: Gradient '{}' contains {} invalid values - SKIPPING STEP",
+                        name, invalid_count
+                    );
+                } else {
+                    warn!("SFT: Gradient '{}' contains NaN/Inf - SKIPPING STEP", name);
+                }
+
+                let ts = self.training_state.as_mut().unwrap();
+                ts.nan_gradient_count += 1;
+                ts.consecutive_nan_count += 1;
+
+                if ts.nan_gradient_count >= max_nan_gradients as u64 {
+                    return Err(napi::Error::from_reason(format!(
+                        "Training stopped: exceeded max NaN gradient count ({}/{})",
+                        ts.nan_gradient_count, max_nan_gradients
+                    )));
+                }
+
+                if ts.consecutive_nan_count >= emergency_save_threshold as u32 {
+                    warn!(
+                        "Emergency save triggered: {} consecutive NaN gradients",
+                        ts.consecutive_nan_count
+                    );
+                }
+
+                synchronize_and_clear_cache();
+                return Ok(crate::training_model::TrainStepPlainMetrics {
+                    loss: loss_value,
+                    gradients_applied: false,
+                    mean_advantage: 0.0,
+                    std_advantage: 0.0,
+                    nan_gradient_count: ts.nan_gradient_count,
+                    peak_memory_mb: get_peak_memory() / 1e6,
+                    active_memory_mb: get_active_memory() / 1e6,
+                    total_tokens: 0,
+                    step: ts.step,
+                });
+            }
+        }
+
+        // Element-wise gradient clipping (if configured)
+        let clipped_gradients = if let Some(clip_val) = config.gradient_clip_value {
+            let mut clamped: HashMap<String, MxArray> = HashMap::new();
+            for (name, grad) in gradients.iter() {
+                let c = grad.clip(Some(-clip_val), Some(clip_val))?;
+                c.eval();
+                clamped.insert(name.clone(), c);
+            }
+            clamped
+        } else {
+            gradients.clone()
+        };
+
+        // Gradient norm clipping (if configured)
+        let final_gradients = if let Some(clip_norm) = config.gradient_clip_norm {
+            let grad_refs: HashMap<String, &MxArray> = clipped_gradients
+                .iter()
+                .map(|(k, v)| (k.clone(), v))
+                .collect();
+            GradientUtils::clip_grad_norm(grad_refs, clip_norm)?
+        } else {
+            clipped_gradients
+        };
+
+        // Accumulate gradients
+        let ts = self.training_state.as_mut().unwrap();
+        // Reset consecutive NaN count on successful gradient computation
+        ts.consecutive_nan_count = 0;
+
+        Self::accumulate_gradients_inner(ts, final_gradients)?;
+        ts.micro_step += 1;
+
+        let grad_acc_steps = config.gradient_accumulation_steps.unwrap_or(1);
+        let learning_rate = config.learning_rate.unwrap_or(2e-5);
+        let weight_decay = config.weight_decay.unwrap_or(0.01);
+
+        let gradients_applied = if ts.micro_step >= grad_acc_steps {
+            let grads = ts
+                .accumulated_gradients
+                .take()
+                .ok_or_else(|| napi::Error::from_reason("No accumulated gradients"))?;
+
+            // Apply optimizer step
+            if let Some(ref mut optimizer) = ts.optimizer {
+                // AdamW path
+                let mut param_names_vec: Vec<String> = Vec::new();
+                let mut param_refs: Vec<&MxArray> = Vec::new();
+                let mut grad_refs: Vec<&MxArray> = Vec::new();
+
+                // Scale gradients if using accumulation
+                let scaled_grads: HashMap<String, MxArray>;
+                let grads_to_use = if grad_acc_steps > 1 {
+                    let scale = 1.0 / grad_acc_steps as f32;
+                    let scale_arr = MxArray::from_float32(&[scale], &[])?;
+                    scaled_grads = grads
+                        .iter()
+                        .map(|(name, grad)| (name.clone(), grad.mul(&scale_arr).unwrap()))
+                        .collect();
+                    &scaled_grads
+                } else {
+                    &grads
+                };
+
+                for (name, grad) in grads_to_use {
+                    if let Some(param) = params.get(name) {
+                        param_names_vec.push(name.clone());
+                        param_refs.push(param);
+                        grad_refs.push(grad);
+                    }
+                }
+
+                let updated = optimizer.update_batch(
+                    param_names_vec.clone(),
+                    param_refs.clone(),
+                    grad_refs,
+                )?;
+
+                // Create deltas: delta = param - updated (so param - 1.0 * delta = updated)
+                let delta_map: HashMap<String, MxArray> = param_names_vec
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let delta = param_refs[i].sub(&updated[i]).unwrap();
+                        (name.clone(), delta)
+                    })
+                    .collect();
+
+                let delta_refs: HashMap<String, &MxArray> =
+                    delta_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+                self.apply_gradients_inner(delta_refs, 1.0, &params)?;
+
+                debug!(
+                    "SFT: Applied AdamW update (step={})",
+                    self.training_state.as_ref().unwrap().step
+                );
+            } else {
+                // SGD path with weight decay
+                let lr = learning_rate / grad_acc_steps as f64;
+
+                // Apply weight decay to gradients if configured
+                let grads_with_decay = if weight_decay > 0.0 {
+                    grads
+                        .into_iter()
+                        .map(|(name, grad)| {
+                            if let Some(param) = params.get(&name) {
+                                if let Ok(decay_term) = param.mul_scalar(weight_decay)
+                                    && let Ok(new_grad) = grad.add(&decay_term)
+                                {
+                                    return (name, new_grad);
+                                }
+                                (name, grad)
+                            } else {
+                                (name, grad)
+                            }
+                        })
+                        .collect::<HashMap<_, _>>()
+                } else {
+                    grads
+                };
+
+                let grads_refs: HashMap<String, &MxArray> = grads_with_decay
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v))
+                    .collect();
+                self.apply_gradients_inner(grads_refs, lr, &params)?;
+                debug!("SFT: Applied SGD gradients with lr: {}", lr);
+            }
+
+            let ts = self.training_state.as_mut().unwrap();
+            ts.accumulated_gradients = None;
+            ts.micro_step = 0;
+            ts.step += 1;
+            true
+        } else {
+            ts.step += 1;
+            false
+        };
+
+        // Count valid tokens from the labels
+        let total_tokens = {
+            let ignore_val = MxArray::scalar_int(-100)?;
+            let valid_mask = labels_arr.not_equal(&ignore_val)?;
+            let count = valid_mask.sum(None, Some(false))?;
+            count.eval();
+            count.item_at_int32(0).unwrap_or(0)
+        };
+
+        // CRITICAL: heavy_cleanup after autograd to clear compiled graph cache
+        heavy_cleanup();
+
+        let ts = self.training_state.as_ref().unwrap();
+        Ok(crate::training_model::TrainStepPlainMetrics {
+            loss: loss_value,
+            gradients_applied,
+            mean_advantage: 0.0,
+            std_advantage: 0.0,
+            nan_gradient_count: ts.nan_gradient_count,
+            peak_memory_mb: get_peak_memory() / 1e6,
+            active_memory_mb: get_active_memory() / 1e6,
+            total_tokens,
+            step: ts.step,
+        })
+    }
+
     /// Accumulate gradients into training state.
     fn accumulate_gradients_inner(
         ts: &mut crate::training_state::ModelThreadTrainingState,
@@ -2787,7 +3090,6 @@ impl Qwen3Inner {
 
     /// Extract all trainable parameters from the model.
     /// Direct field access — no locks needed on model thread.
-    #[allow(dead_code)]
     fn get_parameters_sync(&self) -> Result<HashMap<String, MxArray>> {
         let mut params = HashMap::new();
 
@@ -2862,127 +3164,15 @@ impl Qwen3Inner {
 
         Ok(params)
     }
-
-    /// Load parameters into the model.
-    /// Direct field access — no locks needed on model thread.
-    #[allow(dead_code)]
-    fn load_parameters_sync(&mut self, params: HashMap<String, MxArray>) -> Result<()> {
-        info!("Loading {} parameters into model (thread)", params.len());
-
-        if let Some(weight) = params.get("embedding.weight") {
-            self.embedding.set_weight(weight)?;
-        }
-
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            let prefix = format!("layers.{}", i);
-
-            let attn = &mut layer.self_attn;
-            if let Some(w) = params.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
-                attn.set_q_proj_weight(w)?;
-            }
-            if let Some(w) = params.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
-                attn.set_k_proj_weight(w)?;
-            }
-            if let Some(w) = params.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
-                attn.set_v_proj_weight(w)?;
-            }
-            if let Some(w) = params.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
-                attn.set_o_proj_weight(w)?;
-            }
-            if self.config.use_qk_norm {
-                if let Some(w) = params.get(&format!("{}.self_attn.q_norm.weight", prefix)) {
-                    attn.set_q_norm_weight(w)?;
-                }
-                if let Some(w) = params.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
-                    attn.set_k_norm_weight(w)?;
-                }
-            }
-
-            let mlp = &mut layer.mlp;
-            if let Some(w) = params.get(&format!("{}.mlp.gate_proj.weight", prefix)) {
-                mlp.set_gate_proj_weight(w)?;
-            }
-            if let Some(w) = params.get(&format!("{}.mlp.up_proj.weight", prefix)) {
-                mlp.set_up_proj_weight(w)?;
-            }
-            if let Some(w) = params.get(&format!("{}.mlp.down_proj.weight", prefix)) {
-                mlp.set_down_proj_weight(w)?;
-            }
-
-            if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
-                layer.set_input_layernorm_weight(w)?;
-            }
-            if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
-                layer.set_post_attention_layernorm_weight(w)?;
-            }
-        }
-
-        if let Some(weight) = params.get("final_norm.weight") {
-            self.final_norm.set_weight(weight)?;
-        }
-        if let Some(weight) = params.get("lm_head.weight") {
-            self.lm_head.set_weight(weight)?;
-        }
-
-        info!("Parameters loaded successfully (thread)");
-        Ok(())
-    }
-
-    /// Save model weights as SafeTensors checkpoint.
-    #[allow(dead_code)]
-    fn save_checkpoint_sync(&self, path: &str) -> Result<()> {
-        use std::fs;
-        use std::path::Path;
-
-        let params = self.get_parameters_sync()?;
-
-        // Validate parameters for NaN/Inf before saving
-        for (name, param) in params.iter() {
-            let data = param.to_float32()?;
-            let invalid_count = data
-                .iter()
-                .filter(|v| v.is_nan() || v.is_infinite())
-                .count();
-            if invalid_count > 0 {
-                return Err(napi::Error::from_reason(format!(
-                    "Cannot save: parameter '{}' contains {} NaN/Inf values",
-                    name, invalid_count
-                )));
-            }
-        }
-
-        let save_path = Path::new(path);
-        fs::create_dir_all(save_path).map_err(|e| {
-            napi::Error::from_reason(format!("Failed to create directory {}: {}", path, e))
-        })?;
-
-        // Save config
-        let config_path = save_path.join("config.json");
-        let config_json = serde_json::to_string_pretty(&self.config)
-            .map_err(|e| napi::Error::from_reason(format!("Failed to serialize config: {}", e)))?;
-        fs::write(&config_path, config_json)
-            .map_err(|e| napi::Error::from_reason(format!("Failed to write config: {}", e)))?;
-
-        // Save weights
-        let safetensors_path = save_path.join("weights.safetensors");
-        let metadata = Some(serde_json::json!({
-            "format": "mlx-node",
-            "version": "1.0"
-        }));
-        crate::utils::safetensors::save_safetensors(&safetensors_path, &params, metadata)?;
-
-        info!("Checkpoint saved to {}", path);
-        Ok(())
-    }
 }
 
 /// Qwen3 Model with automatic differentiation support
 ///
-/// Uses a dedicated model thread for inference commands.
-/// Training clones (`thread == None`) use `Arc<RwLock<>>` fields directly.
+/// Uses a dedicated model thread for inference and training commands.
+/// Training commands are routed via `TrainingDispatch`.
 #[napi]
 pub struct Qwen3Model {
-    /// Dedicated model thread for inference. `None` for training clones.
+    /// Dedicated model thread for inference and training.
     pub(crate) thread: Option<ModelThread<Qwen3Cmd>>,
     pub(crate) config: Qwen3Config,
     pub(crate) embedding: Embedding,
@@ -3345,71 +3535,6 @@ impl Qwen3Model {
                 }))
             }
             None => Ok(None),
-        }
-    }
-
-    /// Forward pass with KV caching for incremental generation (training only, not exposed to NAPI)
-    ///
-    /// # Arguments
-    /// * `input_ids` - Token IDs, shape: [batch_size, seq_len]
-    /// * `use_cache` - Whether to use KV caching (must call init_kv_caches() first)
-    ///
-    /// # Returns
-    /// * Logits, shape: [batch_size, seq_len, vocab_size]
-    #[allow(dead_code)]
-    pub(crate) fn forward_with_cache(
-        &self,
-        input_ids: &MxArray,
-        use_cache: bool,
-    ) -> Result<MxArray> {
-        // Acquire read locks for model components
-        let layers_guard = self.layers.read().map_err(|_| {
-            Error::new(
-                napi::Status::GenericFailure,
-                "Failed to acquire layers read lock",
-            )
-        })?;
-        let final_norm_guard = self.final_norm.read().map_err(|_| {
-            Error::new(
-                napi::Status::GenericFailure,
-                "Failed to acquire final_norm read lock",
-            )
-        })?;
-        let lm_head_guard = self.lm_head.read().map_err(|_| {
-            Error::new(
-                napi::Status::GenericFailure,
-                "Failed to acquire lm_head read lock",
-            )
-        })?;
-
-        if use_cache {
-            // Acquire lock for public API (used in training, batch generation, etc.)
-            let mut caches_borrowed = self.kv_caches.write().map_err(|_| {
-                Error::new(
-                    napi::Status::GenericFailure,
-                    "Failed to acquire kv caches write lock",
-                )
-            })?;
-
-            Self::forward_with_cache_direct(
-                input_ids,
-                caches_borrowed.as_mut(),
-                &self.embedding.get_weight(),
-                &layers_guard,
-                self.config.tie_word_embeddings,
-                &final_norm_guard,
-                &lm_head_guard,
-            )
-        } else {
-            Self::forward_with_cache_direct(
-                input_ids,
-                None,
-                &self.embedding.get_weight(),
-                &layers_guard,
-                self.config.tie_word_embeddings,
-                &final_norm_guard,
-                &lm_head_guard,
-            )
         }
     }
 
@@ -4249,48 +4374,6 @@ impl Qwen3Model {
         Ok(!scheduler_guard.is_empty())
     }
 
-    // Lock-free forward pass for hot path (generation loop)
-    // Takes direct mutable reference to caches, avoiding RwLock overhead
-    #[allow(dead_code)]
-    fn forward_with_cache_direct(
-        input_ids: &MxArray,
-        kv_caches: Option<&mut Vec<KVCache>>,
-        embedding_weight: &MxArray,
-        layers: &[TransformerBlock],
-        tie_word_embeddings: bool,
-        final_norm: &RMSNorm,
-        lm_head: &Linear,
-    ) -> Result<MxArray> {
-        // Embedding lookup
-        let mut hidden_states = embedding_weight.take(input_ids, 0)?;
-
-        // Pass through transformer layers with optional caching
-        // Note: We pass mask=None and let the Attention layer automatically use
-        // the optimized "causal" mode during prefill (seq_len > 1).
-        // During generation (seq_len == 1), no mask is needed due to KV cache.
-        if let Some(caches) = kv_caches {
-            for (i, layer) in layers.iter().enumerate() {
-                hidden_states = layer.forward(&hidden_states, None, Some(&mut caches[i]))?;
-            }
-        } else {
-            for layer in layers.iter() {
-                hidden_states = layer.forward(&hidden_states, None, None)?;
-            }
-        }
-
-        // Final layer norm
-        hidden_states = final_norm.forward(&hidden_states)?;
-
-        // LM head to get logits
-        let logits = if tie_word_embeddings {
-            hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
-        } else {
-            lm_head.forward(&hidden_states)?
-        };
-
-        Ok(logits)
-    }
-
     /// Fused forward pass using C++ implementation for maximum performance.
     /// Reduces FFI calls from ~300 to 1 per forward pass.
     /// Updates KV cache in-place to avoid allocations (matches mlx-lm's overwrite_descriptor pattern).
@@ -4454,580 +4537,6 @@ impl Qwen3Model {
     #[napi]
     pub fn get_config(&self) -> Qwen3Config {
         self.config.clone()
-    }
-
-    /// Clone the model for use in a training session
-    ///
-    /// This is now a cheap O(1) operation that just clones the Arcs.
-    /// Since we use RwLock for interior mutability, gradient application
-    /// through apply_gradients() works without needing unique Arc ownership.
-    /// This eliminates the ~4GB memory overhead that was previously required.
-    ///
-    /// Note: Paged attention is not cloned for training sessions since
-    /// training uses standard KVCache with gradient flow.
-    pub fn clone_for_session(&self) -> Result<Self> {
-        // Cheap Arc clones - O(1) operation, no deep copying of model weights
-        // The RwLock inside allows shared mutable access for gradient updates
-        // Training clones never have a model thread (thread: None).
-        Ok(Self {
-            thread: None, // Training clones use Arc<RwLock<>> directly
-            config: self.config.clone(),
-            embedding: self.embedding.clone(),
-            layers: Arc::clone(&self.layers),
-            final_norm: Arc::clone(&self.final_norm),
-            lm_head: Arc::clone(&self.lm_head),
-            kv_caches: Arc::new(RwLock::new(None)), // Fresh KV caches for session
-            tokenizer: self.tokenizer.clone(),
-            // Don't clone paged attention for training - use standard KVCache
-            paged_cache: None,
-            scheduler: None,
-            cached_kv_keys: Arc::new(RwLock::new(Vec::new())),
-            cached_kv_values: Arc::new(RwLock::new(Vec::new())),
-            cached_cache_idx: Arc::new(RwLock::new(0)),
-            cached_token_history: Arc::new(RwLock::new(Vec::new())),
-            generation_lock: Arc::new(TokioMutex::new(())),
-        })
-    }
-
-    /// Decode tokens from an MxArray to text
-    ///
-    /// Internal method for use by training session.
-    pub async fn decode_tokens(&self, tokens: &MxArray) -> Result<String> {
-        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
-            Error::new(
-                Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load().",
-            )
-        })?;
-
-        // Convert MxArray to Vec<u32>
-        let token_ids = tokens.to_uint32()?;
-
-        napi::bindgen_prelude::spawn_blocking(move || {
-            tokenizer.decode_sync(&token_ids, true) // skip special tokens
-        })
-        .await
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Decoding task failed: {}", e),
-            )
-        })?
-    }
-
-    /// Apply chat template and return token IDs as Vec<u32>
-    ///
-    /// Internal async method for use by training session.
-    /// Named differently to avoid conflict with the NAPI-exported version.
-    pub async fn apply_chat_template_internal(
-        &self,
-        messages: &[ChatMessage],
-        add_generation_prompt: Option<bool>,
-    ) -> Result<Vec<u32>> {
-        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
-            Error::new(
-                Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load().",
-            )
-        })?;
-
-        let add_prompt = add_generation_prompt.unwrap_or(true);
-
-        let suffix = if add_prompt {
-            "<|im_start|>assistant\n"
-        } else {
-            ""
-        };
-        let cap: usize = messages
-            .iter()
-            .map(|m| 15 + m.role.len() + 1 + m.content.len() + 12)
-            .sum::<usize>()
-            + suffix.len();
-        let mut formatted = String::with_capacity(cap);
-        for msg in messages {
-            formatted.push_str("<|im_start|>");
-            formatted.push_str(&msg.role);
-            formatted.push('\n');
-            formatted.push_str(&msg.content);
-            formatted.push_str("<|im_end|>\n");
-        }
-        formatted.push_str(suffix);
-
-        napi::bindgen_prelude::spawn_blocking(move || {
-            tokenizer.encode_sync(&formatted, Some(false))
-        })
-        .await
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Chat template task failed: {}", e),
-            )
-        })?
-    }
-
-    /// Decode tokens from an MxArray to text (sync version)
-    ///
-    /// Internal method for use by training session - does not use spawn_blocking.
-    pub fn decode_tokens_sync(&self, tokens: &MxArray) -> Result<String> {
-        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
-            Error::new(
-                Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load().",
-            )
-        })?;
-
-        // Convert MxArray to Vec<u32>
-        let token_ids = tokens.to_uint32()?;
-
-        tokenizer.decode_sync(&token_ids, true) // skip special tokens
-    }
-
-    /// Apply chat template and return token IDs as Vec<u32> (sync version)
-    ///
-    /// Internal sync method for use by training session - does not use spawn_blocking.
-    /// Delegates to the tokenizer's apply_chat_template_sync which handles Jinja2 + tools.
-    ///
-    /// # Arguments
-    /// * `messages` - Chat messages to format
-    /// * `add_generation_prompt` - Whether to add assistant prompt at end
-    /// * `tools` - Optional tool definitions for function calling
-    /// * `enable_thinking` - Optional flag to enable thinking mode (<think> tags)
-    pub fn apply_chat_template_sync(
-        &self,
-        messages: &[ChatMessage],
-        add_generation_prompt: Option<bool>,
-        tools: Option<&[ToolDefinition]>,
-        enable_thinking: Option<bool>,
-    ) -> Result<Vec<u32>> {
-        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
-            Error::new(
-                Status::InvalidArg,
-                "Tokenizer not available. Model must be loaded via load().",
-            )
-        })?;
-
-        // Use the tokenizer's apply_chat_template_sync which handles Jinja2 + tools
-        tokenizer.apply_chat_template_sync(messages, add_generation_prompt, tools, enable_thinking)
-    }
-
-    /// Generate tokens for training (sync version)
-    ///
-    /// Internal sync method for use by training session - does not use spawn_blocking.
-    /// This is a synchronous version that runs generation on the calling thread.
-    pub fn generate_for_training_sync(
-        &self,
-        input_ids: &MxArray,
-        config: Option<GenerationConfig>,
-    ) -> Result<GenerationResult> {
-        let config = config.unwrap_or_default();
-        let input_ids = input_ids.clone();
-        // Extract configuration with defaults
-        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
-        let temperature = config.temperature.unwrap_or(1.0);
-        let top_k = config.top_k.unwrap_or(0);
-        let top_p = config.top_p.unwrap_or(1.0);
-        let min_p = config.min_p.unwrap_or(0.0);
-        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
-        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-        let presence_context_size = config.presence_context_size.unwrap_or(20);
-        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-        let ngram_size = config.ngram_size.unwrap_or(64);
-        let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
-        let return_logprobs = config.return_logprobs.unwrap_or(true);
-        let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
-
-        // Calculate model size for wired_limit context
-        let model_size_bytes = self.calculate_memory_size();
-
-        let embedding_weight = self.embedding.get_weight();
-        // Acquire read locks for model components
-        let layers_guard = self.layers.read().map_err(|_| {
-            Error::new(
-                napi::Status::GenericFailure,
-                "Failed to acquire layers read lock",
-            )
-        })?;
-        let final_norm_guard = self.final_norm.read().map_err(|_| {
-            Error::new(
-                napi::Status::GenericFailure,
-                "Failed to acquire final_norm read lock",
-            )
-        })?;
-        let lm_head_guard = self.lm_head.read().map_err(|_| {
-            Error::new(
-                napi::Status::GenericFailure,
-                "Failed to acquire lm_head read lock",
-            )
-        })?;
-        let layers = &*layers_guard;
-        let final_norm = &*final_norm_guard;
-        let lm_head = &*lm_head_guard;
-        let model_config = &self.config;
-
-        debug!(
-            "Starting sync generation: max_tokens={}, temp={}, top_k={}, top_p={}, rep_penalty={}",
-            max_new_tokens, temperature, top_k, top_p, repetition_penalty
-        );
-
-        // Create dedicated generation stream
-        let generation_stream = Stream::new(DeviceType::Gpu);
-
-        // Wired limit context for GPU memory management
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
-
-        // Local KV caches
-        let num_layers = layers.len();
-        let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];
-        let mut kv_values: Vec<Option<MxArray>> = vec![None; num_layers];
-        let mut cache_idx: i32 = 0;
-
-        // For single-sequence generation: batch=1, no left padding, rope offset starts at 0
-        let mut rope_offsets = MxArray::from_int32(&[0], &[1])?;
-        let left_padding = MxArray::from_int32(&[0], &[1])?;
-
-        // Get input tokens for repetition penalty context
-        let input_tokens = input_ids.to_uint32()?;
-
-        // Prepare generation state
-        let current_ids = input_ids.clone();
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
-        let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(max_new_tokens as usize)
-        } else {
-            Vec::new()
-        };
-        let mut finish_reason = "length";
-
-        // Sampling config
-        let sampling_config = SamplingConfig {
-            temperature: Some(temperature),
-            top_k: Some(top_k),
-            top_p: Some(top_p),
-            min_p: Some(min_p),
-        };
-
-        // Profiler for generate decode loop
-        let mut profiler = crate::decode_profiler::DecodeProfiler::new("generate", "qwen3");
-        profiler.set_prompt_tokens(current_ids.shape_at(1).unwrap_or(0) as u32);
-        profiler.snapshot_memory_before();
-
-        // PREFILL: Process prompt (chunked for long sequences)
-        // Get the sequence length from input shape [1, seq_len]
-        let total_seq_len = current_ids.shape_at(1)? as usize;
-
-        // Determine if we should use chunked prefill
-        // Use chunking if prefill_step_size > 0 and seq_len exceeds it
-        let use_chunked_prefill = prefill_step_size > 0 && total_seq_len > prefill_step_size;
-
-        profiler.begin_prefill();
-        let mut last_logits = if use_chunked_prefill {
-            // === CHUNKED PREFILL ===
-            // Process prompt in chunks to improve memory efficiency and enable async pipelining
-            debug!(
-                "Using chunked prefill: seq_len={}, step_size={}",
-                total_seq_len, prefill_step_size
-            );
-
-            let mut offset = 0usize;
-
-            // Process all chunks except the last one (we need logits only from the last chunk)
-            while offset + prefill_step_size < total_seq_len {
-                let chunk_end = offset + prefill_step_size;
-
-                // Slice the chunk: [1, seq_len] -> [1, chunk_size]
-                let chunk = current_ids.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
-
-                // Update rope_offsets for this chunk (starts at current offset)
-                rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
-
-                {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    // Forward pass updates KV cache but we discard intermediate logits
-                    let _ = Self::forward_fused(
-                        &chunk,
-                        &embedding_weight,
-                        layers,
-                        final_norm,
-                        lm_head,
-                        model_config,
-                        &mut kv_keys,
-                        &mut kv_values,
-                        &mut cache_idx,
-                        &rope_offsets,
-                        &left_padding,
-                    )?;
-                }
-
-                // Async eval for pipelining: start GPU work on cache while we prepare next chunk
-                // This allows overlap between GPU computation and CPU preparation
-                for kv_key in kv_keys.iter().flatten() {
-                    kv_key.eval();
-                }
-                for kv_value in kv_values.iter().flatten() {
-                    kv_value.eval();
-                }
-
-                // Clear cache after processing large chunks to prevent memory accumulation
-                synchronize_and_clear_cache();
-
-                offset = chunk_end;
-            }
-
-            // Process final chunk to get logits for sampling
-            let final_chunk = current_ids.slice(&[0, offset as i64], &[1, total_seq_len as i64])?;
-            rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
-
-            let logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                Self::forward_fused(
-                    &final_chunk,
-                    &embedding_weight,
-                    layers,
-                    final_norm,
-                    lm_head,
-                    model_config,
-                    &mut kv_keys,
-                    &mut kv_values,
-                    &mut cache_idx,
-                    &rope_offsets,
-                    &left_padding,
-                )?
-            };
-
-            // Extract last token logits from final chunk
-            let chunk_seq_len = logits.shape_at(1)?;
-            logits
-                .slice_axis(1, chunk_seq_len - 1, chunk_seq_len)?
-                .squeeze(Some(&[0, 1]))?
-        } else {
-            // === SINGLE-PASS PREFILL (original behavior for short sequences) ===
-            let logits = {
-                let _stream_ctx = StreamContext::new(generation_stream);
-                Self::forward_fused(
-                    &current_ids,
-                    &embedding_weight,
-                    layers,
-                    final_norm,
-                    lm_head,
-                    model_config,
-                    &mut kv_keys,
-                    &mut kv_values,
-                    &mut cache_idx,
-                    &rope_offsets,
-                    &left_padding,
-                )?
-            };
-
-            // Extract last token logits (shape: [1, seq_len, vocab_size] -> [vocab_size])
-            let seq_len = logits.shape_at(1)?;
-            logits
-                .slice_axis(1, seq_len - 1, seq_len)?
-                .squeeze(Some(&[0, 1]))?
-        };
-
-        profiler.end_prefill();
-
-        // Update rope_offsets after prefill (all tokens have been processed)
-        rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
-
-        // Apply repetition penalty to prefill logits if enabled
-        if repetition_penalty != 1.0 && !input_tokens.is_empty() {
-            last_logits = apply_repetition_penalty(
-                &last_logits,
-                &input_tokens,
-                repetition_penalty,
-                Some(repetition_context_size),
-            )?;
-        }
-        if presence_penalty != 0.0 {
-            last_logits = apply_presence_penalty(
-                &last_logits,
-                &input_tokens,
-                presence_penalty,
-                Some(presence_context_size),
-            )?;
-        }
-        if frequency_penalty != 0.0 {
-            last_logits = apply_frequency_penalty(
-                &last_logits,
-                &input_tokens,
-                frequency_penalty,
-                Some(frequency_context_size),
-            )?;
-        }
-
-        // Sample first token
-        let (mut token, mut logprobs_arr) = if return_logprobs {
-            let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
-            (tok, Some(lp))
-        } else {
-            let tok = sample(&last_logits, Some(sampling_config))?;
-            (tok, None)
-        };
-
-        // DECODE loop
-        // Cleanup interval to release intermediate tensors and prevent memory accumulation
-        // Every 64 tokens is a good balance between memory savings and performance
-        const DECODE_CLEANUP_INTERVAL: i32 = 256; // Aligned with mlx-lm
-
-        // Track time from decode start to first token extraction (for accurate TTFT).
-        // Only allocate Instant when chat() requested performance metrics — training
-        // callers never set report_performance so this is always None for them.
-        let report_performance = config.report_performance.unwrap_or(false);
-        let decode_start = if report_performance {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_elapsed_ms: Option<f64> = None;
-
-        // Pre-allocate constant array for incrementing rope offsets (avoids allocation per iteration)
-        let one_arr = MxArray::from_int32(&[1], &[1])?;
-
-        for step in 0..max_new_tokens {
-            let _stream_ctx = StreamContext::new(generation_stream);
-
-            // Sync to materialize the token
-            token.eval();
-
-            // Periodic cleanup to release computation graph memory
-            // This prevents O(n) memory growth during long generations
-            if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
-                synchronize_and_clear_cache();
-            }
-
-            // Extract current token value
-            let token_value = token.item_at_int32(0)? as u32;
-            profiler.mark_first_token();
-            if let Some(ds) = decode_start
-                && first_token_elapsed_ms.is_none()
-            {
-                first_token_elapsed_ms = Some(ds.elapsed().as_secs_f64() * 1000.0);
-            }
-
-            // Add to generated tokens
-            generated_tokens.push(token_value);
-
-            // Extract logprob if needed (eval first — read_scalar requires materialized data)
-            if return_logprobs && let Some(ref lp) = logprobs_arr {
-                lp.eval();
-                let token_logprob = lp.item_at_float32(token_value as usize)?;
-                generated_logprobs.push(token_logprob);
-            }
-
-            // Check for repetitive generation (prevents OOM from degenerate loops)
-            if let Some(reason) = check_repetition_cutoff(
-                &generated_tokens,
-                max_consecutive_tokens,
-                max_ngram_repeats,
-                ngram_size,
-            ) {
-                finish_reason = reason;
-                break;
-            }
-
-            // Check for EOS
-            if let Some(eos_id) = eos_token_id
-                && token_value == eos_id as u32
-            {
-                finish_reason = "stop";
-                break;
-            }
-
-            // Forward pass with just the new token
-            let next_input = MxArray::from_uint32(&[token_value], &[1, 1])?;
-            let next_logits = Self::forward_fused(
-                &next_input,
-                &embedding_weight,
-                layers,
-                final_norm,
-                lm_head,
-                model_config,
-                &mut kv_keys,
-                &mut kv_values,
-                &mut cache_idx,
-                &rope_offsets,
-                &left_padding,
-            )?;
-            // Increment rope offset for next iteration (use int32 addition to preserve dtype)
-            rope_offsets = rope_offsets.add(&one_arr)?;
-
-            // Extract last token logits (shape: [1, 1, vocab_size] -> [vocab_size])
-            let next_last_logits = next_logits.slice_axis(1, 0, 1)?.squeeze(Some(&[0, 1]))?;
-
-            // Apply penalties
-            last_logits = next_last_logits;
-            if repetition_penalty != 1.0 || presence_penalty != 0.0 || frequency_penalty != 0.0 {
-                let context_tokens: Vec<u32> = input_tokens
-                    .iter()
-                    .copied()
-                    .chain(generated_tokens.iter().copied())
-                    .collect();
-                if repetition_penalty != 1.0 {
-                    last_logits = apply_repetition_penalty(
-                        &last_logits,
-                        &context_tokens,
-                        repetition_penalty,
-                        Some(repetition_context_size),
-                    )?;
-                }
-                if presence_penalty != 0.0 {
-                    last_logits = apply_presence_penalty(
-                        &last_logits,
-                        &context_tokens,
-                        presence_penalty,
-                        Some(presence_context_size),
-                    )?;
-                }
-                if frequency_penalty != 0.0 {
-                    last_logits = apply_frequency_penalty(
-                        &last_logits,
-                        &context_tokens,
-                        frequency_penalty,
-                        Some(frequency_context_size),
-                    )?;
-                }
-            }
-
-            // Sample next token
-            let (next_tok, next_lp) = if return_logprobs {
-                let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
-                (tok, Some(lp))
-            } else {
-                (sample(&last_logits, Some(sampling_config))?, None)
-            };
-
-            token = next_tok;
-            logprobs_arr = next_lp;
-
-            profiler.step();
-        }
-
-        profiler.snapshot_memory_after();
-        profiler.report();
-
-        // Build result
-        let tokens_array =
-            MxArray::from_uint32(&generated_tokens, &[generated_tokens.len() as i64])?;
-        let logprobs_array = if return_logprobs {
-            MxArray::from_float32(&generated_logprobs, &[generated_logprobs.len() as i64])?
-        } else {
-            MxArray::from_float32(&[], &[0])?
-        };
-
-        Ok(GenerationResult {
-            text: String::new(), // Training doesn't need decoded text
-            tokens: tokens_array,
-            logprobs: logprobs_array,
-            finish_reason: finish_reason.to_string(),
-            num_tokens: generated_tokens.len(),
-            first_token_elapsed_ms,
-        })
     }
 
     /// Generate tokens using speculative decoding with a draft model.
@@ -5545,691 +5054,9 @@ impl Qwen3Model {
         })
     }
 
-    /// Generate multiple completions for multiple prompts with batched GPU processing.
-    ///
-    /// This method generates G completions for each of the N prompts efficiently:
-    /// - For each prompt: prefill once, then batch all G completions during decode
-    /// - Significantly faster than N×G sequential calls
-    ///
-    /// # Arguments
-    /// * `prompt_arrays` - N prompt token arrays, each shape [1, prompt_len]
-    /// * `group_size` - Number of completions to generate per prompt (G)
-    /// * `config` - Generation configuration
-    ///
-    /// # Returns
-    /// BatchGenerationResult with N*G completions (G per prompt, N prompts)
-    pub fn generate_batch_for_training_sync(
-        &self,
-        prompt_arrays: &[MxArray],
-        group_size: usize,
-        config: Option<GenerationConfig>,
-    ) -> Result<BatchGenerationResult> {
-        use crate::stream::{DeviceType, Stream, StreamContext};
-        use tracing::debug;
-
-        let config = config.unwrap_or_default();
-        let num_prompts = prompt_arrays.len();
-        let total_completions = num_prompts * group_size;
-
-        // Extract configuration with defaults
-        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
-        let temperature = config.temperature.unwrap_or(1.0);
-        let top_k = config.top_k.unwrap_or(0);
-        let top_p = config.top_p.unwrap_or(1.0);
-        let min_p = config.min_p.unwrap_or(0.0);
-        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
-        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-        let presence_context_size = config.presence_context_size.unwrap_or(20);
-        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-        let ngram_size = config.ngram_size.unwrap_or(64);
-        let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
-        let return_logprobs = config.return_logprobs.unwrap_or(true);
-        let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
-
-        // Calculate model size for wired_limit context
-        let model_size_bytes = self.calculate_memory_size();
-
-        let embedding_weight = self.embedding.get_weight();
-        // Acquire read locks for model components
-        let layers_guard = self.layers.read().map_err(|_| {
-            Error::new(
-                napi::Status::GenericFailure,
-                "Failed to acquire layers read lock",
-            )
-        })?;
-        let final_norm_guard = self.final_norm.read().map_err(|_| {
-            Error::new(
-                napi::Status::GenericFailure,
-                "Failed to acquire final_norm read lock",
-            )
-        })?;
-        let lm_head_guard = self.lm_head.read().map_err(|_| {
-            Error::new(
-                napi::Status::GenericFailure,
-                "Failed to acquire lm_head read lock",
-            )
-        })?;
-        let layers = &*layers_guard;
-        let final_norm = &*final_norm_guard;
-        let lm_head = &*lm_head_guard;
-        let model_config = &self.config;
-        let num_layers = layers.len();
-
-        debug!(
-            "Starting batched generation: {} prompts, {} group_size, max_tokens={}, prefill_step_size={}",
-            num_prompts, group_size, max_new_tokens, prefill_step_size
-        );
-
-        // Create dedicated generation stream
-        let generation_stream = Stream::new(DeviceType::Gpu);
-
-        // Wired limit context for GPU memory management
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
-
-        // Sampling config
-        let sampling_config = SamplingConfig {
-            temperature: Some(temperature),
-            top_k: Some(top_k),
-            top_p: Some(top_p),
-            min_p: Some(min_p),
-        };
-
-        // Results storage
-        let mut all_tokens: Vec<MxArray> = Vec::with_capacity(total_completions);
-        let mut all_logprobs: Vec<MxArray> = Vec::with_capacity(total_completions);
-        let mut all_texts: Vec<String> = Vec::with_capacity(total_completions);
-        let mut all_finish_reasons: Vec<Vec<String>> = Vec::with_capacity(num_prompts);
-        let mut all_token_counts: Vec<Vec<u32>> = Vec::with_capacity(num_prompts);
-
-        // Process each prompt with batched generation for its G completions
-        for (prompt_idx, prompt_array) in prompt_arrays.iter().enumerate() {
-            debug!("Processing prompt {} of {}", prompt_idx + 1, num_prompts);
-
-            // Get prompt tokens for repetition penalty context (as Vec<u32> for cloning)
-            let prompt_tokens: Vec<u32> = prompt_array.to_uint32()?.to_vec();
-            let _prompt_len = prompt_array.shape_at(1)?; // Kept for potential future use
-
-            // === PREFILL: Process prompt (chunked for long sequences) ===
-            let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];
-            let mut kv_values: Vec<Option<MxArray>> = vec![None; num_layers];
-            let mut cache_idx: i32 = 0;
-
-            // For prefill: single batch element, no left padding
-            let prefill_left_padding = MxArray::from_int32(&[0], &[1])?;
-
-            // Get the sequence length from prompt shape [1, seq_len]
-            let total_seq_len = prompt_array.shape_at(1)? as usize;
-
-            // Determine if we should use chunked prefill
-            let use_chunked_prefill = prefill_step_size > 0 && total_seq_len > prefill_step_size;
-
-            let last_logits = if use_chunked_prefill {
-                // === CHUNKED PREFILL ===
-                debug!(
-                    "Prompt {}: Using chunked prefill: seq_len={}, step_size={}",
-                    prompt_idx + 1,
-                    total_seq_len,
-                    prefill_step_size
-                );
-
-                let mut offset = 0usize;
-
-                // Process all chunks except the last one
-                while offset + prefill_step_size < total_seq_len {
-                    let chunk_end = offset + prefill_step_size;
-
-                    // Slice the chunk: [1, seq_len] -> [1, chunk_size]
-                    let chunk = prompt_array.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
-
-                    // Update rope_offsets for this chunk
-                    let prefill_rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
-
-                    {
-                        let _stream_ctx = StreamContext::new(generation_stream);
-                        let _ = Self::forward_fused(
-                            &chunk,
-                            &embedding_weight,
-                            layers,
-                            final_norm,
-                            lm_head,
-                            model_config,
-                            &mut kv_keys,
-                            &mut kv_values,
-                            &mut cache_idx,
-                            &prefill_rope_offsets,
-                            &prefill_left_padding,
-                        )?;
-                    }
-
-                    // Async eval for pipelining
-                    for kv_key in kv_keys.iter().flatten() {
-                        kv_key.eval();
-                    }
-                    for kv_value in kv_values.iter().flatten() {
-                        kv_value.eval();
-                    }
-
-                    // Clear cache after processing large chunks
-                    synchronize_and_clear_cache();
-
-                    offset = chunk_end;
-                }
-
-                // Process final chunk to get logits
-                let final_chunk =
-                    prompt_array.slice(&[0, offset as i64], &[1, total_seq_len as i64])?;
-                let prefill_rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
-
-                let prefill_logits = {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    Self::forward_fused(
-                        &final_chunk,
-                        &embedding_weight,
-                        layers,
-                        final_norm,
-                        lm_head,
-                        model_config,
-                        &mut kv_keys,
-                        &mut kv_values,
-                        &mut cache_idx,
-                        &prefill_rope_offsets,
-                        &prefill_left_padding,
-                    )?
-                };
-
-                // Extract last token logits from final chunk [1, vocab_size]
-                let chunk_seq_len = prefill_logits.shape_at(1)?;
-                prefill_logits
-                    .slice_axis(1, chunk_seq_len - 1, chunk_seq_len)?
-                    .squeeze(Some(&[1]))?
-            } else {
-                // === SINGLE-PASS PREFILL (original behavior) ===
-                let prefill_rope_offsets = MxArray::from_int32(&[0], &[1])?;
-
-                let prefill_logits = {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    Self::forward_fused(
-                        prompt_array,
-                        &embedding_weight,
-                        layers,
-                        final_norm,
-                        lm_head,
-                        model_config,
-                        &mut kv_keys,
-                        &mut kv_values,
-                        &mut cache_idx,
-                        &prefill_rope_offsets,
-                        &prefill_left_padding,
-                    )?
-                };
-
-                // Extract last token logits [1, vocab_size]
-                let seq_len = prefill_logits.shape_at(1)?;
-                prefill_logits
-                    .slice_axis(1, seq_len - 1, seq_len)?
-                    .squeeze(Some(&[1]))?
-            };
-
-            // === EXPAND KV CACHE FOR GROUP ===
-            // Repeat each cache tensor along batch dimension for group_size copies
-            let mut batch_kv_keys: Vec<Option<MxArray>> = Vec::with_capacity(num_layers);
-            let mut batch_kv_values: Vec<Option<MxArray>> = Vec::with_capacity(num_layers);
-            let mut batch_cache_idx: i32 = cache_idx; // Shared cache index for all batch elements
-
-            for layer_idx in 0..num_layers {
-                if let Some(ref keys) = kv_keys[layer_idx] {
-                    // Repeat along batch dimension: [1, heads, seq, dim] -> [G, heads, seq, dim]
-                    let repeated_keys = keys.repeat_along_axis(0, group_size as i32)?;
-                    batch_kv_keys.push(Some(repeated_keys));
-                } else {
-                    batch_kv_keys.push(None);
-                }
-
-                if let Some(ref values) = kv_values[layer_idx] {
-                    let repeated_values = values.repeat_along_axis(0, group_size as i32)?;
-                    batch_kv_values.push(Some(repeated_values));
-                } else {
-                    batch_kv_values.push(None);
-                }
-            }
-
-            // Create per-sequence RoPE offsets and left padding for batched generation
-            // All sequences in the group start at the same position (cache_idx) with no left padding
-            // Track as Rust Vecs for efficient increments/filtering, convert to MxArray only when needed
-            let mut rope_offsets_vec: Vec<i32> = vec![cache_idx; group_size];
-            let mut left_padding_vec: Vec<i32> = vec![0; group_size];
-
-            // Expand last logits for group [1, vocab] -> [G, vocab]
-            let batch_logits = last_logits.repeat_along_axis(0, group_size as i32)?;
-
-            // Apply repetition penalty to initial logits
-            let mut batch_logits = if repetition_penalty != 1.0 && !prompt_tokens.is_empty() {
-                self.apply_batch_repetition_penalty(
-                    &batch_logits,
-                    &vec![prompt_tokens.clone(); group_size],
-                    repetition_penalty,
-                    repetition_context_size,
-                )?
-            } else {
-                batch_logits
-            };
-            {
-                let histories = vec![prompt_tokens.clone(); group_size];
-                if presence_penalty != 0.0 {
-                    let mut rows = Vec::with_capacity(group_size);
-                    for (i, ctx) in histories.iter().enumerate().take(group_size) {
-                        let row = batch_logits
-                            .slice_axis(0, i as i64, (i + 1) as i64)?
-                            .squeeze(Some(&[0]))?;
-                        rows.push(apply_presence_penalty(
-                            &row,
-                            ctx,
-                            presence_penalty,
-                            Some(presence_context_size),
-                        )?);
-                    }
-                    let refs: Vec<&MxArray> = rows.iter().collect();
-                    batch_logits = MxArray::stack(refs, Some(0))?;
-                }
-                if frequency_penalty != 0.0 {
-                    let mut rows = Vec::with_capacity(group_size);
-                    for (i, ctx) in histories.iter().enumerate().take(group_size) {
-                        let row = batch_logits
-                            .slice_axis(0, i as i64, (i + 1) as i64)?
-                            .squeeze(Some(&[0]))?;
-                        rows.push(apply_frequency_penalty(
-                            &row,
-                            ctx,
-                            frequency_penalty,
-                            Some(frequency_context_size),
-                        )?);
-                    }
-                    let refs: Vec<&MxArray> = rows.iter().collect();
-                    batch_logits = MxArray::stack(refs, Some(0))?;
-                }
-            }
-
-            // === BATCHED DECODE STATE ===
-            // Track per-sequence state
-            let mut generated_tokens: Vec<Vec<u32>> =
-                vec![Vec::with_capacity(max_new_tokens as usize); group_size];
-            let mut generated_logprobs: Vec<Vec<f32>> = if return_logprobs {
-                vec![Vec::with_capacity(max_new_tokens as usize); group_size]
-            } else {
-                vec![Vec::new(); group_size]
-            };
-            let mut token_histories: Vec<Vec<u32>> =
-                (0..group_size).map(|_| prompt_tokens.clone()).collect();
-            let mut active_mask: Vec<bool> = vec![true; group_size];
-
-            // Track original indices to restore order after remapping
-            // When sequences finish early and we filter arrays, this maps current index -> original index
-            let mut original_indices: Vec<usize> = (0..group_size).collect();
-
-            // Store completed sequence results before they get filtered out
-            // (original_idx, tokens, logprobs, finish_reason)
-            let mut completed_sequences: Vec<(usize, Vec<u32>, Vec<f32>, String)> = Vec::new();
-
-            // Sample first tokens for all group members
-            let (mut current_tokens, mut current_logprobs_arr) = if return_logprobs {
-                let (toks, lps) = sample_and_logprobs(&batch_logits, Some(sampling_config))?;
-                (toks, Some(lps))
-            } else {
-                let toks = sample(&batch_logits, Some(sampling_config))?;
-                (toks, None)
-            };
-
-            // === DECODE LOOP ===
-            const DECODE_CLEANUP_INTERVAL: i32 = 256; // Aligned with mlx-lm
-
-            for step in 0..max_new_tokens {
-                let _stream_ctx = StreamContext::new(generation_stream);
-
-                // Async eval for GPU-CPU pipelining - starts GPU work, returns immediately
-                // This allows overlap: GPU computes while CPU extracts from previous iteration
-                if return_logprobs {
-                    if let Some(ref lp) = current_logprobs_arr {
-                        MxArray::async_eval_arrays(&[&current_tokens, lp]);
-                    } else {
-                        MxArray::async_eval_arrays(&[&current_tokens]);
-                    }
-                } else {
-                    MxArray::async_eval_arrays(&[&current_tokens]);
-                }
-
-                // Periodic cleanup
-                if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
-                    synchronize_and_clear_cache();
-                }
-
-                // Count active sequences
-                let active_count = active_mask.iter().filter(|&&x| x).count();
-                if active_count == 0 {
-                    break;
-                }
-
-                // Extract token values - will wait for async eval if not done yet
-                let token_values = current_tokens.to_int32()?;
-
-                // Update state for each sequence - collect deactivations first to avoid borrow conflict
-                let mut to_deactivate: Vec<(usize, String)> = Vec::new();
-
-                // Extract all logprobs at once if needed (avoids crashes from item_at_float32_2d)
-                // Also determine actual vocab_size from the logprobs array shape
-                // Note: async_eval_arrays already triggered eval, so to_float32 will wait if needed
-                let (logprobs_data, actual_vocab_size): (Option<Vec<f32>>, usize) =
-                    if return_logprobs {
-                        if let Some(ref lp) = current_logprobs_arr {
-                            let shape: Vec<i64> = lp.shape()?.iter().copied().collect();
-                            // Shape is [batch, vocab_size], get vocab_size from last dim
-                            let vocab_size = if shape.len() >= 2 {
-                                shape[shape.len() - 1] as usize
-                            } else {
-                                151936 // Fallback for Qwen3
-                            };
-                            (Some(lp.to_float32()?.to_vec()), vocab_size)
-                        } else {
-                            (None, 151936)
-                        }
-                    } else {
-                        (None, 151936)
-                    };
-
-                for seq_idx in 0..active_mask.len() {
-                    if !active_mask[seq_idx] {
-                        continue;
-                    }
-
-                    let token_value = token_values[seq_idx] as u32;
-                    generated_tokens[seq_idx].push(token_value);
-                    token_histories[seq_idx].push(token_value);
-
-                    // Extract logprob using pre-loaded data
-                    if return_logprobs && let Some(ref data) = logprobs_data {
-                        let flat_idx = seq_idx * actual_vocab_size + token_value as usize;
-                        let token_logprob = data[flat_idx];
-                        generated_logprobs[seq_idx].push(token_logprob);
-                    }
-
-                    // Check for repetitive generation
-                    if let Some(reason) = check_repetition_cutoff(
-                        &generated_tokens[seq_idx],
-                        max_consecutive_tokens,
-                        max_ngram_repeats,
-                        ngram_size,
-                    ) {
-                        to_deactivate.push((seq_idx, reason.to_string()));
-                        continue;
-                    }
-
-                    // Check for EOS
-                    if let Some(eos_id) = eos_token_id
-                        && token_value == eos_id as u32
-                    {
-                        to_deactivate.push((seq_idx, "stop".to_string()));
-                        continue;
-                    }
-                }
-
-                // Apply deactivations - save completed sequence data before filtering
-                for (seq_idx, reason) in to_deactivate {
-                    // Save this completed sequence's data with its original index
-                    let orig_idx = original_indices[seq_idx];
-                    completed_sequences.push((
-                        orig_idx,
-                        generated_tokens[seq_idx].clone(),
-                        generated_logprobs[seq_idx].clone(),
-                        reason,
-                    ));
-                    active_mask[seq_idx] = false;
-                }
-
-                // Check if all sequences finished
-                let active_count = active_mask.iter().filter(|&&x| x).count();
-                if active_count == 0 {
-                    break;
-                }
-
-                // === BATCHED FORWARD PASS ===
-                // Build input tensor [active_count, 1] with next tokens for active sequences
-                let active_indices: Vec<usize> = active_mask
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, is_active)| **is_active)
-                    .map(|(idx, _)| idx)
-                    .collect();
-
-                // Get active tokens
-                let active_token_values: Vec<u32> = active_indices
-                    .iter()
-                    .map(|&idx| *generated_tokens[idx].last().unwrap())
-                    .collect();
-
-                // If not all sequences are active, we need to filter the KV cache
-                if active_count < group_size {
-                    let indices_i32: Vec<i32> = active_indices.iter().map(|&x| x as i32).collect();
-                    let indices_array =
-                        MxArray::from_int32(&indices_i32, &[indices_i32.len() as i64])?;
-
-                    for layer_idx in 0..num_layers {
-                        if let Some(ref keys) = batch_kv_keys[layer_idx] {
-                            batch_kv_keys[layer_idx] = Some(keys.take(&indices_array, 0)?);
-                        }
-                        if let Some(ref values) = batch_kv_values[layer_idx] {
-                            batch_kv_values[layer_idx] = Some(values.take(&indices_array, 0)?);
-                        }
-                    }
-
-                    // CRITICAL: Also filter rope_offsets and left_padding Vecs
-                    rope_offsets_vec = active_indices
-                        .iter()
-                        .map(|&i| rope_offsets_vec[i])
-                        .collect();
-                    left_padding_vec = active_indices
-                        .iter()
-                        .map(|&i| left_padding_vec[i])
-                        .collect();
-
-                    // Update active mask to reflect new indices
-                    active_mask = vec![true; active_count];
-
-                    // Remap generated_tokens, generated_logprobs, token_histories, original_indices
-                    // Note: completed sequence data is saved to completed_sequences BEFORE filtering
-                    generated_tokens = active_indices
-                        .iter()
-                        .map(|&i| std::mem::take(&mut generated_tokens[i]))
-                        .collect();
-                    generated_logprobs = active_indices
-                        .iter()
-                        .map(|&i| std::mem::take(&mut generated_logprobs[i]))
-                        .collect();
-                    token_histories = active_indices
-                        .iter()
-                        .map(|&i| std::mem::take(&mut token_histories[i]))
-                        .collect();
-                    original_indices = active_indices
-                        .iter()
-                        .map(|&i| original_indices[i])
-                        .collect();
-                }
-
-                // Create input tensor for forward pass [active_count, 1]
-                let next_input = MxArray::from_uint32(
-                    &active_token_values,
-                    &[active_token_values.len() as i64, 1],
-                )?;
-
-                // Convert Vecs to MxArrays for forward pass (only when needed)
-                let batch_rope_offsets =
-                    MxArray::from_int32(&rope_offsets_vec, &[rope_offsets_vec.len() as i64])?;
-                let batch_left_padding =
-                    MxArray::from_int32(&left_padding_vec, &[left_padding_vec.len() as i64])?;
-
-                // Forward pass with array offsets
-                let next_logits = Self::forward_fused(
-                    &next_input,
-                    &embedding_weight,
-                    layers,
-                    final_norm,
-                    lm_head,
-                    model_config,
-                    &mut batch_kv_keys,
-                    &mut batch_kv_values,
-                    &mut batch_cache_idx,
-                    &batch_rope_offsets,
-                    &batch_left_padding,
-                )?;
-
-                // Increment rope offsets for next iteration (pure Rust arithmetic - nanoseconds vs microseconds)
-                for offset in rope_offsets_vec.iter_mut() {
-                    *offset += 1;
-                }
-
-                // Extract logits [active_count, 1, vocab] -> [active_count, vocab]
-                let next_last_logits = next_logits.squeeze(Some(&[1]))?;
-
-                // Apply repetition penalty
-                let mut next_last_logits = if repetition_penalty != 1.0 {
-                    self.apply_batch_repetition_penalty(
-                        &next_last_logits,
-                        &token_histories,
-                        repetition_penalty,
-                        repetition_context_size,
-                    )?
-                } else {
-                    next_last_logits
-                };
-                {
-                    let batch_size = token_histories.len();
-                    if presence_penalty != 0.0 {
-                        let mut rows = Vec::with_capacity(batch_size);
-                        for (i, ctx) in token_histories.iter().enumerate().take(batch_size) {
-                            let row = next_last_logits
-                                .slice_axis(0, i as i64, (i + 1) as i64)?
-                                .squeeze(Some(&[0]))?;
-                            rows.push(apply_presence_penalty(
-                                &row,
-                                ctx,
-                                presence_penalty,
-                                Some(presence_context_size),
-                            )?);
-                        }
-                        let refs: Vec<&MxArray> = rows.iter().collect();
-                        next_last_logits = MxArray::stack(refs, Some(0))?;
-                    }
-                    if frequency_penalty != 0.0 {
-                        let mut rows = Vec::with_capacity(batch_size);
-                        for (i, ctx) in token_histories.iter().enumerate().take(batch_size) {
-                            let row = next_last_logits
-                                .slice_axis(0, i as i64, (i + 1) as i64)?
-                                .squeeze(Some(&[0]))?;
-                            rows.push(apply_frequency_penalty(
-                                &row,
-                                ctx,
-                                frequency_penalty,
-                                Some(frequency_context_size),
-                            )?);
-                        }
-                        let refs: Vec<&MxArray> = rows.iter().collect();
-                        next_last_logits = MxArray::stack(refs, Some(0))?;
-                    }
-                }
-
-                // Sample next tokens
-                let (next_tokens, next_lp) = if return_logprobs {
-                    let (toks, lps) =
-                        sample_and_logprobs(&next_last_logits, Some(sampling_config))?;
-                    (toks, Some(lps))
-                } else {
-                    (sample(&next_last_logits, Some(sampling_config))?, None)
-                };
-
-                current_tokens = next_tokens;
-                current_logprobs_arr = next_lp;
-            }
-
-            // === COLLECT RESULTS FOR THIS PROMPT ===
-            // Merge completed sequences (finished early) with remaining active sequences
-            // Each entry: (original_idx, tokens, logprobs, finish_reason)
-            let mut all_sequence_results: Vec<(usize, Vec<u32>, Vec<f32>, String)> =
-                Vec::with_capacity(group_size);
-
-            // Track which original indices have already been saved to completed_sequences
-            // This is needed because when ALL sequences finish early (active_count == 0),
-            // the filtering block is skipped and original_indices remains unchanged
-            let completed_orig_indices: std::collections::HashSet<usize> = completed_sequences
-                .iter()
-                .map(|(orig_idx, _, _, _)| *orig_idx)
-                .collect();
-
-            // Add completed sequences (already have their data saved)
-            all_sequence_results.extend(completed_sequences);
-
-            // Add remaining active sequences (hit max_new_tokens) - only those not already completed
-            for (i, orig_idx) in original_indices.iter().enumerate() {
-                if !completed_orig_indices.contains(orig_idx) {
-                    all_sequence_results.push((
-                        *orig_idx,
-                        std::mem::take(&mut generated_tokens[i]),
-                        std::mem::take(&mut generated_logprobs[i]),
-                        "length".to_string(),
-                    ));
-                }
-            }
-
-            // Sort by original index to restore proper ordering
-            all_sequence_results.sort_by_key(|(orig_idx, _, _, _)| *orig_idx);
-
-            // Now collect in order
-            let mut prompt_finish_reasons = Vec::with_capacity(group_size);
-            let mut prompt_token_counts = Vec::with_capacity(group_size);
-
-            for (_orig_idx, tokens, logprobs, reason) in all_sequence_results {
-                prompt_finish_reasons.push(reason);
-                prompt_token_counts.push(tokens.len() as u32);
-
-                // Convert to MxArray
-                let tokens_arr = MxArray::from_uint32(&tokens, &[tokens.len() as i64])?;
-                all_tokens.push(tokens_arr);
-
-                if return_logprobs {
-                    let logprobs_arr = MxArray::from_float32(&logprobs, &[logprobs.len() as i64])?;
-                    all_logprobs.push(logprobs_arr);
-                } else {
-                    all_logprobs.push(MxArray::from_float32(&[], &[0])?);
-                }
-
-                all_texts.push(String::new()); // Text decoding handled separately
-            }
-
-            all_finish_reasons.push(prompt_finish_reasons);
-            all_token_counts.push(prompt_token_counts);
-
-            // Heavy cleanup after each prompt's generation
-            heavy_cleanup();
-        }
-
-        Ok(BatchGenerationResult {
-            tokens: all_tokens,
-            logprobs: all_logprobs,
-            texts: all_texts,
-            finish_reasons: all_finish_reasons,
-            token_counts: all_token_counts,
-            num_prompts,
-            group_size: group_size as u32,
-        })
-    }
-
     /// True parallel batch generation with left-padding support.
     ///
-    /// Unlike `generate_batch_for_training_sync` which processes prompts sequentially,
-    /// this method processes ALL N*G sequences in parallel using the batched FFI kernel.
-    /// This provides 2-4x speedup for GRPO training.
+    /// Processes ALL N*G sequences in parallel using the batched FFI kernel.
     ///
     /// # Arguments
     /// * `prompt_arrays` - N prompt token arrays (1D, variable lengths)

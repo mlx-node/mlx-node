@@ -289,7 +289,6 @@ impl Gradients {
         ])
     }
 
-    #[allow(dead_code)] // Not currently exposed via NAPI but kept for future use
     /// Compute gradients for multi-head attention layer.
     ///
     /// This is a simplified implementation that computes gradients for the learned

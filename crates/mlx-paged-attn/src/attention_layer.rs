@@ -60,12 +60,6 @@ pub struct PagedAttentionLayer {
     /// Softcapping value (1.0 = no softcapping)
     softcap: f32,
 
-    /// ALiBi slopes (optional, for ALiBi attention)
-    /// TODO: Implement ALiBi support in paged_attention kernel
-    #[allow(dead_code)]
-    #[cfg(target_os = "macos")]
-    alibi_slopes: Option<Vec<f32>>,
-
     /// K scale for FP8 quantization (1.0 for non-FP8)
     k_scale: f32,
 
@@ -131,8 +125,6 @@ impl PagedAttentionLayer {
             scale,
             block_size: params.block_size,
             softcap,
-            #[cfg(target_os = "macos")]
-            alibi_slopes: params.alibi_slopes,
             k_scale,
             v_scale,
             use_fp8: params.use_fp8,

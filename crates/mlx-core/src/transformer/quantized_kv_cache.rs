@@ -54,8 +54,6 @@ pub struct QuantizedKVCache {
 
     // Cache state
     offset: i32, // Number of tokens cached
-    #[allow(dead_code)]
-    step: i32, // Pre-allocation step size (for future optimization)
 }
 
 /// Configuration options for QuantizedKVCache
@@ -109,7 +107,6 @@ impl QuantizedKVCache {
 
         let bits = config.bits.unwrap_or(8);
         let group_size = config.group_size.unwrap_or(64);
-        let step = config.step.unwrap_or(256);
 
         // Validate bits
         let bits = if bits != 4 && bits != 8 {
@@ -132,7 +129,6 @@ impl QuantizedKVCache {
             bits,
             group_size,
             offset: 0,
-            step,
         }
     }
 

@@ -1249,10 +1249,8 @@ fn validate_mandatory_weights(
 /// Spawns a `ModelThread<Qwen35Cmd>` that loads all weights inside the init_fn.
 /// Returns a `Qwen3_5Model` thin shell with the thread handle.
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
-    use super::model::VisionCacheInner;
     use crate::nn::{Embedding, RMSNorm};
-    use std::collections::HashMap as StdHashMap;
-    use std::sync::{Mutex, RwLock};
+    use std::sync::RwLock;
 
     let model_path = model_path.to_string();
 
@@ -1461,9 +1459,6 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
     // Create dummy training fields (not used by inference models)
-    let fa_idx = (0..config.num_layers as usize)
-        .find(|&i| !config.is_linear_layer(i))
-        .unwrap_or(0);
     let embedding = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)?;
 
     Ok(Qwen3_5Model {
@@ -1481,13 +1476,8 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         lm_head: std::sync::Arc::new(RwLock::new(None)),
         caches: std::sync::Arc::new(RwLock::new(None)),
         tokenizer,
-        fa_idx,
         vision_encoder: None,
         spatial_merge_size: None,
-        vision_cache: std::sync::Arc::new(Mutex::new(VisionCacheInner {
-            entries: StdHashMap::new(),
-            generation: 0,
-        })),
         cached_token_history: std::sync::Arc::new(RwLock::new(Vec::new())),
         cached_image_key: std::sync::Arc::new(RwLock::new(None)),
         cached_rope_deltas: std::sync::Arc::new(RwLock::new(None)),

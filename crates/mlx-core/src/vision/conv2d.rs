@@ -130,7 +130,6 @@ impl Conv2d {
 ///
 /// This is the actual convolution implementation using MLX's conv_general.
 /// MLX uses NHWC format for inputs and OHWI format for weights.
-#[allow(dead_code)]
 pub fn conv2d_forward(
     input: &MxArray,
     weight: &MxArray,

@@ -13,7 +13,6 @@ use crate::optimizers::AdamW;
 ///
 /// Created when `InitTraining` command is received, destroyed when training ends.
 /// All MxArray state lives here — never crosses the thread boundary.
-#[allow(dead_code)] // Infrastructure for Phase 2+ training thread migration
 pub(crate) struct ModelThreadTrainingState {
     // === Optimizer ===
     pub optimizer: Option<AdamW>,
@@ -46,10 +45,8 @@ pub(crate) struct ModelThreadTrainingState {
     pub emergency_save_threshold: i32,
     pub verbose_nan_detection: bool,
     pub gradient_checkpointing: bool,
-    pub weight_decay: f64,
 }
 
-#[allow(dead_code)] // Infrastructure for Phase 2+ training thread migration
 impl ModelThreadTrainingState {
     /// Create a new training state from engine configuration values.
     pub fn new(
@@ -61,7 +58,6 @@ impl ModelThreadTrainingState {
         emergency_save_threshold: i32,
         verbose_nan_detection: bool,
         gradient_checkpointing: bool,
-        weight_decay: f64,
         optimizer: Option<AdamW>,
     ) -> Self {
         Self {
@@ -82,7 +78,6 @@ impl ModelThreadTrainingState {
             emergency_save_threshold,
             verbose_nan_detection,
             gradient_checkpointing,
-            weight_decay,
         }
     }
 

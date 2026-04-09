@@ -161,9 +161,6 @@ pub enum TrainingMessage {
 /// Historical metric for sparkline restoration
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResumeMetric {
-    /// Step number (included for JSON compatibility, not used in TUI)
-    #[allow(dead_code)]
-    pub step: i64,
     /// Loss value
     pub loss: f64,
     /// Mean reward (GRPO)

@@ -139,14 +139,15 @@ export declare class GenerationResult {
 /**
  * GRPO Training Engine
  *
- * Complete training engine that runs entirely in Rust.
+ * Thin coordinator that routes all MLX operations through the model thread.
+ * No MxArrays or model state live here — only plain data crosses the boundary.
  */
 export declare class GrpoTrainingEngine {
   /**
    * Create a new training engine from a Qwen3 model
    *
    * # Arguments
-   * * `model` - The Qwen3 model to train (will be cloned internally)
+   * * `model` - The Qwen3 model (must be loaded via load())
    * * `config` - Engine configuration
    */
   constructor(model: Qwen3Model, config: GrpoEngineConfig);
@@ -162,8 +163,8 @@ export declare class GrpoTrainingEngine {
    * This method performs the complete training cycle:
    * 1. Generate completions for each prompt (G times per prompt)
    * 2. Use provided rewards to compute advantages
-   * 3. Compute GRPO loss and gradients
-   * 4. Apply gradients (respecting accumulation steps)
+   * 3. Compute GRPO loss and gradients (on model thread)
+   * 4. Apply gradients (respecting accumulation steps, on model thread)
    *
    * # Arguments
    * * `prompts` - Array of chat conversations to use as prompts
@@ -190,13 +191,14 @@ export declare class GrpoTrainingEngine {
   /**
    * Run a training step with pre-generated completions
    *
-   * This method performs training using pre-generated completions,
-   * eliminating the double-generation issue.
+   * Uses the cached MxArrays from the most recent generate_batch_for_training
+   * call on the model thread. The generation_result parameter is used only for
+   * validation (the actual MxArrays are cached on the model thread).
    *
    * # Arguments
    * * `prompts` - Array of chat conversations to use as prompts
    * * `rewards` - Reward values for each completion (num_prompts * group_size)
-   * * `generation_result` - Pre-generated completion data from generate_batch_for_training
+   * * `generation_result` - Pre-generated completion data (used for validation)
    *
    * # Returns
    * * Training step metrics
@@ -209,8 +211,8 @@ export declare class GrpoTrainingEngine {
   /**
    * Unified training step with JS reward callback and optional output recording
    *
-   * Same as `train_step_auto` but optionally captures the full RewardOutput data
-   * for persistence to an output store database.
+   * Generates completions via the model thread, calls the JS reward function
+   * with plain data, then dispatches the training step to the model thread.
    *
    * # Arguments
    * * `prompts` - Array of chat conversations to use as prompts
@@ -261,20 +263,15 @@ export declare class GrpoTrainingEngine {
   /**
    * Save optimizer state (moment tensors + step) to a SafeTensors file.
    *
-   * The step counter is stored in the `__metadata__` field.
-   * Each parameter's first moment (m) and second moment (v) are stored as
-   * `{param_name}.m` and `{param_name}.v` tensors.
-   *
-   * No-op if the engine uses SGD (no optimizer state to save).
+   * TODO: Route through model thread SaveCheckpoint command once optimizer
+   * state serialization is added to ModelThreadTrainingState.
    */
   saveOptimizerState(path: string): void;
   /**
    * Load optimizer state (moment tensors + step) from a SafeTensors file.
    *
-   * Restores the step counter from metadata and sets first/second moment
-   * tensors for each parameter found in the file.
-   *
-   * No-op if the engine uses SGD (no optimizer to restore).
+   * TODO: Route through model thread once optimizer state loading is added
+   * to ModelThreadTrainingState.
    */
   loadOptimizerState(path: string): void;
 }
@@ -805,9 +802,9 @@ export declare class QianfanOCRModel {
 /**
  * Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
  *
- * All inference state lives on a dedicated OS thread. NAPI methods dispatch
- * commands via channels and await responses. Training support uses a
- * separate `Arc<RwLock<>>` path via `clone_for_training()`.
+ * All inference and training state lives on a dedicated OS thread. NAPI methods
+ * dispatch commands via channels and await responses. Training commands are
+ * routed through `TrainingDispatch` to the model thread.
  */
 export declare class Qwen35Model {
   /** Create a new Qwen3.5 model with the given configuration. */
@@ -870,8 +867,8 @@ export declare class Qwen35Model {
   /**
    * Save the model weights and configuration to a directory.
    *
-   * For inference models: dispatches to model thread.
-   * For training clones: uses Arc<RwLock<>> training fields directly.
+   * Dispatches to model thread for inference models.
+   * Fallback path uses Arc<RwLock<>> fields directly (legacy).
    */
   saveModel(savePath: string): Promise<undefined>;
 }
@@ -880,9 +877,9 @@ export type Qwen3_5Model = Qwen35Model;
 /**
  * Qwen3.5 MoE Model -- hybrid linear/full attention with Mixture-of-Experts.
  *
- * All inference state lives on a dedicated OS thread. NAPI methods dispatch
- * commands via channels and await responses. Training support uses a
- * separate `Arc<RwLock<>>` path via `clone_for_training()`.
+ * All inference and training state lives on a dedicated OS thread. NAPI methods
+ * dispatch commands via channels and await responses. Training commands are
+ * routed through `TrainingDispatch` to the model thread.
  */
 export declare class Qwen35MoeModel {
   /**
@@ -931,8 +928,8 @@ export declare class Qwen35MoeModel {
   /**
    * Save the model weights and configuration to a directory.
    *
-   * For inference models: dispatches to model thread.
-   * For training clones: uses Arc<RwLock<>> training fields directly.
+   * Dispatches to model thread for inference models.
+   * Fallback path uses Arc<RwLock<>> fields directly (legacy).
    */
   saveModel(savePath: string): Promise<undefined>;
 }
@@ -941,8 +938,8 @@ export type Qwen3_5MoeModel = Qwen35MoeModel;
 /**
  * Qwen3 Model with automatic differentiation support
  *
- * Uses a dedicated model thread for inference commands.
- * Training clones (`thread == None`) use `Arc<RwLock<>>` fields directly.
+ * Uses a dedicated model thread for inference and training commands.
+ * Training commands are routed via `TrainingDispatch`.
  */
 export declare class Qwen3Model {
   /** Create a new Qwen3 model with the given configuration */
@@ -1613,7 +1610,12 @@ export declare class Qwen3Tokenizer {
   getEndoftextToken(): string;
 }
 
-/** SFT Training Engine */
+/**
+ * SFT Training Engine
+ *
+ * Thin coordinator that routes all MLX operations through the model thread.
+ * No MxArrays or model state live here - only plain data crosses the boundary.
+ */
 export declare class SftTrainingEngine {
   /** Create a new SFT training engine from a Qwen3 model */
   constructor(model: Qwen3Model, config: SftEngineConfig);
@@ -1630,9 +1632,10 @@ export declare class SftTrainingEngine {
   /**
    * Flush any accumulated gradients at epoch end
    *
-   * When stepsPerEpoch % gradient_accumulation_steps != 0, there may be
-   * leftover gradients from the final micro-batches. This method applies
-   * them with proper averaging, matching TRL behavior.
+   * With the model thread architecture, gradient accumulation is handled
+   * on the model thread. This method is kept for API compatibility but
+   * currently logs a warning. Partial accumulation at epoch boundaries
+   * will be handled in a future update.
    */
   flushGradients(): boolean;
   /**
@@ -1659,11 +1662,26 @@ export declare class SftTrainingEngine {
   reset(): void;
   /** Restore training state (for resuming from checkpoint) */
   restoreState(step: number, epoch: number): void;
-  /** Get the underlying Qwen3 model for checkpointing */
+  /**
+   * Get the underlying Qwen3 model for checkpointing
+   *
+   * NOTE: With the model thread architecture, direct model access is no longer
+   * supported. Use save_checkpoint() on the model directly instead.
+   */
   getModel(): Qwen3Model;
-  /** Get the underlying Qwen3.5 dense model for checkpointing */
+  /**
+   * Get the underlying Qwen3.5 dense model for checkpointing
+   *
+   * NOTE: With the model thread architecture, direct model access is no longer
+   * supported. Use save_checkpoint() on the model directly instead.
+   */
   getQwen35Model(): Qwen35Model;
-  /** Get the underlying Qwen3.5 MoE model for checkpointing */
+  /**
+   * Get the underlying Qwen3.5 MoE model for checkpointing
+   *
+   * NOTE: With the model thread architecture, direct model access is no longer
+   * supported. Use save_checkpoint() on the model directly instead.
+   */
   getQwen35MoeModel(): Qwen35MoeModel;
 }
 

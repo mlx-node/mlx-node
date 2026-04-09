@@ -453,7 +453,7 @@ impl InternViTModel {
     }
 
     /// Number of encoder layers
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }

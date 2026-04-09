@@ -52,8 +52,6 @@ use tracing::warn;
 
 /// Special token IDs for Qwen3 models
 const ENDOFTEXT_TOKEN_ID: u32 = 151643;
-#[allow(dead_code)] // Reserved for future use (e.g., get_im_start_token_id())
-const IM_START_TOKEN_ID: u32 = 151644;
 const IM_END_TOKEN_ID: u32 = 151645;
 
 /// Valid roles for ChatML format (prevents role injection attacks)

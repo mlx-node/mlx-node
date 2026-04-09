@@ -1508,10 +1508,8 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5MoeModel> {
 /// All model state lives on the spawned thread. Returns a thin NAPI shell
 /// with the thread handle and dummy training fields.
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
-    use crate::models::qwen3_5::model::VisionCacheInner;
     use crate::nn::{Embedding, RMSNorm};
-    use std::collections::HashMap as StdHashMap;
-    use std::sync::{Mutex, RwLock};
+    use std::sync::RwLock;
 
     let model_path = model_path.to_string();
 
@@ -1738,10 +1736,6 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         fa_idx,
         vision_encoder: None,
         spatial_merge_size: None,
-        vision_cache: std::sync::Arc::new(Mutex::new(VisionCacheInner {
-            entries: StdHashMap::new(),
-            generation: 0,
-        })),
         cached_token_history: std::sync::Arc::new(RwLock::new(Vec::new())),
         cached_image_key: std::sync::Arc::new(RwLock::new(None)),
         cached_rope_deltas: std::sync::Arc::new(RwLock::new(None)),

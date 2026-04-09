@@ -22,12 +22,6 @@ use std::sync::Arc;
 /// Note: This is an internal implementation detail used by ERNIELanguageModel.
 /// Not exposed to TypeScript - users interact with high-level VLModel API.
 pub struct MultimodalRoPE {
-    /// Head dimension (stored for potential future use)
-    #[allow(dead_code)]
-    dim: i32,
-    /// Base theta for frequency computation (stored for potential future use)
-    #[allow(dead_code)]
-    base: f32,
     /// mRoPE sections [temporal, height, width] (e.g., [16, 24, 24])
     mrope_section: [i32; 3],
     /// Pre-computed inverse frequencies, pre-shaped to [1, 1, half_dim, 1] for broadcasting
@@ -89,8 +83,6 @@ impl MultimodalRoPE {
         let inv_freq = MxArray::from_float32(&inv_freq_data, &[1, 1, inv_freq_dim, 1])?;
 
         Ok(Self {
-            dim,
-            base,
             mrope_section: mrope_section_arr,
             inv_freq: Arc::new(inv_freq),
             inv_freq_dim,

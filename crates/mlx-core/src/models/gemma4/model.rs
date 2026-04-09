@@ -170,9 +170,6 @@ pub(crate) enum Gemma4Cmd {
 #[napi]
 pub struct Gemma4Model {
     pub(crate) thread: crate::model_thread::ModelThread<Gemma4Cmd>,
-    /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
-    #[allow(dead_code)]
-    pub(crate) config: Gemma4Config,
     pub(crate) model_id: u64,
     pub(crate) image_processor: Option<Gemma4ImageProcessor>,
 }
@@ -719,7 +716,6 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
 impl Gemma4Model {
     #[napi(constructor)]
     pub fn new(config: Gemma4Config) -> Result<Self> {
-        let config_clone = config.clone();
         let image_processor = config.vision_config.as_ref().map(|vc| {
             Gemma4ImageProcessor::new(
                 vc.patch_size,
@@ -743,7 +739,6 @@ impl Gemma4Model {
 
         Ok(Self {
             thread,
-            config: config_clone,
             model_id,
             image_processor,
         })
