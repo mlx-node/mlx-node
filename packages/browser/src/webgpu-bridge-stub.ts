@@ -86,6 +86,7 @@ export function createBridgeStub(
   const RPC_HISTORY_SIZE = 32;
   const rpcHistory: Array<{ n: number; fn: number }> = [];
 
+
   // Pending compute pass state for fusion (setPipeline + setBindGroup → single dispatch RPC)
   let pendingPass = -1;
   let pendingPipeline = -1;
@@ -126,9 +127,31 @@ export function createBridgeStub(
   let fakeBufferCounter = 0x7D000000; // distinct range from fakeHandleCounter (0x7F000000)
   const deferredBufferRemap = new Map<number, number>(); // fake → real handle
 
+  // Buffers awaiting GPU creation (deferred from wgpuBufferUnmap).
+  // Data lives in WASM shadow memory until dispatch time.
+  interface DeferredCreation {
+    usage: number;
+    size: number;
+    wasmPtr: number;
+  }
+  const deferredCreations = new Map<number, DeferredCreation>();
+
   /** Resolve a buffer handle: if it's a deferred fake handle, return the real one. */
   function resolveBufferHandle(handle: number): number {
     return deferredBufferRemap.get(handle) ?? handle;
+  }
+
+  /** Force-create a deferred buffer (fallback when it can't be inlined in dispatch). */
+  function materializeDeferredBuffer(fakeHandle: number): void {
+    const def = deferredCreations.get(fakeHandle);
+    if (!def) return;
+    deferredCreations.delete(fakeHandle);
+    const sizeLo = def.size & 0xFFFFFFFF;
+    const sizeHi = Math.floor(def.size / 0x100000000);
+    const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, def.usage, sizeLo, sizeHi, def.wasmPtr);
+    deferredBufferRemap.set(fakeHandle, realHandle);
+    bufSizes[realHandle] = def.size;
+    wasmFree(def.wasmPtr);
   }
 
   // Eagerly-parsed bind group descriptors for FUSED_FULL_DISPATCH.
@@ -163,10 +186,15 @@ export function createBridgeStub(
   function flushPendingWrites(): void {
     if (pendingWriteBuffers.size === 0) return;
     for (const [handle, pending] of pendingWriteBuffers) {
+      // Materialize deferred buffer if needed
+      if (deferredCreations.has(handle)) {
+        materializeDeferredBuffer(handle);
+      }
+      const resolved = resolveBufferHandle(handle);
       // Allocate temporary WASM memory to pass data through RPC
       const wasmPtr = wasmMalloc(pending.data.byteLength);
       heap().set(pending.data, wasmPtr);
-      rpcCall(RpcFn.QUEUE_WRITE_BUFFER, handle, 0, 0, wasmPtr, pending.data.byteLength);
+      rpcCall(RpcFn.QUEUE_WRITE_BUFFER, resolved, 0, 0, wasmPtr, pending.data.byteLength);
       wasmFree(wasmPtr);
     }
     pendingWriteBuffers.clear();
@@ -256,7 +284,7 @@ export function createBridgeStub(
       cmdU32[I_CB_COUNT] = 0;
     }
 
-    // Signal gpu-worker and block
+    // Signal gpu-worker and block until done
     Atomics.store(cmdView, STATUS_INDEX, STATUS.PENDING);
     Atomics.notify(cmdView, STATUS_INDEX);
     const waitResult = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 10_000);
@@ -737,37 +765,91 @@ export function createBridgeStub(
           pendingBgData.delete(pendingBindGroup);
           const entryCount = bgDesc.entries.length;
 
-          // Check if any bind group entry has a pending deferred writeBuffer
+          // Check if any bind group entry has a pending writeBuffer or deferred creation
           let uniformEntryIdx = -1;
           let uniformData: Uint8Array | null = null;
+          let deferredFakeHandle = -1;  // track deferred creation to finalize after RPC
+          let deferredInfo: DeferredCreation | undefined;
+
           for (let i = 0; i < entryCount; i++) {
-            const pending = pendingWriteBuffers.get(bgDesc.entries[i].bufferHandle);
+            const bufHandle = bgDesc.entries[i].bufferHandle;
+            // Check pending writeBuffer first (takes priority — latest data)
+            const pending = pendingWriteBuffers.get(bufHandle);
             if (pending) {
               uniformEntryIdx = i;
               uniformData = pending.data;
-              pendingWriteBuffers.delete(bgDesc.entries[i].bufferHandle);
-              break;  // only inline one write per dispatch
+              pendingWriteBuffers.delete(bufHandle);
+              // Also check if this buffer needs creation
+              deferredInfo = deferredCreations.get(bufHandle);
+              if (deferredInfo) {
+                deferredFakeHandle = bufHandle;
+                deferredCreations.delete(bufHandle);
+              }
+              break;
+            }
+            // Check deferred buffer creation (data from mappedAtCreation)
+            const def = deferredCreations.get(bufHandle);
+            if (def && def.size <= 256) {
+              uniformEntryIdx = i;
+              uniformData = heap().slice(def.wasmPtr, def.wasmPtr + def.size);
+              deferredFakeHandle = bufHandle;
+              deferredInfo = def;
+              deferredCreations.delete(bufHandle);
+              break;
+            }
+          }
+
+          // Materialize any remaining deferred creations in the bind group
+          // that weren't handled as the uniform entry
+          for (let i = 0; i < entryCount; i++) {
+            const bufHandle = bgDesc.entries[i].bufferHandle;
+            if (deferredCreations.has(bufHandle)) {
+              materializeDeferredBuffer(bufHandle);
+              bgDesc.entries[i].bufferHandle = resolveBufferHandle(bufHandle);
             }
           }
 
           // Write entry data into the callback ring space BEFORE rpcCall
-          // (rpcCall will skip zeroing CALLBACK_COUNT for these fnIds)
           cmdU32[I_CB_COUNT] = entryCount;
           for (let i = 0; i < entryCount; i++) {
             const e = bgDesc.entries[i];
             const base = (CMD_OFFSET.CALLBACK_BASE + i * 12) >>> 2;
-            cmdU32[base] = e.bufferHandle;
+            // Use 0 for deferred creation entry (gpu-worker will create buffer)
+            cmdU32[base] = (i === uniformEntryIdx && deferredInfo) ? 0 : resolveBufferHandle(e.bufferHandle);
             cmdU32[base + 1] = e.sizeLo;
             cmdU32[base + 2] = e.sizeHi;
           }
 
           if (uniformData && uniformData.byteLength <= 256) {
-            // FUSED_DISPATCH_WITH_UNIFORM: pack writeBuffer + bind group + dispatch in one RPC
+            // FUSED_DISPATCH_WITH_UNIFORM: pack data + bind group + dispatch in one RPC
+            // ARG7 = buffer usage flags (for deferred creation, or 0 if buffer exists)
+            const usage = deferredInfo ? deferredInfo.usage : 0;
             cmdU32[CMD_OFFSET.UNIFORM_DATA_SIZE >>> 2] = uniformData.byteLength;
             new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformData.byteLength).set(uniformData);
-            rpcCall(RpcFn.FUSED_DISPATCH_WITH_UNIFORM, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z, uniformEntryIdx);
+            const result = rpcCall(RpcFn.FUSED_DISPATCH_WITH_UNIFORM, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z, uniformEntryIdx);
+
+            // Finalize deferred buffer creation: gpu-worker returns real handle
+            if (deferredInfo && deferredFakeHandle >= 0) {
+              if (result > 0) {
+                deferredBufferRemap.set(deferredFakeHandle, result);
+                bufSizes[result] = deferredInfo.size;
+              }
+              wasmFree(deferredInfo.wasmPtr);
+            }
           } else {
-            // Flush any remaining pending writes that weren't inlined
+            // No inline data or too large — flush and use FUSED_FULL_DISPATCH
+            if (deferredInfo && deferredFakeHandle >= 0) {
+              // Can't inline — fall back to immediate creation
+              const sizeLo = deferredInfo.size & 0xFFFFFFFF;
+              const sizeHi = Math.floor(deferredInfo.size / 0x100000000);
+              const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, deferredInfo.usage, sizeLo, sizeHi, deferredInfo.wasmPtr);
+              deferredBufferRemap.set(deferredFakeHandle, realHandle);
+              bufSizes[realHandle] = deferredInfo.size;
+              wasmFree(deferredInfo.wasmPtr);
+              // Rewrite the entry with the real handle
+              const base = (CMD_OFFSET.CALLBACK_BASE + uniformEntryIdx * 12) >>> 2;
+              cmdU32[base] = realHandle;
+            }
             flushPendingWrites();
             rpcCall(RpcFn.FUSED_FULL_DISPATCH, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z);
           }
@@ -871,20 +953,28 @@ export function createBridgeStub(
     },
 
     wgpuBufferUnmap(bufferHandle: number): void {
-      // Fast path: deferred mappedAtCreation buffer — create buffer + write data in 1 RPC
-      // via CREATE_BUFFER_FROM_DATA (fused createBuffer + writeBuffer).
+      // Fast path: deferred mappedAtCreation buffer — defer GPU buffer creation to dispatch
+      // time so it can be folded into FUSED_DISPATCH_WITH_UNIFORM (0 RPCs here).
       const mapped = mappedAtCreationBuffers.get(bufferHandle);
       if (mapped) {
         mappedAtCreationBuffers.delete(bufferHandle);
-        const sizeLo = mapped.size & 0xFFFFFFFF;
-        const sizeHi = Math.floor(mapped.size / 0x100000000);
-        // CREATE_BUFFER_FROM_DATA: args = usage, sizeLo, sizeHi, wasmDataPtr
-        const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, mapped.usage, sizeLo, sizeHi, mapped.wasmPtr);
-        // Store remap so subsequent uses of the fake handle resolve to the real one
-        deferredBufferRemap.set(bufferHandle, realHandle);
-        // Cache size under real handle too (keep fake entry for getSize lookups)
-        bufSizes[realHandle] = mapped.size;
-        wasmFree(mapped.wasmPtr);
+        if (mapped.size <= 256) {
+          // Small buffer (uniform): defer creation to dispatch time
+          deferredCreations.set(bufferHandle, {
+            usage: mapped.usage,
+            size: mapped.size,
+            wasmPtr: mapped.wasmPtr,
+          });
+          // DON'T free wasmPtr — data is needed at dispatch time
+        } else {
+          // Large buffer: create immediately (won't fit in inline dispatch data)
+          const sizeLo = mapped.size & 0xFFFFFFFF;
+          const sizeHi = Math.floor(mapped.size / 0x100000000);
+          const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, mapped.usage, sizeLo, sizeHi, mapped.wasmPtr);
+          deferredBufferRemap.set(bufferHandle, realHandle);
+          bufSizes[realHandle] = mapped.size;
+          wasmFree(mapped.wasmPtr);
+        }
         unmapPtrs.delete(bufferHandle);
         return;
       }
@@ -907,15 +997,27 @@ export function createBridgeStub(
 
     wgpuBufferDestroy(bufferHandle: number): void {
       // No-op: gpu-worker already skips buffer destroy to avoid "destroyed in submit" errors.
-      // If a deferred buffer was never unmapped (unlikely), clean up the pending state.
+      // Clean up deferred state if present.
       const mapped = mappedAtCreationBuffers.get(bufferHandle);
       if (mapped) {
         mappedAtCreationBuffers.delete(bufferHandle);
         wasmFree(mapped.wasmPtr);
       }
+      const def = deferredCreations.get(bufferHandle);
+      if (def) {
+        deferredCreations.delete(bufferHandle);
+        wasmFree(def.wasmPtr);
+      }
     },
 
     wgpuBufferRelease(handle: number): void {
+      // Clean up deferred creation if buffer is released before dispatch
+      const def = deferredCreations.get(handle);
+      if (def) {
+        deferredCreations.delete(handle);
+        wasmFree(def.wasmPtr);
+        return; // no GPU buffer was created, nothing to release
+      }
       const resolved = resolveBufferHandle(handle);
       if (resolved !== handle) {
         // Clean up remap entry — buffer is being released

@@ -89,6 +89,23 @@ let queue: GPUQueue;
 let adapter: GPUAdapter;
 let hasShaderF16 = false;
 
+// Track pass→encoder association for end+begin after each dispatch.
+// WebGPU disallows buffer aliasing within a single compute pass, so each
+// dispatch must get its own pass. The C++ backend calls end_compute_pass()
+// after every dispatch, but the bridge stub caches the pass for reuse.
+// We fix this by ending+restarting the pass in the gpu-worker after every dispatch.
+const passEncoderMap = new Map<number, number>(); // passHandle → encoderHandle
+
+function endAndRestartPass(passHandle: number): void {
+  const encoderHandle = passEncoderMap.get(passHandle);
+  if (encoderHandle === undefined) return;
+  const pass = handles[passHandle] as GPUComputePassEncoder;
+  pass.end();
+  const encoder = handles[encoderHandle] as GPUCommandEncoder;
+  const newPass = encoder.beginComputePass();
+  handles[passHandle] = newPass; // Replace in-place — bridge stub's cached handle stays valid
+}
+
 // Pre-registered handles (set during init)
 let instanceHandle: number;
 let adapterHandle: number;
@@ -100,6 +117,7 @@ let queueHandle: number;
 let cmdBuffer: SharedArrayBuffer;  // Raw SharedArrayBuffer for typed array views into command data
 let cmdView: Int32Array;
 let cmdDataView: DataView;
+let cmdU32: Uint32Array;  // Fast unsigned reads (avoids DataView overhead in hot path)
 let wasmMemoryObj: WebAssembly.Memory;  // Memory object — .buffer always reflects current size after grow()
 let readbackView: Uint8Array;
 
@@ -142,6 +160,7 @@ self.onmessage = async (e: MessageEvent) => {
 
     cmdView = new Int32Array(cmdBuffer);
     cmdDataView = new DataView(cmdBuffer);
+    cmdU32 = new Uint32Array(cmdBuffer);
 
     // Create GPU device
     const gpu = navigator.gpu;
@@ -286,52 +305,459 @@ self.onmessage = async (e: MessageEvent) => {
 
 // ---------- Command Processing Loop ----------
 
+// ---------- Standalone RMSNorm GPU test (bypasses C++/WASM pipeline) ----------
+async function runRMSNormTest(wgslCode: string): Promise<void> {
+  try {
+    console.log('[RMSNorm-TEST] Starting standalone GPU test...');
+
+    const entryMatch = wgslCode.match(/fn\s+(rmsnorm_\w+)\s*\(/);
+    if (!entryMatch) {
+      console.error('[RMSNorm-TEST] Could not find entry point in WGSL');
+      return;
+    }
+    const entryPoint = entryMatch[1];
+    console.log(`[RMSNorm-TEST] Entry point: ${entryPoint}`);
+
+    const axisSize = 4;
+    const inputData = new Float32Array([1.0, 2.0, 3.0, 4.0]);
+    const weightData = new Float32Array([1.0, 1.0, 1.0, 1.0]);
+
+    // Expected: sum_sq=30, mean_sq=7.5, inv_rms≈0.365148, output≈[0.3651, 0.7303, 1.0954, 1.4606]
+    const sumSq = inputData.reduce((s, v) => s + v * v, 0);
+    const invRms = 1.0 / Math.sqrt(sumSq / axisSize + 1e-6);
+    const expected = Array.from(inputData).map((v, i) => v * invRms * weightData[i]);
+    console.log(`[RMSNorm-TEST] Expected: [${expected.map(v => v.toFixed(6)).join(', ')}]`);
+
+    // Create GPU buffers
+    const inputBuf = device.createBuffer({
+      size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const weightBuf = device.createBuffer({
+      size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const outputBuf = device.createBuffer({
+      size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    const stagingBuf = device.createBuffer({
+      size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    const paramsBuf = device.createBuffer({
+      size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    // Pack uniform params: vec4<u32> = [axis_size, w_stride, eps_as_bits, pad]
+    const paramsData = new ArrayBuffer(16);
+    const pv = new DataView(paramsData);
+    pv.setUint32(0, axisSize, true);
+    pv.setUint32(4, 1, true);         // w_stride = 1
+    pv.setFloat32(8, 1e-6, true);     // eps — bitcast<f32> in shader recovers float
+    pv.setUint32(12, 0, true);        // pad
+
+    queue.writeBuffer(inputBuf, 0, inputData);
+    queue.writeBuffer(weightBuf, 0, weightData);
+    queue.writeBuffer(paramsBuf, 0, new Uint8Array(paramsData));
+
+    const module = device.createShaderModule({ code: wgslCode });
+    const pipeline = device.createComputePipeline({
+      layout: 'auto',
+      compute: { module, entryPoint },
+    });
+
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: inputBuf } },
+        { binding: 1, resource: { buffer: weightBuf } },
+        { binding: 2, resource: { buffer: outputBuf } },
+        { binding: 3, resource: { buffer: paramsBuf } },
+      ],
+    });
+
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(1);  // 1 row = 1 workgroup
+    pass.end();
+    enc.copyBufferToBuffer(outputBuf, 0, stagingBuf, 0, 16);
+    queue.submit([enc.finish()]);
+
+    await stagingBuf.mapAsync(GPUMapMode.READ);
+    const result = new Float32Array(stagingBuf.getMappedRange().slice(0));
+    stagingBuf.unmap();
+
+    console.log(`[RMSNorm-TEST] Actual:   [${Array.from(result).map(v => v.toFixed(6)).join(', ')}]`);
+    console.log(`[RMSNorm-TEST] Expected: [${expected.map(v => v.toFixed(6)).join(', ')}]`);
+
+    let maxErr = 0;
+    for (let i = 0; i < axisSize; i++) {
+      maxErr = Math.max(maxErr, Math.abs(result[i] - expected[i]));
+    }
+    console.log(`[RMSNorm-TEST] Max error: ${maxErr.toExponential(4)}`);
+
+    if (maxErr < 1e-4) {
+      console.log('[RMSNorm-TEST] PASS — Shader correct. Bug is in C++/WASM dispatch.');
+    } else {
+      console.log('[RMSNorm-TEST] FAIL — Shader produces wrong results!');
+    }
+
+    inputBuf.destroy();
+    weightBuf.destroy();
+    outputBuf.destroy();
+    stagingBuf.destroy();
+    paramsBuf.destroy();
+  } catch (e) {
+    console.error('[RMSNorm-TEST] Error:', e);
+  }
+}
+
+// ---------- Inlined hot-path handlers ----------
+// These bypass processCommand entirely: no async overhead, no closure
+// allocation, no switch dispatch, no flushCallbacks (hot paths produce
+// no callbacks). Called directly from the command loop.
+
+function handleFusedFullDispatch(): void {
+  const passHandle = cmdU32[I_ARG0];
+  const pipelineHandle = cmdU32[I_ARG0 + 1];
+  const layoutHandle = cmdU32[I_ARG0 + 2];
+  const x = cmdU32[I_ARG0 + 3];
+  const y = cmdU32[I_ARG0 + 4];
+  const z = cmdU32[I_ARG0 + 5];
+  const entryCount = cmdU32[I_CB_COUNT];
+
+  // Direct handle access (no null check) — hot path, handles always valid
+  const layout = handles[layoutHandle] as GPUBindGroupLayout;
+  const entries: GPUBindGroupEntry[] = [];
+  let eIdx = I_CB_BASE;
+  for (let i = 0; i < entryCount; i++) {
+    const buffer = handles[cmdU32[eIdx]] as GPUBuffer;
+    const sizeLo = cmdU32[eIdx + 1];
+    const sizeHi = cmdU32[eIdx + 2];
+    eIdx += 3;
+    const size = sizeLo + sizeHi * 0x100000000;
+    const resource: GPUBufferBinding = { buffer, offset: 0 };
+    if (size !== 0 && size < 2 ** 53) resource.size = size;
+    entries.push({ binding: i, resource });
+  }
+
+  const bindGroup = device.createBindGroup({ layout, entries });
+  const pass = handles[passHandle] as GPUComputePassEncoder;
+  pass.setPipeline(handles[pipelineHandle] as GPUComputePipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(x, y, z);
+  endAndRestartPass(passHandle);
+  cmdU32[I_RESULT] = 0;
+}
+
+let _fusedUniformDbgCount = 0;
+
+// Debug readback: captures bind group buffers from first 4-entry dispatch
+// for async GPU readback after next submit. Uses a done flag (not null check)
+// so it only fires once across the entire session.
+let _debugReadbackDone = false;
+let _debugReadbackBuffers: { buf: GPUBuffer; size: number; label: string }[] | null = null;
+function handleFusedDispatchWithUniform(): void {
+  const passHandle = cmdU32[I_ARG0];
+  const pipelineHandle = cmdU32[I_ARG0 + 1];
+  const layoutHandle = cmdU32[I_ARG0 + 2];
+  const x = cmdU32[I_ARG0 + 3];
+  const y = cmdU32[I_ARG0 + 4];
+  const z = cmdU32[I_ARG0 + 5];
+  const uniformEntryIdx = cmdU32[I_ARG0 + 6];
+  const entryCount = cmdU32[I_CB_COUNT];
+  const uniformDataSize = cmdU32[I_UNIFORM_SIZE];
+
+  // DEBUG: log first 5 dispatches with 4 entries (likely RMSNorm)
+  if (entryCount === 4 && _fusedUniformDbgCount < 5) {
+    _fusedUniformDbgCount++;
+    const u32 = new Uint32Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, Math.min(uniformDataSize / 4, 4));
+    const f32 = new Float32Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, Math.min(uniformDataSize / 4, 4));
+    // Log entry buffer handles and sizes
+    const entries: string[] = [];
+    let eDbg = I_CB_BASE;
+    for (let i = 0; i < entryCount; i++) {
+      const bh = cmdU32[eDbg]; const sL = cmdU32[eDbg+1]; const sH = cmdU32[eDbg+2];
+      entries.push(`[${i}] buf=${bh} size=${sL + sH * 0x100000000}`);
+      eDbg += 3;
+    }
+    console.log(`[RMSNorm-DBG #${_fusedUniformDbgCount}] entries=${entryCount} uniformIdx=${uniformEntryIdx} uniformSize=${uniformDataSize} dispatch=(${x},${y},${z})`);
+    console.log(`  params: axis_size=${u32[0]} w_stride=${u32[1]} eps_bits=0x${u32[2]?.toString(16)} eps_f32=${f32[2]} pad=${u32[3]}`);
+    console.log(`  bindings: ${entries.join(', ')}`);
+  }
+
+  // Direct handle access — hot path, handles always valid
+  const layout = handles[layoutHandle] as GPUBindGroupLayout;
+  const entries: GPUBindGroupEntry[] = [];
+  let newBufferHandle = 0;  // set if we create a buffer inline
+
+  // Check if uniform entry needs buffer creation (handle = 0)
+  const uniformBufHandle = cmdU32[I_CB_BASE + uniformEntryIdx * 3];
+
+  if (uniformBufHandle === 0 && uniformDataSize > 0) {
+    // Deferred buffer creation: create buffer + write data inline
+    // ARG7 has the buffer usage flags from the bridge stub
+    const usage = cmdU32[I_ARG0 + 7] || (0x0080 | 0x0008); // STORAGE | COPY_DST fallback
+    const uniformData = new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformDataSize);
+    const buffer = device.createBuffer({ size: uniformDataSize, usage });
+    queue.writeBuffer(buffer, 0, uniformData);
+    const handle = addHandle(buffer);
+    bufferSizesArr[handle] = uniformDataSize;
+    newBufferHandle = handle;
+    // Patch the entry handle for bind group creation below
+    cmdU32[I_CB_BASE + uniformEntryIdx * 3] = handle;
+  } else if (uniformDataSize > 0) {
+    // Buffer exists — just write data
+    const uniformBuffer = handles[uniformBufHandle] as GPUBuffer;
+    const uniformData = new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformDataSize);
+    queue.writeBuffer(uniformBuffer, 0, uniformData);
+  }
+
+  let eIdx = I_CB_BASE;
+  for (let i = 0; i < entryCount; i++) {
+    const bufHandle = cmdU32[eIdx];
+    const buffer = handles[bufHandle] as GPUBuffer;
+    const sizeLo = cmdU32[eIdx + 1];
+    const sizeHi = cmdU32[eIdx + 2];
+    eIdx += 3;
+    const size = sizeLo + sizeHi * 0x100000000;
+    const resource: GPUBufferBinding = { buffer, offset: 0 };
+    if (size !== 0 && size < 2 ** 53) resource.size = size;
+    entries.push({ binding: i, resource });
+  }
+
+  const bindGroup = device.createBindGroup({ layout, entries });
+  const pass = handles[passHandle] as GPUComputePassEncoder;
+  pass.setPipeline(handles[pipelineHandle] as GPUComputePipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(x, y, z);
+  endAndRestartPass(passHandle);
+
+  // Capture buffers for async readback — target RMSNorm specifically:
+  // RMSNorm signature: 4 entries, uniformIdx=3, uniformSize=16
+  if (entryCount === 4 && uniformEntryIdx === 3 && uniformDataSize === 16 && !_debugReadbackDone) {
+    _debugReadbackDone = true;
+    _debugReadbackBuffers = [];
+    let eDbg2 = I_CB_BASE;
+    const labels = ['input', 'weight', 'output', 'uniform'];
+    for (let i = 0; i < entryCount; i++) {
+      const bh = cmdU32[eDbg2];
+      const sL = cmdU32[eDbg2 + 1];
+      const sH = cmdU32[eDbg2 + 2];
+      const bufSize = sL + sH * 0x100000000;
+      // Skip uniform buffer (no COPY_SRC usage) — only read data buffers
+      if (i !== uniformEntryIdx) {
+        _debugReadbackBuffers.push({
+          buf: handles[bh] as GPUBuffer,
+          size: Math.min(bufSize, 512), // read first 128 f32 values
+          label: labels[i] || `entry${i}`,
+        });
+      }
+      eDbg2 += 3;
+    }
+    console.log('[DBG-READBACK] Captured RMSNorm buffers:', _debugReadbackBuffers.map(b => `${b.label}(${b.size}b)`).join(', '));
+  }
+
+  // Return new buffer handle (or 0 if no creation)
+  cmdU32[I_RESULT] = newBufferHandle;
+}
+
+function handleFusedSubmit(): void {
+  const encoderHandle = cmdU32[I_ARG0];
+  const passHandle = cmdU32[I_ARG0 + 1];
+  if (passHandle > 0) {
+    (handles[passHandle] as GPUComputePassEncoder).end();
+    passEncoderMap.delete(passHandle);
+    releaseHandle(passHandle);
+  }
+  const encoder = handles[encoderHandle] as GPUCommandEncoder;
+  const cmdBuf = encoder.finish();
+  queue.submit([cmdBuf]);
+  releaseHandle(encoderHandle);
+
+  // Async readback of captured RMSNorm buffers
+  if (_debugReadbackBuffers) {
+    const bufs = _debugReadbackBuffers;
+    _debugReadbackBuffers = null; // one-shot
+
+    // Create staging buffers and copy in a separate encoder
+    const stagings: { staging: GPUBuffer; label: string }[] = [];
+    const readEnc = device.createCommandEncoder();
+    for (const { buf, size, label } of bufs) {
+      const readSize = Math.min(size, 128); // first 32 f32 values
+      if (readSize === 0) continue;
+      const staging = device.createBuffer({
+        size: readSize,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      readEnc.copyBufferToBuffer(buf, 0, staging, 0, readSize);
+      stagings.push({ staging, label });
+    }
+    queue.submit([readEnc.finish()]);
+
+    // Schedule async map+log (runs when event loop yields)
+    queueMicrotask(async () => {
+      try {
+        await device.queue.onSubmittedWorkDone();
+        for (const { staging, label } of stagings) {
+          await staging.mapAsync(GPUMapMode.READ);
+          const f32 = new Float32Array(staging.getMappedRange());
+          const all = Array.from(f32);
+          const nonZero = all.filter(v => v !== 0).length;
+          const hasNaN = all.some(v => Number.isNaN(v));
+          const hasInf = all.some(v => !Number.isFinite(v) && !Number.isNaN(v));
+          const min = Math.min(...all);
+          const max = Math.max(...all);
+          const first16 = all.slice(0, 16).map(v => v.toFixed(6)).join(', ');
+          console.log(
+            `[DBG-READBACK] ${label} (${all.length} f32): nonZero=${nonZero} min=${min.toFixed(6)} max=${max.toFixed(6)} NaN=${hasNaN} Inf=${hasInf}`,
+          );
+          console.log(`  first16: [${first16}]`);
+          if (all.length > 16) {
+            const last16 = all.slice(-16).map(v => v.toFixed(6)).join(', ');
+            console.log(`  last16: [${last16}]`);
+          }
+          staging.unmap();
+          staging.destroy();
+        }
+        console.log('[DBG-READBACK] Done');
+      } catch (e) {
+        console.error('[DBG-READBACK] Error:', e);
+      }
+    });
+  }
+
+  cmdU32[I_RESULT] = 0;
+}
+
+function handleFusedCopyBuffer(): void {
+  const encoderHandle = cmdU32[I_ARG0];
+  const passHandle = cmdU32[I_ARG0 + 1];
+  const srcHandle = cmdU32[I_ARG0 + 2];
+  const srcOffset = cmdU32[I_ARG0 + 3];
+  const dstHandle = cmdU32[I_ARG0 + 4];
+  const dstOffset = cmdU32[I_ARG0 + 5];
+  const size = cmdU32[I_ARG0 + 6];
+
+  const encoder = handles[encoderHandle] as GPUCommandEncoder;
+
+  if (passHandle !== 0) {
+    (handles[passHandle] as GPUComputePassEncoder).end();
+    passEncoderMap.delete(passHandle);
+    releaseHandle(passHandle);
+  }
+
+  encoder.copyBufferToBuffer(
+    handles[srcHandle] as GPUBuffer, srcOffset,
+    handles[dstHandle] as GPUBuffer, dstOffset,
+    size,
+  );
+
+  const newPass = encoder.beginComputePass();
+  const newPassHandle = addHandle(newPass);
+  passEncoderMap.set(newPassHandle, encoderHandle);
+  cmdU32[I_RESULT] = newPassHandle;
+}
+
 async function commandLoop(): Promise<void> {
+  // Adaptive spin: after dispatch commands (likely followed by another dispatch),
+  // spin longer to catch back-to-back commands without V8 event loop overhead.
+  // After submit/readback, skip spin (long gap expected).
+  const SPIN_DISPATCH = 2000;  // optimal: 500→13.3, 1000→14.0, 1500→16.4, 2000→17.5, 4000→17.6
+  const SPIN_NONE = 0;
+  let spinBudget = SPIN_NONE;  // set after each command based on type
+
+  let currentStatus = Atomics.load(cmdView, STATUS_INDEX);
+
   while (true) {
     // Wait for wasm-worker to set STATUS = PENDING.
-    // After we set DONE, the wasm-worker reads the result, sets IDLE,
-    // then sets PENDING for the next command. We must wait for PENDING
-    // specifically, not just "not IDLE".
-    let currentStatus = Atomics.load(cmdView, STATUS_INDEX);
-    let waitLoops = 0;
-    while (currentStatus !== STATUS.PENDING) {
-      const result = Atomics.waitAsync(cmdView, STATUS_INDEX, currentStatus);
-      if (result.async) {
-        await result.value;
-      } else {
-        // Yield to prevent blocking the event loop on synchronous not-equal
-        await new Promise(r => setTimeout(r, 0));
+    if (currentStatus !== STATUS.PENDING) {
+      // Spin-check based on previous command's expected follow-up.
+      // Must use Atomics.load (not raw read) — V8 JIT will hoist raw reads
+      // out of loops, returning stale cached values from SharedArrayBuffer.
+      let spun = false;
+      for (let s = 0; s < spinBudget; s++) {
+        currentStatus = Atomics.load(cmdView, STATUS_INDEX);
+        if (currentStatus === STATUS.PENDING) { spun = true; break; }
       }
-      currentStatus = Atomics.load(cmdView, STATUS_INDEX);
-      waitLoops++;
-      if (waitLoops % 1000 === 0) {
-        console.log(`[GPU Worker] waiting for PENDING, status=${currentStatus}, loops=${waitLoops}`);
+
+      if (!spun) {
+        // Fall back to async wait
+        let waitLoops = 0;
+        while (currentStatus !== STATUS.PENDING) {
+          const result = Atomics.waitAsync(cmdView, STATUS_INDEX, currentStatus);
+          if (result.async) {
+            await result.value;
+          } else {
+            await new Promise(r => setTimeout(r, 0));
+          }
+          currentStatus = Atomics.load(cmdView, STATUS_INDEX);
+          waitLoops++;
+          if (waitLoops % 1000 === 0) {
+            console.log(`[GPU Worker] waiting for PENDING, status=${currentStatus}, loops=${waitLoops}`);
+          }
+        }
       }
     }
 
-    const fnId = cmdDataView.getUint32(CMD_OFFSET.FN_ID, true);
+    const fnId = cmdU32[0]; // CMD_OFFSET.FN_ID / 4 = 0
 
-    try {
-      await processCommand(fnId);
-    } catch (err) {
-      console.error(`[GPU Worker] Error processing fn ${fnId}:`, err);
-      // Return 0 (null handle) to signal error
-      cmdDataView.setUint32(CMD_OFFSET.RESULT, 0, true);
+    // Fast path: hot dispatch functions bypass processCommand entirely.
+    if (fnId === RpcFn.FUSED_DISPATCH_WITH_UNIFORM) {
+      try {
+        handleFusedDispatchWithUniform();
+      } catch (err) {
+        console.error(`[GPU Worker] Error in FUSED_DISPATCH_WITH_UNIFORM:`, err);
+        cmdU32[I_RESULT] = 0;
+      }
+      spinBudget = SPIN_DISPATCH;
+    } else if (fnId === RpcFn.FUSED_FULL_DISPATCH) {
+      try {
+        handleFusedFullDispatch();
+      } catch (err) {
+        console.error(`[GPU Worker] Error in FUSED_FULL_DISPATCH:`, err);
+        cmdU32[I_RESULT] = 0;
+      }
+      spinBudget = SPIN_DISPATCH;
+    } else if (fnId === RpcFn.FUSED_COPY_BUFFER) {
+      try {
+        handleFusedCopyBuffer();
+      } catch (err) {
+        console.error(`[GPU Worker] Error in FUSED_COPY_BUFFER:`, err);
+        cmdU32[I_RESULT] = 0;
+      }
+      spinBudget = SPIN_DISPATCH;  // copy is followed by dispatches
+    } else if (fnId === RpcFn.FUSED_SUBMIT) {
+      try {
+        handleFusedSubmit();
+      } catch (err) {
+        console.error(`[GPU Worker] Error in FUSED_SUBMIT:`, err);
+        cmdU32[I_RESULT] = 0;
+      }
+      spinBudget = SPIN_NONE;
+    } else {
+      try {
+        await processCommand(fnId);
+      } catch (err) {
+        console.error(`[GPU Worker] Error processing fn ${fnId}:`, err);
+        cmdU32[I_RESULT] = 0;
+      }
+      flushCallbacks();
+      spinBudget = SPIN_NONE;
     }
-
-    // Write pending callbacks into the callback ring
-    flushCallbacks();
 
     // Signal completion
     Atomics.store(cmdView, STATUS_INDEX, STATUS.DONE);
     Atomics.notify(cmdView, STATUS_INDEX);
+
+    // Pre-check for next command
+    currentStatus = Atomics.load(cmdView, STATUS_INDEX);
   }
 }
 
 function flushCallbacks(): void {
   const pending = cbTail - cbHead;
   const count = Math.min(pending, MAX_CALLBACKS_PER_CALL);
-  cmdDataView.setUint32(CMD_OFFSET.CALLBACK_COUNT, count, true);
+  cmdU32[I_CB_COUNT] = count;
 
   for (let i = 0; i < count; i++) {
     const cb = cbRing[cbHead + i];
@@ -355,24 +781,32 @@ function flushCallbacks(): void {
 
 // ---------- Command Dispatch ----------
 
-async function processCommand(fnId: number): Promise<void> {
-  // Argument readers (lazy, read from shared memory on demand)
-  const arg0 = () => cmdDataView.getUint32(CMD_OFFSET.ARG0, true);
-  const arg1 = () => cmdDataView.getUint32(CMD_OFFSET.ARG1, true);
-  const arg2 = () => cmdDataView.getUint32(CMD_OFFSET.ARG2, true);
-  const arg3 = () => cmdDataView.getUint32(CMD_OFFSET.ARG3, true);
-  const arg4 = () => cmdDataView.getUint32(CMD_OFFSET.ARG4, true);
-  const arg5 = () => cmdDataView.getUint32(CMD_OFFSET.ARG5, true);
-  const arg6 = () => cmdDataView.getUint32(CMD_OFFSET.ARG6, true);
-  const arg7 = () => cmdDataView.getUint32(CMD_OFFSET.ARG7, true);
-  const arg0Hi = () => cmdDataView.getUint32(CMD_OFFSET.ARG0_HI, true);
-  const arg1Hi = () => cmdDataView.getUint32(CMD_OFFSET.ARG1_HI, true);
-  const arg2Hi = () => cmdDataView.getUint32(CMD_OFFSET.ARG2_HI, true);
+// Uint32Array indices for direct reads (element index = byte offset / 4)
+const I_ARG0 = CMD_OFFSET.ARG0 >>> 2;     // 4
+const I_RESULT = CMD_OFFSET.RESULT >>> 2;  // 2
+const I_RESULT_HI = CMD_OFFSET.RESULT_HI >>> 2; // 3
+const I_CB_COUNT = CMD_OFFSET.CALLBACK_COUNT >>> 2;
+const I_CB_BASE = CMD_OFFSET.CALLBACK_BASE >>> 2;
+const I_UNIFORM_SIZE = CMD_OFFSET.UNIFORM_DATA_SIZE >>> 2;
 
-  const setResult = (v: number) => cmdDataView.setUint32(CMD_OFFSET.RESULT, v, true);
+async function processCommand(fnId: number): Promise<void> {
+  // Argument readers via Uint32Array (faster than DataView — no endianness check)
+  const arg0 = () => cmdU32[I_ARG0];
+  const arg1 = () => cmdU32[I_ARG0 + 1];
+  const arg2 = () => cmdU32[I_ARG0 + 2];
+  const arg3 = () => cmdU32[I_ARG0 + 3];
+  const arg4 = () => cmdU32[I_ARG0 + 4];
+  const arg5 = () => cmdU32[I_ARG0 + 5];
+  const arg6 = () => cmdU32[I_ARG0 + 6];
+  const arg7 = () => cmdU32[I_ARG0 + 7];
+  const arg0Hi = () => cmdU32[CMD_OFFSET.ARG0_HI >>> 2];
+  const arg1Hi = () => cmdU32[CMD_OFFSET.ARG1_HI >>> 2];
+  const arg2Hi = () => cmdU32[CMD_OFFSET.ARG2_HI >>> 2];
+
+  const setResult = (v: number) => { cmdU32[I_RESULT] = v; };
   const setResultBig = (lo: number, hi: number) => {
-    cmdDataView.setUint32(CMD_OFFSET.RESULT, lo, true);
-    cmdDataView.setUint32(CMD_OFFSET.RESULT_HI, hi, true);
+    cmdU32[I_RESULT] = lo;
+    cmdU32[I_RESULT_HI] = hi;
   };
 
   // 1J: Use cached DataView/Uint8Array over WASM memory.
@@ -490,7 +924,13 @@ async function processCommand(fnId: number): Promise<void> {
       //   4: chain.sType (uint32) = 5
       //   8: code (ptr4)
       const codePtr = view.getUint32(nextInChainPtr + 8, true);
-      const code = readString(codePtr);
+      let code = readString(codePtr);
+      // DEBUG: log RMSNorm shader source
+      if (code.includes('rmsnorm') || code.includes('inv_rms') || code.includes('inverseSqrt')) {
+        console.log(`[WGSL-DUMP] RMSNorm shader (${code.length} chars):\n` + code);
+        // Run standalone GPU test with known values
+        runRMSNormTest(code);
+      }
       const module = device.createShaderModule({ code });
       setResult(addHandle(module));
       break;
@@ -715,7 +1155,9 @@ async function processCommand(fnId: number): Promise<void> {
       const encoderHandle = arg0();
       const encoder = getHandle<GPUCommandEncoder>(encoderHandle);
       const pass = encoder.beginComputePass();
-      setResult(addHandle(pass));
+      const ph = addHandle(pass);
+      passEncoderMap.set(ph, encoderHandle);
+      setResult(ph);
       break;
     }
 
@@ -816,6 +1258,7 @@ async function processCommand(fnId: number): Promise<void> {
       const y = arg2();
       const z = arg3();
       getHandle<GPUComputePassEncoder>(passHandle).dispatchWorkgroups(x, y, z);
+      endAndRestartPass(passHandle);
       setResult(0);
       break;
     }
@@ -824,12 +1267,14 @@ async function processCommand(fnId: number): Promise<void> {
       // Args: passHandle
       const passHandle = arg0();
       getHandle<GPUComputePassEncoder>(passHandle).end();
+      passEncoderMap.delete(passHandle);
       setResult(0);
       break;
     }
 
     case RpcFn.COMPUTE_PASS_RELEASE: {
       const handle = arg0();
+      passEncoderMap.delete(handle);
       releaseHandle(handle);
       setResult(0);
       break;
@@ -1042,6 +1487,7 @@ async function processCommand(fnId: number): Promise<void> {
       pass.setPipeline(getHandle<GPUComputePipeline>(pipelineHandle));
       pass.setBindGroup(0, getHandle<GPUBindGroup>(bgHandle));
       pass.dispatchWorkgroups(x, y, z);
+      endAndRestartPass(passHandle);
       setResult(0);
       break;
     }
@@ -1061,6 +1507,7 @@ async function processCommand(fnId: number): Promise<void> {
       pass.setBindGroup(0, getHandle<GPUBindGroup>(bg0Handle));
       pass.setBindGroup(1, getHandle<GPUBindGroup>(bg1Handle));
       pass.dispatchWorkgroups(x, y, z);
+      endAndRestartPass(passHandle);
       setResult(0);
       break;
     }
@@ -1072,6 +1519,7 @@ async function processCommand(fnId: number): Promise<void> {
       const passHandle = arg1();
       if (passHandle > 0) {
         getHandle<GPUComputePassEncoder>(passHandle).end();
+        passEncoderMap.delete(passHandle);
         releaseHandle(passHandle);
       }
       const encoder = getHandle<GPUCommandEncoder>(encoderHandle);
@@ -1084,30 +1532,26 @@ async function processCommand(fnId: number): Promise<void> {
 
     case RpcFn.FUSED_FULL_DISPATCH: {
       // Fused: inline createBindGroup + setPipeline + setBindGroup(0) + dispatch
-      // ARGs: passHandle, pipelineHandle, layoutHandle, dispatchX, Y, Z
-      // CALLBACK_COUNT: entryCount (repurposed — written by bridge-stub before signaling)
-      // CALLBACK_BASE+: entries (bufHandle:u32, sizeLo:u32, sizeHi:u32) × entryCount
-      const passHandle = arg0();
-      const pipelineHandle = arg1();
-      const layoutHandle = arg2();
-      const x = arg3();
-      const y = arg4();
-      const z = arg5();
+      // Direct cmdU32 reads for hot-path performance (no DataView/closure overhead)
+      const passHandle = cmdU32[I_ARG0];
+      const pipelineHandle = cmdU32[I_ARG0 + 1];
+      const layoutHandle = cmdU32[I_ARG0 + 2];
+      const x = cmdU32[I_ARG0 + 3];
+      const y = cmdU32[I_ARG0 + 4];
+      const z = cmdU32[I_ARG0 + 5];
+      const entryCount = cmdU32[I_CB_COUNT];
 
-      const entryCount = cmdDataView.getUint32(CMD_OFFSET.CALLBACK_COUNT, true);
       const layout = getHandle<GPUBindGroupLayout>(layoutHandle);
       const entries: GPUBindGroupEntry[] = [];
+      let eIdx = I_CB_BASE;  // Uint32Array index for entry data (stride = 3 u32s = 12 bytes)
       for (let i = 0; i < entryCount; i++) {
-        const base = CMD_OFFSET.CALLBACK_BASE + i * 12;
-        const bufferHandle = cmdDataView.getUint32(base, true);
-        const sizeLo = cmdDataView.getUint32(base + 4, true);
-        const sizeHi = cmdDataView.getUint32(base + 8, true);
+        const buffer = getHandle<GPUBuffer>(cmdU32[eIdx]);
+        const sizeLo = cmdU32[eIdx + 1];
+        const sizeHi = cmdU32[eIdx + 2];
+        eIdx += 3;
         const size = sizeLo + sizeHi * 0x100000000;
-        const buffer = getHandle<GPUBuffer>(bufferHandle);
         const resource: GPUBufferBinding = { buffer, offset: 0 };
-        if (size !== 0 && size < 2 ** 53) {
-          resource.size = size;
-        }
+        if (size !== 0 && size < 2 ** 53) resource.size = size;
         entries.push({ binding: i, resource });
       }
 
@@ -1116,50 +1560,44 @@ async function processCommand(fnId: number): Promise<void> {
       pass.setPipeline(getHandle<GPUComputePipeline>(pipelineHandle));
       pass.setBindGroup(0, bindGroup);
       pass.dispatchWorkgroups(x, y, z);
-      setResult(0);
+      endAndRestartPass(passHandle);
+      cmdU32[I_RESULT] = 0;
       break;
     }
 
     case RpcFn.FUSED_DISPATCH_WITH_UNIFORM: {
-      // Like FUSED_FULL_DISPATCH but also writes inline uniform data to one bind group buffer.
-      // This fuses QUEUE_WRITE_BUFFER + createBindGroup + setPipeline + setBindGroup + dispatch
-      // into a single RPC, eliminating one round-trip per compute dispatch.
-      // ARGs: passHandle, pipelineHandle, layoutHandle, dispatchX, Y, Z, uniformEntryIdx
-      // CALLBACK_COUNT: entryCount
-      // CALLBACK_BASE+: entries (bufHandle:u32, sizeLo:u32, sizeHi:u32) × entryCount
-      // UNIFORM_DATA_SIZE (offset 188): u32 size of inline uniform data
-      // UNIFORM_DATA (offset 192+): the uniform data bytes
-      const passHandle = arg0();
-      const pipelineHandle = arg1();
-      const layoutHandle = arg2();
-      const x = arg3();
-      const y = arg4();
-      const z = arg5();
-      const uniformEntryIdx = arg6();
-
-      const entryCount = cmdDataView.getUint32(CMD_OFFSET.CALLBACK_COUNT, true);
-      const uniformDataSize = cmdDataView.getUint32(CMD_OFFSET.UNIFORM_DATA_SIZE, true);
+      // Like FUSED_FULL_DISPATCH but also writes inline uniform data to one buffer.
+      // Direct cmdU32 reads for hot-path performance.
+      const passHandle = cmdU32[I_ARG0];
+      const pipelineHandle = cmdU32[I_ARG0 + 1];
+      const layoutHandle = cmdU32[I_ARG0 + 2];
+      const x = cmdU32[I_ARG0 + 3];
+      const y = cmdU32[I_ARG0 + 4];
+      const z = cmdU32[I_ARG0 + 5];
+      const uniformEntryIdx = cmdU32[I_ARG0 + 6];
+      const entryCount = cmdU32[I_CB_COUNT];
+      const uniformDataSize = cmdU32[I_UNIFORM_SIZE];
 
       const layout = getHandle<GPUBindGroupLayout>(layoutHandle);
       const entries: GPUBindGroupEntry[] = [];
+
+      // Write uniform data BEFORE the entry loop (avoids per-iteration conditional)
+      if (uniformDataSize > 0) {
+        const uniformBufHandle = cmdU32[I_CB_BASE + uniformEntryIdx * 3];
+        const uniformBuffer = getHandle<GPUBuffer>(uniformBufHandle);
+        const uniformData = new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformDataSize);
+        queue.writeBuffer(uniformBuffer, 0, uniformData);
+      }
+
+      let eIdx = I_CB_BASE;
       for (let i = 0; i < entryCount; i++) {
-        const base = CMD_OFFSET.CALLBACK_BASE + i * 12;
-        const bufferHandle = cmdDataView.getUint32(base, true);
-        const sizeLo = cmdDataView.getUint32(base + 4, true);
-        const sizeHi = cmdDataView.getUint32(base + 8, true);
+        const buffer = getHandle<GPUBuffer>(cmdU32[eIdx]);
+        const sizeLo = cmdU32[eIdx + 1];
+        const sizeHi = cmdU32[eIdx + 2];
+        eIdx += 3;
         const size = sizeLo + sizeHi * 0x100000000;
-        const buffer = getHandle<GPUBuffer>(bufferHandle);
-
-        // Write inline uniform data to this buffer before creating the bind group
-        if (i === uniformEntryIdx && uniformDataSize > 0) {
-          const uniformData = new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformDataSize);
-          queue.writeBuffer(buffer, 0, uniformData);
-        }
-
         const resource: GPUBufferBinding = { buffer, offset: 0 };
-        if (size !== 0 && size < 2 ** 53) {
-          resource.size = size;
-        }
+        if (size !== 0 && size < 2 ** 53) resource.size = size;
         entries.push({ binding: i, resource });
       }
 
@@ -1168,7 +1606,8 @@ async function processCommand(fnId: number): Promise<void> {
       pass.setPipeline(getHandle<GPUComputePipeline>(pipelineHandle));
       pass.setBindGroup(0, bindGroup);
       pass.dispatchWorkgroups(x, y, z);
-      setResult(0);
+      endAndRestartPass(passHandle);
+      cmdU32[I_RESULT] = 0;
       break;
     }
 
