@@ -393,46 +393,4 @@ describe('Parameter Manager', () => {
     });
   });
 
-  describe('Integration with Forward Pass', () => {
-    it('should use extracted parameters for inference', () => {
-      const model = new Qwen3Model(tinyConfig);
-
-      // Get parameters (verifies extraction works)
-      model.getParameters();
-
-      // Create input
-      const inputIds = MxArray.fromInt32(new Int32Array([0, 1, 2, 3, 4]), shape(1, 5));
-
-      // Run forward pass
-      const logits = model.forward(inputIds);
-
-      // Check output shape
-      const resultShape = logits.shape();
-      expect(Array.from(resultShape).map(Number)).toEqual([1, 5, tinyConfig.vocabSize]);
-    });
-
-    it('should produce consistent outputs after parameter update', () => {
-      const model = new Qwen3Model(tinyConfig);
-      const inputIds = MxArray.fromInt32(new Int32Array([0, 1, 2]), shape(1, 3));
-
-      // First forward pass
-      const logits1 = model.forward(inputIds);
-
-      // Update parameters (scale by 0.9)
-      const params = model.getParameters();
-      const scaledParams: Record<string, MxArray> = {};
-      for (const [name, param] of Object.entries(params)) {
-        scaledParams[name] = param.mul(MxArray.full(shape(), 0.9));
-      }
-      model.loadParameters(scaledParams);
-
-      // Second forward pass (should be different)
-      const logits2 = model.forward(inputIds);
-
-      // Outputs should be different
-      const diff = logits1.sub(logits2);
-      const maxDiff = diff.abs().max().toFloat32()[0];
-      expect(maxDiff).toBeGreaterThan(0.01);
-    });
-  });
 });

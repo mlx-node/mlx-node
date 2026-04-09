@@ -56,56 +56,6 @@ describe.sequential('Qwen3 Model', () => {
     });
   });
 
-  describe('Forward Pass', () => {
-    it('should perform forward pass without cache', () => {
-      const model = new Qwen3Model(QWEN3_CONFIGS['qwen3-0.6b']);
-
-      // Create dummy input
-      const batchSize = 2;
-      const seqLen = 10;
-      const inputIds = MxArray.randint(shape(batchSize, seqLen), 0, model.getConfig().vocabSize);
-
-      // Forward pass
-      const logits = model.forward(inputIds);
-
-      // Check output shape
-      expect(logits).toBeDefined();
-      // Shape should be (batch, seq_len, vocab_size)
-      // Note: We'd need a shape comparison method here
-      // expectedShape = shape(batchSize, seqLen, model.getConfig().vocabSize);
-    });
-
-    it('should perform forward pass with KV cache', () => {
-      const model = new Qwen3Model(QWEN3_CONFIGS['qwen3-0.6b']);
-
-      // Initialize KV caches
-      model.initKvCaches();
-
-      // Create dummy input
-      const batchSize = 1;
-      const seqLen = 5;
-      const inputIds = MxArray.randint(shape(batchSize, seqLen), 0, model.getConfig().vocabSize);
-
-      // First forward pass with cache (processes full prompt)
-      const logits1 = model.forwardWithCache(inputIds, true);
-      expect(logits1).toBeDefined();
-      const logits1Shape = logits1.shape();
-      expect(Number(logits1Shape[0])).toBe(batchSize);
-      expect(Number(logits1Shape[1])).toBe(seqLen);
-
-      // Second forward pass with cache (single new token)
-      const newTokens = MxArray.randint(shape(batchSize, 1), 0, model.getConfig().vocabSize);
-      const logits2 = model.forwardWithCache(newTokens, true);
-      expect(logits2).toBeDefined();
-      const logits2Shape = logits2.shape();
-      expect(Number(logits2Shape[0])).toBe(batchSize);
-      expect(Number(logits2Shape[1])).toBe(1); // Single token output
-
-      // Reset caches
-      model.resetKvCaches();
-    });
-  });
-
   describe('Text Generation', () => {
     it('should generate text from prompt (requires model files)', async () => {
       // Note: This test requires a real pretrained model with tokenizer

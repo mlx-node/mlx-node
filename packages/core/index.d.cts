@@ -109,6 +109,9 @@ export declare class DocUnwarpModel {
  * Supports E2B (2.3B), E4B (4.5B), and 31B variants.
  * Features: hybrid attention (sliding + global), GeGLU MLP, logit softcapping,
  * embedding scaling, and optional per-layer embeddings.
+ *
+ * All model state lives on a dedicated OS thread. NAPI methods dispatch
+ * commands via channels and await responses.
  */
 export declare class Gemma4Model {
   constructor(config: Gemma4Config);
@@ -802,9 +805,9 @@ export declare class QianfanOCRModel {
 /**
  * Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
  *
- * Uses interior mutability (RwLock) for layers, final_norm, lm_head, and caches
- * to allow async generation via spawn_blocking without blocking the Node.js event loop.
- * This matches the pattern used by Qwen3Model.
+ * All inference state lives on a dedicated OS thread. NAPI methods dispatch
+ * commands via channels and await responses. Training support uses a
+ * separate `Arc<RwLock<>>` path via `clone_for_training()`.
  */
 export declare class Qwen35Model {
   /** Create a new Qwen3.5 model with the given configuration. */
@@ -829,18 +832,6 @@ export declare class Qwen35Model {
    */
   setCache(cache: PromptCache): void;
   /**
-   * Forward pass through the model.
-   *
-   * # Arguments
-   * * `input_ids` - Token IDs [B, T]
-   *
-   * # Returns
-   * Logits [B, T, vocab_size]
-   */
-  forward(inputIds: MxArray): MxArray;
-  /** Forward pass with cache for incremental generation. */
-  forwardWithCache(inputIds: MxArray): MxArray;
-  /**
    * Load a pretrained model from a directory.
    *
    * Expects the directory to contain:
@@ -849,25 +840,20 @@ export declare class Qwen35Model {
    * - tokenizer.json + tokenizer_config.json
    */
   static load(path: string): Promise<Qwen35Model>;
-  /**
-   * Generate text from a prompt token sequence.
-   *
-   * Runs generation on a worker thread via spawn_blocking to avoid
-   * blocking the Node.js event loop.
-   */
+  /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
   /**
    * Chat API with tool calling support.
    *
-   * Runs tokenization + generation on a worker thread via spawn_blocking
-   * to avoid blocking the Node.js event loop.
+   * Dispatches to the dedicated model thread and awaits the result.
    */
   chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Streaming chat API with tool calling support.
    *
-   * Same as `chat()` but streams tokens one-by-one via the callback.
-   * Returns a `ChatStreamHandle` immediately; generation runs in background.
+   * Dispatches to the dedicated model thread. Tokens stream back via
+   * an mpsc channel bridged to the JS callback. Returns a `ChatStreamHandle`
+   * immediately; generation runs on the model thread.
    * Call `handle.cancel()` to abort generation early.
    */
   chatStream(
@@ -875,18 +861,17 @@ export declare class Qwen35Model {
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /** Get the number of parameters in the model. */
+  /**
+   * Get the number of parameters in the model.
+   *
+   * Pure config computation — no model-thread dispatch needed.
+   */
   numParameters(): number;
   /**
    * Save the model weights and configuration to a directory.
    *
-   * This saves:
-   * - config.json: Model configuration (with model_type for detectModelType)
-   * - weights.safetensors: Full model weights in SafeTensors format
-   * - weights.mlx: Parameter metadata (for reference)
-   *
-   * # Arguments
-   * * `save_path` - Directory to save the model
+   * For inference models: dispatches to model thread.
+   * For training clones: uses Arc<RwLock<>> training fields directly.
    */
   saveModel(savePath: string): Promise<undefined>;
 }
@@ -895,39 +880,41 @@ export type Qwen3_5Model = Qwen35Model;
 /**
  * Qwen3.5 MoE Model -- hybrid linear/full attention with Mixture-of-Experts.
  *
- * Supports C++ MoE forward path (non-compiled, builds fresh graph per step)
- * when weights are registered via `register_moe_weights_with_cpp`.
- * Falls back to Rust forward_inner path for test models without stored weights.
+ * All inference state lives on a dedicated OS thread. NAPI methods dispatch
+ * commands via channels and await responses. Training support uses a
+ * separate `Arc<RwLock<>>` path via `clone_for_training()`.
  */
 export declare class Qwen35MoeModel {
+  /**
+   * Create a new Qwen3.5 MoE model with the given configuration.
+   *
+   * Spawns a dedicated model thread that owns all inference state.
+   */
   constructor(config: Qwen35MoeConfig);
-  /**
-   * Take the KV cache from the model, returning a `PromptCache` handle.
-   *
-   * The cache is moved out of the model — calling `takeCache()` twice
-   * returns `null` the second time. Pass the cache back via `setCache()`
-   * before the next `chat()` call for incremental prefill.
-   */
-  takeCache(): PromptCache | null;
-  /**
-   * Restore a previously taken `PromptCache` into the model.
-   *
-   * On the next `chat()` call with `reuseCache: true`, the model will
-   * prefix-match the new tokens against the cache and only prefill the delta.
-   */
-  setCache(cache: PromptCache): void;
+  /** Initialize caches for incremental generation. */
   initCaches(): void;
+  /** Reset all caches. */
   resetCaches(): void;
-  forward(inputIds: MxArray): MxArray;
-  forwardWithCache(inputIds: MxArray): MxArray;
+  /** Take the KV cache from the model, returning a `PromptCache` handle. */
+  takeCache(): PromptCache | null;
+  /** Restore a previously taken `PromptCache` into the model. */
+  setCache(cache: PromptCache): void;
+  /** Load a pretrained model from a directory. */
   static load(path: string): Promise<Qwen35MoeModel>;
+  /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
+  /**
+   * Chat API with tool calling support.
+   *
+   * Dispatches to the dedicated model thread and awaits the result.
+   */
   chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Streaming chat API with tool calling support.
    *
-   * Same as `chat()` but streams tokens one-by-one via the callback.
-   * Returns a `ChatStreamHandle` immediately; generation runs in background.
+   * Dispatches to the dedicated model thread. Tokens stream back via
+   * an mpsc channel bridged to the JS callback. Returns a `ChatStreamHandle`
+   * immediately; generation runs on the model thread.
    * Call `handle.cancel()` to abort generation early.
    */
   chatStream(
@@ -935,17 +922,17 @@ export declare class Qwen35MoeModel {
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
+  /**
+   * Get the number of parameters in the model.
+   *
+   * Pure config computation -- no model-thread dispatch needed.
+   */
   numParameters(): number;
   /**
    * Save the model weights and configuration to a directory.
    *
-   * This saves:
-   * - config.json: Model configuration (with model_type for detectModelType)
-   * - weights.safetensors: Full model weights in SafeTensors format
-   * - weights.mlx: Parameter metadata (for reference)
-   *
-   * # Arguments
-   * * `save_path` - Directory to save the model
+   * For inference models: dispatches to model thread.
+   * For training clones: uses Arc<RwLock<>> training fields directly.
    */
   saveModel(savePath: string): Promise<undefined>;
 }
@@ -954,9 +941,8 @@ export type Qwen3_5MoeModel = Qwen35MoeModel;
 /**
  * Qwen3 Model with automatic differentiation support
  *
- * Uses interior mutability (RwLock) for layers, final_norm, and lm_head
- * to allow gradient application without deep cloning the model.
- * This eliminates the previous ~4GB memory overhead from clone_for_session().
+ * Uses a dedicated model thread for inference commands.
+ * Training clones (`thread == None`) use `Arc<RwLock<>>` fields directly.
  */
 export declare class Qwen3Model {
   /** Create a new Qwen3 model with the given configuration */
@@ -966,16 +952,6 @@ export declare class Qwen3Model {
    * Call this when starting a new conversation to ensure a full prefill.
    */
   resetCache(): void;
-  /**
-   * Forward pass through the model
-   *
-   * # Arguments
-   * * `input_ids` - Token IDs, shape: [batch_size, seq_len]
-   *
-   * # Returns
-   * * Logits, shape: [batch_size, seq_len, vocab_size]
-   */
-  forward(inputIds: MxArray): MxArray;
   /**
    * Initialize KV caches for incremental generation
    *
@@ -1002,17 +978,6 @@ export declare class Qwen3Model {
    * Returns the number of waiting, running, and completed sequences.
    */
   schedulerStats(): SchedulerStatsNapi | null;
-  /**
-   * Forward pass with KV caching for incremental generation
-   *
-   * # Arguments
-   * * `input_ids` - Token IDs, shape: [batch_size, seq_len]
-   * * `use_cache` - Whether to use KV caching (must call init_kv_caches() first)
-   *
-   * # Returns
-   * * Logits, shape: [batch_size, seq_len, vocab_size]
-   */
-  forwardWithCache(inputIds: MxArray, useCache: boolean): MxArray;
   /**
    * Forward pass with paged attention for memory-efficient inference.
    *
@@ -1871,9 +1836,17 @@ export type VLMChatResult = VlmChatResult;
  *
  * A generic VLM for OCR and document understanding tasks.
  * Currently supports PaddleOCR-VL architecture (vision encoder + ERNIE language model).
+ *
+ * All model state lives on a dedicated OS thread. NAPI methods dispatch
+ * commands via channels and await responses.
  */
 export declare class VLModel {
-  /** Create a new PaddleOCR-VL model */
+  /**
+   * Create a new PaddleOCR-VL model (empty, not loaded).
+   *
+   * Creates a model thread with an empty inner. Use `VLModel.load()` instead
+   * for loading a model from disk.
+   */
   constructor(config: ModelConfig);
   /** Set the tokenizer */
   setTokenizer(tokenizer: Qwen3Tokenizer): void;
@@ -1956,9 +1929,7 @@ export declare class VLModel {
   /**
    * Generate text tokens given input tokens and optional image
    *
-   * Uses KV caching for efficient generation - each step only processes the
-   * new token(s) while reusing cached key-value states from previous tokens.
-   * Vision features are computed once at the start and cached.
+   * Uses KV caching for efficient generation.
    *
    * # Arguments
    * * `input_ids` - Input token IDs [1, seq_len]

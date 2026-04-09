@@ -8,7 +8,7 @@ import { MxArray, Qwen3Model } from '@mlx-node/core';
 import type { Qwen3Config } from '@mlx-node/lm';
 import { describe, it, expect } from 'vite-plus/test';
 
-import { shape, int32 } from '../test-utils.js';
+import { shape } from '../test-utils.js';
 
 // Tiny test configuration for fast testing
 const TEST_CONFIG: Qwen3Config = {
@@ -150,27 +150,6 @@ describe('Qwen3 Parameter Management', () => {
       assertArrayClose(params2['lm_head.weight'], params1['lm_head.weight'], 1e-8);
     });
 
-    it('should produce identical outputs after parameter loading', () => {
-      const model1 = new Qwen3Model(TEST_CONFIG);
-      const model2 = new Qwen3Model(TEST_CONFIG);
-
-      // Create test input
-      const inputIds = MxArray.fromInt32(int32(1, 2, 3, 4, 5), shape(1, 5));
-
-      // Get output from model1
-      const output1 = model1.forward(inputIds);
-
-      // Extract and load parameters into model2
-      const params = model1.getParameters();
-      model2.loadParameters(params);
-
-      // Get output from model2
-      const output2 = model2.forward(inputIds);
-
-      // Outputs should be identical
-      assertArrayClose(output2, output1, 1e-6);
-    });
-
     it('should handle partial parameter loading', () => {
       const model = new Qwen3Model(TEST_CONFIG);
 
@@ -230,49 +209,9 @@ describe('Qwen3 Parameter Management', () => {
       expect(diffCount).toBeGreaterThan(originalQWeight.length * 0.9);
     });
 
-    it('should affect model outputs when parameters change', () => {
-      const model = new Qwen3Model(TEST_CONFIG);
-
-      // Create test input
-      const inputIds = MxArray.fromInt32(int32(1, 2, 3), shape(1, 3));
-
-      // Get original output
-      const output1 = model.forward(inputIds);
-
-      // Modify a single weight matrix
-      const params = model.getParameters();
-      const qWeight = params['layers.0.self_attn.q_proj.weight'];
-      const modifiedQWeight = qWeight.add(MxArray.randomNormal(qWeight.shape(), 0, 0.1));
-
-      model.loadParameters({
-        'layers.0.self_attn.q_proj.weight': modifiedQWeight,
-      });
-
-      // Get new output
-      const output2 = model.forward(inputIds);
-
-      // Outputs should be different
-      const diff = output2.sub(output1).abs().mean().toFloat32()[0];
-      expect(diff).toBeGreaterThan(1e-6);
-    });
   });
 
   describe('Edge Cases', () => {
-    it('should handle empty parameter dict in loadParameters', () => {
-      const model = new Qwen3Model(TEST_CONFIG);
-
-      // Save original output
-      const inputIds = MxArray.fromInt32(int32(1, 2, 3), shape(1, 3));
-      const originalOutput = model.forward(inputIds);
-
-      // Load empty dict
-      model.loadParameters({});
-
-      // Output should be unchanged
-      const newOutput = model.forward(inputIds);
-      assertArrayClose(newOutput, originalOutput, 1e-8);
-    });
-
     it('should handle loading with missing keys', () => {
       const model = new Qwen3Model(TEST_CONFIG);
       const params = model.getParameters();
