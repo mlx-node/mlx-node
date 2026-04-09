@@ -150,6 +150,11 @@ struct EngineState {
     /// in-flight `train_step()` can detect that its stale post-await
     /// writeback would resurrect cleared/restored state and skip the update.
     generation: u64,
+    /// Terminal invalidation flag — set by `reset()` so this handle can no
+    /// longer drive the model thread's training state. Any subsequent
+    /// dispatch from this engine errors out. A fresh engine must be
+    /// constructed to resume training.
+    invalidated: bool,
 }
 
 impl Default for EngineState {
@@ -165,6 +170,7 @@ impl Default for EngineState {
             consecutive_nan_count: 0,
             needs_emergency_save: false,
             generation: 0,
+            invalidated: false,
         }
     }
 }
@@ -321,18 +327,12 @@ impl SftTrainingEngine {
 
         let config = self.config.clone();
 
-        // Snapshot the lifecycle generation before dispatching so that if
-        // reset() or restore_state() lands while we're awaiting the model
-        // thread, the stale writeback below is dropped instead of resurrecting
-        // cleared state.
-        let start_generation = {
-            self.state
-                .read()
-                .map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
-                })?
-                .generation
-        };
+        // Reject dispatch from an invalidated engine, and snapshot the
+        // lifecycle generation before dispatching so that if reset() or
+        // restore_state() lands while we're awaiting the model thread, the
+        // stale writeback below is dropped instead of resurrecting cleared
+        // state.
+        let start_generation = self.ensure_valid_snapshot_generation()?;
 
         // Dispatch to model thread
         let metrics = self
@@ -548,11 +548,25 @@ impl SftTrainingEngine {
 
     /// Reset training state (for new training run)
     ///
-    /// Also drops the training state (optimizer, step counter) on the model
-    /// thread so a subsequent construction (or a new training session on the
-    /// same model) can re-initialize it cleanly.
+    /// This is a TERMINAL operation on this handle. It drops the training
+    /// state (optimizer, step counter) on the model thread so a fresh
+    /// `SftTrainingEngine` can be constructed on the same model, and marks
+    /// THIS handle as invalidated. Any subsequent dispatch-requiring method
+    /// on this handle returns an error — callers must construct a new
+    /// engine to continue training.
     #[napi]
     pub fn reset(&self) -> Result<()> {
+        // Short-circuit if already reset — idempotent.
+        {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| Error::new(Status::GenericFailure, "Lock error"))?;
+            if state.invalidated {
+                return Ok(());
+            }
+        }
+
         // Drop model-thread training state first (optimizer + ts.step).
         self.dispatch_reset_training_blocking()?;
 
@@ -566,7 +580,8 @@ impl SftTrainingEngine {
         let next_generation = state.generation.wrapping_add(1);
         *state = EngineState::default();
         state.generation = next_generation;
-        info!("Training state reset");
+        state.invalidated = true;
+        info!("Training state reset (engine handle invalidated)");
         Ok(())
     }
 
@@ -578,6 +593,7 @@ impl SftTrainingEngine {
     /// correction step separately.
     #[napi]
     pub fn restore_state(&self, step: i64, epoch: i32) -> Result<()> {
+        self.ensure_valid()?;
         // Update the authoritative ts.step on the model thread first.
         self.dispatch_set_training_step_blocking(step)?;
 
@@ -593,6 +609,42 @@ impl SftTrainingEngine {
         state.generation = state.generation.wrapping_add(1);
         info!("Restored training state: step={}, epoch={}", step, epoch);
         Ok(())
+    }
+
+    /// Returns an error if this engine handle has been invalidated via
+    /// `reset()`. Call at the top of any method that dispatches to the
+    /// model thread.
+    fn ensure_valid(&self) -> Result<()> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state read lock"))?;
+        if state.invalidated {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "SftTrainingEngine handle has been invalidated by reset(). \
+                 Construct a new engine to continue training.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Atomically check that this engine has not been invalidated and
+    /// snapshot the current lifecycle generation. Used by `train_step()` to
+    /// gate its post-await writeback.
+    fn ensure_valid_snapshot_generation(&self) -> Result<u64> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state read lock"))?;
+        if state.invalidated {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "SftTrainingEngine handle has been invalidated by reset(). \
+                 Construct a new engine to continue training.",
+            ));
+        }
+        Ok(state.generation)
     }
 
     /// Get the underlying Qwen3 model for checkpointing

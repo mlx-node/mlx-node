@@ -124,6 +124,14 @@ describe.sequential('SftTrainingEngine — training state lifecycle', () => {
       // to stale state or error out).
       engineB.restoreState(7, 1);
       expect(engineB.getStep()).toBe(7);
+
+      // CRITICAL (H5 widening fence): the old engineA handle still holds a
+      // live cmd_sender pointing at engineB's model-thread training state.
+      // After reset(), that handle is invalidated and any dispatching call
+      // must refuse to touch engineB's state.
+      expect(() => engineA.restoreState(999, 999)).toThrow(/invalidated/i);
+      // engineB's step is unchanged — the old handle's restore was rejected.
+      expect(engineB.getStep()).toBe(7);
     } finally {
       engineB.reset();
     }

@@ -352,6 +352,11 @@ struct EngineState {
     /// `train_step*()` can detect that its stale post-await writeback would
     /// resurrect cleared state and skip the update.
     generation: u64,
+    /// Terminal invalidation flag — set by `reset()` so this handle can no
+    /// longer drive the model thread's training state. Any subsequent
+    /// dispatch from this engine errors out. A fresh engine must be
+    /// constructed to resume training.
+    invalidated: bool,
 }
 
 impl Default for EngineState {
@@ -368,6 +373,7 @@ impl Default for EngineState {
             consecutive_nan_count: 0,
             needs_emergency_save: false,
             generation: 0,
+            invalidated: false,
         }
     }
 }
@@ -627,17 +633,11 @@ impl GRPOTrainingEngine {
         let generation_start = std::time::Instant::now();
         let gen_config = self.build_gen_config();
 
-        // Snapshot the lifecycle generation before any await points so that
-        // if `reset()` runs concurrently, our stale post-await writeback is
-        // discarded and does not resurrect cleared state.
-        let start_generation = {
-            self.state
-                .read()
-                .map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
-                })?
-                .generation
-        };
+        // Reject dispatch from an invalidated handle and snapshot the
+        // lifecycle generation before any await points so that if `reset()`
+        // runs concurrently, our stale post-await writeback is discarded
+        // and does not resurrect cleared state.
+        let start_generation = self.ensure_valid_snapshot_generation()?;
 
         // === Phase 1: Generate completions via model thread (single batched call) ===
         let gen_data = self
@@ -738,6 +738,7 @@ impl GRPOTrainingEngine {
         &self,
         prompts: Vec<Vec<ChatMessage>>,
     ) -> Result<GenerateBatchResult> {
+        self.ensure_valid()?;
         let group_size = self.config.group_size.unwrap_or(4) as usize;
         let gen_config = self.build_gen_config();
 
@@ -829,16 +830,10 @@ impl GRPOTrainingEngine {
 
         let training_start = std::time::Instant::now();
 
-        // Snapshot the lifecycle generation before the train_step await so
-        // any concurrent reset wins cleanly.
-        let start_generation = {
-            self.state
-                .read()
-                .map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
-                })?
-                .generation
-        };
+        // Reject dispatch from an invalidated handle and snapshot the
+        // lifecycle generation before the train_step await so any
+        // concurrent reset wins cleanly.
+        let start_generation = self.ensure_valid_snapshot_generation()?;
 
         // Dispatch train step to model thread (uses cached MxArrays from generate phase)
         let loss_config = self.build_loss_config(num_prompts, group_size);
@@ -924,18 +919,11 @@ impl GRPOTrainingEngine {
         let generation_start = std::time::Instant::now();
         let gen_config = self.build_gen_config();
 
-        // Snapshot the lifecycle generation before any await points so that
-        // if `reset()` / `restore_state()` runs concurrently, our stale
-        // post-await writebacks are discarded and do not resurrect cleared
-        // state.
-        let start_generation = {
-            self.state
-                .read()
-                .map_err(|_| {
-                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
-                })?
-                .generation
-        };
+        // Reject dispatch from an invalidated handle and snapshot the
+        // lifecycle generation before any await points so that if `reset()`
+        // runs concurrently, our stale post-await writebacks are discarded
+        // and do not resurrect cleared state.
+        let start_generation = self.ensure_valid_snapshot_generation()?;
 
         // === Phase 1: Generate completions via model thread ===
         info!(
@@ -1363,12 +1351,27 @@ impl GRPOTrainingEngine {
         })
     }
 
-    /// Reset the engine for a fresh training run
+    /// Reset the engine for a fresh training run.
     ///
-    /// Also drops the training state (optimizer, step counter) on the model
-    /// thread so `InitTraining` can be called again in the same process.
+    /// This is a TERMINAL operation on this handle. It drops the training
+    /// state (optimizer, step counter) on the model thread so a fresh
+    /// `GRPOTrainingEngine` can be constructed on the same model, and marks
+    /// THIS handle as invalidated. Any subsequent dispatch-requiring method
+    /// on this handle returns an error — callers must construct a new
+    /// engine to continue training.
     #[napi]
     pub fn reset(&self) -> Result<()> {
+        // Short-circuit if already reset — idempotent.
+        {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?;
+            if state.invalidated {
+                return Ok(());
+            }
+        }
+
         // Drop model-thread training state first (optimizer + ts.step).
         self.dispatch_reset_training_blocking()?;
 
@@ -1383,8 +1386,9 @@ impl GRPOTrainingEngine {
         let next_generation = state.generation.wrapping_add(1);
         *state = EngineState::default();
         state.generation = next_generation;
+        state.invalidated = true;
 
-        info!("Training engine reset");
+        info!("Training engine reset (engine handle invalidated)");
         Ok(())
     }
 
@@ -1450,6 +1454,7 @@ impl GRPOTrainingEngine {
     /// populated any moment tensors.
     #[napi]
     pub async fn save_optimizer_state(&self, path: String) -> Result<()> {
+        self.ensure_valid()?;
         self.dispatch_save_optimizer_state(path).await
     }
 
@@ -1458,7 +1463,44 @@ impl GRPOTrainingEngine {
     /// Routes through the model thread. No-op if the engine uses SGD.
     #[napi]
     pub async fn load_optimizer_state(&self, path: String) -> Result<()> {
+        self.ensure_valid()?;
         self.dispatch_load_optimizer_state(path).await
+    }
+
+    /// Returns an error if this engine handle has been invalidated via
+    /// `reset()`. Call at the top of any method that dispatches to the
+    /// model thread.
+    fn ensure_valid(&self) -> Result<()> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state read lock"))?;
+        if state.invalidated {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "GRPOTrainingEngine handle has been invalidated by reset(). \
+                 Construct a new engine to continue training.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Atomically check that this engine has not been invalidated and
+    /// snapshot the current lifecycle generation. Used by the train_step*()
+    /// methods to gate their post-await writebacks.
+    fn ensure_valid_snapshot_generation(&self) -> Result<u64> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state read lock"))?;
+        if state.invalidated {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "GRPOTrainingEngine handle has been invalidated by reset(). \
+                 Construct a new engine to continue training.",
+            ));
+        }
+        Ok(state.generation)
     }
 }
 

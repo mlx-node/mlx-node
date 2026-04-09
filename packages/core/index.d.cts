@@ -244,10 +244,14 @@ export declare class GrpoTrainingEngine {
   /** End the current epoch and get metrics */
   endEpoch(epochTimeSecs: number): EngineEpochMetrics;
   /**
-   * Reset the engine for a fresh training run
+   * Reset the engine for a fresh training run.
    *
-   * Also drops the training state (optimizer, step counter) on the model
-   * thread so `InitTraining` can be called again in the same process.
+   * This is a TERMINAL operation on this handle. It drops the training
+   * state (optimizer, step counter) on the model thread so a fresh
+   * `GRPOTrainingEngine` can be constructed on the same model, and marks
+   * THIS handle as invalidated. Any subsequent dispatch-requiring method
+   * on this handle returns an error — callers must construct a new
+   * engine to continue training.
    */
   reset(): void;
   /** Check if reward registry has any rewards registered */
@@ -1675,9 +1679,12 @@ export declare class SftTrainingEngine {
   /**
    * Reset training state (for new training run)
    *
-   * Also drops the training state (optimizer, step counter) on the model
-   * thread so a subsequent construction (or a new training session on the
-   * same model) can re-initialize it cleanly.
+   * This is a TERMINAL operation on this handle. It drops the training
+   * state (optimizer, step counter) on the model thread so a fresh
+   * `SftTrainingEngine` can be constructed on the same model, and marks
+   * THIS handle as invalidated. Any subsequent dispatch-requiring method
+   * on this handle returns an error — callers must construct a new
+   * engine to continue training.
    */
   reset(): void;
   /**
