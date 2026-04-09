@@ -92,7 +92,16 @@
  * train step on exactly this shape with `maxCompletionLength: 256`).
  */
 
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -532,5 +541,148 @@ describe.sequential('GRPOTrainer checkpoint + optimizer state round-trip', () =>
       resumeFromCheckpoint: checkpointPath,
     });
     expect(trainerResumed.getStep()).toBe(0);
+  });
+
+  // Lock-in test for the "fail loud on lying checkpoint" resume-path
+  // hardening added alongside the saveCheckpoint fix. Manually constructs
+  // a checkpoint directory whose `training_state.json` claims
+  // `hasOptimizerState: true` but omits `optimizer_state.safetensors`, then
+  // asserts that `GRPOTrainer.create({ resumeFromCheckpoint })` throws.
+  //
+  // Before task H3 the resume path's try/catch around `loadOptimizerState`
+  // silently swallowed the missing file, leaving the caller with a fresh
+  // optimizer and no indication of the drift.
+  it('fails loudly when a resumed checkpoint lies about hasOptimizerState', async () => {
+    const tempModel = await createTempModel();
+    const checkpointDir = mkdtempSync(join(tmpdir(), 'mlx-grpo-opt-lie-'));
+    cleanups.push(() => {
+      try {
+        tempModel.cleanup();
+      } catch (err) {
+        console.warn('Failed to cleanup temp model:', err);
+      }
+      if (existsSync(checkpointDir)) {
+        try {
+          rmSync(checkpointDir, { recursive: true, force: true });
+        } catch (err) {
+          console.warn(`Failed to cleanup checkpoint dir ${checkpointDir}:`, err);
+        }
+      }
+    });
+
+    const loaded = await loadModel(tempModel.modelPath);
+    const model = loaded as unknown as Qwen3Model;
+
+    const trainerOptions = {
+      modelName: 'qwen3-tiny-lie',
+      modelPath: tempModel.modelPath,
+      groupSize: 2,
+      maxCompletionLength: 16,
+      learningRate: 0,
+      rewardFunction: constantReward,
+      logConsole: false,
+      outputDir: checkpointDir,
+    } as const;
+
+    // Step 1: produce a legitimate checkpoint via saveCheckpoint WITHOUT
+    // running a training step (so the model weights are saved but no
+    // optimizer state file is produced).
+    const trainer = new GRPOTrainer(model, trainerOptions);
+    const checkpointName = 'checkpoint-lie';
+    const checkpointPath = await trainer.saveCheckpoint(checkpointName);
+
+    // Sanity: the honest save did NOT write the optimizer file and did NOT
+    // claim hasOptimizerState. This is the precondition for the lie we're
+    // about to inject.
+    const optimizerStatePath = join(checkpointPath, 'optimizer_state.safetensors');
+    expect(existsSync(optimizerStatePath)).toBe(false);
+    const statePath = join(checkpointPath, 'training_state.json');
+    const honestState: TrainingStateJson = JSON.parse(readFileSync(statePath, 'utf-8'));
+    expect(honestState.hasOptimizerState).toBe(false);
+
+    // Step 2: INJECT the lie — rewrite training_state.json to falsely claim
+    // hasOptimizerState=true while leaving the safetensors file absent.
+    const lyingState = { ...honestState, hasOptimizerState: true };
+    writeFileSync(statePath, JSON.stringify(lyingState, null, 2));
+    expect(existsSync(optimizerStatePath)).toBe(false);
+
+    // Step 3: resume must throw. The exact shape of the error matters less
+    // than the fact that it fails instead of silently loading nothing.
+    await expect(
+      GRPOTrainer.create({
+        ...trainerOptions,
+        resumeFromCheckpoint: checkpointPath,
+      }),
+    ).rejects.toThrow(/hasOptimizerState=true but .* does not exist/);
+  });
+
+  // Lock-in test for the stale-file reuse hole Codex caught. If the
+  // checkpoint directory already contains a leftover
+  // `optimizer_state.safetensors` from a previous save and the current
+  // save is a legitimate no-op (SGD / empty AdamW state), the old file
+  // must not be allowed to masquerade as fresh state for this save.
+  // `saveCheckpoint` unlinks the file up-front so `existsSync` after the
+  // save reflects only what the current save produced.
+  it('removes stale optimizer_state.safetensors when the current save is a no-op', async () => {
+    const tempModel = await createTempModel();
+    const checkpointDir = mkdtempSync(join(tmpdir(), 'mlx-grpo-opt-stale-'));
+    cleanups.push(() => {
+      try {
+        tempModel.cleanup();
+      } catch (err) {
+        console.warn('Failed to cleanup temp model:', err);
+      }
+      if (existsSync(checkpointDir)) {
+        try {
+          rmSync(checkpointDir, { recursive: true, force: true });
+        } catch (err) {
+          console.warn(`Failed to cleanup checkpoint dir ${checkpointDir}:`, err);
+        }
+      }
+    });
+
+    const loaded = await loadModel(tempModel.modelPath);
+    const model = loaded as unknown as Qwen3Model;
+
+    const trainerOptions = {
+      modelName: 'qwen3-tiny-stale',
+      modelPath: tempModel.modelPath,
+      groupSize: 2,
+      maxCompletionLength: 16,
+      learningRate: 0,
+      rewardFunction: constantReward,
+      logConsole: false,
+      outputDir: checkpointDir,
+    } as const;
+
+    const trainer = new GRPOTrainer(model, trainerOptions);
+
+    // Pre-populate the checkpoint directory with a BOGUS
+    // optimizer_state.safetensors that looks like it came from a previous
+    // save. This is exactly the corruption scenario: the save below will
+    // be a no-op (no training step has run), so without the unlink fix
+    // the stale file would survive and `existsSync` would lie.
+    const checkpointName = 'checkpoint-stale';
+    const checkpointPath = join(checkpointDir, checkpointName);
+    mkdirSync(checkpointPath, { recursive: true });
+    const optimizerStatePath = join(checkpointPath, 'optimizer_state.safetensors');
+    writeFileSync(optimizerStatePath, 'STALE FROM PREVIOUS SAVE');
+    expect(existsSync(optimizerStatePath)).toBe(true);
+
+    // Save a no-op checkpoint. saveCheckpoint must unlink the stale file
+    // before calling saveOptimizerState, so the post-save existsSync
+    // accurately reflects that this save produced nothing.
+    await trainer.saveCheckpoint(checkpointName);
+
+    expect(
+      existsSync(optimizerStatePath),
+      'saveCheckpoint must unlink a stale optimizer_state.safetensors before a no-op save',
+    ).toBe(false);
+
+    const stateJson: TrainingStateJson = JSON.parse(readFileSync(join(checkpointPath, 'training_state.json'), 'utf-8'));
+    expect(
+      stateJson.hasOptimizerState,
+      'hasOptimizerState must be false when the current save produced no file, even if a stale one was present',
+    ).toBe(false);
   });
 });
