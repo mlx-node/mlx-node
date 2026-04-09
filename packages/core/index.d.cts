@@ -263,17 +263,18 @@ export declare class GrpoTrainingEngine {
   /**
    * Save optimizer state (moment tensors + step) to a SafeTensors file.
    *
-   * TODO: Route through model thread SaveCheckpoint command once optimizer
-   * state serialization is added to ModelThreadTrainingState.
+   * Routes through the model thread so AdamW moments and step counter
+   * survive across checkpoint/resume. No-op if the engine uses SGD
+   * (no optimizer to save) or before the first optimizer update has
+   * populated any moment tensors.
    */
-  saveOptimizerState(path: string): void;
+  saveOptimizerState(path: string): Promise<void>;
   /**
    * Load optimizer state (moment tensors + step) from a SafeTensors file.
    *
-   * TODO: Route through model thread once optimizer state loading is added
-   * to ModelThreadTrainingState.
+   * Routes through the model thread. No-op if the engine uses SGD.
    */
-  loadOptimizerState(path: string): void;
+  loadOptimizerState(path: string): Promise<void>;
 }
 export type GRPOTrainingEngine = GrpoTrainingEngine;
 

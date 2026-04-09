@@ -1058,7 +1058,7 @@ export class GRPOTrainer<T = unknown> {
       if (resumedState.hasOptimizerState) {
         const optimizerStatePath = join(modelPath, 'optimizer_state.safetensors');
         try {
-          trainer.engine.loadOptimizerState(optimizerStatePath);
+          await trainer.engine.loadOptimizerState(optimizerStatePath);
           logger.info(`Restored optimizer state from checkpoint`);
         } catch (e) {
           logger.warn(`Failed to restore optimizer state: ${String(e)}`);
@@ -1914,7 +1914,7 @@ export class GRPOTrainer<T = unknown> {
 
     // Save optimizer state (AdamW moments + step counter)
     try {
-      this.engine.saveOptimizerState(join(checkpointPath, 'optimizer_state.safetensors'));
+      await this.engine.saveOptimizerState(join(checkpointPath, 'optimizer_state.safetensors'));
       state.hasOptimizerState = true;
       // Re-write training_state.json with updated hasOptimizerState flag
       writeFileSync(statePath, JSON.stringify(state, null, 2));

@@ -173,6 +173,14 @@ pub(crate) enum Qwen35Cmd {
         config: crate::sft::engine::SftEngineConfig,
         reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
     },
+    SaveOptimizerState {
+        path: String,
+        reply: ResponseTx<()>,
+    },
+    LoadOptimizerState {
+        path: String,
+        reply: ResponseTx<()>,
+    },
 }
 
 /// Command handler for the dedicated model thread.
@@ -262,6 +270,12 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
                 labels_shape,
                 config,
             ));
+        }
+        Qwen35Cmd::SaveOptimizerState { path, reply } => {
+            let _ = reply.send(inner.save_optimizer_state_sync(path));
+        }
+        Qwen35Cmd::LoadOptimizerState { path, reply } => {
+            let _ = reply.send(inner.load_optimizer_state_sync(path));
         }
     }
 }
@@ -1749,6 +1763,20 @@ impl Qwen35Inner {
         ));
         info!("Training state initialized on model thread (Qwen3.5 Dense)");
         Ok(())
+    }
+
+    fn save_optimizer_state_sync(&self, path: String) -> Result<()> {
+        let ts = self.training_state.as_ref().ok_or_else(|| {
+            napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
+        })?;
+        ts.save_optimizer_state_sync(&path)
+    }
+
+    fn load_optimizer_state_sync(&mut self, path: String) -> Result<()> {
+        let ts = self.training_state.as_mut().ok_or_else(|| {
+            napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
+        })?;
+        ts.load_optimizer_state_sync(&path)
     }
 
     /// Generate completions for training.

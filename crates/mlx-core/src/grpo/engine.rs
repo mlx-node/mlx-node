@@ -1359,22 +1359,21 @@ impl GRPOTrainingEngine {
 
     /// Save optimizer state (moment tensors + step) to a SafeTensors file.
     ///
-    /// TODO: Route through model thread SaveCheckpoint command once optimizer
-    /// state serialization is added to ModelThreadTrainingState.
+    /// Routes through the model thread so AdamW moments and step counter
+    /// survive across checkpoint/resume. No-op if the engine uses SGD
+    /// (no optimizer to save) or before the first optimizer update has
+    /// populated any moment tensors.
     #[napi]
-    pub fn save_optimizer_state(&self, _path: String) -> Result<()> {
-        warn!("Optimizer state save not yet migrated to model thread — no-op");
-        Ok(())
+    pub async fn save_optimizer_state(&self, path: String) -> Result<()> {
+        self.dispatch_save_optimizer_state(path).await
     }
 
     /// Load optimizer state (moment tensors + step) from a SafeTensors file.
     ///
-    /// TODO: Route through model thread once optimizer state loading is added
-    /// to ModelThreadTrainingState.
+    /// Routes through the model thread. No-op if the engine uses SGD.
     #[napi]
-    pub fn load_optimizer_state(&self, _path: String) -> Result<()> {
-        warn!("Optimizer state load not yet migrated to model thread — no-op");
-        Ok(())
+    pub async fn load_optimizer_state(&self, path: String) -> Result<()> {
+        self.dispatch_load_optimizer_state(path).await
     }
 }
 
@@ -1486,6 +1485,52 @@ impl GRPOTrainingEngine {
                         loss_config,
                         reply: tx,
                     })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+        }
+        rx.await
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    async fn dispatch_save_optimizer_state(&self, path: String) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match &self.dispatch {
+            TrainingDispatch::Qwen3(sender) => {
+                sender
+                    .send(Qwen3Cmd::SaveOptimizerState { path, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Dense(sender) => {
+                sender
+                    .send(Qwen35Cmd::SaveOptimizerState { path, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Moe(sender) => {
+                sender
+                    .send(Qwen35MoeCmd::SaveOptimizerState { path, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+        }
+        rx.await
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    async fn dispatch_load_optimizer_state(&self, path: String) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match &self.dispatch {
+            TrainingDispatch::Qwen3(sender) => {
+                sender
+                    .send(Qwen3Cmd::LoadOptimizerState { path, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Dense(sender) => {
+                sender
+                    .send(Qwen35Cmd::LoadOptimizerState { path, reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Moe(sender) => {
+                sender
+                    .send(Qwen35MoeCmd::LoadOptimizerState { path, reply: tx })
                     .map_err(|_| Error::from_reason("Model thread exited"))?;
             }
         }
