@@ -1601,11 +1601,7 @@ impl Qwen35Inner {
         prompt_tokens: MxArray,
         config: Qwen3_5GenerationConfig,
     ) -> Result<Qwen3_5GenerationResult> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
-            .clone();
+        let tokenizer = self.tokenizer.clone();
 
         // Init caches
         self.init_caches_sync()?;
@@ -1684,9 +1680,11 @@ impl Qwen35Inner {
             "length"
         };
 
-        let text = tokenizer
-            .decode_sync(&generated_tokens, true)
-            .unwrap_or_default();
+        let text = if let Some(ref tok) = tokenizer {
+            tok.decode_sync(&generated_tokens, true).unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         Ok(Qwen3_5GenerationResult {
             tokens: generated_tokens.clone(),
