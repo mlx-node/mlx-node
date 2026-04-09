@@ -1612,13 +1612,236 @@ impl Qwen35MoeInner {
     }
 
     /// Save model weights and configuration to a directory (synchronous).
-    pub(crate) fn save_model_sync(&self, _save_path: &str) -> Result<()> {
-        // Save model is handled by the training clone path in the NAPI shell.
-        // The model thread only owns inference state — training saves use the
-        // Arc<RwLock<>> training fields directly.
-        Err(Error::from_reason(
-            "save_model not supported on dedicated model thread; use training clone path",
-        ))
+    ///
+    /// Runs on the dedicated model thread and serializes all weights owned
+    /// directly by `Qwen35MoeInner` (no locks). Mirrors the dense implementation
+    /// in `qwen3_5::model::Qwen35Inner::save_model_sync`, adapted for the MoE
+    /// MLP variant (per-layer dense vs sparse expert routing).
+    pub(crate) fn save_model_sync(&self, save_path: &str) -> Result<()> {
+        use super::decoder_layer::{AttentionType, MLPType};
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+
+        // Embedding
+        params.insert("embedding.weight".to_string(), self.embedding.get_weight());
+
+        // Transformer layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+
+            // Attention weights
+            match &layer.attn {
+                AttentionType::Linear(gdn) => {
+                    params.insert(
+                        format!("{}.linear_attn.in_proj_qkvz.weight", prefix),
+                        gdn.get_in_proj_qkvz_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.in_proj_ba.weight", prefix),
+                        gdn.get_in_proj_ba_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.conv1d.weight", prefix),
+                        gdn.get_conv1d_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.norm.weight", prefix),
+                        gdn.get_norm_weight(),
+                    );
+                    params.insert(
+                        format!("{}.linear_attn.out_proj.weight", prefix),
+                        gdn.get_out_proj_weight(),
+                    );
+                    params.insert(format!("{}.linear_attn.dt_bias", prefix), gdn.get_dt_bias());
+                    params.insert(format!("{}.linear_attn.a_log", prefix), gdn.get_a_log());
+                }
+                AttentionType::Full(attn) => {
+                    params.insert(
+                        format!("{}.self_attn.q_proj.weight", prefix),
+                        attn.get_q_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.k_proj.weight", prefix),
+                        attn.get_k_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.v_proj.weight", prefix),
+                        attn.get_v_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.o_proj.weight", prefix),
+                        attn.get_o_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.q_norm.weight", prefix),
+                        attn.get_q_norm_weight(),
+                    );
+                    params.insert(
+                        format!("{}.self_attn.k_norm.weight", prefix),
+                        attn.get_k_norm_weight(),
+                    );
+                }
+            }
+
+            // MLP weights — different for Dense vs MoE layers
+            match &layer.mlp {
+                MLPType::Dense(mlp) => {
+                    params.insert(
+                        format!("{}.mlp.gate_proj.weight", prefix),
+                        mlp.get_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.up_proj.weight", prefix),
+                        mlp.get_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.down_proj.weight", prefix),
+                        mlp.get_down_proj_weight(),
+                    );
+                }
+                MLPType::MoE(moe) => {
+                    // Router gate
+                    params.insert(format!("{}.mlp.gate.weight", prefix), moe.get_gate_weight());
+                    // Expert weights (3D: [num_experts, out, in])
+                    let switch_mlp = moe.get_switch_mlp();
+                    params.insert(
+                        format!("{}.mlp.switch_mlp.gate_proj.weight", prefix),
+                        switch_mlp.get_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.switch_mlp.up_proj.weight", prefix),
+                        switch_mlp.get_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
+                        switch_mlp.get_down_proj_weight(),
+                    );
+                    // Shared expert
+                    params.insert(
+                        format!("{}.mlp.shared_expert.gate_proj.weight", prefix),
+                        moe.get_shared_expert_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.shared_expert.up_proj.weight", prefix),
+                        moe.get_shared_expert_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{}.mlp.shared_expert.down_proj.weight", prefix),
+                        moe.get_shared_expert_down_proj_weight(),
+                    );
+                    // Shared expert gate
+                    params.insert(
+                        format!("{}.mlp.shared_expert_gate.weight", prefix),
+                        moe.get_shared_expert_gate_weight(),
+                    );
+                }
+            }
+
+            // Layer norms
+            params.insert(
+                format!("{}.input_layernorm.weight", prefix),
+                layer.get_input_layernorm_weight(),
+            );
+            params.insert(
+                format!("{}.post_attention_layernorm.weight", prefix),
+                layer.get_post_attention_layernorm_weight(),
+            );
+        }
+
+        // Final norm
+        params.insert(
+            "final_norm.weight".to_string(),
+            self.final_norm.get_weight(),
+        );
+
+        // LM head (only if not tied to the embedding)
+        if !self.config.tie_word_embeddings
+            && let Some(ref lm_head) = self.lm_head
+        {
+            params.insert("lm_head.weight".to_string(), lm_head.get_weight());
+        }
+
+        // Include vision encoder weights when present (VLM models)
+        if let Some(ref vision_enc) = self.vision_encoder {
+            let vision_params = vision_enc.get_parameters();
+            params.extend(vision_params);
+        }
+
+        // Validate all parameters for NaN/Inf before writing to disk
+        for (name, param) in params.iter() {
+            let data = param.to_float32()?;
+            let invalid_count = data
+                .iter()
+                .filter(|v| v.is_nan() || v.is_infinite())
+                .count();
+            if invalid_count > 0 {
+                return Err(napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!(
+                        "Cannot save model: parameter '{}' contains {} NaN/Inf values.",
+                        name, invalid_count
+                    ),
+                ));
+            }
+        }
+
+        let params_clone: HashMap<String, MxArray> =
+            params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        // Weights metadata (reference sidecar)
+        let mut weights_metadata = serde_json::Map::new();
+        for (key, array) in params.iter() {
+            let shape_data = array.shape()?;
+            let shape: Vec<i64> = shape_data.as_ref().to_vec();
+            let dtype = array.dtype()?;
+            let mut param_info = serde_json::Map::new();
+            param_info.insert("shape".to_string(), serde_json::json!(shape));
+            param_info.insert("dtype".to_string(), serde_json::json!(dtype as i32));
+            weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
+        }
+
+        // Serialize config and inject model_type for detectModelType
+        let mut config_value = serde_json::to_value(&self.config).map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Failed to serialize config: {e}"),
+            )
+        })?;
+        if let serde_json::Value::Object(ref mut map) = config_value {
+            map.insert("model_type".to_string(), serde_json::json!("qwen3_5_moe"));
+        }
+
+        let weights_json = serde_json::json!({
+            "version": "1.0",
+            "config": config_value,
+            "weights": weights_metadata,
+            "note": "Full weights are in weights.safetensors"
+        });
+
+        let path = std::path::Path::new(save_path);
+        std::fs::create_dir_all(path)?;
+
+        info!("Saving model to {}", save_path);
+
+        let config_path = path.join("config.json");
+        let config_json = serde_json::to_string_pretty(&config_value)?;
+        std::fs::write(&config_path, config_json)?;
+        info!("Saved config.json");
+
+        let safetensors_path = path.join("weights.safetensors");
+        let metadata = Some(serde_json::json!({
+            "format": "mlx-node",
+            "version": "1.0"
+        }));
+        crate::utils::safetensors::save_safetensors(&safetensors_path, &params_clone, metadata)?;
+        info!("Saved weights.safetensors");
+
+        let weights_str = serde_json::to_string_pretty(&weights_json)?;
+        let weights_path = path.join("weights.mlx");
+        std::fs::write(&weights_path, weights_str)?;
+        info!("Saved weights.mlx metadata");
+
+        Ok(())
     }
 
     // ========== Training methods (run on model thread) ==========
