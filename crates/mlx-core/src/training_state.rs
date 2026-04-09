@@ -162,3 +162,58 @@ impl ModelThreadTrainingState {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::optimizers::AdamW;
+
+    #[test]
+    fn new_initializes_counters_to_zero_and_caches_to_none() {
+        let state = ModelThreadTrainingState::new(1e-4, 1, None, None, 100, 5, false, true, None);
+        assert_eq!(state.step, 0);
+        assert_eq!(state.micro_step, 0);
+        assert_eq!(state.nan_gradient_count, 0);
+        assert_eq!(state.consecutive_nan_count, 0);
+        assert!(state.accumulated_gradients.is_none());
+        assert!(state.cached_prompt_tokens.is_none());
+        assert!(state.cached_completion_tokens.is_none());
+        assert!(state.cached_completion_logprobs.is_none());
+        assert!(state.optimizer.is_none());
+        assert_eq!(state.learning_rate, 1e-4);
+        assert_eq!(state.grad_accumulation_steps, 1);
+        assert_eq!(state.max_nan_gradients, 100);
+        assert_eq!(state.emergency_save_threshold, 5);
+        assert!(!state.verbose_nan_detection);
+        assert!(state.gradient_checkpointing);
+    }
+
+    #[test]
+    fn clear_generation_cache_drops_all_three_caches() {
+        let mut state =
+            ModelThreadTrainingState::new(1e-4, 1, None, None, 100, 5, false, true, None);
+        state.cached_prompt_tokens = Some(vec![]);
+        state.cached_completion_tokens = Some(vec![]);
+        state.cached_completion_logprobs = Some(vec![]);
+        state.clear_generation_cache();
+        assert!(state.cached_prompt_tokens.is_none());
+        assert!(state.cached_completion_tokens.is_none());
+        assert!(state.cached_completion_logprobs.is_none());
+    }
+
+    #[test]
+    fn new_accepts_adamw_optimizer() {
+        let adamw = AdamW::new(
+            Some(1e-4),
+            Some(0.9),
+            Some(0.999),
+            Some(1e-8),
+            Some(0.01),
+            Some(true),
+        );
+        let state =
+            ModelThreadTrainingState::new(1e-4, 1, None, None, 100, 5, false, true, Some(adamw));
+        assert!(state.optimizer.is_some());
+        assert_eq!(state.optimizer.as_ref().unwrap().get_step(), 0);
+    }
+}
