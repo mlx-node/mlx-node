@@ -128,9 +128,13 @@ pub(crate) struct Qwen3Inner {
     pub(crate) cached_kv_values: Vec<Option<MxArray>>,
     pub(crate) cached_cache_idx: i32,
     pub(crate) cached_token_history: Vec<u32>,
+    /// Training state owned by the model thread.
+    /// Created when `InitTraining` command is received, destroyed when training ends.
+    pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
+#[allow(dead_code)] // Training variants used in Phase 3+
 pub(crate) enum Qwen3Cmd {
     Chat {
         messages: Vec<ChatMessage>,
@@ -196,6 +200,37 @@ pub(crate) enum Qwen3Cmd {
     },
     SchedulerStats {
         reply: ResponseTx<Option<SchedulerStatsNapi>>,
+    },
+    // --- Training commands ---
+    InitTraining {
+        config: Box<crate::grpo::engine::GRPOEngineConfig>,
+        model_type: crate::training_model::ModelType,
+        reply: ResponseTx<()>,
+    },
+    GenerateForTraining {
+        prompts: Vec<crate::tokenizer::ChatMessage>,
+        group_size: usize,
+        gen_config: super::GenerationConfig,
+        enable_thinking: Option<bool>,
+        tools: Option<Vec<crate::tokenizer::ToolDefinition>>,
+        reply: ResponseTx<crate::training_model::GenerationPlainData>,
+    },
+    TrainStepGRPO {
+        rewards: Vec<f64>,
+        group_size: i32,
+        loss_config: crate::grpo::loss::GRPOLossConfig,
+        reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
+    },
+    GetParameters {
+        reply: ResponseTx<std::collections::HashMap<String, crate::array::MxArray>>,
+    },
+    LoadParameters {
+        params: std::collections::HashMap<String, crate::array::MxArray>,
+        reply: ResponseTx<()>,
+    },
+    SaveCheckpoint {
+        path: String,
+        reply: ResponseTx<()>,
     },
 }
 
@@ -289,6 +324,47 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
         }
         Qwen3Cmd::SchedulerStats { reply } => {
             let _ = reply.send(Ok(inner.scheduler_stats_sync()));
+        }
+        // --- Training commands ---
+        Qwen3Cmd::InitTraining {
+            config,
+            model_type,
+            reply,
+        } => {
+            let _ = reply.send(inner.init_training_sync(*config, model_type));
+        }
+        Qwen3Cmd::GenerateForTraining {
+            prompts,
+            group_size,
+            gen_config,
+            enable_thinking,
+            tools,
+            reply,
+        } => {
+            let _ = reply.send(inner.generate_for_training_thread_sync(
+                prompts,
+                group_size,
+                gen_config,
+                enable_thinking,
+                tools,
+            ));
+        }
+        Qwen3Cmd::TrainStepGRPO {
+            rewards,
+            group_size,
+            loss_config,
+            reply,
+        } => {
+            let _ = reply.send(inner.train_step_grpo_sync(rewards, group_size, loss_config));
+        }
+        Qwen3Cmd::GetParameters { reply } => {
+            let _ = reply.send(inner.get_parameters_sync());
+        }
+        Qwen3Cmd::LoadParameters { params, reply } => {
+            let _ = reply.send(inner.load_parameters_sync(params));
+        }
+        Qwen3Cmd::SaveCheckpoint { path, reply } => {
+            let _ = reply.send(inner.save_checkpoint_sync(&path));
         }
     }
 }
@@ -385,6 +461,7 @@ impl Qwen3Inner {
             cached_kv_values: Vec::new(),
             cached_cache_idx: 0,
             cached_token_history: Vec::new(),
+            training_state: None,
         })
     }
 
@@ -1908,6 +1985,994 @@ impl Qwen3Inner {
             num_prompts,
             group_size,
         })
+    }
+
+    // ========== Training methods (run on model thread) ==========
+
+    /// Initialize training state with optimizer and configuration.
+    #[allow(dead_code)]
+    fn init_training_sync(
+        &mut self,
+        config: crate::grpo::engine::GRPOEngineConfig,
+        _model_type: ModelType,
+    ) -> Result<()> {
+        let optimizer = if config.optimizer_type.as_deref().unwrap_or("adamw") == "adamw" {
+            Some(crate::optimizers::AdamW::new(
+                config.learning_rate,
+                config.adamw_beta1,
+                config.adamw_beta2,
+                config.adamw_eps,
+                config.weight_decay,
+                Some(true), // bias correction
+            ))
+        } else {
+            None
+        };
+
+        self.training_state = Some(crate::training_state::ModelThreadTrainingState::new(
+            config.learning_rate.unwrap_or(1e-6),
+            config.gradient_accumulation_steps.unwrap_or(1),
+            config.gradient_clip_norm,
+            config.gradient_clip_value,
+            config.max_nan_gradients.unwrap_or(100),
+            config.emergency_save_threshold.unwrap_or(5),
+            config.verbose_nan_detection.unwrap_or(false),
+            config.gradient_checkpointing.unwrap_or(true),
+            config.weight_decay.unwrap_or(0.01),
+            optimizer,
+        ));
+        info!("Training state initialized on model thread");
+        Ok(())
+    }
+
+    /// Generate completions for training.
+    ///
+    /// Tokenizes prompts using Jinja2 chat template, generates completions,
+    /// caches MxArray results in training_state for the subsequent training step,
+    /// and returns plain data across the thread boundary.
+    #[allow(dead_code)]
+    fn generate_for_training_thread_sync(
+        &mut self,
+        prompts: Vec<ChatMessage>,
+        group_size: usize,
+        gen_config: super::GenerationConfig,
+        enable_thinking: Option<bool>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<crate::training_model::GenerationPlainData> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("Tokenizer not available."))?
+            .clone();
+
+        // Tokenize the prompt using Jinja2 chat template (supports tools + thinking)
+        let prompt_token_ids = tokenizer.apply_chat_template_sync(
+            &prompts,
+            Some(true),
+            tools.as_deref(),
+            enable_thinking,
+        )?;
+
+        let prompt_array =
+            MxArray::from_uint32(&prompt_token_ids, &[1, prompt_token_ids.len() as i64])?;
+        let prompt_array_1d = prompt_array.squeeze(Some(&[0]))?;
+        let prompt_text = tokenizer.decode_sync(&prompt_token_ids, true)?;
+
+        let mut completion_texts = Vec::with_capacity(group_size);
+        let mut prompt_texts = Vec::with_capacity(group_size);
+        let mut completion_tokens_plain = Vec::with_capacity(group_size);
+        let mut completion_logprobs_plain = Vec::with_capacity(group_size);
+        let mut token_counts = Vec::with_capacity(group_size);
+        let mut finish_reasons = Vec::with_capacity(group_size);
+
+        // Cache MxArrays for the training step
+        let mut cached_completion_tokens = Vec::with_capacity(group_size);
+        let mut cached_completion_logprobs = Vec::with_capacity(group_size);
+
+        // Generate G completions
+        for _g in 0..group_size {
+            let result =
+                self.generate_single_for_training_sync(&prompt_array, Some(gen_config.clone()))?;
+
+            // Extract plain data for crossing thread boundary
+            let tok_ids: Vec<i32> = result
+                .tokens
+                .to_uint32()?
+                .iter()
+                .map(|&t| t as i32)
+                .collect();
+            let lp_data: Vec<f32> = result.logprobs.to_float32()?.to_vec();
+            let decoded = tokenizer
+                .decode_sync(&tok_ids.iter().map(|&t| t as u32).collect::<Vec<_>>(), true)?;
+
+            completion_texts.push(decoded);
+            prompt_texts.push(prompt_text.clone());
+            completion_tokens_plain.push(tok_ids);
+            completion_logprobs_plain.push(lp_data);
+            token_counts.push(result.num_tokens as u32);
+            finish_reasons.push(result.finish_reason.clone());
+
+            // Cache MxArrays (these stay on the model thread)
+            cached_completion_tokens.push(result.tokens);
+            cached_completion_logprobs.push(result.logprobs);
+
+            // Clean up between completions to prevent Metal context accumulation
+            heavy_cleanup();
+        }
+
+        // Store cached MxArrays in training_state
+        if let Some(ref mut ts) = self.training_state {
+            // For single-prompt generate, we store one prompt entry
+            ts.cached_prompt_tokens = Some(vec![prompt_array_1d]);
+            ts.cached_completion_tokens = Some(cached_completion_tokens);
+            ts.cached_completion_logprobs = Some(cached_completion_logprobs);
+        }
+
+        Ok(crate::training_model::GenerationPlainData {
+            completion_texts,
+            prompt_texts,
+            completion_tokens: completion_tokens_plain,
+            completion_logprobs: completion_logprobs_plain,
+            token_counts,
+            finish_reasons,
+        })
+    }
+
+    /// Generate a single completion for training purposes.
+    ///
+    /// Uses fresh local KV caches (not the shared inference caches).
+    /// Returns GenerationResult with MxArray tokens and logprobs.
+    fn generate_single_for_training_sync(
+        &self,
+        input_ids: &MxArray,
+        config: Option<super::GenerationConfig>,
+    ) -> Result<GenerationResult> {
+        let config = config.unwrap_or_default();
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
+        let temperature = config.temperature.unwrap_or(1.0);
+        let top_k = config.top_k.unwrap_or(0);
+        let top_p = config.top_p.unwrap_or(1.0);
+        let min_p = config.min_p.unwrap_or(0.0);
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
+        let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
+        let return_logprobs = config.return_logprobs.unwrap_or(true);
+        let prefill_step_size = config.prefill_step_size.unwrap_or(2048) as usize;
+
+        let embedding_weight = self.embedding.get_weight();
+        let layers = &self.layers;
+        let final_norm = &self.final_norm;
+        let lm_head = &self.lm_head;
+        let model_config = &self.config;
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        let num_layers = layers.len();
+        let mut kv_keys: Vec<Option<MxArray>> = vec![None; num_layers];
+        let mut kv_values: Vec<Option<MxArray>> = vec![None; num_layers];
+        let mut cache_idx: i32 = 0;
+
+        let mut rope_offsets = MxArray::from_int32(&[0], &[1])?;
+        let left_padding = MxArray::from_int32(&[0], &[1])?;
+
+        let input_tokens = input_ids.to_uint32()?;
+        let current_ids = input_ids.clone();
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut generated_logprobs: Vec<f32> = if return_logprobs {
+            Vec::with_capacity(max_new_tokens as usize)
+        } else {
+            Vec::new()
+        };
+        let mut finish_reason = "length";
+
+        let sampling_config = SamplingConfig {
+            temperature: Some(temperature),
+            top_k: Some(top_k),
+            top_p: Some(top_p),
+            min_p: Some(min_p),
+        };
+
+        // PREFILL
+        let total_seq_len = current_ids.shape_at(1)? as usize;
+        let use_chunked_prefill = prefill_step_size > 0 && total_seq_len > prefill_step_size;
+        let mut last_logits = if use_chunked_prefill {
+            let mut offset = 0usize;
+            while offset + prefill_step_size < total_seq_len {
+                let chunk_end = offset + prefill_step_size;
+                let chunk = current_ids.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
+                rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
+                {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    let _ = Qwen3Model::forward_fused(
+                        &chunk,
+                        &embedding_weight,
+                        layers,
+                        final_norm,
+                        lm_head,
+                        model_config,
+                        &mut kv_keys,
+                        &mut kv_values,
+                        &mut cache_idx,
+                        &rope_offsets,
+                        &left_padding,
+                    )?;
+                }
+                for kv_key in kv_keys.iter().flatten() {
+                    kv_key.eval();
+                }
+                for kv_value in kv_values.iter().flatten() {
+                    kv_value.eval();
+                }
+                synchronize_and_clear_cache();
+                offset = chunk_end;
+            }
+            let final_chunk = current_ids.slice(&[0, offset as i64], &[1, total_seq_len as i64])?;
+            rope_offsets = MxArray::from_int32(&[offset as i32], &[1])?;
+            let logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                Qwen3Model::forward_fused(
+                    &final_chunk,
+                    &embedding_weight,
+                    layers,
+                    final_norm,
+                    lm_head,
+                    model_config,
+                    &mut kv_keys,
+                    &mut kv_values,
+                    &mut cache_idx,
+                    &rope_offsets,
+                    &left_padding,
+                )?
+            };
+            let chunk_seq_len = logits.shape_at(1)?;
+            logits
+                .slice_axis(1, chunk_seq_len - 1, chunk_seq_len)?
+                .squeeze(Some(&[0, 1]))?
+        } else {
+            let logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                Qwen3Model::forward_fused(
+                    &current_ids,
+                    &embedding_weight,
+                    layers,
+                    final_norm,
+                    lm_head,
+                    model_config,
+                    &mut kv_keys,
+                    &mut kv_values,
+                    &mut cache_idx,
+                    &rope_offsets,
+                    &left_padding,
+                )?
+            };
+            let seq_len = logits.shape_at(1)?;
+            logits
+                .slice_axis(1, seq_len - 1, seq_len)?
+                .squeeze(Some(&[0, 1]))?
+        };
+
+        rope_offsets = MxArray::from_int32(&[cache_idx], &[1])?;
+
+        if repetition_penalty != 1.0 && !input_tokens.is_empty() {
+            last_logits = apply_repetition_penalty(
+                &last_logits,
+                &input_tokens,
+                repetition_penalty,
+                Some(repetition_context_size),
+            )?;
+        }
+        if presence_penalty != 0.0 {
+            last_logits = apply_presence_penalty(
+                &last_logits,
+                &input_tokens,
+                presence_penalty,
+                Some(presence_context_size),
+            )?;
+        }
+        if frequency_penalty != 0.0 {
+            last_logits = apply_frequency_penalty(
+                &last_logits,
+                &input_tokens,
+                frequency_penalty,
+                Some(frequency_context_size),
+            )?;
+        }
+
+        let (mut token, mut logprobs) = if return_logprobs {
+            let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
+            (tok, Some(lp))
+        } else {
+            (sample(&last_logits, Some(sampling_config))?, None)
+        };
+
+        // DECODE
+        const DECODE_CLEANUP_INTERVAL: i32 = 256;
+        let one_arr = MxArray::from_int32(&[1], &[1])?;
+        for step in 0..max_new_tokens {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            token.eval();
+            if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
+                synchronize_and_clear_cache();
+            }
+            let token_value = token.item_at_int32(0)? as u32;
+            generated_tokens.push(token_value);
+            if return_logprobs && let Some(ref lp) = logprobs {
+                lp.eval();
+                let lp_value = lp.item_at_float32(0)?;
+                generated_logprobs.push(lp_value);
+            }
+            if let Some(eos) = eos_token_id
+                && token_value == eos as u32
+            {
+                finish_reason = "stop";
+                break;
+            }
+            if let Some(reason) = check_repetition_cutoff(
+                &generated_tokens,
+                max_consecutive_tokens,
+                max_ngram_repeats,
+                ngram_size,
+            ) {
+                finish_reason = reason;
+                break;
+            }
+            let next_ids = MxArray::from_uint32(&[token_value], &[1, 1])?;
+            let next_logits = Qwen3Model::forward_fused(
+                &next_ids,
+                &embedding_weight,
+                layers,
+                final_norm,
+                lm_head,
+                model_config,
+                &mut kv_keys,
+                &mut kv_values,
+                &mut cache_idx,
+                &rope_offsets,
+                &left_padding,
+            )?;
+            rope_offsets = rope_offsets.add(&one_arr)?;
+            let next_last_logits = next_logits.slice_axis(1, 0, 1)?.squeeze(Some(&[0, 1]))?;
+            last_logits = next_last_logits;
+            if repetition_penalty != 1.0 || presence_penalty != 0.0 || frequency_penalty != 0.0 {
+                let context_tokens: Vec<u32> = input_tokens
+                    .iter()
+                    .copied()
+                    .chain(generated_tokens.iter().copied())
+                    .collect();
+                if repetition_penalty != 1.0 {
+                    last_logits = apply_repetition_penalty(
+                        &last_logits,
+                        &context_tokens,
+                        repetition_penalty,
+                        Some(repetition_context_size),
+                    )?;
+                }
+                if presence_penalty != 0.0 {
+                    last_logits = apply_presence_penalty(
+                        &last_logits,
+                        &context_tokens,
+                        presence_penalty,
+                        Some(presence_context_size),
+                    )?;
+                }
+                if frequency_penalty != 0.0 {
+                    last_logits = apply_frequency_penalty(
+                        &last_logits,
+                        &context_tokens,
+                        frequency_penalty,
+                        Some(frequency_context_size),
+                    )?;
+                }
+            }
+            let (next_tok, next_lp) = if return_logprobs {
+                let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
+                (tok, Some(lp))
+            } else {
+                (sample(&last_logits, Some(sampling_config))?, None)
+            };
+            token = next_tok;
+            logprobs = next_lp;
+        }
+
+        let tokens_array =
+            MxArray::from_uint32(&generated_tokens, &[generated_tokens.len() as i64])?;
+        let logprobs_array = if return_logprobs {
+            MxArray::from_float32(&generated_logprobs, &[generated_logprobs.len() as i64])?
+        } else {
+            MxArray::from_float32(&[], &[0])?
+        };
+
+        Ok(GenerationResult {
+            text: String::new(), // Text decoding done by caller
+            tokens: tokens_array,
+            logprobs: logprobs_array,
+            finish_reason: finish_reason.to_string(),
+            num_tokens: generated_tokens.len(),
+            first_token_elapsed_ms: None,
+        })
+    }
+
+    /// GRPO training step: compute loss, gradients, and apply optimizer.
+    ///
+    /// Consumes cached MxArrays from the generation phase, computes loss and
+    /// gradients via autograd, validates and clips gradients, accumulates them,
+    /// and applies the optimizer step when accumulation is complete.
+    #[allow(dead_code)]
+    fn train_step_grpo_sync(
+        &mut self,
+        rewards: Vec<f64>,
+        group_size: i32,
+        loss_config: crate::grpo::loss::GRPOLossConfig,
+    ) -> Result<crate::training_model::TrainStepPlainMetrics> {
+        use crate::array::memory::{get_active_memory, get_peak_memory, reset_peak_memory};
+        use crate::grpo::advantages::compute_advantages;
+        use crate::grpo::autograd::compute_loss_and_gradients_autograd;
+        use crate::optimizers::GradientUtils;
+
+        reset_peak_memory();
+
+        // Get cached generation results from training_state
+        let ts = self.training_state.as_ref().ok_or_else(|| {
+            napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
+        })?;
+
+        let prompt_tokens = ts.cached_prompt_tokens.as_ref().ok_or_else(|| {
+            napi::Error::from_reason("No cached prompt tokens. Call GenerateForTraining first.")
+        })?;
+        let completion_tokens = ts.cached_completion_tokens.as_ref().ok_or_else(|| {
+            napi::Error::from_reason("No cached completion tokens. Call GenerateForTraining first.")
+        })?;
+        let completion_logprobs = ts.cached_completion_logprobs.as_ref().ok_or_else(|| {
+            napi::Error::from_reason(
+                "No cached completion logprobs. Call GenerateForTraining first.",
+            )
+        })?;
+
+        let use_checkpointing = ts.gradient_checkpointing;
+        let gradient_clip_value = ts.gradient_clip_value;
+        let gradient_clip_norm = ts.gradient_clip_norm;
+        let verbose_nan = ts.verbose_nan_detection;
+        let learning_rate = ts.learning_rate;
+        let max_nan_gradients = ts.max_nan_gradients;
+        let emergency_save_threshold = ts.emergency_save_threshold;
+
+        // Get model parameters
+        let params = self.get_parameters_sync()?;
+        let model_type = ModelType::Qwen3(self.config.clone());
+
+        // Compute loss and gradients
+        let prompt_refs: Vec<&MxArray> = prompt_tokens.iter().collect();
+        let completion_refs: Vec<&MxArray> = completion_tokens.iter().collect();
+        let logprob_refs: Vec<&MxArray> = completion_logprobs.iter().collect();
+
+        let (loss_value, gradients) = compute_loss_and_gradients_autograd(
+            &model_type,
+            &params,
+            &prompt_refs,
+            &completion_refs,
+            &logprob_refs,
+            &rewards,
+            group_size,
+            loss_config,
+            use_checkpointing,
+        )?;
+
+        // Check for NaN/Inf loss
+        if loss_value.is_nan() || loss_value.is_infinite() {
+            warn!("Skipping step due to invalid loss: {}", loss_value);
+            synchronize_and_clear_cache();
+            let ts = self.training_state.as_ref().unwrap();
+            return Ok(crate::training_model::TrainStepPlainMetrics {
+                loss: loss_value,
+                gradients_applied: false,
+                mean_advantage: 0.0,
+                std_advantage: 0.0,
+                nan_gradient_count: ts.nan_gradient_count,
+                peak_memory_mb: get_peak_memory() / 1e6,
+                active_memory_mb: get_active_memory() / 1e6,
+                total_tokens: 0,
+                step: ts.step,
+            });
+        }
+
+        // Validate ALL gradients — skip entire step if ANY has NaN/Inf
+        for (name, grad) in gradients.iter() {
+            grad.eval();
+            let has_invalid = grad.has_nan_or_inf()?;
+            if has_invalid {
+                if verbose_nan {
+                    let data = grad.to_float32()?;
+                    let invalid_count = data
+                        .iter()
+                        .filter(|v| v.is_nan() || v.is_infinite())
+                        .count();
+                    warn!(
+                        "Gradient '{}' contains {} invalid values - SKIPPING STEP",
+                        name, invalid_count
+                    );
+                } else {
+                    warn!("Gradient '{}' contains NaN/Inf - SKIPPING STEP", name);
+                }
+
+                let ts = self.training_state.as_mut().unwrap();
+                ts.nan_gradient_count += 1;
+                ts.consecutive_nan_count += 1;
+
+                if ts.nan_gradient_count >= max_nan_gradients as u64 {
+                    return Err(napi::Error::from_reason(format!(
+                        "Training stopped: exceeded max NaN gradient count ({}/{})",
+                        ts.nan_gradient_count, max_nan_gradients
+                    )));
+                }
+
+                if ts.consecutive_nan_count >= emergency_save_threshold as u32 {
+                    warn!(
+                        "Emergency save triggered: {} consecutive NaN gradients",
+                        ts.consecutive_nan_count
+                    );
+                }
+
+                synchronize_and_clear_cache();
+                return Ok(crate::training_model::TrainStepPlainMetrics {
+                    loss: loss_value,
+                    gradients_applied: false,
+                    mean_advantage: 0.0,
+                    std_advantage: 0.0,
+                    nan_gradient_count: ts.nan_gradient_count,
+                    peak_memory_mb: get_peak_memory() / 1e6,
+                    active_memory_mb: get_active_memory() / 1e6,
+                    total_tokens: 0,
+                    step: ts.step,
+                });
+            }
+        }
+
+        // Element-wise gradient clipping
+        let grad_clip_val = gradient_clip_value.unwrap_or(1.0);
+        let mut clamped_gradients: HashMap<String, MxArray> = HashMap::new();
+        for (name, grad) in gradients.iter() {
+            let clamped = grad.clip(Some(-grad_clip_val), Some(grad_clip_val))?;
+            clamped.eval();
+            clamped_gradients.insert(name.clone(), clamped);
+        }
+
+        // Gradient norm clipping
+        let clipped_gradients = if let Some(max_norm) = gradient_clip_norm {
+            let grad_refs: HashMap<String, &MxArray> = clamped_gradients
+                .iter()
+                .map(|(k, v)| (k.clone(), v))
+                .collect();
+            GradientUtils::clip_grad_norm(grad_refs, max_norm)?
+        } else {
+            clamped_gradients
+        };
+
+        // Accumulate gradients
+        let ts = self.training_state.as_mut().unwrap();
+        // Reset consecutive NaN count on successful gradient computation
+        ts.consecutive_nan_count = 0;
+
+        Self::accumulate_gradients_inner(ts, clipped_gradients)?;
+        ts.micro_step += 1;
+
+        let grad_acc_steps = ts.grad_accumulation_steps;
+        let gradients_applied = if ts.micro_step >= grad_acc_steps {
+            let grads = ts
+                .accumulated_gradients
+                .take()
+                .ok_or_else(|| napi::Error::from_reason("No accumulated gradients"))?;
+
+            // Apply optimizer step
+            if let Some(ref mut optimizer) = ts.optimizer {
+                // AdamW path
+                let mut param_names_vec: Vec<String> = Vec::new();
+                let mut param_refs: Vec<&MxArray> = Vec::new();
+                let mut grad_refs: Vec<&MxArray> = Vec::new();
+
+                // Scale gradients if using accumulation
+                let scaled_grads: HashMap<String, MxArray>;
+                let grads_to_use = if grad_acc_steps > 1 {
+                    let scale = 1.0 / grad_acc_steps as f32;
+                    let scale_arr = MxArray::from_float32(&[scale], &[])?;
+                    scaled_grads = grads
+                        .iter()
+                        .map(|(name, grad)| (name.clone(), grad.mul(&scale_arr).unwrap()))
+                        .collect();
+                    &scaled_grads
+                } else {
+                    &grads
+                };
+
+                for (name, grad) in grads_to_use {
+                    if let Some(param) = params.get(name) {
+                        param_names_vec.push(name.clone());
+                        param_refs.push(param);
+                        grad_refs.push(grad);
+                    }
+                }
+
+                let updated = optimizer.update_batch(
+                    param_names_vec.clone(),
+                    param_refs.clone(),
+                    grad_refs,
+                )?;
+
+                // Create deltas: delta = param - updated (so param - 1.0 * delta = updated)
+                let delta_map: HashMap<String, MxArray> = param_names_vec
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let delta = param_refs[i].sub(&updated[i]).unwrap();
+                        (name.clone(), delta)
+                    })
+                    .collect();
+
+                let delta_refs: HashMap<String, &MxArray> =
+                    delta_map.iter().map(|(k, v)| (k.clone(), v)).collect();
+                self.apply_gradients_inner(delta_refs, 1.0, &params)?;
+
+                debug!(
+                    "Applied AdamW update (step={})",
+                    self.training_state.as_ref().unwrap().step
+                );
+            } else {
+                // SGD path
+                let lr = learning_rate / grad_acc_steps as f64;
+                let grads_refs: HashMap<String, &MxArray> =
+                    grads.iter().map(|(k, v)| (k.clone(), v)).collect();
+                self.apply_gradients_inner(grads_refs, lr, &params)?;
+                debug!("Applied SGD gradients with lr: {}", lr);
+            }
+
+            let ts = self.training_state.as_mut().unwrap();
+            ts.accumulated_gradients = None;
+            ts.micro_step = 0;
+            ts.step += 1;
+            true
+        } else {
+            ts.step += 1;
+            false
+        };
+
+        // Compute advantage statistics
+        let rewards_f32: Vec<f32> = rewards.iter().map(|&r| r as f32).collect();
+        let rewards_array = MxArray::from_float32(&rewards_f32, &[rewards.len() as i64])?;
+        let advantages = compute_advantages(&rewards_array, group_size, "group".to_string())?;
+        let adv_data = advantages.to_float32()?;
+        let mean_advantage =
+            adv_data.iter().map(|&a| a as f64).sum::<f64>() / adv_data.len().max(1) as f64;
+        let std_advantage = {
+            let variance = adv_data
+                .iter()
+                .map(|&a| {
+                    let diff = a as f64 - mean_advantage;
+                    diff * diff
+                })
+                .sum::<f64>()
+                / adv_data.len().max(1) as f64;
+            variance.sqrt()
+        };
+
+        // Clear cached generation data
+        if let Some(ref mut ts) = self.training_state {
+            ts.clear_generation_cache();
+        }
+
+        // CRITICAL: heavy_cleanup after autograd to clear compiled graph cache
+        heavy_cleanup();
+
+        let ts = self.training_state.as_ref().unwrap();
+        let total_tokens: i32 = if let Some(ref ct) = ts.cached_completion_tokens {
+            ct.iter()
+                .filter_map(|t| t.shape_at(0).ok())
+                .map(|n| n as i32)
+                .sum()
+        } else {
+            0
+        };
+
+        Ok(crate::training_model::TrainStepPlainMetrics {
+            loss: loss_value,
+            gradients_applied,
+            mean_advantage,
+            std_advantage,
+            nan_gradient_count: ts.nan_gradient_count,
+            peak_memory_mb: get_peak_memory() / 1e6,
+            active_memory_mb: get_active_memory() / 1e6,
+            total_tokens,
+            step: ts.step,
+        })
+    }
+
+    /// Accumulate gradients into training state.
+    fn accumulate_gradients_inner(
+        ts: &mut crate::training_state::ModelThreadTrainingState,
+        new_grads: HashMap<String, MxArray>,
+    ) -> Result<()> {
+        match &mut ts.accumulated_gradients {
+            Some(acc) => {
+                for (name, grad) in new_grads {
+                    grad.eval();
+                    if grad.has_nan_or_inf()? {
+                        warn!(
+                            "Skipping gradient accumulation for '{}' due to NaN/Inf",
+                            name
+                        );
+                        continue;
+                    }
+                    if let Some(existing) = acc.get_mut(&name) {
+                        let summed = existing.add(&grad)?;
+                        summed.eval();
+                        *existing = summed;
+                    } else {
+                        acc.insert(name, grad);
+                    }
+                }
+            }
+            None => {
+                let mut evaluated_grads = HashMap::with_capacity(new_grads.len());
+                for (name, grad) in new_grads {
+                    grad.eval();
+                    if grad.has_nan_or_inf()? {
+                        warn!("Skipping initial gradient for '{}' due to NaN/Inf", name);
+                        continue;
+                    }
+                    evaluated_grads.insert(name, grad);
+                }
+                ts.accumulated_gradients = Some(evaluated_grads);
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply gradients to model weights (SGD or AdamW delta application).
+    ///
+    /// Direct field access on Qwen3Inner — no locks needed.
+    fn apply_gradients_inner(
+        &mut self,
+        gradients: HashMap<String, &MxArray>,
+        learning_rate: f64,
+        current_params: &HashMap<String, MxArray>,
+    ) -> Result<()> {
+        let updated_params =
+            crate::training_model::compute_sgd_updates(&gradients, learning_rate, current_params)?;
+
+        // Apply updated parameters directly to model fields
+        for (name, updated_param) in updated_params.iter() {
+            if name == "lm_head.weight" {
+                self.lm_head.set_weight(updated_param)?;
+            } else if name == "final_norm.weight" {
+                self.final_norm.set_weight(updated_param)?;
+            } else if name == "embedding.weight" {
+                self.embedding.set_weight(updated_param)?;
+            } else if name.starts_with("layers.") {
+                let parts: Vec<&str> = name.split('.').collect();
+                if parts.len() >= 3
+                    && let Ok(layer_idx) = parts[1].parse::<usize>()
+                    && layer_idx < self.layers.len()
+                {
+                    let layer = &mut self.layers[layer_idx];
+                    if name.contains(".self_attn.q_proj.weight") {
+                        layer.self_attn.set_q_proj_weight(updated_param)?;
+                    } else if name.contains(".self_attn.k_proj.weight") {
+                        layer.self_attn.set_k_proj_weight(updated_param)?;
+                    } else if name.contains(".self_attn.v_proj.weight") {
+                        layer.self_attn.set_v_proj_weight(updated_param)?;
+                    } else if name.contains(".self_attn.o_proj.weight") {
+                        layer.self_attn.set_o_proj_weight(updated_param)?;
+                    } else if name.contains(".mlp.gate_proj.weight") {
+                        layer.mlp.set_gate_proj_weight(updated_param)?;
+                    } else if name.contains(".mlp.up_proj.weight") {
+                        layer.mlp.set_up_proj_weight(updated_param)?;
+                    } else if name.contains(".mlp.down_proj.weight") {
+                        layer.mlp.set_down_proj_weight(updated_param)?;
+                    } else if name.contains(".input_layernorm.weight") {
+                        layer.set_input_layernorm_weight(updated_param)?;
+                    } else if name.contains(".post_attention_layernorm.weight") {
+                        layer.set_post_attention_layernorm_weight(updated_param)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract all trainable parameters from the model.
+    /// Direct field access — no locks needed on model thread.
+    #[allow(dead_code)]
+    fn get_parameters_sync(&self) -> Result<HashMap<String, MxArray>> {
+        let mut params = HashMap::new();
+
+        // Embedding
+        params.insert("embedding.weight".to_string(), self.embedding.get_weight());
+
+        // Transformer layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+
+            let attn = &layer.self_attn;
+            params.insert(
+                format!("{}.self_attn.q_proj.weight", prefix),
+                attn.get_q_proj_weight(),
+            );
+            params.insert(
+                format!("{}.self_attn.k_proj.weight", prefix),
+                attn.get_k_proj_weight(),
+            );
+            params.insert(
+                format!("{}.self_attn.v_proj.weight", prefix),
+                attn.get_v_proj_weight(),
+            );
+            params.insert(
+                format!("{}.self_attn.o_proj.weight", prefix),
+                attn.get_o_proj_weight(),
+            );
+
+            if self.config.use_qk_norm {
+                if let Some(q_norm_weight) = attn.get_q_norm_weight() {
+                    params.insert(format!("{}.self_attn.q_norm.weight", prefix), q_norm_weight);
+                }
+                if let Some(k_norm_weight) = attn.get_k_norm_weight() {
+                    params.insert(format!("{}.self_attn.k_norm.weight", prefix), k_norm_weight);
+                }
+            }
+
+            let mlp = &layer.mlp;
+            params.insert(
+                format!("{}.mlp.gate_proj.weight", prefix),
+                mlp.get_gate_proj_weight(),
+            );
+            params.insert(
+                format!("{}.mlp.up_proj.weight", prefix),
+                mlp.get_up_proj_weight(),
+            );
+            params.insert(
+                format!("{}.mlp.down_proj.weight", prefix),
+                mlp.get_down_proj_weight(),
+            );
+
+            params.insert(
+                format!("{}.input_layernorm.weight", prefix),
+                layer.get_input_layernorm_weight(),
+            );
+            params.insert(
+                format!("{}.post_attention_layernorm.weight", prefix),
+                layer.get_post_attention_layernorm_weight(),
+            );
+        }
+
+        // Final norm
+        params.insert(
+            "final_norm.weight".to_string(),
+            self.final_norm.get_weight(),
+        );
+
+        // LM head (only if not tied to embeddings)
+        if !self.config.tie_word_embeddings {
+            params.insert("lm_head.weight".to_string(), self.lm_head.get_weight());
+        }
+
+        Ok(params)
+    }
+
+    /// Load parameters into the model.
+    /// Direct field access — no locks needed on model thread.
+    #[allow(dead_code)]
+    fn load_parameters_sync(&mut self, params: HashMap<String, MxArray>) -> Result<()> {
+        info!("Loading {} parameters into model (thread)", params.len());
+
+        if let Some(weight) = params.get("embedding.weight") {
+            self.embedding.set_weight(weight)?;
+        }
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let prefix = format!("layers.{}", i);
+
+            let attn = &mut layer.self_attn;
+            if let Some(w) = params.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
+                attn.set_q_proj_weight(w)?;
+            }
+            if let Some(w) = params.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
+                attn.set_k_proj_weight(w)?;
+            }
+            if let Some(w) = params.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
+                attn.set_v_proj_weight(w)?;
+            }
+            if let Some(w) = params.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
+                attn.set_o_proj_weight(w)?;
+            }
+            if self.config.use_qk_norm {
+                if let Some(w) = params.get(&format!("{}.self_attn.q_norm.weight", prefix)) {
+                    attn.set_q_norm_weight(w)?;
+                }
+                if let Some(w) = params.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
+                    attn.set_k_norm_weight(w)?;
+                }
+            }
+
+            let mlp = &mut layer.mlp;
+            if let Some(w) = params.get(&format!("{}.mlp.gate_proj.weight", prefix)) {
+                mlp.set_gate_proj_weight(w)?;
+            }
+            if let Some(w) = params.get(&format!("{}.mlp.up_proj.weight", prefix)) {
+                mlp.set_up_proj_weight(w)?;
+            }
+            if let Some(w) = params.get(&format!("{}.mlp.down_proj.weight", prefix)) {
+                mlp.set_down_proj_weight(w)?;
+            }
+
+            if let Some(w) = params.get(&format!("{}.input_layernorm.weight", prefix)) {
+                layer.set_input_layernorm_weight(w)?;
+            }
+            if let Some(w) = params.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
+                layer.set_post_attention_layernorm_weight(w)?;
+            }
+        }
+
+        if let Some(weight) = params.get("final_norm.weight") {
+            self.final_norm.set_weight(weight)?;
+        }
+        if let Some(weight) = params.get("lm_head.weight") {
+            self.lm_head.set_weight(weight)?;
+        }
+
+        info!("Parameters loaded successfully (thread)");
+        Ok(())
+    }
+
+    /// Save model weights as SafeTensors checkpoint.
+    #[allow(dead_code)]
+    fn save_checkpoint_sync(&self, path: &str) -> Result<()> {
+        use std::fs;
+        use std::path::Path;
+
+        let params = self.get_parameters_sync()?;
+
+        // Validate parameters for NaN/Inf before saving
+        for (name, param) in params.iter() {
+            let data = param.to_float32()?;
+            let invalid_count = data
+                .iter()
+                .filter(|v| v.is_nan() || v.is_infinite())
+                .count();
+            if invalid_count > 0 {
+                return Err(napi::Error::from_reason(format!(
+                    "Cannot save: parameter '{}' contains {} NaN/Inf values",
+                    name, invalid_count
+                )));
+            }
+        }
+
+        let save_path = Path::new(path);
+        fs::create_dir_all(save_path).map_err(|e| {
+            napi::Error::from_reason(format!("Failed to create directory {}: {}", path, e))
+        })?;
+
+        // Save config
+        let config_path = save_path.join("config.json");
+        let config_json = serde_json::to_string_pretty(&self.config)
+            .map_err(|e| napi::Error::from_reason(format!("Failed to serialize config: {}", e)))?;
+        fs::write(&config_path, config_json)
+            .map_err(|e| napi::Error::from_reason(format!("Failed to write config: {}", e)))?;
+
+        // Save weights
+        let safetensors_path = save_path.join("weights.safetensors");
+        let metadata = Some(serde_json::json!({
+            "format": "mlx-node",
+            "version": "1.0"
+        }));
+        crate::utils::safetensors::save_safetensors(&safetensors_path, &params, metadata)?;
+
+        info!("Checkpoint saved to {}", path);
+        Ok(())
     }
 }
 
