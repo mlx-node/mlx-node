@@ -23,11 +23,12 @@
  * requires a thread-backed model).
  */
 
-import { Qwen3Model, SftTrainingEngine, type SftEngineConfig } from '@mlx-node/core';
+import { MxArray, Qwen3Model, SftTrainingEngine, type SftEngineConfig } from '@mlx-node/core';
 import { loadModel } from '@mlx-node/lm';
 import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
 
 import { createTempModel } from '../test-model-utils';
+import { int32, shape } from '../test-utils';
 
 const sftConfig: SftEngineConfig = {
   learningRate: 2e-5,
@@ -59,7 +60,7 @@ describe.sequential('SftTrainingEngine — training state lifecycle', () => {
     tempModel?.cleanup();
   });
 
-  it('restoreState() plumbs the step to the model thread (H2)', () => {
+  it('restoreState() plumbs the step to the model thread (H2)', async () => {
     const engine = new SftTrainingEngine(model, sftConfig);
     try {
       // Fresh engine starts at step 0.
@@ -72,6 +73,26 @@ describe.sequential('SftTrainingEngine — training state lifecycle', () => {
       // Engine-side cache reflects the restored value.
       expect(engine.getStep()).toBe(42);
       expect(engine.getEpoch()).toBe(2);
+
+      // End-to-end plumb verification: run an actual SFT train step.
+      // `ts.step` on the model thread is incremented from the restored
+      // value, and the returned metrics.step is the authoritative count.
+      // If `restoreState()` had only updated the local cache (the exact
+      // bug H2 fixes), the model thread would have started from 0 and
+      // returned step=1 here instead of step=43.
+      const seqLen = 8;
+      const inputIds = MxArray.fromInt32(
+        int32(1, 2, 3, 4, 5, 6, 7, 8),
+        shape(1, seqLen),
+      );
+      const labels = MxArray.fromInt32(
+        int32(2, 3, 4, 5, 6, 7, 8, 9),
+        shape(1, seqLen),
+      );
+      const metrics = await engine.trainStep(inputIds, labels);
+      expect(metrics.step).toBe(43);
+      // And the engine-side cache is still consistent after the step.
+      expect(engine.getStep()).toBe(43);
     } finally {
       // Clean up: drop training state on the model thread so the next
       // test's `new SftTrainingEngine(model, ...)` doesn't trip the

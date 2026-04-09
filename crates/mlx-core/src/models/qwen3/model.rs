@@ -397,7 +397,7 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
                 Ok(ts.step)
             } else {
                 Err(napi::Error::from_reason(
-                    "Training not initialized. Call InitTraining first.",
+                    "Training state not initialized. Call InitTraining first.",
                 ))
             };
             let _ = reply.send(result);
@@ -408,7 +408,7 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
                 Ok(())
             } else {
                 Err(napi::Error::from_reason(
-                    "Training not initialized. Call InitTraining first.",
+                    "Training state not initialized. Call InitTraining first.",
                 ))
             };
             let _ = reply.send(result);
@@ -2749,17 +2749,24 @@ impl Qwen3Inner {
         if loss_value.is_nan() || loss_value.is_infinite() {
             warn!("Skipping step due to invalid loss: {}", loss_value);
             synchronize_and_clear_cache();
-            let ts = self.training_state.as_ref().unwrap();
+            // Skipped steps must still advance the authoritative step counter
+            // (H1) and drop the cached generation so the next cycle starts
+            // clean.
+            let ts = self.training_state.as_mut().unwrap();
+            ts.clear_generation_cache();
+            ts.step += 1;
+            let new_step = ts.step;
+            let nan_count = ts.nan_gradient_count;
             return Ok(crate::training_model::TrainStepPlainMetrics {
                 loss: loss_value,
                 gradients_applied: false,
                 mean_advantage: 0.0,
                 std_advantage: 0.0,
-                nan_gradient_count: ts.nan_gradient_count,
+                nan_gradient_count: nan_count,
                 peak_memory_mb: get_peak_memory() / 1e6,
                 active_memory_mb: get_active_memory() / 1e6,
                 total_tokens: 0,
-                step: ts.step,
+                step: new_step,
             });
         }
 
@@ -2800,17 +2807,23 @@ impl Qwen3Inner {
                     );
                 }
 
+                // Advance the authoritative step counter (H1) and clear the
+                // cached generation data so the next cycle starts clean.
+                ts.clear_generation_cache();
+                ts.step += 1;
+                let new_step = ts.step;
+                let nan_count = ts.nan_gradient_count;
                 synchronize_and_clear_cache();
                 return Ok(crate::training_model::TrainStepPlainMetrics {
                     loss: loss_value,
                     gradients_applied: false,
                     mean_advantage: 0.0,
                     std_advantage: 0.0,
-                    nan_gradient_count: ts.nan_gradient_count,
+                    nan_gradient_count: nan_count,
                     peak_memory_mb: get_peak_memory() / 1e6,
                     active_memory_mb: get_active_memory() / 1e6,
                     total_tokens: 0,
-                    step: ts.step,
+                    step: new_step,
                 });
             }
         }
