@@ -26,6 +26,7 @@ pub mod tokenizer;
 pub mod tools;
 pub mod tracing;
 pub mod training_model;
+pub mod training_state;
 pub mod transformer;
 pub mod utils;
 pub mod vision;

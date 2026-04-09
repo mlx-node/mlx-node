@@ -18,7 +18,7 @@ pub type StreamTx<T> = tokio::sync::mpsc::UnboundedSender<napi::Result<T>>;
 /// (e.g. `Gemma4Cmd`, `Qwen3Cmd`).
 pub struct ModelThread<Cmd: Send + 'static> {
     cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<Cmd>>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    _handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl<Cmd: Send + 'static> ModelThread<Cmd> {
@@ -67,9 +67,15 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
 
         let thread = Self {
             cmd_tx: Some(cmd_tx),
-            handle: Some(handle),
+            _handle: Some(handle),
         };
         (thread, init_rx)
+    }
+
+    /// Get a reference to the command sender.
+    /// Training engines use this to send training commands directly.
+    pub fn cmd_sender(&self) -> Option<&tokio::sync::mpsc::UnboundedSender<Cmd>> {
+        self.cmd_tx.as_ref()
     }
 
     /// Send a command to the model thread.
@@ -87,10 +93,13 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
 impl<Cmd: Send + 'static> Drop for ModelThread<Cmd> {
     fn drop(&mut self) {
         // Close the command channel so the thread's recv loop exits.
+        // We intentionally do NOT join the thread here — dropping the
+        // JoinHandle detaches it.  The thread will finish processing any
+        // in-flight command, drop its state (freeing Metal resources),
+        // and exit on its own.  Joining can block for seconds while MLX
+        // tears down GPU allocations, which causes vitest fork workers
+        // to time out and get killed.
         self.cmd_tx.take();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
     }
 }
 

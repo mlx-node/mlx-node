@@ -189,6 +189,43 @@ impl TrainableModel for TrainableModelEnum {
     }
 }
 
+/// Plain generation results that cross the thread boundary.
+/// No MxArrays — only plain Rust types (Vec<u32>, Vec<f32>, String, etc.).
+/// The model thread caches the MxArray versions internally for the subsequent training step.
+#[allow(dead_code)] // Infrastructure for Phase 2+ training thread migration
+pub(crate) struct GenerationPlainData {
+    pub completion_texts: Vec<String>,
+    pub prompt_texts: Vec<String>,
+    pub completion_tokens: Vec<Vec<i32>>,
+    pub completion_logprobs: Vec<Vec<f32>>,
+    pub token_counts: Vec<u32>,
+    pub finish_reasons: Vec<String>,
+}
+
+/// Plain training metrics that cross the thread boundary.
+/// No MxArrays — only plain numeric types.
+#[allow(dead_code)] // Infrastructure for Phase 2+ training thread migration
+pub(crate) struct TrainStepPlainMetrics {
+    pub loss: f64,
+    pub gradients_applied: bool,
+    pub mean_advantage: f64,
+    pub std_advantage: f64,
+    pub nan_gradient_count: u64,
+    pub peak_memory_mb: f64,
+    pub active_memory_mb: f64,
+    pub total_tokens: i32,
+    pub step: i64,
+}
+
+/// Dispatch handle for sending training commands to the appropriate model thread.
+/// Training engines hold this instead of Arc<RwLock<TrainableModelEnum>>.
+#[allow(dead_code)] // Infrastructure for Phase 2+ training thread migration
+pub(crate) enum TrainingDispatch {
+    Qwen3(tokio::sync::mpsc::UnboundedSender<crate::models::qwen3::Qwen3Cmd>),
+    Qwen35Dense(tokio::sync::mpsc::UnboundedSender<crate::models::qwen3_5::model::Qwen35Cmd>),
+    Qwen35Moe(tokio::sync::mpsc::UnboundedSender<crate::models::qwen3_5_moe::model::Qwen35MoeCmd>),
+}
+
 /// Compute SGD parameter updates: param = param - lr * grad.
 ///
 /// Shared helper used by all model implementations to avoid duplicating the
