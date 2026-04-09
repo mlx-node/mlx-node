@@ -8,8 +8,6 @@ import { MxArray, Qwen3Model } from '@mlx-node/core';
 import type { Qwen3Config } from '@mlx-node/lm';
 import { describe, it, expect } from 'vite-plus/test';
 
-
-
 // Tiny test configuration for fast testing
 const TEST_CONFIG: Qwen3Config = {
   vocabSize: 1000,

@@ -81,14 +81,8 @@ describe.sequential('SftTrainingEngine — training state lifecycle', () => {
       // bug H2 fixes), the model thread would have started from 0 and
       // returned step=1 here instead of step=43.
       const seqLen = 8;
-      const inputIds = MxArray.fromInt32(
-        int32(1, 2, 3, 4, 5, 6, 7, 8),
-        shape(1, seqLen),
-      );
-      const labels = MxArray.fromInt32(
-        int32(2, 3, 4, 5, 6, 7, 8, 9),
-        shape(1, seqLen),
-      );
+      const inputIds = MxArray.fromInt32(int32(1, 2, 3, 4, 5, 6, 7, 8), shape(1, seqLen));
+      const labels = MxArray.fromInt32(int32(2, 3, 4, 5, 6, 7, 8, 9), shape(1, seqLen));
       const metrics = await engine.trainStep(inputIds, labels);
       expect(metrics.step).toBe(43);
       // And the engine-side cache is still consistent after the step.
