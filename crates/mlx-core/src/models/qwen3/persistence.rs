@@ -18,7 +18,7 @@ use crate::array::MxArray;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::{load_safetensors_lazy, save_safetensors};
 
-use super::model::{Qwen3Inner, handle_qwen3_cmd};
+use super::model::{Qwen3Cmd, Qwen3Inner, handle_qwen3_cmd};
 use super::{Qwen3Config, Qwen3Model};
 
 /// Validate that all required parameters were loaded with correct shapes
@@ -217,6 +217,14 @@ impl Qwen3Model {
     /// - weights.safetensors: Full model weights in SafeTensors format
     /// - weights.mlx: Parameter metadata (for reference)
     ///
+    /// Dispatches to the dedicated model thread for inference models loaded
+    /// via `load()` — all MxArray reads must happen on the thread that owns
+    /// them to avoid the MLX cross-thread `CommandEncoder` crash.
+    ///
+    /// Falls back to reading `Arc<RwLock<>>` fields directly for the legacy
+    /// `new Qwen3Model(config)` code path (`thread: None`), which is still
+    /// used by in-memory test fixtures such as `createTempModel`.
+    ///
     /// # Arguments
     /// * `save_path` - Directory to save the model
     #[napi]
@@ -225,7 +233,23 @@ impl Qwen3Model {
         env: &'env Env,
         save_path: String,
     ) -> Result<PromiseRaw<'env, ()>> {
-        // Get all parameters
+        if let Some(ref thread) = self.thread {
+            // Inference model: dispatch to dedicated model thread so MxArray
+            // reads happen on the thread that owns them.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            thread.send(Qwen3Cmd::SaveModel {
+                save_path,
+                reply: tx,
+            })?;
+            let promise = env.spawn_future(async move {
+                rx.await
+                    .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
+            })?;
+            return Ok(promise);
+        }
+
+        // Legacy fallback: no dedicated thread (e.g. `new Qwen3Model(config)`
+        // used by in-memory tests). Read the Arc<RwLock<>> fields directly.
         let params = self.get_parameters()?;
 
         // Validate all parameters for NaN/Inf before saving
@@ -268,9 +292,19 @@ impl Qwen3Model {
         }
 
         let config = self.get_config();
+        let mut config_value = serde_json::to_value(&config).map_err(|e| {
+            napi::Error::new(
+                Status::GenericFailure,
+                format!("Failed to serialize config: {e}"),
+            )
+        })?;
+        if let serde_json::Value::Object(ref mut map) = config_value {
+            map.insert("model_type".to_string(), serde_json::json!("qwen3"));
+        }
+
         let weights_json = serde_json::json!({
             "version": "1.0",
-            "config": config,
+            "config": config_value,
             "weights": weights_metadata,
             "note": "Full weights are in weights.safetensors"
         });
@@ -285,7 +319,7 @@ impl Qwen3Model {
 
                 // 1. Save configuration as JSON
                 let config_path = path.join("config.json");
-                let config_json = serde_json::to_string_pretty(&config)?;
+                let config_json = serde_json::to_string_pretty(&config_value)?;
                 fs::write(&config_path, config_json)?;
                 info!("Saved config.json");
 

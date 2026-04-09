@@ -236,6 +236,10 @@ pub(crate) enum Qwen3Cmd {
         path: String,
         reply: ResponseTx<()>,
     },
+    SaveModel {
+        save_path: String,
+        reply: ResponseTx<()>,
+    },
 }
 
 /// Command handler for the dedicated model thread.
@@ -382,6 +386,9 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
         }
         Qwen3Cmd::LoadOptimizerState { path, reply } => {
             let _ = reply.send(inner.load_optimizer_state_sync(path));
+        }
+        Qwen3Cmd::SaveModel { save_path, reply } => {
+            let _ = reply.send(inner.save_model_sync(&save_path));
         }
     }
 }
@@ -2050,6 +2057,165 @@ impl Qwen3Inner {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
         })?;
         ts.save_optimizer_state_sync(&path)
+    }
+
+    /// Save the model weights and configuration to disk (runs on model thread).
+    ///
+    /// Collects all parameters directly from this `Qwen3Inner`'s fields (which
+    /// are owned by the dedicated model thread), validates them for NaN/Inf,
+    /// writes them as SafeTensors, and emits a `config.json` tagged with
+    /// `model_type: "qwen3"` for `detectModelType` on reload.
+    pub(crate) fn save_model_sync(&self, save_path: &str) -> Result<()> {
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+
+        // Embedding
+        params.insert("embedding.weight".to_string(), self.embedding.get_weight());
+
+        // Transformer layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("layers.{}", i);
+
+            let attn = &layer.self_attn;
+            params.insert(
+                format!("{}.self_attn.q_proj.weight", prefix),
+                attn.get_q_proj_weight(),
+            );
+            params.insert(
+                format!("{}.self_attn.k_proj.weight", prefix),
+                attn.get_k_proj_weight(),
+            );
+            params.insert(
+                format!("{}.self_attn.v_proj.weight", prefix),
+                attn.get_v_proj_weight(),
+            );
+            params.insert(
+                format!("{}.self_attn.o_proj.weight", prefix),
+                attn.get_o_proj_weight(),
+            );
+
+            // QK norm parameters (if enabled)
+            if self.config.use_qk_norm {
+                if let Some(q_norm_weight) = attn.get_q_norm_weight() {
+                    params.insert(format!("{}.self_attn.q_norm.weight", prefix), q_norm_weight);
+                }
+                if let Some(k_norm_weight) = attn.get_k_norm_weight() {
+                    params.insert(format!("{}.self_attn.k_norm.weight", prefix), k_norm_weight);
+                }
+            }
+
+            let mlp = &layer.mlp;
+            params.insert(
+                format!("{}.mlp.gate_proj.weight", prefix),
+                mlp.get_gate_proj_weight(),
+            );
+            params.insert(
+                format!("{}.mlp.up_proj.weight", prefix),
+                mlp.get_up_proj_weight(),
+            );
+            params.insert(
+                format!("{}.mlp.down_proj.weight", prefix),
+                mlp.get_down_proj_weight(),
+            );
+
+            params.insert(
+                format!("{}.input_layernorm.weight", prefix),
+                layer.get_input_layernorm_weight(),
+            );
+            params.insert(
+                format!("{}.post_attention_layernorm.weight", prefix),
+                layer.get_post_attention_layernorm_weight(),
+            );
+        }
+
+        // Final norm
+        params.insert(
+            "final_norm.weight".to_string(),
+            self.final_norm.get_weight(),
+        );
+
+        // LM head (only if not tied to embeddings)
+        if !self.config.tie_word_embeddings {
+            params.insert("lm_head.weight".to_string(), self.lm_head.get_weight());
+        }
+
+        // Validate every parameter for NaN/Inf before touching the filesystem.
+        for (name, param) in params.iter() {
+            let data = param.to_float32()?;
+            let invalid_count = data
+                .iter()
+                .filter(|v| v.is_nan() || v.is_infinite())
+                .count();
+            if invalid_count > 0 {
+                return Err(napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!(
+                        "Cannot save model: parameter '{}' contains {} NaN/Inf values. \
+                        Model weights are corrupted, likely due to training instability. \
+                        Consider reducing learning rate or using an earlier checkpoint.",
+                        name, invalid_count
+                    ),
+                ));
+            }
+        }
+
+        let params_clone: HashMap<String, MxArray> =
+            params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        // Build weights.mlx metadata (shape + dtype only; full data is in safetensors).
+        let mut weights_metadata = serde_json::Map::new();
+        for (key, array) in params.iter() {
+            let shape_data = array.shape()?;
+            let shape: Vec<i64> = shape_data.as_ref().to_vec();
+            let dtype = array.dtype()?;
+            let mut param_info = serde_json::Map::new();
+            param_info.insert("shape".to_string(), serde_json::json!(shape));
+            param_info.insert("dtype".to_string(), serde_json::json!(dtype as i32));
+            weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
+        }
+
+        // Config JSON — inject `model_type: "qwen3"` so `detectModelType`
+        // routes the saved directory back to the Qwen3 loader.
+        let mut config_value = serde_json::to_value(&self.config).map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Failed to serialize config: {e}"),
+            )
+        })?;
+        if let serde_json::Value::Object(ref mut map) = config_value {
+            map.insert("model_type".to_string(), serde_json::json!("qwen3"));
+        }
+
+        let weights_json = serde_json::json!({
+            "version": "1.0",
+            "config": config_value,
+            "weights": weights_metadata,
+            "note": "Full weights are in weights.safetensors"
+        });
+
+        let path = std::path::Path::new(save_path);
+        std::fs::create_dir_all(path)?;
+
+        info!("Saving model to {}", save_path);
+
+        let config_path = path.join("config.json");
+        let config_json = serde_json::to_string_pretty(&config_value)?;
+        std::fs::write(&config_path, config_json)?;
+        info!("Saved config.json");
+
+        let safetensors_path = path.join("weights.safetensors");
+        let metadata = Some(serde_json::json!({
+            "format": "mlx-node",
+            "version": "1.0"
+        }));
+        crate::utils::safetensors::save_safetensors(&safetensors_path, &params_clone, metadata)?;
+        info!("Saved weights.safetensors");
+
+        let weights_str = serde_json::to_string_pretty(&weights_json)?;
+        let weights_path = path.join("weights.mlx");
+        std::fs::write(&weights_path, weights_str)?;
+        info!("Saved weights.mlx metadata");
+
+        Ok(())
     }
 
     fn load_optimizer_state_sync(&mut self, path: String) -> Result<()> {

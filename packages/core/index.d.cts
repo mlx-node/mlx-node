@@ -1459,6 +1459,14 @@ export declare class Qwen3Model {
    * - weights.safetensors: Full model weights in SafeTensors format
    * - weights.mlx: Parameter metadata (for reference)
    *
+   * Dispatches to the dedicated model thread for inference models loaded
+   * via `load()` — all MxArray reads must happen on the thread that owns
+   * them to avoid the MLX cross-thread `CommandEncoder` crash.
+   *
+   * Falls back to reading `Arc<RwLock<>>` fields directly for the legacy
+   * `new Qwen3Model(config)` code path (`thread: None`), which is still
+   * used by in-memory test fixtures such as `createTempModel`.
+   *
    * # Arguments
    * * `save_path` - Directory to save the model
    */
