@@ -622,23 +622,18 @@ impl GRPOTrainingEngine {
         let generation_start = std::time::Instant::now();
         let gen_config = self.build_gen_config();
 
-        // === Phase 1: Generate completions via model thread ===
-        let mut total_tokens: i32 = 0;
-        for prompt_messages in &prompts {
-            let gen_data = self
-                .dispatch_generate(
-                    prompt_messages,
-                    group_size,
-                    gen_config.clone(),
-                    self.config.enable_thinking,
-                    self.config.tools.clone(),
-                )
-                .await?;
+        // === Phase 1: Generate completions via model thread (single batched call) ===
+        let gen_data = self
+            .dispatch_generate(
+                &prompts,
+                group_size,
+                gen_config.clone(),
+                self.config.enable_thinking,
+                self.config.tools.clone(),
+            )
+            .await?;
 
-            for tc in &gen_data.token_counts {
-                total_tokens += *tc as i32;
-            }
-        }
+        let total_tokens: i32 = gen_data.token_counts.iter().map(|&tc| tc as i32).sum();
 
         let generation_time_ms = generation_start.elapsed().as_secs_f64() * 1000.0;
         let training_start = std::time::Instant::now();
@@ -646,7 +641,7 @@ impl GRPOTrainingEngine {
         // === Phase 2: Train via model thread ===
         let loss_config = self.build_loss_config(num_prompts, group_size);
         let metrics = self
-            .dispatch_train_step(rewards.clone(), group_size as i32, loss_config)
+            .dispatch_train_step(rewards.clone(), group_size as i32, loss_config, None)
             .await?;
 
         let training_time_ms = training_start.elapsed().as_secs_f64() * 1000.0;
@@ -730,30 +725,31 @@ impl GRPOTrainingEngine {
         let group_size = self.config.group_size.unwrap_or(4) as usize;
         let gen_config = self.build_gen_config();
 
-        let mut all_texts = Vec::new();
+        // Single batched dispatch — the returned GenerationPlainData already
+        // holds all prompts' data in prompt-major order.
+        let gen_data = self
+            .dispatch_generate(
+                &prompts,
+                group_size,
+                gen_config.clone(),
+                self.config.enable_thinking,
+                self.config.tools.clone(),
+            )
+            .await?;
+
+        let total_completions = gen_data.completion_texts.len();
+        let mut all_texts = Vec::with_capacity(total_completions);
         let mut all_tokens = Vec::new();
         let mut all_logprobs = Vec::new();
-        let mut all_lengths = Vec::new();
-        let mut all_reasons = Vec::new();
+        let mut all_lengths = Vec::with_capacity(total_completions);
+        let mut all_reasons = Vec::with_capacity(total_completions);
 
-        for prompt_messages in &prompts {
-            let gen_data = self
-                .dispatch_generate(
-                    prompt_messages,
-                    group_size,
-                    gen_config.clone(),
-                    self.config.enable_thinking,
-                    self.config.tools.clone(),
-                )
-                .await?;
-
-            for i in 0..gen_data.completion_texts.len() {
-                all_texts.push(gen_data.completion_texts[i].clone());
-                all_lengths.push(gen_data.completion_tokens[i].len() as i32);
-                all_tokens.extend(gen_data.completion_tokens[i].iter().map(|&t| t as i64));
-                all_logprobs.extend(gen_data.completion_logprobs[i].iter().map(|&l| l as f64));
-                all_reasons.push(gen_data.finish_reasons[i].clone());
-            }
+        for i in 0..total_completions {
+            all_texts.push(gen_data.completion_texts[i].clone());
+            all_lengths.push(gen_data.completion_tokens[i].len() as i32);
+            all_tokens.extend(gen_data.completion_tokens[i].iter().map(|&t| t as i64));
+            all_logprobs.extend(gen_data.completion_logprobs[i].iter().map(|&l| l as f64));
+            all_reasons.push(gen_data.finish_reasons[i].clone());
         }
 
         Ok(GenerateBatchResult {
@@ -820,7 +816,7 @@ impl GRPOTrainingEngine {
         // Dispatch train step to model thread (uses cached MxArrays from generate phase)
         let loss_config = self.build_loss_config(num_prompts, group_size);
         let metrics = self
-            .dispatch_train_step(rewards.clone(), group_size as i32, loss_config)
+            .dispatch_train_step(rewards.clone(), group_size as i32, loss_config, None)
             .await?;
 
         let training_time_ms = training_start.elapsed().as_secs_f64() * 1000.0;
@@ -914,27 +910,31 @@ impl GRPOTrainingEngine {
         let mut all_token_counts: Vec<u32> = Vec::with_capacity(expected_completions);
         let mut all_finish_reasons: Vec<String> = Vec::with_capacity(expected_completions);
 
-        for prompt_messages in &prompts {
-            let gen_data = self
-                .dispatch_generate(
-                    prompt_messages,
-                    group_size,
-                    gen_config.clone(),
-                    self.config.enable_thinking,
-                    self.config.tools.clone(),
-                )
-                .await?;
+        // Single batched dispatch — accumulates completions for all prompts in
+        // prompt-major order on the model thread.
+        let gen_data = self
+            .dispatch_generate(
+                &prompts,
+                group_size,
+                gen_config.clone(),
+                self.config.enable_thinking,
+                self.config.tools.clone(),
+            )
+            .await?;
 
-            // First prompt text from this batch
-            if let Some(pt) = gen_data.prompt_texts.first() {
+        // Collect one prompt text per prompt (prompt_texts is repeated per
+        // completion in prompt-major order, so stride by group_size).
+        for p in 0..num_prompts {
+            let base = p * group_size;
+            if let Some(pt) = gen_data.prompt_texts.get(base) {
                 all_prompt_texts.push(pt.clone());
             }
+        }
 
-            for i in 0..gen_data.completion_texts.len() {
-                all_completion_texts.push(gen_data.completion_texts[i].clone());
-                all_token_counts.push(gen_data.token_counts[i]);
-                all_finish_reasons.push(gen_data.finish_reasons[i].clone());
-            }
+        for i in 0..gen_data.completion_texts.len() {
+            all_completion_texts.push(gen_data.completion_texts[i].clone());
+            all_token_counts.push(gen_data.token_counts[i]);
+            all_finish_reasons.push(gen_data.finish_reasons[i].clone());
         }
 
         let generation_time_ms = generation_start.elapsed().as_secs_f64() * 1000.0;
@@ -1023,6 +1023,9 @@ impl GRPOTrainingEngine {
                 expected_completions
             );
 
+            // Drop stale MxArrays on the model thread before returning.
+            self.dispatch_clear_generation_cache().await?;
+
             let mut state = self.state.write().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire state write lock")
             })?;
@@ -1067,6 +1070,9 @@ impl GRPOTrainingEngine {
                 "Only {} valid completions for {} prompts - skipping training",
                 filtered_count, num_prompts
             );
+
+            // Drop stale MxArrays on the model thread before returning.
+            self.dispatch_clear_generation_cache().await?;
 
             let mut state = self.state.write().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire state write lock")
@@ -1136,6 +1142,7 @@ impl GRPOTrainingEngine {
                 filtered_rewards.clone(),
                 effective_group_size as i32,
                 loss_config,
+                Some(valid_indices.clone()),
             )
             .await?;
 
@@ -1385,24 +1392,29 @@ impl GRPOTrainingEngine {
     /// Send GenerateForTraining command and await plain data result.
     async fn dispatch_generate(
         &self,
-        prompts: &[ChatMessage],
+        prompts: &[Vec<ChatMessage>],
         group_size: usize,
         gen_config: GenerationConfig,
         enable_thinking: Option<bool>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<GenerationPlainData> {
         // ChatMessage doesn't implement Clone (contains Uint8Array), so we
-        // reconstruct the messages from their serializable fields. Images are
+        // reconstruct each message from its serializable fields. Images are
         // not used during training, so we drop them.
-        let owned_prompts: Vec<ChatMessage> = prompts
+        let owned_prompts: Vec<Vec<ChatMessage>> = prompts
             .iter()
-            .map(|m| ChatMessage {
-                role: m.role.clone(),
-                content: m.content.clone(),
-                tool_calls: m.tool_calls.clone(),
-                tool_call_id: m.tool_call_id.clone(),
-                reasoning_content: m.reasoning_content.clone(),
-                images: None, // Images not used in training
+            .map(|prompt_messages| {
+                prompt_messages
+                    .iter()
+                    .map(|m| ChatMessage {
+                        role: m.role.clone(),
+                        content: m.content.clone(),
+                        tool_calls: m.tool_calls.clone(),
+                        tool_call_id: m.tool_call_id.clone(),
+                        reasoning_content: m.reasoning_content.clone(),
+                        images: None, // Images not used in training
+                    })
+                    .collect()
             })
             .collect();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1454,6 +1466,7 @@ impl GRPOTrainingEngine {
         rewards: Vec<f64>,
         group_size: i32,
         loss_config: GRPOLossConfig,
+        valid_indices: Option<Vec<usize>>,
     ) -> Result<TrainStepPlainMetrics> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         match &self.dispatch {
@@ -1463,6 +1476,7 @@ impl GRPOTrainingEngine {
                         rewards,
                         group_size,
                         loss_config,
+                        valid_indices,
                         reply: tx,
                     })
                     .map_err(|_| Error::from_reason("Model thread exited"))?;
@@ -1473,6 +1487,7 @@ impl GRPOTrainingEngine {
                         rewards,
                         group_size,
                         loss_config,
+                        valid_indices,
                         reply: tx,
                     })
                     .map_err(|_| Error::from_reason("Model thread exited"))?;
@@ -1483,8 +1498,37 @@ impl GRPOTrainingEngine {
                         rewards,
                         group_size,
                         loss_config,
+                        valid_indices,
                         reply: tx,
                     })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+        }
+        rx.await
+            .map_err(|_| Error::from_reason("Model thread exited"))?
+    }
+
+    /// Send ClearGenerationCache command and await completion.
+    ///
+    /// Used by `train_step_auto`'s early-return paths (all-filtered and
+    /// no-valid-completions) to drop stale MxArrays on the model thread
+    /// before returning.
+    async fn dispatch_clear_generation_cache(&self) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match &self.dispatch {
+            TrainingDispatch::Qwen3(sender) => {
+                sender
+                    .send(Qwen3Cmd::ClearGenerationCache { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Dense(sender) => {
+                sender
+                    .send(Qwen35Cmd::ClearGenerationCache { reply: tx })
+                    .map_err(|_| Error::from_reason("Model thread exited"))?;
+            }
+            TrainingDispatch::Qwen35Moe(sender) => {
+                sender
+                    .send(Qwen35MoeCmd::ClearGenerationCache { reply: tx })
                     .map_err(|_| Error::from_reason("Model thread exited"))?;
             }
         }

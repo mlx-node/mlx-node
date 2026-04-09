@@ -207,7 +207,7 @@ pub(crate) enum Qwen3Cmd {
         reply: ResponseTx<()>,
     },
     GenerateForTraining {
-        prompts: Vec<crate::tokenizer::ChatMessage>,
+        prompts: Vec<Vec<crate::tokenizer::ChatMessage>>,
         group_size: usize,
         gen_config: super::GenerationConfig,
         enable_thinking: Option<bool>,
@@ -218,7 +218,11 @@ pub(crate) enum Qwen3Cmd {
         rewards: Vec<f64>,
         group_size: i32,
         loss_config: crate::grpo::loss::GRPOLossConfig,
+        valid_indices: Option<Vec<usize>>,
         reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
+    },
+    ClearGenerationCache {
+        reply: ResponseTx<()>,
     },
     TrainStepSFT {
         input_ids: Vec<i32>,
@@ -361,9 +365,21 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
             rewards,
             group_size,
             loss_config,
+            valid_indices,
             reply,
         } => {
-            let _ = reply.send(inner.train_step_grpo_sync(rewards, group_size, loss_config));
+            let _ = reply.send(inner.train_step_grpo_sync(
+                rewards,
+                group_size,
+                loss_config,
+                valid_indices,
+            ));
+        }
+        Qwen3Cmd::ClearGenerationCache { reply } => {
+            if let Some(ref mut ts) = inner.training_state {
+                ts.clear_generation_cache();
+            }
+            let _ = reply.send(Ok(()));
         }
         Qwen3Cmd::TrainStepSFT {
             input_ids,
@@ -2232,7 +2248,7 @@ impl Qwen3Inner {
     /// and returns plain data across the thread boundary.
     fn generate_for_training_thread_sync(
         &mut self,
-        prompts: Vec<ChatMessage>,
+        prompts: Vec<Vec<ChatMessage>>,
         group_size: usize,
         gen_config: super::GenerationConfig,
         enable_thinking: Option<bool>,
@@ -2244,65 +2260,72 @@ impl Qwen3Inner {
             .ok_or_else(|| napi::Error::from_reason("Tokenizer not available."))?
             .clone();
 
-        // Tokenize the prompt using Jinja2 chat template (supports tools + thinking)
-        let prompt_token_ids = tokenizer.apply_chat_template_sync(
-            &prompts,
-            Some(true),
-            tools.as_deref(),
-            enable_thinking,
-        )?;
+        let num_prompts = prompts.len();
+        let total_completions = num_prompts * group_size;
 
-        let prompt_array =
-            MxArray::from_uint32(&prompt_token_ids, &[1, prompt_token_ids.len() as i64])?;
-        let prompt_array_1d = prompt_array.squeeze(Some(&[0]))?;
-        let prompt_text = tokenizer.decode_sync(&prompt_token_ids, true)?;
-
-        let mut completion_texts = Vec::with_capacity(group_size);
-        let mut prompt_texts = Vec::with_capacity(group_size);
-        let mut completion_tokens_plain = Vec::with_capacity(group_size);
-        let mut completion_logprobs_plain = Vec::with_capacity(group_size);
-        let mut token_counts = Vec::with_capacity(group_size);
-        let mut finish_reasons = Vec::with_capacity(group_size);
+        let mut completion_texts = Vec::with_capacity(total_completions);
+        let mut prompt_texts = Vec::with_capacity(total_completions);
+        let mut completion_tokens_plain = Vec::with_capacity(total_completions);
+        let mut completion_logprobs_plain = Vec::with_capacity(total_completions);
+        let mut token_counts = Vec::with_capacity(total_completions);
+        let mut finish_reasons = Vec::with_capacity(total_completions);
 
         // Cache MxArrays for the training step
-        let mut cached_completion_tokens = Vec::with_capacity(group_size);
-        let mut cached_completion_logprobs = Vec::with_capacity(group_size);
+        let mut cached_prompt_tokens: Vec<MxArray> = Vec::with_capacity(num_prompts);
+        let mut cached_completion_tokens: Vec<MxArray> = Vec::with_capacity(total_completions);
+        let mut cached_completion_logprobs: Vec<MxArray> = Vec::with_capacity(total_completions);
 
-        // Generate G completions
-        for _g in 0..group_size {
-            let result =
-                self.generate_single_for_training_sync(&prompt_array, Some(gen_config.clone()))?;
+        for prompt_messages in prompts.iter() {
+            // Tokenize the prompt using Jinja2 chat template (supports tools + thinking)
+            let prompt_token_ids = tokenizer.apply_chat_template_sync(
+                prompt_messages,
+                Some(true),
+                tools.as_deref(),
+                enable_thinking,
+            )?;
 
-            // Extract plain data for crossing thread boundary
-            let tok_ids: Vec<i32> = result
-                .tokens
-                .to_uint32()?
-                .iter()
-                .map(|&t| t as i32)
-                .collect();
-            let lp_data: Vec<f32> = result.logprobs.to_float32()?.to_vec();
-            let decoded = tokenizer
-                .decode_sync(&tok_ids.iter().map(|&t| t as u32).collect::<Vec<_>>(), true)?;
+            let prompt_array =
+                MxArray::from_uint32(&prompt_token_ids, &[1, prompt_token_ids.len() as i64])?;
+            let prompt_array_1d = prompt_array.squeeze(Some(&[0]))?;
+            let prompt_text = tokenizer.decode_sync(&prompt_token_ids, true)?;
 
-            completion_texts.push(decoded);
-            prompt_texts.push(prompt_text.clone());
-            completion_tokens_plain.push(tok_ids);
-            completion_logprobs_plain.push(lp_data);
-            token_counts.push(result.num_tokens as u32);
-            finish_reasons.push(result.finish_reason.clone());
+            // Generate group_size completions for this prompt
+            for _g in 0..group_size {
+                let result = self
+                    .generate_single_for_training_sync(&prompt_array, Some(gen_config.clone()))?;
 
-            // Cache MxArrays (these stay on the model thread)
-            cached_completion_tokens.push(result.tokens);
-            cached_completion_logprobs.push(result.logprobs);
+                // Extract plain data for crossing thread boundary
+                let tok_ids: Vec<i32> = result
+                    .tokens
+                    .to_uint32()?
+                    .iter()
+                    .map(|&t| t as i32)
+                    .collect();
+                let lp_data: Vec<f32> = result.logprobs.to_float32()?.to_vec();
+                let decoded = tokenizer
+                    .decode_sync(&tok_ids.iter().map(|&t| t as u32).collect::<Vec<_>>(), true)?;
 
-            // Clean up between completions to prevent Metal context accumulation
-            heavy_cleanup();
+                completion_texts.push(decoded);
+                prompt_texts.push(prompt_text.clone());
+                completion_tokens_plain.push(tok_ids);
+                completion_logprobs_plain.push(lp_data);
+                token_counts.push(result.num_tokens as u32);
+                finish_reasons.push(result.finish_reason.clone());
+
+                // Cache MxArrays (these stay on the model thread)
+                cached_completion_tokens.push(result.tokens);
+                cached_completion_logprobs.push(result.logprobs);
+
+                // Clean up between completions to prevent Metal context accumulation
+                heavy_cleanup();
+            }
+
+            cached_prompt_tokens.push(prompt_array_1d);
         }
 
-        // Store cached MxArrays in training_state
+        // Store cached MxArrays in training_state (prompt-major layout)
         if let Some(ref mut ts) = self.training_state {
-            // For single-prompt generate, we store one prompt entry
-            ts.cached_prompt_tokens = Some(vec![prompt_array_1d]);
+            ts.cached_prompt_tokens = Some(cached_prompt_tokens);
             ts.cached_completion_tokens = Some(cached_completion_tokens);
             ts.cached_completion_logprobs = Some(cached_completion_logprobs);
         }
@@ -2608,6 +2631,7 @@ impl Qwen3Inner {
         rewards: Vec<f64>,
         group_size: i32,
         loss_config: crate::grpo::loss::GRPOLossConfig,
+        valid_indices: Option<Vec<usize>>,
     ) -> Result<crate::training_model::TrainStepPlainMetrics> {
         use crate::array::memory::{get_active_memory, get_peak_memory, reset_peak_memory};
         use crate::grpo::advantages::compute_advantages;
@@ -2645,10 +2669,30 @@ impl Qwen3Inner {
         let params = self.get_parameters_sync()?;
         let model_type = ModelType::Qwen3(self.config.clone());
 
-        // Compute loss and gradients
+        // Build completion/logprob refs, optionally filtering by valid_indices from
+        // the engine's degenerate-completion filter. prompt_refs always has one
+        // entry per prompt — the autograd function expands them to one per
+        // completion via repeat_n(group_size), so the `group_size` passed here
+        // must be the effective group size after filtering (the engine computes
+        // effective_group_size = valid_indices.len() / num_prompts).
         let prompt_refs: Vec<&MxArray> = prompt_tokens.iter().collect();
-        let completion_refs: Vec<&MxArray> = completion_tokens.iter().collect();
-        let logprob_refs: Vec<&MxArray> = completion_logprobs.iter().collect();
+        let (completion_refs, logprob_refs): (Vec<&MxArray>, Vec<&MxArray>) =
+            if let Some(ref indices) = valid_indices {
+                let c: Vec<&MxArray> = indices
+                    .iter()
+                    .filter_map(|&i| completion_tokens.get(i))
+                    .collect();
+                let l: Vec<&MxArray> = indices
+                    .iter()
+                    .filter_map(|&i| completion_logprobs.get(i))
+                    .collect();
+                (c, l)
+            } else {
+                (
+                    completion_tokens.iter().collect(),
+                    completion_logprobs.iter().collect(),
+                )
+            };
 
         let (loss_value, gradients) = compute_loss_and_gradients_autograd(
             &model_type,
@@ -2858,14 +2902,8 @@ impl Qwen3Inner {
             variance.sqrt()
         };
 
-        // Clear cached generation data
-        if let Some(ref mut ts) = self.training_state {
-            ts.clear_generation_cache();
-        }
-
-        // CRITICAL: heavy_cleanup after autograd to clear compiled graph cache
-        heavy_cleanup();
-
+        // Count tokens BEFORE clearing the cache — otherwise total_tokens is
+        // always zero on the success path.
         let ts = self.training_state.as_ref().unwrap();
         let total_tokens: i32 = if let Some(ref ct) = ts.cached_completion_tokens {
             ct.iter()
@@ -2876,6 +2914,15 @@ impl Qwen3Inner {
             0
         };
 
+        // Clear cached generation data
+        if let Some(ref mut ts) = self.training_state {
+            ts.clear_generation_cache();
+        }
+
+        // CRITICAL: heavy_cleanup after autograd to clear compiled graph cache
+        heavy_cleanup();
+
+        let ts = self.training_state.as_ref().unwrap();
         Ok(crate::training_model::TrainStepPlainMetrics {
             loss: loss_value,
             gradients_applied,

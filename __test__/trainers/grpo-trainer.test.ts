@@ -458,6 +458,21 @@ describe.sequential('GRPOTrainer - trainStep()', () => {
       expect(metrics).toBeDefined();
       expect(metrics.totalTokens).toBeGreaterThan(0);
       expect(isFinite(metrics.loss)).toBe(true);
+
+      // Second trainStep with DIFFERENT prompts. This catches the B1 regression
+      // where the generation cache would silently hold the wrong prompts after
+      // the per-prompt dispatch loop overwrote it each iteration.
+      const otherPromptMessages = [
+        [{ role: 'user' as const, content: 'Another question A' }],
+        [{ role: 'user' as const, content: 'Another question B' }],
+      ];
+
+      const metrics2 = await trainer.trainStep(otherPromptMessages);
+
+      expect(metrics2).toBeDefined();
+      expect(metrics2.totalTokens).toBeGreaterThan(0);
+      expect(isFinite(metrics2.loss)).toBe(true);
+      expect(metrics2.step).toBe(metrics.step + 1);
     });
   });
 
