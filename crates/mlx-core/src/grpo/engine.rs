@@ -348,6 +348,10 @@ struct EngineState {
     consecutive_nan_count: u32,
     /// Flag indicating an emergency checkpoint should be saved
     needs_emergency_save: bool,
+    /// Lifecycle generation — bumped by `reset()` so an in-flight
+    /// `train_step*()` can detect that its stale post-await writeback would
+    /// resurrect cleared state and skip the update.
+    generation: u64,
 }
 
 impl Default for EngineState {
@@ -363,6 +367,7 @@ impl Default for EngineState {
             nan_gradient_count: 0,
             consecutive_nan_count: 0,
             needs_emergency_save: false,
+            generation: 0,
         }
     }
 }
@@ -622,6 +627,18 @@ impl GRPOTrainingEngine {
         let generation_start = std::time::Instant::now();
         let gen_config = self.build_gen_config();
 
+        // Snapshot the lifecycle generation before any await points so that
+        // if `reset()` runs concurrently, our stale post-await writeback is
+        // discarded and does not resurrect cleared state.
+        let start_generation = {
+            self.state
+                .read()
+                .map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
+                })?
+                .generation
+        };
+
         // === Phase 1: Generate completions via model thread (single batched call) ===
         let gen_data = self
             .dispatch_generate(
@@ -646,45 +663,44 @@ impl GRPOTrainingEngine {
 
         let training_time_ms = training_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Update engine state from model thread metrics
-        {
-            let mut state = self.state.write().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-            })?;
-            state.step = metrics.step;
-            state.epoch_steps += 1;
-
-            // Mirror NaN tracking
-            state.nan_gradient_count = metrics.nan_gradient_count;
-
-            // Check emergency save threshold
-            if !metrics.gradients_applied && metrics.nan_gradient_count > 0 {
-                state.consecutive_nan_count += 1;
-                let emergency_threshold = self.config.emergency_save_threshold.unwrap_or(5) as u32;
-                if state.consecutive_nan_count >= emergency_threshold && !state.needs_emergency_save
-                {
-                    state.needs_emergency_save = true;
-                    warn!(
-                        "Emergency save triggered: {} consecutive steps with NaN/Inf gradients",
-                        state.consecutive_nan_count
-                    );
-                }
-            } else {
-                state.consecutive_nan_count = 0;
-            }
-        }
-
         // Compute reward stats (plain data, safe on NAPI thread)
         let (mean_reward, std_reward) = compute_reward_stats(&rewards);
 
-        // Update epoch accumulators
+        // Update engine state from model thread metrics — gated on generation
+        // so a concurrent reset wins cleanly.
         {
             let mut state = self.state.write().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire state write lock")
             })?;
-            state.epoch_loss_sum += metrics.loss;
-            state.epoch_reward_sum += mean_reward;
-            state.epoch_tokens += total_tokens as i64;
+            if state.generation == start_generation {
+                state.step = metrics.step;
+                state.epoch_steps += 1;
+
+                // Mirror NaN tracking
+                state.nan_gradient_count = metrics.nan_gradient_count;
+
+                // Check emergency save threshold
+                if !metrics.gradients_applied && metrics.nan_gradient_count > 0 {
+                    state.consecutive_nan_count += 1;
+                    let emergency_threshold =
+                        self.config.emergency_save_threshold.unwrap_or(5) as u32;
+                    if state.consecutive_nan_count >= emergency_threshold
+                        && !state.needs_emergency_save
+                    {
+                        state.needs_emergency_save = true;
+                        warn!(
+                            "Emergency save triggered: {} consecutive steps with NaN/Inf gradients",
+                            state.consecutive_nan_count
+                        );
+                    }
+                } else {
+                    state.consecutive_nan_count = 0;
+                }
+
+                state.epoch_loss_sum += metrics.loss;
+                state.epoch_reward_sum += mean_reward;
+                state.epoch_tokens += total_tokens as i64;
+            }
         }
 
         Ok(EngineStepMetrics {
@@ -813,6 +829,17 @@ impl GRPOTrainingEngine {
 
         let training_start = std::time::Instant::now();
 
+        // Snapshot the lifecycle generation before the train_step await so
+        // any concurrent reset wins cleanly.
+        let start_generation = {
+            self.state
+                .read()
+                .map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
+                })?
+                .generation
+        };
+
         // Dispatch train step to model thread (uses cached MxArrays from generate phase)
         let loss_config = self.build_loss_config(num_prompts, group_size);
         let metrics = self
@@ -821,38 +848,36 @@ impl GRPOTrainingEngine {
 
         let training_time_ms = training_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Update engine state
-        {
-            let mut state = self.state.write().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-            })?;
-            state.step = metrics.step;
-            state.epoch_steps += 1;
-            state.nan_gradient_count = metrics.nan_gradient_count;
-
-            if !metrics.gradients_applied && metrics.nan_gradient_count > 0 {
-                state.consecutive_nan_count += 1;
-                let emergency_threshold = self.config.emergency_save_threshold.unwrap_or(5) as u32;
-                if state.consecutive_nan_count >= emergency_threshold && !state.needs_emergency_save
-                {
-                    state.needs_emergency_save = true;
-                }
-            } else {
-                state.consecutive_nan_count = 0;
-            }
-        }
-
         let (mean_reward, std_reward) = compute_reward_stats(&rewards);
         let total_tokens: i32 = generation_result.completion_lengths.iter().sum();
 
-        // Update epoch accumulators
+        // Update engine state — gated on generation.
         {
             let mut state = self.state.write().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire state write lock")
             })?;
-            state.epoch_loss_sum += metrics.loss;
-            state.epoch_reward_sum += mean_reward;
-            state.epoch_tokens += total_tokens as i64;
+            if state.generation == start_generation {
+                state.step = metrics.step;
+                state.epoch_steps += 1;
+                state.nan_gradient_count = metrics.nan_gradient_count;
+
+                if !metrics.gradients_applied && metrics.nan_gradient_count > 0 {
+                    state.consecutive_nan_count += 1;
+                    let emergency_threshold =
+                        self.config.emergency_save_threshold.unwrap_or(5) as u32;
+                    if state.consecutive_nan_count >= emergency_threshold
+                        && !state.needs_emergency_save
+                    {
+                        state.needs_emergency_save = true;
+                    }
+                } else {
+                    state.consecutive_nan_count = 0;
+                }
+
+                state.epoch_loss_sum += metrics.loss;
+                state.epoch_reward_sum += mean_reward;
+                state.epoch_tokens += total_tokens as i64;
+            }
         }
 
         Ok(EngineStepMetrics {
@@ -898,6 +923,19 @@ impl GRPOTrainingEngine {
 
         let generation_start = std::time::Instant::now();
         let gen_config = self.build_gen_config();
+
+        // Snapshot the lifecycle generation before any await points so that
+        // if `reset()` / `restore_state()` runs concurrently, our stale
+        // post-await writebacks are discarded and do not resurrect cleared
+        // state.
+        let start_generation = {
+            self.state
+                .read()
+                .map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
+                })?
+                .generation
+        };
 
         // === Phase 1: Generate completions via model thread ===
         info!(
@@ -1047,14 +1085,16 @@ impl GRPOTrainingEngine {
 
             // Bump ts.step on the model thread (it's the single source of truth)
             // and drop stale MxArrays in the same round-trip. Mirror the result
-            // into the engine's read-through cache.
+            // into the engine's read-through cache — gated on generation.
             let current_step = self.dispatch_bump_skipped_step().await?;
 
             {
                 let mut state = self.state.write().map_err(|_| {
                     Error::new(Status::GenericFailure, "Failed to acquire state write lock")
                 })?;
-                state.step = current_step;
+                if state.generation == start_generation {
+                    state.step = current_step;
+                }
             }
 
             let (mean_reward, std_reward) = compute_reward_stats(&rewards);
@@ -1100,14 +1140,16 @@ impl GRPOTrainingEngine {
 
             // Bump ts.step on the model thread (it's the single source of truth)
             // and drop stale MxArrays in the same round-trip. Mirror the result
-            // into the engine's read-through cache.
+            // into the engine's read-through cache — gated on generation.
             let current_step = self.dispatch_bump_skipped_step().await?;
 
             {
                 let mut state = self.state.write().map_err(|_| {
                     Error::new(Status::GenericFailure, "Failed to acquire state write lock")
                 })?;
-                state.step = current_step;
+                if state.generation == start_generation {
+                    state.step = current_step;
+                }
             }
 
             let (mean_reward, std_reward) = compute_reward_stats(&rewards);
@@ -1177,38 +1219,37 @@ impl GRPOTrainingEngine {
 
         let training_time_ms = training_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Update engine state
-        {
-            let mut state = self.state.write().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire state write lock")
-            })?;
-            state.step = metrics.step;
-            state.epoch_steps += 1;
-            state.nan_gradient_count = metrics.nan_gradient_count;
-
-            if !metrics.gradients_applied && metrics.nan_gradient_count > 0 {
-                state.consecutive_nan_count += 1;
-                let emergency_threshold = self.config.emergency_save_threshold.unwrap_or(5) as u32;
-                if state.consecutive_nan_count >= emergency_threshold && !state.needs_emergency_save
-                {
-                    state.needs_emergency_save = true;
-                }
-            } else {
-                state.consecutive_nan_count = 0;
-            }
-        }
-
         let (mean_reward, std_reward) = compute_reward_stats(&filtered_rewards);
         let total_tokens: u32 = all_token_counts.iter().sum();
 
-        // Update epoch accumulators
+        // Update engine state — gated on generation so a concurrent
+        // reset wins cleanly.
         {
             let mut state = self.state.write().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire state write lock")
             })?;
-            state.epoch_loss_sum += metrics.loss;
-            state.epoch_reward_sum += mean_reward;
-            state.epoch_tokens += total_tokens as i64;
+            if state.generation == start_generation {
+                state.step = metrics.step;
+                state.epoch_steps += 1;
+                state.nan_gradient_count = metrics.nan_gradient_count;
+
+                if !metrics.gradients_applied && metrics.nan_gradient_count > 0 {
+                    state.consecutive_nan_count += 1;
+                    let emergency_threshold =
+                        self.config.emergency_save_threshold.unwrap_or(5) as u32;
+                    if state.consecutive_nan_count >= emergency_threshold
+                        && !state.needs_emergency_save
+                    {
+                        state.needs_emergency_save = true;
+                    }
+                } else {
+                    state.consecutive_nan_count = 0;
+                }
+
+                state.epoch_loss_sum += metrics.loss;
+                state.epoch_reward_sum += mean_reward;
+                state.epoch_tokens += total_tokens as i64;
+            }
         }
 
         let step_metrics = EngineStepMetrics {
@@ -1336,7 +1377,12 @@ impl GRPOTrainingEngine {
             .write()
             .map_err(|_| Error::new(Status::GenericFailure, "Failed to acquire state lock"))?;
 
+        // Preserve-and-bump the lifecycle generation so any in-flight
+        // `train_step*()` with a stale `start_generation` skips its
+        // post-await writeback and doesn't resurrect cleared state.
+        let next_generation = state.generation.wrapping_add(1);
         *state = EngineState::default();
+        state.generation = next_generation;
 
         info!("Training engine reset");
         Ok(())

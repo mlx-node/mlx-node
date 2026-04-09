@@ -146,6 +146,10 @@ struct EngineState {
     consecutive_nan_count: u32,
     /// Flag indicating an emergency checkpoint should be saved
     needs_emergency_save: bool,
+    /// Lifecycle generation — bumped by `reset()` / `restore_state()` so an
+    /// in-flight `train_step()` can detect that its stale post-await
+    /// writeback would resurrect cleared/restored state and skip the update.
+    generation: u64,
 }
 
 impl Default for EngineState {
@@ -160,6 +164,7 @@ impl Default for EngineState {
             nan_gradient_count: 0,
             consecutive_nan_count: 0,
             needs_emergency_save: false,
+            generation: 0,
         }
     }
 }
@@ -316,6 +321,19 @@ impl SftTrainingEngine {
 
         let config = self.config.clone();
 
+        // Snapshot the lifecycle generation before dispatching so that if
+        // reset() or restore_state() lands while we're awaiting the model
+        // thread, the stale writeback below is dropped instead of resurrecting
+        // cleared state.
+        let start_generation = {
+            self.state
+                .read()
+                .map_err(|_| {
+                    Error::new(Status::GenericFailure, "Failed to acquire state read lock")
+                })?
+                .generation
+        };
+
         // Dispatch to model thread
         let metrics = self
             .dispatch_train_step_sft(ids_data, ids_shape, labels_data, labels_shape, config)
@@ -328,31 +346,35 @@ impl SftTrainingEngine {
             let mut state = self.state.write().map_err(|_| {
                 Error::new(Status::GenericFailure, "Failed to acquire state write lock")
             })?;
-            state.step = metrics.step;
-            state.epoch_steps += 1;
+            if state.generation == start_generation {
+                state.step = metrics.step;
+                state.epoch_steps += 1;
 
-            // Mirror NaN tracking
-            state.nan_gradient_count = metrics.nan_gradient_count;
+                // Mirror NaN tracking
+                state.nan_gradient_count = metrics.nan_gradient_count;
 
-            // Check emergency save threshold
-            if !metrics.gradients_applied && metrics.nan_gradient_count > 0 {
-                state.consecutive_nan_count += 1;
-                let emergency_threshold = self.config.emergency_save_threshold.unwrap_or(5) as u32;
-                if state.consecutive_nan_count >= emergency_threshold && !state.needs_emergency_save
-                {
-                    state.needs_emergency_save = true;
-                    warn!(
-                        "Emergency save triggered: {} consecutive steps with NaN/Inf gradients",
-                        state.consecutive_nan_count
-                    );
+                // Check emergency save threshold
+                if !metrics.gradients_applied && metrics.nan_gradient_count > 0 {
+                    state.consecutive_nan_count += 1;
+                    let emergency_threshold =
+                        self.config.emergency_save_threshold.unwrap_or(5) as u32;
+                    if state.consecutive_nan_count >= emergency_threshold
+                        && !state.needs_emergency_save
+                    {
+                        state.needs_emergency_save = true;
+                        warn!(
+                            "Emergency save triggered: {} consecutive steps with NaN/Inf gradients",
+                            state.consecutive_nan_count
+                        );
+                    }
+                } else {
+                    state.consecutive_nan_count = 0;
                 }
-            } else {
-                state.consecutive_nan_count = 0;
-            }
 
-            // Update epoch accumulators
-            state.epoch_loss_sum += metrics.loss;
-            state.epoch_tokens += metrics.total_tokens as i64;
+                // Update epoch accumulators
+                state.epoch_loss_sum += metrics.loss;
+                state.epoch_tokens += metrics.total_tokens as i64;
+            }
         }
 
         Ok(SftStepMetrics {
@@ -538,7 +560,12 @@ impl SftTrainingEngine {
             .state
             .write()
             .map_err(|_| Error::new(Status::GenericFailure, "Lock error"))?;
+        // Preserve-and-bump the lifecycle generation so any in-flight
+        // train_step() that resumes after this reset detects the change
+        // and skips its stale writeback.
+        let next_generation = state.generation.wrapping_add(1);
         *state = EngineState::default();
+        state.generation = next_generation;
         info!("Training state reset");
         Ok(())
     }
@@ -560,6 +587,10 @@ impl SftTrainingEngine {
             .map_err(|_| Error::new(Status::GenericFailure, "Lock error"))?;
         state.step = step;
         state.epoch = epoch;
+        // Bump the lifecycle generation so any in-flight `train_step()` with
+        // a stale `start_generation` skips its post-await writeback and
+        // doesn't clobber the restored step/epoch.
+        state.generation = state.generation.wrapping_add(1);
         info!("Restored training state: step={}, epoch={}", step, epoch);
         Ok(())
     }
