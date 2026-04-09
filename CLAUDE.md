@@ -4,6 +4,10 @@ MLX-Node brings Apple's MLX library to Node.js with Metal GPU acceleration (plus
 
 ## References
 
+### MLX Source (Single Source of Truth)
+
+`crates/mlx-sys/mlx` is a **symlink** to `/Users/brooklyn/workspace/github/mlx` — NOT a git submodule. All MLX C++ changes, including the WebGPU backend, are made in `/Users/brooklyn/workspace/github/mlx` and automatically picked up by the WASM build. Never re-initialize this as a submodule. The symlink is in `.gitignore`.
+
 There are already some wild used inference implementations for your reference:
 
 - ./mlx-lm, the MLX inference Python library from the official MLX team

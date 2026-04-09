@@ -215,3 +215,6 @@ __pycache__/
 *.metallib
 .vite-agent
 /Model-Optimizer
+
+# MLX source is a local symlink, not tracked in git
+crates/mlx-sys/mlx

@@ -1,3 +1,0 @@
-[submodule "crates/mlx-sys/mlx"]
-	path = crates/mlx-sys/mlx
-	url = https://github.com/mlx-node/mlx.git
