@@ -259,6 +259,33 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
     model = Qwen35Model.loadFromGpuBuffers(configJson, gpuTensors, tokenizerJson, tokenizerConfigJson);
     post({ type: 'progress', step: 'init_model', message: `Model ready (${(performance.now() - t1).toFixed(0)}ms)` });
 
+    // 6. Pipeline warmup: run a minimal inference to force WebGPU shader
+    // compilation for every kernel used in the decode hot path. Without this,
+    // the first user-visible inference pays 100-300ms of pipeline compilation
+    // on the critical path (TTFT). Warmup uses a 1-token prompt and 2 output
+    // tokens — enough to exercise prompt+decode code paths once.
+    try {
+      post({ type: 'progress', step: 'warmup', message: 'Warming up pipelines...' });
+      const t2 = performance.now();
+      const warmupFn = model.chatSync || model.chat_sync || model.chat;
+      warmupFn.call(
+        model,
+        [{ role: 'user', content: 'hi' }],
+        {
+          enableThinking: false,
+          reportPerformance: false,
+          maxNewTokens: 2,
+          max_new_tokens: 2,
+          temperature: 0,
+        },
+      );
+      post({ type: 'progress', step: 'warmup', message: `Warmup done (${(performance.now() - t2).toFixed(0)}ms)` });
+    } catch (warmupErr) {
+      // Non-fatal: if warmup fails, first user inference just pays the
+      // compilation cost instead. Log and continue.
+      post({ type: 'progress', step: 'warmup', message: `Warmup skipped: ${String(warmupErr)}` });
+    }
+
     post({ type: 'ready' });
   } catch (e) {
     post({ type: 'error', message: String(e), stack: (e instanceof Error) ? e.stack : undefined });
