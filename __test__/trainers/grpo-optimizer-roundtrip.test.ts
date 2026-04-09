@@ -32,10 +32,20 @@
  * `tokens >= 0.9 * max_completion_length`), `train_step_grpo_sync` is never
  * called, the optimizer state map stays empty, and
  * `save_optimizer_state_sync` takes the `keys.is_empty()` early return
- * without writing a file. The test then passes vacuously — the save appears
- * to succeed, `hasOptimizerState` is set to `true` by `saveCheckpoint`
- * unconditionally, the resume-path `try/catch` swallows the missing file,
- * and nothing actually exercises the optimizer-state round-trip.
+ * without writing a file. In this scenario the optimizer-state round-trip
+ * is not exercised at all.
+ *
+ * After task H3 (fix saveCheckpoint hasOptimizerState lie), `saveCheckpoint`
+ * checks whether the safetensors file actually exists on disk after
+ * `saveOptimizerState` returns and only sets `hasOptimizerState=true` when a
+ * file is present. So if this test accidentally degrades into the no-op
+ * path, the `expect(stateJson.hasOptimizerState).toBe(true)` assertion below
+ * will fail loudly instead of vacuously passing. The resume path in
+ * `GRPOTrainer.create` also no longer swallows a missing optimizer file —
+ * if `hasOptimizerState` is true and the file is missing, resume throws
+ * immediately. A separate test case below (`does not claim hasOptimizerState
+ * when no training step has run`) pins the no-op path so the fix stays
+ * fixed.
  *
  * To force the pipeline to actually populate optimizer state we need three
  * things:
@@ -434,5 +444,93 @@ describe.sequential('GRPOTrainer checkpoint + optimizer state round-trip', () =>
           attemptErrors.join('\n'),
       );
     }
+  });
+
+  // Lock-in test for task H3 (fix saveCheckpoint hasOptimizerState lie).
+  //
+  // Before the fix, `saveCheckpoint` unconditionally set
+  // `state.hasOptimizerState = true` whenever `engine.saveOptimizerState()`
+  // returned successfully. But `save_optimizer_state_sync` on the Rust side
+  // legitimately returns `Ok(())` without writing a file in two cases:
+  //   (a) SGD / no optimizer configured.
+  //   (b) AdamW configured but no training step has ever populated the
+  //       state map (e.g. we checkpoint right after construction, or every
+  //       rollout was filtered by the degenerate-completion filter).
+  //
+  // This test exercises case (b): construct a trainer, save a checkpoint
+  // WITHOUT running any training step, and verify that:
+  //   1. `optimizer_state.safetensors` does NOT exist on disk
+  //   2. `training_state.json` has `hasOptimizerState === false`
+  //   3. Resuming from that checkpoint does NOT throw (because the flag
+  //      correctly says there is nothing to restore), and does not try
+  //      to read the missing file.
+  it('does not claim hasOptimizerState when no training step has run', async () => {
+    const tempModel = await createTempModel();
+    const checkpointDir = mkdtempSync(join(tmpdir(), 'mlx-grpo-opt-noop-'));
+    cleanups.push(() => {
+      try {
+        tempModel.cleanup();
+      } catch (err) {
+        console.warn('Failed to cleanup temp model:', err);
+      }
+      if (existsSync(checkpointDir)) {
+        try {
+          rmSync(checkpointDir, { recursive: true, force: true });
+        } catch (err) {
+          console.warn(`Failed to cleanup checkpoint dir ${checkpointDir}:`, err);
+        }
+      }
+    });
+
+    const loaded = await loadModel(tempModel.modelPath);
+    expect(loaded).toBeInstanceOf(Qwen3Model);
+    const model = loaded as unknown as Qwen3Model;
+
+    const trainerOptions = {
+      modelName: 'qwen3-tiny-noop-save',
+      modelPath: tempModel.modelPath,
+      groupSize: 2,
+      maxCompletionLength: 16,
+      learningRate: 0,
+      rewardFunction: constantReward,
+      logConsole: false,
+      outputDir: checkpointDir,
+    } as const;
+
+    const trainer = new GRPOTrainer(model, trainerOptions);
+
+    // Save a checkpoint WITHOUT running any training step. AdamW's state
+    // map is empty at this point (init_state is only called the first time
+    // `update_batch` sees a parameter name, which happens inside
+    // `train_step_grpo_sync`). So `save_optimizer_state_sync` will take the
+    // `keys.is_empty()` early return and NOT write a file.
+    const checkpointName = 'checkpoint-0';
+    const checkpointPath = await trainer.saveCheckpoint(checkpointName);
+    expect(checkpointPath).toBe(join(checkpointDir, checkpointName));
+
+    // Verify the safetensors file was NOT written.
+    const optimizerStatePath = join(checkpointPath, 'optimizer_state.safetensors');
+    expect(
+      existsSync(optimizerStatePath),
+      'optimizer_state.safetensors must NOT exist when no training step has populated AdamW moments',
+    ).toBe(false);
+
+    // And the JSON flag must reflect reality.
+    const stateJson: TrainingStateJson = JSON.parse(readFileSync(join(checkpointPath, 'training_state.json'), 'utf-8'));
+    expect(
+      stateJson.hasOptimizerState,
+      'saveCheckpoint must NOT claim hasOptimizerState=true when no file was written',
+    ).toBe(false);
+
+    // Resume path: hasOptimizerState=false means the resume code must NOT
+    // attempt to load the missing file. Before task H3 this path was gated
+    // correctly already, but the *value* of the flag was wrong. With the fix,
+    // resume must succeed without throwing on a missing optimizer file,
+    // precisely because `hasOptimizerState` is honestly reported as false.
+    const trainerResumed = await GRPOTrainer.create({
+      ...trainerOptions,
+      resumeFromCheckpoint: checkpointPath,
+    });
+    expect(trainerResumed.getStep()).toBe(0);
   });
 });

@@ -1054,14 +1054,33 @@ export class GRPOTrainer<T = unknown> {
         );
       }
 
-      // Restore optimizer state if available
-      if (resumedState.hasOptimizerState) {
+      // Restore optimizer state if available.
+      //
+      // If the checkpoint claims it has optimizer state (`hasOptimizerState`
+      // set by `saveCheckpoint` only after verifying the file exists on
+      // disk), any problem loading it is a HARD ERROR: the alternative is to
+      // silently continue with a fresh optimizer, which masks corruption and
+      // leaves the user wondering why their training dynamics drifted after
+      // a resume. Missing file => corrupt checkpoint; throw failure =>
+      // corrupt checkpoint. Either way, fail loud.
+      if (resumedState.hasOptimizerState === true) {
         const optimizerStatePath = join(modelPath, 'optimizer_state.safetensors');
+        if (!existsSync(optimizerStatePath)) {
+          throw new Error(
+            `Corrupt checkpoint at ${modelPath}: training_state.json declares ` +
+              `hasOptimizerState=true but ${optimizerStatePath} does not exist. ` +
+              `Refusing to silently continue with a fresh optimizer.`,
+          );
+        }
         try {
           await trainer.engine.loadOptimizerState(optimizerStatePath);
           logger.info(`Restored optimizer state from checkpoint`);
         } catch (e) {
-          logger.warn(`Failed to restore optimizer state: ${String(e)}`);
+          throw new Error(
+            `Failed to restore optimizer state from ${optimizerStatePath}: ${String(e)}. ` +
+              `Refusing to silently continue with a fresh optimizer on a checkpoint that ` +
+              `declared hasOptimizerState=true.`,
+          );
         }
       }
 
@@ -1913,14 +1932,47 @@ export class GRPOTrainer<T = unknown> {
     }
 
     // Save optimizer state (AdamW moments + step counter)
+    //
+    // NOTE: `save_optimizer_state_sync` on the Rust side intentionally returns
+    // `Ok(())` WITHOUT writing a file in two cases (see
+    // crates/mlx-core/src/training_state.rs):
+    //   1. No optimizer configured (SGD path — `self.optimizer.is_none()`).
+    //   2. AdamW configured but the state map is empty because no training
+    //      step has ever run through `update_batch` (e.g. checkpoint taken
+    //      before any trainStep, or every rollout was filtered by the
+    //      degenerate-completion filter).
+    //
+    // Those are legitimate no-ops on the Rust side, but the TS trainer MUST
+    // NOT lie about disk state: `hasOptimizerState` is the flag the resume
+    // path reads to decide whether to call `loadOptimizerState`, and if we
+    // set it to `true` when no file exists, the resume path will try to load
+    // a missing file and mask real errors. So we check disk truth after the
+    // save completes and only claim `hasOptimizerState` when a file is
+    // actually there.
+    const optimizerStatePath = join(checkpointPath, 'optimizer_state.safetensors');
     try {
-      await this.engine.saveOptimizerState(join(checkpointPath, 'optimizer_state.safetensors'));
-      state.hasOptimizerState = true;
-      // Re-write training_state.json with updated hasOptimizerState flag
+      await this.engine.saveOptimizerState(optimizerStatePath);
+      const wroteOptimizerState = existsSync(optimizerStatePath);
+      state.hasOptimizerState = wroteOptimizerState;
+      if (!wroteOptimizerState) {
+        // Expected when SGD is configured or no training step has populated
+        // AdamW moments yet — logged at debug so it doesn't spam normal runs
+        // but is still discoverable from -vv traces.
+        this.logger.debug(
+          `saveOptimizerState returned ok but no file at ${optimizerStatePath} ` +
+            `(SGD or empty AdamW state); hasOptimizerState=false`,
+        );
+      }
+      // Re-write training_state.json with the accurate hasOptimizerState flag
       writeFileSync(statePath, JSON.stringify(state, null, 2));
     } catch (e) {
-      // Non-fatal: training can continue without optimizer state on resume
+      // A thrown error from saveOptimizerState is a real save failure (not the
+      // legitimate no-op path above). Leave hasOptimizerState at its default
+      // (false) so resume doesn't try to load a file that may be missing or
+      // partially written. Log loud — real save failures should be visible.
       this.logger.warn(`Failed to save optimizer state: ${String(e)}`);
+      state.hasOptimizerState = false;
+      writeFileSync(statePath, JSON.stringify(state, null, 2));
     }
 
     this.logger.info(`Checkpoint saved: ${checkpointPath}`);
