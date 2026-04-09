@@ -1629,6 +1629,11 @@ impl Qwen35MoeInner {
         config: crate::grpo::engine::GRPOEngineConfig,
         _model_type: crate::training_model::ModelType,
     ) -> Result<()> {
+        if self.training_state.is_some() {
+            return Err(napi::Error::from_reason(
+                "Training state already initialized. A single model thread can host only one active training run.",
+            ));
+        }
         let optimizer = if config.optimizer_type.as_deref().unwrap_or("adamw") == "adamw" {
             Some(crate::optimizers::AdamW::new(
                 config.learning_rate,
