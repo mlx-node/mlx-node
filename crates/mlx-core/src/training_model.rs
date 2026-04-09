@@ -84,6 +84,11 @@ impl ModelType {
 /// `calculate_memory_size`, and `save_model_sync` exist on concrete model types
 /// but are NOT in this trait — engines call them on the concrete types before
 /// wrapping in `TrainableModelEnum`.
+///
+/// NOTE: With Phase 3 migration, GRPOTrainingEngine no longer uses this trait
+/// (routes through model thread commands instead). Kept for SFT engine and
+/// potential future use. Will be cleaned up in Phase 5/6.
+#[allow(dead_code)]
 pub(crate) trait TrainableModel: Send + Sync {
     /// Extract all trainable parameters as a name→array map.
     fn get_parameters(&self) -> Result<HashMap<String, MxArray>>;
@@ -127,6 +132,8 @@ pub(crate) trait TrainableModel: Send + Sync {
 /// Enum wrapping all trainable model types.
 ///
 /// Stored inside training engines to allow model-agnostic training.
+/// NOTE: No longer used by GRPOTrainingEngine (Phase 3). Kept for SFT engine.
+#[allow(dead_code)]
 pub(crate) enum TrainableModelEnum {
     Qwen3(Qwen3Model),
     Qwen35Dense(Qwen3_5Model),
@@ -192,7 +199,6 @@ impl TrainableModel for TrainableModelEnum {
 /// Plain generation results that cross the thread boundary.
 /// No MxArrays — only plain Rust types (Vec<u32>, Vec<f32>, String, etc.).
 /// The model thread caches the MxArray versions internally for the subsequent training step.
-#[allow(dead_code)] // Infrastructure for Phase 2+ training thread migration
 pub(crate) struct GenerationPlainData {
     pub completion_texts: Vec<String>,
     pub prompt_texts: Vec<String>,
@@ -204,7 +210,6 @@ pub(crate) struct GenerationPlainData {
 
 /// Plain training metrics that cross the thread boundary.
 /// No MxArrays — only plain numeric types.
-#[allow(dead_code)] // Infrastructure for Phase 2+ training thread migration
 pub(crate) struct TrainStepPlainMetrics {
     pub loss: f64,
     pub gradients_applied: bool,
@@ -219,7 +224,6 @@ pub(crate) struct TrainStepPlainMetrics {
 
 /// Dispatch handle for sending training commands to the appropriate model thread.
 /// Training engines hold this instead of Arc<RwLock<TrainableModelEnum>>.
-#[allow(dead_code)] // Infrastructure for Phase 2+ training thread migration
 pub(crate) enum TrainingDispatch {
     Qwen3(tokio::sync::mpsc::UnboundedSender<crate::models::qwen3::Qwen3Cmd>),
     Qwen35Dense(tokio::sync::mpsc::UnboundedSender<crate::models::qwen3_5::model::Qwen35Cmd>),

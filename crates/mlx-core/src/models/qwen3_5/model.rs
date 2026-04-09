@@ -81,6 +81,7 @@ pub(crate) static COMPILED_WEIGHTS_RWLOCK: std::sync::RwLock<()> = std::sync::Rw
 /// Returns `Some(guard)` if this model owns the compiled weights, `None` otherwise.
 /// The guard must be held for the lifetime of the compiled decode to prevent
 /// concurrent model loads from swapping weights mid-generation.
+#[allow(dead_code)] // Used by training clone path (kept for SFT engine)
 pub(crate) fn acquire_compiled_weight_guard(
     model_id: u64,
 ) -> Option<std::sync::RwLockReadGuard<'static, ()>> {
@@ -4182,6 +4183,7 @@ impl Qwen3_5Model {
     }
 
     /// Tokenize messages using the model's chat template.
+    #[allow(dead_code)] // Used by TrainableModel impl (kept for SFT engine)
     pub(crate) fn apply_chat_template_sync(
         &self,
         messages: &[ChatMessage],
@@ -4201,6 +4203,7 @@ impl Qwen3_5Model {
     /// Uses the compiled C++ forward path when available (~10x faster than Rust).
     /// Generation does NOT need differentiability — gradients are computed separately
     /// via the functional forward path in autograd Phase 2.
+    #[allow(dead_code)] // Used by TrainableModel impl (kept for SFT engine)
     pub(crate) fn generate_for_training_sync(
         &self,
         input_ids: &MxArray,
@@ -4380,6 +4383,7 @@ impl Qwen3_5Model {
     }
 
     /// Generate a batch of completions for GRPO training.
+    #[allow(dead_code)] // Used by TrainableModel impl (kept for SFT engine)
     pub(crate) fn generate_batch_for_training_sync(
         &self,
         prompt_arrays: &[MxArray],
@@ -4401,6 +4405,7 @@ impl Qwen3_5Model {
     }
 
     /// Decode token IDs to text.
+    #[allow(dead_code)] // Used by TrainableModel impl (kept for SFT engine)
     pub(crate) fn decode_tokens_sync(&self, tokens: &MxArray) -> Result<String> {
         let tokenizer = self
             .tokenizer

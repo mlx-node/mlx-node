@@ -2,6 +2,10 @@
 //!
 //! Provides a model-agnostic generation loop that can be parameterized by
 //! a forward function, avoiding duplication between Dense and MoE models.
+//!
+//! NOTE: These functions are called from model impl methods that are now
+//! dead code after Phase 3 GRPO migration. Kept for SFT engine use.
+#![allow(dead_code)]
 
 use napi::bindgen_prelude::*;
 

@@ -4061,6 +4061,7 @@ impl Qwen3_5MoeModel {
     }
 
     /// Tokenize messages using the model's chat template.
+    #[allow(dead_code)] // Used by TrainableModel impl (kept for SFT engine)
     pub(crate) fn apply_chat_template_sync(
         &self,
         messages: &[ChatMessage],
@@ -4080,6 +4081,7 @@ impl Qwen3_5MoeModel {
     /// Uses the C++ MoE forward path when available (~10x faster than Rust).
     /// Generation does NOT need differentiability — gradients are computed separately
     /// via the functional forward path in autograd Phase 2.
+    #[allow(dead_code)] // Used by TrainableModel impl (kept for SFT engine)
     pub(crate) fn generate_for_training_sync(
         &self,
         input_ids: &MxArray,
@@ -4274,6 +4276,7 @@ impl Qwen3_5MoeModel {
     }
 
     /// Generate a batch of completions for GRPO training.
+    #[allow(dead_code)] // Used by TrainableModel impl (kept for SFT engine)
     pub(crate) fn generate_batch_for_training_sync(
         &self,
         prompt_arrays: &[MxArray],
@@ -4295,6 +4298,7 @@ impl Qwen3_5MoeModel {
     }
 
     /// Decode token IDs to text.
+    #[allow(dead_code)] // Used by TrainableModel impl (kept for SFT engine)
     pub(crate) fn decode_tokens_sync(&self, tokens: &MxArray) -> Result<String> {
         let tokenizer = self
             .tokenizer
