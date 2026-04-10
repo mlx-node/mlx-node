@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { Writable } from 'node:stream';
 
 import { createHandler, ModelRegistry } from '@mlx-node/server';
 import { describe, expect, it, vi } from 'vite-plus/test';
@@ -39,7 +40,6 @@ function createMockRes(): {
   getHeaders: () => Record<string, string | string[]>;
   waitForEnd: () => Promise<void>;
 } {
-  const { Writable } = require('node:stream');
   let status = 200;
   let body = '';
   const headers: Record<string, string | string[]> = {};
@@ -49,7 +49,7 @@ function createMockRes(): {
   });
 
   const writable = new Writable({
-    write(chunk: Buffer | string, _encoding: string, callback: () => void) {
+    write(chunk: Uint8Array | string, _encoding: string, callback: () => void) {
       body += chunk.toString();
       callback();
     },
@@ -77,7 +77,7 @@ function createMockRes(): {
   writable.headersSent = false;
 
   const origEnd = writable.end.bind(writable);
-  writable.end = (chunk?: string | Buffer, ...args: any[]) => {
+  writable.end = (chunk?: string | Uint8Array, ...args: any[]) => {
     if (chunk) body += chunk.toString();
     writable.headersSent = true;
     origEnd(undefined, ...args);
@@ -396,7 +396,7 @@ describe('createHandler', () => {
       const registry = new ModelRegistry();
       const handler = createHandler(registry);
       const req = createMockReq('POST', '/v1/models');
-      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      const { res, getStatus, waitForEnd } = createMockRes();
 
       handler(req, res);
       await waitForEnd();

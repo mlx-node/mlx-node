@@ -24,7 +24,7 @@ function createMockRes(): {
   const headers: Record<string, string | string[]> = {};
 
   const writable = new Writable({
-    write(chunk: Buffer | string, _encoding: string, callback: () => void) {
+    write(chunk: Uint8Array | string, _encoding: string, callback: () => void) {
       body += chunk.toString();
       callback();
     },
@@ -52,7 +52,7 @@ function createMockRes(): {
   writable.headersSent = false;
 
   const origEnd = writable.end.bind(writable);
-  writable.end = (chunk?: string | Buffer, ...args: any[]) => {
+  writable.end = (chunk?: string | Uint8Array, ...args: any[]) => {
     if (chunk) body += chunk.toString();
     writable.headersSent = true;
     origEnd(undefined, ...args);
