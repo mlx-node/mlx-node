@@ -581,6 +581,10 @@ export async function handleCreateResponse(
     sendBadRequest(res, 'Missing required field: input', 'input');
     return;
   }
+  if (typeof body.input !== 'string' && !Array.isArray(body.input)) {
+    sendBadRequest(res, 'Field "input" must be a string or an array', 'input');
+    return;
+  }
 
   // Look up model
   const model = registry.get(body.model);

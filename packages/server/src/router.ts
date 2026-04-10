@@ -12,13 +12,25 @@ import { sendBadRequest, sendMethodNotAllowed, sendNotFound } from './errors.js'
 import type { ModelRegistry } from './registry.js';
 import type { ResponsesAPIRequest } from './types.js';
 
+/** Maximum request body size: 10 MB. */
+const MAX_BODY_BYTES = 10 * 1024 * 1024;
+
 /**
- * Read the request body as a UTF-8 string.
+ * Read the request body as a UTF-8 string, rejecting if it exceeds the size limit.
  */
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let totalBytes = 0;
+    req.on('data', (chunk: Buffer) => {
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_BODY_BYTES) {
+        req.destroy();
+        reject(new Error('Request body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
     req.on('error', reject);
   });
@@ -57,8 +69,10 @@ export async function routeRequest(
     try {
       const raw = await readBody(req);
       body = JSON.parse(raw) as ResponsesAPIRequest;
-    } catch {
-      sendBadRequest(res, 'Invalid JSON in request body');
+    } catch (err) {
+      const msg =
+        err instanceof Error && err.message === 'Request body too large' ? err.message : 'Invalid JSON in request body';
+      sendBadRequest(res, msg);
       return;
     }
 

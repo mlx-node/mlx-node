@@ -199,6 +199,25 @@ describe('createHandler', () => {
       expect(parsed.error.message).toContain('input');
     });
 
+    it('returns 400 when input is not a string or array', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 42,
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toContain('string or an array');
+    });
+
     it('returns 404 when model is not found', async () => {
       const registry = new ModelRegistry();
       const handler = createHandler(registry);
