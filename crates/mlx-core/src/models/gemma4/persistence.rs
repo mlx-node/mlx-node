@@ -185,7 +185,7 @@ fn parse_layer_types(raw: &Value, text_cfg: Option<&Value>, num_layers: i32) -> 
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
-        if !types.is_empty() {
+        if types.len() >= num_layers as usize {
             return types;
         }
     }

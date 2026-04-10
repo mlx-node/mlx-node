@@ -218,12 +218,12 @@ impl Gemma4Config {
         if !self.is_kv_shared_layer(layer_idx) {
             return None;
         }
-        let target_type = &self.layer_types[layer_idx];
+        let target_type = self.layer_types.get(layer_idx)?;
         let first_shared = self.first_kv_shared_layer();
         // Search backwards from first_shared-1 to 0 for the same layer type
         (0..first_shared)
             .rev()
-            .find(|&i| self.layer_types[i] == *target_type)
+            .find(|&i| self.layer_types.get(i).is_some_and(|t| t == target_type))
     }
 
     /// Whether a non-shared layer should store its full KV for sharing.
@@ -237,9 +237,12 @@ impl Gemma4Config {
             // No sharing enabled
             return false;
         }
-        let my_type = &self.layer_types[layer_idx];
+        let Some(my_type) = self.layer_types.get(layer_idx) else {
+            return false;
+        };
         // Check if this is the last non-shared layer of this type
-        !(layer_idx + 1..first_shared).any(|i| self.layer_types[i] == *my_type)
+        !(layer_idx + 1..first_shared)
+            .any(|i| self.layer_types.get(i).is_some_and(|t| t == my_type))
     }
 }
 
