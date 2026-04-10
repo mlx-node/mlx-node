@@ -339,6 +339,29 @@ describe('mapRequest', () => {
     expect(config.reuseCache).toBe(true);
   });
 
+  it('places instructions before prior messages when both are provided', () => {
+    const priorMessages = [
+      { role: 'user' as const, content: 'First message' },
+      { role: 'assistant' as const, content: 'First response' },
+    ];
+
+    const { messages } = mapRequest(
+      {
+        model: 'test-model',
+        input: 'Second message',
+        instructions: 'Be concise.',
+      },
+      priorMessages,
+    );
+
+    expect(messages).toEqual([
+      { role: 'system', content: 'Be concise.' },
+      { role: 'user', content: 'First message' },
+      { role: 'assistant', content: 'First response' },
+      { role: 'user', content: 'Second message' },
+    ]);
+  });
+
   it('does not set reuseCache when no prior messages', () => {
     const { config } = mapRequest({
       model: 'test-model',

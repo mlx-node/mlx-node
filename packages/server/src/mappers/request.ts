@@ -53,14 +53,14 @@ export interface MappedRequest {
 export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage[]): MappedRequest {
   const messages: ChatMessage[] = [];
 
+  // System instructions go first (before any history)
+  if (req.instructions) {
+    messages.push({ role: 'system', content: req.instructions });
+  }
+
   // Prepend any prior conversation messages (from previous_response_id chain)
   if (priorMessages) {
     messages.push(...priorMessages);
-  }
-
-  // System instructions go first
-  if (req.instructions) {
-    messages.push({ role: 'system', content: req.instructions });
   }
 
   // Map input

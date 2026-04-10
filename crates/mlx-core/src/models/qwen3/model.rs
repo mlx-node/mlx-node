@@ -1301,7 +1301,7 @@ impl Qwen3Inner {
             Some(ids) => ids.shape_at(1).unwrap_or(token_ids_vec.len() as i64) as f64,
             None => 1.0,
         };
-        let prompt_token_count = actual_prefill_count;
+        let prompt_token_count = token_ids_vec.len() as f64;
 
         let embedding_weight = self.embedding.get_weight();
         let layers = &self.layers;
@@ -1637,7 +1637,7 @@ impl Qwen3Inner {
             Some(crate::profiling::PerformanceMetrics {
                 ttft_ms,
                 prefill_tokens_per_second: if ttft_ms > 0.0 {
-                    prompt_token_count / (ttft_ms / 1000.0)
+                    actual_prefill_count / (ttft_ms / 1000.0)
                 } else {
                     0.0
                 },

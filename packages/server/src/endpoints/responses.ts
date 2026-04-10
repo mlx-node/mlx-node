@@ -148,12 +148,12 @@ async function handleStreamingNative(
           item_id: reasoningItemId,
           output_index: outputItems.length - (hasEmittedMessage ? 1 : 0) - 1,
           summary_index: 0,
-          text: reasoningText,
+          text: event.thinking ?? reasoningText,
         });
         const reasoningItem: ReasoningOutputItem = {
           id: reasoningItemId,
           type: 'reasoning',
-          summary: [{ type: 'summary_text', text: reasoningText }],
+          summary: [{ type: 'summary_text', text: event.thinking ?? reasoningText }],
         };
         const riIndex = outputItems.findIndex((i) => i.id === reasoningItemId);
         if (riIndex >= 0) {
@@ -277,6 +277,10 @@ async function handleStreamingNative(
 
     // Delta event
     if (event.isReasoning) {
+      // Filter out </think> tag from reasoning deltas
+      const deltaText = event.text.replace(/<\/think>/g, '');
+      if (!deltaText) continue; // Skip empty deltas (e.g., just the </think> token)
+
       if (!hasEmittedReasoning) {
         // First reasoning chunk -- add reasoning item
         hasEmittedReasoning = true;
@@ -291,12 +295,12 @@ async function handleStreamingNative(
 
         writeSSEEvent(res, 'response.output_item.added', { output_index: riIndex, item: reasoningItem });
       }
-      reasoningText += event.text;
+      reasoningText += deltaText;
       writeSSEEvent(res, 'response.reasoning_summary_text.delta', {
         item_id: reasoningItemId,
         output_index: outputItems.findIndex((i) => i.id === reasoningItemId),
         summary_index: 0,
-        delta: event.text,
+        delta: deltaText,
       });
     } else {
       if (!suppressTextDeltas) {
@@ -592,8 +596,10 @@ export async function handleCreateResponse(
   // Map request — full messages include prior + new input
   const { messages, config } = mapRequest(body, priorMessages);
 
-  // Compute the new-only messages (what this request added, excluding prior history)
-  const newInputMessages = priorMessages ? messages.slice(priorMessages.length) : messages;
+  // Compute the new-only messages (what this request added, excluding prior history).
+  // Instructions (if any) are placed first, then prior messages, then new input.
+  const priorOffset = (priorMessages?.length ?? 0) + (body.instructions ? 1 : 0);
+  const newInputMessages = priorMessages ? messages.slice(priorOffset) : messages;
 
   try {
     if (body.stream) {
