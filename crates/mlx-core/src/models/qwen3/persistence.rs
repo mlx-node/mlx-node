@@ -376,6 +376,27 @@ impl Qwen3Model {
     }
 }
 
+/// Create a random-init Qwen3 model and save it to disk.
+///
+/// Builds a `Qwen3Model` via the direct-constructor path (random weights),
+/// saves it to `save_path`, and drops the in-memory shell. Used by TypeScript
+/// test fixtures that need an on-disk checkpoint without keeping a NAPI model
+/// instance alive.
+///
+/// This routes through the existing legacy (`thread: None`) save code path in
+/// `Qwen3Model::save_model`, which clones parameters into the async task — so
+/// the caller's model reference can safely drop once this function returns the
+/// promise.
+#[napi]
+pub fn create_random_qwen3_checkpoint<'env>(
+    env: &'env Env,
+    config: Qwen3Config,
+    save_path: String,
+) -> Result<PromiseRaw<'env, ()>> {
+    let model = Qwen3Model::new(config)?;
+    model.save_model(env, save_path)
+}
+
 /// Parse Qwen3Config from a serde_json::Value (shared between load paths).
 fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
     let bos_token_id = raw_config["bos_token_id"]

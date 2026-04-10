@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
+use napi_derive::napi;
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -1892,4 +1893,21 @@ fn register_moe_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u6
 
     // Set model ID AFTER all weights are stored.
     unsafe { sys::mlx_set_model_id(model_id) };
+}
+
+/// Create a random-init Qwen3.5 MoE model and save it to disk.
+///
+/// Builds a `Qwen3_5MoeModel` via the direct-constructor path (which spawns a
+/// dedicated model thread with random-init weights), saves it to `save_path`
+/// by dispatching `Qwen35MoeCmd::SaveModel` to that thread, and drops the
+/// shell once the save completes. Used by TypeScript test fixtures that need
+/// an on-disk checkpoint without keeping a NAPI model instance alive.
+#[napi]
+pub fn create_random_qwen35_moe_checkpoint<'env>(
+    env: &'env Env,
+    config: Qwen3_5MoeConfig,
+    save_path: String,
+) -> Result<PromiseRaw<'env, ()>> {
+    let model = Qwen3_5MoeModel::new(config)?;
+    model.save_model(env, save_path)
 }

@@ -2376,6 +2376,43 @@ export declare function createPaddleocrVlConfig(): ModelConfig;
 /** Create a default Qianfan-OCR configuration (JS factory function) */
 export declare function createQianfanOcrConfig(): QianfanOcrConfig;
 
+/**
+ * Create a random-init Qwen3.5 model and save it to disk.
+ *
+ * Builds a `Qwen3_5Model` via the direct-constructor path (which spawns a
+ * dedicated model thread with random-init weights), saves it to `save_path`
+ * by dispatching `Qwen35Cmd::SaveModel` to that thread, and drops the shell
+ * once the save completes. Used by TypeScript test fixtures that need an
+ * on-disk checkpoint without keeping a NAPI model instance alive.
+ */
+export declare function createRandomQwen35Checkpoint(config: Qwen35Config, savePath: string): Promise<undefined>;
+
+/**
+ * Create a random-init Qwen3.5 MoE model and save it to disk.
+ *
+ * Builds a `Qwen3_5MoeModel` via the direct-constructor path (which spawns a
+ * dedicated model thread with random-init weights), saves it to `save_path`
+ * by dispatching `Qwen35MoeCmd::SaveModel` to that thread, and drops the
+ * shell once the save completes. Used by TypeScript test fixtures that need
+ * an on-disk checkpoint without keeping a NAPI model instance alive.
+ */
+export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig, savePath: string): Promise<undefined>;
+
+/**
+ * Create a random-init Qwen3 model and save it to disk.
+ *
+ * Builds a `Qwen3Model` via the direct-constructor path (random weights),
+ * saves it to `save_path`, and drops the in-memory shell. Used by TypeScript
+ * test fixtures that need an on-disk checkpoint without keeping a NAPI model
+ * instance alive.
+ *
+ * This routes through the existing legacy (`thread: None`) save code path in
+ * `Qwen3Model::save_model`, which clones parameters into the async task — so
+ * the caller's model reference can safely drop once this function returns the
+ * promise.
+ */
+export declare function createRandomQwen3Checkpoint(config: Qwen3Config, savePath: string): Promise<undefined>;
+
 /** Document element - either a table or paragraph */
 export interface DocumentElement {
   elementType: ElementType;

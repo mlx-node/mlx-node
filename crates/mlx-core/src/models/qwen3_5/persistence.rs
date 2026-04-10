@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
+use napi_derive::napi;
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -1794,4 +1795,21 @@ pub(crate) fn load_vision_weights(
         config.num_layers
     );
     Ok(())
+}
+
+/// Create a random-init Qwen3.5 model and save it to disk.
+///
+/// Builds a `Qwen3_5Model` via the direct-constructor path (which spawns a
+/// dedicated model thread with random-init weights), saves it to `save_path`
+/// by dispatching `Qwen35Cmd::SaveModel` to that thread, and drops the shell
+/// once the save completes. Used by TypeScript test fixtures that need an
+/// on-disk checkpoint without keeping a NAPI model instance alive.
+#[napi]
+pub fn create_random_qwen35_checkpoint<'env>(
+    env: &'env Env,
+    config: Qwen3_5Config,
+    save_path: String,
+) -> Result<PromiseRaw<'env, ()>> {
+    let model = Qwen3_5Model::new(config)?;
+    model.save_model(env, save_path)
 }

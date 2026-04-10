@@ -16,4 +16,5 @@ mod speculative;
 pub use config::*;
 pub use generation::*;
 pub use model::*;
+pub use persistence::*;
 pub use speculative::*;
