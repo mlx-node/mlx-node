@@ -512,112 +512,6 @@ self.onmessage = async (e: MessageEvent) => {
 
 // ---------- Command Processing Loop ----------
 
-// ---------- Standalone RMSNorm GPU test (bypasses C++/WASM pipeline) ----------
-async function runRMSNormTest(wgslCode: string): Promise<void> {
-  try {
-    console.log('[RMSNorm-TEST] Starting standalone GPU test...');
-
-    const entryMatch = wgslCode.match(/fn\s+(rmsnorm_\w+)\s*\(/);
-    if (!entryMatch) {
-      console.error('[RMSNorm-TEST] Could not find entry point in WGSL');
-      return;
-    }
-    const entryPoint = entryMatch[1];
-    console.log(`[RMSNorm-TEST] Entry point: ${entryPoint}`);
-
-    const axisSize = 4;
-    const inputData = new Float32Array([1.0, 2.0, 3.0, 4.0]);
-    const weightData = new Float32Array([1.0, 1.0, 1.0, 1.0]);
-
-    // Expected: sum_sq=30, mean_sq=7.5, inv_rms≈0.365148, output≈[0.3651, 0.7303, 1.0954, 1.4606]
-    const sumSq = inputData.reduce((s, v) => s + v * v, 0);
-    const invRms = 1.0 / Math.sqrt(sumSq / axisSize + 1e-6);
-    const expected = Array.from(inputData).map((v, i) => v * invRms * weightData[i]);
-    console.log(`[RMSNorm-TEST] Expected: [${expected.map(v => v.toFixed(6)).join(', ')}]`);
-
-    // Create GPU buffers
-    const inputBuf = device.createBuffer({
-      size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    const weightBuf = device.createBuffer({
-      size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    const outputBuf = device.createBuffer({
-      size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-    });
-    const stagingBuf = device.createBuffer({
-      size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
-    const paramsBuf = device.createBuffer({
-      size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-
-    // Pack uniform params: vec4<u32> = [axis_size, w_stride, eps_as_bits, pad]
-    const paramsData = new ArrayBuffer(16);
-    const pv = new DataView(paramsData);
-    pv.setUint32(0, axisSize, true);
-    pv.setUint32(4, 1, true);         // w_stride = 1
-    pv.setFloat32(8, 1e-6, true);     // eps — bitcast<f32> in shader recovers float
-    pv.setUint32(12, 0, true);        // pad
-
-    queue.writeBuffer(inputBuf, 0, inputData);
-    queue.writeBuffer(weightBuf, 0, weightData);
-    queue.writeBuffer(paramsBuf, 0, new Uint8Array(paramsData));
-
-    const module = device.createShaderModule({ code: wgslCode });
-    const pipeline = device.createComputePipeline({
-      layout: 'auto',
-      compute: { module, entryPoint },
-    });
-
-    const bindGroup = device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: inputBuf } },
-        { binding: 1, resource: { buffer: weightBuf } },
-        { binding: 2, resource: { buffer: outputBuf } },
-        { binding: 3, resource: { buffer: paramsBuf } },
-      ],
-    });
-
-    const enc = device.createCommandEncoder();
-    const pass = enc.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(1);  // 1 row = 1 workgroup
-    pass.end();
-    enc.copyBufferToBuffer(outputBuf, 0, stagingBuf, 0, 16);
-    queue.submit([enc.finish()]);
-
-    await stagingBuf.mapAsync(GPUMapMode.READ);
-    const result = new Float32Array(stagingBuf.getMappedRange().slice(0));
-    stagingBuf.unmap();
-
-    console.log(`[RMSNorm-TEST] Actual:   [${Array.from(result).map(v => v.toFixed(6)).join(', ')}]`);
-    console.log(`[RMSNorm-TEST] Expected: [${expected.map(v => v.toFixed(6)).join(', ')}]`);
-
-    let maxErr = 0;
-    for (let i = 0; i < axisSize; i++) {
-      maxErr = Math.max(maxErr, Math.abs(result[i] - expected[i]));
-    }
-    console.log(`[RMSNorm-TEST] Max error: ${maxErr.toExponential(4)}`);
-
-    if (maxErr < 1e-4) {
-      console.log('[RMSNorm-TEST] PASS — Shader correct. Bug is in C++/WASM dispatch.');
-    } else {
-      console.log('[RMSNorm-TEST] FAIL — Shader produces wrong results!');
-    }
-
-    inputBuf.destroy();
-    weightBuf.destroy();
-    outputBuf.destroy();
-    stagingBuf.destroy();
-    paramsBuf.destroy();
-  } catch (e) {
-    console.error('[RMSNorm-TEST] Error:', e);
-  }
-}
-
 // ---------- Inlined hot-path handlers ----------
 // These bypass processCommand entirely: no async overhead, no closure
 // allocation, no switch dispatch, no flushCallbacks (hot paths produce
@@ -656,13 +550,6 @@ function handleFusedFullDispatch(): void {
   cmdU32[I_RESULT] = 0;
 }
 
-let _fusedUniformDbgCount = 0;
-
-// Debug readback: captures bind group buffers from first 4-entry dispatch
-// for async GPU readback after next submit. Uses a done flag (not null check)
-// so it only fires once across the entire session.
-let _debugReadbackDone = false;
-let _debugReadbackBuffers: { buf: GPUBuffer; size: number; label: string }[] | null = null;
 function handleFusedDispatchWithUniform(): void {
   const passHandle = cmdU32[I_ARG0];
   const pipelineHandle = cmdU32[I_ARG0 + 1];
@@ -673,24 +560,6 @@ function handleFusedDispatchWithUniform(): void {
   const uniformEntryIdx = cmdU32[I_ARG0 + 6];
   const entryCount = cmdU32[I_CB_COUNT];
   const uniformDataSize = cmdU32[I_UNIFORM_SIZE];
-
-  // DEBUG: log first 5 dispatches with 4 entries (likely RMSNorm)
-  if (entryCount === 4 && _fusedUniformDbgCount < 5) {
-    _fusedUniformDbgCount++;
-    const u32 = new Uint32Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, Math.min(uniformDataSize / 4, 4));
-    const f32 = new Float32Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, Math.min(uniformDataSize / 4, 4));
-    // Log entry buffer handles and sizes
-    const entries: string[] = [];
-    let eDbg = I_CB_BASE;
-    for (let i = 0; i < entryCount; i++) {
-      const bh = cmdU32[eDbg]; const sL = cmdU32[eDbg+1]; const sH = cmdU32[eDbg+2];
-      entries.push(`[${i}] buf=${bh} size=${sL + sH * 0x100000000}`);
-      eDbg += 3;
-    }
-    console.log(`[RMSNorm-DBG #${_fusedUniformDbgCount}] entries=${entryCount} uniformIdx=${uniformEntryIdx} uniformSize=${uniformDataSize} dispatch=(${x},${y},${z})`);
-    console.log(`  params: axis_size=${u32[0]} w_stride=${u32[1]} eps_bits=0x${u32[2]?.toString(16)} eps_f32=${f32[2]} pad=${u32[3]}`);
-    console.log(`  bindings: ${entries.join(', ')}`);
-  }
 
   // Direct handle access — hot path, handles always valid
   const layout = handles[layoutHandle] as GPUBindGroupLayout;
@@ -739,31 +608,6 @@ function handleFusedDispatchWithUniform(): void {
   pass.dispatchWorkgroups(x, y, z);
   endAndRestartPass(passHandle);
 
-  // Capture buffers for async readback — target RMSNorm specifically:
-  // RMSNorm signature: 4 entries, uniformIdx=3, uniformSize=16
-  if (entryCount === 4 && uniformEntryIdx === 3 && uniformDataSize === 16 && !_debugReadbackDone) {
-    _debugReadbackDone = true;
-    _debugReadbackBuffers = [];
-    let eDbg2 = I_CB_BASE;
-    const labels = ['input', 'weight', 'output', 'uniform'];
-    for (let i = 0; i < entryCount; i++) {
-      const bh = cmdU32[eDbg2];
-      const sL = cmdU32[eDbg2 + 1];
-      const sH = cmdU32[eDbg2 + 2];
-      const bufSize = sL + sH * 0x100000000;
-      // Skip uniform buffer (no COPY_SRC usage) — only read data buffers
-      if (i !== uniformEntryIdx) {
-        _debugReadbackBuffers.push({
-          buf: handles[bh] as GPUBuffer,
-          size: Math.min(bufSize, 512), // read first 128 f32 values
-          label: labels[i] || `entry${i}`,
-        });
-      }
-      eDbg2 += 3;
-    }
-    console.log('[DBG-READBACK] Captured RMSNorm buffers:', _debugReadbackBuffers.map(b => `${b.label}(${b.size}b)`).join(', '));
-  }
-
   // Return new buffer handle (or 0 if no creation)
   cmdU32[I_RESULT] = newBufferHandle;
 }
@@ -780,58 +624,6 @@ function handleFusedSubmit(): void {
   const cmdBuf = encoder.finish();
   queue.submit([cmdBuf]);
   releaseHandle(encoderHandle);
-
-  // Async readback of captured RMSNorm buffers
-  if (_debugReadbackBuffers) {
-    const bufs = _debugReadbackBuffers;
-    _debugReadbackBuffers = null; // one-shot
-
-    // Create staging buffers and copy in a separate encoder
-    const stagings: { staging: GPUBuffer; label: string }[] = [];
-    const readEnc = device.createCommandEncoder();
-    for (const { buf, size, label } of bufs) {
-      const readSize = Math.min(size, 128); // first 32 f32 values
-      if (readSize === 0) continue;
-      const staging = device.createBuffer({
-        size: readSize,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
-      readEnc.copyBufferToBuffer(buf, 0, staging, 0, readSize);
-      stagings.push({ staging, label });
-    }
-    queue.submit([readEnc.finish()]);
-
-    // Schedule async map+log (runs when event loop yields)
-    queueMicrotask(async () => {
-      try {
-        await device.queue.onSubmittedWorkDone();
-        for (const { staging, label } of stagings) {
-          await staging.mapAsync(GPUMapMode.READ);
-          const f32 = new Float32Array(staging.getMappedRange());
-          const all = Array.from(f32);
-          const nonZero = all.filter(v => v !== 0).length;
-          const hasNaN = all.some(v => Number.isNaN(v));
-          const hasInf = all.some(v => !Number.isFinite(v) && !Number.isNaN(v));
-          const min = Math.min(...all);
-          const max = Math.max(...all);
-          const first16 = all.slice(0, 16).map(v => v.toFixed(6)).join(', ');
-          console.log(
-            `[DBG-READBACK] ${label} (${all.length} f32): nonZero=${nonZero} min=${min.toFixed(6)} max=${max.toFixed(6)} NaN=${hasNaN} Inf=${hasInf}`,
-          );
-          console.log(`  first16: [${first16}]`);
-          if (all.length > 16) {
-            const last16 = all.slice(-16).map(v => v.toFixed(6)).join(', ');
-            console.log(`  last16: [${last16}]`);
-          }
-          staging.unmap();
-          staging.destroy();
-        }
-        console.log('[DBG-READBACK] Done');
-      } catch (e) {
-        console.error('[DBG-READBACK] Error:', e);
-      }
-    });
-  }
 
   cmdU32[I_RESULT] = 0;
 }
@@ -1132,12 +924,6 @@ async function processCommand(fnId: number): Promise<void> {
       //   8: code (ptr4)
       const codePtr = view.getUint32(nextInChainPtr + 8, true);
       let code = readString(codePtr);
-      // DEBUG: log RMSNorm shader source
-      if (code.includes('rmsnorm') || code.includes('inv_rms') || code.includes('inverseSqrt')) {
-        console.log(`[WGSL-DUMP] RMSNorm shader (${code.length} chars):\n` + code);
-        // Run standalone GPU test with known values
-        runRMSNormTest(code);
-      }
       const module = device.createShaderModule({ code });
       setResult(addHandle(module));
       break;

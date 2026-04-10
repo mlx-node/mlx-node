@@ -3151,7 +3151,7 @@ static void cpu_sdpa_ref(
     const float* q, const float* k, const float* v,
     float* out,
     int B, int Hq, int Hkv, int Tq, int L, int D,
-    float scale, bool do_causal) {
+    float scale, bool do_causal, const float* mask = nullptr) {
     int gqa = Hq / Hkv;
     int q_offset = L - Tq; // causal offset (like the tile kernel)
     for (int b = 0; b < B; b++) {
@@ -3168,6 +3168,9 @@ static void cpu_sdpa_ref(
                         dot += q_row[d] * k_row[d];
                     }
                     scores[l] = dot * scale;
+                    if (mask != nullptr) {
+                        scores[l] += mask[qi * L + l];
+                    }
                 }
                 // Apply causal mask: mask out l > qi + q_offset
                 if (do_causal) {
@@ -3229,7 +3232,7 @@ int mlx_test_sdpa_tile_d256_gqa(float* out_vals, int max_count) {
         // CPU reference
         std::vector<float> cpu_ref(N);
         cpu_sdpa_ref(q_data.data(), k_data.data(), v_data.data(),
-                     cpu_ref.data(), B, Hq, Hkv, Tq, L, D, scale, true);
+                     cpu_ref.data(), B, Hq, Hkv, Tq, L, D, scale, true, nullptr);
 
         // Output: [tile..., cpu_ref...]
         int out_count = std::min(max_count, 2 * N);
@@ -3330,7 +3333,7 @@ int mlx_test_sdpa_tile_d256_gqa_nocausal(float* out_vals, int max_count) {
         // CPU reference (no causal)
         std::vector<float> cpu_ref(N);
         cpu_sdpa_ref(q_data.data(), k_data.data(), v_data.data(),
-                     cpu_ref.data(), B, Hq, Hkv, Tq, L, D, scale, false);
+                     cpu_ref.data(), B, Hq, Hkv, Tq, L, D, scale, false, nullptr);
 
         // Output: [tile..., cpu_ref...]
         int out_count = std::min(max_count, 2 * N);
@@ -3373,7 +3376,7 @@ int mlx_test_sdpa_tile_d256_causal_gqa_minimal(float* out_vals, int max_count) {
         // CPU reference
         std::vector<float> cpu_ref(N);
         cpu_sdpa_ref(q_data.data(), k_data.data(), v_data.data(),
-                     cpu_ref.data(), B, Hq, Hkv, Tq, L, D, scale, true);
+                     cpu_ref.data(), B, Hq, Hkv, Tq, L, D, scale, true, nullptr);
 
         // Output: [tile..., cpu_ref...]
         int out_count = std::min(max_count, 2 * N);
