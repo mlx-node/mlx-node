@@ -111,8 +111,9 @@ export interface TempModel {
  * Locate a Qwen tokenizer.json in the local `.cache`. Prefers Qwen3.5
  * tokenizers first (which are a superset), falling back to the Qwen3
  * tokenizer (compatible vocab) so tests still run on machines that only
- * have the smaller model downloaded. This is the single canonical tokenizer
- * search across the `__test__` tree after Phase 2.
+ * have the smaller model downloaded. Canonical tokenizer search used by
+ * all `createTemp*Model` helpers here. (A duplicate still exists in
+ * `__test__/trainers/grpo-qwen35.test.ts` and will be removed in Phase 3.)
  */
 export function findTokenizerPath(): string {
   const candidates = [
@@ -125,9 +126,9 @@ export function findTokenizerPath(): string {
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;
   }
+  const searched = candidates.map((c) => `  - ${c}`).join('\n');
   throw new Error(
-    'Could not find a Qwen tokenizer.json in .cache/models. ' +
-      'Run `yarn download:qwen3` or download a Qwen3.5 model first.',
+    `Could not find a Qwen tokenizer.json. Searched:\n${searched}\nDownload a Qwen model first, e.g.:\n  yarn mlx download model -m Qwen/Qwen3-0.6B -o .cache/models/qwen3-0.6b`,
   );
 }
 
