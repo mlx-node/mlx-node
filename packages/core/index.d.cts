@@ -119,7 +119,7 @@ export declare class Gemma4Model {
   /** Load a Gemma4 model from a directory. */
   static load(modelPath: string): Promise<Gemma4Model>;
   /** Chat with the model using a list of messages. */
-  chat(messages: Array<ChatMessage>, config?: Gemma4ChatConfig | undefined | null): Promise<Gemma4ChatResult>;
+  chat(messages: Array<ChatMessage>, config?: Gemma4ChatConfig | undefined | null): Promise<ChatResult>;
 }
 
 /** Result from text generation with detailed metadata */
@@ -784,7 +784,7 @@ export declare class QianfanOCRModel {
    *
    * High-level API: processes images, formats prompt, generates, and decodes.
    */
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<QianfanChatResult>;
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Streaming chat with the model.
    *
@@ -1994,6 +1994,7 @@ export interface ChatResult {
   toolCalls: Array<ToolCallResult>;
   thinking?: string;
   numTokens: number;
+  promptTokens: number;
   finishReason: string;
   rawText: string;
   /** Performance metrics (present when `reportPerformance: true` in config) */
@@ -2020,6 +2021,7 @@ export interface ChatStreamChunk {
   toolCalls?: Array<ToolCallResult>;
   thinking?: string;
   numTokens?: number;
+  promptTokens?: number;
   rawText?: string;
   /** Performance metrics (only present in the final chunk when `reportPerformance: true`) */
   performance?: PerformanceMetrics;
@@ -2333,15 +2335,6 @@ export interface Gemma4ChatConfig {
    * `Some(false)` = disabled, `Some(true)` = enabled.
    */
   enableThinking?: boolean;
-}
-
-/** Gemma4 chat result. */
-export interface Gemma4ChatResult {
-  text: string;
-  numTokens: number;
-  finishReason: string;
-  /** Performance metrics (always present). */
-  performance?: PerformanceMetrics;
 }
 
 /**
@@ -3082,24 +3075,6 @@ export interface ProfilingSummary {
   avgTimeToFirstTokenMs: number;
   /** Average prefill time (ms). */
   avgPrefillMs: number;
-}
-
-/** Result from a Qianfan-OCR chat() call. */
-export interface QianfanChatResult {
-  /** Generated text (with thinking/tool_call tags stripped) */
-  text: string;
-  /** Parsed tool calls (if any) */
-  toolCalls: Array<ToolCallResult>;
-  /** Thinking content (text inside <think>...</think> tags) */
-  thinking?: string;
-  /** Number of generated tokens */
-  numTokens: number;
-  /** Why generation stopped: "stop", "length", or "repetition" */
-  finishReason: string;
-  /** Raw generated text before parsing */
-  rawText: string;
-  /** Performance metrics (only present when `reportPerformance: true`) */
-  performance?: PerformanceMetrics;
 }
 
 /** Full Qianfan-OCR model configuration */

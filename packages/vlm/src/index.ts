@@ -73,7 +73,7 @@ export { PADDLEOCR_VL_CONFIGS, type PaddleOCRVLConfig } from './models/paddleocr
 // Qianfan-OCR model (InternVL architecture)
 export { QianfanOCRModel } from './models/qianfan-ocr.js';
 export { createQianfanOcrConfig } from '@mlx-node/core';
-export type { QianfanOcrConfig, InternVisionConfig, Qwen3LmConfig, QianfanChatResult } from '@mlx-node/core';
+export type { QianfanOcrConfig, InternVisionConfig, Qwen3LmConfig } from '@mlx-node/core';
 
 // Chat result type
 export { VlmChatResult, type VLMChatResult } from '@mlx-node/core';
