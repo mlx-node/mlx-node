@@ -218,6 +218,25 @@ describe('createHandler', () => {
       expect(parsed.error.message).toContain('string or an array');
     });
 
+    it('returns 400 when input array contains null items', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: [null],
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toContain('non-null object');
+    });
+
     it('returns 404 when model is not found', async () => {
       const registry = new ModelRegistry();
       const handler = createHandler(registry);
@@ -610,6 +629,182 @@ describe('createHandler', () => {
       expect(messageItems).toHaveLength(0);
       expect(fcItems).toHaveLength(1);
       expect(fcItems[0].name).toBe('search');
+    });
+
+    it('does not emit whitespace-only prefix delta when whitespace and <tool_call> arrive in same chunk', async () => {
+      // Model emits "\n<tool_call>\n..." in a single chunk — a common pattern where the
+      // model puts a newline before the tool-call markup. The cleanPrefix ("\n") is
+      // whitespace-only and must not create a dangling message item.
+      const streamEvents = [
+        // Single chunk: newline immediately followed by the tool-call opening tag
+        { done: false, text: '\n<tool_call>\n', isReasoning: false },
+        { done: false, text: '{"name": "get_time", "arguments": {}}', isReasoning: false },
+        { done: false, text: '\n</tool_call>', isReasoning: false },
+        // Final event: empty parsed text (only tool call output)
+        {
+          done: true,
+          text: '',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'call_ws',
+              name: 'get_time',
+              arguments: '{}',
+              status: 'ok',
+              rawContent: '',
+            },
+          ],
+          thinking: null,
+          numTokens: 12,
+          promptTokens: 8,
+          reasoningTokens: 0,
+          rawText: '\n<tool_call>\n{"name": "get_time", "arguments": {}}\n</tool_call>',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('stream-model', mockModel);
+
+      const handler = createHandler(registry);
+      const reqBody = {
+        model: 'stream-model',
+        input: 'What time is it?',
+        stream: true,
+      };
+      const req = createMockReq('POST', '/v1/responses', reqBody);
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      handler(req, res);
+      await waitForEnd();
+
+      const body = getBody();
+
+      // Parse all SSE events
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      // 1. No text deltas at all (the "\n" prefix is whitespace-only, must not be emitted)
+      const textDeltas = events.filter((e) => e.event === 'response.output_text.delta');
+      expect(textDeltas).toHaveLength(0);
+
+      // 2. Completed response must have only function_call items, no message items
+      const completedEvent = events.find((e) => e.event === 'response.completed');
+      expect(completedEvent).toBeDefined();
+      const response = completedEvent!.data.response as Record<string, unknown>;
+      const output = response.output as Array<Record<string, unknown>>;
+
+      const messageItems = output.filter((i) => i.type === 'message');
+      const fcItems = output.filter((i) => i.type === 'function_call');
+      expect(messageItems).toHaveLength(0);
+      expect(fcItems).toHaveLength(1);
+      expect(fcItems[0].name).toBe('get_time');
+
+      // 3. Every output_item.added event must have a corresponding output_item.done event
+      const addedItemIds = events
+        .filter((e) => e.event === 'response.output_item.added')
+        .map((e) => (e.data.item as Record<string, unknown>).id as string);
+      const doneItemIds = events
+        .filter((e) => e.event === 'response.output_item.done')
+        .map((e) => (e.data.item as Record<string, unknown>).id as string);
+      for (const id of addedItemIds) {
+        expect(doneItemIds).toContain(id);
+      }
+    });
+
+    it('gracefully closes dangling message item when whitespace arrives in separate chunk before <tool_call>', async () => {
+      // Model emits "\n" in one chunk, then "<tool_call>..." in the next. The "\n" chunk
+      // gets emitted as a delta (we cannot suppress it without look-ahead). When the tool
+      // call tag arrives in the next chunk, suppressTextDeltas is set. At finalization
+      // the skipMessageItem branch must send done events to close the dangling item so
+      // clients do not see it stuck in-progress, AND the completed response must not
+      // contain that message item.
+      const streamEvents = [
+        // First chunk is just a newline — arrives before the tool-call tag
+        { done: false, text: '\n', isReasoning: false },
+        // Second chunk contains the tool-call opening tag
+        { done: false, text: '<tool_call>\n', isReasoning: false },
+        { done: false, text: '{"name": "get_time", "arguments": {}}', isReasoning: false },
+        { done: false, text: '\n</tool_call>', isReasoning: false },
+        // Final event: empty parsed text (only tool call output)
+        {
+          done: true,
+          text: '',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'call_ws2',
+              name: 'get_time',
+              arguments: '{}',
+              status: 'ok',
+              rawContent: '',
+            },
+          ],
+          thinking: null,
+          numTokens: 13,
+          promptTokens: 8,
+          reasoningTokens: 0,
+          rawText: '\n<tool_call>\n{"name": "get_time", "arguments": {}}\n</tool_call>',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('stream-model', mockModel);
+
+      const handler = createHandler(registry);
+      const reqBody = {
+        model: 'stream-model',
+        input: 'What time is it?',
+        stream: true,
+      };
+      const req = createMockReq('POST', '/v1/responses', reqBody);
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      handler(req, res);
+      await waitForEnd();
+
+      const body = getBody();
+
+      // Parse all SSE events
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      // 1. Completed response must have only function_call items, no message items
+      const completedEvent = events.find((e) => e.event === 'response.completed');
+      expect(completedEvent).toBeDefined();
+      const response = completedEvent!.data.response as Record<string, unknown>;
+      const output = response.output as Array<Record<string, unknown>>;
+
+      const messageItems = output.filter((i) => i.type === 'message');
+      const fcItems = output.filter((i) => i.type === 'function_call');
+      expect(messageItems).toHaveLength(0);
+      expect(fcItems).toHaveLength(1);
+      expect(fcItems[0].name).toBe('get_time');
+
+      // 2. Every output_item.added event must have a corresponding output_item.done event
+      //    (no dangling items stuck in-progress)
+      const addedItemIds = events
+        .filter((e) => e.event === 'response.output_item.added')
+        .map((e) => (e.data.item as Record<string, unknown>).id as string);
+      const doneItemIds = events
+        .filter((e) => e.event === 'response.output_item.done')
+        .map((e) => (e.data.item as Record<string, unknown>).id as string);
+      for (const id of addedItemIds) {
+        expect(doneItemIds).toContain(id);
+      }
     });
 
     it('streams text deltas normally when no tool calls are present', async () => {

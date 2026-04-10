@@ -68,6 +68,9 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
     messages.push({ role: 'user', content: req.input });
   } else {
     for (const item of req.input) {
+      if (item == null || typeof item !== 'object') {
+        throw new Error('Each input item must be a non-null object');
+      }
       const itemType = item.type ?? 'message';
 
       if (itemType === 'message') {

@@ -233,8 +233,41 @@ async function handleStreamingNative(
           item: messageItem,
         });
       } else if (hasEmittedMessage && messageItemId && skipMessageItem) {
-        // Remove the message placeholder from outputItems since we're skipping it
+        // A message item was started (output_item.added / content_part.added events already
+        // sent to the client) but we now know it should be suppressed because the final
+        // text is empty and there are tool calls.  Send proper done events to close out
+        // the item gracefully so clients do not see a dangling in-progress item, then
+        // remove it from outputItems so it does not appear in the completed response.
         const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
+        const miOutputIndex = miIndex >= 0 ? miIndex : outputIndex;
+
+        writeSSEEvent(res, 'response.output_text.done', {
+          item_id: messageItemId,
+          output_index: miOutputIndex,
+          content_index: 0,
+          text: '',
+        });
+
+        const emptyTextPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+        writeSSEEvent(res, 'response.content_part.done', {
+          item_id: messageItemId,
+          output_index: miOutputIndex,
+          content_index: 0,
+          part: emptyTextPart,
+        });
+
+        const closedMessageItem: MessageOutputItem = {
+          id: messageItemId,
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [],
+        };
+        writeSSEEvent(res, 'response.output_item.done', {
+          output_index: miOutputIndex,
+          item: closedMessageItem,
+        });
+
         if (miIndex >= 0) {
           outputItems.splice(miIndex, 1);
         }
@@ -335,9 +368,13 @@ async function handleStreamingNative(
         // Check for full tool-call tag
         const tagIdx = pendingText.indexOf(TOOL_CALL_TAG);
         if (tagIdx >= 0) {
-          // Emit any clean text before the tag
+          // Emit any clean text before the tag.
+          // Trim whitespace-only prefixes: whitespace immediately before <tool_call>
+          // is always markup-related (e.g. "\n<tool_call>"), not user-visible content.
+          // Emitting it would create a dangling message item that needs special-casing
+          // at finalization when skipMessageItem is true.
           const cleanPrefix = pendingText.slice(0, tagIdx);
-          if (cleanPrefix) {
+          if (cleanPrefix.trim()) {
             if (!hasEmittedMessage) {
               hasEmittedMessage = true;
               messageItemId = genId('msg_');
@@ -624,7 +661,14 @@ export async function handleCreateResponse(
   }
 
   // Map request — full messages include prior + new input
-  const { messages, config } = mapRequest(body, priorMessages);
+  let messages: ChatMessage[];
+  let config: ChatConfig;
+  try {
+    ({ messages, config } = mapRequest(body, priorMessages));
+  } catch (err) {
+    sendBadRequest(res, err instanceof Error ? err.message : 'Invalid request input', 'input');
+    return;
+  }
 
   // Compute the new-only messages (what this request added, excluding prior history
   // and instructions). Instructions are stored separately and should not be persisted
