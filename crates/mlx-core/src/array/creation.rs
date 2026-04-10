@@ -430,6 +430,71 @@ impl MxArray {
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
+    // ===== Tile (prefill) SDPA parity tests =====
+
+    /// Tq=2, D=64, f32. Minimal tile shape — exercises zero-padding of
+    /// non-live Q rows inside a single 16-row Q tile.
+    #[napi]
+    pub fn test_sdpa_tile_tq2_d64(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(32) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_sdpa_tile_tq2_d64(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    /// Tq=8, D=128, Hq=8, Hkv=2, causal. Single tile + GQA 4:1 + causal.
+    #[napi]
+    pub fn test_sdpa_tile_tq8_d128_causal_gqa(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(32) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe {
+            sys::mlx_test_sdpa_tile_tq8_d128_causal_gqa(buf.as_mut_ptr(), c as i32)
+        };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    /// Tq=32, D=128, additive float mask. Two Q tiles + row-contiguous
+    /// [1,1,Tq,L] additive mask. Exercises the mask binding path.
+    #[napi]
+    pub fn test_sdpa_tile_tq32_d128_addmask(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(32) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe {
+            sys::mlx_test_sdpa_tile_tq32_d128_addmask(buf.as_mut_ptr(), c as i32)
+        };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    /// Tq=33, D=128, causal. Partial last tile (1 live row out of 16) —
+    /// exercises the `q_row < Tq` store guard.
+    #[napi]
+    pub fn test_sdpa_tile_tq33_d128_tailtile(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(32) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe {
+            sys::mlx_test_sdpa_tile_tq33_d128_tailtile(buf.as_mut_ptr(), c as i32)
+        };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    /// Tq=128, D=128, L=4096 causal. Large prefill-like workload — 8 Q tiles,
+    /// 512 KV blocks. Main bandwidth stress + online softmax running-state
+    /// consistency test.
+    #[napi]
+    pub fn test_sdpa_tile_tq128_d128_l4096(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(32) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe {
+            sys::mlx_test_sdpa_tile_tq128_d128_l4096(buf.as_mut_ptr(), c as i32)
+        };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
     #[napi]
     pub fn test_full_attn_layer_bf16(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(20) as usize;

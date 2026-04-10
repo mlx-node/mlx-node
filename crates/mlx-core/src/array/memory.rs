@@ -10,6 +10,16 @@ pub fn wgpu_set_packed_bf16_enabled(enabled: bool) {
     unsafe { sys::mlx_wgpu_set_packed_bf16_enabled(enabled) }
 }
 
+/// Force the WebGPU SDPA primitive onto the decomposed
+/// matmul→softmax→matmul fallback path. Plumbed from the
+/// `?sdpa_fallback=1` demo URL param so the browser can A/B-test the
+/// fused vector + tile SDPA kernels against the baseline without a
+/// rebuild. No-op on non-WebGPU builds.
+#[napi]
+pub fn wgpu_set_sdpa_fallback_forced(enabled: bool) {
+    unsafe { sys::mlx_wgpu_set_sdpa_fallback_forced(enabled) }
+}
+
 /// Clear the MLX memory cache to prevent memory pressure buildup
 /// Should be called periodically during long-running operations
 /// Internal Rust-only function - memory management is handled automatically by the trainer

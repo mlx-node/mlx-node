@@ -44,8 +44,14 @@ function post(msg: any) {
   (self as any).postMessage(msg);
 }
 
-async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: boolean }) {
+async function handleInit(data: {
+  wasmUrl: string;
+  modelUrl: string;
+  packBf16?: boolean;
+  sdpaFallback?: boolean;
+}) {
   const packBf16 = data.packBf16 === true;
+  const sdpaFallback = data.sdpaFallback === true;
   try {
     // 1. Spawn gpu-worker (owns GPUDevice, event loop free for GPU callbacks)
     post({ type: 'progress', step: 'gpu', message: 'Initializing WebGPU...' });
@@ -183,7 +189,21 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
     if (typeof mlxExports.wgpuSetPackedBf16Enabled === 'function') {
       mlxExports.wgpuSetPackedBf16Enabled(packBf16);
     }
-    post({ type: 'progress', step: 'wasm', message: `WASM loaded${packBf16 ? ' (pack_bf16=1)' : ''}` });
+    // Flip the SDPA fallback kill-switch. When true, the WebGPU backend's
+    // fast/tile SDPA kernels are bypassed in favor of the decomposed
+    // matmul→softmax→matmul path — used by the demo to A/B the fused
+    // kernels against the baseline without a rebuild.
+    if (typeof mlxExports.wgpuSetSdpaFallbackForced === 'function') {
+      mlxExports.wgpuSetSdpaFallbackForced(sdpaFallback);
+    }
+    const flagSuffix =
+      (packBf16 ? ' pack_bf16=1' : '') +
+      (sdpaFallback ? ' sdpa_fallback=1' : '');
+    post({
+      type: 'progress',
+      step: 'wasm',
+      message: `WASM loaded${flagSuffix ? ' (' + flagSuffix.trim() + ')' : ''}`,
+    });
 
     // 3. Fetch model files
     post({ type: 'progress', step: 'model', message: 'Fetching config...' });

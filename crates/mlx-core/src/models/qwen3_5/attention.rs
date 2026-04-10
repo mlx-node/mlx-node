@@ -184,27 +184,25 @@ impl Qwen3_5Attention {
         };
 
         // Scaled dot-product attention.
-        // When no explicit mask is provided:
-        //   - seq_len > 1 (prefill): use "causal" mode — MLX's fused Metal kernel handles
-        //     causal masking internally without materializing an O(N²) mask array.
-        //     This matches Python mlx-lm's `create_attention_mask` returning "causal".
-        //   - seq_len == 1 (decode): no mask needed (single token only attends to past).
-        // When an explicit mask is provided (e.g., sliding window): use it directly.
-        // Manual SDPA implementation to bypass the fast::sdpa fallback
-        // for debugging WebGPU divergence
+        //
+        // We use manual SDPA (matmul -> mask -> softmax -> matmul) because:
+        //   1. The fused WGSL tile kernel doesn't yet support D=256 (Qwen3.5-0.8B's
+        //      head_dim). When use_fallback() returns true, MLX's decomposed path
+        //      reshapes Q/K/V into 5D for GQA, but WebGPU matmul doesn't handle 5D
+        //      correctly, producing garbage output.
+        //   2. The manual path expands K/V heads explicitly (tile+reshape) which
+        //      avoids the 5D matmul and works correctly on WebGPU.
+        //
+        // TODO: Once the D=256 tile kernel is fixed, switch to
+        // `scaled_dot_product_attention_causal` to get the fused kernel benefit.
         let output = {
             use crate::array::MxArray;
-            // Cast scale to bf16 to maintain dtype throughout
             let scale_scalar = MxArray::scalar_float(self.scale as f64)?
                 .astype(queries.dtype()?)?;
             let q_scaled = queries.mul(&scale_scalar)?;
 
-            // GQA: expand q heads to match kv heads
             let n_rep = self.num_heads / self.num_kv_heads;
-            // For GQA: repeat K/V heads to match Q heads count
-            // This avoids 5D broadcast matmul which WebGPU doesn't handle correctly
             let (q_for_attn, k_for_attn, v_for_attn) = if n_rep > 1 {
-                // Repeat K: [B, Hkv, T, D] → [B, Hkv, 1, T, D] → tile → [B, Hkv, n_rep, T, D] → reshape [B, Hq, T, D]
                 let kv_len = keys.shape_at(2)?;
                 let k_expanded = keys.reshape(&[
                     batch, self.num_kv_heads as i64, 1, kv_len, self.head_dim as i64
@@ -227,7 +225,6 @@ impl Qwen3_5Attention {
                 (q_scaled, keys.clone(), values.clone())
             };
 
-            // scores = q @ k^T  (swap last 2 axes of k)
             let k_ndim = k_for_attn.ndim()? as i64;
             let mut perm: Vec<i32> = (0..k_ndim as i32).collect();
             let n = perm.len();
@@ -235,7 +232,6 @@ impl Qwen3_5Attention {
             let k_t = k_for_attn.transpose(Some(&perm))?;
             let mut scores = q_for_attn.matmul(&k_t)?;
 
-            // Causal mask for prefill
             if seq_len > 1 {
                 let kv_len = scores.shape_at(scores.ndim()? - 1)?;
                 let q_len = scores.shape_at(scores.ndim()? - 2)?;
@@ -250,14 +246,8 @@ impl Qwen3_5Attention {
                 scores = mask_bool.where_(&scores, &neg_inf)?;
             }
 
-            // softmax
             let attn_weights = crate::nn::Activations::softmax(&scores, Some(-1))?;
-
-            // output = weights @ v
-            let mut attn_out = attn_weights.matmul(&v_for_attn)?;
-
-            // Already [B, Hq, T, D] — no reshape needed
-            attn_out
+            attn_weights.matmul(&v_for_attn)?
         };
 
 

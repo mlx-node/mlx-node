@@ -1,13 +1,14 @@
 #include "mlx_common.h"
 
 #ifdef MLX_USE_WEBGPU
-// Forward-declare the WebGPU backend's packed-bf16 toggle so we don't have to
-// include <webgpu/webgpu.h> (which allocator.h transitively pulls in) from
-// the stream TU — the webgpu headers live on the matmul/device side of the
-// build, not on the FFI-bridge side. The real definition is in
+// Forward-declare the WebGPU backend's packed-bf16 and SDPA-fallback toggles
+// so we don't have to include <webgpu/webgpu.h> (which allocator.h transitively
+// pulls in) from the stream TU — the webgpu headers live on the matmul/device
+// side of the build, not on the FFI-bridge side. The real definitions are in
 // mlx/backend/webgpu/allocator.cpp.
 namespace mlx::core::wgpu {
 void set_packed_bf16_enabled(bool enabled);
+void set_sdpa_fallback_forced(bool enabled);
 }  // namespace mlx::core::wgpu
 #endif
 
@@ -337,6 +338,18 @@ size_t mlx_array_nbytes(mlx_array* handle) {
 void mlx_wgpu_set_packed_bf16_enabled(bool enabled) {
 #ifdef MLX_USE_WEBGPU
   mlx::core::wgpu::set_packed_bf16_enabled(enabled);
+#else
+  (void)enabled;
+#endif
+}
+
+// Force the WebGPU SDPA primitive onto the decomposed matmul→softmax→matmul
+// fallback path. Plumbed from ?sdpa_fallback=1 so the demo can A/B-test the
+// fused tile/vector kernels against the baseline at runtime without a
+// rebuild. On non-WebGPU builds this is a no-op.
+void mlx_wgpu_set_sdpa_fallback_forced(bool enabled) {
+#ifdef MLX_USE_WEBGPU
+  mlx::core::wgpu::set_sdpa_fallback_forced(enabled);
 #else
   (void)enabled;
 #endif

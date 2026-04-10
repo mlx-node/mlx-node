@@ -2971,5 +2971,171 @@ int mlx_test_categorical_sampling_bf16(float* out_vals, int max_count) {
     }
 }
 
+// =====================================================================
+// SDPA tile (prefill) parity tests. These exercise the Tq > 1 code path
+// in the WebGPU backend that was added alongside the fused tile kernel.
+// They are deterministic sin/cos patterns so we can assert parity vs the
+// decomposed fallback at low absolute tolerance (≈1e-4 for f32,
+// ≈5e-3 for bf16 due to accumulation).
+// =====================================================================
+
+// Tq=2, D=64. Minimal tile case — smaller than BQ=16 so it exercises
+// the "partial first tile" zero-padding path for Q rows. No mask, no causal.
+// Uses f32 throughout for tightest parity check.
+int mlx_test_sdpa_tile_tq2_d64(float* out_vals, int max_count) {
+    using namespace mlx::core;
+    try {
+        int B = 1, Hq = 2, Hkv = 2, Tq = 2, L = 8, D = 64;
+        std::vector<float> q_data(B * Hq * Tq * D);
+        std::vector<float> k_data(B * Hkv * L * D);
+        std::vector<float> v_data(B * Hkv * L * D);
+        for (int i = 0; i < (int)q_data.size(); i++) q_data[i] = std::sin(i * 0.017f) * 0.5f;
+        for (int i = 0; i < (int)k_data.size(); i++) k_data[i] = std::cos(i * 0.023f) * 0.5f;
+        for (int i = 0; i < (int)v_data.size(); i++) v_data[i] = std::sin(i * 0.031f + 1.0f) * 0.3f;
+
+        auto q = array(q_data.data(), {B, Hq, Tq, D}, float32);
+        auto k = array(k_data.data(), {B, Hkv, L, D}, float32);
+        auto v = array(v_data.data(), {B, Hkv, L, D}, float32);
+        eval_safe(q); eval_safe(k); eval_safe(v);
+
+        float scale = 1.0f / std::sqrt((float)D);
+        auto result = fast::scaled_dot_product_attention(
+            q, k, v, scale, "", std::nullopt, {});
+        eval_safe(result);
+        return output_result(result, out_vals, max_count);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_sdpa_tile_tq2_d64] %s\n", e.what());
+        return -1;
+    }
+}
+
+// Tq=8, D=128, Hq=8, Hkv=2 causal GQA. Single tile (Tq < BQ=16), causal
+// mask active, GQA 4:1 — exercises the causal path and the GQA head
+// reindexing (h_kv = h / gqa_factor).
+int mlx_test_sdpa_tile_tq8_d128_causal_gqa(float* out_vals, int max_count) {
+    using namespace mlx::core;
+    try {
+        int B = 1, Hq = 8, Hkv = 2, Tq = 8, L = 8, D = 128;
+        std::vector<float> q_data(B * Hq * Tq * D);
+        std::vector<float> k_data(B * Hkv * L * D);
+        std::vector<float> v_data(B * Hkv * L * D);
+        for (int i = 0; i < (int)q_data.size(); i++) q_data[i] = std::sin(i * 0.011f) * 0.4f;
+        for (int i = 0; i < (int)k_data.size(); i++) k_data[i] = std::cos(i * 0.013f) * 0.4f;
+        for (int i = 0; i < (int)v_data.size(); i++) v_data[i] = std::sin(i * 0.019f + 0.5f) * 0.25f;
+
+        auto q = array(q_data.data(), {B, Hq, Tq, D}, float32);
+        auto k = array(k_data.data(), {B, Hkv, L, D}, float32);
+        auto v = array(v_data.data(), {B, Hkv, L, D}, float32);
+        eval_safe(q); eval_safe(k); eval_safe(v);
+
+        float scale = 1.0f / std::sqrt((float)D);
+        auto result = fast::scaled_dot_product_attention(
+            q, k, v, scale, "causal", std::nullopt, {});
+        eval_safe(result);
+        return output_result(result, out_vals, max_count);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_sdpa_tile_tq8_d128_causal_gqa] %s\n", e.what());
+        return -1;
+    }
+}
+
+// Tq=32, D=128 additive float mask [1,1,Tq,L]. Two full Q tiles (32 / BQ=16)
+// and two KV blocks (16 / BK=8). The mask is row-contiguous in the target
+// shape so the kernel's mask indexing path runs directly (after fast.cpp
+// broadcasts and the ensure_contig copy).
+int mlx_test_sdpa_tile_tq32_d128_addmask(float* out_vals, int max_count) {
+    using namespace mlx::core;
+    try {
+        int B = 1, Hq = 4, Hkv = 2, Tq = 32, L = 16, D = 128;
+        std::vector<float> q_data(B * Hq * Tq * D);
+        std::vector<float> k_data(B * Hkv * L * D);
+        std::vector<float> v_data(B * Hkv * L * D);
+        for (int i = 0; i < (int)q_data.size(); i++) q_data[i] = std::sin(i * 0.009f) * 0.45f;
+        for (int i = 0; i < (int)k_data.size(); i++) k_data[i] = std::cos(i * 0.013f) * 0.45f;
+        for (int i = 0; i < (int)v_data.size(); i++) v_data[i] = std::sin(i * 0.017f + 0.3f) * 0.3f;
+
+        auto q = array(q_data.data(), {B, Hq, Tq, D}, float32);
+        auto k = array(k_data.data(), {B, Hkv, L, D}, float32);
+        auto v = array(v_data.data(), {B, Hkv, L, D}, float32);
+
+        // Mask: [1,1,Tq,L], sin-perturbed negative bias on some entries.
+        std::vector<float> mask_data(Tq * L, 0.0f);
+        for (int i = 0; i < Tq * L; i++) {
+            if ((i % 5) == 0) mask_data[i] = -1.0f;
+        }
+        auto mask = array(mask_data.data(), {1, 1, Tq, L}, float32);
+        eval_safe(q); eval_safe(k); eval_safe(v); eval_safe(mask);
+
+        float scale = 1.0f / std::sqrt((float)D);
+        auto result = fast::scaled_dot_product_attention(
+            q, k, v, scale, "", mask, {});
+        eval_safe(result);
+        return output_result(result, out_vals, max_count);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_sdpa_tile_tq32_d128_addmask] %s\n", e.what());
+        return -1;
+    }
+}
+
+// Tq=33, D=128 causal. Three Q tiles: ceil(33/16) = 3. The last tile has
+// only 1 live query row (tq=0) with rows 1..15 zero-padded. Exercises the
+// `q_row < Tq` store guard at the tail.
+int mlx_test_sdpa_tile_tq33_d128_tailtile(float* out_vals, int max_count) {
+    using namespace mlx::core;
+    try {
+        int B = 1, Hq = 4, Hkv = 2, Tq = 33, L = 33, D = 128;
+        std::vector<float> q_data(B * Hq * Tq * D);
+        std::vector<float> k_data(B * Hkv * L * D);
+        std::vector<float> v_data(B * Hkv * L * D);
+        for (int i = 0; i < (int)q_data.size(); i++) q_data[i] = std::sin(i * 0.007f) * 0.4f;
+        for (int i = 0; i < (int)k_data.size(); i++) k_data[i] = std::cos(i * 0.011f) * 0.4f;
+        for (int i = 0; i < (int)v_data.size(); i++) v_data[i] = std::sin(i * 0.013f + 0.2f) * 0.25f;
+
+        auto q = array(q_data.data(), {B, Hq, Tq, D}, float32);
+        auto k = array(k_data.data(), {B, Hkv, L, D}, float32);
+        auto v = array(v_data.data(), {B, Hkv, L, D}, float32);
+        eval_safe(q); eval_safe(k); eval_safe(v);
+
+        float scale = 1.0f / std::sqrt((float)D);
+        auto result = fast::scaled_dot_product_attention(
+            q, k, v, scale, "causal", std::nullopt, {});
+        eval_safe(result);
+        return output_result(result, out_vals, max_count);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_sdpa_tile_tq33_d128_tailtile] %s\n", e.what());
+        return -1;
+    }
+}
+
+// Tq=128, D=128, L=4096 causal. Prefill-like shape: large KV, 8 Q tiles,
+// 512 KV blocks (4096 / BK=8). Main bandwidth stress test — covers online
+// softmax running-max/sum updates across many blocks.
+int mlx_test_sdpa_tile_tq128_d128_l4096(float* out_vals, int max_count) {
+    using namespace mlx::core;
+    try {
+        int B = 1, Hq = 2, Hkv = 1, Tq = 128, L = 4096, D = 128;
+        std::vector<float> q_data(B * Hq * Tq * D);
+        std::vector<float> k_data(B * Hkv * L * D);
+        std::vector<float> v_data(B * Hkv * L * D);
+        for (int i = 0; i < (int)q_data.size(); i++) q_data[i] = std::sin(i * 0.003f) * 0.35f;
+        for (int i = 0; i < (int)k_data.size(); i++) k_data[i] = std::cos(i * 0.004f) * 0.35f;
+        for (int i = 0; i < (int)v_data.size(); i++) v_data[i] = std::sin(i * 0.005f + 0.1f) * 0.2f;
+
+        auto q = array(q_data.data(), {B, Hq, Tq, D}, float32);
+        auto k = array(k_data.data(), {B, Hkv, L, D}, float32);
+        auto v = array(v_data.data(), {B, Hkv, L, D}, float32);
+        eval_safe(q); eval_safe(k); eval_safe(v);
+
+        float scale = 1.0f / std::sqrt((float)D);
+        auto result = fast::scaled_dot_product_attention(
+            q, k, v, scale, "causal", std::nullopt, {});
+        eval_safe(result);
+        return output_result(result, out_vals, max_count);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_sdpa_tile_tq128_d128_l4096] %s\n", e.what());
+        return -1;
+    }
+}
+
 }  // extern "C"
 

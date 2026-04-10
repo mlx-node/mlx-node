@@ -170,6 +170,19 @@ async function initAndRun(wasmUrl: string) {
   };
   setPackedBf16(false);
 
+  // ---- SDPA fallback force helper ----
+  // Toggle the WebGPU SDPA primitive's runtime kill-switch. When true,
+  // `ScaledDotProductAttention::use_fallback()` returns true unconditionally
+  // so the decomposed matmul→softmax→matmul path runs instead of the fused
+  // tile/vector kernels. Used by the tile SDPA parity tests to get a reference
+  // value from the fallback path, then compare against the fused-kernel output.
+  const setSdpaFallbackForced = (v: boolean) => {
+    if (typeof mlxExports.wgpuSetSdpaFallbackForced === 'function') {
+      mlxExports.wgpuSetSdpaFallbackForced(v);
+    }
+  };
+  setSdpaFallbackForced(false);
+
   // Convert a Float32Array → bf16 bytes by truncating each f32 to its
   // upper 16 bits (round-toward-zero). Hands the bytes to the bf16 array
   // constructor, which (when packed flag is on and size ≥ threshold) flips
@@ -2753,6 +2766,91 @@ async function initAndRun(wasmUrl: string) {
       if (vals[0] === -999) throw new Error('testSdpaDecodeGqa error');
       const ref = [0.011597, 0.011475, 0.011597, 0.011475, 0.011536, 0.011414, 0.011353, 0.011414, 0.011230, 0.011230];
       assertClose(vals.slice(0, 10), ref, 0.01);
+    }},
+
+    // =============== SDPA Tile (prefill) parity tests ===============
+    //
+    // Each test runs a Tq > 1 SDPA helper twice:
+    //   1) With setSdpaFallbackForced(true)  -> decomposed matmul path (reference)
+    //   2) With setSdpaFallbackForced(false) -> fused tile kernel (under test)
+    // The two arrays must match within `tol`. This catches any algebraic
+    // divergence in the tile kernel's online softmax + running accumulators
+    // without hardcoding reference values (which would drift across dtypes
+    // and compilers).
+
+    { name: 'SDPA tile Tq=2 D=64 (f32)', run() {
+      const COUNT = 64;
+      setSdpaFallbackForced(true);
+      let ref: number[];
+      try {
+        ref = MxArray.testSdpaTileTq2D64(COUNT);
+      } finally {
+        setSdpaFallbackForced(false);
+      }
+      if (ref[0] === -999) throw new Error('testSdpaTileTq2D64 ref error');
+      const vals = MxArray.testSdpaTileTq2D64(COUNT);
+      if (vals[0] === -999) throw new Error('testSdpaTileTq2D64 tile error');
+      assertClose(vals, ref, 1e-4);
+    }},
+
+    { name: 'SDPA tile Tq=8 D=128 causal GQA (f32)', run() {
+      const COUNT = 32;
+      setSdpaFallbackForced(true);
+      let ref: number[];
+      try {
+        ref = MxArray.testSdpaTileTq8D128CausalGqa(COUNT);
+      } finally {
+        setSdpaFallbackForced(false);
+      }
+      if (ref[0] === -999) throw new Error('testSdpaTileTq8D128CausalGqa ref error');
+      const vals = MxArray.testSdpaTileTq8D128CausalGqa(COUNT);
+      if (vals[0] === -999) throw new Error('testSdpaTileTq8D128CausalGqa tile error');
+      assertClose(vals, ref, 1e-4);
+    }},
+
+    { name: 'SDPA tile Tq=32 D=128 additive mask (f32)', run() {
+      const COUNT = 32;
+      setSdpaFallbackForced(true);
+      let ref: number[];
+      try {
+        ref = MxArray.testSdpaTileTq32D128Addmask(COUNT);
+      } finally {
+        setSdpaFallbackForced(false);
+      }
+      if (ref[0] === -999) throw new Error('testSdpaTileTq32D128Addmask ref error');
+      const vals = MxArray.testSdpaTileTq32D128Addmask(COUNT);
+      if (vals[0] === -999) throw new Error('testSdpaTileTq32D128Addmask tile error');
+      assertClose(vals, ref, 1e-4);
+    }},
+
+    { name: 'SDPA tile Tq=33 D=128 causal partial-last-tile (f32)', run() {
+      const COUNT = 32;
+      setSdpaFallbackForced(true);
+      let ref: number[];
+      try {
+        ref = MxArray.testSdpaTileTq33D128Tailtile(COUNT);
+      } finally {
+        setSdpaFallbackForced(false);
+      }
+      if (ref[0] === -999) throw new Error('testSdpaTileTq33D128Tailtile ref error');
+      const vals = MxArray.testSdpaTileTq33D128Tailtile(COUNT);
+      if (vals[0] === -999) throw new Error('testSdpaTileTq33D128Tailtile tile error');
+      assertClose(vals, ref, 1e-4);
+    }},
+
+    { name: 'SDPA tile Tq=128 D=128 L=4096 causal (f32)', run() {
+      const COUNT = 32;
+      setSdpaFallbackForced(true);
+      let ref: number[];
+      try {
+        ref = MxArray.testSdpaTileTq128D128L4096(COUNT);
+      } finally {
+        setSdpaFallbackForced(false);
+      }
+      if (ref[0] === -999) throw new Error('testSdpaTileTq128D128L4096 ref error');
+      const vals = MxArray.testSdpaTileTq128D128L4096(COUNT);
+      if (vals[0] === -999) throw new Error('testSdpaTileTq128D128L4096 tile error');
+      assertClose(vals, ref, 1e-4);
     }},
 
     // --- Full attention layer bf16 ---

@@ -289,15 +289,24 @@ worker.addEventListener('messageerror', (e) => {
 // backend. This is a runtime A/B toggle — no rebuild required. The flag is
 // forwarded to the WASM worker which calls wgpuSetPackedBf16Enabled on the
 // native binding before the model is loaded.
+//
+// ?sdpa_fallback=1 forces the WebGPU SDPA primitive onto the decomposed
+// matmul→softmax→matmul path, bypassing the fused vector / tile kernels.
+// Used for A/B-ing TTFT against the fused tile kernel without a rebuild.
 const urlParams = new URLSearchParams(location.search);
 const packBf16 = urlParams.get('pack_bf16') === '1';
-log(`Starting MLX Worker${packBf16 ? ' (pack_bf16=1)' : ''}...`);
+const sdpaFallback = urlParams.get('sdpa_fallback') === '1';
+const flagBadges =
+  (packBf16 ? ' (pack_bf16=1)' : '') +
+  (sdpaFallback ? ' (sdpa_fallback=1)' : '');
+log(`Starting MLX Worker${flagBadges}...`);
 setStatus('Initializing...', 'info');
 worker.postMessage({
   type: 'init',
   wasmUrl: new URL('/mlx-core.opt.wasm', location.href).href,
   modelUrl: '/model',
   packBf16,
+  sdpaFallback,
 });
 
 // Chat handler

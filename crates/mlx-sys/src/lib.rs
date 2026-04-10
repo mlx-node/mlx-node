@@ -677,6 +677,12 @@ unsafe extern "C-unwind" {
     /// Plumbed from the TS init message so the browser can opt in at runtime.
     pub fn mlx_wgpu_set_packed_bf16_enabled(enabled: bool);
 
+    /// Force the WebGPU SDPA primitive onto the decomposed
+    /// matmul→softmax→matmul fallback path. Plumbed from ?sdpa_fallback=1
+    /// so the demo can A/B-test the fused vector + tile kernels against the
+    /// baseline at runtime. No-op on non-WebGPU builds.
+    pub fn mlx_wgpu_set_sdpa_fallback_forced(enabled: bool);
+
     /// Opt an existing upload-pending bf16 array into PackedBf16 storage when
     /// eligible (flag is on, dtype is bf16, size >= min_elements, and the
     /// buffer has not yet been used on the GPU). Returns true if the flip
@@ -1362,6 +1368,24 @@ unsafe extern "C-unwind" {
     pub fn mlx_test_qk_norm_rope(out: *mut f32, max_count: i32) -> i32;
     pub fn mlx_test_sdpa_additive_mask(out: *mut f32, max_count: i32) -> i32;
     pub fn mlx_test_sdpa_decode_gqa(out: *mut f32, max_count: i32) -> i32;
+    // Tile (prefill) SDPA parity tests for the Tq > 1 fused kernel.
+    pub fn mlx_test_sdpa_tile_tq2_d64(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_tile_tq8_d128_causal_gqa(
+        out: *mut f32,
+        max_count: i32,
+    ) -> i32;
+    pub fn mlx_test_sdpa_tile_tq32_d128_addmask(
+        out: *mut f32,
+        max_count: i32,
+    ) -> i32;
+    pub fn mlx_test_sdpa_tile_tq33_d128_tailtile(
+        out: *mut f32,
+        max_count: i32,
+    ) -> i32;
+    pub fn mlx_test_sdpa_tile_tq128_d128_l4096(
+        out: *mut f32,
+        max_count: i32,
+    ) -> i32;
     pub fn mlx_test_full_attn_layer_bf16(out: *mut f32, max_count: i32) -> i32;
     pub fn mlx_test_rms_norm_bf16(out: *mut f32, max_count: i32) -> i32;
     pub fn mlx_test_swiglu_mlp_bf16(out: *mut f32, max_count: i32) -> i32;
