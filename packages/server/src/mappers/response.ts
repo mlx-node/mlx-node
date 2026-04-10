@@ -84,14 +84,10 @@ export function buildOutputItems(result: ChatResult): OutputItem[] {
  * Build the usage object from a ChatResult.
  */
 export function buildUsage(result: ChatResult): ResponseUsage {
-  // The model reports total output tokens but does not separate reasoning
-  // tokens from content tokens. Report 0 for reasoning_tokens — this matches
-  // the behavior of most inference backends (vLLM, etc.) that don't track
-  // thinking tokens separately.
   return {
     input_tokens: result.promptTokens,
     output_tokens: result.numTokens,
-    output_tokens_details: { reasoning_tokens: 0 },
+    output_tokens_details: { reasoning_tokens: result.reasoningTokens },
     total_tokens: result.promptTokens + result.numTokens,
   };
 }

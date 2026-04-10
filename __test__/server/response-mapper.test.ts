@@ -11,10 +11,18 @@ import {
 function makeChatResult(overrides: Record<string, unknown> = {}) {
   return {
     text: 'Hello!',
-    toolCalls: [] as { name: string; arguments: string; id?: string }[],
+    toolCalls: [] as {
+      id: string;
+      name: string;
+      arguments: Record<string, unknown> | string;
+      status: string;
+      rawContent: string;
+      error?: string;
+    }[],
     thinking: undefined as string | undefined,
     numTokens: 5,
     promptTokens: 10,
+    reasoningTokens: 0,
     finishReason: 'stop',
     rawText: 'Hello!',
     performance: undefined,
@@ -69,7 +77,7 @@ describe('buildOutputItems', () => {
   it('produces function_call items after message when tool calls are present', () => {
     const result = makeChatResult({
       text: 'Let me check the weather.',
-      toolCalls: [{ name: 'get_weather', arguments: '{"city":"SF"}', id: 'call_123' }],
+      toolCalls: [{ id: 'call_123', name: 'get_weather', arguments: '{"city":"SF"}', status: 'ok', rawContent: '' }],
     });
     const items = buildOutputItems(result);
 
@@ -85,7 +93,7 @@ describe('buildOutputItems', () => {
   it('omits message item when text is empty and tool calls are present', () => {
     const result = makeChatResult({
       text: '',
-      toolCalls: [{ name: 'get_weather', arguments: '{}' }],
+      toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{}', status: 'ok', rawContent: '' }],
     });
     const items = buildOutputItems(result);
 
@@ -106,7 +114,7 @@ describe('buildOutputItems', () => {
   it('stringifies non-string tool call arguments', () => {
     const result = makeChatResult({
       text: '',
-      toolCalls: [{ name: 'fn', arguments: { key: 'value' } }],
+      toolCalls: [{ id: 'call_2', name: 'fn', arguments: { key: 'value' }, status: 'ok', rawContent: '' }],
     });
     const items = buildOutputItems(result);
 
@@ -117,7 +125,7 @@ describe('buildOutputItems', () => {
   it('generates unique IDs for each item', () => {
     const result = makeChatResult({
       thinking: 'hmm',
-      toolCalls: [{ name: 'fn', arguments: '{}' }],
+      toolCalls: [{ id: 'call_3', name: 'fn', arguments: '{}', status: 'ok', rawContent: '' }],
     });
     const items = buildOutputItems(result);
 
@@ -144,6 +152,16 @@ describe('buildUsage', () => {
     expect(usage.output_tokens).toBe(25);
     expect(usage.total_tokens).toBe(40);
     expect(usage.output_tokens_details.reasoning_tokens).toBe(0);
+  });
+
+  it('reports reasoning_tokens from ChatResult', () => {
+    const result = makeChatResult({ promptTokens: 15, numTokens: 25, reasoningTokens: 12 });
+    const usage = buildUsage(result);
+
+    expect(usage.input_tokens).toBe(15);
+    expect(usage.output_tokens).toBe(25);
+    expect(usage.total_tokens).toBe(40);
+    expect(usage.output_tokens_details.reasoning_tokens).toBe(12);
   });
 
   it('handles zero tokens', () => {

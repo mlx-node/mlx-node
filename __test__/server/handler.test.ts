@@ -1,8 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-import { describe, expect, it, vi } from 'vite-plus/test';
-
 import { createHandler, ModelRegistry } from '@mlx-node/server';
+import { describe, expect, it, vi } from 'vite-plus/test';
 
 // ---------------------------------------------------------------------------
 // Mock helpers
@@ -103,6 +102,7 @@ function createMockModel() {
       thinking: undefined,
       numTokens: 5,
       promptTokens: 10,
+      reasoningTokens: 0,
       finishReason: 'stop',
       rawText: 'Hello!',
       performance: undefined,

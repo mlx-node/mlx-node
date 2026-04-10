@@ -196,10 +196,11 @@ async function handleStreamingNative(
 
       // Build completed response
       const promptTokens = event.promptTokens ?? 0;
+      const reasoningTokens = event.reasoningTokens ?? 0;
       const usage = {
         input_tokens: promptTokens,
         output_tokens: event.numTokens,
-        output_tokens_details: { reasoning_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: reasoningTokens },
         total_tokens: promptTokens + event.numTokens,
       };
 

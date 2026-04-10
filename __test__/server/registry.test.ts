@@ -1,6 +1,5 @@
-import { describe, expect, it, vi } from 'vite-plus/test';
-
 import { ModelRegistry } from '@mlx-node/server';
+import { describe, expect, it, vi } from 'vite-plus/test';
 
 describe('ModelRegistry', () => {
   it('registers and retrieves a model', () => {

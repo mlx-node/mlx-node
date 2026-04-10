@@ -2016,6 +2016,7 @@ export interface ChatResult {
   thinking?: string;
   numTokens: number;
   promptTokens: number;
+  reasoningTokens: number;
   finishReason: string;
   rawText: string;
   /** Performance metrics (present when `reportPerformance: true` in config) */
@@ -2043,6 +2044,7 @@ export interface ChatStreamChunk {
   thinking?: string;
   numTokens?: number;
   promptTokens?: number;
+  reasoningTokens?: number;
   rawText?: string;
   /** Performance metrics (only present in the final chunk when `reportPerformance: true`) */
   performance?: PerformanceMetrics;

@@ -73,7 +73,10 @@ describe.sequential('_createChatStream bridge', () => {
       toolCalls: [],
       thinking: 'some thinking',
       numTokens: 2,
+      promptTokens: 0,
+      reasoningTokens: 0,
       rawText: 'raw final text',
+      performance: undefined,
     });
   });
 
