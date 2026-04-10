@@ -80,6 +80,7 @@ fn escape_gemma4_content(s: &str) -> String {
 use super::config::Gemma4Config;
 use super::decoder_layer::Gemma4DecoderLayer;
 use super::layer_cache::Gemma4LayerCache;
+use crate::models::qwen3_5::model::ChatResult;
 use tracing::{debug, info};
 
 /// Gemma4 generation configuration.
@@ -93,16 +94,6 @@ pub struct Gemma4ChatConfig {
     /// Enable thinking mode. `None` = let the template decide,
     /// `Some(false)` = disabled, `Some(true)` = enabled.
     pub enable_thinking: Option<bool>,
-}
-
-/// Gemma4 chat result.
-#[napi(object)]
-pub struct Gemma4ChatResult {
-    pub text: String,
-    pub num_tokens: u32,
-    pub finish_reason: String,
-    /// Performance metrics (always present).
-    pub performance: Option<crate::profiling::PerformanceMetrics>,
 }
 
 /// PLE (Per-Layer Embeddings) model-level components.
@@ -155,7 +146,7 @@ pub(crate) enum Gemma4Cmd {
         messages: Vec<ChatMessage>,
         config: Gemma4ChatConfig,
         processed_images: Vec<ProcessedGemma4Image>,
-        reply: ResponseTx<Gemma4ChatResult>,
+        reply: ResponseTx<ChatResult>,
     },
 }
 
@@ -276,7 +267,7 @@ impl Gemma4Inner {
         messages: Vec<ChatMessage>,
         config: Gemma4ChatConfig,
         processed_images: Vec<ProcessedGemma4Image>,
-    ) -> Result<Gemma4ChatResult> {
+    ) -> Result<ChatResult> {
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
 
         let tokenizer = self
@@ -688,10 +679,14 @@ impl Gemma4Inner {
             },
         });
 
-        Ok(Gemma4ChatResult {
-            text,
+        Ok(ChatResult {
+            text: text.clone(),
+            tool_calls: vec![],
+            thinking: None,
             num_tokens: generated_tokens.len() as u32,
+            prompt_tokens: prompt_token_count as u32,
             finish_reason,
+            raw_text: text,
             performance,
         })
     }
@@ -761,7 +756,7 @@ impl Gemma4Model {
         &self,
         messages: Vec<ChatMessage>,
         config: Option<Gemma4ChatConfig>,
-    ) -> Result<Gemma4ChatResult> {
+    ) -> Result<ChatResult> {
         let config = config.unwrap_or(Gemma4ChatConfig {
             max_new_tokens: None,
             temperature: None,
