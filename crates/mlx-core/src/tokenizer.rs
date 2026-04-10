@@ -327,7 +327,10 @@ impl Qwen3Tokenizer {
             config
                 .as_ref()
                 .and_then(|c| c.get(key))
-                .and_then(|v| v.as_str())
+                .and_then(|v| {
+                    v.as_str()
+                        .or_else(|| v.get("content").and_then(|c| c.as_str()))
+                })
                 .and_then(|token_str| tokenizer.token_to_id(token_str))
         };
 
