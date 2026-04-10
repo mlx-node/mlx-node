@@ -781,6 +781,12 @@ impl Qwen35MoeInner {
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
+        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+            enable_thinking.unwrap_or(true),
+            p.thinking_token_budget,
+            think_end_id,
+        );
+
         if use_cpp {
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
@@ -854,13 +860,6 @@ impl Qwen35MoeInner {
 
             profiler.set_label("moe_chat_compiled");
 
-            let starts_in_thinking = enable_thinking.unwrap_or(true);
-            let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-                starts_in_thinking,
-                p.thinking_token_budget,
-                think_end_id,
-            );
-
             let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     Ok((forward_moe_cpp(ids, emb)?, false))
@@ -921,13 +920,6 @@ impl Qwen35MoeInner {
         } else {
             // Rust fallback decode loop
             profiler.set_label("moe_chat_rust");
-
-            let starts_in_thinking = enable_thinking.unwrap_or(true);
-            let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-                starts_in_thinking,
-                p.thinking_token_budget,
-                think_end_id,
-            );
 
             let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
@@ -997,6 +989,7 @@ impl Qwen35MoeInner {
             p.include_reasoning,
             enable_thinking.unwrap_or(true),
             prefill_tokens.len() as u32,
+            reasoning_tracker.reasoning_token_count(),
         )
     }
 
@@ -1282,6 +1275,11 @@ impl Qwen35MoeInner {
 
         let starts_in_thinking = enable_thinking.unwrap_or(true);
         let mut last_is_reasoning = starts_in_thinking;
+        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+            starts_in_thinking,
+            p.thinking_token_budget,
+            think_end_id,
+        );
 
         if use_cpp {
             let _moe_guard = MoeResetGuard;
@@ -1354,11 +1352,6 @@ impl Qwen35MoeInner {
 
             profiler.set_label("moe_chat_stream_compiled");
 
-            let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-                starts_in_thinking,
-                p.thinking_token_budget,
-                think_end_id,
-            );
             let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     Ok((forward_moe_cpp(ids, emb)?, false))
@@ -1427,11 +1420,6 @@ impl Qwen35MoeInner {
         } else {
             profiler.set_label("moe_chat_stream_rust");
 
-            let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-                starts_in_thinking,
-                p.thinking_token_budget,
-                think_end_id,
-            );
             let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
@@ -1510,6 +1498,7 @@ impl Qwen35MoeInner {
                     thinking: None,
                     num_tokens: None,
                     prompt_tokens: None,
+                    reasoning_tokens: None,
                     raw_text: None,
                     performance: None,
                     is_reasoning: Some(last_is_reasoning),
@@ -1553,6 +1542,7 @@ impl Qwen35MoeInner {
                 thinking,
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
+                reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
                 raw_text: Some(text),
                 performance: perf_metrics,
                 is_reasoning: None,

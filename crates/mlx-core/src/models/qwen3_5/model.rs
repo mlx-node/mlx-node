@@ -933,6 +933,12 @@ impl Qwen35Inner {
             None
         };
 
+        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+            enable_thinking.unwrap_or(true),
+            p.thinking_token_budget,
+            think_end_id,
+        );
+
         if use_compiled {
             if vlm_compiled_init_done {
                 // VLM prefill already initialized compiled state
@@ -996,13 +1002,6 @@ impl Qwen35Inner {
 
             profiler.set_label("chat_compiled");
 
-            let starts_in_thinking = enable_thinking.unwrap_or(true);
-            let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-                starts_in_thinking,
-                p.thinking_token_budget,
-                think_end_id,
-            );
-
             let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     Ok((forward_compiled(ids, emb)?, false))
@@ -1061,13 +1060,6 @@ impl Qwen35Inner {
             }
         } else {
             profiler.set_label("chat_rust");
-
-            let starts_in_thinking = enable_thinking.unwrap_or(true);
-            let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-                starts_in_thinking,
-                p.thinking_token_budget,
-                think_end_id,
-            );
 
             MxArray::async_eval_arrays(&[&y]);
 
@@ -1138,6 +1130,7 @@ impl Qwen35Inner {
             p.include_reasoning,
             enable_thinking.unwrap_or(true),
             prefill_tokens.len() as u32,
+            reasoning_tracker.reasoning_token_count(),
         )
     }
 
@@ -1415,6 +1408,11 @@ impl Qwen35Inner {
 
         let starts_in_thinking = enable_thinking.unwrap_or(true);
         let mut last_is_reasoning = starts_in_thinking;
+        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+            starts_in_thinking,
+            p.thinking_token_budget,
+            think_end_id,
+        );
 
         if use_compiled {
             if vlm_compiled_init_done {
@@ -1476,12 +1474,6 @@ impl Qwen35Inner {
             }
 
             profiler.set_label("chat_stream_compiled");
-
-            let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-                starts_in_thinking,
-                p.thinking_token_budget,
-                think_end_id,
-            );
 
             let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
@@ -1549,12 +1541,6 @@ impl Qwen35Inner {
             }
         } else {
             profiler.set_label("chat_stream_rust");
-
-            let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-                starts_in_thinking,
-                p.thinking_token_budget,
-                think_end_id,
-            );
 
             let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
@@ -1633,6 +1619,7 @@ impl Qwen35Inner {
                     thinking: None,
                     num_tokens: None,
                     prompt_tokens: None,
+                    reasoning_tokens: None,
                     raw_text: None,
                     performance: None,
                     is_reasoning: Some(last_is_reasoning),
@@ -1676,6 +1663,7 @@ impl Qwen35Inner {
                 thinking,
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
+                reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
                 raw_text: Some(text),
                 performance: perf_metrics,
                 is_reasoning: None,
@@ -3163,6 +3151,7 @@ pub struct ChatResult {
     pub thinking: Option<String>,
     pub num_tokens: u32,
     pub prompt_tokens: u32,
+    pub reasoning_tokens: u32,
     pub finish_reason: String,
     pub raw_text: String,
     /// Performance metrics (present when `reportPerformance: true` in config)
@@ -3180,6 +3169,7 @@ pub struct ChatStreamChunk {
     pub thinking: Option<String>,
     pub num_tokens: Option<u32>,
     pub prompt_tokens: Option<u32>,
+    pub reasoning_tokens: Option<u32>,
     pub raw_text: Option<String>,
     /// Performance metrics (only present in the final chunk when `reportPerformance: true`)
     pub performance: Option<crate::profiling::PerformanceMetrics>,
