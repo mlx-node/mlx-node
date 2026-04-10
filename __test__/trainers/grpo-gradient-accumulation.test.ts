@@ -1,11 +1,27 @@
-import { MxArray, Qwen3Model } from '@mlx-node/core';
+import { MxArray } from '@mlx-node/core';
 import { describe, it, expect } from 'vite-plus/test';
 
 import { shape } from '../test-utils';
 
+/** Element-wise gradient accumulation (mirrors the logic previously on Qwen3Model). */
+function accumulateGradients(
+  accumulated: Record<string, MxArray>,
+  newGrads: Record<string, MxArray>,
+): Record<string, MxArray> {
+  const result: Record<string, MxArray> = { ...accumulated };
+  for (const [key, grad] of Object.entries(newGrads)) {
+    if (key in result) {
+      result[key] = result[key].add(grad);
+    } else {
+      result[key] = grad;
+    }
+  }
+  return result;
+}
+
 describe('GRPO Gradient Accumulation', () => {
   describe('Gradient Accumulation Math', () => {
-    it('should correctly accumulate gradients using Qwen3Model.accumulateGradients', () => {
+    it('should correctly accumulate gradients', () => {
       // Test gradient accumulation helper function
       const grad1 = {
         param1: MxArray.fromFloat32(new Float32Array([1.0, 2.0]), shape(2)),
@@ -17,7 +33,7 @@ describe('GRPO Gradient Accumulation', () => {
         param2: MxArray.fromFloat32(new Float32Array([1.0]), shape(1)),
       };
 
-      const accumulated = Qwen3Model.accumulateGradients(grad1, grad2);
+      const accumulated = accumulateGradients(grad1, grad2);
 
       // Check param1: [1.0, 2.0] + [0.5, 1.5] = [1.5, 3.5]
       const param1Values = accumulated['param1'].toFloat32();
@@ -36,7 +52,7 @@ describe('GRPO Gradient Accumulation', () => {
         param1: MxArray.fromFloat32(new Float32Array([1.0, 2.0]), shape(2)),
       };
 
-      const accumulated = Qwen3Model.accumulateGradients(grad1, grad2);
+      const accumulated = accumulateGradients(grad1, grad2);
 
       // First accumulation should just copy grad2
       const param1Values = accumulated['param1'].toFloat32();
@@ -56,7 +72,7 @@ describe('GRPO Gradient Accumulation', () => {
       // Accumulate N identical gradients
       let accumulated: Record<string, MxArray> = {};
       for (let i = 0; i < N; i++) {
-        accumulated = Qwen3Model.accumulateGradients(accumulated, baseGrad);
+        accumulated = accumulateGradients(accumulated, baseGrad);
       }
 
       // Sum should be N times the base gradient
@@ -81,7 +97,7 @@ describe('GRPO Gradient Accumulation', () => {
         const grad1 = { param: MxArray.fromFloat32(data, sh) };
         const grad2 = { param: MxArray.fromFloat32(data, sh) };
 
-        const accumulated = Qwen3Model.accumulateGradients(grad1, grad2);
+        const accumulated = accumulateGradients(grad1, grad2);
         const accShape = accumulated['param'].shape();
 
         // Convert BigInt64Array to regular numbers for comparison
@@ -150,7 +166,7 @@ describe('GRPO Gradient Accumulation', () => {
       // Method 1: Accumulate and apply with scaled LR (what grpo-trainer does)
       let accumulated: Record<string, MxArray> = {};
       for (const g of grads) {
-        accumulated = Qwen3Model.accumulateGradients(accumulated, { w: g });
+        accumulated = accumulateGradients(accumulated, { w: g });
       }
       const scaledLr = MxArray.fromFloat32(new Float32Array([lr / N]), shape(1));
       const scaledGrad1 = scaledLr.mul(accumulated['w']);
