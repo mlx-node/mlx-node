@@ -1129,7 +1129,11 @@ impl Qwen35Inner {
             performance,
             p.include_reasoning,
             enable_thinking.unwrap_or(true),
-            prefill_tokens.len() as u32,
+            if has_images {
+                expanded_tokens.len() as u32
+            } else {
+                tokens.len() as u32
+            },
             reasoning_tracker.reasoning_token_count(),
         )
     }
@@ -1629,7 +1633,11 @@ impl Qwen35Inner {
         }
 
         let num_tokens = generated_tokens.len() as u32;
-        let prompt_token_count = prefill_tokens.len() as u32;
+        let prompt_token_count = if has_images {
+            expanded_tokens.len() as u32
+        } else {
+            tokens.len() as u32
+        };
 
         let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
             &text,
