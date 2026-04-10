@@ -36,6 +36,7 @@
 pub mod connection;
 pub mod error;
 pub mod reader;
+pub mod response_store;
 pub mod schema;
 pub mod types;
 pub mod writer;
