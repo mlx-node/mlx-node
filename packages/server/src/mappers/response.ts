@@ -63,8 +63,8 @@ export function buildOutputItems(result: ChatResult): OutputItem[] {
     items.push(messageItem);
   }
 
-  // Function call items
-  for (const tc of result.toolCalls) {
+  // Function call items (only successfully parsed tool calls)
+  for (const tc of result.toolCalls.filter((t) => t.status === 'ok')) {
     const callId = tc.id ?? genId('call_');
     const fcItem: FunctionCallOutputItem = {
       id: genId('fc_'),

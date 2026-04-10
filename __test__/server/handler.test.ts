@@ -455,13 +455,16 @@ describe('createHandler', () => {
               id: 'call_123',
               name: 'get_weather',
               arguments: '{"city": "SF"}',
+              status: 'ok',
+              rawContent: '',
             },
           ],
           thinking: null,
           numTokens: 20,
           promptTokens: 10,
           reasoningTokens: 0,
-          rawText: 'Let me look that up.\n<tool_call>\n{"name": "get_weather", "arguments": {"city": "SF"}}\n</tool_call>',
+          rawText:
+            'Let me look that up.\n<tool_call>\n{"name": "get_weather", "arguments": {"city": "SF"}}\n</tool_call>',
         },
       ];
 
@@ -536,7 +539,7 @@ describe('createHandler', () => {
           done: true,
           text: '', // No clean text
           finishReason: 'tool_calls',
-          toolCalls: [{ id: 'call_456', name: 'search', arguments: '{"q": "test"}' }],
+          toolCalls: [{ id: 'call_456', name: 'search', arguments: '{"q": "test"}', status: 'ok', rawContent: '' }],
           thinking: null,
           numTokens: 15,
           promptTokens: 8,
@@ -664,6 +667,8 @@ describe('createHandler', () => {
               id: 'call_split',
               name: 'get_weather',
               arguments: '{"city": "SF"}',
+              status: 'ok',
+              rawContent: '',
             },
           ],
           thinking: null,

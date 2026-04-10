@@ -5,7 +5,7 @@ use crate::error::DbError;
 
 pub async fn get_response(pool: &SqlitePool, id: &str) -> Result<Option<StoredResponse>, DbError> {
     let row: Option<StoredResponseRow> = sqlx::query_as(
-        "SELECT id, created_at, model, status, instructions, input_json, output_json, output_text, usage_json, previous_response_id, config_json, expires_at FROM responses WHERE id = ?",
+        "SELECT id, created_at, model, status, instructions, input_json, output_json, output_text, usage_json, previous_response_id, config_json, expires_at FROM responses WHERE id = ? AND (expires_at IS NULL OR expires_at > unixepoch())",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -24,7 +24,7 @@ pub async fn get_response_chain(
 
     while let Some(ref cid) = current_id {
         let row: Option<StoredResponseRow> = sqlx::query_as(
-            "SELECT id, created_at, model, status, instructions, input_json, output_json, output_text, usage_json, previous_response_id, config_json, expires_at FROM responses WHERE id = ?",
+            "SELECT id, created_at, model, status, instructions, input_json, output_json, output_text, usage_json, previous_response_id, config_json, expires_at FROM responses WHERE id = ? AND (expires_at IS NULL OR expires_at > unixepoch())",
         )
         .bind(cid)
         .fetch_optional(pool)

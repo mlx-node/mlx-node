@@ -170,7 +170,7 @@ async function handleStreamingNative(
       // If the parsed text is empty and there are tool calls, skip the message item entirely
       // (matching the non-streaming buildOutputItems behavior).
       const finalText = event.text;
-      const hasToolCalls = event.toolCalls.length > 0;
+      const hasToolCalls = event.toolCalls.some((t) => t.status === 'ok');
       const skipMessageItem = !finalText && hasToolCalls;
 
       // Recovery: if tool-call suppression was triggered but the final event has no
@@ -241,7 +241,7 @@ async function handleStreamingNative(
       }
 
       // Emit function call items
-      for (const tc of event.toolCalls) {
+      for (const tc of event.toolCalls.filter((t) => t.status === 'ok')) {
         const callId = tc.id ?? genId('call_');
         const fcItem: FunctionCallOutputItem = {
           id: genId('fc_'),
