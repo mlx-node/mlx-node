@@ -308,27 +308,58 @@ self.onmessage = async (e: MessageEvent) => {
     // buffer's storage_mode is PackedBf16. gpu-worker.ts sees the raw
     // safetensors names (pre-rename) so the suffixes match what lands
     // in qwen3_5/persistence.rs:norm_suffixes before prefix stripping
-    // and renaming. Notably `.linear_attn.norm.weight` is f32, not bf16,
-    // so the isBf16 check below already excludes it. The text-only
-    // model.norm.weight is captured by the "norm.weight" suffix.
+    // and renaming.
+    //
+    // EXACT allowlist — derived from the Qwen3.5-0.8B VL safetensors
+    // header (see packed_bf16_norm_allowlist investigation). Four
+    // per-layer text-model norms plus the final LM-head norm are the
+    // only RMSNorm weights we pack; vision_tower.* and the per-layer
+    // `.linear_attn.norm.weight` MUST be rejected by name (not just by
+    // the below-threshold fallback or the bf16 guard — this is the
+    // primary safety net).
+    //
+    // Actual names in the header (prefix-stripped forms shown with the
+    // `language_model.model.` prefix that the safetensors loader sees
+    // prior to persistence.rs's rename pass):
+    //   - language_model.model.layers.{i}.input_layernorm.weight         [1024] bf16
+    //   - language_model.model.layers.{i}.post_attention_layernorm.weight [1024] bf16
+    //   - language_model.model.layers.{i}.self_attn.q_norm.weight        [ 256] bf16
+    //   - language_model.model.layers.{i}.self_attn.k_norm.weight        [ 256] bf16
+    //   - language_model.model.norm.weight                               [1024] bf16
+    //
+    // Rejected norm-like names in the same header:
+    //   - language_model.model.layers.{i}.linear_attn.norm.weight       [ 128] bf16
+    //       (128 is below NORM_PACKED_MIN_ELEMENTS but the name guard
+    //        here is the primary rejection, not the threshold.)
+    //   - vision_tower.blocks.{i}.norm1.weight / .norm2.weight          [ 768] bf16
+    //   - vision_tower.blocks.{i}.norm1.bias   / .norm2.bias            [ 768] bf16
+    //   - vision_tower.merger.norm.weight / .bias                       [ 768] bf16
+    //
+    // Use exact endsWith tails to rule out any future tensor that might
+    // happen to end with `.norm.weight`. The final-norm check uses a
+    // dedicated endsWith('.model.norm.weight') so `model.norm.weight`
+    // (text-only rename) and `language_model.model.norm.weight` (VL)
+    // both match without a loose `.norm.weight` suffix that also
+    // accidentally grabs `linear_attn.norm.weight` or future vision
+    // norms.
     const isNormConsumedWeight = (name: string): boolean => {
       if (!name.endsWith('.weight')) return false;
+      // Reject vision-tower tensors explicitly — belt and suspenders in
+      // case a future refactor drops the endsWith-specific check below.
+      if (name.startsWith('vision_tower.')) return false;
+      // Per-layer pre-attention RMSNorm.
       if (name.endsWith('.input_layernorm.weight')) return true;
+      // Per-layer post-attention RMSNorm (feeds the MLP).
       if (name.endsWith('.post_attention_layernorm.weight')) return true;
-      if (name.endsWith('.q_norm.weight')) return true;
-      if (name.endsWith('.k_norm.weight')) return true;
-      // Final LM-head norm: "model.norm.weight" (text-only) /
-      // "model.language_model.norm.weight" (VL). `.norm.weight` is a
-      // loose suffix that would accidentally grab `.linear_attn.norm.weight`
-      // too — but that tensor is f32, so the isBf16 guard in the caller
-      // handles it. Matching the full "norm.weight" tail keeps the
-      // allowlist minimal.
-      if (name === 'norm.weight') return true;
-      if (name.endsWith('.norm.weight')) {
-        // Exclude linear_attn.norm (f32) via name, belt and suspenders.
-        if (name.endsWith('.linear_attn.norm.weight')) return false;
-        return true;
-      }
+      // Per-layer full-attention q/k RMSNorm (GQA head normalization).
+      if (name.endsWith('.self_attn.q_norm.weight')) return true;
+      if (name.endsWith('.self_attn.k_norm.weight')) return true;
+      // Final LM-head norm. Matches both the text-only (`model.norm.weight`)
+      // and VL (`language_model.model.norm.weight`) names via the shared
+      // `.model.norm.weight` tail, without leaking matches to
+      // `.linear_attn.norm.weight` or any `vision_tower.*.norm.weight`.
+      if (name === 'model.norm.weight') return true;
+      if (name.endsWith('.model.norm.weight')) return true;
       return false;
     };
 

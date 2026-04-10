@@ -616,11 +616,18 @@ export declare class MxArray {
    * WebGPU backend does not treat as an "upload-pending" buffer and so
    * cannot be placed in the packed-bf16 storage mode. When the WebGPU
    * backend has the packed-bf16 flag enabled AND the buffer is large
-   * enough (>= 4096 elements), the underlying WebGPUBuffer is flipped to
-   * `StorageMode::PackedBf16` here so the first GPU upload stores the
-   * weights 2-per-u32 and downstream GEMV dispatches the packed kernel.
+   * enough (>= `minElements`, default `PACKED_BF16_DEFAULT_MIN_ELEMENTS`),
+   * the underlying WebGPUBuffer is flipped to `StorageMode::PackedBf16`
+   * here so the first GPU upload stores the weights 2-per-u32 and downstream
+   * GEMV dispatches the packed kernel.
+   *
+   * The optional `minElements` override exists strictly for the browser
+   * test suite, which needs to exercise the small-norm packed path at the
+   * production `NORM_PACKED_MIN_ELEMENTS = 256` threshold used by
+   * `gpu-worker.ts` (D=1024 norm weights are far below the default 4096
+   * GEMV-tuned floor). Callers outside tests MUST NOT pass this override.
    */
-  static fromBfloat16Bytes(data: Uint8Array, shape: BigInt64Array): MxArray;
+  static fromBfloat16Bytes(data: Uint8Array, shape: BigInt64Array, minElements?: number | undefined | null): MxArray;
   static zeros(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
   static scalarFloat(value: number): MxArray;
   static scalarInt(value: number): MxArray;

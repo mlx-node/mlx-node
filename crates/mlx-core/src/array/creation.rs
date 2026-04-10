@@ -114,11 +114,22 @@ impl MxArray {
     /// WebGPU backend does not treat as an "upload-pending" buffer and so
     /// cannot be placed in the packed-bf16 storage mode. When the WebGPU
     /// backend has the packed-bf16 flag enabled AND the buffer is large
-    /// enough (>= 4096 elements), the underlying WebGPUBuffer is flipped to
-    /// `StorageMode::PackedBf16` here so the first GPU upload stores the
-    /// weights 2-per-u32 and downstream GEMV dispatches the packed kernel.
+    /// enough (>= `min_elements`, default `PACKED_BF16_DEFAULT_MIN_ELEMENTS`),
+    /// the underlying WebGPUBuffer is flipped to `StorageMode::PackedBf16`
+    /// here so the first GPU upload stores the weights 2-per-u32 and downstream
+    /// GEMV dispatches the packed kernel.
+    ///
+    /// The optional `min_elements` override exists strictly for the browser
+    /// test suite, which needs to exercise the small-norm packed path at the
+    /// production `NORM_PACKED_MIN_ELEMENTS = 256` threshold used by
+    /// `gpu-worker.ts` (D=1024 norm weights are far below the default 4096
+    /// GEMV-tuned floor). Callers outside tests MUST NOT pass this override.
     #[napi(js_name = "fromBfloat16Bytes")]
-    pub fn from_bfloat16_bytes(data: &[u8], shape: &[i64]) -> Result<Self> {
+    pub fn from_bfloat16_bytes(
+        data: &[u8],
+        shape: &[i64],
+        min_elements: Option<u32>,
+    ) -> Result<Self> {
         if data.len() % 2 != 0 {
             return Err(napi::Error::from_reason(format!(
                 "from_bfloat16_bytes: byte length {} is not even",
@@ -137,9 +148,12 @@ impl MxArray {
         // Opt into packed-bf16 storage when the runtime flag is enabled and
         // the buffer is weight-sized. A no-op if the flag is off or if the
         // buffer is too small for the packed GEMV to be worthwhile.
-        const PACKED_BF16_MIN_ELEMENTS: usize = 4096;
+        const PACKED_BF16_DEFAULT_MIN_ELEMENTS: usize = 4096;
+        let threshold = min_elements
+            .map(|m| m as usize)
+            .unwrap_or(PACKED_BF16_DEFAULT_MIN_ELEMENTS);
         unsafe {
-            sys::mlx_wgpu_try_opt_in_packed_bf16(arr.as_raw_ptr(), PACKED_BF16_MIN_ELEMENTS);
+            sys::mlx_wgpu_try_opt_in_packed_bf16(arr.as_raw_ptr(), threshold);
         }
         Ok(arr)
     }

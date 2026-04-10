@@ -190,6 +190,16 @@ async function initAndRun(wasmUrl: string) {
   const makeBf16 = (src: Float32Array, shape: BigInt64Array) => {
     return MxArray.fromBfloat16Bytes(f32ToBf16Bytes(src), shape);
   };
+  // Test-only variant: matches the production `gpu-worker.ts`
+  // NORM_PACKED_MIN_ELEMENTS=256 threshold used by the RMSNorm upload path,
+  // which is lower than the GEMV-tuned default of 4096 baked into
+  // `fromBfloat16Bytes`. Exercises the packed-norm path for small D=1024
+  // Qwen3.5 RMSNorm weights that would otherwise sit below the default floor.
+  // Do NOT use outside packed-norm tests — the default 4096 floor is there
+  // for a reason on matmul paths.
+  const makeBf16NormThreshold = (src: Float32Array, shape: BigInt64Array) => {
+    return MxArray.fromBfloat16Bytes(f32ToBf16Bytes(src), shape, 256);
+  };
   // Tolerance for packed-vs-unpacked parity. Both paths take the same
   // truncated bf16 bytes — the only difference is GPU storage layout — so
   // results should be bit-identical modulo accumulator ordering. 1e-3 abs
@@ -3329,6 +3339,72 @@ async function initAndRun(wasmUrl: string) {
           // in the upconverted layout the kernel's `input` binding expects.
           setPackedBf16(true);
           const w1 = makeBf16(wData, wShape);
+          setPackedBf16(false);
+          const x1 = makeBf16(xData, xShape);
+          const y1 = x1.fastRmsNorm(w1, eps);
+          const y1f = y1.astype(F32);
+          y1f.eval();
+          const y1Arr = [...y1f.toFloat32()];
+
+          if (y0Arr.length !== R * D || y1Arr.length !== R * D) {
+            throw new Error(`lengths ${y0Arr.length}, ${y1Arr.length}`);
+          }
+          for (let i = 0; i < y0Arr.length; i++) {
+            const d = Math.abs(y0Arr[i] - y1Arr[i]);
+            if (d > PACKED_TOL) {
+              throw new Error(`[${i}]: f32=${y0Arr[i]} packed=${y1Arr[i]} diff=${d}`);
+            }
+          }
+        } finally {
+          setPackedBf16(false);
+        }
+      },
+    },
+
+    {
+      name: 'packed bf16 rmsnorm D=1024 production norm threshold (256)',
+      run() {
+        // Mirrors the production Qwen3.5-0.8B hidden_size = 1024 RMSNorm
+        // weight shape. gpu-worker.ts uses NORM_PACKED_MIN_ELEMENTS = 256
+        // on the real-model upload path, far below the default 4096 floor
+        // baked into fromBfloat16Bytes. This test uses the test-only
+        // `min_elements` override on from_bfloat16_bytes so the packed
+        // storage flip actually fires at D=1024. Parity between the
+        // baseline (w upconverted to f32) and packed (w as array<u32>)
+        // runs proves the packed RMSNorm kernel (`rmsnorm_*_bf16p_*`)
+        // is both dispatched AND correct for the real shape the Qwen3.5
+        // model ships. The previous D=4096/4098 tests happened to work
+        // through the default-floor path but did NOT cover the 256-floor
+        // production branch.
+        const F32 = 0;
+        const R = 4, D = 1024;
+        const eps = 1e-5;
+        const xData = new Float32Array(R * D);
+        for (let i = 0; i < xData.length; i++) xData[i] = Math.sin(i * 0.01) * 0.5;
+        const wData = new Float32Array(D);
+        for (let i = 0; i < D; i++) wData[i] = 1.0 + Math.cos(i * 0.003) * 0.2;
+        const xShape = new BigInt64Array([BigInt(R), BigInt(D)]);
+        const wShape = new BigInt64Array([BigInt(D)]);
+
+        try {
+          // Baseline: flag off, w goes to array<f32>. Use the regular
+          // makeBf16 (default 4096 floor) — at D=1024 the flag-off path
+          // short-circuits on the enabled check, so no storage flip.
+          setPackedBf16(false);
+          const x0 = makeBf16(xData, xShape);
+          const w0 = makeBf16(wData, wShape);
+          const y0 = x0.fastRmsNorm(w0, eps);
+          const y0f = y0.astype(F32);
+          y0f.eval();
+          const y0Arr = [...y0f.toFloat32()];
+
+          // Packed: flag ON + lowered 256 threshold. The storage flip
+          // fires because n_elem=1024 >= 256 AND the flag is enabled,
+          // matching what gpu-worker.ts does for the real safetensors
+          // norm upload. x stays unpacked via the regular makeBf16 helper
+          // with the flag flipped off first.
+          setPackedBf16(true);
+          const w1 = makeBf16NormThreshold(wData, wShape);
           setPackedBf16(false);
           const x1 = makeBf16(xData, xShape);
           const y1 = x1.fastRmsNorm(w1, eps);
