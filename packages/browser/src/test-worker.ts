@@ -3866,16 +3866,9 @@ async function initAndRun(wasmUrl: string) {
       const fused = MxArray.testSdpaTileTq8D128CausalGqa(COUNT);
       if (fused[0] === -999) throw new Error('SDPA fused tile GQA error');
 
-      // Both paths should produce matching results for all heads
+      // Both paths should produce matching results for the full output
       // (before the fix, fallback produced garbage for GQA shapes)
-      for (let h = 0; h < Hq; h++) {
-        const off = h * Tq * D;
-        assertClose(
-          fallback.slice(off, off + D),
-          fused.slice(off, off + D),
-          1e-4,
-        );
-      }
+      assertClose(fallback, fused, 1e-4);
     }},
 
   ];

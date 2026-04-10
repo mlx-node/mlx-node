@@ -3506,13 +3506,30 @@ int mlx_test_matmul_broadcast_batch(float* out_vals, int max_count) {
         auto result = matmul(a_arr, b_arr);
         eval_safe(result);
 
-        // CPU reference: manually broadcast B to [1,4,2,128,8] then matmul
-        auto b_broadcast = broadcast_to(b_arr, {B, Hq_Hkv, Hkv, D, Tk});
-        eval_safe(b_broadcast);
-
-        // Reference matmul on CPU by computing element-wise
-        // result shape: [1, 4, 2, 1, 8]
+        // CPU reference: explicit nested-loop matmul with broadcast semantics
+        // A = [1, Hq_Hkv, Hkv, Tq, D]  ->  a_data[b1][b2][0][k]
+        // B = [1, 1,      Hkv, D,  Tk]  ->  b_data[b2][k][j]  (b1 broadcasts)
+        // out = [1, Hq_Hkv, Hkv, Tq, Tk]
         int out_size = B * Hq_Hkv * Hkv * Tq * Tk;
+        std::vector<float> cpu_ref(out_size, 0.0f);
+        for (int b1 = 0; b1 < Hq_Hkv; b1++) {
+            for (int b2 = 0; b2 < Hkv; b2++) {
+                // A[0][b1][b2][0][k]: offset = (b1*Hkv + b2) * Tq * D
+                int a_off = (b1 * Hkv + b2) * Tq * D;
+                // B[0][0][b2][k][j]: offset = b2 * D * Tk  (dim 1 broadcasts)
+                int b_off = b2 * D * Tk;
+                // out[0][b1][b2][0][j]: offset = (b1*Hkv + b2) * Tq * Tk
+                int o_off = (b1 * Hkv + b2) * Tq * Tk;
+                for (int j = 0; j < Tk; j++) {
+                    float sum = 0.0f;
+                    for (int k = 0; k < D; k++) {
+                        sum += a_data[a_off + k] * b_data[b_off + k * Tk + j];
+                    }
+                    cpu_ref[o_off + j] = sum;
+                }
+            }
+        }
+
         int total = 2 * out_size;
         int count = std::min(max_count, total);
 
@@ -3521,15 +3538,8 @@ int mlx_test_matmul_broadcast_batch(float* out_vals, int max_count) {
         eval_safe(gpu_flat);
         const float* gpu_ptr = gpu_flat.data<float>();
 
-        // CPU reference: do the matmul with the broadcasted B
-        auto cpu_result = matmul(a_arr, b_broadcast);
-        // Force CPU eval by converting to a known state
-        auto cpu_flat = reshape(astype(cpu_result, float32), {-1});
-        eval_safe(cpu_flat);
-        const float* cpu_ptr = cpu_flat.data<float>();
-
         for (int i = 0; i < count; i++) {
-            out_vals[i] = (i < out_size) ? gpu_ptr[i] : cpu_ptr[i - out_size];
+            out_vals[i] = (i < out_size) ? gpu_ptr[i] : cpu_ref[i - out_size];
         }
         return count;
     } catch (const std::exception& e) {
