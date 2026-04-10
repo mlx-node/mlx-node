@@ -1412,6 +1412,27 @@ export declare class Qwen3Tokenizer {
 }
 
 /**
+ * Response store for OpenAI Responses API persistence.
+ *
+ * Stores responses in SQLite to support `previous_response_id`
+ * for multi-turn conversation state.
+ */
+export declare class ResponseStore {
+  /** Open (or create) a response store at the given path. */
+  static open(path: string): Promise<ResponseStore>;
+  /** Store a response. */
+  store(response: StoredResponseRecord): Promise<void>;
+  /** Get a single response by ID. */
+  get(id: string): Promise<StoredResponseRecord | null>;
+  /** Get the full conversation chain for a response (oldest first). */
+  getChain(id: string): Promise<Array<StoredResponseRecord>>;
+  /** Delete a response by ID. Returns true if a row was deleted. */
+  delete(id: string): Promise<boolean>;
+  /** Delete expired responses. Returns the number of rows deleted. */
+  cleanupExpired(): Promise<number>;
+}
+
+/**
  * SFT Training Engine
  *
  * Thin coordinator that routes all MLX operations through the model thread.
@@ -3490,6 +3511,22 @@ export interface StepSummary {
   numToolCalls: number;
   eosCount: number;
   lengthCount: number;
+}
+
+/** A stored response record exposed to JavaScript. */
+export interface StoredResponseRecord {
+  id: string;
+  createdAt: number;
+  model: string;
+  status: string;
+  instructions?: string;
+  inputJson: string;
+  outputJson: string;
+  outputText: string;
+  usageJson: string;
+  previousResponseId?: string;
+  configJson?: string;
+  expiresAt?: number;
 }
 
 /** A table structure */
