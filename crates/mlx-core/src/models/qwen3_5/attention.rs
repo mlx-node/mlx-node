@@ -1,5 +1,5 @@
 use crate::array::MxArray;
-use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
+use crate::array::attention::scaled_dot_product_attention_causal;
 use crate::models::paddleocr_vl::language::{MultimodalRoPE, apply_multimodal_rotary_pos_emb};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
@@ -102,7 +102,7 @@ impl Qwen3_5Attention {
     pub fn forward(
         &self,
         x: &MxArray,
-        mask: Option<&MxArray>,
+        _mask: Option<&MxArray>,
         cache: Option<&mut KVCache>,
         position_ids: Option<&MxArray>,
     ) -> Result<MxArray> {
@@ -183,72 +183,14 @@ impl Qwen3_5Attention {
             (keys, values)
         };
 
-        // Scaled dot-product attention.
-        //
-        // We use manual SDPA (matmul -> mask -> softmax -> matmul) because:
-        //   1. The fused WGSL tile kernel doesn't yet support D=256 (Qwen3.5-0.8B's
-        //      head_dim). When use_fallback() returns true, MLX's decomposed path
-        //      reshapes Q/K/V into 5D for GQA, but WebGPU matmul doesn't handle 5D
-        //      correctly, producing garbage output.
-        //   2. The manual path expands K/V heads explicitly (tile+reshape) which
-        //      avoids the 5D matmul and works correctly on WebGPU.
-        //
-        // TODO: Once the D=256 tile kernel is fixed, switch to
-        // `scaled_dot_product_attention_causal` to get the fused kernel benefit.
-        let output = {
-            use crate::array::MxArray;
-            let scale_scalar = MxArray::scalar_float(self.scale as f64)?
-                .astype(queries.dtype()?)?;
-            let q_scaled = queries.mul(&scale_scalar)?;
-
-            let n_rep = self.num_heads / self.num_kv_heads;
-            let (q_for_attn, k_for_attn, v_for_attn) = if n_rep > 1 {
-                let kv_len = keys.shape_at(2)?;
-                let k_expanded = keys.reshape(&[
-                    batch, self.num_kv_heads as i64, 1, kv_len, self.head_dim as i64
-                ])?;
-                let k_tiled = k_expanded.tile(&[1, 1, n_rep as i32, 1, 1])?;
-                let k_flat = k_tiled.reshape(&[
-                    batch, self.num_heads as i64, kv_len, self.head_dim as i64
-                ])?;
-
-                let v_expanded = values.reshape(&[
-                    batch, self.num_kv_heads as i64, 1, kv_len, self.head_dim as i64
-                ])?;
-                let v_tiled = v_expanded.tile(&[1, 1, n_rep as i32, 1, 1])?;
-                let v_flat = v_tiled.reshape(&[
-                    batch, self.num_heads as i64, kv_len, self.head_dim as i64
-                ])?;
-
-                (q_scaled, k_flat, v_flat)
-            } else {
-                (q_scaled, keys.clone(), values.clone())
-            };
-
-            let k_ndim = k_for_attn.ndim()? as i64;
-            let mut perm: Vec<i32> = (0..k_ndim as i32).collect();
-            let n = perm.len();
-            perm.swap(n - 1, n - 2);
-            let k_t = k_for_attn.transpose(Some(&perm))?;
-            let mut scores = q_for_attn.matmul(&k_t)?;
-
-            if seq_len > 1 {
-                let kv_len = scores.shape_at(scores.ndim()? - 1)?;
-                let q_len = scores.shape_at(scores.ndim()? - 2)?;
-                let offset_val = kv_len - q_len;
-                let q_idx = MxArray::arange(offset_val as f64, (q_len + offset_val) as f64, None, None)?;
-                let k_idx = MxArray::arange(0.0, kv_len as f64, None, None)?;
-                let q_idx_2d = q_idx.reshape(&[q_len, 1])?;
-                let k_idx_2d = k_idx.reshape(&[1, kv_len])?;
-                let mask_bool = q_idx_2d.greater_equal(&k_idx_2d)?;
-                let neg_inf = MxArray::scalar_float(f64::NEG_INFINITY)?
-                    .astype(scores.dtype()?)?;
-                scores = mask_bool.where_(&scores, &neg_inf)?;
-            }
-
-            let attn_weights = crate::nn::Activations::softmax(&scores, Some(-1))?;
-            attn_weights.matmul(&v_for_attn)?
-        };
+        // Fused scaled dot-product attention with causal masking.
+        // The kernel handles GQA internally (no need to expand K/V heads).
+        let output = scaled_dot_product_attention_causal(
+            &queries,
+            &keys,
+            &values,
+            self.scale as f64,
+        )?;
 
 
         // Transpose back: [B, H, T, D] → [B, T, H, D] → flatten to [B, T, H*D]
