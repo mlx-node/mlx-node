@@ -91,8 +91,14 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
   const handler = createHandler(registry, { cors, store });
   const server = httpCreateServer(handler);
 
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => {
+      server.removeListener('error', onError);
+      reject(err);
+    };
+    server.on('error', onError);
     server.listen(port, host, () => {
+      server.removeListener('error', onError);
       resolve();
     });
   });
