@@ -613,5 +613,146 @@ describe('createHandler', () => {
       expect(textDone).toBeDefined();
       expect(textDone!.data.text).toBe('Hello world!');
     });
+
+    it('does not leak markup when <tool_call> is split across chunks', async () => {
+      // The tag '<tool_call>' is split: first chunk ends with '<tool', second starts with '_call>'
+      const streamEvents = [
+        { done: false, text: 'Looking up', isReasoning: false },
+        { done: false, text: '.\n<tool', isReasoning: false },
+        { done: false, text: '_call>\n{"name": "get_weather"', isReasoning: false },
+        { done: false, text: ', "arguments": {"city": "SF"}}', isReasoning: false },
+        { done: false, text: '\n</tool_call>', isReasoning: false },
+        {
+          done: true,
+          text: 'Looking up.',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'call_split',
+              name: 'get_weather',
+              arguments: '{"city": "SF"}',
+            },
+          ],
+          thinking: null,
+          numTokens: 18,
+          promptTokens: 8,
+          reasoningTokens: 0,
+          rawText: 'Looking up.\n<tool_call>\n{"name": "get_weather", "arguments": {"city": "SF"}}\n</tool_call>',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('stream-model', mockModel);
+
+      const handler = createHandler(registry);
+      const reqBody = {
+        model: 'stream-model',
+        input: 'Weather in SF?',
+        stream: true,
+      };
+      const req = createMockReq('POST', '/v1/responses', reqBody);
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      handler(req, res);
+      await waitForEnd();
+
+      const body = getBody();
+
+      // Parse all SSE events
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      // Collect all text deltas
+      const textDeltas = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string);
+
+      const allDeltaText = textDeltas.join('');
+
+      // No raw markup should appear
+      expect(allDeltaText).not.toContain('<tool_call>');
+      expect(allDeltaText).not.toContain('<tool');
+      expect(allDeltaText).not.toContain('get_weather');
+
+      // Clean text should be emitted
+      expect(allDeltaText).toContain('Looking up');
+
+      // Function call should still be present in output
+      const completedEvent = events.find((e) => e.event === 'response.completed');
+      expect(completedEvent).toBeDefined();
+      const response = completedEvent!.data.response as Record<string, unknown>;
+      const output = response.output as Array<Record<string, unknown>>;
+      const fcItems = output.filter((i) => i.type === 'function_call');
+      expect(fcItems).toHaveLength(1);
+      expect(fcItems[0].name).toBe('get_weather');
+    });
+
+    it('flushes pending text as delta when stream ends without tool calls', async () => {
+      // Text that ends with a partial prefix of '<tool_call>' (e.g., ends with '<')
+      // but the stream finishes without any actual tool call
+      const streamEvents = [
+        { done: false, text: 'Value is 5 <', isReasoning: false },
+        { done: false, text: ' 10', isReasoning: false },
+        {
+          done: true,
+          text: 'Value is 5 < 10',
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 6,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: 'Value is 5 < 10',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('stream-model', mockModel);
+
+      const handler = createHandler(registry);
+      const reqBody = {
+        model: 'stream-model',
+        input: 'Compare values',
+        stream: true,
+      };
+      const req = createMockReq('POST', '/v1/responses', reqBody);
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      handler(req, res);
+      await waitForEnd();
+
+      const body = getBody();
+
+      // Parse SSE events
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      // The text with '<' should eventually be flushed
+      const textDeltas = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string);
+      const allDeltaText = textDeltas.join('');
+      expect(allDeltaText).toContain('Value is 5');
+      expect(allDeltaText).toContain('< 10');
+
+      // output_text.done should have the final text
+      const textDone = events.find((e) => e.event === 'response.output_text.done');
+      expect(textDone).toBeDefined();
+      expect(textDone!.data.text).toBe('Value is 5 < 10');
+    });
   });
 });

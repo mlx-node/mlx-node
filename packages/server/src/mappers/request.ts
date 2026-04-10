@@ -116,11 +116,20 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
     config.reasoningEffort = req.reasoning.effort;
   }
   if (req.tools && req.tools.length > 0) {
-    config.tools = req.tools.map(mapTool);
+    if (req.tool_choice === 'none') {
+      // Don't pass any tools — user explicitly disabled tool use
+    } else if (typeof req.tool_choice === 'object' && req.tool_choice?.type === 'function') {
+      // Only pass the specifically named tool
+      const targetName = req.tool_choice.name;
+      const matched = req.tools.filter((t) => t.name === targetName);
+      if (matched.length > 0) {
+        config.tools = matched.map(mapTool);
+      }
+    } else {
+      // 'auto', 'required', or unspecified — pass all tools
+      config.tools = req.tools.map(mapTool);
+    }
   }
-  // Note: tool_choice is echoed back in the response but is handled at
-  // the chat template level (not via ChatConfig). The model's Jinja2
-  // template applies tool_choice behavior when tools are provided.
   if (priorMessages && priorMessages.length > 0) {
     config.reuseCache = true;
   }

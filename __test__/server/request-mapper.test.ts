@@ -192,6 +192,131 @@ describe('mapRequest', () => {
     expect(config.tools![0].function.parameters).toBeUndefined();
   });
 
+  it('does not pass tools when tool_choice is none', () => {
+    const { config } = mapRequest({
+      model: 'test-model',
+      input: 'Hello',
+      tool_choice: 'none',
+      tools: [
+        {
+          type: 'function',
+          name: 'get_weather',
+          description: 'Get weather for a city',
+          parameters: {
+            type: 'object',
+            properties: { city: { type: 'string' } },
+            required: ['city'],
+          },
+        },
+      ],
+    });
+
+    expect(config.tools).toBeUndefined();
+  });
+
+  it('passes only the named tool when tool_choice specifies a function', () => {
+    const { config } = mapRequest({
+      model: 'test-model',
+      input: 'Hello',
+      tool_choice: { type: 'function', name: 'search' },
+      tools: [
+        {
+          type: 'function',
+          name: 'get_weather',
+          description: 'Get weather',
+        },
+        {
+          type: 'function',
+          name: 'search',
+          description: 'Search the web',
+        },
+        {
+          type: 'function',
+          name: 'calculator',
+          description: 'Do math',
+        },
+      ],
+    });
+
+    expect(config.tools).toHaveLength(1);
+    expect(config.tools![0].function.name).toBe('search');
+  });
+
+  it('passes all tools when tool_choice is auto', () => {
+    const { config } = mapRequest({
+      model: 'test-model',
+      input: 'Hello',
+      tool_choice: 'auto',
+      tools: [
+        {
+          type: 'function',
+          name: 'get_weather',
+        },
+        {
+          type: 'function',
+          name: 'search',
+        },
+      ],
+    });
+
+    expect(config.tools).toHaveLength(2);
+  });
+
+  it('passes all tools when tool_choice is required', () => {
+    const { config } = mapRequest({
+      model: 'test-model',
+      input: 'Hello',
+      tool_choice: 'required',
+      tools: [
+        {
+          type: 'function',
+          name: 'get_weather',
+        },
+        {
+          type: 'function',
+          name: 'search',
+        },
+      ],
+    });
+
+    expect(config.tools).toHaveLength(2);
+  });
+
+  it('passes all tools when tool_choice is unspecified', () => {
+    const { config } = mapRequest({
+      model: 'test-model',
+      input: 'Hello',
+      tools: [
+        {
+          type: 'function',
+          name: 'get_weather',
+        },
+        {
+          type: 'function',
+          name: 'search',
+        },
+      ],
+    });
+
+    expect(config.tools).toHaveLength(2);
+  });
+
+  it('does not set tools when tool_choice function name does not match any tool', () => {
+    const { config } = mapRequest({
+      model: 'test-model',
+      input: 'Hello',
+      tool_choice: { type: 'function', name: 'nonexistent' },
+      tools: [
+        {
+          type: 'function',
+          name: 'get_weather',
+        },
+      ],
+    });
+
+    expect(config.tools).toBeUndefined();
+  });
+
   it('prepends prior messages and sets reuseCache', () => {
     const priorMessages = [
       { role: 'user' as const, content: 'First message' },

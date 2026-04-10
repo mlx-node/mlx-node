@@ -86,11 +86,14 @@ async function handleStreamingNative(
   const outputItems: OutputItem[] = [];
   let outputIndex = 0;
 
+  const TOOL_CALL_TAG = '<tool_call>';
+
   // State tracking for streaming
   let reasoningItemId: string | null = null;
   let reasoningText = '';
   let messageItemId: string | null = null;
   let messageText = '';
+  let pendingText = '';
   let hasEmittedMessage = false;
   let hasEmittedReasoning = false;
   let suppressTextDeltas = false;
@@ -104,6 +107,40 @@ async function handleStreamingNative(
   for await (const event of chatStream) {
     if (event.done) {
       // Final event -- close open items and emit completed
+
+      // Flush any remaining pending text (no tool call tag was found)
+      if (!suppressTextDeltas && pendingText) {
+        if (!hasEmittedMessage) {
+          hasEmittedMessage = true;
+          messageItemId = genId('msg_');
+          const messageItem: MessageOutputItem = {
+            id: messageItemId,
+            type: 'message',
+            role: 'assistant',
+            status: 'in_progress',
+            content: [],
+          };
+          const miIndex = outputItems.length;
+          outputItems.push(messageItem);
+          outputIndex = miIndex;
+          writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+          const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+          writeSSEEvent(res, 'response.content_part.added', {
+            item_id: messageItemId,
+            output_index: miIndex,
+            content_index: 0,
+            part: textPart,
+          });
+        }
+        messageText += pendingText;
+        writeSSEEvent(res, 'response.output_text.delta', {
+          item_id: messageItemId,
+          output_index: outputItems.findIndex((i) => i.id === messageItemId),
+          content_index: 0,
+          delta: pendingText,
+        });
+        pendingText = '';
+      }
 
       // Close reasoning item if open
       if (hasEmittedReasoning && reasoningItemId) {
@@ -262,47 +299,93 @@ async function handleStreamingNative(
         delta: event.text,
       });
     } else {
-      messageText += event.text;
-
-      // Detect tool-call markup in the accumulated text. Once we see `<tool_call>`,
-      // suppress all further text deltas — the raw XML should not leak to clients.
-      if (!suppressTextDeltas && messageText.includes('<tool_call>')) {
-        suppressTextDeltas = true;
-      }
-
       if (!suppressTextDeltas) {
-        if (!hasEmittedMessage) {
-          // First content chunk -- add message item
-          hasEmittedMessage = true;
-          messageItemId = genId('msg_');
-          const messageItem: MessageOutputItem = {
-            id: messageItemId,
-            type: 'message',
-            role: 'assistant',
-            status: 'in_progress',
-            content: [],
-          };
-          const miIndex = outputItems.length;
-          outputItems.push(messageItem);
-          outputIndex = miIndex;
+        pendingText += event.text;
 
-          writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+        // Check for full tool-call tag
+        const tagIdx = pendingText.indexOf(TOOL_CALL_TAG);
+        if (tagIdx >= 0) {
+          // Emit any clean text before the tag
+          const cleanPrefix = pendingText.slice(0, tagIdx);
+          if (cleanPrefix) {
+            if (!hasEmittedMessage) {
+              hasEmittedMessage = true;
+              messageItemId = genId('msg_');
+              const messageItem: MessageOutputItem = {
+                id: messageItemId,
+                type: 'message',
+                role: 'assistant',
+                status: 'in_progress',
+                content: [],
+              };
+              const miIndex = outputItems.length;
+              outputItems.push(messageItem);
+              outputIndex = miIndex;
+              writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+              const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+              writeSSEEvent(res, 'response.content_part.added', {
+                item_id: messageItemId,
+                output_index: miIndex,
+                content_index: 0,
+                part: textPart,
+              });
+            }
+            messageText += cleanPrefix;
+            writeSSEEvent(res, 'response.output_text.delta', {
+              item_id: messageItemId,
+              output_index: outputItems.findIndex((i) => i.id === messageItemId),
+              content_index: 0,
+              delta: cleanPrefix,
+            });
+          }
+          suppressTextDeltas = true;
+          pendingText = '';
+        } else {
+          // Check if pendingText ends with a partial prefix of '<tool_call>'
+          let safeLen = pendingText.length;
+          for (let i = 1; i <= Math.min(pendingText.length, TOOL_CALL_TAG.length - 1); i++) {
+            const suffix = pendingText.slice(-i);
+            if (TOOL_CALL_TAG.startsWith(suffix)) {
+              safeLen = pendingText.length - i;
+              break;
+            }
+          }
 
-          // Add content part
-          const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-          writeSSEEvent(res, 'response.content_part.added', {
-            item_id: messageItemId,
-            output_index: miIndex,
-            content_index: 0,
-            part: textPart,
-          });
+          const safeText = pendingText.slice(0, safeLen);
+          pendingText = pendingText.slice(safeLen);
+
+          if (safeText) {
+            if (!hasEmittedMessage) {
+              hasEmittedMessage = true;
+              messageItemId = genId('msg_');
+              const messageItem: MessageOutputItem = {
+                id: messageItemId,
+                type: 'message',
+                role: 'assistant',
+                status: 'in_progress',
+                content: [],
+              };
+              const miIndex = outputItems.length;
+              outputItems.push(messageItem);
+              outputIndex = miIndex;
+              writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+              const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+              writeSSEEvent(res, 'response.content_part.added', {
+                item_id: messageItemId,
+                output_index: miIndex,
+                content_index: 0,
+                part: textPart,
+              });
+            }
+            messageText += safeText;
+            writeSSEEvent(res, 'response.output_text.delta', {
+              item_id: messageItemId,
+              output_index: outputItems.findIndex((i) => i.id === messageItemId),
+              content_index: 0,
+              delta: safeText,
+            });
+          }
         }
-        writeSSEEvent(res, 'response.output_text.delta', {
-          item_id: messageItemId,
-          output_index: outputItems.findIndex((i) => i.id === messageItemId),
-          content_index: 0,
-          delta: event.text,
-        });
       }
     }
   }
