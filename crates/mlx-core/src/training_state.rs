@@ -693,9 +693,14 @@ mod tests {
         let mut ts = make_training_state_with_adamw();
         let err = ts.load_optimizer_state_sync(path_str).unwrap_err();
         let msg = err.reason.to_lowercase();
+        // Must report wrong-type explicitly, not the old missing-field wording.
         assert!(
-            msg.contains("'format'") || msg.contains("format") && msg.contains("string"),
-            "expected wrong-type error for 'format', got: {msg}"
+            msg.contains("must be a string") && msg.contains("format"),
+            "expected wrong-type error for 'format' mentioning 'must be a string', got: {msg}"
+        );
+        assert!(
+            !msg.contains("missing required"),
+            "should not report 'missing required' for a present-but-wrong-type field, got: {msg}"
         );
     }
 
@@ -715,9 +720,19 @@ mod tests {
         let mut ts = make_training_state_with_adamw();
         let err = ts.load_optimizer_state_sync(path_str).unwrap_err();
         let msg = err.reason.to_lowercase();
+        // Must report wrong-type explicitly, not the old missing-field or
+        // unparseable-integer wording.
         assert!(
-            msg.contains("'step'") || msg.contains("step") && msg.contains("string"),
-            "expected wrong-type error for 'step', got: {msg}"
+            msg.contains("must be a string") && msg.contains("step"),
+            "expected wrong-type error for 'step' mentioning 'must be a string', got: {msg}"
+        );
+        assert!(
+            !msg.contains("missing required"),
+            "should not report 'missing required' for a present-but-wrong-type field, got: {msg}"
+        );
+        assert!(
+            !msg.contains("not a valid i64"),
+            "should not report 'not a valid i64' before the type check rejects the field, got: {msg}"
         );
     }
 
