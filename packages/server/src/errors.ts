@@ -65,3 +65,32 @@ export function sendMethodNotAllowed(res: ServerResponse, allowed: string): void
 export function sendInternalError(res: ServerResponse, message: string): void {
   sendError(res, 500, 'server_error', message);
 }
+
+/**
+ * Send an Anthropic-compatible JSON error response.
+ */
+export function sendAnthropicError(res: ServerResponse, status: number, type: string, message: string): void {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ type: 'error', error: { type, message } }));
+}
+
+/**
+ * Send an Anthropic 400 Bad Request error.
+ */
+export function sendAnthropicBadRequest(res: ServerResponse, message: string): void {
+  sendAnthropicError(res, 400, 'invalid_request_error', message);
+}
+
+/**
+ * Send an Anthropic 404 Not Found error.
+ */
+export function sendAnthropicNotFound(res: ServerResponse, message: string): void {
+  sendAnthropicError(res, 404, 'not_found_error', message);
+}
+
+/**
+ * Send an Anthropic 500 Internal Server Error.
+ */
+export function sendAnthropicInternalError(res: ServerResponse, message: string): void {
+  sendAnthropicError(res, 500, 'api_error', message);
+}

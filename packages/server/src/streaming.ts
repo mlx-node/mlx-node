@@ -22,7 +22,7 @@ export function beginSSE(res: ServerResponse): void {
  * The `type` is always the SSE event type, even if the data object contains
  * its own `type` field (which would be for a different purpose).
  */
-export function writeSSEEvent(res: ServerResponse, eventType: string, data: Record<string, unknown>): void {
+export function writeSSEEvent(res: ServerResponse, eventType: string, data: object): void {
   // Spread data first, then override type to ensure the SSE event type wins
   const payload = { ...data, type: eventType };
   res.write(`event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`);

@@ -418,7 +418,9 @@ describe('createHandler', () => {
       expect(getStatus()).toBe(204);
       expect(getHeaders()['access-control-allow-origin']).toBe('*');
       expect(getHeaders()['access-control-allow-methods']).toBe('GET, POST, OPTIONS');
-      expect(getHeaders()['access-control-allow-headers']).toBe('Content-Type, Authorization');
+      expect(getHeaders()['access-control-allow-headers']).toBe(
+        'Content-Type, Authorization, x-api-key, anthropic-version',
+      );
     });
 
     it('includes CORS headers on normal responses', async () => {

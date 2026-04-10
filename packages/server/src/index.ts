@@ -1,9 +1,9 @@
 /**
- * @mlx-node/server -- OpenAI Responses API server for MLX models
+ * @mlx-node/server -- OpenAI Responses API & Anthropic Messages API server for MLX models
  *
- * Exposes loaded models via `POST /v1/responses` (OpenAI Responses API)
- * and `GET /v1/models`. Supports both streaming (SSE) and non-streaming
- * response modes.
+ * Exposes loaded models via `POST /v1/responses` (OpenAI Responses API),
+ * `POST /v1/messages` (Anthropic Messages API), and `GET /v1/models`.
+ * Supports both streaming (SSE) and non-streaming response modes.
  *
  * @example
  * ```typescript
@@ -61,6 +61,38 @@ export type {
   InputTextPart,
   StreamEvent,
 } from './types.js';
+
+// Types (Anthropic Messages API)
+export type {
+  AnthropicMessagesRequest,
+  AnthropicMessagesResponse,
+  AnthropicMessage,
+  AnthropicContentBlock,
+  AnthropicTextContentBlock,
+  AnthropicImageContentBlock,
+  AnthropicToolResultContentBlock,
+  AnthropicToolUseContentBlock,
+  AnthropicThinkingContentBlock,
+  AnthropicToolDefinition,
+  AnthropicToolChoice,
+  AnthropicResponseContent,
+  AnthropicResponseTextBlock,
+  AnthropicResponseThinkingBlock,
+  AnthropicResponseToolUseBlock,
+  AnthropicUsage,
+  AnthropicStreamEvent,
+  AnthropicMessageStartEvent,
+  AnthropicContentBlockStartEvent,
+  AnthropicContentBlockDeltaEvent,
+  AnthropicContentBlockStopEvent,
+  AnthropicMessageDeltaEvent,
+  AnthropicMessageStopEvent,
+  AnthropicDelta,
+  AnthropicTextDelta,
+  AnthropicThinkingDelta,
+  AnthropicInputJsonDelta,
+  SystemBlock,
+} from './types-anthropic.js';
 
 // Streaming utilities
 export { writeSSEEvent, beginSSE, endSSE } from './streaming.js';

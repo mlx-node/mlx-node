@@ -44,7 +44,12 @@ export interface ServerInstance {
 }
 
 /**
- * Create and start an MLX-Node HTTP server exposing the Responses API.
+ * Create and start an MLX-Node HTTP server exposing the Responses API and Messages API.
+ *
+ * Endpoints:
+ * - `POST /v1/responses` — OpenAI Responses API
+ * - `POST /v1/messages` — Anthropic Messages API
+ * - `GET /v1/models` — List registered models
  *
  * @example
  * ```typescript
@@ -55,7 +60,7 @@ export interface ServerInstance {
  * const model = await Qwen35Model.load('./models/qwen3.5-3b');
  * registry.register('qwen3.5-3b', model);
  *
- * // Server is now accepting requests at POST /v1/responses
+ * // Server is now accepting requests at POST /v1/responses and POST /v1/messages
  * // Ctrl-C or call close() to stop.
  * ```
  */

@@ -6,10 +6,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ResponseStore } from '@mlx-node/core';
 
+import { handleCreateMessage } from './endpoints/messages.js';
 import { handleListModels } from './endpoints/models.js';
 import { handleCreateResponse } from './endpoints/responses.js';
-import { sendBadRequest, sendMethodNotAllowed, sendNotFound } from './errors.js';
+import { sendAnthropicBadRequest, sendBadRequest, sendMethodNotAllowed, sendNotFound } from './errors.js';
 import type { ModelRegistry } from './registry.js';
+import type { AnthropicMessagesRequest } from './types-anthropic.js';
 import type { ResponsesAPIRequest } from './types.js';
 
 /** Maximum request body size: 10 MB. */
@@ -77,6 +79,28 @@ export async function routeRequest(
     }
 
     await handleCreateResponse(res, body, registry, store);
+    return;
+  }
+
+  // POST /v1/messages (Anthropic Messages API)
+  if (path === '/v1/messages') {
+    if (req.method !== 'POST') {
+      sendMethodNotAllowed(res, 'POST');
+      return;
+    }
+
+    let body: AnthropicMessagesRequest;
+    try {
+      const raw = await readBody(req);
+      body = JSON.parse(raw) as AnthropicMessagesRequest;
+    } catch (err) {
+      const msg =
+        err instanceof Error && err.message === 'Request body too large' ? err.message : 'Invalid JSON in request body';
+      sendAnthropicBadRequest(res, msg);
+      return;
+    }
+
+    await handleCreateMessage(res, body, registry);
     return;
   }
 
