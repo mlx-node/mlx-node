@@ -245,19 +245,19 @@ impl Qwen3Tokenizer {
 
         // First: try tokenizer_config.json (embedded template)
         let config_path = dir.join("tokenizer_config.json");
-        if config_path.exists() {
-            let config_content = std::fs::read_to_string(&config_path).ok()?;
-            let config: serde_json::Value = serde_json::from_str(&config_content).ok()?;
-            if let Some(template) = config.get("chat_template").and_then(|v| v.as_str()) {
-                // Basic template safety validation
-                if let Err(warning) = Self::validate_template_safety(template) {
-                    // Log warning but don't fail - the template may still work
-                    #[cfg(debug_assertions)]
-                    eprintln!("Warning: {}", warning);
-                    let _ = warning; // Suppress unused warning in release builds
-                }
-                return Some(template.to_string());
+        if config_path.exists()
+            && let Ok(config_content) = std::fs::read_to_string(&config_path)
+            && let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_content)
+            && let Some(template) = config.get("chat_template").and_then(|v| v.as_str())
+        {
+            // Basic template safety validation
+            if let Err(warning) = Self::validate_template_safety(template) {
+                // Log warning but don't fail - the template may still work
+                #[cfg(debug_assertions)]
+                eprintln!("Warning: {}", warning);
+                let _ = warning; // Suppress unused warning in release builds
             }
+            return Some(template.to_string());
         }
 
         // Second: try standalone chat_template.jinja file (used by Gemma4 HF snapshots)
