@@ -158,6 +158,44 @@ async function initAndRun(wasmUrl: string) {
     }
   }
 
+  // ---- Packed bf16 helpers ----
+  // Toggle the WebGPU backend's runtime flag that decides whether
+  // bf16 weight buffers go through the packed-bf16 storage path. The flag
+  // is process-wide on the C++ side; tests bracket their dispatches with
+  // setPackedBf16(true/false) and always restore false in `finally`.
+  const setPackedBf16 = (v: boolean) => {
+    if (typeof mlxExports.wgpuSetPackedBf16Enabled === 'function') {
+      mlxExports.wgpuSetPackedBf16Enabled(v);
+    }
+  };
+  setPackedBf16(false);
+
+  // Convert a Float32Array → bf16 bytes by truncating each f32 to its
+  // upper 16 bits (round-toward-zero). Hands the bytes to the bf16 array
+  // constructor, which (when packed flag is on and size ≥ threshold) flips
+  // the underlying WebGPUBuffer into PackedBf16 storage.
+  const f32ToBf16Bytes = (src: Float32Array): Uint8Array => {
+    const out = new Uint8Array(src.length * 2);
+    const f32buf = new Float32Array(1);
+    const u32view = new Uint32Array(f32buf.buffer);
+    for (let i = 0; i < src.length; i++) {
+      f32buf[0] = src[i];
+      const bits = u32view[0];
+      const hi = (bits >>> 16) & 0xffff;
+      out[2 * i] = hi & 0xff;
+      out[2 * i + 1] = (hi >>> 8) & 0xff;
+    }
+    return out;
+  };
+  const makeBf16 = (src: Float32Array, shape: BigInt64Array) => {
+    return MxArray.fromBfloat16Bytes(f32ToBf16Bytes(src), shape);
+  };
+  // Tolerance for packed-vs-unpacked parity. Both paths take the same
+  // truncated bf16 bytes — the only difference is GPU storage layout — so
+  // results should be bit-identical modulo accumulator ordering. 1e-3 abs
+  // is conservative for the f32 accumulators used in the GEMV reductions.
+  const PACKED_TOL = 1e-3;
+
   // ---- Tests ----
   const tests: { name: string; run: () => void }[] = [
     { name: 'create float32', run() {
@@ -3011,6 +3049,198 @@ async function initAndRun(wasmUrl: string) {
         if (runs[0][i] !== runs[1][i]) throw new Error(`Non-deterministic at [${i}]: ${runs[0][i]} vs ${runs[1][i]}`);
       }
     }},
+
+    {
+      name: 'packed bf16 gemv K=896 N=2048 transposed',
+      run() {
+        const F32 = 0;
+        const K = 896, N = 2048;
+        // W is [N, K] so W.transpose() produces a column-major view that
+        // check_transpose reports as b_transposed=true (the linear_proj
+        // hot path). 2048*896 = 1.8M elements, well above the 4096 opt-in
+        // threshold, so the packed flip will fire when the flag is on.
+        const wData = new Float32Array(N * K);
+        for (let i = 0; i < wData.length; i++) wData[i] = Math.sin(i * 0.001) * 0.25;
+        const xData = new Float32Array(K);
+        for (let i = 0; i < K; i++) xData[i] = Math.cos(i * 0.01) * 0.5;
+        const wShape = new BigInt64Array([BigInt(N), BigInt(K)]);
+        const xShape = new BigInt64Array([1n, BigInt(K)]);
+
+        try {
+          // Baseline: flag OFF, fresh weight, f32-storage path.
+          setPackedBf16(false);
+          const W0 = makeBf16(wData, wShape);
+          const x0 = makeBf16(xData, xShape);
+          const y0 = x0.matmul(W0.transpose());
+          const y0f = y0.astype(F32);
+          y0f.eval();
+          const y0Arr = [...y0f.toFloat32()];
+
+          // Packed: flag ON, fresh weight → buffer flip fires on upload.
+          setPackedBf16(true);
+          const W1 = makeBf16(wData, wShape);
+          const x1 = makeBf16(xData, xShape);
+          const y1 = x1.matmul(W1.transpose());
+          const y1f = y1.astype(F32);
+          y1f.eval();
+          const y1Arr = [...y1f.toFloat32()];
+
+          if (y0Arr.length !== N) throw new Error(`baseline length=${y0Arr.length}`);
+          if (y1Arr.length !== N) throw new Error(`packed length=${y1Arr.length}`);
+          for (let i = 0; i < N; i++) {
+            const d = Math.abs(y0Arr[i] - y1Arr[i]);
+            if (d > PACKED_TOL) {
+              throw new Error(`[${i}]: f32=${y0Arr[i]} packed=${y1Arr[i]} diff=${d}`);
+            }
+          }
+        } finally {
+          setPackedBf16(false);
+        }
+      },
+    },
+
+    {
+      name: 'packed bf16 gemv K=128 N=1 transposed (below-threshold fallback)',
+      run() {
+        // 128 elements is far below the 4096 opt-in threshold, so the
+        // packed flip must NOT fire even with the flag on. This test
+        // verifies the dispatcher correctly falls back to the f32 kernel
+        // for tiny weight buffers and still produces matching output.
+        const F32 = 0;
+        const K = 128, N = 1;
+        const wData = new Float32Array(N * K);
+        for (let i = 0; i < wData.length; i++) wData[i] = Math.sin(i * 0.05) * 0.3;
+        const xData = new Float32Array(K);
+        for (let i = 0; i < K; i++) xData[i] = Math.cos(i * 0.02);
+        const wShape = new BigInt64Array([BigInt(N), BigInt(K)]);
+        const xShape = new BigInt64Array([1n, BigInt(K)]);
+
+        try {
+          setPackedBf16(false);
+          const W0 = makeBf16(wData, wShape);
+          const y0 = makeBf16(xData, xShape).matmul(W0.transpose());
+          const y0f = y0.astype(F32);
+          y0f.eval();
+          const y0Arr = [...y0f.toFloat32()];
+
+          setPackedBf16(true);
+          const W1 = makeBf16(wData, wShape);
+          const y1 = makeBf16(xData, xShape).matmul(W1.transpose());
+          const y1f = y1.astype(F32);
+          y1f.eval();
+          const y1Arr = [...y1f.toFloat32()];
+
+          if (y0Arr.length !== N || y1Arr.length !== N) {
+            throw new Error(`lengths ${y0Arr.length}, ${y1Arr.length}`);
+          }
+          for (let i = 0; i < N; i++) {
+            if (Math.abs(y0Arr[i] - y1Arr[i]) > PACKED_TOL) {
+              throw new Error(`[${i}]: f32=${y0Arr[i]} vs ${y1Arr[i]}`);
+            }
+          }
+        } finally {
+          setPackedBf16(false);
+        }
+      },
+    },
+
+    {
+      name: 'packed bf16 gemv K=896 N=7 transposed odd-N',
+      run() {
+        // Odd N exercises the multi-col bounds-check (non-n_aligned) path.
+        // 7*896 = 6272 elements — above the 4096 threshold, so packed
+        // storage fires. N=7 is below the multi-col=16 threshold though,
+        // so this also covers the single-col packed GEMV variant.
+        const F32 = 0;
+        const K = 896, N = 7;
+        const wData = new Float32Array(N * K);
+        for (let i = 0; i < wData.length; i++) wData[i] = Math.sin(i * 0.003) * 0.4;
+        const xData = new Float32Array(K);
+        for (let i = 0; i < K; i++) xData[i] = Math.cos(i * 0.015) * 0.3;
+        const wShape = new BigInt64Array([BigInt(N), BigInt(K)]);
+        const xShape = new BigInt64Array([1n, BigInt(K)]);
+
+        try {
+          setPackedBf16(false);
+          const W0 = makeBf16(wData, wShape);
+          const y0 = makeBf16(xData, xShape).matmul(W0.transpose());
+          const y0f = y0.astype(F32);
+          y0f.eval();
+          const y0Arr = [...y0f.toFloat32()];
+
+          setPackedBf16(true);
+          const W1 = makeBf16(wData, wShape);
+          const y1 = makeBf16(xData, xShape).matmul(W1.transpose());
+          const y1f = y1.astype(F32);
+          y1f.eval();
+          const y1Arr = [...y1f.toFloat32()];
+
+          if (y0Arr.length !== N || y1Arr.length !== N) {
+            throw new Error(`lengths ${y0Arr.length}, ${y1Arr.length}`);
+          }
+          for (let i = 0; i < N; i++) {
+            const d = Math.abs(y0Arr[i] - y1Arr[i]);
+            if (d > PACKED_TOL) {
+              throw new Error(`[${i}]: f32=${y0Arr[i]} packed=${y1Arr[i]} diff=${d}`);
+            }
+          }
+        } finally {
+          setPackedBf16(false);
+        }
+      },
+    },
+
+    {
+      name: 'packed bf16 gemv K=896 N=2048 transposed offset-sliced',
+      run() {
+        // Source = [2*N, K] bf16; slice src[N:2*N, :] so the view has a
+        // non-zero offset() in BYTES. The packed dispatcher divides offset
+        // by 4 to produce a u32 index — (N*K*2) / 4 = N*K/2, and K is even
+        // so the packed indexing lands on a u32 boundary. This exercises
+        // the offset_b = offset()/4 branch in matmul.cpp.
+        const F32 = 0;
+        const K = 896, N = 2048;
+        const srcRows = 2 * N;
+        const srcData = new Float32Array(srcRows * K);
+        for (let i = 0; i < srcData.length; i++) srcData[i] = Math.sin(i * 0.0005) * 0.2;
+        const xData = new Float32Array(K);
+        for (let i = 0; i < K; i++) xData[i] = Math.cos(i * 0.008) * 0.4;
+        const srcShape = new BigInt64Array([BigInt(srcRows), BigInt(K)]);
+        const xShape = new BigInt64Array([1n, BigInt(K)]);
+        const sliceStart = new BigInt64Array([BigInt(N), 0n]);
+        const sliceStop = new BigInt64Array([BigInt(srcRows), BigInt(K)]);
+
+        try {
+          setPackedBf16(false);
+          const Src0 = makeBf16(srcData, srcShape);
+          const W0 = Src0.slice(sliceStart, sliceStop);
+          const y0 = makeBf16(xData, xShape).matmul(W0.transpose());
+          const y0f = y0.astype(F32);
+          y0f.eval();
+          const y0Arr = [...y0f.toFloat32()];
+
+          setPackedBf16(true);
+          const Src1 = makeBf16(srcData, srcShape);
+          const W1 = Src1.slice(sliceStart, sliceStop);
+          const y1 = makeBf16(xData, xShape).matmul(W1.transpose());
+          const y1f = y1.astype(F32);
+          y1f.eval();
+          const y1Arr = [...y1f.toFloat32()];
+
+          if (y0Arr.length !== N || y1Arr.length !== N) {
+            throw new Error(`lengths ${y0Arr.length}, ${y1Arr.length}`);
+          }
+          for (let i = 0; i < N; i++) {
+            const d = Math.abs(y0Arr[i] - y1Arr[i]);
+            if (d > PACKED_TOL) {
+              throw new Error(`[${i}]: f32=${y0Arr[i]} packed=${y1Arr[i]} diff=${d}`);
+            }
+          }
+        } finally {
+          setPackedBf16(false);
+        }
+      },
+    },
 
   ];
 

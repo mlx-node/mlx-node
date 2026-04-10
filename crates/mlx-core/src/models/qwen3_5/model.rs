@@ -4938,6 +4938,14 @@ impl Qwen3_5Model {
                 .iter()
                 .filter_map(|v| v.as_i64())
                 .collect();
+            // `packedBf16` is an optional metadata flag set by the JS
+            // weight-upload path (gpu-worker.ts). When true, the GPU buffer
+            // already holds packed u32 pairs (2 bf16 per slot) and the C++
+            // backend's StorageMode must be flipped so the packed GEMV
+            // kernel fires for this weight.
+            let packed_bf16 = tensor.get("packedBf16")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             let dtype = match dtype_code {
                 0 => crate::array::DType::Float32,
@@ -4950,6 +4958,11 @@ impl Qwen3_5Model {
             };
 
             let arr = array_from_gpu_buffer(handle, byte_size, &shape, dtype)?;
+            if packed_bf16 {
+                unsafe {
+                    mlx_sys::mlx_wgpu_mark_buffer_packed_bf16(arr.as_raw_ptr());
+                }
+            }
             params.insert(name.to_string(), arr);
         }
 

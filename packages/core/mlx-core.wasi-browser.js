@@ -101,3 +101,4 @@ export const parseToolCallsFromText = __napiModule.exports.parseToolCallsFromTex
 export const parseVlmOutput = __napiModule.exports.parseVlmOutput;
 export const resetProfilingData = __napiModule.exports.resetProfilingData;
 export const setProfilingEnabled = __napiModule.exports.setProfilingEnabled;
+export const wgpuSetPackedBf16Enabled = __napiModule.exports.wgpuSetPackedBf16Enabled;

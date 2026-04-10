@@ -1,4 +1,6 @@
 #include "mlx_common.h"
+#include "mlx/dtype.h"
+#include <cstdint>
 #include <new>
 #ifdef MLX_USE_WEBGPU
 // Forward-declare the WebGPU types we need (avoids webgpu.h include path issues)
@@ -6,12 +8,23 @@ typedef struct WGPUBufferImpl* WGPUBuffer;
 extern "C" void wgpuBufferDestroy(WGPUBuffer buffer);
 extern "C" void wgpuBufferRelease(WGPUBuffer buffer);
 namespace mlx::core::wgpu {
+// MUST match mlx/backend/webgpu/allocator.h exactly (field order + types).
+// Any drift is an ODR violation: `new WebGPUBuffer{}` here allocates the
+// layout defined below, but code in allocator.cpp reads/writes the real
+// layout, corrupting the heap if they disagree.
+enum class StorageMode : uint8_t {
+  Upconverted,
+  PackedBf16,
+};
 struct WebGPUBuffer {
   WGPUBuffer buffer;
   size_t size;
   void* cpu_ptr{nullptr};
+  size_t cpu_bytes{0};
   bool cpu_dirty{false};
   bool gpu_has_data{false};
+  mlx::core::Dtype::Val dtype_val{mlx::core::Dtype::Val::float32};
+  StorageMode storage_mode{StorageMode::Upconverted};
 };
 }
 #endif

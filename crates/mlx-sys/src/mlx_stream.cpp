@@ -1,5 +1,16 @@
 #include "mlx_common.h"
 
+#ifdef MLX_USE_WEBGPU
+// Forward-declare the WebGPU backend's packed-bf16 toggle so we don't have to
+// include <webgpu/webgpu.h> (which allocator.h transitively pulls in) from
+// the stream TU — the webgpu headers live on the matmul/device side of the
+// build, not on the FFI-bridge side. The real definition is in
+// mlx/backend/webgpu/allocator.cpp.
+namespace mlx::core::wgpu {
+void set_packed_bf16_enabled(bool enabled);
+}  // namespace mlx::core::wgpu
+#endif
+
 // ============================================================================
 // Stream Operations (extern "C" for FFI)
 // ============================================================================
@@ -318,6 +329,17 @@ int32_t mlx_set_cache_limit(uint64_t limit, uint64_t* out_old_limit) {
 size_t mlx_array_nbytes(mlx_array* handle) {
   auto arr = reinterpret_cast<array*>(handle);
   return static_cast<uint64_t>(arr->nbytes());
+}
+
+// Toggle the WebGPU backend's packed-bf16 storage path. Plumbed from the TS
+// init message (?pack_bf16=1) so the browser can opt into packed weights at
+// runtime. On non-WebGPU builds this is a no-op.
+void mlx_wgpu_set_packed_bf16_enabled(bool enabled) {
+#ifdef MLX_USE_WEBGPU
+  mlx::core::wgpu::set_packed_bf16_enabled(enabled);
+#else
+  (void)enabled;
+#endif
 }
 
 }  // extern "C"

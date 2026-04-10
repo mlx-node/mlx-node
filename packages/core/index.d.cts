@@ -608,6 +608,19 @@ export declare class MxArray {
   static fromInt64(data: BigInt64Array, shape: BigInt64Array): MxArray;
   static fromUint32(data: Uint32Array, shape: BigInt64Array): MxArray;
   static fromFloat32(data: Float32Array, shape: BigInt64Array): MxArray;
+  /**
+   * NAPI-exposed variant that accepts the raw bf16 bytes as a `Uint8Array`.
+   * The input length must be `elements * 2`. This is the only path to build
+   * a CPU-resident bf16 weight buffer from JavaScript — the regular
+   * `fromFloat32(...).astype(BF16)` idiom produces a *GPU output*, which the
+   * WebGPU backend does not treat as an "upload-pending" buffer and so
+   * cannot be placed in the packed-bf16 storage mode. When the WebGPU
+   * backend has the packed-bf16 flag enabled AND the buffer is large
+   * enough (>= 4096 elements), the underlying WebGPUBuffer is flipped to
+   * `StorageMode::PackedBf16` here so the first GPU upload stores the
+   * weights 2-per-u32 and downstream GEMV dispatches the packed kernel.
+   */
+  static fromBfloat16Bytes(data: Uint8Array, shape: BigInt64Array): MxArray;
   static zeros(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
   static scalarFloat(value: number): MxArray;
   static scalarInt(value: number): MxArray;

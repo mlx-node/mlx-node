@@ -107,6 +107,43 @@ impl MxArray {
         MxArray::from_handle(handle, "array_from_bfloat16")
     }
 
+    /// NAPI-exposed variant that accepts the raw bf16 bytes as a `Uint8Array`.
+    /// The input length must be `elements * 2`. This is the only path to build
+    /// a CPU-resident bf16 weight buffer from JavaScript — the regular
+    /// `fromFloat32(...).astype(BF16)` idiom produces a *GPU output*, which the
+    /// WebGPU backend does not treat as an "upload-pending" buffer and so
+    /// cannot be placed in the packed-bf16 storage mode. When the WebGPU
+    /// backend has the packed-bf16 flag enabled AND the buffer is large
+    /// enough (>= 4096 elements), the underlying WebGPUBuffer is flipped to
+    /// `StorageMode::PackedBf16` here so the first GPU upload stores the
+    /// weights 2-per-u32 and downstream GEMV dispatches the packed kernel.
+    #[napi(js_name = "fromBfloat16Bytes")]
+    pub fn from_bfloat16_bytes(data: &[u8], shape: &[i64]) -> Result<Self> {
+        if data.len() % 2 != 0 {
+            return Err(napi::Error::from_reason(format!(
+                "from_bfloat16_bytes: byte length {} is not even",
+                data.len()
+            )));
+        }
+        let n_elem = data.len() / 2;
+        validate_data_shape(n_elem, shape, "from_bfloat16_bytes")?;
+        // SAFETY: the caller-owned Uint8Array has the same lifetime as the
+        // NAPI call; u16 alignment isn't required here because the underlying
+        // FFI just memcpy's `n_elem * 2` bytes into the mlx_array allocation.
+        let u16_ptr = data.as_ptr() as *const u16;
+        let handle =
+            unsafe { sys::mlx_array_from_bfloat16(u16_ptr, shape.as_ptr(), shape.len()) };
+        let arr = MxArray::from_handle(handle, "array_from_bfloat16_bytes")?;
+        // Opt into packed-bf16 storage when the runtime flag is enabled and
+        // the buffer is weight-sized. A no-op if the flag is off or if the
+        // buffer is too small for the packed GEMV to be worthwhile.
+        const PACKED_BF16_MIN_ELEMENTS: usize = 4096;
+        unsafe {
+            sys::mlx_wgpu_try_opt_in_packed_bf16(arr.as_raw_ptr(), PACKED_BF16_MIN_ELEMENTS);
+        }
+        Ok(arr)
+    }
+
     /// Create an MxArray from raw float16 bytes (as u16 values).
     /// This enables zero-copy loading of f16 weights from safetensors.
     /// The input is the raw bytes reinterpreted as u16 (2 bytes per element).

@@ -230,23 +230,95 @@ self.onmessage = async (e: MessageEvent) => {
   if (e.data.type === 'upload_weights') {
     // Bulk weight upload: read directly from SharedArrayBuffer, create GPU buffers.
     // Zero-copy from shared memory → GPU via mappedAtCreation.
-    const { weightsSab, dataOffset, tensors } = e.data as {
+    const { weightsSab, dataOffset, tensors, packBf16 } = e.data as {
       weightsSab: SharedArrayBuffer;
       dataOffset: number;
       tensors: Array<{ name: string; byteOffset: number; byteSize: number; dtype: string; shape: number[] }>;
+      packBf16?: boolean;
+    };
+
+    // Minimum element count for the packed-bf16 path. Matches the threshold
+    // used by fromBfloat16Bytes so every bf16 tensor the model touches follows
+    // the same opt-in policy. Small tensors (norm weights, biases) keep the
+    // existing expand-to-f32 layout.
+    const PACKED_MIN_ELEMENTS = 4096;
+    const usePackBf16 = packBf16 === true;
+
+    // Only tensors consumed by matmul (Step-A GEMV b_transposed=true hot path)
+    // are eligible for the packed-bf16 layout. Other ops — notably embedding
+    // lookup via `take()` at forward entry, and RMSNorm/LayerNorm elementwise
+    // multiplies — still read the buffer as array<f32> / array<bf16> and
+    // would produce garbage if fed packed u32 pairs. The Qwen3.5 compiled
+    // decode path routes every `*_proj.weight` (q/k/v/o_proj, gate/up/down_proj,
+    // in_proj_qkvz, in_proj_ba, out_proj, ...) and `lm_head.weight` through
+    // `matmul(x, transpose(weight))` in `linear_proj()`, so those are the
+    // only safe names. Embedding (`model.embed_tokens.weight`), norms
+    // (`*norm*.weight`), GDN scalars (A_log, dt_bias), and conv1d kernels
+    // all stay upconverted. Step B/C will extend this allowlist once the
+    // corresponding packed kernels land.
+    const isMatmulConsumedWeight = (name: string): boolean => {
+      if (!name.endsWith('.weight')) return false;
+      // Linear projections — all routed through linear_proj() →
+      // matmul(x, transpose(weight)) in mlx_qwen35_common.h. Both decode (GEMV)
+      // and prefill (GEMM) of these weights consume the buffer with
+      // b_transposed=true, which is the only path that has a packed kernel.
+      // MLP (SwiGLU) projections.
+      if (name.endsWith('.mlp.gate_proj.weight')) return true;
+      if (name.endsWith('.mlp.up_proj.weight')) return true;
+      if (name.endsWith('.mlp.down_proj.weight')) return true;
+      // Self-attention projections.
+      if (name.endsWith('.self_attn.q_proj.weight')) return true;
+      if (name.endsWith('.self_attn.k_proj.weight')) return true;
+      if (name.endsWith('.self_attn.v_proj.weight')) return true;
+      if (name.endsWith('.self_attn.o_proj.weight')) return true;
+      // Linear (gated-delta) attention out_proj. The fused in_proj_qkvz /
+      // in_proj_ba weights are concatenated by the persistence layer into
+      // *new* buffers — they don't carry the storage_mode opt-in we set on
+      // the source weight, so leave them upconverted (Step B will fix when
+      // it adds GEMM support to the concatenation pipeline).
+      if (name.endsWith('.linear_attn.out_proj.weight')) return true;
+      return false;
     };
 
     const handles: number[] = [];
     const uploadedDtypes: string[] = [];
+    const packedBf16Flags: boolean[] = [];
+    const packedNames: string[] = [];
+    const unpackedBf16Names: string[] = [];
     for (const tensor of tensors) {
       const isBf16 = tensor.dtype === 'BF16';
       const isF16 = tensor.dtype === 'F16';
-      // bf16 always expands to f32 — WGSL has no bf16 type.
-      // f16 stays native when shader-f16 is available (halves upload bandwidth);
-      // otherwise expands to f32.
-      const needsExpand = isBf16 || (isF16 && !hasShaderF16);
       const numElements = tensor.byteSize / (isBf16 || isF16 ? 2 : 4);
-      const gpuByteSize = needsExpand ? numElements * 4 : tensor.byteSize;
+
+      // Packed bf16 path: reinterpret consecutive bf16 pairs as u32 slots.
+      // Each slot holds two bf16 elements (low | hi << 16) — exactly the
+      // layout the WebGPU backend's upload_with_conversion path produces.
+      // Odd element counts pad the trailing slot with zero; the kernel
+      // masks out-of-range loads so the pad is harmless.
+      const packedEligible =
+        usePackBf16 &&
+        isBf16 &&
+        numElements >= PACKED_MIN_ELEMENTS &&
+        isMatmulConsumedWeight(tensor.name);
+      if (isBf16 && numElements >= PACKED_MIN_ELEMENTS && usePackBf16) {
+        if (packedEligible) {
+          packedNames.push(tensor.name);
+        } else {
+          unpackedBf16Names.push(tensor.name);
+        }
+      }
+      // bf16 expands to f32 for legacy storage; f16 stays native when shader-f16 is available.
+      const needsExpand = (isBf16 && !packedEligible) || (isF16 && !hasShaderF16);
+
+      let gpuByteSize: number;
+      if (packedEligible) {
+        // Packed: 2 bf16 per u32 = same byte count as the raw bf16 source.
+        gpuByteSize = Math.ceil(numElements / 2) * 4;
+      } else if (needsExpand) {
+        gpuByteSize = numElements * 4;
+      } else {
+        gpuByteSize = tensor.byteSize;
+      }
       const alignedSize = Math.max(4, Math.ceil(gpuByteSize / 4) * 4);
 
       const gpuBuffer = device.createBuffer({
@@ -256,7 +328,20 @@ self.onmessage = async (e: MessageEvent) => {
       });
 
       const mapped = gpuBuffer.getMappedRange();
-      if (needsExpand) {
+      if (packedEligible) {
+        // bf16 is already 2 bytes per element and contiguous in the source
+        // buffer; a u32 view of the mapped range stores pairs directly.
+        // Note: both the source SAB and the mapped buffer are little-endian
+        // wasm targets, so a raw byte copy preserves the (lo, hi) layout
+        // that unpack_bf16_pair() expects in WGSL.
+        const src = new Uint8Array(weightsSab, dataOffset + tensor.byteOffset, tensor.byteSize);
+        const dst = new Uint8Array(mapped, 0, tensor.byteSize);
+        dst.set(src);
+        // Pad the trailing odd slot with zero bytes (already zero-initialized
+        // via mappedAtCreation) — explicit comment for future maintainers.
+        uploadedDtypes.push('BF16');
+        packedBf16Flags.push(true);
+      } else if (needsExpand) {
         // Convert bf16/f16 → f32 in the mapped buffer
         const src16 = new Uint16Array(weightsSab, dataOffset + tensor.byteOffset, numElements);
         const dst32 = new Uint32Array(mapped);
@@ -268,9 +353,6 @@ self.onmessage = async (e: MessageEvent) => {
         } else {
           // f16 → f32: proper IEEE 754 conversion
           const dstF32 = new Float32Array(mapped);
-          const tmpU16 = new Uint16Array(1);
-          const tmpBuf = new ArrayBuffer(4);
-          const tmpU32 = new Uint32Array(tmpBuf);
           for (let j = 0; j < numElements; j++) {
             const h = src16[j];
             const sign = (h >> 15) & 1;
@@ -286,11 +368,13 @@ self.onmessage = async (e: MessageEvent) => {
           }
         }
         uploadedDtypes.push('F32');
+        packedBf16Flags.push(false);
       } else {
         const mappedU8 = new Uint8Array(mapped);
         const src = new Uint8Array(weightsSab, dataOffset + tensor.byteOffset, tensor.byteSize);
         mappedU8.set(src);
         uploadedDtypes.push(tensor.dtype);
+        packedBf16Flags.push(false);
       }
       gpuBuffer.unmap();
 
@@ -299,7 +383,16 @@ self.onmessage = async (e: MessageEvent) => {
       handles.push(handle);
     }
 
-    self.postMessage({ type: 'weights_uploaded', handles, uploadedDtypes });
+    self.postMessage({
+      type: 'weights_uploaded',
+      handles,
+      uploadedDtypes,
+      packedBf16Flags,
+      debugPackedNames: packedNames,
+      debugUnpackedBf16Names: unpackedBf16Names,
+      debugPackedTotal: packedNames.length,
+      debugUnpackedBf16Total: unpackedBf16Names.length,
+    });
   }
 };
 

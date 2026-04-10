@@ -51,6 +51,54 @@ mlx_array* mlx_array_from_bfloat16(const uint16_t* data,
   return reinterpret_cast<mlx_array*>(arr);
 }
 
+#ifdef MLX_USE_WEBGPU
+// Forward-declare the packed-bf16 helpers living in the webgpu backend
+// translation unit (mlx/backend/webgpu/allocator.cpp). We avoid including
+// "mlx/backend/webgpu/allocator.h" directly because it transitively pulls
+// in <webgpu/webgpu.h>, which isn't on the include path for the FFI
+// bridge TU.
+//
+// IMPORTANT: the enclosing file is wrapped in `extern "C"`, so we must
+// explicitly switch back to C++ linkage for the forward declaration —
+// otherwise the namespaced mlx::core::wgpu symbols end up with C linkage
+// at the use site (unmangled) and wasm-ld's --allow-undefined turns them
+// into unresolved env imports at instantiation time.
+extern "C++" {
+namespace mlx::core::wgpu {
+bool try_opt_in_packed_bf16(mlx::core::array& arr, size_t min_elements);
+bool mark_buffer_packed_bf16(mlx::core::array& arr);
+}  // namespace mlx::core::wgpu
+}  // extern "C++"
+
+// Opt a bf16 array into PackedBf16 storage if the runtime flag is on and
+// the buffer is still in upload-pending state. A no-op if any precondition
+// fails — safe to call unconditionally from a constructor.
+bool mlx_wgpu_try_opt_in_packed_bf16(mlx_array* handle, size_t min_elements) {
+  if (!handle) return false;
+  auto& arr = *reinterpret_cast<mlx::core::array*>(handle);
+  return mlx::core::wgpu::try_opt_in_packed_bf16(arr, min_elements);
+}
+
+// Unconditionally mark an imported bf16 buffer as PackedBf16 storage. Used
+// by the JS-side weight upload path (gpu-worker.ts) which packs bf16 into
+// u32 pairs before creating the GPU buffer.
+bool mlx_wgpu_mark_buffer_packed_bf16(mlx_array* handle) {
+  if (!handle) return false;
+  auto& arr = *reinterpret_cast<mlx::core::array*>(handle);
+  return mlx::core::wgpu::mark_buffer_packed_bf16(arr);
+}
+#else
+bool mlx_wgpu_try_opt_in_packed_bf16(mlx_array* handle, size_t min_elements) {
+  (void)handle;
+  (void)min_elements;
+  return false;
+}
+bool mlx_wgpu_mark_buffer_packed_bf16(mlx_array* handle) {
+  (void)handle;
+  return false;
+}
+#endif
+
 // Create array from float16 raw bytes (uint16 representation)
 // This enables zero-copy loading of f16 weights from safetensors
 mlx_array* mlx_array_from_float16(const uint16_t* data,

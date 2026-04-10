@@ -23,15 +23,17 @@ TextDecoder.prototype.decode = function (input?: BufferSource | null, options?: 
   return _origDecode.call(this, input, options);
 };
 
-import {
-  instantiateNapiModule,
-  getDefaultContext,
-  WASI,
-} from '@napi-rs/wasm-runtime';
+import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-runtime';
 
-import { createBridgeStub } from './webgpu-bridge-stub.js';
-import { CMD_OFFSET, READBACK_BUFFER_SIZE, STREAM_BUFFER_SIZE, STREAM_HEADER_SIZE, STREAM_TEXT_OFFSET } from './rpc-protocol.js';
+import {
+  CMD_OFFSET,
+  READBACK_BUFFER_SIZE,
+  STREAM_BUFFER_SIZE,
+  STREAM_HEADER_SIZE,
+  STREAM_TEXT_OFFSET,
+} from './rpc-protocol.js';
 import { parseSafeTensorsHeader, dtypeToCode } from './safetensors.js';
+import { createBridgeStub } from './webgpu-bridge-stub.js';
 
 let model: any = null;
 let mlxExports: any = null;
@@ -42,7 +44,8 @@ function post(msg: any) {
   (self as any).postMessage(msg);
 }
 
-async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
+async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: boolean }) {
+  const packBf16 = data.packBf16 === true;
   try {
     // 1. Spawn gpu-worker (owns GPUDevice, event loop free for GPU callbacks)
     post({ type: 'progress', step: 'gpu', message: 'Initializing WebGPU...' });
@@ -57,10 +60,7 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
       shared: true,
     });
 
-    const gpuWorker = new Worker(
-      new URL('./gpu-worker.ts', import.meta.url),
-      { type: 'module' },
-    );
+    const gpuWorker = new Worker(new URL('./gpu-worker.ts', import.meta.url), { type: 'module' });
 
     // Wait for gpu-worker to create GPUDevice and be ready
     const gpuReady = await new Promise<any>((resolve, reject) => {
@@ -72,18 +72,24 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
         type: 'init',
         cmdBuffer,
         readbackBuffer,
-        wasmMemory: sharedMemory,  // Send Memory object, not .buffer — .buffer getter always returns current byteLength after grow()
+        wasmMemory: sharedMemory, // Send Memory object, not .buffer — .buffer getter always returns current byteLength after grow()
       });
     });
     post({ type: 'progress', step: 'gpu', message: 'WebGPU ready' });
 
     // 2. Create bridge stub (RPC via Atomics.wait to gpu-worker)
-    const bridge = createBridgeStub(cmdBuffer, sharedMemory, {
-      instanceHandle: gpuReady.instanceHandle,
-      adapterHandle: gpuReady.adapterHandle,
-      deviceHandle: gpuReady.deviceHandle,
-      queueHandle: gpuReady.queueHandle,
-    }, readbackBuffer, gpuReady.features);
+    const bridge = createBridgeStub(
+      cmdBuffer,
+      sharedMemory,
+      {
+        instanceHandle: gpuReady.instanceHandle,
+        adapterHandle: gpuReady.adapterHandle,
+        deviceHandle: gpuReady.deviceHandle,
+        queueHandle: gpuReady.queueHandle,
+      },
+      readbackBuffer,
+      gpuReady.features,
+    );
 
     // 3. Load WASM with bridge stub
     post({ type: 'progress', step: 'wasm', message: 'Loading WASM module...' });
@@ -148,14 +154,21 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
     });
 
     mlxExports = napiModule.exports;
-    post({ type: 'progress', step: 'wasm', message: 'WASM loaded' });
+    // Flip the backend's packed-bf16 flag BEFORE any model/weight work runs.
+    // wgpu_buffer() checks this flag on first upload to decide whether an
+    // eligible bf16 weight gets flipped into StorageMode::PackedBf16. Toggling
+    // after the fact is a no-op for already-uploaded buffers.
+    if (typeof mlxExports.wgpuSetPackedBf16Enabled === 'function') {
+      mlxExports.wgpuSetPackedBf16Enabled(packBf16);
+    }
+    post({ type: 'progress', step: 'wasm', message: `WASM loaded${packBf16 ? ' (pack_bf16=1)' : ''}` });
 
     // 3. Fetch model files
     post({ type: 'progress', step: 'model', message: 'Fetching config...' });
-    const configJson = await fetch(`${data.modelUrl}/config.json`).then(r => r.text());
+    const configJson = await fetch(`${data.modelUrl}/config.json`).then((r) => r.text());
 
     post({ type: 'progress', step: 'model', message: 'Fetching tokenizer...' });
-    const tokenizerJson = await fetch(`${data.modelUrl}/tokenizer.json`).then(r => r.text());
+    const tokenizerJson = await fetch(`${data.modelUrl}/tokenizer.json`).then((r) => r.text());
     // Fetch tokenizer_config.json for the Jinja2 chat template
     let tokenizerConfigJson: string | undefined;
     try {
@@ -197,7 +210,14 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
     const t0 = performance.now();
     const { tensors, dataOffset } = parseSafeTensorsHeader(weightsBuffer.buffer);
 
-    const gpuTensors: Array<{ name: string; handle: number; dtypeCode: number; shape: number[]; byteSize: number }> = [];
+    const gpuTensors: Array<{
+      name: string;
+      handle: number;
+      dtypeCode: number;
+      shape: number[];
+      byteSize: number;
+      packedBf16?: boolean;
+    }> = [];
 
     // Zero-copy weight upload via SharedArrayBuffer.
     // Copy weights into a SharedArrayBuffer, send it to gpu-worker.
@@ -206,7 +226,7 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
     const weightsSab = new SharedArrayBuffer(weightsBuffer.byteLength);
     new Uint8Array(weightsSab).set(new Uint8Array(weightsBuffer.buffer));
 
-    const tensorMeta = tensors.map(t => ({
+    const tensorMeta = tensors.map((t) => ({
       name: t.name,
       byteOffset: t.byteOffset,
       byteSize: t.byteSize,
@@ -214,11 +234,37 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
       shape: t.shape,
     }));
 
-    const uploadResult = await new Promise<{ handles: number[]; uploadedDtypes: string[] }>((resolve) => {
+    const uploadResult = await new Promise<{
+      handles: number[];
+      uploadedDtypes: string[];
+      packedBf16Flags?: boolean[];
+    }>((resolve) => {
       const handler = (e: MessageEvent) => {
         if (e.data.type === 'weights_uploaded') {
           gpuWorker.removeEventListener('message', handler);
-          resolve({ handles: e.data.handles, uploadedDtypes: e.data.uploadedDtypes });
+          // Forward debug info from the GPU worker to the main page console
+          // (worker console.log doesn't always reach the page DevTools tab).
+          const dbgPacked = e.data.debugPackedNames ?? [];
+          const dbgUnpacked = e.data.debugUnpackedBf16Names ?? [];
+          const dbgPackedTotal = e.data.debugPackedTotal ?? 0;
+          const dbgUnpackedTotal = e.data.debugUnpackedBf16Total ?? 0;
+          (self as any).postMessage({
+            type: 'log',
+            message: `[PACKBF16] packed=${dbgPackedTotal} unpacked-large-bf16=${dbgUnpackedTotal}`,
+          });
+          // Print one tensor name per log line so the full lists fit in the
+          // message buffer instead of being truncated.
+          for (const n of dbgPacked) {
+            (self as any).postMessage({ type: 'log', message: `[PACKBF16] PACK ${n}` });
+          }
+          for (const n of dbgUnpacked) {
+            (self as any).postMessage({ type: 'log', message: `[PACKBF16] SKIP ${n}` });
+          }
+          resolve({
+            handles: e.data.handles,
+            uploadedDtypes: e.data.uploadedDtypes,
+            packedBf16Flags: e.data.packedBf16Flags,
+          });
         }
       };
       gpuWorker.addEventListener('message', handler);
@@ -228,29 +274,46 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
         weightsSab,
         dataOffset,
         tensors: tensorMeta,
+        packBf16,
       });
     });
 
-    const { handles, uploadedDtypes } = uploadResult;
+    const { handles, uploadedDtypes, packedBf16Flags } = uploadResult;
     for (let i = 0; i < tensors.length; i++) {
       // Use the ORIGINAL dtype (bf16/f16) not the GPU storage dtype (f32).
       // The MLX WebGPU backend expects bf16 arrays (stored as f32 internally).
       // Passing f32 dtype breaks the model's type tracking, causing incorrect
       // behavior in operations like SDPA that check result_type().
       const originalDtype = tensors[i].dtype;
-      const gpuByteSize = (uploadedDtypes[i] !== originalDtype)
-        ? (tensors[i].byteSize / 2) * 4  // expanded from 2 bytes to 4 bytes per element
-        : tensors[i].byteSize;
+      const isPacked = packedBf16Flags?.[i] === true;
+      // GPU byte size:
+      //   - packed bf16: 2 bytes/elem, padded to u32 (same as source bf16 size, rounded up)
+      //   - expanded (bf16→f32 or f16→f32): 4 bytes/elem
+      //   - native: original byte size
+      let gpuByteSize: number;
+      if (isPacked) {
+        const numElements = tensors[i].shape.reduce((a, b) => a * b, 1);
+        gpuByteSize = Math.ceil(numElements / 2) * 4;
+      } else if (uploadedDtypes[i] !== originalDtype) {
+        gpuByteSize = (tensors[i].byteSize / 2) * 4; // expanded from 2 to 4 bytes per element
+      } else {
+        gpuByteSize = tensors[i].byteSize;
+      }
       gpuTensors.push({
         name: tensors[i].name,
         handle: handles[i],
         dtypeCode: dtypeToCode(originalDtype),
         shape: tensors[i].shape,
         byteSize: gpuByteSize,
+        packedBf16: isPacked,
       });
     }
 
-    post({ type: 'progress', step: 'gpu_upload', message: `${tensors.length} GPU buffers created (${(performance.now() - t0).toFixed(0)}ms)` });
+    post({
+      type: 'progress',
+      step: 'gpu_upload',
+      message: `${tensors.length} GPU buffers created (${(performance.now() - t0).toFixed(0)}ms)`,
+    });
 
     // 5. Build model
     post({ type: 'progress', step: 'init_model', message: 'Initializing model...' });
@@ -268,17 +331,13 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
       post({ type: 'progress', step: 'warmup', message: 'Warming up pipelines...' });
       const t2 = performance.now();
       const warmupFn = model.chatSync || model.chat_sync || model.chat;
-      warmupFn.call(
-        model,
-        [{ role: 'user', content: 'hi' }],
-        {
-          enableThinking: false,
-          reportPerformance: false,
-          maxNewTokens: 2,
-          max_new_tokens: 2,
-          temperature: 0,
-        },
-      );
+      warmupFn.call(model, [{ role: 'user', content: 'hi' }], {
+        enableThinking: false,
+        reportPerformance: false,
+        maxNewTokens: 2,
+        max_new_tokens: 2,
+        temperature: 0,
+      });
       post({ type: 'progress', step: 'warmup', message: `Warmup done (${(performance.now() - t2).toFixed(0)}ms)` });
     } catch (warmupErr) {
       // Non-fatal: if warmup fails, first user inference just pays the
@@ -288,7 +347,7 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string }) {
 
     post({ type: 'ready' });
   } catch (e) {
-    post({ type: 'error', message: String(e), stack: (e instanceof Error) ? e.stack : undefined });
+    post({ type: 'error', message: String(e), stack: e instanceof Error ? e.stack : undefined });
   }
 }
 
@@ -297,7 +356,7 @@ async function handleChat(data: { messages: any[]; config?: any }) {
     const chatFn = model.chatSync || model.chat_sync || model.chat;
     const chatConfig = {
       ...(data.config ?? {}),
-      enableThinking: true,  // Let model think — thinking block gets stripped from final output
+      enableThinking: true, // Let model think — thinking block gets stripped from final output
       reportPerformance: true,
     };
 
@@ -333,14 +392,22 @@ async function handleChat(data: { messages: any[]; config?: any }) {
                   for (let i = strPtr; i < mem.length && mem[i] !== 0 && i - strPtr < 500; i++) {
                     const ch = mem[i];
                     if (ch >= 32 && ch < 127) s += String.fromCharCode(ch);
-                    else { s = ''; break; }
+                    else {
+                      s = '';
+                      break;
+                    }
                   }
-                  if (s.length > 5) { detail = `C++ exception: ${s}`; break; }
+                  if (s.length > 5) {
+                    detail = `C++ exception: ${s}`;
+                    break;
+                  }
                 }
               }
             }
           }
-        } catch { /* extraction failed */ }
+        } catch {
+          /* extraction failed */
+        }
       }
       post({ type: 'progress', step: 'chat', message: `chatFn THREW: ${detail}\nStack: ${stack}` });
       console.error('[WASM Error]', detail, '\nStack:', stack);
@@ -357,11 +424,13 @@ async function handleChat(data: { messages: any[]; config?: any }) {
       finishReason: result.finishReason,
       toolCalls: result.toolCalls,
       thinking: result.thinking,
-      performance: result.performance ? {
-        ttftMs: result.performance.ttftMs,
-        prefillTokensPerSecond: result.performance.prefillTokensPerSecond,
-        decodeTokensPerSecond: result.performance.decodeTokensPerSecond,
-      } : null,
+      performance: result.performance
+        ? {
+            ttftMs: result.performance.ttftMs,
+            prefillTokensPerSecond: result.performance.prefillTokensPerSecond,
+            decodeTokensPerSecond: result.performance.decodeTokensPerSecond,
+          }
+        : null,
     });
   } catch (e) {
     let message = String(e);

@@ -158,3 +158,4 @@ module.exports.parseToolCallsFromText = __napiModule.exports.parseToolCallsFromT
 module.exports.parseVlmOutput = __napiModule.exports.parseVlmOutput;
 module.exports.resetProfilingData = __napiModule.exports.resetProfilingData;
 module.exports.setProfilingEnabled = __napiModule.exports.setProfilingEnabled;
+module.exports.wgpuSetPackedBf16Enabled = __napiModule.exports.wgpuSetPackedBf16Enabled;

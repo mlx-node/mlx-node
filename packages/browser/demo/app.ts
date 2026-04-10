@@ -71,13 +71,10 @@ async function startStreamWatch() {
     const result = Atomics.waitAsync(streamI32!, 1, currentSeq);
     if (result.async) {
       // Race the wait with a timeout so we can check streamActive
-      await Promise.race([
-        result.value,
-        new Promise(r => setTimeout(r, 5000)),
-      ]);
+      await Promise.race([result.value, new Promise((r) => setTimeout(r, 5000))]);
     } else {
       // Already changed — continue immediately
-      await new Promise(r => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
     }
   }
 }
@@ -138,7 +135,9 @@ function appendStreamedToken(fullText: string) {
   if (thinkEndIdx >= 0) {
     // Found </think> — thinking is complete
     isInThinking = false;
-    const thinkContent = fullText.substring(thinkStartIdx >= 0 ? thinkStartIdx + thinkStart.length : 0, thinkEndIdx).trim();
+    const thinkContent = fullText
+      .substring(thinkStartIdx >= 0 ? thinkStartIdx + thinkStart.length : 0, thinkEndIdx)
+      .trim();
 
     if (thinkContent.length > 3) {
       // Show thinking section only if substantial
@@ -199,10 +198,7 @@ function finalizeAssistantMessage(text: string, thinking: string | null) {
 }
 
 // Create the MLX Worker
-const worker = new Worker(
-  new URL('../src/mlx-worker.ts', import.meta.url),
-  { type: 'module' },
-);
+const worker = new Worker(new URL('../src/mlx-worker.ts', import.meta.url), { type: 'module' });
 
 // Handle messages from worker
 worker.onmessage = (e) => {
@@ -214,6 +210,12 @@ worker.onmessage = (e) => {
       streamBuffer = data.buffer;
       streamI32 = new Int32Array(streamBuffer);
       streamBytes = new Uint8Array(streamBuffer);
+      break;
+
+    case 'log':
+      // Forwarded log from the worker (e.g. PACKBF16 debug from gpu-worker).
+      // Routed through the main-thread console so DevTools / MCP capture it.
+      console.log(data.message);
       break;
 
     case 'progress':
@@ -241,7 +243,9 @@ worker.onmessage = (e) => {
       messages.push({ role: 'assistant', content: data.rawText });
 
       if (data.performance) {
-        log(`${data.numTokens} tokens | TTFT ${data.performance.ttftMs.toFixed(0)}ms | Decode ${data.performance.decodeTokensPerSecond.toFixed(1)} tok/s`);
+        log(
+          `${data.numTokens} tokens | TTFT ${data.performance.ttftMs.toFixed(0)}ms | Decode ${data.performance.decodeTokensPerSecond.toFixed(1)} tok/s`,
+        );
       }
       setStatus('Qwen 3.5 0.8B — Ready', 'ready');
       sendBtn.disabled = false;
@@ -281,12 +285,19 @@ worker.addEventListener('messageerror', (e) => {
 });
 
 // Initialize
-log('Starting MLX Worker...');
+// ?pack_bf16=1 opts into the packed-bf16 weight storage path for the WebGPU
+// backend. This is a runtime A/B toggle — no rebuild required. The flag is
+// forwarded to the WASM worker which calls wgpuSetPackedBf16Enabled on the
+// native binding before the model is loaded.
+const urlParams = new URLSearchParams(location.search);
+const packBf16 = urlParams.get('pack_bf16') === '1';
+log(`Starting MLX Worker${packBf16 ? ' (pack_bf16=1)' : ''}...`);
 setStatus('Initializing...', 'info');
 worker.postMessage({
   type: 'init',
   wasmUrl: new URL('/mlx-core.opt.wasm', location.href).href,
   modelUrl: '/model',
+  packBf16,
 });
 
 // Chat handler
