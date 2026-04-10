@@ -230,10 +230,18 @@ self.onmessage = async (e: MessageEvent) => {
   if (e.data.type === 'upload_weights') {
     // Bulk weight upload: read directly from SharedArrayBuffer, create GPU buffers.
     // Zero-copy from shared memory → GPU via mappedAtCreation.
-    const { weightsSab, dataOffset, tensors, packBf16 } = e.data as {
+    //
+    // Step B: mergedSab holds pre-concatenated linear_attn.in_proj_qkvz /
+    // in_proj_ba bytes produced by the mlx-worker before upload. Tensors
+    // tagged `fromMerged: true` read their bytes from mergedSab with NO
+    // additional dataOffset adjustment (the merged SAB is a bare byte blob;
+    // dataOffset is the safetensors data region offset and only applies to
+    // weightsSab).
+    const { weightsSab, mergedSab, dataOffset, tensors, packBf16 } = e.data as {
       weightsSab: SharedArrayBuffer;
+      mergedSab?: SharedArrayBuffer;
       dataOffset: number;
-      tensors: Array<{ name: string; byteOffset: number; byteSize: number; dtype: string; shape: number[] }>;
+      tensors: Array<{ name: string; byteOffset: number; byteSize: number; dtype: string; shape: number[]; fromMerged?: boolean }>;
       packBf16?: boolean;
     };
 
@@ -271,12 +279,16 @@ self.onmessage = async (e: MessageEvent) => {
       if (name.endsWith('.self_attn.k_proj.weight')) return true;
       if (name.endsWith('.self_attn.v_proj.weight')) return true;
       if (name.endsWith('.self_attn.o_proj.weight')) return true;
-      // Linear (gated-delta) attention out_proj. The fused in_proj_qkvz /
-      // in_proj_ba weights are concatenated by the persistence layer into
-      // *new* buffers — they don't carry the storage_mode opt-in we set on
-      // the source weight, so leave them upconverted (Step B will fix when
-      // it adds GEMM support to the concatenation pipeline).
+      // Linear (gated-delta) attention projections. in_proj_qkvz /
+      // in_proj_ba are PRE-MERGED in JS (mlx-worker.ts) before upload so
+      // the merged buffer takes its OWN PackedBf16 opt-in on first upload
+      // — no Rust concat, no storage_mode propagation needed. out_proj is
+      // already a single weight. All three land on matmul(x, W.T) via
+      // linear_proj() in mlx_qwen35_common.h → b_transposed=true packed
+      // kernel.
       if (name.endsWith('.linear_attn.out_proj.weight')) return true;
+      if (name.endsWith('.linear_attn.in_proj_qkvz.weight')) return true;
+      if (name.endsWith('.linear_attn.in_proj_ba.weight')) return true;
       return false;
     };
 
@@ -289,6 +301,15 @@ self.onmessage = async (e: MessageEvent) => {
       const isBf16 = tensor.dtype === 'BF16';
       const isF16 = tensor.dtype === 'F16';
       const numElements = tensor.byteSize / (isBf16 || isF16 ? 2 : 4);
+      // Synthetic (pre-merged) tensors live in mergedSab starting at
+      // tensor.byteOffset (a raw offset into the merged blob, NOT offset by
+      // the safetensors dataOffset). Real safetensors tensors live in
+      // weightsSab at dataOffset + tensor.byteOffset.
+      const srcSab: SharedArrayBuffer = tensor.fromMerged ? (mergedSab as SharedArrayBuffer) : weightsSab;
+      const srcByteOffset = tensor.fromMerged ? tensor.byteOffset : dataOffset + tensor.byteOffset;
+      if (tensor.fromMerged && !mergedSab) {
+        throw new Error(`Tensor ${tensor.name} marked fromMerged but mergedSab missing`);
+      }
 
       // Packed bf16 path: reinterpret consecutive bf16 pairs as u32 slots.
       // Each slot holds two bf16 elements (low | hi << 16) — exactly the
@@ -334,7 +355,7 @@ self.onmessage = async (e: MessageEvent) => {
         // Note: both the source SAB and the mapped buffer are little-endian
         // wasm targets, so a raw byte copy preserves the (lo, hi) layout
         // that unpack_bf16_pair() expects in WGSL.
-        const src = new Uint8Array(weightsSab, dataOffset + tensor.byteOffset, tensor.byteSize);
+        const src = new Uint8Array(srcSab, srcByteOffset, tensor.byteSize);
         const dst = new Uint8Array(mapped, 0, tensor.byteSize);
         dst.set(src);
         // Pad the trailing odd slot with zero bytes (already zero-initialized
@@ -343,7 +364,7 @@ self.onmessage = async (e: MessageEvent) => {
         packedBf16Flags.push(true);
       } else if (needsExpand) {
         // Convert bf16/f16 → f32 in the mapped buffer
-        const src16 = new Uint16Array(weightsSab, dataOffset + tensor.byteOffset, numElements);
+        const src16 = new Uint16Array(srcSab, srcByteOffset, numElements);
         const dst32 = new Uint32Array(mapped);
         if (isBf16) {
           // bf16 → f32: shift left by 16 (bf16 is upper 16 bits of f32)
@@ -371,7 +392,7 @@ self.onmessage = async (e: MessageEvent) => {
         packedBf16Flags.push(false);
       } else {
         const mappedU8 = new Uint8Array(mapped);
-        const src = new Uint8Array(weightsSab, dataOffset + tensor.byteOffset, tensor.byteSize);
+        const src = new Uint8Array(srcSab, srcByteOffset, tensor.byteSize);
         mappedU8.set(src);
         uploadedDtypes.push(tensor.dtype);
         packedBf16Flags.push(false);

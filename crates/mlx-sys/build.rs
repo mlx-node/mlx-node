@@ -57,7 +57,12 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
     // Without this, Clang's Itanium ABI marks inline virtuals as
     // 'available_externally' in the key function's TU, causing vtable
     // entries to reference undefined symbols that wasm-ld resolves incorrectly.
-    let cxx_flags = format!("{common_flags} -fwasm-exceptions");
+    // MLX_WGPU_LOG_KERNELS: emit one stderr line per unique matmul kernel
+    // variant the first time it is compiled. Used to verify that the packed
+    // bf16 kernel variant (entry_name containing "_bf16p") is actually
+    // dispatching for production Qwen3.5 shapes. Zero steady-state overhead
+    // because the log lives inside the shader-module cache-miss lambda.
+    let cxx_flags = format!("{common_flags} -fwasm-exceptions -DMLX_WGPU_LOG_KERNELS=1");
 
     let status = Command::new("cmake")
         .current_dir(&build_dir)

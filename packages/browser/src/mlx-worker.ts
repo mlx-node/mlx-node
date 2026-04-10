@@ -93,7 +93,29 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
 
     // 3. Load WASM with bridge stub
     post({ type: 'progress', step: 'wasm', message: 'Loading WASM module...' });
-    const wasi = new WASI({ version: 'preview1' });
+    // Forward lines starting with [MLX-KERNEL] to the main thread so we can
+    // verify which matmul kernel variants fire. The WASM stderr lands on
+    // the mlx-worker's own devtools target which isn't readable from the
+    // main frame console.
+    const wasi = new WASI({
+      version: 'preview1',
+      print: function (...args: unknown[]) {
+        const line = args.map(String).join(' ');
+        if (line.includes('[MLX-KERNEL]')) {
+          post({ type: 'log', message: line });
+        } else {
+          console.log(...args);
+        }
+      },
+      printErr: function (...args: unknown[]) {
+        const line = args.map(String).join(' ');
+        if (line.includes('[MLX-KERNEL]')) {
+          post({ type: 'log', message: line });
+        } else {
+          console.error(...args);
+        }
+      },
+    } as any);
     const context = getDefaultContext();
     const wasmFile = await fetch(data.wasmUrl).then((r) => r.arrayBuffer());
 
@@ -208,7 +230,9 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
     // 4. Parse SafeTensors + create GPU buffers (zero-copy)
     post({ type: 'progress', step: 'gpu_upload', message: 'Creating GPU buffers...' });
     const t0 = performance.now();
-    const { tensors, dataOffset } = parseSafeTensorsHeader(weightsBuffer.buffer);
+    const parsed = parseSafeTensorsHeader(weightsBuffer.buffer);
+    let { tensors } = parsed;
+    const { dataOffset } = parsed;
 
     const gpuTensors: Array<{
       name: string;
@@ -226,9 +250,130 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
     const weightsSab = new SharedArrayBuffer(weightsBuffer.byteLength);
     new Uint8Array(weightsSab).set(new Uint8Array(weightsBuffer.buffer));
 
-    const tensorMeta = tensors.map((t) => ({
+    // ------------------------------------------------------------------
+    // Step B: pre-merge linear_attn.in_proj_qkv + in_proj_z → in_proj_qkvz
+    //          and        linear_attn.in_proj_b   + in_proj_a → in_proj_ba
+    //
+    // Both projections in Qwen3.5 store their operands row-contiguous
+    // ([rows_src, hidden]) with a constant dtype. axis-0 concat is therefore
+    // a straight byte append: bytes(src0) ++ bytes(src1). Doing this in JS
+    // BEFORE upload means the merged tensor enters the gpu-worker upload
+    // loop as a single buffer with its OWN PackedBf16 opt-in, instead of
+    // going through the Rust fallback in persistence.rs::merge_split_projections
+    // that produces a fresh buffer with no storage_mode propagation.
+    //
+    // The Rust merge code is a fallback: it scans for `.in_proj_qkv.weight`
+    // and `.in_proj_b.weight` keys and only runs when present. Once we
+    // remove the split `.weight` entries here, it becomes a no-op. If we
+    // encounter a quantized checkpoint (any `.scales` or `.biases` sibling
+    // to the split .weight) we SKIP the JS pre-merge for that prefix so
+    // the Rust code still handles the paired quantization metadata.
+    // ------------------------------------------------------------------
+    const tensorByName = new Map(tensors.map((t) => [t.name, t]));
+    const mergeSpecs = [
+      { outSuffix: '.linear_attn.in_proj_qkvz.weight', aSuffix: '.linear_attn.in_proj_qkv.weight', bSuffix: '.linear_attn.in_proj_z.weight' },
+      { outSuffix: '.linear_attn.in_proj_ba.weight',   aSuffix: '.linear_attn.in_proj_b.weight',   bSuffix: '.linear_attn.in_proj_a.weight' },
+    ];
+    type MergePlan = { outName: string; aTensor: typeof tensors[number]; bTensor: typeof tensors[number]; outShape: number[]; outByteSize: number };
+    const mergePlans: MergePlan[] = [];
+    const removedNames = new Set<string>();
+    for (const tensor of tensors) {
+      for (const spec of mergeSpecs) {
+        if (!tensor.name.endsWith(spec.aSuffix)) continue;
+        const prefix = tensor.name.slice(0, -spec.aSuffix.length);
+        const bName = `${prefix}${spec.bSuffix}`;
+        const bTensor = tensorByName.get(bName);
+        if (!bTensor) break;
+        // Skip if either side has a quant scale/bias sibling; leave those
+        // prefixes for the Rust merge code to handle the full triple.
+        const hasQuantSibling = (name: string) => {
+          const base = name.replace(/\.weight$/, '');
+          return tensorByName.has(`${base}.scales`) || tensorByName.has(`${base}.biases`);
+        };
+        if (hasQuantSibling(tensor.name) || hasQuantSibling(bName)) break;
+        // Both must be the same dtype; shapes must be 2-D row-contiguous
+        // with matching trailing dimension (hidden_size). Safetensors
+        // tensors are always dense row-major, so this holds for bf16/f32.
+        if (tensor.dtype !== bTensor.dtype) break;
+        if (tensor.shape.length !== 2 || bTensor.shape.length !== 2) break;
+        if (tensor.shape[1] !== bTensor.shape[1]) break;
+        const outShape = [tensor.shape[0] + bTensor.shape[0], tensor.shape[1]];
+        mergePlans.push({
+          outName: `${prefix}${spec.outSuffix}`,
+          aTensor: tensor,
+          bTensor,
+          outShape,
+          outByteSize: tensor.byteSize + bTensor.byteSize,
+        });
+        removedNames.add(tensor.name);
+        removedNames.add(bName);
+        break;
+      }
+    }
+
+    // Build a merged-bytes SAB that the gpu-worker will read from for
+    // synthetic (pre-merged) tensors. Byte layout: plans[0] bytes ||
+    // plans[1] bytes || ... . Offsets are recorded in the synthetic tensor
+    // meta so gpu-worker can slice without any extra copies.
+    let mergedSab: SharedArrayBuffer | undefined;
+    const syntheticTensors: Array<{ name: string; dtype: string; shape: number[]; byteOffset: number; byteSize: number; fromMerged: true }> = [];
+    if (mergePlans.length > 0) {
+      const totalBytes = mergePlans.reduce((s, p) => s + p.outByteSize, 0);
+      mergedSab = new SharedArrayBuffer(totalBytes);
+      const mergedU8 = new Uint8Array(mergedSab);
+      const srcU8 = new Uint8Array(weightsSab);
+      let cursor = 0;
+      for (const plan of mergePlans) {
+        // axis-0 concat = bytes(a) ++ bytes(b)
+        mergedU8.set(
+          srcU8.subarray(dataOffset + plan.aTensor.byteOffset, dataOffset + plan.aTensor.byteOffset + plan.aTensor.byteSize),
+          cursor,
+        );
+        cursor += plan.aTensor.byteSize;
+        mergedU8.set(
+          srcU8.subarray(dataOffset + plan.bTensor.byteOffset, dataOffset + plan.bTensor.byteOffset + plan.bTensor.byteSize),
+          cursor,
+        );
+        cursor += plan.bTensor.byteSize;
+        syntheticTensors.push({
+          name: plan.outName,
+          dtype: plan.aTensor.dtype,
+          shape: plan.outShape,
+          byteOffset: cursor - plan.outByteSize,
+          byteSize: plan.outByteSize,
+          fromMerged: true,
+        });
+      }
+    }
+
+    // Drop the split source tensors; append synthetic merged tensors.
+    tensors = tensors.filter((t) => !removedNames.has(t.name));
+    post({
+      type: 'log',
+      message: `[PACKBF16] pre-merged ${syntheticTensors.length} linear_attn split projections (removed ${removedNames.size} source tensors)`,
+    });
+
+    const tensorMeta: Array<{ name: string; byteOffset: number; byteSize: number; dtype: string; shape: number[]; fromMerged?: boolean }> = [
+      ...tensors.map((t) => ({
+        name: t.name,
+        byteOffset: t.byteOffset,
+        byteSize: t.byteSize,
+        dtype: t.dtype,
+        shape: t.shape,
+      })),
+      ...syntheticTensors.map((t) => ({
+        name: t.name,
+        byteOffset: t.byteOffset,
+        byteSize: t.byteSize,
+        dtype: t.dtype,
+        shape: t.shape,
+        fromMerged: true as const,
+      })),
+    ];
+    // Keep tensors list in sync with tensorMeta so the post-upload loop
+    // that builds gpuTensors iterates over the same entries we uploaded.
+    const tensorsForGpu: Array<{ name: string; byteSize: number; dtype: string; shape: number[] }> = tensorMeta.map((t) => ({
       name: t.name,
-      byteOffset: t.byteOffset,
       byteSize: t.byteSize,
       dtype: t.dtype,
       shape: t.shape,
@@ -272,6 +417,7 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
       gpuWorker.postMessage({
         type: 'upload_weights',
         weightsSab,
+        mergedSab,
         dataOffset,
         tensors: tensorMeta,
         packBf16,
@@ -279,12 +425,12 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
     });
 
     const { handles, uploadedDtypes, packedBf16Flags } = uploadResult;
-    for (let i = 0; i < tensors.length; i++) {
+    for (let i = 0; i < tensorsForGpu.length; i++) {
       // Use the ORIGINAL dtype (bf16/f16) not the GPU storage dtype (f32).
       // The MLX WebGPU backend expects bf16 arrays (stored as f32 internally).
       // Passing f32 dtype breaks the model's type tracking, causing incorrect
       // behavior in operations like SDPA that check result_type().
-      const originalDtype = tensors[i].dtype;
+      const originalDtype = tensorsForGpu[i].dtype;
       const isPacked = packedBf16Flags?.[i] === true;
       // GPU byte size:
       //   - packed bf16: 2 bytes/elem, padded to u32 (same as source bf16 size, rounded up)
@@ -292,18 +438,18 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
       //   - native: original byte size
       let gpuByteSize: number;
       if (isPacked) {
-        const numElements = tensors[i].shape.reduce((a, b) => a * b, 1);
+        const numElements = tensorsForGpu[i].shape.reduce((a, b) => a * b, 1);
         gpuByteSize = Math.ceil(numElements / 2) * 4;
       } else if (uploadedDtypes[i] !== originalDtype) {
-        gpuByteSize = (tensors[i].byteSize / 2) * 4; // expanded from 2 to 4 bytes per element
+        gpuByteSize = (tensorsForGpu[i].byteSize / 2) * 4; // expanded from 2 to 4 bytes per element
       } else {
-        gpuByteSize = tensors[i].byteSize;
+        gpuByteSize = tensorsForGpu[i].byteSize;
       }
       gpuTensors.push({
-        name: tensors[i].name,
+        name: tensorsForGpu[i].name,
         handle: handles[i],
         dtypeCode: dtypeToCode(originalDtype),
-        shape: tensors[i].shape,
+        shape: tensorsForGpu[i].shape,
         byteSize: gpuByteSize,
         packedBf16: isPacked,
       });
@@ -312,7 +458,7 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
     post({
       type: 'progress',
       step: 'gpu_upload',
-      message: `${tensors.length} GPU buffers created (${(performance.now() - t0).toFixed(0)}ms)`,
+      message: `${tensorsForGpu.length} GPU buffers created (${(performance.now() - t0).toFixed(0)}ms)`,
     });
 
     // 5. Build model

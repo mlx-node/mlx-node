@@ -3191,6 +3191,109 @@ async function initAndRun(wasmUrl: string) {
     },
 
     {
+      name: 'packed bf16 byte-concat parity (axis=0, bf16)',
+      run() {
+        // Verify that the Step-B JS-side byte concatenation produces the
+        // same bytes as MxArray.concatenate(a, b, 0) for a bf16 pair with
+        // matching trailing dimension. This is the invariant that the
+        // pre-merge in mlx-worker.ts relies on: for row-major bf16 the
+        // axis-0 concat IS a straight byte append, so we can build the
+        // merged in_proj_qkvz bytes in JS before upload without calling
+        // into MLX.
+        const F32 = 0;
+        const ROWS_A = 3, ROWS_B = 5, COLS = 8;
+        const aData = new Float32Array(ROWS_A * COLS);
+        for (let i = 0; i < aData.length; i++) aData[i] = Math.sin(i * 0.1) * 0.7;
+        const bData = new Float32Array(ROWS_B * COLS);
+        for (let i = 0; i < bData.length; i++) bData[i] = Math.cos(i * 0.2 + 1) * 0.4;
+        const aShape = new BigInt64Array([BigInt(ROWS_A), BigInt(COLS)]);
+        const bShape = new BigInt64Array([BigInt(ROWS_B), BigInt(COLS)]);
+
+        // Reference path: build bf16 via MxArray → concatenate → read back.
+        const aBf16 = makeBf16(aData, aShape);
+        const bBf16 = makeBf16(bData, bShape);
+        const refConcat = MxArray.concatenate(aBf16, bBf16, 0);
+        const refVals = [...refConcat.astype(F32).toFloat32()];
+
+        // JS byte-concat path: take the bf16 source bytes, append them,
+        // hand to fromBfloat16Bytes with the combined shape. This mirrors
+        // exactly what mlx-worker.ts does before upload.
+        const aBytes = f32ToBf16Bytes(aData);
+        const bBytes = f32ToBf16Bytes(bData);
+        const mergedBytes = new Uint8Array(aBytes.length + bBytes.length);
+        mergedBytes.set(aBytes, 0);
+        mergedBytes.set(bBytes, aBytes.length);
+        const mergedShape = new BigInt64Array([BigInt(ROWS_A + ROWS_B), BigInt(COLS)]);
+        const jsMerged = MxArray.fromBfloat16Bytes(mergedBytes, mergedShape);
+        const jsVals = [...jsMerged.astype(F32).toFloat32()];
+
+        if (refVals.length !== jsVals.length) {
+          throw new Error(`length mismatch ${refVals.length} vs ${jsVals.length}`);
+        }
+        for (let i = 0; i < refVals.length; i++) {
+          if (refVals[i] !== jsVals[i]) {
+            throw new Error(`[${i}]: ref=${refVals[i]} js=${jsVals[i]}`);
+          }
+        }
+      },
+    },
+
+    {
+      name: 'packed bf16 gemv K=1024 N=8192 transposed (in_proj_qkvz scale)',
+      run() {
+        // Qwen3.5-0.8B linear_attn.in_proj_qkvz.weight is [8192, 1024] bf16
+        // (16 Q heads + 16 K heads + 16 V heads + 16 Z streams, each
+        // head_dim=128 → 64 × 128 = 8192 rows, hidden_size=1024 cols). The
+        // decode GEMV is x @ W.T which lands on b_transposed=true, the
+        // only branch with a packed bf16 kernel. This test exercises the
+        // exact shape the Step-B pre-merge produces for the dominant
+        // bandwidth-bound weight in the Qwen3.5 decode path.
+        const F32 = 0;
+        const K = 1024, N = 8192;
+        const wData = new Float32Array(N * K);
+        // Deterministic, non-trivial pattern; keep values small so bf16
+        // truncation doesn't dominate the parity tolerance.
+        for (let i = 0; i < wData.length; i++) wData[i] = Math.sin(i * 0.0007) * 0.2;
+        const xData = new Float32Array(K);
+        for (let i = 0; i < K; i++) xData[i] = Math.cos(i * 0.013) * 0.3;
+        const wShape = new BigInt64Array([BigInt(N), BigInt(K)]);
+        const xShape = new BigInt64Array([1n, BigInt(K)]);
+
+        try {
+          setPackedBf16(false);
+          const W0 = makeBf16(wData, wShape);
+          const y0 = makeBf16(xData, xShape).matmul(W0.transpose());
+          const y0f = y0.astype(F32);
+          y0f.eval();
+          const y0Arr = [...y0f.toFloat32()];
+
+          setPackedBf16(true);
+          const W1 = makeBf16(wData, wShape);
+          const y1 = makeBf16(xData, xShape).matmul(W1.transpose());
+          const y1f = y1.astype(F32);
+          y1f.eval();
+          const y1Arr = [...y1f.toFloat32()];
+
+          if (y0Arr.length !== N || y1Arr.length !== N) {
+            throw new Error(`lengths ${y0Arr.length}, ${y1Arr.length}`);
+          }
+          // Larger K/N → more accumulated rounding noise, so loosen the
+          // parity bound slightly. Still well below any meaningful output
+          // drift for model forward passes.
+          const TOL = 5e-3;
+          for (let i = 0; i < N; i++) {
+            const d = Math.abs(y0Arr[i] - y1Arr[i]);
+            if (d > TOL) {
+              throw new Error(`[${i}]: f32=${y0Arr[i]} packed=${y1Arr[i]} diff=${d}`);
+            }
+          }
+        } finally {
+          setPackedBf16(false);
+        }
+      },
+    },
+
+    {
       name: 'packed bf16 gemv K=896 N=2048 transposed offset-sliced',
       run() {
         // Source = [2*N, K] bf16; slice src[N:2*N, :] so the view has a
