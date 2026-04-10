@@ -378,23 +378,44 @@ impl Qwen3Model {
 
 /// Create a random-init Qwen3 model and save it to disk.
 ///
-/// Builds a `Qwen3Model` via the direct-constructor path (random weights),
-/// saves it to `save_path`, and drops the in-memory shell. Used by TypeScript
-/// test fixtures that need an on-disk checkpoint without keeping a NAPI model
-/// instance alive.
-///
-/// This routes through the existing legacy (`thread: None`) save code path in
-/// `Qwen3Model::save_model`, which clones parameters into the async task — so
-/// the caller's model reference can safely drop once this function returns the
-/// promise.
+/// Spawns a dedicated `ModelThread<Qwen3Cmd>` whose init builds a fresh
+/// random-weight `Qwen3Inner` directly, then dispatches `Qwen3Cmd::SaveModel`
+/// on that thread. The thread is dropped at the end of the promise, so the
+/// in-memory model is released once the checkpoint has been written. Used by
+/// TypeScript test fixtures that need an on-disk checkpoint without keeping a
+/// NAPI model instance alive.
 #[napi]
 pub fn create_random_qwen3_checkpoint<'env>(
     env: &'env Env,
     config: Qwen3Config,
     save_path: String,
 ) -> Result<PromiseRaw<'env, ()>> {
-    let model = Qwen3Model::new(config)?;
-    model.save_model(env, save_path)
+    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+        move || {
+            let inner = Qwen3Inner::new(config)?;
+            Ok((inner, ()))
+        },
+        handle_qwen3_cmd,
+    );
+
+    env.spawn_future(async move {
+        init_rx
+            .await
+            .map_err(|_| napi::Error::from_reason("Model thread exited during init"))??;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        thread.send(Qwen3Cmd::SaveModel {
+            save_path,
+            reply: tx,
+        })?;
+        rx.await
+            .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))??;
+
+        // Drop the thread explicitly so the dedicated OS thread shuts down
+        // now that the checkpoint has been written.
+        drop(thread);
+        Ok(())
+    })
 }
 
 /// Parse Qwen3Config from a serde_json::Value (shared between load paths).

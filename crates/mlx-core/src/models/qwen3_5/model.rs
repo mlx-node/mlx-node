@@ -3211,6 +3211,9 @@ pub struct Qwen3_5Model {
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5Config,
     pub(crate) model_id: u64,
+    /// Shell-only field, scheduled for deletion in P6b along with the
+    /// legacy constructor/`apply_weights` path.
+    #[allow(dead_code)]
     pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
 
     // === Training support fields (Arc<RwLock<>>) ===
@@ -3221,8 +3224,12 @@ pub struct Qwen3_5Model {
     pub(crate) final_norm: Arc<RwLock<RMSNorm>>,
     pub(crate) lm_head: Arc<RwLock<Option<Linear>>>,
     pub(crate) caches: Arc<RwLock<Option<Vec<Qwen3_5LayerCache>>>>,
+    /// Shell-only field, scheduled for deletion in P6b.
+    #[allow(dead_code)]
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) vision_encoder: Option<Arc<Qwen3_5VisionEncoder>>,
+    /// Shell-only field, scheduled for deletion in P6b.
+    #[allow(dead_code)]
     pub(crate) spatial_merge_size: Option<i32>,
     pub(crate) cached_token_history: Arc<RwLock<Vec<u32>>>,
     pub(crate) cached_image_key: Arc<RwLock<Option<u64>>>,
@@ -4013,16 +4020,25 @@ impl Qwen3_5Model {
     }
 
     /// Set the vision encoder (wraps in Arc).
+    ///
+    /// Shell-only method, scheduled for deletion in P6b.
+    #[allow(dead_code)]
     pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) {
         self.vision_encoder = Some(Arc::new(enc));
     }
 
     /// Set the image processor.
+    ///
+    /// Shell-only method, scheduled for deletion in P6b.
+    #[allow(dead_code)]
     pub(crate) fn set_image_processor(&mut self, proc: Qwen35VLImageProcessor) {
         self.image_processor = Some(Arc::new(proc));
     }
 
     /// Set the spatial merge size.
+    ///
+    /// Shell-only method, scheduled for deletion in P6b.
+    #[allow(dead_code)]
     pub(crate) fn set_spatial_merge_size(&mut self, size: i32) {
         self.spatial_merge_size = Some(size);
     }

@@ -3388,7 +3388,7 @@ impl Qwen3Inner {
 
     /// Extract all trainable parameters from the model.
     /// Direct field access — no locks needed on model thread.
-    fn get_parameters_sync(&self) -> Result<HashMap<String, MxArray>> {
+    pub(crate) fn get_parameters_sync(&self) -> Result<HashMap<String, MxArray>> {
         let mut params = HashMap::new();
 
         // Embedding

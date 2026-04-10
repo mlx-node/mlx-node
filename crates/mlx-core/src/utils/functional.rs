@@ -1679,7 +1679,7 @@ pub(crate) fn forward_hidden_states_dispatch(
 #[cfg(test)]
 mod forward_pass_equivalence_tests {
     use super::*;
-    use crate::models::qwen3::{Qwen3Config, Qwen3Model};
+    use crate::models::qwen3::{Qwen3Config, Qwen3Inner};
 
     /// Helper to check if two arrays are close within tolerance
     fn arrays_close(a: &[f32], b: &[f32], atol: f32, rtol: f32) -> bool {
@@ -1693,6 +1693,31 @@ mod forward_pass_equivalence_tests {
             }
         }
         true
+    }
+
+    /// Reference stateful forward implementation, operating directly on the
+    /// lock-free `Qwen3Inner` fields. Mirrors the shell `Qwen3Model::forward`
+    /// and is used as the "ground truth" in the functional equivalence tests.
+    fn stateful_forward_reference(
+        inner: &Qwen3Inner,
+        input_ids: &MxArray,
+    ) -> napi::Result<MxArray> {
+        let mut hidden_states = inner.embedding.forward(input_ids)?;
+
+        for layer in inner.layers.iter() {
+            hidden_states = layer.forward(&hidden_states, None, None)?;
+        }
+
+        hidden_states = inner.final_norm.forward(&hidden_states)?;
+
+        let logits = if inner.config.tie_word_embeddings {
+            let embedding_weight = inner.embedding.get_weight();
+            hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
+        } else {
+            inner.lm_head.forward(&hidden_states)?
+        };
+
+        Ok(logits)
     }
 
     /// Create a tiny model config for fast testing
@@ -1725,16 +1750,16 @@ mod forward_pass_equivalence_tests {
     fn test_stateful_and_functional_forward_produce_identical_outputs() {
         // Create model with tiny config
         let config = tiny_config();
-        let model = Qwen3Model::new(config.clone()).unwrap();
+        let inner = Qwen3Inner::new(config.clone()).unwrap();
 
         // Get parameters as HashMap
-        let params = model.get_parameters().unwrap();
+        let params = inner.get_parameters_sync().unwrap();
 
         // Create input tokens [batch=1, seq_len=5]
         let input_ids = MxArray::from_int32(&[0, 1, 2, 3, 4], &[1, 5]).unwrap();
 
         // Run stateful forward pass
-        let stateful_output = model.forward(&input_ids).unwrap();
+        let stateful_output = stateful_forward_reference(&inner, &input_ids).unwrap();
         stateful_output.eval();
 
         // Run functional forward pass
@@ -1764,8 +1789,8 @@ mod forward_pass_equivalence_tests {
     #[test]
     fn test_equivalence_across_batch_sizes() {
         let config = tiny_config();
-        let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters().unwrap();
+        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let params = inner.get_parameters_sync().unwrap();
 
         for batch_size in [1, 2, 4] {
             // Create input tokens [batch, seq_len=4]
@@ -1776,7 +1801,7 @@ mod forward_pass_equivalence_tests {
                 MxArray::from_int32(&input_data, &[batch_size as i64, seq_len as i64]).unwrap();
 
             // Run both forward passes
-            let stateful_output = model.forward(&input_ids).unwrap();
+            let stateful_output = stateful_forward_reference(&inner, &input_ids).unwrap();
             stateful_output.eval();
 
             let functional_output = qwen3_forward_functional(&config, &params, &input_ids).unwrap();
@@ -1802,8 +1827,8 @@ mod forward_pass_equivalence_tests {
     #[test]
     fn test_equivalence_across_sequence_lengths() {
         let config = tiny_config();
-        let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters().unwrap();
+        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let params = inner.get_parameters_sync().unwrap();
 
         for seq_len in [1, 4, 16] {
             // Create input tokens [batch=1, seq_len]
@@ -1811,7 +1836,7 @@ mod forward_pass_equivalence_tests {
             let input_ids = MxArray::from_int32(&input_data, &[1, seq_len as i64]).unwrap();
 
             // Run both forward passes
-            let stateful_output = model.forward(&input_ids).unwrap();
+            let stateful_output = stateful_forward_reference(&inner, &input_ids).unwrap();
             stateful_output.eval();
 
             let functional_output = qwen3_forward_functional(&config, &params, &input_ids).unwrap();
@@ -1840,14 +1865,14 @@ mod forward_pass_equivalence_tests {
         let mut config = tiny_config();
         config.tie_word_embeddings = true;
 
-        let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters().unwrap();
+        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let params = inner.get_parameters_sync().unwrap();
 
         // Create input
         let input_ids = MxArray::from_int32(&[0, 1, 2, 3], &[1, 4]).unwrap();
 
         // Run both forward passes
-        let stateful_output = model.forward(&input_ids).unwrap();
+        let stateful_output = stateful_forward_reference(&inner, &input_ids).unwrap();
         stateful_output.eval();
 
         let functional_output = qwen3_forward_functional(&config, &params, &input_ids).unwrap();
@@ -2108,7 +2133,7 @@ mod chunked_lm_head_tests {
 #[cfg(test)]
 mod chunked_forward_tests {
     use super::*;
-    use crate::models::qwen3::{Qwen3Config, Qwen3Model};
+    use crate::models::qwen3::{Qwen3Config, Qwen3Inner};
 
     /// Helper to check if two arrays are close within tolerance
     fn arrays_close(a: &[f32], b: &[f32], atol: f32, rtol: f32) -> bool {
@@ -2153,8 +2178,8 @@ mod chunked_forward_tests {
     fn test_chunked_forward_matches_full() {
         // Chunked forward should produce identical results to full forward
         let config = tiny_config();
-        let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters().unwrap();
+        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let params = inner.get_parameters_sync().unwrap();
 
         // Create input with batch_size > chunk_size to trigger chunking
         // batch=8, seq=4, chunk_size=2 -> 4 chunks
@@ -2199,8 +2224,8 @@ mod chunked_forward_tests {
     #[test]
     fn test_chunked_forward_various_chunk_sizes() {
         let config = tiny_config();
-        let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters().unwrap();
+        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let params = inner.get_parameters_sync().unwrap();
 
         let batch = 12;
         let seq = 4;
@@ -2237,8 +2262,8 @@ mod chunked_forward_tests {
     fn test_chunked_forward_small_batch_skips_chunking() {
         // When batch_size <= chunk_size, should skip chunking (identical path)
         let config = tiny_config();
-        let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters().unwrap();
+        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let params = inner.get_parameters_sync().unwrap();
 
         let batch = 2;
         let seq = 4;
@@ -2266,8 +2291,8 @@ mod chunked_forward_tests {
     #[test]
     fn test_chunked_forward_output_shape() {
         let config = tiny_config();
-        let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters().unwrap();
+        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let params = inner.get_parameters_sync().unwrap();
 
         let batch = 8;
         let seq = 6;
@@ -2293,8 +2318,8 @@ mod chunked_forward_tests {
         let mut config = tiny_config();
         config.tie_word_embeddings = true;
 
-        let model = Qwen3Model::new(config.clone()).unwrap();
-        let params = model.get_parameters().unwrap();
+        let inner = Qwen3Inner::new(config.clone()).unwrap();
+        let params = inner.get_parameters_sync().unwrap();
 
         let batch = 6;
         let seq = 4;
