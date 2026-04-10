@@ -383,19 +383,52 @@ mod tests {
 
     #[test]
     fn save_load_round_trip_restores_step_and_moments() {
+        use std::collections::HashSet;
+
         let path_str = tmp_path("round_trip");
         let path_str = path_str.as_str();
 
-        // Build a state with one updated parameter so moments are non-zero.
+        // Build a state with TWO updated parameters so the key set is
+        // non-trivial and we can catch silent re-ordering / dropped keys.
         let mut ts = make_training_state_with_adamw();
-        let param = MxArray::from_float32(&[1.0f32, 2.0, 3.0], &[3]).unwrap();
-        let grad = MxArray::from_float32(&[0.1f32, 0.2, 0.3], &[3]).unwrap();
+        let param_w = MxArray::from_float32(&[1.0f32, 2.0, 3.0], &[3]).unwrap();
+        let grad_w = MxArray::from_float32(&[0.1f32, 0.2, 0.3], &[3]).unwrap();
+        let param_b = MxArray::from_float32(&[0.5f32, -0.5], &[2]).unwrap();
+        let grad_b = MxArray::from_float32(&[0.4f32, -0.4], &[2]).unwrap();
         let opt = ts.optimizer.as_mut().unwrap();
         let _updated = opt
-            .update_batch(vec!["weight".to_string()], vec![&param], vec![&grad])
+            .update_batch(
+                vec!["weight".to_string(), "bias".to_string()],
+                vec![&param_w, &param_b],
+                vec![&grad_w, &grad_b],
+            )
             .unwrap();
         let saved_step = opt.get_step();
         assert_eq!(saved_step, 1);
+
+        // Capture the exact saved moment values so we can compare post-load.
+        let saved_keys: HashSet<String> = opt.get_state_keys().into_iter().collect();
+        assert_eq!(
+            saved_keys,
+            ["weight".to_string(), "bias".to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
+
+        fn moment_values(arr: &MxArray, len: usize) -> Vec<f32> {
+            arr.eval();
+            (0..len).map(|i| arr.item_at_float32(i).unwrap()).collect()
+        }
+        let saved_m_w = moment_values(&opt.get_first_moment("weight".into()).unwrap(), 3);
+        let saved_v_w = moment_values(&opt.get_second_moment("weight".into()).unwrap(), 3);
+        let saved_m_b = moment_values(&opt.get_first_moment("bias".into()).unwrap(), 2);
+        let saved_v_b = moment_values(&opt.get_second_moment("bias".into()).unwrap(), 2);
+
+        // Sanity: first moment = (1-β1)*grad = 0.1 * grad, so should be non-zero
+        // wherever grad is non-zero. Guards against a regression that silently
+        // saves all-zero tensors.
+        assert!(saved_m_w.iter().any(|x| x.abs() > 1e-6));
+        assert!(saved_v_w.iter().any(|x| x.abs() > 1e-9));
 
         // Save.
         ts.save_optimizer_state_sync(path_str).unwrap();
@@ -405,23 +438,28 @@ mod tests {
         ts2.load_optimizer_state_sync(path_str).unwrap();
 
         let opt2 = ts2.optimizer.as_ref().unwrap();
-        // (a) step matches
+
+        // (a) step matches exactly.
         assert_eq!(opt2.get_step(), saved_step);
-        // (b) both keys present
-        let keys = opt2.get_state_keys();
-        assert!(keys.contains(&"weight".to_string()));
-        // (c) reading back first moment yields non-zero values
-        let m = opt2.get_first_moment("weight".to_string()).unwrap();
-        m.eval();
-        // first moment = (1-β1)*grad = 0.1 * [0.1, 0.2, 0.3] ≈ [0.01, 0.02, 0.03]
-        // Just confirm it's not all zeros (exact value checked via non-zero sum).
-        let sum = m.sum(None, None).unwrap();
-        sum.eval();
-        let s = sum.item_at_float32(0).unwrap();
-        assert!(
-            s.abs() > 1e-6,
-            "first moment sum should be non-zero, got {s}"
+
+        // (b) exact key-set equality — no extras, no drops.
+        let loaded_keys: HashSet<String> = opt2.get_state_keys().into_iter().collect();
+        assert_eq!(
+            loaded_keys, saved_keys,
+            "loaded optimizer key set must match saved set"
         );
+
+        // (c) first moment `m` values match exactly (both params).
+        let loaded_m_w = moment_values(&opt2.get_first_moment("weight".into()).unwrap(), 3);
+        let loaded_m_b = moment_values(&opt2.get_first_moment("bias".into()).unwrap(), 2);
+        assert_eq!(loaded_m_w, saved_m_w, "first moment `m` for weight");
+        assert_eq!(loaded_m_b, saved_m_b, "first moment `m` for bias");
+
+        // (d) second moment `v` values match exactly (both params).
+        let loaded_v_w = moment_values(&opt2.get_second_moment("weight".into()).unwrap(), 3);
+        let loaded_v_b = moment_values(&opt2.get_second_moment("bias".into()).unwrap(), 2);
+        assert_eq!(loaded_v_w, saved_v_w, "second moment `v` for weight");
+        assert_eq!(loaded_v_b, saved_v_b, "second moment `v` for bias");
     }
 
     // =========================================================================
