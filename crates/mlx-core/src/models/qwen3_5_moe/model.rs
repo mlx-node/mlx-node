@@ -2271,7 +2271,6 @@ impl Qwen35MoeInner {
             logprobs: logprobs_array,
             finish_reason: finish_reason.to_string(),
             num_tokens: generated_tokens.len(),
-            first_token_elapsed_ms: None,
         })
     }
 

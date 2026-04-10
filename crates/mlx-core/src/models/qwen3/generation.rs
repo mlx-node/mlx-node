@@ -144,11 +144,6 @@ pub struct GenerationResult {
 
     /// Number of tokens generated
     pub(crate) num_tokens: usize,
-
-    /// Elapsed ms from generation start to first token extraction (for TTFT).
-    /// Only set when called from chat() with reportPerformance.
-    #[allow(dead_code)]
-    pub(crate) first_token_elapsed_ms: Option<f64>,
 }
 
 #[napi]
