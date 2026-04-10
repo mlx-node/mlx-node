@@ -3016,6 +3016,40 @@ async function initAndRun(wasmUrl: string) {
       }
     }},
 
+    // --- SDPA vector D=256 (decode, Tq=1) ---
+    { name: 'SDPA vector D=256 Tq=1 GQA (f32, Qwen3.5-0.8B decode shape)', run() {
+      // B=1, Hq=8, Hkv=2, Tq=1, L=32, D=256 -> output [1,8,1,256] = 2048 elements
+      // GQA 4:1: heads 0-3 use KV head 0, heads 4-7 use KV head 1.
+      // C++ returns [vector_output..., cpu_reference...] = 2*N floats.
+      const D = 256, Hq = 8;
+      const N = Hq * 1 * D; // 2048 per half
+      const both = MxArray.testSdpaVectorD256(2 * N);
+      if (both[0] === -999) throw new Error('testSdpaVectorD256 error');
+      const vec = both.slice(0, N);
+      const ref = both.slice(N, 2 * N);
+      // Check all heads against CPU reference
+      for (let h = 0; h < Hq; h++) {
+        const off = h * D;
+        assertClose(vec.slice(off, off + D), ref.slice(off, off + D), 1e-3);
+      }
+    }},
+
+    { name: 'SDPA vector D=256 simple (no GQA, Tq=1)', run() {
+      // B=1, Hq=2, Hkv=2, Tq=1, L=16, D=256 -> output [1,2,1,256] = 512 elements
+      // C++ returns [vector_output..., cpu_reference...] = 2*N floats.
+      const D = 256, Hq = 2;
+      const N = Hq * 1 * D; // 512 per half
+      const both = MxArray.testSdpaVectorD256Simple(2 * N);
+      if (both[0] === -999) throw new Error('testSdpaVectorD256Simple error');
+      const vec = both.slice(0, N);
+      const ref = both.slice(N, 2 * N);
+      // Check both heads
+      for (let h = 0; h < Hq; h++) {
+        const off = h * D;
+        assertClose(vec.slice(off, off + D), ref.slice(off, off + D), 1e-3);
+      }
+    }},
+
     // --- Full attention layer bf16 ---
     { name: 'full attention layer bf16 (Q/K/V proj+QK norm+RoPE+GQA+SDPA+gate+Oproj)', run() {
       const vals = MxArray.testFullAttnLayerBf16(20);

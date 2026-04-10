@@ -3391,5 +3391,89 @@ int mlx_test_sdpa_tile_d256_causal_gqa_minimal(float* out_vals, int max_count) {
     }
 }
 
+// D=256 vector kernel with GQA: Qwen3.5-0.8B decode shape (Tq=1, Hq=8, Hkv=2).
+// Returns [vector_output..., cpu_reference...] concatenated (2*N floats).
+int mlx_test_sdpa_vector_d256(float* out_vals, int max_count) {
+    using namespace mlx::core;
+    try {
+        int B = 1, Hq = 8, Hkv = 2, Tq = 1, L = 32, D = 256;
+        int N = Hq * Tq * D; // 2048 per half
+        std::vector<float> q_data(B * Hq * Tq * D);
+        std::vector<float> k_data(B * Hkv * L * D);
+        std::vector<float> v_data(B * Hkv * L * D);
+        for (int i = 0; i < (int)q_data.size(); i++) q_data[i] = std::sin(i * 0.007f) * 0.3f;
+        for (int i = 0; i < (int)k_data.size(); i++) k_data[i] = std::cos(i * 0.011f) * 0.3f;
+        for (int i = 0; i < (int)v_data.size(); i++) v_data[i] = std::sin(i * 0.013f + 0.7f) * 0.2f;
+
+        // Vector kernel (Tq=1 decode path, fused SDPA)
+        auto q = array(q_data.data(), {B, Hq, Tq, D}, float32);
+        auto k = array(k_data.data(), {B, Hkv, L, D}, float32);
+        auto v = array(v_data.data(), {B, Hkv, L, D}, float32);
+        eval_safe(q); eval_safe(k); eval_safe(v);
+        float scale = 1.0f / std::sqrt((float)D);
+        auto result = fast::scaled_dot_product_attention(
+            q, k, v, scale, "", std::nullopt, {});
+        eval_safe(result);
+
+        // CPU reference (do_causal=false for Tq=1 decode)
+        std::vector<float> cpu_ref(N);
+        cpu_sdpa_ref(q_data.data(), k_data.data(), v_data.data(),
+                     cpu_ref.data(), B, Hq, Hkv, Tq, L, D, scale, false, nullptr);
+
+        // Output: [vector..., cpu_ref...]
+        int out_count = std::min(max_count, 2 * N);
+        const float* vec_ptr = result.data<float>();
+        for (int i = 0; i < out_count; i++) {
+            out_vals[i] = (i < N) ? vec_ptr[i] : cpu_ref[i - N];
+        }
+        return out_count;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_sdpa_vector_d256] %s\n", e.what());
+        return -1;
+    }
+}
+
+// Simplest D=256 vector case: no GQA, minimal dims (Tq=1, H=Hkv=2, L=16).
+// Returns [vector_output..., cpu_reference...] concatenated (2*N floats).
+int mlx_test_sdpa_vector_d256_simple(float* out_vals, int max_count) {
+    using namespace mlx::core;
+    try {
+        int B = 1, Hq = 2, Hkv = 2, Tq = 1, L = 16, D = 256;
+        int N = Hq * Tq * D; // 512 per half
+        std::vector<float> q_data(B * Hq * Tq * D);
+        std::vector<float> k_data(B * Hkv * L * D);
+        std::vector<float> v_data(B * Hkv * L * D);
+        for (int i = 0; i < (int)q_data.size(); i++) q_data[i] = std::sin(i * 0.01f) * 0.3f;
+        for (int i = 0; i < (int)k_data.size(); i++) k_data[i] = std::cos(i * 0.02f) * 0.3f;
+        for (int i = 0; i < (int)v_data.size(); i++) v_data[i] = std::sin(i * 0.015f + 0.5f) * 0.2f;
+
+        // Vector kernel (Tq=1 decode path)
+        auto q = array(q_data.data(), {B, Hq, Tq, D}, float32);
+        auto k = array(k_data.data(), {B, Hkv, L, D}, float32);
+        auto v = array(v_data.data(), {B, Hkv, L, D}, float32);
+        eval_safe(q); eval_safe(k); eval_safe(v);
+        float scale = 1.0f / std::sqrt((float)D);
+        auto result = fast::scaled_dot_product_attention(
+            q, k, v, scale, "", std::nullopt, {});
+        eval_safe(result);
+
+        // CPU reference
+        std::vector<float> cpu_ref(N);
+        cpu_sdpa_ref(q_data.data(), k_data.data(), v_data.data(),
+                     cpu_ref.data(), B, Hq, Hkv, Tq, L, D, scale, false, nullptr);
+
+        // Output: [vector..., cpu_ref...]
+        int out_count = std::min(max_count, 2 * N);
+        const float* vec_ptr = result.data<float>();
+        for (int i = 0; i < out_count; i++) {
+            out_vals[i] = (i < N) ? vec_ptr[i] : cpu_ref[i - N];
+        }
+        return out_count;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_sdpa_vector_d256_simple] %s\n", e.what());
+        return -1;
+    }
+}
+
 }  // extern "C"
 

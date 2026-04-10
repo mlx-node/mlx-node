@@ -556,6 +556,30 @@ impl MxArray {
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
+    /// D=256 vector kernel with GQA: Qwen3.5-0.8B decode shape (Tq=1, Hq=8, Hkv=2, L=32).
+    #[napi]
+    pub fn test_sdpa_vector_d256(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(32) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe {
+            sys::mlx_test_sdpa_vector_d256(buf.as_mut_ptr(), c as i32)
+        };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    /// Simplest D=256 vector case: no GQA, Tq=1, H=Hkv=2, L=16.
+    #[napi]
+    pub fn test_sdpa_vector_d256_simple(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(32) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe {
+            sys::mlx_test_sdpa_vector_d256_simple(buf.as_mut_ptr(), c as i32)
+        };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
     #[napi]
     pub fn test_full_attn_layer_bf16(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(20) as usize;
