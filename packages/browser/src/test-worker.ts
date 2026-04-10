@@ -177,9 +177,10 @@ async function initAndRun(wasmUrl: string) {
   // tile/vector kernels. Used by the tile SDPA parity tests to get a reference
   // value from the fallback path, then compare against the fused-kernel output.
   const setSdpaFallbackForced = (v: boolean) => {
-    if (typeof mlxExports.wgpuSetSdpaFallbackForced === 'function') {
-      mlxExports.wgpuSetSdpaFallbackForced(v);
+    if (typeof mlxExports.wgpuSetSdpaFallbackForced !== 'function') {
+      throw new Error('wgpuSetSdpaFallbackForced not found — SDPA fallback toggle not available');
     }
+    mlxExports.wgpuSetSdpaFallbackForced(v);
   };
   setSdpaFallbackForced(false);
 
@@ -2777,9 +2778,18 @@ async function initAndRun(wasmUrl: string) {
     // divergence in the tile kernel's online softmax + running accumulators
     // without hardcoding reference values (which would drift across dtypes
     // and compilers).
+    //
+    // Each test fetches the FULL flat output (all batches, heads, Q rows, D)
+    // and compares representative slices:
+    //   - First Q row, first D elements (prefix)
+    //   - Last Q row of head 0 (tail / partial-tile rows)
+    //   - Last head's first Q row (GQA head reindexing coverage)
+    // This ensures tail-tile rows and later GQA heads are tested, not just
+    // the leading prefix.
 
     { name: 'SDPA tile Tq=2 D=64 (f32)', run() {
-      const COUNT = 64;
+      // Output shape: [1, 2, 2, 64] = 256 elements total
+      const COUNT = 256;
       setSdpaFallbackForced(true);
       let ref: number[];
       try {
@@ -2790,11 +2800,19 @@ async function initAndRun(wasmUrl: string) {
       if (ref[0] === -999) throw new Error('testSdpaTileTq2D64 ref error');
       const vals = MxArray.testSdpaTileTq2D64(COUNT);
       if (vals[0] === -999) throw new Error('testSdpaTileTq2D64 tile error');
+      // Full output comparison — small enough to check entirely
       assertClose(vals, ref, 1e-4);
     }},
 
     { name: 'SDPA tile Tq=8 D=128 causal GQA (f32)', run() {
-      const COUNT = 32;
+      // B=1, Hq=8, Hkv=2, Tq=8, D=128 -> output [1,8,8,128] = 8192 elements
+      // GQA 4:1: heads 0-3 use KV head 0, heads 4-7 use KV head 1.
+      // Fetch full output but compare within KV-head-0 territory (heads 0-3,
+      // 4096 elements) which covers first Q row, last Q row, and multiple
+      // query heads sharing a single KV head.
+      const D = 128, Tq = 8, Hq = 8;
+      const gqa = Hq / 2; // 4 heads per KV head
+      const COUNT = Hq * Tq * D; // 8192 (full output)
       setSdpaFallbackForced(true);
       let ref: number[];
       try {
@@ -2805,11 +2823,25 @@ async function initAndRun(wasmUrl: string) {
       if (ref[0] === -999) throw new Error('testSdpaTileTq8D128CausalGqa ref error');
       const vals = MxArray.testSdpaTileTq8D128CausalGqa(COUNT);
       if (vals[0] === -999) throw new Error('testSdpaTileTq8D128CausalGqa tile error');
-      assertClose(vals, ref, 1e-4);
+      // Check head 0, first Q row (prefix)
+      assertClose(vals.slice(0, D), ref.slice(0, D), 1e-4);
+      // Check head 0, last Q row (row 7)
+      const h0LastRow = (Tq - 1) * D; // 896
+      assertClose(vals.slice(h0LastRow, h0LastRow + D), ref.slice(h0LastRow, h0LastRow + D), 1e-4);
+      // Check head 3 (last head in KV-head-0 group) — GQA h/gqa_factor coverage
+      const h3Start = 3 * Tq * D; // 3072
+      assertClose(vals.slice(h3Start, h3Start + D), ref.slice(h3Start, h3Start + D), 1e-4);
+      // Check head 3, last Q row
+      const h3LastRow = h3Start + (Tq - 1) * D; // 3968
+      assertClose(vals.slice(h3LastRow, h3LastRow + D), ref.slice(h3LastRow, h3LastRow + D), 1e-4);
     }},
 
     { name: 'SDPA tile Tq=32 D=128 additive mask (f32)', run() {
-      const COUNT = 32;
+      // B=1, Hq=4, Hkv=2, Tq=32, D=128 -> output [1,4,32,128] = 16384 elements
+      // GQA 2:1: heads 0-1 use KV head 0. Fetch full output, compare within
+      // KV-head-0 territory (heads 0-1, 8192 elements).
+      const D = 128, Tq = 32, Hq = 4;
+      const COUNT = Hq * Tq * D; // 16384 (full output)
       setSdpaFallbackForced(true);
       let ref: number[];
       try {
@@ -2820,11 +2852,26 @@ async function initAndRun(wasmUrl: string) {
       if (ref[0] === -999) throw new Error('testSdpaTileTq32D128Addmask ref error');
       const vals = MxArray.testSdpaTileTq32D128Addmask(COUNT);
       if (vals[0] === -999) throw new Error('testSdpaTileTq32D128Addmask tile error');
-      assertClose(vals, ref, 1e-4);
+      // Check head 0, first Q row (prefix)
+      assertClose(vals.slice(0, D), ref.slice(0, D), 1e-4);
+      // Check head 0, last Q row (row 31 — end of second full tile)
+      const h0LastRow = (Tq - 1) * D; // 3968
+      assertClose(vals.slice(h0LastRow, h0LastRow + D), ref.slice(h0LastRow, h0LastRow + D), 1e-4);
+      // Check head 1 (second head in KV-head-0 group)
+      const h1Start = 1 * Tq * D; // 4096
+      assertClose(vals.slice(h1Start, h1Start + D), ref.slice(h1Start, h1Start + D), 1e-4);
+      // Check head 1, last Q row
+      const h1LastRow = h1Start + (Tq - 1) * D; // 8064
+      assertClose(vals.slice(h1LastRow, h1LastRow + D), ref.slice(h1LastRow, h1LastRow + D), 1e-4);
     }},
 
     { name: 'SDPA tile Tq=33 D=128 causal partial-last-tile (f32)', run() {
-      const COUNT = 32;
+      // B=1, Hq=4, Hkv=2, Tq=33, D=128 -> output [1,4,33,128] = 16896 elements
+      // GQA 2:1: heads 0-1 use KV head 0. Tail row is row 32 (the lone row
+      // in the 3rd tile). Fetch full output, compare within KV-head-0
+      // territory including the tail row.
+      const D = 128, Tq = 33, Hq = 4;
+      const COUNT = Hq * Tq * D; // 16896 (full output)
       setSdpaFallbackForced(true);
       let ref: number[];
       try {
@@ -2835,11 +2882,23 @@ async function initAndRun(wasmUrl: string) {
       if (ref[0] === -999) throw new Error('testSdpaTileTq33D128Tailtile ref error');
       const vals = MxArray.testSdpaTileTq33D128Tailtile(COUNT);
       if (vals[0] === -999) throw new Error('testSdpaTileTq33D128Tailtile tile error');
-      assertClose(vals, ref, 1e-4);
+      // Check head 0, first Q row (prefix)
+      assertClose(vals.slice(0, D), ref.slice(0, D), 1e-4);
+      // Check head 0, tail row (row 32 — the partial-last-tile row)
+      const tailRow = 32 * D; // 4096
+      assertClose(vals.slice(tailRow, tailRow + D), ref.slice(tailRow, tailRow + D), 1e-4);
+      // Check head 1 (second head in KV-head-0 group), first Q row
+      const h1Start = 1 * Tq * D; // 4224
+      assertClose(vals.slice(h1Start, h1Start + D), ref.slice(h1Start, h1Start + D), 1e-4);
+      // Check head 1, tail row (row 32)
+      const h1Tail = h1Start + 32 * D; // 8320
+      assertClose(vals.slice(h1Tail, h1Tail + D), ref.slice(h1Tail, h1Tail + D), 1e-4);
     }},
 
     { name: 'SDPA tile Tq=128 D=128 L=4096 causal (f32)', run() {
-      const COUNT = 32;
+      // B=1, Hq=2, Tq=128, D=128 -> output [1,2,128,128] = 32768 elements
+      const D = 128, Tq = 128, Hq = 2;
+      const COUNT = Hq * Tq * D; // 32768
       setSdpaFallbackForced(true);
       let ref: number[];
       try {
@@ -2850,7 +2909,20 @@ async function initAndRun(wasmUrl: string) {
       if (ref[0] === -999) throw new Error('testSdpaTileTq128D128L4096 ref error');
       const vals = MxArray.testSdpaTileTq128D128L4096(COUNT);
       if (vals[0] === -999) throw new Error('testSdpaTileTq128D128L4096 tile error');
-      assertClose(vals, ref, 1e-4);
+      // Check head 0, first Q row (prefix)
+      assertClose(vals.slice(0, D), ref.slice(0, D), 1e-4);
+      // Check head 0, last Q row (row 127 — end of 8th tile)
+      const h0LastRow = (Tq - 1) * D; // 127*128 = 16256
+      assertClose(vals.slice(h0LastRow, h0LastRow + D), ref.slice(h0LastRow, h0LastRow + D), 1e-4);
+      // Check head 0, mid Q row (row 64 — middle tile boundary)
+      const h0MidRow = 64 * D; // 64*128 = 8192
+      assertClose(vals.slice(h0MidRow, h0MidRow + D), ref.slice(h0MidRow, h0MidRow + D), 1e-4);
+      // Check head 1 (last head), first Q row
+      const h1Start = 1 * Tq * D; // 1*128*128 = 16384
+      assertClose(vals.slice(h1Start, h1Start + D), ref.slice(h1Start, h1Start + D), 1e-4);
+      // Check head 1, last Q row
+      const h1LastRow = h1Start + (Tq - 1) * D; // 16384 + 16256 = 32640
+      assertClose(vals.slice(h1LastRow, h1LastRow + D), ref.slice(h1LastRow, h1LastRow + D), 1e-4);
     }},
 
     // --- Full attention layer bf16 ---
