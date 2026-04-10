@@ -8,7 +8,7 @@ use super::config::Gemma4Config;
 use super::layer_cache::Gemma4LayerCache;
 use super::mlp::GemmaMLP;
 use super::moe::{Gemma4MoE, Gemma4Router};
-use super::quantized_linear::{Gemma4MLPVariant, QuantizedLinear};
+use super::quantized_linear::{Gemma4MLPVariant, QuantizedLinear, QuantizedSwitchLinear};
 
 /// A single decoder layer in the Gemma4 model.
 ///
@@ -361,9 +361,27 @@ impl Gemma4DecoderLayer {
         }
     }
 
+    pub fn set_moe_gate_up_proj_quantized(&mut self, qsl: QuantizedSwitchLinear) -> Result<()> {
+        if let Some(ref mut moe) = self.moe {
+            moe.set_gate_up_proj_quantized(qsl);
+            Ok(())
+        } else {
+            Err(Error::from_reason("MoE not initialized"))
+        }
+    }
+
     pub fn set_moe_down_proj(&mut self, w: &MxArray) -> Result<()> {
         if let Some(ref mut moe) = self.moe {
             moe.set_down_proj(w)
+        } else {
+            Err(Error::from_reason("MoE not initialized"))
+        }
+    }
+
+    pub fn set_moe_down_proj_quantized(&mut self, qsl: QuantizedSwitchLinear) -> Result<()> {
+        if let Some(ref mut moe) = self.moe {
+            moe.set_down_proj_quantized(qsl);
+            Ok(())
         } else {
             Err(Error::from_reason("MoE not initialized"))
         }

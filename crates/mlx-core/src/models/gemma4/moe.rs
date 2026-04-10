@@ -3,6 +3,8 @@ use crate::nn::{Activations, Linear};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
+use super::quantized_linear::QuantizedSwitchLinear;
+
 /// Gemma4 MoE Router.
 ///
 /// Matches mlx-lm gemma4_text.py Router:
@@ -113,22 +115,30 @@ impl Gemma4Router {
     }
 }
 
+/// Expert projection: either a dense weight (gather_mm) or quantized (gather_qmm).
+pub enum ExpertProj {
+    /// Dense weight tensor for gather_mm.
+    Dense(MxArray),
+    /// Quantized expert weights for gather_qmm.
+    Quantized(QuantizedSwitchLinear),
+}
+
 /// Gemma4 MoE Experts block.
 ///
 /// Weights are stored in their ORIGINAL layout (no pre-transpose):
 ///   gate_up_proj: [num_experts, 2*moe_inter, hidden]
 ///   down_proj:    [num_experts, hidden, moe_inter]
 ///
-/// The transpose to [E, in, out] happens lazily inside gather_mm via
+/// Dense path: transpose to [E, in, out] happens lazily inside gather_mm via
 /// `swapaxes(-1, -2)`, matching Python's SwitchLinear which does:
 ///   `mx.gather_mm(x, self["weight"].swapaxes(-1, -2), ...)`
 ///
-/// This avoids materializing a ~30GB transposed copy of the expert weights.
+/// Quantized path: gather_qmm handles the transpose internally (transpose=true).
 pub struct Gemma4MoE {
     /// Fused gate+up projection: [num_experts, 2*moe_inter, hidden]
-    gate_up_proj: MxArray,
+    gate_up_proj: ExpertProj,
     /// Down projection: [num_experts, hidden, moe_inter]
-    down_proj: MxArray,
+    down_proj: ExpertProj,
     /// Pre-created scalar of top_k for floor_divide.
     k_scalar: MxArray,
     /// Pre-computed token indices for single-token decode: [K] zeros.
@@ -146,16 +156,18 @@ impl Gemma4MoE {
         moe_intermediate_size: u32,
     ) -> Result<Self> {
         let fused_inter = (2 * moe_intermediate_size) as i64;
-        let gate_up_proj =
-            MxArray::zeros(&[num_experts as i64, fused_inter, hidden_size as i64], None)?;
-        let down_proj = MxArray::zeros(
+        let gate_up_proj = ExpertProj::Dense(MxArray::zeros(
+            &[num_experts as i64, fused_inter, hidden_size as i64],
+            None,
+        )?);
+        let down_proj = ExpertProj::Dense(MxArray::zeros(
             &[
                 num_experts as i64,
                 hidden_size as i64,
                 moe_intermediate_size as i64,
             ],
             None,
-        )?;
+        )?);
         let k_scalar = MxArray::scalar_int(top_k as i32)?;
         // Pre-compute token indices for single-token unsorted path: all zeros
         let single_token_indices =
@@ -223,9 +235,15 @@ impl Gemma4MoE {
             (x_rep, flat_indices, None)
         };
 
-        // Lazy transpose matching Python SwitchLinear (zero-copy view, no memory duplication)
-        let gate_up_proj_t = self.gate_up_proj.transpose(Some(&[0, 2, 1]))?;
-        let gate_up = x_for_gather.gather_mm(&gate_up_proj_t, &idx_for_gather, do_sort)?;
+        // gate_up projection: Dense uses gather_mm with lazy transpose,
+        // Quantized uses gather_qmm (transpose handled internally).
+        let gate_up = match &self.gate_up_proj {
+            ExpertProj::Dense(w) => {
+                let w_t = w.transpose(Some(&[0, 2, 1]))?;
+                x_for_gather.gather_mm(&w_t, &idx_for_gather, do_sort)?
+            }
+            ExpertProj::Quantized(qsl) => qsl.forward(&x_for_gather, &idx_for_gather, do_sort)?,
+        };
 
         let gate = gate_up.slice_axis(2, 0, moe_inter)?;
         let up = gate_up.slice_axis(2, moe_inter, 2 * moe_inter)?;
@@ -236,8 +254,15 @@ impl Gemma4MoE {
             MxArray::from_handle(handle, "moe_geglu")?
         };
 
-        let down_proj_t = self.down_proj.transpose(Some(&[0, 2, 1]))?;
-        let down = hidden.gather_mm(&down_proj_t, &idx_for_gather, do_sort)?;
+        // down projection: Dense uses gather_mm with lazy transpose,
+        // Quantized uses gather_qmm (transpose handled internally).
+        let down = match &self.down_proj {
+            ExpertProj::Dense(w) => {
+                let w_t = w.transpose(Some(&[0, 2, 1]))?;
+                hidden.gather_mm(&w_t, &idx_for_gather, do_sort)?
+            }
+            ExpertProj::Quantized(qsl) => qsl.forward(&hidden, &idx_for_gather, do_sort)?,
+        };
 
         let down_final = if let Some(inv_order) = needs_unsort {
             down.take(&inv_order, 0)?
@@ -260,12 +285,20 @@ impl Gemma4MoE {
     // ========== Weight setters ==========
 
     pub fn set_gate_up_proj(&mut self, w: &MxArray) -> Result<()> {
-        self.gate_up_proj = w.clone();
+        self.gate_up_proj = ExpertProj::Dense(w.clone());
         Ok(())
     }
 
+    pub fn set_gate_up_proj_quantized(&mut self, qsl: QuantizedSwitchLinear) {
+        self.gate_up_proj = ExpertProj::Quantized(qsl);
+    }
+
     pub fn set_down_proj(&mut self, w: &MxArray) -> Result<()> {
-        self.down_proj = w.clone();
+        self.down_proj = ExpertProj::Dense(w.clone());
         Ok(())
+    }
+
+    pub fn set_down_proj_quantized(&mut self, qsl: QuantizedSwitchLinear) {
+        self.down_proj = ExpertProj::Quantized(qsl);
     }
 }

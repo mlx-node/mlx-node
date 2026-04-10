@@ -18,7 +18,8 @@ use super::image_processor::Gemma4ImageProcessor;
 use super::model::{Gemma4Inner, Gemma4Model, warmup_forward};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, is_mxfp8_checkpoint, is_quantized_checkpoint,
-    try_build_mxfp8_quantized_linear, try_build_quantized_linear,
+    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
+    try_build_quantized_linear, try_build_quantized_switch_linear,
 };
 
 /// Parse config.json into Gemma4Config.
@@ -382,8 +383,13 @@ fn validate_required_weights(
                 )));
             }
             // Expert weights: HF fused OR mlx-lm split format
-            let has_fused = has(&format!("{}.experts.gate_up_proj", prefix))
-                && has(&format!("{}.experts.down_proj", prefix));
+            // HF uses bare keys (experts.gate_up_proj), mlx-lm uses .weight suffix.
+            // The has() helper also checks for .scales (quantized variant).
+            let has_fused_bare = params.contains_key(&format!("{}.experts.gate_up_proj", prefix))
+                && params.contains_key(&format!("{}.experts.down_proj", prefix));
+            let has_fused_weight = has(&format!("{}.experts.gate_up_proj.weight", prefix))
+                && has(&format!("{}.experts.down_proj.weight", prefix));
+            let has_fused = has_fused_bare || has_fused_weight;
             let has_split = has(&format!("{}.experts.switch_glu.gate_proj.weight", prefix))
                 && has(&format!("{}.experts.switch_glu.up_proj.weight", prefix))
                 && has(&format!("{}.experts.switch_glu.down_proj.weight", prefix));
@@ -728,27 +734,53 @@ fn apply_weights(
                 layer.set_moe_per_expert_scale(w)?;
             }
 
-            // Expert weights: support both fused (HF) and split (mlx-lm) formats.
-            // HF format: experts.gate_up_proj [E, 2*moe_inter, hidden]
-            // mlx-lm format: experts.switch_glu.gate_proj.weight + experts.switch_glu.up_proj.weight
-            if let Some(w) = params.get(&format!("{}.experts.gate_up_proj", prefix)) {
-                layer.set_moe_gate_up_proj(w)?;
-            } else if let (Some(gate), Some(up)) = (
-                params.get(&format!("{}.experts.switch_glu.gate_proj.weight", prefix)),
-                params.get(&format!("{}.experts.switch_glu.up_proj.weight", prefix)),
-            ) {
-                // Fuse split gate+up back into [E, 2*moe_inter, hidden]
-                let fused = MxArray::concatenate(gate, up, 1)?;
-                layer.set_moe_gate_up_proj(&fused)?;
-            }
-            // HF format: experts.down_proj [E, hidden, moe_inter]
-            // mlx-lm format: experts.switch_glu.down_proj.weight
-            if let Some(w) = params.get(&format!("{}.experts.down_proj", prefix)) {
-                layer.set_moe_down_proj(w)?;
-            } else if let Some(w) =
-                params.get(&format!("{}.experts.switch_glu.down_proj.weight", prefix))
+            // Expert weights: try quantized first, then fall back to dense.
+            // After the fusion loop, mlx-lm keys are:
+            //   experts.gate_up_proj.{weight,scales,biases}
+            //   experts.down_proj.{weight,scales,biases}
+            // HF pre-fused format uses bare keys without .weight suffix:
+            //   experts.gate_up_proj, experts.down_proj
             {
-                layer.set_moe_down_proj(w)?;
+                let gate_up_prefix = format!("{}.experts.gate_up_proj", prefix);
+                if let Some(qsl) = try_build_quantized_switch_linear(
+                    params,
+                    &gate_up_prefix,
+                    DEFAULT_QUANT_GROUP_SIZE,
+                    DEFAULT_QUANT_BITS,
+                ) {
+                    layer.set_moe_gate_up_proj_quantized(qsl)?;
+                } else if let Some(qsl) =
+                    try_build_mxfp8_quantized_switch_linear(params, &gate_up_prefix)
+                {
+                    layer.set_moe_gate_up_proj_quantized(qsl)?;
+                } else if let Some(w) = params.get(&format!("{}.weight", gate_up_prefix)) {
+                    // mlx-lm fused dense format
+                    layer.set_moe_gate_up_proj(w)?;
+                } else if let Some(w) = params.get(&gate_up_prefix) {
+                    // HF pre-fused bare key format
+                    layer.set_moe_gate_up_proj(w)?;
+                }
+            }
+            {
+                let down_prefix = format!("{}.experts.down_proj", prefix);
+                if let Some(qsl) = try_build_quantized_switch_linear(
+                    params,
+                    &down_prefix,
+                    DEFAULT_QUANT_GROUP_SIZE,
+                    DEFAULT_QUANT_BITS,
+                ) {
+                    layer.set_moe_down_proj_quantized(qsl)?;
+                } else if let Some(qsl) =
+                    try_build_mxfp8_quantized_switch_linear(params, &down_prefix)
+                {
+                    layer.set_moe_down_proj_quantized(qsl)?;
+                } else if let Some(w) = params.get(&format!("{}.weight", down_prefix)) {
+                    // mlx-lm fused dense format
+                    layer.set_moe_down_proj(w)?;
+                } else if let Some(w) = params.get(&down_prefix) {
+                    // HF pre-fused bare key format
+                    layer.set_moe_down_proj(w)?;
+                }
             }
 
             // MoE-specific norms
@@ -1072,19 +1104,60 @@ impl Gemma4Inner {
         if config.enable_moe_block {
             for i in 0..config.num_hidden_layers as usize {
                 let prefix = format!("layers.{}", i);
+
+                // Fuse split gate+up .weight into a single gate_up_proj
                 let gate_key = format!("{}.experts.switch_glu.gate_proj.weight", prefix);
                 let up_key = format!("{}.experts.switch_glu.up_proj.weight", prefix);
                 if let (Some(gate), Some(up)) = (params.remove(&gate_key), params.remove(&up_key)) {
                     let fused = MxArray::concatenate(&gate, &up, 1)?;
-                    params.insert(format!("{}.experts.gate_up_proj", prefix), fused);
+                    params.insert(format!("{}.experts.gate_up_proj.weight", prefix), fused);
                 }
-                // Remap split down_proj key so apply_weights and C++ path both find it
+
+                // Fuse split gate+up .scales for quantized checkpoints
+                let gate_scales = format!("{}.experts.switch_glu.gate_proj.scales", prefix);
+                let up_scales = format!("{}.experts.switch_glu.up_proj.scales", prefix);
+                if let (Some(gs), Some(us)) =
+                    (params.remove(&gate_scales), params.remove(&up_scales))
+                {
+                    let fused = MxArray::concatenate(&gs, &us, 1)?;
+                    params.insert(format!("{}.experts.gate_up_proj.scales", prefix), fused);
+                }
+
+                // Fuse split gate+up .biases for quantized checkpoints (affine mode)
+                let gate_biases = format!("{}.experts.switch_glu.gate_proj.biases", prefix);
+                let up_biases = format!("{}.experts.switch_glu.up_proj.biases", prefix);
+                if let (Some(gb), Some(ub)) =
+                    (params.remove(&gate_biases), params.remove(&up_biases))
+                {
+                    let fused = MxArray::concatenate(&gb, &ub, 1)?;
+                    params.insert(format!("{}.experts.gate_up_proj.biases", prefix), fused);
+                }
+
+                // Remap split down_proj .weight so apply_weights and C++ path both find it
                 let down_split = format!("{}.experts.switch_glu.down_proj.weight", prefix);
-                let down_fused = format!("{}.experts.down_proj", prefix);
+                let down_fused = format!("{}.experts.down_proj.weight", prefix);
                 if !params.contains_key(&down_fused)
                     && let Some(w) = params.remove(&down_split)
                 {
                     params.insert(down_fused, w);
+                }
+
+                // Remap split down_proj .scales
+                let down_scales_split = format!("{}.experts.switch_glu.down_proj.scales", prefix);
+                let down_scales_fused = format!("{}.experts.down_proj.scales", prefix);
+                if !params.contains_key(&down_scales_fused)
+                    && let Some(s) = params.remove(&down_scales_split)
+                {
+                    params.insert(down_scales_fused, s);
+                }
+
+                // Remap split down_proj .biases
+                let down_biases_split = format!("{}.experts.switch_glu.down_proj.biases", prefix);
+                let down_biases_fused = format!("{}.experts.down_proj.biases", prefix);
+                if !params.contains_key(&down_biases_fused)
+                    && let Some(b) = params.remove(&down_biases_split)
+                {
+                    params.insert(down_biases_fused, b);
                 }
             }
         }
