@@ -3480,7 +3480,7 @@ int mlx_test_sdpa_vector_d256_simple(float* out_vals, int max_count) {
 // B = [1, 1, 2, 128, 8]  (broadcasts on dim 1)
 // After collapse_batches, this produces a multi-element batch_shape that
 // exercises the multi-dim batch stride decomposition in the WebGPU matmul
-// kernel. Returns [gpu_output..., cpu_reference...] interleaved.
+// kernel. Returns [gpu_output..., cpu_reference...] concatenated.
 int mlx_test_matmul_broadcast_batch(float* out_vals, int max_count) {
     using namespace mlx::core;
     try {
