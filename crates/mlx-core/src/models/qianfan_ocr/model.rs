@@ -27,7 +27,7 @@ use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
 use crate::models::qianfan_ocr::processing::QianfanImageProcessor;
 use crate::models::qianfan_ocr::vision::InternViTModel;
 use crate::models::qwen3_5::model::extract_images_from_messages;
-use crate::models::qwen3_5::model::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
+use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::sampling::{
     SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
     check_repetition_cutoff, sample,
@@ -35,32 +35,7 @@ use crate::sampling::{
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 use crate::tools;
-use crate::tools::ToolCallResult;
 use crate::utils::safetensors::SafeTensorsFile;
-
-// ============================================================================
-// ChatResult
-// ============================================================================
-
-/// Result from a Qianfan-OCR chat() call.
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct QianfanChatResult {
-    /// Generated text (with thinking/tool_call tags stripped)
-    pub text: String,
-    /// Parsed tool calls (if any)
-    pub tool_calls: Vec<ToolCallResult>,
-    /// Thinking content (text inside <think>...</think> tags)
-    pub thinking: Option<String>,
-    /// Number of generated tokens
-    pub num_tokens: u32,
-    /// Why generation stopped: "stop", "length", or "repetition"
-    pub finish_reason: String,
-    /// Raw generated text before parsing
-    pub raw_text: String,
-    /// Performance metrics (only present when `reportPerformance: true`)
-    pub performance: Option<crate::profiling::PerformanceMetrics>,
-}
 
 // ============================================================================
 // QianfanOCRModel
@@ -184,7 +159,7 @@ impl QianfanOCRModel {
         &self,
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
-    ) -> Result<QianfanChatResult> {
+    ) -> Result<ChatResult> {
         if !self.is_initialized() {
             return Err(Error::from_reason(
                 "Model not initialized. Call QianfanOCRModel.load() first.",
@@ -579,11 +554,12 @@ impl QianfanOCRModel {
                 None
             };
 
-            Ok(QianfanChatResult {
+            Ok(ChatResult {
                 text: text.trim().to_string(),
                 tool_calls,
                 thinking,
                 num_tokens: generated_tokens.len() as u32,
+                prompt_tokens: prefill_token_count as u32,
                 finish_reason,
                 raw_text: raw_decoded,
                 performance,
@@ -1470,11 +1446,12 @@ mod tests {
 
     #[test]
     fn test_chat_result_creation() {
-        let result = QianfanChatResult {
+        let result = ChatResult {
             text: "Hello".to_string(),
             tool_calls: vec![],
             thinking: None,
             num_tokens: 1,
+            prompt_tokens: 0,
             finish_reason: "stop".to_string(),
             raw_text: "Hello".to_string(),
             performance: None,

@@ -15,4 +15,4 @@ pub mod vision;
 
 // Re-export public items
 pub use config::{InternVisionConfig, QianfanOCRConfig, Qwen3LMConfig, create_qianfan_ocr_config};
-pub use model::{QianfanChatResult, QianfanOCRModel};
+pub use model::QianfanOCRModel;
