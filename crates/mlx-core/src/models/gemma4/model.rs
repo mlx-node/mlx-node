@@ -507,7 +507,7 @@ impl Gemma4Inner {
 
         let use_compiled = std::env::var("GEMMA4_USE_COMPILE").is_ok()
             && self.config.num_kv_shared_layers.is_none_or(|n| n <= 0)
-            && unsafe { mlx_sys::mlx_weight_count() } > 0;
+            && unsafe { mlx_sys::mlx_qwen35_get_model_id() } == self.model_id;
 
         if use_compiled {
             // Legacy compiled C++ path (opt-in via GEMMA4_USE_COMPILE=1)
