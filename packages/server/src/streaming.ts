@@ -19,9 +19,12 @@ export function beginSSE(res: ServerResponse): void {
  * Write a single SSE event.
  *
  * Includes the `type` field in the data payload for OpenAI SDK compatibility.
+ * The `type` is always the SSE event type, even if the data object contains
+ * its own `type` field (which would be for a different purpose).
  */
-export function writeSSEEvent(res: ServerResponse, eventType: string, data: unknown): void {
-  const payload = { type: eventType, ...(data as Record<string, unknown>) };
+export function writeSSEEvent(res: ServerResponse, eventType: string, data: Record<string, unknown>): void {
+  // Spread data first, then override type to ensure the SSE event type wins
+  const payload = { ...data, type: eventType };
   res.write(`event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`);
 }
 

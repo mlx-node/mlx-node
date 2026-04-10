@@ -535,7 +535,7 @@ export async function handleCreateResponse(
       sendInternalError(res, message);
     } else {
       // Headers already sent (streaming) -- best effort: write error event and close
-      writeSSEEvent(res, 'error', { type: 'server_error', message });
+      writeSSEEvent(res, 'error', { error_type: 'server_error', message });
       endSSE(res);
     }
   }
