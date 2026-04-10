@@ -217,6 +217,34 @@ describe('createHandler', () => {
       expect(parsed.error.message).toContain('nonexistent');
     });
 
+    it('returns 404 when previous_response_id is not found in store', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+
+      const mockStore = {
+        getChain: vi.fn().mockRejectedValue(new Error('not found')),
+        save: vi.fn(),
+        cleanup: vi.fn(),
+      };
+
+      const handler = createHandler(registry, { store: mockStore as any });
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'Hello',
+        previous_response_id: 'resp_missing',
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(404);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('not_found_error');
+      expect(parsed.error.message).toContain('resp_missing');
+      expect(parsed.error.message).toContain('not found or expired');
+    });
+
     it('passes mapped messages and config to model.chat', async () => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel();

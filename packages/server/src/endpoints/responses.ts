@@ -498,7 +498,7 @@ export async function handleCreateResponse(
       priorMessages = reconstructMessagesFromChain(chain);
       previousResponseId = body.previous_response_id;
     } catch {
-      sendInternalError(res, 'Failed to resolve previous_response_id chain');
+      sendNotFound(res, `Previous response "${body.previous_response_id}" not found or expired`);
       return;
     }
   } else if (body.previous_response_id && !store) {
