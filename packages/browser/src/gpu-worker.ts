@@ -197,6 +197,10 @@ self.onmessage = async (e: MessageEvent) => {
         maxComputeWorkgroupSizeZ: 64,
         maxComputeInvocationsPerWorkgroup: 256,
         maxComputeWorkgroupsPerDimension: 65535,
+        // D=256 tile SDPA needs ~25 KiB shared memory (BQ*D + BK*D + extras).
+        // The WebGPU minimum is 16384 (16 KiB); request the adapter's max
+        // (32768 on Apple M3) so D=256 kernels can compile and run.
+        maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
         maxBindGroups: 4,
         maxBindingsPerBindGroup: Math.min(adapter.limits.maxBindingsPerBindGroup, 16),
       },

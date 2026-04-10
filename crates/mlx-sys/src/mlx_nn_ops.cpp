@@ -3137,5 +3137,256 @@ int mlx_test_sdpa_tile_tq128_d128_l4096(float* out_vals, int max_count) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CPU reference SDPA for GQA correctness tests.
+//
+// Computes out[b,h,q,d] = softmax(Q[b,h,q,:] . K[b,h_kv,l,:]^T * scale
+//                                  [+ causal mask]) . V[b,h_kv,l,d]
+// where h_kv = h / gqa_factor.
+//
+// This avoids the MLX decomposed fallback (unflatten+expand_dims+matmul)
+// which has a GQA bug on the WebGPU backend.
+// ---------------------------------------------------------------------------
+static void cpu_sdpa_ref(
+    const float* q, const float* k, const float* v,
+    float* out,
+    int B, int Hq, int Hkv, int Tq, int L, int D,
+    float scale, bool do_causal) {
+    int gqa = Hq / Hkv;
+    int q_offset = L - Tq; // causal offset (like the tile kernel)
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < Hq; h++) {
+            int hkv = h / gqa;
+            for (int qi = 0; qi < Tq; qi++) {
+                // Compute scores: dot(Q[b,h,qi,:], K[b,hkv,l,:]) * scale
+                std::vector<float> scores(L);
+                const float* q_row = q + ((b * Hq + h) * Tq + qi) * D;
+                for (int l = 0; l < L; l++) {
+                    const float* k_row = k + ((b * Hkv + hkv) * L + l) * D;
+                    float dot = 0.0f;
+                    for (int d = 0; d < D; d++) {
+                        dot += q_row[d] * k_row[d];
+                    }
+                    scores[l] = dot * scale;
+                }
+                // Apply causal mask: mask out l > qi + q_offset
+                if (do_causal) {
+                    int q_abs = qi + q_offset;
+                    for (int l = 0; l < L; l++) {
+                        if (l > q_abs) {
+                            scores[l] = -1e9f; // large negative
+                        }
+                    }
+                }
+                // Softmax
+                float max_s = scores[0];
+                for (int l = 1; l < L; l++) max_s = std::max(max_s, scores[l]);
+                float sum_exp = 0.0f;
+                for (int l = 0; l < L; l++) {
+                    scores[l] = std::exp(scores[l] - max_s);
+                    sum_exp += scores[l];
+                }
+                for (int l = 0; l < L; l++) scores[l] /= sum_exp;
+                // Weighted sum of V
+                float* out_row = out + ((b * Hq + h) * Tq + qi) * D;
+                for (int d = 0; d < D; d++) out_row[d] = 0.0f;
+                for (int l = 0; l < L; l++) {
+                    const float* v_row = v + ((b * Hkv + hkv) * L + l) * D;
+                    for (int d = 0; d < D; d++) {
+                        out_row[d] += scores[l] * v_row[d];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// D=256 tile kernel with GQA: Qwen3.5-0.8B shape (Hq=8, Hkv=2, gqa=4:1).
+// Returns [tile_output..., cpu_reference...] concatenated (2*N floats).
+// JS requests count = 2*Hq*Tq*D and compares first half vs second half.
+int mlx_test_sdpa_tile_d256_gqa(float* out_vals, int max_count) {
+    using namespace mlx::core;
+    try {
+        int B = 1, Hq = 8, Hkv = 2, Tq = 8, L = 16, D = 256;
+        int N = Hq * Tq * D; // 16384 per half
+        std::vector<float> q_data(B * Hq * Tq * D);
+        std::vector<float> k_data(B * Hkv * L * D);
+        std::vector<float> v_data(B * Hkv * L * D);
+        for (int i = 0; i < (int)q_data.size(); i++) q_data[i] = std::sin(i * 0.007f) * 0.3f;
+        for (int i = 0; i < (int)k_data.size(); i++) k_data[i] = std::cos(i * 0.011f) * 0.3f;
+        for (int i = 0; i < (int)v_data.size(); i++) v_data[i] = std::sin(i * 0.013f + 0.7f) * 0.2f;
+
+        // Tile kernel
+        auto q = array(q_data.data(), {B, Hq, Tq, D}, float32);
+        auto k = array(k_data.data(), {B, Hkv, L, D}, float32);
+        auto v = array(v_data.data(), {B, Hkv, L, D}, float32);
+        eval_safe(q); eval_safe(k); eval_safe(v);
+        float scale = 1.0f / std::sqrt((float)D);
+        auto result = fast::scaled_dot_product_attention(
+            q, k, v, scale, "causal", std::nullopt, {});
+        eval_safe(result);
+
+        // CPU reference
+        std::vector<float> cpu_ref(N);
+        cpu_sdpa_ref(q_data.data(), k_data.data(), v_data.data(),
+                     cpu_ref.data(), B, Hq, Hkv, Tq, L, D, scale, true);
+
+        // Output: [tile..., cpu_ref...]
+        int out_count = std::min(max_count, 2 * N);
+        const float* tile_ptr = result.data<float>();
+        for (int i = 0; i < out_count; i++) {
+            out_vals[i] = (i < N) ? tile_ptr[i] : cpu_ref[i - N];
+        }
+        return out_count;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_sdpa_tile_d256_gqa] %s\n", e.what());
+        return -1;
+    }
+}
+
+// Simplest D=256 tile case. No causal, no GQA, minimal dims.
+// Uses the MLX fallback as reference (no GQA = fallback is correct).
+int mlx_test_sdpa_tile_d256_simple(float* out_vals, int max_count) {
+    using namespace mlx::core;
+    try {
+        int B = 1, Hq = 1, Hkv = 1, Tq = 2, L = 4, D = 256;
+        std::vector<float> q_data(B * Hq * Tq * D);
+        std::vector<float> k_data(B * Hkv * L * D);
+        std::vector<float> v_data(B * Hkv * L * D);
+        for (int i = 0; i < (int)q_data.size(); i++) q_data[i] = std::sin(i * 0.01f) * 0.3f;
+        for (int i = 0; i < (int)k_data.size(); i++) k_data[i] = std::cos(i * 0.02f) * 0.3f;
+        for (int i = 0; i < (int)v_data.size(); i++) v_data[i] = std::sin(i * 0.03f + 0.5f) * 0.2f;
+
+        auto q = array(q_data.data(), {B, Hq, Tq, D}, float32);
+        auto k = array(k_data.data(), {B, Hkv, L, D}, float32);
+        auto v = array(v_data.data(), {B, Hkv, L, D}, float32);
+        eval_safe(q); eval_safe(k); eval_safe(v);
+
+        float scale = 1.0f / std::sqrt((float)D);
+        auto result = fast::scaled_dot_product_attention(
+            q, k, v, scale, "", std::nullopt, {});
+        eval_safe(result);
+        return output_result(result, out_vals, max_count);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_sdpa_tile_d256_simple] %s\n", e.what());
+        return -1;
+    }
+}
+
+// D=256 with causal but NO GQA (Hq=Hkv). Isolates causal from GQA.
+// Uses the MLX fallback as reference (no GQA = fallback is correct).
+int mlx_test_sdpa_tile_d256_causal(float* out_vals, int max_count) {
+    using namespace mlx::core;
+    try {
+        int B = 1, Hq = 2, Hkv = 2, Tq = 8, L = 16, D = 256;
+        std::vector<float> q_data(B * Hq * Tq * D);
+        std::vector<float> k_data(B * Hkv * L * D);
+        std::vector<float> v_data(B * Hkv * L * D);
+        for (int i = 0; i < (int)q_data.size(); i++) q_data[i] = std::sin(i * 0.007f) * 0.3f;
+        for (int i = 0; i < (int)k_data.size(); i++) k_data[i] = std::cos(i * 0.011f) * 0.3f;
+        for (int i = 0; i < (int)v_data.size(); i++) v_data[i] = std::sin(i * 0.013f + 0.7f) * 0.2f;
+
+        auto q = array(q_data.data(), {B, Hq, Tq, D}, float32);
+        auto k = array(k_data.data(), {B, Hkv, L, D}, float32);
+        auto v = array(v_data.data(), {B, Hkv, L, D}, float32);
+        eval_safe(q); eval_safe(k); eval_safe(v);
+
+        float scale = 1.0f / std::sqrt((float)D);
+        auto result = fast::scaled_dot_product_attention(
+            q, k, v, scale, "causal", std::nullopt, {});
+        eval_safe(result);
+        return output_result(result, out_vals, max_count);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_sdpa_tile_d256_causal] %s\n", e.what());
+        return -1;
+    }
+}
+
+// D=256 with GQA (Hq=8, Hkv=2) but NO causal. Isolates GQA from causal.
+// Returns [tile_output..., cpu_reference...] (2*N floats), same as the
+// causal GQA variant. CPU reference avoids the broken MLX fallback.
+int mlx_test_sdpa_tile_d256_gqa_nocausal(float* out_vals, int max_count) {
+    using namespace mlx::core;
+    try {
+        int B = 1, Hq = 8, Hkv = 2, Tq = 8, L = 16, D = 256;
+        int N = Hq * Tq * D; // 16384 per half
+        std::vector<float> q_data(B * Hq * Tq * D);
+        std::vector<float> k_data(B * Hkv * L * D);
+        std::vector<float> v_data(B * Hkv * L * D);
+        for (int i = 0; i < (int)q_data.size(); i++) q_data[i] = std::sin(i * 0.007f) * 0.3f;
+        for (int i = 0; i < (int)k_data.size(); i++) k_data[i] = std::cos(i * 0.011f) * 0.3f;
+        for (int i = 0; i < (int)v_data.size(); i++) v_data[i] = std::sin(i * 0.013f + 0.7f) * 0.2f;
+
+        // Tile kernel
+        auto q = array(q_data.data(), {B, Hq, Tq, D}, float32);
+        auto k = array(k_data.data(), {B, Hkv, L, D}, float32);
+        auto v = array(v_data.data(), {B, Hkv, L, D}, float32);
+        eval_safe(q); eval_safe(k); eval_safe(v);
+        float scale = 1.0f / std::sqrt((float)D);
+        auto result = fast::scaled_dot_product_attention(
+            q, k, v, scale, "", std::nullopt, {});
+        eval_safe(result);
+
+        // CPU reference (no causal)
+        std::vector<float> cpu_ref(N);
+        cpu_sdpa_ref(q_data.data(), k_data.data(), v_data.data(),
+                     cpu_ref.data(), B, Hq, Hkv, Tq, L, D, scale, false);
+
+        // Output: [tile..., cpu_ref...]
+        int out_count = std::min(max_count, 2 * N);
+        const float* tile_ptr = result.data<float>();
+        for (int i = 0; i < out_count; i++) {
+            out_vals[i] = (i < N) ? tile_ptr[i] : cpu_ref[i - N];
+        }
+        return out_count;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_sdpa_tile_d256_gqa_nocausal] %s\n", e.what());
+        return -1;
+    }
+}
+
+// D=256 minimal causal+GQA: H=4, Hkv=2, gqa=2:1, Tq=2, L=4.
+// h=0,1 → KV head 0; h=2,3 → KV head 1.
+// Returns [tile_output..., cpu_reference...] (2*N floats).
+int mlx_test_sdpa_tile_d256_causal_gqa_minimal(float* out_vals, int max_count) {
+    using namespace mlx::core;
+    try {
+        int B = 1, Hq = 4, Hkv = 2, Tq = 2, L = 4, D = 256;
+        int N = Hq * Tq * D; // 2048 per half
+        std::vector<float> q_data(B * Hq * Tq * D);
+        std::vector<float> k_data(B * Hkv * L * D);
+        std::vector<float> v_data(B * Hkv * L * D);
+        for (int i = 0; i < (int)q_data.size(); i++) q_data[i] = std::sin(i * 0.007f) * 0.3f;
+        for (int i = 0; i < (int)k_data.size(); i++) k_data[i] = std::cos(i * 0.011f) * 0.3f;
+        for (int i = 0; i < (int)v_data.size(); i++) v_data[i] = std::sin(i * 0.013f + 0.7f) * 0.2f;
+
+        // Tile kernel
+        auto q = array(q_data.data(), {B, Hq, Tq, D}, float32);
+        auto k = array(k_data.data(), {B, Hkv, L, D}, float32);
+        auto v = array(v_data.data(), {B, Hkv, L, D}, float32);
+        eval_safe(q); eval_safe(k); eval_safe(v);
+        float scale = 1.0f / std::sqrt((float)D);
+        auto result = fast::scaled_dot_product_attention(
+            q, k, v, scale, "causal", std::nullopt, {});
+        eval_safe(result);
+
+        // CPU reference
+        std::vector<float> cpu_ref(N);
+        cpu_sdpa_ref(q_data.data(), k_data.data(), v_data.data(),
+                     cpu_ref.data(), B, Hq, Hkv, Tq, L, D, scale, true);
+
+        // Output: [tile..., cpu_ref...]
+        int out_count = std::min(max_count, 2 * N);
+        const float* tile_ptr = result.data<float>();
+        for (int i = 0; i < out_count; i++) {
+            out_vals[i] = (i < N) ? tile_ptr[i] : cpu_ref[i - N];
+        }
+        return out_count;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_sdpa_tile_d256_causal_gqa_minimal] %s\n", e.what());
+        return -1;
+    }
+}
+
 }  // extern "C"
 

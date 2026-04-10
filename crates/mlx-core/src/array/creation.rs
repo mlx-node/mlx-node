@@ -495,6 +495,67 @@ impl MxArray {
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
+    /// Tq=8, D=256, Hq=8, Hkv=2 causal GQA (Qwen3.5-0.8B shape). Exercises
+    /// the D=256 tile path with DPT=32 and GQA 4:1 head reindexing.
+    #[napi]
+    pub fn test_sdpa_tile_d256_gqa(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(32) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe {
+            sys::mlx_test_sdpa_tile_d256_gqa(buf.as_mut_ptr(), c as i32)
+        };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    /// Diagnostic: simplest D=256 tile case. No causal, no GQA, minimal dims.
+    #[napi]
+    pub fn test_sdpa_tile_d256_simple(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(32) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe {
+            sys::mlx_test_sdpa_tile_d256_simple(buf.as_mut_ptr(), c as i32)
+        };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    /// Diagnostic: D=256 with causal, no GQA.
+    #[napi]
+    pub fn test_sdpa_tile_d256_causal(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(32) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe {
+            sys::mlx_test_sdpa_tile_d256_causal(buf.as_mut_ptr(), c as i32)
+        };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    /// Diagnostic: D=256 with GQA, no causal.
+    #[napi]
+    pub fn test_sdpa_tile_d256_gqa_nocausal(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(32) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe {
+            sys::mlx_test_sdpa_tile_d256_gqa_nocausal(buf.as_mut_ptr(), c as i32)
+        };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
+    /// Minimal causal+GQA at D=256: H=2 Hkv=1 gqa=2 Tq=2 L=4.
+    #[napi]
+    pub fn test_sdpa_tile_d256_causal_gqa_minimal(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(32) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe {
+            sys::mlx_test_sdpa_tile_d256_causal_gqa_minimal(buf.as_mut_ptr(), c as i32)
+        };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
+
     #[napi]
     pub fn test_full_attn_layer_bf16(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(20) as usize;

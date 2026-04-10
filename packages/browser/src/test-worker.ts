@@ -2925,6 +2925,97 @@ async function initAndRun(wasmUrl: string) {
       assertClose(vals.slice(h1LastRow, h1LastRow + D), ref.slice(h1LastRow, h1LastRow + D), 1e-4);
     }},
 
+    { name: 'SDPA tile D=256 Tq=8 causal GQA (f32, Qwen3.5-0.8B shape)', run() {
+      // B=1, Hq=8, Hkv=2, Tq=8, L=16, D=256 -> output [1,8,8,256] = 16384 elements
+      // GQA 4:1: heads 0-3 use KV head 0, heads 4-7 use KV head 1.
+      // C++ returns [tile_output..., cpu_reference...] = 2*N floats.
+      const D = 256, Tq = 8, Hq = 8;
+      const N = Hq * Tq * D; // 16384 per half
+      const both = MxArray.testSdpaTileD256Gqa(2 * N);
+      if (both[0] === -999) throw new Error('testSdpaTileD256Gqa error');
+      const tile = both.slice(0, N);
+      const ref = both.slice(N, 2 * N);
+      // Check all heads: h0-h3 (KV head 0) and h4-h7 (KV head 1)
+      for (let h = 0; h < Hq; h++) {
+        const off = h * Tq * D;
+        assertClose(tile.slice(off, off + D), ref.slice(off, off + D), 1e-3);
+      }
+      // Also check last row of head 0
+      const lastRow = (Tq - 1) * D;
+      assertClose(tile.slice(lastRow, lastRow + D), ref.slice(lastRow, lastRow + D), 1e-3);
+    }},
+
+    { name: 'SDPA tile D=256 simple (no causal, no GQA)', run() {
+      // B=1, Hq=1, Hkv=1, Tq=2, L=4, D=256 -> output [1,1,2,256] = 512 elements
+      const D = 256;
+      const COUNT = 512;
+      setSdpaFallbackForced(true);
+      let ref: number[];
+      try {
+        ref = MxArray.testSdpaTileD256Simple(COUNT);
+      } finally {
+        setSdpaFallbackForced(false);
+      }
+      if (ref[0] === -999) throw new Error('testSdpaTileD256Simple ref error');
+      const vals = MxArray.testSdpaTileD256Simple(COUNT);
+      if (vals[0] === -999) throw new Error('testSdpaTileD256Simple tile error');
+      // Full comparison
+      assertClose(vals.slice(0, D), ref.slice(0, D), 1e-4);
+      assertClose(vals.slice(D, 2*D), ref.slice(D, 2*D), 1e-4);
+    }},
+
+    { name: 'SDPA tile D=256 causal (no GQA)', run() {
+      const D = 256, Tq = 8, Hq = 2;
+      const COUNT = Hq * Tq * D;
+      setSdpaFallbackForced(true);
+      let ref: number[];
+      try {
+        ref = MxArray.testSdpaTileD256Causal(COUNT);
+      } finally {
+        setSdpaFallbackForced(false);
+      }
+      if (ref[0] === -999) throw new Error('testSdpaTileD256Causal ref error');
+      const vals = MxArray.testSdpaTileD256Causal(COUNT);
+      if (vals[0] === -999) throw new Error('testSdpaTileD256Causal tile error');
+      assertClose(vals.slice(0, D), ref.slice(0, D), 1e-4);
+      const lastRow = (Tq - 1) * D;
+      assertClose(vals.slice(lastRow, lastRow + D), ref.slice(lastRow, lastRow + D), 1e-4);
+    }},
+
+    { name: 'SDPA tile D=256 GQA (no causal)', run() {
+      // B=1, Hq=8, Hkv=2, Tq=8, L=16, D=256 -> N=16384
+      // C++ returns [tile_output..., cpu_reference...] = 2*N floats.
+      const D = 256, Tq = 8, Hq = 8;
+      const N = Hq * Tq * D;
+      const both = MxArray.testSdpaTileD256GqaNocausal(2 * N);
+      if (both[0] === -999) throw new Error('testSdpaTileD256GqaNocausal error');
+      const tile = both.slice(0, N);
+      const ref = both.slice(N, 2 * N);
+      // Check h0 (KV head 0), h4 (KV head 1), and last row of h7
+      assertClose(tile.slice(0, D), ref.slice(0, D), 1e-3);
+      const h4Start = 4 * Tq * D;
+      assertClose(tile.slice(h4Start, h4Start + D), ref.slice(h4Start, h4Start + D), 1e-3);
+      const h7LastRow = 7 * Tq * D + (Tq - 1) * D;
+      assertClose(tile.slice(h7LastRow, h7LastRow + D), ref.slice(h7LastRow, h7LastRow + D), 1e-3);
+    }},
+
+    { name: 'SDPA tile D=256 minimal causal+GQA (H=4 Hkv=2)', run() {
+      // B=1, Hq=4, Hkv=2, Tq=2, L=4, D=256 -> N=2048
+      // h=0,1 → KV head 0; h=2,3 → KV head 1
+      // C++ returns [tile_output..., cpu_reference...] = 2*N floats.
+      const D = 256, Tq = 2, Hq = 4;
+      const N = Hq * Tq * D; // 2048
+      const both = MxArray.testSdpaTileD256CausalGqaMinimal(2 * N);
+      if (both[0] === -999) throw new Error('testSdpaTileD256CausalGqaMinimal error');
+      const tile = both.slice(0, N);
+      const ref = both.slice(N, 2 * N);
+      // Check all 4 heads against CPU reference
+      for (let h = 0; h < Hq; h++) {
+        const off = h * Tq * D;
+        assertClose(tile.slice(off, off + D), ref.slice(off, off + D), 1e-3);
+      }
+    }},
+
     // --- Full attention layer bf16 ---
     { name: 'full attention layer bf16 (Q/K/V proj+QK norm+RoPE+GQA+SDPA+gate+Oproj)', run() {
       const vals = MxArray.testFullAttnLayerBf16(20);

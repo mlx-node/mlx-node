@@ -1386,6 +1386,26 @@ unsafe extern "C-unwind" {
         out: *mut f32,
         max_count: i32,
     ) -> i32;
+    pub fn mlx_test_sdpa_tile_d256_gqa(
+        out: *mut f32,
+        max_count: i32,
+    ) -> i32;
+    pub fn mlx_test_sdpa_tile_d256_simple(
+        out: *mut f32,
+        max_count: i32,
+    ) -> i32;
+    pub fn mlx_test_sdpa_tile_d256_causal(
+        out: *mut f32,
+        max_count: i32,
+    ) -> i32;
+    pub fn mlx_test_sdpa_tile_d256_gqa_nocausal(
+        out: *mut f32,
+        max_count: i32,
+    ) -> i32;
+    pub fn mlx_test_sdpa_tile_d256_causal_gqa_minimal(
+        out: *mut f32,
+        max_count: i32,
+    ) -> i32;
     pub fn mlx_test_full_attn_layer_bf16(out: *mut f32, max_count: i32) -> i32;
     pub fn mlx_test_rms_norm_bf16(out: *mut f32, max_count: i32) -> i32;
     pub fn mlx_test_swiglu_mlp_bf16(out: *mut f32, max_count: i32) -> i32;
