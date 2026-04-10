@@ -92,7 +92,7 @@ export interface MessageOutputItem {
   id: string;
   type: 'message';
   role: 'assistant';
-  status: 'completed' | 'incomplete';
+  status: 'completed' | 'incomplete' | 'in_progress';
   content: OutputTextPart[];
 }
 
@@ -143,7 +143,7 @@ export interface ResponseObject {
   id: string;
   object: 'response';
   created_at: number;
-  status: 'completed' | 'incomplete' | 'failed';
+  status: 'completed' | 'incomplete' | 'in_progress' | 'failed';
   model: string;
   output: OutputItem[];
   output_text: string;

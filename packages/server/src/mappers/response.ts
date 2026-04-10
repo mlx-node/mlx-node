@@ -157,7 +157,7 @@ export function buildPartialResponse(
     id: responseId,
     object: 'response',
     created_at: Math.floor(Date.now() / 1000),
-    status: 'completed', // will be updated in response.completed
+    status: 'in_progress',
     model: req.model,
     output: [],
     output_text: '',

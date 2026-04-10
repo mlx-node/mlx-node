@@ -757,6 +757,7 @@ module.exports.Qwen35MoeModel = nativeBinding.Qwen35MoeModel;
 module.exports.Qwen3_5MoeModel = nativeBinding.Qwen3_5MoeModel;
 module.exports.Qwen3Model = nativeBinding.Qwen3Model;
 module.exports.Qwen3Tokenizer = nativeBinding.Qwen3Tokenizer;
+module.exports.ResponseStore = nativeBinding.ResponseStore;
 module.exports.SftTrainingEngine = nativeBinding.SftTrainingEngine;
 module.exports.Tensor = nativeBinding.Tensor;
 module.exports.TextDetModel = nativeBinding.TextDetModel;

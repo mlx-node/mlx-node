@@ -48,13 +48,14 @@ async function handleNonStreaming(
   responseId: string,
   previousResponseId: string | undefined,
   store: ResponseStore | null,
+  newInputMessages: ChatMessage[],
 ): Promise<void> {
   const result = (await model.chat(messages, config)) as ChatResult;
   const response = buildResponseObject(result, req, responseId, previousResponseId);
 
-  // Persist
+  // Persist only the new input messages (not the full expanded conversation)
   if (store && req.store !== false) {
-    await persistResponse(store, response, messages, previousResponseId);
+    await persistResponse(store, response, newInputMessages, previousResponseId);
   }
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -74,12 +75,13 @@ async function handleStreamingNative(
   responseId: string,
   previousResponseId: string | undefined,
   store: ResponseStore | null,
+  newInputMessages: ChatMessage[],
 ): Promise<void> {
   beginSSE(res);
 
   const partial = buildPartialResponse(req, responseId, previousResponseId);
-  writeSSEEvent(res, 'response.created', partial);
-  writeSSEEvent(res, 'response.in_progress', partial);
+  writeSSEEvent(res, 'response.created', { response: partial });
+  writeSSEEvent(res, 'response.in_progress', { response: partial });
 
   const outputItems: OutputItem[] = [];
   let outputIndex = 0;
@@ -193,11 +195,12 @@ async function handleStreamingNative(
       }
 
       // Build completed response
+      const promptTokens = event.promptTokens ?? 0;
       const usage = {
-        input_tokens: 0, // not available from stream final directly
+        input_tokens: promptTokens,
         output_tokens: event.numTokens,
         output_tokens_details: { reasoning_tokens: 0 },
-        total_tokens: event.numTokens,
+        total_tokens: promptTokens + event.numTokens,
       };
 
       const completedResponse: ResponseObject = {
@@ -209,11 +212,11 @@ async function handleStreamingNative(
         usage,
       };
 
-      writeSSEEvent(res, 'response.completed', completedResponse);
+      writeSSEEvent(res, 'response.completed', { response: completedResponse });
 
-      // Persist
+      // Persist only the new input messages
       if (store && req.store !== false) {
-        await persistResponse(store, completedResponse, messages, previousResponseId);
+        await persistResponse(store, completedResponse, newInputMessages, previousResponseId);
       }
 
       endSSE(res);
@@ -252,7 +255,7 @@ async function handleStreamingNative(
           id: messageItemId,
           type: 'message',
           role: 'assistant',
-          status: 'completed',
+          status: 'in_progress',
           content: [],
         };
         const miIndex = outputItems.length;
@@ -294,12 +297,13 @@ async function handleStreamingSimulated(
   responseId: string,
   previousResponseId: string | undefined,
   store: ResponseStore | null,
+  newInputMessages: ChatMessage[],
 ): Promise<void> {
   beginSSE(res);
 
   const partial = buildPartialResponse(req, responseId, previousResponseId);
-  writeSSEEvent(res, 'response.created', partial);
-  writeSSEEvent(res, 'response.in_progress', partial);
+  writeSSEEvent(res, 'response.created', { response: partial });
+  writeSSEEvent(res, 'response.in_progress', { response: partial });
 
   // Run chat() to completion
   const result = (await model.chat(messages, config)) as ChatResult;
@@ -375,11 +379,11 @@ async function handleStreamingSimulated(
 
   // Completed response
   const response = buildResponseObject(result, req, responseId, previousResponseId);
-  writeSSEEvent(res, 'response.completed', response);
+  writeSSEEvent(res, 'response.completed', { response });
 
-  // Persist
+  // Persist only the new input messages
   if (store && req.store !== false) {
-    await persistResponse(store, response, messages, previousResponseId);
+    await persistResponse(store, response, newInputMessages, previousResponseId);
   }
 
   endSSE(res);
@@ -392,16 +396,19 @@ async function handleStreamingSimulated(
 async function persistResponse(
   store: ResponseStore,
   response: ResponseObject,
-  messages: ChatMessage[],
+  newInputMessages: ChatMessage[],
   previousResponseId: string | undefined,
 ): Promise<void> {
+  // Store only the NEW input messages from this request, not the full
+  // expanded conversation. Chain reconstruction re-derives the full history
+  // by following previous_response_id links.
   const record: StoredResponseRecord = {
     id: response.id,
     createdAt: response.created_at,
     model: response.model,
     status: response.status,
     instructions: response.instructions ?? undefined,
-    inputJson: JSON.stringify(messages),
+    inputJson: JSON.stringify(newInputMessages),
     outputJson: JSON.stringify(response.output),
     outputText: response.output_text,
     usageJson: JSON.stringify(response.usage),
@@ -475,18 +482,51 @@ export async function handleCreateResponse(
     return;
   }
 
-  // Map request
+  // Map request — full messages include prior + new input
   const { messages, config } = mapRequest(body, priorMessages);
+
+  // Compute the new-only messages (what this request added, excluding prior history)
+  const newInputMessages = priorMessages ? messages.slice(priorMessages.length) : messages;
 
   try {
     if (body.stream) {
       if (registry.hasStreamSupport(model)) {
-        await handleStreamingNative(res, model, messages, config, body, responseId, previousResponseId, store);
+        await handleStreamingNative(
+          res,
+          model,
+          messages,
+          config,
+          body,
+          responseId,
+          previousResponseId,
+          store,
+          newInputMessages,
+        );
       } else {
-        await handleStreamingSimulated(res, model, messages, config, body, responseId, previousResponseId, store);
+        await handleStreamingSimulated(
+          res,
+          model,
+          messages,
+          config,
+          body,
+          responseId,
+          previousResponseId,
+          store,
+          newInputMessages,
+        );
       }
     } else {
-      await handleNonStreaming(res, model, messages, config, body, responseId, previousResponseId, store);
+      await handleNonStreaming(
+        res,
+        model,
+        messages,
+        config,
+        body,
+        responseId,
+        previousResponseId,
+        store,
+        newInputMessages,
+      );
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error during inference';

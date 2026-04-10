@@ -118,6 +118,9 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
   if (req.tools && req.tools.length > 0) {
     config.tools = req.tools.map(mapTool);
   }
+  // Note: tool_choice is echoed back in the response but is handled at
+  // the chat template level (not via ChatConfig). The model's Jinja2
+  // template applies tool_choice behavior when tools are provided.
   if (priorMessages && priorMessages.length > 0) {
     config.reuseCache = true;
   }
