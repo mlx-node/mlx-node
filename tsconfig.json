@@ -6,6 +6,7 @@
     { "path": "./packages/trl" },
     { "path": "./packages/vlm" },
     { "path": "./packages/cli" },
+    { "path": "./packages/server" },
     { "path": "./examples" },
     { "path": "./__test__" }
   ],

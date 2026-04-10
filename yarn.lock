@@ -491,6 +491,16 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@mlx-node/server@workspace:*, @mlx-node/server@workspace:packages/server":
+  version: 0.0.0-use.local
+  resolution: "@mlx-node/server@workspace:packages/server"
+  dependencies:
+    "@mlx-node/core": "workspace:*"
+    "@mlx-node/lm": "workspace:*"
+    "@types/node": "catalog:"
+  languageName: unknown
+  linkType: soft
+
 "@mlx-node/trl@workspace:*, @mlx-node/trl@workspace:packages/trl":
   version: 0.0.0-use.local
   resolution: "@mlx-node/trl@workspace:packages/trl"
@@ -4106,6 +4116,7 @@ __metadata:
     "@mlx-node/cli": "workspace:*"
     "@mlx-node/internal-tools": "workspace:*"
     "@mlx-node/lm": "workspace:*"
+    "@mlx-node/server": "workspace:*"
     "@mlx-node/trl": "workspace:*"
     "@mlx-node/vlm": "workspace:*"
     "@napi-rs/cli": "npm:^3.5.1"

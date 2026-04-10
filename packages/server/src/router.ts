@@ -1,0 +1,77 @@
+/**
+ * Simple path-based router for /v1/* endpoints.
+ */
+
+import type { IncomingMessage, ServerResponse } from 'node:http';
+
+import type { ResponseStore } from '@mlx-node/core';
+
+import { handleListModels } from './endpoints/models.js';
+import { handleCreateResponse } from './endpoints/responses.js';
+import { sendBadRequest, sendMethodNotAllowed, sendNotFound } from './errors.js';
+import type { ModelRegistry } from './registry.js';
+import type { ResponsesAPIRequest } from './types.js';
+
+/**
+ * Read the request body as a UTF-8 string.
+ */
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+    req.on('error', reject);
+  });
+}
+
+/**
+ * Route an incoming request to the appropriate endpoint handler.
+ */
+export async function routeRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  registry: ModelRegistry,
+  store: ResponseStore | null,
+): Promise<void> {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+  const path = url.pathname;
+
+  // GET /v1/models
+  if (path === '/v1/models') {
+    if (req.method !== 'GET') {
+      sendMethodNotAllowed(res, 'GET');
+      return;
+    }
+    handleListModels(res, registry);
+    return;
+  }
+
+  // POST /v1/responses
+  if (path === '/v1/responses') {
+    if (req.method !== 'POST') {
+      sendMethodNotAllowed(res, 'POST');
+      return;
+    }
+
+    let body: ResponsesAPIRequest;
+    try {
+      const raw = await readBody(req);
+      body = JSON.parse(raw) as ResponsesAPIRequest;
+    } catch {
+      sendBadRequest(res, 'Invalid JSON in request body');
+      return;
+    }
+
+    await handleCreateResponse(res, body, registry, store);
+    return;
+  }
+
+  // Health check
+  if (path === '/health' || path === '/v1/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok' }));
+    return;
+  }
+
+  sendNotFound(res, `No route matches ${req.method} ${path}`);
+}

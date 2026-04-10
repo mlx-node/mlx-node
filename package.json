@@ -24,6 +24,7 @@
     "@mlx-node/cli": "workspace:*",
     "@mlx-node/internal-tools": "workspace:*",
     "@mlx-node/lm": "workspace:*",
+    "@mlx-node/server": "workspace:*",
     "@mlx-node/trl": "workspace:*",
     "@mlx-node/vlm": "workspace:*",
     "@napi-rs/cli": "^3.5.1",

@@ -1,0 +1,36 @@
+{
+  "name": "@mlx-node/server",
+  "version": "0.0.1",
+  "homepage": "https://github.com/mlx-node/mlx-node",
+  "bugs": {
+    "url": "https://github.com/mlx-node/mlx-node/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mlx-node/mlx-node.git",
+    "directory": "packages/server"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@mlx-node/core": "workspace:*",
+    "@mlx-node/lm": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:"
+  }
+}

@@ -61,6 +61,7 @@ export default defineConfig({
       '@mlx-node/core': resolve(__dirname, './packages/core/index.cjs'),
       '@mlx-node/lm': resolve(__dirname, './packages/lm/src/index.ts'),
       '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),
+      '@mlx-node/server': resolve(__dirname, './packages/server/src/index.ts'),
     },
   },
 });

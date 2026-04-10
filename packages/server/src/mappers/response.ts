@@ -1,0 +1,176 @@
+/**
+ * Maps ChatResult / ChatStreamEvent to OpenAI Responses API output.
+ */
+
+import { randomUUID } from 'node:crypto';
+
+import type { ChatResult } from '@mlx-node/core';
+
+import type {
+  FunctionCallOutputItem,
+  MessageOutputItem,
+  OutputItem,
+  ReasoningOutputItem,
+  ResponseObject,
+  ResponsesAPIRequest,
+  ResponseUsage,
+} from '../types.js';
+
+/**
+ * Generate a prefixed unique ID.
+ */
+export function genId(prefix: string): string {
+  return `${prefix}${randomUUID().replaceAll('-', '')}`;
+}
+
+/**
+ * Map the internal finishReason to the Responses API status.
+ */
+export function mapFinishReasonToStatus(finishReason: string): 'completed' | 'incomplete' {
+  switch (finishReason) {
+    case 'length':
+      return 'incomplete';
+    default:
+      return 'completed';
+  }
+}
+
+/**
+ * Build the output items array from a ChatResult.
+ */
+export function buildOutputItems(result: ChatResult): OutputItem[] {
+  const items: OutputItem[] = [];
+
+  // Reasoning item
+  if (result.thinking) {
+    const reasoningItem: ReasoningOutputItem = {
+      id: genId('rs_'),
+      type: 'reasoning',
+      summary: [{ type: 'summary_text', text: result.thinking }],
+    };
+    items.push(reasoningItem);
+  }
+
+  // Message item (always present even if text is empty, as long as there is content)
+  if (result.text || result.toolCalls.length === 0) {
+    const messageItem: MessageOutputItem = {
+      id: genId('msg_'),
+      type: 'message',
+      role: 'assistant',
+      status: mapFinishReasonToStatus(result.finishReason),
+      content: [{ type: 'output_text', text: result.text, annotations: [] as never[] }],
+    };
+    items.push(messageItem);
+  }
+
+  // Function call items
+  for (const tc of result.toolCalls) {
+    const callId = tc.id ?? genId('call_');
+    const fcItem: FunctionCallOutputItem = {
+      id: genId('fc_'),
+      type: 'function_call',
+      call_id: callId,
+      name: tc.name,
+      arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
+      status: 'completed',
+    };
+    items.push(fcItem);
+  }
+
+  return items;
+}
+
+/**
+ * Build the usage object from a ChatResult.
+ */
+export function buildUsage(result: ChatResult): ResponseUsage {
+  // We cannot distinguish reasoning tokens at this layer, so report 0
+  const reasoningTokens = 0;
+  return {
+    input_tokens: result.promptTokens,
+    output_tokens: result.numTokens,
+    output_tokens_details: { reasoning_tokens: reasoningTokens },
+    total_tokens: result.promptTokens + result.numTokens,
+  };
+}
+
+/**
+ * Compute `output_text` from output items (concatenate all output_text parts).
+ */
+export function computeOutputText(items: OutputItem[]): string {
+  const parts: string[] = [];
+  for (const item of items) {
+    if (item.type === 'message') {
+      for (const c of item.content) {
+        parts.push(c.text);
+      }
+    }
+  }
+  return parts.join('');
+}
+
+/**
+ * Build a full ResponseObject from a ChatResult and the original request.
+ */
+export function buildResponseObject(
+  result: ChatResult,
+  req: ResponsesAPIRequest,
+  responseId: string,
+  previousResponseId?: string,
+): ResponseObject {
+  const output = buildOutputItems(result);
+  const status = mapFinishReasonToStatus(result.finishReason);
+
+  return {
+    id: responseId,
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    status,
+    model: req.model,
+    output,
+    output_text: computeOutputText(output),
+    error: null,
+    incomplete_details: status === 'incomplete' ? { reason: 'max_output_tokens' } : null,
+    usage: buildUsage(result),
+    instructions: req.instructions ?? null,
+    temperature: req.temperature ?? null,
+    top_p: req.top_p ?? null,
+    max_output_tokens: req.max_output_tokens ?? null,
+    tools: req.tools ?? [],
+    tool_choice: req.tool_choice ?? null,
+    reasoning: req.reasoning ?? null,
+    previous_response_id: previousResponseId ?? null,
+  };
+}
+
+/**
+ * Build a partial (in-progress) ResponseObject for streaming.
+ * This is emitted at response.created / response.in_progress before
+ * any output is available.
+ */
+export function buildPartialResponse(
+  req: ResponsesAPIRequest,
+  responseId: string,
+  previousResponseId?: string,
+): ResponseObject {
+  return {
+    id: responseId,
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    status: 'completed', // will be updated in response.completed
+    model: req.model,
+    output: [],
+    output_text: '',
+    error: null,
+    incomplete_details: null,
+    usage: { input_tokens: 0, output_tokens: 0, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 0 },
+    instructions: req.instructions ?? null,
+    temperature: req.temperature ?? null,
+    top_p: req.top_p ?? null,
+    max_output_tokens: req.max_output_tokens ?? null,
+    tools: req.tools ?? [],
+    tool_choice: req.tool_choice ?? null,
+    reasoning: req.reasoning ?? null,
+    previous_response_id: previousResponseId ?? null,
+  };
+}
