@@ -3294,6 +3294,115 @@ async function initAndRun(wasmUrl: string) {
     },
 
     {
+      name: 'packed bf16 rmsnorm D=4096',
+      run() {
+        // RMSNorm parity: baseline (w as f32-upconverted bf16) vs packed
+        // (w as PackedBf16 array<u32>). D=4096 is exactly at the opt-in
+        // threshold so the packed flip fires on a single row of weights.
+        // Input x must stay UN-packed — the RMSNorm kernel still binds
+        // `input` as `array<f32>` regardless of the weight storage — so
+        // we toggle the flag off before creating x, then back on for w,
+        // then off again for the packed run's x as well. The packed path
+        // only differs in how `weight` is bound and unpacked in the shader.
+        const F32 = 0;
+        const R = 4, D = 4096;
+        const eps = 1e-5;
+        const xData = new Float32Array(R * D);
+        for (let i = 0; i < xData.length; i++) xData[i] = Math.sin(i * 0.01) * 0.5;
+        const wData = new Float32Array(D);
+        for (let i = 0; i < D; i++) wData[i] = 1.0 + Math.cos(i * 0.003) * 0.2;
+        const xShape = new BigInt64Array([BigInt(R), BigInt(D)]);
+        const wShape = new BigInt64Array([BigInt(D)]);
+
+        try {
+          // Baseline: everything unpacked (flag off), w goes to array<f32>.
+          setPackedBf16(false);
+          const x0 = makeBf16(xData, xShape);
+          const w0 = makeBf16(wData, wShape);
+          const y0 = x0.fastRmsNorm(w0, eps);
+          const y0f = y0.astype(F32);
+          y0f.eval();
+          const y0Arr = [...y0f.toFloat32()];
+
+          // Packed: create w FIRST with flag on (flips w's buffer to
+          // PackedBf16), then flip flag off before creating x so x stays
+          // in the upconverted layout the kernel's `input` binding expects.
+          setPackedBf16(true);
+          const w1 = makeBf16(wData, wShape);
+          setPackedBf16(false);
+          const x1 = makeBf16(xData, xShape);
+          const y1 = x1.fastRmsNorm(w1, eps);
+          const y1f = y1.astype(F32);
+          y1f.eval();
+          const y1Arr = [...y1f.toFloat32()];
+
+          if (y0Arr.length !== R * D || y1Arr.length !== R * D) {
+            throw new Error(`lengths ${y0Arr.length}, ${y1Arr.length}`);
+          }
+          for (let i = 0; i < y0Arr.length; i++) {
+            const d = Math.abs(y0Arr[i] - y1Arr[i]);
+            if (d > PACKED_TOL) {
+              throw new Error(`[${i}]: f32=${y0Arr[i]} packed=${y1Arr[i]} diff=${d}`);
+            }
+          }
+        } finally {
+          setPackedBf16(false);
+        }
+      },
+    },
+
+    {
+      name: 'packed bf16 rmsnorm D=4098 even-tail (buffer pad check)',
+      run() {
+        // Even dim > 4096 exercises the aligned packed weight read path
+        // with a non-power-of-two K. Keeps the u32 pair count = D/2 =
+        // 2049 slots, verifying the bind-group size accounting matches
+        // ((D+1)/2)*4 = 4100 bytes (rounded to 4). Guards against off-by-one
+        // errors in wgpu_packed_alloc_size vs the shader's axis_size bound.
+        const F32 = 0;
+        const R = 2, D = 4098;
+        const eps = 1e-5;
+        const xData = new Float32Array(R * D);
+        for (let i = 0; i < xData.length; i++) xData[i] = Math.cos(i * 0.007) * 0.4;
+        const wData = new Float32Array(D);
+        for (let i = 0; i < D; i++) wData[i] = 0.9 + Math.sin(i * 0.005) * 0.15;
+        const xShape = new BigInt64Array([BigInt(R), BigInt(D)]);
+        const wShape = new BigInt64Array([BigInt(D)]);
+
+        try {
+          setPackedBf16(false);
+          const x0 = makeBf16(xData, xShape);
+          const w0 = makeBf16(wData, wShape);
+          const y0 = x0.fastRmsNorm(w0, eps);
+          const y0f = y0.astype(F32);
+          y0f.eval();
+          const y0Arr = [...y0f.toFloat32()];
+
+          setPackedBf16(true);
+          const w1 = makeBf16(wData, wShape);
+          setPackedBf16(false);
+          const x1 = makeBf16(xData, xShape);
+          const y1 = x1.fastRmsNorm(w1, eps);
+          const y1f = y1.astype(F32);
+          y1f.eval();
+          const y1Arr = [...y1f.toFloat32()];
+
+          if (y0Arr.length !== R * D || y1Arr.length !== R * D) {
+            throw new Error(`lengths ${y0Arr.length}, ${y1Arr.length}`);
+          }
+          for (let i = 0; i < y0Arr.length; i++) {
+            const d = Math.abs(y0Arr[i] - y1Arr[i]);
+            if (d > PACKED_TOL) {
+              throw new Error(`[${i}]: f32=${y0Arr[i]} packed=${y1Arr[i]} diff=${d}`);
+            }
+          }
+        } finally {
+          setPackedBf16(false);
+        }
+      },
+    },
+
+    {
       name: 'packed bf16 gemv K=896 N=2048 transposed offset-sliced',
       run() {
         // Source = [2*N, K] bf16; slice src[N:2*N, :] so the view has a

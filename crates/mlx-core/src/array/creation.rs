@@ -434,6 +434,20 @@ impl MxArray {
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
+    /// Call `mlx::fast::rms_norm(self, weight, eps)` directly. This is a
+    /// thin NAPI wrapper around the FFI signature so browser tests can
+    /// exercise the fused RMSNorm GPU kernel against arbitrary weight
+    /// tensors (the C++ test helpers only expose fixed-dim bench cases).
+    /// Intended for kernel parity testing — production code uses the
+    /// `RMSNorm` layer in `nn/normalization.rs`.
+    #[napi]
+    pub fn fast_rms_norm(&self, weight: &MxArray, eps: f64) -> Result<Self> {
+        let handle = unsafe {
+            sys::mlx_fast_rms_norm(self.as_raw_ptr(), weight.as_raw_ptr(), eps as f32)
+        };
+        MxArray::from_handle(handle, "fast_rms_norm")
+    }
+
     #[napi]
     pub fn test_swiglu_mlp_bf16(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(20) as usize;

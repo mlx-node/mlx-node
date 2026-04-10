@@ -246,10 +246,19 @@ self.onmessage = async (e: MessageEvent) => {
     };
 
     // Minimum element count for the packed-bf16 path. Matches the threshold
-    // used by fromBfloat16Bytes so every bf16 tensor the model touches follows
-    // the same opt-in policy. Small tensors (norm weights, biases) keep the
-    // existing expand-to-f32 layout.
+    // used by fromBfloat16Bytes so matmul-consumed weights use the same
+    // opt-in policy. Step C extends this with a lower per-norm threshold
+    // so 1-D norm weight vectors (hidden_size = 1024 on Qwen3.5-0.8B) also
+    // opt into the packed layout and the packed normalization kernel.
     const PACKED_MIN_ELEMENTS = 4096;
+    // Norm weights are tiny (hidden_size bf16, typically 512–8192 elements);
+    // the packed layout saves trivial DRAM bandwidth (norms are L2-resident
+    // on M3) but routes them through the same `_bf16p` kernel variant the
+    // rest of the backend uses, which keeps the code paths uniform and
+    // avoids a special "bf16 norm weight" exception in the dispatcher.
+    // 256 is above any scalar broadcast case and well below the smallest
+    // real norm (1024) so the threshold only matters for synthetic tests.
+    const NORM_PACKED_MIN_ELEMENTS = 256;
     const usePackBf16 = packBf16 === true;
 
     // Only tensors consumed by matmul (Step-A GEMV b_transposed=true hot path)
@@ -292,6 +301,37 @@ self.onmessage = async (e: MessageEvent) => {
       return false;
     };
 
+    // Step C: norm weights consumed by fast::RMSNorm / fast::LayerNorm.
+    // These flow through `make_rmsnorm_kernel` / `make_layernorm_kernel`
+    // in backend/webgpu/normalization.cpp which (as of Step C) bind the
+    // weight as `array<u32>` and unpack via unpack_bf16_pair when the
+    // buffer's storage_mode is PackedBf16. gpu-worker.ts sees the raw
+    // safetensors names (pre-rename) so the suffixes match what lands
+    // in qwen3_5/persistence.rs:norm_suffixes before prefix stripping
+    // and renaming. Notably `.linear_attn.norm.weight` is f32, not bf16,
+    // so the isBf16 check below already excludes it. The text-only
+    // model.norm.weight is captured by the "norm.weight" suffix.
+    const isNormConsumedWeight = (name: string): boolean => {
+      if (!name.endsWith('.weight')) return false;
+      if (name.endsWith('.input_layernorm.weight')) return true;
+      if (name.endsWith('.post_attention_layernorm.weight')) return true;
+      if (name.endsWith('.q_norm.weight')) return true;
+      if (name.endsWith('.k_norm.weight')) return true;
+      // Final LM-head norm: "model.norm.weight" (text-only) /
+      // "model.language_model.norm.weight" (VL). `.norm.weight` is a
+      // loose suffix that would accidentally grab `.linear_attn.norm.weight`
+      // too — but that tensor is f32, so the isBf16 guard in the caller
+      // handles it. Matching the full "norm.weight" tail keeps the
+      // allowlist minimal.
+      if (name === 'norm.weight') return true;
+      if (name.endsWith('.norm.weight')) {
+        // Exclude linear_attn.norm (f32) via name, belt and suspenders.
+        if (name.endsWith('.linear_attn.norm.weight')) return false;
+        return true;
+      }
+      return false;
+    };
+
     const handles: number[] = [];
     const uploadedDtypes: string[] = [];
     const packedBf16Flags: boolean[] = [];
@@ -316,12 +356,30 @@ self.onmessage = async (e: MessageEvent) => {
       // layout the WebGPU backend's upload_with_conversion path produces.
       // Odd element counts pad the trailing slot with zero; the kernel
       // masks out-of-range loads so the pad is harmless.
-      const packedEligible =
+      //
+      // Two separate allowlists:
+      //   matmul-consumed weights (large, K >= 4096) → packed GEMV/GEMM
+      //   norm-consumed weights (small, hidden_size) → packed RMSNorm/LayerNorm
+      // Each has its own min-elements threshold because the motivating
+      // kernels have different feasibility floors.
+      const matmulConsumed =
         usePackBf16 &&
         isBf16 &&
         numElements >= PACKED_MIN_ELEMENTS &&
         isMatmulConsumedWeight(tensor.name);
-      if (isBf16 && numElements >= PACKED_MIN_ELEMENTS && usePackBf16) {
+      const normConsumed =
+        usePackBf16 &&
+        isBf16 &&
+        numElements >= NORM_PACKED_MIN_ELEMENTS &&
+        isNormConsumedWeight(tensor.name);
+      const packedEligible = matmulConsumed || normConsumed;
+      if (
+        isBf16 &&
+        usePackBf16 &&
+        (numElements >= PACKED_MIN_ELEMENTS ||
+          (numElements >= NORM_PACKED_MIN_ELEMENTS &&
+            isNormConsumedWeight(tensor.name)))
+      ) {
         if (packedEligible) {
           packedNames.push(tensor.name);
         } else {
