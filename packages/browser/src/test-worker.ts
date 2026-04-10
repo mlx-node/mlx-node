@@ -3825,6 +3825,59 @@ async function initAndRun(wasmUrl: string) {
       },
     },
 
+    // =============== Multi-dim batch matmul (GQA broadcast) ===============
+
+    { name: 'matmul broadcast batch (multi-dim batch strides, GQA pattern)', run() {
+      // A=[1,4,2,1,128], B=[1,1,2,128,8] -> output [1,4,2,1,8]
+      // B broadcasts on dim 1, producing multi-dim batch_shape after
+      // collapse_batches. This exercises the multi-dim batch stride
+      // decomposition added to fix GQA in the decomposed SDPA fallback path.
+      const Hq_Hkv = 4, Hkv = 2, Tq = 1, Tk = 8;
+      const N = Hq_Hkv * Hkv * Tq * Tk; // 64
+      const both = MxArray.testMatmulBroadcastBatch(2 * N);
+      if (both[0] === -999) throw new Error('testMatmulBroadcastBatch error');
+      const gpu = both.slice(0, N);
+      const ref = both.slice(N, 2 * N);
+      // Check all elements: GPU must match broadcasted-B reference
+      assertClose(gpu, ref, 1e-4);
+    }},
+
+    // =============== SDPA fallback GQA correctness ===============
+    //
+    // With the multi-dim batch stride fix in matmul, the decomposed SDPA
+    // fallback path should now produce correct results for GQA shapes.
+    // This test forces the fallback and compares against the fused tile kernel.
+
+    { name: 'SDPA fallback GQA correctness (Tq=8 D=128 Hq=8 Hkv=2)', run() {
+      const D = 128, Tq = 8, Hq = 8;
+      const COUNT = Hq * Tq * D; // 8192
+
+      // Run with fallback forced (decomposed matmul path)
+      setSdpaFallbackForced(true);
+      let fallback: number[];
+      try {
+        fallback = MxArray.testSdpaTileTq8D128CausalGqa(COUNT);
+      } finally {
+        setSdpaFallbackForced(false);
+      }
+      if (fallback[0] === -999) throw new Error('SDPA fallback GQA error');
+
+      // Run with fused tile kernel
+      const fused = MxArray.testSdpaTileTq8D128CausalGqa(COUNT);
+      if (fused[0] === -999) throw new Error('SDPA fused tile GQA error');
+
+      // Both paths should produce matching results for all heads
+      // (before the fix, fallback produced garbage for GQA shapes)
+      for (let h = 0; h < Hq; h++) {
+        const off = h * Tq * D;
+        assertClose(
+          fallback.slice(off, off + D),
+          fused.slice(off, off + D),
+          1e-4,
+        );
+      }
+    }},
+
   ];
 
   let passed = 0, failed = 0;

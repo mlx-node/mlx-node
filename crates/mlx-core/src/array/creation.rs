@@ -683,6 +683,18 @@ impl MxArray {
         if n <= 0 { return vec![-999.0]; }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
+
+    /// Multi-dim batch matmul with broadcasting (GQA pattern).
+    /// Returns [gpu_output..., cpu_reference...] to verify multi-dim batch
+    /// stride decomposition in the WebGPU matmul kernel.
+    #[napi]
+    pub fn test_matmul_broadcast_batch(max_count: Option<i32>) -> Vec<f64> {
+        let c = max_count.unwrap_or(128) as usize;
+        let mut buf = vec![0f32; c];
+        let n = unsafe { sys::mlx_test_matmul_broadcast_batch(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 { return vec![-999.0]; }
+        buf[..n as usize].iter().map(|v| *v as f64).collect()
+    }
 }
 
 #[cfg(test)]

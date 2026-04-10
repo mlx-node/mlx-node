@@ -1424,6 +1424,7 @@ unsafe extern "C-unwind" {
     pub fn mlx_test_gdn_multi_step_bf16(out: *mut f32, max_count: i32) -> i32;
     pub fn mlx_test_gdn_layer_bf16(out: *mut f32, max_count: i32) -> i32;
     pub fn mlx_test_categorical_sampling_bf16(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_matmul_broadcast_batch(out: *mut f32, max_count: i32) -> i32;
 }
 
 // Gradient computation types
