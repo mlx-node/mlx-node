@@ -173,6 +173,32 @@ async function handleStreamingNative(
       const hasToolCalls = event.toolCalls.length > 0;
       const skipMessageItem = !finalText && hasToolCalls;
 
+      // Recovery: if tool-call suppression was triggered but the final event has no
+      // parsed tool calls (false alarm — e.g., literal "<tool_call>" in model output),
+      // create a message item using the final parsed text.
+      if (suppressTextDeltas && !hasToolCalls && finalText && !hasEmittedMessage) {
+        hasEmittedMessage = true;
+        messageItemId = genId('msg_');
+        const messageItem: MessageOutputItem = {
+          id: messageItemId,
+          type: 'message',
+          role: 'assistant',
+          status: 'in_progress',
+          content: [],
+        };
+        const miIndex = outputItems.length;
+        outputItems.push(messageItem);
+        outputIndex = miIndex;
+        writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+        const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+        writeSSEEvent(res, 'response.content_part.added', {
+          item_id: messageItemId,
+          output_index: miIndex,
+          content_index: 0,
+          part: textPart,
+        });
+      }
+
       if (hasEmittedMessage && messageItemId && !skipMessageItem) {
         const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
         const contentIndex = 0;
@@ -596,10 +622,12 @@ export async function handleCreateResponse(
   // Map request — full messages include prior + new input
   const { messages, config } = mapRequest(body, priorMessages);
 
-  // Compute the new-only messages (what this request added, excluding prior history).
-  // Instructions (if any) are placed first, then prior messages, then new input.
-  const priorOffset = (priorMessages?.length ?? 0) + (body.instructions ? 1 : 0);
-  const newInputMessages = priorMessages ? messages.slice(priorOffset) : messages;
+  // Compute the new-only messages (what this request added, excluding prior history
+  // and instructions). Instructions are stored separately and should not be persisted
+  // as input messages — otherwise chained calls replay stale system messages.
+  const instructionsOffset = body.instructions ? 1 : 0;
+  const priorOffset = instructionsOffset + (priorMessages?.length ?? 0);
+  const newInputMessages = messages.slice(priorOffset);
 
   try {
     if (body.stream) {

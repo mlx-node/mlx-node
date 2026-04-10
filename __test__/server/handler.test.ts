@@ -245,6 +245,39 @@ describe('createHandler', () => {
       expect(parsed.error.message).toContain('not found or expired');
     });
 
+    it('does not persist instructions as input messages in store', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+
+      let storedRecord: any = null;
+      const mockStore = {
+        getChain: vi.fn(),
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecord = record;
+          return Promise.resolve();
+        }),
+        cleanupExpired: vi.fn(),
+      };
+
+      const handler = createHandler(registry, { store: mockStore as any });
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'Hello',
+        instructions: 'Be brief',
+      });
+      const { res, waitForEnd } = createMockRes();
+
+      handler(req, res);
+      await waitForEnd();
+
+      expect(mockStore.store).toHaveBeenCalledTimes(1);
+      const inputMessages = JSON.parse(storedRecord.inputJson);
+      // Instructions should NOT be in the stored input messages
+      expect(inputMessages).toHaveLength(1);
+      expect(inputMessages[0].role).toBe('user');
+      expect(inputMessages[0].content).toBe('Hello');
+    });
+
     it('passes mapped messages and config to model.chat', async () => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel();
