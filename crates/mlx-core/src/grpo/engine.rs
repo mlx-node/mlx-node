@@ -419,8 +419,6 @@ impl GRPOTrainingEngine {
         // Extract the cmd_sender from the model's thread
         let sender = model
             .thread
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Model must be loaded via load() for training"))?
             .cmd_sender()
             .ok_or_else(|| Error::from_reason("Model thread not running"))?
             .clone();
@@ -449,7 +447,7 @@ impl GRPOTrainingEngine {
     /// Create a new training engine from a Qwen3.5 dense model
     #[napi(factory)]
     pub fn from_qwen35(model: &Qwen3_5Model, config: GRPOEngineConfig) -> Result<Self> {
-        let model_type = ModelType::Qwen35Dense(model.get_config());
+        let model_type = ModelType::Qwen35Dense(model.config.clone());
 
         info!(
             "Creating training engine (Qwen3.5 Dense): {} layers, {} hidden",
@@ -459,8 +457,6 @@ impl GRPOTrainingEngine {
 
         let sender = model
             .thread
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Model must be loaded via load() for training"))?
             .cmd_sender()
             .ok_or_else(|| Error::from_reason("Model thread not running"))?
             .clone();
@@ -488,7 +484,7 @@ impl GRPOTrainingEngine {
     /// Create a new training engine from a Qwen3.5 MoE model
     #[napi(factory)]
     pub fn from_qwen35_moe(model: &Qwen3_5MoeModel, config: GRPOEngineConfig) -> Result<Self> {
-        let model_type = ModelType::Qwen35Moe(model.get_config());
+        let model_type = ModelType::Qwen35Moe(model.config.clone());
 
         info!(
             "Creating training engine (Qwen3.5 MoE): {} layers, {} hidden",
@@ -498,8 +494,6 @@ impl GRPOTrainingEngine {
 
         let sender = model
             .thread
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Model must be loaded via load() for training"))?
             .cmd_sender()
             .ok_or_else(|| Error::from_reason("Model thread not running"))?
             .clone();

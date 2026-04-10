@@ -206,8 +206,6 @@ impl SftTrainingEngine {
         // Extract the cmd_sender from the model's thread
         let sender = model
             .thread
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Model must be loaded via load() for training"))?
             .cmd_sender()
             .ok_or_else(|| Error::from_reason("Model thread not running"))?
             .clone();
@@ -235,7 +233,7 @@ impl SftTrainingEngine {
     /// Create a new SFT training engine from a Qwen3.5 dense model
     #[napi(factory)]
     pub fn from_qwen35(model: &Qwen3_5Model, config: SftEngineConfig) -> Result<Self> {
-        let model_type = ModelType::Qwen35Dense(model.get_config());
+        let model_type = ModelType::Qwen35Dense(model.config.clone());
 
         info!(
             "Creating SFT training engine (Qwen3.5 Dense): {} layers, {} hidden, lr={}",
@@ -246,8 +244,6 @@ impl SftTrainingEngine {
 
         let sender = model
             .thread
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Model must be loaded via load() for training"))?
             .cmd_sender()
             .ok_or_else(|| Error::from_reason("Model thread not running"))?
             .clone();
@@ -274,7 +270,7 @@ impl SftTrainingEngine {
     /// Create a new SFT training engine from a Qwen3.5 MoE model
     #[napi(factory)]
     pub fn from_qwen35_moe(model: &Qwen3_5MoeModel, config: SftEngineConfig) -> Result<Self> {
-        let model_type = ModelType::Qwen35Moe(model.get_config());
+        let model_type = ModelType::Qwen35Moe(model.config.clone());
 
         info!(
             "Creating SFT training engine (Qwen3.5 MoE): {} layers, {} hidden, lr={}",
@@ -285,8 +281,6 @@ impl SftTrainingEngine {
 
         let sender = model
             .thread
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Model must be loaded via load() for training"))?
             .cmd_sender()
             .ok_or_else(|| Error::from_reason("Model thread not running"))?
             .clone();

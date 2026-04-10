@@ -817,8 +817,6 @@ export declare class QianfanOCRModel {
  * routed through `TrainingDispatch` to the model thread.
  */
 export declare class Qwen35Model {
-  /** Create a new Qwen3.5 model with the given configuration. */
-  constructor(config: Qwen35Config);
   /** Initialize caches for incremental generation. */
   initCaches(): void;
   /** Reset all caches. */
@@ -877,8 +875,7 @@ export declare class Qwen35Model {
   /**
    * Save the model weights and configuration to a directory.
    *
-   * Dispatches to model thread for inference models.
-   * Fallback path uses Arc<RwLock<>> fields directly (legacy).
+   * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
 }
@@ -892,12 +889,6 @@ export type Qwen3_5Model = Qwen35Model;
  * routed through `TrainingDispatch` to the model thread.
  */
 export declare class Qwen35MoeModel {
-  /**
-   * Create a new Qwen3.5 MoE model with the given configuration.
-   *
-   * Spawns a dedicated model thread that owns all inference state.
-   */
-  constructor(config: Qwen35MoeConfig);
   /** Initialize caches for incremental generation. */
   initCaches(): void;
   /** Reset all caches. */
@@ -938,8 +929,7 @@ export declare class Qwen35MoeModel {
   /**
    * Save the model weights and configuration to a directory.
    *
-   * Dispatches to model thread for inference models.
-   * Fallback path uses Arc<RwLock<>> fields directly (legacy).
+   * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
 }
@@ -952,8 +942,6 @@ export type Qwen3_5MoeModel = Qwen35MoeModel;
  * Training commands are routed via `TrainingDispatch`.
  */
 export declare class Qwen3Model {
-  /** Create a new Qwen3 model with the given configuration */
-  constructor(config: Qwen3Config);
   /**
    * Reset the KV cache used for cache reuse across chat() calls.
    * Call this when starting a new conversation to ensure a full prefill.
@@ -971,8 +959,6 @@ export declare class Qwen3Model {
    * Clears cached key-value states. Call this between different generation sequences.
    */
   resetKvCaches(): void;
-  /** Check if paged attention is enabled for this model */
-  hasPagedAttention(): boolean;
   /**
    * Get paged attention memory statistics (if enabled)
    *
@@ -1070,205 +1056,6 @@ export declare class Qwen3Model {
   hasPagedWork(): boolean;
   /** Get model configuration */
   getConfig(): Qwen3Config;
-  /**
-   * Generate tokens using speculative decoding with a draft model.
-   *
-   * Speculative decoding uses a smaller draft model to generate tokens speculatively,
-   * then verifies them with the target model in a single forward pass. This can achieve
-   * 2-3x speedup when the draft model has high acceptance rate.
-   *
-   * # Algorithm
-   * 1. Draft model generates N tokens speculatively (cheap forward passes)
-   * 2. Target model (self) verifies all N tokens in one forward pass
-   * 3. Accept/reject using rejection sampling
-   * 4. On rejection, resample from adjusted distribution
-   * 5. Rewind caches and continue
-   *
-   * # Arguments
-   * * `draft_model` - Smaller model for speculative generation (should share tokenizer)
-   * * `input_ids` - Input token IDs [1, seq_len]
-   * * `config` - Generation configuration (includes num_draft_tokens)
-   *
-   * # Returns
-   * GenerationResult with tokens, logprobs, and speculative stats in finish_reason
-   *
-   * # Example (TypeScript)
-   * ```typescript
-   * const targetModel = await loadModel('qwen3-7b');
-   * const draftModel = await loadModel('qwen3-0.5b');
-   *
-   * const result = targetModel.generateSpeculativeSync(draftModel, inputIds, {
-   *   numDraftTokens: 5,
-   *   maxNewTokens: 100,
-   *   temperature: 0.7,
-   * });
-   * ```
-   */
-  generateSpeculativeSync(
-    draftModel: Qwen3Model,
-    inputIds: MxArray,
-    config?: GenerationConfig | undefined | null,
-  ): GenerationResult;
-  /** Count total number of parameters in the model */
-  numParameters(): number;
-  /**
-   * Get all model parameters as a dictionary mapping names to arrays
-   *
-   * This matches the TypeScript API for compatibility
-   */
-  getParameters(): Record<string, MxArray>;
-  /** Load parameters from a dictionary */
-  loadParameters(params: Record<string, MxArray>): void;
-  /**
-   * Compute forward pass and loss (for evaluation)
-   *
-   * # Arguments
-   * * `input_ids` - Input token IDs, shape: [batch_size, seq_len]
-   * * `labels` - Target token IDs, shape: [batch_size, seq_len]
-   *
-   * # Returns
-   * * Scalar loss value
-   */
-  computeLoss(inputIds: MxArray, labels: MxArray): MxArray;
-  /**
-   * Compute loss and gradients using a hybrid approach
-   *
-   * This implementation computes gradients for the output layers and uses
-   * numerical approximations for other parameters. This is sufficient to
-   * demonstrate that training works while we build out full MLX autograd integration.
-   *
-   * # Arguments
-   * * `input_ids` - Input token IDs, shape: [batch_size, seq_len]
-   * * `labels` - Target token IDs, shape: [batch_size, seq_len]
-   *
-   * # Returns
-   * * A tuple of (loss, gradients_dict) where gradients_dict maps parameter names to gradient arrays
-   *
-   * # Phase 6A Status
-   * Current implementation computes:
-   * - ✅ Exact gradients for LM head (output layer)
-   * - ⚠吅 Numerical approximations for other layers
-   *
-   * Future: Full MLX autograd will compute exact gradients for all 250+ parameters
-   */
-  computeLossAndGradients(inputIds: MxArray, labels: MxArray): [MxArray, Record<string, MxArray>];
-  /**
-   * Complete GRPO training step using MLX Autograd (RECOMMENDED)
-   *
-   * This method uses automatic differentiation to compute gradients, eliminating
-   * the need for manual backward pass implementation. This is the preferred approach.
-   *
-   * # Arguments
-   * * `prompt_tokens` - Prompt token sequences [batch_size, seq_len] (1D arrays)
-   * * `completion_tokens` - Completion sequences [batch*G, completion_len] (1D arrays)
-   * * `completion_logprobs` - Logprobs from generation [batch*G, completion_len] (1D arrays)
-   * * `rewards` - Reward scores for each completion [batch*G]
-   * * `group_size` - Number of completions per prompt (G)
-   * * `config` - GRPO loss configuration
-   * * `learning_rate` - Learning rate for parameter updates
-   *
-   * # Returns
-   * * Tuple of (loss_value, metrics_dict)
-   */
-  trainStepGrpoAutograd(
-    promptTokens: Array<MxArray>,
-    completionTokens: Array<MxArray>,
-    completionLogprobs: Array<MxArray>,
-    rewards: Float64Array,
-    groupSize: number,
-    config: GrpoLossConfig,
-    learningRate: number,
-  ): [number, Record<string, number>];
-  /**
-   * Compute gradients only without applying them (for gradient accumulation)
-   *
-   * This method computes GRPO loss and gradients but does NOT update parameters.
-   * Used for gradient accumulation where gradients are summed across multiple
-   * micro-batches before applying them.
-   *
-   * # Arguments
-   * * `prompt_tokens` - Prompt token sequences [batch_size, seq_len] (1D arrays)
-   * * `completion_tokens` - Completion sequences [batch*G, completion_len] (1D arrays)
-   * * `completion_logprobs` - Logprobs from generation [batch*G, completion_len] (1D arrays)
-   * * `rewards` - Reward scores for each completion [batch*G]
-   * * `group_size` - Number of completions per prompt (G)
-   * * `config` - GRPO loss configuration
-   *
-   * # Returns
-   * * Tuple of (loss_value, gradients_dict, metrics_dict)
-   */
-  computeGradientsOnlyGrpoAutograd(
-    promptTokens: Array<MxArray>,
-    completionTokens: Array<MxArray>,
-    completionLogprobs: Array<MxArray>,
-    rewards: Float64Array,
-    groupSize: number,
-    config: GrpoLossConfig,
-  ): [number, Record<string, MxArray>, Record<string, number>];
-  /**
-   * Accumulate gradients into existing gradient dictionary
-   *
-   * This is a helper method for gradient accumulation. It adds new_gradients
-   * to accumulated_gradients element-wise.
-   *
-   * # Arguments
-   * * `accumulated_gradients` - Existing accumulated gradients (will be modified in-place conceptually, but returns new dict)
-   * * `new_gradients` - New gradients to add
-   *
-   * # Returns
-   * * Updated gradient dictionary with accumulated values
-   */
-  static accumulateGradients(
-    accumulatedGradients: Record<string, MxArray>,
-    newGradients: Record<string, MxArray>,
-  ): Record<string, MxArray>;
-  /**
-   * Complete GRPO training step using manual gradients (Legacy)
-   *
-   * This method performs a full GRPO training iteration:
-   * 1. Takes completions (already generated) with their logprobs and rewards
-   * 2. Computes advantages
-   * 3. Computes GRPO loss and gradients
-   * 4. Updates model parameters
-   *
-   * NOTE: Use train_step_grpo_autograd instead for automatic differentiation.
-   *
-   * # Arguments
-   * * `prompt_tokens` - Prompt token sequences [batch_size, seq_len] (1D arrays)
-   * * `completion_tokens` - Completion sequences [batch*G, completion_len] (1D arrays)
-   * * `completion_logprobs` - Logprobs from generation [batch*G, completion_len] (1D arrays)
-   * * `rewards` - Reward scores for each completion [batch*G]
-   * * `group_size` - Number of completions per prompt (G)
-   * * `config` - GRPO loss configuration
-   * * `learning_rate` - Learning rate for parameter updates
-   *
-   * # Returns
-   * * Tuple of (loss_value, metrics_dict)
-   */
-  trainStepGrpo(
-    promptTokens: Array<MxArray>,
-    completionTokens: Array<MxArray>,
-    completionLogprobs: Array<MxArray>,
-    rewards: Float64Array,
-    groupSize: number,
-    config: GrpoLossConfig,
-    learningRate: number,
-  ): [number, Record<string, number>];
-  /**
-   * Apply gradients to model parameters
-   *
-   * # Arguments
-   * * `gradients` - Dictionary mapping parameter names to gradient arrays
-   * * `learning_rate` - Learning rate for gradient descent
-   *
-   * This performs a simple SGD update: param = param - lr * grad
-   * Only updates parameters that have gradients; others remain unchanged.
-   *
-   * IMPORTANT: This function preserves the original dtype of parameters.
-   * The learning rate scalar is cast to match param dtype to prevent
-   * promotion to float32 during arithmetic operations.
-   */
-  applyGradients(gradients: Record<string, MxArray>, learningRate: number): void;
   /**
    * Text-to-text generation with integrated tokenization
    *
@@ -1473,9 +1260,6 @@ export declare class Qwen3Model {
    * them to avoid the MLX cross-thread `CommandEncoder` crash.
    *
    * Falls back to reading `Arc<RwLock<>>` fields directly for the legacy
-   * `new Qwen3Model(config)` code path (`thread: None`), which is still
-   * used by in-memory test fixtures such as `createTempModel`.
-   *
    * # Arguments
    * * `save_path` - Directory to save the model
    */

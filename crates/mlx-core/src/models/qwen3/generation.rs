@@ -147,6 +147,7 @@ pub struct GenerationResult {
 
     /// Elapsed ms from generation start to first token extraction (for TTFT).
     /// Only set when called from chat() with reportPerformance.
+    #[allow(dead_code)]
     pub(crate) first_token_elapsed_ms: Option<f64>,
 }
 

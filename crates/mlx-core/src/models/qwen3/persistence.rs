@@ -8,7 +8,6 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use futures::TryFutureExt;
 use napi::{Env, Status, bindgen_prelude::*, tokio};
 use napi_derive::napi;
 use serde_json::Value;
@@ -16,7 +15,7 @@ use tracing::info;
 
 use crate::array::MxArray;
 use crate::tokenizer::Qwen3Tokenizer;
-use crate::utils::safetensors::{load_safetensors_lazy, save_safetensors};
+use crate::utils::safetensors::load_safetensors_lazy;
 
 use super::model::{Qwen3Cmd, Qwen3Inner, handle_qwen3_cmd};
 use super::{Qwen3Config, Qwen3Model};
@@ -222,9 +221,6 @@ impl Qwen3Model {
     /// them to avoid the MLX cross-thread `CommandEncoder` crash.
     ///
     /// Falls back to reading `Arc<RwLock<>>` fields directly for the legacy
-    /// `new Qwen3Model(config)` code path (`thread: None`), which is still
-    /// used by in-memory test fixtures such as `createTempModel`.
-    ///
     /// # Arguments
     /// * `save_path` - Directory to save the model
     #[napi]
@@ -233,124 +229,17 @@ impl Qwen3Model {
         env: &'env Env,
         save_path: String,
     ) -> Result<PromiseRaw<'env, ()>> {
-        if let Some(ref thread) = self.thread {
-            // Inference model: dispatch to dedicated model thread so MxArray
-            // reads happen on the thread that owns them.
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            thread.send(Qwen3Cmd::SaveModel {
-                save_path,
-                reply: tx,
-            })?;
-            let promise = env.spawn_future(async move {
-                rx.await
-                    .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
-            })?;
-            return Ok(promise);
-        }
-
-        // Legacy fallback: no dedicated thread (e.g. `new Qwen3Model(config)`
-        // used by in-memory tests). Read the Arc<RwLock<>> fields directly.
-        let params = self.get_parameters()?;
-
-        // Validate all parameters for NaN/Inf before saving
-        // This prevents saving corrupted checkpoints that would fail on resume
-        for (name, param) in params.iter() {
-            let data = param.to_float32()?;
-            let invalid_count = data
-                .iter()
-                .filter(|v| v.is_nan() || v.is_infinite())
-                .count();
-            if invalid_count > 0 {
-                return Err(napi::Error::new(
-                    Status::GenericFailure,
-                    format!(
-                        "Cannot save model: parameter '{}' contains {} NaN/Inf values. \
-                        Model weights are corrupted, likely due to training instability. \
-                        Consider reducing learning rate or using an earlier checkpoint.",
-                        name, invalid_count
-                    ),
-                ));
-            }
-        }
-
-        // Clone parameters for async task
-        let params_clone: HashMap<String, MxArray> =
-            params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-
-        // Create weights metadata (for reference)
-        let mut weights_metadata = serde_json::Map::new();
-        for (key, array) in params.iter() {
-            let shape_data = array.shape()?;
-            let shape: Vec<i64> = shape_data.as_ref().to_vec();
-            let dtype = array.dtype()?;
-
-            let mut param_info = serde_json::Map::new();
-            param_info.insert("shape".to_string(), serde_json::json!(shape));
-            param_info.insert("dtype".to_string(), serde_json::json!(dtype as i32));
-
-            weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
-        }
-
-        let config = self.get_config();
-        let mut config_value = serde_json::to_value(&config).map_err(|e| {
-            napi::Error::new(
-                Status::GenericFailure,
-                format!("Failed to serialize config: {e}"),
-            )
+        // Dispatch to dedicated model thread so MxArray reads happen on the
+        // thread that owns them.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.thread.send(Qwen3Cmd::SaveModel {
+            save_path,
+            reply: tx,
         })?;
-        if let serde_json::Value::Object(ref mut map) = config_value {
-            map.insert("model_type".to_string(), serde_json::json!("qwen3"));
-        }
-
-        let weights_json = serde_json::json!({
-            "version": "1.0",
-            "config": config_value,
-            "weights": weights_metadata,
-            "note": "Full weights are in weights.safetensors"
-        });
-
         let promise = env.spawn_future(async move {
-            tokio::task::spawn_blocking(move || {
-                // Create directory if it doesn't exist
-                let path = Path::new(&save_path);
-                fs::create_dir_all(path)?;
-
-                info!("Saving model to {}", save_path);
-
-                // 1. Save configuration as JSON
-                let config_path = path.join("config.json");
-                let config_json = serde_json::to_string_pretty(&config_value)?;
-                fs::write(&config_path, config_json)?;
-                info!("Saved config.json");
-
-                // 2. Save full weights in SafeTensors format
-                let safetensors_path = path.join("weights.safetensors");
-                let metadata = Some(serde_json::json!({
-                    "format": "mlx-node",
-                    "version": "1.0"
-                }));
-                save_safetensors(&safetensors_path, &params_clone, metadata)?;
-                info!("Saved weights.safetensors");
-
-                // 3. Save weights metadata (for reference)
-                let weights_str = serde_json::to_string_pretty(&weights_json)?;
-                let weights_path = path.join("weights.mlx");
-                fs::write(&weights_path, weights_str)?;
-                info!("Saved weights.mlx metadata");
-
-                Ok::<_, Error>(())
-            })
-            .map_err(|err| {
-                napi::Error::new(
-                    Status::GenericFailure,
-                    format!("Failed to save model: {}", err),
-                )
-            })
-            .await
-            .flatten()?;
-            Ok(())
+            rx.await
+                .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
         })?;
-
         Ok(promise)
     }
 
@@ -556,10 +445,6 @@ fn load_safetensors_mapped(path: &Path) -> Result<HashMap<String, MxArray>> {
 ///
 /// Returns a thin `Qwen3Model` NAPI shell with the thread handle.
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
-    use crate::nn::{Embedding, Linear, RMSNorm};
-    use std::sync::RwLock;
-    use tokio::sync::Mutex as TokioMutex;
-
     let model_path = model_path.to_string();
 
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
@@ -703,32 +588,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
-    // Create dummy training fields (not used by inference models loaded via thread)
-    let embedding = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)?;
-
     Ok(Qwen3Model {
-        thread: Some(thread),
+        thread,
         config: config.clone(),
-        embedding,
-        layers: std::sync::Arc::new(RwLock::new(Vec::new())),
-        final_norm: std::sync::Arc::new(RwLock::new(RMSNorm::new(
-            config.hidden_size as u32,
-            Some(config.rms_norm_eps),
-        )?)),
-        lm_head: std::sync::Arc::new(RwLock::new(Linear::new(
-            config.hidden_size as u32,
-            config.vocab_size as u32,
-            Some(false),
-        )?)),
-        kv_caches: std::sync::Arc::new(RwLock::new(None)),
         tokenizer,
-        paged_cache: None,
-        scheduler: None,
-        cached_kv_keys: std::sync::Arc::new(RwLock::new(Vec::new())),
-        cached_kv_values: std::sync::Arc::new(RwLock::new(Vec::new())),
-        cached_cache_idx: std::sync::Arc::new(RwLock::new(0)),
-        cached_token_history: std::sync::Arc::new(RwLock::new(Vec::new())),
-        generation_lock: std::sync::Arc::new(TokioMutex::new(())),
     })
 }
 

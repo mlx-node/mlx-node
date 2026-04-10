@@ -789,9 +789,6 @@ fn apply_weights_moe_inner(
 /// All model state lives on the spawned thread. Returns a thin NAPI shell
 /// with the thread handle and dummy training fields.
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
-    use crate::nn::{Embedding, RMSNorm};
-    use std::sync::RwLock;
-
     let model_path = model_path.to_string();
 
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
@@ -989,38 +986,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         handle_qwen35_moe_cmd,
     );
 
-    let (config, model_id, image_processor, tokenizer) = init_rx
+    let (config, model_id, _image_processor, _tokenizer) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
-    // Create dummy training fields (not used by inference models)
-    let fa_idx = (0..config.num_layers as usize)
-        .find(|&i| !config.is_linear_layer(i))
-        .unwrap_or(0);
-    let embedding = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)?;
-
     Ok(Qwen3_5MoeModel {
-        thread: Some(thread),
-        config: config.clone(),
+        thread,
+        config,
         model_id,
-        image_processor,
-        // Training fields (unused for inference)
-        embedding,
-        layers: std::sync::Arc::new(RwLock::new(Vec::new())),
-        final_norm: std::sync::Arc::new(RwLock::new(RMSNorm::new(
-            config.hidden_size as u32,
-            Some(config.rms_norm_eps),
-        )?)),
-        lm_head: std::sync::Arc::new(RwLock::new(None)),
-        caches: std::sync::Arc::new(RwLock::new(None)),
-        tokenizer,
-        fa_idx,
-        vision_encoder: None,
-        spatial_merge_size: None,
-        cached_token_history: std::sync::Arc::new(RwLock::new(Vec::new())),
-        cached_image_key: std::sync::Arc::new(RwLock::new(None)),
-        cached_rope_deltas: std::sync::Arc::new(RwLock::new(None)),
-        generation_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     })
 }
 

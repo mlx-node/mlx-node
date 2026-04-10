@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -3207,165 +3207,24 @@ impl ChatStreamHandle {
 #[napi]
 pub struct Qwen3_5Model {
     /// Dedicated model thread for inference and training.
-    pub(crate) thread: Option<crate::model_thread::ModelThread<Qwen35Cmd>>,
+    pub(crate) thread: crate::model_thread::ModelThread<Qwen35Cmd>,
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5Config,
     pub(crate) model_id: u64,
-    /// Shell-only field, scheduled for deletion in P6b along with the
-    /// legacy constructor/`apply_weights` path.
-    #[allow(dead_code)]
-    pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
-
-    // === Training support fields (Arc<RwLock<>>) ===
-    // These are ONLY used by training clones (thread == None).
-    // For inference models, all state lives on the dedicated model thread.
-    pub(crate) embedding: Embedding,
-    pub(crate) layers: Arc<RwLock<Vec<DecoderLayer>>>,
-    pub(crate) final_norm: Arc<RwLock<RMSNorm>>,
-    pub(crate) lm_head: Arc<RwLock<Option<Linear>>>,
-    pub(crate) caches: Arc<RwLock<Option<Vec<Qwen3_5LayerCache>>>>,
-    /// Shell-only field, scheduled for deletion in P6b.
-    #[allow(dead_code)]
-    pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
-    pub(crate) vision_encoder: Option<Arc<Qwen3_5VisionEncoder>>,
-    /// Shell-only field, scheduled for deletion in P6b.
-    #[allow(dead_code)]
-    pub(crate) spatial_merge_size: Option<i32>,
-    pub(crate) cached_token_history: Arc<RwLock<Vec<u32>>>,
-    pub(crate) cached_image_key: Arc<RwLock<Option<u64>>>,
-    pub(crate) cached_rope_deltas: Arc<RwLock<Option<i32>>>,
-    pub(crate) generation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[napi]
 impl Qwen3_5Model {
-    /// Create a new Qwen3.5 model with the given configuration.
-    #[napi(constructor)]
-    pub fn new(config: Qwen3_5Config) -> Result<Self> {
-        let config_clone = config.clone();
-        let config_for_shell = config.clone();
-
-        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
-            move || {
-                let inner = Qwen35Inner::new(config)?;
-                let model_id = inner.model_id;
-                Ok((inner, model_id))
-            },
-            handle_qwen35_cmd,
-        );
-
-        let model_id = init_rx
-            .blocking_recv()
-            .map_err(|_| napi::Error::from_reason("Model thread exited during init"))??;
-
-        // Create dummy training fields (not used for inference-only models)
-        let embedding = Embedding::new(
-            config_for_shell.vocab_size as u32,
-            config_for_shell.hidden_size as u32,
-        )?;
-
-        Ok(Self {
-            thread: Some(thread),
-            config: config_clone,
-            model_id,
-            image_processor: None,
-            // Training fields (unused for inference models, but needed for type compatibility)
-            embedding,
-            layers: Arc::new(RwLock::new(Vec::new())),
-            final_norm: Arc::new(RwLock::new(RMSNorm::new(
-                config_for_shell.hidden_size as u32,
-                Some(config_for_shell.rms_norm_eps),
-            )?)),
-            lm_head: Arc::new(RwLock::new(None)),
-            caches: Arc::new(RwLock::new(None)),
-            tokenizer: None,
-            vision_encoder: None,
-            spatial_merge_size: None,
-            cached_token_history: Arc::new(RwLock::new(Vec::new())),
-            cached_image_key: Arc::new(RwLock::new(None)),
-            cached_rope_deltas: Arc::new(RwLock::new(None)),
-            generation_lock: Arc::new(tokio::sync::Mutex::new(())),
-        })
-    }
-
     /// Initialize caches for incremental generation.
     #[napi]
     pub fn init_caches(&self) -> Result<()> {
-        if let Some(ref thread) = self.thread {
-            return crate::model_thread::send_and_block(thread, |reply| Qwen35Cmd::InitCaches {
-                reply,
-            });
-        }
-        // Training clone fallback (no model thread)
-        let _guard = self.generation_lock.try_lock().map_err(|_| {
-            Error::from_reason("Cannot init caches while generation is in progress")
-        })?;
-        self.init_caches_inner()
-    }
-
-    /// Init caches without checking the generation lock (for internal use
-    /// by generate_for_training_sync which already holds the lock).
-    fn init_caches_inner(&self) -> Result<()> {
-        let caches = (0..self.config.num_layers as usize)
-            .map(|i| {
-                if self.config.is_linear_layer(i) {
-                    Qwen3_5LayerCache::new_linear()
-                } else {
-                    Qwen3_5LayerCache::new_full_attention()
-                }
-            })
-            .collect();
-        let mut caches_guard = self
-            .caches
-            .write()
-            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
-        *caches_guard = Some(caches);
-        self.clear_reuse_state();
-        Ok(())
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::InitCaches { reply })
     }
 
     /// Reset all caches.
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
-        if let Some(ref thread) = self.thread {
-            return crate::model_thread::send_and_block(thread, |reply| Qwen35Cmd::ResetCaches {
-                reply,
-            });
-        }
-        // Training clone fallback
-        let _guard = self.generation_lock.try_lock().map_err(|_| {
-            Error::from_reason("Cannot reset caches while generation is in progress")
-        })?;
-        self.reset_caches_inner()
-    }
-
-    /// Reset caches without checking the generation lock.
-    fn reset_caches_inner(&self) -> Result<()> {
-        let mut caches_guard = self
-            .caches
-            .write()
-            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
-        if let Some(ref mut caches) = *caches_guard {
-            for cache in caches.iter_mut() {
-                cache.reset();
-            }
-        }
-        *caches_guard = None;
-        self.clear_reuse_state();
-        Ok(())
-    }
-
-    /// Clear cached token history, image key, and rope deltas.
-    fn clear_reuse_state(&self) {
-        if let Ok(mut th) = self.cached_token_history.write() {
-            th.clear();
-        }
-        if let Ok(mut ik) = self.cached_image_key.write() {
-            *ik = None;
-        }
-        if let Ok(mut rd) = self.cached_rope_deltas.write() {
-            *rd = None;
-        }
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::ResetCaches { reply })
     }
 
     /// Take the KV cache from the model, returning a `PromptCache` handle.
@@ -3375,32 +3234,8 @@ impl Qwen3_5Model {
     /// before the next `chat()` call for incremental prefill.
     #[napi]
     pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
-        if let Some(ref thread) = self.thread {
-            return crate::model_thread::send_and_block(thread, |reply| Qwen35Cmd::TakeCache {
-                reply,
-            })
-            .ok()?;
-        }
-        // Training clone fallback
-        let _guard = self.generation_lock.try_lock().ok()?;
-        let mut caches_guard = self.caches.write().ok()?;
-        let token_history_guard = self.cached_token_history.read().ok()?;
-        let caches = caches_guard.take()?;
-        if token_history_guard.is_empty() {
-            *caches_guard = Some(caches);
-            return None;
-        }
-        let image_key = self.cached_image_key.read().ok().and_then(|g| *g);
-        let rope_deltas = self.cached_rope_deltas.read().ok().and_then(|g| *g);
-        Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
-            caches,
-            token_history_guard.clone(),
-            "qwen3_5",
-            self.config.num_layers as usize,
-            image_key,
-            rope_deltas,
-            self.model_id,
-        ))
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::TakeCache { reply })
+            .ok()?
     }
 
     /// Restore a previously taken `PromptCache` into the model.
@@ -3431,49 +3266,22 @@ impl Qwen3_5Model {
                 "Cache was created by a different model instance (different checkpoint or config)",
             ));
         }
-        if let Some(ref thread) = self.thread {
-            // Extract the cache data to send to model thread
-            let owned_cache = crate::models::qwen3_5::prompt_cache::PromptCache::new(
-                cache.take_caches().ok_or_else(|| {
-                    Error::from_reason("PromptCache is empty (already consumed or disposed)")
-                })?,
-                cache.token_history().to_vec(),
-                "qwen3_5",
-                cache.num_layers(),
-                cache.image_cache_key(),
-                cache.rope_deltas(),
-                cache.model_id(),
-            );
-            return crate::model_thread::send_and_block(thread, |reply| Qwen35Cmd::SetCache {
-                cache: owned_cache,
-                reply,
-            });
-        }
-        // Training clone fallback
-        let _guard = self
-            .generation_lock
-            .try_lock()
-            .map_err(|_| Error::from_reason("Cannot set cache while generation is in progress"))?;
-        let restored_caches = cache.take_caches().ok_or_else(|| {
-            Error::from_reason("PromptCache is empty (already consumed or disposed)")
-        })?;
-        let mut caches_guard = self
-            .caches
-            .write()
-            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
-        let mut token_history_guard = self
-            .cached_token_history
-            .write()
-            .map_err(|_| Error::from_reason("Failed to acquire token history write lock"))?;
-        *caches_guard = Some(restored_caches);
-        *token_history_guard = cache.token_history().to_vec();
-        if let Ok(mut ik) = self.cached_image_key.write() {
-            *ik = cache.image_cache_key();
-        }
-        if let Ok(mut rd) = self.cached_rope_deltas.write() {
-            *rd = cache.rope_deltas();
-        }
-        Ok(())
+        // Extract the cache data to send to model thread
+        let owned_cache = crate::models::qwen3_5::prompt_cache::PromptCache::new(
+            cache.take_caches().ok_or_else(|| {
+                Error::from_reason("PromptCache is empty (already consumed or disposed)")
+            })?,
+            cache.token_history().to_vec(),
+            "qwen3_5",
+            cache.num_layers(),
+            cache.image_cache_key(),
+            cache.rope_deltas(),
+            cache.model_id(),
+        );
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::SetCache {
+            cache: owned_cache,
+            reply,
+        })
     }
 
     /// Load a pretrained model from a directory.
@@ -3507,11 +3315,7 @@ impl Qwen3_5Model {
                 batch_size
             )));
         }
-        let thread = self
-            .thread
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("generate() not available on training clones"))?;
-        crate::model_thread::send_and_await(thread, |reply| Qwen35Cmd::Generate {
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::Generate {
             prompt_tokens: prompt_tokens.clone(),
             config,
             reply,
@@ -3551,11 +3355,7 @@ impl Qwen3_5Model {
             reuse_cache: None,
         });
 
-        let thread = self
-            .thread
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("chat() not available on training clones"))?;
-        crate::model_thread::send_and_await(thread, |reply| Qwen35Cmd::Chat {
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::Chat {
             messages,
             config,
             reply,
@@ -3601,11 +3401,6 @@ impl Qwen3_5Model {
             reuse_cache: None,
         });
 
-        let thread = self
-            .thread
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("chat_stream() not available on training clones"))?;
-
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
 
@@ -3614,7 +3409,7 @@ impl Qwen3_5Model {
             tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
 
         // Send streaming command to model thread
-        thread.send(Qwen35Cmd::ChatStream {
+        self.thread.send(Qwen35Cmd::ChatStream {
             messages,
             config,
             stream_tx,
@@ -3675,128 +3470,22 @@ impl Qwen3_5Model {
 
     /// Save the model weights and configuration to a directory.
     ///
-    /// Dispatches to model thread for inference models.
-    /// Fallback path uses Arc<RwLock<>> fields directly (legacy).
+    /// Dispatches to model thread.
     #[napi]
     pub fn save_model<'env>(
         &self,
         env: &'env Env,
         save_path: String,
     ) -> Result<PromiseRaw<'env, ()>> {
-        if let Some(ref thread) = self.thread {
-            // Inference model: dispatch to model thread
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            thread.send(Qwen35Cmd::SaveModel {
-                save_path,
-                reply: tx,
-            })?;
-            let promise = env.spawn_future(async move {
-                rx.await
-                    .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
-            })?;
-            return Ok(promise);
-        }
-
-        // Fallback: use Arc<RwLock<>> fields directly (legacy path)
-        let mut params = self.get_parameters_for_training()?;
-
-        if let Some(ref vision_enc) = self.vision_encoder {
-            let vision_params = vision_enc.get_parameters();
-            params.extend(vision_params);
-        }
-
-        for (name, param) in params.iter() {
-            let data = param.to_float32()?;
-            let invalid_count = data
-                .iter()
-                .filter(|v| v.is_nan() || v.is_infinite())
-                .count();
-            if invalid_count > 0 {
-                return Err(napi::Error::new(
-                    Status::GenericFailure,
-                    format!(
-                        "Cannot save model: parameter '{}' contains {} NaN/Inf values. \
-                        Model weights are corrupted, likely due to training instability. \
-                        Consider reducing learning rate or using an earlier checkpoint.",
-                        name, invalid_count
-                    ),
-                ));
-            }
-        }
-
-        let params_clone: HashMap<String, MxArray> =
-            params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-
-        let mut weights_metadata = serde_json::Map::new();
-        for (key, array) in params.iter() {
-            let shape_data = array.shape()?;
-            let shape: Vec<i64> = shape_data.as_ref().to_vec();
-            let dtype = array.dtype()?;
-            let mut param_info = serde_json::Map::new();
-            param_info.insert("shape".to_string(), serde_json::json!(shape));
-            param_info.insert("dtype".to_string(), serde_json::json!(dtype as i32));
-            weights_metadata.insert(key.clone(), serde_json::Value::Object(param_info));
-        }
-
-        let config = self.get_config();
-        let mut config_value = serde_json::to_value(&config).map_err(|e| {
-            napi::Error::new(
-                Status::GenericFailure,
-                format!("Failed to serialize config: {e}"),
-            )
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.thread.send(Qwen35Cmd::SaveModel {
+            save_path,
+            reply: tx,
         })?;
-        if let serde_json::Value::Object(ref mut map) = config_value {
-            map.insert("model_type".to_string(), serde_json::json!("qwen3_5"));
-        }
-
-        let weights_json = serde_json::json!({
-            "version": "1.0",
-            "config": config_value,
-            "weights": weights_metadata,
-            "note": "Full weights are in weights.safetensors"
-        });
-
         let promise = env.spawn_future(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let path = std::path::Path::new(&save_path);
-                std::fs::create_dir_all(path)?;
-                info!("Saving model to {}", save_path);
-
-                let config_path = path.join("config.json");
-                let config_json = serde_json::to_string_pretty(&config_value)?;
-                std::fs::write(&config_path, config_json)?;
-                info!("Saved config.json");
-
-                let safetensors_path = path.join("weights.safetensors");
-                let metadata = Some(serde_json::json!({
-                    "format": "mlx-node",
-                    "version": "1.0"
-                }));
-                crate::utils::safetensors::save_safetensors(
-                    &safetensors_path,
-                    &params_clone,
-                    metadata,
-                )?;
-                info!("Saved weights.safetensors");
-
-                let weights_str = serde_json::to_string_pretty(&weights_json)?;
-                let weights_path = path.join("weights.mlx");
-                std::fs::write(&weights_path, weights_str)?;
-                info!("Saved weights.mlx metadata");
-
-                Ok::<_, Error>(())
-            })
-            .await
-            .map_err(|err| {
-                napi::Error::new(
-                    Status::GenericFailure,
-                    format!("Failed to save model: {}", err),
-                )
-            })?;
-            result?;
-            Ok(())
+            rx.await
+                .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
         })?;
-
         Ok(promise)
     }
 }
@@ -3942,272 +3631,6 @@ fn forward_compiled(input_ids: &MxArray, embedding_weight: &MxArray) -> Result<M
 fn eval_token_and_compiled_caches(next_token: &MxArray) {
     unsafe {
         mlx_sys::mlx_qwen35_eval_token_and_compiled_caches(next_token.as_raw_ptr());
-    }
-}
-
-/// Evaluate the sampled token AND all cache arrays together in a single async_eval call.
-///
-/// This is the key fix for performance: without evaluating the cache arrays, they remain
-/// as lazy computation nodes. Each decode step's graph then includes the entire lazy chain
-/// from all previous steps (O(N^2) graph growth), causing GPU execution time to grow
-/// linearly with the number of decode steps.
-///
-/// By evaluating cache arrays here (alongside next_token), MLX materializes them and
-/// breaks the dependency chain (via arr.detach() internally). The next step then starts
-/// with a clean graph bounded to exactly one decode step.
-///
-/// This matches Python mlx-lm's behavior: async_eval(y, logprobs) evaluates y (the token)
-/// whose graph transitively causes all cache state INPUTS to be detached/materialized.
-// Internal methods (not NAPI-exported)
-impl Qwen3_5Model {
-    /// Forward pass from pre-computed embeddings with M-RoPE position IDs (VLM mode).
-    ///
-    /// Used by `Qwen3_5VLModel` to inject vision features into the text stream.
-    pub fn forward_from_embeddings_with_positions(
-        &self,
-        hidden_states: &MxArray,
-        position_ids: Option<&MxArray>,
-    ) -> Result<MxArray> {
-        let mut h = hidden_states.clone();
-
-        let mut layers_guard = self
-            .layers
-            .write()
-            .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
-        let mut caches_guard = self
-            .caches
-            .write()
-            .map_err(|_| Error::from_reason("Failed to acquire caches write lock"))?;
-
-        let num_layers = layers_guard.len();
-        for i in 0..num_layers {
-            let cache = caches_guard.as_mut().map(|c| &mut c[i]);
-            let layer_pos = if layers_guard[i].is_linear() {
-                None
-            } else {
-                position_ids
-            };
-            h = layers_guard[i].forward(&h, None, cache, layer_pos, true)?;
-        }
-
-        drop(layers_guard);
-        drop(caches_guard);
-
-        let final_norm_guard = self
-            .final_norm
-            .read()
-            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
-        let h = final_norm_guard.forward(&h)?;
-        drop(final_norm_guard);
-
-        let lm_head_guard = self
-            .lm_head
-            .read()
-            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
-        match &*lm_head_guard {
-            Some(head) => head.forward(&h),
-            None => {
-                let weight = self.embedding.get_weight();
-                let weight_t = weight.transpose(Some(&[1, 0]))?;
-                h.matmul(&weight_t)
-            }
-        }
-    }
-
-    /// Get embeddings for input IDs (used by VLModel).
-    pub fn get_embeddings(&self, input_ids: &MxArray) -> Result<MxArray> {
-        self.embedding.forward(input_ids)
-    }
-
-    /// Set the vision encoder (wraps in Arc).
-    ///
-    /// Shell-only method, scheduled for deletion in P6b.
-    #[allow(dead_code)]
-    pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) {
-        self.vision_encoder = Some(Arc::new(enc));
-    }
-
-    /// Set the image processor.
-    ///
-    /// Shell-only method, scheduled for deletion in P6b.
-    #[allow(dead_code)]
-    pub(crate) fn set_image_processor(&mut self, proc: Qwen35VLImageProcessor) {
-        self.image_processor = Some(Arc::new(proc));
-    }
-
-    /// Set the spatial merge size.
-    ///
-    /// Shell-only method, scheduled for deletion in P6b.
-    #[allow(dead_code)]
-    pub(crate) fn set_spatial_merge_size(&mut self, size: i32) {
-        self.spatial_merge_size = Some(size);
-    }
-
-    /// Initialize M-RoPE on all full attention layers (VLM mode).
-    pub fn init_mrope_layers(
-        &self,
-        mrope_section: Vec<i32>,
-        rope_theta: f64,
-        max_position_embeddings: i32,
-    ) -> Result<()> {
-        let rope_dims = self.config.rope_dims();
-        let mut layers_guard = self
-            .layers
-            .write()
-            .map_err(|_| Error::from_reason("Failed to acquire layers write lock"))?;
-        for layer in layers_guard.iter_mut() {
-            if let super::decoder_layer::AttentionType::Full(ref mut attn) = layer.attn {
-                attn.init_mrope(
-                    mrope_section.clone(),
-                    rope_theta,
-                    max_position_embeddings,
-                    rope_dims,
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
-
-// ========== Training Support Methods ==========
-// These methods are Rust-internal only (not exposed via NAPI).
-// Used by save_model and the model thread training handlers.
-
-impl Qwen3_5Model {
-    /// Get model configuration.
-    pub(crate) fn get_config(&self) -> Qwen3_5Config {
-        self.config.clone()
-    }
-
-    /// Extract all trainable parameters as a name→array map.
-    ///
-    /// Parameter naming convention matches HuggingFace format:
-    /// - `embedding.weight`
-    /// - Linear attention layers: `layers.{i}.linear_attn.{in_proj_qkvz,in_proj_ba,conv1d,norm,out_proj}.weight`
-    /// - Linear attention learnable: `layers.{i}.linear_attn.{a_log,dt_bias}`
-    /// - Full attention layers: `layers.{i}.self_attn.{q_proj,k_proj,v_proj,o_proj}.weight`
-    /// - Full attention norms: `layers.{i}.self_attn.{q_norm,k_norm}.weight`
-    /// - All layers: `layers.{i}.mlp.{gate_proj,up_proj,down_proj}.weight`
-    /// - All layers: `layers.{i}.{input_layernorm,post_attention_layernorm}.weight`
-    /// - `final_norm.weight`
-    /// - `lm_head.weight` (if not tied)
-    pub(crate) fn get_parameters_for_training(&self) -> Result<HashMap<String, MxArray>> {
-        use super::decoder_layer::AttentionType;
-
-        let mut params = HashMap::new();
-
-        let layers_guard = self
-            .layers
-            .read()
-            .map_err(|_| Error::from_reason("Failed to acquire layers read lock"))?;
-        let final_norm_guard = self
-            .final_norm
-            .read()
-            .map_err(|_| Error::from_reason("Failed to acquire final_norm read lock"))?;
-        let lm_head_guard = self
-            .lm_head
-            .read()
-            .map_err(|_| Error::from_reason("Failed to acquire lm_head read lock"))?;
-
-        // Embedding
-        params.insert("embedding.weight".to_string(), self.embedding.get_weight());
-
-        // Transformer layers
-        for (i, layer) in layers_guard.iter().enumerate() {
-            let prefix = format!("layers.{}", i);
-
-            match &layer.attn {
-                AttentionType::Linear(gdn) => {
-                    params.insert(
-                        format!("{}.linear_attn.in_proj_qkvz.weight", prefix),
-                        gdn.get_in_proj_qkvz_weight(),
-                    );
-                    params.insert(
-                        format!("{}.linear_attn.in_proj_ba.weight", prefix),
-                        gdn.get_in_proj_ba_weight(),
-                    );
-                    params.insert(
-                        format!("{}.linear_attn.conv1d.weight", prefix),
-                        gdn.get_conv1d_weight(),
-                    );
-                    params.insert(
-                        format!("{}.linear_attn.norm.weight", prefix),
-                        gdn.get_norm_weight(),
-                    );
-                    params.insert(
-                        format!("{}.linear_attn.out_proj.weight", prefix),
-                        gdn.get_out_proj_weight(),
-                    );
-                    params.insert(format!("{}.linear_attn.dt_bias", prefix), gdn.get_dt_bias());
-                    params.insert(format!("{}.linear_attn.a_log", prefix), gdn.get_a_log());
-                }
-                AttentionType::Full(attn) => {
-                    params.insert(
-                        format!("{}.self_attn.q_proj.weight", prefix),
-                        attn.get_q_proj_weight(),
-                    );
-                    params.insert(
-                        format!("{}.self_attn.k_proj.weight", prefix),
-                        attn.get_k_proj_weight(),
-                    );
-                    params.insert(
-                        format!("{}.self_attn.v_proj.weight", prefix),
-                        attn.get_v_proj_weight(),
-                    );
-                    params.insert(
-                        format!("{}.self_attn.o_proj.weight", prefix),
-                        attn.get_o_proj_weight(),
-                    );
-                    params.insert(
-                        format!("{}.self_attn.q_norm.weight", prefix),
-                        attn.get_q_norm_weight(),
-                    );
-                    params.insert(
-                        format!("{}.self_attn.k_norm.weight", prefix),
-                        attn.get_k_norm_weight(),
-                    );
-                }
-            }
-
-            // MLP (all layers have dense MLP)
-            params.insert(
-                format!("{}.mlp.gate_proj.weight", prefix),
-                layer.mlp.get_gate_proj_weight(),
-            );
-            params.insert(
-                format!("{}.mlp.up_proj.weight", prefix),
-                layer.mlp.get_up_proj_weight(),
-            );
-            params.insert(
-                format!("{}.mlp.down_proj.weight", prefix),
-                layer.mlp.get_down_proj_weight(),
-            );
-
-            // Layer norms
-            params.insert(
-                format!("{}.input_layernorm.weight", prefix),
-                layer.get_input_layernorm_weight(),
-            );
-            params.insert(
-                format!("{}.post_attention_layernorm.weight", prefix),
-                layer.get_post_attention_layernorm_weight(),
-            );
-        }
-
-        // Final norm
-        params.insert(
-            "final_norm.weight".to_string(),
-            final_norm_guard.get_weight(),
-        );
-
-        // LM head (only if not tied)
-        if !self.config.tie_word_embeddings
-            && let Some(ref lm_head) = *lm_head_guard
-        {
-            params.insert("lm_head.weight".to_string(), lm_head.get_weight());
-        }
-
-        Ok(params)
     }
 }
 
