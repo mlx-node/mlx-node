@@ -110,6 +110,31 @@ function createMockModel() {
   };
 }
 
+/**
+ * Create a mock model that supports chatStream() with configurable events.
+ * Each event in `streamEvents` is yielded by the async generator.
+ */
+function createMockStreamModel(streamEvents: Array<Record<string, unknown>>) {
+  return {
+    chat: vi.fn().mockResolvedValue({
+      text: '',
+      toolCalls: [],
+      thinking: undefined,
+      numTokens: 0,
+      promptTokens: 0,
+      reasoningTokens: 0,
+      finishReason: 'stop',
+      rawText: '',
+      performance: undefined,
+    }),
+    async *chatStream() {
+      for (const event of streamEvents) {
+        yield event;
+      }
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -345,6 +370,220 @@ describe('createHandler', () => {
       expect(getStatus()).toBe(200);
       const parsed = JSON.parse(getBody());
       expect(parsed.status).toBe('ok');
+    });
+  });
+
+  describe('streaming with tool calls', () => {
+    it('does not leak <tool_call> markup in text deltas', async () => {
+      // Simulate a model that streams normal text, then tool-call markup, then final event
+      const streamEvents = [
+        { done: false, text: 'Let me ', isReasoning: false },
+        { done: false, text: 'look that up.', isReasoning: false },
+        // Tool-call markup starts leaking
+        { done: false, text: '\n<tool_call>\n', isReasoning: false },
+        { done: false, text: '{"name": "get_weather",', isReasoning: false },
+        { done: false, text: ' "arguments": {"city": "SF"}}', isReasoning: false },
+        { done: false, text: '\n</tool_call>', isReasoning: false },
+        // Final event with parsed results
+        {
+          done: true,
+          text: 'Let me look that up.',
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              id: 'call_123',
+              name: 'get_weather',
+              arguments: '{"city": "SF"}',
+            },
+          ],
+          thinking: null,
+          numTokens: 20,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          rawText: 'Let me look that up.\n<tool_call>\n{"name": "get_weather", "arguments": {"city": "SF"}}\n</tool_call>',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('stream-model', mockModel);
+
+      const handler = createHandler(registry);
+      const reqBody = {
+        model: 'stream-model',
+        input: 'What is the weather in SF?',
+        stream: true,
+      };
+      const req = createMockReq('POST', '/v1/responses', reqBody);
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      handler(req, res);
+      await waitForEnd();
+
+      const body = getBody();
+
+      // Parse all SSE events
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      // Collect all text deltas
+      const textDeltas = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string);
+
+      // Text deltas should NOT contain tool-call markup
+      const allDeltaText = textDeltas.join('');
+      expect(allDeltaText).not.toContain('<tool_call>');
+      expect(allDeltaText).not.toContain('</tool_call>');
+      expect(allDeltaText).not.toContain('get_weather');
+
+      // The clean text deltas should be present
+      expect(allDeltaText).toContain('Let me ');
+      expect(allDeltaText).toContain('look that up.');
+
+      // There should be a function_call item in the completed response
+      const completedEvent = events.find((e) => e.event === 'response.completed');
+      expect(completedEvent).toBeDefined();
+      const response = completedEvent!.data.response as Record<string, unknown>;
+      const output = response.output as Array<Record<string, unknown>>;
+
+      // Should have a message item and a function_call item
+      const messageItems = output.filter((i) => i.type === 'message');
+      const fcItems = output.filter((i) => i.type === 'function_call');
+      expect(messageItems).toHaveLength(1);
+      expect(fcItems).toHaveLength(1);
+      expect(fcItems[0].name).toBe('get_weather');
+
+      // The message content should be clean (no markup)
+      const msgContent = (messageItems[0].content as Array<Record<string, unknown>>)[0];
+      expect(msgContent.text).toBe('Let me look that up.');
+    });
+
+    it('skips message item when final text is empty and tool calls are present', async () => {
+      // Model immediately produces tool-call markup, no visible text
+      const streamEvents = [
+        { done: false, text: '<tool_call>\n', isReasoning: false },
+        { done: false, text: '{"name": "search", "arguments": {"q": "test"}}', isReasoning: false },
+        { done: false, text: '\n</tool_call>', isReasoning: false },
+        {
+          done: true,
+          text: '', // No clean text
+          finishReason: 'tool_calls',
+          toolCalls: [{ id: 'call_456', name: 'search', arguments: '{"q": "test"}' }],
+          thinking: null,
+          numTokens: 15,
+          promptTokens: 8,
+          reasoningTokens: 0,
+          rawText: '<tool_call>\n{"name": "search", "arguments": {"q": "test"}}\n</tool_call>',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('stream-model', mockModel);
+
+      const handler = createHandler(registry);
+      const reqBody = {
+        model: 'stream-model',
+        input: 'Search for test',
+        stream: true,
+      };
+      const req = createMockReq('POST', '/v1/responses', reqBody);
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      handler(req, res);
+      await waitForEnd();
+
+      const body = getBody();
+
+      // Parse SSE events
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      // No text deltas should have been emitted at all
+      const textDeltas = events.filter((e) => e.event === 'response.output_text.delta');
+      expect(textDeltas).toHaveLength(0);
+
+      // Completed response should have only function_call items, no message items
+      const completedEvent = events.find((e) => e.event === 'response.completed');
+      expect(completedEvent).toBeDefined();
+      const response = completedEvent!.data.response as Record<string, unknown>;
+      const output = response.output as Array<Record<string, unknown>>;
+
+      const messageItems = output.filter((i) => i.type === 'message');
+      const fcItems = output.filter((i) => i.type === 'function_call');
+      expect(messageItems).toHaveLength(0);
+      expect(fcItems).toHaveLength(1);
+      expect(fcItems[0].name).toBe('search');
+    });
+
+    it('streams text deltas normally when no tool calls are present', async () => {
+      const streamEvents = [
+        { done: false, text: 'Hello', isReasoning: false },
+        { done: false, text: ' world!', isReasoning: false },
+        {
+          done: true,
+          text: 'Hello world!',
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 3,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: 'Hello world!',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('stream-model', mockModel);
+
+      const handler = createHandler(registry);
+      const reqBody = {
+        model: 'stream-model',
+        input: 'Say hello',
+        stream: true,
+      };
+      const req = createMockReq('POST', '/v1/responses', reqBody);
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      handler(req, res);
+      await waitForEnd();
+
+      const body = getBody();
+
+      // Parse SSE events
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      // All text deltas should be present
+      const textDeltas = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string);
+      expect(textDeltas).toEqual(['Hello', ' world!']);
+
+      // output_text.done should have the final text
+      const textDone = events.find((e) => e.event === 'response.output_text.done');
+      expect(textDone).toBeDefined();
+      expect(textDone!.data.text).toBe('Hello world!');
     });
   });
 });

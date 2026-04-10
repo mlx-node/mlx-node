@@ -93,6 +93,7 @@ async function handleStreamingNative(
   let messageText = '';
   let hasEmittedMessage = false;
   let hasEmittedReasoning = false;
+  let suppressTextDeltas = false;
 
   const chatStream = (
     model as unknown as {
@@ -127,8 +128,15 @@ async function handleStreamingNative(
         });
       }
 
-      // Close message item if open
-      if (hasEmittedMessage && messageItemId) {
+      // Close message item if open.
+      // Use the final event's parsed text (markup-stripped) as the authoritative content.
+      // If the parsed text is empty and there are tool calls, skip the message item entirely
+      // (matching the non-streaming buildOutputItems behavior).
+      const finalText = event.text;
+      const hasToolCalls = event.toolCalls.length > 0;
+      const skipMessageItem = !finalText && hasToolCalls;
+
+      if (hasEmittedMessage && messageItemId && !skipMessageItem) {
         const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
         const contentIndex = 0;
 
@@ -136,10 +144,10 @@ async function handleStreamingNative(
           item_id: messageItemId,
           output_index: miIndex >= 0 ? miIndex : outputIndex,
           content_index: contentIndex,
-          text: messageText,
+          text: finalText,
         });
 
-        const textPart = { type: 'output_text' as const, text: messageText, annotations: [] as never[] };
+        const textPart = { type: 'output_text' as const, text: finalText, annotations: [] as never[] };
         writeSSEEvent(res, 'response.content_part.done', {
           item_id: messageItemId,
           output_index: miIndex >= 0 ? miIndex : outputIndex,
@@ -161,6 +169,12 @@ async function handleStreamingNative(
           output_index: miIndex >= 0 ? miIndex : outputIndex,
           item: messageItem,
         });
+      } else if (hasEmittedMessage && messageItemId && skipMessageItem) {
+        // Remove the message placeholder from outputItems since we're skipping it
+        const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
+        if (miIndex >= 0) {
+          outputItems.splice(miIndex, 1);
+        }
       }
 
       // Emit function call items
@@ -248,39 +262,48 @@ async function handleStreamingNative(
         delta: event.text,
       });
     } else {
-      if (!hasEmittedMessage) {
-        // First content chunk -- add message item
-        hasEmittedMessage = true;
-        messageItemId = genId('msg_');
-        const messageItem: MessageOutputItem = {
-          id: messageItemId,
-          type: 'message',
-          role: 'assistant',
-          status: 'in_progress',
-          content: [],
-        };
-        const miIndex = outputItems.length;
-        outputItems.push(messageItem);
-        outputIndex = miIndex;
+      messageText += event.text;
 
-        writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+      // Detect tool-call markup in the accumulated text. Once we see `<tool_call>`,
+      // suppress all further text deltas — the raw XML should not leak to clients.
+      if (!suppressTextDeltas && messageText.includes('<tool_call>')) {
+        suppressTextDeltas = true;
+      }
 
-        // Add content part
-        const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-        writeSSEEvent(res, 'response.content_part.added', {
+      if (!suppressTextDeltas) {
+        if (!hasEmittedMessage) {
+          // First content chunk -- add message item
+          hasEmittedMessage = true;
+          messageItemId = genId('msg_');
+          const messageItem: MessageOutputItem = {
+            id: messageItemId,
+            type: 'message',
+            role: 'assistant',
+            status: 'in_progress',
+            content: [],
+          };
+          const miIndex = outputItems.length;
+          outputItems.push(messageItem);
+          outputIndex = miIndex;
+
+          writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+
+          // Add content part
+          const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+          writeSSEEvent(res, 'response.content_part.added', {
+            item_id: messageItemId,
+            output_index: miIndex,
+            content_index: 0,
+            part: textPart,
+          });
+        }
+        writeSSEEvent(res, 'response.output_text.delta', {
           item_id: messageItemId,
-          output_index: miIndex,
+          output_index: outputItems.findIndex((i) => i.id === messageItemId),
           content_index: 0,
-          part: textPart,
+          delta: event.text,
         });
       }
-      messageText += event.text;
-      writeSSEEvent(res, 'response.output_text.delta', {
-        item_id: messageItemId,
-        output_index: outputItems.findIndex((i) => i.id === messageItemId),
-        content_index: 0,
-        delta: event.text,
-      });
     }
   }
 }
