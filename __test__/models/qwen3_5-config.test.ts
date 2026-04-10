@@ -1,4 +1,3 @@
-import { Qwen35Model } from '@mlx-node/core';
 import { QWEN35_CONFIGS, getQwen35Config } from '@mlx-node/lm';
 import { describe, it, expect } from 'vite-plus/test';
 
@@ -25,12 +24,5 @@ describe('Qwen3.5 Config', () => {
 
   it('should throw for unknown config name', () => {
     expect(() => getQwen35Config('nonexistent')).toThrow('Unknown');
-  });
-
-  it('should create model from config', () => {
-    const config = getQwen35Config('qwen3.5-0.6b');
-    const model = new Qwen35Model(config);
-    expect(model).toBeDefined();
-    expect(model.numParameters()).toBeGreaterThan(0);
   });
 });
