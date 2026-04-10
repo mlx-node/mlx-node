@@ -787,7 +787,7 @@ fn apply_weights_moe_inner(
 /// Load a pretrained Qwen3.5 MoE model into a dedicated model thread.
 ///
 /// All model state lives on the spawned thread. Returns a thin NAPI shell
-/// with the thread handle and dummy training fields.
+/// with the thread handle and model configuration.
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
     let model_path = model_path.to_string();
 
