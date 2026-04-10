@@ -1656,6 +1656,7 @@ impl Qwen3Inner {
             tool_calls,
             thinking,
             num_tokens: generated_tokens.len() as u32,
+            prompt_tokens: prompt_token_count as u32,
             finish_reason,
             raw_text,
             performance,

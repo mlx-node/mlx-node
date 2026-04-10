@@ -996,6 +996,7 @@ impl Qwen35MoeInner {
             performance,
             p.include_reasoning,
             enable_thinking.unwrap_or(true),
+            prefill_tokens.len() as u32,
         )
     }
 
@@ -1508,6 +1509,7 @@ impl Qwen35MoeInner {
                     tool_calls: None,
                     thinking: None,
                     num_tokens: None,
+                    prompt_tokens: None,
                     raw_text: None,
                     performance: None,
                     is_reasoning: Some(last_is_reasoning),
@@ -1517,6 +1519,7 @@ impl Qwen35MoeInner {
         }
 
         let num_tokens = generated_tokens.len() as u32;
+        let prompt_token_count = prefill_tokens.len() as u32;
 
         let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
             &text,
@@ -1549,6 +1552,7 @@ impl Qwen35MoeInner {
                 tool_calls: Some(tool_calls),
                 thinking,
                 num_tokens: Some(num_tokens),
+                prompt_tokens: Some(prompt_token_count),
                 raw_text: Some(text),
                 performance: perf_metrics,
                 is_reasoning: None,
