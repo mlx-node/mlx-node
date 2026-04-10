@@ -153,14 +153,16 @@ impl ModelThreadTrainingState {
         })?;
 
         // --- Invariant 2: `format` field required and must be "adamw_optimizer_state" ---
-        let fmt = metadata
-            .get("format")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                Error::from_reason(format!(
-                    "'{path}': optimizer state file is missing required metadata field 'format'"
-                ))
-            })?;
+        let fmt = metadata.get("format").ok_or_else(|| {
+            Error::from_reason(format!(
+                "'{path}': optimizer state file is missing required metadata field 'format'"
+            ))
+        })?;
+        let fmt = fmt.as_str().ok_or_else(|| {
+            Error::from_reason(format!(
+                "'{path}': metadata field 'format' must be a string, got {fmt}"
+            ))
+        })?;
         if fmt != "adamw_optimizer_state" {
             return Err(Error::from_reason(format!(
                 "'{path}': expected format=adamw_optimizer_state, got format={fmt}"
@@ -168,14 +170,16 @@ impl ModelThreadTrainingState {
         }
 
         // --- Invariant 3: `step` field required and parseable as i64 ---
-        let step_str = metadata
-            .get("step")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                Error::from_reason(format!(
-                    "'{path}': optimizer state file is missing required metadata field 'step'"
-                ))
-            })?;
+        let step_val = metadata.get("step").ok_or_else(|| {
+            Error::from_reason(format!(
+                "'{path}': optimizer state file is missing required metadata field 'step'"
+            ))
+        })?;
+        let step_str = step_val.as_str().ok_or_else(|| {
+            Error::from_reason(format!(
+                "'{path}': metadata field 'step' must be a string, got {step_val}"
+            ))
+        })?;
         let step = step_str.parse::<i64>().map_err(|_| {
             Error::from_reason(format!(
                 "'{path}': metadata field 'step' is not a valid i64 integer: {step_str:?}"
@@ -185,12 +189,23 @@ impl ModelThreadTrainingState {
         // Load tensor data now that metadata is validated.
         let tensors = st_file.load_tensors(path)?;
 
-        // --- Invariant 4: every tensor key must end in `.m` or `.v` ---
+        // --- Invariant 4: every tensor key must end in `.m` or `.v` and have a non-empty param name ---
         for tensor_key in tensors.keys() {
-            if !tensor_key.ends_with(".m") && !tensor_key.ends_with(".v") {
-                return Err(Error::from_reason(format!(
-                    "'{path}': unexpected tensor key {tensor_key:?} — all keys must end in '.m' or '.v' (is this a model.safetensors file?)"
-                )));
+            let stripped = tensor_key
+                .strip_suffix(".m")
+                .or_else(|| tensor_key.strip_suffix(".v"));
+            match stripped {
+                None => {
+                    return Err(Error::from_reason(format!(
+                        "'{path}': unexpected tensor key {tensor_key:?} — all keys must end in '.m' or '.v' (is this a model.safetensors file?)"
+                    )));
+                }
+                Some("") => {
+                    return Err(Error::from_reason(format!(
+                        "'{path}': tensor key {tensor_key:?} has empty param name"
+                    )));
+                }
+                Some(_) => {}
             }
         }
 
@@ -626,6 +641,83 @@ mod tests {
         assert!(
             msg.contains("nan") || msg.contains("inf") || msg.contains("corrupt"),
             "expected NaN/Inf error, got: {msg}"
+        );
+    }
+
+    // =========================================================================
+    // Test 8b: Empty param name (literal ".m" key) rejected
+    // =========================================================================
+
+    #[test]
+    fn load_empty_param_name_returns_error() {
+        // A tensor keyed literally ".m" strips to an empty param name. Even
+        // though it has the right suffix, accepting it would create an
+        // optimizer state entry with an empty name, which can never match
+        // any real parameter.
+        let path_str = tmp_path("empty_param");
+        let path_str = path_str.as_str();
+
+        write_test_safetensors(
+            path_str,
+            Some(serde_json::json!({"format": "adamw_optimizer_state", "step": "1"})),
+            &[(".m", 1.0), (".v", 1.0)],
+        );
+
+        let mut ts = make_training_state_with_adamw();
+        let err = ts.load_optimizer_state_sync(path_str).unwrap_err();
+        let msg = err.reason.to_lowercase();
+        assert!(
+            msg.contains("empty") && msg.contains("param"),
+            "expected empty-param-name error, got: {msg}"
+        );
+    }
+
+    // =========================================================================
+    // Test 8c: Wrong JSON type for `format` / `step` metadata rejected
+    // =========================================================================
+
+    #[test]
+    fn load_non_string_format_returns_error() {
+        // Metadata field `format` exists but is not a string. The error must
+        // distinguish "wrong type" from "missing", or the user wastes time
+        // debugging the wrong thing.
+        let path_str = tmp_path("non_string_format");
+        let path_str = path_str.as_str();
+
+        write_test_safetensors(
+            path_str,
+            Some(serde_json::json!({"format": 42, "step": "1"})),
+            &[("weight.m", 1.0), ("weight.v", 1.0)],
+        );
+
+        let mut ts = make_training_state_with_adamw();
+        let err = ts.load_optimizer_state_sync(path_str).unwrap_err();
+        let msg = err.reason.to_lowercase();
+        assert!(
+            msg.contains("'format'") || msg.contains("format") && msg.contains("string"),
+            "expected wrong-type error for 'format', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_non_string_step_returns_error() {
+        // Metadata field `step` exists but is a JSON number rather than the
+        // string we serialize. Must report wrong-type, not "missing".
+        let path_str = tmp_path("non_string_step");
+        let path_str = path_str.as_str();
+
+        write_test_safetensors(
+            path_str,
+            Some(serde_json::json!({"format": "adamw_optimizer_state", "step": 1})),
+            &[("weight.m", 1.0), ("weight.v", 1.0)],
+        );
+
+        let mut ts = make_training_state_with_adamw();
+        let err = ts.load_optimizer_state_sync(path_str).unwrap_err();
+        let msg = err.reason.to_lowercase();
+        assert!(
+            msg.contains("'step'") || msg.contains("step") && msg.contains("string"),
+            "expected wrong-type error for 'step', got: {msg}"
         );
     }
 
