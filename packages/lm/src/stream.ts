@@ -11,7 +11,7 @@ import type {
   ChatStreamHandle,
   PerformanceMetrics,
   ToolCallResult,
-  Gemma4ChatConfig
+  Gemma4ChatConfig,
 } from '@mlx-node/core';
 
 export interface ChatStreamDelta {
@@ -210,8 +210,6 @@ export class Gemma4Model extends Gemma4ModelNative {
 
   // @ts-expect-error — override callback-based chatStream with AsyncGenerator
   async *chatStream(messages: ChatMessage[], config?: Gemma4ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
-    // fixme: We pass `as any` because Gemma4ChatStreamChunk and ChatStreamChunk are structurally identical...
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    yield* _createChatStream(_nativeGemma4ChatStream as any, this, messages, config);
+    yield* _createChatStream(_nativeGemma4ChatStream, this, messages, config);
   }
 }
