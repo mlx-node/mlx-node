@@ -25,12 +25,11 @@ echo ""
 echo "--- Step 1: Building WASM via NAPI-RS ---"
 cd "$ROOT_DIR"
 
-# -fwasm-exceptions enables native WASM EH (try/catch/throw instructions).
-# Set globally so ALL cc-rs crates (esaxx-rs, etc.) compile with EH support.
-# Note: vtable GC is prevented by --whole-archive in mlx-sys/build.rs;
-# stack size (64 MB) is set by napi_build::setup() in mlx-core/build.rs.
+# C++ exception flags (-fexceptions -fwasm-exceptions) are set in mlx-sys/build.rs
+# for both cmake and cc::Build. Vtable GC is prevented by --whole-archive in
+# mlx-sys/build.rs. Stack size (64 MB) is set by napi_build::setup() in
+# mlx-core/build.rs.
 if ! WASI_SDK_PATH="$WASI_SDK_PATH" \
-  CXXFLAGS="-fexceptions -fwasm-exceptions" \
     "$ROOT_DIR/node_modules/.bin/napi" build \
       --manifest-path crates/mlx-core/Cargo.toml \
       --target wasm32-wasip1-threads \
