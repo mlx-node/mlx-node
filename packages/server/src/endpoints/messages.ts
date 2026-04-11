@@ -363,7 +363,7 @@ async function handleStreamingSimulated(
 
   // message_delta + message_stop
   const stopReason = mapStopReason(result.finishReason, hasToolCalls);
-  writeSSEEvent(res, 'message_delta', buildMessageDelta(stopReason, result.numTokens));
+  writeSSEEvent(res, 'message_delta', buildMessageDelta(stopReason, result.numTokens, result.promptTokens));
   writeSSEEvent(res, 'message_stop', buildMessageStop());
 
   endSSE(res);
