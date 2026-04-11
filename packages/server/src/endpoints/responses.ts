@@ -605,6 +605,10 @@ export async function handleCreateResponse(
   store: ResponseStore | null,
 ): Promise<void> {
   // Validate required fields
+  if (body == null || typeof body !== 'object') {
+    sendBadRequest(res, 'Request body must be a JSON object', 'body');
+    return;
+  }
   if (!body.model) {
     sendBadRequest(res, 'Missing required field: model', 'model');
     return;

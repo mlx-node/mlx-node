@@ -370,6 +370,10 @@ export async function handleCreateMessage(
   registry: ModelRegistry,
 ): Promise<void> {
   // Validate required fields
+  if (body == null || typeof body !== 'object') {
+    sendAnthropicBadRequest(res, 'Request body must be a JSON object');
+    return;
+  }
   if (!body.model) {
     sendAnthropicBadRequest(res, 'Missing required field: model');
     return;

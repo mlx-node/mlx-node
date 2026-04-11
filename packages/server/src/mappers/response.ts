@@ -51,8 +51,11 @@ export function buildOutputItems(result: ChatResult): OutputItem[] {
     items.push(reasoningItem);
   }
 
+  // Function call items (only successfully parsed tool calls)
+  const okToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
+
   // Message item (always present even if text is empty, as long as there is content)
-  if (result.text || result.toolCalls.length === 0) {
+  if (result.text || okToolCalls.length === 0) {
     const messageItem: MessageOutputItem = {
       id: genId('msg_'),
       type: 'message',
@@ -63,8 +66,7 @@ export function buildOutputItems(result: ChatResult): OutputItem[] {
     items.push(messageItem);
   }
 
-  // Function call items (only successfully parsed tool calls)
-  for (const tc of result.toolCalls.filter((t) => t.status === 'ok')) {
+  for (const tc of okToolCalls) {
     const callId = tc.id ?? genId('call_');
     const fcItem: FunctionCallOutputItem = {
       id: genId('fc_'),

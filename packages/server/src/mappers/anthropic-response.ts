@@ -54,13 +54,15 @@ export function buildAnthropicContent(result: ChatResult): AnthropicResponseCont
     content.push({ type: 'thinking', thinking: result.thinking });
   }
 
-  // Text block (present if text is non-empty, or if there are no tool calls)
-  if (result.text || result.toolCalls.length === 0) {
+  // Tool use blocks (only successfully parsed tool calls)
+  const okToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
+
+  // Text block (present if text is non-empty, or if there are no ok tool calls)
+  if (result.text || okToolCalls.length === 0) {
     content.push({ type: 'text', text: result.text });
   }
 
-  // Tool use blocks (only successfully parsed tool calls)
-  for (const tc of result.toolCalls.filter((t) => t.status === 'ok')) {
+  for (const tc of okToolCalls) {
     content.push({
       type: 'tool_use',
       id: tc.id ?? genId('toolu_'),
