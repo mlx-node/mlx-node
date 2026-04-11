@@ -12,10 +12,15 @@ import type { ContentPart, ResponsesAPIRequest, ResponsesToolDefinition } from '
  */
 function resolveContent(content: string | ContentPart[]): string {
   if (typeof content === 'string') return content;
-  return content
-    .filter((p) => p.type === 'input_text')
-    .map((p) => p.text)
-    .join('');
+  const parts: string[] = [];
+  for (const p of content) {
+    if (p.type === 'input_text') {
+      parts.push(p.text);
+    } else {
+      throw new Error(`Unsupported content part type: "${p.type}"`);
+    }
+  }
+  return parts.join('');
 }
 
 /**

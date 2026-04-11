@@ -237,7 +237,7 @@ async function handleStreamingNative(
         if (tagIdx >= 0) {
           // Emit clean prefix as text deltas
           const cleanPrefix = pendingText.slice(0, tagIdx);
-          if (cleanPrefix) {
+          if (cleanPrefix.trim()) {
             if (!hasEmittedText) {
               if (hasEmittedThinking) {
                 writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));

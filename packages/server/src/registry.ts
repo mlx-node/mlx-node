@@ -65,9 +65,11 @@ export class ModelRegistry {
 
   /**
    * Check whether a model supports streaming via `chatStream()`.
-   * Uses duck-typing: if the model has a `chatStream` method it is streaming-capable.
+   * Uses duck-typing: the model must have a `chatStream` method that returns an
+   * async iterable (2 params), not a callback-based stream (3 params).
    */
   hasStreamSupport(model: ServableModel): boolean {
-    return typeof (model as unknown as Record<string, unknown>)['chatStream'] === 'function';
+    const fn = (model as unknown as Record<string, unknown>)['chatStream'];
+    return typeof fn === 'function' && (fn as Function).length <= 2;
   }
 }
