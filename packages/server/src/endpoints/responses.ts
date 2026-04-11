@@ -328,8 +328,10 @@ async function handleStreamingNative(
           item: closedMessageItem,
         });
 
+        // Mark for exclusion from final response but keep in array
+        // so subsequent output_index values remain unique.
         if (miIndex >= 0) {
-          outputItems.splice(miIndex, 1);
+          (outputItems[miIndex] as Record<string, unknown>)._suppressed = true;
         }
       }
 
@@ -374,11 +376,12 @@ async function handleStreamingNative(
         total_tokens: promptTokens + event.numTokens,
       };
 
+      const finalOutput = outputItems.filter((i) => !(i as Record<string, unknown>)._suppressed);
       const completedResponse: ResponseObject = {
         ...partial,
         status: mapFinishReasonToStatus(event.finishReason),
-        output: outputItems,
-        output_text: computeOutputText(outputItems),
+        output: finalOutput,
+        output_text: computeOutputText(finalOutput),
         incomplete_details: event.finishReason === 'length' ? { reason: 'max_output_tokens' } : null,
         usage,
       };
@@ -498,11 +501,12 @@ async function handleStreamingNative(
   // Safety net: if the async iterator exhausted without a done event,
   // emit a completed response with whatever partial state we have so
   // clients and previous_response_id chaining don't see a dangling stream.
+  const fallbackOutput = outputItems.filter((i) => !(i as Record<string, unknown>)._suppressed);
   const fallbackResponse: ResponseObject = {
     ...partial,
     status: 'incomplete',
-    output: outputItems,
-    output_text: computeOutputText(outputItems),
+    output: fallbackOutput,
+    output_text: computeOutputText(fallbackOutput),
     incomplete_details: { reason: 'max_output_tokens' },
     usage: { input_tokens: 0, output_tokens: 0, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 0 },
   };

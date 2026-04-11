@@ -554,13 +554,27 @@ impl QianfanOCRModel {
                 None
             };
 
+            let reasoning_tokens = if thinking.is_some() {
+                if let Some(end_id) = tokenizer.think_end_id() {
+                    generated_tokens
+                        .iter()
+                        .position(|&t| t == end_id)
+                        .map(|pos| pos as u32)
+                        .unwrap_or(generated_tokens.len() as u32)
+                } else {
+                    generated_tokens.len() as u32
+                }
+            } else {
+                0
+            };
+
             Ok(ChatResult {
                 text: text.trim().to_string(),
                 tool_calls,
                 thinking,
                 num_tokens: generated_tokens.len() as u32,
                 prompt_tokens: prefill_token_count as u32,
-                reasoning_tokens: 0,
+                reasoning_tokens,
                 finish_reason,
                 raw_text: raw_decoded,
                 performance,
@@ -1001,6 +1015,20 @@ impl QianfanOCRModel {
                             None
                         };
 
+                        let reasoning_tokens = if thinking.is_some() {
+                            if let Some(end_id) = tokenizer.think_end_id() {
+                                generated_tokens
+                                    .iter()
+                                    .position(|&t| t == end_id)
+                                    .map(|pos| pos as u32)
+                                    .unwrap_or(generated_tokens.len() as u32)
+                            } else {
+                                generated_tokens.len() as u32
+                            }
+                        } else {
+                            0
+                        };
+
                         emit(ChatStreamChunk {
                             text: text.trim().to_string(),
                             done: true,
@@ -1009,7 +1037,7 @@ impl QianfanOCRModel {
                             thinking,
                             num_tokens: Some(generated_tokens.len() as u32),
                             prompt_tokens: Some(prefill_token_count as u32),
-                            reasoning_tokens: Some(0),
+                            reasoning_tokens: Some(reasoning_tokens),
                             raw_text: Some(raw_decoded),
                             performance,
                             is_reasoning: None,

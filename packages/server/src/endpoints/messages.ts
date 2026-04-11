@@ -284,6 +284,10 @@ async function handleStreamingNative(
 
   // Safety net: if the async iterator exhausted without a done event,
   // emit terminal events so clients don't see a dangling stream.
+  if (hasEmittedThinking && !hasEmittedText) {
+    // Thinking block was opened but text block was never started — close thinking
+    writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+  }
   if (hasEmittedText) {
     writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
   }
