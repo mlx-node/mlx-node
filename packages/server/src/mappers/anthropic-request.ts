@@ -108,8 +108,9 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
               content: resolveToolResultContent(block.content),
               toolCallId: block.tool_use_id,
             });
+          } else {
+            throw new Error(`Unsupported content block type: "${block.type}"`);
           }
-          // Ignore other block types
         }
 
         // Flush any remaining text/images
