@@ -77,6 +77,17 @@ async function handleStreamingNative(
   store: ResponseStore | null,
   newInputMessages: ChatMessage[],
 ): Promise<void> {
+  const chatStream = (
+    model as unknown as {
+      chatStream(m: ChatMessage[], c: unknown): AsyncGenerator<ChatStreamEvent>;
+    }
+  ).chatStream(messages, config);
+
+  if (!chatStream || typeof (chatStream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] !== 'function') {
+    // chatStream did not return an async iterable — fall back to simulated streaming
+    return handleStreamingSimulated(res, model, messages, config, req, responseId, previousResponseId, store, newInputMessages);
+  }
+
   beginSSE(res);
 
   const partial = buildPartialResponse(req, responseId, previousResponseId);
@@ -97,17 +108,6 @@ async function handleStreamingNative(
   let hasEmittedMessage = false;
   let hasEmittedReasoning = false;
   let suppressTextDeltas = false;
-
-  const chatStream = (
-    model as unknown as {
-      chatStream(m: ChatMessage[], c: unknown): AsyncGenerator<ChatStreamEvent>;
-    }
-  ).chatStream(messages, config);
-
-  if (!chatStream || typeof (chatStream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] !== 'function') {
-    // chatStream did not return an async iterable — fall back to simulated streaming
-    return handleStreamingSimulated(res, model, messages, config, req, responseId, previousResponseId, store, newInputMessages);
-  }
 
   for await (const event of chatStream) {
     if (event.done) {

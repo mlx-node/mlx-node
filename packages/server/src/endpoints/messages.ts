@@ -57,6 +57,17 @@ async function handleStreamingNative(
   config: ChatConfig,
   body: AnthropicMessagesRequest,
 ): Promise<void> {
+  const chatStream = (
+    model as unknown as {
+      chatStream(m: ChatMessage[], c: unknown): AsyncGenerator<ChatStreamEvent>;
+    }
+  ).chatStream(messages, config);
+
+  if (!chatStream || typeof (chatStream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] !== 'function') {
+    // chatStream did not return an async iterable — fall back to simulated streaming
+    return handleStreamingSimulated(res, model, messages, config, body);
+  }
+
   const messageId = genId('msg_');
   beginSSE(res);
 
@@ -69,17 +80,6 @@ async function handleStreamingNative(
   let suppressTextDeltas = false;
   let emittedTextLength = 0;
   const TOOL_CALL_TAG = '<tool_call>';
-
-  const chatStream = (
-    model as unknown as {
-      chatStream(m: ChatMessage[], c: unknown): AsyncGenerator<ChatStreamEvent>;
-    }
-  ).chatStream(messages, config);
-
-  if (!chatStream || typeof (chatStream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] !== 'function') {
-    // chatStream did not return an async iterable — fall back to simulated streaming
-    return handleStreamingSimulated(res, model, messages, config, body);
-  }
 
   for await (const event of chatStream) {
     if (event.done) {
