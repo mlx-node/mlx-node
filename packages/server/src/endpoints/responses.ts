@@ -495,7 +495,23 @@ async function handleStreamingNative(
     }
   }
 
-  // Safety net: if the async iterator exhausted without a done event, close SSE
+  // Safety net: if the async iterator exhausted without a done event,
+  // emit a completed response with whatever partial state we have so
+  // clients and previous_response_id chaining don't see a dangling stream.
+  const fallbackResponse: ResponseObject = {
+    ...partial,
+    status: 'incomplete',
+    output: outputItems,
+    output_text: computeOutputText(outputItems),
+    incomplete_details: { reason: 'max_output_tokens' },
+    usage: { input_tokens: 0, output_tokens: 0, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 0 },
+  };
+
+  if (store && req.store !== false) {
+    await persistResponse(store, fallbackResponse, newInputMessages, previousResponseId);
+  }
+
+  writeSSEEvent(res, 'response.completed', { response: fallbackResponse });
   endSSE(res);
 }
 

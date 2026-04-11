@@ -282,7 +282,13 @@ async function handleStreamingNative(
     }
   }
 
-  // Safety net: if the async iterator exhausted without a done event, close SSE
+  // Safety net: if the async iterator exhausted without a done event,
+  // emit terminal events so clients don't see a dangling stream.
+  if (hasEmittedText) {
+    writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
+  }
+  writeSSEEvent(res, 'message_delta', buildMessageDelta('end_turn', 0));
+  writeSSEEvent(res, 'message_stop', buildMessageStop());
   endSSE(res);
 }
 
