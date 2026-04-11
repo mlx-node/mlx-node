@@ -30,6 +30,14 @@ function createMockReq(method: string, url: string, body?: object): IncomingMess
   return req;
 }
 
+class MockServerResponse extends Writable {
+  headersSent = true;
+
+  writeHead(_s: number, _h?: Record<string, string>) {}
+  setHeader(_name: string, _value: string) {}
+  getHeader(_name: string) {}
+}
+
 /**
  * Capture writes to a ServerResponse via a simple writable mock.
  */
@@ -48,7 +56,7 @@ function createMockRes(): {
     endResolve = resolve;
   });
 
-  const writable = new Writable({
+  const writable = new MockServerResponse({
     write(chunk: Uint8Array | string, _encoding: string, callback: () => void) {
       body += chunk.toString();
       callback();
@@ -77,10 +85,11 @@ function createMockRes(): {
   writable.headersSent = false;
 
   const origEnd = writable.end.bind(writable);
-  writable.end = (chunk?: string | Uint8Array, ...args: any[]) => {
+  // @ts-expect-error
+  writable.end = (chunk: string | Uint8Array, encoding: BufferEncoding, cb?: () => void) => {
     if (chunk) body += chunk.toString();
     writable.headersSent = true;
-    origEnd(undefined, ...args);
+    origEnd(undefined, encoding, cb);
     endResolve();
     return writable;
   };
