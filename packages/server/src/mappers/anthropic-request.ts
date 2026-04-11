@@ -130,17 +130,24 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
       if (typeof content === 'string') {
         messages.push({ role: 'assistant', content });
       } else {
-        // Combine all blocks into a single assistant message
+        // Combine all blocks into a single assistant message.
+        // The internal ChatMessage format does not support mixed text/tool_use
+        // ordering, so reject interleaved blocks rather than silently reordering.
         let text = '';
         let reasoningContent: string | undefined;
         const toolCalls: { id: string; name: string; arguments: string }[] = [];
+        let seenToolUse = false;
 
         for (const block of content as AnthropicContentBlock[]) {
           if (block.type === 'text') {
+            if (seenToolUse) {
+              throw new Error('Text blocks after tool_use blocks are not supported in assistant messages');
+            }
             text += block.text;
           } else if (block.type === 'thinking') {
             reasoningContent = (reasoningContent ?? '') + block.thinking;
           } else if (block.type === 'tool_use') {
+            seenToolUse = true;
             toolCalls.push({
               id: block.id,
               name: block.name,
