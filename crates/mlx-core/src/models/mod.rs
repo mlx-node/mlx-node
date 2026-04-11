@@ -5,6 +5,7 @@
  */
 pub mod gemma4;
 pub mod harrier;
+pub mod lfm2;
 pub mod paddleocr_vl;
 pub mod pp_doc_ori;
 pub mod pp_doc_unwarp;

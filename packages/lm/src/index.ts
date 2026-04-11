@@ -26,6 +26,11 @@ export type { HarrierConfig } from '@mlx-node/core';
 export { Qwen35Model, Qwen35Model as Qwen3_5Model } from './stream.js';
 export type { Qwen35Config, Qwen35GenerationConfig, Qwen35GenerationResult } from '@mlx-node/core';
 
+// LFM2 models
+export { Lfm2Model } from './stream.js';
+export type { Lfm2Config } from '@mlx-node/core';
+export { LFM2_CONFIGS, getLfm2Config } from './models/lfm2-configs.js';
+
 // MoE variant
 export { Qwen35MoeModel, Qwen35MoeModel as Qwen3_5MoeModel } from './stream.js';
 export type { Qwen35MoeConfig, Qwen35MoeGenerationConfig, Qwen35MoeGenerationResult } from '@mlx-node/core';

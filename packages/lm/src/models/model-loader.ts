@@ -10,9 +10,9 @@ import { join } from 'node:path';
 import { Gemma4Model, HarrierModel, Qwen3Model, QianfanOCRModel } from '@mlx-node/core';
 
 import type { LoadableModel, TrainableModel } from '../interfaces.js';
-import { Qwen35Model, Qwen35MoeModel } from '../stream.js';
+import { Lfm2Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
-export type ModelType = 'qwen3' | 'qwen3_5' | 'qwen3_5_moe' | 'internvl_chat' | 'qianfan-ocr' | 'harrier' | 'gemma4';
+export type ModelType = 'qwen3' | 'qwen3_5' | 'qwen3_5_moe' | 'internvl_chat' | 'qianfan-ocr' | 'harrier' | 'gemma4' | 'lfm2';
 
 const SUPPORTED_MODEL_TYPES = new Set<ModelType>([
   'qwen3',
@@ -22,6 +22,7 @@ const SUPPORTED_MODEL_TYPES = new Set<ModelType>([
   'qianfan-ocr',
   'harrier',
   'gemma4',
+  'lfm2',
 ]);
 
 /**
@@ -47,6 +48,8 @@ export async function loadModel(modelPath: string): Promise<LoadableModel> {
       return QianfanOCRModel.load(modelPath) as unknown as Promise<LoadableModel>;
     case 'gemma4':
       return Gemma4Model.load(modelPath) as unknown as Promise<LoadableModel>;
+    case 'lfm2':
+      return Lfm2Model.load(modelPath) as unknown as Promise<LoadableModel>;
   }
 }
 

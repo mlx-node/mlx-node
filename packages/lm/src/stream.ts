@@ -1,4 +1,8 @@
-import { Qwen35Model as Qwen35ModelNative, Qwen35MoeModel as Qwen35MoeModelNative } from '@mlx-node/core';
+import {
+  Lfm2Model as Lfm2ModelNative,
+  Qwen35Model as Qwen35ModelNative,
+  Qwen35MoeModel as Qwen35MoeModelNative,
+} from '@mlx-node/core';
 import type {
   ChatConfig,
   ChatMessage,
@@ -34,6 +38,8 @@ export type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
 const _nativeDenseChatStream = Qwen35ModelNative.prototype.chatStream;
 // oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeMoeChatStream = Qwen35MoeModelNative.prototype.chatStream;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeLfm2ChatStream = Lfm2ModelNative.prototype.chatStream;
 
 /**
  * Shared AsyncGenerator implementation that wraps a native callback-based
@@ -153,5 +159,29 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
   // @ts-expect-error — override callback-based chatStream with AsyncGenerator
   async *chatStream(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
     yield* _createChatStream(_nativeMoeChatStream, this, messages, config);
+  }
+}
+
+/**
+ * LFM2 model with AsyncGenerator-based `chatStream()`.
+ *
+ * @example
+ * ```typescript
+ * const model = await Lfm2Model.load('./models/lfm2.5-1.2b-thinking');
+ * for await (const event of model.chatStream(messages)) {
+ *   if (!event.done) process.stdout.write(event.text);
+ * }
+ * ```
+ */
+export class Lfm2Model extends Lfm2ModelNative {
+  static override async load(modelPath: string): Promise<Lfm2Model> {
+    const instance = await Lfm2ModelNative.load(modelPath);
+    Object.setPrototypeOf(instance, Lfm2Model.prototype);
+    return instance as unknown as Lfm2Model;
+  }
+
+  // @ts-expect-error — override callback-based chatStream with AsyncGenerator
+  async *chatStream(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
+    yield* _createChatStream(_nativeLfm2ChatStream, this, messages, config);
   }
 }

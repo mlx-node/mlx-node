@@ -362,6 +362,33 @@ export declare class HarrierModel {
   static load(modelPath: string): Promise<HarrierModel>;
 }
 
+/**
+ * LFM2 language model (LFM2.5-1.2B-Thinking).
+ *
+ * Hybrid conv+attention architecture from Liquid AI. 16 layers total:
+ * 10 conv layers + 6 full_attention layers. Features gated short
+ * convolutions for local processing and standard attention for global context.
+ *
+ * All model state lives on a dedicated OS thread. NAPI methods dispatch
+ * commands via channels and await responses.
+ */
+export declare class Lfm2Model {
+  /** Load an LFM2 model from a directory containing safetensors and config.json. */
+  static load(modelPath: string): Promise<Lfm2Model>;
+  /** Chat with the model using a list of messages. */
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /** Streaming chat with the model. Calls the callback for each token chunk. */
+  chatStream(
+    messages: Array<ChatMessage>,
+    config: ChatConfig | undefined | null,
+    callback: (err: Error | null, arg: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Get the model configuration. */
+  getConfig(): Lfm2Config;
+  /** Estimated number of model parameters. */
+  numParameters(): number;
+}
+
 export declare class MxArray {
   equal(other: MxArray): MxArray;
   notEqual(other: MxArray): MxArray;
@@ -2878,6 +2905,35 @@ export interface LayoutElement {
   bbox: Array<number>;
   /** Reading order index (0 = first element to read) */
   order: number;
+}
+
+/**
+ * LFM2 model configuration.
+ *
+ * Supports LiquidAI's LFM2.5 hybrid conv+attention architecture.
+ * 16 layers total: 10 conv + 6 full_attention, defined by `layer_types` array.
+ */
+export interface Lfm2Config {
+  vocabSize: number;
+  hiddenSize: number;
+  numHiddenLayers: number;
+  numAttentionHeads: number;
+  numKeyValueHeads: number;
+  maxPositionEmbeddings: number;
+  normEps: number;
+  convBias: boolean;
+  convLCache: number;
+  blockDim: number;
+  blockFfDim: number;
+  blockMultipleOf: number;
+  blockFfnDimMultiplier: number;
+  blockAutoAdjustFfDim: boolean;
+  ropeTheta: number;
+  layerTypes: Array<string>;
+  tieEmbedding: boolean;
+  eosTokenId: number;
+  bosTokenId: number;
+  padTokenId: number;
 }
 
 export interface MemorySnapshot {
