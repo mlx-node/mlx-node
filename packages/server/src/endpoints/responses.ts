@@ -215,6 +215,18 @@ async function handleStreamingNative(
         }
       }
 
+      // Emit any unsent suffix when final text is longer than what was streamed
+      if (hasEmittedMessage && finalText && finalText.length > messageText.length && !tagBuffer.suppressed) {
+        const unsent = finalText.slice(messageText.length);
+        messageText += unsent;
+        writeSSEEvent(res, 'response.output_text.delta', {
+          item_id: messageItemId,
+          output_index: outputItems.findIndex((i) => i.id === messageItemId),
+          content_index: 0,
+          delta: unsent,
+        });
+      }
+
       // Recovery: text was never emitted during streaming but final has text
       // (possible if all text arrived in the final event only)
       if (!hasEmittedMessage && finalText && !skipMessageItem) {
@@ -685,8 +697,13 @@ export async function handleCreateResponse(
       }
       priorMessages = reconstructMessagesFromChain(chain);
       previousResponseId = body.previous_response_id;
-    } catch {
-      sendNotFound(res, `Previous response "${body.previous_response_id}" not found or expired`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '';
+      if (/not found/i.test(msg)) {
+        sendNotFound(res, `Previous response "${body.previous_response_id}" not found or expired`);
+      } else {
+        sendInternalError(res, `Failed to retrieve previous response: ${msg || 'unknown error'}`);
+      }
       return;
     }
   } else if (body.previous_response_id && !store) {

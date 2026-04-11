@@ -149,13 +149,19 @@ async function handleStreamingNative(
         }
       }
 
+      // Emit any unsent suffix when final text is longer than what was streamed
+      if (hasEmittedText && finalText && finalText.length > emittedTextLength) {
+        const unsent = finalText.slice(emittedTextLength);
+        emittedTextLength += unsent.length;
+        writeSSEEvent(
+          res,
+          'content_block_delta',
+          buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: unsent }),
+        );
+      }
+
       if (hasEmittedText) {
-        if (!finalText && hasToolCalls) {
-          // Text block was opened but final text is empty with tool calls -- close it
-          writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-        } else {
-          writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-        }
+        writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
         contentBlockIndex++;
       } else if (!finalText && hasToolCalls) {
         // No text at all and tool calls present -- skip text block entirely
