@@ -105,6 +105,7 @@ async function handleStreamingNative(
   let messageText = '';
   let hasEmittedMessage = false;
   let hasEmittedReasoning = false;
+  let suppressedMessageIndex = -1;
   const tagBuffer = new ToolCallTagBuffer();
 
   for await (const event of chatStream) {
@@ -328,10 +329,10 @@ async function handleStreamingNative(
           item: closedMessageItem,
         });
 
-        // Mark for exclusion from final response but keep in array
-        // so subsequent output_index values remain unique.
+        // Track suppressed index for exclusion from final response
+        // but keep in array so subsequent output_index values remain unique.
         if (miIndex >= 0) {
-          (outputItems[miIndex] as Record<string, unknown>)._suppressed = true;
+          suppressedMessageIndex = miIndex;
         }
       }
 
@@ -376,7 +377,7 @@ async function handleStreamingNative(
         total_tokens: promptTokens + event.numTokens,
       };
 
-      const finalOutput = outputItems.filter((i) => !(i as Record<string, unknown>)._suppressed);
+      const finalOutput = outputItems.filter((_, idx) => idx !== suppressedMessageIndex);
       const completedResponse: ResponseObject = {
         ...partial,
         status: mapFinishReasonToStatus(event.finishReason),
@@ -501,7 +502,7 @@ async function handleStreamingNative(
   // Safety net: if the async iterator exhausted without a done event,
   // emit a completed response with whatever partial state we have so
   // clients and previous_response_id chaining don't see a dangling stream.
-  const fallbackOutput = outputItems.filter((i) => !(i as Record<string, unknown>)._suppressed);
+  const fallbackOutput = outputItems.filter((_, idx) => idx !== suppressedMessageIndex);
   const fallbackResponse: ResponseObject = {
     ...partial,
     status: 'incomplete',
