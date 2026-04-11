@@ -1651,11 +1651,8 @@ impl Qwen3Inner {
             None
         };
 
-        let reasoning_tokens = tools::count_reasoning_tokens(
-            &thinking,
-            &generated_tokens,
-            tokenizer.think_end_id(),
-        );
+        let reasoning_tokens =
+            tools::count_reasoning_tokens(&thinking, &generated_tokens, tokenizer.think_end_id());
 
         Ok(ChatResult {
             text: cleaned_text,
