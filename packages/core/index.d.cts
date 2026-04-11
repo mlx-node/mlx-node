@@ -120,6 +120,12 @@ export declare class Gemma4Model {
   static load(modelPath: string): Promise<Gemma4Model>;
   /** Chat with the model using a list of messages. */
   chat(messages: Array<ChatMessage>, config?: Gemma4ChatConfig | undefined | null): Promise<ChatResult>;
+  /** Streaming chat with the model using a list of messages. */
+  chatStream(
+    messages: ChatMessage[],
+    config: Gemma4ChatConfig | null | undefined,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
 }
 
 /** Result from text generation with detailed metadata */

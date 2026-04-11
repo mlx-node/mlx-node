@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use napi::Either;
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 
 use crate::array::{DType, MxArray};
-use crate::model_thread::ResponseTx;
+use crate::model_thread::{ResponseTx, StreamTx};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
@@ -80,7 +82,7 @@ fn escape_gemma4_content(s: &str) -> String {
 use super::config::Gemma4Config;
 use super::decoder_layer::Gemma4DecoderLayer;
 use super::layer_cache::Gemma4LayerCache;
-use crate::models::qwen3_5::model::ChatResult;
+use crate::models::qwen3_5::model::{ChatResult, ChatStreamChunk, ChatStreamHandle};
 use tracing::{debug, info};
 
 /// Gemma4 generation configuration.
@@ -119,6 +121,14 @@ pub(crate) struct PleComponents {
     pub vocab_size_per_layer_input: i32,
 }
 
+struct StreamSender(StreamTx<ChatStreamChunk>);
+
+impl StreamSender {
+    fn call(&self, result: Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
+        let _ = self.0.send(result);
+    }
+}
+
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
 /// No `Arc<RwLock<>>` — the model thread has sole ownership.
@@ -147,6 +157,13 @@ pub(crate) enum Gemma4Cmd {
         config: Gemma4ChatConfig,
         processed_images: Vec<ProcessedGemma4Image>,
         reply: ResponseTx<ChatResult>,
+    },
+    ChatStream {
+        messages: Vec<ChatMessage>,
+        config: Gemma4ChatConfig,
+        processed_images: Vec<ProcessedGemma4Image>,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
     },
 }
 
@@ -691,6 +708,466 @@ impl Gemma4Inner {
             performance,
         })
     }
+
+    pub(crate) fn chat_stream_sync(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: Gemma4ChatConfig,
+        processed_images: Vec<ProcessedGemma4Image>,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        let cb = StreamSender(stream_tx.clone());
+        let result =
+            self.chat_stream_sync_inner(messages, config, processed_images, &cb, &cancelled);
+        if let Err(e) = result {
+            let _ = stream_tx.send(Err(e));
+        }
+    }
+
+    fn chat_stream_sync_inner(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: Gemma4ChatConfig,
+        processed_images: Vec<ProcessedGemma4Image>,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
+
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+
+        let has_images = !processed_images.is_empty();
+        let sampling_config = make_sampling_config(&config, &self.config);
+        let enable_thinking = config.enable_thinking;
+        let eos_ids = self.config.eos_token_ids.clone();
+
+        let tokens = if tokenizer.has_chat_template() {
+            tokenizer.apply_chat_template_sync(&messages, Some(true), None, enable_thinking)?
+        } else {
+            if enable_thinking == Some(true) {
+                return Err(Error::from_reason(
+                    "enable_thinking=true requires a chat template",
+                ));
+            }
+            let mut prompt_text = String::from("<bos>");
+            for msg in &messages {
+                let role = match msg.role.as_str() {
+                    "assistant" => "model",
+                    "developer" => "system",
+                    other => other,
+                };
+                prompt_text.push_str(&format!("<|turn>{}\n", role));
+                if let Some(ref tool_calls) = msg.tool_calls {
+                    for tc in tool_calls {
+                        prompt_text.push_str(&format!(
+                            "<|tool_call>call:{}{{{}}}<tool_call|>",
+                            tc.name,
+                            json_args_to_gemma4_dsl(&escape_gemma4_content(&tc.arguments))
+                        ));
+                    }
+                }
+                prompt_text.push_str(&escape_gemma4_content(&msg.content));
+                prompt_text.push_str("<turn|>\n");
+            }
+            prompt_text.push_str("<|turn>model\n");
+            tokenizer.encode_sync(&prompt_text, Some(false))?
+        };
+
+        let tokens = if has_images && !processed_images.is_empty() {
+            let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
+            let boi_token_id = self.config.boi_token_id.unwrap_or(255999) as u32;
+            let eoi_token_id = self.config.eoi_token_id.unwrap_or(258882) as u32;
+            expand_image_tokens(
+                &tokens,
+                &processed_images,
+                image_token_id,
+                boi_token_id,
+                eoi_token_id,
+            )
+        } else {
+            tokens
+        };
+
+        let token_arr: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let prompt = MxArray::from_int32(&token_arr, &[1, tokens.len() as i64])?;
+
+        let mut caches = init_caches_for_config(&self.config);
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+
+        let generation_start = std::time::Instant::now();
+        let prompt_token_count = tokens.len();
+
+        let vision_embeds: Option<MxArray> = if has_images
+            && !processed_images.is_empty()
+            && let Some(ref vt) = self.vision_tower
+            && let Some(ref ev) = self.embed_vision
+        {
+            let image_token_id = self.config.image_token_id.unwrap_or(258880);
+            let mut all_features: Vec<MxArray> = Vec::new();
+            for proc in &processed_images {
+                let features = vt.forward(&proc.pixel_values)?;
+                let projected = ev.forward(&features)?;
+                all_features.push(projected);
+            }
+            let image_features = if all_features.len() == 1 {
+                all_features.remove(0)
+            } else {
+                let refs: Vec<&MxArray> = all_features.iter().collect();
+                MxArray::concatenate_many(refs, Some(1))?
+            };
+            let text_embeds = self.embed_tokens.forward(&prompt)?;
+            let text_embeds = text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+            let embed_dtype = text_embeds.dtype()?;
+            let image_features = image_features.astype(embed_dtype)?;
+            let image_token = MxArray::scalar_int(image_token_id)?;
+            let image_mask = prompt.equal(&image_token)?;
+            let mask_count_arr = image_mask.astype(DType::Int32)?.sum(None, None)?;
+            mask_count_arr.eval();
+            let mask_count = mask_count_arr.item_at_int32(0)? as i64;
+            let feature_count = image_features.shape_at(1)?;
+            if mask_count != feature_count {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    format!(
+                        "Image token count ({mask_count}) does not match vision feature count ({feature_count})."
+                    ),
+                ));
+            }
+            let image_mask_expanded = image_mask.expand_dims(-1)?;
+            let image_mask_expanded = image_mask_expanded.broadcast_to(&text_embeds.shape()?)?;
+            Some(masked_scatter(
+                &text_embeds,
+                &image_mask_expanded,
+                &image_features,
+            )?)
+        } else {
+            None
+        };
+
+        {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            if let Some(ref embeds) = vision_embeds {
+                prefill_body_gemma4_with_embeds(
+                    &prompt,
+                    embeds,
+                    &self.embed_tokens,
+                    &self.layers,
+                    &mut caches,
+                    &self.final_norm,
+                    self.ple.as_ref(),
+                    &self.config,
+                )?;
+            } else {
+                prefill_body_gemma4(
+                    &prompt,
+                    &self.embed_tokens,
+                    &self.layers,
+                    &mut caches,
+                    &self.final_norm,
+                    self.ple.as_ref(),
+                    &self.config,
+                )?;
+            }
+        }
+        eval_gemma4_caches(&caches);
+
+        let last_token = prompt.slice_axis(1, tokens.len() as i64 - 1, tokens.len() as i64)?;
+        let logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            forward_inner(
+                &last_token,
+                &self.embed_tokens,
+                &self.layers,
+                &mut caches,
+                &self.final_norm,
+                &self.lm_head,
+                self.embed_weight_t.as_ref(),
+                self.ple.as_ref(),
+                &self.config,
+            )?
+        };
+        let logits = logits.squeeze(Some(&[1]))?;
+        let y = sample_next_token(&logits, sampling_config)?;
+        y.eval();
+        eval_gemma4_caches(&caches);
+
+        let first_token_instant = std::time::Instant::now();
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut finish_reason = "length".to_string();
+
+        let use_compiled = std::env::var("GEMMA4_USE_COMPILE").is_ok()
+            && self.config.num_kv_shared_layers.is_none_or(|n| n <= 0)
+            && unsafe { mlx_sys::mlx_qwen35_get_model_id() } == self.model_id;
+
+        let mut decode_stream = tokenizer.inner().decode_stream(true);
+        let mut streamed_text_len = 0;
+
+        if use_compiled {
+            let _compiled_guard = COMPILED_FORWARD_MUTEX.lock().unwrap();
+            let mut cache_arrays_owned: Vec<MxArray> = Vec::with_capacity(caches.len() * 2);
+            for (layer_idx, cache) in caches.iter().enumerate() {
+                let (k, v) = cache.get_cached_kv().ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Compiled Gemma4 decode expected cache for layer {}",
+                        layer_idx
+                    ))
+                })?;
+                cache_arrays_owned.push(k);
+                cache_arrays_owned.push(v);
+            }
+            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                cache_arrays_owned.iter().map(|a| a.as_raw_ptr()).collect();
+            let layer_types_i32: Vec<i32> = (0..self.config.num_hidden_layers as usize)
+                .map(|i| if self.config.is_global_layer(i) { 1 } else { 0 })
+                .collect();
+            let max_kv_len =
+                (tokens.len() as i32 + max_new_tokens).min(self.config.max_position_embeddings);
+
+            unsafe {
+                mlx_sys::mlx_gemma4_init_from_prefill(
+                    self.config.num_hidden_layers,
+                    self.config.hidden_size,
+                    self.config.num_attention_heads,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                    self.config.effective_kv_heads(true),
+                    self.config.effective_head_dim(true),
+                    self.config.rope_theta as f32,
+                    self.config.rope_local_base_freq as f32,
+                    self.config.partial_rotary_factor as f32,
+                    self.config.rms_norm_eps as f32,
+                    self.config.sliding_window,
+                    if self.config.tie_word_embeddings {
+                        1
+                    } else {
+                        0
+                    },
+                    max_kv_len,
+                    1,
+                    self.config.num_experts.unwrap_or(0),
+                    self.config.top_k_experts.unwrap_or(0),
+                    self.config.moe_intermediate_size.unwrap_or(0),
+                    self.config.intermediate_size,
+                    self.config.final_logit_softcapping.unwrap_or(0.0) as f32,
+                    layer_types_i32.as_ptr(),
+                    layer_types_i32.len() as i32,
+                    cache_ptrs.as_mut_ptr(),
+                    tokens.len() as i32,
+                );
+            }
+
+            let embed_weight = self.embed_tokens.get_weight();
+            let mut current_y = y;
+            for step in 0..max_new_tokens {
+                let next_y = if step + 1 < max_new_tokens {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    let next_ids = current_y.reshape(&[1, 1])?;
+                    let logits = forward_gemma4_cpp(&next_ids, &embed_weight)?;
+                    let next_token = sample_next_token(&logits, sampling_config)?;
+                    eval_token_and_gemma4_caches(&next_token);
+                    Some(next_token)
+                } else {
+                    None
+                };
+
+                let token_id = current_y.item_at_int32(0)? as u32;
+                generated_tokens.push(token_id);
+
+                if cancelled.load(Ordering::Relaxed) {
+                    finish_reason = "cancelled".to_string();
+                    break;
+                }
+
+                let token_text = Qwen3Tokenizer::step_decode_stream(
+                    &mut decode_stream,
+                    tokenizer.inner(),
+                    token_id,
+                    &generated_tokens,
+                    streamed_text_len,
+                );
+                streamed_text_len += token_text.len();
+
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: token_text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        performance: None,
+                        is_reasoning: None,
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+
+                if eos_ids.contains(&(token_id as i32)) {
+                    finish_reason = "stop".to_string();
+                    break;
+                }
+                if let Some(next_token) = next_y {
+                    current_y = next_token;
+                } else {
+                    break;
+                }
+                if (step + 1) % 256 == 0 {
+                    crate::array::synchronize_and_clear_cache();
+                }
+            }
+            unsafe {
+                mlx_sys::mlx_gemma4_reset();
+            }
+        } else {
+            let mut current_y = y;
+            for step in 0..max_new_tokens {
+                let next_y = if step + 1 < max_new_tokens {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    let next_ids = current_y.reshape(&[1, 1])?;
+                    let logits = forward_inner(
+                        &next_ids,
+                        &self.embed_tokens,
+                        &self.layers,
+                        &mut caches,
+                        &self.final_norm,
+                        &self.lm_head,
+                        self.embed_weight_t.as_ref(),
+                        self.ple.as_ref(),
+                        &self.config,
+                    )?;
+                    let logits = logits.squeeze(Some(&[1]))?;
+                    let next_token = sample_next_token(&logits, sampling_config)?;
+                    MxArray::async_eval_arrays(&[&next_token]);
+                    Some(next_token)
+                } else {
+                    None
+                };
+
+                let token_id = current_y.item_at_int32(0)? as u32;
+                generated_tokens.push(token_id);
+
+                if cancelled.load(Ordering::Relaxed) {
+                    finish_reason = "cancelled".to_string();
+                    break;
+                }
+
+                let token_text = Qwen3Tokenizer::step_decode_stream(
+                    &mut decode_stream,
+                    tokenizer.inner(),
+                    token_id,
+                    &generated_tokens,
+                    streamed_text_len,
+                );
+                streamed_text_len += token_text.len();
+
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: token_text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        performance: None,
+                        is_reasoning: None,
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+
+                if eos_ids.contains(&(token_id as i32)) {
+                    finish_reason = "stop".to_string();
+                    break;
+                }
+                if let Some(next_token) = next_y {
+                    current_y = next_token;
+                } else {
+                    break;
+                }
+
+                if (step + 1) % 256 == 0 {
+                    crate::array::clear_cache();
+                }
+            }
+        }
+
+        let text = tokenizer.decode_sync(&generated_tokens, true)?;
+
+        // Flush any residual bytes that might not have resolved at the streaming layer
+        if text.len() > streamed_text_len {
+            let residual = text[streamed_text_len..].to_string();
+            cb.call(
+                Ok(ChatStreamChunk {
+                    text: residual,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    prompt_tokens: None,
+                    reasoning_tokens: None,
+                    raw_text: None,
+                    performance: None,
+                    is_reasoning: None,
+                }),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+        }
+
+        let generation_end = std::time::Instant::now();
+        let ttft_ms = first_token_instant
+            .duration_since(generation_start)
+            .as_secs_f64()
+            * 1000.0;
+        let decode_ms = generation_end
+            .duration_since(first_token_instant)
+            .as_secs_f64()
+            * 1000.0;
+        let gen_toks = generated_tokens.len() as f64;
+
+        let performance = Some(crate::profiling::PerformanceMetrics {
+            ttft_ms,
+            prefill_tokens_per_second: if ttft_ms > 0.0 {
+                prompt_token_count as f64 / (ttft_ms / 1000.0)
+            } else {
+                0.0
+            },
+            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                (gen_toks - 1.0) / (decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+
+        // Emit final block
+        cb.call(
+            Ok(ChatStreamChunk {
+                text: String::new(),
+                done: true,
+                finish_reason: Some(finish_reason),
+                tool_calls: Some(vec![]),
+                thinking: None,
+                num_tokens: Some(generated_tokens.len() as u32),
+                prompt_tokens: Some(prompt_token_count as u32),
+                reasoning_tokens: Some(0),
+                raw_text: Some(text),
+                performance,
+                is_reasoning: None,
+            }),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+
+        Ok(())
+    }
 }
 
 /// Command handler for the dedicated model thread.
@@ -704,6 +1181,15 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
         } => {
             let result = inner.chat_sync(messages, config, processed_images);
             let _ = reply.send(result);
+        }
+        Gemma4Cmd::ChatStream {
+            messages,
+            config,
+            processed_images,
+            stream_tx,
+            cancelled,
+        } => {
+            inner.chat_stream_sync(messages, config, processed_images, stream_tx, cancelled);
         }
     }
 }
@@ -791,6 +1277,66 @@ impl Gemma4Model {
             reply,
         })
         .await
+    }
+
+    /// Streaming chat with the model using a list of messages.
+    #[napi(
+        ts_args_type = "messages: ChatMessage[], config: Gemma4ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<Gemma4ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let config = config.unwrap_or(Gemma4ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            enable_thinking: None,
+        });
+
+        // Process images before sending command
+        let all_images = extract_images_from_messages(&messages);
+        let processed_images = if !all_images.is_empty() {
+            let ip = self.image_processor.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "Images provided but model has no vision support (no vision_config in config.json)",
+                )
+            })?;
+            let mut results = Vec::with_capacity(all_images.len());
+            for img_bytes in &all_images {
+                results.push(ip.process_bytes(img_bytes)?);
+            }
+            results
+        } else {
+            Vec::new()
+        };
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        self.thread.send(Gemma4Cmd::ChatStream {
+            messages,
+            config,
+            processed_images,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+
+        let callback = Arc::new(callback);
+        tokio::spawn(async move {
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
     }
 }
 
