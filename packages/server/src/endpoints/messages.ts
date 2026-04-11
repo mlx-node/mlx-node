@@ -275,6 +275,9 @@ async function handleStreamingNative(
       }
     }
   }
+
+  // Safety net: if the async iterator exhausted without a done event, close SSE
+  endSSE(res);
 }
 
 // ---------------------------------------------------------------------------

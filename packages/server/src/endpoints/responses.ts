@@ -215,6 +215,38 @@ async function handleStreamingNative(
         }
       }
 
+      // Recovery: text was never emitted during streaming but final has text
+      // (possible if all text arrived in the final event only)
+      if (!hasEmittedMessage && finalText && !skipMessageItem) {
+        hasEmittedMessage = true;
+        messageItemId = genId('msg_');
+        const messageItem: MessageOutputItem = {
+          id: messageItemId,
+          type: 'message',
+          role: 'assistant',
+          status: 'in_progress',
+          content: [],
+        };
+        const miIndex = outputItems.length;
+        outputItems.push(messageItem);
+        outputIndex = miIndex;
+        writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+        const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+        writeSSEEvent(res, 'response.content_part.added', {
+          item_id: messageItemId,
+          output_index: miIndex,
+          content_index: 0,
+          part: textPart,
+        });
+        messageText = finalText;
+        writeSSEEvent(res, 'response.output_text.delta', {
+          item_id: messageItemId,
+          output_index: miIndex,
+          content_index: 0,
+          delta: finalText,
+        });
+      }
+
       if (hasEmittedMessage && messageItemId && !skipMessageItem) {
         const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
         const contentIndex = 0;
@@ -450,6 +482,9 @@ async function handleStreamingNative(
       }
     }
   }
+
+  // Safety net: if the async iterator exhausted without a done event, close SSE
+  endSSE(res);
 }
 
 // ---------------------------------------------------------------------------

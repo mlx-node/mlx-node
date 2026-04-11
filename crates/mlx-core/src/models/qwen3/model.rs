@@ -1659,7 +1659,9 @@ impl Qwen3Inner {
                     .map(|pos| pos as u32)
                     .unwrap_or(generated_tokens.len() as u32)
             } else {
-                0
+                // No think_end_id — count all generated tokens as reasoning
+                // (matches ReasoningTracker behavior in Qwen3.5/MoE)
+                generated_tokens.len() as u32
             }
         } else {
             0
