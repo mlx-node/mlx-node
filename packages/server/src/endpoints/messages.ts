@@ -76,6 +76,11 @@ async function handleStreamingNative(
     }
   ).chatStream(messages, config);
 
+  if (!chatStream || typeof (chatStream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] !== 'function') {
+    // chatStream did not return an async iterable — fall back to simulated streaming
+    return handleStreamingSimulated(res, model, messages, config, body);
+  }
+
   for await (const event of chatStream) {
     if (event.done) {
       // Final event
@@ -249,11 +254,11 @@ async function handleStreamingNative(
                 buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
               );
             }
-            emittedTextLength += cleanPrefix.length;
+            emittedTextLength += cleanPrefix.trim().length;
             writeSSEEvent(
               res,
               'content_block_delta',
-              buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: cleanPrefix }),
+              buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: cleanPrefix.trim() }),
             );
           }
           suppressTextDeltas = true;

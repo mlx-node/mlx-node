@@ -104,6 +104,11 @@ async function handleStreamingNative(
     }
   ).chatStream(messages, config);
 
+  if (!chatStream || typeof (chatStream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] !== 'function') {
+    // chatStream did not return an async iterable — fall back to simulated streaming
+    return handleStreamingSimulated(res, model, messages, config, req, responseId, previousResponseId, store, newInputMessages);
+  }
+
   for await (const event of chatStream) {
     if (event.done) {
       // Final event -- close open items and emit completed
@@ -336,12 +341,12 @@ async function handleStreamingNative(
         usage,
       };
 
-      writeSSEEvent(res, 'response.completed', { response: completedResponse });
-
       // Persist only the new input messages
       if (store && req.store !== false) {
         await persistResponse(store, completedResponse, newInputMessages, previousResponseId);
       }
+
+      writeSSEEvent(res, 'response.completed', { response: completedResponse });
 
       endSSE(res);
       return;
@@ -410,12 +415,12 @@ async function handleStreamingNative(
                 part: textPart,
               });
             }
-            messageText += cleanPrefix;
+            messageText += cleanPrefix.trim();
             writeSSEEvent(res, 'response.output_text.delta', {
               item_id: messageItemId,
               output_index: outputItems.findIndex((i) => i.id === messageItemId),
               content_index: 0,
-              delta: cleanPrefix,
+              delta: cleanPrefix.trim(),
             });
           }
           suppressTextDeltas = true;
@@ -566,12 +571,13 @@ async function handleStreamingSimulated(
 
   // Completed response
   const response = buildResponseObject(result, req, responseId, previousResponseId);
-  writeSSEEvent(res, 'response.completed', { response });
 
   // Persist only the new input messages
   if (store && req.store !== false) {
     await persistResponse(store, response, newInputMessages, previousResponseId);
   }
+
+  writeSSEEvent(res, 'response.completed', { response });
 
   endSSE(res);
 }
