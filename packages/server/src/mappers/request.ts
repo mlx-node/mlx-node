@@ -97,6 +97,8 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
           content: fco.output,
           toolCallId: fco.call_id,
         });
+      } else {
+        throw new Error(`Unsupported input item type: "${itemType}"`);
       }
     }
   }

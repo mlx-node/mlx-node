@@ -79,39 +79,41 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
       if (typeof content === 'string') {
         messages.push({ role: 'user', content });
       } else {
-        // Collect text blocks and tool_result blocks separately
-        const textParts: string[] = [];
-        const toolResults: { toolCallId: string; content: string }[] = [];
+        // Emit messages in original block order, grouping consecutive text/image blocks
+        let pendingText: string[] = [];
+        let pendingImages: Uint8Array[] = [];
 
-        const images: Uint8Array[] = [];
+        const flushUserBlock = (): void => {
+          if (pendingText.length > 0 || pendingImages.length > 0) {
+            const userMsg: ChatMessage = { role: 'user', content: pendingText.join('') };
+            if (pendingImages.length > 0) {
+              userMsg.images = pendingImages;
+            }
+            messages.push(userMsg);
+            pendingText = [];
+            pendingImages = [];
+          }
+        };
 
         for (const block of content as AnthropicContentBlock[]) {
           if (block.type === 'text') {
-            textParts.push(block.text);
-          } else if (block.type === 'tool_result') {
-            toolResults.push({
-              toolCallId: block.tool_use_id,
-              content: resolveToolResultContent(block.content),
-            });
+            pendingText.push(block.text);
           } else if (block.type === 'image' && block.source.type === 'base64') {
-            images.push(Buffer.from(block.source.data, 'base64'));
+            pendingImages.push(Buffer.from(block.source.data, 'base64'));
+          } else if (block.type === 'tool_result') {
+            // Flush any pending text/images before the tool result
+            flushUserBlock();
+            messages.push({
+              role: 'tool',
+              content: resolveToolResultContent(block.content),
+              toolCallId: block.tool_use_id,
+            });
           }
           // Ignore other block types
         }
 
-        // Emit user message if there is text or images
-        if (textParts.length > 0 || images.length > 0) {
-          const userMsg: ChatMessage = { role: 'user', content: textParts.join('') };
-          if (images.length > 0) {
-            userMsg.images = images;
-          }
-          messages.push(userMsg);
-        }
-
-        // Emit each tool_result as a separate tool message
-        for (const tr of toolResults) {
-          messages.push({ role: 'tool', content: tr.content, toolCallId: tr.toolCallId });
-        }
+        // Flush any remaining text/images
+        flushUserBlock();
       }
     } else if (role === 'assistant') {
       if (typeof content === 'string') {

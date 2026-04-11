@@ -65,7 +65,6 @@ async function handleStreamingNative(
   let contentBlockIndex = 0;
   let hasEmittedThinking = false;
   let hasEmittedText = false;
-  let thinkingText = '';
   let pendingText = '';
   let suppressTextDeltas = false;
   let emittedTextLength = 0;
@@ -223,7 +222,6 @@ async function handleStreamingNative(
         );
         contentBlockIndex++;
       }
-      thinkingText += deltaText;
       writeSSEEvent(
         res,
         'content_block_delta',
