@@ -44,7 +44,7 @@ fi
 # Set globally so ALL cc-rs crates (esaxx-rs, etc.) compile with EH support.
 if ! WASI_SDK_PATH="$WASI_SDK_PATH" \
   CXXFLAGS="-fexceptions -fwasm-exceptions" \
-  RUSTFLAGS="-C link-arg=-zstack-size=16777216 $EXPORT_FLAGS" \
+  RUSTFLAGS="$EXPORT_FLAGS" \
     "$ROOT_DIR/node_modules/.bin/napi" build \
       --manifest-path crates/mlx-core/Cargo.toml \
       --target wasm32-wasip1-threads \

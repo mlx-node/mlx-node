@@ -526,7 +526,7 @@ Key build flags:
 
 # Linking
 -Wl,--whole-archive=mlx    # Prevents vtable method GC
--zstack-size=8388608       # 8 MB stack (build.rs); build-wasm.sh uses 16 MB
+-zstack-size=64000000      # 64 MB stack (set by napi_build::setup() for all WASI targets)
 
 # cmake defines
 -DMLX_BUILD_WEBGPU=ON
@@ -862,7 +862,7 @@ void MyOp::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 - **Browser console**: Check for WebGPU validation errors in the browser console. Common issues: buffer aliasing (same buffer in read and read_write slots), buffer too small, workgroup size mismatch.
 
-- **WASM crashes**: Deep model call stacks can overflow the WASM stack (8 MB in `build.rs`, 16 MB in `build-wasm.sh`). Symptoms: silent crash or `RuntimeError: unreachable`. Increase `-zstack-size` in the build script.
+- **WASM crashes**: Deep model call stacks can overflow the WASM stack (64 MB, set by `napi_build::setup()` in `crates/mlx-core/build.rs`). Symptoms: silent crash or `RuntimeError: unreachable`. The stack size is managed solely by the napi-build crate — do not add redundant `-zstack-size` flags in `build-wasm.sh` or `mlx-sys/build.rs`.
 
 - **WASM rebuild not picking up changes**: Touch `CMakeLists.txt` to force cmake reconfigure. Touch `build.rs` to force Cargo to re-run the build script. Never delete the cmake build cache.
 

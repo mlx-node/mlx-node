@@ -192,12 +192,9 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
     println!("cargo:rustc-link-search=native={}", sysroot_lib.display());
     println!("cargo:rustc-link-lib=static=c++");
     println!("cargo:rustc-link-lib=static=c++abi");
-    // Increase WASM stack size to 8MB (default is 64KB-1MB, too small for deep
-    // model call stacks: chat_sync → forward → 24 layers → matmul → ...)
-    println!("cargo:rustc-link-arg=-Wl,-z,stack-size=8388608");
 }
 
-fn build_native(manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
+fn build_native(mlx_dir: &Path, src_dir: &Path) {
     let metal_disabled = env::var_os("MLX_DISABLE_METAL").is_some();
     if !metal_disabled && !metal_toolchain_available() {
         panic!(
@@ -351,6 +348,6 @@ fn main() {
     if is_wasm_target(&target) {
         build_wasi(&manifest_dir, &mlx_dir, &src_dir);
     } else {
-        build_native(&manifest_dir, &mlx_dir, &src_dir);
+        build_native(&mlx_dir, &src_dir);
     }
 }

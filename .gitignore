@@ -213,6 +213,8 @@ __pycache__/
 /unsloth
 /mlx-vlm
 *.metallib
+*.wasm
+__screenshots__/
 .vite-agent
 /Model-Optimizer
 

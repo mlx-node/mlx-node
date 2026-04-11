@@ -4,15 +4,68 @@
 
 function post(data: any) { (self as any).postMessage(data); }
 
+// State for on-demand (vitest) mode
+let testMap: Map<string, () => void> | null = null;
+let wasmInstRef: WebAssembly.Instance | null = null;
+let wasmTagRef: WebAssembly.Tag | null = null;
+
 // Register message handler IMMEDIATELY (before any async work)
 self.onmessage = async (e: MessageEvent) => {
-  if (e.data.type !== 'init') return;
-  try {
-    await initAndRun(e.data.wasmUrl);
-  } catch (err: any) {
-    post({ type: 'error', message: `${err.message}\n${err.stack || ''}` });
+  const { type } = e.data;
+  if (type === 'init-vitest') {
+    // Init WASM + GPU, then wait for individual 'run' messages
+    try {
+      await initAndRun(e.data.wasmUrl);
+    } catch (err: any) {
+      post({ type: 'error', message: `${err.message}\n${err.stack || ''}` });
+    }
+  } else if (type === 'run') {
+    // Run a single test by name (vitest mode)
+    if (!testMap) {
+      post({ type: 'result', name: e.data.name, passed: false, error: 'Not initialized' });
+      return;
+    }
+    const fn = testMap.get(e.data.name);
+    if (!fn) {
+      post({ type: 'result', name: e.data.name, passed: false, error: `Test not found: ${e.data.name}` });
+      return;
+    }
+    try {
+      fn();
+      post({ type: 'result', name: e.data.name, passed: true });
+    } catch (err: any) {
+      let msg = err.message || `${err}`;
+      if (err instanceof WebAssembly.Exception && wasmInstRef && wasmTagRef) {
+        msg = extractWasmError(err, wasmInstRef, wasmTagRef) || msg;
+      }
+      post({ type: 'result', name: e.data.name, passed: false, error: msg });
+    }
   }
 };
+
+function extractWasmError(err: WebAssembly.Exception, wasmInst: WebAssembly.Instance, tag: WebAssembly.Tag): string | null {
+  try {
+    const ptr = err.getArg(tag, 0);
+    const mem = new Uint8Array((wasmInst.exports.memory as WebAssembly.Memory).buffer);
+    const view = new DataView(mem.buffer);
+    const found: string[] = [];
+    for (const off of [4, 8, 12, 16, 20]) {
+      if (ptr + off + 4 < mem.length) {
+        const strPtr = view.getUint32(ptr + off, true);
+        if (strPtr > 1024 && strPtr < mem.length - 4) {
+          let s = '';
+          for (let i = strPtr; i < mem.length && mem[i] !== 0 && i - strPtr < 200; i++) {
+            const ch = mem[i];
+            if (ch >= 32 && ch < 127) s += String.fromCharCode(ch);
+            else { s = ''; break; }
+          }
+          if (s.length > 5) found.push(`@${off}:${s}`);
+        }
+      }
+    }
+    return found.length > 0 ? `C++: ${found[0]}` : null;
+  } catch { return null; }
+}
 
 async function initAndRun(wasmUrl: string) {
   post({ type: 'status', message: 'Importing modules...' });
@@ -148,7 +201,7 @@ async function initAndRun(wasmUrl: string) {
   const MxArray = mlxExports.MxArray;
   if (!MxArray) throw new Error('MxArray not found');
 
-  post({ type: 'status', message: 'WASM loaded. Running tests...' });
+  post({ type: 'status', message: 'WASM loaded. Ready for tests.' });
 
   // ---- Test helpers ----
   function assertClose(actual: number[], expected: number[], tol = 1e-3) {
@@ -3125,7 +3178,7 @@ async function initAndRun(wasmUrl: string) {
     // --- Stream channel test ---
     { name: 'stream channel SharedArrayBuffer write', run() {
       // test_stream_channel writes "hello from WASM stream" to the stream buffer
-      const result = (MxArray as any).testStreamChannel?.();
+      const result = (mlxExports as any).testStreamChannel?.();
       if (result === undefined) throw new Error('testStreamChannel not available (non-WASM build?)');
       if (result !== true) throw new Error(`testStreamChannel returned ${result}`);
     }},
@@ -3873,41 +3926,12 @@ async function initAndRun(wasmUrl: string) {
 
   ];
 
-  let passed = 0, failed = 0;
-  for (const t of tests) {
-    try { t.run(); passed++; post({ type: 'result', name: t.name, passed: true }); }
-    catch (e: any) {
-      failed++;
-      let msg = e.message || `${e}`;
-      if (e instanceof WebAssembly.Exception && wasmInst) {
-        try {
-          const ptr = e.getArg(tag, 0);
-          const mem = new Uint8Array((wasmInst.exports.memory as WebAssembly.Memory).buffer);
-          const view = new DataView(mem.buffer);
-          // Try to read exception message by scanning memory near the pointer
-          // __cxa_exception header is before the thrown object, object starts at ptr
-          // For std::runtime_error: [vtable(4), __imp_(4+)], __imp_ points to string
-          // Try multiple offsets to find a readable string
-          const found: string[] = [];
-          for (const off of [4, 8, 12, 16, 20]) {
-            if (ptr + off + 4 < mem.length) {
-              const strPtr = view.getUint32(ptr + off, true);
-              if (strPtr > 1024 && strPtr < mem.length - 4) {
-                let s = '';
-                for (let i = strPtr; i < mem.length && mem[i] !== 0 && i - strPtr < 200; i++) {
-                  const ch = mem[i];
-                  if (ch >= 32 && ch < 127) s += String.fromCharCode(ch);
-                  else { s = ''; break; }
-                }
-                if (s.length > 5) found.push(`@${off}:${s}`);
-              }
-            }
-          }
-          msg = found.length > 0 ? `C++: ${found[0]}` : `WasmException(ptr=${ptr}, no readable msg)`;
-        } catch (ex: any) { msg += ` [extract err: ${ex.message}]`; }
-      }
-      post({ type: 'result', name: t.name, passed: false, error: msg });
-    }
-  }
-  post({ type: 'done', summary: `Done: ${passed} passed, ${failed} failed of ${tests.length}` });
+  // Build name→function map for on-demand execution
+  const map = new Map<string, () => void>();
+  for (const t of tests) map.set(t.name, t.run);
+
+  testMap = map;
+  wasmInstRef = wasmInst;
+  wasmTagRef = tag;
+  post({ type: 'ready', tests: tests.map(t => t.name) });
 }
