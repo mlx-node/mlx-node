@@ -1,4 +1,5 @@
 import {
+  Gemma4Model as Gemma4ModelNative,
   Lfm2Model as Lfm2ModelNative,
   Qwen35Model as Qwen35ModelNative,
   Qwen35MoeModel as Qwen35MoeModelNative,
@@ -10,6 +11,7 @@ import type {
   ChatStreamHandle,
   PerformanceMetrics,
   ToolCallResult,
+  Gemma4ChatConfig
 } from '@mlx-node/core';
 
 export interface ChatStreamDelta {
@@ -40,6 +42,8 @@ const _nativeDenseChatStream = Qwen35ModelNative.prototype.chatStream;
 const _nativeMoeChatStream = Qwen35MoeModelNative.prototype.chatStream;
 // oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeLfm2ChatStream = Lfm2ModelNative.prototype.chatStream;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeGemma4ChatStream = Gemma4ModelNative.prototype.chatStream;
 
 /**
  * Shared AsyncGenerator implementation that wraps a native callback-based
@@ -183,5 +187,31 @@ export class Lfm2Model extends Lfm2ModelNative {
   // @ts-expect-error — override callback-based chatStream with AsyncGenerator
   async *chatStream(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
     yield* _createChatStream(_nativeLfm2ChatStream, this, messages, config);
+  }
+}
+
+/**
+ * Gemma4 model with AsyncGenerator-based `chatStream()`.
+ *
+ * @example
+ * ```typescript
+ * const model = await Gemma4Model.load('./models/gemma-4-e2b');
+ * for await (const event of model.chatStream(messages)) {
+ *   if (!event.done) process.stdout.write(event.text);
+ * }
+ * ```
+ */
+export class Gemma4Model extends Gemma4ModelNative {
+  static override async load(modelPath: string): Promise<Gemma4Model> {
+    const instance = await Gemma4ModelNative.load(modelPath);
+    Object.setPrototypeOf(instance, Gemma4Model.prototype);
+    return instance as unknown as Gemma4Model;
+  }
+
+  // @ts-expect-error — override callback-based chatStream with AsyncGenerator
+  async *chatStream(messages: ChatMessage[], config?: Gemma4ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
+    // fixme: We pass `as any` because Gemma4ChatStreamChunk and ChatStreamChunk are structurally identical...
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    yield* _createChatStream(_nativeGemma4ChatStream as any, this, messages, config);
   }
 }
