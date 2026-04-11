@@ -23,10 +23,15 @@ export interface MappedAnthropicRequest {
 function resolveToolResultContent(content?: string | { type: 'text'; text: string }[]): string {
   if (content == null) return '';
   if (typeof content === 'string') return content;
-  return content
-    .filter((b) => b.type === 'text')
-    .map((b) => b.text)
-    .join('');
+  const parts: string[] = [];
+  for (const b of content) {
+    if (b.type === 'text') {
+      parts.push(b.text);
+    } else {
+      throw new Error(`Unsupported tool_result content type: "${(b as { type: string }).type}"`);
+    }
+  }
+  return parts.join('');
 }
 
 /**
@@ -136,6 +141,8 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
               name: block.name,
               arguments: JSON.stringify(block.input),
             });
+          } else {
+            throw new Error(`Unsupported assistant content block type: "${block.type}"`);
           }
         }
 
