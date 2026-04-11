@@ -1651,13 +1651,27 @@ impl Qwen3Inner {
             None
         };
 
+        let reasoning_tokens = if thinking.is_some() {
+            if let Some(end_id) = tokenizer.think_end_id() {
+                generated_tokens
+                    .iter()
+                    .position(|&t| t == end_id)
+                    .map(|pos| (pos + 1) as u32)
+                    .unwrap_or(generated_tokens.len() as u32)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
         Ok(ChatResult {
             text: cleaned_text,
             tool_calls,
             thinking,
             num_tokens: generated_tokens.len() as u32,
             prompt_tokens: prompt_token_count as u32,
-            reasoning_tokens: 0,
+            reasoning_tokens,
             finish_reason,
             raw_text,
             performance,

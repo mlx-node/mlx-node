@@ -19,12 +19,12 @@ export function beginSSE(res: ServerResponse): void {
  * Write a single SSE event.
  *
  * Includes the `type` field in the data payload for OpenAI SDK compatibility.
- * The `type` is always the SSE event type, even if the data object contains
- * its own `type` field (which would be for a different purpose).
+ * If the data object already contains a `type` field, it takes precedence.
+ * Otherwise, `type` defaults to the SSE event type name.
  */
 export function writeSSEEvent(res: ServerResponse, eventType: string, data: object): void {
-  // Spread data first, then override type to ensure the SSE event type wins
-  const payload = { ...data, type: eventType };
+  // Default type to eventType, but let data's own type field take precedence
+  const payload = { type: eventType, ...data };
   res.write(`event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`);
 }
 
