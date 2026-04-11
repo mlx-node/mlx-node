@@ -25,26 +25,12 @@ echo ""
 echo "--- Step 1: Building WASM via NAPI-RS ---"
 cd "$ROOT_DIR"
 
-# Generate --export flags for vtable-referenced functions.
-# wasm-ld's GC removes functions whose only references are through vtable DATA
-# relocations (not CODE relocations). Marking them as exports makes them GC roots.
-EXPORT_LIST="$SCRIPT_DIR/eval_gpu_exports.txt"
-EXPORT_FLAGS=""
-if [[ -f "$EXPORT_LIST" ]]; then
-  while IFS= read -r sym; do
-    [[ -z "$sym" ]] && continue
-    EXPORT_FLAGS="$EXPORT_FLAGS -C link-arg=--export=$sym"
-  done < "$EXPORT_LIST"
-  echo "Loaded $(wc -l < "$EXPORT_LIST" | tr -d ' ') export symbols from $EXPORT_LIST"
-else
-  echo "[WARN] $EXPORT_LIST not found — vtable symbols may be GC'd."
-fi
-
 # -fwasm-exceptions enables native WASM EH (try/catch/throw instructions).
 # Set globally so ALL cc-rs crates (esaxx-rs, etc.) compile with EH support.
+# Note: vtable GC is prevented by --whole-archive in mlx-sys/build.rs;
+# stack size (64 MB) is set by napi_build::setup() in mlx-core/build.rs.
 if ! WASI_SDK_PATH="$WASI_SDK_PATH" \
   CXXFLAGS="-fexceptions -fwasm-exceptions" \
-  RUSTFLAGS="$EXPORT_FLAGS" \
     "$ROOT_DIR/node_modules/.bin/napi" build \
       --manifest-path crates/mlx-core/Cargo.toml \
       --target wasm32-wasip1-threads \
