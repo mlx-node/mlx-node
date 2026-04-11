@@ -12,6 +12,7 @@ import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
 import type { ChatStreamEvent } from '@mlx-node/lm';
 
 import { sendAnthropicBadRequest, sendAnthropicInternalError, sendAnthropicNotFound } from '../errors.js';
+import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import { mapAnthropicRequest } from '../mappers/anthropic-request.js';
 import {
   buildAnthropicResponse,
@@ -76,17 +77,16 @@ async function handleStreamingNative(
   let contentBlockIndex = 0;
   let hasEmittedThinking = false;
   let hasEmittedText = false;
-  let pendingText = '';
-  let suppressTextDeltas = false;
   let emittedTextLength = 0;
-  const TOOL_CALL_TAG = '<tool_call>';
+  const tagBuffer = new ToolCallTagBuffer();
 
   for await (const event of chatStream) {
     if (event.done) {
       // Final event
 
-      // Flush any remaining pendingText
-      if (!suppressTextDeltas && pendingText) {
+      // Flush any remaining pending text
+      const remainingText = tagBuffer.flush();
+      if (!tagBuffer.suppressed && remainingText) {
         if (!hasEmittedText) {
           // Close thinking block if open
           if (hasEmittedThinking) {
@@ -99,13 +99,12 @@ async function handleStreamingNative(
             buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
           );
         }
-        emittedTextLength += pendingText.length;
+        emittedTextLength += remainingText.length;
         writeSSEEvent(
           res,
           'content_block_delta',
-          buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: pendingText }),
+          buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: remainingText }),
         );
-        pendingText = '';
       }
 
       // Close thinking block if open and text was never emitted
@@ -120,7 +119,7 @@ async function handleStreamingNative(
 
       // Recovery: if tool-call suppression was triggered but no tool calls were parsed,
       // create a text block from the final event text (no text was streamed before suppression)
-      if (suppressTextDeltas && !hasToolCalls && finalText && !hasEmittedText) {
+      if (tagBuffer.suppressed && !hasToolCalls && finalText && !hasEmittedText) {
         if (hasEmittedThinking) {
           // Thinking block already closed above
         }
@@ -136,7 +135,7 @@ async function handleStreamingNative(
           'content_block_delta',
           buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: finalText }),
         );
-      } else if (suppressTextDeltas && !hasToolCalls && finalText && hasEmittedText) {
+      } else if (tagBuffer.suppressed && !hasToolCalls && finalText && hasEmittedText) {
         // Recovery: text was already being streamed but got cut off by a false-alarm <tool_call>
         // tag. Emit the portion of the final text that was never sent as a delta.
         const unsent = finalText.slice(emittedTextLength);
@@ -234,69 +233,45 @@ async function handleStreamingNative(
       );
     } else {
       // Text delta with tool_call tag buffering
-      if (!suppressTextDeltas) {
-        pendingText += event.text;
-
-        // Check for full tool-call tag
-        const tagIdx = pendingText.indexOf(TOOL_CALL_TAG);
-        if (tagIdx >= 0) {
-          // Emit clean prefix as text deltas
-          const cleanPrefix = pendingText.slice(0, tagIdx);
-          if (cleanPrefix.trim()) {
-            if (!hasEmittedText) {
-              if (hasEmittedThinking) {
-                writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
-              }
-              hasEmittedText = true;
-              writeSSEEvent(
-                res,
-                'content_block_start',
-                buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
-              );
+      const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
+      if (tagFound) {
+        if (cleanPrefix.trim()) {
+          if (!hasEmittedText) {
+            if (hasEmittedThinking) {
+              writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
             }
-            emittedTextLength += cleanPrefix.trim().length;
+            hasEmittedText = true;
             writeSSEEvent(
               res,
-              'content_block_delta',
-              buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: cleanPrefix.trim() }),
+              'content_block_start',
+              buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
             );
           }
-          suppressTextDeltas = true;
-          pendingText = '';
-        } else {
-          // Check if pendingText ends with a partial prefix of '<tool_call>'
-          let safeLen = pendingText.length;
-          for (let i = 1; i <= Math.min(pendingText.length, TOOL_CALL_TAG.length - 1); i++) {
-            const suffix = pendingText.slice(-i);
-            if (TOOL_CALL_TAG.startsWith(suffix)) {
-              safeLen = pendingText.length - i;
-              break;
-            }
-          }
-
-          const safeText = pendingText.slice(0, safeLen);
-          pendingText = pendingText.slice(safeLen);
-
-          if (safeText) {
-            if (!hasEmittedText) {
-              if (hasEmittedThinking) {
-                writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
-              }
-              hasEmittedText = true;
-              writeSSEEvent(
-                res,
-                'content_block_start',
-                buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
-              );
-            }
-            emittedTextLength += safeText.length;
-            writeSSEEvent(
-              res,
-              'content_block_delta',
-              buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: safeText }),
-            );
-          }
+          emittedTextLength += cleanPrefix.length;
+          writeSSEEvent(
+            res,
+            'content_block_delta',
+            buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: cleanPrefix }),
+          );
         }
+      } else if (safeText) {
+        if (!hasEmittedText) {
+          if (hasEmittedThinking) {
+            writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+          }
+          hasEmittedText = true;
+          writeSSEEvent(
+            res,
+            'content_block_start',
+            buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
+          );
+        }
+        emittedTextLength += safeText.length;
+        writeSSEEvent(
+          res,
+          'content_block_delta',
+          buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: safeText }),
+        );
       }
     }
   }

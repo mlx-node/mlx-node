@@ -82,6 +82,9 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
         const msg = item as { role: string; content: string | ContentPart[] };
         // Map "developer" role to "system" (OpenAI convention)
         const role = msg.role === 'developer' ? 'system' : msg.role;
+        if (role !== 'user' && role !== 'assistant' && role !== 'system') {
+          throw new Error(`Unsupported message role: "${msg.role}"`);
+        }
         messages.push({
           role,
           content: resolveContent(msg.content),

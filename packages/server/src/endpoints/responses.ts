@@ -12,6 +12,7 @@ import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponse
 import type { ChatStreamEvent } from '@mlx-node/lm';
 
 import { sendBadRequest, sendInternalError, sendNotFound } from '../errors.js';
+import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import { mapRequest, reconstructMessagesFromChain } from '../mappers/request.js';
 import {
   buildOutputItems,
@@ -97,24 +98,22 @@ async function handleStreamingNative(
   const outputItems: OutputItem[] = [];
   let outputIndex = 0;
 
-  const TOOL_CALL_TAG = '<tool_call>';
-
   // State tracking for streaming
   let reasoningItemId: string | null = null;
   let reasoningText = '';
   let messageItemId: string | null = null;
   let messageText = '';
-  let pendingText = '';
   let hasEmittedMessage = false;
   let hasEmittedReasoning = false;
-  let suppressTextDeltas = false;
+  const tagBuffer = new ToolCallTagBuffer();
 
   for await (const event of chatStream) {
     if (event.done) {
       // Final event -- close open items and emit completed
 
       // Flush any remaining pending text (no tool call tag was found)
-      if (!suppressTextDeltas && pendingText) {
+      const remainingText = tagBuffer.flush();
+      if (!tagBuffer.suppressed && remainingText) {
         if (!hasEmittedMessage) {
           hasEmittedMessage = true;
           messageItemId = genId('msg_');
@@ -137,14 +136,13 @@ async function handleStreamingNative(
             part: textPart,
           });
         }
-        messageText += pendingText;
+        messageText += remainingText;
         writeSSEEvent(res, 'response.output_text.delta', {
           item_id: messageItemId,
           output_index: outputItems.findIndex((i) => i.id === messageItemId),
           content_index: 0,
-          delta: pendingText,
+          delta: remainingText,
         });
-        pendingText = '';
       }
 
       // Close reasoning item if open
@@ -181,7 +179,7 @@ async function handleStreamingNative(
       // Recovery: if tool-call suppression was triggered but the final event has no
       // parsed tool calls (false alarm — e.g., literal "<tool_call>" in model output),
       // create a message item using the final parsed text.
-      if (suppressTextDeltas && !hasToolCalls && finalText && !hasEmittedMessage) {
+      if (tagBuffer.suppressed && !hasToolCalls && finalText && !hasEmittedMessage) {
         hasEmittedMessage = true;
         messageItemId = genId('msg_');
         const messageItem: MessageOutputItem = {
@@ -202,7 +200,7 @@ async function handleStreamingNative(
           content_index: 0,
           part: textPart,
         });
-      } else if (suppressTextDeltas && !hasToolCalls && finalText && hasEmittedMessage) {
+      } else if (tagBuffer.suppressed && !hasToolCalls && finalText && hasEmittedMessage) {
         // Recovery: text was already being streamed but got cut off by a false-alarm
         // <tool_call> tag. Emit the unsent portion as a delta.
         const unsent = finalText.slice(messageText.length);
@@ -380,97 +378,75 @@ async function handleStreamingNative(
         delta: deltaText,
       });
     } else {
-      if (!suppressTextDeltas) {
-        pendingText += event.text;
-
-        // Check for full tool-call tag
-        const tagIdx = pendingText.indexOf(TOOL_CALL_TAG);
-        if (tagIdx >= 0) {
-          // Emit any clean text before the tag.
-          // Trim whitespace-only prefixes: whitespace immediately before <tool_call>
-          // is always markup-related (e.g. "\n<tool_call>"), not user-visible content.
-          // Emitting it would create a dangling message item that needs special-casing
-          // at finalization when skipMessageItem is true.
-          const cleanPrefix = pendingText.slice(0, tagIdx);
-          if (cleanPrefix.trim()) {
-            if (!hasEmittedMessage) {
-              hasEmittedMessage = true;
-              messageItemId = genId('msg_');
-              const messageItem: MessageOutputItem = {
-                id: messageItemId,
-                type: 'message',
-                role: 'assistant',
-                status: 'in_progress',
-                content: [],
-              };
-              const miIndex = outputItems.length;
-              outputItems.push(messageItem);
-              outputIndex = miIndex;
-              writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
-              const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-              writeSSEEvent(res, 'response.content_part.added', {
-                item_id: messageItemId,
-                output_index: miIndex,
-                content_index: 0,
-                part: textPart,
-              });
-            }
-            messageText += cleanPrefix.trim();
-            writeSSEEvent(res, 'response.output_text.delta', {
+      // Text delta with tool_call tag buffering
+      const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
+      if (tagFound) {
+        // Emit any clean text before the tag.
+        // Trim whitespace-only prefixes: whitespace immediately before <tool_call>
+        // is always markup-related (e.g. "\n<tool_call>"), not user-visible content.
+        // Emitting it would create a dangling message item that needs special-casing
+        // at finalization when skipMessageItem is true.
+        if (cleanPrefix.trim()) {
+          if (!hasEmittedMessage) {
+            hasEmittedMessage = true;
+            messageItemId = genId('msg_');
+            const messageItem: MessageOutputItem = {
+              id: messageItemId,
+              type: 'message',
+              role: 'assistant',
+              status: 'in_progress',
+              content: [],
+            };
+            const miIndex = outputItems.length;
+            outputItems.push(messageItem);
+            outputIndex = miIndex;
+            writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+            const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+            writeSSEEvent(res, 'response.content_part.added', {
               item_id: messageItemId,
-              output_index: outputItems.findIndex((i) => i.id === messageItemId),
+              output_index: miIndex,
               content_index: 0,
-              delta: cleanPrefix.trim(),
+              part: textPart,
             });
           }
-          suppressTextDeltas = true;
-          pendingText = '';
-        } else {
-          // Check if pendingText ends with a partial prefix of '<tool_call>'
-          let safeLen = pendingText.length;
-          for (let i = 1; i <= Math.min(pendingText.length, TOOL_CALL_TAG.length - 1); i++) {
-            const suffix = pendingText.slice(-i);
-            if (TOOL_CALL_TAG.startsWith(suffix)) {
-              safeLen = pendingText.length - i;
-              break;
-            }
-          }
-
-          const safeText = pendingText.slice(0, safeLen);
-          pendingText = pendingText.slice(safeLen);
-
-          if (safeText) {
-            if (!hasEmittedMessage) {
-              hasEmittedMessage = true;
-              messageItemId = genId('msg_');
-              const messageItem: MessageOutputItem = {
-                id: messageItemId,
-                type: 'message',
-                role: 'assistant',
-                status: 'in_progress',
-                content: [],
-              };
-              const miIndex = outputItems.length;
-              outputItems.push(messageItem);
-              outputIndex = miIndex;
-              writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
-              const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-              writeSSEEvent(res, 'response.content_part.added', {
-                item_id: messageItemId,
-                output_index: miIndex,
-                content_index: 0,
-                part: textPart,
-              });
-            }
-            messageText += safeText;
-            writeSSEEvent(res, 'response.output_text.delta', {
-              item_id: messageItemId,
-              output_index: outputItems.findIndex((i) => i.id === messageItemId),
-              content_index: 0,
-              delta: safeText,
-            });
-          }
+          messageText += cleanPrefix;
+          writeSSEEvent(res, 'response.output_text.delta', {
+            item_id: messageItemId,
+            output_index: outputItems.findIndex((i) => i.id === messageItemId),
+            content_index: 0,
+            delta: cleanPrefix,
+          });
         }
+      } else if (safeText) {
+        if (!hasEmittedMessage) {
+          hasEmittedMessage = true;
+          messageItemId = genId('msg_');
+          const messageItem: MessageOutputItem = {
+            id: messageItemId,
+            type: 'message',
+            role: 'assistant',
+            status: 'in_progress',
+            content: [],
+          };
+          const miIndex = outputItems.length;
+          outputItems.push(messageItem);
+          outputIndex = miIndex;
+          writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+          const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+          writeSSEEvent(res, 'response.content_part.added', {
+            item_id: messageItemId,
+            output_index: miIndex,
+            content_index: 0,
+            part: textPart,
+          });
+        }
+        messageText += safeText;
+        writeSSEEvent(res, 'response.output_text.delta', {
+          item_id: messageItemId,
+          output_index: outputItems.findIndex((i) => i.id === messageItemId),
+          content_index: 0,
+          delta: safeText,
+        });
       }
     }
   }
