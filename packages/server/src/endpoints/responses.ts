@@ -197,6 +197,19 @@ async function handleStreamingNative(
           content_index: 0,
           part: textPart,
         });
+      } else if (suppressTextDeltas && !hasToolCalls && finalText && hasEmittedMessage) {
+        // Recovery: text was already being streamed but got cut off by a false-alarm
+        // <tool_call> tag. Emit the unsent portion as a delta.
+        const unsent = finalText.slice(messageText.length);
+        if (unsent) {
+          messageText += unsent;
+          writeSSEEvent(res, 'response.output_text.delta', {
+            item_id: messageItemId,
+            output_index: outputItems.findIndex((i) => i.id === messageItemId),
+            content_index: 0,
+            delta: unsent,
+          });
+        }
       }
 
       if (hasEmittedMessage && messageItemId && !skipMessageItem) {

@@ -94,3 +94,11 @@ export function sendAnthropicNotFound(res: ServerResponse, message: string): voi
 export function sendAnthropicInternalError(res: ServerResponse, message: string): void {
   sendAnthropicError(res, 500, 'api_error', message);
 }
+
+/**
+ * Send an Anthropic 405 Method Not Allowed error.
+ */
+export function sendAnthropicMethodNotAllowed(res: ServerResponse, allowed: string): void {
+  res.writeHead(405, { Allow: allowed, 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Method not allowed' } }));
+}

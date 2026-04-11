@@ -201,7 +201,7 @@ async function handleStreamingNative(
 
       // Emit message_delta and message_stop
       const stopReason = mapStopReason(event.finishReason, hasToolCalls);
-      writeSSEEvent(res, 'message_delta', buildMessageDelta(stopReason, event.numTokens));
+      writeSSEEvent(res, 'message_delta', buildMessageDelta(stopReason, event.numTokens, event.promptTokens));
       writeSSEEvent(res, 'message_stop', buildMessageStop());
 
       endSSE(res);
