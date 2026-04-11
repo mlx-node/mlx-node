@@ -561,6 +561,32 @@ pub fn has_think_end_token(generated_tokens: &[u32], think_end_id: Option<u32>) 
     think_end_id.is_some_and(|id| generated_tokens.contains(&id))
 }
 
+/// Count the number of reasoning tokens in generated output.
+///
+/// When `thinking` is Some (reasoning was detected), scans `generated_tokens`
+/// for the `think_end_id` position. Tokens before that position are reasoning
+/// tokens (excluding the `</think>` token itself). If `think_end_id` is not
+/// in the vocabulary, all generated tokens are counted as reasoning.
+/// Returns 0 when thinking is None.
+pub fn count_reasoning_tokens(
+    thinking: &Option<String>,
+    generated_tokens: &[u32],
+    think_end_id: Option<u32>,
+) -> u32 {
+    if thinking.is_none() {
+        return 0;
+    }
+    if let Some(end_id) = think_end_id {
+        generated_tokens
+            .iter()
+            .position(|&t| t == end_id)
+            .map(|pos| pos as u32)
+            .unwrap_or(generated_tokens.len() as u32)
+    } else {
+        generated_tokens.len() as u32
+    }
+}
+
 /// Split generated output using token-level thinking detection.
 ///
 /// When the think-end token was found in generated tokens (`think_end_tag` is Some),

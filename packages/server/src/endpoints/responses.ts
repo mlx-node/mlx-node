@@ -201,6 +201,13 @@ async function handleStreamingNative(
           content_index: 0,
           part: textPart,
         });
+        messageText = finalText;
+        writeSSEEvent(res, 'response.output_text.delta', {
+          item_id: messageItemId,
+          output_index: miIndex,
+          content_index: 0,
+          delta: finalText,
+        });
       } else if (tagBuffer.suppressed && !hasToolCalls && finalText && hasEmittedMessage) {
         // Recovery: text was already being streamed but got cut off by a false-alarm
         // <tool_call> tag. Emit the unsent portion as a delta.

@@ -308,13 +308,13 @@ async function handleStreamingSimulated(
   body: AnthropicMessagesRequest,
 ): Promise<void> {
   const messageId = genId('msg_');
+
+  beginSSE(res);
+  writeSSEEvent(res, 'message_start', buildMessageStartEvent(body, messageId, 0));
+
   const result = (await model.chat(messages, config)) as ChatResult;
   const okToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
   const hasToolCalls = okToolCalls.length > 0;
-
-  beginSSE(res);
-
-  writeSSEEvent(res, 'message_start', buildMessageStartEvent(body, messageId, result.promptTokens));
 
   let contentBlockIndex = 0;
 

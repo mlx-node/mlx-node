@@ -1651,21 +1651,11 @@ impl Qwen3Inner {
             None
         };
 
-        let reasoning_tokens = if thinking.is_some() {
-            if let Some(end_id) = tokenizer.think_end_id() {
-                generated_tokens
-                    .iter()
-                    .position(|&t| t == end_id)
-                    .map(|pos| pos as u32)
-                    .unwrap_or(generated_tokens.len() as u32)
-            } else {
-                // No think_end_id — count all generated tokens as reasoning
-                // (matches ReasoningTracker behavior in Qwen3.5/MoE)
-                generated_tokens.len() as u32
-            }
-        } else {
-            0
-        };
+        let reasoning_tokens = tools::count_reasoning_tokens(
+            &thinking,
+            &generated_tokens,
+            tokenizer.think_end_id(),
+        );
 
         Ok(ChatResult {
             text: cleaned_text,
