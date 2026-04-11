@@ -12,15 +12,36 @@ const buildCommand = createBuildCommand(process.argv.slice(2));
 const cli = new NapiCli();
 const buildOptions = buildCommand.getOptions();
 
-const { task } = await cli.build({
-  ...buildOptions,
+Object.assign(buildOptions, {
   manifestPath: join(__dirname, '../../crates/mlx-core/Cargo.toml'),
   packageJsonPath: join(__dirname, 'package.json'),
   platform: true,
   outputDir: __dirname,
-  jsBinding: 'index.cjs',
-  dts: 'index.d.cts',
-});
+})
+
+const isWasmBuild = buildOptions.target === 'wasm32-wasip1-threads'
+
+if (isWasmBuild) {
+  // tokio_unstable: enables multi-thread tokio runtime on WASM (requires
+  // asyncWorkPoolSize > 0 in emnapi instantiation so wasi_thread_spawn works).
+  process.env.RUSTFLAGS = '--cfg tokio_unstable'
+  // esaxx-rs (pulled in by tokenizers) uses C++ try/catch — needs -fexceptions
+  // globally. mlx-sys/build.rs sets these for its own cmake/cc::Build, but
+  // esaxx-rs uses its own cc::Build that reads TARGET_CXXFLAGS from env.
+  process.env.TARGET_CXXFLAGS = '-fwasm-exceptions -fexceptions'
+  Object.assign(buildOptions, {
+    noJsBinding: true,
+    noDefaultFeatures: true,
+    features: ['browser'],
+  })
+} else {
+  Object.assign(buildOptions, {
+    jsBinding: 'index.cjs',
+    dts: 'index.d.cts',
+  })
+}
+
+const { task } = await cli.build(buildOptions);
 const outputs = await task;
 
 for (const output of outputs) {
@@ -28,7 +49,7 @@ for (const output of outputs) {
     const { code } = await format(output.path, await readFile(output.path, 'utf-8'), viteConfig.fmt);
     await writeFile(output.path, code);
   }
-  if (output.kind === 'dts') {
+  if (output.kind === 'dts' && !isWasmBuild) {
     const code = await readFile(output.path, 'utf-8');
     const replaced = code.replace('export declare const enum OutputFormat {', 'export enum OutputFormat {');
     await writeFile(output.path, replaced);
@@ -42,6 +63,12 @@ const target = process.argv.find(a => a.includes('wasm32'));
 if (!target) {
   await copyMetallib();
 } else {
+  // Copy raw WASM binary to the runtime location (symlinked by browser demo)
+  const rawWasm = join(__dirname, '../../target/wasm32-wasip1-threads', buildOptions.profile ?? 'wasi', 'mlx_core.wasm');
+  const runtimeWasm = join(__dirname, 'mlx-core.wasm32-wasi.opt.wasm');
+  await copyFile(rawWasm, runtimeWasm);
+  console.log(`Copied WASM: ${rawWasm} -> ${runtimeWasm}`);
+
   // Patch generated WASM browser/worker files with extra imports needed by
   // MLX (C++ exception stubs, WebGPU bridge no-ops, GPU init).
   // These are WASM imports not provided by emnapi/WASI.

@@ -25,11 +25,16 @@ echo ""
 echo "--- Step 1: Building WASM via NAPI-RS ---"
 cd "$ROOT_DIR"
 
-# C++ exception flags (-fexceptions -fwasm-exceptions) are set in mlx-sys/build.rs
-# for both cmake and cc::Build. Vtable GC is prevented by --whole-archive in
-# mlx-sys/build.rs. Stack size (64 MB) is set by napi_build::setup() in
-# mlx-core/build.rs.
+# Build flags are consolidated in packages/core/build.ts (single source of truth):
+#   RUSTFLAGS='--cfg tokio_unstable'  — multi-thread tokio on WASM
+#   TARGET_CXXFLAGS='-fwasm-exceptions -fexceptions' — esaxx-rs needs -fexceptions
+# Stack size (64 MB) is set by napi_build::setup() in crates/mlx-core/build.rs.
+# Vtable GC is prevented by --whole-archive in mlx-sys/build.rs.
+#
+# This shell script is a convenience wrapper; prefer `yarn workspace @mlx-node/core build:wasm`.
 if ! WASI_SDK_PATH="$WASI_SDK_PATH" \
+    RUSTFLAGS='--cfg tokio_unstable' \
+    TARGET_CXXFLAGS='-fwasm-exceptions -fexceptions' \
     "$ROOT_DIR/node_modules/.bin/napi" build \
       --manifest-path crates/mlx-core/Cargo.toml \
       --target wasm32-wasip1-threads \

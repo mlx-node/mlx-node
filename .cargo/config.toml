@@ -2,7 +2,3 @@
 # MLX uses a shared Metal device/stream, so tests must run sequentially
 [env]
 RUST_TEST_THREADS = "1"
-
-# WASM stack size: 8MB (default ~1MB is too small for deep model call stacks)
-[target.wasm32-wasip1-threads]
-rustflags = ["-C", "link-arg=-zstack-size=8388608"]

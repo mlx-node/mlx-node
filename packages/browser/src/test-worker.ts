@@ -166,8 +166,14 @@ async function initAndRun(wasmUrl: string) {
   try {
     napiModResult = await instantiateNapiModule(wasmFile, {
       context,
-      asyncWorkPoolSize: 0,
+      asyncWorkPoolSize: 4,
       wasi,
+      onCreateWorker() {
+        return new Worker(
+          new URL('./webgpu-worker.mjs', import.meta.url),
+          { type: 'module' },
+        );
+      },
       overwriteImports(importObject: Record<string, Record<string, unknown>>) {
         importObject.env = {
           ...importObject.env,

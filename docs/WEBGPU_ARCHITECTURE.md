@@ -507,18 +507,24 @@ The WASM build involves multiple stages:
 1. **Cargo + NAPI-RS** compiles Rust code targeting `wasm32-wasip1-threads`
 2. **cmake** (invoked by `build.rs`) cross-compiles MLX C++ with WASI-SDK
 3. **wasm-ld** links everything into a single `.wasm` binary (~20 MB)
-4. The binary is copied to `packages/core/index.wasm`
+4. The binary is copied to `packages/core/mlx-core.wasm32-wasi.opt.wasm`
+
+**Single source of truth**: `packages/core/build.ts` is the canonical build entry point for WASM. It sets all environment variables (`RUSTFLAGS`, `TARGET_CXXFLAGS`) and build options. The shell script `packages/browser/build-wasm.sh` mirrors these flags for convenience but `build.ts` is authoritative. Do not add build flags in other locations (`.cargo/config.toml`, `mlx-sys/build.rs`, etc.).
 
 Key build flags:
 
 ```bash
-# C++ compilation (via cmake)
+# Environment (set by build.ts)
+RUSTFLAGS='--cfg tokio_unstable'                    # Multi-thread tokio runtime on WASM
+TARGET_CXXFLAGS='-fwasm-exceptions -fexceptions'    # Required by esaxx-rs (C++ try/catch)
+
+# C++ compilation (via cmake, set in mlx-sys/build.rs)
 -fwasm-exceptions          # WASM native exception handling
 -femit-all-decls           # Forces emission of inline virtual methods
 -fvisibility=hidden        # Consistent vtable visibility
 -fvisibility-inlines-hidden
 
-# C++ compilation (bridge files via cc::Build)
+# C++ compilation (bridge files via cc::Build in mlx-sys/build.rs)
 -fexceptions
 -fwasm-exceptions
 -fvisibility=hidden
@@ -526,7 +532,7 @@ Key build flags:
 
 # Linking
 -Wl,--whole-archive=mlx    # Prevents vtable method GC
--zstack-size=64000000      # 64 MB stack (set by napi_build::setup() for all WASI targets)
+-zstack-size=64000000      # 64 MB stack (set by napi_build::setup() in crates/mlx-core/build.rs)
 
 # cmake defines
 -DMLX_BUILD_WEBGPU=ON
@@ -534,6 +540,8 @@ Key build flags:
 -DMLX_USE_WEBGPU
 -DWEBGPU_BACKEND_WASI_IMPORT
 ```
+
+**tokio_unstable**: Enables `tokio::runtime::Builder::new_multi_thread()` in napi-rs for WASM targets. Requires `asyncWorkPoolSize > 0` in emnapi instantiation so `wasi_thread_spawn` can create thread pool workers. Without this, napi-rs falls back to `new_current_thread()` which cannot run `spawn_blocking` or parallel async tasks.
 
 **Critical**: The MLX source at `crates/mlx-sys/mlx` is a **symlink** to `/Users/brooklyn/workspace/github/mlx`, not a git submodule. All C++ changes are made in the mlx repo and automatically picked up by WASM builds. Never re-init this as a submodule.
 
@@ -667,9 +675,9 @@ This section documents every significant bug and pitfall encountered during deve
 
 **Symptom**: `cannot use 'try' with exceptions disabled` during WASM build.
 
-**Root cause**: The `tokenizers` crate pulls in `esaxx-rs` which uses C++ `try`/`catch`, incompatible with WASI-SDK's `-fno-exceptions` for non-WASM-exception code.
+**Root cause**: The `tokenizers` crate pulls in `esaxx-rs` which uses C++ `try`/`catch`. `esaxx-rs` has its own `cc::Build` that reads `TARGET_CXXFLAGS` from the environment — `mlx-sys/build.rs` can only set flags for its own cmake/cc::Build, not for other crates.
 
-**Fix**: `tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }`.
+**Fix**: Set `TARGET_CXXFLAGS='-fwasm-exceptions -fexceptions'` in `build.ts` (the single source of truth for WASM build flags). This propagates to all crates' `cc::Build` invocations via the environment.
 
 #### Lazy static init for compiled ops
 
@@ -862,7 +870,9 @@ void MyOp::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 - **Browser console**: Check for WebGPU validation errors in the browser console. Common issues: buffer aliasing (same buffer in read and read_write slots), buffer too small, workgroup size mismatch.
 
-- **WASM crashes**: Deep model call stacks can overflow the WASM stack (64 MB, set by `napi_build::setup()` in `crates/mlx-core/build.rs`). Symptoms: silent crash or `RuntimeError: unreachable`. The stack size is managed solely by the napi-build crate — do not add redundant `-zstack-size` flags in `build-wasm.sh` or `mlx-sys/build.rs`.
+- **WASM crashes**: Deep model call stacks can overflow the WASM stack (64 MB, set by `napi_build::setup()` in `crates/mlx-core/build.rs`). Symptoms: silent crash or `RuntimeError: unreachable`. The stack size is managed solely by the napi-build crate — do not add redundant `-zstack-size` flags elsewhere.
+
+- **WASM build flags**: All WASM build configuration lives in `packages/core/build.ts` (single source of truth). `RUSTFLAGS` (tokio_unstable) and `TARGET_CXXFLAGS` (exception flags for esaxx-rs) are set there. Do not duplicate these in `.cargo/config.toml`, `mlx-sys/build.rs`, or shell scripts.
 
 - **WASM rebuild not picking up changes**: Touch `CMakeLists.txt` to force cmake reconfigure. Touch `build.rs` to force Cargo to re-run the build script. Never delete the cmake build cache.
 
