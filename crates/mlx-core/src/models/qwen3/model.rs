@@ -1656,7 +1656,7 @@ impl Qwen3Inner {
                 generated_tokens
                     .iter()
                     .position(|&t| t == end_id)
-                    .map(|pos| (pos + 1) as u32)
+                    .map(|pos| pos as u32)
                     .unwrap_or(generated_tokens.len() as u32)
             } else {
                 0
