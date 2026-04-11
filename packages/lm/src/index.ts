@@ -17,7 +17,7 @@
 export { Qwen3Model, Qwen3Tokenizer } from '@mlx-node/core';
 
 // Gemma4 models
-export { Gemma4Model } from '@mlx-node/core';
+export { Gemma4Model, Gemma4Model as Gemma4_Model } from './stream.js';
 export type { Gemma4Config, Gemma4ChatConfig } from '@mlx-node/core';
 
 // Embedding models
