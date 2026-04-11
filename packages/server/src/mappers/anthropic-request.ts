@@ -68,10 +68,15 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
       messages.push({ role: 'system', content: req.system });
     } else {
       // Array of SystemBlock — concatenate all text blocks
-      const systemText = (req.system as SystemBlock[])
-        .filter((b) => b.type === 'text')
-        .map((b) => b.text)
-        .join('');
+      const systemParts: string[] = [];
+      for (const b of req.system as SystemBlock[]) {
+        if (b.type === 'text') {
+          systemParts.push(b.text);
+        } else {
+          throw new Error(`Unsupported system block type: "${(b as { type: string }).type}"`);
+        }
+      }
+      const systemText = systemParts.join('');
       messages.push({ role: 'system', content: systemText });
     }
   }

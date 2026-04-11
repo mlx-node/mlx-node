@@ -30,6 +30,9 @@ function resolveContent(content: string | ContentPart[]): string {
  * so we stringify the properties object here.
  */
 function mapTool(tool: ResponsesToolDefinition): ToolDefinition {
+  if (tool.type !== 'function') {
+    throw new Error(`Unsupported tool type: "${tool.type}"`);
+  }
   const params = tool.parameters;
   return {
     type: 'function',
