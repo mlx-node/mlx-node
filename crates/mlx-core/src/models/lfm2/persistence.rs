@@ -175,6 +175,10 @@ fn sanitize_weights(
 
 /// Apply sanitized weights to an Lfm2Inner.
 fn apply_weights(inner: &mut Lfm2Inner, params: &HashMap<String, MxArray>) -> Result<()> {
+    // Fail loudly on partial/renamed checkpoints before ever running inference
+    // with randomly-initialized projections.
+    validate_mandatory_weights(params, &inner.config, inner.layers.len())?;
+
     info!("Applying weights: {} tensors", params.len(),);
 
     // Embedding
@@ -269,6 +273,105 @@ fn apply_weights(inner: &mut Lfm2Inner, params: &HashMap<String, MxArray>) -> Re
     }
 
     info!("All weights applied successfully");
+    Ok(())
+}
+
+/// Validate all mandatory LFM2 tensors are present in the sanitized param map.
+///
+/// Load-time failure on a missing key is much easier to diagnose than silent
+/// garbage generations caused by leftover random initialization. Mirrors the
+/// Qwen3.5 validator and matches mlx-lm's strict-load semantics.
+fn validate_mandatory_weights(
+    params: &HashMap<String, MxArray>,
+    config: &Lfm2Config,
+    num_layers: usize,
+) -> Result<()> {
+    let mut missing: Vec<String> = Vec::new();
+
+    // Model-level weights
+    if !params.contains_key("embed_tokens.weight") {
+        missing.push("embed_tokens.weight".to_string());
+    }
+    if !params.contains_key("embedding_norm.weight") {
+        missing.push("embedding_norm.weight".to_string());
+    }
+    if !config.tie_embedding && !params.contains_key("lm_head.weight") {
+        missing.push("lm_head.weight".to_string());
+    }
+
+    // Per-layer weights
+    for i in 0..num_layers {
+        let prefix = format!("layers.{}", i);
+        let required_common = [
+            format!("{}.operator_norm.weight", prefix),
+            format!("{}.ffn_norm.weight", prefix),
+            format!("{}.feed_forward.gate_proj.weight", prefix),
+            format!("{}.feed_forward.up_proj.weight", prefix),
+            format!("{}.feed_forward.down_proj.weight", prefix),
+        ];
+        for key in &required_common {
+            if !params.contains_key(key) {
+                missing.push(key.clone());
+            }
+        }
+
+        if config.is_attention_layer(i) {
+            let attn_prefix = format!("{}.self_attn", prefix);
+            let required_attn = [
+                format!("{}.q_proj.weight", attn_prefix),
+                format!("{}.k_proj.weight", attn_prefix),
+                format!("{}.v_proj.weight", attn_prefix),
+                format!("{}.out_proj.weight", attn_prefix),
+                format!("{}.q_layernorm.weight", attn_prefix),
+                format!("{}.k_layernorm.weight", attn_prefix),
+            ];
+            for key in &required_attn {
+                if !params.contains_key(key) {
+                    missing.push(key.clone());
+                }
+            }
+        } else {
+            let conv_prefix = format!("{}.conv", prefix);
+            let required_conv = [
+                format!("{}.conv.weight", conv_prefix),
+                format!("{}.in_proj.weight", conv_prefix),
+                format!("{}.out_proj.weight", conv_prefix),
+            ];
+            for key in &required_conv {
+                if !params.contains_key(key) {
+                    missing.push(key.clone());
+                }
+            }
+            if config.conv_bias {
+                let required_bias = [
+                    format!("{}.conv.bias", conv_prefix),
+                    format!("{}.in_proj.bias", conv_prefix),
+                    format!("{}.out_proj.bias", conv_prefix),
+                ];
+                for key in &required_bias {
+                    if !params.contains_key(key) {
+                        missing.push(key.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        // Cap the error string so huge missing-sets stay readable.
+        let shown = &missing[..missing.len().min(20)];
+        return Err(Error::from_reason(format!(
+            "LFM2 checkpoint missing {} mandatory weight(s): {:?}{}",
+            missing.len(),
+            shown,
+            if missing.len() > shown.len() {
+                " ..."
+            } else {
+                ""
+            }
+        )));
+    }
+
     Ok(())
 }
 
