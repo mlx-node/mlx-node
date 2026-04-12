@@ -25,10 +25,8 @@ TextDecoder.prototype.decode = function (input?: BufferSource | null, options?: 
 
 import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-runtime';
 
-import {
-  CMD_OFFSET,
-  READBACK_BUFFER_SIZE,
-} from './rpc-protocol.js';
+import { createSabRing } from './chat-stream-sab.js';
+import { CMD_OFFSET, READBACK_BUFFER_SIZE } from './rpc-protocol.js';
 import { parseSafeTensorsHeader, dtypeToCode } from './safetensors.js';
 import { createBridgeStub } from './webgpu-bridge-stub.js';
 
@@ -41,12 +39,7 @@ function post(msg: any) {
   (self as any).postMessage(msg);
 }
 
-async function handleInit(data: {
-  wasmUrl: string;
-  modelUrl: string;
-  packBf16?: boolean;
-  sdpaFallback?: boolean;
-}) {
+async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: boolean; sdpaFallback?: boolean }) {
   const packBf16 = data.packBf16 === true;
   const sdpaFallback = data.sdpaFallback === true;
   try {
@@ -203,9 +196,7 @@ async function handleInit(data: {
     if (typeof mlxExports.wgpuSetSdpaFallbackForced === 'function') {
       mlxExports.wgpuSetSdpaFallbackForced(sdpaFallback);
     }
-    const flagSuffix =
-      (packBf16 ? ' pack_bf16=1' : '') +
-      (sdpaFallback ? ' sdpa_fallback=1' : '');
+    const flagSuffix = (packBf16 ? ' pack_bf16=1' : '') + (sdpaFallback ? ' sdpa_fallback=1' : '');
     post({
       type: 'progress',
       step: 'wasm',
@@ -295,13 +286,7 @@ async function handleInit(data: {
       new Uint8Array(sharedMemory.buffer).set(src, uptr);
 
       // Create MLX array in Rust (C++ copies from pointer) then free WASM buffer
-      Qwen35Model.addCpuTensor(
-        t.name,
-        uptr,
-        t.byteSize,
-        t.shape,
-        dtypeToCode(t.dtype),
-      );
+      Qwen35Model.addCpuTensor(t.name, uptr, t.byteSize, t.shape, dtypeToCode(t.dtype));
       wasmFree(ptr);
 
       if (i % 50 === 0) {
@@ -318,10 +303,7 @@ async function handleInit(data: {
 
     // 6. Pipeline warmup — first inference warms GPU pipelines + shader compilation
     post({ type: 'progress', step: 'warmup', message: 'Warming up...' });
-    await model.chat(
-      [{ role: 'user', content: 'hi' }],
-      { maxNewTokens: 2, temperature: 0 },
-    );
+    await model.chat([{ role: 'user', content: 'hi' }], { maxNewTokens: 2, temperature: 0 });
     post({ type: 'progress', step: 'warmup', message: 'Warmup complete' });
 
     post({ type: 'ready' });
@@ -333,22 +315,29 @@ async function handleInit(data: {
 async function handleChat(data: { messages: any[]; config?: any }) {
   try {
     const chatConfig = {
-      ...(data.config ?? {}),
+      ...data.config,
       enableThinking: true,
       reportPerformance: true,
     };
 
-    // Use chatStream for per-token streaming — each chunk is posted to main thread
-    // via postMessage so the UI can render tokens incrementally.
+    // Allocate a 256 KiB SAB ring. Keep sabRing alive for the duration of the
+    // stream so the SAB is not GC'd before the WASM producer finishes writing.
+    const sabRing = createSabRing(262_144);
+    const { sab } = sabRing;
+
+    // Convert the SharedArrayBuffer to a Buffer for the NAPI call.
+    // The buffer polyfill supports SharedArrayBuffer at lines 134-137 of its
+    // index.js — Buffer.from(sab) creates a Uint8Array view over the SAB.
+    const sabBuf = Buffer.from(sab as unknown as ArrayBuffer);
+
     const t0 = performance.now();
-    const handle = await model.chatStream(
-      data.messages,
-      chatConfig,
-      (err: Error | null, chunk: any) => {
-        if (err) {
-          post({ type: 'error', message: err.message, stack: err.stack });
-          return;
-        }
+
+    // Start the SAB ring reader before launching the stream so that no tokens
+    // are missed. onChunk/onError mirror the existing chatStream callback body.
+    let abortController: AbortController | null = null;
+
+    abortController = sabRing.reader(
+      (chunk) => {
         if (chunk.done) {
           const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
           post({ type: 'progress', step: 'chat', message: `chatStream completed in ${elapsed}s` });
@@ -368,6 +357,8 @@ async function handleChat(data: { messages: any[]; config?: any }) {
                 }
               : null,
           });
+          // Stop the waitAsync loop now that the stream is done.
+          abortController!.abort();
         } else {
           post({
             type: 'chunk',
@@ -376,7 +367,15 @@ async function handleChat(data: { messages: any[]; config?: any }) {
           });
         }
       },
+      (e) => {
+        post({ type: 'error', message: e.message, stack: e.stack });
+      },
     );
+
+    // Use chatStreamSab — writes directly into the SAB ring, no TSFN on the
+    // hot decode path. handle.cancel() + abortController.abort() tear down both
+    // sides cleanly if cancellation is needed in the future.
+    const handle = await model.chatStreamSab(data.messages, chatConfig, sabBuf);
     // handle.cancel() available for cancellation if needed
     void handle;
   } catch (e) {
