@@ -1763,7 +1763,10 @@ impl Qwen35Inner {
 
         // Guard: respect cancellation before doing any work.
         if cancelled.load(Ordering::Relaxed) {
-            send_stream_error_chunk(&cb, "chat_stream_session_start cancelled before start");
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_session_start cancelled before start",
+            );
             return;
         }
 
@@ -1772,8 +1775,8 @@ impl Qwen35Inner {
             .iter()
             .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
         if has_images {
-            send_stream_error_chunk(
-                &cb,
+            send_stream_error(
+                &stream_tx,
                 "chat_stream_session_start is text-only; session paths do not support images",
             );
             return;
@@ -1781,8 +1784,8 @@ impl Qwen35Inner {
 
         // Guard: reuse_cache must not be explicitly disabled.
         if config.reuse_cache == Some(false) {
-            send_stream_error_chunk(
-                &cb,
+            send_stream_error(
+                &stream_tx,
                 "chat_stream_session_start requires reuse_cache=true (leave as None or set to true). \
                  The session API only makes sense with cache reuse enabled.",
             );
@@ -1793,8 +1796,8 @@ impl Qwen35Inner {
         let im_end_id = match self.tokenizer.as_ref().and_then(|t| t.im_end_id()) {
             Some(id) => id,
             None => {
-                send_stream_error_chunk(
-                    &cb,
+                send_stream_error(
+                    &stream_tx,
                     "chat_stream_session_start requires a tokenizer with an <|im_end|> special token",
                 );
                 return;
@@ -1829,17 +1832,18 @@ impl Qwen35Inner {
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     ) {
-        let cb = StreamSender(stream_tx.clone());
-
         if cancelled.load(Ordering::Relaxed) {
-            send_stream_error_chunk(&cb, "chat_stream_session_continue cancelled before start");
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_session_continue cancelled before start",
+            );
             return;
         }
 
         let tokenizer = match self.tokenizer.as_ref() {
             Some(t) => t.clone(),
             None => {
-                send_stream_error_chunk(&cb, "Tokenizer not loaded");
+                send_stream_error(&stream_tx, "Tokenizer not loaded");
                 return;
             }
         };
@@ -1898,37 +1902,41 @@ impl Qwen35Inner {
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     ) {
-        let cb = StreamSender(stream_tx.clone());
-
         // Respect cancellation before any work.
         if cancelled.load(Ordering::Relaxed) {
-            send_stream_error_chunk(&cb, "chat_stream_tokens_delta cancelled before start");
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta cancelled before start",
+            );
             return;
         }
 
         // --- Same four guards as chat_tokens_delta_sync ---
         if config.reuse_cache == Some(false) {
-            send_stream_error_chunk(
-                &cb,
+            send_stream_error(
+                &stream_tx,
                 "chat_stream_tokens_delta requires reuse_cache to be enabled; \
                  the delta path operates on session state by construction",
             );
             return;
         }
         if self.caches.is_none() {
-            send_stream_error_chunk(
-                &cb,
+            send_stream_error(
+                &stream_tx,
                 "chat_stream_tokens_delta requires an initialized session (call chat_stream_session_start first)",
             );
             return;
         }
         if delta_tokens.is_empty() {
-            send_stream_error_chunk(&cb, "chat_stream_tokens_delta requires a non-empty delta");
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta requires a non-empty delta",
+            );
             return;
         }
         if self.cached_image_key.is_some() {
-            send_stream_error_chunk(
-                &cb,
+            send_stream_error(
+                &stream_tx,
                 "chat_stream_tokens_delta is text-only; session currently holds image state",
             );
             return;
@@ -1937,6 +1945,7 @@ impl Qwen35Inner {
         // All guards passed — enter the prefill+decode helper. Any error
         // returned from here propagates as an mpsc error, same as
         // `chat_stream_sync`.
+        let cb = StreamSender(stream_tx.clone());
         let result =
             self.chat_stream_tokens_delta_sync_inner(delta_tokens, config, &cb, &cancelled);
         if let Err(e) = result {
@@ -4215,31 +4224,32 @@ impl StreamSender {
     }
 }
 
-/// Send a final `done=true` error chunk through the stream.
+/// Report a guard-violation error through the stream channel.
 ///
 /// Used by the streaming session entry points (`chat_stream_session_*`
-/// and `chat_stream_tokens_delta_sync`) to report guard-violation
-/// errors. Unlike the normal error path (`stream_tx.send(Err(...))`),
-/// this emits a structured final chunk so the JS-side generator
-/// bridge still sees a terminal `done: true` event and cleans up
-/// without throwing.
-fn send_stream_error_chunk(cb: &StreamSender, message: &str) {
-    cb.call(
-        Ok(ChatStreamChunk {
-            text: message.to_string(),
-            done: true,
-            finish_reason: Some("error".to_string()),
-            tool_calls: Some(Vec::new()),
-            thinking: None,
-            num_tokens: Some(0),
-            prompt_tokens: Some(0),
-            reasoning_tokens: Some(0),
-            raw_text: Some(message.to_string()),
-            performance: None,
-            is_reasoning: None,
-        }),
-        ThreadsafeFunctionCallMode::NonBlocking,
-    );
+/// and `chat_stream_tokens_delta_sync`) to surface pre-decode guard
+/// failures — text-only violations, missing tokenizer special tokens,
+/// reuse_cache=false, empty delta, etc.
+///
+/// Sends an `Err(napi::Error::from_reason(message))` item into the
+/// mpsc so the NAPI forwarding task invokes the TS callback with
+/// `(err, null)`. On the TS side, `_runChatStream` pushes the error
+/// onto its queue and throws it from the async generator, which
+/// `Qwen35Session.sendStream` catches in its `try { ... } finally`
+/// block. The finally clears `inFlight`, `sawFinal` stays false, and
+/// `turnCount` is NOT incremented — so the next `sendStream()` call
+/// re-routes through `chatStreamSessionStart` instead of trying to
+/// continue a session that never initialized. The exception also
+/// re-throws to the caller so the failure is observable.
+///
+/// Important: historically this helper emitted a fake `done: true`
+/// `ChatStreamChunk` with `finish_reason: "error"`, which the TS side
+/// treated as a successful final chunk and caused the session to
+/// advance to a bricked turn 1. Do NOT reintroduce that pattern —
+/// guard failures MUST come through as `Err` so the error path is
+/// exercised.
+fn send_stream_error(stream_tx: &StreamTx<ChatStreamChunk>, message: &str) {
+    let _ = stream_tx.send(Err(napi::Error::from_reason(message.to_string())));
 }
 
 /// RAII guard that calls `mlx_qwen35_compiled_reset()` on drop.

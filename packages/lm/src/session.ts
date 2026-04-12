@@ -156,6 +156,17 @@ export class Qwen35Session {
         reuseCache: true,
       };
 
+      // `sawFinal` is set ONLY when the stream emits a successful
+      // terminal chunk — i.e. `done: true` with a non-error
+      // `finishReason`. Guard-violation errors from the native side
+      // now arrive as thrown exceptions (see `send_stream_error` in
+      // Rust), so the natural `try { ... } finally` flow already
+      // prevents the counter from advancing on failure. This extra
+      // `finishReason !== 'error'` check is belt-and-suspenders: if
+      // any future code path were to emit a `done: true` chunk with
+      // `finishReason: 'error'` as a regular stream event (instead of
+      // throwing), we still refuse to advance the session and brick
+      // subsequent turns.
       let sawFinal = false;
       if (this.turnCount === 0) {
         const messages: ChatMessage[] = [];
@@ -164,19 +175,20 @@ export class Qwen35Session {
         }
         messages.push({ role: 'user', content: userMessage });
         for await (const event of this.model.chatStreamSessionStart(messages, mergedConfig)) {
-          if (event.done) sawFinal = true;
+          if (event.done && event.finishReason !== 'error') sawFinal = true;
           yield event;
         }
       } else {
         for await (const event of this.model.chatStreamSessionContinue(userMessage, mergedConfig)) {
-          if (event.done) sawFinal = true;
+          if (event.done && event.finishReason !== 'error') sawFinal = true;
           yield event;
         }
       }
 
       // Only advance the turn counter when the stream completed
-      // normally (the caller drained all chunks including `done: true`).
-      // Caller-break or mid-stream exceptions leave `turnCount`
+      // normally (the caller drained all chunks including a
+      // successful `done: true`). Caller-break, mid-stream
+      // exceptions, or error-finish chunks leave `turnCount`
       // untouched — see JSDoc above for the rationale.
       if (sawFinal) {
         this.turnCount++;
