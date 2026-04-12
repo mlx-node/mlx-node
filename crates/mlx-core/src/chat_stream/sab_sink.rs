@@ -97,7 +97,7 @@ thread_local! {
 // ---------------------------------------------------------------------------
 // Minimum usable SAB size: header + record header + 1 payload byte + 1 slack.
 // ---------------------------------------------------------------------------
-const MIN_SAB_LEN: usize = SAB_HEADER_BYTES + RECORD_HEADER_BYTES + 1 + 1;
+pub const MIN_SAB_LEN: usize = SAB_HEADER_BYTES + RECORD_HEADER_BYTES + 1 + 1;
 
 // ---------------------------------------------------------------------------
 // SabSink struct

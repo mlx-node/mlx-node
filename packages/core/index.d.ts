@@ -716,19 +716,6 @@ export declare class Qwen35Model {
    */
   chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Streaming chat API with tool calling support.
-   *
-   * Dispatches to the dedicated model thread. Tokens stream back via
-   * an mpsc channel bridged to the JS callback. Returns a `ChatStreamHandle`
-   * immediately; generation runs on the model thread.
-   * Call `handle.cancel()` to abort generation early.
-   */
-  chatStream(
-    messages: ChatMessage[],
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
-  /**
    * Get the number of parameters in the model.
    *
    * Pure config computation — no model-thread dispatch needed.
@@ -740,6 +727,19 @@ export declare class Qwen35Model {
    * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
+  /**
+   * Streaming chat API backed by a SharedArrayBuffer ring buffer.
+   *
+   * The caller passes a `Buffer` whose backing is a region inside the
+   * wasm32-wasip1-threads `SharedArrayBuffer` heap. Tokens are written
+   * directly into the ring without crossing the worker boundary via
+   * `postMessage`, achieving ~25 tok/s vs ~9 tok/s for the TSFN path.
+   *
+   * `sab` must be at least `MIN_SAB_LEN` bytes. The JS caller is
+   * responsible for keeping the SAB alive until the returned
+   * `ChatStreamHandle` is cancelled or generation finishes.
+   */
+  chatStreamSab(messages: ChatMessage[], config: ChatConfig | null, sab: Buffer): Promise<ChatStreamHandle>;
 }
 export type Qwen3_5Model = Qwen35Model;
 
@@ -770,19 +770,6 @@ export declare class Qwen35MoeModel {
    */
   chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Streaming chat API with tool calling support.
-   *
-   * Dispatches to the dedicated model thread. Tokens stream back via
-   * an mpsc channel bridged to the JS callback. Returns a `ChatStreamHandle`
-   * immediately; generation runs on the model thread.
-   * Call `handle.cancel()` to abort generation early.
-   */
-  chatStream(
-    messages: ChatMessage[],
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
-  /**
    * Get the number of parameters in the model.
    *
    * Pure config computation -- no model-thread dispatch needed.
@@ -794,6 +781,19 @@ export declare class Qwen35MoeModel {
    * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
+  /**
+   * Streaming chat API backed by a SharedArrayBuffer ring buffer.
+   *
+   * The caller passes a `Buffer` whose backing is a region inside the
+   * wasm32-wasip1-threads `SharedArrayBuffer` heap. Tokens are written
+   * directly into the ring without crossing the worker boundary via
+   * `postMessage`, achieving ~25 tok/s vs ~9 tok/s for the TSFN path.
+   *
+   * `sab` must be at least `MIN_SAB_LEN` bytes. The JS caller is
+   * responsible for keeping the SAB alive until the returned
+   * `ChatStreamHandle` is cancelled or generation finishes.
+   */
+  chatStreamSab(messages: ChatMessage[], config: ChatConfig | null, sab: Buffer): Promise<ChatStreamHandle>;
 }
 export type Qwen3_5MoeModel = Qwen35MoeModel;
 

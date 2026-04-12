@@ -3,12 +3,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::*;
+#[cfg(not(target_family = "wasm"))]
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 use tracing::{info, warn};
 
 use crate::array::MxArray;
-use crate::chat_stream::{ChatStreamSink, TsfnSink};
+use crate::chat_stream::ChatStreamSink;
+#[cfg(target_family = "wasm")]
+use crate::chat_stream::{MIN_SAB_LEN, SabSink};
+#[cfg(not(target_family = "wasm"))]
+use crate::chat_stream::TsfnSink;
 use crate::model_thread::ResponseTx;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
@@ -5433,6 +5438,152 @@ impl Qwen3_5Model {
                 .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
         })?;
         Ok(promise)
+    }
+}
+
+/// Native-only streaming: NAPI ThreadsafeFunction path (libuv, ~1 μs per token).
+///
+/// Kept in a separate `#[napi] impl` block so that napi-rs does not generate
+/// the `chat_stream_c_callback` helper under `#[cfg(target_family = "wasm")]`,
+/// where `ThreadsafeFunction` is unavailable.
+#[cfg(not(target_family = "wasm"))]
+#[napi]
+impl Qwen3_5Model {
+    /// Streaming chat API with tool calling support.
+    ///
+    /// Dispatches to the dedicated model thread. Tokens stream back directly
+    /// via an `Arc<dyn ChatStreamSink>` handed to the model thread. Returns a
+    /// `ChatStreamHandle` immediately; generation runs on the model thread.
+    /// Call `handle.cancel()` to abort generation early.
+    ///
+    /// Native-only. On WASM, use `chatStreamSab` instead.
+    #[napi(
+        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+
+        let sink: Arc<dyn ChatStreamSink> = Arc::new(TsfnSink::new(callback));
+
+        // Send streaming command to model thread. The sink is Send + Sync + 'static
+        // so it can be moved into the model thread without an intermediate channel.
+        self.thread.send(Qwen35Cmd::ChatStream {
+            messages,
+            config,
+            sink,
+            cancelled: cancelled_inner,
+        })?;
+
+        Ok(ChatStreamHandle { cancelled })
+    }
+}
+
+/// WASM-only streaming: SharedArrayBuffer ring-buffer path (~25 tok/s).
+///
+/// Kept in a separate `#[napi] impl` block so that napi-rs generates the
+/// correct WASM bindings without pulling in `ThreadsafeFunction`.
+#[cfg(target_family = "wasm")]
+#[napi]
+impl Qwen3_5Model {
+    /// Streaming chat API backed by a SharedArrayBuffer ring buffer.
+    ///
+    /// The caller passes a `Buffer` whose backing is a region inside the
+    /// wasm32-wasip1-threads `SharedArrayBuffer` heap. Tokens are written
+    /// directly into the ring without crossing the worker boundary via
+    /// `postMessage`, achieving ~25 tok/s vs ~9 tok/s for the TSFN path.
+    ///
+    /// `sab` must be at least `MIN_SAB_LEN` bytes. The JS caller is
+    /// responsible for keeping the SAB alive until the returned
+    /// `ChatStreamHandle` is cancelled or generation finishes.
+    #[napi(
+        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, sab: Buffer"
+    )]
+    pub async fn chat_stream_sab(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+        sab: Buffer,
+    ) -> Result<ChatStreamHandle> {
+        if sab.len() < MIN_SAB_LEN {
+            return Err(napi::Error::from_reason(format!(
+                "chat_stream_sab: SAB too small ({} < {})",
+                sab.len(),
+                MIN_SAB_LEN
+            )));
+        }
+
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+
+        // SAFETY: The JS caller passes a Buffer whose backing is a region inside
+        // the wasm32-wasip1-threads SharedArrayBuffer heap. The pointer remains
+        // valid for as long as the JS side holds a reference to the Uint8Array.
+        // The Arc<SabSink> lives on the model thread until decode finishes; the JS
+        // caller is responsible for not reclaiming the SAB before cancellation.
+        let sink_inner =
+            unsafe { SabSink::from_raw(sab.as_ptr() as *mut u8, sab.len()) }?;
+        let sink: Arc<dyn ChatStreamSink> = Arc::new(sink_inner);
+
+        self.thread.send(Qwen35Cmd::ChatStream {
+            messages,
+            config,
+            sink,
+            cancelled: cancelled_inner,
+        })?;
+
+        Ok(ChatStreamHandle { cancelled })
     }
 }
 
