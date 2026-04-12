@@ -487,6 +487,117 @@ describe('Qwen35Session', () => {
       // No assertion on turn count here — that's covered by the
       // dedicated "does NOT increment" test.
     });
+
+    it('does NOT increment turnCount when the stream throws a guard-violation error', async () => {
+      // Simulates the Rust side's `send_stream_error` helper: a
+      // guard-violation (text-only, missing im_end_id, reuse_cache
+      // disabled, etc.) arrives as a thrown exception from the async
+      // generator rather than a fake `done: true` chunk. The session
+      // must catch this in its `finally` block, clear `inFlight`, and
+      // leave `turnCount` untouched so the NEXT `sendStream()` routes
+      // back through `chatStreamSessionStart` — otherwise the session
+      // would be bricked on its first failure.
+      // eslint-disable-next-line require-yield
+      const failingStart = vi.fn(async function* streamStart(
+        _messages: ChatMessage[],
+        _config?: ChatConfig | null,
+      ): AsyncGenerator<ChatStreamEvent> {
+        // Throw BEFORE any yield to simulate a pre-decode guard
+        // violation coming through as an `Err` on the Rust mpsc.
+        await Promise.resolve();
+        throw new Error('tokenizer: im_end_id not found');
+      });
+      const chatStreamSessionContinue = vi.fn(async function* streamContinue(
+        _userMessage: string,
+        _config?: ChatConfig | null,
+      ): AsyncGenerator<ChatStreamEvent> {
+        yield finalChunk('should not be called');
+      });
+      const resetCaches = vi.fn();
+      const model = {
+        chatStreamSessionStart: failingStart,
+        chatStreamSessionContinue,
+        resetCaches,
+      } as unknown as Qwen35Model;
+      const session = new Qwen35Session(model);
+
+      await expect(async () => {
+        for await (const _e of session.sendStream('Hi')) {
+          void _e;
+        }
+      }).rejects.toThrow('tokenizer: im_end_id not found');
+
+      // Turn counter must NOT have advanced.
+      expect(session.turns).toBe(0);
+      // Continue path must NOT have been called.
+      expect(chatStreamSessionContinue).not.toHaveBeenCalled();
+
+      // Swap in a succeeding start mock. The next sendStream() must
+      // still route through the turn-0 start path, proving the
+      // session wasn't bricked by the earlier failure.
+      const succeedingStart = vi.fn(async function* streamStart(
+        _messages: ChatMessage[],
+        _config?: ChatConfig | null,
+      ): AsyncGenerator<ChatStreamEvent> {
+        yield { text: 'ok', done: false } satisfies ChatStreamEvent;
+        yield finalChunk('ok');
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (model as any).chatStreamSessionStart = succeedingStart;
+
+      for await (const _e of session.sendStream('Retry')) {
+        void _e;
+      }
+      expect(succeedingStart).toHaveBeenCalledTimes(1);
+      expect(chatStreamSessionContinue).not.toHaveBeenCalled();
+      expect(session.turns).toBe(1);
+    });
+
+    it('does NOT increment turnCount when the final chunk has finishReason="error"', async () => {
+      // Belt-and-suspenders test: even if a hypothetical future code
+      // path were to yield a `done: true` chunk with
+      // `finishReason: 'error'` as a regular stream event (instead of
+      // throwing), `Qwen35Session.sendStream` must NOT treat it as a
+      // successful completion. Refusing to advance the counter keeps
+      // the session routing on the turn-0 `chatStreamSessionStart`
+      // path so the next send re-initializes rather than piling onto
+      // a non-existent session.
+      const errorFinalChunk: ChatStreamEvent = {
+        text: 'fake error chunk',
+        done: true,
+        finishReason: 'error',
+        toolCalls: [],
+        thinking: null,
+        numTokens: 0,
+        promptTokens: 0,
+        reasoningTokens: 0,
+        rawText: 'fake error chunk',
+      };
+      const chatStreamSessionStart = vi.fn(async function* streamStart(
+        _messages: ChatMessage[],
+        _config?: ChatConfig | null,
+      ): AsyncGenerator<ChatStreamEvent> {
+        yield errorFinalChunk;
+      });
+      const chatStreamSessionContinue = vi.fn();
+      const resetCaches = vi.fn();
+      const model = {
+        chatStreamSessionStart,
+        chatStreamSessionContinue,
+        resetCaches,
+      } as unknown as Qwen35Model;
+      const session = new Qwen35Session(model);
+
+      // Iteration completes normally — no exception — but we should
+      // see the error chunk yielded and turnCount stays at 0.
+      const events: ChatStreamEvent[] = [];
+      for await (const e of session.sendStream('Hi')) {
+        events.push(e);
+      }
+      expect(events).toEqual([errorFinalChunk]);
+      expect(session.turns).toBe(0);
+      expect(chatStreamSessionContinue).not.toHaveBeenCalled();
+    });
   });
 });
 
