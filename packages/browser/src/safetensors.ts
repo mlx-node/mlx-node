@@ -56,21 +56,20 @@ export function parseSafeTensorsHeader(buffer: ArrayBuffer): ParsedSafeTensors {
   return { tensors, metadata, dataOffset };
 }
 
-/** Map SafeTensors dtype string to the integer code our C++ FFI expects */
+/**
+ * Map SafeTensors dtype string to the integer code our C++ FFI expects.
+ * Must match the DType enum in mlx-core/src/array/mod.rs:
+ *   Float32=0, Int32=1, Float16=2, BFloat16=3, Uint32=4, Uint8=5
+ */
 export function dtypeToCode(dtype: string): number {
   switch (dtype) {
-    case 'F32': return 0;
-    case 'F16': return 1;
-    case 'BF16': return 2;
-    case 'I32': return 3;
-    case 'U32': return 4;
-    case 'I8': return 5;
-    case 'U8': return 6;
-    case 'I16': return 7;
-    case 'U16': return 8;
-    case 'I64': return 9;
-    case 'BOOL': return 10;
-    default: return 0;
+    case 'F32': return 0;  // DType::Float32
+    case 'I32': return 1;  // DType::Int32
+    case 'F16': return 2;  // DType::Float16
+    case 'BF16': return 3; // DType::BFloat16
+    case 'U32': return 4;  // DType::Uint32
+    case 'U8': return 5;   // DType::Uint8
+    default: return 0;     // fallback to float32
   }
 }
 

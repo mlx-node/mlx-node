@@ -61,7 +61,8 @@ function readString(memory: ArrayBuffer, ptr: number): string {
   const bytes = new Uint8Array(memory);
   let end = ptr;
   while (bytes[end] !== 0) end++;
-  return new TextDecoder().decode(bytes.subarray(ptr, end));
+  // .slice() copies to a regular ArrayBuffer — TextDecoder rejects SharedArrayBuffer views
+  return new TextDecoder().decode(bytes.slice(ptr, end));
 }
 
 // ---------- Bridge Factory ----------
@@ -143,6 +144,7 @@ export function createWebGPUBridge(
   const helperWorker = new Worker(URL.createObjectURL(helperBlob));
 
   let pendingCallbacks = 0;
+  let pendingResolvers: Array<() => void> = [];
   let pollCount = 0;
 
   // Track mapped buffer ranges for the WASM memory shadow pattern
@@ -184,6 +186,42 @@ export function createWebGPUBridge(
       _adapter: number, _descPtr: number, callbackPtr: number, userdataPtr: number,
     ): void {
       callCallback(callbackPtr, 0, deviceHandle, 0, userdataPtr);
+    },
+
+    wgpuAdapterGetLimits(_adapterHandle: number, limitsPtr: number): number {
+      // Write adapter limits to the provided pointer (same struct as device limits).
+      // In this direct bridge the adapter + device limits are identical.
+      const view = new DataView(wasmMemory.buffer);
+      // WGPULimits struct starts at limitsPtr + 8 (past nextInChain + sType).
+      const base = limitsPtr + 8;
+      view.setUint32(base + 0, device.limits.maxTextureDimension1D, true);
+      view.setUint32(base + 4, device.limits.maxTextureDimension2D, true);
+      view.setUint32(base + 8, device.limits.maxTextureDimension3D, true);
+      view.setUint32(base + 12, device.limits.maxTextureArrayLayers, true);
+      view.setUint32(base + 16, device.limits.maxBindGroups, true);
+      view.setUint32(base + 20, device.limits.maxBindingsPerBindGroup, true);
+      view.setUint32(base + 24, device.limits.maxDynamicUniformBuffersPerPipelineLayout, true);
+      view.setUint32(base + 28, device.limits.maxDynamicStorageBuffersPerPipelineLayout, true);
+      view.setUint32(base + 32, device.limits.maxSampledTexturesPerShaderStage, true);
+      view.setUint32(base + 36, device.limits.maxSamplersPerShaderStage, true);
+      view.setUint32(base + 40, device.limits.maxStorageBuffersPerShaderStage, true);
+      view.setUint32(base + 44, device.limits.maxStorageTexturesPerShaderStage, true);
+      view.setUint32(base + 48, device.limits.maxUniformBuffersPerShaderStage, true);
+      // maxUniformBufferBindingSize at +52 (u64)
+      const ubbs = device.limits.maxUniformBufferBindingSize;
+      view.setUint32(base + 52, ubbs & 0xFFFFFFFF, true);
+      view.setUint32(base + 56, 0, true);
+      // maxStorageBufferBindingSize at +60 (u64)
+      const sbbs = device.limits.maxStorageBufferBindingSize;
+      view.setUint32(base + 60, sbbs & 0xFFFFFFFF, true);
+      view.setUint32(base + 64, 0, true);
+      return 1; // success
+    },
+
+    wgpuAdapterHasFeature(_adapter: number, feature: number): number {
+      if (feature === 14 && adapter.features.has('shader-f16')) return 1;  // WGPUFeatureName_ShaderF16
+      if (feature === 0x3F1 && adapter.features.has('subgroups')) return 1; // WGPUFeatureName_Subgroups
+      return 0;
     },
 
     wgpuAdapterRelease(): void {},

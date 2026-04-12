@@ -119,8 +119,6 @@ impl Conv1d {
 
     /// Manual depthwise conv1d for WASM/WebGPU where the Convolution primitive
     /// is not available. Uses only slice + multiply + add ops.
-    ///
-    /// Only supports: stride=1, padding=0, dilation=1, groups=in_channels (depthwise).
     #[cfg(target_family = "wasm")]
     fn forward_conv(&self, input: &MxArray) -> Result<MxArray> {
         let in_channels = input.shape_at(2)?;
@@ -143,9 +141,6 @@ impl Conv1d {
 
     /// Depthwise conv1d using only elementwise ops.
     /// Weight: [C, K, 1], Input: [B, T, C] → Output: [B, T-K+1, C]
-    ///
-    /// For each kernel position k:
-    ///   output += input[:, k:T_out+k, :] * weight[:, k, 0]
     fn forward_depthwise(&self, input: &MxArray) -> Result<MxArray> {
         let seq_len = input.shape_at(1)?;
         let kernel_size = self.weight.shape_at(1)?;
@@ -165,9 +160,11 @@ impl Conv1d {
         for k in 0..kernel_size {
             // input[:, k:k+t_out, :] → [B, T_out, C]
             let input_slice = input.slice_axis(1, k, k + t_out)?;
-            // weight_2d[:, k] → [C] → reshape to [1, 1, C] for broadcast
+            // weight_2d[:, k] → [C, 1]
             let w_k = weight_2d.slice_axis(1, k, k + 1)?; // [C, 1]
-            let w_k = w_k.reshape(&[1, 1, -1])?; // [1, 1, C]
+            let w_k = w_k.squeeze(Some(&[1]))?;           // [C]
+            let w_k = w_k.reshape(&[1, 1, -1])?;          // [1, 1, C]
+
             let term = input_slice.mul(&w_k)?;
             result = Some(match result {
                 Some(acc) => acc.add(&term)?,
@@ -175,7 +172,7 @@ impl Conv1d {
             });
         }
 
-        result.ok_or_else(|| Error::from_reason("Conv1d: kernel_size is 0".to_string()))
+        result.ok_or_else(|| Error::from_reason("Conv1d: empty kernel".to_string()))
     }
 
     pub fn get_weight(&self) -> MxArray {

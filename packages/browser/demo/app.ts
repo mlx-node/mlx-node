@@ -294,7 +294,7 @@ worker.addEventListener('messageerror', (e) => {
 // matmul→softmax→matmul path, bypassing the fused vector / tile kernels.
 // Used for A/B-ing TTFT against the fused tile kernel without a rebuild.
 const urlParams = new URLSearchParams(location.search);
-const packBf16 = urlParams.get('pack_bf16') === '1';
+const packBf16 = urlParams.get('pack_bf16') !== '0'; // enabled by default, ?pack_bf16=0 to disable
 const sdpaFallback = urlParams.get('sdpa_fallback') === '1';
 const flagBadges =
   (packBf16 ? ' (pack_bf16=1)' : '') +
@@ -303,7 +303,7 @@ log(`Starting MLX Worker${flagBadges}...`);
 setStatus('Initializing...', 'info');
 worker.postMessage({
   type: 'init',
-  wasmUrl: new URL('/mlx-core.opt.wasm', location.href).href,
+  wasmUrl: new URL(`/mlx-core.opt.wasm?v=${Date.now()}`, location.href).href,
   modelUrl: '/model',
   packBf16,
   sdpaFallback,

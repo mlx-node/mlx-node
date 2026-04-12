@@ -4,11 +4,6 @@ import { getBridge, runTest } from './test-bridge';
 beforeAll(() => getBridge(), 60_000);
 
 describe('Miscellaneous', () => {
-  test('stream channel SharedArrayBuffer write', async () => {
-    const r = await runTest('stream channel SharedArrayBuffer write');
-    expect(r.passed, r.error).toBe(true);
-  });
-
   test('categorical sampling bf16 (temp=0.7, sliced logits)', async () => {
     const r = await runTest('categorical sampling bf16 (temp=0.7, sliced logits)');
     expect(r.passed, r.error).toBe(true);

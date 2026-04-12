@@ -1154,6 +1154,29 @@ pub fn load_safetensors_from_buffer(
     Ok(ctx.tensors)
 }
 
+/// Create an MLX array from raw CPU data at a WASM memory pointer.
+/// Copies the data into MLX-managed memory. The caller can free the source
+/// buffer after this returns.
+///
+/// `dtype_code` uses the C++ mapping: 0=f32, 1=f16, 2=bf16, 3=i32, 4=u32, 6=u8
+pub fn array_from_cpu_data(
+    data_ptr: u32,
+    byte_size: usize,
+    shape: &[i64],
+    dtype_code: i32,
+) -> Result<crate::array::MxArray> {
+    let handle = unsafe {
+        mlx_sys::mlx_array_from_cpu_data(
+            data_ptr as *const std::os::raw::c_void,
+            byte_size,
+            shape.as_ptr(),
+            shape.len(),
+            dtype_code,
+        )
+    };
+    crate::array::MxArray::from_handle(handle, "array_from_cpu_data")
+}
+
 /// Create an MLX array wrapping an existing WGPUBuffer handle (zero-copy).
 /// The handle is an integer representing the GPU buffer created by the JS WebGPU bridge.
 /// The array takes ownership of the buffer.

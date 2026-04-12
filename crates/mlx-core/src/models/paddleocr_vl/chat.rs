@@ -13,12 +13,16 @@ use crate::array::MxArray;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatRole {
     /// User message
+    #[napi(value = "user")]
     User,
     /// Assistant response
+    #[napi(value = "assistant")]
     Assistant,
     /// System prompt
+    #[napi(value = "system")]
     System,
     /// Tool response
+    #[napi(value = "tool")]
     Tool,
 }
 

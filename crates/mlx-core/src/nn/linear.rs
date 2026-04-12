@@ -38,7 +38,8 @@ impl Linear {
         } else {
             None
         };
-        Ok(Self { weight, bias, in_features, out_features, quantized: None })
+        let weight_t = weight.transpose(Some(&[1, 0]))?;
+        Ok(Self { weight, weight_t, bias, in_features, out_features, quantized: None })
     }
 
     /// Create a new Linear layer

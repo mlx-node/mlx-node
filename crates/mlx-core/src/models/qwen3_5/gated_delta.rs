@@ -25,8 +25,8 @@ fn gpu_architecture_gen() -> i32 {
 
 /// Compute decay gate: g = exp(-exp(A_log) * softplus(a + dt_bias))
 ///
-/// On native: uses a fused C++ implementation via FFI.
-/// On WASM: uses pure Rust/MLX ops to avoid compiled kernel issues.
+/// Uses a fused C++ implementation that builds the full expression in a single
+/// FFI call, allowing MLX's graph optimizer to see the complete expression.
 ///
 /// Shapes:
 ///   A_log: [Hv]
@@ -291,8 +291,9 @@ fn gated_delta_ops_inner(
     mask: Option<&MxArray>,
     layer_idx: Option<usize>,
 ) -> Result<(MxArray, MxArray)> {
-    let seq_len = q.shape_at(1)?;
     let debug_prefix = layer_idx.map(|layer| format!("layer.{layer:02}.gdn.recurrence"));
+
+    let seq_len = q.shape_at(1)?;
 
     // Extract dimensions once to avoid per-step FFI calls in gated_delta_step
     let batch = q.shape_at(0)?;
@@ -406,7 +407,6 @@ pub(crate) fn gated_delta_update_inner(
     let num_v_heads = v.shape_at(2)?;
     let v_dim = v.shape_at(3)?;
     let k_dim = q.shape_at(3)?;
-    let debug_prefix = layer_idx.map(|layer| format!("layer.{layer:02}.gdn.recurrence"));
 
     // When use_kernel=false, use only ops-based paths for full differentiability (autograd).
     // compute_g builds a standard MLX expression graph via C++ (differentiable),
@@ -415,10 +415,6 @@ pub(crate) fn gated_delta_update_inner(
         let beta = Activations::sigmoid(b)?;
         // compute_g returns exp(g_log) directly — use it as the decay gate without log/exp round-trip
         let g = compute_g(a_log, a, dt_bias)?;
-        if let Some(prefix) = debug_prefix.as_ref() {
-            log_tensor_stats(&format!("{prefix}.beta"), &beta);
-            log_tensor_stats(&format!("{prefix}.g"), &g);
-        }
 
         // GQA head expansion
         let (q, k) = if num_v_heads != num_k_heads {
@@ -445,20 +441,13 @@ pub(crate) fn gated_delta_update_inner(
             Some(s) => s.clone(),
             None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
         };
-        if let Some(prefix) = debug_prefix.as_ref() {
-            log_tensor_stats(&format!("{prefix}.q_expanded"), &q);
-            log_tensor_stats(&format!("{prefix}.k_expanded"), &k);
-            log_tensor_stats(&format!("{prefix}.v"), v);
-            log_tensor_stats(&format!("{prefix}.state_init"), &initial_state);
-        }
 
-        return gated_delta_ops_inner(&q, &k, v, &g, &beta, &initial_state, mask, layer_idx);
+        return gated_delta_ops(&q, &k, v, &g, &beta, &initial_state, mask);
     }
 
     // Compute beta = sigmoid(b) and g_log = -exp(A_log) * softplus(a + dt_bias)
-    // On WASM/WebGPU: skip fused Metal kernel — it creates lazy graphs using
-    // CustomKernel primitives that have no WebGPU impl. The graph creation succeeds
-    // but eval fails, bypassing the ops-based fallback.
+    // Try fused Metal kernel first (single dispatch), fall back to separate ops.
+    // g_log is the log-space gate; per-step kernel needs exp(g_log), chunked needs g_log directly.
     #[cfg(not(target_family = "wasm"))]
     let (beta, g_log) = match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32) {
         Ok((beta_flat, g_flat)) => {
@@ -469,26 +458,29 @@ pub(crate) fn gated_delta_update_inner(
         }
         Err(_) => {
             let beta = Activations::sigmoid(b)?;
+            // compute_g returns exp(g_log), so take log to get g_log
             let g = compute_g(a_log, a, dt_bias)?;
             let g_log = g.log()?;
             (beta, g_log)
         }
     };
-    // On WASM: compute g_log = -exp(A_log) * softplus(a + dt_bias) DIRECTLY
-    // without the exp→log round-trip that loses precision.
-    // The ops-based path at line 556 will call exp(g_log) to get the decay gate.
+
     #[cfg(target_family = "wasm")]
     let (beta, g_log) = {
         let beta = Activations::sigmoid(b)?;
-        // Compute g_log = -A * softplus(x) directly (no intermediate exp)
-        let big_a = a_log.exp()?;                           // exp(A_log): [Hv]
-        let x = a.add(dt_bias)?;                            // a + dt_bias: [B, T, Hv]
+        let big_a = a_log.exp()?;
+        let x = a.add(dt_bias)?;
         let threshold = MxArray::from_float32(&[20.0f32], &[1])?;
-        let sp = x.exp()?.add_scalar(1.0)?.log()?;          // log(1 + exp(x))
-        let sp = x.greater(&threshold)?.where_(&x, &sp)?;   // stable softplus
-        let g_log = big_a.mul(&sp)?.negative()?;            // g_log = -(A * sp)
+        let sp = x.exp()?.add_scalar(1.0)?.log()?;
+        let sp = x.greater(&threshold)?.where_(&x, &sp)?;
+        let g_log = big_a.mul(&sp)?.negative()?;
         (beta, g_log)
     };
+
+    if let Some(layer) = layer_idx {
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.beta"), &beta);
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.g_log"), &g_log);
+    }
 
     // GQA head expansion: repeat q,k from Hk to Hv heads
     let (q, k) = if num_v_heads != num_k_heads {
@@ -511,24 +503,28 @@ pub(crate) fn gated_delta_update_inner(
         (q.clone(), k.clone())
     };
 
+    if let Some(layer) = layer_idx {
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.q_expanded"), &q);
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.k_expanded"), &k);
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.v"), v);
+    }
+
     // Initialize state if not provided: [B, Hv, Dv, Dk]
     // Use v's dtype to avoid f32 promotion for bf16/f16 models
     let initial_state = match state {
         Some(s) => s.clone(),
         None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
     };
-    if let Some(prefix) = debug_prefix.as_ref() {
-        log_tensor_stats(&format!("{prefix}.q_expanded"), &q);
-        log_tensor_stats(&format!("{prefix}.k_expanded"), &k);
-        log_tensor_stats(&format!("{prefix}.v"), v);
-        log_tensor_stats(&format!("{prefix}.state_init"), &initial_state);
+
+    if let Some(layer) = layer_idx {
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.state_init"), &initial_state);
+        let g_exp = g_log.exp()?;
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.g_exp"), &g_exp);
     }
 
     let seq_len = q.shape_at(1)?;
 
     // Use Metal kernel for recurrence (requires Dk divisible by 32 for SIMD register blocking)
-    // Skip custom kernels on WASM/WebGPU — they use CustomKernel which has no WebGPU impl.
-    // The lazy graph creation succeeds but eval fails, bypassing the ops-based fallback.
     #[cfg(not(target_family = "wasm"))]
     if k_dim % 32 == 0 {
         // Chunked kernel for long sequences on M5+ (Neural Accelerator-accelerated prefill).
@@ -555,8 +551,5 @@ pub(crate) fn gated_delta_update_inner(
 
     // Ops-based sequential loop fallback (also needs exp(g_log))
     let g = g_log.exp()?;
-    if let Some(prefix) = debug_prefix.as_ref() {
-        log_tensor_stats(&format!("{prefix}.g_exp"), &g);
-    }
     gated_delta_ops_inner(&q, &k, v, &g, &beta, &initial_state, mask, layer_idx)
 }

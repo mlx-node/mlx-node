@@ -29,6 +29,47 @@ use super::quantized_linear::{
 };
 use super::vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 
+/// Descriptor for a single GPU-resident tensor, passed from the JS layer.
+///
+/// The JS side (gpu-worker.ts) pre-uploads SafeTensors weight data to WebGPU
+/// buffers and passes an array of these descriptors to `loadFromGpuBuffers`.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct GpuTensorInfo {
+    /// Weight name (e.g. "model.layers.0.mlp.gate_proj.weight")
+    pub name: String,
+    /// Opaque WGPUBuffer handle (u32 on WASM, cast to void* for FFI)
+    pub handle: u32,
+    /// C++ dtype code: 0=f32, 1=f16, 2=bf16, 3=i32, 4=u32, 5=i8, 6=u8
+    pub dtype_code: i32,
+    /// Tensor shape dimensions (JS number[] maps to Vec<i32>)
+    pub shape: Vec<i32>,
+    /// GPU buffer size in bytes
+    pub byte_size: u32,
+    /// Whether bf16 data is packed 2-per-u32 (PackedBf16 storage mode)
+    pub packed_bf16: Option<bool>,
+}
+
+/// Descriptor for a CPU-resident tensor in WASM linear memory.
+///
+/// The JS side parses the SafeTensors header, copies each tensor's bytes into
+/// WASM memory (via malloc), and passes an array of these descriptors. Each
+/// tensor is small enough (~1-50 MB) that peak WASM memory stays under 2 GB.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct CpuTensorInfo {
+    /// Weight name (e.g. "model.layers.0.mlp.gate_proj.weight")
+    pub name: String,
+    /// WASM memory pointer (from malloc) where tensor bytes reside
+    pub ptr: u32,
+    /// C++ dtype code: 0=f32, 1=f16, 2=bf16, 3=i32, 4=u32, 6=u8
+    pub dtype_code: i32,
+    /// Tensor shape dimensions
+    pub shape: Vec<i32>,
+    /// Tensor size in bytes
+    pub byte_size: u32,
+}
+
 /// Sanitize weights from HuggingFace format (dense variant).
 ///
 /// Handles:
@@ -107,7 +148,7 @@ pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> 
 /// 6. Remove MTP (multi-token prediction) weights
 /// 7. FP8 E4M3 dequantization (weight + weight_scale_inv → bf16)
 /// 8. 4-bit affine re-quantization (for FP8 source checkpoints)
-pub(crate) fn sanitize_weights(
+fn sanitize_weights(
     mut params: HashMap<String, MxArray>,
     config: &Qwen3_5Config,
 ) -> Result<HashMap<String, MxArray>> {
@@ -219,9 +260,9 @@ pub(crate) fn sanitize_weights(
     Ok(result)
 }
 
-/// Apply weights to a Qwen3.5 dense model.
-pub(crate) fn apply_weights(
-    model: &mut Qwen3_5Model,
+/// Apply weights directly to a Qwen35Inner (no locks needed).
+fn apply_weights_inner(
+    inner: &mut Qwen35Inner,
     params: &HashMap<String, MxArray>,
     config: &Qwen3_5Config,
     quant_bits: i32,
@@ -603,8 +644,11 @@ fn validate_mandatory_weights(
     Ok(())
 }
 
-/// Load a pretrained Qwen3.5 dense model from a directory.
-pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
+/// Load a Qwen3.5 dense model using a dedicated model thread.
+///
+/// Spawns a `ModelThread<Qwen35Cmd>` that loads all weights inside the init_fn.
+/// Returns a `Qwen3_5Model` thin shell with the thread handle.
+pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
     let model_path = model_path.to_string();
 
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
@@ -854,10 +898,6 @@ pub async fn load(model_path: &str) -> Result<Qwen3_5Model> {
 /// Register all sanitized weights with the C++ fused forward pass.
 /// Sets model_id AFTER all weights are stored — ensures no inference sees
 /// a partially-populated weight map with the new model's ID.
-pub(crate) fn register_weights_with_cpp_public(params: &HashMap<String, MxArray>, model_id: u64) {
-    register_weights_with_cpp(params, model_id);
-}
-
 fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
     use mlx_sys as sys;
 
@@ -926,7 +966,7 @@ fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
 }
 
 /// Parse Qwen3.5 dense config from JSON.
-pub(crate) fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
+fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
     let text_cfg = raw.get("text_config");
 
     let gi = |keys: &[&str], default: i32| get_config_i32(raw, text_cfg, keys, default);
@@ -1166,6 +1206,395 @@ pub(crate) fn load_vision_weights(
         config.num_layers
     );
     Ok(())
+}
+
+/// Map a JS dtype code (from dtypeToCode in safetensors.ts) to a Rust DType.
+///
+/// JS codes match the Rust DType discriminant order:
+///   0=f32, 1=i32, 2=f16, 3=bf16, 4=u32, 5=u8
+fn dtype_from_code(code: i32) -> Result<DType> {
+    match code {
+        0 => Ok(DType::Float32),
+        1 => Ok(DType::Int32),
+        2 => Ok(DType::Float16),
+        3 => Ok(DType::BFloat16),
+        4 => Ok(DType::Uint32),
+        5 => Ok(DType::Uint8),
+        other => Err(Error::from_reason(format!(
+            "Unsupported GPU tensor dtype code: {}",
+            other
+        ))),
+    }
+}
+
+/// Load a Qwen3.5 dense model from pre-created GPU buffers (zero-copy).
+///
+/// This is the browser/WASM counterpart to `load_with_thread`. Instead of reading
+/// SafeTensors from disk, it takes GPU buffer handles that the JS side already
+/// uploaded to WebGPU. Each `GpuTensorInfo` describes one weight tensor's name,
+/// GPU handle, dtype, shape, and byte size.
+///
+/// The function is synchronous because WASM is single-threaded and the async
+/// machinery (emnapi worker pool) cannot yield during model init.
+pub async fn load_from_gpu_buffers(
+    config_json: &str,
+    gpu_tensors: Vec<GpuTensorInfo>,
+    tokenizer_json: &str,
+    tokenizer_config_json: Option<&str>,
+) -> Result<Qwen3_5Model> {
+    use mlx_sys as sys;
+    use tokenizers::Tokenizer;
+
+    // 1. Parse config
+    let raw: Value = serde_json::from_str(config_json)
+        .map_err(|e| Error::from_reason(format!("Failed to parse config JSON: {}", e)))?;
+    let config = parse_config(&raw)?;
+
+    info!(
+        "Qwen3.5 GPU-buffer load: {} layers, hidden={}, heads={}, kv_heads={}, tensors={}",
+        config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
+        gpu_tensors.len(),
+    );
+
+    // 2. Create arrays from GPU buffer handles
+    let mut raw_params: HashMap<String, MxArray> = HashMap::with_capacity(gpu_tensors.len());
+
+    for tensor in &gpu_tensors {
+        let dtype = dtype_from_code(tensor.dtype_code)?;
+        let shape_i64: Vec<i64> = tensor.shape.iter().map(|&d| d as i64).collect();
+        let arr = crate::utils::safetensors::array_from_gpu_buffer(
+            tensor.handle,
+            tensor.byte_size as usize,
+            &shape_i64,
+            dtype,
+        )?;
+
+        // Mark packed bf16 buffers (bf16 stored as 2-per-u32 on GPU)
+        if tensor.packed_bf16.unwrap_or(false) {
+            unsafe {
+                sys::mlx_wgpu_mark_buffer_packed_bf16(arr.as_raw_ptr());
+            }
+        }
+
+        raw_params.insert(tensor.name.clone(), arr);
+    }
+    info!("Created {} arrays from GPU buffers", raw_params.len());
+
+    // 3. Sanitize weights (strip prefixes, merge split projections, etc.)
+    let params = sanitize_weights(raw_params, &config)?;
+    let quantized = is_quantized_checkpoint(&params);
+    info!(
+        "Sanitized to {} parameters (quantized={})",
+        params.len(),
+        quantized,
+    );
+
+    // 4. Parse quantization config
+    let quant_cfg = raw
+        .get("quantization")
+        .or_else(|| raw.get("quantization_config"));
+    let quant_bits = quant_cfg
+        .and_then(|q| q["bits"].as_i64())
+        .unwrap_or(DEFAULT_QUANT_BITS as i64) as i32;
+    let quant_group_size = quant_cfg
+        .and_then(|q| q["group_size"].as_i64())
+        .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64) as i32;
+    let per_layer_quant: HashMap<String, (i32, i32)> = quant_cfg
+        .and_then(|q| q.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter(|(_, v)| v.is_object())
+                .filter_map(|(k, v)| {
+                    let bits = v["bits"].as_i64()? as i32;
+                    let gs = v["group_size"].as_i64().unwrap_or(quant_group_size as i64) as i32;
+                    let normalized = k
+                        .strip_prefix("model.language_model.")
+                        .or_else(|| k.strip_prefix("language_model.model."))
+                        .or_else(|| k.strip_prefix("language_model."))
+                        .or_else(|| k.strip_prefix("model."))
+                        .unwrap_or(k)
+                        .to_string();
+                    Some((normalized, (bits, gs)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 5. Create tokenizer from JSON string
+    let tokenizer = Tokenizer::from_bytes(tokenizer_json)
+        .map_err(|e| Error::from_reason(format!("Failed to parse tokenizer JSON: {}", e)))?;
+
+    // Create tokenizer wrapper (detect_think_end runs internally)
+    let mut tok = Qwen3Tokenizer::from_tokenizer(tokenizer);
+
+    // Extract chat template from tokenizer_config.json if provided
+    let chat_template = tokenizer_config_json.and_then(|cfg_json| {
+        serde_json::from_str::<Value>(cfg_json)
+            .ok()
+            .and_then(|v| v.get("chat_template")?.as_str().map(String::from))
+    });
+    tok.set_chat_template(chat_template);
+
+    // 6. Build inner model and apply weights
+    let mut inner = Qwen35Inner::new(config.clone())?;
+
+    apply_weights_inner(
+        &mut inner,
+        &params,
+        &config,
+        quant_bits,
+        quant_group_size,
+        &per_layer_quant,
+    )?;
+
+    // 7. Register weights with C++ compiled forward path.
+    // On WASM/WebGPU the compiled C++ forward (mlx::core::compile) traps — it
+    // references Metal/Accelerate ops not available on WebGPU. Unconditionally
+    // skip and use the Rust forward path which dispatches WebGPU kernels directly.
+    #[cfg(not(target_family = "wasm"))]
+    if !is_quantized_checkpoint(&params) && !is_mxfp8_checkpoint(&params) {
+        register_weights_with_cpp(&params, inner.model_id);
+    } else {
+        info!("Skipping C++ compiled path for quantized model (using Rust quantized_matmul)");
+        let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
+        unsafe { sys::mlx_clear_weights() };
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
+        unsafe { sys::mlx_clear_weights() };
+    }
+
+    // 8. Set tokenizer
+    inner.set_tokenizer(Arc::new(tok));
+
+    info!("Qwen3.5 model loaded from GPU buffers successfully");
+
+    // 9. Spawn model thread
+    let model_id = inner.model_id;
+    let config_out = inner.config.clone();
+
+    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+        move || Ok((inner, (config_out.clone(), model_id))),
+        handle_qwen35_cmd,
+    );
+
+    // Await the model thread's init (async to avoid blocking the event loop on WASM)
+    let (config_final, model_id_final) = init_rx
+        .await
+        .map_err(|_| Error::from_reason("Model thread exited during GPU buffer load"))??;
+
+    Ok(Qwen3_5Model {
+        thread,
+        config: config_final,
+        model_id: model_id_final,
+    })
+}
+
+// ── Per-tensor CPU accumulator ──────────────────────────────────────────
+//
+// Instead of passing all 473 CpuTensorInfos in one NAPI call (which causes
+// emnapi DataView bounds errors when WASM memory has grown past its initial
+// size), we accumulate tensors one at a time via `accumulate_cpu_tensor`.
+// After all tensors are added, `build_model_from_cpu_tensors` drains the
+// accumulator and builds the model.
+//
+// This also allows JS to free each WASM tensor buffer immediately after the
+// MLX array is created, keeping peak WASM memory much lower.
+
+use std::sync::Mutex;
+
+pub(crate) static CPU_TENSOR_ACCUMULATOR: Mutex<Option<HashMap<String, MxArray>>> = Mutex::new(None);
+
+/// Config and tokenizer strings, stored before tensor accumulation begins
+/// (when WASM memory is still small, avoiding emnapi DataView stale bounds).
+pub(crate) struct CpuModelConfig {
+    config_json: String,
+    tokenizer_json: String,
+    tokenizer_config_json: Option<String>,
+}
+pub(crate) static CPU_MODEL_CONFIG: Mutex<Option<CpuModelConfig>> = Mutex::new(None);
+
+/// Map JS dtype codes (Rust DType discriminant order) to C++ dtype codes.
+fn js_to_cpp_dtype(js_code: i32) -> i32 {
+    match js_code {
+        0 => 0,  // Float32 → float32
+        1 => 3,  // Int32 → int32
+        2 => 1,  // Float16 → float16
+        3 => 2,  // BFloat16 → bfloat16
+        4 => 4,  // Uint32 → uint32
+        5 => 6,  // Uint8 → uint8
+        _ => 0,  // fallback float32
+    }
+}
+
+/// Store config and tokenizer strings before tensor accumulation begins.
+///
+/// Must be called BEFORE any `accumulate_cpu_tensor` calls, while WASM memory
+/// is still small. This avoids emnapi DataView bounds errors that occur when
+/// passing large strings after WASM memory has grown past its initial size.
+pub fn set_cpu_model_config(
+    config_json: String,
+    tokenizer_json: String,
+    tokenizer_config_json: Option<String>,
+) {
+    let mut guard = CPU_MODEL_CONFIG.lock().unwrap();
+    *guard = Some(CpuModelConfig {
+        config_json,
+        tokenizer_json,
+        tokenizer_config_json,
+    });
+}
+
+/// Add one CPU-resident tensor to the accumulator.
+///
+/// Creates an MLX array from `ptr` (WASM linear memory address) immediately —
+/// the C++ array constructor copies the data, so JS can free the WASM buffer
+/// right after this returns.
+///
+/// Call `build_model_from_cpu_tensors` after all tensors are accumulated.
+pub fn accumulate_cpu_tensor(
+    name: String,
+    ptr: u32,
+    byte_size: u32,
+    shape: Vec<i32>,
+    dtype_code: i32,
+) -> Result<()> {
+    let shape_i64: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+    let cpp_dtype = js_to_cpp_dtype(dtype_code);
+    let arr = crate::utils::safetensors::array_from_cpu_data(
+        ptr,
+        byte_size as usize,
+        &shape_i64,
+        cpp_dtype,
+    )?;
+
+    let mut guard = CPU_TENSOR_ACCUMULATOR.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.insert(name, arr);
+    Ok(())
+}
+
+/// Build a Qwen3.5 inner model from previously accumulated CPU tensors.
+///
+/// Drains both the config (from `set_cpu_model_config`) and tensor accumulator
+/// (from `accumulate_cpu_tensor`). Returns the inner model ready for thread spawn.
+/// Fully synchronous — no thread creation or async work.
+pub fn build_model_inner_from_cpu_tensors() -> Result<Qwen35Inner> {
+    use mlx_sys as sys;
+    use tokenizers::Tokenizer;
+
+    // 1. Drain accumulated config and tensors
+    let cfg = {
+        let mut guard = CPU_MODEL_CONFIG.lock().unwrap();
+        guard.take().ok_or_else(|| {
+            Error::from_reason("No model config stored — call setCpuModelConfig first")
+        })?
+    };
+
+    let raw_params = {
+        let mut guard = CPU_TENSOR_ACCUMULATOR.lock().unwrap();
+        guard.take().unwrap_or_default()
+    };
+    if raw_params.is_empty() {
+        return Err(Error::from_reason(
+            "No CPU tensors accumulated — call addCpuTensor first",
+        ));
+    }
+
+    let config_json = &cfg.config_json;
+    let tokenizer_json = &cfg.tokenizer_json;
+    let tokenizer_config_json = cfg.tokenizer_config_json.as_deref();
+
+    // 2. Parse config
+    let raw: Value = serde_json::from_str(config_json)
+        .map_err(|e| Error::from_reason(format!("Failed to parse config JSON: {}", e)))?;
+    let config = parse_config(&raw)?;
+
+    info!(
+        "Qwen3.5 build from {} CPU tensors: {} layers, hidden={}, heads={}, kv_heads={}",
+        raw_params.len(),
+        config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
+    );
+
+    // 3. Sanitize weights (strip prefixes, merge split projections, etc.)
+    let params = sanitize_weights(raw_params, &config)?;
+    let quantized = is_quantized_checkpoint(&params);
+
+    // 4. Parse quantization config
+    let quant_cfg = raw
+        .get("quantization")
+        .or_else(|| raw.get("quantization_config"));
+    let quant_bits = quant_cfg
+        .and_then(|q| q["bits"].as_i64())
+        .unwrap_or(DEFAULT_QUANT_BITS as i64) as i32;
+    let quant_group_size = quant_cfg
+        .and_then(|q| q["group_size"].as_i64())
+        .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64) as i32;
+    let per_layer_quant: HashMap<String, (i32, i32)> = quant_cfg
+        .and_then(|q| q.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter(|(_, v)| v.is_object())
+                .filter_map(|(k, v)| {
+                    let bits = v["bits"].as_i64()? as i32;
+                    let gs = v["group_size"].as_i64().unwrap_or(quant_group_size as i64) as i32;
+                    let normalized = k
+                        .strip_prefix("model.language_model.")
+                        .or_else(|| k.strip_prefix("language_model.model."))
+                        .or_else(|| k.strip_prefix("language_model."))
+                        .or_else(|| k.strip_prefix("model."))
+                        .unwrap_or(k)
+                        .to_string();
+                    Some((normalized, (bits, gs)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 5. Create tokenizer from JSON string
+    let tokenizer = Tokenizer::from_bytes(tokenizer_json)
+        .map_err(|e| Error::from_reason(format!("Failed to parse tokenizer JSON: {}", e)))?;
+
+    let mut tok = Qwen3Tokenizer::from_tokenizer(tokenizer);
+
+    let chat_template = tokenizer_config_json.and_then(|cfg_json| {
+        serde_json::from_str::<Value>(cfg_json)
+            .ok()
+            .and_then(|v| v.get("chat_template")?.as_str().map(String::from))
+    });
+    tok.set_chat_template(chat_template);
+
+    // 6. Build inner model and apply weights
+    let mut inner = Qwen35Inner::new(config.clone())?;
+
+    apply_weights_inner(
+        &mut inner,
+        &params,
+        &config,
+        quant_bits,
+        quant_group_size,
+        &per_layer_quant,
+    )?;
+
+    // 7. On WASM, skip C++ compiled forward path (uses Metal/Accelerate ops)
+    #[cfg(not(target_family = "wasm"))]
+    if !is_quantized_checkpoint(&params) && !is_mxfp8_checkpoint(&params) {
+        register_weights_with_cpp(&params, inner.model_id);
+    } else {
+        let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
+        unsafe { sys::mlx_clear_weights() };
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
+        unsafe { sys::mlx_clear_weights() };
+    }
+
+    // 8. Set tokenizer
+    inner.set_tokenizer(Arc::new(tok));
+
+    Ok(inner)
 }
 
 /// Create a random-init Qwen3.5 model and save it to disk.

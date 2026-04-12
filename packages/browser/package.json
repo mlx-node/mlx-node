@@ -9,7 +9,7 @@
   },
   "scripts": {
     "dev": "vite",
-    "test": "vitest --config vitest.config.ts",
+    "test": "vp test --config vitest.config.ts",
     "build": "echo 'TODO: build WASM + bundle'"
   },
   "dependencies": {

@@ -216,6 +216,7 @@ impl DecoderLayer {
                 attn.forward(&normed, mask, kvc, position_ids)?
             }
         };
+
         log_tensor_stats(
             &format!("layer.{:02}.decoder.attn_out", self.layer_idx),
             &attn_out,

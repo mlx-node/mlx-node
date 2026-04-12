@@ -38,6 +38,46 @@ mlx_array* mlx_array_from_float32(const float* data,
   return reinterpret_cast<mlx_array*>(arr);
 }
 
+/// Create an MLX array from raw CPU bytes with a runtime dtype code.
+/// Copies the data into an MLX-managed CPU buffer. The caller can free
+/// the source memory after this returns.
+///
+/// dtype_code mapping (same as mlx_array_from_gpu_buffer):
+///   0=float32, 1=float16, 2=bfloat16, 3=int32, 4=uint32, 5=int8, 6=uint8
+mlx_array* mlx_array_from_cpu_data(
+    const void* data,
+    size_t byte_size,
+    const int64_t* shape,
+    size_t ndim,
+    int32_t dtype_code
+) {
+  using namespace mlx::core;
+  Shape target_shape = make_shape(shape, ndim);
+  switch (dtype_code) {
+    case 0: // float32
+      return reinterpret_cast<mlx_array*>(
+          new array(static_cast<const float*>(data), target_shape, float32));
+    case 1: // float16
+      return reinterpret_cast<mlx_array*>(
+          new array(static_cast<const float16_t*>(data), target_shape, float16));
+    case 2: // bfloat16
+      return reinterpret_cast<mlx_array*>(
+          new array(reinterpret_cast<const bfloat16_t*>(data), target_shape, bfloat16));
+    case 3: // int32
+      return reinterpret_cast<mlx_array*>(
+          new array(static_cast<const int32_t*>(data), target_shape, int32));
+    case 4: // uint32
+      return reinterpret_cast<mlx_array*>(
+          new array(static_cast<const uint32_t*>(data), target_shape, uint32));
+    case 6: // uint8
+      return reinterpret_cast<mlx_array*>(
+          new array(static_cast<const uint8_t*>(data), target_shape, uint8));
+    default:
+      return reinterpret_cast<mlx_array*>(
+          new array(static_cast<const float*>(data), target_shape, float32));
+  }
+}
+
 // Create array from bfloat16 raw bytes (uint16 representation)
 // This enables zero-copy loading of bf16 weights from safetensors
 mlx_array* mlx_array_from_bfloat16(const uint16_t* data,

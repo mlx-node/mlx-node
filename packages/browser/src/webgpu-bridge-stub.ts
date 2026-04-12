@@ -67,12 +67,26 @@ export function createBridgeStub(
     wasmTable = instance.exports.__indirect_function_table as WebAssembly.Table;
     _wasmMalloc = instance.exports.malloc as (size: number) => number;
     wasmFree = instance.exports.free as (ptr: number) => void;
+    // Replay callbacks that were queued during _initialize
+    for (const { fnPtr, args } of pendingCallbacks) {
+      const fn = wasmTable.get(fnPtr) as ((...a: number[]) => void) | null;
+      if (fn) fn(...args);
+    }
+    pendingCallbacks.length = 0;
   }
 
   /**
    * Invoke a WASM callback function via the indirect function table.
    */
+  // Callbacks queued during _initialize (before wasmTable is set via setInstance)
+  const pendingCallbacks: Array<{ fnPtr: number; args: number[] }> = [];
+
   function callCallback(fnPtr: number, ...args: number[]): void {
+    if (!wasmTable) {
+      // Queue callback for replay after setInstance
+      pendingCallbacks.push({ fnPtr, args });
+      return;
+    }
     const fn = wasmTable.get(fnPtr) as ((...a: number[]) => void) | null;
     if (fn) fn(...args);
   }
@@ -292,8 +306,16 @@ export function createBridgeStub(
       rpcCount++;
       if (rpcHistory.length >= RPC_HISTORY_SIZE) rpcHistory.shift();
       rpcHistory.push({ n: rpcCount, fn: fnId });
-      console.error(`[RPC TIMEOUT] fn=${fnId} (#${rpcCount}) timed out after 10s!`);
-      Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING);
+      const msg = `[RPC TIMEOUT] fn=${fnId} (#${rpcCount}) timed out after 10s! STATUS=${Atomics.load(cmdView, STATUS_INDEX)}`;
+      console.error(msg);
+      try { (self as any).postMessage({ type: 'error', message: msg }); } catch {}
+      // Second attempt with 30s timeout (avoid infinite hang during init)
+      const retry = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 30_000);
+      if (retry === 'timed-out') {
+        console.error(`[RPC FATAL] fn=${fnId} total 40s timeout — returning 0`);
+        Atomics.store(cmdView, STATUS_INDEX, STATUS.IDLE);
+        return 0;
+      }
     }
 
     const result = cmdU32[I_RESULT];
@@ -346,7 +368,13 @@ export function createBridgeStub(
       console.error(`[RPC TIMEOUT] Last ${rpcHistory.length} calls:`,
         rpcHistory.map(h => `#${h.n}:fn=${h.fn}`).join(', '));
       console.error(`[RPC TIMEOUT] Status word:`, Atomics.load(cmdView, STATUS_INDEX));
-      Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING);
+      // Second attempt with 30s timeout (avoid infinite hang during init)
+      const retry = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 30_000);
+      if (retry === 'timed-out') {
+        console.error(`[RPC FATAL] fn=${fnId} total 40s timeout — returning 0`);
+        Atomics.store(cmdView, STATUS_INDEX, STATUS.IDLE);
+        return 0;
+      }
     }
 
     const result = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);

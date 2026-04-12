@@ -1318,6 +1318,16 @@ unsafe extern "C-unwind" {
         ctx: *mut std::os::raw::c_void,
     ) -> i32;
 
+    /// Create an MLX array from raw CPU data bytes. Copies the data into
+    /// MLX-managed memory. The caller can free the source buffer after this returns.
+    pub fn mlx_array_from_cpu_data(
+        data: *const std::os::raw::c_void,
+        byte_size: usize,
+        shape: *const i64,
+        ndim: usize,
+        dtype_code: i32,
+    ) -> *mut mlx_array;
+
     /// Create an MLX array wrapping an existing WGPUBuffer (zero-copy).
     /// The array takes ownership and will destroy/release the buffer when freed.
     pub fn mlx_array_from_gpu_buffer(

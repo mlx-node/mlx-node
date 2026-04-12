@@ -652,50 +652,40 @@ fn cpu_categorical_sample(logits: &MxArray, temperature: f64) -> Result<MxArray>
         ));
     }
 
-    // Apply temperature and find max for numerical stability in one pass
+    // Apply temperature
     let inv_temp = 1.0 / temperature;
-    let max_val = data.iter().copied().fold(f32::NEG_INFINITY, |m, v| {
-        m.max(v * inv_temp as f32)
-    });
+    let scaled: Vec<f64> = data.iter().map(|&x| (x as f64) * inv_temp).collect();
 
-    // Compute softmax(logits/temperature) and cumulative sum in one pass
-    let mut cumsum = 0.0f64;
-    let mut probs: Vec<f64> = Vec::with_capacity(data.len());
-    for &logit in &data {
-        let scaled = (logit as f64) * inv_temp;
-        let p = (scaled - max_val as f64).exp();
-        cumsum += p;
-        probs.push(cumsum);
+    // Softmax: shift by max for numerical stability
+    let max_val = scaled.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let exps: Vec<f64> = scaled.iter().map(|&x| (x - max_val).exp()).collect();
+    let sum: f64 = exps.iter().sum();
+    let probs: Vec<f64> = exps.iter().map(|&e| e / sum).collect();
+
+    // Cumulative sum
+    let mut cumsum = Vec::with_capacity(probs.len());
+    let mut acc = 0.0;
+    for &p in &probs {
+        acc += p;
+        cumsum.push(acc);
     }
 
-    let total = cumsum;
-
-    // Generate random threshold using xorshift64 (thread-local state).
-    // We avoid std::rand and MLX random::uniform to prevent WASM heap pressure.
-    use std::cell::Cell;
+    // Sample using thread-local RNG
+    use std::cell::RefCell;
     thread_local! {
-        static RNG_STATE: Cell<u64> = Cell::new(0xDEAD_BEEF_CAFE_BABEu64);
+        static RNG: RefCell<u64> = RefCell::new(0x12345678_9abcdef0);
     }
-    let r: f64 = RNG_STATE.with(|state| {
-        let mut s = state.get();
+    let r: f64 = RNG.with(|rng| {
+        let mut state = rng.borrow_mut();
         // xorshift64
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        state.set(s);
-        // Convert to (0, 1) — avoid exactly 0 or 1
-        ((s >> 11) as f64 + 0.5) / ((1u64 << 53) as f64)
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        (*state as f64) / (u64::MAX as f64)
     });
 
-    // Find first token where cumsum/total > r
-    let threshold = r * total;
-    let token_id = probs
-        .iter()
-        .position(|&cs| cs > threshold)
-        .unwrap_or(data.len() - 1);
-
-    // Return as scalar u32 MxArray (matching argmax return type)
-    MxArray::from_uint32(&[token_id as u32], &[1])
+    let idx = cumsum.iter().position(|&c| c > r).unwrap_or(probs.len() - 1);
+    MxArray::from_int32(&[idx as i32], &[1])
 }
 
 /// Sample using optimized path - fully compiled C++ implementation.

@@ -13,6 +13,7 @@ export default defineConfig({
       enabled: true,
       provider: playwright({
         launchOptions: {
+          channel: 'chrome',
           args: [
             '--enable-unsafe-webgpu',
             '--enable-features=Vulkan',

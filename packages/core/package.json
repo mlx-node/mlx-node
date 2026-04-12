@@ -28,6 +28,7 @@
   },
   "scripts": {
     "build": "oxnode ./build.ts --release",
+    "build:wasm": "oxnode ./build.ts --target wasm32-wasip1-threads --profile wasi",
     "preversion": "oxnode ./build.ts && git add ."
   },
   "devDependencies": {

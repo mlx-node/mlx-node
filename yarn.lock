@@ -204,7 +204,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@emnapi/core@npm:^1.7.1, @emnapi/core@npm:^1.9.1":
+"@emnapi/core@npm:^1.9.1":
   version: 1.9.1
   resolution: "@emnapi/core@npm:1.9.1"
   dependencies:
@@ -214,7 +214,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@emnapi/runtime@npm:^1.7.1, @emnapi/runtime@npm:^1.9.1":
+"@emnapi/runtime@npm:^1.9.1":
   version: 1.9.1
   resolution: "@emnapi/runtime@npm:1.9.1"
   dependencies:
@@ -5217,78 +5217,6 @@ __metadata:
     oxlint: bin/oxlint
     vp: bin/vp
   checksum: 10c0/ac144286201fa527f3604ab2f0470a4b67f70a8e6accb9215d18369dd24cbc58ce3533591eaa078660444f40e6f25700e8559ae6c4beed2d31ecf0fa7ee05b0a
-  languageName: node
-  linkType: hard
-
-"vite@npm:@voidzero-dev/vite-plus-core@latest":
-  version: 0.1.14
-  resolution: "@voidzero-dev/vite-plus-core@npm:0.1.14"
-  dependencies:
-    "@oxc-project/runtime": "npm:=0.121.0"
-    "@oxc-project/types": "npm:=0.122.0"
-    fsevents: "npm:~2.3.3"
-    lightningcss: "npm:^1.30.2"
-    postcss: "npm:^8.5.6"
-  peerDependencies:
-    "@arethetypeswrong/core": ^0.18.1
-    "@tsdown/css": 0.21.4
-    "@tsdown/exe": 0.21.4
-    "@types/node": ^20.19.0 || >=22.12.0
-    "@vitejs/devtools": ^0.1.0
-    esbuild: ^0.27.0
-    jiti: ">=1.21.0"
-    less: ^4.0.0
-    publint: ^0.3.0
-    sass: ^1.70.0
-    sass-embedded: ^1.70.0
-    stylus: ">=0.54.8"
-    sugarss: ^5.0.0
-    terser: ^5.16.0
-    tsx: ^4.8.1
-    typescript: ^5.0.0
-    unplugin-unused: ^0.5.0
-    yaml: ^2.4.2
-  dependenciesMeta:
-    fsevents:
-      optional: true
-  peerDependenciesMeta:
-    "@arethetypeswrong/core":
-      optional: true
-    "@tsdown/css":
-      optional: true
-    "@tsdown/exe":
-      optional: true
-    "@types/node":
-      optional: true
-    "@vitejs/devtools":
-      optional: true
-    esbuild:
-      optional: true
-    jiti:
-      optional: true
-    less:
-      optional: true
-    publint:
-      optional: true
-    sass:
-      optional: true
-    sass-embedded:
-      optional: true
-    stylus:
-      optional: true
-    sugarss:
-      optional: true
-    terser:
-      optional: true
-    tsx:
-      optional: true
-    typescript:
-      optional: true
-    unplugin-unused:
-      optional: true
-    yaml:
-      optional: true
-  checksum: 10c0/feda068c525d08aeb0be12a4ed408493e7e1b7d8d041b8ff46ae180fceb731d5bec13a2a311b40ce719ef606419d781a0efa32ef049d680fb4c918435f65bdea
   languageName: node
   linkType: hard
 

@@ -1,64 +1,47 @@
 /**
- * MLX Web Worker with WebGPU bridge
+ * MLX Web Worker — child thread for model inference
  *
- * Each worker creates its own GPUDevice so spawn_blocking can run
- * GPU inference without blocking the main thread.
+ * Uses the shared RPC bridge (Atomics.wait → gpu-worker) for all WebGPU calls.
+ * The direct bridge (own GPUDevice per child worker) deadlocks because
+ * wgpuBufferMapAsync registers a JS Promise .then() callback, but raw_ptr()'s
+ * C++ polling loop calls poll_instance() which is a no-op on WASM — the event
+ * loop never runs, the callback never fires, infinite loop.
+ *
+ * The RPC bridge avoids this: wgpuBufferMapAsync blocks via Atomics.wait,
+ * the gpu-worker (whose event loop is free) processes the async mapAsync,
+ * writes the callback result back, and drainCallbacks fires it synchronously
+ * before the RPC call returns.
  */
 import { instantiateNapiModuleSync, MessageHandler, WASI } from '@napi-rs/wasm-runtime';
-import { createWebGPUBridge } from './webgpu-bridge.js';
+import { createBridgeStub } from './webgpu-bridge-stub.js';
+import {
+  STREAM_BUFFER_SIZE,
+  STREAM_HEADER_SIZE,
+  STREAM_TEXT_OFFSET,
+} from './rpc-protocol.js';
 
-// Pre-initialize WebGPU on this worker
-let bridge = null;
-const webgpuReady = (async () => {
-  if (!navigator.gpu) return;
-  try {
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) return;
-    const device = await adapter.requestDevice({
-      requiredLimits: {
-        maxStorageBuffersPerShaderStage: Math.min(adapter.limits.maxStorageBuffersPerShaderStage, 10),
-        maxBufferSize: Math.min(adapter.limits.maxBufferSize, 1 << 30),
-        maxStorageBufferBindingSize: Math.min(adapter.limits.maxStorageBufferBindingSize, 1 << 30),
-      },
-    });
-    bridge = createWebGPUBridge(adapter, device);
-    console.log('[Worker] WebGPU bridge ready');
-  } catch (e) {
-    console.warn('[Worker] WebGPU init failed:', e);
-  }
-})();
-
-// No-op stubs for when WebGPU is unavailable
-const WEBGPU_NOOP = {
-  wgpuCreateInstance: () => 0, wgpuInstanceRequestAdapter: () => {},
-  wgpuInstanceRelease: () => {}, wgpuAdapterRequestDevice: () => {},
-  wgpuAdapterRelease: () => {}, wgpuDeviceSetUncapturedErrorCallback: () => {},
-  wgpuDeviceSetDeviceLostCallback: () => {}, wgpuDeviceGetQueue: () => 0,
-  mlx_webgpu_poll: () => {}, wgpuDeviceCreateComputePipeline: () => 0,
-  wgpuComputePipelineGetBindGroupLayout: () => 0,
-  wgpuDeviceCreateShaderModule: () => 0, wgpuQueueOnSubmittedWorkDone: () => {},
-  wgpuAdapterGetProperties: () => {}, wgpuDeviceGetLimits: () => 0,
-  wgpuCommandEncoderRelease: () => {}, wgpuComputePassEncoderEnd: () => {},
-  wgpuComputePassEncoderRelease: () => {},
-  wgpuDeviceCreateCommandEncoder: () => 0,
-  wgpuCommandEncoderBeginComputePass: () => 0,
-  wgpuComputePassEncoderSetPipeline: () => {},
-  wgpuComputePassEncoderSetBindGroup: () => {},
-  wgpuComputePassEncoderDispatchWorkgroups: () => {},
-  wgpuCommandEncoderFinish: () => 0, wgpuQueueSubmit: () => {},
-  wgpuCommandBufferRelease: () => {}, wgpuDeviceCreateBuffer: () => 0,
-  wgpuBufferDestroy: () => {}, wgpuBufferRelease: () => {},
-  wgpuCommandEncoderCopyBufferToBuffer: () => {},
-  wgpuBufferMapAsync: () => {}, wgpuBufferGetConstMappedRange: () => 0,
-  wgpuBufferUnmap: () => {}, wgpuBufferGetSize: () => 0n,
-  wgpuBindGroupRelease: () => {}, wgpuDeviceCreateBindGroup: () => 0,
-  wgpuBufferGetMappedRange: () => 0,
-};
+// RPC config received from mlx-worker before emnapi's init message
+let rpcConfig = null;
 
 const handler = new MessageHandler({
   async onLoad({ wasmModule, wasmMemory }) {
-    // Wait for WebGPU device to be ready
-    await webgpuReady;
+    // Wait for RPC config (arrives before emnapi's init message)
+    while (!rpcConfig) {
+      await new Promise(r => setTimeout(r, 1));
+    }
+
+    const bridge = createBridgeStub(
+      rpcConfig.cmdBuffer,
+      wasmMemory,
+      rpcConfig.handles,
+      rpcConfig.readbackBuffer,
+      rpcConfig.features,
+    );
+
+    // Stream channel stubs — write decoded tokens to SharedArrayBuffer
+    const streamBuffer = rpcConfig.streamBuffer;
+    const streamView = streamBuffer ? new Uint8Array(streamBuffer) : null;
+    const streamI32 = streamBuffer ? new Int32Array(streamBuffer) : null;
 
     const wasi = new WASI({
       print: function () { console.log.apply(console, arguments); },
@@ -76,16 +59,38 @@ const handler = new MessageHandler({
           memory: wasmMemory,
           __cpp_exception: new WebAssembly.Tag({ parameters: ['i32'] }),
           _ZN3mlx4core3gpu4initEv: () => {},
-          ...(bridge ? bridge.imports : WEBGPU_NOOP),
+          // Stream channel for token streaming (same impl as mlx-worker.ts)
+          mlx_stream_write: (ptr, len) => {
+            if (!streamView || !streamI32) return;
+            const maxLen = STREAM_BUFFER_SIZE - STREAM_TEXT_OFFSET;
+            if (len > maxLen) len = maxLen;
+            const wasmMem = new Uint8Array(wasmMemory.buffer);
+            const text = wasmMem.slice(ptr, ptr + len);
+            streamView.set(text, STREAM_TEXT_OFFSET);
+            Atomics.store(streamI32, 0, len);
+            Atomics.add(streamI32, 1, 1);
+            Atomics.notify(streamI32, 1);
+          },
+          mlx_stream_reset: () => {
+            if (!streamI32) return;
+            Atomics.store(streamI32, 0, 0);
+            Atomics.store(streamI32, 1, 0);
+          },
+          ...bridge.imports,
         };
       },
       beforeInit({ instance }) {
-        if (bridge) bridge.setInstance(instance);
+        bridge.setInstance(instance);
       },
     });
   },
 });
 
 globalThis.onmessage = function (e) {
+  // Intercept RPC config before emnapi's handler sees it
+  if (e.data?.type === '__mlx_rpc_config') {
+    rpcConfig = e.data;
+    return;
+  }
   handler.handle(e);
 };

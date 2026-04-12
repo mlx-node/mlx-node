@@ -64,7 +64,7 @@ if (!target) {
   await copyMetallib();
 } else {
   // Copy raw WASM binary to the runtime location (symlinked by browser demo)
-  const rawWasm = join(__dirname, '../../target/wasm32-wasip1-threads', buildOptions.profile ?? 'wasi', 'mlx_core.wasm');
+  const rawWasm = join(__dirname, '../../target/wasm32-wasip1-threads', buildOptions.profile ?? 'release', 'mlx_core.wasm');
   const runtimeWasm = join(__dirname, 'mlx-core.wasm32-wasi.opt.wasm');
   await copyFile(rawWasm, runtimeWasm);
   console.log(`Copied WASM: ${rawWasm} -> ${runtimeWasm}`);

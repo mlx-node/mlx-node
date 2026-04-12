@@ -31,12 +31,15 @@ struct WebGPUBuffer {
 
 extern "C" {
 
+#ifndef MLX_USE_WEBGPU
 // Export computation graph to DOT file for debugging
+// Not available on WASM (no filesystem, no std::ofstream)
 void mlx_export_to_dot(const char* path, mlx_array* handle) {
     auto& arr = *reinterpret_cast<array*>(handle);
     std::ofstream ofs(path);
     mlx::core::export_to_dot(ofs, arr);
 }
+#endif
 
 mlx_array* mlx_array_transpose(mlx_array* handle,
                                const int32_t* axes,

@@ -25,6 +25,9 @@ pub struct GatedDeltaNet {
     dt_bias: MxArray, // [num_v_heads]
     a_log: MxArray,   // [num_v_heads]
 
+    // Metadata
+    layer_idx: usize,
+
     // Dimensions
     num_k_heads: i32,
     num_v_heads: i32,
@@ -34,7 +37,6 @@ pub struct GatedDeltaNet {
     value_dim: i32,
     conv_dim: i32,
     conv_kernel_dim: i32,
-    layer_idx: usize,
 }
 
 impl GatedDeltaNet {
@@ -90,6 +92,7 @@ impl GatedDeltaNet {
             out_proj: LinearProj::Standard(out_proj),
             dt_bias,
             a_log,
+            layer_idx,
             num_k_heads,
             num_v_heads,
             key_head_dim,
@@ -98,7 +101,6 @@ impl GatedDeltaNet {
             value_dim,
             conv_dim,
             conv_kernel_dim,
-            layer_idx,
         })
     }
 
@@ -118,9 +120,9 @@ impl GatedDeltaNet {
         mut cache: Option<&mut ArraysCache>,
         use_kernel: bool,
     ) -> Result<MxArray> {
+        let layer = self.layer_idx;
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
-        let layer = self.layer_idx;
 
         // Project to qkvz: [B, T, key_dim*2 + value_dim*2]
         let qkvz = self.in_proj_qkvz.forward(x)?;
@@ -130,25 +132,23 @@ impl GatedDeltaNet {
 
         // Split ba into b and a: each [B, T, num_v_heads]
         let b = ba.slice_axis(2, 0, self.num_v_heads as i64)?;
-        let a = ba.slice_axis(2, self.num_v_heads as i64, (self.num_v_heads * 2) as i64)?;
         log_tensor_stats(&format!("layer.{layer:02}.gdn.ba_b"), &b);
+        let a = ba.slice_axis(2, self.num_v_heads as i64, (self.num_v_heads * 2) as i64)?;
         log_tensor_stats(&format!("layer.{layer:02}.gdn.ba_a"), &a);
 
         // Split qkvz: qkv goes through conv, z bypasses
         // qkv: [B, T, key_dim*2 + value_dim] = [B, T, conv_dim]
         // z: [B, T, value_dim]
         let qkv = qkvz.slice_axis(2, 0, self.conv_dim as i64)?;
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.qkv"), &qkv);
         let z = qkvz.slice_axis(
             2,
             self.conv_dim as i64,
             (self.key_dim * 2 + self.value_dim * 2) as i64,
         )?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.qkv"), &qkv);
         log_tensor_stats(&format!("layer.{layer:02}.gdn.z"), &z);
-        log_tensor_stats(
-            &format!("layer.{layer:02}.gdn.conv1d_weight"),
-            &self.conv1d.get_weight(),
-        );
+        let conv1d_weight = self.conv1d.get_weight();
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.conv1d_weight"), &conv1d_weight);
         log_tensor_stats(&format!("layer.{layer:02}.gdn.dt_bias"), &self.dt_bias);
         log_tensor_stats(&format!("layer.{layer:02}.gdn.a_log"), &self.a_log);
 
@@ -198,6 +198,7 @@ impl GatedDeltaNet {
 
         // Conv1d: [B, T_in, conv_dim] → [B, T_out, conv_dim]
         let conv_out = self.conv1d.forward(&conv_input)?;
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.conv_out"), &conv_out);
 
         // Take last seq_len timesteps (conv may produce more than seq_len if conv_state was prepended)
         let conv_out_len = conv_out.shape_at(1)?;
@@ -206,18 +207,18 @@ impl GatedDeltaNet {
         } else {
             conv_out
         };
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.conv_out"), &conv_out);
 
         // Apply SiLU activation
-        let conv_out = Activations::silu(&conv_out)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.conv_out_silu"), &conv_out);
+        let conv_out_silu = Activations::silu(&conv_out)?;
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.conv_out_silu"), &conv_out_silu);
+        let conv_out = conv_out_silu;
 
         // Split into q, k, v
         let q_flat = conv_out.slice_axis(2, 0, self.key_dim as i64)?;
-        let k_flat = conv_out.slice_axis(2, self.key_dim as i64, (self.key_dim * 2) as i64)?;
-        let v_flat = conv_out.slice_axis(2, (self.key_dim * 2) as i64, self.conv_dim as i64)?;
         log_tensor_stats(&format!("layer.{layer:02}.gdn.q_flat"), &q_flat);
+        let k_flat = conv_out.slice_axis(2, self.key_dim as i64, (self.key_dim * 2) as i64)?;
         log_tensor_stats(&format!("layer.{layer:02}.gdn.k_flat"), &k_flat);
+        let v_flat = conv_out.slice_axis(2, (self.key_dim * 2) as i64, self.conv_dim as i64)?;
         log_tensor_stats(&format!("layer.{layer:02}.gdn.v_flat"), &v_flat);
 
         // Reshape to head format
@@ -241,17 +242,18 @@ impl GatedDeltaNet {
             self.num_v_heads as i64,
             self.value_head_dim as i64,
         ])?;
+
         // Apply RMS norm scaling to q and k (matching Python exactly):
         //   inv_scale = head_k_dim^(-0.5)
         //   q = (inv_scale^2) * rms_norm(q, None, 1e-6)
         //   k = inv_scale * rms_norm(k, None, 1e-6)
         let inv_scale = (self.key_head_dim as f64).powf(-0.5);
         let q_normed = rms_norm_no_weight(&q, 1e-6)?;
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.q_normed"), &q_normed);
         let k_normed = rms_norm_no_weight(&k, 1e-6)?;
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.k_normed"), &k_normed);
         let q = q_normed.mul_scalar(inv_scale * inv_scale)?;
         let k = k_normed.mul_scalar(inv_scale)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.q_normed"), &q);
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.k_normed"), &k);
 
         // Run gated delta recurrence
         let recurrent_state = cache.as_deref().and_then(|c| c.get(1));
@@ -295,7 +297,7 @@ impl GatedDeltaNet {
 
         // Output projection
         let out = self.out_proj.forward(&y_flat)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.out_proj"), &out);
+        log_tensor_stats(&format!("layer.{layer:02}.gdn.out"), &out);
         Ok(out)
     }
 

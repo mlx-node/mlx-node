@@ -26,7 +26,7 @@ use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::SafeTensorsFile;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
-use napi::{Env, Status, bindgen_prelude::*, tokio};
+use napi::{Env, Status, bindgen_prelude::*};
 use napi_derive::napi;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -205,44 +205,10 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
 // VLModelInner implementation
 // ---------------------------------------------------------------------------
 
-    /// Set the language model (internal - used by VLModel::load())
-    pub fn set_language_model(&mut self, lm: &ERNIELanguageModel) {
-        self.language_model = Some(Arc::new(RwLock::new(lm.clone())));
-    }
-
-    /// Set the tokenizer
-    #[napi]
-    pub fn set_tokenizer(&mut self, tokenizer: &Qwen3Tokenizer) {
-        self.tokenizer = Some(Arc::new(tokenizer.clone()));
-    }
-
-    /// Check if tokenizer is available
-    #[napi(getter)]
-    pub fn has_tokenizer(&self) -> bool {
-        self.tokenizer.is_some()
-    }
-
-    /// Chat with the VLM model
-    ///
-    /// High-level API for conversational interaction with images.
-    ///
-    /// # Arguments
-    /// * `messages` - Chat messages (role + content)
-    /// * `config` - Chat configuration (including images for automatic processing)
-    ///
-    /// # Returns
-    /// * VLMChatResult with generated text
-    ///
-    /// # Example
-    /// ```typescript
-    /// const result = await model.chat(
-    ///   [{ role: 'user', content: 'Describe this image.' }],
-    ///   { images: [readFileSync('./photo.jpg')], maxNewTokens: 256 }
-    /// );
-    /// ```
-    #[napi]
-    pub async fn chat(
-        &self,
+impl VLModelInner {
+    /// Synchronous chat implementation. Runs on the dedicated model thread.
+    fn chat_sync(
+        &mut self,
         messages: Vec<VLMChatMessage>,
         config: Option<VLMChatConfig>,
         image_bytes: Option<Vec<Vec<u8>>>,
@@ -279,22 +245,6 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
 
         let vision_config = self.config.vision_config.clone();
         let eos_token_id = self.config.eos_token_id;
-        let tokenizer_clone = tokenizer.clone();
-        let (input_ids, pixel_values, grid_thw, gen_config) =
-            napi::bindgen_prelude::spawn_blocking(move || {
-                // Process images if image buffers provided
-                let (pixel_values, grid_thw) = if let Some(ref images) = config.images {
-                    if images.is_empty() {
-                        (None, None)
-                    } else {
-                        let processor_config = ImageProcessorConfig {
-                            patch_size: vision_config.patch_size,
-                            merge_size: vision_config.spatial_merge_size,
-                            ..ImageProcessorConfig::default()
-                        };
-                        let processor = ImageProcessor::new(Some(processor_config));
-                        let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
-                        let processed = processor.process_many(&image_refs)?;
 
         // Process images
         let (pixel_values, grid_thw) = if let Some(ref images) = image_bytes {
@@ -386,22 +336,11 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
             Some(gen_config),
         )?;
 
-        // spawn_blocking: decode tokens → text (CPU-bound)
-        let result_tokens = result.tokens.clone();
-        let text = napi::bindgen_prelude::spawn_blocking(move || {
-            result_tokens.eval();
-            let tokens_vec = result_tokens.to_uint32()?;
-            let text = tokenizer.decode_sync(&tokens_vec, true)?;
-            let text = text.replace("<|im_end|>", "").trim().to_string();
-            Ok::<String, Error>(text)
-        })
-        .await
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("VLM chat decoding failed: {}", e),
-            )
-        })??;
+        // Decode tokens → text
+        result.tokens.eval();
+        let tokens_vec = result.tokens.to_uint32()?;
+        let text = tokenizer.decode_sync(&tokens_vec, true)?;
+        let text = text.replace("<|im_end|>", "").trim().to_string();
 
         Ok(VLMChatResult {
             text,
@@ -486,23 +425,9 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
         lm.forward(input_ids, Some(&inputs_embeds), mask, None)
     }
 
-    /// Generate text tokens given input tokens and optional image
-    ///
-    /// Uses KV caching for efficient generation - each step only processes the
-    /// new token(s) while reusing cached key-value states from previous tokens.
-    /// Vision features are computed once at the start and cached.
-    ///
-    /// # Arguments
-    /// * `input_ids` - Input token IDs [1, seq_len]
-    /// * `pixel_values` - Optional image patches [1, num_patches, C, H, W]
-    /// * `image_grid_thw` - Optional grid dimensions [1, 3]
-    /// * `config` - Generation configuration
-    ///
-    /// # Returns
-    /// * GenerationResult with tokens, logprobs, and finish reason
-    #[napi]
-    pub async fn generate(
-        &self,
+    /// Synchronous generate. Runs on the dedicated model thread.
+    fn generate_sync(
+        &mut self,
         input_ids: &MxArray,
         pixel_values: Option<&MxArray>,
         image_grid_thw: Option<&MxArray>,
@@ -511,21 +436,20 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
         let config = config.unwrap_or_default();
         let model_config = self.config.clone();
 
-        napi::bindgen_prelude::spawn_blocking(move || {
-            // Extract config with defaults - aligned with mlx-vlm generate_step defaults
-            let max_new_tokens = config.max_new_tokens.unwrap_or(256); // mlx-vlm DEFAULT_MAX_TOKENS
-            let temperature = config.temperature.unwrap_or(0.0); // mlx-vlm: greedy by default
-            let top_k = config.top_k.unwrap_or(0);
-            let top_p = config.top_p.unwrap_or(1.0);
-            let min_p = config.min_p.unwrap_or(0.0);
-            let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-            let repetition_context_size = config.repetition_context_size.unwrap_or(20);
-            let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-            let presence_context_size = config.presence_context_size.unwrap_or(20);
-            let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-            let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-            let eos_token_id = config.eos_token_id.unwrap_or(model_config.eos_token_id);
-            let return_logprobs = config.return_logprobs.unwrap_or(false);
+        // Extract config with defaults
+        let max_new_tokens = config.max_new_tokens.unwrap_or(256);
+        let temperature = config.temperature.unwrap_or(0.0);
+        let top_k = config.top_k.unwrap_or(0);
+        let top_p = config.top_p.unwrap_or(1.0);
+        let min_p = config.min_p.unwrap_or(0.0);
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(20);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+        let eos_token_id = config.eos_token_id.unwrap_or(model_config.eos_token_id);
+        let return_logprobs = config.return_logprobs.unwrap_or(false);
 
         debug!(
             "Starting VLM generation with KV cache: max_tokens={}, temp={}, top_k={}, top_p={}, rep_penalty={}",
@@ -854,70 +778,10 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
         })
     }
 
-    /// Batch OCR: extract text from multiple images simultaneously
-    ///
-    /// Processes N images with sequential prefill + batched decode for ~N× decode throughput.
-    ///
-    /// # Arguments
-    /// * `images` - Encoded image buffers
-    /// * `config` - Optional chat configuration (shared across all items)
-    ///
-    /// # Returns
-    /// * Vec of extracted text strings, one per image
-    ///
-    /// # Example
-    /// ```typescript
-    /// import { readFileSync } from 'fs';
-    /// const images = ['page1.jpg', 'page2.jpg'].map(p => readFileSync(p));
-    /// const texts = await model.ocrBatch(images);
-    /// ```
-    #[napi]
-    pub async fn ocr_batch(
-        &self,
-        images: Vec<Buffer>,
-        config: Option<VLMChatConfig>,
-    ) -> Result<Vec<String>> {
-        let prompt = "Extract all text from this image.".to_string();
-
-        let batch: Vec<VLMBatchItem> = images
-            .into_iter()
-            .map(|image_data| VLMBatchItem {
-                messages: vec![VLMChatMessage {
-                    role: ChatRole::User,
-                    content: prompt.clone(),
-                }],
-                images: Some(vec![image_data]),
-            })
-            .collect();
-
-        let results = self.batch(batch, config).await?;
-
-        Ok(results
-            .into_iter()
-            .map(|r| {
-                let text = r.text;
-                text.strip_prefix("\\(\\text{")
-                    .and_then(|s| s.strip_suffix("}\\)"))
-                    .map(|s| s.to_string())
-                    .unwrap_or(text)
-            })
-            .collect())
-    }
-
-    /// Batch chat: process multiple items simultaneously
-    ///
-    /// Sequential prefill + batched decode. Each item can have different images/prompts.
-    ///
-    /// # Arguments
-    /// * `batch` - Batch items, each with messages and optional images
-    /// * `config` - Optional shared chat configuration
-    ///
-    /// # Returns
-    /// * Vec of VLMChatResult, one per batch item
-    #[napi]
-    pub async fn batch(
-        &self,
-        batch: Vec<VLMBatchItem>,
+    /// Synchronous batch processing. Runs on the dedicated model thread.
+    fn batch_sync(
+        &mut self,
+        batch: Vec<SendableVLMBatchItem>,
         config: Option<VLMChatConfig>,
     ) -> Result<Vec<VLMChatResult>> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
@@ -978,30 +842,64 @@ pub(crate) fn handle_vlmodel_cmd(inner: &mut VLModelInner, cmd: VLModelCmd) {
 
         let model_config = &self.config;
 
-        // spawn_blocking: image processing + tokenization + generate_batch + decoding
-        napi::bindgen_prelude::spawn_blocking(move || {
-            let gen_config = GenerationConfig {
-                max_new_tokens: config.max_new_tokens,
-                temperature: config.temperature,
-                top_k: config.top_k,
-                top_p: config.top_p,
-                min_p: None,
-                repetition_penalty: config.repetition_penalty,
-                repetition_context_size: None,
-                presence_penalty: config.presence_penalty,
-                presence_context_size: config.presence_context_size,
-                frequency_penalty: config.frequency_penalty,
-                frequency_context_size: config.frequency_context_size,
-                max_consecutive_tokens: None,
-                max_ngram_repeats: None,
-                ngram_size: None,
-                eos_token_id: Some(model_config.eos_token_id),
-                return_logprobs: config.return_logprobs,
-                prefill_step_size: None,
-                kv_cache_bits: None,
-                kv_cache_group_size: None,
-                num_draft_tokens: None,
-                report_performance: None,
+        let gen_config = GenerationConfig {
+            max_new_tokens: config.max_new_tokens,
+            temperature: config.temperature,
+            top_k: config.top_k,
+            top_p: config.top_p,
+            min_p: None,
+            repetition_penalty: config.repetition_penalty,
+            repetition_context_size: None,
+            presence_penalty: config.presence_penalty,
+            presence_context_size: config.presence_context_size,
+            frequency_penalty: config.frequency_penalty,
+            frequency_context_size: config.frequency_context_size,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            eos_token_id: Some(model_config.eos_token_id),
+            return_logprobs: config.return_logprobs,
+            prefill_step_size: None,
+            kv_cache_bits: None,
+            kv_cache_group_size: None,
+            num_draft_tokens: None,
+            report_performance: None,
+        };
+
+        // Prepare per-item inputs
+        let batch_size = batch.len();
+        let mut all_input_ids = Vec::with_capacity(batch_size);
+        let mut all_pixel_values = Vec::with_capacity(batch_size);
+        let mut all_grid_thws = Vec::with_capacity(batch_size);
+
+        for item in &batch {
+            let (pixel_values, grid_thw) = if let Some(ref images) = item.images {
+                if images.is_empty() {
+                    (None, None)
+                } else {
+                    let processor_config = ImageProcessorConfig {
+                        patch_size: model_config.vision_config.patch_size,
+                        merge_size: model_config.vision_config.spatial_merge_size,
+                        ..ImageProcessorConfig::default()
+                    };
+                    let processor = ImageProcessor::new(Some(processor_config));
+                    let image_refs: Vec<&[u8]> = images.iter().map(|b| &b[..]).collect();
+                    let processed = processor.process_many(&image_refs)?;
+                    let pv = processed.pixel_values();
+                    let pv_shape = pv.shape()?;
+                    let new_shape = BigInt64Array::from(vec![
+                        1i64,
+                        pv_shape[0],
+                        pv_shape[1],
+                        pv_shape[2],
+                        pv_shape[3],
+                    ]);
+                    let pixel_values = pv.reshape(&new_shape)?;
+                    let grid_thw = processed.grid_thw();
+                    (Some(pixel_values), Some(grid_thw))
+                }
+            } else {
+                (None, None)
             };
 
             let num_image_tokens = if let Some(ref grid) = grid_thw {

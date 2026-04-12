@@ -170,7 +170,6 @@ impl Qwen3_5Attention {
             (queries, keys)
         };
 
-
         // Transpose to [B, H, T, D] for KVCache and SDPA
         let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
         let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
@@ -192,7 +191,6 @@ impl Qwen3_5Attention {
             self.scale as f64,
         )?;
 
-
         // Transpose back: [B, H, T, D] → [B, T, H, D] → flatten to [B, T, H*D]
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;
         let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
@@ -201,7 +199,6 @@ impl Qwen3_5Attention {
         // gate is already [B, T, H*D] from the per-head split above
         let gate_sigmoid = Activations::sigmoid(&gate)?;
         let gated_output = output.mul(&gate_sigmoid)?;
-
 
         // Output projection
         let result = self.o_proj.forward(&gated_output)?;
