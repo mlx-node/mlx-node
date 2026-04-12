@@ -60,7 +60,7 @@ Main Thread (UI)          wasm-worker              gpu-worker
 
 ### SharedArrayBuffer RPC Protocol
 
-Defined in `src/rpc-protocol.ts` (193 lines). The command buffer is a fixed-size 512-byte SharedArrayBuffer:
+Defined in `src/rpc-protocol.ts` (184 lines). The command buffer is a fixed-size 512-byte SharedArrayBuffer:
 
 ```
 Offset  Field              Size     Description
@@ -118,15 +118,15 @@ GPU objects (buffers, pipelines, bind groups, etc.) are tracked by integer handl
 
 ### Token Streaming
 
-Decoded tokens are streamed to the main thread via a separate SharedArrayBuffer channel (256 KB):
+Decoded tokens stream from the WASM worker to the main thread via NAPI `ThreadsafeFunction` callbacks. The `chatStream()` API fires a callback per token with a `ChatStreamChunk` containing delta text and an `isReasoning` flag:
 
-```
-[0..3]   u32: write cursor (byte offset)
-[4..7]   u32: sequence number (incremented per token)
-[8..N]   utf-8 text data (cumulative)
-```
+1. mlx-worker calls `model.chatStream(messages, config, callback)`
+2. Each token triggers `callback(null, { text, isReasoning, done: false })`
+3. mlx-worker posts `{ type: 'chunk', text, isReasoning }` to main thread via `postMessage`
+4. Final chunk has `done: true` with full `text`, `thinking`, `performance` stats
+5. Main thread appends delta tokens to the UI incrementally
 
-The WASM module writes tokens via `mlx_stream_write()`, increments the sequence counter with `Atomics.add`, and wakes the main thread with `Atomics.notify`. The main thread uses `Atomics.waitAsync` for non-blocking per-token rendering.
+This replaced an earlier SharedArrayBuffer-based `mlx_stream_write()` channel. The NAPI callback approach is simpler (no shared memory protocol) and provides structured per-token metadata (thinking vs response) that SharedArrayBuffer polling could not.
 
 ### Browser Source Files
 
@@ -135,14 +135,14 @@ The WASM module writes tokens via `mlx_stream_write()`, increments the sequence 
 | `src/gpu-worker.ts` | 1,679 | GPU thread: WebGPU API calls, handle table, fused dispatch |
 | `src/webgpu-bridge-stub.ts` | 1,091 | C-API stubs: encodes wgpu* calls into RPC |
 | `src/webgpu-bridge.ts` | 620 | Bridge setup and initialization |
-| `src/mlx-worker.ts` | 675 | WASM thread: model loading, inference orchestration |
+| `src/mlx-worker.ts` | 410 | WASM thread: model loading, inference orchestration |
 | `src/test-worker.ts` | 3,913 | Browser test suite (178 test cases) |
-| `src/rpc-protocol.ts` | 193 | SharedArrayBuffer layout and RPC function IDs |
+| `src/rpc-protocol.ts` | 184 | SharedArrayBuffer layout and RPC function IDs |
 | `src/cxx-stubs.ts` | 131 | C++ standard library stubs for WASM |
 | `src/wasm-loader.ts` | 116 | WASM module loading and instantiation |
 | `src/safetensors.ts` | 117 | SafeTensors file parsing |
 | `src/index.ts` | 6 | Package entry point |
-| `demo/app.ts` | 385 | Demo app: Qwen3.5 chat UI |
+| `demo/app.ts` | 313 | Demo app: Qwen3.5 chat UI |
 | `demo/test-ops-runner.ts` | 62 | Test runner HTML page logic |
 
 ### URL Query Parameters
@@ -711,6 +711,20 @@ Without these, the two-worker architecture cannot function.
 **Symptom**: Unexpectedly low throughput in the TypeScript bridge.
 
 **Fix**: Use plain 32-bit numbers wherever possible. Split 64-bit values into two 32-bit halves.
+
+#### WASM child worker deadlock on `wgpuBufferMapAsync`
+
+**Symptom**: Child WASM workers (emnapi thread pool) hang indefinitely during `raw_ptr()` — the first GPU→CPU readback after a compute operation never completes.
+
+**Root cause**: Three factors combine into an unrecoverable deadlock:
+
+1. `Buffer::raw_ptr()` in `allocator.cpp` calls `wgpuBufferMapAsync()` with a C callback, then enters a polling loop: `while (!map_data.done) { poll_instance(dev.gpu_instance()); }`
+2. On WASM (`__wasm__`), `poll_instance()` is a **no-op** — the JS bridge handles async operations, not a native polling mechanism
+3. With the **direct bridge** (each worker gets its own `GPUDevice`), `wgpuBufferMapAsync` registers a JS `Promise.then()` callback. But the polling loop blocks the thread's event loop, so the Promise callback never fires → infinite loop
+
+This only manifests in **child workers** (emnapi thread pool), not the main wasm-worker. The main wasm-worker uses the RPC bridge where `wgpuBufferMapAsync` translates to `Atomics.wait` → gpu-worker handles the async map → writes callback info back → `drainCallbacks()` fires the C callback synchronously before the RPC returns.
+
+**Fix**: Child workers must use the **RPC bridge** (shared `cmdBuffer` + `Atomics.wait` → gpu-worker), not the direct bridge. The gpu-worker's event loop is free to process the `mapAsync` Promise, writes the result back via the callback ring in SharedArrayBuffer, and the wasm-worker's `drainCallbacks()` invokes the C callback synchronously. See `webgpu-worker.mjs` for the child worker RPC bridge setup.
 
 ---
 

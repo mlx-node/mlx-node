@@ -41,11 +41,17 @@ if (isWasmBuild) {
   })
 }
 
+// Snapshot hand-written wasi-worker-browser.mjs BEFORE cli.build() overwrites it.
+// NAPI-RS always regenerates this file, but ours is the source of truth.
+const wasiWorkerBrowserPath = join(__dirname, 'wasi-worker-browser.mjs');
+const wasiWorkerBrowserSrc = isWasmBuild ? await readFile(wasiWorkerBrowserPath, 'utf-8').catch(() => null) : null;
+
 const { task } = await cli.build(buildOptions);
 const outputs = await task;
 
 for (const output of outputs) {
-  if (output.kind !== 'node') {
+  // Skip formatting wasi-worker-browser.mjs — hand-written, not auto-generated
+  if (output.kind !== 'node' && !output.path.endsWith('wasi-worker-browser.mjs')) {
     const { code } = await format(output.path, await readFile(output.path, 'utf-8'), viteConfig.fmt);
     await writeFile(output.path, code);
   }
@@ -54,6 +60,11 @@ for (const output of outputs) {
     const replaced = code.replace('export declare const enum OutputFormat {', 'export enum OutputFormat {');
     await writeFile(output.path, replaced);
   }
+}
+
+// Restore hand-written wasi-worker-browser.mjs after NAPI-RS overwrote it
+if (wasiWorkerBrowserSrc) {
+  await writeFile(wasiWorkerBrowserPath, wasiWorkerBrowserSrc);
 }
 
 // Copy mlx.metallib for colocated Metal shader loading
@@ -68,63 +79,6 @@ if (!target) {
   const runtimeWasm = join(__dirname, 'mlx-core.wasm32-wasi.opt.wasm');
   await copyFile(rawWasm, runtimeWasm);
   console.log(`Copied WASM: ${rawWasm} -> ${runtimeWasm}`);
-
-  // Patch generated WASM browser/worker files with extra imports needed by
-  // MLX (C++ exception stubs, WebGPU bridge no-ops, GPU init).
-  // These are WASM imports not provided by emnapi/WASI.
-  await patchWasmEntries();
-}
-
-// Extra WASM imports needed by MLX that emnapi/WASI don't provide.
-// Injected into both the browser entry and worker entry files.
-const MLX_EXTRA_IMPORTS = `
-      // WASM exception tag for C++ exceptions (used by -fwasm-exceptions)
-      __cpp_exception: new WebAssembly.Tag({ parameters: ['i32'] }),
-      // MLX GPU init — no-op (GPU initialized lazily via WebGPU bridge)
-      _ZN3mlx4core3gpu4initEv: () => {},
-      // WebGPU stubs (real bridge injected by consumer via overwriteImports)
-      wgpuCreateInstance: () => 0, wgpuInstanceRequestAdapter: () => {},
-      wgpuInstanceRelease: () => {}, wgpuAdapterRequestDevice: () => {},
-      wgpuAdapterRelease: () => {}, wgpuDeviceSetUncapturedErrorCallback: () => {},
-      wgpuDeviceSetDeviceLostCallback: () => {}, wgpuDeviceGetQueue: () => 0,
-      mlx_webgpu_poll: () => {}, wgpuDeviceCreateComputePipeline: () => 0,
-      wgpuComputePipelineGetBindGroupLayout: () => 0,
-      wgpuDeviceCreateShaderModule: () => 0, wgpuQueueOnSubmittedWorkDone: () => {},
-      wgpuAdapterGetProperties: () => {}, wgpuDeviceGetLimits: () => 0,
-      wgpuCommandEncoderRelease: () => {}, wgpuComputePassEncoderEnd: () => {},
-      wgpuComputePassEncoderRelease: () => {},
-      wgpuDeviceCreateCommandEncoder: () => 0,
-      wgpuCommandEncoderBeginComputePass: () => 0,
-      wgpuComputePassEncoderSetPipeline: () => {},
-      wgpuComputePassEncoderSetBindGroup: () => {},
-      wgpuComputePassEncoderDispatchWorkgroups: () => {},
-      wgpuCommandEncoderFinish: () => 0, wgpuQueueSubmit: () => {},
-      wgpuCommandBufferRelease: () => {}, wgpuDeviceCreateBuffer: () => 0,
-      wgpuBufferDestroy: () => {}, wgpuBufferRelease: () => {},
-      wgpuCommandEncoderCopyBufferToBuffer: () => {},
-      wgpuBufferMapAsync: () => {}, wgpuBufferGetConstMappedRange: () => 0,
-      wgpuBufferUnmap: () => {}, wgpuBufferGetSize: () => 0,
-      wgpuBindGroupRelease: () => {}, wgpuDeviceCreateBindGroup: () => 0,
-      wgpuBufferGetMappedRange: () => 0,`;
-
-async function patchWasmEntries() {
-  for (const file of ['mlx-core.wasi-browser.js', 'wasi-worker-browser.mjs']) {
-    const filePath = join(__dirname, file);
-    try {
-      let code = await readFile(filePath, 'utf-8');
-      // Inject extra imports after the "memory: ..." line in overwriteImports
-      if (!code.includes('__cpp_exception')) {
-        code = code.replace(
-          /memory:\s*(?:__sharedMemory|wasmMemory),?\n/,
-          (match) => match + MLX_EXTRA_IMPORTS + '\n',
-        );
-        await writeFile(filePath, code);
-        console.log(`Patched ${file} with MLX extra imports`);
-      }
-    } catch {
-      // File might not exist for non-WASM builds
-    }
-  }
 }
 
 async function copyMetallib() {
