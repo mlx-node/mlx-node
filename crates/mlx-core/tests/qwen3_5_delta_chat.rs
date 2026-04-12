@@ -23,6 +23,28 @@ use std::path::Path;
 use mlx_core::models::qwen3_5::model::{ChatConfig, Qwen3_5Model};
 use mlx_core::tokenizer::{ChatMessage, Qwen3Tokenizer};
 
+/// Wire format for a text-only conversation delta.
+///
+/// Must mirror the Qwen3.5 ChatML jinja template's assistant/user/assistant
+/// turn structure. Phase 2's TypeScript session class references this
+/// constant (via a grep anchor) as the single source of truth for the
+/// delta wire format. Placeholders:
+///
+///   `{prev_raw}`  — the previous assistant turn's `raw_text` (before `<|im_end|>`)
+///   `{next_user}` — the new user message body
+const DELTA_FORMAT_TEMPLATE: &str =
+    "{prev_raw}<|im_end|>\n<|im_start|>user\n{next_user}<|im_end|>\n<|im_start|>assistant\n";
+
+/// Render `DELTA_FORMAT_TEMPLATE` with the given substitutions. Kept as a
+/// helper so the test and any downstream caller use the exact same
+/// formatting logic (and so a typo in one placeholder doesn't silently
+/// desync them).
+fn render_delta(prev_raw: &str, next_user: &str) -> String {
+    DELTA_FORMAT_TEMPLATE
+        .replace("{prev_raw}", prev_raw)
+        .replace("{next_user}", next_user)
+}
+
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
         max_new_tokens: Some(max_new_tokens),
@@ -71,7 +93,13 @@ fn encode_delta(tokenizer: &tokenizers::Tokenizer, text: &str) -> Vec<u32> {
     encoding.get_ids().to_vec()
 }
 
-#[tokio::test(flavor = "current_thread")]
+// The delta bridge (`chat_tokens_delta_blocking`) uses
+// `tokio::sync::oneshot::Receiver::blocking_recv()` internally. That would
+// deadlock on a `flavor = "current_thread"` runtime — tokio explicitly
+// warns against blocking on the executor thread — so run the test with a
+// multi-thread runtime with enough workers to keep any ambient tasks
+// unblocked while the bridge is waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint"]
 async fn delta_path_keeps_ttft_flat_across_turns() {
     // Gate on env var. Returning early here means a plain `cargo test
@@ -112,6 +140,13 @@ async fn delta_path_keeps_ttft_flat_across_turns() {
         .await
         .expect("failed to load Qwen3.5 model");
 
+    /// Compact per-turn snapshot used for structural assertions below.
+    #[derive(Debug, Clone)]
+    struct TurnSnapshot {
+        ttft_ms: f64,
+        prompt_tokens: u32,
+    }
+
     // --- Turn 1: regular chat_sync path (establishes the session) ---
     let turn1_cfg = chat_config_default(64);
     let turn1_messages = vec![user_message("Say hi in one short word.")];
@@ -119,21 +154,25 @@ async fn delta_path_keeps_ttft_flat_across_turns() {
         .chat(turn1_messages, Some(turn1_cfg))
         .await
         .expect("turn 1 chat failed");
-    let ttft1 = r1
-        .performance
-        .as_ref()
-        .expect("turn 1 performance missing")
-        .ttft_ms;
+    let turn1 = TurnSnapshot {
+        ttft_ms: r1
+            .performance
+            .as_ref()
+            .expect("turn 1 performance missing")
+            .ttft_ms,
+        prompt_tokens: r1.prompt_tokens,
+    };
     println!(
         "turn 1 ttft={:.1}ms prompt_tokens={} num_tokens={}",
-        ttft1, r1.prompt_tokens, r1.num_tokens
+        turn1.ttft_ms, turn1.prompt_tokens, r1.num_tokens
     );
 
     // --- Turns 2..=4: delta path ---
     //
-    // We build a delta of the form
-    //   <assistant-reply>\n<|im_end|>\n<|im_start|>user\n<next>\n<|im_end|>\n<|im_start|>assistant\n
-    // where <assistant-reply> is the raw_text from the previous turn.
+    // We build a delta by rendering `DELTA_FORMAT_TEMPLATE` with the
+    // previous assistant reply's raw text (which the decode loop stopped
+    // exactly on `<|im_end|>` and therefore does NOT contain the id) and
+    // the new user message.
     //
     // The cached token history at this point is the full Turn-1 prompt
     // (post-chat_sync `save_cache_state_direct` appends the generated
@@ -145,21 +184,25 @@ async fn delta_path_keeps_ttft_flat_across_turns() {
         "Any synonym?",
         "One more, different?",
     ];
-    let mut ttfts = Vec::new();
-    ttfts.push(ttft1);
+    let mut snapshots: Vec<TurnSnapshot> = vec![turn1.clone()];
 
     for (idx, next_user) in user_followups.iter().enumerate() {
         let turn_idx = idx + 2;
-        // Close the last assistant turn with <|im_end|>, then open the
-        // new user turn. We intentionally mirror the jinja template's
-        // raw format for Qwen3.5 ChatML.
-        let delta_text = format!(
-            "{assistant_tail}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n",
-            assistant_tail = prev_raw,
-            user = next_user,
-        );
+        let delta_text = render_delta(&prev_raw, next_user);
         let delta_tokens = encode_delta(&raw_tokenizer, &delta_text);
-        assert!(!delta_tokens.is_empty());
+        assert!(!delta_tokens.is_empty(), "delta tokens unexpectedly empty");
+
+        // The session path uses `<|im_end|>` as its stop token, so a
+        // well-formed delta must NOT contain the id — otherwise the decode
+        // loop would stop on the delta itself. Guarding here means an
+        // encoding mismatch surfaces as a clear assertion instead of an
+        // obscure 0-token generation.
+        assert!(
+            !delta_tokens.contains(&im_end_id),
+            "delta must not contain <|im_end|> (id={}): {:?}",
+            im_end_id,
+            delta_tokens
+        );
 
         let cfg = chat_config_default(64);
         let result = model
@@ -178,40 +221,87 @@ async fn delta_path_keeps_ttft_flat_across_turns() {
             delta_tokens.len()
         );
 
-        // Cache must have been extended: prompt_tokens should grow roughly
-        // linearly (cached history + delta), but TTFT should NOT.
-        assert!(result.prompt_tokens >= delta_tokens.len() as u32);
+        snapshots.push(TurnSnapshot {
+            ttft_ms: ttft,
+            prompt_tokens: result.prompt_tokens,
+        });
 
-        ttfts.push(ttft);
         // The raw reply from chat_tokens_delta ends before <|im_end|>
         // because the decode loop stops on im_end_id. Chain on it.
         prev_raw = result.raw_text.clone();
 
-        // Sanity: the session path uses <|im_end|> as its stop token,
-        // so a successful turn must NOT produce the id in the generated
-        // sequence (it stops exactly on it). We can't directly inspect
-        // generated_tokens here, but finish_reason carries the signal.
         assert!(
             result.finish_reason == "stop" || result.finish_reason == "length",
             "unexpected finish_reason: {}",
             result.finish_reason
         );
-        let _ = im_end_id; // (keep the binding referenced for clarity)
     }
 
-    // Core assertion: TTFT stays flat (≤1.5x of turn 1) across all turns.
-    // The broken pre-Phase-1 path would balloon linearly as the history
-    // grows — we pick 1.5x as a generous bound that still catches a
-    // full re-prefill regression.
-    let ttft_turn4 = *ttfts.last().unwrap();
-    let bound = ttft1 * 1.5;
+    // --- Structural assertions ---------------------------------------
+    //
+    // These guard against a regressed delta path that silently falls back
+    // to full re-prefill. A simple `ttft_turn4 < ttft_turn1 * 1.5` would
+    // pass even if the cache were being rebuilt from scratch each turn on
+    // a fast-enough machine; the structural checks below catch that case.
+    assert_eq!(snapshots.len(), 4, "expected 4 turn snapshots");
+    let turn1 = &snapshots[0];
+    let turn2 = &snapshots[1];
+    let turn3 = &snapshots[2];
+    let turn4 = &snapshots[3];
+
+    // 1. prompt_tokens must GROW across delta turns. Each delta extends
+    //    the context with the previous assistant reply + new user turn +
+    //    the ChatML scaffolding, so strictly-increasing `prompt_tokens`
+    //    is direct evidence the session accumulates history rather than
+    //    being reset.
     assert!(
-        ttft_turn4 < bound,
-        "delta-path TTFT regression: turn1={:.1}ms turn4={:.1}ms bound={:.1}ms. \
-         TTFTs: {:?}",
-        ttft1,
-        ttft_turn4,
-        bound,
-        ttfts
+        turn2.prompt_tokens > turn1.prompt_tokens,
+        "delta turn 2 didn't grow prompt_tokens ({} -> {})",
+        turn1.prompt_tokens,
+        turn2.prompt_tokens
+    );
+    assert!(
+        turn3.prompt_tokens > turn2.prompt_tokens,
+        "delta turn 3 didn't grow prompt_tokens ({} -> {})",
+        turn2.prompt_tokens,
+        turn3.prompt_tokens
+    );
+    assert!(
+        turn4.prompt_tokens > turn3.prompt_tokens,
+        "delta turn 4 didn't grow prompt_tokens ({} -> {})",
+        turn3.prompt_tokens,
+        turn4.prompt_tokens
+    );
+
+    // 2. TTFT stays flat (≤1.5x of turn 1) across all turns. The broken
+    //    pre-Phase-1 path would balloon linearly as the history grows —
+    //    1.5x is a generous bound that still catches a full re-prefill
+    //    regression.
+    let bound_vs_turn1 = turn1.ttft_ms * 1.5;
+    assert!(
+        turn4.ttft_ms < bound_vs_turn1,
+        "delta-path TTFT regression vs turn 1: turn1={:.1}ms turn4={:.1}ms bound={:.1}ms. \
+         snapshots: {:?}",
+        turn1.ttft_ms,
+        turn4.ttft_ms,
+        bound_vs_turn1,
+        snapshots
+    );
+
+    // 3. Turn 4 should be in the same flat-TTFT regime as turn 2 (the
+    //    first delta turn). Turn 1 includes any one-time warmups the
+    //    chat_sync path happens to do — comparing turn 4 to turn 2
+    //    filters that out and catches a gradual slowdown across deltas
+    //    that an only-vs-turn-1 check would miss. Allow 2x noise to
+    //    avoid flakes on shared runners.
+    let bound_vs_turn2 = turn2.ttft_ms * 2.0;
+    assert!(
+        turn4.ttft_ms < bound_vs_turn2,
+        "turn 4 TTFT much slower than turn 2: turn2={:.1}ms turn4={:.1}ms bound={:.1}ms. \
+         snapshots: {:?}",
+        turn2.ttft_ms,
+        turn4.ttft_ms,
+        bound_vs_turn2,
+        snapshots
     );
 }
