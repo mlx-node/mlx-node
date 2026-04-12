@@ -533,6 +533,12 @@ impl Lfm2Inner {
             let is_reasoning = reasoning_tracker.observe_token(token_id);
             last_is_reasoning = is_reasoning;
 
+            // Check stop condition before streaming to avoid leaking EOS text
+            if token_id == eos_id {
+                finish_reason = String::from("stop");
+                break;
+            }
+
             // Check cancellation
             if cancelled.load(Ordering::Relaxed) {
                 finish_reason = String::from("cancelled");
@@ -564,12 +570,6 @@ impl Lfm2Inner {
                 }),
                 ThreadsafeFunctionCallMode::NonBlocking,
             );
-
-            // Check stop condition
-            if token_id == eos_id {
-                finish_reason = String::from("stop");
-                break;
-            }
 
             if let Some(reason) = crate::sampling::check_repetition_cutoff(
                 &generated_tokens,
