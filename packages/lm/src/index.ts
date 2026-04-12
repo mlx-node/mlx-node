@@ -26,6 +26,9 @@ export type { HarrierConfig } from '@mlx-node/core';
 export { Qwen35Model, Qwen35Model as Qwen3_5Model } from './stream.js';
 export type { Qwen35Config, Qwen35GenerationConfig, Qwen35GenerationResult } from '@mlx-node/core';
 
+// Server-side session wrapper for Qwen3.5 Dense multi-round chat
+export { Qwen35Session, type Qwen35SessionOptions } from './session.js';
+
 // LFM2 models
 export { Lfm2Model } from './stream.js';
 export type { Lfm2Config } from '@mlx-node/core';
