@@ -192,11 +192,14 @@ impl Lfm2Inner {
     ) {
         if reuse_cache {
             let mut full_history = tokens.to_vec();
-            let history_tokens = if finish_reason == "length" && !generated_tokens.is_empty() {
-                &generated_tokens[..generated_tokens.len() - 1]
-            } else {
-                generated_tokens
-            };
+            let history_tokens =
+                if (finish_reason == "length" || finish_reason == "cancelled")
+                    && !generated_tokens.is_empty()
+                {
+                    &generated_tokens[..generated_tokens.len() - 1]
+                } else {
+                    generated_tokens
+                };
             full_history.extend_from_slice(history_tokens);
             self.cached_token_history = full_history;
         } else {
@@ -748,7 +751,7 @@ impl Lfm2Model {
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
-        let config = config.unwrap_or_default_chat_config();
+        let config = config.unwrap_or_default();
 
         crate::model_thread::send_and_await(&self.thread, |reply| Lfm2Cmd::Chat {
             messages,
@@ -766,7 +769,7 @@ impl Lfm2Model {
         config: Option<ChatConfig>,
         callback: napi::threadsafe_function::ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or_default_chat_config();
+        let config = config.unwrap_or_default();
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
@@ -844,37 +847,5 @@ impl Lfm2Model {
         }
 
         total
-    }
-}
-
-/// Helper trait to create default ChatConfig.
-trait DefaultChatConfig {
-    fn unwrap_or_default_chat_config(self) -> ChatConfig;
-}
-
-impl DefaultChatConfig for Option<ChatConfig> {
-    fn unwrap_or_default_chat_config(self) -> ChatConfig {
-        self.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-        })
     }
 }
