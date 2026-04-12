@@ -3775,6 +3775,33 @@ impl Qwen3_5Model {
     }
 }
 
+/// Non-NAPI bridge methods on `Qwen3_5Model`.
+///
+/// These are `pub` (so integration tests in `tests/` can call them) but
+/// intentionally NOT annotated with `#[napi]`, so nothing leaks to the
+/// TypeScript bindings.
+#[doc(hidden)]
+impl Qwen3_5Model {
+    /// Dispatch a `ChatTokensDelta` command to the dedicated model thread and
+    /// block until the reply is received.
+    ///
+    /// Phase 1 surface: only used by the gated integration test
+    /// `crates/mlx-core/tests/qwen3_5_delta_chat.rs`. Phase 2 will replace
+    /// this with a proper `#[napi] pub async fn chat_tokens_delta` once the
+    /// TS session class is built.
+    pub fn chat_tokens_delta_blocking(
+        &self,
+        delta_tokens: Vec<u32>,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::ChatTokensDelta {
+            delta_tokens,
+            config,
+            reply,
+        })
+    }
+}
+
 /// Default prefill chunk size (tokens per chunk).
 /// Matches Python mlx-lm's `prefill_step_size` default of 2048.
 const PREFILL_STEP_SIZE: i64 = 2048;
