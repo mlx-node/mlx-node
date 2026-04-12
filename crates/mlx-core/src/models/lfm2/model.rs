@@ -368,7 +368,7 @@ impl Lfm2Inner {
             compute_performance_metrics(
                 generation_start,
                 first_token_instant,
-                prompt_token_count,
+                prefill_tokens.len(),
                 generated_tokens.len(),
             )
         } else {
@@ -626,7 +626,7 @@ impl Lfm2Inner {
             compute_performance_metrics(
                 generation_start,
                 first_token_instant,
-                prompt_token_count,
+                prefill_tokens.len(),
                 generated_tokens.len(),
             )
         } else {
