@@ -8,6 +8,14 @@ fn default_rope_theta() -> f64 {
     1_000_000.0
 }
 
+fn default_block_multiple_of() -> i32 {
+    256
+}
+
+fn default_block_ffn_dim_multiplier() -> f64 {
+    1.0
+}
+
 /// LFM2 model configuration.
 ///
 /// Supports LiquidAI's LFM2.5 hybrid conv+attention architecture.
@@ -29,8 +37,11 @@ pub struct Lfm2Config {
     pub block_dim: i32,
     #[serde(default)]
     pub block_ff_dim: i32,
+    #[serde(default = "default_block_multiple_of")]
     pub block_multiple_of: i32,
+    #[serde(default = "default_block_ffn_dim_multiplier")]
     pub block_ffn_dim_multiplier: f64,
+    #[serde(default)]
     pub block_auto_adjust_ff_dim: bool,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
