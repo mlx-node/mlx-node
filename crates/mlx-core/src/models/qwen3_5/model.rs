@@ -848,6 +848,18 @@ impl Qwen35Inner {
             ));
         }
 
+        // Mirror the symmetric guard in `chat_tokens_delta_sync`. The session
+        // API only makes sense with cache reuse enabled: if we silently accept
+        // `reuse_cache = false` here, the post-decode `save_cache_state_direct`
+        // path wipes the caches we just populated, and the next
+        // `chat_session_continue` call fails with a cryptic "missing session"
+        // error. Fail fast before mutating any state.
+        if config.reuse_cache == Some(false) {
+            return Err(Error::from_reason(
+                "chat_session_start requires reuse_cache=true (pass ChatConfig { reuse_cache: Some(true), .. } or leave as None). The session API only makes sense with cache reuse enabled.",
+            ));
+        }
+
         let tokenizer = self
             .tokenizer
             .as_ref()
