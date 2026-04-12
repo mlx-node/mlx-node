@@ -133,6 +133,9 @@ pub(crate) enum Qwen35Cmd {
     ///
     /// Phase 1: scaffolding only — no NAPI dispatch yet. Constructed by the
     /// gated integration test and (in Phase 2) by a TS session class.
+    // TODO(phase2): remove `#[allow(dead_code)]` once the NAPI
+    // `chat_tokens_delta` entry point lands and the TS session class
+    // dispatches this command.
     #[allow(dead_code)]
     ChatTokensDelta {
         delta_tokens: Vec<u32>,
@@ -1002,6 +1005,18 @@ impl Qwen35Inner {
         delta_tokens: Vec<u32>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
+        // The delta path is a session-reuse operation by construction: it
+        // prefills on top of the existing caches. `reuse_cache = Some(false)`
+        // would make the post-decode `save_cache_state_direct` wipe those
+        // caches + `cached_token_history`, making the delta turn both depend
+        // on and then destroy the session — confusing and wrong. Reject early
+        // so no state is mutated.
+        if config.reuse_cache == Some(false) {
+            return Err(Error::from_reason(
+                "chat_tokens_delta_sync requires reuse_cache to be enabled; \
+                 the delta path operates on session state by construction",
+            ));
+        }
         if self.caches.is_none() {
             return Err(Error::from_reason(
                 "chat_tokens_delta_sync requires an initialized session (call chat first)",
@@ -1044,8 +1059,11 @@ impl Qwen35Inner {
         full_token_history.extend(delta_tokens.iter().copied());
 
         let p = extract_chat_params(&config);
-        // Phase 1: hardcode thinking=on for the session path. Phase 2 will
-        // plumb this through from the ChatConfig.
+        // FIXME(phase2): plumb enable_thinking from config.reasoning_effort
+        // via `chat_common::resolve_enable_thinking(&config)`. Phase 1 hardcodes
+        // thinking=on so the session path can be exercised without the full
+        // reasoning-effort plumbing; callers who want no-think mode must use
+        // `chat_sync` until Phase 2 lands.
         let enable_thinking: Option<bool> = Some(true);
 
         let generation_start = if report_perf {
@@ -3788,7 +3806,7 @@ impl Qwen3_5Model {
     /// Phase 1 surface: only used by the gated integration test
     /// `crates/mlx-core/tests/qwen3_5_delta_chat.rs`. Phase 2 will replace
     /// this with a proper `#[napi] pub async fn chat_tokens_delta` once the
-    /// TS session class is built.
+    /// TS session class is built. **To be removed in Phase 2.**
     pub fn chat_tokens_delta_blocking(
         &self,
         delta_tokens: Vec<u32>,
