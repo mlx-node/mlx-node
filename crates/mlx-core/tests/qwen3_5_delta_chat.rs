@@ -252,7 +252,9 @@ async fn session_path_keeps_ttft_flat_across_turns() {
 /// helper panics — a partial stream would break the delta-cache
 /// invariants expected by subsequent turns.
 async fn drain_stream_turn(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<napi::Result<mlx_core::models::qwen3_5::model::ChatStreamChunk>>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<
+        napi::Result<mlx_core::models::qwen3_5::model::ChatStreamChunk>,
+    >,
 ) -> (
     Vec<mlx_core::models::qwen3_5::model::ChatStreamChunk>,
     f64,
@@ -481,7 +483,10 @@ async fn stream_session_cancellation_preserves_cache_for_next_turn() {
     // is still consistent, just with a partial previous reply.
     let turn2_cfg = chat_config_default(32);
     let (_handle2, rx2) = model
-        .chat_stream_session_continue_for_test("What number were you on?".to_string(), Some(turn2_cfg))
+        .chat_stream_session_continue_for_test(
+            "What number were you on?".to_string(),
+            Some(turn2_cfg),
+        )
         .expect("follow-up continue after cancel failed to dispatch");
     let (chunks2, _ttft2, done2) = drain_stream_turn(rx2).await;
     assert!(
