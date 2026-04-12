@@ -170,7 +170,7 @@ describe('Qwen35Session', () => {
     await session.send('Second');
     expect(session.turns).toBe(2);
 
-    session.reset();
+    await session.reset();
 
     expect(resetCaches).toHaveBeenCalledTimes(1);
     expect(session.turns).toBe(0);

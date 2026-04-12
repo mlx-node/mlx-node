@@ -21,7 +21,7 @@
  * const session = new Qwen35Session(model, { system: 'Be concise.' });
  * const r1 = await session.send('Say hi in one word.');
  * const r2 = await session.send('Another word?');
- * session.reset();
+ * await session.reset();
  * ```
  */
 import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
@@ -120,8 +120,12 @@ export class Qwen35Session {
    * Clears the underlying model's KV caches (via `resetCaches()`) and
    * resets the turn counter so the next `send()` goes through
    * `chatSessionStart` again.
+   *
+   * Returns a `Promise<void>` even though the current native
+   * `resetCaches()` is synchronous — this locks in an async-friendly
+   * signature so future async implementations don't break callers.
    */
-  reset(): void {
+  async reset(): Promise<void> {
     this.model.resetCaches();
     this.turnCount = 0;
   }
