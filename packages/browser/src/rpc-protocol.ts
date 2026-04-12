@@ -182,12 +182,3 @@ export const STATUS_INDEX = CMD_OFFSET.STATUS / 4;
 // This avoids creating views on the growable WASM SharedArrayBuffer from
 // the gpu-worker (whose byteLength may not reflect wasm-worker's memory growth).
 export const READBACK_BUFFER_SIZE = 4 * 1024 * 1024; // 4MB
-
-// --- Streaming text channel ---
-// SharedArrayBuffer layout for streaming decoded text from WASM worker to main thread:
-//   [0..3]  u32: write cursor (byte offset where next write goes)
-//   [4..7]  u32: sequence number (incremented on each token, so reader detects updates)
-//   [8..N]  utf-8 text data (cumulative decoded text so far)
-export const STREAM_HEADER_SIZE = 8; // 2 x u32
-export const STREAM_BUFFER_SIZE = 256 * 1024; // 256 KB for streamed text
-export const STREAM_TEXT_OFFSET = STREAM_HEADER_SIZE;

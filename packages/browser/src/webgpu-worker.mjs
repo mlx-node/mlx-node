@@ -49,9 +49,6 @@ const handler = new MessageHandler({
           memory: wasmMemory,
           __cpp_exception: new WebAssembly.Tag({ parameters: ['i32'] }),
           _ZN3mlx4core3gpu4initEv: () => {},
-          // Stream stubs — streaming is handled by chatStream's NAPI callback
-          mlx_stream_write: () => {},
-          mlx_stream_reset: () => {},
           ...bridge.imports,
         };
       },

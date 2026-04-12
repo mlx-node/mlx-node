@@ -130,10 +130,6 @@ async function handleInit(data: {
     const cxxStubs = {
       __cpp_exception: cppExceptionTag,
       _ZN3mlx4core3gpu4initEv: () => {},
-      // Stream stubs — streaming is handled by chatStream's NAPI callback,
-      // but the WASM imports still need these symbols to link.
-      mlx_stream_write: () => {},
-      mlx_stream_reset: () => {},
     };
 
     const { napiModule } = await instantiateNapiModule(wasmFile, {
