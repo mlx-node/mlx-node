@@ -358,6 +358,82 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
     }
 }
 
+/// Input bundle for [`Qwen35Inner::chat_with_caches_inner`].
+///
+/// Packs every value the shared post-prefill pipeline needs into a single
+/// named struct so callers don't have to thread 20+ positional arguments.
+/// Constructed by the prefill-side of [`Qwen35Inner::chat_sync`] and
+/// [`Qwen35Inner::chat_tokens_delta_sync`].
+///
+/// The caller is responsible for:
+///   - acquiring `DENSE_COMPILED_MUTEX` and `COMPILED_WEIGHTS_RWLOCK` in
+///     the correct order (when `use_compiled == true`),
+///   - constructing a `WiredLimitContext` tied to `generation_stream` for
+///     the lifetime of the call,
+///   - running prefill and packaging the resulting `last_logits`,
+///     `seq_len`, and `vlm_compiled_init_done`.
+pub(crate) struct ChatDecodeInputs {
+    // --- Prefill outputs -------------------------------------------------
+    /// Logits for the last position of the prefill chunk. Penalties and
+    /// sampling run against this to produce the first decoded token.
+    pub last_logits: MxArray,
+    /// Total context length after prefill (cached + newly-prefilled).
+    /// Used to compute the compiled path's `max_kv_len`.
+    pub seq_len: i64,
+    /// `true` when the VLM prefill has already run the compiled init.
+    /// `false` for text-only paths and the session delta path.
+    pub vlm_compiled_init_done: bool,
+
+    // --- Compiled-path state --------------------------------------------
+    /// `true` when this model owns the compiled weights and the compiled
+    /// forward path is usable for decode.
+    pub use_compiled: bool,
+    /// `true` when the current turn carries images.
+    pub has_images: bool,
+    /// Length of the cached prefix that the prefill reused. Only
+    /// consulted by the VLM rope-delta replay branch.
+    pub cached_prefix_len: usize,
+
+    // --- Token bookkeeping ----------------------------------------------
+    /// Full pre-decode token sequence. Seeds the decode loop's running
+    /// history (mutated in place) and the penalty context.
+    pub token_history_init: Vec<u32>,
+    /// Token snapshot handed to `save_cache_state_direct`. For text-only
+    /// this equals `token_history_init`; for VLM it's the pre-expansion
+    /// tokens.
+    pub save_tokens: Vec<u32>,
+    /// Expanded token sequence (with image placeholders expanded) used by
+    /// the VLM save path. `None` for text-only.
+    pub save_expanded_tokens: Option<Vec<u32>>,
+    /// Image cache key for the current turn. 0 for text-only.
+    pub save_image_cache_key: u64,
+
+    // --- Tokenizer / reasoning state ------------------------------------
+    pub tokenizer: Arc<Qwen3Tokenizer>,
+    pub think_end_id: Option<u32>,
+    pub think_end_str: Option<String>,
+    pub enable_thinking: Option<bool>,
+    /// End-of-sequence token id for the decode loop. For `chat_sync` this
+    /// is `config.eos_token_id`; for the session delta path it's
+    /// `<|im_end|>` so cache boundaries stay clean.
+    pub eos_id: u32,
+
+    // --- Profiler / perf metrics ----------------------------------------
+    pub profiler: crate::decode_profiler::DecodeProfiler,
+    pub generation_start: Option<std::time::Instant>,
+    pub first_token_instant: Option<std::time::Instant>,
+    /// Number of tokens actually prefilled this turn (for throughput math).
+    pub prefill_tokens_len: usize,
+    /// Prompt token count reported on the `ChatResult`.
+    pub prompt_tokens_for_result: u32,
+
+    // --- MLX state ------------------------------------------------------
+    pub embedding_weight: MxArray,
+    pub embedding_weight_t: MxArray,
+    pub generation_stream: Stream,
+    pub params: super::chat_common::ChatParams,
+}
+
 // ========== Qwen35Inner implementation ==========
 // All these methods run on the dedicated model thread (synchronous, no locks).
 
@@ -957,32 +1033,32 @@ impl Qwen35Inner {
             None
         };
 
-        self.chat_with_caches_inner(
+        self.chat_with_caches_inner(ChatDecodeInputs {
             last_logits,
             seq_len,
             vlm_compiled_init_done,
             use_compiled,
             has_images,
             cached_prefix_len,
-            tokens.clone(),
-            p,
-            enable_thinking,
-            eos_id,
+            token_history_init: tokens.clone(),
+            save_tokens: tokens,
+            save_expanded_tokens,
+            save_image_cache_key: current_image_cache_key,
+            tokenizer,
             think_end_id,
             think_end_str,
-            tokenizer,
+            enable_thinking,
+            eos_id,
+            profiler,
+            generation_start,
+            first_token_instant,
+            prefill_tokens_len: prefill_tokens.len(),
+            prompt_tokens_for_result,
             embedding_weight,
             embedding_weight_t,
             generation_stream,
-            profiler,
-            prefill_tokens.len(),
-            prompt_tokens_for_result,
-            generation_start,
-            first_token_instant,
-            tokens,
-            save_expanded_tokens,
-            current_image_cache_key,
-        )
+            params: p,
+        })
     }
 
     /// Session-based chat continuation via a pre-tokenized delta.
@@ -1143,32 +1219,32 @@ impl Qwen35Inner {
         // the generated tokens.
         let save_tokens = full_token_history.clone();
 
-        self.chat_with_caches_inner(
+        self.chat_with_caches_inner(ChatDecodeInputs {
             last_logits,
-            total_seq_len,
-            false, // vlm_compiled_init_done
+            seq_len: total_seq_len,
+            vlm_compiled_init_done: false,
             use_compiled,
-            false, // has_images
+            has_images: false,
             cached_prefix_len,
-            full_token_history,
-            p,
-            enable_thinking,
-            eos_id,
+            token_history_init: full_token_history,
+            save_tokens,
+            save_expanded_tokens: None,
+            save_image_cache_key: 0,
+            tokenizer,
             think_end_id,
             think_end_str,
-            tokenizer,
+            enable_thinking,
+            eos_id,
+            profiler,
+            generation_start,
+            first_token_instant,
+            prefill_tokens_len: delta_tokens.len(),
+            prompt_tokens_for_result,
             embedding_weight,
             embedding_weight_t,
             generation_stream,
-            profiler,
-            delta_tokens.len(),
-            prompt_tokens_for_result,
-            generation_start,
-            first_token_instant,
-            save_tokens,
-            None, // save_expanded_tokens
-            0,    // save_image_cache_key
-        )
+            params: p,
+        })
     }
 
     /// Shared post-prefill pipeline: penalty → sample → compiled init (if needed)
@@ -1176,47 +1252,47 @@ impl Qwen35Inner {
     ///
     /// Extracted from `chat_sync` so it can also be driven by the text-only
     /// session path (`chat_tokens_delta_sync`). Preserves the exact semantics
-    /// of `chat_sync` for the existing caller — `token_history` starts as the
+    /// of `chat_sync` for the existing caller — `token_history_init` is the
     /// full pre-decode token sequence (used for penalty context and the decode
     /// loop's running history), and the decode loop mutates it in place.
     ///
     /// The caller is responsible for:
     /// - Holding the `DENSE_COMPILED_MUTEX` / `COMPILED_WEIGHTS_RWLOCK` guards
-    ///   (when `use_compiled == true`) for the lifetime of this call.
-    /// - Creating a `WiredLimitContext` tied to `generation_stream` for the
-    ///   lifetime of this call.
-    /// - Running prefill and passing the resulting `(last_logits, seq_len,
-    ///   vlm_compiled_init_done)` tuple.
+    ///   (when `inputs.use_compiled == true`) for the lifetime of this call.
+    /// - Creating a `WiredLimitContext` tied to `inputs.generation_stream` for
+    ///   the lifetime of this call.
+    /// - Running prefill and populating the resulting `last_logits`, `seq_len`,
+    ///   and `vlm_compiled_init_done` fields of `ChatDecodeInputs`.
     /// - Pre-starting the profiler (`set_prompt_tokens`, `snapshot_memory_before`,
     ///   `begin_prefill`, `end_prefill`).
-    #[allow(clippy::too_many_arguments)]
-    fn chat_with_caches_inner(
-        &mut self,
-        last_logits: MxArray,
-        seq_len: i64,
-        vlm_compiled_init_done: bool,
-        use_compiled: bool,
-        has_images: bool,
-        cached_prefix_len: usize,
-        token_history_init: Vec<u32>,
-        p: super::chat_common::ChatParams,
-        enable_thinking: Option<bool>,
-        eos_id: u32,
-        think_end_id: Option<u32>,
-        think_end_str: Option<String>,
-        tokenizer: Arc<Qwen3Tokenizer>,
-        embedding_weight: MxArray,
-        embedding_weight_t: MxArray,
-        generation_stream: Stream,
-        mut profiler: crate::decode_profiler::DecodeProfiler,
-        prefill_tokens_len: usize,
-        prompt_tokens_for_result: u32,
-        generation_start: Option<std::time::Instant>,
-        mut first_token_instant: Option<std::time::Instant>,
-        save_tokens: Vec<u32>,
-        save_expanded_tokens: Option<Vec<u32>>,
-        save_image_cache_key: u64,
-    ) -> Result<ChatResult> {
+    fn chat_with_caches_inner(&mut self, inputs: ChatDecodeInputs) -> Result<ChatResult> {
+        let ChatDecodeInputs {
+            last_logits,
+            seq_len,
+            vlm_compiled_init_done,
+            use_compiled,
+            has_images,
+            cached_prefix_len,
+            token_history_init,
+            save_tokens,
+            save_expanded_tokens,
+            save_image_cache_key,
+            tokenizer,
+            think_end_id,
+            think_end_str,
+            enable_thinking,
+            eos_id,
+            mut profiler,
+            generation_start,
+            mut first_token_instant,
+            prefill_tokens_len,
+            prompt_tokens_for_result,
+            embedding_weight,
+            embedding_weight_t,
+            generation_stream,
+            params: p,
+        } = inputs;
+
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let max_new_tokens = p.max_new_tokens;
@@ -1420,9 +1496,13 @@ impl Qwen35Inner {
             generated_tokens.len(),
         );
 
-        // Silence "unused" warnings — the decode_loop! macro consumes `y`
-        // internally by name, rustc cannot see that through the tt repetition.
-        let _ = y;
+        // `y` is the last sampled token from the decode loop. The
+        // `decode_loop!` macro assigns to `y` each iteration and the final
+        // assignment in the last iteration is never observed, which without
+        // this explicit discard trips `clippy::unused_assignments` (the
+        // macro repetition hides the usage pattern from the lint). Binding
+        // here is cleaner than spraying `#[allow]` inside the macro body.
+        let _final_sampled_token = y;
 
         finalize_chat_result(
             &tokenizer,
