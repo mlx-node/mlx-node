@@ -123,6 +123,22 @@ pub(crate) enum Qwen35Cmd {
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     },
+    /// Session-based chat continuation: prefill a pre-tokenized delta on top
+    /// of the existing KV caches, then decode. Text-only; requires an active
+    /// session (prior `Chat` call that initialized `self.caches`).
+    ///
+    /// This bypasses the jinja chat template entirely — the caller is
+    /// responsible for producing the correctly-formatted delta tokens
+    /// (typically `<assistant-reply><|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`).
+    ///
+    /// Phase 1: scaffolding only — no NAPI dispatch yet. Constructed by the
+    /// gated integration test and (in Phase 2) by a TS session class.
+    #[allow(dead_code)]
+    ChatTokensDelta {
+        delta_tokens: Vec<u32>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
     Generate {
         prompt_tokens: MxArray,
         config: Qwen3_5GenerationConfig,
@@ -219,6 +235,13 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
             cancelled,
         } => {
             inner.chat_stream_sync(messages, config, stream_tx, cancelled);
+        }
+        Qwen35Cmd::ChatTokensDelta {
+            delta_tokens,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.chat_tokens_delta_sync(delta_tokens, config));
         }
         Qwen35Cmd::Generate {
             prompt_tokens,
@@ -956,6 +979,177 @@ impl Qwen35Inner {
             tokens,
             save_expanded_tokens,
             current_image_cache_key,
+        )
+    }
+
+    /// Session-based chat continuation via a pre-tokenized delta.
+    ///
+    /// Runs a text-only prefill of `delta_tokens` on top of the existing KV
+    /// caches and decodes the next reply. Unlike `chat_sync`, this path:
+    /// - skips the jinja chat template entirely (caller produces the delta),
+    /// - skips prefix verification (caller owns cache coherence by construction),
+    /// - uses `<|im_end|>` (from the tokenizer vocab) as its stop token instead
+    ///   of `config.eos_token_id`, yielding clean cache boundaries for the next
+    ///   turn's delta,
+    /// - hardcodes `enable_thinking = Some(true)` (Phase 2 will wire this from
+    ///   config; for now, callers who want no-think mode must use `chat_sync`),
+    /// - is text-only: errors if the session has images.
+    ///
+    /// Requires a live session: `self.caches` must have been initialized by a
+    /// prior `chat_sync` call. Errors otherwise.
+    pub(crate) fn chat_tokens_delta_sync(
+        &mut self,
+        delta_tokens: Vec<u32>,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        if self.caches.is_none() {
+            return Err(Error::from_reason(
+                "chat_tokens_delta_sync requires an initialized session (call chat first)",
+            ));
+        }
+        if delta_tokens.is_empty() {
+            return Err(Error::from_reason(
+                "chat_tokens_delta_sync requires a non-empty delta",
+            ));
+        }
+        if self.cached_image_key.is_some() {
+            return Err(Error::from_reason(
+                "chat_tokens_delta_sync is text-only; session currently holds image state",
+            ));
+        }
+
+        let report_perf = config.report_performance.unwrap_or(false);
+
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        // Session path: use <|im_end|> as eos, NOT config.eos_token_id.
+        // This yields clean cache boundaries (see Phase 0 validation notes).
+        let eos_id = tokenizer
+            .im_end_id()
+            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))?;
+
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
+
+        // Build full token history = cached_history + delta. Used for
+        // penalty context AND as the running token history in the decode loop.
+        // Also used as the snapshot we hand to `save_cache_state_direct` so
+        // the saved `cached_token_history` correctly reflects the appended
+        // delta plus the generated tokens.
+        let mut full_token_history = self.cached_token_history.clone();
+        full_token_history.extend(delta_tokens.iter().copied());
+
+        let p = extract_chat_params(&config);
+        // Phase 1: hardcode thinking=on for the session path. Phase 2 will
+        // plumb this through from the ChatConfig.
+        let enable_thinking: Option<bool> = Some(true);
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let first_token_instant: Option<std::time::Instant> = None;
+
+        let model_id = self.model_id;
+
+        // Check compiled path availability (same contract as chat_sync).
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let _compiled_lock = if use_compiled {
+            Some(
+                DENSE_COMPILED_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+
+        let mut _weight_guard = None;
+        let use_compiled = if use_compiled {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
+        let mut profiler = crate::decode_profiler::DecodeProfiler::new("chat_delta", "qwen3_5");
+        profiler.set_prompt_tokens(delta_tokens.len() as u32);
+        profiler.snapshot_memory_before();
+
+        // Text-only prefill of the delta on top of the existing caches.
+        profiler.begin_prefill();
+        let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
+        let logits = chunked_prefill(
+            &prompt,
+            &embedding_weight,
+            &mut self.layers,
+            &mut self.caches,
+            &self.final_norm,
+            &self.lm_head,
+            Some(&embedding_weight_t),
+            generation_stream,
+        )?;
+        let prefill_out_seq_len = logits.shape_at(1)?;
+        let last_logits = logits.slice_axis(1, prefill_out_seq_len - 1, prefill_out_seq_len)?;
+        let last_logits = last_logits.squeeze(Some(&[1]))?;
+        // Total context length post-prefill = full history length.
+        let total_seq_len = full_token_history.len() as i64;
+        profiler.end_prefill();
+
+        let prompt_tokens_for_result = full_token_history.len() as u32;
+
+        // For the delta path there is no cached_prefix_len distinction — the
+        // caches already reflect the entire prior history. Pass 0 so the
+        // rope-deltas branch inside the helper is skipped (text-only anyway).
+        let cached_prefix_len = 0usize;
+
+        // For cache save, pass the full token history (cached + delta) as
+        // `save_tokens`; the helper / `save_cache_state_direct` will append
+        // the generated tokens.
+        let save_tokens = full_token_history.clone();
+
+        self.chat_with_caches_inner(
+            last_logits,
+            total_seq_len,
+            false, // vlm_compiled_init_done
+            use_compiled,
+            false, // has_images
+            cached_prefix_len,
+            full_token_history,
+            p,
+            enable_thinking,
+            eos_id,
+            think_end_id,
+            think_end_str,
+            tokenizer,
+            embedding_weight,
+            embedding_weight_t,
+            generation_stream,
+            profiler,
+            delta_tokens.len(),
+            prompt_tokens_for_result,
+            generation_start,
+            first_token_instant,
+            save_tokens,
+            None, // save_expanded_tokens
+            0,    // save_image_cache_key
         )
     }
 
