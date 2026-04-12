@@ -119,14 +119,8 @@ pub struct SabSink {
     /// another thread may mutate. All reads/writes go through atomic ops or
     /// `copy_nonoverlapping`.
     ptr: *mut u8,
-    /// Total byte length of the SAB (header + body).
-    total_len: usize,
     /// Body length = total_len - SAB_HEADER_BYTES. Cached to avoid recomputing.
     body_len: usize,
-    /// Producer-local shadow of `read_cur`. Refreshed via an atomic load when
-    /// we don't have enough room to write a record. Purely an optimisation —
-    /// the source of truth is the header slot.
-    cached_read_cur: std::cell::Cell<u32>,
 }
 
 // SAFETY: The ptr is into a SharedArrayBuffer owned for the lifetime of this
@@ -161,13 +155,16 @@ impl SabSink {
                 "SabSink: SAB too small ({total_len} < {MIN_SAB_LEN})"
             )));
         }
+        // All header slots are AtomicU32; the ring body starts at SAB_HEADER_BYTES
+        // which is itself 4-byte aligned, so alignment of the base pointer is the
+        // sole requirement. Emscripten/WASI SABs are page-aligned but assert
+        // anyway — a misaligned pointer would make every atomic op UB.
+        debug_assert!(
+            (ptr as usize) % 4 == 0,
+            "SabSink: SAB pointer must be 4-byte aligned"
+        );
         let body_len = total_len - SAB_HEADER_BYTES;
-        Ok(Self {
-            ptr,
-            total_len,
-            body_len,
-            cached_read_cur: std::cell::Cell::new(0),
-        })
+        Ok(Self { ptr, body_len })
     }
 }
 
@@ -248,7 +245,6 @@ impl SabSink {
             }
             let write = self.load_write_cur();
             let read = self.load_read_cur();
-            self.cached_read_cur.set(read);
             let free = free_bytes(write, read, self.body_len as u32);
             if free as usize >= needed {
                 return true;
