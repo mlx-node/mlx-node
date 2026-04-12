@@ -21,8 +21,31 @@ fn parse_config(model_path: &Path) -> Result<Lfm2Config> {
     let config_path = model_path.join("config.json");
     let raw_str = fs::read_to_string(&config_path)
         .map_err(|e| Error::from_reason(format!("Failed to read config.json: {}", e)))?;
-    let raw: Value = serde_json::from_str(&raw_str)
+    let mut raw: Value = serde_json::from_str(&raw_str)
         .map_err(|e| Error::from_reason(format!("Failed to parse config.json: {}", e)))?;
+
+    // Some LFM2 checkpoints (e.g. LiquidAI/LFM2-350M) only ship `full_attn_idxs`
+    // without `layer_types`. Synthesize `layer_types` from `full_attn_idxs` so
+    // the serde struct (which requires `layer_types`) can deserialize.
+    if !raw.get("layer_types").is_some_and(|v| v.is_array())
+        && let Some(num_layers) = raw.get("num_hidden_layers").and_then(|v| v.as_i64())
+        && let Some(full_idxs) = raw.get("full_attn_idxs").and_then(|v| v.as_array())
+    {
+        let attn_set: std::collections::HashSet<i64> =
+            full_idxs.iter().filter_map(|v| v.as_i64()).collect();
+        let layer_types: Vec<Value> = (0..num_layers)
+            .map(|i| {
+                if attn_set.contains(&i) {
+                    Value::String("full_attention".to_string())
+                } else {
+                    Value::String("conv".to_string())
+                }
+            })
+            .collect();
+        if let Some(obj) = raw.as_object_mut() {
+            obj.insert("layer_types".to_string(), Value::Array(layer_types));
+        }
+    }
 
     let mut config: Lfm2Config = serde_json::from_value(raw.clone())
         .map_err(|e| Error::from_reason(format!("Failed to deserialize Lfm2Config: {}", e)))?;
