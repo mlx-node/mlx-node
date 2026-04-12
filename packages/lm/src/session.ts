@@ -26,7 +26,7 @@
  */
 import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
 
-import type { Qwen35Model } from './stream.js';
+import type { ChatStreamEvent, Qwen35Model } from './stream.js';
 
 export interface Qwen35SessionOptions {
   /**
@@ -109,6 +109,78 @@ export class Qwen35Session {
       const result = await this.model.chatSessionContinue(userMessage, mergedConfig);
       this.turnCount++;
       return result;
+    } finally {
+      this.inFlight = false;
+    }
+  }
+
+  /**
+   * Streaming variant of {@link Qwen35Session#send}.
+   *
+   * Returns an `AsyncGenerator<ChatStreamEvent>` that yields delta
+   * chunks followed by a single final `done: true` chunk.
+   *
+   * Turn routing matches `send()`:
+   *   - Turn 1 → `chatStreamSessionStart` with the optional system
+   *     prompt + user message.
+   *   - Turn 2+ → `chatStreamSessionContinue` with just the user
+   *     message string.
+   *
+   * `turnCount` is incremented ONLY when the final `done: true` chunk
+   * has been yielded. If the caller breaks out of the `for await` loop
+   * before that, the turn is considered abandoned — the partial
+   * assistant reply is still in the cache (saved by the Rust side) but
+   * `turnCount` stays at the previous value so the next `sendStream()`
+   * / `send()` call routes as if the aborted stream never happened:
+   * turn 0 aborts re-route through `chatStreamSessionStart` which
+   * resets the caches again, and turn N (N>0) aborts stay on the
+   * `chatStreamSessionContinue` path. In both cases the session state
+   * stays consistent.
+   *
+   * The `inFlight` flag is cleared in ALL termination paths (normal
+   * completion, caller break, exception) via the generator's
+   * `finally` block.
+   */
+  async *sendStream(userMessage: string, config?: ChatConfig): AsyncGenerator<ChatStreamEvent> {
+    if (this.inFlight) {
+      throw new Error('Qwen35Session: concurrent send() not allowed; await the previous call first');
+    }
+    this.inFlight = true;
+    try {
+      const mergedConfig: ChatConfig = {
+        ...this.defaultConfig,
+        ...config,
+        // Same as `send()`: force reuseCache on regardless of the
+        // caller's input, or the post-decode save_cache_state step
+        // would wipe the very cache the next turn depends on.
+        reuseCache: true,
+      };
+
+      let sawFinal = false;
+      if (this.turnCount === 0) {
+        const messages: ChatMessage[] = [];
+        if (this.system != null) {
+          messages.push({ role: 'system', content: this.system });
+        }
+        messages.push({ role: 'user', content: userMessage });
+        for await (const event of this.model.chatStreamSessionStart(messages, mergedConfig)) {
+          if (event.done) sawFinal = true;
+          yield event;
+        }
+      } else {
+        for await (const event of this.model.chatStreamSessionContinue(userMessage, mergedConfig)) {
+          if (event.done) sawFinal = true;
+          yield event;
+        }
+      }
+
+      // Only advance the turn counter when the stream completed
+      // normally (the caller drained all chunks including `done: true`).
+      // Caller-break or mid-stream exceptions leave `turnCount`
+      // untouched — see JSDoc above for the rationale.
+      if (sawFinal) {
+        this.turnCount++;
+      }
     } finally {
       this.inFlight = false;
     }

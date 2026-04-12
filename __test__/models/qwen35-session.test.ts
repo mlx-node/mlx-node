@@ -424,12 +424,21 @@ describe('Qwen35Session', () => {
     });
 
     it('clears inFlight on exception from the underlying stream', async () => {
+      // First call throws after a partial delta; subsequent calls
+      // complete normally. Use a shared counter so the second `sendStream`
+      // retry routes through the same `chatStreamSessionStart` mock but
+      // with the non-throwing branch.
+      let callCount = 0;
       const chatStreamSessionStart = vi.fn(async function* streamStart(
         _messages: ChatMessage[],
         _config?: ChatConfig | null,
       ): AsyncGenerator<ChatStreamEvent> {
+        callCount++;
         yield { text: 'partial', done: false } satisfies ChatStreamEvent;
-        throw new Error('boom');
+        if (callCount === 1) {
+          throw new Error('boom');
+        }
+        yield finalChunk('recovered');
       });
       const chatStreamSessionContinue = vi.fn(async function* streamContinue(
         _userMessage: string,

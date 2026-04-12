@@ -928,6 +928,36 @@ export declare class Qwen35Model {
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
   /**
+   * Streaming variant of [`Self::chat_session_start`].
+   *
+   * Dispatches to the dedicated model thread. Behaviourally identical
+   * to `chat_session_start` (text-only, resets caches, uses
+   * `<|im_end|>` as eos) but streams token deltas through the JS
+   * callback instead of returning a `ChatResult`. Used by the
+   * TypeScript `Qwen35Session.sendStream()` for turn 1 of a
+   * multi-round streaming conversation.
+   */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /**
+   * Streaming variant of [`Self::chat_session_continue`].
+   *
+   * Appends a ChatML user/assistant delta on top of the live session
+   * caches and streams the decoded reply. Requires a live session
+   * started via [`Self::chat_stream_session_start`] (or the
+   * non-streaming [`Self::chat_session_start`]). Used by the
+   * TypeScript `Qwen35Session.sendStream()` for turns 2..N of a
+   * multi-round streaming conversation.
+   */
+  chatStreamSessionContinue(
+    userMessage: string,
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /**
    * Get the number of parameters in the model.
    *
    * Pure config computation — no model-thread dispatch needed.

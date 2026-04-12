@@ -39,6 +39,10 @@ export type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
 // oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeDenseChatStream = Qwen35ModelNative.prototype.chatStream;
 // oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeDenseChatStreamSessionStart = Qwen35ModelNative.prototype.chatStreamSessionStart;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeDenseChatStreamSessionContinue = Qwen35ModelNative.prototype.chatStreamSessionContinue;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeMoeChatStream = Qwen35MoeModelNative.prototype.chatStream;
 // oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeLfm2ChatStream = Lfm2ModelNative.prototype.chatStream;
@@ -46,22 +50,18 @@ const _nativeLfm2ChatStream = Lfm2ModelNative.prototype.chatStream;
 const _nativeGemma4ChatStream = Gemma4ModelNative.prototype.chatStream;
 
 /**
- * Shared AsyncGenerator implementation that wraps a native callback-based
- * chatStream into a `for await...of`-compatible stream.
+ * Shared AsyncGenerator adapter for callback-based native streaming methods.
  *
- * Cancellation is automatic via the generator's `finally` block.
+ * Takes a `startCall` closure that, given the JS-side callback, dispatches
+ * the underlying native stream (whatever method signature that is — the
+ * closure captures `messages` / `config` / `userMessage` etc) and resolves
+ * with a `ChatStreamHandle`. The generator pumps the resulting chunk queue,
+ * transforms each chunk into a `ChatStreamEvent`, and calls `handle.cancel()`
+ * in a `finally` block so early termination (user `break`, exception) still
+ * cleans up native state.
  */
-/** @internal Exported for testing only. */
-export async function* _createChatStream(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  nativeMethod: (
-    messages: ChatMessage[],
-    config: any,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ) => Promise<ChatStreamHandle>,
-  self: unknown,
-  messages: ChatMessage[],
-  config: unknown,
+async function* _runChatStream(
+  startCall: (callback: (err: Error | null, chunk: ChatStreamChunk) => void) => Promise<ChatStreamHandle>,
 ): AsyncGenerator<ChatStreamEvent> {
   const queue: Array<{ chunk?: ChatStreamChunk; error?: Error }> = [];
   let resolve: (() => void) | null = null;
@@ -86,7 +86,7 @@ export async function* _createChatStream(
     notify();
   };
 
-  const handle = await nativeMethod.call(self, messages, config ?? null, callback);
+  const handle = await startCall(callback);
 
   try {
     while (true) {
@@ -119,6 +119,27 @@ export async function* _createChatStream(
 }
 
 /**
+ * Legacy `_createChatStream` shape kept for the existing tests at
+ * `__test__/models/qwen35-stream.test.ts`. New code should use
+ * `_runChatStream` directly with a bound `startCall` closure.
+ *
+ * @internal Exported for testing only.
+ */
+export async function* _createChatStream(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  nativeMethod: (
+    messages: ChatMessage[],
+    config: any,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ) => Promise<ChatStreamHandle>,
+  self: unknown,
+  messages: ChatMessage[],
+  config: unknown,
+): AsyncGenerator<ChatStreamEvent> {
+  yield* _runChatStream((callback) => nativeMethod.call(self, messages, config ?? null, callback));
+}
+
+/**
  * Qwen3.5 dense model with AsyncGenerator-based `chatStream()`.
  *
  * @example
@@ -139,6 +160,37 @@ export class Qwen35Model extends Qwen35ModelNative {
   // @ts-expect-error — override callback-based chatStream with AsyncGenerator
   async *chatStream(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
     yield* _createChatStream(_nativeDenseChatStream, this, messages, config);
+  }
+
+  /**
+   * Streaming variant of {@link Qwen35Model#chatSessionStart}.
+   *
+   * Resets the KV caches, runs the jinja chat template, prefills on
+   * top of the fresh caches, and streams the decoded reply token-by-
+   * token. Stops on `<|im_end|>` so the cached history ends on a
+   * clean ChatML boundary that subsequent `chatStreamSessionContinue`
+   * deltas can append to. Text-only.
+   */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionStart(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeDenseChatStreamSessionStart.call(this, messages, config ?? null, callback),
+    );
+  }
+
+  /**
+   * Streaming variant of {@link Qwen35Model#chatSessionContinue}.
+   *
+   * Builds a raw ChatML delta on top of the live session caches,
+   * tokenizes it, prefills the delta, and streams the decoded reply.
+   * Requires a live session started via `chatSessionStart` or
+   * `chatStreamSessionStart`. Stops on `<|im_end|>`.
+   */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionContinue(userMessage: string, config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeDenseChatStreamSessionContinue.call(this, userMessage, config ?? null, callback),
+    );
   }
 }
 
