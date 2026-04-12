@@ -677,6 +677,14 @@ impl Qwen3Tokenizer {
             .collect()
     }
 
+    /// `pub(crate)` wrapper around [`Self::sanitize_messages`] so other
+    /// modules (notably the Qwen3.5 session-continue path) can subject
+    /// user-supplied strings to the same role/content injection guard used
+    /// by the jinja rendering path.
+    pub(crate) fn sanitize_messages_public(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        Self::sanitize_messages(messages)
+    }
+
     /// Format messages using simple ChatML format (fallback when no template).
     /// Expects pre-sanitized messages (call sanitize_messages first).
     fn format_chatml_presanitized(messages: &[ChatMessage], add_generation_prompt: bool) -> String {

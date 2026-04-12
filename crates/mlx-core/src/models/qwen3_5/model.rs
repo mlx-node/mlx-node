@@ -125,20 +125,40 @@ pub(crate) enum Qwen35Cmd {
     },
     /// Session-based chat continuation: prefill a pre-tokenized delta on top
     /// of the existing KV caches, then decode. Text-only; requires an active
-    /// session (prior `Chat` call that initialized `self.caches`).
+    /// session (prior `Chat`/`ChatSessionStart` call that initialized
+    /// `self.caches`).
     ///
     /// This bypasses the jinja chat template entirely — the caller is
     /// responsible for producing the correctly-formatted delta tokens
-    /// (typically `<assistant-reply><|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`).
+    /// (typically `\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`).
     ///
-    /// Phase 1: scaffolding only — no NAPI dispatch yet. Constructed by the
-    /// gated integration test and (in Phase 2) by a TS session class.
-    // TODO(phase2): remove `#[allow(dead_code)]` once the NAPI
-    // `chat_tokens_delta` entry point lands and the TS session class
-    // dispatches this command.
+    /// Constructed internally by `chat_session_continue_sync` after building
+    /// and tokenizing the delta. Not currently wired through a NAPI method
+    /// directly — external callers use `ChatSessionContinue` instead, which
+    /// handles delta construction on the model thread. Kept as its own
+    /// variant so the lower-level pre-tokenized entry point stays exposed
+    /// for the gated integration test and future advanced use cases.
     #[allow(dead_code)]
     ChatTokensDelta {
         delta_tokens: Vec<u32>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Start a new session via the text-only jinja-render path with
+    /// `<|im_end|>` as the stop token. See
+    /// [`Qwen35Inner::chat_session_start_sync`] for the behavioural
+    /// contract (full cache reset, text-only, session boundary).
+    ChatSessionStart {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Continue an existing session by appending a user turn. See
+    /// [`Qwen35Inner::chat_session_continue_sync`] — builds a raw ChatML
+    /// delta from `user_message`, tokenizes it, and prefills on top of
+    /// the live caches.
+    ChatSessionContinue {
+        user_message: String,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
@@ -245,6 +265,20 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
             reply,
         } => {
             let _ = reply.send(inner.chat_tokens_delta_sync(delta_tokens, config));
+        }
+        Qwen35Cmd::ChatSessionStart {
+            messages,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.chat_session_start_sync(messages, config));
+        }
+        Qwen35Cmd::ChatSessionContinue {
+            user_message,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.chat_session_continue_sync(user_message, config));
         }
         Qwen35Cmd::Generate {
             prompt_tokens,
@@ -781,6 +815,74 @@ impl Qwen35Inner {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
+        self.chat_sync_core(messages, config, None)
+    }
+
+    /// Session-aware variant of `chat_sync` used to START a new session.
+    ///
+    /// Unlike `chat_sync`, this path:
+    ///   - is text-only (errors if any message carries images),
+    ///   - uses `<|im_end|>` (from the tokenizer vocab) as its stop token
+    ///     instead of `config.eos_token_id`, so the cached history ends on a
+    ///     clean ChatML boundary that subsequent `chat_session_continue_sync`
+    ///     deltas can append to without re-rendering the jinja template,
+    ///   - resets the caches up-front so the session is guaranteed to start
+    ///     from a known-clean state regardless of any prior `chat_sync`
+    ///     invocations.
+    ///
+    /// After this call, callers MUST use `chat_session_continue_sync` (or
+    /// equivalently `chat_tokens_delta_sync`) for subsequent turns — going
+    /// back to `chat_sync` would retry prefix verification against a cached
+    /// history that ends on `<|im_end|>`, which no jinja template renders.
+    pub(crate) fn chat_session_start_sync(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        let has_images = messages
+            .iter()
+            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
+        if has_images {
+            return Err(Error::from_reason(
+                "chat_session_start_sync is text-only; session paths do not support images",
+            ));
+        }
+
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+        let im_end_id = tokenizer
+            .im_end_id()
+            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))?;
+
+        // Full reset: the session-start path always begins from a clean
+        // state. This matches the documented contract that the session is
+        // owned end-to-end by the `Qwen35Session`/`chat_session_*` surface
+        // and intentionally invalidates any prior legacy-chat cache.
+        self.reset_caches_sync()?;
+        self.init_caches_sync()?;
+
+        self.chat_sync_core(messages, config, Some(im_end_id))
+    }
+
+    /// Core implementation of `chat_sync` / `chat_session_start_sync`.
+    ///
+    /// Factored so both paths share the jinja rendering + prefill + decode
+    /// plumbing. The only behavioural difference is the EOS token:
+    ///
+    ///   - `chat_sync` passes `eos_override = None`, so the decode loop
+    ///     stops on `config.eos_token_id` (matches legacy behaviour exactly).
+    ///   - `chat_session_start_sync` passes `eos_override = Some(im_end_id)`
+    ///     so the cached history ends on `<|im_end|>`, yielding clean
+    ///     ChatML boundaries for subsequent session deltas.
+    fn chat_sync_core(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        eos_override: Option<u32>,
+    ) -> Result<ChatResult> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -944,7 +1046,11 @@ impl Qwen35Inner {
             (prefill_tokens, cached_prefix_len)
         };
 
-        let eos_id = self.config.eos_token_id as u32;
+        // Session-start paths pass `Some(<|im_end|>)` to yield clean ChatML
+        // cache boundaries for subsequent delta continuations; legacy
+        // `chat_sync` passes `None` and preserves config-driven EOS for
+        // byte-for-byte compatibility with existing callers.
+        let eos_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
 
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let generation_stream = Stream::new(DeviceType::Gpu);
@@ -1070,12 +1176,12 @@ impl Qwen35Inner {
     /// - uses `<|im_end|>` (from the tokenizer vocab) as its stop token instead
     ///   of `config.eos_token_id`, yielding clean cache boundaries for the next
     ///   turn's delta,
-    /// - hardcodes `enable_thinking = Some(true)` (Phase 2 will wire this from
-    ///   config; for now, callers who want no-think mode must use `chat_sync`),
+    /// - resolves `enable_thinking` from `config.reasoning_effort` via
+    ///   `chat_common::resolve_enable_thinking`, same as `chat_sync`,
     /// - is text-only: errors if the session has images.
     ///
     /// Requires a live session: `self.caches` must have been initialized by a
-    /// prior `chat_sync` call. Errors otherwise.
+    /// prior `chat_sync` / `chat_session_start_sync` call. Errors otherwise.
     pub(crate) fn chat_tokens_delta_sync(
         &mut self,
         delta_tokens: Vec<u32>,
@@ -1135,12 +1241,7 @@ impl Qwen35Inner {
         full_token_history.extend(delta_tokens.iter().copied());
 
         let p = extract_chat_params(&config);
-        // FIXME(phase2): plumb enable_thinking from config.reasoning_effort
-        // via `chat_common::resolve_enable_thinking(&config)`. Phase 1 hardcodes
-        // thinking=on so the session path can be exercised without the full
-        // reasoning-effort plumbing; callers who want no-think mode must use
-        // `chat_sync` until Phase 2 lands.
-        let enable_thinking: Option<bool> = Some(true);
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -1245,6 +1346,74 @@ impl Qwen35Inner {
             generation_stream,
             params: p,
         })
+    }
+
+    /// Session-based chat continuation via a plain user message string.
+    ///
+    /// Convenience entry point on top of `chat_tokens_delta_sync`: builds the
+    /// ChatML delta that closes the previous assistant turn (the cache ended
+    /// on `<|im_end|>` courtesy of `chat_session_start_sync`), opens a new
+    /// user turn with `user_message`, and opens a fresh assistant turn.
+    /// Then tokenizes the delta and delegates to `chat_tokens_delta_sync`.
+    ///
+    /// The delta is built manually (NOT via jinja) to keep prefix stability
+    /// against the cached state: re-rendering the full conversation through
+    /// jinja would tokenize differently than the accumulated cache and break
+    /// the prefix match that makes session reuse correct.
+    ///
+    /// Text-only; errors propagate from `chat_tokens_delta_sync`.
+    pub(crate) fn chat_session_continue_sync(
+        &mut self,
+        user_message: String,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        // Match `chat_sync`'s sanitization so the session path is subject to
+        // the same role/content injection protection as the legacy path.
+        // The delta is text-only — images are stripped here anyway because
+        // they are never valid on the session continue path.
+        let synthetic = ChatMessage {
+            role: "user".to_string(),
+            content: user_message,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            images: None,
+        };
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
+        let sanitized_user = &sanitized[0].content;
+
+        // Build the delta in ChatML wire format. The cached history ends on
+        // `<|im_end|>` (because `chat_session_start_sync` uses `im_end_id`
+        // as eos). The leading `\n` closes that turn's line; then we open a
+        // new user turn and prime an assistant turn. When thinking mode is
+        // explicitly enabled (reasoning_effort ∈ {"medium","high"}) or left
+        // as default, the Qwen3.5 jinja template inserts `<think>\n` after
+        // the assistant prelude — mirror that here so the delta stays
+        // template-equivalent. When thinking is explicitly disabled, omit
+        // the prefix so the first generated token is a plain content token.
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let thinking_prefix = match enable_thinking {
+            Some(false) => "",
+            // None = template default (Qwen3.5: thinking on) and
+            // Some(true) both take the thinking path.
+            _ => "<think>\n",
+        };
+
+        let delta_text = format!(
+            "\n<|im_start|>user\n{sanitized_user}<|im_end|>\n<|im_start|>assistant\n{thinking_prefix}",
+        );
+
+        // `add_special_tokens: Some(false)` — we do NOT want the tokenizer
+        // auto-prepending BOS. The delta is already a raw ChatML snippet.
+        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
+
+        self.chat_tokens_delta_sync(delta_tokens, config)
     }
 
     /// Shared post-prefill pipeline: penalty → sample → compiled init (if needed)
@@ -3746,6 +3915,102 @@ impl Qwen3_5Model {
         .await
     }
 
+    /// Start a new chat session.
+    ///
+    /// Unlike [`chat`], this entry point is text-only and uses `<|im_end|>`
+    /// as its stop token so the cached KV state ends on a clean ChatML
+    /// boundary. Subsequent turns in the same session MUST go through
+    /// [`chat_session_continue`] — calling the legacy `chat` method on the
+    /// same model after `chat_session_start` would attempt to prefix-match
+    /// against a cache that ends on `<|im_end|>`, which no jinja template
+    /// renders. The session is owned end-to-end by the `chat_session_*`
+    /// surface.
+    ///
+    /// This method is the production entry point used by the TypeScript
+    /// `Qwen35Session` class for turn 1 of a multi-round conversation.
+    #[napi]
+    pub async fn chat_session_start(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::ChatSessionStart {
+            messages,
+            config,
+            reply,
+        })
+        .await
+    }
+
+    /// Continue an existing chat session with a new user message.
+    ///
+    /// Appends a raw ChatML user/assistant delta to the session's cached
+    /// KV state, then decodes the assistant reply. Stops on `<|im_end|>`
+    /// so the cache remains on a clean boundary for the next turn.
+    ///
+    /// Requires a live session started via [`chat_session_start`]. Errors
+    /// if the session is empty, carries image state, or if
+    /// `config.reuse_cache` is explicitly set to `false`.
+    #[napi]
+    pub async fn chat_session_continue(
+        &self,
+        user_message: String,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::ChatSessionContinue {
+            user_message,
+            config,
+            reply,
+        })
+        .await
+    }
+
     /// Streaming chat API with tool calling support.
     ///
     /// Dispatches to the dedicated model thread. Tokens stream back via
@@ -3870,33 +4135,6 @@ impl Qwen3_5Model {
                 .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
         })?;
         Ok(promise)
-    }
-}
-
-/// Non-NAPI bridge methods on `Qwen3_5Model`.
-///
-/// These are `pub` (so integration tests in `tests/` can call them) but
-/// intentionally NOT annotated with `#[napi]`, so nothing leaks to the
-/// TypeScript bindings.
-#[doc(hidden)]
-impl Qwen3_5Model {
-    /// Dispatch a `ChatTokensDelta` command to the dedicated model thread and
-    /// block until the reply is received.
-    ///
-    /// Phase 1 surface: only used by the gated integration test
-    /// `crates/mlx-core/tests/qwen3_5_delta_chat.rs`. Phase 2 will replace
-    /// this with a proper `#[napi] pub async fn chat_tokens_delta` once the
-    /// TS session class is built. **To be removed in Phase 2.**
-    pub fn chat_tokens_delta_blocking(
-        &self,
-        delta_tokens: Vec<u32>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::ChatTokensDelta {
-            delta_tokens,
-            config,
-            reply,
-        })
     }
 }
 

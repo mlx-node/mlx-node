@@ -1,14 +1,13 @@
-//! Gated integration test for the Phase 1 session-based chat delta path.
+//! Gated integration test for the session-based chat delta path.
 //!
-//! This test exercises `Qwen3_5Model::chat_tokens_delta_blocking`, the
-//! non-NAPI bridge that dispatches `Qwen35Cmd::ChatTokensDelta` to the
-//! dedicated model thread. It validates that TTFT stays roughly flat
-//! across 4 turns — proving the KV caches are actually being reused and
-//! the new turn only pays for its delta prefill, not a full re-prefill
-//! of the accumulating history.
+//! This test exercises the Phase 2 production surface — `chat_session_start`
+//! for turn 1 and `chat_session_continue` for turns 2..=4 — and validates
+//! that TTFT stays roughly flat across turns. That is direct evidence the
+//! KV caches are being reused and each new turn only pays for its delta
+//! prefill, not a full re-prefill of the accumulating history.
 //!
-//! The test is gated because it needs a real Qwen3.5 Dense checkpoint
-//! on disk. Run it manually with:
+//! The test is gated because it needs a real Qwen3.5 Dense checkpoint on
+//! disk. Run it manually with:
 //!
 //! ```shell
 //! MLX_TEST_MODEL_PATH=./.cache/models/qwen3.5-0.8b-mlx-bf16 \
@@ -21,29 +20,7 @@
 use std::path::Path;
 
 use mlx_core::models::qwen3_5::model::{ChatConfig, Qwen3_5Model};
-use mlx_core::tokenizer::{ChatMessage, Qwen3Tokenizer};
-
-/// Wire format for a text-only conversation delta.
-///
-/// Must mirror the Qwen3.5 ChatML jinja template's assistant/user/assistant
-/// turn structure. Phase 2's TypeScript session class references this
-/// constant (via a grep anchor) as the single source of truth for the
-/// delta wire format. Placeholders:
-///
-///   `{prev_raw}`  — the previous assistant turn's `raw_text` (before `<|im_end|>`)
-///   `{next_user}` — the new user message body
-const DELTA_FORMAT_TEMPLATE: &str =
-    "{prev_raw}<|im_end|>\n<|im_start|>user\n{next_user}<|im_end|>\n<|im_start|>assistant\n";
-
-/// Render `DELTA_FORMAT_TEMPLATE` with the given substitutions. Kept as a
-/// helper so the test and any downstream caller use the exact same
-/// formatting logic (and so a typo in one placeholder doesn't silently
-/// desync them).
-fn render_delta(prev_raw: &str, next_user: &str) -> String {
-    DELTA_FORMAT_TEMPLATE
-        .replace("{prev_raw}", prev_raw)
-        .replace("{next_user}", next_user)
-}
+use mlx_core::tokenizer::ChatMessage;
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
@@ -81,27 +58,9 @@ fn user_message(content: &str) -> ChatMessage {
     }
 }
 
-/// Tokenize a literal assistant-reply-then-new-user-turn delta string,
-/// the same way the TS session class will in Phase 2.
-///
-/// Callers are responsible for the exact wire format — this test just
-/// verifies that the delta path does not re-prefill the entire conversation.
-fn encode_delta(tokenizer: &tokenizers::Tokenizer, text: &str) -> Vec<u32> {
-    let encoding = tokenizer
-        .encode(text, false)
-        .expect("encoding delta text failed");
-    encoding.get_ids().to_vec()
-}
-
-// The delta bridge (`chat_tokens_delta_blocking`) uses
-// `tokio::sync::oneshot::Receiver::blocking_recv()` internally. That would
-// deadlock on a `flavor = "current_thread"` runtime — tokio explicitly
-// warns against blocking on the executor thread — so run the test with a
-// multi-thread runtime with enough workers to keep any ambient tasks
-// unblocked while the bridge is waiting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint"]
-async fn delta_path_keeps_ttft_flat_across_turns() {
+async fn session_path_keeps_ttft_flat_across_turns() {
     // Gate on env var. Returning early here means a plain `cargo test
     // --ignored` without the env var passes without booting MLX.
     let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
@@ -119,22 +78,6 @@ async fn delta_path_keeps_ttft_flat_across_turns() {
         model_path
     );
 
-    // Load a companion tokenizer directly so the test can build raw
-    // delta token sequences without going through the jinja template.
-    let tokenizer_json = model_dir.join("tokenizer.json");
-    assert!(
-        tokenizer_json.exists(),
-        "expected tokenizer.json at {}",
-        tokenizer_json.display()
-    );
-    let raw_tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_json)
-        .expect("failed to load raw tokenizers::Tokenizer");
-    let qwen_tokenizer =
-        Qwen3Tokenizer::from_file(&tokenizer_json).expect("failed to load Qwen3Tokenizer");
-    let im_end_id = qwen_tokenizer
-        .im_end_id()
-        .expect("tokenizer missing <|im_end|>");
-
     // Load the model via the normal async path.
     let model = Qwen3_5Model::load(model_path.clone())
         .await
@@ -147,13 +90,17 @@ async fn delta_path_keeps_ttft_flat_across_turns() {
         prompt_tokens: u32,
     }
 
-    // --- Turn 1: regular chat_sync path (establishes the session) ---
+    // --- Turn 1: chat_session_start establishes a clean session ---
+    //
+    // Unlike the legacy `chat()` path, this uses `<|im_end|>` as eos so the
+    // cached history ends on a clean ChatML boundary that the subsequent
+    // `chat_session_continue` deltas can append to.
     let turn1_cfg = chat_config_default(64);
     let turn1_messages = vec![user_message("Say hi in one short word.")];
     let r1 = model
-        .chat(turn1_messages, Some(turn1_cfg))
+        .chat_session_start(turn1_messages, Some(turn1_cfg))
         .await
-        .expect("turn 1 chat failed");
+        .expect("turn 1 chat_session_start failed");
     let turn1 = TurnSnapshot {
         ttft_ms: r1
             .performance
@@ -167,18 +114,12 @@ async fn delta_path_keeps_ttft_flat_across_turns() {
         turn1.ttft_ms, turn1.prompt_tokens, r1.num_tokens
     );
 
-    // --- Turns 2..=4: delta path ---
+    // --- Turns 2..=4: chat_session_continue (delta path) ---
     //
-    // We build a delta by rendering `DELTA_FORMAT_TEMPLATE` with the
-    // previous assistant reply's raw text (which the decode loop stopped
-    // exactly on `<|im_end|>` and therefore does NOT contain the id) and
-    // the new user message.
-    //
-    // The cached token history at this point is the full Turn-1 prompt
-    // (post-chat_sync `save_cache_state_direct` appends the generated
-    // tokens too, trimming the trailing token when finish_reason=="length"),
-    // so the delta just has to close the assistant turn and open a new one.
-    let mut prev_raw = r1.raw_text.clone();
+    // The session state is owned entirely by the model thread — the
+    // caller just passes plain user strings. `chat_session_continue_sync`
+    // builds the ChatML delta, tokenizes it, and prefills on top of the
+    // live caches. No template rendering, no prefix matching.
     let user_followups = [
         "And in another word?",
         "Any synonym?",
@@ -188,25 +129,10 @@ async fn delta_path_keeps_ttft_flat_across_turns() {
 
     for (idx, next_user) in user_followups.iter().enumerate() {
         let turn_idx = idx + 2;
-        let delta_text = render_delta(&prev_raw, next_user);
-        let delta_tokens = encode_delta(&raw_tokenizer, &delta_text);
-        assert!(!delta_tokens.is_empty(), "delta tokens unexpectedly empty");
-
-        // The session path uses `<|im_end|>` as its stop token, so a
-        // well-formed delta must NOT contain the id — otherwise the decode
-        // loop would stop on the delta itself. Guarding here means an
-        // encoding mismatch surfaces as a clear assertion instead of an
-        // obscure 0-token generation.
-        assert!(
-            !delta_tokens.contains(&im_end_id),
-            "delta must not contain <|im_end|> (id={}): {:?}",
-            im_end_id,
-            delta_tokens
-        );
-
         let cfg = chat_config_default(64);
         let result = model
-            .chat_tokens_delta_blocking(delta_tokens.clone(), cfg)
+            .chat_session_continue((*next_user).to_string(), Some(cfg))
+            .await
             .expect("delta chat failed");
         let ttft = result
             .performance
@@ -214,21 +140,14 @@ async fn delta_path_keeps_ttft_flat_across_turns() {
             .expect("delta performance missing")
             .ttft_ms;
         println!(
-            "turn {turn_idx} ttft={:.1}ms prompt_tokens={} num_tokens={} delta_len={}",
-            ttft,
-            result.prompt_tokens,
-            result.num_tokens,
-            delta_tokens.len()
+            "turn {turn_idx} ttft={:.1}ms prompt_tokens={} num_tokens={}",
+            ttft, result.prompt_tokens, result.num_tokens,
         );
 
         snapshots.push(TurnSnapshot {
             ttft_ms: ttft,
             prompt_tokens: result.prompt_tokens,
         });
-
-        // The raw reply from chat_tokens_delta ends before <|im_end|>
-        // because the decode loop stops on im_end_id. Chain on it.
-        prev_raw = result.raw_text.clone();
 
         assert!(
             result.finish_reason == "stop" || result.finish_reason == "length",
@@ -273,7 +192,7 @@ async fn delta_path_keeps_ttft_flat_across_turns() {
         turn4.prompt_tokens
     );
 
-    // 2. TTFT stays flat (≤1.5x of turn 1) across all turns. The broken
+    // 2. TTFT stays flat (<=1.5x of turn 1) across all turns. The broken
     //    pre-Phase-1 path would balloon linearly as the history grows —
     //    1.5x is a generous bound that still catches a full re-prefill
     //    regression.
@@ -290,7 +209,7 @@ async fn delta_path_keeps_ttft_flat_across_turns() {
 
     // 3. Turn 4 should be in the same flat-TTFT regime as turn 2 (the
     //    first delta turn). Turn 1 includes any one-time warmups the
-    //    chat_sync path happens to do — comparing turn 4 to turn 2
+    //    session-start path happens to do — comparing turn 4 to turn 2
     //    filters that out and catches a gradual slowdown across deltas
     //    that an only-vs-turn-1 check would miss. Allow 2x noise to
     //    avoid flakes on shared runners.

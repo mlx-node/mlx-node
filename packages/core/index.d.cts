@@ -887,6 +887,34 @@ export declare class Qwen35Model {
    */
   chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Start a new chat session.
+   *
+   * Unlike [`chat`], this entry point is text-only and uses `<|im_end|>`
+   * as its stop token so the cached KV state ends on a clean ChatML
+   * boundary. Subsequent turns in the same session MUST go through
+   * [`chat_session_continue`] — calling the legacy `chat` method on the
+   * same model after `chat_session_start` would attempt to prefix-match
+   * against a cache that ends on `<|im_end|>`, which no jinja template
+   * renders. The session is owned end-to-end by the `chat_session_*`
+   * surface.
+   *
+   * This method is the production entry point used by the TypeScript
+   * `Qwen35Session` class for turn 1 of a multi-round conversation.
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a new user message.
+   *
+   * Appends a raw ChatML user/assistant delta to the session's cached
+   * KV state, then decodes the assistant reply. Stops on `<|im_end|>`
+   * so the cache remains on a clean boundary for the next turn.
+   *
+   * Requires a live session started via [`chat_session_start`]. Errors
+   * if the session is empty, carries image state, or if
+   * `config.reuse_cache` is explicitly set to `false`.
+   */
+  chatSessionContinue(userMessage: string, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
    * Streaming chat API with tool calling support.
    *
    * Dispatches to the dedicated model thread. Tokens stream back via
