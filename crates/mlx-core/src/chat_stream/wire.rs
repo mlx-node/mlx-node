@@ -218,9 +218,10 @@ pub struct ParsedRecord<'a> {
 // Fast-path predicate
 // ---------------------------------------------------------------------------
 
-/// Returns `true` when only the `text` field (and optionally `is_reasoning`)
-/// carries data. Both `is_reasoning = Some(true)` and `is_reasoning = Some(false)`
-/// qualify — the flag is encoded in the record header's flags byte.
+/// Returns `true` when the chunk carries only `text` plus a concrete
+/// `is_reasoning: Some(_)` boolean — the fast path encodes the boolean in
+/// one flag bit. `is_reasoning == None` falls through to JSON so the three
+/// states (`None`, `Some(false)`, `Some(true)`) round-trip losslessly.
 ///
 /// Note: if `text` is longer than [`MAX_PAYLOAD_BYTES`] the caller falls back
 /// to JSON even when this predicate returns true.
@@ -233,6 +234,7 @@ fn is_text_fast_path(chunk: &ChatStreamChunk) -> bool {
         && chunk.num_tokens.is_none()
         && chunk.raw_text.is_none()
         && chunk.performance.is_none()
+        && chunk.is_reasoning.is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +264,7 @@ pub fn classify_payload<'a>(
         Err(e) => Ok(EncodedPayload::Error(e.reason.clone())),
         Ok(chunk) => {
             if is_text_fast_path(chunk) && chunk.text.len() <= MAX_PAYLOAD_BYTES {
+                // is_text_fast_path guarantees is_reasoning.is_some()
                 Ok(EncodedPayload::Text {
                     bytes: chunk.text.as_bytes(),
                     is_reasoning: chunk.is_reasoning.unwrap_or(false),
@@ -404,6 +407,8 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
+    /// Minimal chunk that lands on the text fast path. `is_reasoning` is
+    /// `Some(false)` — the fast path requires a concrete boolean.
     fn plain_text_chunk(text: &str) -> ChatStreamChunk {
         ChatStreamChunk {
             text: text.to_string(),
@@ -414,7 +419,7 @@ mod tests {
             num_tokens: None,
             raw_text: None,
             performance: None,
-            is_reasoning: None,
+            is_reasoning: Some(false),
         }
     }
 
@@ -605,10 +610,7 @@ mod tests {
     fn test_decode_plain_text_chunk() {
         let chunk = plain_text_chunk("token");
         let decoded = round_trip(&chunk).unwrap();
-        // is_reasoning gets normalised to Some(false) from None on decode
-        assert_eq!(decoded.text, "token");
-        assert!(!decoded.done);
-        assert!(decoded.finish_reason.is_none());
+        compare_chunks(&chunk, &decoded);
     }
 
     #[test]
@@ -616,8 +618,7 @@ mod tests {
         let mut chunk = plain_text_chunk("step one");
         chunk.is_reasoning = Some(true);
         let decoded = round_trip(&chunk).unwrap();
-        assert_eq!(decoded.text, "step one");
-        assert_eq!(decoded.is_reasoning, Some(true));
+        compare_chunks(&chunk, &decoded);
     }
 
     #[test]
@@ -634,10 +635,7 @@ mod tests {
             is_reasoning: None,
         };
         let decoded = round_trip(&chunk).unwrap();
-        assert!(decoded.done);
-        assert_eq!(decoded.finish_reason.as_deref(), Some("stop"));
-        assert_eq!(decoded.num_tokens, Some(10));
-        assert_eq!(decoded.raw_text.as_deref(), Some("raw"));
+        compare_chunks(&chunk, &decoded);
     }
 
     #[test]
@@ -659,9 +657,7 @@ mod tests {
             is_reasoning: None,
         };
         let decoded = round_trip(&chunk).unwrap();
-        let calls = decoded.tool_calls.unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "my_tool");
+        compare_chunks(&chunk, &decoded);
     }
 
     #[test]
@@ -683,9 +679,84 @@ mod tests {
             is_reasoning: None,
         };
         let decoded = round_trip(&chunk).unwrap();
-        let p = decoded.performance.unwrap();
-        assert!((p.ttft_ms - 12.5).abs() < 1e-9);
-        assert!((p.decode_tokens_per_second - 80.0).abs() < 1e-9);
+        compare_chunks(&chunk, &decoded);
+    }
+
+    // -----------------------------------------------------------------------
+    // Drift-guard: maximally populated chunk. The destructuring below forces
+    // a compile error if a new field is added to ChatStreamChunk without
+    // updating this test — which is the cheapest mechanical way to keep the
+    // WireChunk mirror and the From impls in sync.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_decode_maximally_populated_chunk() {
+        let perf = crate::profiling::PerformanceMetrics {
+            ttft_ms: 1.5,
+            prefill_tokens_per_second: 512.0,
+            decode_tokens_per_second: 45.5,
+        };
+        let tc = ToolCallResult::ok(
+            "search".to_string(),
+            serde_json::json!({"q": "rust"}),
+            "raw".to_string(),
+        );
+        let chunk = ChatStreamChunk {
+            text: "full".to_string(),
+            done: true,
+            finish_reason: Some("stop".to_string()),
+            tool_calls: Some(vec![tc]),
+            thinking: Some("thinking text".to_string()),
+            num_tokens: Some(99),
+            raw_text: Some("raw output".to_string()),
+            performance: Some(perf),
+            is_reasoning: Some(true),
+        };
+        // Destructuring ensures a new field on ChatStreamChunk won't compile
+        // without updating this test (and hence WireChunk + From impls).
+        let ChatStreamChunk {
+            text: _,
+            done: _,
+            finish_reason: _,
+            tool_calls: _,
+            thinking: _,
+            num_tokens: _,
+            raw_text: _,
+            performance: _,
+            is_reasoning: _,
+        } = &chunk;
+        let decoded = round_trip(&chunk).unwrap();
+        compare_chunks(&chunk, &decoded);
+    }
+
+    // -----------------------------------------------------------------------
+    // is_reasoning: None round-trips via JSON (not the text fast path)
+    // so the three states (None, Some(false), Some(true)) are lossless.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_classify_is_reasoning_none_falls_through_to_json() {
+        let mut chunk = plain_text_chunk("word");
+        chunk.is_reasoning = None;
+        match classify_payload(&Ok(chunk)).unwrap() {
+            EncodedPayload::Json(_) => {}
+            other => panic!("expected Json for is_reasoning=None, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_is_reasoning_none_roundtrip() {
+        let mut chunk = plain_text_chunk("word");
+        chunk.is_reasoning = None;
+        let decoded = round_trip(&chunk).unwrap();
+        compare_chunks(&chunk, &decoded);
+        assert_eq!(decoded.is_reasoning, None);
+    }
+
+    #[test]
+    fn test_decode_is_reasoning_some_false_roundtrip() {
+        let chunk = plain_text_chunk("word"); // is_reasoning = Some(false)
+        let decoded = round_trip(&chunk).unwrap();
+        compare_chunks(&chunk, &decoded);
+        assert_eq!(decoded.is_reasoning, Some(false));
     }
 
     // -----------------------------------------------------------------------
@@ -734,15 +805,25 @@ mod tests {
         let chunk = plain_text_chunk(&big_text);
         let result = Ok(chunk);
         let payload = classify_payload(&result).unwrap();
-        match payload {
-            // The JSON payload itself will also be > MAX_PAYLOAD_BYTES, so
-            // write_record would fail — but classify_payload correctly routes
-            // to Json rather than Text.
+        match &payload {
             EncodedPayload::Json(_) => {}
             EncodedPayload::Text { .. } => {
                 panic!("expected Json fallback for oversized text, got Text")
             }
             other => panic!("expected Json, got {:?}", other),
         }
+        // The JSON payload itself is > MAX_PAYLOAD_BYTES, so write_record
+        // must reject with a "payload too large" error rather than panic.
+        let mut buf = vec![0u8; RECORD_HEADER_BYTES + MAX_PAYLOAD_BYTES + 64];
+        let res = write_record(&mut buf, &payload);
+        assert!(
+            res.is_err(),
+            "write_record should reject oversized JSON payload"
+        );
+        let err_msg = res.unwrap_err().reason;
+        assert!(
+            err_msg.contains("payload too large"),
+            "unexpected error: {err_msg}"
+        );
     }
 }
