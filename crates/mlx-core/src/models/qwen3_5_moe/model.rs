@@ -3,11 +3,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 use tracing::{info, warn};
 
-use crate::model_thread::{ResponseTx, StreamTx};
+use crate::chat_stream::{ChatStreamSink, TsfnSink};
+use crate::model_thread::ResponseTx;
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
     ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle, VisionCache, VisionCacheInner,
@@ -150,7 +151,7 @@ pub(crate) enum Qwen35MoeCmd {
     ChatStreamSessionStart {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
+        sink: Arc<dyn ChatStreamSink>,
         cancelled: Arc<AtomicBool>,
     },
     /// Streaming session-continue: same semantics as
@@ -304,7 +305,7 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
         Qwen35MoeCmd::ChatStreamSessionStart {
             messages,
             config,
-            stream_tx,
+            sink,
             cancelled,
         } => {
             inner.chat_stream_session_start_sync(messages, config, stream_tx, cancelled);
@@ -457,16 +458,6 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
         Qwen35MoeCmd::LoadOptimizerState { path, reply } => {
             let _ = reply.send(inner.load_optimizer_state_sync(path));
         }
-    }
-}
-
-/// Wrapper around `StreamTx` that provides a `.call()` method matching the
-/// `ThreadsafeFunction` interface expected by the `decode_loop!` macro.
-struct StreamSender(StreamTx<ChatStreamChunk>);
-
-impl StreamSender {
-    fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
-        let _ = self.0.send(result);
     }
 }
 
@@ -1581,7 +1572,7 @@ impl Qwen35MoeInner {
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
                 streaming: {
-                    callback: cb,
+                    callback: sink,
                     cancelled: cancelled,
                     decode_stream: decode_stream,
                     tokenizer: tokenizer_for_decode,
@@ -1660,7 +1651,7 @@ impl Qwen35MoeInner {
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
                 streaming: {
-                    callback: cb,
+                    callback: sink,
                     cancelled: cancelled,
                     decode_stream: decode_stream,
                     tokenizer: tokenizer_for_decode,
@@ -4893,7 +4884,7 @@ impl Qwen3_5MoeModel {
         self.thread.send(Qwen35MoeCmd::ChatStreamSessionStart {
             messages,
             config,
-            stream_tx,
+            sink,
             cancelled: cancelled_inner,
         })?;
 

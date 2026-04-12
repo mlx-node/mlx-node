@@ -3,12 +3,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 use tracing::{info, warn};
 
 use crate::array::MxArray;
-use crate::model_thread::{ResponseTx, StreamTx};
+use crate::chat_stream::{ChatStreamSink, TsfnSink};
+use crate::model_thread::ResponseTx;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
@@ -150,7 +151,7 @@ pub(crate) enum Qwen35Cmd {
     ChatStreamSessionStart {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
+        sink: Arc<dyn ChatStreamSink>,
         cancelled: Arc<AtomicBool>,
     },
     /// Streaming session-continue: same semantics as
@@ -304,7 +305,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         Qwen35Cmd::ChatStreamSessionStart {
             messages,
             config,
-            stream_tx,
+            sink,
             cancelled,
         } => {
             inner.chat_stream_session_start_sync(messages, config, stream_tx, cancelled);
@@ -1905,7 +1906,7 @@ impl Qwen35Inner {
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
+        sink: Arc<dyn ChatStreamSink>,
         cancelled: Arc<AtomicBool>,
     ) {
         let cb = StreamSender(stream_tx.clone());
@@ -1951,7 +1952,7 @@ impl Qwen35Inner {
 
         let result = self.chat_stream_sync_inner(messages, config, im_end_id, &cb, &cancelled);
         if let Err(e) = result {
-            let _ = stream_tx.send(Err(e));
+            sink.send(Err(e));
         }
     }
 
@@ -2898,7 +2899,7 @@ impl Qwen35Inner {
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
                 streaming: {
-                    callback: cb,
+                    callback: sink,
                     cancelled: cancelled,
                     decode_stream: decode_stream,
                     tokenizer: tokenizer_for_decode,
@@ -2975,7 +2976,7 @@ impl Qwen35Inner {
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
                 streaming: {
-                    callback: cb,
+                    callback: sink,
                     cancelled: cancelled,
                     decode_stream: decode_stream,
                     tokenizer: tokenizer_for_decode,
@@ -4432,20 +4433,6 @@ impl Qwen35Inner {
     }
 }
 
-/// Wrapper around `StreamTx` that provides a `.call()` method matching the
-/// `ThreadsafeFunction` interface expected by the `decode_loop!` macro.
-///
-/// This allows the macro to work unchanged for both:
-/// - MoE model: passes a real `ThreadsafeFunction` (old path, until Phase 4)
-/// - Dense model: passes this `StreamSender` (new dedicated-thread path)
-struct StreamSender(StreamTx<ChatStreamChunk>);
-
-impl StreamSender {
-    fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
-        let _ = self.0.send(result);
-    }
-}
-
 /// RAII guard that calls `mlx_qwen35_compiled_reset()` on drop.
 ///
 /// Ensures C++ compiled state is always cleaned up, even if the decode
@@ -4811,11 +4798,9 @@ impl Qwen3_5Model {
 
         // 3. Return Promise — event loop processes onCreateWorker while we await
         env.spawn_future(async move {
-            let (config_final, model_id_final) = init_rx
-                .await
-                .map_err(|_| {
-                    napi::Error::from_reason("Model thread exited during CPU tensor load")
-                })??;
+            let (config_final, model_id_final) = init_rx.await.map_err(|_| {
+                napi::Error::from_reason("Model thread exited during CPU tensor load")
+            })??;
 
             Ok(Qwen3_5Model {
                 thread,
@@ -5066,7 +5051,7 @@ impl Qwen3_5Model {
         self.thread.send(Qwen35Cmd::ChatStreamSessionStart {
             messages,
             config,
-            stream_tx,
+            sink,
             cancelled: cancelled_inner,
         })?;
 
