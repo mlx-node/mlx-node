@@ -30,60 +30,13 @@ const messages: Array<{ role: string; content: string; images?: Uint8Array[] }> 
   { role: 'system', content: 'You are a helpful assistant. Be concise.' },
 ];
 
-// Import stream protocol constants
-const STREAM_HEADER_SIZE = 8;
-const STREAM_TEXT_OFFSET = STREAM_HEADER_SIZE;
-
-// Stream buffer — set when worker sends it
-let streamBuffer: SharedArrayBuffer | null = null;
-let streamI32: Int32Array | null = null;
-let streamBytes: Uint8Array | null = null;
-let lastStreamSeq = 0;
-const textDecoder = new TextDecoder();
-
 // Streaming state
 let currentAssistantDiv: HTMLDivElement | null = null;
 let currentThinkingDiv: HTMLDivElement | null = null;
 let currentResponseDiv: HTMLDivElement | null = null;
 let isInThinking = false;
-
-let streamActive = false;
-
-async function startStreamWatch() {
-  if (!streamI32 || !streamBytes) return;
-  streamActive = true;
-  lastStreamSeq = 0;
-
-  // Use Atomics.waitAsync to get notified when the sequence counter changes
-  // This avoids polling — the promise resolves when WASM writes a new token
-  while (streamActive) {
-    const currentSeq = Atomics.load(streamI32!, 1);
-    if (currentSeq !== lastStreamSeq && currentSeq > 0) {
-      lastStreamSeq = currentSeq;
-      const len = Atomics.load(streamI32!, 0);
-      if (len > 0) {
-        const text = textDecoder.decode(streamBytes!.slice(STREAM_TEXT_OFFSET, STREAM_TEXT_OFFSET + len));
-        appendStreamedToken(text);
-        setStatus(`Generating... ${currentSeq} tokens`, 'info');
-      }
-    }
-    // Wait for next sequence change (non-blocking on main thread)
-    const result = Atomics.waitAsync(streamI32!, 1, currentSeq);
-    if (result.async) {
-      // Race the wait with a timeout so we can check streamActive
-      await Promise.race([result.value, new Promise((r) => setTimeout(r, 5000))]);
-    } else {
-      // Already changed — continue immediately
-      await new Promise((r) => setTimeout(r, 0));
-    }
-  }
-}
-
-function stopStreamWatch() {
-  streamActive = false;
-  // Wake up any pending waitAsync by writing a sentinel
-  if (streamI32) Atomics.notify(streamI32, 1);
-}
+let streamedText = ''; // Accumulates all streamed tokens
+let streamTokenCount = 0;
 
 function createAssistantMessage(): HTMLDivElement {
   const assistantDiv = document.createElement('div');
@@ -119,52 +72,31 @@ function createAssistantMessage(): HTMLDivElement {
   return assistantDiv;
 }
 
-function appendStreamedToken(fullText: string) {
+function appendStreamedToken(deltaText: string, isReasoning: boolean) {
   if (!currentAssistantDiv || !currentThinkingDiv || !currentResponseDiv) return;
 
-  const thinkStart = '<think>';
-  const thinkEnd = '</think>';
-  const thinkEndIdx = fullText.indexOf(thinkEnd);
-  const thinkStartIdx = fullText.indexOf(thinkStart);
+  streamedText += deltaText;
+  streamTokenCount++;
+  setStatus(`Generating... ${streamTokenCount} tokens`, 'info');
 
-  // Detect if model is producing thinking
-  if (!isInThinking && thinkStartIdx === 0) {
+  if (isReasoning) {
+    // Model is in thinking mode — show thinking content
     isInThinking = true;
-  }
-
-  if (thinkEndIdx >= 0) {
-    // Found </think> — thinking is complete
-    isInThinking = false;
-    const thinkContent = fullText
-      .substring(thinkStartIdx >= 0 ? thinkStartIdx + thinkStart.length : 0, thinkEndIdx)
-      .trim();
-
-    if (thinkContent.length > 3) {
-      // Show thinking section only if substantial
-      currentThinkingDiv.style.display = '';
-      const thinkingContentEl = currentThinkingDiv.querySelector('.thinking-content') as HTMLElement;
-      if (thinkingContentEl) thinkingContentEl.textContent = thinkContent;
+    currentThinkingDiv.style.display = '';
+    currentThinkingDiv.open = true;
+    const thinkingContentEl = currentThinkingDiv.querySelector('.thinking-content') as HTMLElement;
+    if (thinkingContentEl) thinkingContentEl.textContent += deltaText;
+    const summary = currentThinkingDiv.querySelector('summary') as HTMLElement;
+    if (summary) summary.textContent = 'Thinking...';
+  } else {
+    // Transition from thinking → response
+    if (isInThinking) {
+      isInThinking = false;
       const summary = currentThinkingDiv.querySelector('summary') as HTMLElement;
       if (summary) summary.textContent = 'Thought process';
       currentThinkingDiv.open = false;
     }
-    // Show response after </think>
-    const responseText = fullText.substring(thinkEndIdx + thinkEnd.length).replace(/^\n/, '');
-    currentResponseDiv.textContent = responseText || '';
-  } else if (isInThinking) {
-    // Still thinking — show thinking content only if substantial
-    const thinkContent = fullText.replace(/^<think>\n?/, '').trim();
-    if (thinkContent.length > 3) {
-      currentThinkingDiv.style.display = '';
-      currentThinkingDiv.open = true;
-      const thinkingContentEl = currentThinkingDiv.querySelector('.thinking-content') as HTMLElement;
-      if (thinkingContentEl) thinkingContentEl.textContent = thinkContent;
-      const summary = currentThinkingDiv.querySelector('summary') as HTMLElement;
-      if (summary) summary.textContent = 'Thinking...';
-    }
-  } else {
-    // No thinking at all — just show response directly
-    currentResponseDiv.textContent = fullText;
+    currentResponseDiv.textContent += deltaText;
   }
 
   chatEl.scrollTop = chatEl.scrollHeight;
@@ -205,11 +137,9 @@ worker.onmessage = (e) => {
   const { type, ...data } = e.data;
 
   switch (type) {
-    case 'stream_buffer':
-      // Receive the SharedArrayBuffer for streaming text
-      streamBuffer = data.buffer;
-      streamI32 = new Int32Array(streamBuffer);
-      streamBytes = new Uint8Array(streamBuffer);
+    case 'chunk':
+      // Per-token streaming chunk from chatStream callback
+      appendStreamedToken(data.text, data.isReasoning);
       break;
 
     case 'log':
@@ -235,10 +165,7 @@ worker.onmessage = (e) => {
       imageBtn.disabled = false;
       break;
 
-    // 'chunk' messages no longer used — streaming via SharedArrayBuffer polling
-
     case 'result': {
-      stopStreamWatch();
       finalizeAssistantMessage(data.text, data.thinking);
       messages.push({ role: 'assistant', content: data.rawText });
 
@@ -256,7 +183,6 @@ worker.onmessage = (e) => {
     }
 
     case 'error':
-      stopStreamWatch();
       log(`Error: ${data.message}`);
       if (currentResponseDiv) {
         currentResponseDiv.textContent = `Error: ${data.message}`;
@@ -340,8 +266,10 @@ function handleSend() {
 
   // Show pending response with thinking/response structure
   setStatus('Generating...', 'info');
+  streamedText = '';
+  streamTokenCount = 0;
+  isInThinking = false;
   createAssistantMessage();
-  startStreamWatch(); // async — runs in background
 
   // Send to worker
   worker.postMessage({

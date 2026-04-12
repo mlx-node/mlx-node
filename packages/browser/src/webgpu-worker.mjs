@@ -14,11 +14,6 @@
  */
 import { instantiateNapiModuleSync, MessageHandler, WASI } from '@napi-rs/wasm-runtime';
 import { createBridgeStub } from './webgpu-bridge-stub.js';
-import {
-  STREAM_BUFFER_SIZE,
-  STREAM_HEADER_SIZE,
-  STREAM_TEXT_OFFSET,
-} from './rpc-protocol.js';
 
 // RPC config received from mlx-worker before emnapi's init message
 let rpcConfig = null;
@@ -38,11 +33,6 @@ const handler = new MessageHandler({
       rpcConfig.features,
     );
 
-    // Stream channel stubs — write decoded tokens to SharedArrayBuffer
-    const streamBuffer = rpcConfig.streamBuffer;
-    const streamView = streamBuffer ? new Uint8Array(streamBuffer) : null;
-    const streamI32 = streamBuffer ? new Int32Array(streamBuffer) : null;
-
     const wasi = new WASI({
       print: function () { console.log.apply(console, arguments); },
       printErr: function () { console.error.apply(console, arguments); },
@@ -59,23 +49,9 @@ const handler = new MessageHandler({
           memory: wasmMemory,
           __cpp_exception: new WebAssembly.Tag({ parameters: ['i32'] }),
           _ZN3mlx4core3gpu4initEv: () => {},
-          // Stream channel for token streaming (same impl as mlx-worker.ts)
-          mlx_stream_write: (ptr, len) => {
-            if (!streamView || !streamI32) return;
-            const maxLen = STREAM_BUFFER_SIZE - STREAM_TEXT_OFFSET;
-            if (len > maxLen) len = maxLen;
-            const wasmMem = new Uint8Array(wasmMemory.buffer);
-            const text = wasmMem.slice(ptr, ptr + len);
-            streamView.set(text, STREAM_TEXT_OFFSET);
-            Atomics.store(streamI32, 0, len);
-            Atomics.add(streamI32, 1, 1);
-            Atomics.notify(streamI32, 1);
-          },
-          mlx_stream_reset: () => {
-            if (!streamI32) return;
-            Atomics.store(streamI32, 0, 0);
-            Atomics.store(streamI32, 1, 0);
-          },
+          // Stream stubs — streaming is handled by chatStream's NAPI callback
+          mlx_stream_write: () => {},
+          mlx_stream_reset: () => {},
           ...bridge.imports,
         };
       },

@@ -28,9 +28,6 @@ import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-ru
 import {
   CMD_OFFSET,
   READBACK_BUFFER_SIZE,
-  STREAM_BUFFER_SIZE,
-  STREAM_HEADER_SIZE,
-  STREAM_TEXT_OFFSET,
 } from './rpc-protocol.js';
 import { parseSafeTensorsHeader, dtypeToCode } from './safetensors.js';
 import { createBridgeStub } from './webgpu-bridge-stub.js';
@@ -57,9 +54,6 @@ async function handleInit(data: {
     post({ type: 'progress', step: 'gpu', message: 'Initializing WebGPU...' });
     const cmdBuffer = new SharedArrayBuffer(CMD_OFFSET.TOTAL);
     const readbackBuffer = new SharedArrayBuffer(READBACK_BUFFER_SIZE);
-    // Streaming text channel — WASM writes decoded tokens here, main thread polls
-    const streamBuffer = new SharedArrayBuffer(STREAM_BUFFER_SIZE);
-    post({ type: 'stream_buffer', buffer: streamBuffer });
     // WASM module requires min 1002 pages (~66 MB). We use 4096 (~268 MB)
     // for headroom during WASM init (thread stacks, emnapi, etc.) and let
     // memory.grow expand as needed — keeps total well under the 2 GB JS
@@ -112,7 +106,7 @@ async function handleInit(data: {
       version: 'preview1',
       print: function (...args: unknown[]) {
         const line = args.map(String).join(' ');
-        if (line.includes('[MLX-KERNEL]') || line.includes('[CPU-BUILD]')) {
+        if (line.includes('[MLX-KERNEL]')) {
           post({ type: 'log', message: line });
         } else {
           console.log(...args);
@@ -120,7 +114,7 @@ async function handleInit(data: {
       },
       printErr: function (...args: unknown[]) {
         const line = args.map(String).join(' ');
-        if (line.includes('[MLX-KERNEL]') || line.includes('[CPU-BUILD]')) {
+        if (line.includes('[MLX-KERNEL]')) {
           post({ type: 'log', message: line });
         } else {
           console.error(...args);
@@ -133,31 +127,13 @@ async function handleInit(data: {
     const cppExceptionTag = new WebAssembly.Tag({ parameters: ['i32'] });
     cppTag = cppExceptionTag;
 
-    // Stream channel: WASM calls mlx_stream_write(ptr, len) to push decoded text
-    const streamView = new Uint8Array(streamBuffer);
-    const streamI32 = new Int32Array(streamBuffer);
     const cxxStubs = {
       __cpp_exception: cppExceptionTag,
       _ZN3mlx4core3gpu4initEv: () => {},
-      // Called from Rust with a pointer into WASM memory and byte length
-      mlx_stream_write: (ptr: number, len: number) => {
-        const maxLen = STREAM_BUFFER_SIZE - STREAM_TEXT_OFFSET;
-        if (len > maxLen) len = maxLen; // Truncate to prevent overflow
-        const wasmMem = new Uint8Array(sharedMemory.buffer);
-        const text = wasmMem.slice(ptr, ptr + len);
-        const writePos = STREAM_TEXT_OFFSET;
-        streamView.set(text, writePos);
-        // Update header: [0]=byte length, [1]=sequence counter
-        Atomics.store(streamI32, 0, len);
-        Atomics.add(streamI32, 1, 1);
-        // Wake main thread's Atomics.waitAsync
-        Atomics.notify(streamI32, 1);
-      },
-      // Reset stream buffer (called before chat starts)
-      mlx_stream_reset: () => {
-        Atomics.store(streamI32, 0, 0);
-        Atomics.store(streamI32, 1, 0);
-      },
+      // Stream stubs — streaming is handled by chatStream's NAPI callback,
+      // but the WASM imports still need these symbols to link.
+      mlx_stream_write: () => {},
+      mlx_stream_reset: () => {},
     };
 
     const { napiModule } = await instantiateNapiModule(wasmFile, {
@@ -183,7 +159,6 @@ async function handleInit(data: {
             queueHandle: gpuReady.queueHandle,
           },
           features: gpuReady.features,
-          streamBuffer,
         });
         return w;
       },
@@ -363,128 +338,57 @@ async function handleChat(data: { messages: any[]; config?: any }) {
   try {
     const chatConfig = {
       ...(data.config ?? {}),
-      enableThinking: true, // Let model think — thinking block gets stripped from final output
+      enableThinking: true,
       reportPerformance: true,
     };
 
-    // Async chat — tokio_unstable + asyncWorkPoolSize > 0 enables async NAPI
-    // on WASM. The Rust model thread handles inference; the JS side awaits.
-    post({ type: 'progress', step: 'chat', message: 'Calling model.chat()...' });
+    // Use chatStream for per-token streaming — each chunk is posted to main thread
+    // via postMessage so the UI can render tokens incrementally.
     const t0 = performance.now();
-    let result: any;
-    try {
-      result = await model.chat(data.messages, chatConfig);
-    } catch (e: any) {
-      // Get WASM stack trace and try to extract C++ exception message
-      const stack = e.stack || '';
-      let detail = `${e.constructor?.name}: ${e.message}`;
-      if (e instanceof WebAssembly.Exception && wasmInst) {
-        try {
-          const ptr = e.getArg(cppTag, 0);
-          if (typeof ptr === 'number') {
-            const mem = new Uint8Array((wasmInst.exports.memory as WebAssembly.Memory).buffer);
-            const view = new DataView(mem.buffer);
-            // Scan exception object fields to find readable error message
-            for (const off of [4, 8, 12, 16, 20]) {
-              if (ptr + off + 4 < mem.length) {
-                const strPtr = view.getUint32(ptr + off, true);
-                if (strPtr > 1024 && strPtr < mem.length - 4) {
-                  let s = '';
-                  for (let i = strPtr; i < mem.length && mem[i] !== 0 && i - strPtr < 500; i++) {
-                    const ch = mem[i];
-                    if (ch >= 32 && ch < 127) s += String.fromCharCode(ch);
-                    else {
-                      s = '';
-                      break;
-                    }
-                  }
-                  if (s.length > 5) {
-                    detail = `C++ exception: ${s}`;
-                    break;
-                  }
-                }
-              }
-            }
-          }
-        } catch {
-          /* extraction failed */
+    const handle = await model.chatStream(
+      data.messages,
+      chatConfig,
+      (err: Error | null, chunk: any) => {
+        if (err) {
+          post({ type: 'error', message: err.message, stack: err.stack });
+          return;
         }
-      }
-      post({ type: 'progress', step: 'chat', message: `chatFn THREW: ${detail}\nStack: ${stack}` });
-      console.error('[WASM Error]', detail, '\nStack:', stack);
-      throw e;
-    }
-    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-    post({ type: 'progress', step: 'chat', message: `chatFn returned in ${elapsed}s` });
-
-    post({
-      type: 'result',
-      text: result.text,
-      rawText: result.rawText,
-      numTokens: result.numTokens,
-      finishReason: result.finishReason,
-      toolCalls: result.toolCalls,
-      thinking: result.thinking,
-      performance: result.performance
-        ? {
-            ttftMs: result.performance.ttftMs,
-            prefillTokensPerSecond: result.performance.prefillTokensPerSecond,
-            decodeTokensPerSecond: result.performance.decodeTokensPerSecond,
-          }
-        : null,
-    });
+        if (chunk.done) {
+          const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+          post({ type: 'progress', step: 'chat', message: `chatStream completed in ${elapsed}s` });
+          post({
+            type: 'result',
+            text: chunk.text,
+            rawText: chunk.rawText,
+            numTokens: chunk.numTokens,
+            finishReason: chunk.finishReason,
+            toolCalls: chunk.toolCalls,
+            thinking: chunk.thinking,
+            performance: chunk.performance
+              ? {
+                  ttftMs: chunk.performance.ttftMs,
+                  prefillTokensPerSecond: chunk.performance.prefillTokensPerSecond,
+                  decodeTokensPerSecond: chunk.performance.decodeTokensPerSecond,
+                }
+              : null,
+          });
+        } else {
+          post({
+            type: 'chunk',
+            text: chunk.text,
+            isReasoning: chunk.isReasoning ?? false,
+          });
+        }
+      },
+    );
+    // handle.cancel() available for cancellation if needed
+    void handle;
   } catch (e) {
     let message = String(e);
     let stack: string | undefined;
     if (e instanceof Error) {
       message = e.message;
       stack = e.stack;
-    } else if (e instanceof WebAssembly.Exception) {
-      // Try to extract C++ exception message via getArg + WASM memory
-      let cppMsg = '';
-      try {
-        const cppExceptionTag = new WebAssembly.Tag({ parameters: ['i32'] });
-        if ((e as any).is?.(cppExceptionTag)) {
-          const exnPtr = (e as any).getArg(cppExceptionTag, 0) as number;
-          // The exception ptr points to the thrown object. For std::runtime_error,
-          // the what() string is at a known offset. Try to read via __cxa_begin_catch.
-          if (wasmInst?.exports?.__cxa_begin_catch && wasmInst?.exports?.__cxa_end_catch) {
-            const beginCatch = wasmInst.exports.__cxa_begin_catch as Function;
-            const endCatch = wasmInst.exports.__cxa_end_catch as Function;
-            const objPtr = beginCatch(exnPtr);
-            // Read the vtable to find what() — offset 0 is vtable ptr, what() is at vtable[2]
-            // For now, just try to read a string at a common offset
-            try {
-              const mem = new Uint8Array((wasmInst.exports.memory as WebAssembly.Memory).buffer);
-              // std::exception vtable: [0]=typeinfo, [4]=destructor, [8]=what()
-              // what() returns a const char*. Call it via indirect call.
-              const view = new DataView(mem.buffer);
-              const vtablePtr = view.getUint32(objPtr, true);
-              const whatFnPtr = view.getUint32(vtablePtr + 8, true);
-              // Call what() via wasm table
-              const table = wasmInst.exports.__indirect_function_table as WebAssembly.Table;
-              if (table && whatFnPtr > 0) {
-                const whatFn = table.get(whatFnPtr) as Function;
-                const strPtr = whatFn(objPtr) as number;
-                // Read null-terminated string from WASM memory
-                let str = '';
-                for (let i = strPtr; i < mem.length && mem[i] !== 0; i++) {
-                  str += String.fromCharCode(mem[i]);
-                }
-                if (str) cppMsg = str;
-              }
-            } catch (readErr) {
-              cppMsg = `(could not read what(): ${readErr})`;
-            }
-            endCatch();
-          }
-        }
-      } catch (tagErr) {
-        // getArg failed — different tag or format
-      }
-      message = cppMsg
-        ? `C++ exception: ${cppMsg}`
-        : `WebAssembly.Exception (C++ exception escaped to JS — likely an unimplemented op or runtime error in MLX)`;
     }
     post({ type: 'error', message, stack });
   }
