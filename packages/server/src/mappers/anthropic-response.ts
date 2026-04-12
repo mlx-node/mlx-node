@@ -169,7 +169,11 @@ export function buildContentBlockStop(index: number): AnthropicContentBlockStopE
 /**
  * Build a message_delta event with the final stop_reason and token count.
  */
-export function buildMessageDelta(stopReason: string, outputTokens: number, inputTokens?: number): AnthropicMessageDeltaEvent {
+export function buildMessageDelta(
+  stopReason: string,
+  outputTokens: number,
+  inputTokens?: number,
+): AnthropicMessageDeltaEvent {
   return {
     type: 'message_delta',
     delta: {

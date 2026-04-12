@@ -17,7 +17,7 @@ function resolveContent(content: string | ContentPart[]): string {
     if (p.type === 'input_text') {
       parts.push(p.text);
     } else {
-      throw new Error(`Unsupported content part type: "${p.type}"`);
+      throw new Error(`Unsupported content part type: "${p.type as string}"`);
     }
   }
   return parts.join('');
@@ -31,7 +31,7 @@ function resolveContent(content: string | ContentPart[]): string {
  */
 function mapTool(tool: ResponsesToolDefinition): ToolDefinition {
   if (tool.type !== 'function') {
-    throw new Error(`Unsupported tool type: "${tool.type}"`);
+    throw new Error(`Unsupported tool type: "${tool.type as string}"`);
   }
   const params = tool.parameters;
   return {
@@ -109,7 +109,7 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
           toolCallId: fco.call_id,
         });
       } else {
-        throw new Error(`Unsupported input item type: "${itemType}"`);
+        throw new Error(`Unsupported input item type: "${itemType as string}"`);
       }
     }
   }

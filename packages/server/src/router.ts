@@ -9,7 +9,13 @@ import type { ResponseStore } from '@mlx-node/core';
 import { handleCreateMessage } from './endpoints/messages.js';
 import { handleListModels } from './endpoints/models.js';
 import { handleCreateResponse } from './endpoints/responses.js';
-import { sendAnthropicBadRequest, sendAnthropicMethodNotAllowed, sendBadRequest, sendMethodNotAllowed, sendNotFound } from './errors.js';
+import {
+  sendAnthropicBadRequest,
+  sendAnthropicMethodNotAllowed,
+  sendBadRequest,
+  sendMethodNotAllowed,
+  sendNotFound,
+} from './errors.js';
 import type { ModelRegistry } from './registry.js';
 import type { AnthropicMessagesRequest } from './types-anthropic.js';
 import type { ResponsesAPIRequest } from './types.js';

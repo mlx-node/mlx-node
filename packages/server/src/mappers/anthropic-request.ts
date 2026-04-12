@@ -168,7 +168,7 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
         messages.push(assistantMsg);
       }
     } else {
-      throw new Error(`Unsupported message role: "${role}"`);
+      throw new Error(`Unsupported message role: "${role as string}"`);
     }
   }
 

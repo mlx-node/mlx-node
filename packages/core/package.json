@@ -31,9 +31,9 @@
     "preversion": "oxnode ./build.ts && git add ."
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.5.1",
-    "@oxc-node/cli": "^0.0.35",
-    "oxfmt": "^0.40.0"
+    "@napi-rs/cli": "^3.6.1",
+    "@oxc-node/cli": "^0.1.0",
+    "vite-plus": "catalog:"
   },
   "optionalDependencies": {
     "@mlx-node/core-darwin-arm64": "workspace:*"

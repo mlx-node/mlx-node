@@ -12,7 +12,6 @@ import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponse
 import type { ChatStreamEvent } from '@mlx-node/lm';
 
 import { sendBadRequest, sendInternalError, sendNotFound } from '../errors.js';
-import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import { mapRequest, reconstructMessagesFromChain } from '../mappers/request.js';
 import {
   buildOutputItems,
@@ -24,6 +23,7 @@ import {
 } from '../mappers/response.js';
 import type { ModelRegistry, ServableModel } from '../registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
+import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import type {
   FunctionCallOutputItem,
   MessageOutputItem,
@@ -86,7 +86,17 @@ async function handleStreamingNative(
 
   if (!chatStream || typeof (chatStream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] !== 'function') {
     // chatStream did not return an async iterable — fall back to simulated streaming
-    return handleStreamingSimulated(res, model, messages, config, req, responseId, previousResponseId, store, newInputMessages);
+    return handleStreamingSimulated(
+      res,
+      model,
+      messages,
+      config,
+      req,
+      responseId,
+      previousResponseId,
+      store,
+      newInputMessages,
+    );
   }
 
   beginSSE(res);

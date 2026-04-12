@@ -3,7 +3,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { NapiCli, createBuildCommand } from '@napi-rs/cli';
-import { format } from 'oxfmt';
+import { format } from 'vite-plus/fmt';
 
 import viteConfig from '../../vite.config';
 

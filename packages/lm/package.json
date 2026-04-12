@@ -31,6 +31,6 @@
     "@mlx-node/core": "workspace:*"
   },
   "devDependencies": {
-    "@types/node": "catalog:"
+    "@types/node": "^25.6.0"
   }
 }

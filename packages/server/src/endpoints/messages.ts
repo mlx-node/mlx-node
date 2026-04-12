@@ -12,7 +12,6 @@ import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
 import type { ChatStreamEvent } from '@mlx-node/lm';
 
 import { sendAnthropicBadRequest, sendAnthropicInternalError, sendAnthropicNotFound } from '../errors.js';
-import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import { mapAnthropicRequest } from '../mappers/anthropic-request.js';
 import {
   buildAnthropicResponse,
@@ -27,6 +26,7 @@ import {
 import { genId } from '../mappers/response.js';
 import type { ModelRegistry, ServableModel } from '../registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
+import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import type { AnthropicMessagesRequest } from '../types-anthropic.js';
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,15 @@ import { Gemma4Model, HarrierModel, Qwen3Model, QianfanOCRModel } from '@mlx-nod
 import type { LoadableModel, TrainableModel } from '../interfaces.js';
 import { Lfm2Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
-export type ModelType = 'qwen3' | 'qwen3_5' | 'qwen3_5_moe' | 'internvl_chat' | 'qianfan-ocr' | 'harrier' | 'gemma4' | 'lfm2';
+export type ModelType =
+  | 'qwen3'
+  | 'qwen3_5'
+  | 'qwen3_5_moe'
+  | 'internvl_chat'
+  | 'qianfan-ocr'
+  | 'harrier'
+  | 'gemma4'
+  | 'lfm2';
 
 const SUPPORTED_MODEL_TYPES = new Set<ModelType>([
   'qwen3',
