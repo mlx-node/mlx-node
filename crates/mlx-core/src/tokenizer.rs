@@ -1240,6 +1240,19 @@ impl Qwen3Tokenizer {
     pub fn think_end_str(&self) -> Option<&str> {
         self.think_end_str.as_deref()
     }
+
+    /// Get the `<|im_end|>` token ID, if the tokenizer has it in its vocab.
+    ///
+    /// This is the "turn end" sentinel for ChatML-style templates. It's
+    /// preferable to `config.json:eos_token_id` for session-based chat
+    /// because it yields clean cache boundaries: cached history ends at
+    /// `<|im_end|>`, and the next turn's delta starts with
+    /// `\n<|im_start|>user\n...`. Using the raw `eos_token_id` from
+    /// `config.json` (which may be `<|endoftext|>` for Qwen3.5) wastes
+    /// decode tokens and makes clean template continuation impossible.
+    pub fn im_end_id(&self) -> Option<u32> {
+        self.tokenizer.token_to_id("<|im_end|>")
+    }
 }
 
 fn encoding_to_uint32_array<'env>(

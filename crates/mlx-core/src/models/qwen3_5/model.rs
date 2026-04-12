@@ -712,7 +712,7 @@ impl Qwen35Inner {
         } else {
             None
         };
-        let mut first_token_instant: Option<std::time::Instant> = None;
+        let first_token_instant: Option<std::time::Instant> = None;
 
         let model_id = self.model_id;
 
@@ -843,8 +843,6 @@ impl Qwen35Inner {
         };
 
         let eos_id = self.config.eos_token_id as u32;
-        let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut finish_reason = String::from("length");
 
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let generation_stream = Stream::new(DeviceType::Gpu);
@@ -858,8 +856,7 @@ impl Qwen35Inner {
 
         // === VLM or text prefill branching ===
         profiler.begin_prefill();
-        let (mut last_logits, seq_len, vlm_compiled_init_done) = if has_images
-            && cached_prefix_len == 0
+        let (last_logits, seq_len, vlm_compiled_init_done) = if has_images && cached_prefix_len == 0
         {
             if let Some(vision_enc) = self.vision_encoder.clone() {
                 let final_tokens = &expanded_tokens;
@@ -922,8 +919,97 @@ impl Qwen35Inner {
         };
         profiler.end_prefill();
 
-        let mut token_history: Vec<u32> = tokens.clone();
-        last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
+        let prompt_tokens_for_result = if has_images {
+            expanded_tokens.len() as u32
+        } else {
+            tokens.len() as u32
+        };
+
+        let save_expanded_tokens = if has_images {
+            Some(expanded_tokens.clone())
+        } else {
+            None
+        };
+
+        self.chat_with_caches_inner(
+            last_logits,
+            seq_len,
+            vlm_compiled_init_done,
+            use_compiled,
+            has_images,
+            cached_prefix_len,
+            tokens.clone(),
+            p,
+            enable_thinking,
+            eos_id,
+            think_end_id,
+            think_end_str,
+            tokenizer,
+            embedding_weight,
+            embedding_weight_t,
+            generation_stream,
+            profiler,
+            prefill_tokens.len(),
+            prompt_tokens_for_result,
+            generation_start,
+            first_token_instant,
+            tokens,
+            save_expanded_tokens,
+            current_image_cache_key,
+        )
+    }
+
+    /// Shared post-prefill pipeline: penalty → sample → compiled init (if needed)
+    /// → decode loop → cache export → save cache state → finalize result.
+    ///
+    /// Extracted from `chat_sync` so it can also be driven by the text-only
+    /// session path (`chat_tokens_delta_sync`). Preserves the exact semantics
+    /// of `chat_sync` for the existing caller — `token_history` starts as the
+    /// full pre-decode token sequence (used for penalty context and the decode
+    /// loop's running history), and the decode loop mutates it in place.
+    ///
+    /// The caller is responsible for:
+    /// - Holding the `DENSE_COMPILED_MUTEX` / `COMPILED_WEIGHTS_RWLOCK` guards
+    ///   (when `use_compiled == true`) for the lifetime of this call.
+    /// - Creating a `WiredLimitContext` tied to `generation_stream` for the
+    ///   lifetime of this call.
+    /// - Running prefill and passing the resulting `(last_logits, seq_len,
+    ///   vlm_compiled_init_done)` tuple.
+    /// - Pre-starting the profiler (`set_prompt_tokens`, `snapshot_memory_before`,
+    ///   `begin_prefill`, `end_prefill`).
+    #[allow(clippy::too_many_arguments)]
+    fn chat_with_caches_inner(
+        &mut self,
+        last_logits: MxArray,
+        seq_len: i64,
+        vlm_compiled_init_done: bool,
+        use_compiled: bool,
+        has_images: bool,
+        cached_prefix_len: usize,
+        token_history_init: Vec<u32>,
+        p: super::chat_common::ChatParams,
+        enable_thinking: Option<bool>,
+        eos_id: u32,
+        think_end_id: Option<u32>,
+        think_end_str: Option<String>,
+        tokenizer: Arc<Qwen3Tokenizer>,
+        embedding_weight: MxArray,
+        embedding_weight_t: MxArray,
+        generation_stream: Stream,
+        mut profiler: crate::decode_profiler::DecodeProfiler,
+        prefill_tokens_len: usize,
+        prompt_tokens_for_result: u32,
+        generation_start: Option<std::time::Instant>,
+        mut first_token_instant: Option<std::time::Instant>,
+        save_tokens: Vec<u32>,
+        save_expanded_tokens: Option<Vec<u32>>,
+        save_image_cache_key: u64,
+    ) -> Result<ChatResult> {
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut finish_reason = String::from("length");
+        let max_new_tokens = p.max_new_tokens;
+
+        let last_logits = apply_all_penalties(last_logits, &token_history_init, &p)?;
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
@@ -932,6 +1018,8 @@ impl Qwen35Inner {
         } else {
             None
         };
+
+        let mut token_history: Vec<u32> = token_history_init;
 
         let mut reasoning_tracker = chat_common::ReasoningTracker::new(
             enable_thinking.unwrap_or(true),
@@ -1031,7 +1119,7 @@ impl Qwen35Inner {
             );
 
             // Export caches from C++ before CompiledResetGuard drops
-            if reuse_cache {
+            if p.reuse_cache {
                 let num_layers = self.config.num_layers as usize;
                 let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
                     vec![std::ptr::null_mut(); num_layers * 2];
@@ -1104,9 +1192,9 @@ impl Qwen35Inner {
             has_images,
             &generated_tokens,
             &finish_reason,
-            &tokens,
-            Some(&expanded_tokens),
-            current_image_cache_key,
+            &save_tokens,
+            save_expanded_tokens.as_deref(),
+            save_image_cache_key,
             &mut self.cached_token_history,
             &mut self.cached_image_key,
             &mut self.cached_rope_deltas,
@@ -1116,9 +1204,13 @@ impl Qwen35Inner {
         let performance = compute_performance_metrics(
             generation_start,
             first_token_instant,
-            prefill_tokens.len(),
+            prefill_tokens_len,
             generated_tokens.len(),
         );
+
+        // Silence "unused" warnings — the decode_loop! macro consumes `y`
+        // internally by name, rustc cannot see that through the tt repetition.
+        let _ = y;
 
         finalize_chat_result(
             &tokenizer,
@@ -1129,11 +1221,7 @@ impl Qwen35Inner {
             performance,
             p.include_reasoning,
             enable_thinking.unwrap_or(true),
-            if has_images {
-                expanded_tokens.len() as u32
-            } else {
-                tokens.len() as u32
-            },
+            prompt_tokens_for_result,
             reasoning_tracker.reasoning_token_count(),
         )
     }
