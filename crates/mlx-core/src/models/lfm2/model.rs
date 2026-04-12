@@ -192,14 +192,11 @@ impl Lfm2Inner {
     ) {
         if reuse_cache {
             let mut full_history = tokens.to_vec();
-            let history_tokens =
-                if (finish_reason == "length" || finish_reason == "cancelled")
-                    && !generated_tokens.is_empty()
-                {
-                    &generated_tokens[..generated_tokens.len() - 1]
-                } else {
-                    generated_tokens
-                };
+            let history_tokens = if finish_reason == "length" && !generated_tokens.is_empty() {
+                &generated_tokens[..generated_tokens.len() - 1]
+            } else {
+                generated_tokens
+            };
             full_history.extend_from_slice(history_tokens);
             self.cached_token_history = full_history;
         } else {
@@ -284,12 +281,9 @@ impl Lfm2Inner {
 
         let logits = self.chunked_prefill(&prompt, generation_stream)?;
 
-        // Take logits for last token only
-        let last_logits = logits.slice_axis(
-            1,
-            prefill_tokens.len() as i64 - 1,
-            prefill_tokens.len() as i64,
-        )?;
+        // Take logits for last token only (use actual returned seq len, not total prompt len)
+        let seq_len = logits.shape_at(1)?;
+        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
         let last_logits = last_logits.squeeze(Some(&[1]))?;
 
         // Apply penalties and sample first token
@@ -488,11 +482,8 @@ impl Lfm2Inner {
         let prompt = MxArray::from_int32(&token_arr, &[1, prefill_tokens.len() as i64])?;
 
         let logits = self.chunked_prefill(&prompt, generation_stream)?;
-        let last_logits = logits.slice_axis(
-            1,
-            prefill_tokens.len() as i64 - 1,
-            prefill_tokens.len() as i64,
-        )?;
+        let seq_len = logits.shape_at(1)?;
+        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
         let last_logits = last_logits.squeeze(Some(&[1]))?;
 
         let sampling_config = p.sampling_config;
