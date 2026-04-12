@@ -9,6 +9,7 @@ use crate::models::qwen3_5::model::ChatStreamChunk;
 
 pub mod tsfn_sink;
 pub use tsfn_sink::TsfnSink;
+pub mod wire;
 
 /// Sink that receives per-token [`ChatStreamChunk`] results during streaming
 /// chat generation and delivers them to the JavaScript caller.
