@@ -7,6 +7,10 @@
 
 use crate::models::qwen3_5::model::ChatStreamChunk;
 
+#[cfg(target_arch = "wasm32")]
+pub mod sab_sink;
+#[cfg(target_arch = "wasm32")]
+pub use sab_sink::SabSink;
 pub mod tsfn_sink;
 pub use tsfn_sink::TsfnSink;
 pub mod wire;
