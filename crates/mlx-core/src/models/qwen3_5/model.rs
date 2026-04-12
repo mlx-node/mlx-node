@@ -5072,9 +5072,95 @@ impl Qwen3_5Model {
 
         let callback = Arc::new(callback);
         tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            // Pass-through mode: batch_size 0 or 1 preserves exact legacy behavior.
+            if batch_size <= 1 {
+                while let Some(result) = stream_rx.recv().await {
+                    callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+                }
+                return;
             }
+
+            // A chunk is "typical" (i.e., safe to coalesce into a batch) iff it
+            // carries only a text delta + is_reasoning flag. Anything with
+            // done/finish_reason/tool_calls/performance/num_tokens/thinking/
+            // raw_text is a semantically-loaded chunk and must be emitted alone.
+            fn is_typical(chunk: &ChatStreamChunk) -> bool {
+                !chunk.done
+                    && chunk.finish_reason.is_none()
+                    && chunk.tool_calls.is_none()
+                    && chunk.performance.is_none()
+                    && chunk.num_tokens.is_none()
+                    && chunk.thinking.is_none()
+                    && chunk.raw_text.is_none()
+            }
+
+            let mut buf: Vec<ChatStreamChunk> = Vec::with_capacity(batch_size);
+
+            // Flush the buffer as a single merged chunk. If only one chunk is
+            // buffered, emit it directly to avoid a needless clone/allocation.
+            let flush = |buf: &mut Vec<ChatStreamChunk>,
+                         callback: &Arc<ThreadsafeFunction<ChatStreamChunk, ()>>| {
+                if buf.is_empty() {
+                    return;
+                }
+                if buf.len() == 1 {
+                    let only = buf.drain(..).next().unwrap();
+                    callback.call(Ok(only), ThreadsafeFunctionCallMode::NonBlocking);
+                    return;
+                }
+                let is_reasoning = buf[0].is_reasoning;
+                let mut merged_text = String::new();
+                for c in buf.iter() {
+                    merged_text.push_str(&c.text);
+                }
+                let merged = ChatStreamChunk {
+                    text: merged_text,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    raw_text: None,
+                    performance: None,
+                    is_reasoning,
+                };
+                buf.clear();
+                callback.call(Ok(merged), ThreadsafeFunctionCallMode::NonBlocking);
+            };
+
+            while let Some(result) = stream_rx.recv().await {
+                match result {
+                    Err(e) => {
+                        // Rule 1: flush anything buffered before propagating the error.
+                        flush(&mut buf, &callback);
+                        callback.call(Err(e), ThreadsafeFunctionCallMode::NonBlocking);
+                    }
+                    Ok(chunk) => {
+                        if !is_typical(&chunk) {
+                            // Rule 2: terminal / semantically-loaded chunk must be
+                            // emitted alone, never merged into a batch.
+                            flush(&mut buf, &callback);
+                            callback
+                                .call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
+                            continue;
+                        }
+                        // Rule 3: is_reasoning boundary forces a flush so UIs can
+                        // distinguish <think> content from final content.
+                        if let Some(front) = buf.first() {
+                            if front.is_reasoning != chunk.is_reasoning {
+                                flush(&mut buf, &callback);
+                            }
+                        }
+                        buf.push(chunk);
+                        if buf.len() >= batch_size {
+                            flush(&mut buf, &callback);
+                        }
+                    }
+                }
+            }
+
+            // Channel closed: flush any trailing partial batch.
+            flush(&mut buf, &callback);
         });
 
         Ok(ChatStreamHandle { cancelled })
