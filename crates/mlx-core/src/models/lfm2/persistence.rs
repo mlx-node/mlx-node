@@ -36,15 +36,19 @@ fn parse_config(model_path: &Path) -> Result<Lfm2Config> {
 
     // Fix 1: Accept canonical HF config keys — block_dim defaults to hidden_size,
     // block_ff_dim falls back to intermediate_size then hidden_size.
+    // HF's `intermediate_size` is the already-resolved MLP width, so when we take
+    // that fallback we must disable auto-adjust to avoid a second 2/3 shrink in
+    // `computed_ff_dim()`.
     if config.block_dim == 0 {
         config.block_dim = config.hidden_size;
     }
     if config.block_ff_dim == 0 {
-        config.block_ff_dim = raw
-            .get("intermediate_size")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32)
-            .unwrap_or(config.hidden_size);
+        if let Some(intermediate_size) = raw.get("intermediate_size").and_then(|v| v.as_i64()) {
+            config.block_ff_dim = intermediate_size as i32;
+            config.block_auto_adjust_ff_dim = false;
+        } else {
+            config.block_ff_dim = config.hidden_size;
+        }
     }
 
     // Fix 2: Respect tie_word_embeddings for HF Transformers checkpoints.

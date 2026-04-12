@@ -183,16 +183,26 @@ impl Lfm2Inner {
     }
 
     /// Save cache state for reuse in the next chat() call.
+    ///
+    /// `last_token_in_cache` must reflect whether the final entry in
+    /// `generated_tokens` was actually forwarded through the model and written
+    /// into the KV/conv caches. The loop skips the forward pass for the token
+    /// sampled at `step == max_new_tokens - 1`, so in that case the last pushed
+    /// token is NOT in the caches even if the loop exits via EOS or another
+    /// early-stop reason. Trimming based on the cache state (not the finish
+    /// reason string) keeps `cached_token_history` aligned with the layer
+    /// caches so a later `reuse_cache=true` call can't skip prefill for an
+    /// uncached tail token.
     fn save_cache_state(
         &mut self,
         reuse_cache: bool,
         tokens: &[u32],
         generated_tokens: &[u32],
-        finish_reason: &str,
+        last_token_in_cache: bool,
     ) {
         if reuse_cache {
             let mut full_history = tokens.to_vec();
-            let history_tokens = if finish_reason == "length" && !generated_tokens.is_empty() {
+            let history_tokens = if !last_token_in_cache && !generated_tokens.is_empty() {
                 &generated_tokens[..generated_tokens.len() - 1]
             } else {
                 generated_tokens
@@ -301,6 +311,7 @@ impl Lfm2Inner {
         }
 
         // Decode loop — double-buffered lazy eval pattern
+        let mut last_token_in_cache = false;
         for step in 0..max_new_tokens {
             let next_y = if step + 1 < max_new_tokens {
                 let _stream_ctx = StreamContext::new(generation_stream);
@@ -324,6 +335,11 @@ impl Lfm2Inner {
             } else {
                 None
             };
+
+            // The forward pass inside the branch above writes the current `y`
+            // into KV/conv caches, so the token we are about to push is cached
+            // iff that branch ran (i.e. `next_y.is_some()`).
+            last_token_in_cache = next_y.is_some();
 
             // Extract current token
             let token_id = y.item_at_int32(0)? as u32;
@@ -358,7 +374,7 @@ impl Lfm2Inner {
         }
 
         // Save cache state for next call
-        self.save_cache_state(reuse_cache, &tokens, &generated_tokens, &finish_reason);
+        self.save_cache_state(reuse_cache, &tokens, &generated_tokens, last_token_in_cache);
 
         // Compute performance metrics
         let performance = if report_perf {
@@ -497,6 +513,7 @@ impl Lfm2Inner {
         }
 
         // Decode loop
+        let mut last_token_in_cache = false;
         for step in 0..max_new_tokens {
             let next_y = if step + 1 < max_new_tokens {
                 let _stream_ctx = StreamContext::new(generation_stream);
@@ -519,6 +536,11 @@ impl Lfm2Inner {
             } else {
                 None
             };
+
+            // The forward pass inside the branch above writes the current `y`
+            // into KV/conv caches, so the token we are about to push is cached
+            // iff that branch ran (i.e. `next_y.is_some()`).
+            last_token_in_cache = next_y.is_some();
 
             // Extract current token
             let token_id = y.item_at_int32(0)? as u32;
@@ -586,7 +608,7 @@ impl Lfm2Inner {
         }
 
         // Save cache state
-        self.save_cache_state(reuse_cache, &tokens, &generated_tokens, &finish_reason);
+        self.save_cache_state(reuse_cache, &tokens, &generated_tokens, last_token_in_cache);
 
         // Flush residual buffered bytes from decode_stream
         let full_text = tokenizer
