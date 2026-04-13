@@ -326,6 +326,77 @@ describe('ChatSession', () => {
       await session.sendToolResult('call-1', 'tool output');
       expect(session.hasImages).toBe(true);
     });
+
+    it('failed image-change restart rolls back state and re-routes through start on next call', async () => {
+      const { model, chatSessionStart, resetCaches } = makeMockModel();
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      // Turn 1: image start succeeds.
+      await session.send('describe A', { images: [imgA] });
+      // Turn 2: text follow-up takes the delta path.
+      await session.send('text follow-up');
+      expect(session.turns).toBe(2);
+      expect(session.hasImages).toBe(true);
+
+      // Turn 3: image change triggers restart, but the native call
+      // rejects. State must roll back: prior history is preserved,
+      // but turnCount + lastImagesKey drop so the next call re-routes
+      // through the start path (caches were already wiped).
+      chatSessionStart.mockRejectedValueOnce(new Error('restart-fail'));
+      await expect(session.send('describe B', { images: [imgB] })).rejects.toThrow('restart-fail');
+
+      // resetCaches was called once (the failed restart).
+      expect(resetCaches).toHaveBeenCalledTimes(1);
+      expect(session.turns).toBe(0);
+      expect(session.hasImages).toBe(false);
+
+      // Recovery call: routes through the start path with the
+      // preserved prior conversation + the new user turn.
+      const recoveryResult = await session.send('describe B again', { images: [imgB] });
+      expect(recoveryResult.text).toBe('start-reply');
+
+      // chatSessionStart has now been called three times total:
+      //   [0] initial turn-1 start
+      //   [1] failed image-change restart
+      //   [2] recovery start
+      expect(chatSessionStart).toHaveBeenCalledTimes(3);
+      const recoveryMessages = chatSessionStart.mock.calls[2][0];
+      // The recovery messages preserve the full prior history plus
+      // the new user turn with the new image attached.
+      expect(recoveryMessages).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe A', images: [imgA] },
+        { role: 'assistant', content: 'start-reply' },
+        { role: 'user', content: 'text follow-up' },
+        { role: 'assistant', content: 'continue-reply' },
+        { role: 'user', content: 'describe B again', images: [imgB] },
+      ]);
+      // One successful turn after the rollback (the recovery).
+      expect(session.turns).toBe(1);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Error rollback
+  // -------------------------------------------------------------------
+
+  describe('error rollback', () => {
+    it('failed first-turn start does NOT corrupt history', async () => {
+      const { model, chatSessionStart } = makeMockModel();
+      chatSessionStart.mockRejectedValueOnce(new Error('first-fail'));
+      const session = new ChatSession(model);
+
+      await expect(session.send('hello')).rejects.toThrow('first-fail');
+      expect(session.turns).toBe(0);
+      expect(session.hasImages).toBe(false);
+
+      // Recovery call: history must not contain the failed user push.
+      // The next start messages should be just the new user turn.
+      await session.send('hello again');
+      const messages = chatSessionStart.mock.calls[1][0];
+      expect(messages).toEqual([{ role: 'user', content: 'hello again' }]);
+      expect(session.turns).toBe(1);
+    });
   });
 
   // -------------------------------------------------------------------
@@ -412,6 +483,43 @@ describe('ChatSession', () => {
       expect(chatSessionStart).toHaveBeenCalledTimes(2);
       const [messages] = chatSessionStart.mock.calls[1];
       expect(messages).toEqual([{ role: 'user', content: 'fresh' }]);
+    });
+
+    it('rejects reset() while a send() is in flight', async () => {
+      let resolveFirst: (r: ChatResult) => void = () => {
+        /* overwritten below */
+      };
+      const first = new Promise<ChatResult>((r) => {
+        resolveFirst = r;
+      });
+      const chatSessionStart = vi.fn(async () => first);
+      const model: SessionCapableModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn(async () => makeChatResult('c')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('t')),
+        chatStreamSessionStart: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      const firstPromise = session.send('first');
+      await expect(session.reset()).rejects.toThrow(/cannot reset.*in flight/i);
+
+      resolveFirst(makeChatResult('first'));
+      await firstPromise;
+      expect(session.turns).toBe(1);
+
+      // After the in-flight call completes, reset works again.
+      await session.reset();
+      expect(session.turns).toBe(0);
     });
   });
 

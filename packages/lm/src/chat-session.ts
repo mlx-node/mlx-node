@@ -20,9 +20,9 @@
  *
  *   - An image hash (`lastImagesKey`) tracks the images bound to the
  *     current cache. A `send()` call whose image set has changed
- *     (different bytes, different ordering, or images→no-images)
- *     triggers a full restart: `resetCaches()` → push the new user
- *     message (with images) to history → `chatSessionStart(history)`.
+ *     (different bytes or different ordering) triggers a full
+ *     restart: `resetCaches()` → push the new user message (with
+ *     images) to history → `chatSessionStart(history)`.
  *
  *   - Text-only `send()` on turn >= 1 takes the cheap delta path.
  *
@@ -188,7 +188,7 @@ function computeImagesKey(images: Uint8Array[] | undefined): string | null {
     hi = ((newHi1 << 16) | newHi0) >>> 0;
   }
 
-  // Frame each image with a 4-byte big-endian length prefix so
+  // Frame each image with a 4-byte little-endian length prefix so
   // `[ab, c]` and `[a, bc]` hash to distinct values.
   mix(images.length & 0xff);
   mix((images.length >>> 8) & 0xff);
@@ -210,9 +210,9 @@ function computeImagesKey(images: Uint8Array[] | undefined): string | null {
  * Cross-model chat session. See module docstring for design notes.
  *
  * The generic parameter `M` statically captures the concrete model
- * type (e.g. `Qwen35Model`) so callers preserve IDE autocomplete on
- * `session.model` should they ever need to reach through. Internally
- * the class only uses the `SessionCapableModel` surface.
+ * type so the structural interface stays as expressive as the
+ * concrete one. Internally the class only uses the
+ * `SessionCapableModel` surface.
  */
 export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   private readonly model: M;
@@ -228,9 +228,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   private history: ChatMessage[] = [];
 
   /**
-   * SHA-256 hex key of the image set currently bound to the server's
-   * KV cache. `null` when no images are cached. A `send()` whose new
-   * key differs triggers a full `chatSessionStart` restart.
+   * Hex-encoded byte-identity key of the image set currently bound
+   * to the server's KV cache (FNV-1a 64-bit; see `computeImagesKey`).
+   * `null` when no images are cached. A `send()` whose new key
+   * differs triggers a full `chatSessionStart` restart.
    */
   private lastImagesKey: string | null = null;
 
@@ -427,6 +428,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * though `resetCaches()` is currently synchronous.
    */
   async reset(): Promise<void> {
+    if (this.inFlight) {
+      throw new Error('ChatSession: cannot reset() while a send() is in flight; await the previous call first');
+    }
     this.model.resetCaches();
     this.history = [];
     this.lastImagesKey = null;
@@ -454,8 +458,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   /**
    * Shared start-path logic for `send()`. Handles both the turn-0
    * first-ever-send case and the image-change mid-session restart
-   * case. When restarting, resets caches and rebuilds history from
-   * scratch (with the system prompt prepended if configured).
+   * case. The image-change restart preserves prior history so the
+   * native side gets the full conversation re-rendered with the new
+   * image set.
    */
   private async runStartPath(
     userMessage: string,
@@ -465,18 +470,41 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     isFirstTurn: boolean,
     config: ChatConfig,
   ): Promise<ChatResult> {
+    // Capture pre-state so the restart can be rolled back if the
+    // native call fails. The image-change branch resets caches BEFORE
+    // we know whether the new prefill will succeed, so on failure we
+    // also have to drop turnCount + lastImagesKey to force the next
+    // call to re-route through the start path (rather than a delta
+    // continue against wiped caches).
+    const wasImageChangeRestart = imageChanged && !isFirstTurn;
+    const historyLenBefore = this.history.length;
+
     this.prepareStartPath(imageChanged, isFirstTurn);
     const userMsg = this.buildUserMessage(userMessage, images);
     this.history.push(userMsg);
-    // Pass a shallow snapshot so later pushes to `this.history`
-    // (e.g. the assistant reply below) don't retroactively mutate
-    // what the native side / any mock observed as its `messages`
-    // argument.
-    const result = await this.model.chatSessionStart(this.history.slice(), config);
-    this.history.push({ role: 'assistant', content: result.text });
-    this.turnCount++;
-    this.lastImagesKey = newImagesKey;
-    return result;
+    try {
+      // Pass a shallow snapshot so later pushes to `this.history`
+      // (e.g. the assistant reply below) don't retroactively mutate
+      // what the native side / any mock observed as its `messages`
+      // argument.
+      const result = await this.model.chatSessionStart(this.history.slice(), config);
+      this.history.push({ role: 'assistant', content: result.text });
+      this.turnCount++;
+      this.lastImagesKey = newImagesKey;
+      return result;
+    } catch (err) {
+      // Roll back: drop the tentative user push so history stays
+      // consistent with turnCount.
+      this.history.length = historyLenBefore;
+      if (wasImageChangeRestart) {
+        // Caches were wiped by prepareStartPath() but the new prefill
+        // failed. Force the next call to re-route through the start
+        // path with the (preserved) prior history.
+        this.turnCount = 0;
+        this.lastImagesKey = null;
+      }
+      throw err;
+    }
   }
 
   /** Streaming counterpart to {@link runStartPath}. */
@@ -488,14 +516,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     isFirstTurn: boolean,
     config: ChatConfig,
   ): AsyncGenerator<ChatStreamEvent> {
+    // Capture pre-state so any non-successful exit can roll back.
+    // See `runStartPath` for the full rationale.
+    const wasImageChangeRestart = imageChanged && !isFirstTurn;
+    const historyLenBefore = this.history.length;
+
     this.prepareStartPath(imageChanged, isFirstTurn);
     const userMsg = this.buildUserMessage(userMessage, images);
     // Stage the user message on the pending history BEFORE the
     // stream starts — the native call reads it synchronously via
-    // `model.chatStreamSessionStart(history, config)`. Pop the
-    // tentative push on error so history stays consistent with
-    // turnCount.
-    const pendingUserIdx = this.history.length;
+    // `model.chatStreamSessionStart(history, config)`.
     this.history.push(userMsg);
 
     let sawFinal = false;
@@ -518,8 +548,15 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       }
     } catch (err) {
       // Roll back the tentative user-message push so the next retry
-      // sees a consistent history / turnCount pairing.
-      this.history.length = pendingUserIdx;
+      // sees a consistent history / turnCount pairing. If the wipe
+      // already happened, also drop turnCount + lastImagesKey so the
+      // next call re-routes through the start path with the preserved
+      // prior history.
+      this.history.length = historyLenBefore;
+      if (wasImageChangeRestart) {
+        this.turnCount = 0;
+        this.lastImagesKey = null;
+      }
       throw err;
     }
 
@@ -530,8 +567,13 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     } else {
       // Caller broke mid-stream or final chunk had finishReason=error.
       // Drop the tentative user push so the next call re-routes
-      // through the start path with a clean slate.
-      this.history.length = pendingUserIdx;
+      // through the start path with a clean slate. If the wipe
+      // already happened, also drop turnCount + lastImagesKey.
+      this.history.length = historyLenBefore;
+      if (wasImageChangeRestart) {
+        this.turnCount = 0;
+        this.lastImagesKey = null;
+      }
     }
   }
 
