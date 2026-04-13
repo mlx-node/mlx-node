@@ -4,17 +4,175 @@
 //! across both model variants: config extraction, penalty application,
 //! performance metrics, result finalization, and cache management.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
+use crate::model_thread::StreamTx;
 use crate::sampling::{
     SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
 };
-use crate::tokenizer::Qwen3Tokenizer;
+use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 use crate::tools;
 
 use super::layer_cache::Qwen3_5LayerCache;
-use super::model::{ChatConfig, ChatResult};
+use super::model::{ChatConfig, ChatResult, ChatStreamChunk};
+
+/// Load-bearing typed error prefix used when `chat_session_continue_sync`
+/// rejects an image parameter because images are changing mid-session.
+///
+/// Wire contract: when the Rust session-continue path detects that the
+/// caller is trying to switch the active image set after a session has
+/// already been initialized with different images, it returns a
+/// `napi::Error` whose message begins with this prefix. The TypeScript
+/// session layer pattern-matches the prefix to recognize the condition
+/// and trigger an image-change restart (tearing down the old session
+/// state and re-entering the `chat_session_start` path).
+///
+/// Because TS matches on the literal prefix, this constant MUST NOT
+/// change without a coordinated update on both sides of the NAPI
+/// boundary.
+///
+/// Introduced as part of the chat_common helper promotion; wired up by
+/// later session-refactor steps, so `#[allow(dead_code)]` until then.
+#[allow(dead_code)]
+pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESSION_RESTART:";
+
+/// Hash raw image bytes to a u64 key for cache lookup.
+pub(crate) fn hash_image_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Combine individual image hashes into a single cache key.
+/// Order matters: different orderings of the same images produce different keys.
+pub(crate) fn combine_image_hashes(hashes: &[u64]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for h in hashes {
+        h.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Compute a combined cache key from raw image bytes.
+pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
+    let individual_hashes: Vec<u64> = all_images.iter().map(|img| hash_image_bytes(img)).collect();
+    combine_image_hashes(&individual_hashes)
+}
+
+/// Report a guard-violation error through the stream channel.
+///
+/// Used by the streaming session entry points (`chat_stream_session_*`
+/// and `chat_stream_tokens_delta_sync`) to surface pre-decode guard
+/// failures — text-only violations, missing tokenizer special tokens,
+/// reuse_cache=false, empty delta, etc.
+///
+/// Sends an `Err(napi::Error::from_reason(message))` item into the
+/// mpsc so the NAPI forwarding task invokes the TS callback with
+/// `(err, null)`. On the TS side, `_runChatStream` pushes the error
+/// onto its queue and throws it from the async generator, which
+/// `Qwen35Session.sendStream` catches in its `try { ... } finally`
+/// block. The finally clears `inFlight`, `sawFinal` stays false, and
+/// `turnCount` is NOT incremented — so the next `sendStream()` call
+/// re-routes through `chatStreamSessionStart` instead of trying to
+/// continue a session that never initialized. The exception also
+/// re-throws to the caller so the failure is observable.
+///
+/// Important: historically this helper emitted a fake `done: true`
+/// `ChatStreamChunk` with `finish_reason: "error"`, which the TS side
+/// treated as a successful final chunk and caused the session to
+/// advance to a bricked turn 1. Do NOT reintroduce that pattern —
+/// guard failures MUST come through as `Err` so the error path is
+/// exercised.
+pub(crate) fn send_stream_error(stream_tx: &StreamTx<ChatStreamChunk>, message: &str) {
+    let _ = stream_tx.send(Err(napi::Error::from_reason(message.to_string())));
+}
+
+/// Build a synthetic `ChatMessage` wrapping a user-role text-only message.
+///
+/// Used by the session-continue paths to feed a single user turn through
+/// `Qwen3Tokenizer::sanitize_messages_public` without leaking any of the
+/// extended optional fields (tool calls, images, etc.) that a real client
+/// request might carry. Those fields are deliberately set to `None` so
+/// the sanitization pass only has to police the textual `content` field.
+pub(crate) fn build_synthetic_user_message(user: &str) -> ChatMessage {
+    ChatMessage {
+        role: "user".to_string(),
+        content: user.to_string(),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+        images: None,
+    }
+}
+
+/// Build the ChatML wire-format delta text for a session-continue turn.
+///
+/// The cached history ends on `<|im_end|>` (because `chat_session_start_sync`
+/// uses `im_end_id` as eos). The leading `\n` closes that turn's line; then
+/// we open a new user turn and prime an assistant turn.
+///
+/// When thinking mode is explicitly enabled (`reasoning_effort ∈ {"medium",
+/// "high"}`) or left as default, the Qwen3.5 jinja template inserts
+/// `<think>\n` after the assistant prelude — mirror that here so the delta
+/// stays template-equivalent. When thinking is explicitly disabled
+/// (`Some(false)`), omit the prefix so the first generated token is a
+/// plain content token.
+///
+/// `sanitized_user` MUST already be passed through
+/// `Qwen3Tokenizer::sanitize_messages_public` by the caller — this helper
+/// does not re-sanitize.
+pub(crate) fn build_chatml_continue_delta_text(
+    sanitized_user: &str,
+    enable_thinking: Option<bool>,
+) -> String {
+    let thinking_prefix = match enable_thinking {
+        Some(false) => "",
+        // None = template default (Qwen3.5: thinking on) and
+        // Some(true) both take the thinking path.
+        _ => "<think>\n",
+    };
+    format!(
+        "\n<|im_start|>user\n{sanitized_user}<|im_end|>\n<|im_start|>assistant\n{thinking_prefix}",
+    )
+}
+
+/// Build the ChatML wire-format delta text for a tool-result turn.
+///
+/// Qwen3.5's chat template renders tool-role messages as a `user` turn
+/// wrapping the tool result in `<tool_response>` tags:
+///
+/// ```text
+/// <|im_start|>user
+/// <tool_response>
+/// {content}
+/// </tool_response><|im_end|>
+/// ```
+///
+/// The `tool_call_id` is NOT rendered anywhere by the template — Qwen
+/// identifies tool responses purely by position and wrapper tags, so we
+/// intentionally drop it here. Callers may still log it for their own
+/// bookkeeping, but it does not enter the wire format.
+///
+/// Like `build_chatml_continue_delta_text`, this helper assumes the cached
+/// history ends on `<|im_end|>` and emits a leading `\n` to close that
+/// turn's line. After the tool response we open an assistant turn ready
+/// for the next generation step. Thinking-prefix handling is intentionally
+/// omitted here: a tool-result continuation by definition follows an
+/// assistant turn that just emitted tool calls, and the model is expected
+/// to resume normal content generation (not re-enter a fresh `<think>`
+/// block) for the tool reply.
+///
+/// Introduced as part of the chat_common helper promotion; wired up by
+/// later session-refactor steps, so `#[allow(dead_code)]` until then.
+#[allow(dead_code)]
+pub(crate) fn build_chatml_tool_delta_text(_tool_call_id: &str, content: &str) -> String {
+    format!(
+        "\n<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n<|im_start|>assistant\n",
+    )
+}
 
 /// Extracted chat parameters with defaults applied.
 pub(crate) struct ChatParams {

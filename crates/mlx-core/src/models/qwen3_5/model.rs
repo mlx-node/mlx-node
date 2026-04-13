@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -18,8 +17,9 @@ use crate::tools::ToolCallResult;
 
 use super::chat_common;
 use super::chat_common::{
-    apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
-    save_cache_state_direct, verify_cache_prefix_direct,
+    apply_all_penalties, build_chatml_continue_delta_text, build_synthetic_user_message,
+    compute_image_cache_key, compute_performance_metrics, extract_chat_params,
+    finalize_chat_result, save_cache_state_direct, send_stream_error, verify_cache_prefix_direct,
 };
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
@@ -40,29 +40,6 @@ pub(crate) struct VisionCacheInner {
 }
 
 pub(crate) type VisionCache = Arc<Mutex<VisionCacheInner>>;
-
-/// Hash raw image bytes to a u64 key for cache lookup.
-pub(crate) fn hash_image_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Combine individual image hashes into a single cache key.
-/// Order matters: different orderings of the same images produce different keys.
-pub(crate) fn combine_image_hashes(hashes: &[u64]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    for h in hashes {
-        h.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-/// Compute a combined cache key from raw image bytes.
-pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
-    let individual_hashes: Vec<u64> = all_images.iter().map(|img| hash_image_bytes(img)).collect();
-    combine_image_hashes(&individual_hashes)
-}
 
 /// Monotonically incrementing counter for assigning unique model IDs.
 /// Shared by BOTH dense and MoE models — the C++ weight map is shared,
@@ -1423,37 +1400,15 @@ impl Qwen35Inner {
         // the same role/content injection protection as the legacy path.
         // The delta is text-only — images are stripped here anyway because
         // they are never valid on the session continue path.
-        let synthetic = ChatMessage {
-            role: "user".to_string(),
-            content: user_message,
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            images: None,
-        };
+        let synthetic = build_synthetic_user_message(&user_message);
         let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
         let sanitized_user = &sanitized[0].content;
 
-        // Build the delta in ChatML wire format. The cached history ends on
-        // `<|im_end|>` (because `chat_session_start_sync` uses `im_end_id`
-        // as eos). The leading `\n` closes that turn's line; then we open a
-        // new user turn and prime an assistant turn. When thinking mode is
-        // explicitly enabled (reasoning_effort ∈ {"medium","high"}) or left
-        // as default, the Qwen3.5 jinja template inserts `<think>\n` after
-        // the assistant prelude — mirror that here so the delta stays
-        // template-equivalent. When thinking is explicitly disabled, omit
-        // the prefix so the first generated token is a plain content token.
+        // Build the delta in ChatML wire format. See
+        // `chat_common::build_chatml_continue_delta_text` for the exact
+        // wire format and thinking-prefix semantics.
         let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let thinking_prefix = match enable_thinking {
-            Some(false) => "",
-            // None = template default (Qwen3.5: thinking on) and
-            // Some(true) both take the thinking path.
-            _ => "<think>\n",
-        };
-
-        let delta_text = format!(
-            "\n<|im_start|>user\n{sanitized_user}<|im_end|>\n<|im_start|>assistant\n{thinking_prefix}",
-        );
+        let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
 
         // `add_special_tokens: Some(false)` — we do NOT want the tokenizer
         // auto-prepending BOS. The delta is already a raw ChatML snippet.
@@ -1851,26 +1806,12 @@ impl Qwen35Inner {
         // Sanitize the user message the same way chat_session_continue_sync
         // does so the streaming path is subject to the same role/content
         // injection protection.
-        let synthetic = ChatMessage {
-            role: "user".to_string(),
-            content: user_message,
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            images: None,
-        };
+        let synthetic = build_synthetic_user_message(&user_message);
         let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
         let sanitized_user = &sanitized[0].content;
 
         let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let thinking_prefix = match enable_thinking {
-            Some(false) => "",
-            _ => "<think>\n",
-        };
-
-        let delta_text = format!(
-            "\n<|im_start|>user\n{sanitized_user}<|im_end|>\n<|im_start|>assistant\n{thinking_prefix}",
-        );
+        let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
 
         let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
             Ok(t) => t,
@@ -4222,34 +4163,6 @@ impl StreamSender {
     fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
         let _ = self.0.send(result);
     }
-}
-
-/// Report a guard-violation error through the stream channel.
-///
-/// Used by the streaming session entry points (`chat_stream_session_*`
-/// and `chat_stream_tokens_delta_sync`) to surface pre-decode guard
-/// failures — text-only violations, missing tokenizer special tokens,
-/// reuse_cache=false, empty delta, etc.
-///
-/// Sends an `Err(napi::Error::from_reason(message))` item into the
-/// mpsc so the NAPI forwarding task invokes the TS callback with
-/// `(err, null)`. On the TS side, `_runChatStream` pushes the error
-/// onto its queue and throws it from the async generator, which
-/// `Qwen35Session.sendStream` catches in its `try { ... } finally`
-/// block. The finally clears `inFlight`, `sawFinal` stays false, and
-/// `turnCount` is NOT incremented — so the next `sendStream()` call
-/// re-routes through `chatStreamSessionStart` instead of trying to
-/// continue a session that never initialized. The exception also
-/// re-throws to the caller so the failure is observable.
-///
-/// Important: historically this helper emitted a fake `done: true`
-/// `ChatStreamChunk` with `finish_reason: "error"`, which the TS side
-/// treated as a successful final chunk and caused the session to
-/// advance to a bricked turn 1. Do NOT reintroduce that pattern —
-/// guard failures MUST come through as `Err` so the error path is
-/// exercised.
-fn send_stream_error(stream_tx: &StreamTx<ChatStreamChunk>, message: &str) {
-    let _ = stream_tx.send(Err(napi::Error::from_reason(message.to_string())));
 }
 
 /// RAII guard that calls `mlx_qwen35_compiled_reset()` on drop.

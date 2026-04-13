@@ -11,8 +11,8 @@ use crate::model_thread::{ResponseTx, StreamTx};
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
     ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle, VisionCache, VisionCacheInner,
-    compute_image_cache_key, compute_num_image_tokens, extract_images_from_messages,
-    inject_image_placeholders, vlm_prepare_vision_features,
+    compute_num_image_tokens, extract_images_from_messages, inject_image_placeholders,
+    vlm_prepare_vision_features,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
@@ -26,8 +26,8 @@ use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
 use crate::models::qwen3_5::chat_common;
 use crate::models::qwen3_5::chat_common::{
-    apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
-    save_cache_state_direct, verify_cache_prefix_direct,
+    apply_all_penalties, compute_image_cache_key, compute_performance_metrics, extract_chat_params,
+    finalize_chat_result, save_cache_state_direct, verify_cache_prefix_direct,
 };
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
