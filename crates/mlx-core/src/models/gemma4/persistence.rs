@@ -14,7 +14,6 @@ use crate::models::qwen3_5::persistence_common::{
 use crate::tokenizer::Qwen3Tokenizer;
 
 use super::config::Gemma4Config;
-use super::image_processor::Gemma4ImageProcessor;
 use super::model::{Gemma4Inner, Gemma4Model, warmup_forward};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, is_mxfp8_checkpoint, is_quantized_checkpoint,
@@ -1222,26 +1221,20 @@ impl Gemma4Model {
             move || {
                 let inner = Gemma4Inner::load_from_dir(&model_path)?;
                 let model_id = inner.model_id;
-                let image_processor = inner.image_processor.as_ref().map(|ip| {
-                    Gemma4ImageProcessor::new(
-                        ip.patch_size,
-                        ip.max_soft_tokens,
-                        ip.pooling_kernel_size,
-                    )
-                });
-                Ok((inner, (model_id, image_processor)))
+                let has_vision = inner.image_processor.is_some();
+                Ok((inner, (model_id, has_vision)))
             },
             super::model::handle_gemma4_cmd,
         );
 
-        let (model_id, image_processor) = init_rx
+        let (model_id, has_vision) = init_rx
             .await
             .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
         Ok(Gemma4Model {
             thread,
             model_id,
-            image_processor,
+            has_vision,
         })
     }
 }

@@ -135,21 +135,44 @@ pub(crate) struct Gemma4Inner {
     pub(crate) embed_vision: Option<Gemma4MultimodalEmbedder>,
     pub(crate) image_processor: Option<Gemma4ImageProcessor>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    /// Lazily-initialized KV caches that persist across chat turns.
+    ///
+    /// `None` after construction and after `reset_caches_sync`. Populated on
+    /// the first call to `init_caches_sync`, which is triggered lazily by
+    /// `chat_sync_core` / `chat_stream_sync_core` on the first turn of a
+    /// session. Step 5c will use this state to implement the session API
+    /// methods (`chat_session_start_sync`, `chat_session_continue_sync`,
+    /// etc.) that share a live cache across turns.
+    pub(crate) caches: Option<Vec<Gemma4LayerCache>>,
+    /// Tokens (post image-expansion) whose KV state is currently live in
+    /// `caches`. Maintained in parallel with `caches` for prefix-reuse
+    /// verification in Step 5c. Empty when no session is active.
+    pub(crate) cached_token_history: Vec<u32>,
+    /// Content hash of the image set associated with the live cache. Used
+    /// in Step 5c to detect mid-session image changes (which require a
+    /// full session restart). `None` when no session is active or the
+    /// session is text-only.
+    pub(crate) cached_image_key: Option<u64>,
     pub(crate) model_id: u64,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
+///
+/// Images ride along inside `ChatMessage.images` (`Vec<Uint8Array>`) and are
+/// decoded by the Gemma4 image processor on the model thread inside
+/// `chat_sync_core` / `chat_stream_sync_core`. napi-rs's `Uint8Array` has
+/// an `unsafe impl Send`, so it's safe to cross thread boundaries in the
+/// command channel. See Step 5b of the chat-session refactor for why image
+/// processing moved off the NAPI thread.
 pub(crate) enum Gemma4Cmd {
     Chat {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        processed_images: Vec<ProcessedGemma4Image>,
         reply: ResponseTx<ChatResult>,
     },
     ChatStream {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        processed_images: Vec<ProcessedGemma4Image>,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     },
@@ -167,7 +190,11 @@ pub(crate) enum Gemma4Cmd {
 pub struct Gemma4Model {
     pub(crate) thread: crate::model_thread::ModelThread<Gemma4Cmd>,
     pub(crate) model_id: u64,
-    pub(crate) image_processor: Option<Gemma4ImageProcessor>,
+    /// Whether the loaded config includes `vision_config`. Mirrored here so
+    /// the NAPI side can fail fast on image inputs to a text-only model
+    /// without round-tripping to the model thread. The actual image
+    /// processor lives on `Gemma4Inner` and runs on the model thread.
+    pub(crate) has_vision: bool,
 }
 
 static MODEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -258,8 +285,60 @@ impl Gemma4Inner {
             embed_vision,
             image_processor,
             tokenizer: None,
+            caches: None,
+            cached_token_history: Vec::new(),
+            cached_image_key: None,
             model_id,
         })
+    }
+
+    /// Initialize the per-turn KV caches in-place.
+    ///
+    /// Called lazily by `chat_sync_core` / `chat_stream_sync_core` on the
+    /// first turn of a session (or whenever `self.caches` is `None` because a
+    /// previous `reset_caches_sync` wiped them). Subsequent turns reuse the
+    /// already-populated cache in-place.
+    ///
+    /// Layer-type routing mirrors the free `init_caches_for_config` used
+    /// by `warmup_forward`: global layers get `KVCache`, sliding layers get
+    /// `RotatingKVCache` with `config.sliding_window`.
+    pub(crate) fn init_caches_sync(&mut self) -> Result<()> {
+        let caches = (0..self.config.num_hidden_layers as usize)
+            .map(|i| {
+                if self.config.is_global_layer(i) {
+                    Gemma4LayerCache::new_global()
+                } else {
+                    Gemma4LayerCache::new_sliding(self.config.sliding_window)
+                }
+            })
+            .collect();
+        self.caches = Some(caches);
+        self.clear_reuse_state();
+        Ok(())
+    }
+
+    /// Drop the live KV caches and clear reuse-tracking state.
+    ///
+    /// `Gemma4LayerCache` has no `reset()` (the inner `KVCache` /
+    /// `RotatingKVCache` don't expose one here), so this simply takes the
+    /// Vec and lets the next `init_caches_sync` rebuild. Cleared reuse
+    /// state ensures a subsequent chat turn can't mistakenly claim a cache
+    /// prefix hit against stale history.
+    ///
+    /// Currently only called by Step 5c's session API (not yet wired),
+    /// hence the allow(dead_code).
+    #[allow(dead_code)]
+    pub(crate) fn reset_caches_sync(&mut self) -> Result<()> {
+        self.caches = None;
+        self.clear_reuse_state();
+        Ok(())
+    }
+
+    /// Clear cached token history and image key. Called from both
+    /// `init_caches_sync` and `reset_caches_sync`.
+    fn clear_reuse_state(&mut self) {
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
     }
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
@@ -281,11 +360,29 @@ impl Gemma4Inner {
     /// `thinking_token_budget`, `include_reasoning`, `report_performance`,
     /// `reuse_cache`. (`report_performance` and `reuse_cache` become supported
     /// in Steps 5b and 5c of the chat-session refactor.)
-    fn chat_sync(
+    pub(crate) fn chat_sync(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        processed_images: Vec<ProcessedGemma4Image>,
+    ) -> Result<ChatResult> {
+        self.chat_sync_core(messages, config, None)
+    }
+
+    /// Core implementation of `chat_sync` and (in Step 5c) the session-start
+    /// variants.
+    ///
+    /// `eos_override`:
+    ///   - `None` (passed by `chat_sync`): stop on any of
+    ///     `config.eos_token_ids` (matches legacy behaviour exactly).
+    ///   - `Some(id)` (will be used by `chat_session_start_sync` in 5c):
+    ///     stop on `id` OR any of `config.eos_token_ids`, so the cached
+    ///     history ends on a caller-controlled boundary (typically a
+    ///     turn-terminator token).
+    pub(crate) fn chat_sync_core(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        eos_override: Option<u32>,
     ) -> Result<ChatResult> {
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
 
@@ -293,6 +390,27 @@ impl Gemma4Inner {
             .tokenizer
             .clone()
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+
+        // Decode images on the model thread. `ChatMessage.images` is a
+        // `Vec<Uint8Array>` which is `Send` via napi-rs's `unsafe impl`,
+        // so we can cross the thread boundary inside `Gemma4Cmd::Chat`
+        // and do the image decode + resize + patching here instead of
+        // duplicating the processor on the NAPI side.
+        let raw_images = extract_images_from_messages(&messages);
+        let processed_images: Vec<ProcessedGemma4Image> = if raw_images.is_empty() {
+            Vec::new()
+        } else {
+            let ip = self.image_processor.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "Images provided but model has no vision support (no vision_config in config.json)",
+                )
+            })?;
+            let mut out = Vec::with_capacity(raw_images.len());
+            for bytes in &raw_images {
+                out.push(ip.process_bytes(bytes)?);
+            }
+            out
+        };
 
         let has_images = !processed_images.is_empty();
         let sampling_config = make_sampling_config(&config, &self.config);
@@ -376,8 +494,12 @@ impl Gemma4Inner {
         let token_arr: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let prompt = MxArray::from_int32(&token_arr, &[1, tokens.len() as i64])?;
 
-        // Initialize caches
-        let mut caches = init_caches_for_config(&self.config);
+        // Lazily initialize the persistent KV caches on the first turn.
+        // Subsequent turns reuse `self.caches` in place. Step 5c wires
+        // the session-reset and prefix-verification paths on top of this.
+        if self.caches.is_none() {
+            self.init_caches_sync()?;
+        }
 
         // Create dedicated generation stream for GPU scheduling.
         let generation_stream = Stream::new(DeviceType::Gpu);
@@ -453,8 +575,16 @@ impl Gemma4Inner {
         // Prefill: process tokens [0:N-1] through body only (no lm_head),
         // then run last token through full forward to get logits.
         // Matches mlx-lm generate_step pattern.
+        //
+        // `self.caches` was populated by the lazy-init block above, so the
+        // expect cannot fire — kept defensive for the (impossible) future
+        // where init_caches_sync silently no-ops.
         {
             let _stream_ctx = StreamContext::new(generation_stream);
+            let caches = self
+                .caches
+                .as_mut()
+                .expect("caches populated by init_caches_sync above");
             if let Some(ref embeds) = vision_embeds {
                 // Vision path: prefill with merged embeddings
                 prefill_body_gemma4_with_embeds(
@@ -462,7 +592,7 @@ impl Gemma4Inner {
                     embeds,
                     &self.embed_tokens,
                     &self.layers,
-                    &mut caches,
+                    caches,
                     &self.final_norm,
                     self.ple.as_ref(),
                     &self.config,
@@ -473,24 +603,32 @@ impl Gemma4Inner {
                     &prompt,
                     &self.embed_tokens,
                     &self.layers,
-                    &mut caches,
+                    caches,
                     &self.final_norm,
                     self.ple.as_ref(),
                     &self.config,
                 )?;
             }
         }
-        eval_gemma4_caches(&caches);
+        eval_gemma4_caches(
+            self.caches
+                .as_ref()
+                .expect("caches populated by init_caches_sync above"),
+        );
 
         // Last token → logits
         let last_token = prompt.slice_axis(1, tokens.len() as i64 - 1, tokens.len() as i64)?;
         let logits = {
             let _stream_ctx = StreamContext::new(generation_stream);
+            let caches = self
+                .caches
+                .as_mut()
+                .expect("caches populated by init_caches_sync above");
             forward_inner(
                 &last_token,
                 &self.embed_tokens,
                 &self.layers,
-                &mut caches,
+                caches,
                 &self.final_norm,
                 &self.lm_head,
                 self.embed_weight_t.as_ref(),
@@ -501,7 +639,11 @@ impl Gemma4Inner {
         let logits = logits.squeeze(Some(&[1]))?;
         let y = sample_next_token(&logits, sampling_config)?;
         y.eval();
-        eval_gemma4_caches(&caches);
+        eval_gemma4_caches(
+            self.caches
+                .as_ref()
+                .expect("caches populated by init_caches_sync above"),
+        );
 
         // Mark first token time (TTFT = time to first token)
         let first_token_instant = std::time::Instant::now();
@@ -522,8 +664,12 @@ impl Gemma4Inner {
         if use_compiled {
             // Legacy compiled C++ path (opt-in via GEMMA4_USE_COMPILE=1)
             let _compiled_guard = COMPILED_FORWARD_MUTEX.lock().unwrap();
-            let mut cache_arrays_owned: Vec<MxArray> = Vec::with_capacity(caches.len() * 2);
-            for (layer_idx, cache) in caches.iter().enumerate() {
+            let caches_ref = self
+                .caches
+                .as_ref()
+                .expect("caches populated by init_caches_sync above");
+            let mut cache_arrays_owned: Vec<MxArray> = Vec::with_capacity(caches_ref.len() * 2);
+            for (layer_idx, cache) in caches_ref.iter().enumerate() {
                 let (k, v) = cache.get_cached_kv().ok_or_else(|| {
                     Error::from_reason(format!(
                         "Compiled Gemma4 decode expected cache for layer {} after prefill",
@@ -593,7 +739,7 @@ impl Gemma4Inner {
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
-                if eos_ids.contains(&(token_id as i32)) {
+                if is_eos_token(token_id, &eos_ids, eos_override) {
                     finish_reason = "stop".to_string();
                     break;
                 }
@@ -624,13 +770,17 @@ impl Gemma4Inner {
             for step in 0..max_new_tokens {
                 let next_y = if step + 1 < max_new_tokens {
                     let _stream_ctx = StreamContext::new(generation_stream);
+                    let caches = self
+                        .caches
+                        .as_mut()
+                        .expect("caches populated by init_caches_sync above");
 
                     let next_ids = current_y.reshape(&[1, 1])?;
                     let logits = forward_inner(
                         &next_ids,
                         &self.embed_tokens,
                         &self.layers,
-                        &mut caches,
+                        caches,
                         &self.final_norm,
                         &self.lm_head,
                         self.embed_weight_t.as_ref(),
@@ -648,7 +798,7 @@ impl Gemma4Inner {
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
-                if eos_ids.contains(&(token_id as i32)) {
+                if is_eos_token(token_id, &eos_ids, eos_override) {
                     finish_reason = "stop".to_string();
                     break;
                 }
@@ -730,25 +880,31 @@ impl Gemma4Inner {
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        processed_images: Vec<ProcessedGemma4Image>,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     ) {
         let cb = StreamSender(stream_tx.clone());
-        let result =
-            self.chat_stream_sync_inner(messages, config, processed_images, &cb, &cancelled);
+        let result = self.chat_stream_sync_core(messages, config, &cb, &cancelled, None);
         if let Err(e) = result {
             let _ = stream_tx.send(Err(e));
         }
     }
 
-    fn chat_stream_sync_inner(
+    /// Core implementation of `chat_stream_sync` and (in Step 5c) the
+    /// streaming session-start variant.
+    ///
+    /// `eos_override`:
+    ///   - `None` (passed by `chat_stream_sync`): stop on any of
+    ///     `config.eos_token_ids` (matches legacy behaviour exactly).
+    ///   - `Some(id)` (will be used by `chat_stream_session_start_sync` in 5c):
+    ///     stop on `id` OR any of `config.eos_token_ids`.
+    fn chat_stream_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        processed_images: Vec<ProcessedGemma4Image>,
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
+        eos_override: Option<u32>,
     ) -> Result<()> {
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
 
@@ -756,6 +912,24 @@ impl Gemma4Inner {
             .tokenizer
             .clone()
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+
+        // Decode images on the model thread. See `chat_sync_core` for the
+        // same pattern and why this lives here instead of the NAPI side.
+        let raw_images = extract_images_from_messages(&messages);
+        let processed_images: Vec<ProcessedGemma4Image> = if raw_images.is_empty() {
+            Vec::new()
+        } else {
+            let ip = self.image_processor.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "Images provided but model has no vision support (no vision_config in config.json)",
+                )
+            })?;
+            let mut out = Vec::with_capacity(raw_images.len());
+            for bytes in &raw_images {
+                out.push(ip.process_bytes(bytes)?);
+            }
+            out
+        };
 
         let has_images = !processed_images.is_empty();
         let sampling_config = make_sampling_config(&config, &self.config);
@@ -817,7 +991,12 @@ impl Gemma4Inner {
         let token_arr: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let prompt = MxArray::from_int32(&token_arr, &[1, tokens.len() as i64])?;
 
-        let mut caches = init_caches_for_config(&self.config);
+        // Lazily initialize the persistent KV caches on the first turn.
+        // Subsequent turns reuse `self.caches` in place.
+        if self.caches.is_none() {
+            self.init_caches_sync()?;
+        }
+
         let generation_stream = Stream::new(DeviceType::Gpu);
         let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
 
@@ -873,13 +1052,17 @@ impl Gemma4Inner {
 
         {
             let _stream_ctx = StreamContext::new(generation_stream);
+            let caches = self
+                .caches
+                .as_mut()
+                .expect("caches populated by init_caches_sync above");
             if let Some(ref embeds) = vision_embeds {
                 prefill_body_gemma4_with_embeds(
                     &prompt,
                     embeds,
                     &self.embed_tokens,
                     &self.layers,
-                    &mut caches,
+                    caches,
                     &self.final_norm,
                     self.ple.as_ref(),
                     &self.config,
@@ -889,23 +1072,31 @@ impl Gemma4Inner {
                     &prompt,
                     &self.embed_tokens,
                     &self.layers,
-                    &mut caches,
+                    caches,
                     &self.final_norm,
                     self.ple.as_ref(),
                     &self.config,
                 )?;
             }
         }
-        eval_gemma4_caches(&caches);
+        eval_gemma4_caches(
+            self.caches
+                .as_ref()
+                .expect("caches populated by init_caches_sync above"),
+        );
 
         let last_token = prompt.slice_axis(1, tokens.len() as i64 - 1, tokens.len() as i64)?;
         let logits = {
             let _stream_ctx = StreamContext::new(generation_stream);
+            let caches = self
+                .caches
+                .as_mut()
+                .expect("caches populated by init_caches_sync above");
             forward_inner(
                 &last_token,
                 &self.embed_tokens,
                 &self.layers,
-                &mut caches,
+                caches,
                 &self.final_norm,
                 &self.lm_head,
                 self.embed_weight_t.as_ref(),
@@ -916,7 +1107,11 @@ impl Gemma4Inner {
         let logits = logits.squeeze(Some(&[1]))?;
         let y = sample_next_token(&logits, sampling_config)?;
         y.eval();
-        eval_gemma4_caches(&caches);
+        eval_gemma4_caches(
+            self.caches
+                .as_ref()
+                .expect("caches populated by init_caches_sync above"),
+        );
 
         let first_token_instant = std::time::Instant::now();
         let mut generated_tokens: Vec<u32> = Vec::new();
@@ -931,8 +1126,12 @@ impl Gemma4Inner {
 
         if use_compiled {
             let _compiled_guard = COMPILED_FORWARD_MUTEX.lock().unwrap();
-            let mut cache_arrays_owned: Vec<MxArray> = Vec::with_capacity(caches.len() * 2);
-            for (layer_idx, cache) in caches.iter().enumerate() {
+            let caches_ref = self
+                .caches
+                .as_ref()
+                .expect("caches populated by init_caches_sync above");
+            let mut cache_arrays_owned: Vec<MxArray> = Vec::with_capacity(caches_ref.len() * 2);
+            for (layer_idx, cache) in caches_ref.iter().enumerate() {
                 let (k, v) = cache.get_cached_kv().ok_or_else(|| {
                     Error::from_reason(format!(
                         "Compiled Gemma4 decode expected cache for layer {}",
@@ -1031,7 +1230,7 @@ impl Gemma4Inner {
                     ThreadsafeFunctionCallMode::NonBlocking,
                 );
 
-                if eos_ids.contains(&(token_id as i32)) {
+                if is_eos_token(token_id, &eos_ids, eos_override) {
                     finish_reason = "stop".to_string();
                     break;
                 }
@@ -1052,12 +1251,16 @@ impl Gemma4Inner {
             for step in 0..max_new_tokens {
                 let next_y = if step + 1 < max_new_tokens {
                     let _stream_ctx = StreamContext::new(generation_stream);
+                    let caches = self
+                        .caches
+                        .as_mut()
+                        .expect("caches populated by init_caches_sync above");
                     let next_ids = current_y.reshape(&[1, 1])?;
                     let logits = forward_inner(
                         &next_ids,
                         &self.embed_tokens,
                         &self.layers,
-                        &mut caches,
+                        caches,
                         &self.final_norm,
                         &self.lm_head,
                         self.embed_weight_t.as_ref(),
@@ -1106,7 +1309,7 @@ impl Gemma4Inner {
                     ThreadsafeFunctionCallMode::NonBlocking,
                 );
 
-                if eos_ids.contains(&(token_id as i32)) {
+                if is_eos_token(token_id, &eos_ids, eos_override) {
                     finish_reason = "stop".to_string();
                     break;
                 }
@@ -1198,20 +1401,18 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
         Gemma4Cmd::Chat {
             messages,
             config,
-            processed_images,
             reply,
         } => {
-            let result = inner.chat_sync(messages, config, processed_images);
+            let result = inner.chat_sync(messages, config);
             let _ = reply.send(result);
         }
         Gemma4Cmd::ChatStream {
             messages,
             config,
-            processed_images,
             stream_tx,
             cancelled,
         } => {
-            inner.chat_stream_sync(messages, config, processed_images, stream_tx, cancelled);
+            inner.chat_stream_sync(messages, config, stream_tx, cancelled);
         }
     }
 }
@@ -1220,13 +1421,7 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
 impl Gemma4Model {
     #[napi(constructor)]
     pub fn new(config: Gemma4Config) -> Result<Self> {
-        let image_processor = config.vision_config.as_ref().map(|vc| {
-            Gemma4ImageProcessor::new(
-                vc.patch_size,
-                vc.default_output_length,
-                vc.pooling_kernel_size,
-            )
-        });
+        let has_vision = config.vision_config.is_some();
 
         let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
             move || {
@@ -1244,7 +1439,7 @@ impl Gemma4Model {
         Ok(Self {
             thread,
             model_id,
-            image_processor,
+            has_vision,
         })
     }
 
@@ -1268,27 +1463,21 @@ impl Gemma4Model {
     ) -> Result<ChatResult> {
         let config = config.unwrap_or_default();
 
-        // Process images before sending command (Uint8Array is !Send)
-        let all_images = extract_images_from_messages(&messages);
-        let processed_images = if !all_images.is_empty() {
-            let ip = self.image_processor.as_ref().ok_or_else(|| {
-                Error::from_reason(
-                    "Images provided but model has no vision support (no vision_config in config.json)",
-                )
-            })?;
-            let mut results = Vec::with_capacity(all_images.len());
-            for img_bytes in &all_images {
-                results.push(ip.process_bytes(img_bytes)?);
-            }
-            results
-        } else {
-            Vec::new()
-        };
+        // Fast-fail: if images provided but model has no vision support.
+        // Actual image processing happens on the model thread inside chat_sync_core.
+        if !self.has_vision
+            && messages
+                .iter()
+                .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
+        {
+            return Err(Error::from_reason(
+                "Images provided but model has no vision support (no vision_config in config.json)",
+            ));
+        }
 
         crate::model_thread::send_and_await(&self.thread, |reply| Gemma4Cmd::Chat {
             messages,
             config,
-            processed_images,
             reply,
         })
         .await
@@ -1306,22 +1495,17 @@ impl Gemma4Model {
     ) -> Result<ChatStreamHandle> {
         let config = config.unwrap_or_default();
 
-        // Process images before sending command
-        let all_images = extract_images_from_messages(&messages);
-        let processed_images = if !all_images.is_empty() {
-            let ip = self.image_processor.as_ref().ok_or_else(|| {
-                Error::from_reason(
-                    "Images provided but model has no vision support (no vision_config in config.json)",
-                )
-            })?;
-            let mut results = Vec::with_capacity(all_images.len());
-            for img_bytes in &all_images {
-                results.push(ip.process_bytes(img_bytes)?);
-            }
-            results
-        } else {
-            Vec::new()
-        };
+        // Fast-fail: if images provided but model has no vision support.
+        // Actual image processing happens on the model thread inside chat_stream_sync_core.
+        if !self.has_vision
+            && messages
+                .iter()
+                .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
+        {
+            return Err(Error::from_reason(
+                "Images provided but model has no vision support (no vision_config in config.json)",
+            ));
+        }
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
@@ -1332,7 +1516,6 @@ impl Gemma4Model {
         self.thread.send(Gemma4Cmd::ChatStream {
             messages,
             config,
-            processed_images,
             stream_tx,
             cancelled: cancelled_inner,
         })?;
@@ -1417,6 +1600,13 @@ pub(crate) fn warmup_forward(inner: &Gemma4Inner) -> Result<()> {
     Ok(())
 }
 
+/// Build throwaway KV caches for a Gemma4 config.
+///
+/// Used by `warmup_forward` to run a single dummy token through the
+/// full layer stack at load time (triggering Metal shader compilation)
+/// without touching the persistent `self.caches` on `Gemma4Inner`. The
+/// persistent path lazily initializes its caches inside `chat_sync_core` /
+/// `chat_stream_sync_core` via `init_caches_sync`.
 fn init_caches_for_config(config: &Gemma4Config) -> Vec<Gemma4LayerCache> {
     let num_layers = config.num_hidden_layers as usize;
     let mut caches = Vec::with_capacity(num_layers);
@@ -1428,6 +1618,22 @@ fn init_caches_for_config(config: &Gemma4Config) -> Vec<Gemma4LayerCache> {
         }
     }
     caches
+}
+
+/// Check whether `token` should terminate decoding.
+///
+/// The config-level `eos_token_ids` are always honored. When a session
+/// caller passes `eos_override`, that token id is treated as an additional
+/// stop token — it does NOT replace the config list. This matches the
+/// dense model's `chat_sync_core` semantics: session-start callers get
+/// their clean boundary token (e.g. `<|im_end|>`) while still respecting
+/// the underlying model's intrinsic eos set.
+#[inline]
+fn is_eos_token(token: u32, eos_ids: &[i32], eos_override: Option<u32>) -> bool {
+    if eos_ids.contains(&(token as i32)) {
+        return true;
+    }
+    eos_override.is_some_and(|id| id == token)
 }
 
 fn make_sampling_config(
