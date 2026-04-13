@@ -119,11 +119,11 @@ export declare class Gemma4Model {
   /** Load a Gemma4 model from a directory. */
   static load(modelPath: string): Promise<Gemma4Model>;
   /** Chat with the model using a list of messages. */
-  chat(messages: Array<ChatMessage>, config?: Gemma4ChatConfig | undefined | null): Promise<ChatResult>;
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /** Streaming chat with the model using a list of messages. */
   chatStream(
     messages: ChatMessage[],
-    config: Gemma4ChatConfig | null | undefined,
+    config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
 }
@@ -2685,20 +2685,6 @@ export interface FunctionParameters {
   properties?: string;
   /** List of required parameter names */
   required?: Array<string>;
-}
-
-/** Gemma4 generation configuration. */
-export interface Gemma4ChatConfig {
-  maxNewTokens?: number;
-  temperature?: number;
-  topK?: number;
-  topP?: number;
-  minP?: number;
-  /**
-   * Enable thinking mode. `None` = let the template decide,
-   * `Some(false)` = disabled, `Some(true)` = enabled.
-   */
-  enableThinking?: boolean;
 }
 
 /**

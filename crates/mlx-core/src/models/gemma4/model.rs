@@ -82,21 +82,9 @@ fn escape_gemma4_content(s: &str) -> String {
 use super::config::Gemma4Config;
 use super::decoder_layer::Gemma4DecoderLayer;
 use super::layer_cache::Gemma4LayerCache;
-use crate::models::qwen3_5::model::{ChatResult, ChatStreamChunk, ChatStreamHandle};
+use crate::models::qwen3_5::chat_common;
+use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use tracing::{debug, info};
-
-/// Gemma4 generation configuration.
-#[napi(object)]
-pub struct Gemma4ChatConfig {
-    pub max_new_tokens: Option<i32>,
-    pub temperature: Option<f64>,
-    pub top_k: Option<i32>,
-    pub top_p: Option<f64>,
-    pub min_p: Option<f64>,
-    /// Enable thinking mode. `None` = let the template decide,
-    /// `Some(false)` = disabled, `Some(true)` = enabled.
-    pub enable_thinking: Option<bool>,
-}
 
 /// PLE (Per-Layer Embeddings) model-level components.
 ///
@@ -154,13 +142,13 @@ pub(crate) struct Gemma4Inner {
 pub(crate) enum Gemma4Cmd {
     Chat {
         messages: Vec<ChatMessage>,
-        config: Gemma4ChatConfig,
+        config: ChatConfig,
         processed_images: Vec<ProcessedGemma4Image>,
         reply: ResponseTx<ChatResult>,
     },
     ChatStream {
         messages: Vec<ChatMessage>,
-        config: Gemma4ChatConfig,
+        config: ChatConfig,
         processed_images: Vec<ProcessedGemma4Image>,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -278,11 +266,25 @@ impl Gemma4Inner {
         self.tokenizer = Some(tokenizer);
     }
 
-    /// Synchronous chat implementation. Runs on the dedicated model thread.
+    /// Gemma4 chat entry point using the unified [`ChatConfig`].
+    ///
+    /// ## Field support
+    ///
+    /// **Supported**: `max_new_tokens`, `temperature`, `top_k`, `top_p`, `min_p`,
+    /// `tools`, `reasoning_effort` (mapped to the template's `enable_thinking`
+    /// kwarg via `chat_common::resolve_enable_thinking`).
+    ///
+    /// **Silent no-ops** (Gemma4 decode loop has no code path that reads them):
+    /// `repetition_penalty`, `repetition_context_size`, `presence_penalty`,
+    /// `presence_context_size`, `frequency_penalty`, `frequency_context_size`,
+    /// `max_consecutive_tokens`, `max_ngram_repeats`, `ngram_size`,
+    /// `thinking_token_budget`, `include_reasoning`, `report_performance`,
+    /// `reuse_cache`. (`report_performance` and `reuse_cache` become supported
+    /// in Steps 5b and 5c of the chat-session refactor.)
     fn chat_sync(
         &mut self,
         messages: Vec<ChatMessage>,
-        config: Gemma4ChatConfig,
+        config: ChatConfig,
         processed_images: Vec<ProcessedGemma4Image>,
     ) -> Result<ChatResult> {
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
@@ -294,7 +296,7 @@ impl Gemma4Inner {
 
         let has_images = !processed_images.is_empty();
         let sampling_config = make_sampling_config(&config, &self.config);
-        let enable_thinking = config.enable_thinking;
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
         let eos_ids = self.config.eos_token_ids.clone();
 
         // Try the tokenizer's chat template if available (handles role mapping,
@@ -303,8 +305,8 @@ impl Gemma4Inner {
         let tokens = if tokenizer.has_chat_template() {
             tokenizer.apply_chat_template_sync(
                 &messages,
-                Some(true),      // add_generation_prompt
-                None,            // no tools
+                Some(true), // add_generation_prompt
+                config.tools.as_deref(),
                 enable_thinking, // None = template default
             )?
         } else {
@@ -709,10 +711,25 @@ impl Gemma4Inner {
         })
     }
 
+    /// Gemma4 streaming chat entry point using the unified [`ChatConfig`].
+    ///
+    /// ## Field support
+    ///
+    /// **Supported**: `max_new_tokens`, `temperature`, `top_k`, `top_p`, `min_p`,
+    /// `tools`, `reasoning_effort` (mapped to the template's `enable_thinking`
+    /// kwarg via `chat_common::resolve_enable_thinking`).
+    ///
+    /// **Silent no-ops** (Gemma4 decode loop has no code path that reads them):
+    /// `repetition_penalty`, `repetition_context_size`, `presence_penalty`,
+    /// `presence_context_size`, `frequency_penalty`, `frequency_context_size`,
+    /// `max_consecutive_tokens`, `max_ngram_repeats`, `ngram_size`,
+    /// `thinking_token_budget`, `include_reasoning`, `report_performance`,
+    /// `reuse_cache`. (`report_performance` and `reuse_cache` become supported
+    /// in Steps 5b and 5c of the chat-session refactor.)
     pub(crate) fn chat_stream_sync(
         &mut self,
         messages: Vec<ChatMessage>,
-        config: Gemma4ChatConfig,
+        config: ChatConfig,
         processed_images: Vec<ProcessedGemma4Image>,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -728,7 +745,7 @@ impl Gemma4Inner {
     fn chat_stream_sync_inner(
         &mut self,
         messages: Vec<ChatMessage>,
-        config: Gemma4ChatConfig,
+        config: ChatConfig,
         processed_images: Vec<ProcessedGemma4Image>,
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
@@ -742,11 +759,16 @@ impl Gemma4Inner {
 
         let has_images = !processed_images.is_empty();
         let sampling_config = make_sampling_config(&config, &self.config);
-        let enable_thinking = config.enable_thinking;
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
         let eos_ids = self.config.eos_token_ids.clone();
 
         let tokens = if tokenizer.has_chat_template() {
-            tokenizer.apply_chat_template_sync(&messages, Some(true), None, enable_thinking)?
+            tokenizer.apply_chat_template_sync(
+                &messages,
+                Some(true),
+                config.tools.as_deref(),
+                enable_thinking,
+            )?
         } else {
             if enable_thinking == Some(true) {
                 return Err(Error::from_reason(
@@ -1242,16 +1264,9 @@ impl Gemma4Model {
     pub async fn chat(
         &self,
         messages: Vec<ChatMessage>,
-        config: Option<Gemma4ChatConfig>,
+        config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
-        let config = config.unwrap_or(Gemma4ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            enable_thinking: None,
-        });
+        let config = config.unwrap_or_default();
 
         // Process images before sending command (Uint8Array is !Send)
         let all_images = extract_images_from_messages(&messages);
@@ -1281,22 +1296,15 @@ impl Gemma4Model {
 
     /// Streaming chat with the model using a list of messages.
     #[napi(
-        ts_args_type = "messages: ChatMessage[], config: Gemma4ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
     pub async fn chat_stream(
         &self,
         messages: Vec<ChatMessage>,
-        config: Option<Gemma4ChatConfig>,
+        config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or(Gemma4ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            enable_thinking: None,
-        });
+        let config = config.unwrap_or_default();
 
         // Process images before sending command
         let all_images = extract_images_from_messages(&messages);
@@ -1423,7 +1431,7 @@ fn init_caches_for_config(config: &Gemma4Config) -> Vec<Gemma4LayerCache> {
 }
 
 fn make_sampling_config(
-    config: &Gemma4ChatConfig,
+    config: &ChatConfig,
     model_config: &Gemma4Config,
 ) -> Option<SamplingConfig> {
     let temp = config
