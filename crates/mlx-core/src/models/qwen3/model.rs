@@ -1723,9 +1723,9 @@ impl Qwen3Inner {
     ///
     /// Thin wrapper that delegates to [`Self::chat_stream_sync_core`] with
     /// `eos_override = None`. Any error returned from the core is forwarded
-    /// to the stream channel via
-    /// [`chat_common::send_stream_error`] so the TypeScript async generator
-    /// observes the failure as a terminal error, then bubbled up.
+    /// directly through the stream channel via `stream_tx.send(Err(e))`,
+    /// matching the dense/MoE/LFM2 convention: the channel is the sole
+    /// error surface and the wrapper itself returns `()`.
     ///
     /// Qwen3 legacy previously had **no** streaming path at all — this is
     /// the first-ever `chat_stream_*` method on the legacy variant. It is
@@ -1741,13 +1741,11 @@ impl Qwen3Inner {
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
-    ) -> Result<()> {
+    ) {
         let cb = StreamSender(stream_tx.clone());
         if let Err(e) = self.chat_stream_sync_core(messages, config, None, &cb, &cancelled) {
-            chat_common::send_stream_error(&stream_tx, &e.to_string());
-            return Err(e);
+            let _ = stream_tx.send(Err(e));
         }
-        Ok(())
     }
 
     /// Core synchronous streaming chat implementation with optional EOS
@@ -1876,6 +1874,17 @@ impl Qwen3Inner {
                     MxArray::from_uint32(&token_ids_vec, &[1, token_ids_vec.len() as i64])?;
                 (None, None, 0, Some(input_ids))
             };
+
+        // Actual prefill delta (mirrors `chat_sync_core`): on a cache-hit
+        // turn only the post-prefix tokens are really prefilled, the rest
+        // are replayed from cache. On a zero-delta turn we re-run just the
+        // last token to rebuild logits, so the effective delta is 1. This
+        // is what feeds `compute_performance_metrics` below so that
+        // `prefill_tokens_per_second` reflects real work done.
+        let actual_prefill_len: usize = match &prefill_input_ids {
+            Some(ids) => ids.shape_at(1)? as usize,
+            None => 1,
+        };
 
         let prefill_step_size: usize = 2048;
         let prompt_token_count = token_ids_vec.len() as u32;
@@ -2181,7 +2190,7 @@ impl Qwen3Inner {
         let perf_metrics = chat_common::compute_performance_metrics(
             generation_start,
             first_token_instant,
-            token_ids_vec.len(),
+            actual_prefill_len,
             generated_tokens.len(),
         );
 
