@@ -177,8 +177,10 @@ export function createBridgeStub(
   const bufferUsages: Record<number, number> = {};
 
   // Buffer pool: recycle real gpu-worker handles by usage+size key.
-  // Key format: `${usage}:${size}`. Value: LIFO stack of live handles whose
+  // Key format: `${usage}:${size}`. Value: stack of live handles whose
   // BUFFER_RELEASE RPC was suppressed — they stay alive in the gpu-worker.
+  // Policy: LIFO reuse (pop hot buffers first), FIFO eviction of the oldest
+  // on overflow (shift from the front when the bucket is full).
   const bufferPool = new Map<string, number[]>();
   const POOL_CAP_PER_KEY = 32;
   let bufferPoolHits = 0;
@@ -247,6 +249,9 @@ export function createBridgeStub(
     deferredBufferRemap.set(fakeHandle, realHandle);
     bufSizes[realHandle] = def.size;
     bufferUsages[realHandle] = def.usage;
+    // Scrub the fake handle's shadow size entry (set when the fake was created)
+    // so bufSizes doesn't accumulate stale fake-handle keys over time.
+    delete bufSizes[fakeHandle];
     wasmFree(def.wasmPtr);
   }
 
@@ -625,6 +630,8 @@ export function createBridgeStub(
         const stack = bufferPool.get(key);
         if (stack !== undefined && stack.length > 0) {
           const reused = stack.pop()!;
+          // Drop empty buckets so bufferPool doesn't accumulate dead (usage,size) keys.
+          if (stack.length === 0) bufferPool.delete(key);
           bufferPoolHits++;
           bufSizes[reused] = size;
           bufferUsages[reused] = usage;
@@ -1007,6 +1014,9 @@ export function createBridgeStub(
                 bufSizes[result] = deferredInfo.size;
                 bufferUsages[result] = deferredInfo.usage;
               }
+              // Scrub the fake handle's shadow size entry (set when the fake
+              // was created) so bufSizes doesn't accumulate stale keys.
+              delete bufSizes[deferredFakeHandle];
               wasmFree(deferredInfo.wasmPtr);
             }
           } else {
@@ -1025,6 +1035,8 @@ export function createBridgeStub(
               deferredBufferRemap.set(deferredFakeHandle, realHandle);
               bufSizes[realHandle] = deferredInfo.size;
               bufferUsages[realHandle] = deferredInfo.usage;
+              // Scrub the fake handle's shadow size entry.
+              delete bufSizes[deferredFakeHandle];
               wasmFree(deferredInfo.wasmPtr);
               // Rewrite the entry with the real handle
               const base = (CMD_OFFSET.CALLBACK_BASE + uniformEntryIdx * 12) >>> 2;
@@ -1154,6 +1166,8 @@ export function createBridgeStub(
           deferredBufferRemap.set(bufferHandle, realHandle);
           bufSizes[realHandle] = mapped.size;
           bufferUsages[realHandle] = mapped.usage;
+          // Scrub the fake handle's shadow size entry.
+          delete bufSizes[bufferHandle];
           wasmFree(mapped.wasmPtr);
         }
         unmapPtrs.delete(bufferHandle);
@@ -1203,6 +1217,16 @@ export function createBridgeStub(
     },
 
     wgpuBufferRelease(handle: number): void {
+      // Clean up shadow state if this fake mapped-at-creation buffer was never unmapped.
+      // Must run before any pool/RPC logic — the fake handle has no gpu-worker object,
+      // and the WASM shadow allocation would otherwise leak.
+      const mapped = mappedAtCreationBuffers.get(handle);
+      if (mapped) {
+        mappedAtCreationBuffers.delete(handle);
+        wasmFree(mapped.wasmPtr);
+        delete bufSizes[handle];
+        return;
+      }
       // Clean up deferred creation if buffer is released before dispatch
       const def = deferredCreations.get(handle);
       if (def) {
@@ -1214,6 +1238,12 @@ export function createBridgeStub(
       if (resolved !== handle) {
         deferredBufferRemap.delete(handle);
       }
+
+      // Drop any deferred writeBuffer for this handle. If the user is releasing
+      // the buffer with a pending write still unflushed, that write was effectively
+      // discarded anyway — and if the handle gets pooled and reused, a stale flush
+      // would clobber the new buffer's contents. Clearing is safe in both cases.
+      pendingWriteBuffers.delete(resolved);
 
       // Try to pool the real handle instead of releasing to the gpu-worker.
       const size = bufSizes[resolved];
@@ -1232,6 +1262,8 @@ export function createBridgeStub(
         // Pool full: evict oldest (FIFO) and release it, then pool the new one.
         const evicted = stack.shift()!;
         rpcCall(RpcFn.BUFFER_RELEASE, evicted);
+        delete bufSizes[evicted];
+        delete bufferUsages[evicted];
         stack.push(resolved);
         return;
       }
