@@ -1025,6 +1025,81 @@ export declare class QianfanOCRModel {
   ): Promise<Array<number>>;
   /** Reset KV caches and token history. */
   resetCaches(): void;
+  /**
+   * Start a new chat session.
+   *
+   * Equivalent to [`Self::chat`] but stops decoding on `<|im_end|>` and
+   * leaves the KV caches on a clean turn boundary so subsequent
+   * [`Self::chat_session_continue`] /
+   * [`Self::chat_session_continue_tool`] calls can append a raw
+   * ChatML delta on top without re-rendering the chat template.
+   *
+   * Qianfan-OCR is always a VLM (InternViT + Qwen3 language model), so
+   * this entry point accepts images in `messages` without the text-only
+   * fast-fail used by plain language models.
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a new user message.
+   *
+   * Appends a raw ChatML user/assistant delta to the session's cached
+   * KV state, then decodes the model reply. Stops on `<|im_end|>` so
+   * the cache remains on a clean turn boundary for the next turn.
+   *
+   * Requires a live session started via
+   * [`Self::chat_session_start`]. Errors if the session is empty or
+   * if `config.reuse_cache` is explicitly set to `false`.
+   *
+   * `images` is an opt-in guard parameter: when non-empty the native
+   * side returns an error whose message begins with
+   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+   * `ChatSession` layer can catch the prefix and route image-changes
+   * back through a fresh `chatSessionStart` uniformly across all
+   * model backends. Qianfan-OCR is a VLM but the continue path cannot
+   * splice new vision features into a live KV cache — image changes
+   * always require a fresh session start.
+   */
+  chatSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null | undefined,
+    config: ChatConfig | null | undefined,
+  ): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a tool-result turn.
+   *
+   * Builds a ChatML `<tool_response>` delta from `tool_call_id` and
+   * `content` and prefills it on top of the live session caches, then
+   * decodes the model reply. Stops on `<|im_end|>` so the cache stays
+   * on a clean turn boundary for the next turn.
+   *
+   * Requires a live session started via
+   * [`Self::chat_session_start`].
+   */
+  chatSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatResult>;
+  /** Streaming variant of [`Self::chat_session_start`]. */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null | undefined,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of [`Self::chat_session_continue`]. */
+  chatStreamSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null | undefined,
+    config: ChatConfig | null | undefined,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of [`Self::chat_session_continue_tool`]. */
+  chatStreamSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config: ChatConfig | null | undefined,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
 }
 
 /**

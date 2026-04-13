@@ -107,6 +107,70 @@ pub(crate) enum QianfanOCRCmd {
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     },
+    /// Start a new session via the text-only / VLM jinja-render path with
+    /// `<|im_end|>` as the stop token. See
+    /// [`QianfanOCRInner::chat_session_start_sync`] for the behavioural
+    /// contract (full cache reset, session-boundary eos, VLM-capable).
+    ChatSessionStart {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Continue an existing session by appending a user turn. See
+    /// [`QianfanOCRInner::chat_session_continue_sync`] — builds a raw
+    /// ChatML delta from `user_message`, tokenizes it, and prefills on
+    /// top of the live caches.
+    ///
+    /// `images` is an opt-in guard parameter: non-empty input is rejected
+    /// with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error so
+    /// the TS `ChatSession` layer can route image-changes back through a
+    /// fresh `chat_session_start`.
+    ChatSessionContinue {
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Continue an existing session with a tool-result delta. See
+    /// [`QianfanOCRInner::chat_session_continue_tool_sync`] — builds a
+    /// ChatML `<tool_response>` delta and prefills on top of the live
+    /// caches.
+    ChatSessionContinueTool {
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Streaming session-start: same semantics as
+    /// [`ChatSessionStart`](Self::ChatSessionStart) but streams token
+    /// deltas through `stream_tx`.
+    ChatStreamSessionStart {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
+    /// Streaming session-continue: same semantics as
+    /// [`ChatSessionContinue`](Self::ChatSessionContinue) but streams
+    /// token deltas through `stream_tx`. Carries the same opt-in
+    /// `images` guard parameter.
+    ChatStreamSessionContinue {
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
+    /// Streaming tool-result continuation: same semantics as
+    /// [`ChatSessionContinueTool`](Self::ChatSessionContinueTool) but
+    /// streams token deltas through `stream_tx`.
+    ChatStreamSessionContinueTool {
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
     Generate {
         input_ids: MxArray,
         max_new_tokens: i32,
@@ -130,7 +194,7 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
             config,
             reply,
         } => {
-            let _ = reply.send(inner.chat_sync_core(messages, config));
+            let _ = reply.send(inner.chat_sync_core(messages, config, None));
         }
         QianfanOCRCmd::ChatStream {
             messages,
@@ -138,7 +202,69 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
             stream_tx,
             cancelled,
         } => {
-            inner.chat_stream_sync_core(messages, config, stream_tx, cancelled);
+            inner.chat_stream_sync_core(messages, config, stream_tx, cancelled, None);
+        }
+        QianfanOCRCmd::ChatSessionStart {
+            messages,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.chat_session_start_sync(messages, config));
+        }
+        QianfanOCRCmd::ChatSessionContinue {
+            user_message,
+            images,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.chat_session_continue_sync(user_message, images, config));
+        }
+        QianfanOCRCmd::ChatSessionContinueTool {
+            tool_call_id,
+            content,
+            config,
+            reply,
+        } => {
+            let _ =
+                reply.send(inner.chat_session_continue_tool_sync(tool_call_id, content, config));
+        }
+        QianfanOCRCmd::ChatStreamSessionStart {
+            messages,
+            config,
+            stream_tx,
+            cancelled,
+        } => {
+            inner.chat_stream_session_start_sync(messages, config, stream_tx, cancelled);
+        }
+        QianfanOCRCmd::ChatStreamSessionContinue {
+            user_message,
+            images,
+            config,
+            stream_tx,
+            cancelled,
+        } => {
+            inner.chat_stream_session_continue_sync(
+                user_message,
+                images,
+                config,
+                stream_tx,
+                cancelled,
+            );
+        }
+        QianfanOCRCmd::ChatStreamSessionContinueTool {
+            tool_call_id,
+            content,
+            config,
+            stream_tx,
+            cancelled,
+        } => {
+            inner.chat_stream_session_continue_tool_sync(
+                tool_call_id,
+                content,
+                config,
+                stream_tx,
+                cancelled,
+            );
         }
         QianfanOCRCmd::Generate {
             input_ids,
@@ -235,10 +361,20 @@ impl QianfanOCRInner {
     /// → bridge → language-model prefill/decode pipeline, KV cache reuse
     /// via prefix matching, repetition/presence/frequency penalties,
     /// thinking/tool call parsing, and optional performance metrics.
+    ///
+    /// `eos_override` controls which token terminates decoding:
+    ///   - `None`: legacy `chat_sync` behaviour — stops on
+    ///     `self.config.eos_token_id` (preserves byte-for-byte compat).
+    ///   - `Some(id)`: session-aware path (used by
+    ///     [`Self::chat_session_start_sync`]) — stops on the supplied id
+    ///     (typically `<|im_end|>`) so the cached history ends on a
+    ///     clean ChatML boundary that subsequent `chat_session_continue_*`
+    ///     calls can append a raw delta on top of.
     fn chat_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
+        eos_override: Option<u32>,
     ) -> Result<ChatResult> {
         let max_new_tokens = config.max_new_tokens.unwrap_or(512);
         let temperature = config.temperature.unwrap_or(0.0);
@@ -334,7 +470,11 @@ impl QianfanOCRInner {
         // Trim happens below after we know seq_len — see clamped_prefix
 
         // --- Step 6: Prefill ---
-        let eos_token_id = self.config.eos_token_id;
+        // Session-start paths pass `Some(<|im_end|>)` to yield a clean
+        // ChatML cache boundary for subsequent delta continuations;
+        // legacy `chat_sync` passes `None` and preserves config-driven
+        // EOS for byte-for-byte compatibility with existing callers.
+        let eos_token_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
 
         let merged_embeds = if let Some(ref vf) = vision_features {
             let text_embeds = {
@@ -455,7 +595,7 @@ impl QianfanOCRInner {
             all_tokens.push(token_value);
 
             // Check EOS
-            if token_value == eos_token_id as u32 {
+            if token_value == eos_token_id {
                 finish_reason = "stop".to_string();
                 break;
             }
@@ -533,10 +673,19 @@ impl QianfanOCRInner {
             full_history.extend_from_slice(&generated_tokens[..forwarded]);
             self.cached_token_history = full_history;
             self.cached_cache_offset = self.get_cache_offset();
+            // Track image state so the session delta path's guard 4
+            // (cached_image_key.is_some()) correctly rejects delta
+            // continuations that would collide with prior image context.
+            self.cached_image_key = if image_bytes.is_empty() {
+                None
+            } else {
+                Some(crate::models::qwen3_5::chat_common::compute_image_cache_key(&image_bytes))
+            };
         } else {
             // Not reusing — clear metadata to prevent stale prefix matches
             self.cached_token_history.clear();
             self.cached_cache_offset = 0;
+            self.cached_image_key = None;
         }
 
         // --- Step 10: Decode and parse ---
@@ -600,12 +749,18 @@ impl QianfanOCRInner {
     /// `stream_tx` and checks `cancelled` on every decode iteration.
     /// Drives the same hoisted cache state so prefix matching and
     /// repetition penalties behave identically to the non-streaming path.
+    ///
+    /// `eos_override` threads through exactly as in
+    /// [`chat_sync_core`](Self::chat_sync_core): `None` for the legacy
+    /// stream path, `Some(<|im_end|>)` for
+    /// [`chat_stream_session_start_sync`](Self::chat_stream_session_start_sync).
     fn chat_stream_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
+        eos_override: Option<u32>,
     ) {
         let sender = StreamSender(stream_tx.clone());
         let emit = |chunk: ChatStreamChunk| {
@@ -693,7 +848,10 @@ impl QianfanOCRInner {
                 self.init_kv_caches();
             }
 
-            let eos_token_id = self.config.eos_token_id;
+            // Session-aware eos routing — see `chat_sync_core` for the
+            // full contract. Legacy stream callers pass `None`, session
+            // starts pass `Some(<|im_end|>)`.
+            let eos_token_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
 
             let merged_embeds = if let Some(ref vf) = vision_features {
                 let text_embeds = {
@@ -811,7 +969,7 @@ impl QianfanOCRInner {
                 generated_tokens.push(token_value);
                 all_tokens.push(token_value);
 
-                if token_value == eos_token_id as u32 {
+                if token_value == eos_token_id {
                     finish_reason = "stop".to_string();
                     break;
                 }
@@ -911,9 +1069,16 @@ impl QianfanOCRInner {
                 full_history.extend_from_slice(&generated_tokens[..forwarded]);
                 self.cached_token_history = full_history;
                 self.cached_cache_offset = self.get_cache_offset();
+                // Track image state — mirrors the non-streaming save block.
+                self.cached_image_key = if image_bytes.is_empty() {
+                    None
+                } else {
+                    Some(crate::models::qwen3_5::chat_common::compute_image_cache_key(&image_bytes))
+                };
             } else {
                 self.cached_token_history.clear();
                 self.cached_cache_offset = 0;
+                self.cached_image_key = None;
             }
 
             // Final chunk
@@ -981,6 +1146,903 @@ impl QianfanOCRInner {
             // callback's error channel.
             let _ = stream_tx.send(Err(e));
         }
+    }
+
+    // ========================================================================
+    // Session chat API (Step 6b)
+    // ========================================================================
+
+    /// Resolve the tokenizer id of `<|im_end|>`, the Qwen3 ChatML end-of-turn
+    /// marker. Qianfan-OCR sits on Qwen3 for its language model, so the
+    /// ChatML wire format applies directly — stopping on `<|im_end|>` keeps
+    /// the cached history on a clean delta boundary for the session
+    /// continuation paths.
+    fn im_end_id(&self) -> Result<u32> {
+        self.tokenizer
+            .im_end_id()
+            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))
+    }
+
+    /// Start a new chat session.
+    ///
+    /// Fully resets the caches and delegates to [`Self::chat_sync_core`]
+    /// with `<|im_end|>` as the stop token so the decode loop leaves the
+    /// caches on a clean ChatML boundary that subsequent
+    /// [`Self::chat_session_continue_sync`] /
+    /// [`Self::chat_session_continue_tool_sync`] calls can append a raw
+    /// delta on top of.
+    ///
+    /// Vision-capable: `messages` may carry images (they will be decoded
+    /// through the InternViT → bridge pipeline inside `chat_sync_core`,
+    /// same as the legacy chat path).
+    pub(crate) fn chat_session_start_sync(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        // Mirror the symmetric guard in `chat_tokens_delta_sync`. The
+        // session API only makes sense with cache reuse enabled: if we
+        // silently accept `reuse_cache = false`, the post-decode save
+        // block wipes the caches we just populated, and the next
+        // `chat_session_continue` call fails with a cryptic guard error.
+        // Fail fast before mutating any state.
+        if config.reuse_cache == Some(false) {
+            return Err(Error::from_reason(
+                "chat_session_start requires reuse_cache=true (pass ChatConfig { reuse_cache: Some(true), .. } or leave as None). The session API only makes sense with cache reuse enabled.",
+            ));
+        }
+
+        // Resolve `<|im_end|>` up front so session_continue can rely on the
+        // cached history always terminating on a clean ChatML boundary.
+        let im_end_id = self.im_end_id()?;
+
+        // Full reset: the session-start path always begins from a clean
+        // state. This matches the documented contract that the session is
+        // owned end-to-end by the `chat_session_*` surface and
+        // intentionally invalidates any prior cache.
+        self.reset_caches_sync();
+
+        self.chat_sync_core(messages, config, Some(im_end_id))
+    }
+
+    /// Continue an existing chat session with a user turn.
+    ///
+    /// Builds a ChatML wire-format delta (`\n<|im_start|>user\n...
+    /// <|im_end|>\n<|im_start|>assistant\n`), tokenizes it, and prefills
+    /// on top of the live caches via [`Self::chat_tokens_delta_sync`].
+    ///
+    /// Text-only on the delta path: callers that need to change the
+    /// image set must restart the session via
+    /// [`Self::chat_session_start_sync`]. The `images` parameter is an
+    /// opt-in guard that returns an
+    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error when
+    /// non-empty, letting the TS `ChatSession` layer pattern-match the
+    /// prefix and route image-changes through a fresh session start.
+    pub(crate) fn chat_session_continue_sync(
+        &mut self,
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        // Guard 1: text-only delta path.
+        if images.as_ref().is_some_and(|v| !v.is_empty()) {
+            return Err(Error::from_reason(format!(
+                "{}chat_session_continue is text-only; start a new session with chat_session_start to change the image",
+                crate::models::qwen3_5::chat_common::IMAGE_CHANGE_RESTART_PREFIX
+            )));
+        }
+
+        let tokenizer = self.tokenizer.clone();
+
+        // Subject the session path to the same role/content injection
+        // sanitization as the legacy chat path so all entry points stay
+        // uniform.
+        let synthetic =
+            crate::models::qwen3_5::chat_common::build_synthetic_user_message(&user_message);
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
+        let sanitized_user = &sanitized[0].content;
+
+        let enable_thinking = crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config);
+        let delta_text = crate::models::qwen3_5::chat_common::build_chatml_continue_delta_text(
+            sanitized_user,
+            enable_thinking,
+        );
+        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
+
+        self.chat_tokens_delta_sync(delta_tokens, config)
+    }
+
+    /// Continue an existing chat session with a tool-result turn.
+    ///
+    /// Builds a ChatML `<tool_response>`-wrapped delta from `content` and
+    /// prefills it on top of the live session caches. The `tool_call_id`
+    /// is intentionally dropped from the wire format — Qwen3.5's chat
+    /// template identifies tool responses by position and wrapper tags,
+    /// not an explicit id. Callers may still log it for bookkeeping.
+    ///
+    /// Text-only; delegates to [`Self::chat_tokens_delta_sync`] which
+    /// inherits the same text-only-delta invariant (errors if the
+    /// session currently holds image state).
+    pub(crate) fn chat_session_continue_tool_sync(
+        &mut self,
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        let tokenizer = self.tokenizer.clone();
+
+        let enable_thinking = crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config);
+        let delta_text = crate::models::qwen3_5::chat_common::build_chatml_tool_delta_text(
+            &tool_call_id,
+            &content,
+            enable_thinking,
+        );
+        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
+
+        self.chat_tokens_delta_sync(delta_tokens, config)
+    }
+
+    /// Prefill a pre-tokenized delta on top of the existing KV caches and
+    /// run the decode loop. Text-only session primitive used by
+    /// [`Self::chat_session_continue_sync`] and
+    /// [`Self::chat_session_continue_tool_sync`].
+    ///
+    /// Uses `<|im_end|>` as the eos token so the cached history continues
+    /// to end on a clean ChatML boundary for the next turn.
+    pub(crate) fn chat_tokens_delta_sync(
+        &mut self,
+        delta_tokens: Vec<u32>,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        // --- Five guards (mirrors Gemma4/Qwen3). ---
+        // The delta path is a session-reuse operation by construction: it
+        // prefills on top of the existing caches. `reuse_cache = Some(false)`
+        // would make the post-decode save block wipe those caches +
+        // `cached_token_history`, making the delta turn both depend on
+        // and then destroy the session. Reject early so no state is
+        // mutated.
+        if config.reuse_cache == Some(false) {
+            return Err(Error::from_reason(
+                "chat_tokens_delta_sync requires reuse_cache to be enabled; \
+                 the delta path operates on session state by construction",
+            ));
+        }
+        if self.cached_token_history.is_empty() {
+            return Err(Error::from_reason(
+                "chat_tokens_delta_sync requires an initialized session (call chat_session_start first)",
+            ));
+        }
+        if delta_tokens.is_empty() {
+            return Err(Error::from_reason(
+                "chat_tokens_delta_sync requires at least one delta token",
+            ));
+        }
+        if self.cached_image_key.is_some() {
+            return Err(Error::from_reason(format!(
+                "{}chat_tokens_delta_sync cannot be called while image state is cached; call chat_session_start with the new images instead",
+                crate::models::qwen3_5::chat_common::IMAGE_CHANGE_RESTART_PREFIX
+            )));
+        }
+        if self.kv_caches.is_none() {
+            return Err(Error::from_reason(
+                "chat_tokens_delta_sync requires live KV caches; call chat_session_start first",
+            ));
+        }
+
+        // Session path: use `<|im_end|>` as eos, NOT config.eos_token_id.
+        // This keeps the cached history aligned on a clean ChatML
+        // boundary for the next `chat_session_continue*` call.
+        let eos_token_id = self.im_end_id()?;
+
+        let max_new_tokens = config.max_new_tokens.unwrap_or(512);
+        let temperature = config.temperature.unwrap_or(0.0);
+        let top_k = config.top_k.unwrap_or(0);
+        let top_p = config.top_p.unwrap_or(1.0);
+        let min_p = config.min_p.unwrap_or(0.0);
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
+        let report_perf = config.report_performance.unwrap_or(false);
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        // Build the full token history = cached_history + delta. Used as
+        // penalty context AND the snapshot saved back into
+        // `cached_token_history` at the end.
+        let mut all_tokens: Vec<u32> =
+            Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len());
+        all_tokens.extend_from_slice(&self.cached_token_history);
+        all_tokens.extend_from_slice(&delta_tokens);
+
+        let prefill_token_count = all_tokens.len();
+
+        // Text-only prefill of the delta on top of the existing caches.
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let input_ids = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
+        let merged_embeds = {
+            let _ctx = StreamContext::new(generation_stream);
+            self.language_model.get_embeddings(&input_ids)?
+        };
+
+        // Follow the pre-existing `take()`+restore pattern from
+        // `chat_sync_core` for consistency; a follow-up task will fix
+        // all sites together.
+        let mut cache = self.kv_caches.take();
+        let prefill_logits = {
+            let _ctx = StreamContext::new(generation_stream);
+            self.language_model
+                .forward_from_embeddings(&merged_embeds, &mut cache)?
+        };
+        self.kv_caches = cache;
+
+        prefill_logits.eval();
+        synchronize_and_clear_cache();
+
+        // Last logits for first sampled token
+        let prefill_seq = prefill_logits.shape()?[1];
+        let mut last_logits = prefill_logits
+            .slice_axis(1, prefill_seq - 1, prefill_seq)?
+            .squeeze(Some(&[0, 1]))?;
+
+        let sampling_config = SamplingConfig {
+            temperature: Some(temperature),
+            top_k: Some(top_k),
+            top_p: Some(top_p),
+            min_p: Some(min_p),
+        };
+
+        if repetition_penalty != 1.0 {
+            last_logits = apply_repetition_penalty(
+                &last_logits,
+                &all_tokens,
+                repetition_penalty,
+                Some(repetition_context_size),
+            )?;
+        }
+        if presence_penalty != 0.0 {
+            last_logits = apply_presence_penalty(
+                &last_logits,
+                &all_tokens,
+                presence_penalty,
+                Some(presence_context_size),
+            )?;
+        }
+        if frequency_penalty != 0.0 {
+            last_logits = apply_frequency_penalty(
+                &last_logits,
+                &all_tokens,
+                frequency_penalty,
+                Some(frequency_context_size),
+            )?;
+        }
+
+        let mut token = sample(&last_logits, Some(sampling_config))?;
+        token.eval();
+
+        let first_token_instant = generation_start.map(|_| std::time::Instant::now());
+
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut finish_reason = "length".to_string();
+
+        for step in 0..max_new_tokens {
+            let token_value = token.item_at_int32(0)? as u32;
+            generated_tokens.push(token_value);
+            all_tokens.push(token_value);
+
+            if token_value == eos_token_id {
+                finish_reason = "stop".to_string();
+                break;
+            }
+
+            if let Some(reason) = check_repetition_cutoff(
+                &generated_tokens,
+                max_consecutive_tokens,
+                max_ngram_repeats,
+                ngram_size,
+            ) {
+                finish_reason = reason.to_string();
+                break;
+            }
+
+            let token_2d = token.reshape(&[1, 1])?;
+            let mut cache = self.kv_caches.take();
+            let logits = {
+                let _ctx = StreamContext::new(generation_stream);
+                self.language_model.forward(&token_2d, &mut cache)?
+            };
+            self.kv_caches = cache;
+
+            let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
+
+            if repetition_penalty != 1.0 {
+                next_logits = apply_repetition_penalty(
+                    &next_logits,
+                    &all_tokens,
+                    repetition_penalty,
+                    Some(repetition_context_size),
+                )?;
+            }
+            if presence_penalty != 0.0 {
+                next_logits = apply_presence_penalty(
+                    &next_logits,
+                    &all_tokens,
+                    presence_penalty,
+                    Some(presence_context_size),
+                )?;
+            }
+            if frequency_penalty != 0.0 {
+                next_logits = apply_frequency_penalty(
+                    &next_logits,
+                    &all_tokens,
+                    frequency_penalty,
+                    Some(frequency_context_size),
+                )?;
+            }
+
+            token = sample(&next_logits, Some(sampling_config))?;
+            token.eval();
+
+            if (step + 1) % 256 == 0 {
+                synchronize_and_clear_cache();
+            }
+        }
+
+        // Sync token history with cache state (same drop-last idiom as
+        // `chat_sync_core`: terminal stop/repetition tokens were sampled
+        // but never forwarded into the cache).
+        let forwarded = if finish_reason == "stop" || finish_reason == "repetition" {
+            generated_tokens.len().saturating_sub(1)
+        } else {
+            generated_tokens.len()
+        };
+        let mut full_history =
+            Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len() + forwarded);
+        full_history.extend_from_slice(&self.cached_token_history);
+        full_history.extend_from_slice(&delta_tokens);
+        full_history.extend_from_slice(&generated_tokens[..forwarded]);
+        self.cached_token_history = full_history;
+        self.cached_cache_offset = self.get_cache_offset();
+        // The delta path is text-only (guarded above); the image key
+        // invariant is preserved by construction, but we still explicitly
+        // leave it as-is (always None here, because guard 4 rejected
+        // any `Some(_)` state on entry).
+
+        // Decode + tool/thinking parsing
+        let raw_decoded = self.tokenizer.decode_sync(&generated_tokens, true)?;
+        let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
+
+        let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
+        let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
+
+        if tool_calls.iter().any(|tc| tc.status == "ok") {
+            finish_reason = "tool_calls".to_string();
+        }
+
+        let performance =
+            if let (Some(gen_start), Some(first_tok)) = (generation_start, first_token_instant) {
+                let generation_end = std::time::Instant::now();
+                let prefill_toks = prefill_token_count as f64;
+                let gen_toks = generated_tokens.len() as f64;
+                let ttft_ms = first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
+                let decode_ms = generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
+                Some(crate::profiling::PerformanceMetrics {
+                    ttft_ms,
+                    prefill_tokens_per_second: if ttft_ms > 0.0 {
+                        prefill_toks / (ttft_ms / 1000.0)
+                    } else {
+                        0.0
+                    },
+                    decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                        (gen_toks - 1.0) / (decode_ms / 1000.0)
+                    } else {
+                        0.0
+                    },
+                })
+            } else {
+                None
+            };
+
+        let reasoning_tokens = tools::count_reasoning_tokens(
+            &thinking,
+            &generated_tokens,
+            self.tokenizer.think_end_id(),
+        );
+
+        Ok(ChatResult {
+            text: text.trim().to_string(),
+            tool_calls,
+            thinking,
+            num_tokens: generated_tokens.len() as u32,
+            prompt_tokens: prefill_token_count as u32,
+            reasoning_tokens,
+            finish_reason,
+            raw_text: raw_decoded,
+            performance,
+        })
+    }
+
+    /// Streaming variant of [`Self::chat_session_start_sync`].
+    pub(crate) fn chat_stream_session_start_sync(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        if cancelled.load(Ordering::Relaxed) {
+            crate::models::qwen3_5::chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_session_start cancelled before start",
+            );
+            return;
+        }
+
+        if config.reuse_cache == Some(false) {
+            crate::models::qwen3_5::chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_session_start requires reuse_cache=true (leave as None or set to true). The session API only makes sense with cache reuse enabled.",
+            );
+            return;
+        }
+
+        let im_end_id = match self.im_end_id() {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = stream_tx.send(Err(e));
+                return;
+            }
+        };
+
+        // Full reset: the session always starts clean.
+        self.reset_caches_sync();
+
+        self.chat_stream_sync_core(messages, config, stream_tx, cancelled, Some(im_end_id));
+    }
+
+    /// Streaming variant of [`Self::chat_session_continue_sync`].
+    pub(crate) fn chat_stream_session_continue_sync(
+        &mut self,
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        if cancelled.load(Ordering::Relaxed) {
+            crate::models::qwen3_5::chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_session_continue cancelled before start",
+            );
+            return;
+        }
+
+        if images.as_ref().is_some_and(|v| !v.is_empty()) {
+            crate::models::qwen3_5::chat_common::send_stream_error(
+                &stream_tx,
+                &format!(
+                    "{}chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the image",
+                    crate::models::qwen3_5::chat_common::IMAGE_CHANGE_RESTART_PREFIX
+                ),
+            );
+            return;
+        }
+
+        let tokenizer = self.tokenizer.clone();
+
+        let synthetic =
+            crate::models::qwen3_5::chat_common::build_synthetic_user_message(&user_message);
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
+        let sanitized_user = &sanitized[0].content;
+
+        let enable_thinking = crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config);
+        let delta_text = crate::models::qwen3_5::chat_common::build_chatml_continue_delta_text(
+            sanitized_user,
+            enable_thinking,
+        );
+
+        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = stream_tx.send(Err(e));
+                return;
+            }
+        };
+
+        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
+    }
+
+    /// Streaming variant of [`Self::chat_session_continue_tool_sync`].
+    pub(crate) fn chat_stream_session_continue_tool_sync(
+        &mut self,
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        if cancelled.load(Ordering::Relaxed) {
+            crate::models::qwen3_5::chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_session_continue_tool cancelled before start",
+            );
+            return;
+        }
+
+        let tokenizer = self.tokenizer.clone();
+
+        let enable_thinking = crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config);
+        let delta_text = crate::models::qwen3_5::chat_common::build_chatml_tool_delta_text(
+            &tool_call_id,
+            &content,
+            enable_thinking,
+        );
+
+        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = stream_tx.send(Err(e));
+                return;
+            }
+        };
+
+        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
+    }
+
+    /// Streaming analog of [`Self::chat_tokens_delta_sync`]: prefill the
+    /// caller-provided delta tokens on top of the existing KV caches and
+    /// stream the reply through `stream_tx`.
+    ///
+    /// Applies the same five guards as the non-streaming path (routed via
+    /// `send_stream_error` so they surface as an error-item rather than a
+    /// fake done chunk). Uses `<|im_end|>` as the eos token so the cached
+    /// history continues to end on a clean ChatML boundary.
+    pub(crate) fn chat_stream_tokens_delta_sync(
+        &mut self,
+        delta_tokens: Vec<u32>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        if cancelled.load(Ordering::Relaxed) {
+            crate::models::qwen3_5::chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta cancelled before start",
+            );
+            return;
+        }
+
+        if config.reuse_cache == Some(false) {
+            crate::models::qwen3_5::chat_common::send_stream_error(
+                &stream_tx,
+                "chat_tokens_delta_sync requires reuse_cache to be enabled; \
+                 the delta path operates on session state by construction",
+            );
+            return;
+        }
+        if self.cached_token_history.is_empty() {
+            crate::models::qwen3_5::chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta requires an initialized session (call chat_stream_session_start first)",
+            );
+            return;
+        }
+        if delta_tokens.is_empty() {
+            crate::models::qwen3_5::chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta requires at least one delta token",
+            );
+            return;
+        }
+        if self.cached_image_key.is_some() {
+            crate::models::qwen3_5::chat_common::send_stream_error(
+                &stream_tx,
+                &format!(
+                    "{}chat_stream_tokens_delta cannot be called while image state is cached; call chat_stream_session_start with the new images instead",
+                    crate::models::qwen3_5::chat_common::IMAGE_CHANGE_RESTART_PREFIX
+                ),
+            );
+            return;
+        }
+        if self.kv_caches.is_none() {
+            crate::models::qwen3_5::chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta requires live KV caches; call chat_stream_session_start first",
+            );
+            return;
+        }
+
+        let result =
+            self.chat_stream_tokens_delta_sync_inner(delta_tokens, config, &stream_tx, &cancelled);
+        if let Err(e) = result {
+            let _ = stream_tx.send(Err(e));
+        }
+    }
+
+    /// Inner body of [`Self::chat_stream_tokens_delta_sync`]: prefill
+    /// delta tokens on top of the live caches, then run the streaming
+    /// decode loop.
+    fn chat_stream_tokens_delta_sync_inner(
+        &mut self,
+        delta_tokens: Vec<u32>,
+        config: ChatConfig,
+        stream_tx: &StreamTx<ChatStreamChunk>,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let sender = StreamSender(stream_tx.clone());
+        let emit = |chunk: ChatStreamChunk| {
+            sender.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
+        };
+
+        let eos_token_id = self.im_end_id()?;
+
+        let max_new_tokens = config.max_new_tokens.unwrap_or(512);
+        let temperature = config.temperature.unwrap_or(0.0);
+        let top_k = config.top_k.unwrap_or(0);
+        let top_p = config.top_p.unwrap_or(1.0);
+        let min_p = config.min_p.unwrap_or(0.0);
+        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size = config.presence_context_size.unwrap_or(20);
+        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size = config.ngram_size.unwrap_or(64);
+        let report_perf = config.report_performance.unwrap_or(false);
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        // Build full token history = cached_history + delta.
+        let mut all_tokens: Vec<u32> =
+            Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len());
+        all_tokens.extend_from_slice(&self.cached_token_history);
+        all_tokens.extend_from_slice(&delta_tokens);
+
+        let prefill_token_count = all_tokens.len();
+
+        // Text-only prefill of the delta on top of the existing caches.
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let input_ids = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
+        let merged_embeds = {
+            let _ctx = StreamContext::new(generation_stream);
+            self.language_model.get_embeddings(&input_ids)?
+        };
+
+        let mut cache = self.kv_caches.take();
+        let prefill_logits = {
+            let _ctx = StreamContext::new(generation_stream);
+            self.language_model
+                .forward_from_embeddings(&merged_embeds, &mut cache)?
+        };
+        self.kv_caches = cache;
+
+        prefill_logits.eval();
+        synchronize_and_clear_cache();
+
+        let prefill_seq = prefill_logits.shape()?[1];
+        let mut last_logits = prefill_logits
+            .slice_axis(1, prefill_seq - 1, prefill_seq)?
+            .squeeze(Some(&[0, 1]))?;
+
+        let sampling_config = SamplingConfig {
+            temperature: Some(temperature),
+            top_k: Some(top_k),
+            top_p: Some(top_p),
+            min_p: Some(min_p),
+        };
+
+        if repetition_penalty != 1.0 {
+            last_logits = apply_repetition_penalty(
+                &last_logits,
+                &all_tokens,
+                repetition_penalty,
+                Some(repetition_context_size),
+            )?;
+        }
+        if presence_penalty != 0.0 {
+            last_logits = apply_presence_penalty(
+                &last_logits,
+                &all_tokens,
+                presence_penalty,
+                Some(presence_context_size),
+            )?;
+        }
+        if frequency_penalty != 0.0 {
+            last_logits = apply_frequency_penalty(
+                &last_logits,
+                &all_tokens,
+                frequency_penalty,
+                Some(frequency_context_size),
+            )?;
+        }
+
+        let mut token = sample(&last_logits, Some(sampling_config))?;
+        token.eval();
+
+        let first_token_instant = generation_start.map(|_| std::time::Instant::now());
+
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut finish_reason = "length".to_string();
+
+        // Stateful decoder for correct multi-byte/CJK streaming.
+        let mut decode_stream = self.tokenizer.inner().decode_stream(true);
+        let mut streamed_text_len: usize = 0;
+
+        for step in 0..max_new_tokens {
+            if cancelled.load(Ordering::Relaxed) {
+                finish_reason = "cancelled".to_string();
+                break;
+            }
+            let token_value = token.item_at_int32(0)? as u32;
+            generated_tokens.push(token_value);
+            all_tokens.push(token_value);
+
+            if token_value == eos_token_id {
+                finish_reason = "stop".to_string();
+                break;
+            }
+
+            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                &mut decode_stream,
+                self.tokenizer.inner(),
+                token_value,
+                &generated_tokens,
+                streamed_text_len,
+            );
+            streamed_text_len += token_text.len();
+
+            emit(ChatStreamChunk {
+                text: token_text,
+                done: false,
+                finish_reason: None,
+                tool_calls: None,
+                thinking: None,
+                num_tokens: None,
+                prompt_tokens: None,
+                reasoning_tokens: None,
+                raw_text: None,
+                performance: None,
+                is_reasoning: None,
+            });
+
+            if let Some(reason) = check_repetition_cutoff(
+                &generated_tokens,
+                max_consecutive_tokens,
+                max_ngram_repeats,
+                ngram_size,
+            ) {
+                finish_reason = reason.to_string();
+                break;
+            }
+
+            let token_2d = token.reshape(&[1, 1])?;
+            let mut cache = self.kv_caches.take();
+            let logits = {
+                let _ctx = StreamContext::new(generation_stream);
+                self.language_model.forward(&token_2d, &mut cache)?
+            };
+            self.kv_caches = cache;
+
+            let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
+
+            if repetition_penalty != 1.0 {
+                next_logits = apply_repetition_penalty(
+                    &next_logits,
+                    &all_tokens,
+                    repetition_penalty,
+                    Some(repetition_context_size),
+                )?;
+            }
+            if presence_penalty != 0.0 {
+                next_logits = apply_presence_penalty(
+                    &next_logits,
+                    &all_tokens,
+                    presence_penalty,
+                    Some(presence_context_size),
+                )?;
+            }
+            if frequency_penalty != 0.0 {
+                next_logits = apply_frequency_penalty(
+                    &next_logits,
+                    &all_tokens,
+                    frequency_penalty,
+                    Some(frequency_context_size),
+                )?;
+            }
+
+            token = sample(&next_logits, Some(sampling_config))?;
+            token.eval();
+
+            if (step + 1) % 256 == 0 {
+                synchronize_and_clear_cache();
+            }
+        }
+
+        // Save token history with the drop-last idiom (matches
+        // non-streaming path).
+        let forwarded = if finish_reason == "stop" || finish_reason == "repetition" {
+            generated_tokens.len().saturating_sub(1)
+        } else {
+            generated_tokens.len()
+        };
+        let mut full_history =
+            Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len() + forwarded);
+        full_history.extend_from_slice(&self.cached_token_history);
+        full_history.extend_from_slice(&delta_tokens);
+        full_history.extend_from_slice(&generated_tokens[..forwarded]);
+        self.cached_token_history = full_history;
+        self.cached_cache_offset = self.get_cache_offset();
+
+        // Final chunk
+        let raw_decoded = self.tokenizer.decode_sync(&generated_tokens, true)?;
+        let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
+        let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
+        let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
+
+        if tool_calls.iter().any(|tc| tc.status == "ok") {
+            finish_reason = "tool_calls".to_string();
+        }
+
+        let performance =
+            if let (Some(gen_start), Some(first_tok)) = (generation_start, first_token_instant) {
+                let generation_end = std::time::Instant::now();
+                let prefill_toks = prefill_token_count as f64;
+                let gen_toks = generated_tokens.len() as f64;
+                let ttft_ms = first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
+                let decode_ms = generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
+                Some(crate::profiling::PerformanceMetrics {
+                    ttft_ms,
+                    prefill_tokens_per_second: if ttft_ms > 0.0 {
+                        prefill_toks / (ttft_ms / 1000.0)
+                    } else {
+                        0.0
+                    },
+                    decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                        (gen_toks - 1.0) / (decode_ms / 1000.0)
+                    } else {
+                        0.0
+                    },
+                })
+            } else {
+                None
+            };
+
+        let reasoning_tokens = tools::count_reasoning_tokens(
+            &thinking,
+            &generated_tokens,
+            self.tokenizer.think_end_id(),
+        );
+
+        emit(ChatStreamChunk {
+            text: text.trim().to_string(),
+            done: true,
+            finish_reason: Some(finish_reason),
+            tool_calls: Some(tool_calls),
+            thinking,
+            num_tokens: Some(generated_tokens.len() as u32),
+            prompt_tokens: Some(prefill_token_count as u32),
+            reasoning_tokens: Some(reasoning_tokens),
+            raw_text: Some(raw_decoded),
+            performance,
+            is_reasoning: None,
+        });
+
+        Ok(())
     }
 
     /// Low-level token generation given pre-tokenized input.
@@ -1266,6 +2328,230 @@ impl QianfanOCRModel {
             return Ok(());
         };
         crate::model_thread::send_and_block(thread, |reply| QianfanOCRCmd::ResetCaches { reply })
+    }
+
+    /// Start a new chat session.
+    ///
+    /// Equivalent to [`Self::chat`] but stops decoding on `<|im_end|>` and
+    /// leaves the KV caches on a clean turn boundary so subsequent
+    /// [`Self::chat_session_continue`] /
+    /// [`Self::chat_session_continue_tool`] calls can append a raw
+    /// ChatML delta on top without re-rendering the chat template.
+    ///
+    /// Qianfan-OCR is always a VLM (InternViT + Qwen3 language model), so
+    /// this entry point accepts images in `messages` without the text-only
+    /// fast-fail used by plain language models.
+    #[napi]
+    pub async fn chat_session_start(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
+        })?;
+
+        let config = config.unwrap_or_default();
+
+        crate::model_thread::send_and_await(thread, |reply| QianfanOCRCmd::ChatSessionStart {
+            messages,
+            config,
+            reply,
+        })
+        .await
+    }
+
+    /// Continue an existing chat session with a new user message.
+    ///
+    /// Appends a raw ChatML user/assistant delta to the session's cached
+    /// KV state, then decodes the model reply. Stops on `<|im_end|>` so
+    /// the cache remains on a clean turn boundary for the next turn.
+    ///
+    /// Requires a live session started via
+    /// [`Self::chat_session_start`]. Errors if the session is empty or
+    /// if `config.reuse_cache` is explicitly set to `false`.
+    ///
+    /// `images` is an opt-in guard parameter: when non-empty the native
+    /// side returns an error whose message begins with
+    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+    /// `ChatSession` layer can catch the prefix and route image-changes
+    /// back through a fresh `chatSessionStart` uniformly across all
+    /// model backends. Qianfan-OCR is a VLM but the continue path cannot
+    /// splice new vision features into a live KV cache — image changes
+    /// always require a fresh session start.
+    #[napi(
+        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
+    )]
+    pub async fn chat_session_continue(
+        &self,
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
+        })?;
+
+        let config = config.unwrap_or_default();
+
+        crate::model_thread::send_and_await(thread, |reply| QianfanOCRCmd::ChatSessionContinue {
+            user_message,
+            images,
+            config,
+            reply,
+        })
+        .await
+    }
+
+    /// Continue an existing chat session with a tool-result turn.
+    ///
+    /// Builds a ChatML `<tool_response>` delta from `tool_call_id` and
+    /// `content` and prefills it on top of the live session caches, then
+    /// decodes the model reply. Stops on `<|im_end|>` so the cache stays
+    /// on a clean turn boundary for the next turn.
+    ///
+    /// Requires a live session started via
+    /// [`Self::chat_session_start`].
+    #[napi]
+    pub async fn chat_session_continue_tool(
+        &self,
+        tool_call_id: String,
+        content: String,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
+        })?;
+
+        let config = config.unwrap_or_default();
+
+        crate::model_thread::send_and_await(thread, |reply| {
+            QianfanOCRCmd::ChatSessionContinueTool {
+                tool_call_id,
+                content,
+                config,
+                reply,
+            }
+        })
+        .await
+    }
+
+    /// Streaming variant of [`Self::chat_session_start`].
+    #[napi(
+        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream_session_start(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
+        })?;
+
+        let config = config.unwrap_or_default();
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        thread.send(QianfanOCRCmd::ChatStreamSessionStart {
+            messages,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+
+        let callback = Arc::new(callback);
+        tokio::spawn(async move {
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
+    }
+
+    /// Streaming variant of [`Self::chat_session_continue`].
+    #[napi(
+        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream_session_continue(
+        &self,
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
+        })?;
+
+        let config = config.unwrap_or_default();
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        thread.send(QianfanOCRCmd::ChatStreamSessionContinue {
+            user_message,
+            images,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+
+        let callback = Arc::new(callback);
+        tokio::spawn(async move {
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
+    }
+
+    /// Streaming variant of [`Self::chat_session_continue_tool`].
+    #[napi(
+        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream_session_continue_tool(
+        &self,
+        tool_call_id: String,
+        content: String,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
+        })?;
+
+        let config = config.unwrap_or_default();
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        thread.send(QianfanOCRCmd::ChatStreamSessionContinueTool {
+            tool_call_id,
+            content,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+
+        let callback = Arc::new(callback);
+        tokio::spawn(async move {
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
     }
 }
 
