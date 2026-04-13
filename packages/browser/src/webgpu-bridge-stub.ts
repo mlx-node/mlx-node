@@ -20,11 +20,50 @@ import {
   STATUS_INDEX,
   CALLBACK_ENTRY_SIZE,
   MAX_CALLBACKS_PER_CALL,
+  STATS_OPCODE_SLOTS,
+  STATS_CALLBACK_SLOTS,
+  STATS_INLINE_OFFSET,
+  STATS_INLINE_SLOTS,
+  STATS_RESERVED_OFFSET,
+  STATS_RESERVED_SLOTS,
 } from './rpc-protocol.js';
+
+export interface BridgeStats {
+  /** Total rpcCall invocations observed since the last reset. */
+  rpcCount: number;
+  /** Histogram of rpcCall invocations keyed by RpcFn numeric value. */
+  byFn: Record<number, number>;
+  /** Buffer pool hits: creates served from the free-list with no RPC. */
+  poolHits: number;
+  /** Buffer pool misses: creates that fell through to a real RPC. */
+  poolMisses: number;
+}
+
+export interface GpuWorkerStats {
+  /** Total RPCs handled by the gpu-worker since its last reset. */
+  totalRpcs: number;
+  /** Histogram keyed by RpcFn numeric value (gpu-worker's view). */
+  byFn: Record<number, number>;
+}
 
 export interface BridgeStub {
   imports: Record<string, (...args: any[]) => number | bigint | void>;
   setInstance(instance: WebAssembly.Instance): void;
+  /**
+   * Phase 0: snapshot the per-stub RPC counter + per-opcode histogram
+   * maintained inside rpcCall / rpcCallWithHi. Used by the `?profile=1`
+   * demo path (see mlx-worker.ts) to attribute wasm-worker → gpu-worker
+   * traffic alongside the C++-side dispatch counters.
+   */
+  getBridgeStats(): BridgeStats;
+  /** Phase 0: zero the counters returned by getBridgeStats. */
+  resetBridgeStats(): void;
+  /**
+   * Phase 0: issue a GET_STATS RPC to the gpu-worker and decode the
+   * per-opcode histogram from the SAB. If `resetAfter` is true the
+   * gpu-worker zeros its histogram after the readback.
+   */
+  fetchGpuWorkerStats(resetAfter: boolean): GpuWorkerStats;
 }
 
 export function createBridgeStub(
@@ -44,7 +83,7 @@ export function createBridgeStub(
 ): BridgeStub {
   const cmdView = new Int32Array(cmdBuffer);
   const cmdDataView = new DataView(cmdBuffer);
-  const cmdU32 = new Uint32Array(cmdBuffer);  // fast unsigned writes (avoids DataView overhead)
+  const cmdU32 = new Uint32Array(cmdBuffer); // fast unsigned writes (avoids DataView overhead)
   const readbackView = readbackBuffer ? new Uint8Array(readbackBuffer) : null;
 
   // WASM exports -- set via setInstance() after WASM instantiation
@@ -100,6 +139,19 @@ export function createBridgeStub(
   const RPC_HISTORY_SIZE = 32;
   const rpcHistory: Array<{ n: number; fn: number }> = [];
 
+  // Phase 0 (?profile=1) observability: histogram of rpcCall invocations
+  // keyed by RpcFn numeric value. Incremented at the very top of rpcCall /
+  // rpcCallWithHi so it reflects the wasm-worker's view of every RPC that
+  // crosses into the gpu-worker. Zero-cost when unused (typed-array +
+  // single Int32 increment per call).
+  const bridgeFnCounts = new Uint32Array(128);
+  let bridgeRpcCount = 0;
+  function bumpBridgeStats(fnId: number): void {
+    bridgeRpcCount++;
+    if (fnId >= 0 && fnId < bridgeFnCounts.length) {
+      bridgeFnCounts[fnId]++;
+    }
+  }
 
   // Pending compute pass state for fusion (setPipeline + setBindGroup → single dispatch RPC)
   let pendingPass = -1;
@@ -116,11 +168,40 @@ export function createBridgeStub(
   let pendingFinishPass = -1; // compute pass to end+release in FUSED_SUBMIT
   let lastFakeCmdBuf = -1;
   let lastFusedEncoder = -1;
-  let fakeHandleCounter = 0x7F000000; // high range to avoid collision with real handles
+  let fakeHandleCounter = 0x7f000000; // high range to avoid collision with real handles
 
   // Buffer size cache: use plain object (faster than Map for integer keys)
   // Caches buffer sizes to avoid BUFFER_GET_SIZE RPCs (~2.5x per dispatch)
   const bufSizes: Record<number, number> = {};
+  // Per-handle usage flags — needed by the release path to key the pool.
+  const bufferUsages: Record<number, number> = {};
+
+  // Buffer pool: recycle real gpu-worker handles by usage+size key.
+  // Key format: `${usage}:${size}`. Value: LIFO stack of live handles whose
+  // BUFFER_RELEASE RPC was suppressed — they stay alive in the gpu-worker.
+  const bufferPool = new Map<string, number[]>();
+  const POOL_CAP_PER_KEY = 32;
+  let bufferPoolHits = 0;
+  let bufferPoolMisses = 0;
+
+  function poolKey(usage: number, size: number): string {
+    return `${usage}:${size}`;
+  }
+
+  // Fake handles (0x7d000000+) must never enter the pool — they have no
+  // corresponding gpu-worker object to recycle.
+  const FAKE_HANDLE_BASE = 0x7d000000;
+
+  // MAP_READ=1 and MAP_WRITE=2 buffers have externally-observable mapping
+  // state that reuse would break. Only pure GPU-resident buffers are safe.
+  const UNSAFE_POOL_USAGE_MASK = 0x0001 | 0x0002; // MAP_READ | MAP_WRITE
+
+  function isPoolable(handle: number, usage: number): boolean {
+    if (handle >= FAKE_HANDLE_BASE) return false;
+    if (handle <= 0) return false;
+    if ((usage & UNSAFE_POOL_USAGE_MASK) !== 0) return false;
+    return true;
+  }
 
   // Deferred mappedAtCreation buffers: skip getMappedRange + unmap RPCs.
   // Instead of sending 3 RPCs (createBuffer+getMappedRange+unmap), we:
@@ -130,15 +211,15 @@ export function createBridgeStub(
   // Total: 1 RPC instead of 2 per uniform buffer creation.
   interface MappedAtCreationInfo {
     wasmPtr: number; // WASM shadow pointer (allocated by wasmMalloc)
-    size: number;    // buffer size in bytes
-    usage: number;   // GPUBufferUsageFlags for deferred creation
+    size: number; // buffer size in bytes
+    usage: number; // GPUBufferUsageFlags for deferred creation
   }
   const mappedAtCreationBuffers = new Map<number, MappedAtCreationInfo>();
 
   // Fake→real handle remapping for deferred buffer creation.
   // After wgpuBufferUnmap sends CREATE_BUFFER_FROM_DATA, the real handle is stored here.
   // All subsequent bridge stub functions that take a buffer handle resolve through this map.
-  let fakeBufferCounter = 0x7D000000; // distinct range from fakeHandleCounter (0x7F000000)
+  let fakeBufferCounter = 0x7d000000; // distinct range from fakeHandleCounter (0x7F000000)
   const deferredBufferRemap = new Map<number, number>(); // fake → real handle
 
   // Buffers awaiting GPU creation (deferred from wgpuBufferUnmap).
@@ -160,11 +241,12 @@ export function createBridgeStub(
     const def = deferredCreations.get(fakeHandle);
     if (!def) return;
     deferredCreations.delete(fakeHandle);
-    const sizeLo = def.size & 0xFFFFFFFF;
+    const sizeLo = def.size & 0xffffffff;
     const sizeHi = Math.floor(def.size / 0x100000000);
     const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, def.usage, sizeLo, sizeHi, def.wasmPtr);
     deferredBufferRemap.set(fakeHandle, realHandle);
     bufSizes[realHandle] = def.size;
+    bufferUsages[realHandle] = def.usage;
     wasmFree(def.wasmPtr);
   }
 
@@ -174,7 +256,7 @@ export function createBridgeStub(
   // This avoids a separate DEVICE_CREATE_BIND_GROUP RPC — the bind group is
   // created inline on the gpu-worker side during dispatch.
   interface BgEntryData {
-    bufferHandle: number;  // already resolved via resolveBufferHandle
+    bufferHandle: number; // already resolved via resolveBufferHandle
     sizeLo: number;
     sizeHi: number;
   }
@@ -183,7 +265,7 @@ export function createBridgeStub(
     entries: BgEntryData[];
   }
   const pendingBgData = new Map<number, ParsedBgDesc>();
-  let fakeBgCounter = 0x7E000000;
+  let fakeBgCounter = 0x7e000000;
 
   // Pipeline bind group layout cache: layouts are lightweight and never released
   const layoutCache: Record<number, number> = {};
@@ -192,7 +274,7 @@ export function createBridgeStub(
   // When wgpuQueueWriteBuffer is called with <=256 bytes at offset 0,
   // we defer the write and pack it inline into FUSED_DISPATCH_WITH_UNIFORM.
   interface PendingWriteBuffer {
-    data: Uint8Array;  // copied from WASM memory (slice, not subarray)
+    data: Uint8Array; // copied from WASM memory (slice, not subarray)
   }
   const pendingWriteBuffers = new Map<number, PendingWriteBuffer>();
 
@@ -221,15 +303,15 @@ export function createBridgeStub(
     pendingBgData.delete(handle);
     // Reconstruct the descriptor in WASM scratch memory and send CREATE_BIND_GROUP RPC
     const ENTRY_SIZE = 40; // WGPUBindGroupEntry is 40 bytes on WASM32
-    const descSize = 20;   // WGPUBindGroupDescriptor is 20 bytes on WASM32
+    const descSize = 20; // WGPUBindGroupDescriptor is 20 bytes on WASM32
     const entriesSize = bgDesc.entries.length * ENTRY_SIZE;
     const scratchPtr = wasmMalloc(descSize + entriesSize);
     const view = new DataView(heap().buffer);
     const entriesArrPtr = scratchPtr + descSize;
 
     // Write WGPUBindGroupDescriptor
-    view.setUint32(scratchPtr + 0, 0, true);  // nextInChain
-    view.setUint32(scratchPtr + 4, 0, true);  // label
+    view.setUint32(scratchPtr + 0, 0, true); // nextInChain
+    view.setUint32(scratchPtr + 4, 0, true); // label
     view.setUint32(scratchPtr + 8, bgDesc.layoutHandle, true);
     view.setUint32(scratchPtr + 12, bgDesc.entries.length, true);
     view.setUint32(scratchPtr + 16, entriesArrPtr, true);
@@ -238,16 +320,16 @@ export function createBridgeStub(
     for (let i = 0; i < bgDesc.entries.length; i++) {
       const e = bgDesc.entries[i];
       const ePtr = entriesArrPtr + i * ENTRY_SIZE;
-      view.setUint32(ePtr + 0, 0, true);   // nextInChain
-      view.setUint32(ePtr + 4, i, true);   // binding = sequential index
+      view.setUint32(ePtr + 0, 0, true); // nextInChain
+      view.setUint32(ePtr + 4, i, true); // binding = sequential index
       view.setUint32(ePtr + 8, e.bufferHandle, true);
-      view.setUint32(ePtr + 12, 0, true);  // padding
-      view.setUint32(ePtr + 16, 0, true);  // offset lo = 0
-      view.setUint32(ePtr + 20, 0, true);  // offset hi = 0
+      view.setUint32(ePtr + 12, 0, true); // padding
+      view.setUint32(ePtr + 16, 0, true); // offset lo = 0
+      view.setUint32(ePtr + 20, 0, true); // offset hi = 0
       view.setUint32(ePtr + 24, e.sizeLo, true);
       view.setUint32(ePtr + 28, e.sizeHi, true);
-      view.setUint32(ePtr + 32, 0, true);  // sampler
-      view.setUint32(ePtr + 36, 0, true);  // textureView
+      view.setUint32(ePtr + 32, 0, true); // sampler
+      view.setUint32(ePtr + 36, 0, true); // textureView
     }
 
     const realHandle = rpcCall(RpcFn.DEVICE_CREATE_BIND_GROUP, scratchPtr);
@@ -275,14 +357,17 @@ export function createBridgeStub(
   }
 
   // Uint32Array indices for direct arg writes (element index = byte offset / 4)
-  const I_FN = CMD_OFFSET.FN_ID >>> 2;          // 0
-  const I_RESULT = CMD_OFFSET.RESULT >>> 2;      // 2
-  const I_ARG0 = CMD_OFFSET.ARG0 >>> 2;         // 4
+  const I_FN = CMD_OFFSET.FN_ID >>> 2; // 0
+  const I_RESULT = CMD_OFFSET.RESULT >>> 2; // 2
+  const I_ARG0 = CMD_OFFSET.ARG0 >>> 2; // 4
   const I_CB_COUNT = CMD_OFFSET.CALLBACK_COUNT >>> 2; // 16
 
-  function rpcCall(
-    fnId: number, a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0,
-  ): number {
+  function rpcCall(fnId: number, a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0): number {
+    // Phase 0: exclude GET_STATS from the bridge histogram so a profile
+    // readback does not skew its own numbers.
+    if (fnId !== RpcFn.GET_STATS) {
+      bumpBridgeStats(fnId);
+    }
     // Write function ID + all arguments via Uint32Array (no DataView overhead, no array alloc)
     cmdU32[I_FN] = fnId;
     cmdU32[I_ARG0] = a0 >>> 0;
@@ -294,7 +379,10 @@ export function createBridgeStub(
     cmdU32[I_ARG0 + 6] = a6 >>> 0;
     // Don't clear CALLBACK_COUNT for FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM —
     // it holds entryCount (written by the caller before rpcCall).
-    if (fnId !== RpcFn.FUSED_FULL_DISPATCH && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM) {
+    // Also skip for GET_STATS because the gpu-worker writes histogram data
+    // into the CALLBACK_COUNT region and we do NOT want rpcCall to
+    // interpret that as a pending-callback count.
+    if (fnId !== RpcFn.FUSED_FULL_DISPATCH && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM && fnId !== RpcFn.GET_STATS) {
       cmdU32[I_CB_COUNT] = 0;
     }
 
@@ -308,7 +396,9 @@ export function createBridgeStub(
       rpcHistory.push({ n: rpcCount, fn: fnId });
       const msg = `[RPC TIMEOUT] fn=${fnId} (#${rpcCount}) timed out after 10s! STATUS=${Atomics.load(cmdView, STATUS_INDEX)}`;
       console.error(msg);
-      try { (self as any).postMessage({ type: 'error', message: msg }); } catch {}
+      try {
+        (self as any).postMessage({ type: 'error', message: msg });
+      } catch {}
       // Second attempt with 30s timeout (avoid infinite hang during init)
       const retry = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 30_000);
       if (retry === 'timed-out') {
@@ -322,10 +412,15 @@ export function createBridgeStub(
 
     // Process pending callbacks only when present (95%+ of calls have 0).
     // Skip for FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM — CALLBACK_COUNT
-    // holds entryCount, not callbacks.
-    if (fnId !== RpcFn.FUSED_FULL_DISPATCH && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM) {
+    // holds entryCount, not callbacks. Also skip for GET_STATS where the
+    // gpu-worker repurposes the callback-ring region for histogram storage.
+    if (fnId !== RpcFn.FUSED_FULL_DISPATCH && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM && fnId !== RpcFn.GET_STATS) {
       if (cmdU32[I_CB_COUNT] > 0) {
-        try { drainCallbacks(fnId); } catch (e) { console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e); }
+        try {
+          drainCallbacks(fnId);
+        } catch (e) {
+          console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e);
+        }
       }
     }
 
@@ -337,11 +432,8 @@ export function createBridgeStub(
    * RPC call that also writes high-bits for u64 arguments.
    * hiArgs maps arg index -> high 32 bits.
    */
-  function rpcCallWithHi(
-    fnId: number,
-    args: number[],
-    hiArgs: Record<number, number>,
-  ): number {
+  function rpcCallWithHi(fnId: number, args: number[], hiArgs: Record<number, number>): number {
+    bumpBridgeStats(fnId);
     cmdDataView.setUint32(CMD_OFFSET.FN_ID, fnId, true);
 
     for (let i = 0; i < args.length && i < 8; i++) {
@@ -365,8 +457,10 @@ export function createBridgeStub(
       if (rpcHistory.length >= RPC_HISTORY_SIZE) rpcHistory.shift();
       rpcHistory.push({ n: rpcCount, fn: fnId });
       console.error(`[RPC TIMEOUT] fn=${fnId} (#${rpcCount}) timed out after 10s! (rpcCallWithHi)`);
-      console.error(`[RPC TIMEOUT] Last ${rpcHistory.length} calls:`,
-        rpcHistory.map(h => `#${h.n}:fn=${h.fn}`).join(', '));
+      console.error(
+        `[RPC TIMEOUT] Last ${rpcHistory.length} calls:`,
+        rpcHistory.map((h) => `#${h.n}:fn=${h.fn}`).join(', '),
+      );
       console.error(`[RPC TIMEOUT] Status word:`, Atomics.load(cmdView, STATUS_INDEX));
       // Second attempt with 30s timeout (avoid infinite hang during init)
       const retry = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 30_000);
@@ -380,7 +474,11 @@ export function createBridgeStub(
     const result = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);
     const cbCount = cmdDataView.getUint32(CMD_OFFSET.CALLBACK_COUNT, true);
     if (cbCount > 0) {
-      try { drainCallbacks(fnId); } catch (e) { console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e); }
+      try {
+        drainCallbacks(fnId);
+      } catch (e) {
+        console.warn(`[Bridge Stub] callback error for fn=${fnId}:`, e);
+      }
     }
     Atomics.store(cmdView, STATUS_INDEX, STATUS.IDLE);
 
@@ -448,9 +546,7 @@ export function createBridgeStub(
       return rpcCall(RpcFn.CREATE_INSTANCE);
     },
 
-    wgpuInstanceRequestAdapter(
-      _instance: number, _optsPtr: number, callbackPtr: number, userdataPtr: number,
-    ): void {
+    wgpuInstanceRequestAdapter(_instance: number, _optsPtr: number, callbackPtr: number, userdataPtr: number): void {
       rpcCall(RpcFn.INSTANCE_REQUEST_ADAPTER, 0, 0, callbackPtr, userdataPtr);
     },
 
@@ -459,9 +555,7 @@ export function createBridgeStub(
     },
 
     // ===== Adapter =====
-    wgpuAdapterRequestDevice(
-      _adapter: number, _descPtr: number, callbackPtr: number, userdataPtr: number,
-    ): void {
+    wgpuAdapterRequestDevice(_adapter: number, _descPtr: number, callbackPtr: number, userdataPtr: number): void {
       rpcCall(RpcFn.ADAPTER_REQUEST_DEVICE, 0, 0, callbackPtr, userdataPtr);
     },
 
@@ -473,8 +567,8 @@ export function createBridgeStub(
     },
 
     wgpuAdapterHasFeature(_adapter: number, feature: number): number {
-      if (feature === 14 && gpuFeatures?.shaderF16) return 1;  // WGPUFeatureName_ShaderF16
-      if (feature === 0x3F1 && gpuFeatures?.subgroups) return 1;  // WGPUFeatureName_Subgroups
+      if (feature === 14 && gpuFeatures?.shaderF16) return 1; // WGPUFeatureName_ShaderF16
+      if (feature === 0x3f1 && gpuFeatures?.subgroups) return 1; // WGPUFeatureName_Subgroups
       return 0;
     },
 
@@ -520,7 +614,31 @@ export function createBridgeStub(
         }
         // No COPY_DST: fall through to normal RPC (gpu-worker handles mapping)
       }
-      return rpcCall(RpcFn.DEVICE_CREATE_BUFFER, descPtr);
+
+      // Non-mapped create: try pool first, else RPC with eager cache populate.
+      const usage = new DataView(h.buffer, h.byteOffset, h.byteLength).getUint32(descPtr + 8, true);
+      const size = new DataView(h.buffer, h.byteOffset, h.byteLength).getUint32(descPtr + 16, true);
+      const mappedAtCreation = h[descPtr + 24] !== 0;
+
+      if (!mappedAtCreation && size > 0) {
+        const key = poolKey(usage, size);
+        const stack = bufferPool.get(key);
+        if (stack !== undefined && stack.length > 0) {
+          const reused = stack.pop()!;
+          bufferPoolHits++;
+          bufSizes[reused] = size;
+          bufferUsages[reused] = usage;
+          return reused;
+        }
+        bufferPoolMisses++;
+      }
+
+      const h2 = rpcCall(RpcFn.DEVICE_CREATE_BUFFER, descPtr);
+      if (h2 > 0 && h2 < FAKE_HANDLE_BASE) {
+        bufSizes[h2] = size; // eager size cache (eliminates BUFFER_GET_SIZE RPCs)
+        bufferUsages[h2] = usage;
+      }
+      return h2;
     },
 
     wgpuDeviceCreateShaderModule(_device: number, descPtr: number): number {
@@ -589,15 +707,11 @@ export function createBridgeStub(
       return rpcCall(RpcFn.DEVICE_GET_LIMITS, limitsPtr);
     },
 
-    wgpuDeviceSetUncapturedErrorCallback(
-      _device: number, _cb: number, _ud: number,
-    ): void {
+    wgpuDeviceSetUncapturedErrorCallback(_device: number, _cb: number, _ud: number): void {
       rpcCall(RpcFn.DEVICE_SET_ERROR_CALLBACK);
     },
 
-    wgpuDeviceSetDeviceLostCallback(
-      _device: number, _cb: number, _ud: number,
-    ): void {
+    wgpuDeviceSetDeviceLostCallback(_device: number, _cb: number, _ud: number): void {
       rpcCall(RpcFn.DEVICE_SET_LOST_CALLBACK);
     },
 
@@ -622,8 +736,11 @@ export function createBridgeStub(
     },
 
     wgpuQueueWriteBuffer(
-      _queue: number, bufferHandle: number, bufferOffset: bigint,
-      dataPtr: number, size: number,
+      _queue: number,
+      bufferHandle: number,
+      bufferOffset: bigint,
+      dataPtr: number,
+      size: number,
     ): void {
       const resolved = resolveBufferHandle(bufferHandle);
       // Defer small writes at offset 0 — will be packed into FUSED_DISPATCH_WITH_UNIFORM
@@ -634,14 +751,12 @@ export function createBridgeStub(
         return;
       }
       // Large or offset writes: send immediately
-      const offsetLo = Number(bufferOffset & 0xFFFFFFFFn);
+      const offsetLo = Number(bufferOffset & 0xffffffffn);
       const offsetHi = Number(bufferOffset >> 32n);
       rpcCall(RpcFn.QUEUE_WRITE_BUFFER, resolved, offsetLo, offsetHi, dataPtr, size);
     },
 
-    wgpuQueueOnSubmittedWorkDone(
-      _queue: number, callbackPtr: number, userdataPtr: number,
-    ): void {
+    wgpuQueueOnSubmittedWorkDone(_queue: number, callbackPtr: number, userdataPtr: number): void {
       rpcCall(RpcFn.QUEUE_ON_SUBMITTED_WORK_DONE, callbackPtr, userdataPtr);
     },
 
@@ -671,8 +786,10 @@ export function createBridgeStub(
 
     wgpuCommandEncoderCopyBufferToBuffer(
       encoderHandle: number,
-      srcHandle: number, srcOffset: bigint,
-      dstHandle: number, dstOffset: bigint,
+      srcHandle: number,
+      srcOffset: bigint,
+      dstHandle: number,
+      dstOffset: bigint,
       size: bigint,
     ): void {
       flushPendingCompute();
@@ -684,13 +801,23 @@ export function createBridgeStub(
       const dstOff32 = Number(dstOffset);
       const size32 = Number(size);
 
-      if (srcOffset <= 0xFFFFFFFF && dstOffset <= 0xFFFFFFFF && size <= 0xFFFFFFFF
-          && activeComputePassEncoder === encoderHandle) {
+      if (
+        srcOffset <= 0xffffffff &&
+        dstOffset <= 0xffffffff &&
+        size <= 0xffffffff &&
+        activeComputePassEncoder === encoderHandle
+      ) {
         // FUSED: end pass (if active) + copy + begin new pass = 1 RPC instead of 3-4
         const passHandle = activeComputePass >= 0 ? activeComputePass : 0;
         const newPassHandle = rpcCall(
           RpcFn.FUSED_COPY_BUFFER,
-          encoderHandle, passHandle, resolvedSrc, srcOff32, resolvedDst, dstOff32, size32,
+          encoderHandle,
+          passHandle,
+          resolvedSrc,
+          srcOff32,
+          resolvedDst,
+          dstOff32,
+          size32,
         );
         activeComputePass = newPassHandle;
         activeComputePassEncoder = encoderHandle;
@@ -701,11 +828,11 @@ export function createBridgeStub(
           activeComputePass = -1;
           activeComputePassEncoder = -1;
         }
-        const srcOffsetLo = Number(srcOffset & 0xFFFFFFFFn);
+        const srcOffsetLo = Number(srcOffset & 0xffffffffn);
         const srcOffsetHi = Number(srcOffset >> 32n);
-        const dstOffsetLo = Number(dstOffset & 0xFFFFFFFFn);
+        const dstOffsetLo = Number(dstOffset & 0xffffffffn);
         const dstOffsetHi = Number(dstOffset >> 32n);
-        const sizeLo = Number(size & 0xFFFFFFFFn);
+        const sizeLo = Number(size & 0xffffffffn);
         const sizeHi = Number(size >> 32n);
         rpcCallWithHi(
           RpcFn.CMD_ENCODER_COPY_BUFFER,
@@ -758,8 +885,11 @@ export function createBridgeStub(
     },
 
     wgpuComputePassEncoderSetBindGroup(
-      passHandle: number, groupIndex: number, bgHandle: number,
-      dynamicOffsetCount: number, dynamicOffsetsPtr: number,
+      passHandle: number,
+      groupIndex: number,
+      bgHandle: number,
+      dynamicOffsetCount: number,
+      dynamicOffsetsPtr: number,
     ): void {
       if (groupIndex === 0 && dynamicOffsetCount === 0 && pendingPipeline >= 0) {
         // Buffer for fusion with upcoming dispatch
@@ -770,13 +900,18 @@ export function createBridgeStub(
       } else {
         // Non-fusable: flush pending and do individual RPC
         flushPendingCompute();
-        rpcCall(RpcFn.COMPUTE_PASS_SET_BIND_GROUP, passHandle, groupIndex, bgHandle, dynamicOffsetCount, dynamicOffsetsPtr);
+        rpcCall(
+          RpcFn.COMPUTE_PASS_SET_BIND_GROUP,
+          passHandle,
+          groupIndex,
+          bgHandle,
+          dynamicOffsetCount,
+          dynamicOffsetsPtr,
+        );
       }
     },
 
-    wgpuComputePassEncoderDispatchWorkgroups(
-      passHandle: number, x: number, y: number, z: number,
-    ): void {
+    wgpuComputePassEncoderDispatchWorkgroups(passHandle: number, x: number, y: number, z: number): void {
       if (pendingPipeline >= 0 && pendingBindGroup >= 0 && pendingBindGroup1 >= 0) {
         // 2 bind groups: materialize any fake handles and use FUSED_DISPATCH_2BG
         flushPendingWrites();
@@ -796,7 +931,7 @@ export function createBridgeStub(
           // Check if any bind group entry has a pending writeBuffer or deferred creation
           let uniformEntryIdx = -1;
           let uniformData: Uint8Array | null = null;
-          let deferredFakeHandle = -1;  // track deferred creation to finalize after RPC
+          let deferredFakeHandle = -1; // track deferred creation to finalize after RPC
           let deferredInfo: DeferredCreation | undefined;
 
           for (let i = 0; i < entryCount; i++) {
@@ -843,7 +978,7 @@ export function createBridgeStub(
             const e = bgDesc.entries[i];
             const base = (CMD_OFFSET.CALLBACK_BASE + i * 12) >>> 2;
             // Use 0 for deferred creation entry (gpu-worker will create buffer)
-            cmdU32[base] = (i === uniformEntryIdx && deferredInfo) ? 0 : resolveBufferHandle(e.bufferHandle);
+            cmdU32[base] = i === uniformEntryIdx && deferredInfo ? 0 : resolveBufferHandle(e.bufferHandle);
             cmdU32[base + 1] = e.sizeLo;
             cmdU32[base + 2] = e.sizeHi;
           }
@@ -854,13 +989,23 @@ export function createBridgeStub(
             const usage = deferredInfo ? deferredInfo.usage : 0;
             cmdU32[CMD_OFFSET.UNIFORM_DATA_SIZE >>> 2] = uniformData.byteLength;
             new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformData.byteLength).set(uniformData);
-            const result = rpcCall(RpcFn.FUSED_DISPATCH_WITH_UNIFORM, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z, uniformEntryIdx);
+            const result = rpcCall(
+              RpcFn.FUSED_DISPATCH_WITH_UNIFORM,
+              pendingPass,
+              pendingPipeline,
+              bgDesc.layoutHandle,
+              x,
+              y,
+              z,
+              uniformEntryIdx,
+            );
 
             // Finalize deferred buffer creation: gpu-worker returns real handle
             if (deferredInfo && deferredFakeHandle >= 0) {
               if (result > 0) {
                 deferredBufferRemap.set(deferredFakeHandle, result);
                 bufSizes[result] = deferredInfo.size;
+                bufferUsages[result] = deferredInfo.usage;
               }
               wasmFree(deferredInfo.wasmPtr);
             }
@@ -868,11 +1013,18 @@ export function createBridgeStub(
             // No inline data or too large — flush and use FUSED_FULL_DISPATCH
             if (deferredInfo && deferredFakeHandle >= 0) {
               // Can't inline — fall back to immediate creation
-              const sizeLo = deferredInfo.size & 0xFFFFFFFF;
+              const sizeLo = deferredInfo.size & 0xffffffff;
               const sizeHi = Math.floor(deferredInfo.size / 0x100000000);
-              const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, deferredInfo.usage, sizeLo, sizeHi, deferredInfo.wasmPtr);
+              const realHandle = rpcCall(
+                RpcFn.CREATE_BUFFER_FROM_DATA,
+                deferredInfo.usage,
+                sizeLo,
+                sizeHi,
+                deferredInfo.wasmPtr,
+              );
               deferredBufferRemap.set(deferredFakeHandle, realHandle);
               bufSizes[realHandle] = deferredInfo.size;
+              bufferUsages[realHandle] = deferredInfo.usage;
               wasmFree(deferredInfo.wasmPtr);
               // Rewrite the entry with the real handle
               const base = (CMD_OFFSET.CALLBACK_BASE + uniformEntryIdx * 12) >>> 2;
@@ -996,11 +1148,12 @@ export function createBridgeStub(
           // DON'T free wasmPtr — data is needed at dispatch time
         } else {
           // Large buffer: create immediately (won't fit in inline dispatch data)
-          const sizeLo = mapped.size & 0xFFFFFFFF;
+          const sizeLo = mapped.size & 0xffffffff;
           const sizeHi = Math.floor(mapped.size / 0x100000000);
           const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, mapped.usage, sizeLo, sizeHi, mapped.wasmPtr);
           deferredBufferRemap.set(bufferHandle, realHandle);
           bufSizes[realHandle] = mapped.size;
+          bufferUsages[realHandle] = mapped.usage;
           wasmFree(mapped.wasmPtr);
         }
         unmapPtrs.delete(bufferHandle);
@@ -1016,9 +1169,12 @@ export function createBridgeStub(
     },
 
     wgpuBufferMapAsync(
-      bufferHandle: number, mode: number,
-      offset: number, size: number,
-      callbackPtr: number, userdataPtr: number,
+      bufferHandle: number,
+      mode: number,
+      offset: number,
+      size: number,
+      callbackPtr: number,
+      userdataPtr: number,
     ): void {
       rpcCall(RpcFn.BUFFER_MAP_ASYNC, resolveBufferHandle(bufferHandle), mode, offset, size, callbackPtr, userdataPtr);
     },
@@ -1036,6 +1192,16 @@ export function createBridgeStub(
         deferredCreations.delete(bufferHandle);
         wasmFree(def.wasmPtr);
       }
+      // Evict from pool by clearing the entire (usage, size) bucket — simpler
+      // and correct: any handle in that bucket with the destroyed handle is gone.
+      const size = bufSizes[bufferHandle];
+      const usage = bufferUsages[bufferHandle];
+      if (size !== undefined && usage !== undefined) {
+        const key = poolKey(usage, size);
+        bufferPool.delete(key);
+        delete bufSizes[bufferHandle];
+        delete bufferUsages[bufferHandle];
+      }
     },
 
     wgpuBufferRelease(handle: number): void {
@@ -1048,10 +1214,33 @@ export function createBridgeStub(
       }
       const resolved = resolveBufferHandle(handle);
       if (resolved !== handle) {
-        // Clean up remap entry — buffer is being released
         deferredBufferRemap.delete(handle);
       }
+
+      // Try to pool the real handle instead of releasing to the gpu-worker.
+      const size = bufSizes[resolved];
+      const usage = bufferUsages[resolved];
+      if (size !== undefined && usage !== undefined && isPoolable(resolved, usage)) {
+        const key = poolKey(usage, size);
+        let stack = bufferPool.get(key);
+        if (stack === undefined) {
+          stack = [];
+          bufferPool.set(key, stack);
+        }
+        if (stack.length < POOL_CAP_PER_KEY) {
+          stack.push(resolved);
+          return; // suppressed RPC — handle stays alive in the gpu-worker
+        }
+        // Pool full: evict oldest (FIFO) and release it, then pool the new one.
+        const evicted = stack.shift()!;
+        rpcCall(RpcFn.BUFFER_RELEASE, evicted);
+        stack.push(resolved);
+        return;
+      }
+
       rpcCall(RpcFn.BUFFER_RELEASE, resolved);
+      if (size !== undefined) delete bufSizes[resolved];
+      if (usage !== undefined) delete bufferUsages[resolved];
     },
 
     // ===== Pipeline =====
@@ -1115,5 +1304,51 @@ export function createBridgeStub(
     },
   };
 
-  return { imports, setInstance };
+  function getBridgeStats(): BridgeStats {
+    const byFn: Record<number, number> = {};
+    for (let i = 0; i < bridgeFnCounts.length; i++) {
+      if (bridgeFnCounts[i] > 0) {
+        byFn[i] = bridgeFnCounts[i];
+      }
+    }
+    return { rpcCount: bridgeRpcCount, byFn, poolHits: bufferPoolHits, poolMisses: bufferPoolMisses };
+  }
+
+  function resetBridgeStats(): void {
+    bridgeRpcCount = 0;
+    bridgeFnCounts.fill(0);
+    bufferPoolHits = 0;
+    bufferPoolMisses = 0;
+  }
+
+  function fetchGpuWorkerStats(resetAfter: boolean): GpuWorkerStats {
+    const totalRpcs = rpcCall(RpcFn.GET_STATS, resetAfter ? 1 : 0) >>> 0;
+    // Three-region layout — see GET_STATS handler in gpu-worker.ts for the
+    // writer side and rpc-protocol.ts for the rationale.
+    const byFn: Record<number, number> = {};
+    const cbBase = CMD_OFFSET.CALLBACK_COUNT >>> 2;
+    for (let i = 0; i < STATS_CALLBACK_SLOTS; i++) {
+      const v = cmdU32[cbBase + i];
+      if (v > 0) byFn[i] = v;
+    }
+    const inlineBase = STATS_INLINE_OFFSET >>> 2;
+    for (let i = 0; i < STATS_INLINE_SLOTS; i++) {
+      const v = cmdU32[inlineBase + i];
+      if (v > 0) byFn[STATS_CALLBACK_SLOTS + i] = v;
+    }
+    const reservedBase = STATS_RESERVED_OFFSET >>> 2;
+    for (let i = 0; i < STATS_RESERVED_SLOTS; i++) {
+      const v = cmdU32[reservedBase + i];
+      if (v > 0) byFn[STATS_CALLBACK_SLOTS + STATS_INLINE_SLOTS + i] = v;
+    }
+    return { totalRpcs, byFn };
+  }
+
+  return {
+    imports,
+    setInstance,
+    getBridgeStats,
+    resetBridgeStats,
+    fetchGpuWorkerStats,
+  };
 }
