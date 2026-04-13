@@ -512,10 +512,37 @@ impl Qwen35MoeInner {
     }
 
     /// Chat synchronous (runs on model thread).
+    ///
+    /// Legacy-compat thin wrapper around [`Self::chat_sync_core`]. Forwards
+    /// with `eos_override = None`, preserving byte-for-byte behaviour of the
+    /// pre-refactor entry point: the decode loop stops on
+    /// `config.eos_token_id`. Session-aware entry points (added in a later
+    /// step) go through `chat_sync_core` directly with
+    /// `eos_override = Some(<|im_end|>)`.
     pub(crate) fn chat_sync(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
+    ) -> Result<ChatResult> {
+        self.chat_sync_core(messages, config, None)
+    }
+
+    /// Core implementation of `chat_sync` / `chat_session_start_sync`.
+    ///
+    /// Factored so both paths share the jinja rendering + prefill + decode
+    /// plumbing. The only behavioural difference is the EOS token:
+    ///
+    ///   - `chat_sync` passes `eos_override = None`, so the decode loop
+    ///     stops on `config.eos_token_id` (matches legacy behaviour exactly).
+    ///   - `chat_session_start_sync` (added in Step 2b) passes
+    ///     `eos_override = Some(im_end_id)` so the cached history ends on
+    ///     `<|im_end|>`, yielding clean ChatML boundaries for subsequent
+    ///     session deltas.
+    fn chat_sync_core(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        eos_override: Option<u32>,
     ) -> Result<ChatResult> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -676,7 +703,11 @@ impl Qwen35MoeInner {
             (prefill_tokens, cached_prefix_len)
         };
 
-        let eos_id = self.config.eos_token_id as u32;
+        // Session-start paths pass `Some(<|im_end|>)` so the cached history
+        // ends on a clean ChatML boundary; the default `chat_sync` path
+        // passes `None` and preserves config-driven EOS for byte-for-byte
+        // compatibility with existing callers.
+        let eos_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
 
@@ -998,6 +1029,13 @@ impl Qwen35MoeInner {
     }
 
     /// Streaming chat synchronous (runs on model thread).
+    ///
+    /// Legacy-compat thin wrapper around [`Self::chat_stream_sync_core`].
+    /// Forwards with `eos_override = None`, preserving byte-for-byte
+    /// behaviour of the pre-refactor entry point: the decode loop stops on
+    /// `config.eos_token_id`. Session-aware streaming entry points (added in
+    /// a later step) go through `chat_stream_sync_core` directly with
+    /// `eos_override = Some(<|im_end|>)`.
     pub(crate) fn chat_stream_sync(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -1006,16 +1044,30 @@ impl Qwen35MoeInner {
         cancelled: Arc<AtomicBool>,
     ) {
         let cb = StreamSender(stream_tx.clone());
-        let result = self.chat_stream_sync_inner(messages, config, &cb, &cancelled);
+        let result = self.chat_stream_sync_core(messages, config, None, &cb, &cancelled);
         if let Err(e) = result {
             let _ = stream_tx.send(Err(e));
         }
     }
 
-    fn chat_stream_sync_inner(
+    /// Core implementation of `chat_stream_sync` /
+    /// `chat_stream_session_start_sync`.
+    ///
+    /// Factored so both paths share the jinja rendering + prefill + decode
+    /// plumbing. The only behavioural difference is the EOS token:
+    ///
+    ///   - `chat_stream_sync` passes `eos_override = None`, so the decode
+    ///     loop stops on `config.eos_token_id` (matches legacy behaviour
+    ///     exactly).
+    ///   - `chat_stream_session_start_sync` (added in Step 2b) passes
+    ///     `eos_override = Some(im_end_id)` so the cached history ends on
+    ///     `<|im_end|>`, yielding clean ChatML boundaries for subsequent
+    ///     session deltas.
+    fn chat_stream_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
+        eos_override: Option<u32>,
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<()> {
@@ -1173,7 +1225,11 @@ impl Qwen35MoeInner {
             (prefill_tokens, cached_prefix_len)
         };
 
-        let eos_id = self.config.eos_token_id as u32;
+        // Session-start streaming paths pass `Some(<|im_end|>)` so the
+        // cached history ends on a clean ChatML boundary; the default
+        // `chat_stream_sync` path passes `None` and preserves config-driven
+        // EOS for byte-for-byte compatibility with existing callers.
+        let eos_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
