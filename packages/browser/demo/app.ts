@@ -411,6 +411,10 @@ const urlParams = new URLSearchParams(location.search);
 const packBf16 = urlParams.get('pack_bf16') !== '0'; // enabled by default, ?pack_bf16=0 to disable
 const sdpaFallback = urlParams.get('sdpa_fallback') === '1';
 const profile = urlParams.get('profile') === '1';
+// Phase 2: DISPATCH_BATCH gating. Default off because the batch-flush
+// ordering is still shaking out — enable explicitly via ?dispatch_batch=1
+// and verify decode parity + RPCs/tok reduction in the profile readout.
+const dispatchBatch = urlParams.get('dispatch_batch') === '1';
 const useSab = urlParams.get('stream_sab') !== '0'; // enabled by default, ?stream_sab=0 to fall back to TSFN
 // ?mode=baseline | sab | tsfn — diagnostic A/B for the streaming path.
 // baseline = non-streaming chat() (ground-truth compute, no sink overhead).
@@ -419,6 +423,7 @@ const flagBadges =
   (packBf16 ? ' (pack_bf16=1)' : '') +
   (sdpaFallback ? ' (sdpa_fallback=1)' : '') +
   (profile ? ' (profile=1)' : '') +
+  (dispatchBatch ? ' (dispatch_batch=1)' : '') +
   (useSab ? '' : ' (stream_sab=0)') +
   (modeParam ? ` (mode=${modeParam})` : '');
 log(`Starting MLX Worker${flagBadges}...`);
@@ -430,6 +435,7 @@ worker.postMessage({
   packBf16,
   sdpaFallback,
   profile,
+  dispatchBatch,
 });
 
 // Chat handler

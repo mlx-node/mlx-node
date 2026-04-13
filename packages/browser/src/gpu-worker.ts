@@ -28,6 +28,7 @@ import {
   STATS_INLINE_SLOTS,
   STATS_RESERVED_OFFSET,
   STATS_RESERVED_SLOTS,
+  DISPATCH_BATCH_HEADER_BYTES,
 } from './rpc-protocol.js';
 
 // ---------- Phase 0 RPC Histogram (?profile=1 observability) ----------
@@ -182,6 +183,12 @@ let cmdU32: Uint32Array; // Fast unsigned reads (avoids DataView overhead in hot
 let wasmMemoryObj: WebAssembly.Memory; // Memory object — .buffer always reflects current size after grow()
 let readbackView: Uint8Array;
 
+// Phase 2: dispatch batch SAB (optional — only present when the mlx-worker
+// passes `dispatchBatchBuffer` in the init message). Used by DISPATCH_BATCH.
+let dispatchBatchU32: Uint32Array | null = null;
+let dispatchBatchU8: Uint8Array | null = null;
+let dispatchBatchBuffer: SharedArrayBuffer | null = null;
+
 // Pending callbacks: accumulated during async operations (mapAsync, adapter/device request).
 // Written to the callback ring in the command buffer when the current RPC call completes.
 interface PendingCallback {
@@ -224,6 +231,12 @@ self.onmessage = async (e: MessageEvent) => {
     cmdView = new Int32Array(cmdBuffer);
     cmdDataView = new DataView(cmdBuffer);
     cmdU32 = new Uint32Array(cmdBuffer);
+
+    if (e.data.dispatchBatchBuffer) {
+      dispatchBatchBuffer = e.data.dispatchBatchBuffer as SharedArrayBuffer;
+      dispatchBatchU32 = new Uint32Array(dispatchBatchBuffer);
+      dispatchBatchU8 = new Uint8Array(dispatchBatchBuffer);
+    }
 
     // Create GPU device
     const gpu = navigator.gpu;
@@ -583,6 +596,98 @@ self.onmessage = async (e: MessageEvent) => {
 // allocation, no switch dispatch, no flushCallbacks (hot paths produce
 // no callbacks). Called directly from the command loop.
 
+/**
+ * Core fused dispatch body shared by single-shot FUSED_FULL_DISPATCH /
+ * FUSED_DISPATCH_WITH_UNIFORM and batched DISPATCH_BATCH. Reads entries and
+ * (optionally) inline uniform bytes from `entrySrc` + `uniformSrc`, which
+ * may alias either the main cmdBuffer or the dedicated batch SAB.
+ *
+ * Returns the new buffer handle if the record triggered inline deferred
+ * buffer creation (FUSED_DISPATCH_WITH_UNIFORM with entries[uniformEntryIdx]=0),
+ * or 0 otherwise.
+ */
+function dispatchFusedRecord(
+  opcode: number,
+  passHandle: number,
+  pipelineHandle: number,
+  layoutHandle: number,
+  x: number,
+  y: number,
+  z: number,
+  entryCount: number,
+  entrySrc: Uint32Array,
+  entrySrcBase: number,
+  uniformEntryIdx: number,
+  uniformDataSize: number,
+  uniformBuffer: ArrayBuffer | SharedArrayBuffer | null,
+  uniformByteOffset: number,
+  uniformUsage: number,
+): number {
+  const layout = handles[layoutHandle] as GPUBindGroupLayout;
+  const entries: GPUBindGroupEntry[] = [];
+  let newBufferHandle = 0;
+
+  // Stage 1: optional uniform write (only for FUSED_DISPATCH_WITH_UNIFORM).
+  // Must run BEFORE createBindGroup so the patched handle (for deferred
+  // creation) lands in entries[uniformEntryIdx].
+  if (opcode === RpcFn.FUSED_DISPATCH_WITH_UNIFORM && uniformDataSize > 0 && uniformBuffer !== null) {
+    const uniformBufHandle = entrySrc[entrySrcBase + uniformEntryIdx * 3];
+    const uniformData = new Uint8Array(uniformBuffer, uniformByteOffset, uniformDataSize);
+    if (uniformBufHandle === 0) {
+      // Deferred buffer creation (inline): create buffer + write data.
+      const usage = uniformUsage || 0x0080 | 0x0008; // STORAGE | COPY_DST fallback
+      let handle: number;
+      const stack = isPoolable(usage) ? bufferPool.get(poolKey(usage, uniformDataSize)) : undefined;
+      if (stack !== undefined && stack.length > 0) {
+        handle = stack.pop()!;
+        if (stack.length === 0) bufferPool.delete(poolKey(usage, uniformDataSize));
+        bufferPoolHitCount++;
+        const pooled = handles[handle] as GPUBuffer;
+        queue.writeBuffer(pooled, 0, uniformData);
+      } else {
+        if (isPoolable(usage)) bufferPoolMissCount++;
+        const buffer = device.createBuffer({ size: uniformDataSize, usage });
+        queue.writeBuffer(buffer, 0, uniformData);
+        handle = addHandle(buffer);
+        bufferSizesArr[handle] = uniformDataSize;
+        bufferUsagesArr[handle] = usage;
+      }
+      newBufferHandle = handle;
+      // Patch the entry handle so the bind group build below picks up the
+      // new GPUBuffer. When `entrySrc === cmdU32` this mutates the main
+      // cmdBuffer in place (as the single-dispatch path used to do);
+      // otherwise it mutates the batch SAB (harmless — the bridge stub
+      // only reuses that SAB from offset 0 on the next batch).
+      entrySrc[entrySrcBase + uniformEntryIdx * 3] = handle;
+    } else {
+      const existing = handles[uniformBufHandle] as GPUBuffer;
+      queue.writeBuffer(existing, 0, uniformData);
+    }
+  }
+
+  // Stage 2: build bind group entries from the inline entry array.
+  let eIdx = entrySrcBase;
+  for (let i = 0; i < entryCount; i++) {
+    const buffer = handles[entrySrc[eIdx]] as GPUBuffer;
+    const sizeLo = entrySrc[eIdx + 1];
+    const sizeHi = entrySrc[eIdx + 2];
+    eIdx += 3;
+    const size = sizeLo + sizeHi * 0x100000000;
+    const resource: GPUBufferBinding = { buffer, offset: 0 };
+    if (size !== 0 && size < 2 ** 53) resource.size = size;
+    entries.push({ binding: i, resource });
+  }
+
+  // Stage 3: issue the dispatch on the cached compute pass.
+  const bindGroup = device.createBindGroup({ layout, entries });
+  const pass = handles[passHandle] as GPUComputePassEncoder;
+  pass.setPipeline(handles[pipelineHandle] as GPUComputePipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(x, y, z);
+  endAndRestartPass(passHandle);
+  return newBufferHandle;
+}
+
 function handleFusedFullDispatch(): void {
   const passHandle = cmdU32[I_ARG0];
   const pipelineHandle = cmdU32[I_ARG0 + 1];
@@ -591,28 +696,23 @@ function handleFusedFullDispatch(): void {
   const y = cmdU32[I_ARG0 + 4];
   const z = cmdU32[I_ARG0 + 5];
   const entryCount = cmdU32[I_CB_COUNT];
-
-  // Direct handle access (no null check) — hot path, handles always valid
-  const layout = handles[layoutHandle] as GPUBindGroupLayout;
-  const entries: GPUBindGroupEntry[] = [];
-  let eIdx = I_CB_BASE;
-  for (let i = 0; i < entryCount; i++) {
-    const buffer = handles[cmdU32[eIdx]] as GPUBuffer;
-    const sizeLo = cmdU32[eIdx + 1];
-    const sizeHi = cmdU32[eIdx + 2];
-    eIdx += 3;
-    const size = sizeLo + sizeHi * 0x100000000;
-    const resource: GPUBufferBinding = { buffer, offset: 0 };
-    if (size !== 0 && size < 2 ** 53) resource.size = size;
-    entries.push({ binding: i, resource });
-  }
-
-  const bindGroup = device.createBindGroup({ layout, entries });
-  const pass = handles[passHandle] as GPUComputePassEncoder;
-  pass.setPipeline(handles[pipelineHandle] as GPUComputePipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(x, y, z);
-  endAndRestartPass(passHandle);
+  dispatchFusedRecord(
+    RpcFn.FUSED_FULL_DISPATCH,
+    passHandle,
+    pipelineHandle,
+    layoutHandle,
+    x,
+    y,
+    z,
+    entryCount,
+    cmdU32,
+    I_CB_BASE,
+    0,
+    0,
+    null,
+    0,
+    0,
+  );
   cmdU32[I_RESULT] = 0;
 }
 
@@ -626,68 +726,79 @@ function handleFusedDispatchWithUniform(): void {
   const uniformEntryIdx = cmdU32[I_ARG0 + 6];
   const entryCount = cmdU32[I_CB_COUNT];
   const uniformDataSize = cmdU32[I_UNIFORM_SIZE];
-
-  // Direct handle access — hot path, handles always valid
-  const layout = handles[layoutHandle] as GPUBindGroupLayout;
-  const entries: GPUBindGroupEntry[] = [];
-  let newBufferHandle = 0; // set if we create a buffer inline
-
-  // Check if uniform entry needs buffer creation (handle = 0)
-  const uniformBufHandle = cmdU32[I_CB_BASE + uniformEntryIdx * 3];
-
-  if (uniformBufHandle === 0 && uniformDataSize > 0) {
-    // Deferred buffer creation: create buffer + write data inline
-    // ARG7 has the buffer usage flags from the bridge stub
-    const usage = cmdU32[I_ARG0 + 7] || 0x0080 | 0x0008; // STORAGE | COPY_DST fallback
-    const uniformData = new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformDataSize);
-    let handle: number;
-    const stack = isPoolable(usage) ? bufferPool.get(poolKey(usage, uniformDataSize)) : undefined;
-    if (stack !== undefined && stack.length > 0) {
-      handle = stack.pop()!;
-      if (stack.length === 0) bufferPool.delete(poolKey(usage, uniformDataSize));
-      bufferPoolHitCount++;
-      const pooled = handles[handle] as GPUBuffer;
-      queue.writeBuffer(pooled, 0, uniformData);
-    } else {
-      if (isPoolable(usage)) bufferPoolMissCount++;
-      const buffer = device.createBuffer({ size: uniformDataSize, usage });
-      queue.writeBuffer(buffer, 0, uniformData);
-      handle = addHandle(buffer);
-      bufferSizesArr[handle] = uniformDataSize;
-      bufferUsagesArr[handle] = usage;
-    }
-    newBufferHandle = handle;
-    // Patch the entry handle for bind group creation below
-    cmdU32[I_CB_BASE + uniformEntryIdx * 3] = handle;
-  } else if (uniformDataSize > 0) {
-    // Buffer exists — just write data
-    const uniformBuffer = handles[uniformBufHandle] as GPUBuffer;
-    const uniformData = new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformDataSize);
-    queue.writeBuffer(uniformBuffer, 0, uniformData);
-  }
-
-  let eIdx = I_CB_BASE;
-  for (let i = 0; i < entryCount; i++) {
-    const bufHandle = cmdU32[eIdx];
-    const buffer = handles[bufHandle] as GPUBuffer;
-    const sizeLo = cmdU32[eIdx + 1];
-    const sizeHi = cmdU32[eIdx + 2];
-    eIdx += 3;
-    const size = sizeLo + sizeHi * 0x100000000;
-    const resource: GPUBufferBinding = { buffer, offset: 0 };
-    if (size !== 0 && size < 2 ** 53) resource.size = size;
-    entries.push({ binding: i, resource });
-  }
-
-  const bindGroup = device.createBindGroup({ layout, entries });
-  const pass = handles[passHandle] as GPUComputePassEncoder;
-  pass.setPipeline(handles[pipelineHandle] as GPUComputePipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(x, y, z);
-  endAndRestartPass(passHandle);
-
-  // Return new buffer handle (or 0 if no creation)
+  const uniformUsage = cmdU32[I_ARG0 + 7];
+  const newBufferHandle = dispatchFusedRecord(
+    RpcFn.FUSED_DISPATCH_WITH_UNIFORM,
+    passHandle,
+    pipelineHandle,
+    layoutHandle,
+    x,
+    y,
+    z,
+    entryCount,
+    cmdU32,
+    I_CB_BASE,
+    uniformEntryIdx,
+    uniformDataSize,
+    cmdBuffer,
+    CMD_OFFSET.UNIFORM_DATA,
+    uniformUsage,
+  );
   cmdU32[I_RESULT] = newBufferHandle;
+}
+
+/**
+ * Phase 2: DISPATCH_BATCH handler. Walks the dispatch batch SAB and issues
+ * each packed FUSED_*_DISPATCH record via the shared dispatchFusedRecord
+ * helper. The dispatch batch SAB is populated by the bridge stub; see
+ * DISPATCH_BATCH in rpc-protocol.ts for the per-record layout.
+ */
+function handleDispatchBatch(): void {
+  if (dispatchBatchU32 === null || dispatchBatchU8 === null || dispatchBatchBuffer === null) {
+    cmdU32[I_RESULT] = 0;
+    return;
+  }
+  const batchCount = cmdU32[I_ARG0];
+  const batchBytes = cmdU32[I_ARG0 + 1];
+  const sab = dispatchBatchU32;
+  const sabBuffer = dispatchBatchBuffer;
+  let cursor = 0;
+  for (let r = 0; r < batchCount; r++) {
+    if (cursor >= batchBytes) break;
+    const base = cursor >>> 2;
+    const opcode = sab[base + 0];
+    const passHandle = sab[base + 1];
+    const pipelineHandle = sab[base + 2];
+    const layoutHandle = sab[base + 3];
+    const x = sab[base + 4];
+    const y = sab[base + 5];
+    const z = sab[base + 6];
+    const uniformEntryIdx = sab[base + 7];
+    const uniformSize = sab[base + 8];
+    const entryCount = sab[base + 9];
+    const entryBase = base + (DISPATCH_BATCH_HEADER_BYTES >>> 2);
+    const uniformByteOffset = cursor + DISPATCH_BATCH_HEADER_BYTES + entryCount * 12;
+    dispatchFusedRecord(
+      opcode,
+      passHandle,
+      pipelineHandle,
+      layoutHandle,
+      x,
+      y,
+      z,
+      entryCount,
+      sab,
+      entryBase,
+      uniformEntryIdx,
+      uniformSize,
+      uniformSize > 0 ? sabBuffer : null,
+      uniformByteOffset,
+      0,
+    );
+    const uniformPadded = (uniformSize + 3) & ~3;
+    cursor += DISPATCH_BATCH_HEADER_BYTES + entryCount * 12 + uniformPadded;
+  }
+  cmdU32[I_RESULT] = 0;
 }
 
 function handleFusedSubmit(): void {
@@ -808,6 +919,14 @@ async function commandLoop(): Promise<void> {
         handleFusedFullDispatch();
       } catch (err) {
         console.error(`[GPU Worker] Error in FUSED_FULL_DISPATCH:`, err);
+        cmdU32[I_RESULT] = 0;
+      }
+      spinBudget = SPIN_DISPATCH;
+    } else if (fnId === RpcFn.DISPATCH_BATCH) {
+      try {
+        handleDispatchBatch();
+      } catch (err) {
+        console.error(`[GPU Worker] Error in DISPATCH_BATCH:`, err);
         cmdU32[I_RESULT] = 0;
       }
       spinBudget = SPIN_DISPATCH;

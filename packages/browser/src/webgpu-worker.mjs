@@ -13,6 +13,7 @@
  * before the RPC call returns.
  */
 import { instantiateNapiModuleSync, MessageHandler, WASI } from '@napi-rs/wasm-runtime';
+
 import { createBridgeStub } from './webgpu-bridge-stub.js';
 
 // RPC config received from mlx-worker before emnapi's init message
@@ -22,7 +23,7 @@ const handler = new MessageHandler({
   async onLoad({ wasmModule, wasmMemory }) {
     // Wait for RPC config (arrives before emnapi's init message)
     while (!rpcConfig) {
-      await new Promise(r => setTimeout(r, 1));
+      await new Promise((r) => setTimeout(r, 1));
     }
 
     const bridge = createBridgeStub(
@@ -31,11 +32,18 @@ const handler = new MessageHandler({
       rpcConfig.handles,
       rpcConfig.readbackBuffer,
       rpcConfig.features,
+      rpcConfig.poolStatsBuffer, // may be undefined — guarded in stub
+      rpcConfig.dispatchBatchBuffer, // Phase 2 — may be undefined
+      rpcConfig.dispatchBatch === true,
     );
 
     const wasi = new WASI({
-      print: function () { console.log.apply(console, arguments); },
-      printErr: function () { console.error.apply(console, arguments); },
+      print: function () {
+        console.log.apply(console, arguments);
+      },
+      printErr: function () {
+        console.error.apply(console, arguments);
+      },
     });
 
     return instantiateNapiModuleSync(wasmModule, {
@@ -49,6 +57,20 @@ const handler = new MessageHandler({
           memory: wasmMemory,
           __cpp_exception: new WebAssembly.Tag({ parameters: ['i32'] }),
           _ZN3mlx4core3gpu4initEv: () => {},
+          // Task 4's SabSink declares __wasm_i32_atomic_wait /
+          // __wasm_atomic_notify as extern "C" — wasm-ld emits them as host
+          // imports, so provide JS stubs wrapping Atomics.wait / notify.
+          // Cache the Int32Array view once per worker (shared memory never
+          // detaches, so the view stays valid for the lifetime of the worker).
+          __wasm_i32_atomic_wait: ((sharedI32) => (ptr, expected, timeoutNs) => {
+            const index = ptr >>> 2;
+            const timeoutMs = timeoutNs === -1n ? Infinity : Number(timeoutNs / 1_000_000n);
+            const result = Atomics.wait(sharedI32, index, expected, timeoutMs);
+            return result === 'ok' ? 0 : result === 'not-equal' ? 1 : 2;
+          })(new Int32Array(wasmMemory.buffer)),
+          __wasm_atomic_notify: ((sharedI32) => (ptr, count) => {
+            return Atomics.notify(sharedI32, ptr >>> 2, count);
+          })(new Int32Array(wasmMemory.buffer)),
           ...bridge.imports,
         };
       },

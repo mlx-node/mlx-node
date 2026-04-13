@@ -26,7 +26,7 @@ TextDecoder.prototype.decode = function (input?: BufferSource | null, options?: 
 import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-runtime';
 
 import { createSabRingOverHeap } from './chat-stream-sab.js';
-import { CMD_OFFSET, READBACK_BUFFER_SIZE } from './rpc-protocol.js';
+import { CMD_OFFSET, READBACK_BUFFER_SIZE, DISPATCH_BATCH_BUFFER_SIZE } from './rpc-protocol.js';
 import { parseSafeTensorsHeader, dtypeToCode } from './safetensors.js';
 import { createBridgeStub, POOL_STATS_SIZE_BYTES, type BridgeStub } from './webgpu-bridge-stub.js';
 
@@ -57,16 +57,23 @@ async function handleInit(data: {
   packBf16?: boolean;
   sdpaFallback?: boolean;
   profile?: boolean;
+  dispatchBatch?: boolean;
 }) {
   const packBf16 = data.packBf16 === true;
   const sdpaFallback = data.sdpaFallback === true;
   profileEnabled = data.profile === true;
+  const dispatchBatch = data.dispatchBatch === true;
   try {
     // 1. Spawn gpu-worker (owns GPUDevice, event loop free for GPU callbacks)
     post({ type: 'progress', step: 'gpu', message: 'Initializing WebGPU...' });
     const cmdBuffer = new SharedArrayBuffer(CMD_OFFSET.TOTAL);
     const readbackBuffer = new SharedArrayBuffer(READBACK_BUFFER_SIZE);
     const poolStatsBuffer = new SharedArrayBuffer(POOL_STATS_SIZE_BYTES);
+    // Phase 2: dedicated dispatch-batch SAB. Always allocate (~16 KiB) so
+    // the same SAB can be retro-enabled by dispatchBatch without respawning
+    // the workers; the bridge stub only starts writing records when
+    // batchEnabled is true.
+    const dispatchBatchBuffer = new SharedArrayBuffer(DISPATCH_BATCH_BUFFER_SIZE);
     // WASM module requires min 1002 pages (~66 MB). We use 4096 (~268 MB)
     // for headroom during WASM init (thread stacks, emnapi, etc.) and let
     // memory.grow expand as needed — keeps total well under the 2 GB JS
@@ -92,6 +99,7 @@ async function handleInit(data: {
         cmdBuffer,
         readbackBuffer,
         wasmMemory: sharedMemory, // Send Memory object, not .buffer — .buffer getter always returns current byteLength after grow()
+        dispatchBatchBuffer,
       });
     });
     post({ type: 'progress', step: 'gpu', message: 'WebGPU ready' });
@@ -109,6 +117,8 @@ async function handleInit(data: {
       readbackBuffer,
       gpuReady.features,
       poolStatsBuffer,
+      dispatchBatchBuffer,
+      dispatchBatch,
     );
     // Retain for ?profile=1 readback (resetBridgeStats / fetchGpuWorkerStats
     // need the same BridgeStub instance that owns the SAB cmdBuffer view).
@@ -184,6 +194,8 @@ async function handleInit(data: {
           cmdBuffer,
           readbackBuffer,
           poolStatsBuffer,
+          dispatchBatchBuffer,
+          dispatchBatch,
           handles: {
             instanceHandle: gpuReady.instanceHandle,
             adapterHandle: gpuReady.adapterHandle,

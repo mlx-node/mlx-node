@@ -138,11 +138,54 @@ export const enum RpcFn {
   // gpu-worker applies the existing single-release pool logic to each handle
   // in the batch (no RESULT is written).
   BUFFER_RELEASE_BATCH = 102,
+  // Phase 2: batched compute dispatch. Packs N FUSED_FULL_DISPATCH /
+  // FUSED_DISPATCH_WITH_UNIFORM records into a dedicated 16 KiB
+  // SharedArrayBuffer (dispatchBatchBuffer) and fires them in one RPC.
+  // Decode hot path issues ~1200 dispatches per token; batching 8-16 per
+  // RPC drops that to ~75-150 round-trips per token.
+  //   ARG0: batchCount   (number of records in the batch SAB)
+  //   ARG1: batchBytes   (cursor into the batch SAB, for optional bounds check)
+  // The per-record layout is described at DISPATCH_BATCH_RECORD_OFFSET below.
+  // Slots 100 and 101 in the stats histogram are already reserved for
+  // smuggled pool hit/miss counters, so DISPATCH_BATCH uses 103.
+  DISPATCH_BATCH = 103,
 }
 
 // Maximum number of handles that fit in a single BUFFER_RELEASE_BATCH RPC.
 // UNIFORM_DATA region is 256 bytes = 64 u32 slots.
 export const MAX_RELEASE_BATCH = 64;
+
+// ---- DISPATCH_BATCH (Phase 2) ----
+//
+// Dedicated 16 KiB SharedArrayBuffer shared between the bridge stub and the
+// gpu-worker. Records are written sequentially from offset 0.
+//
+// Per-record layout (all u32 little-endian except uniformData bytes):
+//   offset  0: opcode             (RpcFn.FUSED_FULL_DISPATCH=96 or FUSED_DISPATCH_WITH_UNIFORM=97)
+//   offset  4: passHandle
+//   offset  8: pipelineHandle
+//   offset 12: layoutHandle
+//   offset 16: x
+//   offset 20: y
+//   offset 24: z
+//   offset 28: uniformEntryIdx    (ignored if opcode == FUSED_FULL_DISPATCH)
+//   offset 32: uniformSize        (bytes of inline uniform data; 0 if none)
+//   offset 36: entryCount
+//   offset 40: entries[entryCount] × 12 bytes (bufHandle, sizeLo, sizeHi)
+//   offset 40 + 12*entryCount: uniformData, padded up to next 4-byte boundary
+//
+// Max record size: 40 + 12*MAX_BATCH_ENTRIES + MAX_INLINE_UNIFORM = 40 + 96 + 256 = 392 bytes.
+// With a 16 KiB buffer that leaves room for ~40 records worst case. We cap
+// the batch at MAX_DISPATCH_BATCH=16 records for ordering-latency safety.
+export const DISPATCH_BATCH_BUFFER_SIZE = 16 * 1024;
+export const MAX_DISPATCH_BATCH = 16;
+export const MAX_DISPATCH_BATCH_ENTRIES = 8;
+export const MAX_DISPATCH_BATCH_UNIFORM = 256;
+// Fixed record header size (opcode + 9 u32 fields = 40 bytes).
+export const DISPATCH_BATCH_HEADER_BYTES = 40;
+// Worst-case per-record size (header + max entries + max uniform).
+export const DISPATCH_BATCH_MAX_RECORD_BYTES =
+  DISPATCH_BATCH_HEADER_BYTES + MAX_DISPATCH_BATCH_ENTRIES * 12 + MAX_DISPATCH_BATCH_UNIFORM;
 
 // Phase 0: total number of RpcFn histogram slots readable via GET_STATS.
 // We split the storage across three regions of the SAB:

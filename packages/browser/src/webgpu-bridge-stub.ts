@@ -27,6 +27,11 @@ import {
   STATS_INLINE_SLOTS,
   STATS_RESERVED_OFFSET,
   STATS_RESERVED_SLOTS,
+  DISPATCH_BATCH_BUFFER_SIZE,
+  MAX_DISPATCH_BATCH,
+  MAX_DISPATCH_BATCH_ENTRIES,
+  MAX_DISPATCH_BATCH_UNIFORM,
+  DISPATCH_BATCH_HEADER_BYTES,
 } from './rpc-protocol.js';
 
 export interface BridgeStats {
@@ -113,6 +118,14 @@ export function createBridgeStub(
   gpuFeatures?: { shaderF16?: boolean; subgroups?: boolean; timestampQuery?: boolean },
   /** Shared pool-stats SAB for cross-worker aggregation (nullable). */
   poolStatsBuffer?: SharedArrayBuffer,
+  /**
+   * Phase 2: dedicated 16 KiB SAB used to pack batched FUSED_*_DISPATCH
+   * records for DISPATCH_BATCH. When undefined (or when `batchEnabled` is
+   * false) the stub falls back to single-dispatch RPCs.
+   */
+  dispatchBatchBuffer?: SharedArrayBuffer,
+  /** Phase 2: gate DISPATCH_BATCH (default: off). */
+  batchEnabled?: boolean,
 ): BridgeStub {
   const cmdView = new Int32Array(cmdBuffer);
   const cmdDataView = new DataView(cmdBuffer);
@@ -424,6 +437,95 @@ export function createBridgeStub(
   const I_RESULT = CMD_OFFSET.RESULT >>> 2; // 2
   const I_ARG0 = CMD_OFFSET.ARG0 >>> 2; // 4
   const I_CB_COUNT = CMD_OFFSET.CALLBACK_COUNT >>> 2; // 16
+  const I_CB_BASE = CMD_OFFSET.CALLBACK_BASE >>> 2; // 17
+
+  // Phase 2: DISPATCH_BATCH state. Views over the dedicated batch SAB (if
+  // provided) plus a byte cursor / record count. Records are appended via
+  // stageDispatchBatchRecord() from the two dispatch sender paths and flushed
+  // as a single DISPATCH_BATCH RPC either when the batch fills up or when any
+  // non-dispatch RPC is about to fire (via the flush-before-any-other-RPC
+  // guard at the top of rpcCall).
+  const batchActive = batchEnabled === true && dispatchBatchBuffer !== undefined;
+  const batchU32 = batchActive ? new Uint32Array(dispatchBatchBuffer!) : null;
+  const batchU8 = batchActive ? new Uint8Array(dispatchBatchBuffer!) : null;
+  let batchCount = 0;
+  let batchBytes = 0;
+
+  function flushDispatchBatchInner(): void {
+    if (batchCount === 0) return;
+    const count = batchCount;
+    const bytes = batchBytes;
+    batchCount = 0;
+    batchBytes = 0;
+    // Write count/bytes as ARG0/ARG1 then fire. Bypass the flush-at-entry
+    // guard by calling rpcCall with DISPATCH_BATCH directly — the guard
+    // already skips DISPATCH_BATCH to avoid re-entrant recursion.
+    rpcCall(RpcFn.DISPATCH_BATCH, count, bytes);
+  }
+
+  /**
+   * Pack one FUSED_*_DISPATCH record (opcode 96 or 97) into the batch SAB.
+   * Returns true if staged, false if the caller should issue a single RPC
+   * instead (batch disabled, or record too large to fit in the buffer).
+   * The record is read directly from the main cmdBuffer — the caller must
+   * populate the cmdBuffer fields exactly as for a single-dispatch RPC.
+   */
+  function stageDispatchBatchRecord(opcode: number): boolean {
+    if (!batchActive || !batchU32 || !batchU8) return false;
+    const entryCount = cmdU32[I_CB_COUNT] >>> 0;
+    if (entryCount > MAX_DISPATCH_BATCH_ENTRIES) return false;
+    const uniformSize =
+      opcode === RpcFn.FUSED_DISPATCH_WITH_UNIFORM ? cmdU32[CMD_OFFSET.UNIFORM_DATA_SIZE >>> 2] >>> 0 : 0;
+    if (uniformSize > MAX_DISPATCH_BATCH_UNIFORM) return false;
+    const uniformPadded = (uniformSize + 3) & ~3;
+    const recordSize = DISPATCH_BATCH_HEADER_BYTES + entryCount * 12 + uniformPadded;
+    // Flush first if this record would overflow the batch SAB or exceed the
+    // per-flush cap. Note: flushing resets batchBytes/batchCount to 0 so the
+    // staged record always starts at offset 0 after a flush.
+    if (batchCount >= MAX_DISPATCH_BATCH || batchBytes + recordSize > DISPATCH_BATCH_BUFFER_SIZE) {
+      flushDispatchBatchInner();
+    }
+    let cursor = batchBytes;
+    const base = cursor >>> 2;
+    batchU32[base + 0] = opcode >>> 0;
+    batchU32[base + 1] = cmdU32[I_ARG0] >>> 0; // passHandle
+    batchU32[base + 2] = cmdU32[I_ARG0 + 1] >>> 0; // pipelineHandle
+    batchU32[base + 3] = cmdU32[I_ARG0 + 2] >>> 0; // layoutHandle
+    batchU32[base + 4] = cmdU32[I_ARG0 + 3] >>> 0; // x
+    batchU32[base + 5] = cmdU32[I_ARG0 + 4] >>> 0; // y
+    batchU32[base + 6] = cmdU32[I_ARG0 + 5] >>> 0; // z
+    batchU32[base + 7] = opcode === RpcFn.FUSED_DISPATCH_WITH_UNIFORM ? cmdU32[I_ARG0 + 6] >>> 0 : 0;
+    batchU32[base + 8] = uniformSize;
+    batchU32[base + 9] = entryCount;
+    cursor += DISPATCH_BATCH_HEADER_BYTES;
+    // Entries: (bufHandle, sizeLo, sizeHi) × entryCount
+    let entrySrc = I_CB_BASE;
+    let entryDst = cursor >>> 2;
+    for (let i = 0; i < entryCount; i++) {
+      batchU32[entryDst] = cmdU32[entrySrc] >>> 0;
+      batchU32[entryDst + 1] = cmdU32[entrySrc + 1] >>> 0;
+      batchU32[entryDst + 2] = cmdU32[entrySrc + 2] >>> 0;
+      entrySrc += 3;
+      entryDst += 3;
+    }
+    cursor += entryCount * 12;
+    // Uniform data (raw bytes) — copy from cmdBuffer.UNIFORM_DATA into the
+    // batch buffer at the cursor. Pad up to 4-byte boundary for the next
+    // record header, but only emit the exact uniformSize back out on read.
+    if (uniformSize > 0) {
+      const src = new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformSize);
+      batchU8.set(src, cursor);
+      cursor += uniformSize;
+      // Zero-pad the tail (optional but keeps the SAB deterministic for
+      // debugging — the receiver only reads uniformSize bytes regardless).
+      const pad = uniformPadded - uniformSize;
+      for (let i = 0; i < pad; i++) batchU8[cursor + i] = 0;
+      cursor += pad;
+    }
+    batchBytes = cursor;
+    batchCount++;
+    return true;
+  }
 
   // Release-batch helpers. Packs pending handles into the UNIFORM_DATA region
   // (192..447 = 64 u32 slots) and fires a single BUFFER_RELEASE_BATCH RPC.
@@ -447,6 +549,24 @@ export function createBridgeStub(
   }
 
   function rpcCall(fnId: number, a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0): number {
+    // Phase 2: flush any staged dispatch batch before *any* other RPC so
+    // the gpu-worker observes the dispatches in program order relative to
+    // subsequent BUFFER_RELEASE_BATCH / QUEUE_WRITE_BUFFER / FUSED_SUBMIT /
+    // mapAsync / new-buffer-create calls. DISPATCH_BATCH itself is exempt
+    // (re-entrancy guard). FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM
+    // are also exempt because the hot dispatch path in
+    // wgpuComputePassEncoderDispatchWorkgroups tries to stage into the batch
+    // first and only falls through to rpcCall when staging is refused — in
+    // that fallback case there is no outstanding batch to worry about.
+    if (
+      batchActive &&
+      batchCount > 0 &&
+      fnId !== RpcFn.DISPATCH_BATCH &&
+      fnId !== RpcFn.FUSED_FULL_DISPATCH &&
+      fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM
+    ) {
+      flushDispatchBatchInner();
+    }
     // Flush any queued releases before *other* RPCs so the gpu-worker
     // observes them before the next dispatch/create. Skip for:
     //   - BUFFER_RELEASE_BATCH itself (re-entrancy guard — flushPendingReleases
@@ -456,10 +576,18 @@ export function createBridgeStub(
     //     would trample those bytes, silently corrupting the dispatch.
     //     The dispatch hot path (wgpuComputePassEncoderDispatchWorkgroups)
     //     explicitly flushes at the top instead.
+    //   - DISPATCH_BATCH: a batched dispatch RPC ordering-wise sits exactly
+    //     where the individual FUSED_*_DISPATCH calls used to. Release
+    //     batching already handles inline-data collision via the same
+    //     per-dispatch flush gate at the top of the hot path, so this one
+    //     piggybacks on that. (DISPATCH_BATCH does not write to UNIFORM_DATA
+    //     in the main cmdBuffer — its uniform bytes live in the dedicated
+    //     dispatchBatchBuffer.)
     if (
       pendingReleases.length > 0 &&
       fnId !== RpcFn.BUFFER_RELEASE_BATCH &&
-      fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM
+      fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM &&
+      fnId !== RpcFn.DISPATCH_BATCH
     ) {
       flushPendingReleases();
     }
@@ -1025,8 +1153,12 @@ export function createBridgeStub(
       // FUSED_DISPATCH_WITH_UNIFORM pre-writes uniform bytes into the SAB
       // UNIFORM_DATA region, so rpcCall's flush-at-entry is disabled for it.
       // Flush here instead, BEFORE any SAB writes, so the gpu-worker sees
-      // pending releases before the next dispatch.
-      if (pendingReleases.length > 0) {
+      // pending releases before the next dispatch — but only when the batch
+      // is large enough to be worth a round-trip. Small-batch flushes on
+      // every dispatch defeat the amortization and drop average batch size
+      // to ~3 handles. Threshold 32 keeps the release visible-to-pool
+      // latency bounded while still amortizing RPCs.
+      if (pendingReleases.length >= 32) {
         flushPendingReleases();
       }
       if (pendingPipeline >= 0 && pendingBindGroup >= 0 && pendingBindGroup1 >= 0) {
@@ -1106,28 +1238,45 @@ export function createBridgeStub(
             const usage = deferredInfo ? deferredInfo.usage : 0;
             cmdU32[CMD_OFFSET.UNIFORM_DATA_SIZE >>> 2] = uniformData.byteLength;
             new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformData.byteLength).set(uniformData);
-            const result = rpcCall(
-              RpcFn.FUSED_DISPATCH_WITH_UNIFORM,
-              pendingPass,
-              pendingPipeline,
-              bgDesc.layoutHandle,
-              x,
-              y,
-              z,
-              uniformEntryIdx,
-            );
+            // Write ARG fields (same positions as a regular rpcCall) so
+            // stageDispatchBatchRecord can copy straight out of cmdU32.
+            cmdU32[I_ARG0] = pendingPass >>> 0;
+            cmdU32[I_ARG0 + 1] = pendingPipeline >>> 0;
+            cmdU32[I_ARG0 + 2] = bgDesc.layoutHandle >>> 0;
+            cmdU32[I_ARG0 + 3] = x >>> 0;
+            cmdU32[I_ARG0 + 4] = y >>> 0;
+            cmdU32[I_ARG0 + 5] = z >>> 0;
+            cmdU32[I_ARG0 + 6] = uniformEntryIdx >>> 0;
+            cmdU32[I_ARG0 + 7] = usage >>> 0;
+            // Batching path: only safe when the call has NO return value
+            // to consume (no deferred buffer creation that expects a new
+            // handle back from the gpu-worker).
+            if (!deferredInfo && stageDispatchBatchRecord(RpcFn.FUSED_DISPATCH_WITH_UNIFORM)) {
+              // staged — no RPC this call
+            } else {
+              const result = rpcCall(
+                RpcFn.FUSED_DISPATCH_WITH_UNIFORM,
+                pendingPass,
+                pendingPipeline,
+                bgDesc.layoutHandle,
+                x,
+                y,
+                z,
+                uniformEntryIdx,
+              );
 
-            // Finalize deferred buffer creation: gpu-worker returns real handle
-            if (deferredInfo && deferredFakeHandle >= 0) {
-              if (result > 0) {
-                deferredBufferRemap.set(deferredFakeHandle, result);
-                bufSizes[result] = deferredInfo.size;
-                bufferUsages[result] = deferredInfo.usage;
+              // Finalize deferred buffer creation: gpu-worker returns real handle
+              if (deferredInfo && deferredFakeHandle >= 0) {
+                if (result > 0) {
+                  deferredBufferRemap.set(deferredFakeHandle, result);
+                  bufSizes[result] = deferredInfo.size;
+                  bufferUsages[result] = deferredInfo.usage;
+                }
+                // Scrub the fake handle's shadow size entry (set when the fake
+                // was created) so bufSizes doesn't accumulate stale keys.
+                delete bufSizes[deferredFakeHandle];
+                wasmFree(deferredInfo.wasmPtr);
               }
-              // Scrub the fake handle's shadow size entry (set when the fake
-              // was created) so bufSizes doesn't accumulate stale keys.
-              delete bufSizes[deferredFakeHandle];
-              wasmFree(deferredInfo.wasmPtr);
             }
           } else {
             // No inline data or too large — flush and use FUSED_FULL_DISPATCH
@@ -1153,7 +1302,19 @@ export function createBridgeStub(
               cmdU32[base] = realHandle;
             }
             flushPendingWrites();
-            rpcCall(RpcFn.FUSED_FULL_DISPATCH, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z);
+            // Write ARG fields for the staging path (same as rpcCall would).
+            cmdU32[I_ARG0] = pendingPass >>> 0;
+            cmdU32[I_ARG0 + 1] = pendingPipeline >>> 0;
+            cmdU32[I_ARG0 + 2] = bgDesc.layoutHandle >>> 0;
+            cmdU32[I_ARG0 + 3] = x >>> 0;
+            cmdU32[I_ARG0 + 4] = y >>> 0;
+            cmdU32[I_ARG0 + 5] = z >>> 0;
+            // FUSED_FULL_DISPATCH has no uniform data; ensure the size slot
+            // is zero so any concurrent batch staging sees uniformSize=0.
+            cmdU32[CMD_OFFSET.UNIFORM_DATA_SIZE >>> 2] = 0;
+            if (!stageDispatchBatchRecord(RpcFn.FUSED_FULL_DISPATCH)) {
+              rpcCall(RpcFn.FUSED_FULL_DISPATCH, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z);
+            }
           }
         } else {
           // Real bind group handle — use existing FUSED_DISPATCH
