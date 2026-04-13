@@ -2343,13 +2343,6 @@ impl Qwen3Inner {
     /// Uses `<|im_end|>` as the eos token (not `config.eos_token_id`) so
     /// the cached history continues to end on a clean ChatML boundary
     /// for the next turn.
-    ///
-    /// IMPORTANT: this method must thread `cached_kv_keys` /
-    /// `cached_kv_values` / `cached_cache_idx` as **mutable references**
-    /// through [`Qwen3Model::forward_fused`] so the C++ side writes the
-    /// delta into the same KV slots the session already owns. Cloning
-    /// the vectors before the call would invalidate the cache after the
-    /// forward returns.
     pub(crate) fn chat_tokens_delta_sync(
         &mut self,
         delta_tokens: Vec<u32>,
@@ -2424,12 +2417,8 @@ impl Qwen3Inner {
 
         let generation_stream = Stream::new(DeviceType::Gpu);
 
-        // Hoist cached KV state out of `self` into local variables so the
-        // borrow checker is happy when these are passed by `&mut` into
-        // `forward_fused` alongside the immutable `layers`/`final_norm`/etc.
-        // references above. Saved back to `self` at the end.
-        let mut kv_keys = std::mem::take(&mut self.cached_kv_keys);
-        let mut kv_values = std::mem::take(&mut self.cached_kv_values);
+        let mut kv_keys = self.cached_kv_keys.clone();
+        let mut kv_values = self.cached_kv_values.clone();
         let mut cache_idx: i32 = self.cached_cache_idx;
 
         // Prefill input: the delta tokens laid out as [1, delta_len]
@@ -2993,13 +2982,8 @@ impl Qwen3Inner {
 
         let generation_stream = Stream::new(DeviceType::Gpu);
 
-        // Hoist cached KV state out of `self` into local variables so the
-        // borrow checker is happy when these are passed by `&mut` into
-        // `forward_fused` alongside the immutable `layers`/`final_norm`/etc.
-        // references and through the `DecodeOps::forward` closure. Saved
-        // back to `self` at the end — matches chat_stream_sync_core.
-        let mut kv_keys = std::mem::take(&mut self.cached_kv_keys);
-        let mut kv_values = std::mem::take(&mut self.cached_kv_values);
+        let mut kv_keys = self.cached_kv_keys.clone();
+        let mut kv_values = self.cached_kv_values.clone();
         let mut cache_idx: i32 = self.cached_cache_idx;
 
         let prefill_input = MxArray::from_uint32(&delta_tokens, &[1, delta_len as i64])?;

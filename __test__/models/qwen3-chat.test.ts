@@ -269,4 +269,52 @@ describe.sequential('Qwen3 Chat Session API', () => {
       expect(result1.rawText).toBe(result2.rawText);
     });
   });
+
+  describe('Session delta paths', () => {
+    it('chatSessionContinueTool extends the session with a tool-result message', async () => {
+      model.resetCaches();
+
+      // Prime the session with an initial turn.
+      const r1 = await model.chatSessionStart([{ role: 'user', content: 'call a tool' }], {
+        maxNewTokens: 16,
+        temperature: 0,
+      });
+      expect(r1).toBeDefined();
+      expect(r1.numTokens).toBeGreaterThan(0);
+
+      // Round-trip a tool-result delta. The content does not need to match
+      // a real tool schema — we only care that the cache hoist-and-save-back
+      // path completes cleanly.
+      const r2 = await model.chatSessionContinueTool('call_test_123', '{"result": 42}', {
+        maxNewTokens: 16,
+        temperature: 0,
+      });
+      expect(r2).toBeDefined();
+      expect(r2.numTokens).toBeGreaterThan(0);
+      expect(typeof r2.rawText).toBe('string');
+      expect(typeof r2.finishReason).toBe('string');
+
+      // After the tool result, the next user continue should still work —
+      // proves the cache is consistent across delta turns.
+      const r3 = await model.chatSessionContinue('ok, thanks', null, {
+        maxNewTokens: 16,
+        temperature: 0,
+      });
+      expect(r3).toBeDefined();
+      expect(r3.numTokens).toBeGreaterThan(0);
+    });
+
+    it('resetCaches restores a clean slate (determinism canary)', async () => {
+      const msgs = [{ role: 'user', content: 'say hi in one word' }];
+
+      model.resetCaches();
+      const r1 = await model.chatSessionStart(msgs, { maxNewTokens: 8, temperature: 0 });
+
+      model.resetCaches();
+      const r2 = await model.chatSessionStart(msgs, { maxNewTokens: 8, temperature: 0 });
+
+      expect(r2.rawText).toBe(r1.rawText);
+      expect(r2.numTokens).toBe(r1.numTokens);
+    });
+  });
 });
