@@ -37,6 +37,10 @@ pub(crate) struct Lfm2Inner {
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     /// Cached token history for KV cache reuse across chat() calls.
     pub(crate) cached_token_history: Vec<u32>,
+    /// Cached image key for structural uniformity with VLM-capable models.
+    /// Always `None` for text-only LFM2; present so session-API code can treat
+    /// all model backends uniformly.
+    pub(crate) cached_image_key: Option<u64>,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -97,6 +101,7 @@ impl Lfm2Inner {
             caches,
             tokenizer: None,
             cached_token_history: Vec::new(),
+            cached_image_key: None,
         })
     }
 
@@ -164,6 +169,7 @@ impl Lfm2Inner {
     fn reset_caches(&mut self) {
         self.caches = init_caches(&self.config);
         self.cached_token_history.clear();
+        self.cached_image_key = None;
     }
 
     /// Check if tokens share a prefix with cached_token_history and return the prefix length.
@@ -216,6 +222,20 @@ impl Lfm2Inner {
 
     /// Synchronous chat implementation. Runs on the dedicated model thread.
     fn chat_sync(&mut self, messages: Vec<ChatMessage>, config: ChatConfig) -> Result<ChatResult> {
+        self.chat_sync_core(messages, config, None)
+    }
+
+    /// Core synchronous chat implementation with optional EOS override.
+    ///
+    /// `eos_override` lets session methods pass a custom EOS token (e.g.
+    /// `<|im_end|>` for Qwen-style ChatML delimiters). Passing `None`
+    /// falls back to `self.config.eos_token_id`.
+    fn chat_sync_core(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        eos_override: Option<u32>,
+    ) -> Result<ChatResult> {
         let tokenizer = self
             .tokenizer
             .clone()
@@ -270,7 +290,7 @@ impl Lfm2Inner {
             (prefill_tokens, cached_prefix_len)
         };
 
-        let eos_id = self.config.eos_token_id as u32;
+        let eos_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut token_history: Vec<u32> = tokens.clone();
         let mut finish_reason = String::from("length");
@@ -413,16 +433,22 @@ impl Lfm2Inner {
         cancelled: Arc<AtomicBool>,
     ) {
         let cb = StreamSender(stream_tx.clone());
-        let result = self.chat_stream_sync_inner(messages, config, &cb, &cancelled);
+        let result = self.chat_stream_sync_core(messages, config, None, &cb, &cancelled);
         if let Err(e) = result {
             let _ = stream_tx.send(Err(e));
         }
     }
 
-    fn chat_stream_sync_inner(
+    /// Core streaming chat implementation with optional EOS override.
+    ///
+    /// `eos_override` lets session methods pass a custom EOS token (e.g.
+    /// `<|im_end|>` for Qwen-style ChatML delimiters). Passing `None`
+    /// falls back to `self.config.eos_token_id`.
+    fn chat_stream_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
+        eos_override: Option<u32>,
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<()> {
@@ -473,7 +499,7 @@ impl Lfm2Inner {
             (prefill_tokens, cached_prefix_len)
         };
 
-        let eos_id = self.config.eos_token_id as u32;
+        let eos_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut token_history: Vec<u32> = tokens.clone();
         let mut finish_reason = String::from("length");
