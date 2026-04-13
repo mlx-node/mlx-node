@@ -34,19 +34,14 @@ export interface ChatStreamFinal {
 
 export type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
 
-// Save references to the native callback-based methods before we override them
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeDenseChatStream = Qwen35ModelNative.prototype.chatStream;
+// Save references to the native callback-based session streaming methods
+// before we override them. The legacy `chatStream` surface was removed in
+// the chat-session refactor; the remaining session entry points below
+// drive all streaming via the `ChatSession` API.
 // oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeDenseChatStreamSessionStart = Qwen35ModelNative.prototype.chatStreamSessionStart;
 // oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeDenseChatStreamSessionContinue = Qwen35ModelNative.prototype.chatStreamSessionContinue;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeMoeChatStream = Qwen35MoeModelNative.prototype.chatStream;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeLfm2ChatStream = Lfm2ModelNative.prototype.chatStream;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeGemma4ChatStream = Gemma4ModelNative.prototype.chatStream;
 
 /**
  * Shared AsyncGenerator adapter for callback-based native streaming methods.
@@ -139,26 +134,17 @@ export async function* _createChatStream(
 }
 
 /**
- * Qwen3.5 dense model with AsyncGenerator-based `chatStream()`.
+ * Qwen3.5 dense model with AsyncGenerator-based session streaming.
  *
- * @example
- * ```typescript
- * const model = await Qwen35Model.load('./models/qwen3.5-3b');
- * for await (const event of model.chatStream(messages)) {
- *   if (!event.done) process.stdout.write(event.text);
- * }
- * ```
+ * Streaming is driven through the session API — `chatStreamSessionStart`
+ * and `chatStreamSessionContinue` below — which adapt the callback-based
+ * native methods to `AsyncGenerator<ChatStreamEvent>`.
  */
 export class Qwen35Model extends Qwen35ModelNative {
   static override async load(modelPath: string): Promise<Qwen35Model> {
     const instance = await Qwen35ModelNative.load(modelPath);
     Object.setPrototypeOf(instance, Qwen35Model.prototype);
     return instance as unknown as Qwen35Model;
-  }
-
-  // @ts-expect-error — override callback-based chatStream with AsyncGenerator
-  async *chatStream(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
-    yield* _createChatStream(_nativeDenseChatStream, this, messages, config);
   }
 
   /**
@@ -198,15 +184,10 @@ export class Qwen35Model extends Qwen35ModelNative {
 }
 
 /**
- * Qwen3.5 MoE model with AsyncGenerator-based `chatStream()`.
+ * Qwen3.5 MoE model wrapper.
  *
- * @example
- * ```typescript
- * const model = await Qwen35MoeModel.load('./models/qwen3.5-moe');
- * for await (const event of model.chatStream(messages)) {
- *   if (!event.done) process.stdout.write(event.text);
- * }
- * ```
+ * Streaming is driven through the `ChatSession` API — the legacy
+ * `chatStream()` surface was removed in the chat-session refactor.
  */
 export class Qwen35MoeModel extends Qwen35MoeModelNative {
   static override async load(modelPath: string): Promise<Qwen35MoeModel> {
@@ -214,23 +195,13 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
     Object.setPrototypeOf(instance, Qwen35MoeModel.prototype);
     return instance as unknown as Qwen35MoeModel;
   }
-
-  // @ts-expect-error — override callback-based chatStream with AsyncGenerator
-  async *chatStream(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
-    yield* _createChatStream(_nativeMoeChatStream, this, messages, config);
-  }
 }
 
 /**
- * LFM2 model with AsyncGenerator-based `chatStream()`.
+ * LFM2 model wrapper.
  *
- * @example
- * ```typescript
- * const model = await Lfm2Model.load('./models/lfm2.5-1.2b-thinking');
- * for await (const event of model.chatStream(messages)) {
- *   if (!event.done) process.stdout.write(event.text);
- * }
- * ```
+ * Streaming is driven through the `ChatSession` API — the legacy
+ * `chatStream()` surface was removed in the chat-session refactor.
  */
 export class Lfm2Model extends Lfm2ModelNative {
   static override async load(modelPath: string): Promise<Lfm2Model> {
@@ -238,33 +209,18 @@ export class Lfm2Model extends Lfm2ModelNative {
     Object.setPrototypeOf(instance, Lfm2Model.prototype);
     return instance as unknown as Lfm2Model;
   }
-
-  // @ts-expect-error — override callback-based chatStream with AsyncGenerator
-  async *chatStream(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
-    yield* _createChatStream(_nativeLfm2ChatStream, this, messages, config);
-  }
 }
 
 /**
- * Gemma4 model with AsyncGenerator-based `chatStream()`.
+ * Gemma4 model wrapper.
  *
- * @example
- * ```typescript
- * const model = await Gemma4Model.load('./models/gemma-4-e2b');
- * for await (const event of model.chatStream(messages)) {
- *   if (!event.done) process.stdout.write(event.text);
- * }
- * ```
+ * Streaming is driven through the `ChatSession` API — the legacy
+ * `chatStream()` surface was removed in the chat-session refactor.
  */
 export class Gemma4Model extends Gemma4ModelNative {
   static override async load(modelPath: string): Promise<Gemma4Model> {
     const instance = await Gemma4ModelNative.load(modelPath);
     Object.setPrototypeOf(instance, Gemma4Model.prototype);
     return instance as unknown as Gemma4Model;
-  }
-
-  // @ts-expect-error — override callback-based chatStream with AsyncGenerator
-  async *chatStream(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
-    yield* _createChatStream(_nativeGemma4ChatStream, this, messages, config);
   }
 }

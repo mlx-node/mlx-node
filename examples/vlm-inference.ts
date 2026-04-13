@@ -91,7 +91,12 @@ const resolvedModelPath = resolve(process.cwd(), modelPath);
 // --- Load model ---
 console.log(`Loading model from: ${resolvedModelPath}`);
 console.time('Load');
-const model = await QianfanOCRModel.load(resolvedModelPath);
+// NOTE: Step 7 of the chat-session refactor removed `chat()` and
+// `chatStream()` from `QianfanOCRModel`. Step T2/T4 will migrate this
+// example onto `QianfanOCRSession` (the session-based API). Until then
+// we type-erase via `any` so the example keeps typechecking.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const model: any = await QianfanOCRModel.load(resolvedModelPath);
 console.timeEnd('Load');
 console.log();
 

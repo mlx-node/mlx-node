@@ -118,14 +118,6 @@ export declare class Gemma4Model {
   modelId(): number;
   /** Load a Gemma4 model from a directory. */
   static load(modelPath: string): Promise<Gemma4Model>;
-  /** Chat with the model using a list of messages. */
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
-  /** Streaming chat with the model using a list of messages. */
-  chatStream(
-    messages: ChatMessage[],
-    config: ChatConfig | null | undefined,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
   /**
    * Reset all caches and clear cached token history. Exposed so
    * tests and session-management code can start from a known clean
@@ -467,14 +459,6 @@ export declare class HarrierModel {
 export declare class Lfm2Model {
   /** Load an LFM2 model from a directory containing safetensors and config.json. */
   static load(modelPath: string): Promise<Lfm2Model>;
-  /** Chat with the model using a list of messages. */
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
-  /** Streaming chat with the model. Calls the callback for each token chunk. */
-  chatStream(
-    messages: Array<ChatMessage>,
-    config: ChatConfig | undefined | null,
-    callback: (err: Error | null, arg: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
   /**
    * Reset all caches and clear cached token history. Exposed so
    * tests and session-management code can start from a known clean
@@ -995,25 +979,6 @@ export declare class QianfanOCRModel {
    */
   static load(modelPath: string): Promise<QianfanOCRModel>;
   /**
-   * Chat with the model.
-   *
-   * High-level API: processes images, formats prompt, generates, and decodes.
-   */
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
-  /**
-   * Streaming chat with the model.
-   *
-   * Same as chat() but emits tokens incrementally via callback. The
-   * decode loop runs on the model thread; this method dispatches a
-   * `ChatStream` command and spawns a tokio pump task that forwards
-   * each streamed chunk to the provided JS callback.
-   */
-  chatStream(
-    messages: ChatMessage[],
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
-  /**
    * Generate text tokens given pre-tokenized input.
    *
    * Lower-level API — prefer chat() for typical usage.
@@ -1141,25 +1106,17 @@ export declare class Qwen35Model {
   /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
   /**
-   * Chat API with tool calling support.
-   *
-   * Dispatches to the dedicated model thread and awaits the result.
-   */
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
-  /**
    * Start a new chat session.
    *
-   * Unlike [`chat`], this entry point is text-only and uses `<|im_end|>`
-   * as its stop token so the cached KV state ends on a clean ChatML
-   * boundary. Subsequent turns in the same session MUST go through
-   * [`chat_session_continue`] — calling the legacy `chat` method on the
-   * same model after `chat_session_start` would attempt to prefix-match
-   * against a cache that ends on `<|im_end|>`, which no jinja template
-   * renders. The session is owned end-to-end by the `chat_session_*`
-   * surface.
+   * Text-only entry point that uses `<|im_end|>` as its stop token so
+   * the cached KV state ends on a clean ChatML boundary. Subsequent
+   * turns in the same session MUST go through [`chat_session_continue`]
+   * so the caller appends raw ChatML deltas on top of the live caches
+   * without rerunning the jinja template. The session is owned
+   * end-to-end by the `chat_session_*` surface.
    *
    * This method is the production entry point used by the TypeScript
-   * `Qwen35Session` class for turn 1 of a multi-round conversation.
+   * `ChatSession` wrapper for turn 1 of a multi-round conversation.
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
@@ -1204,19 +1161,6 @@ export declare class Qwen35Model {
     content: string,
     config?: ChatConfig | undefined | null,
   ): Promise<ChatResult>;
-  /**
-   * Streaming chat API with tool calling support.
-   *
-   * Dispatches to the dedicated model thread. Tokens stream back via
-   * an mpsc channel bridged to the JS callback. Returns a `ChatStreamHandle`
-   * immediately; generation runs on the model thread.
-   * Call `handle.cancel()` to abort generation early.
-   */
-  chatStream(
-    messages: ChatMessage[],
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
   /**
    * Streaming variant of [`Self::chat_session_start`].
    *
@@ -1303,25 +1247,6 @@ export declare class Qwen35MoeModel {
   static load(path: string): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
-  /**
-   * Chat API with tool calling support.
-   *
-   * Dispatches to the dedicated model thread and awaits the result.
-   */
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
-  /**
-   * Streaming chat API with tool calling support.
-   *
-   * Dispatches to the dedicated model thread. Tokens stream back via
-   * an mpsc channel bridged to the JS callback. Returns a `ChatStreamHandle`
-   * immediately; generation runs on the model thread.
-   * Call `handle.cancel()` to abort generation early.
-   */
-  chatStream(
-    messages: ChatMessage[],
-    config: ChatConfig | null,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ): Promise<ChatStreamHandle>;
   /**
    * Start a new chat session.
    *

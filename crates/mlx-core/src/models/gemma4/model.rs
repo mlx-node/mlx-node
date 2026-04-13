@@ -165,17 +165,6 @@ pub(crate) struct Gemma4Inner {
 /// command channel. See Step 5b of the chat-session refactor for why image
 /// processing moved off the NAPI thread.
 pub(crate) enum Gemma4Cmd {
-    Chat {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    ChatStream {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
     /// Start a new chat session via the jinja-render path with `<turn|>`
     /// as the stop token. See [`Gemma4Inner::chat_session_start_sync`] for
     /// the behavioural contract (full cache reset, session boundary on
@@ -393,13 +382,11 @@ impl Gemma4Inner {
     /// state ensures a subsequent chat turn can't mistakenly claim a cache
     /// prefix hit against stale history.
     ///
-    /// Called by the legacy `chat_sync` / `chat_stream_sync` wrappers at
-    /// the top of every turn so that each `model.chat(...)` call starts
-    /// from an empty cache (matching pre-5b semantics). Step 5c's session
-    /// API will also call this when it needs an explicit reset — it does
-    /// NOT get called from `chat_sync_core` / `chat_stream_sync_core`
-    /// directly because those are re-entrant primitives that trust their
-    /// caller's cache-management.
+    /// Called by the session API's reset path and by the chat-session
+    /// start command so that a fresh turn starts from an empty cache.
+    /// It is NOT called from `chat_sync_core` / `chat_stream_sync_core`
+    /// directly because those are re-entrant primitives that trust
+    /// their caller's cache-management.
     pub(crate) fn reset_caches_sync(&mut self) -> Result<()> {
         self.caches = None;
         self.clear_reuse_state();
@@ -417,48 +404,34 @@ impl Gemma4Inner {
         self.tokenizer = Some(tokenizer);
     }
 
-    /// Gemma4 chat entry point using the unified [`ChatConfig`].
+    /// Core Gemma4 chat implementation with optional EOS override.
+    ///
+    /// Shared between the non-streaming and streaming session paths. All
+    /// image decode + resize + patching happens here on the model thread
+    /// (off the NAPI thread) using `ChatMessage.images` which is `Send`
+    /// via napi-rs's `unsafe impl`.
     ///
     /// ## Field support
     ///
-    /// **Supported**: `max_new_tokens`, `temperature`, `top_k`, `top_p`, `min_p`,
-    /// `tools`, `reasoning_effort` (mapped to the template's `enable_thinking`
-    /// kwarg via `chat_common::resolve_enable_thinking`).
+    /// **Supported**: `max_new_tokens`, `temperature`, `top_k`, `top_p`,
+    /// `min_p`, `tools`, `reasoning_effort` (mapped to the template's
+    /// `enable_thinking` kwarg via `chat_common::resolve_enable_thinking`),
+    /// `report_performance`, `reuse_cache`.
     ///
-    /// **Silent no-ops** (Gemma4 decode loop has no code path that reads them):
-    /// `repetition_penalty`, `repetition_context_size`, `presence_penalty`,
-    /// `presence_context_size`, `frequency_penalty`, `frequency_context_size`,
-    /// `max_consecutive_tokens`, `max_ngram_repeats`, `ngram_size`,
-    /// `thinking_token_budget`, `include_reasoning`, `report_performance`,
-    /// `reuse_cache`. (`report_performance` and `reuse_cache` become supported
-    /// in Steps 5b and 5c of the chat-session refactor.)
-    pub(crate) fn chat_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        // Legacy semantics: every `model.chat(...)` call starts from an
-        // empty KV cache. Without this reset, the lazy-init guard in
-        // `chat_sync_core` (`if self.caches.is_none()`) would skip on
-        // call 2+ and append the new prompt's K/V onto the prior turn's
-        // stale cache — producing semantically wrong, non-byte-identical
-        // output. The session API in Step 5c will call `chat_sync_core`
-        // directly with its own cache-management, so only this legacy
-        // wrapper needs the reset.
-        self.reset_caches_sync()?;
-        self.chat_sync_core(messages, config, None)
-    }
-
-    /// Core implementation of `chat_sync` and (in Step 5c) the session-start
-    /// variants.
+    /// **Silent no-ops** (Gemma4 decode loop has no code path that reads
+    /// them): `repetition_penalty`, `repetition_context_size`,
+    /// `presence_penalty`, `presence_context_size`, `frequency_penalty`,
+    /// `frequency_context_size`, `max_consecutive_tokens`,
+    /// `max_ngram_repeats`, `ngram_size`, `thinking_token_budget`,
+    /// `include_reasoning`.
     ///
     /// `eos_override`:
-    ///   - `None` (passed by `chat_sync`): stop on any of
-    ///     `config.eos_token_ids` (matches legacy behaviour exactly).
-    ///   - `Some(id)` (will be used by `chat_session_start_sync` in 5c):
-    ///     stop on `id` OR any of `config.eos_token_ids`, so the cached
-    ///     history ends on a caller-controlled boundary (typically a
-    ///     turn-terminator token).
+    ///   - `None`: stop on any of `config.eos_token_ids` (the pre-session
+    ///     legacy behaviour).
+    ///   - `Some(id)`: stop on `id` OR any of `config.eos_token_ids`, so
+    ///     the cached history ends on a caller-controlled boundary
+    ///     (typically a turn-terminator token). Used by the session-start
+    ///     path to leave the cache on a clean ChatML boundary.
     pub(crate) fn chat_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -474,9 +447,9 @@ impl Gemma4Inner {
 
         // Decode images on the model thread. `ChatMessage.images` is a
         // `Vec<Uint8Array>` which is `Send` via napi-rs's `unsafe impl`,
-        // so we can cross the thread boundary inside `Gemma4Cmd::Chat`
-        // and do the image decode + resize + patching here instead of
-        // duplicating the processor on the NAPI side.
+        // so we can cross the thread boundary inside the Gemma4 session
+        // commands and do the image decode + resize + patching here
+        // instead of duplicating the processor on the NAPI side.
         let raw_images = extract_images_from_messages(&messages);
         let processed_images: Vec<ProcessedGemma4Image> = if raw_images.is_empty() {
             Vec::new()
@@ -913,9 +886,6 @@ impl Gemma4Inner {
         // the last generated token when `finish_reason != "length"` so
         // the cached history ends on the turn-terminator boundary (the
         // final token IS that boundary marker — stop, tool_calls, etc.).
-        // The legacy `chat_sync` wrapper wipes this state on every call
-        // via `reset_caches_sync`, so the write is a harmless no-op for
-        // the legacy path and load-bearing for the session path.
         let history_tokens: &[u32] = if finish_reason != "length" && !generated_tokens.is_empty() {
             &generated_tokens[..generated_tokens.len() - 1]
         } else {
@@ -971,50 +941,31 @@ impl Gemma4Inner {
         })
     }
 
-    /// Gemma4 streaming chat entry point using the unified [`ChatConfig`].
+    /// Core Gemma4 streaming chat implementation with optional EOS override.
+    ///
+    /// Shared between the non-streaming session-start / session-continue
+    /// streaming paths. All image decode + resize + patching happens here
+    /// on the model thread (off the NAPI thread).
     ///
     /// ## Field support
     ///
-    /// **Supported**: `max_new_tokens`, `temperature`, `top_k`, `top_p`, `min_p`,
-    /// `tools`, `reasoning_effort` (mapped to the template's `enable_thinking`
-    /// kwarg via `chat_common::resolve_enable_thinking`).
+    /// **Supported**: `max_new_tokens`, `temperature`, `top_k`, `top_p`,
+    /// `min_p`, `tools`, `reasoning_effort` (mapped to the template's
+    /// `enable_thinking` kwarg via `chat_common::resolve_enable_thinking`),
+    /// `report_performance`, `reuse_cache`.
     ///
-    /// **Silent no-ops** (Gemma4 decode loop has no code path that reads them):
-    /// `repetition_penalty`, `repetition_context_size`, `presence_penalty`,
-    /// `presence_context_size`, `frequency_penalty`, `frequency_context_size`,
-    /// `max_consecutive_tokens`, `max_ngram_repeats`, `ngram_size`,
-    /// `thinking_token_budget`, `include_reasoning`, `report_performance`,
-    /// `reuse_cache`. (`report_performance` and `reuse_cache` become supported
-    /// in Steps 5b and 5c of the chat-session refactor.)
-    pub(crate) fn chat_stream_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        // Legacy semantics: every `model.chatStream(...)` call starts
-        // from an empty KV cache. See `chat_sync` above for the full
-        // rationale — this mirrors the same fix for the streaming path.
-        if let Err(e) = self.reset_caches_sync() {
-            let _ = stream_tx.send(Err(e));
-            return;
-        }
-        let cb = StreamSender(stream_tx.clone());
-        let result = self.chat_stream_sync_core(messages, config, &cb, &cancelled, None);
-        if let Err(e) = result {
-            let _ = stream_tx.send(Err(e));
-        }
-    }
-
-    /// Core implementation of `chat_stream_sync` and (in Step 5c) the
-    /// streaming session-start variant.
+    /// **Silent no-ops** (Gemma4 decode loop has no code path that reads
+    /// them): `repetition_penalty`, `repetition_context_size`,
+    /// `presence_penalty`, `presence_context_size`, `frequency_penalty`,
+    /// `frequency_context_size`, `max_consecutive_tokens`,
+    /// `max_ngram_repeats`, `ngram_size`, `thinking_token_budget`,
+    /// `include_reasoning`.
     ///
     /// `eos_override`:
-    ///   - `None` (passed by `chat_stream_sync`): stop on any of
-    ///     `config.eos_token_ids` (matches legacy behaviour exactly).
-    ///   - `Some(id)` (will be used by `chat_stream_session_start_sync` in 5c):
-    ///     stop on `id` OR any of `config.eos_token_ids`.
+    ///   - `None`: stop on any of `config.eos_token_ids` (the pre-session
+    ///     legacy behaviour).
+    ///   - `Some(id)`: stop on `id` OR any of `config.eos_token_ids`
+    ///     (used by streaming session-start to stop at `<end_of_turn>`).
     fn chat_stream_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -1589,8 +1540,7 @@ impl Gemma4Inner {
     /// delta on top of.
     ///
     /// Vision-capable: `messages` may carry images (they'll be decoded
-    /// on the model thread inside `chat_sync_core`, same as the legacy
-    /// `chat_sync` path).
+    /// on the model thread inside `chat_sync_core`).
     pub(crate) fn chat_session_start_sync(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -2401,22 +2351,6 @@ fn build_gemma4_tool_delta_text(
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
     match cmd {
-        Gemma4Cmd::Chat {
-            messages,
-            config,
-            reply,
-        } => {
-            let result = inner.chat_sync(messages, config);
-            let _ = reply.send(result);
-        }
-        Gemma4Cmd::ChatStream {
-            messages,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_sync(messages, config, stream_tx, cancelled);
-        }
         Gemma4Cmd::ChatSessionStart {
             messages,
             config,
@@ -2521,82 +2455,6 @@ impl Gemma4Model {
     #[napi]
     pub async fn load(model_path: String) -> Result<Gemma4Model> {
         Self::load_from_dir(&model_path).await
-    }
-
-    /// Chat with the model using a list of messages.
-    #[napi]
-    pub async fn chat(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        let config = config.unwrap_or_default();
-
-        // Fast-fail: if images provided but model has no vision support.
-        // Actual image processing happens on the model thread inside chat_sync_core.
-        if !self.has_vision
-            && messages
-                .iter()
-                .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
-        {
-            return Err(Error::from_reason(
-                "Images provided but model has no vision support (no vision_config in config.json)",
-            ));
-        }
-
-        crate::model_thread::send_and_await(&self.thread, |reply| Gemma4Cmd::Chat {
-            messages,
-            config,
-            reply,
-        })
-        .await
-    }
-
-    /// Streaming chat with the model using a list of messages.
-    #[napi(
-        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or_default();
-
-        // Fast-fail: if images provided but model has no vision support.
-        // Actual image processing happens on the model thread inside chat_stream_sync_core.
-        if !self.has_vision
-            && messages
-                .iter()
-                .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
-        {
-            return Err(Error::from_reason(
-                "Images provided but model has no vision support (no vision_config in config.json)",
-            ));
-        }
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-
-        self.thread.send(Gemma4Cmd::ChatStream {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
-
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
     }
 
     /// Reset all caches and clear cached token history. Exposed so

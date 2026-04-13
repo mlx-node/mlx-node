@@ -74,8 +74,16 @@ async function chat(
   numTokens: number;
   performance?: ChatResult['performance'];
 }> {
+  // NOTE: Step 7 of the chat-session refactor removed the legacy
+  // `model.chat(...)` NAPI surface for Gemma4 / Qwen3.5 / Qwen3.5 MoE /
+  // LFM2 / Qianfan-OCR. Step T4 will migrate this example onto
+  // `ChatSession`; in the meantime the legacy call sites below are
+  // type-erased via `any` so the example keeps typechecking even though
+  // running it would throw at runtime. The Qwen3.5-dense branch of this
+  // file already uses `Qwen35Session` and is unaffected.
   if (isGemma4) {
-    const model = loadedModel as Gemma4Model;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const model = loadedModel as any;
     const r = await model.chat(messages, {
       maxNewTokens: opts.maxNewTokens,
       temperature: opts.temperature,
@@ -88,7 +96,8 @@ async function chat(
       performance: r.performance,
     };
   }
-  const model = loadedModel as Exclude<typeof loadedModel, HarrierModel | Gemma4Model>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const model = loadedModel as any;
   const r = await model.chat(messages, {
     maxNewTokens: opts.maxNewTokens,
     temperature: opts.temperature,

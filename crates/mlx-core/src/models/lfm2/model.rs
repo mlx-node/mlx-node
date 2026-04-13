@@ -47,20 +47,9 @@ pub(crate) struct Lfm2Inner {
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Lfm2Cmd {
-    Chat {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    ChatStream {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
     /// Session-based chat continuation: prefill a pre-tokenized delta on top
     /// of the existing LFM2 caches (conv + KV), then decode. Text-only and
-    /// requires an active session (prior `Chat`/`ChatSessionStart` call that
+    /// requires an active session (prior `ChatSessionStart` call that
     /// populated `cached_token_history`).
     ///
     /// This bypasses the jinja chat template entirely — the caller is
@@ -311,11 +300,6 @@ impl Lfm2Inner {
         }
     }
 
-    /// Synchronous chat implementation. Runs on the dedicated model thread.
-    fn chat_sync(&mut self, messages: Vec<ChatMessage>, config: ChatConfig) -> Result<ChatResult> {
-        self.chat_sync_core(messages, config, None)
-    }
-
     /// Core synchronous chat implementation with optional EOS override.
     ///
     /// `eos_override` lets session methods pass a custom EOS token (e.g.
@@ -513,21 +497,6 @@ impl Lfm2Inner {
             prompt_token_count as u32,
             reasoning_tokens,
         )
-    }
-
-    /// Synchronous streaming chat implementation. Runs on the dedicated model thread.
-    fn chat_stream_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        let cb = StreamSender(stream_tx.clone());
-        let result = self.chat_stream_sync_core(messages, config, None, &cb, &cancelled);
-        if let Err(e) = result {
-            let _ = stream_tx.send(Err(e));
-        }
     }
 
     /// Core streaming chat implementation with optional EOS override.
@@ -1594,22 +1563,6 @@ impl Lfm2Inner {
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_lfm2_cmd(inner: &mut Lfm2Inner, cmd: Lfm2Cmd) {
     match cmd {
-        Lfm2Cmd::Chat {
-            messages,
-            config,
-            reply,
-        } => {
-            let result = inner.chat_sync(messages, config);
-            let _ = reply.send(result);
-        }
-        Lfm2Cmd::ChatStream {
-            messages,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_sync(messages, config, stream_tx, cancelled);
-        }
         Lfm2Cmd::ChatTokensDelta {
             delta_tokens,
             config,
@@ -1733,59 +1686,6 @@ impl Lfm2Model {
     #[napi]
     pub async fn load(model_path: String) -> Result<Lfm2Model> {
         Lfm2Model::load_from_dir(&model_path).await
-    }
-
-    /// Chat with the model using a list of messages.
-    #[napi]
-    pub async fn chat(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        let config = config.unwrap_or_default();
-
-        crate::model_thread::send_and_await(&self.thread, |reply| Lfm2Cmd::Chat {
-            messages,
-            config,
-            reply,
-        })
-        .await
-    }
-
-    /// Streaming chat with the model. Calls the callback for each token chunk.
-    #[napi]
-    pub async fn chat_stream(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-        callback: napi::threadsafe_function::ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or_default();
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-
-        // Create mpsc channel to bridge model thread -> tokio task -> JS callback
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-
-        // Send streaming command to model thread
-        self.thread.send(Lfm2Cmd::ChatStream {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
-
-        // Spawn tokio task that reads from stream_rx and calls the JS callback
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
     }
 
     /// Reset all caches and clear cached token history. Exposed so

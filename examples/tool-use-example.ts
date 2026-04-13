@@ -92,6 +92,11 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
   }
 }
 
+// NOTE: Step 7 of the chat-session refactor removed the legacy
+// `model.chat(...)` NAPI surface on Qwen35Model. Step T2 will expose a
+// tool-aware `ChatSession` entry point; until then this example uses an
+// `any` cast so it keeps typechecking. Running it would throw at
+// runtime because the method no longer exists.
 async function runToolConversation(model: Qwen35Model, userPrompt: string) {
   console.log('='.repeat(75));
   console.log(`User: ${userPrompt}`);
@@ -101,7 +106,8 @@ async function runToolConversation(model: Qwen35Model, userPrompt: string) {
 
   // Use chat() API - returns ChatResult with structured tool calls and thinking
   console.log('\n[->] Generating response with tools...');
-  const result = await model.chat(messages, {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const result = await (model as any).chat(messages, {
     tools,
     maxNewTokens: 32768,
     temperature: 0.7,
@@ -115,7 +121,8 @@ async function runToolConversation(model: Qwen35Model, userPrompt: string) {
   console.log(`[INFO] Finish reason: ${result.finishReason}`);
 
   // Check for tool calls - they're already parsed!
-  const validCalls = result.toolCalls.filter((tc) => tc.status === 'ok');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const validCalls = result.toolCalls.filter((tc: any) => tc.status === 'ok');
   if (validCalls.length > 0) {
     console.log(`\n[TOOL] Found ${validCalls.length} tool call(s):`);
 
@@ -125,7 +132,8 @@ async function runToolConversation(model: Qwen35Model, userPrompt: string) {
       {
         role: 'assistant',
         content: result.text,
-        toolCalls: validCalls.map((tc) => ({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        toolCalls: validCalls.map((tc: any) => ({
           id: tc.id,
           name: tc.name,
           arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
@@ -146,7 +154,8 @@ async function runToolConversation(model: Qwen35Model, userPrompt: string) {
 
     // Generate final response with all tool results
     console.log('\n[->] Generating final response...');
-    const finalResult = await model.chat(messages, {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const finalResult = await (model as any).chat(messages, {
       tools,
       maxNewTokens: 2048,
       temperature: 0.9,

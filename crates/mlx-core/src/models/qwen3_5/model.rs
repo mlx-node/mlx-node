@@ -89,21 +89,9 @@ pub(crate) struct Qwen35Inner {
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Qwen35Cmd {
-    Chat {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    ChatStream {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
     /// Session-based chat continuation: prefill a pre-tokenized delta on top
     /// of the existing KV caches, then decode. Text-only; requires an active
-    /// session (prior `Chat`/`ChatSessionStart` call that initialized
-    /// `self.caches`).
+    /// session (prior `ChatSessionStart` call that initialized `self.caches`).
     ///
     /// This bypasses the jinja chat template entirely — the caller is
     /// responsible for producing the correctly-formatted delta tokens
@@ -267,21 +255,6 @@ pub(crate) enum Qwen35Cmd {
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
     match cmd {
-        Qwen35Cmd::Chat {
-            messages,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.chat_sync(messages, config));
-        }
-        Qwen35Cmd::ChatStream {
-            messages,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_sync(messages, config, stream_tx, cancelled);
-        }
         Qwen35Cmd::ChatTokensDelta {
             delta_tokens,
             config,
@@ -880,16 +853,7 @@ impl Qwen35Inner {
         Ok(())
     }
 
-    /// Chat synchronous (runs on model thread).
-    pub(crate) fn chat_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        self.chat_sync_core(messages, config, None)
-    }
-
-    /// Session-aware variant of `chat_sync` used to START a new session.
+    /// Session-aware variant of `chat_sync_core` used to START a new session.
     ///
     /// Unlike `chat_sync`, this path:
     ///   - uses `<|im_end|>` (from the tokenizer vocab) as its stop token
@@ -1791,21 +1755,6 @@ impl Qwen35Inner {
             prompt_tokens_for_result,
             reasoning_tracker.reasoning_token_count(),
         )
-    }
-
-    /// Streaming chat synchronous (runs on model thread).
-    pub(crate) fn chat_stream_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        let cb = StreamSender(stream_tx.clone());
-        let result = self.chat_stream_sync_inner(messages, config, None, &cb, &cancelled);
-        if let Err(e) = result {
-            let _ = stream_tx.send(Err(e));
-        }
     }
 
     /// Streaming chat (session-start variant): same semantics as
@@ -4616,59 +4565,17 @@ impl Qwen3_5Model {
         .await
     }
 
-    /// Chat API with tool calling support.
-    ///
-    /// Dispatches to the dedicated model thread and awaits the result.
-    #[napi]
-    pub async fn chat(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-        });
-
-        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::Chat {
-            messages,
-            config,
-            reply,
-        })
-        .await
-    }
-
     /// Start a new chat session.
     ///
-    /// Unlike [`chat`], this entry point is text-only and uses `<|im_end|>`
-    /// as its stop token so the cached KV state ends on a clean ChatML
-    /// boundary. Subsequent turns in the same session MUST go through
-    /// [`chat_session_continue`] — calling the legacy `chat` method on the
-    /// same model after `chat_session_start` would attempt to prefix-match
-    /// against a cache that ends on `<|im_end|>`, which no jinja template
-    /// renders. The session is owned end-to-end by the `chat_session_*`
-    /// surface.
+    /// Text-only entry point that uses `<|im_end|>` as its stop token so
+    /// the cached KV state ends on a clean ChatML boundary. Subsequent
+    /// turns in the same session MUST go through [`chat_session_continue`]
+    /// so the caller appends raw ChatML deltas on top of the live caches
+    /// without rerunning the jinja template. The session is owned
+    /// end-to-end by the `chat_session_*` surface.
     ///
     /// This method is the production entry point used by the TypeScript
-    /// `Qwen35Session` class for turn 1 of a multi-round conversation.
+    /// `ChatSession` wrapper for turn 1 of a multi-round conversation.
     #[napi]
     pub async fn chat_session_start(
         &self,
@@ -4814,70 +4721,6 @@ impl Qwen3_5Model {
             }
         })
         .await
-    }
-
-    /// Streaming chat API with tool calling support.
-    ///
-    /// Dispatches to the dedicated model thread. Tokens stream back via
-    /// an mpsc channel bridged to the JS callback. Returns a `ChatStreamHandle`
-    /// immediately; generation runs on the model thread.
-    /// Call `handle.cancel()` to abort generation early.
-    #[napi(
-        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-        });
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-
-        // Create mpsc channel to bridge model thread → tokio task → JS callback
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-
-        // Send streaming command to model thread
-        self.thread.send(Qwen35Cmd::ChatStream {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
-
-        // Spawn tokio task that reads from stream_rx and calls the JS callback
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
     }
 
     /// Streaming variant of [`Self::chat_session_start`].

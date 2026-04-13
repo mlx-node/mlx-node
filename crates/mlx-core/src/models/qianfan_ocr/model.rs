@@ -96,17 +96,6 @@ pub(crate) struct QianfanOCRInner {
 
 /// Commands dispatched from NAPI methods to the Qianfan-OCR model thread.
 pub(crate) enum QianfanOCRCmd {
-    Chat {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    ChatStream {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
     /// Start a new session via the text-only / VLM jinja-render path with
     /// `<|im_end|>` as the stop token. See
     /// [`QianfanOCRInner::chat_session_start_sync`] for the behavioural
@@ -189,21 +178,6 @@ pub(crate) enum QianfanOCRCmd {
 /// channel.
 pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOCRCmd) {
     match cmd {
-        QianfanOCRCmd::Chat {
-            messages,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.chat_sync_core(messages, config, None));
-        }
-        QianfanOCRCmd::ChatStream {
-            messages,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_sync_core(messages, config, stream_tx, cancelled, None);
-        }
         QianfanOCRCmd::ChatSessionStart {
             messages,
             config,
@@ -2182,115 +2156,6 @@ impl QianfanOCRModel {
                 })
             },
         )
-    }
-
-    /// Chat with the model.
-    ///
-    /// High-level API: processes images, formats prompt, generates, and decodes.
-    #[napi]
-    pub async fn chat(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        let thread = self.thread.as_ref().ok_or_else(|| {
-            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
-        })?;
-
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-        });
-
-        crate::model_thread::send_and_await(thread, |reply| QianfanOCRCmd::Chat {
-            messages,
-            config,
-            reply,
-        })
-        .await
-    }
-
-    /// Streaming chat with the model.
-    ///
-    /// Same as chat() but emits tokens incrementally via callback. The
-    /// decode loop runs on the model thread; this method dispatches a
-    /// `ChatStream` command and spawns a tokio pump task that forwards
-    /// each streamed chunk to the provided JS callback.
-    #[napi(
-        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        let thread = self.thread.as_ref().ok_or_else(|| {
-            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
-        })?;
-
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-        });
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-
-        thread.send(QianfanOCRCmd::ChatStream {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
-
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
     }
 
     /// Generate text tokens given pre-tokenized input.

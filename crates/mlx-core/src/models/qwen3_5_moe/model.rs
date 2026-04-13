@@ -89,21 +89,9 @@ pub(crate) struct Qwen35MoeInner {
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Qwen35MoeCmd {
-    Chat {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    ChatStream {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
     /// Session-based chat continuation: prefill a pre-tokenized delta on top
     /// of the existing KV caches, then decode. Text-only; requires an active
-    /// session (prior `Chat`/`ChatSessionStart` call that initialized
-    /// `self.caches`).
+    /// session (prior `ChatSessionStart` call that initialized `self.caches`).
     ///
     /// This bypasses the jinja chat template entirely — the caller is
     /// responsible for producing the correctly-formatted delta tokens
@@ -267,21 +255,6 @@ pub(crate) enum Qwen35MoeCmd {
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCmd) {
     match cmd {
-        Qwen35MoeCmd::Chat {
-            messages,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.chat_sync(messages, config));
-        }
-        Qwen35MoeCmd::ChatStream {
-            messages,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_sync(messages, config, stream_tx, cancelled);
-        }
         Qwen35MoeCmd::ChatTokensDelta {
             delta_tokens,
             config,
@@ -667,33 +640,16 @@ impl Qwen35MoeInner {
         Ok(())
     }
 
-    /// Chat synchronous (runs on model thread).
+    /// Core chat implementation with optional EOS override (runs on model
+    /// thread).
     ///
-    /// Legacy-compat thin wrapper around [`Self::chat_sync_core`]. Forwards
-    /// with `eos_override = None`, preserving byte-for-byte behaviour of the
-    /// pre-refactor entry point: the decode loop stops on
-    /// `config.eos_token_id`. Session-aware entry points (added in a later
-    /// step) go through `chat_sync_core` directly with
-    /// `eos_override = Some(<|im_end|>)`.
-    pub(crate) fn chat_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        self.chat_sync_core(messages, config, None)
-    }
-
-    /// Core implementation of `chat_sync` / `chat_session_start_sync`.
-    ///
-    /// Factored so both paths share the jinja rendering + prefill + decode
-    /// plumbing. The only behavioural difference is the EOS token:
-    ///
-    ///   - `chat_sync` passes `eos_override = None`, so the decode loop
-    ///     stops on `config.eos_token_id` (matches legacy behaviour exactly).
-    ///   - `chat_session_start_sync` (added in Step 2b) passes
-    ///     `eos_override = Some(im_end_id)` so the cached history ends on
-    ///     `<|im_end|>`, yielding clean ChatML boundaries for subsequent
-    ///     session deltas.
+    /// `eos_override`:
+    ///   - `None`: the decode loop stops on `config.eos_token_id` (the
+    ///     pre-session legacy behaviour).
+    ///   - `Some(id)`: the decode loop stops on `id` (typically
+    ///     `<|im_end|>`) so the cached history ends on a clean ChatML
+    ///     boundary, yielding a reusable prefix for subsequent session
+    ///     deltas via [`Self::chat_session_start_sync`].
     fn chat_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -1184,41 +1140,16 @@ impl Qwen35MoeInner {
         )
     }
 
-    /// Streaming chat synchronous (runs on model thread).
+    /// Core streaming chat implementation with optional EOS override (runs
+    /// on model thread).
     ///
-    /// Legacy-compat thin wrapper around [`Self::chat_stream_sync_core`].
-    /// Forwards with `eos_override = None`, preserving byte-for-byte
-    /// behaviour of the pre-refactor entry point: the decode loop stops on
-    /// `config.eos_token_id`. Session-aware streaming entry points (added in
-    /// a later step) go through `chat_stream_sync_core` directly with
-    /// `eos_override = Some(<|im_end|>)`.
-    pub(crate) fn chat_stream_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        let cb = StreamSender(stream_tx.clone());
-        let result = self.chat_stream_sync_core(messages, config, None, &cb, &cancelled);
-        if let Err(e) = result {
-            let _ = stream_tx.send(Err(e));
-        }
-    }
-
-    /// Core implementation of `chat_stream_sync` /
-    /// `chat_stream_session_start_sync`.
-    ///
-    /// Factored so both paths share the jinja rendering + prefill + decode
-    /// plumbing. The only behavioural difference is the EOS token:
-    ///
-    ///   - `chat_stream_sync` passes `eos_override = None`, so the decode
-    ///     loop stops on `config.eos_token_id` (matches legacy behaviour
-    ///     exactly).
-    ///   - `chat_stream_session_start_sync` (added in Step 2b) passes
-    ///     `eos_override = Some(im_end_id)` so the cached history ends on
-    ///     `<|im_end|>`, yielding clean ChatML boundaries for subsequent
-    ///     session deltas.
+    /// `eos_override`:
+    ///   - `None`: the decode loop stops on `config.eos_token_id` (the
+    ///     pre-session legacy behaviour).
+    ///   - `Some(id)`: the decode loop stops on `id` (typically
+    ///     `<|im_end|>`) so the cached history ends on a clean ChatML
+    ///     boundary, yielding a reusable prefix for subsequent session
+    ///     deltas via [`Self::chat_stream_session_start_sync`].
     fn chat_stream_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -4607,110 +4538,6 @@ impl Qwen3_5MoeModel {
             reply,
         })
         .await
-    }
-
-    /// Chat API with tool calling support.
-    ///
-    /// Dispatches to the dedicated model thread and awaits the result.
-    #[napi]
-    pub async fn chat(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-        });
-
-        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35MoeCmd::Chat {
-            messages,
-            config,
-            reply,
-        })
-        .await
-    }
-
-    /// Streaming chat API with tool calling support.
-    ///
-    /// Dispatches to the dedicated model thread. Tokens stream back via
-    /// an mpsc channel bridged to the JS callback. Returns a `ChatStreamHandle`
-    /// immediately; generation runs on the model thread.
-    /// Call `handle.cancel()` to abort generation early.
-    #[napi(
-        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-        });
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-
-        // Create mpsc channel to bridge model thread -> tokio task -> JS callback
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-
-        // Send streaming command to model thread
-        self.thread.send(Qwen35MoeCmd::ChatStream {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
-
-        // Spawn tokio task that reads from stream_rx and calls the JS callback
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
     }
 
     /// Start a new chat session.
