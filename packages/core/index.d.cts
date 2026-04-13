@@ -971,17 +971,27 @@ export declare class PromptCache {
  *
  * Combines InternViT vision encoder, MLP bridge with pixel shuffle,
  * and Qwen3 language model for OCR and document understanding.
+ *
+ * All inference state lives on a dedicated OS thread. NAPI methods
+ * dispatch commands via channels and await responses.
  */
 export declare class QianfanOCRModel {
-  /** Create a new QianfanOCRModel from config (uninitialized, no weights). */
+  /**
+   * Create a new QianfanOCRModel from config (uninitialized, no weights).
+   *
+   * This constructor path does not spawn a model thread — the returned
+   * instance is only useful for config inspection. Call
+   * [`QianfanOCRModel::load`] to actually run inference.
+   */
   constructor(config: QianfanOcrConfig);
-  /** Returns true if weights have been loaded. */
+  /** Returns true if weights have been loaded via `load()`. */
   get isInitialized(): boolean;
   /**
    * Load a QianfanOCRModel from a directory.
    *
    * Reads config.json, loads SafeTensors weights (single or sharded),
    * builds vision encoder, bridge, and language model, and loads tokenizer.
+   * All heavy work runs on the dedicated model thread.
    */
   static load(modelPath: string): Promise<QianfanOCRModel>;
   /**
@@ -993,7 +1003,10 @@ export declare class QianfanOCRModel {
   /**
    * Streaming chat with the model.
    *
-   * Same as chat() but emits tokens incrementally via callback.
+   * Same as chat() but emits tokens incrementally via callback. The
+   * decode loop runs on the model thread; this method dispatches a
+   * `ChatStream` command and spawns a tokio pump task that forwards
+   * each streamed chunk to the provided JS callback.
    */
   chatStream(
     messages: ChatMessage[],

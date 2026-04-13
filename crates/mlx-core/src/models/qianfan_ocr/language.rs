@@ -21,13 +21,16 @@ use crate::transformer::kv_cache::KVCache;
 /// Standard transformer with GQA, SiLU MLP, RMSNorm, 1D RoPE, and QK norm.
 /// Differs from the standalone Qwen3Model in that it accepts pre-computed
 /// embeddings from the vision-text merge step.
+///
+/// KV cache state is owned externally by `QianfanOCRInner` (hoisted for the
+/// ModelThread migration in refactor step 6a) so session-capable code paths
+/// can mutate it directly alongside the other cached-turn metadata.
 pub(crate) struct InternVLLanguageModel {
     embedding: Embedding,
     layers: Vec<TransformerBlock>,
     final_norm: RMSNorm,
     lm_head: Option<Linear>,
     tie_word_embeddings: bool,
-    kv_caches: Option<Vec<KVCache>>,
 }
 
 impl InternVLLanguageModel {
@@ -147,8 +150,13 @@ impl InternVLLanguageModel {
             final_norm,
             lm_head,
             tie_word_embeddings,
-            kv_caches: None,
         })
+    }
+
+    /// Number of transformer layers (used by `QianfanOCRInner` to size the
+    /// externally-owned `Vec<KVCache>`).
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
     }
 
     /// Get token embeddings (for the vision-text merge step).
@@ -220,44 +228,6 @@ impl InternVLLanguageModel {
     ) -> Result<MxArray> {
         let embeddings = self.get_embeddings(input_ids)?;
         self.forward_from_embeddings(&embeddings, cache)
-    }
-
-    /// Initialize KV caches for all layers.
-    ///
-    /// Must be called before starting generation with caching.
-    pub fn init_kv_caches(&mut self) {
-        self.kv_caches = Some((0..self.layers.len()).map(|_| KVCache::new()).collect());
-    }
-
-    /// Reset KV caches, clearing all cached key-value states.
-    ///
-    /// Call this between different generation sequences.
-    pub fn reset_kv_caches(&mut self) {
-        if let Some(ref mut caches) = self.kv_caches {
-            for cache in caches.iter_mut() {
-                cache.reset();
-            }
-        }
-    }
-
-    /// Get a mutable reference to the internal KV caches.
-    pub fn kv_caches_mut(&mut self) -> &mut Option<Vec<KVCache>> {
-        &mut self.kv_caches
-    }
-
-    /// Get the number of transformer layers.
-    #[cfg(test)]
-    pub fn num_layers(&self) -> usize {
-        self.layers.len()
-    }
-
-    /// Get the current cache offset (number of cached tokens).
-    pub fn get_cache_offset(&self) -> i32 {
-        self.kv_caches
-            .as_ref()
-            .and_then(|caches| caches.first())
-            .map(|cache| cache.get_offset())
-            .unwrap_or(0)
     }
 }
 
@@ -443,28 +413,6 @@ mod tests {
 
         let shape = logits.shape().unwrap();
         assert_eq!(shape.as_ref(), &[1, 4, 32]); // [B, seq_len, vocab_size]
-    }
-
-    #[test]
-    fn test_kv_cache_init_and_reset() {
-        let config = small_config();
-        let weights = make_dummy_weights("lm", &config);
-        let mut model = InternVLLanguageModel::build(&weights, "lm", &config).unwrap();
-
-        // Initially no caches
-        assert!(model.kv_caches.is_none());
-        assert_eq!(model.get_cache_offset(), 0);
-
-        // Init caches
-        model.init_kv_caches();
-        assert!(model.kv_caches.is_some());
-        assert_eq!(model.kv_caches.as_ref().unwrap().len(), 2);
-        assert_eq!(model.get_cache_offset(), 0);
-
-        // Reset caches
-        model.reset_kv_caches();
-        assert!(model.kv_caches.is_some());
-        assert_eq!(model.get_cache_offset(), 0);
     }
 
     #[test]

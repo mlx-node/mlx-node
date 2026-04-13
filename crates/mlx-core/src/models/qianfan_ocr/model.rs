@@ -5,12 +5,24 @@
  * for OCR and document understanding tasks.
  *
  * Provides NAPI-exposed load(), chat(), chatStream(), and generate() APIs.
+ *
+ * # Architecture
+ *
+ * All model state (weights, KV caches, tokenizer, cached turn metadata) lives
+ * on a dedicated OS thread owned by the `ModelThread<QianfanOCRCmd>` field on
+ * [`QianfanOCRModel`]. NAPI methods are thin shells that marshal arguments
+ * into a `QianfanOCRCmd` and dispatch them through the command channel —
+ * responses flow back via oneshot channels (for `Chat`, `Generate`,
+ * `ResetCaches`) or an mpsc stream (for `ChatStream`). This keeps MLX arrays
+ * off the Tokio worker threads and removes the `Arc<RwLock<>>` plumbing the
+ * legacy layout used to share mutable model state with `spawn_blocking`
+ * closures.
  */
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
 
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Status, bindgen_prelude::*};
@@ -19,6 +31,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::{MxArray, synchronize_and_clear_cache};
+use crate::model_thread::{ResponseTx, StreamTx};
 use crate::models::qianfan_ocr::bridge::InternVLBridge;
 use crate::models::qianfan_ocr::chat::format_qianfan_chat;
 use crate::models::qianfan_ocr::config::{InternVisionConfig, QianfanOCRConfig, Qwen3LMConfig};
@@ -35,160 +48,198 @@ use crate::sampling::{
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 use crate::tools;
+use crate::transformer::kv_cache::KVCache;
 use crate::utils::safetensors::SafeTensorsFile;
 
 // ============================================================================
-// QianfanOCRModel
+// QianfanOCRInner — dedicated-thread owned state
+// ============================================================================
+
+/// Internal Qianfan-OCR model state owned exclusively by the dedicated
+/// model thread.
+///
+/// All fields are plain-owned (no `Arc<RwLock<>>`) because the model
+/// thread has sole mutable access. `kv_caches`, `cached_token_history`,
+/// `cached_image_key`, and `cached_cache_offset` are hoisted out of
+/// [`InternVLLanguageModel`] and the old NAPI struct so future session
+/// methods (Step 6b) can read/mutate them directly alongside the other
+/// per-turn metadata.
+pub(crate) struct QianfanOCRInner {
+    pub(crate) config: QianfanOCRConfig,
+    pub(crate) vision: InternViTModel,
+    pub(crate) bridge: InternVLBridge,
+    pub(crate) language_model: InternVLLanguageModel,
+    pub(crate) tokenizer: Arc<Qwen3Tokenizer>,
+    /// Per-layer KV caches, promoted from [`InternVLLanguageModel`] so
+    /// the Step 6b session methods can inspect / clone / trim them in
+    /// place without going through a wrapper method.
+    pub(crate) kv_caches: Option<Vec<KVCache>>,
+    /// Token history of the prompt + forwarded generated tokens from
+    /// the most recent chat() / chat_stream() call. Used for
+    /// prefix-match-based cache reuse on the next call.
+    pub(crate) cached_token_history: Vec<u32>,
+    /// Cached image set hash from the most recent call. Always `None`
+    /// in Step 6a — session-aware image reuse comes with Step 6b.
+    /// Promoted up-front so the session variants can populate it
+    /// without re-plumbing the struct.
+    pub(crate) cached_image_key: Option<u64>,
+    /// Cache offset from the most recent call (number of tokens
+    /// committed to the KV cache). Mirrors `kv_caches[0].get_offset()`
+    /// at the end of the previous turn and is used by Step 6b to
+    /// validate session continuity without touching the caches.
+    pub(crate) cached_cache_offset: i32,
+}
+
+// ============================================================================
+// Commands dispatched from NAPI methods to the dedicated model thread
+// ============================================================================
+
+/// Commands dispatched from NAPI methods to the Qianfan-OCR model thread.
+pub(crate) enum QianfanOCRCmd {
+    Chat {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    ChatStream {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
+    Generate {
+        input_ids: MxArray,
+        max_new_tokens: i32,
+        temperature: f64,
+        reply: ResponseTx<Vec<u32>>,
+    },
+    ResetCaches {
+        reply: ResponseTx<()>,
+    },
+}
+
+/// Command handler for the dedicated model thread.
+///
+/// Dispatches each command variant to the matching `_sync` method on
+/// [`QianfanOCRInner`] and forwards the result through the response
+/// channel.
+pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOCRCmd) {
+    match cmd {
+        QianfanOCRCmd::Chat {
+            messages,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.chat_sync_core(messages, config));
+        }
+        QianfanOCRCmd::ChatStream {
+            messages,
+            config,
+            stream_tx,
+            cancelled,
+        } => {
+            inner.chat_stream_sync_core(messages, config, stream_tx, cancelled);
+        }
+        QianfanOCRCmd::Generate {
+            input_ids,
+            max_new_tokens,
+            temperature,
+            reply,
+        } => {
+            let _ = reply.send(inner.generate_sync(&input_ids, max_new_tokens, temperature));
+        }
+        QianfanOCRCmd::ResetCaches { reply } => {
+            inner.reset_caches_sync();
+            let _ = reply.send(Ok(()));
+        }
+    }
+}
+
+// ============================================================================
+// QianfanOCRModel — NAPI shell around the dedicated model thread
 // ============================================================================
 
 /// Qianfan-OCR Vision-Language Model (InternVL architecture).
 ///
 /// Combines InternViT vision encoder, MLP bridge with pixel shuffle,
 /// and Qwen3 language model for OCR and document understanding.
+///
+/// All inference state lives on a dedicated OS thread. NAPI methods
+/// dispatch commands via channels and await responses.
 #[napi(js_name = "QianfanOCRModel")]
 pub struct QianfanOCRModel {
+    /// Dedicated model thread owning `QianfanOCRInner`. `None` when the
+    /// model was constructed via `new(config)` without loading weights —
+    /// in that uninitialized state only `isInitialized` is meaningful.
+    thread: Option<crate::model_thread::ModelThread<QianfanOCRCmd>>,
+    /// Cloned from inner for pure-getter NAPI methods (no command
+    /// dispatch needed). For uninitialized instances this holds the
+    /// bare constructor argument. Marked `allow(dead_code)` because
+    /// Step 6a does not expose a config getter — session-aware Step T2
+    /// wiring will.
+    #[allow(dead_code)]
     config: QianfanOCRConfig,
-    vision: Option<Arc<InternViTModel>>,
-    bridge: Option<Arc<InternVLBridge>>,
-    language_model: Option<Arc<RwLock<InternVLLanguageModel>>>,
-    tokenizer: Option<Arc<Qwen3Tokenizer>>,
-    /// Token history for KV cache reuse across chat() calls.
-    cached_token_history: Arc<RwLock<Vec<u32>>>,
+    /// Whether the model was loaded with real weights. `false` for
+    /// `new QianfanOCRModel(config)` calls that predate `load()`.
+    initialized: bool,
 }
 
-#[napi]
-impl QianfanOCRModel {
-    /// Create a new QianfanOCRModel from config (uninitialized, no weights).
-    #[napi(constructor)]
-    pub fn new(config: QianfanOCRConfig) -> Self {
-        Self {
-            config,
-            vision: None,
-            bridge: None,
-            language_model: None,
-            tokenizer: None,
-            cached_token_history: Arc::new(RwLock::new(Vec::new())),
-        }
+// ============================================================================
+// QianfanOCRInner — core model logic (owned by the model thread)
+// ============================================================================
+
+/// Wrapper that adapts [`StreamTx<ChatStreamChunk>`] to the same `call()`
+/// API as a napi [`ThreadsafeFunction`], so the streaming decode loop can
+/// be reused verbatim when migrated off the callback path.
+struct StreamSender(StreamTx<ChatStreamChunk>);
+
+impl StreamSender {
+    fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
+        let _ = self.0.send(result);
+    }
+}
+
+impl QianfanOCRInner {
+    /// Reset the hoisted cache state (KV caches, token history, image key,
+    /// cached offset). Used by both `reset_caches()` and the ResetCaches
+    /// command path.
+    fn reset_caches_sync(&mut self) {
+        self.kv_caches = None;
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_cache_offset = 0;
     }
 
-    /// Returns true if weights have been loaded.
-    #[napi(getter)]
-    pub fn is_initialized(&self) -> bool {
-        self.vision.is_some() && self.bridge.is_some() && self.language_model.is_some()
+    /// Allocate a fresh per-layer KV cache vector sized to match the
+    /// current language model. Pre-Step 6a this lived on
+    /// [`InternVLLanguageModel`]; it was hoisted so future session
+    /// methods can share the same storage with other cached metadata.
+    fn init_kv_caches(&mut self) {
+        let num_layers = self.language_model.num_layers();
+        self.kv_caches = Some((0..num_layers).map(|_| KVCache::new()).collect());
     }
 
-    /// Load a QianfanOCRModel from a directory.
+    /// Current cache offset (number of tokens committed to the KV cache).
+    /// Reads from the first layer's cache — all layers advance together.
+    fn get_cache_offset(&self) -> i32 {
+        self.kv_caches
+            .as_ref()
+            .and_then(|caches| caches.first())
+            .map(|c| c.get_offset())
+            .unwrap_or(0)
+    }
+
+    /// Chat generation (non-streaming).
     ///
-    /// Reads config.json, loads SafeTensors weights (single or sharded),
-    /// builds vision encoder, bridge, and language model, and loads tokenizer.
-    #[napi]
-    pub fn load<'env>(
-        env: &'env Env,
-        model_path: String,
-    ) -> Result<PromiseRaw<'env, QianfanOCRModel>> {
-        env.spawn_future_with_callback(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    let path = Path::new(&model_path);
-
-                    if !path.exists() {
-                        return Err(napi::Error::from_reason(format!(
-                            "Model path does not exist: {}",
-                            model_path
-                        )));
-                    }
-
-                    // --- Parse config.json ---
-                    let config_path = path.join("config.json");
-                    if !config_path.exists() {
-                        return Err(napi::Error::from_reason(format!(
-                            "Config file not found: {}",
-                            config_path.display()
-                        )));
-                    }
-
-                    let config_data = fs::read_to_string(&config_path)?;
-                    let raw: Value = serde_json::from_str(&config_data)?;
-
-                    let config = parse_config_json(&raw);
-
-                    info!(
-                        "Loading Qianfan-OCR model from: {} (vision: {} layers, LM: {} layers)",
-                        model_path,
-                        config.vision_config.num_hidden_layers,
-                        config.llm_config.num_hidden_layers
-                    );
-
-                    // --- Load SafeTensors weights ---
-                    let all_weights = load_safetensors_weights(path)?;
-                    info!("  Loaded {} total tensors", all_weights.len());
-
-                    // Transform keys if still in HuggingFace format (has vision_model. prefix)
-                    let needs_transform =
-                        all_weights.keys().any(|k| k.starts_with("vision_model."));
-                    let weights = if needs_transform {
-                        info!("  Transforming HuggingFace keys to internal format...");
-                        load_qianfan_ocr_weights(all_weights)?
-                    } else {
-                        info!("  Keys already in MLX format, skipping transformation");
-                        all_weights
-                    };
-
-                    Ok::<_, Error>((config, weights, model_path))
-                })
-                .await
-                .map_err(|err| {
-                    Error::new(
-                        Status::GenericFailure,
-                        format!("Failed to load model: {err}"),
-                    )
-                })
-                .flatten()
-            },
-            |_env, (config, weights, model_path)| {
-                build_qianfan_ocr_from_weights(config, weights, &model_path)
-            },
-        )
-    }
-
-    /// Chat with the model.
-    ///
-    /// High-level API: processes images, formats prompt, generates, and decodes.
-    #[napi]
-    pub async fn chat(
-        &self,
+    /// Port of the legacy `chat()` body — preserves the exact InternViT
+    /// → bridge → language-model prefill/decode pipeline, KV cache reuse
+    /// via prefix matching, repetition/presence/frequency penalties,
+    /// thinking/tool call parsing, and optional performance metrics.
+    fn chat_sync_core(
+        &mut self,
         messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
+        config: ChatConfig,
     ) -> Result<ChatResult> {
-        if !self.is_initialized() {
-            return Err(Error::from_reason(
-                "Model not initialized. Call QianfanOCRModel.load() first.",
-            ));
-        }
-
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-        });
-
         let max_new_tokens = config.max_new_tokens.unwrap_or(512);
         let temperature = config.temperature.unwrap_or(0.0);
         let top_k = config.top_k.unwrap_or(0);
@@ -214,32 +265,391 @@ impl QianfanOCRModel {
             None
         };
 
-        let tokenizer = self
-            .tokenizer
-            .clone()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
-        let vision_arc = self.vision.clone();
-        let bridge_arc = self.bridge.clone();
-        let lm_arc = self
-            .language_model
-            .clone()
-            .ok_or_else(|| Error::from_reason("Language model not loaded"))?;
-        let model_config = self.config.clone();
-        let cached_token_history_arc = self.cached_token_history.clone();
-
         // Extract images from messages (CPU bound)
         let image_bytes = extract_images_from_messages(&messages);
 
-        napi::bindgen_prelude::spawn_blocking(move || {
-            // --- Step 1: Process images ---
-            let processor = QianfanImageProcessor::new(&model_config);
+        // --- Step 1: Process images ---
+        let processor = QianfanImageProcessor::new(&self.config);
+        let image_refs: Vec<&[u8]> = image_bytes.iter().map(|b| &b[..]).collect();
+        let processed_images = processor.process_many(&image_refs)?;
+
+        let num_patches_list: Vec<u32> = processed_images.iter().map(|p| p.num_tiles).collect();
+        let num_image_token = self.config.num_image_token() as u32;
+
+        // --- Step 2: Format chat template ---
+        let prompt = format_qianfan_chat(
+            &messages,
+            &num_patches_list,
+            num_image_token,
+            enable_thinking,
+            config.tools.as_deref(),
+        )?;
+
+        // --- Step 3: Tokenize ---
+        let token_ids = self.tokenizer.encode_sync(&prompt, Some(false))?;
+        let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
+
+        // --- Step 4: Vision encoding ---
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let vision_features = if !processed_images.is_empty() {
+            // Stack all tiles from all images: [total_tiles, H, W, C]
+            let all_pixels = stack_processed_images(&processed_images)?;
+
+            let vit_out = {
+                let _ctx = StreamContext::new(generation_stream);
+                self.vision.forward(&all_pixels)?
+            };
+
+            // Bridge: pixel shuffle + MLP projection
+            let bridge_out = {
+                let _ctx = StreamContext::new(generation_stream);
+                self.bridge.forward(&vit_out)?
+            };
+
+            // bridge_out: [total_tiles, tokens_per_tile, llm_hidden]
+            // Flatten to [total_visual_tokens, llm_hidden]
+            let bridge_shape = bridge_out.shape()?;
+            let total_tiles = bridge_shape[0];
+            let tokens_per_tile = bridge_shape[1];
+            let hidden = bridge_shape[2];
+            Some(bridge_out.reshape(&[total_tiles * tokens_per_tile, hidden])?)
+        } else {
+            None
+        };
+
+        // --- Step 5: Prefix matching for KV cache reuse ---
+        let prefix_len = if reuse_cache && image_bytes.is_empty() {
+            // Only reuse cache for text-only; images need full re-prefill
+            // since IMG_CONTEXT token IDs don't capture image content
+            compute_prefix_match(&token_ids, &self.cached_token_history)
+        } else {
+            0
+        };
+
+        if prefix_len == 0 || !reuse_cache {
+            // Full reset for fresh generation
+            self.kv_caches = None;
+            self.init_kv_caches();
+        }
+        // Trim happens below after we know seq_len — see clamped_prefix
+
+        // --- Step 6: Prefill ---
+        let eos_token_id = self.config.eos_token_id;
+
+        let merged_embeds = if let Some(ref vf) = vision_features {
+            let text_embeds = {
+                let _ctx = StreamContext::new(generation_stream);
+                self.language_model.get_embeddings(&input_ids)?
+            };
+            let embed_dtype = text_embeds.dtype()?;
+            let vf_cast = if vf.dtype()? != embed_dtype {
+                vf.astype(embed_dtype)?
+            } else {
+                vf.clone()
+            };
+            merge_vision_features(
+                &input_ids,
+                &text_embeds,
+                &vf_cast,
+                self.config.img_context_token_id,
+            )?
+        } else {
+            let _ctx = StreamContext::new(generation_stream);
+            self.language_model.get_embeddings(&input_ids)?
+        };
+
+        // Clamp prefix to seq_len-1 so there's always at least 1 token to
+        // forward for logits. Handles the full-prefix-hit case where
+        // prefix_len == seq_len (identical prompt resent).
+        let seq_len = merged_embeds.shape()?[1];
+        let clamped_prefix = prefix_len.min(seq_len.saturating_sub(1) as usize);
+
+        // Trim KV cache to clamped_prefix to discard stale suffix tokens
+        if clamped_prefix > 0 && reuse_cache {
+            let cache_offset = self.get_cache_offset();
+            if cache_offset > clamped_prefix as i32
+                && let Some(caches) = self.kv_caches.as_mut()
+            {
+                for c in caches.iter_mut() {
+                    c.trim(clamped_prefix as i32);
+                }
+            }
+        }
+
+        let prefill_embeds = if clamped_prefix > 0 {
+            merged_embeds.slice_axis(1, clamped_prefix as i64, seq_len)?
+        } else {
+            merged_embeds
+        };
+
+        let mut cache = self.kv_caches.take();
+
+        let prefill_logits = {
+            let _ctx = StreamContext::new(generation_stream);
+            self.language_model
+                .forward_from_embeddings(&prefill_embeds, &mut cache)?
+        };
+        self.kv_caches = cache;
+
+        // Eval prefill logits -- caches materialize through dependency graph
+        prefill_logits.eval();
+        synchronize_and_clear_cache();
+
+        // Get last logits for first token sampling
+        let prefill_seq = prefill_logits.shape()?[1];
+        let mut last_logits = prefill_logits
+            .slice_axis(1, prefill_seq - 1, prefill_seq)?
+            .squeeze(Some(&[0, 1]))?;
+
+        // --- Step 7: Sampling config ---
+        let sampling_config = SamplingConfig {
+            temperature: Some(temperature),
+            top_k: Some(top_k),
+            top_p: Some(top_p),
+            min_p: Some(min_p),
+        };
+
+        // Track all tokens for repetition penalty
+        let mut all_tokens: Vec<u32> = token_ids.clone();
+
+        // Apply penalties to first token
+        if repetition_penalty != 1.0 {
+            last_logits = apply_repetition_penalty(
+                &last_logits,
+                &all_tokens,
+                repetition_penalty,
+                Some(repetition_context_size),
+            )?;
+        }
+        if presence_penalty != 0.0 {
+            last_logits = apply_presence_penalty(
+                &last_logits,
+                &all_tokens,
+                presence_penalty,
+                Some(presence_context_size),
+            )?;
+        }
+        if frequency_penalty != 0.0 {
+            last_logits = apply_frequency_penalty(
+                &last_logits,
+                &all_tokens,
+                frequency_penalty,
+                Some(frequency_context_size),
+            )?;
+        }
+
+        // Sample first token
+        let mut token = sample(&last_logits, Some(sampling_config))?;
+        token.eval();
+
+        let first_token_instant = generation_start.map(|_| std::time::Instant::now());
+        let prefill_token_count = token_ids.len();
+
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut finish_reason = "length".to_string();
+
+        // --- Step 8: Decode loop ---
+        for _step in 0..max_new_tokens {
+            let token_value = token.item_at_int32(0)? as u32;
+            generated_tokens.push(token_value);
+            all_tokens.push(token_value);
+
+            // Check EOS
+            if token_value == eos_token_id as u32 {
+                finish_reason = "stop".to_string();
+                break;
+            }
+
+            // Check repetition cutoff
+            if let Some(reason) = check_repetition_cutoff(
+                &generated_tokens,
+                max_consecutive_tokens,
+                max_ngram_repeats,
+                ngram_size,
+            ) {
+                finish_reason = reason.to_string();
+                break;
+            }
+
+            // Forward single token
+            let token_2d = token.reshape(&[1, 1])?;
+            let mut cache = self.kv_caches.take();
+
+            let logits = {
+                let _ctx = StreamContext::new(generation_stream);
+                self.language_model.forward(&token_2d, &mut cache)?
+            };
+            self.kv_caches = cache;
+
+            let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
+
+            // Apply penalties
+            if repetition_penalty != 1.0 {
+                next_logits = apply_repetition_penalty(
+                    &next_logits,
+                    &all_tokens,
+                    repetition_penalty,
+                    Some(repetition_context_size),
+                )?;
+            }
+            if presence_penalty != 0.0 {
+                next_logits = apply_presence_penalty(
+                    &next_logits,
+                    &all_tokens,
+                    presence_penalty,
+                    Some(presence_context_size),
+                )?;
+            }
+            if frequency_penalty != 0.0 {
+                next_logits = apply_frequency_penalty(
+                    &next_logits,
+                    &all_tokens,
+                    frequency_penalty,
+                    Some(frequency_context_size),
+                )?;
+            }
+
+            token = sample(&next_logits, Some(sampling_config))?;
+            token.eval();
+
+            // Periodic cache clearing to prevent memory accumulation
+            if (_step + 1) % 256 == 0 {
+                synchronize_and_clear_cache();
+            }
+        }
+
+        // --- Step 9: Sync token history with cache state ---
+        // On "stop"/"repetition" exits, the terminal token was sampled and
+        // pushed to generated_tokens but never forwarded into the KV cache.
+        // Only include tokens that were actually forwarded so prefix matching
+        // stays aligned with the live cache.
+        if reuse_cache {
+            let forwarded = if finish_reason == "stop" || finish_reason == "repetition" {
+                generated_tokens.len().saturating_sub(1)
+            } else {
+                generated_tokens.len()
+            };
+            let mut full_history = token_ids.clone();
+            full_history.extend_from_slice(&generated_tokens[..forwarded]);
+            self.cached_token_history = full_history;
+            self.cached_cache_offset = self.get_cache_offset();
+        } else {
+            // Not reusing — clear metadata to prevent stale prefix matches
+            self.cached_token_history.clear();
+            self.cached_cache_offset = 0;
+        }
+
+        // --- Step 10: Decode and parse ---
+        let raw_decoded = self.tokenizer.decode_sync(&generated_tokens, true)?;
+        let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
+
+        let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
+        let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
+
+        // Promote finish_reason to "tool_calls" when valid tool calls are parsed
+        if tool_calls.iter().any(|tc| tc.status == "ok") {
+            finish_reason = "tool_calls".to_string();
+        }
+
+        let performance =
+            if let (Some(gen_start), Some(first_tok)) = (generation_start, first_token_instant) {
+                let generation_end = std::time::Instant::now();
+                let prefill_toks = prefill_token_count as f64;
+                let gen_toks = generated_tokens.len() as f64;
+                let ttft_ms = first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
+                let decode_ms = generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
+                Some(crate::profiling::PerformanceMetrics {
+                    ttft_ms,
+                    prefill_tokens_per_second: if ttft_ms > 0.0 {
+                        prefill_toks / (ttft_ms / 1000.0)
+                    } else {
+                        0.0
+                    },
+                    decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                        (gen_toks - 1.0) / (decode_ms / 1000.0)
+                    } else {
+                        0.0
+                    },
+                })
+            } else {
+                None
+            };
+
+        let reasoning_tokens = tools::count_reasoning_tokens(
+            &thinking,
+            &generated_tokens,
+            self.tokenizer.think_end_id(),
+        );
+
+        Ok(ChatResult {
+            text: text.trim().to_string(),
+            tool_calls,
+            thinking,
+            num_tokens: generated_tokens.len() as u32,
+            prompt_tokens: prefill_token_count as u32,
+            reasoning_tokens,
+            finish_reason,
+            raw_text: raw_decoded,
+            performance,
+        })
+    }
+
+    /// Streaming chat generation.
+    ///
+    /// Mirrors [`chat_sync_core`] but emits per-token deltas through
+    /// `stream_tx` and checks `cancelled` on every decode iteration.
+    /// Drives the same hoisted cache state so prefix matching and
+    /// repetition penalties behave identically to the non-streaming path.
+    fn chat_stream_sync_core(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        let sender = StreamSender(stream_tx.clone());
+        let emit = |chunk: ChatStreamChunk| {
+            sender.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
+        };
+
+        let result: Result<()> = (|| {
+            let max_new_tokens = config.max_new_tokens.unwrap_or(512);
+            let temperature = config.temperature.unwrap_or(0.0);
+            let top_k = config.top_k.unwrap_or(0);
+            let top_p = config.top_p.unwrap_or(1.0);
+            let min_p = config.min_p.unwrap_or(0.0);
+            let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+            let repetition_context_size = config.repetition_context_size.unwrap_or(256);
+            let presence_penalty = config.presence_penalty.unwrap_or(0.0);
+            let presence_context_size = config.presence_context_size.unwrap_or(20);
+            let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
+            let frequency_context_size = config.frequency_context_size.unwrap_or(20);
+            let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
+            let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
+            let ngram_size = config.ngram_size.unwrap_or(64);
+            let enable_thinking =
+                crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config)
+                    .unwrap_or(false);
+            let reuse_cache = config.reuse_cache.unwrap_or(true);
+            let report_perf = config.report_performance.unwrap_or(false);
+
+            let generation_start = if report_perf {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
+            let image_bytes = extract_images_from_messages(&messages);
+
+            // --- Process images ---
+            let processor = QianfanImageProcessor::new(&self.config);
             let image_refs: Vec<&[u8]> = image_bytes.iter().map(|b| &b[..]).collect();
             let processed_images = processor.process_many(&image_refs)?;
 
             let num_patches_list: Vec<u32> = processed_images.iter().map(|p| p.num_tiles).collect();
-            let num_image_token = model_config.num_image_token() as u32;
+            let num_image_token = self.config.num_image_token() as u32;
 
-            // --- Step 2: Format chat template ---
+            // --- Format and tokenize ---
             let prompt = format_qianfan_chat(
                 &messages,
                 &num_patches_list,
@@ -247,37 +657,21 @@ impl QianfanOCRModel {
                 enable_thinking,
                 config.tools.as_deref(),
             )?;
-
-            // --- Step 3: Tokenize ---
-            let token_ids = tokenizer.encode_sync(&prompt, Some(false))?;
+            let token_ids = self.tokenizer.encode_sync(&prompt, Some(false))?;
             let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
-            // --- Step 4: Vision encoding ---
+            // --- Vision encoding ---
             let generation_stream = Stream::new(DeviceType::Gpu);
             let vision_features = if !processed_images.is_empty() {
-                let vision = vision_arc
-                    .as_ref()
-                    .ok_or_else(|| Error::from_reason("Vision model not loaded"))?;
-                let bridge = bridge_arc
-                    .as_ref()
-                    .ok_or_else(|| Error::from_reason("Bridge not loaded"))?;
-
-                // Stack all tiles from all images: [total_tiles, H, W, C]
                 let all_pixels = stack_processed_images(&processed_images)?;
-
                 let vit_out = {
                     let _ctx = StreamContext::new(generation_stream);
-                    vision.forward(&all_pixels)?
+                    self.vision.forward(&all_pixels)?
                 };
-
-                // Bridge: pixel shuffle + MLP projection
                 let bridge_out = {
                     let _ctx = StreamContext::new(generation_stream);
-                    bridge.forward(&vit_out)?
+                    self.bridge.forward(&vit_out)?
                 };
-
-                // bridge_out: [total_tiles, tokens_per_tile, llm_hidden]
-                // Flatten to [total_visual_tokens, llm_hidden]
                 let bridge_shape = bridge_out.shape()?;
                 let total_tiles = bridge_shape[0];
                 let tokens_per_tile = bridge_shape[1];
@@ -287,36 +681,24 @@ impl QianfanOCRModel {
                 None
             };
 
-            // --- Step 5: Prefix matching for KV cache reuse ---
-            let mut lm_guard = lm_arc.write().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
-            })?;
-
+            // --- Prefill (with cache reuse support) ---
             let prefix_len = if reuse_cache && image_bytes.is_empty() {
-                // Only reuse cache for text-only; images need full re-prefill
-                // since IMG_CONTEXT token IDs don't capture image content
-                let history = cached_token_history_arc
-                    .read()
-                    .map_err(|_| Error::from_reason("Failed to read cached token history"))?;
-                compute_prefix_match(&token_ids, &history)
+                compute_prefix_match(&token_ids, &self.cached_token_history)
             } else {
                 0
             };
 
             if prefix_len == 0 || !reuse_cache {
-                // Full reset for fresh generation
-                lm_guard.reset_kv_caches();
-                lm_guard.init_kv_caches();
+                self.kv_caches = None;
+                self.init_kv_caches();
             }
-            // Trim happens below after we know seq_len — see clamped_prefix
 
-            // --- Step 6: Prefill ---
-            let eos_token_id = model_config.eos_token_id;
+            let eos_token_id = self.config.eos_token_id;
 
             let merged_embeds = if let Some(ref vf) = vision_features {
                 let text_embeds = {
                     let _ctx = StreamContext::new(generation_stream);
-                    lm_guard.get_embeddings(&input_ids)?
+                    self.language_model.get_embeddings(&input_ids)?
                 };
                 let embed_dtype = text_embeds.dtype()?;
                 let vf_cast = if vf.dtype()? != embed_dtype {
@@ -328,24 +710,20 @@ impl QianfanOCRModel {
                     &input_ids,
                     &text_embeds,
                     &vf_cast,
-                    model_config.img_context_token_id,
+                    self.config.img_context_token_id,
                 )?
             } else {
                 let _ctx = StreamContext::new(generation_stream);
-                lm_guard.get_embeddings(&input_ids)?
+                self.language_model.get_embeddings(&input_ids)?
             };
 
-            // Clamp prefix to seq_len-1 so there's always at least 1 token to
-            // forward for logits. Handles the full-prefix-hit case where
-            // prefix_len == seq_len (identical prompt resent).
             let seq_len = merged_embeds.shape()?[1];
             let clamped_prefix = prefix_len.min(seq_len.saturating_sub(1) as usize);
 
-            // Trim KV cache to clamped_prefix to discard stale suffix tokens
             if clamped_prefix > 0 && reuse_cache {
-                let cache_offset = lm_guard.get_cache_offset();
+                let cache_offset = self.get_cache_offset();
                 if cache_offset > clamped_prefix as i32
-                    && let Some(caches) = lm_guard.kv_caches_mut()
+                    && let Some(caches) = self.kv_caches.as_mut()
                 {
                     for c in caches.iter_mut() {
                         c.trim(clamped_prefix as i32);
@@ -359,25 +737,22 @@ impl QianfanOCRModel {
                 merged_embeds
             };
 
-            let mut cache = lm_guard.kv_caches_mut().take();
-
+            let mut cache = self.kv_caches.take();
             let prefill_logits = {
                 let _ctx = StreamContext::new(generation_stream);
-                lm_guard.forward_from_embeddings(&prefill_embeds, &mut cache)?
+                self.language_model
+                    .forward_from_embeddings(&prefill_embeds, &mut cache)?
             };
-            *lm_guard.kv_caches_mut() = cache;
+            self.kv_caches = cache;
 
-            // Eval prefill logits -- caches materialize through dependency graph
             prefill_logits.eval();
             synchronize_and_clear_cache();
 
-            // Get last logits for first token sampling
-            let prefill_seq = prefill_logits.shape()?[1];
+            let seq_len = prefill_logits.shape()?[1];
             let mut last_logits = prefill_logits
-                .slice_axis(1, prefill_seq - 1, prefill_seq)?
+                .slice_axis(1, seq_len - 1, seq_len)?
                 .squeeze(Some(&[0, 1]))?;
 
-            // --- Step 7: Sampling config ---
             let sampling_config = SamplingConfig {
                 temperature: Some(temperature),
                 top_k: Some(top_k),
@@ -385,10 +760,9 @@ impl QianfanOCRModel {
                 min_p: Some(min_p),
             };
 
-            // Track all tokens for repetition penalty
-            let mut all_tokens: Vec<u32> = token_ids.clone();
+            let prompt_token_ids = token_ids.clone();
+            let mut all_tokens: Vec<u32> = token_ids;
 
-            // Apply penalties to first token
             if repetition_penalty != 1.0 {
                 last_logits = apply_repetition_penalty(
                     &last_logits,
@@ -414,29 +788,60 @@ impl QianfanOCRModel {
                 )?;
             }
 
-            // Sample first token
             let mut token = sample(&last_logits, Some(sampling_config))?;
             token.eval();
 
             let first_token_instant = generation_start.map(|_| std::time::Instant::now());
-            let prefill_token_count = token_ids.len();
+            let prefill_token_count = all_tokens.len();
 
             let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
             let mut finish_reason = "length".to_string();
 
-            // --- Step 8: Decode loop ---
-            for _step in 0..max_new_tokens {
+            // Stateful decoder for correct multi-byte/CJK streaming
+            let mut decode_stream = self.tokenizer.inner().decode_stream(true);
+            let mut streamed_text_len: usize = 0;
+
+            // --- Streaming decode loop ---
+            for step in 0..max_new_tokens {
+                if cancelled.load(Ordering::Relaxed) {
+                    finish_reason = "cancelled".to_string();
+                    break;
+                }
                 let token_value = token.item_at_int32(0)? as u32;
                 generated_tokens.push(token_value);
                 all_tokens.push(token_value);
 
-                // Check EOS
                 if token_value == eos_token_id as u32 {
                     finish_reason = "stop".to_string();
                     break;
                 }
 
-                // Check repetition cutoff
+                // Decode and emit BEFORE repetition check so the
+                // triggering token is streamed to clients
+                let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                    &mut decode_stream,
+                    self.tokenizer.inner(),
+                    token_value,
+                    &generated_tokens,
+                    streamed_text_len,
+                );
+                streamed_text_len += token_text.len();
+
+                emit(ChatStreamChunk {
+                    text: token_text,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    prompt_tokens: None,
+                    reasoning_tokens: None,
+                    raw_text: None,
+                    performance: None,
+                    is_reasoning: None,
+                });
+
+                // Check repetition cutoff (after emit so token is streamed)
                 if let Some(reason) = check_repetition_cutoff(
                     &generated_tokens,
                     max_consecutive_tokens,
@@ -449,17 +854,15 @@ impl QianfanOCRModel {
 
                 // Forward single token
                 let token_2d = token.reshape(&[1, 1])?;
-                let mut cache = lm_guard.kv_caches_mut().take();
-
+                let mut cache = self.kv_caches.take();
                 let logits = {
                     let _ctx = StreamContext::new(generation_stream);
-                    lm_guard.forward(&token_2d, &mut cache)?
+                    self.language_model.forward(&token_2d, &mut cache)?
                 };
-                *lm_guard.kv_caches_mut() = cache;
+                self.kv_caches = cache;
 
                 let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
 
-                // Apply penalties
                 if repetition_penalty != 1.0 {
                     next_logits = apply_repetition_penalty(
                         &next_logits,
@@ -488,43 +891,38 @@ impl QianfanOCRModel {
                 token = sample(&next_logits, Some(sampling_config))?;
                 token.eval();
 
-                // Periodic cache clearing to prevent memory accumulation
-                if (_step + 1) % 256 == 0 {
+                if (step + 1) % 256 == 0 {
                     synchronize_and_clear_cache();
                 }
             }
 
-            // --- Step 9: Sync token history with cache state ---
-            // On "stop"/"repetition" exits, the terminal token was sampled and
-            // pushed to generated_tokens but never forwarded into the KV cache.
-            // Only include tokens that were actually forwarded so prefix matching
-            // stays aligned with the live cache.
+            // Sync token history with cache state.
+            // "length" and "cancelled" break before/at the loop boundary
+            // so all tokens in generated_tokens were forwarded.
+            // "stop" and "repetition" push then break before forward,
+            // so the last token was NOT forwarded.
             if reuse_cache {
                 let forwarded = if finish_reason == "stop" || finish_reason == "repetition" {
                     generated_tokens.len().saturating_sub(1)
                 } else {
                     generated_tokens.len()
                 };
-                let mut full_history = token_ids.clone();
+                let mut full_history = prompt_token_ids;
                 full_history.extend_from_slice(&generated_tokens[..forwarded]);
-                if let Ok(mut history) = cached_token_history_arc.write() {
-                    *history = full_history;
-                }
+                self.cached_token_history = full_history;
+                self.cached_cache_offset = self.get_cache_offset();
             } else {
-                // Not reusing — clear metadata to prevent stale prefix matches
-                if let Ok(mut history) = cached_token_history_arc.write() {
-                    history.clear();
-                }
+                self.cached_token_history.clear();
+                self.cached_cache_offset = 0;
             }
 
-            // --- Step 10: Decode and parse ---
-            let raw_decoded = tokenizer.decode_sync(&generated_tokens, true)?;
+            // Final chunk
+            let raw_decoded = self.tokenizer.decode_sync(&generated_tokens, true)?;
             let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
-
             let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
             let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
 
-            // Promote finish_reason to "tool_calls" when valid tool calls are parsed
+            // Promote finish_reason to "tool_calls" when valid tool calls parsed
             if tool_calls.iter().any(|tc| tc.status == "ok") {
                 finish_reason = "tool_calls".to_string();
             }
@@ -557,50 +955,185 @@ impl QianfanOCRModel {
             let reasoning_tokens = tools::count_reasoning_tokens(
                 &thinking,
                 &generated_tokens,
-                tokenizer.think_end_id(),
+                self.tokenizer.think_end_id(),
             );
 
-            Ok(ChatResult {
+            emit(ChatStreamChunk {
                 text: text.trim().to_string(),
-                tool_calls,
+                done: true,
+                finish_reason: Some(finish_reason),
+                tool_calls: Some(tool_calls),
                 thinking,
-                num_tokens: generated_tokens.len() as u32,
-                prompt_tokens: prefill_token_count as u32,
-                reasoning_tokens,
-                finish_reason,
-                raw_text: raw_decoded,
+                num_tokens: Some(generated_tokens.len() as u32),
+                prompt_tokens: Some(prefill_token_count as u32),
+                reasoning_tokens: Some(reasoning_tokens),
+                raw_text: Some(raw_decoded),
                 performance,
-            })
-        })
-        .await
-        .map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Chat generation failed: {e}"),
-            )
-        })?
+                is_reasoning: None,
+            });
+
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            // Propagate errors through the same stream; the tokio pump task
+            // in `QianfanOCRModel::chat_stream` forwards them to the JS
+            // callback's error channel.
+            let _ = stream_tx.send(Err(e));
+        }
     }
 
-    /// Streaming chat with the model.
+    /// Low-level token generation given pre-tokenized input.
     ///
-    /// Same as chat() but emits tokens incrementally via callback.
-    #[napi(
-        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream(
+    /// Port of the legacy `generate()` body — always starts with a fresh
+    /// cache (clears `kv_caches`, `cached_token_history`, and
+    /// `cached_cache_offset`) and runs a pure greedy-style decode loop.
+    fn generate_sync(
+        &mut self,
+        input_ids: &MxArray,
+        max_new_tokens: i32,
+        temperature: f64,
+    ) -> Result<Vec<u32>> {
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        let sampling_config = SamplingConfig {
+            temperature: Some(temperature),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+
+        self.kv_caches = None;
+        self.init_kv_caches();
+
+        // generate() always does fresh generation — clear cached metadata
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_cache_offset = 0;
+
+        // Prefill
+        let mut cache = self.kv_caches.take();
+        let logits = {
+            let _ctx = StreamContext::new(generation_stream);
+            self.language_model.forward(input_ids, &mut cache)?
+        };
+        self.kv_caches = cache;
+
+        // Eval prefill logits -- caches materialize through dependency graph
+        logits.eval();
+        synchronize_and_clear_cache();
+
+        let seq_len = logits.shape()?[1];
+        let last_logits = logits
+            .slice_axis(1, seq_len - 1, seq_len)?
+            .squeeze(Some(&[0, 1]))?;
+
+        let mut token = sample(&last_logits, Some(sampling_config))?;
+
+        let eos_token_id = self.config.eos_token_id;
+        let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+
+        for step in 0..max_new_tokens {
+            token.eval();
+            let token_value = token.item_at_int32(0)? as u32;
+            generated.push(token_value);
+
+            if token_value == eos_token_id as u32 {
+                break;
+            }
+
+            let token_2d = token.reshape(&[1, 1])?;
+            let mut cache = self.kv_caches.take();
+            let logits = {
+                let _ctx = StreamContext::new(generation_stream);
+                self.language_model.forward(&token_2d, &mut cache)?
+            };
+            self.kv_caches = cache;
+
+            let next_logits = logits.squeeze(Some(&[0, 1]))?;
+            token = sample(&next_logits, Some(sampling_config))?;
+            token.eval();
+
+            if (step + 1) % 256 == 0 {
+                synchronize_and_clear_cache();
+            }
+        }
+
+        Ok(generated)
+    }
+}
+
+#[napi]
+impl QianfanOCRModel {
+    /// Create a new QianfanOCRModel from config (uninitialized, no weights).
+    ///
+    /// This constructor path does not spawn a model thread — the returned
+    /// instance is only useful for config inspection. Call
+    /// [`QianfanOCRModel::load`] to actually run inference.
+    #[napi(constructor)]
+    pub fn new(config: QianfanOCRConfig) -> Self {
+        Self {
+            thread: None,
+            config,
+            initialized: false,
+        }
+    }
+
+    /// Returns true if weights have been loaded via `load()`.
+    #[napi(getter)]
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Load a QianfanOCRModel from a directory.
+    ///
+    /// Reads config.json, loads SafeTensors weights (single or sharded),
+    /// builds vision encoder, bridge, and language model, and loads tokenizer.
+    /// All heavy work runs on the dedicated model thread.
+    #[napi]
+    pub fn load<'env>(
+        env: &'env Env,
+        model_path: String,
+    ) -> Result<PromiseRaw<'env, QianfanOCRModel>> {
+        env.spawn_future_with_callback(
+            async move {
+                let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+                    move || {
+                        let inner = load_qianfan_ocr_inner_from_dir(&model_path)?;
+                        let config = inner.config.clone();
+                        Ok((inner, config))
+                    },
+                    handle_qianfan_ocr_cmd,
+                );
+
+                let config = init_rx
+                    .await
+                    .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
+
+                Ok((thread, config))
+            },
+            |_env, (thread, config)| {
+                Ok(QianfanOCRModel {
+                    thread: Some(thread),
+                    config,
+                    initialized: true,
+                })
+            },
+        )
+    }
+
+    /// Chat with the model.
+    ///
+    /// High-level API: processes images, formats prompt, generates, and decodes.
+    #[napi]
+    pub async fn chat(
         &self,
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        if !self.is_initialized() {
-            return Err(Error::from_reason(
-                "Model not initialized. Call QianfanOCRModel.load() first.",
-            ));
-        }
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_clone = cancelled.clone();
+    ) -> Result<ChatResult> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
+        })?;
 
         let config = config.unwrap_or(ChatConfig {
             max_new_tokens: None,
@@ -625,434 +1158,73 @@ impl QianfanOCRModel {
             reuse_cache: None,
         });
 
-        let max_new_tokens = config.max_new_tokens.unwrap_or(512);
-        let temperature = config.temperature.unwrap_or(0.0);
-        let top_k = config.top_k.unwrap_or(0);
-        let top_p = config.top_p.unwrap_or(1.0);
-        let min_p = config.min_p.unwrap_or(0.0);
-        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
-        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-        let presence_context_size = config.presence_context_size.unwrap_or(20);
-        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-        let ngram_size = config.ngram_size.unwrap_or(64);
-        let enable_thinking =
-            crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config).unwrap_or(false);
-        let reuse_cache = config.reuse_cache.unwrap_or(true);
-        let report_perf = config.report_performance.unwrap_or(false);
+        crate::model_thread::send_and_await(thread, |reply| QianfanOCRCmd::Chat {
+            messages,
+            config,
+            reply,
+        })
+        .await
+    }
 
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+    /// Streaming chat with the model.
+    ///
+    /// Same as chat() but emits tokens incrementally via callback. The
+    /// decode loop runs on the model thread; this method dispatches a
+    /// `ChatStream` command and spawns a tokio pump task that forwards
+    /// each streamed chunk to the provided JS callback.
+    #[napi(
+        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
+        })?;
 
-        let tokenizer = self
-            .tokenizer
-            .clone()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
-        let vision_arc = self.vision.clone();
-        let bridge_arc = self.bridge.clone();
-        let lm_arc = self
-            .language_model
-            .clone()
-            .ok_or_else(|| Error::from_reason("Language model not loaded"))?;
-        let model_config = self.config.clone();
-        let cached_token_history_arc = self.cached_token_history.clone();
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
 
-        let image_bytes = extract_images_from_messages(&messages);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        thread.send(QianfanOCRCmd::ChatStream {
+            messages,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
 
         let callback = Arc::new(callback);
-
         tokio::spawn(async move {
-            let callback_err = callback.clone();
-            let result =
-                napi::bindgen_prelude::spawn_blocking(move || -> std::result::Result<(), Error> {
-                    let emit = |chunk: ChatStreamChunk| {
-                        callback.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
-                    };
-
-                    let result: Result<()> = (|| {
-                        // --- Process images ---
-                        let processor = QianfanImageProcessor::new(&model_config);
-                        let image_refs: Vec<&[u8]> = image_bytes.iter().map(|b| &b[..]).collect();
-                        let processed_images = processor.process_many(&image_refs)?;
-
-                        let num_patches_list: Vec<u32> =
-                            processed_images.iter().map(|p| p.num_tiles).collect();
-                        let num_image_token = model_config.num_image_token() as u32;
-
-                        // --- Format and tokenize ---
-                        let prompt = format_qianfan_chat(
-                            &messages,
-                            &num_patches_list,
-                            num_image_token,
-                            enable_thinking,
-                            config.tools.as_deref(),
-                        )?;
-                        let token_ids = tokenizer.encode_sync(&prompt, Some(false))?;
-                        let input_ids =
-                            MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
-
-                        // --- Vision encoding ---
-                        let generation_stream = Stream::new(DeviceType::Gpu);
-                        let vision_features = if !processed_images.is_empty() {
-                            let vision = vision_arc
-                                .as_ref()
-                                .ok_or_else(|| Error::from_reason("Vision model not loaded"))?;
-                            let bridge = bridge_arc
-                                .as_ref()
-                                .ok_or_else(|| Error::from_reason("Bridge not loaded"))?;
-
-                            let all_pixels = stack_processed_images(&processed_images)?;
-                            let vit_out = {
-                                let _ctx = StreamContext::new(generation_stream);
-                                vision.forward(&all_pixels)?
-                            };
-                            let bridge_out = {
-                                let _ctx = StreamContext::new(generation_stream);
-                                bridge.forward(&vit_out)?
-                            };
-                            let bridge_shape = bridge_out.shape()?;
-                            let total_tiles = bridge_shape[0];
-                            let tokens_per_tile = bridge_shape[1];
-                            let hidden = bridge_shape[2];
-                            Some(bridge_out.reshape(&[total_tiles * tokens_per_tile, hidden])?)
-                        } else {
-                            None
-                        };
-
-                        // --- Prefill (with cache reuse support) ---
-                        let mut lm_guard = lm_arc.write().map_err(|_| {
-                            Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
-                        })?;
-
-                        let prefix_len = if reuse_cache && image_bytes.is_empty() {
-                            let history = cached_token_history_arc.read().map_err(|_| {
-                                Error::from_reason("Failed to read cached token history")
-                            })?;
-                            compute_prefix_match(&token_ids, &history)
-                        } else {
-                            0
-                        };
-
-                        if prefix_len == 0 || !reuse_cache {
-                            lm_guard.reset_kv_caches();
-                            lm_guard.init_kv_caches();
-                        }
-
-                        let eos_token_id = model_config.eos_token_id;
-
-                        let merged_embeds = if let Some(ref vf) = vision_features {
-                            let text_embeds = {
-                                let _ctx = StreamContext::new(generation_stream);
-                                lm_guard.get_embeddings(&input_ids)?
-                            };
-                            let embed_dtype = text_embeds.dtype()?;
-                            let vf_cast = if vf.dtype()? != embed_dtype {
-                                vf.astype(embed_dtype)?
-                            } else {
-                                vf.clone()
-                            };
-                            merge_vision_features(
-                                &input_ids,
-                                &text_embeds,
-                                &vf_cast,
-                                model_config.img_context_token_id,
-                            )?
-                        } else {
-                            let _ctx = StreamContext::new(generation_stream);
-                            lm_guard.get_embeddings(&input_ids)?
-                        };
-
-                        let seq_len = merged_embeds.shape()?[1];
-                        let clamped_prefix = prefix_len.min(seq_len.saturating_sub(1) as usize);
-
-                        if clamped_prefix > 0 && reuse_cache {
-                            let cache_offset = lm_guard.get_cache_offset();
-                            if cache_offset > clamped_prefix as i32
-                                && let Some(caches) = lm_guard.kv_caches_mut()
-                            {
-                                for c in caches.iter_mut() {
-                                    c.trim(clamped_prefix as i32);
-                                }
-                            }
-                        }
-
-                        let prefill_embeds = if clamped_prefix > 0 {
-                            merged_embeds.slice_axis(1, clamped_prefix as i64, seq_len)?
-                        } else {
-                            merged_embeds
-                        };
-
-                        let mut cache = lm_guard.kv_caches_mut().take();
-                        let prefill_logits = {
-                            let _ctx = StreamContext::new(generation_stream);
-                            lm_guard.forward_from_embeddings(&prefill_embeds, &mut cache)?
-                        };
-                        *lm_guard.kv_caches_mut() = cache;
-
-                        prefill_logits.eval();
-                        synchronize_and_clear_cache();
-
-                        let seq_len = prefill_logits.shape()?[1];
-                        let mut last_logits = prefill_logits
-                            .slice_axis(1, seq_len - 1, seq_len)?
-                            .squeeze(Some(&[0, 1]))?;
-
-                        let sampling_config = SamplingConfig {
-                            temperature: Some(temperature),
-                            top_k: Some(top_k),
-                            top_p: Some(top_p),
-                            min_p: Some(min_p),
-                        };
-
-                        let prompt_token_ids = token_ids.clone();
-                        let mut all_tokens: Vec<u32> = token_ids;
-
-                        if repetition_penalty != 1.0 {
-                            last_logits = apply_repetition_penalty(
-                                &last_logits,
-                                &all_tokens,
-                                repetition_penalty,
-                                Some(repetition_context_size),
-                            )?;
-                        }
-                        if presence_penalty != 0.0 {
-                            last_logits = apply_presence_penalty(
-                                &last_logits,
-                                &all_tokens,
-                                presence_penalty,
-                                Some(presence_context_size),
-                            )?;
-                        }
-                        if frequency_penalty != 0.0 {
-                            last_logits = apply_frequency_penalty(
-                                &last_logits,
-                                &all_tokens,
-                                frequency_penalty,
-                                Some(frequency_context_size),
-                            )?;
-                        }
-
-                        let mut token = sample(&last_logits, Some(sampling_config))?;
-                        token.eval();
-
-                        let first_token_instant =
-                            generation_start.map(|_| std::time::Instant::now());
-                        let prefill_token_count = all_tokens.len();
-
-                        let mut generated_tokens: Vec<u32> =
-                            Vec::with_capacity(max_new_tokens as usize);
-                        let mut finish_reason = "length".to_string();
-
-                        // Stateful decoder for correct multi-byte/CJK streaming
-                        let mut decode_stream = tokenizer.inner().decode_stream(true);
-                        let mut streamed_text_len: usize = 0;
-
-                        // --- Streaming decode loop ---
-                        for step in 0..max_new_tokens {
-                            if cancelled_clone.load(Ordering::Relaxed) {
-                                finish_reason = "cancelled".to_string();
-                                break;
-                            }
-                            let token_value = token.item_at_int32(0)? as u32;
-                            generated_tokens.push(token_value);
-                            all_tokens.push(token_value);
-
-                            if token_value == eos_token_id as u32 {
-                                finish_reason = "stop".to_string();
-                                break;
-                            }
-
-                            // Decode and emit BEFORE repetition check so the
-                            // triggering token is streamed to clients
-                            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
-                                &mut decode_stream,
-                                tokenizer.inner(),
-                                token_value,
-                                &generated_tokens,
-                                streamed_text_len,
-                            );
-                            streamed_text_len += token_text.len();
-
-                            emit(ChatStreamChunk {
-                                text: token_text,
-                                done: false,
-                                finish_reason: None,
-                                tool_calls: None,
-                                thinking: None,
-                                num_tokens: None,
-                                prompt_tokens: None,
-                                reasoning_tokens: None,
-                                raw_text: None,
-                                performance: None,
-                                is_reasoning: None,
-                            });
-
-                            // Check repetition cutoff (after emit so token is streamed)
-                            if let Some(reason) = check_repetition_cutoff(
-                                &generated_tokens,
-                                max_consecutive_tokens,
-                                max_ngram_repeats,
-                                ngram_size,
-                            ) {
-                                finish_reason = reason.to_string();
-                                break;
-                            }
-
-                            // Forward single token
-                            let token_2d = token.reshape(&[1, 1])?;
-                            let mut cache = lm_guard.kv_caches_mut().take();
-                            let logits = {
-                                let _ctx = StreamContext::new(generation_stream);
-                                lm_guard.forward(&token_2d, &mut cache)?
-                            };
-                            *lm_guard.kv_caches_mut() = cache;
-
-                            let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
-
-                            if repetition_penalty != 1.0 {
-                                next_logits = apply_repetition_penalty(
-                                    &next_logits,
-                                    &all_tokens,
-                                    repetition_penalty,
-                                    Some(repetition_context_size),
-                                )?;
-                            }
-                            if presence_penalty != 0.0 {
-                                next_logits = apply_presence_penalty(
-                                    &next_logits,
-                                    &all_tokens,
-                                    presence_penalty,
-                                    Some(presence_context_size),
-                                )?;
-                            }
-                            if frequency_penalty != 0.0 {
-                                next_logits = apply_frequency_penalty(
-                                    &next_logits,
-                                    &all_tokens,
-                                    frequency_penalty,
-                                    Some(frequency_context_size),
-                                )?;
-                            }
-
-                            token = sample(&next_logits, Some(sampling_config))?;
-                            token.eval();
-
-                            if (step + 1) % 256 == 0 {
-                                synchronize_and_clear_cache();
-                            }
-                        }
-
-                        // Sync token history with cache state.
-                        // "length" and "cancelled" break before/at the loop boundary
-                        // so all tokens in generated_tokens were forwarded.
-                        // "stop" and "repetition" push then break before forward,
-                        // so the last token was NOT forwarded.
-                        if reuse_cache {
-                            let forwarded =
-                                if finish_reason == "stop" || finish_reason == "repetition" {
-                                    generated_tokens.len().saturating_sub(1)
-                                } else {
-                                    generated_tokens.len()
-                                };
-                            let mut full_history = prompt_token_ids;
-                            full_history.extend_from_slice(&generated_tokens[..forwarded]);
-                            if let Ok(mut history) = cached_token_history_arc.write() {
-                                *history = full_history;
-                            }
-                        } else if let Ok(mut history) = cached_token_history_arc.write() {
-                            history.clear();
-                        }
-
-                        // Final chunk
-                        let raw_decoded = tokenizer.decode_sync(&generated_tokens, true)?;
-                        let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
-                        let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
-                        let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
-
-                        // Promote finish_reason to "tool_calls" when valid tool calls parsed
-                        if tool_calls.iter().any(|tc| tc.status == "ok") {
-                            finish_reason = "tool_calls".to_string();
-                        }
-
-                        let performance = if let (Some(gen_start), Some(first_tok)) =
-                            (generation_start, first_token_instant)
-                        {
-                            let generation_end = std::time::Instant::now();
-                            let prefill_toks = prefill_token_count as f64;
-                            let gen_toks = generated_tokens.len() as f64;
-                            let ttft_ms =
-                                first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
-                            let decode_ms =
-                                generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
-                            Some(crate::profiling::PerformanceMetrics {
-                                ttft_ms,
-                                prefill_tokens_per_second: if ttft_ms > 0.0 {
-                                    prefill_toks / (ttft_ms / 1000.0)
-                                } else {
-                                    0.0
-                                },
-                                decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
-                                    (gen_toks - 1.0) / (decode_ms / 1000.0)
-                                } else {
-                                    0.0
-                                },
-                            })
-                        } else {
-                            None
-                        };
-
-                        let reasoning_tokens = tools::count_reasoning_tokens(
-                            &thinking,
-                            &generated_tokens,
-                            tokenizer.think_end_id(),
-                        );
-
-                        emit(ChatStreamChunk {
-                            text: text.trim().to_string(),
-                            done: true,
-                            finish_reason: Some(finish_reason),
-                            tool_calls: Some(tool_calls),
-                            thinking,
-                            num_tokens: Some(generated_tokens.len() as u32),
-                            prompt_tokens: Some(prefill_token_count as u32),
-                            reasoning_tokens: Some(reasoning_tokens),
-                            raw_text: Some(raw_decoded),
-                            performance,
-                            is_reasoning: None,
-                        });
-
-                        Ok(())
-                    })();
-
-                    // Propagate errors to the outer handler which sends them
-                    // via callback_err.call(Err(...)) — the TS error channel
-                    // that _createChatStream surfaces as thrown exceptions.
-                    result
-                })
-                .await;
-
-            match result {
-                Ok(Ok(())) => {} // Success — final chunk already sent via callback
-                Ok(Err(e)) => {
-                    // Inner closure error (tokenization, lock, array ops, etc.)
-                    callback_err.call(Err(e), ThreadsafeFunctionCallMode::NonBlocking);
-                }
-                Err(e) => {
-                    // JoinError (panic in spawn_blocking)
-                    callback_err.call(
-                        Err(Error::from_reason(format!(
-                            "Chat stream task panicked: {}",
-                            e
-                        ))),
-                        ThreadsafeFunctionCallMode::NonBlocking,
-                    );
-                }
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
             }
         });
 
@@ -1069,105 +1241,31 @@ impl QianfanOCRModel {
         max_new_tokens: Option<i32>,
         temperature: Option<f64>,
     ) -> Result<Vec<u32>> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
+        })?;
+
         let max_new_tokens = max_new_tokens.unwrap_or(256);
         let temperature = temperature.unwrap_or(0.0);
-
-        let lm_arc = self
-            .language_model
-            .clone()
-            .ok_or_else(|| Error::from_reason("Language model not loaded"))?;
-        let cached_token_history_arc = self.cached_token_history.clone();
-        let eos_token_id = self.config.eos_token_id;
         let input_ids = input_ids.clone();
 
-        napi::bindgen_prelude::spawn_blocking(move || {
-            let generation_stream = Stream::new(DeviceType::Gpu);
-
-            let sampling_config = SamplingConfig {
-                temperature: Some(temperature),
-                top_k: Some(0),
-                top_p: Some(1.0),
-                min_p: Some(0.0),
-            };
-
-            let mut lm_guard = lm_arc.write().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
-            })?;
-
-            lm_guard.reset_kv_caches();
-            lm_guard.init_kv_caches();
-
-            // Clear cached history — generate() always does fresh generation
-            if let Ok(mut history) = cached_token_history_arc.write() {
-                history.clear();
-            }
-
-            // Prefill
-            let mut cache = lm_guard.kv_caches_mut().take();
-            let logits = {
-                let _ctx = StreamContext::new(generation_stream);
-                lm_guard.forward(&input_ids, &mut cache)?
-            };
-            *lm_guard.kv_caches_mut() = cache;
-
-            // Eval prefill logits -- caches materialize through dependency graph
-            logits.eval();
-            synchronize_and_clear_cache();
-
-            let seq_len = logits.shape()?[1];
-            let last_logits = logits
-                .slice_axis(1, seq_len - 1, seq_len)?
-                .squeeze(Some(&[0, 1]))?;
-
-            let mut token = sample(&last_logits, Some(sampling_config))?;
-
-            let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
-
-            for step in 0..max_new_tokens {
-                token.eval();
-                let token_value = token.item_at_int32(0)? as u32;
-                generated.push(token_value);
-
-                if token_value == eos_token_id as u32 {
-                    break;
-                }
-
-                let token_2d = token.reshape(&[1, 1])?;
-                let mut cache = lm_guard.kv_caches_mut().take();
-                let logits = {
-                    let _ctx = StreamContext::new(generation_stream);
-                    lm_guard.forward(&token_2d, &mut cache)?
-                };
-                *lm_guard.kv_caches_mut() = cache;
-
-                let next_logits = logits.squeeze(Some(&[0, 1]))?;
-                token = sample(&next_logits, Some(sampling_config))?;
-                token.eval();
-
-                if (step + 1) % 256 == 0 {
-                    synchronize_and_clear_cache();
-                }
-            }
-
-            Ok(generated)
+        crate::model_thread::send_and_await(thread, |reply| QianfanOCRCmd::Generate {
+            input_ids,
+            max_new_tokens,
+            temperature,
+            reply,
         })
         .await
-        .map_err(|e| Error::new(Status::GenericFailure, format!("Generation failed: {e}")))?
     }
 
     /// Reset KV caches and token history.
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
-        if let Some(ref lm) = self.language_model {
-            let mut guard = lm.write().map_err(|_| {
-                Error::new(Status::GenericFailure, "Failed to acquire LM write lock")
-            })?;
-            guard.reset_kv_caches();
-        }
-        if let Ok(mut history) = self.cached_token_history.write() {
-            history.clear();
-        }
-        Ok(())
+        let Some(thread) = self.thread.as_ref() else {
+            // Uninitialized model — nothing to reset.
+            return Ok(());
+        };
+        crate::model_thread::send_and_block(thread, |reply| QianfanOCRCmd::ResetCaches { reply })
     }
 }
 
@@ -1281,12 +1379,60 @@ fn load_safetensors_weights(path: &Path) -> Result<HashMap<String, MxArray>> {
     Ok(all_weights)
 }
 
-/// Build a QianfanOCRModel from transformed weights.
-fn build_qianfan_ocr_from_weights(
-    config: QianfanOCRConfig,
-    weights: HashMap<String, MxArray>,
-    model_path: &str,
-) -> Result<QianfanOCRModel> {
+/// Load a `QianfanOCRInner` from a model directory.
+///
+/// Runs synchronously on the dedicated model thread inside
+/// `ModelThread::spawn_with_init`. Parses `config.json`, loads
+/// SafeTensors weights (single or sharded), transforms key formats if
+/// still in HuggingFace layout, builds the InternViT vision encoder,
+/// MLP bridge, and Qwen3 language model, and loads the tokenizer.
+///
+/// A tokenizer is required — unlike the paddleocr_vl path, Qianfan-OCR
+/// has no `set_tokenizer()` NAPI method, so the model directory must
+/// contain `tokenizer.json` for `chat()` / `chat_stream()` to work.
+fn load_qianfan_ocr_inner_from_dir(model_path: &str) -> Result<QianfanOCRInner> {
+    let path = Path::new(model_path);
+
+    if !path.exists() {
+        return Err(napi::Error::from_reason(format!(
+            "Model path does not exist: {}",
+            model_path
+        )));
+    }
+
+    // --- Parse config.json ---
+    let config_path = path.join("config.json");
+    if !config_path.exists() {
+        return Err(napi::Error::from_reason(format!(
+            "Config file not found: {}",
+            config_path.display()
+        )));
+    }
+
+    let config_data = fs::read_to_string(&config_path)?;
+    let raw: Value = serde_json::from_str(&config_data)?;
+
+    let config = parse_config_json(&raw);
+
+    info!(
+        "Loading Qianfan-OCR model from: {} (vision: {} layers, LM: {} layers)",
+        model_path, config.vision_config.num_hidden_layers, config.llm_config.num_hidden_layers
+    );
+
+    // --- Load SafeTensors weights ---
+    let all_weights = load_safetensors_weights(path)?;
+    info!("  Loaded {} total tensors", all_weights.len());
+
+    // Transform keys if still in HuggingFace format (has vision_model. prefix)
+    let needs_transform = all_weights.keys().any(|k| k.starts_with("vision_model."));
+    let weights = if needs_transform {
+        info!("  Transforming HuggingFace keys to internal format...");
+        load_qianfan_ocr_weights(all_weights)?
+    } else {
+        info!("  Keys already in MLX format, skipping transformation");
+        all_weights
+    };
+
     info!("Building Qianfan-OCR model from weights...");
 
     // --- Build vision encoder ---
@@ -1316,14 +1462,16 @@ fn build_qianfan_ocr_from_weights(
     let tokenizer_path = Path::new(model_path).join("tokenizer.json");
     let tokenizer = if tokenizer_path.exists() {
         info!("  Loading tokenizer from {}", tokenizer_path.display());
-        Some(Arc::new(Qwen3Tokenizer::load_from_file_sync(
+        Arc::new(Qwen3Tokenizer::load_from_file_sync(
             tokenizer_path
                 .to_str()
                 .ok_or_else(|| Error::from_reason("Non-UTF-8 tokenizer path"))?,
-        )?))
+        )?)
     } else {
-        info!("  No tokenizer.json found, tokenizer not loaded");
-        None
+        return Err(Error::from_reason(format!(
+            "Tokenizer not found: {}",
+            tokenizer_path.display()
+        )));
     };
 
     info!(
@@ -1333,13 +1481,16 @@ fn build_qianfan_ocr_from_weights(
         weights.len()
     );
 
-    Ok(QianfanOCRModel {
+    Ok(QianfanOCRInner {
         config,
-        vision: Some(Arc::new(vision)),
-        bridge: Some(Arc::new(bridge)),
-        language_model: Some(Arc::new(RwLock::new(language_model))),
+        vision,
+        bridge,
+        language_model,
         tokenizer,
-        cached_token_history: Arc::new(RwLock::new(Vec::new())),
+        kv_caches: None,
+        cached_token_history: Vec::new(),
+        cached_image_key: None,
+        cached_cache_offset: 0,
     })
 }
 
