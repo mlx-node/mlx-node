@@ -176,6 +176,74 @@ pub(crate) enum Gemma4Cmd {
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     },
+    /// Start a new chat session via the jinja-render path with `<turn|>`
+    /// as the stop token. See [`Gemma4Inner::chat_session_start_sync`] for
+    /// the behavioural contract (full cache reset, session boundary on
+    /// `<turn|>`).
+    ChatSessionStart {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Continue an existing session by appending a user turn. See
+    /// [`Gemma4Inner::chat_session_continue_sync`] — builds a raw Gemma4
+    /// delta (`\n<|turn>user\n...<turn|>\n<|turn>model\n`), tokenizes
+    /// it, and prefills on top of the live caches.
+    ///
+    /// Carries an opt-in `images` guard parameter that is rejected with
+    /// an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error so the
+    /// TS `ChatSession` layer can route image-changes back through a
+    /// fresh `chat_session_start` uniformly across model backends.
+    ChatSessionContinue {
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Continue an existing session with a tool-result delta. See
+    /// [`Gemma4Inner::chat_session_continue_tool_sync`] — builds a
+    /// Gemma4-format tool delta (`\n<|turn>tool\n{content}<turn|>\n<|turn>model\n`)
+    /// and prefills on top of the live caches.
+    ChatSessionContinueTool {
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Streaming session-start: same semantics as
+    /// [`ChatSessionStart`](Self::ChatSessionStart) but streams token
+    /// deltas through `stream_tx`.
+    ChatStreamSessionStart {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
+    /// Streaming session-continue: same semantics as
+    /// [`ChatSessionContinue`](Self::ChatSessionContinue) but streams
+    /// token deltas through `stream_tx`. Carries the same opt-in
+    /// `images` guard parameter.
+    ChatStreamSessionContinue {
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
+    /// Streaming tool-result continuation: same semantics as
+    /// [`ChatSessionContinueTool`](Self::ChatSessionContinueTool) but
+    /// streams token deltas through `stream_tx`.
+    ChatStreamSessionContinueTool {
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
+    /// Reset all caches and clear cached token history. Exposed so tests
+    /// and session-management code can start from a known clean state
+    /// between turns.
+    ResetCaches { reply: ResponseTx<()> },
 }
 
 /// Gemma 4 dense language model.
@@ -426,6 +494,16 @@ impl Gemma4Inner {
         };
 
         let has_images = !processed_images.is_empty();
+        // Compute the image cache key BEFORE the prefill so we can
+        // record it on `self.cached_image_key` after the decode loop.
+        // Session callers inspect this field to decide whether a
+        // session-continue delta is allowed (text-only) or requires
+        // a fresh `chat_session_start`.
+        let new_image_key: Option<u64> = if raw_images.is_empty() {
+            None
+        } else {
+            Some(chat_common::compute_image_cache_key(&raw_images))
+        };
         let sampling_config = make_sampling_config(&config, &self.config);
         let enable_thinking = chat_common::resolve_enable_thinking(&config);
         let eos_ids = self.config.eos_token_ids.clone();
@@ -830,6 +908,25 @@ impl Gemma4Inner {
         // Decode text
         let text = tokenizer.decode_sync(&generated_tokens, true)?;
 
+        // Save session state so subsequent `chat_session_continue_sync`
+        // calls can append a raw delta on top of the live caches. Drop
+        // the last generated token when `finish_reason != "length"` so
+        // the cached history ends on the turn-terminator boundary (the
+        // final token IS that boundary marker — stop, tool_calls, etc.).
+        // The legacy `chat_sync` wrapper wipes this state on every call
+        // via `reset_caches_sync`, so the write is a harmless no-op for
+        // the legacy path and load-bearing for the session path.
+        let history_tokens: &[u32] = if finish_reason != "length" && !generated_tokens.is_empty() {
+            &generated_tokens[..generated_tokens.len() - 1]
+        } else {
+            &generated_tokens[..]
+        };
+        let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
+        new_history.extend(tokens.iter().copied());
+        new_history.extend_from_slice(history_tokens);
+        self.cached_token_history = new_history;
+        self.cached_image_key = new_image_key;
+
         // Compute performance metrics
         let generation_end = std::time::Instant::now();
         let ttft_ms = first_token_instant
@@ -952,6 +1049,14 @@ impl Gemma4Inner {
         };
 
         let has_images = !processed_images.is_empty();
+        // Compute the image cache key BEFORE the prefill so we can
+        // record it on `self.cached_image_key` after the decode loop.
+        // See `chat_sync_core` for the full rationale.
+        let new_image_key: Option<u64> = if raw_images.is_empty() {
+            None
+        } else {
+            Some(chat_common::compute_image_cache_key(&raw_images))
+        };
         let sampling_config = make_sampling_config(&config, &self.config);
         let enable_thinking = chat_common::resolve_enable_thinking(&config);
         let eos_ids = self.config.eos_token_ids.clone();
@@ -1368,6 +1473,21 @@ impl Gemma4Inner {
             );
         }
 
+        // Save session state so subsequent
+        // `chat_stream_session_continue_sync` / `chat_session_continue_sync`
+        // calls can append a raw delta on top of the live caches. See
+        // the non-streaming `chat_sync_core` for the full rationale.
+        let history_tokens: &[u32] = if finish_reason != "length" && !generated_tokens.is_empty() {
+            &generated_tokens[..generated_tokens.len() - 1]
+        } else {
+            &generated_tokens[..]
+        };
+        let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
+        new_history.extend(tokens.iter().copied());
+        new_history.extend_from_slice(history_tokens);
+        self.cached_token_history = new_history;
+        self.cached_image_key = new_image_key;
+
         let generation_end = std::time::Instant::now();
         let ttft_ms = first_token_instant
             .duration_since(generation_start)
@@ -1413,6 +1533,849 @@ impl Gemma4Inner {
 
         Ok(())
     }
+
+    // =================================================================
+    // Session API (Step 5c of the chat-session refactor).
+    //
+    // Gemma4's wire format uses `<turn|>` / `<|turn>` delimiters with
+    // "model" as the assistant role (not ChatML / Qwen3.5). The session
+    // primitives here mirror the Qwen3 / LFM2 surface but with Gemma4's
+    // wire format baked into the delta text builders.
+    //
+    // Image-change invariant: `chat_session_continue` / `_tool` run on
+    // top of the live caches, so they MUST be text-only. If the session
+    // currently carries image state (i.e. `cached_image_key.is_some()`)
+    // we surface an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed
+    // error so the TS `ChatSession` layer can route the caller back
+    // through a fresh `chat_session_start`.
+    // =================================================================
+
+    /// Resolve the token id for Gemma4's `<turn|>` turn terminator.
+    ///
+    /// Used as the `eos_override` in the session-start path so the
+    /// decode loop leaves the caches on a clean `<turn|>` boundary that
+    /// subsequent `chat_session_continue_sync` /
+    /// `chat_session_continue_tool_sync` calls can append a raw delta on
+    /// top of. Computed on demand rather than cached — encoding a
+    /// special token is O(1) and the cost is trivial relative to a
+    /// chat turn.
+    pub(crate) fn turn_end_id(&self) -> Result<u32> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+        let ids = tokenizer.encode_sync("<turn|>", Some(false))?;
+        if ids.is_empty() {
+            return Err(Error::from_reason(
+                "Tokenizer encoded <turn|> to empty id vector",
+            ));
+        }
+        if ids.len() != 1 {
+            return Err(Error::from_reason(format!(
+                "Tokenizer encoded <turn|> to {} tokens; expected 1",
+                ids.len()
+            )));
+        }
+        Ok(ids[0])
+    }
+
+    /// Start a new chat session.
+    ///
+    /// Fully resets the caches and delegates to [`Self::chat_sync_core`]
+    /// with `<turn|>` as the stop token so the decode loop leaves the
+    /// caches on a clean turn boundary that subsequent
+    /// [`Self::chat_session_continue_sync`] /
+    /// [`Self::chat_session_continue_tool_sync`] calls can append a raw
+    /// delta on top of.
+    ///
+    /// Vision-capable: `messages` may carry images (they'll be decoded
+    /// on the model thread inside `chat_sync_core`, same as the legacy
+    /// `chat_sync` path).
+    pub(crate) fn chat_session_start_sync(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        // Resolve the turn-end token up front so session_continue can
+        // rely on the cached history always terminating on a clean
+        // `<turn|>` boundary.
+        let turn_end_id = self.turn_end_id()?;
+
+        // Full reset: the session-start path always begins from a clean
+        // state. This matches the documented contract that the session
+        // is owned end-to-end by the `chat_session_*` surface and
+        // intentionally invalidates any prior cache.
+        self.reset_caches_sync()?;
+
+        self.chat_sync_core(messages, config, Some(turn_end_id))
+    }
+
+    /// Continue an existing chat session with a user turn.
+    ///
+    /// Builds a Gemma4 wire-format delta (`\n<|turn>user\n...<turn|>\n
+    /// <|turn>model\n`), tokenizes it, and prefills on top of the live
+    /// caches via [`Self::chat_tokens_delta_sync`].
+    ///
+    /// Text-only on the delta path: callers that need to change the
+    /// image set must restart the session via
+    /// [`Self::chat_session_start_sync`]. The `images` parameter is an
+    /// opt-in guard that returns an
+    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error when
+    /// non-empty, letting the TS `ChatSession` layer pattern-match the
+    /// prefix and route image-changes through a fresh session start.
+    pub(crate) fn chat_session_continue_sync(
+        &mut self,
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        // Guard 1: text-only delta path.
+        if images.as_ref().is_some_and(|v| !v.is_empty()) {
+            return Err(Error::from_reason(format!(
+                "{}chat_session_continue is text-only; start a new session with chat_session_start to change the image",
+                chat_common::IMAGE_CHANGE_RESTART_PREFIX
+            )));
+        }
+
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        // Subject the session path to the same sanitization as the
+        // legacy chat path so role/content injection guards stay
+        // uniform across all entry points.
+        let synthetic = chat_common::build_synthetic_user_message(&user_message);
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
+        let sanitized_user = &sanitized[0].content;
+
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let delta_text = build_gemma4_continue_delta_text(sanitized_user, enable_thinking);
+        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
+
+        self.chat_tokens_delta_sync(delta_tokens, config)
+    }
+
+    /// Continue an existing chat session with a tool-result turn.
+    ///
+    /// Gemma4's chat template renders tool-role messages as
+    /// `<|turn>tool\n{content}<turn|>` — no `<tool_response>` wrapping.
+    /// We build the delta inline rather than using
+    /// [`chat_common::build_chatml_tool_delta_text`] (which is
+    /// Qwen3.5-specific). The `tool_call_id` is intentionally dropped
+    /// from the wire format — Gemma4's template identifies tool
+    /// responses positionally, not via an explicit id.
+    pub(crate) fn chat_session_continue_tool_sync(
+        &mut self,
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let delta_text = build_gemma4_tool_delta_text(&tool_call_id, &content, enable_thinking);
+        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
+
+        self.chat_tokens_delta_sync(delta_tokens, config)
+    }
+
+    /// Prefill a pre-tokenized delta on top of the existing Gemma4 KV
+    /// caches and run the decode loop. Text-only session primitive used
+    /// by [`Self::chat_session_continue_sync`] and
+    /// [`Self::chat_session_continue_tool_sync`].
+    ///
+    /// Uses `<turn|>` as the eos token so the cached history continues
+    /// to end on a clean turn boundary for the next turn. The delta
+    /// prefill runs through `prefill_body_gemma4` which appends to the
+    /// existing `self.caches` via `update_and_fetch_stash` — no
+    /// separate "append to existing KV" logic is needed.
+    pub(crate) fn chat_tokens_delta_sync(
+        &mut self,
+        delta_tokens: Vec<u32>,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        // --- Four guards (mirrors Qwen3 / LFM2). ---
+        if self.cached_token_history.is_empty() {
+            return Err(Error::from_reason(
+                "chat_tokens_delta_sync requires an initialized session (call chat_session_start first)",
+            ));
+        }
+        if delta_tokens.is_empty() {
+            return Err(Error::from_reason(
+                "chat_tokens_delta_sync requires a non-empty delta",
+            ));
+        }
+        if self.cached_image_key.is_some() {
+            return Err(Error::from_reason(format!(
+                "{}chat_tokens_delta_sync is text-only; session currently holds image state",
+                chat_common::IMAGE_CHANGE_RESTART_PREFIX
+            )));
+        }
+        if self.caches.is_none() {
+            return Err(Error::from_reason(
+                "chat_tokens_delta_sync requires a live cache (call chat_session_start first)",
+            ));
+        }
+
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+
+        // Session path: use `<turn|>` as eos, NOT config.eos_token_ids.
+        // This keeps the cached history aligned on a clean turn boundary
+        // for the next `chat_session_continue*` call.
+        let turn_end_id = self.turn_end_id()?;
+
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
+        let sampling_config = make_sampling_config(&config, &self.config);
+        let eos_ids = self.config.eos_token_ids.clone();
+
+        // Build the full token history = cached_history + delta. Used
+        // when save_cache_state-ing back to `self.cached_token_history`
+        // at the end (the decode loop doesn't actually consult the
+        // history for penalty context — Gemma4's bespoke decode loop
+        // ignores penalties entirely).
+        let mut save_history =
+            Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len());
+        save_history.extend(self.cached_token_history.iter().copied());
+        save_history.extend(delta_tokens.iter().copied());
+
+        let prompt_token_count = save_history.len();
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+
+        let generation_start = std::time::Instant::now();
+
+        // Prefill the delta tokens on top of the existing caches.
+        // `prefill_body_gemma4` processes tokens [0:N-1] through the
+        // transformer body, leaving the last token for `forward_inner`
+        // below to produce logits for the first sampled token. When
+        // `delta_tokens.len() == 1` the prefill is a no-op and we go
+        // straight to forward_inner with that single token.
+        let token_arr: Vec<i32> = delta_tokens.iter().map(|&t| t as i32).collect();
+        let prompt = MxArray::from_int32(&token_arr, &[1, delta_tokens.len() as i64])?;
+
+        {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let caches = self.caches.as_mut().expect("caches checked is_some above");
+            prefill_body_gemma4(
+                &prompt,
+                &self.embed_tokens,
+                &self.layers,
+                caches,
+                &self.final_norm,
+                self.ple.as_ref(),
+                &self.config,
+            )?;
+        }
+        eval_gemma4_caches(self.caches.as_ref().expect("caches checked is_some above"));
+
+        // Last token → logits
+        let last_token =
+            prompt.slice_axis(1, delta_tokens.len() as i64 - 1, delta_tokens.len() as i64)?;
+        let logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let caches = self.caches.as_mut().expect("caches checked is_some above");
+            forward_inner(
+                &last_token,
+                &self.embed_tokens,
+                &self.layers,
+                caches,
+                &self.final_norm,
+                &self.lm_head,
+                self.embed_weight_t.as_ref(),
+                self.ple.as_ref(),
+                &self.config,
+            )?
+        };
+        let logits = logits.squeeze(Some(&[1]))?;
+        let y = sample_next_token(&logits, sampling_config)?;
+        y.eval();
+        eval_gemma4_caches(self.caches.as_ref().expect("caches checked is_some above"));
+
+        let first_token_instant = std::time::Instant::now();
+
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut finish_reason = "length".to_string();
+        let mut current_y = y;
+        for step in 0..max_new_tokens {
+            let next_y = if step + 1 < max_new_tokens {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                let caches = self.caches.as_mut().expect("caches checked is_some above");
+                let next_ids = current_y.reshape(&[1, 1])?;
+                let next_logits = forward_inner(
+                    &next_ids,
+                    &self.embed_tokens,
+                    &self.layers,
+                    caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    self.embed_weight_t.as_ref(),
+                    self.ple.as_ref(),
+                    &self.config,
+                )?;
+                let next_logits = next_logits.squeeze(Some(&[1]))?;
+                let next_token = sample_next_token(&next_logits, sampling_config)?;
+                MxArray::async_eval_arrays(&[&next_token]);
+                Some(next_token)
+            } else {
+                None
+            };
+
+            let token_id = current_y.item_at_int32(0)? as u32;
+            generated_tokens.push(token_id);
+
+            if is_eos_token(token_id, &eos_ids, Some(turn_end_id)) {
+                finish_reason = "stop".to_string();
+                break;
+            }
+            if let Some(next_token) = next_y {
+                current_y = next_token;
+            } else {
+                break;
+            }
+
+            if (step + 1) % 256 == 0 {
+                crate::array::clear_cache();
+            }
+        }
+
+        let text = tokenizer.decode_sync(&generated_tokens, true)?;
+
+        // Save cache state: drop the terminal turn-boundary token when
+        // the decode terminated on stop (matches the semantics of
+        // `chat_sync_core`'s save block).
+        let history_tokens: &[u32] = if finish_reason != "length" && !generated_tokens.is_empty() {
+            &generated_tokens[..generated_tokens.len() - 1]
+        } else {
+            &generated_tokens[..]
+        };
+        let mut new_history = save_history;
+        new_history.extend_from_slice(history_tokens);
+        self.cached_token_history = new_history;
+        // Delta path is text-only; the invariant is enforced by the
+        // guard above, so no image key changes here.
+        // (self.cached_image_key stays None.)
+
+        let generation_end = std::time::Instant::now();
+        let ttft_ms = first_token_instant
+            .duration_since(generation_start)
+            .as_secs_f64()
+            * 1000.0;
+        let decode_ms = generation_end
+            .duration_since(first_token_instant)
+            .as_secs_f64()
+            * 1000.0;
+        let gen_toks = generated_tokens.len() as f64;
+
+        let performance = Some(crate::profiling::PerformanceMetrics {
+            ttft_ms,
+            prefill_tokens_per_second: if ttft_ms > 0.0 {
+                delta_tokens.len() as f64 / (ttft_ms / 1000.0)
+            } else {
+                0.0
+            },
+            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                (gen_toks - 1.0) / (decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+
+        Ok(ChatResult {
+            text: text.clone(),
+            tool_calls: vec![],
+            thinking: None,
+            num_tokens: generated_tokens.len() as u32,
+            prompt_tokens: prompt_token_count as u32,
+            reasoning_tokens: 0,
+            finish_reason,
+            raw_text: text,
+            performance,
+        })
+    }
+
+    /// Streaming variant of [`Self::chat_session_start_sync`].
+    pub(crate) fn chat_stream_session_start_sync(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        if cancelled.load(Ordering::Relaxed) {
+            chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_session_start cancelled before start",
+            );
+            return;
+        }
+
+        let turn_end_id = match self.turn_end_id() {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = stream_tx.send(Err(e));
+                return;
+            }
+        };
+
+        // Full reset: the session-start path always begins clean.
+        if let Err(e) = self.reset_caches_sync() {
+            let _ = stream_tx.send(Err(e));
+            return;
+        }
+
+        let cb = StreamSender(stream_tx.clone());
+        let result =
+            self.chat_stream_sync_core(messages, config, &cb, &cancelled, Some(turn_end_id));
+        if let Err(e) = result {
+            let _ = stream_tx.send(Err(e));
+        }
+    }
+
+    /// Streaming variant of [`Self::chat_session_continue_sync`].
+    pub(crate) fn chat_stream_session_continue_sync(
+        &mut self,
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        if cancelled.load(Ordering::Relaxed) {
+            chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_session_continue cancelled before start",
+            );
+            return;
+        }
+
+        if images.as_ref().is_some_and(|v| !v.is_empty()) {
+            chat_common::send_stream_error(
+                &stream_tx,
+                &format!(
+                    "{}chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the image",
+                    chat_common::IMAGE_CHANGE_RESTART_PREFIX
+                ),
+            );
+            return;
+        }
+
+        let tokenizer = match self.tokenizer.as_ref() {
+            Some(t) => t.clone(),
+            None => {
+                chat_common::send_stream_error(&stream_tx, "Tokenizer not loaded");
+                return;
+            }
+        };
+
+        let synthetic = chat_common::build_synthetic_user_message(&user_message);
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
+        let sanitized_user = &sanitized[0].content;
+
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let delta_text = build_gemma4_continue_delta_text(sanitized_user, enable_thinking);
+
+        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = stream_tx.send(Err(e));
+                return;
+            }
+        };
+
+        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
+    }
+
+    /// Streaming variant of [`Self::chat_session_continue_tool_sync`].
+    pub(crate) fn chat_stream_session_continue_tool_sync(
+        &mut self,
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        if cancelled.load(Ordering::Relaxed) {
+            chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_session_continue_tool cancelled before start",
+            );
+            return;
+        }
+
+        let tokenizer = match self.tokenizer.as_ref() {
+            Some(t) => t.clone(),
+            None => {
+                chat_common::send_stream_error(&stream_tx, "Tokenizer not loaded");
+                return;
+            }
+        };
+
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let delta_text = build_gemma4_tool_delta_text(&tool_call_id, &content, enable_thinking);
+
+        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = stream_tx.send(Err(e));
+                return;
+            }
+        };
+
+        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
+    }
+
+    /// Streaming analog of [`Self::chat_tokens_delta_sync`]: prefill
+    /// the caller-provided delta tokens on top of the existing Gemma4
+    /// caches and stream the reply through `stream_tx`.
+    ///
+    /// Applies the same guards as the non-streaming path and uses
+    /// `<turn|>` as the eos token so the cached history continues to
+    /// end on a clean turn boundary after the reply is saved.
+    pub(crate) fn chat_stream_tokens_delta_sync(
+        &mut self,
+        delta_tokens: Vec<u32>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        if cancelled.load(Ordering::Relaxed) {
+            chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta cancelled before start",
+            );
+            return;
+        }
+
+        // --- Same four guards as chat_tokens_delta_sync ---
+        if self.cached_token_history.is_empty() {
+            chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta requires an initialized session (call chat_stream_session_start first)",
+            );
+            return;
+        }
+        if delta_tokens.is_empty() {
+            chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta requires a non-empty delta",
+            );
+            return;
+        }
+        if self.cached_image_key.is_some() {
+            chat_common::send_stream_error(
+                &stream_tx,
+                &format!(
+                    "{}chat_stream_tokens_delta is text-only; session currently holds image state",
+                    chat_common::IMAGE_CHANGE_RESTART_PREFIX
+                ),
+            );
+            return;
+        }
+        if self.caches.is_none() {
+            chat_common::send_stream_error(
+                &stream_tx,
+                "chat_stream_tokens_delta requires a live cache (call chat_stream_session_start first)",
+            );
+            return;
+        }
+
+        let cb = StreamSender(stream_tx.clone());
+        let result =
+            self.chat_stream_tokens_delta_sync_inner(delta_tokens, config, &cb, &cancelled);
+        if let Err(e) = result {
+            let _ = stream_tx.send(Err(e));
+        }
+    }
+
+    /// Inner body of [`Self::chat_stream_tokens_delta_sync`]: prefill
+    /// delta tokens on top of the live caches, then run the streaming
+    /// decode loop. Mirrors [`Self::chat_stream_sync_core`] but skips
+    /// the message rendering + image processing stages — the caller
+    /// owns cache coherence by construction.
+    fn chat_stream_tokens_delta_sync_inner(
+        &mut self,
+        delta_tokens: Vec<u32>,
+        config: ChatConfig,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+
+        let turn_end_id = self.turn_end_id()?;
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
+        let sampling_config = make_sampling_config(&config, &self.config);
+        let eos_ids = self.config.eos_token_ids.clone();
+
+        let mut save_history =
+            Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len());
+        save_history.extend(self.cached_token_history.iter().copied());
+        save_history.extend(delta_tokens.iter().copied());
+
+        let prompt_token_count = save_history.len();
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+
+        let generation_start = std::time::Instant::now();
+
+        let token_arr: Vec<i32> = delta_tokens.iter().map(|&t| t as i32).collect();
+        let prompt = MxArray::from_int32(&token_arr, &[1, delta_tokens.len() as i64])?;
+
+        {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let caches = self.caches.as_mut().expect("caches checked is_some above");
+            prefill_body_gemma4(
+                &prompt,
+                &self.embed_tokens,
+                &self.layers,
+                caches,
+                &self.final_norm,
+                self.ple.as_ref(),
+                &self.config,
+            )?;
+        }
+        eval_gemma4_caches(self.caches.as_ref().expect("caches checked is_some above"));
+
+        let last_token =
+            prompt.slice_axis(1, delta_tokens.len() as i64 - 1, delta_tokens.len() as i64)?;
+        let logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let caches = self.caches.as_mut().expect("caches checked is_some above");
+            forward_inner(
+                &last_token,
+                &self.embed_tokens,
+                &self.layers,
+                caches,
+                &self.final_norm,
+                &self.lm_head,
+                self.embed_weight_t.as_ref(),
+                self.ple.as_ref(),
+                &self.config,
+            )?
+        };
+        let logits = logits.squeeze(Some(&[1]))?;
+        let y = sample_next_token(&logits, sampling_config)?;
+        y.eval();
+        eval_gemma4_caches(self.caches.as_ref().expect("caches checked is_some above"));
+
+        let first_token_instant = std::time::Instant::now();
+
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut finish_reason = "length".to_string();
+
+        let mut decode_stream = tokenizer.inner().decode_stream(true);
+        let mut streamed_text_len = 0;
+
+        let mut current_y = y;
+        for step in 0..max_new_tokens {
+            let next_y = if step + 1 < max_new_tokens {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                let caches = self.caches.as_mut().expect("caches checked is_some above");
+                let next_ids = current_y.reshape(&[1, 1])?;
+                let next_logits = forward_inner(
+                    &next_ids,
+                    &self.embed_tokens,
+                    &self.layers,
+                    caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    self.embed_weight_t.as_ref(),
+                    self.ple.as_ref(),
+                    &self.config,
+                )?;
+                let next_logits = next_logits.squeeze(Some(&[1]))?;
+                let next_token = sample_next_token(&next_logits, sampling_config)?;
+                MxArray::async_eval_arrays(&[&next_token]);
+                Some(next_token)
+            } else {
+                None
+            };
+
+            let token_id = current_y.item_at_int32(0)? as u32;
+            generated_tokens.push(token_id);
+
+            if cancelled.load(Ordering::Relaxed) {
+                finish_reason = "cancelled".to_string();
+                break;
+            }
+
+            let token_text = Qwen3Tokenizer::step_decode_stream(
+                &mut decode_stream,
+                tokenizer.inner(),
+                token_id,
+                &generated_tokens,
+                streamed_text_len,
+            );
+            streamed_text_len += token_text.len();
+
+            cb.call(
+                Ok(ChatStreamChunk {
+                    text: token_text,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    prompt_tokens: None,
+                    reasoning_tokens: None,
+                    raw_text: None,
+                    performance: None,
+                    is_reasoning: None,
+                }),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+
+            if is_eos_token(token_id, &eos_ids, Some(turn_end_id)) {
+                finish_reason = "stop".to_string();
+                break;
+            }
+            if let Some(next_token) = next_y {
+                current_y = next_token;
+            } else {
+                break;
+            }
+
+            if (step + 1) % 256 == 0 {
+                crate::array::clear_cache();
+            }
+        }
+
+        let text = tokenizer.decode_sync(&generated_tokens, true)?;
+
+        // Flush residual bytes buffered inside decode_stream.
+        if text.len() > streamed_text_len {
+            let residual = text[streamed_text_len..].to_string();
+            cb.call(
+                Ok(ChatStreamChunk {
+                    text: residual,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    prompt_tokens: None,
+                    reasoning_tokens: None,
+                    raw_text: None,
+                    performance: None,
+                    is_reasoning: None,
+                }),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+        }
+
+        // Save cache state for the next session turn.
+        let history_tokens: &[u32] = if finish_reason != "length" && !generated_tokens.is_empty() {
+            &generated_tokens[..generated_tokens.len() - 1]
+        } else {
+            &generated_tokens[..]
+        };
+        let mut new_history = save_history;
+        new_history.extend_from_slice(history_tokens);
+        self.cached_token_history = new_history;
+        // Delta path is text-only; cached_image_key stays None.
+
+        let generation_end = std::time::Instant::now();
+        let ttft_ms = first_token_instant
+            .duration_since(generation_start)
+            .as_secs_f64()
+            * 1000.0;
+        let decode_ms = generation_end
+            .duration_since(first_token_instant)
+            .as_secs_f64()
+            * 1000.0;
+        let gen_toks = generated_tokens.len() as f64;
+
+        let performance = Some(crate::profiling::PerformanceMetrics {
+            ttft_ms,
+            prefill_tokens_per_second: if ttft_ms > 0.0 {
+                delta_tokens.len() as f64 / (ttft_ms / 1000.0)
+            } else {
+                0.0
+            },
+            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                (gen_toks - 1.0) / (decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+
+        cb.call(
+            Ok(ChatStreamChunk {
+                text: String::new(),
+                done: true,
+                finish_reason: Some(finish_reason),
+                tool_calls: Some(vec![]),
+                thinking: None,
+                num_tokens: Some(generated_tokens.len() as u32),
+                prompt_tokens: Some(prompt_token_count as u32),
+                reasoning_tokens: Some(0),
+                raw_text: Some(text),
+                performance,
+                is_reasoning: None,
+            }),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+
+        Ok(())
+    }
+}
+
+/// Build the Gemma4 wire-format delta text for a session-continue turn.
+///
+/// The cached history ends on `<turn|>` (because
+/// `chat_session_start_sync` uses `turn_end_id` as eos). The leading
+/// `\n` closes that turn's line; then we open a new user turn and
+/// prime an assistant ("model") turn.
+///
+/// Gemma4's chat template does NOT inject a `<think>\n` prefix after
+/// the assistant opener the way Qwen3.5's does — `enable_thinking`
+/// affects which template branch renders, not the raw delta. We
+/// accept the parameter for API symmetry but deliberately ignore it.
+///
+/// `sanitized_user` MUST already be passed through
+/// `Qwen3Tokenizer::sanitize_messages_public` by the caller.
+fn build_gemma4_continue_delta_text(sanitized_user: &str, enable_thinking: Option<bool>) -> String {
+    // `enable_thinking` intentionally unused: Gemma4's template does
+    // not render a `<think>` prefix on the raw delta path.
+    let _ = enable_thinking;
+    format!("\n<|turn>user\n{sanitized_user}<turn|>\n<|turn>model\n")
+}
+
+/// Build the Gemma4 wire-format delta text for a tool-result turn.
+///
+/// Gemma4's chat template renders tool-role messages as plain
+/// `<|turn>tool\n{content}<turn|>` blocks — no `<tool_response>`
+/// wrapping (unlike Qwen3.5). The `tool_call_id` is NOT rendered:
+/// Gemma4 identifies tool responses positionally in the turn stream,
+/// not via an explicit id field.
+///
+/// Tool content is passed through [`escape_gemma4_content`] so
+/// malicious tool output containing Gemma4 delimiter tokens can't
+/// escape the tool turn and inject synthetic structure.
+fn build_gemma4_tool_delta_text(
+    _tool_call_id: &str,
+    content: &str,
+    enable_thinking: Option<bool>,
+) -> String {
+    // `enable_thinking` intentionally unused: see
+    // `build_gemma4_continue_delta_text` for why the raw delta path
+    // ignores reasoning mode.
+    let _ = enable_thinking;
+    let escaped = escape_gemma4_content(content);
+    format!("\n<|turn>tool\n{escaped}<turn|>\n<|turn>model\n")
 }
 
 /// Command handler for the dedicated model thread.
@@ -1433,6 +2396,72 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
             cancelled,
         } => {
             inner.chat_stream_sync(messages, config, stream_tx, cancelled);
+        }
+        Gemma4Cmd::ChatSessionStart {
+            messages,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.chat_session_start_sync(messages, config));
+        }
+        Gemma4Cmd::ChatSessionContinue {
+            user_message,
+            images,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.chat_session_continue_sync(user_message, images, config));
+        }
+        Gemma4Cmd::ChatSessionContinueTool {
+            tool_call_id,
+            content,
+            config,
+            reply,
+        } => {
+            let _ =
+                reply.send(inner.chat_session_continue_tool_sync(tool_call_id, content, config));
+        }
+        Gemma4Cmd::ChatStreamSessionStart {
+            messages,
+            config,
+            stream_tx,
+            cancelled,
+        } => {
+            inner.chat_stream_session_start_sync(messages, config, stream_tx, cancelled);
+        }
+        Gemma4Cmd::ChatStreamSessionContinue {
+            user_message,
+            images,
+            config,
+            stream_tx,
+            cancelled,
+        } => {
+            inner.chat_stream_session_continue_sync(
+                user_message,
+                images,
+                config,
+                stream_tx,
+                cancelled,
+            );
+        }
+        Gemma4Cmd::ChatStreamSessionContinueTool {
+            tool_call_id,
+            content,
+            config,
+            stream_tx,
+            cancelled,
+        } => {
+            inner.chat_stream_session_continue_tool_sync(
+                tool_call_id,
+                content,
+                config,
+                stream_tx,
+                cancelled,
+            );
+        }
+        Gemma4Cmd::ResetCaches { reply } => {
+            let result = inner.reset_caches_sync();
+            let _ = reply.send(result);
         }
     }
 }
@@ -1535,6 +2564,238 @@ impl Gemma4Model {
 
         self.thread.send(Gemma4Cmd::ChatStream {
             messages,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+
+        let callback = Arc::new(callback);
+        tokio::spawn(async move {
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
+    }
+
+    /// Reset all caches and clear cached token history. Exposed so
+    /// tests and session-management code can start from a known clean
+    /// state between turns.
+    #[napi]
+    pub async fn reset_caches(&self) -> Result<()> {
+        crate::model_thread::send_and_await(&self.thread, |reply| Gemma4Cmd::ResetCaches { reply })
+            .await
+    }
+
+    /// Start a new chat session.
+    ///
+    /// Equivalent to [`Self::chat`] but stops decoding on `<turn|>` and
+    /// leaves the KV caches on a clean turn boundary so subsequent
+    /// [`Self::chat_session_continue`] /
+    /// [`Self::chat_session_continue_tool`] calls can append a raw
+    /// delta on top without re-rendering the chat template.
+    #[napi]
+    pub async fn chat_session_start(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        let config = config.unwrap_or_default();
+
+        // Fast-fail: images on a text-only model.
+        if !self.has_vision
+            && messages
+                .iter()
+                .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
+        {
+            return Err(Error::from_reason(
+                "Images provided but model has no vision support (no vision_config in config.json)",
+            ));
+        }
+
+        crate::model_thread::send_and_await(&self.thread, |reply| Gemma4Cmd::ChatSessionStart {
+            messages,
+            config,
+            reply,
+        })
+        .await
+    }
+
+    /// Continue an existing chat session with a new user message.
+    ///
+    /// Appends a raw Gemma4 user/model delta to the session's cached KV
+    /// state, then decodes the model reply. Stops on `<turn|>` so the
+    /// cache remains on a clean turn boundary for the next turn.
+    ///
+    /// Requires a live session started via
+    /// [`Self::chat_session_start`]. Errors if the session is empty,
+    /// carries image state, or if `config.reuse_cache` is explicitly
+    /// set to `false`.
+    ///
+    /// `images` is an opt-in guard parameter: when non-empty the native
+    /// side returns an error whose message begins with
+    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+    /// `ChatSession` layer can catch the prefix and route image-changes
+    /// back through a fresh `chatSessionStart` uniformly across all
+    /// model backends.
+    #[napi(
+        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
+    )]
+    pub async fn chat_session_continue(
+        &self,
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        let config = config.unwrap_or_default();
+
+        crate::model_thread::send_and_await(&self.thread, |reply| Gemma4Cmd::ChatSessionContinue {
+            user_message,
+            images,
+            config,
+            reply,
+        })
+        .await
+    }
+
+    /// Continue an existing chat session with a tool-result turn.
+    ///
+    /// Builds a Gemma4-format tool delta
+    /// (`\n<|turn>tool\n{content}<turn|>\n<|turn>model\n`) from
+    /// `content` and prefills it on top of the live session caches,
+    /// then decodes the model reply. Stops on `<turn|>` so the cache
+    /// stays on a clean turn boundary for the next turn.
+    ///
+    /// The `tool_call_id` is currently dropped by the wire format —
+    /// Gemma4's chat template identifies tool responses positionally,
+    /// not via an explicit id. Callers may still log it for their own
+    /// bookkeeping.
+    ///
+    /// Requires a live session started via
+    /// [`Self::chat_session_start`].
+    #[napi]
+    pub async fn chat_session_continue_tool(
+        &self,
+        tool_call_id: String,
+        content: String,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        let config = config.unwrap_or_default();
+
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Gemma4Cmd::ChatSessionContinueTool {
+                tool_call_id,
+                content,
+                config,
+                reply,
+            }
+        })
+        .await
+    }
+
+    /// Streaming variant of [`Self::chat_session_start`].
+    #[napi(
+        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream_session_start(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let config = config.unwrap_or_default();
+
+        // Fast-fail: images on a text-only model.
+        if !self.has_vision
+            && messages
+                .iter()
+                .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
+        {
+            return Err(Error::from_reason(
+                "Images provided but model has no vision support (no vision_config in config.json)",
+            ));
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        self.thread.send(Gemma4Cmd::ChatStreamSessionStart {
+            messages,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+
+        let callback = Arc::new(callback);
+        tokio::spawn(async move {
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
+    }
+
+    /// Streaming variant of [`Self::chat_session_continue`].
+    #[napi(
+        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream_session_continue(
+        &self,
+        user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let config = config.unwrap_or_default();
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        self.thread.send(Gemma4Cmd::ChatStreamSessionContinue {
+            user_message,
+            images,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+
+        let callback = Arc::new(callback);
+        tokio::spawn(async move {
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
+    }
+
+    /// Streaming variant of [`Self::chat_session_continue_tool`].
+    #[napi(
+        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream_session_continue_tool(
+        &self,
+        tool_call_id: String,
+        content: String,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let config = config.unwrap_or_default();
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        self.thread.send(Gemma4Cmd::ChatStreamSessionContinueTool {
+            tool_call_id,
+            content,
             config,
             stream_tx,
             cancelled: cancelled_inner,
