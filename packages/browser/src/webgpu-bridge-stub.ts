@@ -1194,6 +1194,11 @@ export function createBridgeStub(
     },
 
     wgpuBufferDestroy(bufferHandle: number): void {
+      // Drop any deferred writeBuffer keyed by this raw handle BEFORE any
+      // early-return branch — mirrors wgpuBufferRelease (see its comment for
+      // the full rationale on fake-handle flushPendingWrites leaks).
+      pendingWriteBuffers.delete(bufferHandle);
+
       // No-op: gpu-worker already skips buffer destroy to avoid "destroyed in submit" errors.
       // Clean up deferred state if present.
       const mapped = mappedAtCreationBuffers.get(bufferHandle);
@@ -1217,6 +1222,9 @@ export function createBridgeStub(
       const resolved = resolveBufferHandle(bufferHandle);
       if (resolved !== bufferHandle) {
         deferredBufferRemap.delete(bufferHandle);
+        // A deferred writeBuffer could also be keyed on the resolved handle;
+        // drop it so a pooled-reuse of `resolved` can't be clobbered.
+        pendingWriteBuffers.delete(resolved);
       }
       // Destroy is a no-op on the gpu-worker side, so any pooled buddies at
       // this (usage, size) key remain valid GPUBuffers. Leave the pool alone.
@@ -1242,6 +1250,10 @@ export function createBridgeStub(
         mappedAtCreationBuffers.delete(handle);
         wasmFree(mapped.wasmPtr);
         delete bufSizes[handle];
+        // Symmetry with every other cleanup site: benign for fake
+        // mappedAtCreation handles (no bufferUsages entry), but kept for
+        // consistency with the deferred/resolved branches below.
+        delete bufferUsages[handle];
         return;
       }
       // Clean up deferred creation if buffer is released before dispatch
