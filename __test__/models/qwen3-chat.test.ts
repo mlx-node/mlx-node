@@ -1,8 +1,13 @@
 /**
- * Integration tests for the model.chat() API
+ * Integration tests for the Qwen3 chat session API.
  *
- * Tests the high-level chat API with tool calling support.
+ * Tests the session-based high-level chat API with tool calling support.
  * Uses a tiny model with random weights for fast testing.
+ *
+ * The legacy `model.chat()` NAPI entry point has been replaced with
+ * session methods: `chatSessionStart`, `chatSessionContinue`, and
+ * `chatSessionContinueTool`. These tests cover the structural contract
+ * rather than correctness (since the weights are random).
  */
 
 import { loadModel, Qwen3Model, createToolDefinition } from '@mlx-node/lm';
@@ -11,7 +16,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 
 import { createTempModel, TINY_TEST_CONFIG } from '../test-model-utils';
 
-describe.sequential('Qwen3 Chat API', () => {
+describe.sequential('Qwen3 Chat Session API', () => {
   let model: Qwen3Model;
   let cleanup: () => void;
 
@@ -28,11 +33,12 @@ describe.sequential('Qwen3 Chat API', () => {
     cleanup?.();
   });
 
-  describe('Basic Chat', () => {
+  describe('Basic chatSessionStart', () => {
     it('should return ChatResult with expected structure', async () => {
+      model.resetCaches();
       const messages = [{ role: 'user', content: 'Hello' }];
 
-      const result = await model.chat(messages);
+      const result = await model.chatSessionStart(messages);
 
       // Verify ChatResult structure
       expect(result).toBeDefined();
@@ -46,9 +52,10 @@ describe.sequential('Qwen3 Chat API', () => {
     });
 
     it('should generate tokens with default config', async () => {
+      model.resetCaches();
       const messages = [{ role: 'user', content: 'Say something' }];
 
-      const result = await model.chat(messages);
+      const result = await model.chatSessionStart(messages);
 
       // Model should generate at least some tokens
       expect(result.numTokens).toBeGreaterThan(0);
@@ -57,14 +64,51 @@ describe.sequential('Qwen3 Chat API', () => {
     });
 
     it('should respect maxNewTokens config', async () => {
+      model.resetCaches();
       const messages = [{ role: 'user', content: 'Count to 100' }];
 
-      const result = await model.chat(messages, {
+      const result = await model.chatSessionStart(messages, {
         maxNewTokens: 10,
       });
 
       // Should stop around the limit (might be slightly over due to token boundaries)
       expect(result.numTokens).toBeLessThanOrEqual(15);
+    });
+  });
+
+  describe('Multi-turn session', () => {
+    it('should allow continuing an existing session via chatSessionContinue', async () => {
+      model.resetCaches();
+
+      // Turn 1: start
+      const first = await model.chatSessionStart([{ role: 'user', content: 'Hi' }], { maxNewTokens: 10 });
+      expect(first).toBeDefined();
+      expect(first.numTokens).toBeGreaterThan(0);
+
+      // Turn 2: continue with the same session
+      const second = await model.chatSessionContinue('Follow-up question', null, {
+        maxNewTokens: 10,
+      });
+      expect(second).toBeDefined();
+      expect(second.numTokens).toBeGreaterThan(0);
+      // Prompt tokens for the continue must be at least as large as the
+      // initial prompt tokens — the cached history carries forward.
+      expect(second.promptTokens).toBeGreaterThanOrEqual(first.promptTokens);
+    });
+
+    it('should reject image input via chatSessionContinue (text-only backend)', async () => {
+      model.resetCaches();
+      await model.chatSessionStart([{ role: 'user', content: 'Hi' }], { maxNewTokens: 5 });
+
+      const fakeImage = new Uint8Array([0, 1, 2, 3]);
+      await expect(model.chatSessionContinue('Caption this', [fakeImage], null)).rejects.toThrow(
+        /IMAGE_CHANGE_REQUIRES_SESSION_RESTART/,
+      );
+    });
+
+    it('should error when chatSessionContinue is called without an active session', async () => {
+      model.resetCaches();
+      await expect(model.chatSessionContinue('No session first', null, null)).rejects.toThrow();
     });
   });
 
@@ -83,10 +127,11 @@ describe.sequential('Qwen3 Chat API', () => {
     ];
 
     it('should accept tool definitions without error', async () => {
+      model.resetCaches();
       const messages = [{ role: 'user', content: 'Use a tool' }];
 
       // Should not throw even with random weights
-      const result = await model.chat(messages, {
+      const result = await model.chatSessionStart(messages, {
         tools: testTools,
         maxNewTokens: 50,
       });
@@ -96,9 +141,10 @@ describe.sequential('Qwen3 Chat API', () => {
     });
 
     it('should return empty toolCalls when no tool_call tags in output', async () => {
+      model.resetCaches();
       const messages = [{ role: 'user', content: 'Hello' }];
 
-      const result = await model.chat(messages, {
+      const result = await model.chatSessionStart(messages, {
         tools: testTools,
         maxNewTokens: 20,
       });
@@ -144,9 +190,10 @@ describe.sequential('Qwen3 Chat API', () => {
 
   describe('Finish Reasons', () => {
     it('should return "length" when max tokens reached', async () => {
+      model.resetCaches();
       const messages = [{ role: 'user', content: 'Write a very long essay' }];
 
-      const result = await model.chat(messages, {
+      const result = await model.chatSessionStart(messages, {
         maxNewTokens: 5,
         ngramSize: 0, // Disable repetition detection so length limit fires first
       });
@@ -155,10 +202,11 @@ describe.sequential('Qwen3 Chat API', () => {
       expect(result.finishReason).toBe('length');
     });
 
-    it('should return "stop" when EOS token generated', async () => {
+    it('should accept a generous token budget', async () => {
+      model.resetCaches();
       const messages = [{ role: 'user', content: 'Hi' }];
 
-      const result = await model.chat(messages, {
+      const result = await model.chatSessionStart(messages, {
         maxNewTokens: 500, // Give it room to naturally stop
       });
 
@@ -169,9 +217,10 @@ describe.sequential('Qwen3 Chat API', () => {
 
   describe('Thinking Extraction', () => {
     it('should return null thinking when no think tags', async () => {
+      model.resetCaches();
       const messages = [{ role: 'user', content: 'Hello' }];
 
-      const result = await model.chat(messages, {
+      const result = await model.chatSessionStart(messages, {
         maxNewTokens: 50,
       });
 
@@ -183,10 +232,11 @@ describe.sequential('Qwen3 Chat API', () => {
 
   describe('Generation Config', () => {
     it('should accept all config options', async () => {
+      model.resetCaches();
       const messages = [{ role: 'user', content: 'Test' }];
 
       // Should not throw with any valid config
-      const result = await model.chat(messages, {
+      const result = await model.chatSessionStart(messages, {
         maxNewTokens: 20,
         temperature: 0.5,
         topK: 40,
@@ -203,12 +253,14 @@ describe.sequential('Qwen3 Chat API', () => {
       const messages = [{ role: 'user', content: 'Test' }];
 
       // Temperature 0 = greedy decoding (deterministic)
-      const result1 = await model.chat(messages, {
+      model.resetCaches();
+      const result1 = await model.chatSessionStart(messages, {
         maxNewTokens: 10,
         temperature: 0,
       });
 
-      const result2 = await model.chat(messages, {
+      model.resetCaches();
+      const result2 = await model.chatSessionStart(messages, {
         maxNewTokens: 10,
         temperature: 0,
       });

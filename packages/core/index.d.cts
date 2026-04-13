@@ -1421,76 +1421,84 @@ export declare class Qwen3Model {
    */
   generate(messages: Array<ChatMessage>, config?: GenerationConfig | undefined | null): Promise<GenerationResult>;
   /**
-   * High-level chat API with structured response parsing
-   *
-   * The primary API for conversational AI. Handles:
-   * - Chat message formatting with Jinja2 templates
-   * - Tool/function calling with structured output
-   * - Thinking extraction from `<think>` tags
-   * - Clean response text with all special tags stripped
-   *
-   * ## `chat()` vs `generate()`
-   *
-   * | Feature | `chat()` | `generate()` |
-   * |---------|----------|--------------|
-   * | **Purpose** | Conversational AI with tools | Raw text generation |
-   * | **Input** | Chat messages | Token IDs (MxArray) |
-   * | **Tool Support** | Built-in parsing | None |
-   * | **Thinking** | Extracts `<think>` content | Raw text only |
-   * | **Output** | Structured `ChatResult` | Basic `GenerationResult` |
-   * | **Use Case** | Chat apps, agents, assistants | Training, low-level control |
-   *
-   * ## When to use `chat()`
-   * - Building conversational applications
-   * - Need tool/function calling
-   * - Want structured responses with thinking separated
-   * - Working with chat message format
-   *
-   * ## When to use `generate()`
-   * - Training and fine-tuning (need raw logprobs)
-   * - Custom tokenization pipeline
-   * - Low-level generation control
-   * - Non-chat use cases
-   *
-   * # Arguments
-   * * `messages` - Array of chat messages (user/assistant/system roles)
-   * * `config` - Chat configuration including optional tools and generation params
-   *
-   * # Returns
-   * * `ChatResult` containing:
-   *   - `text`: Clean response (tool_call and think tags stripped)
-   *   - `thinking`: Extracted chain-of-thought reasoning (or null)
-   *   - `toolCalls`: Parsed tool calls with native JS object arguments
-   *   - `finishReason`: "stop" | "length" | "tool_calls"
-   *   - `rawText`: Original text before processing (for debugging)
-   *
-   * # Example
-   * ```typescript
-   * // Simple chat
-   * const result = await model.chat(messages);
-   * console.log(result.text);
-   *
-   * // With tools
-   * const result = await model.chat(messages, {
-   *   tools: [{ type: 'function', function: { name: 'get_weather' } }],
-   *   maxNewTokens: 2048,
-   *   temperature: 0.7,
-   * });
-   *
-   * // Handle tool calls
-   * for (const call of result.toolCalls) {
-   *   if (call.status === 'ok') {
-   *     console.log(call.name, call.arguments);  // Arguments is a JS object!
-   *   }
-   * }
-   *
-   * // Access thinking (chain-of-thought)
-   * if (result.thinking) {
-   *   console.log('Model reasoning:', result.thinking);
-   * }
-   * ```
+   * Reset all caches and clear cached token history. Exposed so
+   * tests and session-management code can start from a known clean
+   * state between turns.
    */
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  resetCaches(): void;
+  /**
+   * Start a new chat session.
+   *
+   * Equivalent to the legacy `chat()` entry point but stops decoding
+   * on `<|im_end|>` and leaves the KV caches on a clean ChatML
+   * boundary so subsequent [`Self::chat_session_continue`] /
+   * [`Self::chat_session_continue_tool`] calls can append a raw
+   * delta on top without re-rendering the chat template.
+   *
+   * Requires `config.reuse_cache` to be enabled (the default).
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a new user message.
+   *
+   * Appends a raw ChatML user/assistant delta to the session's
+   * cached KV state, then decodes the assistant reply. Stops on
+   * `<|im_end|>` so the cache remains on a clean boundary for the
+   * next turn.
+   *
+   * Requires a live session started via
+   * [`Self::chat_session_start`]. Errors if the session is empty,
+   * carries image state, or if `config.reuse_cache` is explicitly
+   * set to `false`.
+   *
+   * Qwen3 legacy is text-only; `images` is an opt-in guard parameter:
+   * when non-empty the native side returns an error whose message
+   * begins with `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the
+   * TypeScript `ChatSession` layer can catch the prefix and route
+   * image-changes back through a fresh `chatSessionStart` uniformly
+   * across all model backends.
+   */
+  chatSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null | undefined,
+    config: ChatConfig | null | undefined,
+  ): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a tool-result turn.
+   *
+   * Builds a Qwen3.5-style `<tool_response>`-wrapped user-role delta
+   * from `content` and prefills it on top of the live session
+   * caches, then decodes the assistant reply. Stops on `<|im_end|>`
+   * so the cache stays on a clean boundary for the next turn.
+   *
+   * Requires a live session started via
+   * [`Self::chat_session_start`].
+   */
+  chatSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatResult>;
+  /** Streaming variant of [`Self::chat_session_start`]. */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of [`Self::chat_session_continue`]. */
+  chatStreamSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null | undefined,
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of [`Self::chat_session_continue_tool`]. */
+  chatStreamSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
   /**
    * Generate multiple completions for multiple prompts in batch
    *
