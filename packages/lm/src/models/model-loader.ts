@@ -7,10 +7,10 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { Gemma4Model, HarrierModel, Qwen3Model, QianfanOCRModel } from '@mlx-node/core';
+import { Gemma4Model, HarrierModel, QianfanOCRModel } from '@mlx-node/core';
 
 import type { LoadableModel, TrainableModel } from '../interfaces.js';
-import { Lfm2Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
+import { Lfm2Model, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
 export type ModelType =
   | 'qwen3'
@@ -48,7 +48,7 @@ export async function loadModel(modelPath: string): Promise<LoadableModel> {
     case 'qwen3_5':
       return Qwen35Model.load(modelPath) as unknown as Promise<TrainableModel>;
     case 'qwen3':
-      return Qwen3Model.load(modelPath);
+      return Qwen3Model.load(modelPath) as unknown as Promise<TrainableModel>;
     case 'harrier':
       return HarrierModel.load(modelPath) as unknown as Promise<LoadableModel>;
     case 'internvl_chat':

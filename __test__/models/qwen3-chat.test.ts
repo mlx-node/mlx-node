@@ -26,7 +26,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
     cleanup = temp.cleanup;
 
     // Load the model using loadModel
-    model = (await loadModel(temp.modelPath)) as Qwen3Model;
+    model = (await loadModel(temp.modelPath)) as unknown as Qwen3Model;
   }, 60000); // 60s timeout for model creation
 
   afterAll(() => {

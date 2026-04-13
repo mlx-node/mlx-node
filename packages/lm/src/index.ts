@@ -14,7 +14,8 @@
  */
 
 // Model classes (for inference)
-export { Qwen3Model, Qwen3Tokenizer } from '@mlx-node/core';
+export { Qwen3Tokenizer } from '@mlx-node/core';
+export { Qwen3Model } from './stream.js';
 
 // Gemma4 models
 export { Gemma4Model, Gemma4Model as Gemma4_Model } from './stream.js';

@@ -1,6 +1,7 @@
 import {
   Gemma4Model as Gemma4ModelNative,
   Lfm2Model as Lfm2ModelNative,
+  Qwen3Model as Qwen3ModelNative,
   Qwen35Model as Qwen35ModelNative,
   Qwen35MoeModel as Qwen35MoeModelNative,
 } from '@mlx-node/core';
@@ -77,6 +78,14 @@ const _nativeGemma4ChatStreamSessionStart = Gemma4ModelNative.prototype.chatStre
 const _nativeGemma4ChatStreamSessionContinue = Gemma4ModelNative.prototype.chatStreamSessionContinue;
 // oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeGemma4ChatStreamSessionContinueTool = Gemma4ModelNative.prototype.chatStreamSessionContinueTool;
+
+// Qwen3 (legacy, text-only)
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeQwen3ChatStreamSessionStart = Qwen3ModelNative.prototype.chatStreamSessionStart;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeQwen3ChatStreamSessionContinue = Qwen3ModelNative.prototype.chatStreamSessionContinue;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeQwen3ChatStreamSessionContinueTool = Qwen3ModelNative.prototype.chatStreamSessionContinueTool;
 
 /**
  * Shared AsyncGenerator adapter for callback-based native streaming methods.
@@ -397,6 +406,56 @@ export class Gemma4Model extends Gemma4ModelNative {
   }
 }
 
+/**
+ * Qwen3 (legacy) model wrapper.
+ *
+ * Streaming is driven through the `ChatSession` API — overrides below
+ * adapt the callback-based native methods to
+ * `AsyncGenerator<ChatStreamEvent>` so the wrapper structurally
+ * satisfies `SessionCapableModel`. Qwen3 legacy is text-only; the
+ * native `images` guard rejects non-empty image sets with an
+ * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix.
+ */
+export class Qwen3Model extends Qwen3ModelNative {
+  static override async load(modelPath: string): Promise<Qwen3Model> {
+    const instance = await Qwen3ModelNative.load(modelPath);
+    Object.setPrototypeOf(instance, Qwen3Model.prototype);
+    return instance as unknown as Qwen3Model;
+  }
+
+  /** Streaming variant of {@link Qwen3Model#chatSessionStart}. */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionStart(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeQwen3ChatStreamSessionStart.call(this, messages, config ?? null, callback),
+    );
+  }
+
+  /** Streaming variant of {@link Qwen3Model#chatSessionContinue}. */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null,
+    config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeQwen3ChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+    );
+  }
+
+  /** Streaming variant of {@link Qwen3Model#chatSessionContinueTool}. */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeQwen3ChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+    );
+  }
+}
+
 // -------------------------------------------------------------------
 // Compile-time conformance check
 // -------------------------------------------------------------------
@@ -412,9 +471,11 @@ function _assertSessionCapable(): void {
   const _moe: SessionCapableModel = null as unknown as Qwen35MoeModel;
   const _lfm2: SessionCapableModel = null as unknown as Lfm2Model;
   const _gemma4: SessionCapableModel = null as unknown as Gemma4Model;
+  const _qwen3: SessionCapableModel = null as unknown as Qwen3Model;
   void _qwen35;
   void _moe;
   void _lfm2;
   void _gemma4;
+  void _qwen3;
 }
 void _assertSessionCapable;
