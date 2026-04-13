@@ -263,17 +263,25 @@ describe('ChatSession', () => {
 
       expect(chatSessionStart).toHaveBeenCalledTimes(2);
       expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
-      // Restart path: resetCaches invoked + new start with a
-      // freshly-rebuilt history (just system + new user message).
+      // Restart path: resetCaches invoked exactly once at the image
+      // boundary. History is PRESERVED across the restart — the plan's
+      // Turn 3 example requires "full jinja on 3-turn history + image
+      // B", i.e. chatSessionStart receives the system prompt plus
+      // every prior user / assistant / tool turn plus the new user
+      // turn with the new image attached.
       expect(resetCaches).toHaveBeenCalledTimes(1);
 
       const restartMessages = chatSessionStart.mock.calls[1][0];
       expect(restartMessages).toEqual([
         { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe A', images: [imgA] },
+        { role: 'assistant', content: 'start-reply' },
+        { role: 'tool', content: 'tool-output', toolCallId: 'call-1' },
+        { role: 'assistant', content: 'tool-reply' },
         { role: 'user', content: 'describe B', images: [imgB] },
       ]);
-      // Turn count reset to 1 (one successful send after restart).
-      expect(session.turns).toBe(1);
+      // Three successful turns: initial send, tool result, restart send.
+      expect(session.turns).toBe(3);
     });
 
     it('identical image bytes do NOT trigger a restart', async () => {

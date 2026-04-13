@@ -538,17 +538,21 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   /**
    * Shared pre-start bookkeeping for both `send()` and `sendStream()`:
    *
-   *   - On an image-change restart (turn >= 1), reset caches and
-   *     rebuild history from scratch so the native side gets a clean
-   *     slate.
+   *   - On an image-change restart (turn >= 1), reset the native KV
+   *     caches so the new image set gets a fresh prefill. History is
+   *     intentionally preserved — `chatSessionStart` receives the full
+   *     accumulated conversation plus the new user turn so the jinja
+   *     render walks every prior turn and every prior image again
+   *     (see plan's Turn 3 example: "full jinja on 3-turn history +
+   *     image B"). `lastImagesKey` will be overwritten by the
+   *     successful start path right after, and `turnCount` is
+   *     incremented by the start path the same way as for any other
+   *     turn.
    *   - On a fresh / reset history, re-inject the system prompt.
    */
   private prepareStartPath(imageChanged: boolean, isFirstTurn: boolean): void {
     if (imageChanged && !isFirstTurn) {
       this.model.resetCaches();
-      this.history = [];
-      this.turnCount = 0;
-      this.lastImagesKey = null;
     }
     if (this.history.length === 0 && this.system != null) {
       this.history.push({ role: 'system', content: this.system });
