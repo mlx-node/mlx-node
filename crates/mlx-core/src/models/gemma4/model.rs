@@ -1700,7 +1700,19 @@ impl Gemma4Inner {
         delta_tokens: Vec<u32>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
-        // --- Four guards (mirrors Qwen3 / LFM2). ---
+        // --- Five guards (mirrors Qwen3 / LFM2). ---
+        // The delta path is a session-reuse operation by construction: it
+        // prefills on top of the existing caches. `reuse_cache = Some(false)`
+        // would make the post-decode `save_cache_state_direct` wipe those
+        // caches + `cached_token_history`, making the delta turn both depend
+        // on and then destroy the session — confusing and wrong. Reject early
+        // so no state is mutated.
+        if config.reuse_cache == Some(false) {
+            return Err(Error::from_reason(
+                "chat_tokens_delta_sync requires reuse_cache to be enabled; \
+                 the delta path operates on session state by construction",
+            ));
+        }
         if self.cached_token_history.is_empty() {
             return Err(Error::from_reason(
                 "chat_tokens_delta_sync requires an initialized session (call chat_session_start first)",
@@ -2056,7 +2068,15 @@ impl Gemma4Inner {
             return;
         }
 
-        // --- Same four guards as chat_tokens_delta_sync ---
+        // --- Same five guards as chat_tokens_delta_sync ---
+        if config.reuse_cache == Some(false) {
+            chat_common::send_stream_error(
+                &stream_tx,
+                "chat_tokens_delta_sync requires reuse_cache to be enabled; \
+                 the delta path operates on session state by construction",
+            );
+            return;
+        }
         if self.cached_token_history.is_empty() {
             chat_common::send_stream_error(
                 &stream_tx,
