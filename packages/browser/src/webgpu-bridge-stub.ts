@@ -20,6 +20,7 @@ import {
   STATUS_INDEX,
   CALLBACK_ENTRY_SIZE,
   MAX_CALLBACKS_PER_CALL,
+  MAX_RELEASE_BATCH,
   STATS_OPCODE_SLOTS,
   STATS_CALLBACK_SLOTS,
   STATS_INLINE_OFFSET,
@@ -37,6 +38,18 @@ export interface BridgeStats {
   poolHits: number;
   /** Buffer pool misses: creates that fell through to a real RPC. */
   poolMisses: number;
+  /** DIAG: wgpuDeviceCreateBuffer entry count (all paths). */
+  diagCreateAll: number;
+  /** DIAG: mapped-at-creation + COPY_DST path (fake handle, deferred). */
+  diagCreateMappedCopyDst: number;
+  /** DIAG: mapped-at-creation WITHOUT COPY_DST (falls through to RPC). */
+  diagCreateMappedNoCopyDst: number;
+  /** DIAG: wgpuBufferRelease entry count (all paths). */
+  diagReleaseAll: number;
+  /** DIAG: release of an unknown handle (no size/usage entry). */
+  diagReleaseUnknownHandle: number;
+  /** DIAG: release rejected by isPoolable (fake handle, MAP_* usage). */
+  diagReleaseUnpoolable: number;
 }
 
 export interface GpuWorkerStats {
@@ -44,6 +57,10 @@ export interface GpuWorkerStats {
   totalRpcs: number;
   /** Histogram keyed by RpcFn numeric value (gpu-worker's view). */
   byFn: Record<number, number>;
+  /** Cumulative GPU-worker-side buffer pool hits since its last reset. */
+  gpuPoolHits: number;
+  /** Cumulative GPU-worker-side buffer pool misses since its last reset. */
+  gpuPoolMisses: number;
 }
 
 export interface BridgeStub {
@@ -66,6 +83,20 @@ export interface BridgeStub {
   fetchGpuWorkerStats(resetAfter: boolean): GpuWorkerStats;
 }
 
+// Shared pool-stats SAB layout: 10 u32 slots (all Atomics.add).
+//   0: poolHits
+//   1: poolMisses
+//   2: diagCreateAll
+//   3: diagCreateMappedCopyDst
+//   4: diagCreateMappedNoCopyDst
+//   5: diagReleaseAll
+//   6: diagReleaseUnknownHandle
+//   7: diagReleaseUnpoolable
+//   8: diagPoolEvictions
+//   9: reserved
+export const POOL_STATS_SLOTS = 10;
+export const POOL_STATS_SIZE_BYTES = POOL_STATS_SLOTS * 4;
+
 export function createBridgeStub(
   cmdBuffer: SharedArrayBuffer,
   wasmMemory: WebAssembly.Memory,
@@ -80,6 +111,8 @@ export function createBridgeStub(
   readbackBuffer?: SharedArrayBuffer,
   /** GPU feature flags for local resolution (no RPC needed) */
   gpuFeatures?: { shaderF16?: boolean; subgroups?: boolean; timestampQuery?: boolean },
+  /** Shared pool-stats SAB for cross-worker aggregation (nullable). */
+  poolStatsBuffer?: SharedArrayBuffer,
 ): BridgeStub {
   const cmdView = new Int32Array(cmdBuffer);
   const cmdDataView = new DataView(cmdBuffer);
@@ -183,8 +216,33 @@ export function createBridgeStub(
   // on overflow (shift from the front when the bucket is full).
   const bufferPool = new Map<string, number[]>();
   const POOL_CAP_PER_KEY = 32;
+
+  // Phase 1' release batching: accumulate wgpuBufferRelease handles and
+  // flush them in one BUFFER_RELEASE_BATCH RPC instead of one-per-release.
+  // BUFFER_RELEASE is ~1006/tok on Qwen3.5-0.8B; batching 32-64 per RPC
+  // drops that to ~16-32 RPCs/tok.
+  const pendingReleases: number[] = [];
+  const poolStatsArr = poolStatsBuffer ? new Int32Array(poolStatsBuffer) : null;
+  const POOL_STAT_HITS = 0;
+  const POOL_STAT_MISSES = 1;
+  const POOL_STAT_CREATE_ALL = 2;
+  const POOL_STAT_CREATE_MAPPED_COPY_DST = 3;
+  const POOL_STAT_CREATE_MAPPED_NO_COPY_DST = 4;
+  const POOL_STAT_RELEASE_ALL = 5;
+  const POOL_STAT_RELEASE_UNKNOWN = 6;
+  const POOL_STAT_RELEASE_UNPOOLABLE = 7;
+  const POOL_STAT_EVICTIONS = 8;
+  function bumpPoolStat(slot: number): void {
+    if (poolStatsArr) Atomics.add(poolStatsArr, slot, 1);
+  }
   let bufferPoolHits = 0;
   let bufferPoolMisses = 0;
+  let diagCreateAll = 0;
+  let diagCreateMappedCopyDst = 0;
+  let diagCreateMappedNoCopyDst = 0;
+  let diagReleaseAll = 0;
+  let diagReleaseUnknownHandle = 0;
+  let diagReleaseUnpoolable = 0;
 
   function poolKey(usage: number, size: number): string {
     return `${usage}:${size}`;
@@ -367,7 +425,44 @@ export function createBridgeStub(
   const I_ARG0 = CMD_OFFSET.ARG0 >>> 2; // 4
   const I_CB_COUNT = CMD_OFFSET.CALLBACK_COUNT >>> 2; // 16
 
+  // Release-batch helpers. Packs pending handles into the UNIFORM_DATA region
+  // (192..447 = 64 u32 slots) and fires a single BUFFER_RELEASE_BATCH RPC.
+  // MUST be called before any non-batch RPC so the gpu-worker processes the
+  // releases in the correct order relative to subsequent creates/dispatches.
+  const I_UNIFORM = CMD_OFFSET.UNIFORM_DATA >>> 2; // 48
+  function flushPendingReleases(): void {
+    const count = pendingReleases.length;
+    if (count === 0) return;
+    for (let i = 0; i < count; i++) {
+      cmdU32[I_UNIFORM + i] = pendingReleases[i]! >>> 0;
+    }
+    pendingReleases.length = 0; // clear BEFORE rpcCall to avoid re-entrant flush
+    rpcCall(RpcFn.BUFFER_RELEASE_BATCH, count);
+  }
+  function queueRelease(handle: number): void {
+    pendingReleases.push(handle);
+    if (pendingReleases.length >= MAX_RELEASE_BATCH) {
+      flushPendingReleases();
+    }
+  }
+
   function rpcCall(fnId: number, a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0): number {
+    // Flush any queued releases before *other* RPCs so the gpu-worker
+    // observes them before the next dispatch/create. Skip for:
+    //   - BUFFER_RELEASE_BATCH itself (re-entrancy guard — flushPendingReleases
+    //     calls rpcCall with this fnId)
+    //   - FUSED_DISPATCH_WITH_UNIFORM: the caller has already written inline
+    //     uniform data into the UNIFORM_DATA region. flushPendingReleases
+    //     would trample those bytes, silently corrupting the dispatch.
+    //     The dispatch hot path (wgpuComputePassEncoderDispatchWorkgroups)
+    //     explicitly flushes at the top instead.
+    if (
+      pendingReleases.length > 0 &&
+      fnId !== RpcFn.BUFFER_RELEASE_BATCH &&
+      fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM
+    ) {
+      flushPendingReleases();
+    }
     // Phase 0: exclude GET_STATS from the bridge histogram so a profile
     // readback does not skew its own numbers.
     if (fnId !== RpcFn.GET_STATS) {
@@ -587,6 +682,8 @@ export function createBridgeStub(
 
     // ===== Device =====
     wgpuDeviceCreateBuffer(_device: number, descPtr: number): number {
+      diagCreateAll++;
+      bumpPoolStat(POOL_STAT_CREATE_ALL);
       // WGPUBufferDescriptor (WASM32 layout):
       //   +0  nextInChain (ptr, 4 bytes)
       //   +4  label (ptr, 4 bytes)
@@ -605,6 +702,8 @@ export function createBridgeStub(
         const usage = view.getUint32(descPtr + 8, true);
         const COPY_DST = 0x0008;
         if (usage & COPY_DST) {
+          diagCreateMappedCopyDst++;
+          bumpPoolStat(POOL_STAT_CREATE_MAPPED_COPY_DST);
           // Fully deferred: return a FAKE handle (0 RPCs).
           // The real GPU buffer is created during wgpuBufferUnmap via CREATE_BUFFER_FROM_DATA.
           const sizeLo = view.getUint32(descPtr + 16, true);
@@ -617,6 +716,8 @@ export function createBridgeStub(
           bufSizes[fakeHandle] = size;
           return fakeHandle;
         }
+        diagCreateMappedNoCopyDst++;
+        bumpPoolStat(POOL_STAT_CREATE_MAPPED_NO_COPY_DST);
         // No COPY_DST: fall through to normal RPC (gpu-worker handles mapping)
       }
 
@@ -633,11 +734,13 @@ export function createBridgeStub(
           // Drop empty buckets so bufferPool doesn't accumulate dead (usage,size) keys.
           if (stack.length === 0) bufferPool.delete(key);
           bufferPoolHits++;
+          bumpPoolStat(POOL_STAT_HITS);
           bufSizes[reused] = size;
           bufferUsages[reused] = usage;
           return reused;
         }
         bufferPoolMisses++;
+        bumpPoolStat(POOL_STAT_MISSES);
       }
 
       const h2 = rpcCall(RpcFn.DEVICE_CREATE_BUFFER, descPtr);
@@ -919,6 +1022,13 @@ export function createBridgeStub(
     },
 
     wgpuComputePassEncoderDispatchWorkgroups(passHandle: number, x: number, y: number, z: number): void {
+      // FUSED_DISPATCH_WITH_UNIFORM pre-writes uniform bytes into the SAB
+      // UNIFORM_DATA region, so rpcCall's flush-at-entry is disabled for it.
+      // Flush here instead, BEFORE any SAB writes, so the gpu-worker sees
+      // pending releases before the next dispatch.
+      if (pendingReleases.length > 0) {
+        flushPendingReleases();
+      }
       if (pendingPipeline >= 0 && pendingBindGroup >= 0 && pendingBindGroup1 >= 0) {
         // 2 bind groups: materialize any fake handles and use FUSED_DISPATCH_2BG
         flushPendingWrites();
@@ -1233,6 +1343,8 @@ export function createBridgeStub(
     },
 
     wgpuBufferRelease(handle: number): void {
+      diagReleaseAll++;
+      bumpPoolStat(POOL_STAT_RELEASE_ALL);
       // Drop any deferred writeBuffer keyed by this raw handle. MUST run before
       // any early-return branch: for fake mappedAtCreation / deferred-creation
       // handles, resolveBufferHandle() returns the raw fake id (no remap exists),
@@ -1283,6 +1395,13 @@ export function createBridgeStub(
       // Try to pool the real handle instead of releasing to the gpu-worker.
       const size = bufSizes[resolved];
       const usage = bufferUsages[resolved];
+      if (size === undefined || usage === undefined) {
+        diagReleaseUnknownHandle++;
+        bumpPoolStat(POOL_STAT_RELEASE_UNKNOWN);
+      } else if (!isPoolable(resolved, usage)) {
+        diagReleaseUnpoolable++;
+        bumpPoolStat(POOL_STAT_RELEASE_UNPOOLABLE);
+      }
       if (size !== undefined && usage !== undefined && isPoolable(resolved, usage)) {
         const key = poolKey(usage, size);
         let stack = bufferPool.get(key);
@@ -1296,14 +1415,15 @@ export function createBridgeStub(
         }
         // Pool full: evict oldest (FIFO) and release it, then pool the new one.
         const evicted = stack.shift()!;
-        rpcCall(RpcFn.BUFFER_RELEASE, evicted);
+        bumpPoolStat(POOL_STAT_EVICTIONS);
+        queueRelease(evicted);
         delete bufSizes[evicted];
         delete bufferUsages[evicted];
         stack.push(resolved);
         return;
       }
 
-      rpcCall(RpcFn.BUFFER_RELEASE, resolved);
+      queueRelease(resolved);
       if (size !== undefined) delete bufSizes[resolved];
       if (usage !== undefined) delete bufferUsages[resolved];
     },
@@ -1376,7 +1496,41 @@ export function createBridgeStub(
         byFn[i] = bridgeFnCounts[i];
       }
     }
-    return { rpcCount: bridgeRpcCount, byFn, poolHits: bufferPoolHits, poolMisses: bufferPoolMisses };
+    // Read cumulative counters from the shared pool-stats SAB (every stub
+    // Atomics.adds into this region), not from the per-instance locals —
+    // the per-instance counters only cover calls made through *this* stub
+    // (e.g. the mlx-worker main thread), which misses the pthread workers
+    // that actually do the decode work.
+    let ph = bufferPoolHits;
+    let pm = bufferPoolMisses;
+    let dCreateAll = diagCreateAll;
+    let dCreateMCD = diagCreateMappedCopyDst;
+    let dCreateMNCD = diagCreateMappedNoCopyDst;
+    let dRelAll = diagReleaseAll;
+    let dRelUnk = diagReleaseUnknownHandle;
+    let dRelUnp = diagReleaseUnpoolable;
+    if (poolStatsArr) {
+      ph = Atomics.load(poolStatsArr, POOL_STAT_HITS);
+      pm = Atomics.load(poolStatsArr, POOL_STAT_MISSES);
+      dCreateAll = Atomics.load(poolStatsArr, POOL_STAT_CREATE_ALL);
+      dCreateMCD = Atomics.load(poolStatsArr, POOL_STAT_CREATE_MAPPED_COPY_DST);
+      dCreateMNCD = Atomics.load(poolStatsArr, POOL_STAT_CREATE_MAPPED_NO_COPY_DST);
+      dRelAll = Atomics.load(poolStatsArr, POOL_STAT_RELEASE_ALL);
+      dRelUnk = Atomics.load(poolStatsArr, POOL_STAT_RELEASE_UNKNOWN);
+      dRelUnp = Atomics.load(poolStatsArr, POOL_STAT_RELEASE_UNPOOLABLE);
+    }
+    return {
+      rpcCount: bridgeRpcCount,
+      byFn,
+      poolHits: ph,
+      poolMisses: pm,
+      diagCreateAll: dCreateAll,
+      diagCreateMappedCopyDst: dCreateMCD,
+      diagCreateMappedNoCopyDst: dCreateMNCD,
+      diagReleaseAll: dRelAll,
+      diagReleaseUnknownHandle: dRelUnk,
+      diagReleaseUnpoolable: dRelUnp,
+    };
   }
 
   function resetBridgeStats(): void {
@@ -1384,6 +1538,15 @@ export function createBridgeStub(
     bridgeFnCounts.fill(0);
     bufferPoolHits = 0;
     bufferPoolMisses = 0;
+    diagCreateAll = 0;
+    diagCreateMappedCopyDst = 0;
+    diagCreateMappedNoCopyDst = 0;
+    diagReleaseAll = 0;
+    diagReleaseUnknownHandle = 0;
+    diagReleaseUnpoolable = 0;
+    if (poolStatsArr) {
+      for (let i = 0; i < POOL_STATS_SLOTS; i++) Atomics.store(poolStatsArr, i, 0);
+    }
   }
 
   function fetchGpuWorkerStats(resetAfter: boolean): GpuWorkerStats {
@@ -1406,7 +1569,14 @@ export function createBridgeStub(
       const v = cmdU32[reservedBase + i];
       if (v > 0) byFn[STATS_CALLBACK_SLOTS + STATS_INLINE_SLOTS + i] = v;
     }
-    return { totalRpcs, byFn };
+    // Pool hit/miss counters smuggled by the gpu-worker into reserved slots
+    // 100 and 101 (max real RpcFn opcode is 99). Remove them from byFn so
+    // they don't render as fake opcodes in the histogram.
+    const gpuPoolHits = byFn[100] ?? 0;
+    const gpuPoolMisses = byFn[101] ?? 0;
+    delete byFn[100];
+    delete byFn[101];
+    return { totalRpcs, byFn, gpuPoolHits, gpuPoolMisses };
   }
 
   return {

@@ -182,6 +182,71 @@ worker.onmessage = (e) => {
       break;
     }
 
+    case 'profile': {
+      // Phase 0 observability readout. The payload is a cumulative snapshot
+      // taken right after chat/chatStream completes. We format a single
+      // summary line into the log panel so we can eyeball dispatches/token
+      // without plumbing it through perf.
+      const s = data.stats as {
+        numTokens: number;
+        totalDispatches: number;
+        totalPassEnds: number;
+        bridgeRpcCount: number;
+        bridgeByFn: Record<number, number>;
+        gpuRpcCount: number;
+        gpuByFn: Record<number, number>;
+        poolHits?: number;
+        poolMisses?: number;
+        gpuPoolHits?: number;
+        gpuPoolMisses?: number;
+        diagCreateAll?: number;
+        diagCreateMappedCopyDst?: number;
+        diagCreateMappedNoCopyDst?: number;
+        diagReleaseAll?: number;
+        diagReleaseUnknownHandle?: number;
+        diagReleaseUnpoolable?: number;
+      };
+      const n = Math.max(1, s.numTokens);
+      const dpt = s.totalDispatches / n;
+      const rpt = s.bridgeRpcCount / n;
+      const ept = s.totalPassEnds / n;
+      const gptRpc = s.gpuRpcCount / n;
+      // Emit every non-zero opcode from the gpu-worker histogram, sorted
+      // descending. We need the full picture to diagnose whether the
+      // bottleneck is compute-pass overhead or buffer-lifecycle churn.
+      const allOps = Object.entries(s.gpuByFn)
+        .map(([k, v]) => ({ op: Number(k), count: v }))
+        .filter(({ count }) => count > 0)
+        .sort((a, b) => b.count - a.count)
+        .map(({ op, count }) => `${rpcFnName(op)}(${count}, ${(count / n).toFixed(1)}/t)`)
+        .join(', ');
+      log(
+        `[profile] Decode ${s.numTokens} tok | dispatches=${s.totalDispatches} (${dpt.toFixed(1)}/tok) | ` +
+          `bridgeRPCs=${s.bridgeRpcCount} (${rpt.toFixed(1)}/tok) | ` +
+          `gpuRPCs=${s.gpuRpcCount} (${gptRpc.toFixed(1)}/tok) | ` +
+          `pass_ends=${s.totalPassEnds} (${ept.toFixed(1)}/tok)`,
+      );
+      log(`[profile] opcodes: ${allOps}`);
+      const ph = s.poolHits ?? 0;
+      const pm = s.poolMisses ?? 0;
+      const pt = ph + pm;
+      const phRate = pt > 0 ? ((ph / pt) * 100).toFixed(1) : '0.0';
+      log(
+        `[profile] pool: hits=${ph} (${(ph / n).toFixed(1)}/tok) misses=${pm} (${(pm / n).toFixed(1)}/tok) hitRate=${phRate}%`,
+      );
+      const gph = s.gpuPoolHits ?? 0;
+      const gpm = s.gpuPoolMisses ?? 0;
+      const gpt = gph + gpm;
+      const gphRate = gpt > 0 ? ((gph / gpt) * 100).toFixed(1) : '0.0';
+      log(
+        `[profile] gpu-pool: hits=${gph} (${(gph / n).toFixed(1)}/tok) misses=${gpm} (${(gpm / n).toFixed(1)}/tok) hitRate=${gphRate}%`,
+      );
+      log(
+        `[profile] diag: createAll=${s.diagCreateAll ?? 0} (mappedCopyDst=${s.diagCreateMappedCopyDst ?? 0}, mappedNoCopyDst=${s.diagCreateMappedNoCopyDst ?? 0}) | releaseAll=${s.diagReleaseAll ?? 0} (unknownHandle=${s.diagReleaseUnknownHandle ?? 0}, unpoolable=${s.diagReleaseUnpoolable ?? 0})`,
+      );
+      break;
+    }
+
     case 'error':
       log(`Error: ${data.message}`);
       if (currentResponseDiv) {
@@ -196,6 +261,122 @@ worker.onmessage = (e) => {
       break;
   }
 };
+
+// Phase 0: minimal opcode → name mapping for the profile line. Keeps the
+// demo free of a runtime import of the const-enum RpcFn from rpc-protocol.ts
+// (which is inlined by tsdown and wouldn't produce a reverse mapping).
+function rpcFnName(fn: number): string {
+  switch (fn) {
+    case 1:
+      return 'CREATE_INSTANCE';
+    case 2:
+      return 'INSTANCE_REQUEST_ADAPTER';
+    case 3:
+      return 'INSTANCE_RELEASE';
+    case 4:
+      return 'ADAPTER_REQUEST_DEVICE';
+    case 5:
+      return 'ADAPTER_RELEASE';
+    case 6:
+      return 'ADAPTER_GET_PROPERTIES';
+    case 10:
+      return 'DEVICE_CREATE_BUFFER';
+    case 11:
+      return 'DEVICE_CREATE_SHADER_MODULE';
+    case 12:
+      return 'DEVICE_CREATE_COMPUTE_PIPELINE';
+    case 13:
+      return 'DEVICE_CREATE_BIND_GROUP';
+    case 14:
+      return 'DEVICE_CREATE_COMMAND_ENCODER';
+    case 15:
+      return 'DEVICE_GET_QUEUE';
+    case 16:
+      return 'DEVICE_GET_LIMITS';
+    case 17:
+      return 'DEVICE_SET_ERROR_CALLBACK';
+    case 18:
+      return 'DEVICE_SET_LOST_CALLBACK';
+    case 19:
+      return 'DEVICE_RELEASE';
+    case 20:
+      return 'QUEUE_SUBMIT';
+    case 21:
+      return 'QUEUE_WRITE_BUFFER';
+    case 22:
+      return 'QUEUE_ON_SUBMITTED_WORK_DONE';
+    case 23:
+      return 'QUEUE_RELEASE';
+    case 30:
+      return 'CMD_ENCODER_BEGIN_COMPUTE_PASS';
+    case 31:
+      return 'CMD_ENCODER_COPY_BUFFER';
+    case 32:
+      return 'CMD_ENCODER_FINISH';
+    case 33:
+      return 'CMD_ENCODER_RELEASE';
+    case 34:
+      return 'CMD_BUFFER_RELEASE';
+    case 40:
+      return 'COMPUTE_PASS_SET_PIPELINE';
+    case 41:
+      return 'COMPUTE_PASS_SET_BIND_GROUP';
+    case 42:
+      return 'COMPUTE_PASS_DISPATCH';
+    case 43:
+      return 'COMPUTE_PASS_END';
+    case 44:
+      return 'COMPUTE_PASS_RELEASE';
+    case 50:
+      return 'BUFFER_GET_SIZE';
+    case 51:
+      return 'BUFFER_GET_MAPPED_RANGE';
+    case 52:
+      return 'BUFFER_GET_CONST_MAPPED_RANGE';
+    case 53:
+      return 'BUFFER_UNMAP';
+    case 54:
+      return 'BUFFER_MAP_ASYNC';
+    case 55:
+      return 'BUFFER_DESTROY';
+    case 56:
+      return 'BUFFER_RELEASE';
+    case 60:
+      return 'PIPELINE_GET_BIND_GROUP_LAYOUT';
+    case 61:
+      return 'PIPELINE_RELEASE';
+    case 70:
+      return 'BIND_GROUP_RELEASE';
+    case 71:
+      return 'BIND_GROUP_LAYOUT_RELEASE';
+    case 72:
+      return 'SHADER_MODULE_RELEASE';
+    case 80:
+      return 'POLL';
+    case 90:
+      return 'ADD_GPU_BUFFER';
+    case 91:
+      return 'FUSED_DISPATCH';
+    case 92:
+      return 'FUSED_DISPATCH_2BG';
+    case 93:
+      return 'FUSED_SUBMIT';
+    case 94:
+      return 'FUSED_BG_DISPATCH';
+    case 95:
+      return 'CREATE_BUFFER_FROM_DATA';
+    case 96:
+      return 'FUSED_FULL_DISPATCH';
+    case 97:
+      return 'FUSED_DISPATCH_WITH_UNIFORM';
+    case 98:
+      return 'FUSED_COPY_BUFFER';
+    case 99:
+      return 'GET_STATS';
+    default:
+      return `fn${fn}`;
+  }
+}
 
 worker.onerror = (e) => {
   log(`Worker error: ${e.message || e}`);
@@ -219,12 +400,27 @@ worker.addEventListener('messageerror', (e) => {
 // ?sdpa_fallback=1 forces the WebGPU SDPA primitive onto the decomposed
 // matmul→softmax→matmul path, bypassing the fused vector / tile kernels.
 // Used for A/B-ing TTFT against the fused tile kernel without a rebuild.
+//
+// ?profile=1 enables Phase 0 dispatch-stats observability. When set, the
+// mlx-worker wraps each chat/chatStream call with a reset + readback of
+// the C++ dispatch counters, the wasm-worker RPC histogram, and the
+// gpu-worker RPC histogram. The result lands in the log panel as a
+// single summary line so we can verify the decode dispatches-per-token
+// bottleneck without a rebuild.
 const urlParams = new URLSearchParams(location.search);
 const packBf16 = urlParams.get('pack_bf16') !== '0'; // enabled by default, ?pack_bf16=0 to disable
 const sdpaFallback = urlParams.get('sdpa_fallback') === '1';
+const profile = urlParams.get('profile') === '1';
+const useSab = urlParams.get('stream_sab') !== '0'; // enabled by default, ?stream_sab=0 to fall back to TSFN
+// ?mode=baseline | sab | tsfn — diagnostic A/B for the streaming path.
+// baseline = non-streaming chat() (ground-truth compute, no sink overhead).
+const modeParam = urlParams.get('mode') as 'sab' | 'tsfn' | 'baseline' | null;
 const flagBadges =
   (packBf16 ? ' (pack_bf16=1)' : '') +
-  (sdpaFallback ? ' (sdpa_fallback=1)' : '');
+  (sdpaFallback ? ' (sdpa_fallback=1)' : '') +
+  (profile ? ' (profile=1)' : '') +
+  (useSab ? '' : ' (stream_sab=0)') +
+  (modeParam ? ` (mode=${modeParam})` : '');
 log(`Starting MLX Worker${flagBadges}...`);
 setStatus('Initializing...', 'info');
 worker.postMessage({
@@ -233,6 +429,7 @@ worker.postMessage({
   modelUrl: '/model',
   packBf16,
   sdpaFallback,
+  profile,
 });
 
 // Chat handler
@@ -276,6 +473,8 @@ function handleSend() {
     type: 'chat',
     messages: [...messages],
     config: { maxNewTokens: 512, temperature: 0, reportPerformance: true },
+    useSab,
+    mode: modeParam ?? undefined,
   });
 }
 

@@ -25,28 +25,48 @@ TextDecoder.prototype.decode = function (input?: BufferSource | null, options?: 
 
 import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-runtime';
 
-import { createSabRing } from './chat-stream-sab.js';
+import { createSabRingOverHeap } from './chat-stream-sab.js';
 import { CMD_OFFSET, READBACK_BUFFER_SIZE } from './rpc-protocol.js';
 import { parseSafeTensorsHeader, dtypeToCode } from './safetensors.js';
-import { createBridgeStub } from './webgpu-bridge-stub.js';
+import { createBridgeStub, POOL_STATS_SIZE_BYTES, type BridgeStub } from './webgpu-bridge-stub.js';
 
 let model: any = null;
 let mlxExports: any = null;
 let wasmInst: WebAssembly.Instance | null = null;
 let cppTag: any = null;
+let wasmMemory: WebAssembly.Memory | null = null;
+let wasmMalloc: ((size: number) => number) | null = null;
+let wasmFree: ((ptr: number) => void) | null = null;
+
+// Phase 0 (?profile=1) state. When enabled, handleChat* wraps each
+// generation with a reset + readback of:
+//   - wasm-worker rpcCall histogram (bridge.getBridgeStats)
+//   - gpu-worker rpcCount histogram (bridge.fetchGpuWorkerStats)
+//   - C++ WebGPU dispatch counters (mlxExports.wgpuGetDispatchStats)
+// Then posts a {type:'profile', stats:...} message to the main thread.
+let profileEnabled = false;
+let bridgeRef: BridgeStub | null = null;
 
 function post(msg: any) {
   (self as any).postMessage(msg);
 }
 
-async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: boolean; sdpaFallback?: boolean }) {
+async function handleInit(data: {
+  wasmUrl: string;
+  modelUrl: string;
+  packBf16?: boolean;
+  sdpaFallback?: boolean;
+  profile?: boolean;
+}) {
   const packBf16 = data.packBf16 === true;
   const sdpaFallback = data.sdpaFallback === true;
+  profileEnabled = data.profile === true;
   try {
     // 1. Spawn gpu-worker (owns GPUDevice, event loop free for GPU callbacks)
     post({ type: 'progress', step: 'gpu', message: 'Initializing WebGPU...' });
     const cmdBuffer = new SharedArrayBuffer(CMD_OFFSET.TOTAL);
     const readbackBuffer = new SharedArrayBuffer(READBACK_BUFFER_SIZE);
+    const poolStatsBuffer = new SharedArrayBuffer(POOL_STATS_SIZE_BYTES);
     // WASM module requires min 1002 pages (~66 MB). We use 4096 (~268 MB)
     // for headroom during WASM init (thread stacks, emnapi, etc.) and let
     // memory.grow expand as needed — keeps total well under the 2 GB JS
@@ -57,6 +77,7 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
       maximum: 65536,
       shared: true,
     });
+    wasmMemory = sharedMemory;
 
     const gpuWorker = new Worker(new URL('./gpu-worker.ts', import.meta.url), { type: 'module' });
 
@@ -87,7 +108,11 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
       },
       readbackBuffer,
       gpuReady.features,
+      poolStatsBuffer,
     );
+    // Retain for ?profile=1 readback (resetBridgeStats / fetchGpuWorkerStats
+    // need the same BridgeStub instance that owns the SAB cmdBuffer view).
+    bridgeRef = bridge;
 
     // 3. Load WASM with bridge stub
     post({ type: 'progress', step: 'wasm', message: 'Loading WASM module...' });
@@ -120,9 +145,26 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
     const cppExceptionTag = new WebAssembly.Tag({ parameters: ['i32'] });
     cppTag = cppExceptionTag;
 
+    // Task 4's SabSink declares extern "C" fn __wasm_i32_atomic_wait /
+    // __wasm_atomic_notify expecting LLVM compiler-rt builtins, but wasm-ld
+    // emits them as host imports on wasm32-wasip1-threads. Provide JS stubs
+    // that wrap Atomics.wait / Atomics.notify over the shared memory.
+    // Cache the Int32Array view once (shared memory never detaches, so the
+    // view stays valid for the lifetime of the worker). Avoids per-call
+    // TypedArray construction on the hot atomic notify path.
+    const sharedI32 = new Int32Array(sharedMemory.buffer);
     const cxxStubs = {
       __cpp_exception: cppExceptionTag,
       _ZN3mlx4core3gpu4initEv: () => {},
+      __wasm_i32_atomic_wait: (ptr: number, expected: number, timeoutNs: bigint): number => {
+        const index = ptr >>> 2;
+        const timeoutMs = timeoutNs === -1n ? Infinity : Number(timeoutNs / 1_000_000n);
+        const result = Atomics.wait(sharedI32, index, expected, timeoutMs);
+        return result === 'ok' ? 0 : result === 'not-equal' ? 1 : 2;
+      },
+      __wasm_atomic_notify: (ptr: number, count: number): number => {
+        return Atomics.notify(sharedI32, ptr >>> 2, count);
+      },
     };
 
     const { napiModule } = await instantiateNapiModule(wasmFile, {
@@ -141,6 +183,7 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
           type: '__mlx_rpc_config',
           cmdBuffer,
           readbackBuffer,
+          poolStatsBuffer,
           handles: {
             instanceHandle: gpuReady.instanceHandle,
             adapterHandle: gpuReady.adapterHandle,
@@ -254,8 +297,10 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
     // alive at a time), avoiding the i32 offset overflow that kills bulk loading.
     // After all tensors, buildModelFromCpuTensors drains the Rust accumulator.
     post({ type: 'progress', step: 'init_model', message: 'Parsing safetensors header...' });
-    const wasmMalloc = wasmInst!.exports.malloc as (size: number) => number;
-    const wasmFree = wasmInst!.exports.free as (ptr: number) => void;
+    wasmMalloc = wasmInst!.exports.malloc as (size: number) => number;
+    wasmFree = wasmInst!.exports.free as (ptr: number) => void;
+    const localWasmMalloc = wasmMalloc;
+    const localWasmFree = wasmFree;
 
     const { tensors, dataOffset } = parseSafeTensorsHeader(weightsBuffer.buffer);
     post({ type: 'log', message: `[CPU] Parsed ${tensors.length} tensors, dataOffset=${dataOffset}` });
@@ -274,7 +319,7 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
       if (t.byteSize === 0) continue;
 
       // Malloc a small WASM buffer for this single tensor
-      const ptr = wasmMalloc(t.byteSize);
+      const ptr = localWasmMalloc(t.byteSize);
       if (ptr === 0) {
         throw new Error(`Failed to malloc ${t.byteSize} bytes for tensor "${t.name}" (${i}/${tensors.length})`);
       }
@@ -287,7 +332,7 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
 
       // Create MLX array in Rust (C++ copies from pointer) then free WASM buffer
       Qwen35Model.addCpuTensor(t.name, uptr, t.byteSize, t.shape, dtypeToCode(t.dtype));
-      wasmFree(ptr);
+      localWasmFree(ptr);
 
       if (i % 50 === 0) {
         post({ type: 'progress', step: 'init_model', message: `Loaded ${i}/${tensors.length} tensors...` });
@@ -312,7 +357,133 @@ async function handleInit(data: { wasmUrl: string; modelUrl: string; packBf16?: 
   }
 }
 
-async function handleChat(data: { messages: any[]; config?: any }) {
+const SAB_RING_SIZE = 262_144;
+
+// Phase 0 (?profile=1) helpers. These are no-ops unless profileEnabled is
+// true — each chat/chatStream handler calls resetProfileCounters() before
+// generation and postProfileSnapshot() after. See the 'profile' message
+// handler in demo/app.ts for the display side.
+function resetProfileCounters(): void {
+  if (!profileEnabled) return;
+  try {
+    bridgeRef?.resetBridgeStats();
+  } catch (e) {
+    console.warn('[mlx-worker] resetBridgeStats failed:', e);
+  }
+  try {
+    if (mlxExports && typeof mlxExports.wgpuResetDispatchStats === 'function') {
+      mlxExports.wgpuResetDispatchStats();
+    }
+  } catch (e) {
+    console.warn('[mlx-worker] wgpuResetDispatchStats failed:', e);
+  }
+  try {
+    // Zero the gpu-worker histogram too (reset=1 on the RPC).
+    bridgeRef?.fetchGpuWorkerStats(true);
+  } catch (e) {
+    console.warn('[mlx-worker] fetchGpuWorkerStats(reset=true) failed:', e);
+  }
+}
+
+function postProfileSnapshot(numTokens: number): void {
+  if (!profileEnabled) return;
+  try {
+    const bridgeStats =
+      bridgeRef?.getBridgeStats() ??
+      ({
+        rpcCount: 0,
+        byFn: {},
+        poolHits: 0,
+        poolMisses: 0,
+        diagCreateAll: 0,
+        diagCreateMappedCopyDst: 0,
+        diagCreateMappedNoCopyDst: 0,
+        diagReleaseAll: 0,
+        diagReleaseUnknownHandle: 0,
+        diagReleaseUnpoolable: 0,
+      } as any);
+    const gpuStats = bridgeRef?.fetchGpuWorkerStats(false) ?? {
+      totalRpcs: 0,
+      byFn: {},
+      gpuPoolHits: 0,
+      gpuPoolMisses: 0,
+    };
+    let totalDispatches = 0;
+    let totalPassEnds = 0;
+    if (mlxExports && typeof mlxExports.wgpuGetDispatchStats === 'function') {
+      const arr = mlxExports.wgpuGetDispatchStats() as number[];
+      totalDispatches = arr[0] ?? 0;
+      totalPassEnds = arr[1] ?? 0;
+    }
+    post({
+      type: 'profile',
+      stats: {
+        numTokens,
+        totalDispatches,
+        totalPassEnds,
+        bridgeRpcCount: bridgeStats.rpcCount,
+        bridgeByFn: bridgeStats.byFn,
+        gpuRpcCount: gpuStats.totalRpcs,
+        gpuByFn: gpuStats.byFn,
+        gpuPoolHits: gpuStats.gpuPoolHits,
+        gpuPoolMisses: gpuStats.gpuPoolMisses,
+        poolHits: bridgeStats.poolHits,
+        poolMisses: bridgeStats.poolMisses,
+        diagCreateAll: (bridgeStats as any).diagCreateAll ?? 0,
+        diagCreateMappedCopyDst: (bridgeStats as any).diagCreateMappedCopyDst ?? 0,
+        diagCreateMappedNoCopyDst: (bridgeStats as any).diagCreateMappedNoCopyDst ?? 0,
+        diagReleaseAll: (bridgeStats as any).diagReleaseAll ?? 0,
+        diagReleaseUnknownHandle: (bridgeStats as any).diagReleaseUnknownHandle ?? 0,
+        diagReleaseUnpoolable: (bridgeStats as any).diagReleaseUnpoolable ?? 0,
+      },
+    });
+  } catch (e) {
+    console.warn('[mlx-worker] postProfileSnapshot failed:', e);
+  }
+}
+
+async function handleChat(data: {
+  messages: any[];
+  config?: any;
+  useSab?: boolean;
+  mode?: 'sab' | 'tsfn' | 'baseline';
+}) {
+  if (!wasmMemory || !wasmMalloc || !wasmFree) {
+    post({ type: 'error', message: 'handleChat called before WASM init complete' });
+    return;
+  }
+  const mode = data.mode ?? (data.useSab === false ? 'tsfn' : 'sab');
+
+  if (mode === 'tsfn') {
+    await handleChatTsfn(data);
+    return;
+  }
+  if (mode === 'baseline') {
+    await handleChatBaseline(data);
+    return;
+  }
+  const memory = wasmMemory;
+  const mallocFn = wasmMalloc;
+  const freeFn = wasmFree;
+
+  // Allocate the ring region INSIDE the WASM heap so that the Buffer we hand to
+  // napi-rs shares storage with the Rust SabSink. If we allocated a separate
+  // SharedArrayBuffer and wrapped it in Buffer.from, emnapi/napi-rs would copy
+  // the bytes into the WASM heap on every call, so Rust would write to a heap
+  // copy that this JS reader would never see.
+  const ringOffset = mallocFn(SAB_RING_SIZE);
+  if (ringOffset === 0) {
+    post({ type: 'error', message: `Failed to malloc ${SAB_RING_SIZE} bytes for SAB ring` });
+    return;
+  }
+
+  let freed = false;
+  const freeRing = () => {
+    if (freed) return;
+    freed = true;
+    freeFn(ringOffset);
+  };
+
   try {
     const chatConfig = {
       ...data.config,
@@ -320,27 +491,31 @@ async function handleChat(data: { messages: any[]; config?: any }) {
       reportPerformance: true,
     };
 
-    // Allocate a 256 KiB SAB ring. Keep sabRing alive for the duration of the
-    // stream so the SAB is not GC'd before the WASM producer finishes writing.
-    const sabRing = createSabRing(262_144);
-    const { sab } = sabRing;
+    const sabRing = createSabRingOverHeap(memory, ringOffset, SAB_RING_SIZE);
 
-    // Convert the SharedArrayBuffer to a Buffer for the NAPI call.
-    // The buffer polyfill supports SharedArrayBuffer at lines 134-137 of its
-    // index.js — Buffer.from(sab) creates a Uint8Array view over the SAB.
-    const sabBuf = Buffer.from(sab as unknown as ArrayBuffer);
+    // Buffer.from(arrayBuffer, offset, length) returns a zero-copy VIEW over
+    // the WASM heap. Because the underlying ArrayBuffer IS the WASM memory,
+    // napi-rs can pass the pointer through without copying — Rust's SabSink
+    // and the JS reader see the same bytes.
+    const sabBuf = Buffer.from(memory.buffer, ringOffset, SAB_RING_SIZE);
 
     const t0 = performance.now();
+    let streamResolve: (() => void) | null = null;
+    const streamDone = new Promise<void>((resolve) => {
+      streamResolve = resolve;
+    });
 
-    // Start the SAB ring reader before launching the stream so that no tokens
-    // are missed. onChunk/onError mirror the existing chatStream callback body.
-    let abortController: AbortController | null = null;
+    // Phase 0: zero all counters before the generation starts. We reset
+    // here rather than at the top of handleChat so the SAB-ring alloc
+    // doesn't skew the numbers.
+    resetProfileCounters();
 
-    abortController = sabRing.reader(
+    const abortController = sabRing.reader(
       (chunk) => {
         if (chunk.done) {
           const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
           post({ type: 'progress', step: 'chat', message: `chatStream completed in ${elapsed}s` });
+          postProfileSnapshot(chunk.numTokens ?? 0);
           post({
             type: 'result',
             text: chunk.text,
@@ -357,8 +532,8 @@ async function handleChat(data: { messages: any[]; config?: any }) {
                 }
               : null,
           });
-          // Stop the waitAsync loop now that the stream is done.
-          abortController!.abort();
+          abortController.abort();
+          streamResolve?.();
         } else {
           post({
             type: 'chunk',
@@ -369,15 +544,117 @@ async function handleChat(data: { messages: any[]; config?: any }) {
       },
       (e) => {
         post({ type: 'error', message: e.message, stack: e.stack });
+        abortController.abort();
+        streamResolve?.();
       },
     );
 
-    // Use chatStreamSab — writes directly into the SAB ring, no TSFN on the
-    // hot decode path. handle.cancel() + abortController.abort() tear down both
-    // sides cleanly if cancellation is needed in the future.
+    // chatStreamSab writes directly into the heap-backed ring — no TSFN on the
+    // hot decode path. It returns a handle once the stream is running; the
+    // reader resolves streamDone on the done chunk or on error.
     const handle = await model.chatStreamSab(data.messages, chatConfig, sabBuf);
-    // handle.cancel() available for cancellation if needed
     void handle;
+
+    await streamDone;
+  } catch (e) {
+    let message = String(e);
+    let stack: string | undefined;
+    if (e instanceof Error) {
+      message = e.message;
+      stack = e.stack;
+    }
+    post({ type: 'error', message, stack });
+  } finally {
+    freeRing();
+  }
+}
+
+async function handleChatBaseline(data: { messages: any[]; config?: any }) {
+  try {
+    const chatConfig = {
+      ...data.config,
+      enableThinking: true,
+      reportPerformance: true,
+    };
+    resetProfileCounters();
+    const t0 = performance.now();
+    const result = await model.chat(data.messages, chatConfig);
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+    post({ type: 'progress', step: 'chat', message: `chat (non-stream) completed in ${elapsed}s` });
+    postProfileSnapshot(result.numTokens ?? 0);
+    post({
+      type: 'result',
+      text: result.text,
+      rawText: result.rawText,
+      numTokens: result.numTokens,
+      finishReason: result.finishReason,
+      toolCalls: result.toolCalls,
+      thinking: result.thinking,
+      performance: result.performance
+        ? {
+            ttftMs: result.performance.ttftMs,
+            prefillTokensPerSecond: result.performance.prefillTokensPerSecond,
+            decodeTokensPerSecond: result.performance.decodeTokensPerSecond,
+          }
+        : null,
+    });
+  } catch (e) {
+    let message = String(e);
+    let stack: string | undefined;
+    if (e instanceof Error) {
+      message = e.message;
+      stack = e.stack;
+    }
+    post({ type: 'error', message, stack });
+  }
+}
+
+async function handleChatTsfn(data: { messages: any[]; config?: any }) {
+  try {
+    const chatConfig = {
+      ...data.config,
+      enableThinking: true,
+      reportPerformance: true,
+    };
+    resetProfileCounters();
+    const t0 = performance.now();
+    let doneResolve: (() => void) | null = null;
+    const doneP = new Promise<void>((r) => {
+      doneResolve = r;
+    });
+    const handle = await model.chatStream(data.messages, chatConfig, (err: Error | null, chunk: any) => {
+      if (err) {
+        post({ type: 'error', message: err.message, stack: err.stack });
+        doneResolve?.();
+        return;
+      }
+      if (chunk.done) {
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+        post({ type: 'progress', step: 'chat', message: `chatStream completed in ${elapsed}s` });
+        postProfileSnapshot(chunk.numTokens ?? 0);
+        post({
+          type: 'result',
+          text: chunk.text,
+          rawText: chunk.rawText,
+          numTokens: chunk.numTokens,
+          finishReason: chunk.finishReason,
+          toolCalls: chunk.toolCalls,
+          thinking: chunk.thinking,
+          performance: chunk.performance
+            ? {
+                ttftMs: chunk.performance.ttftMs,
+                prefillTokensPerSecond: chunk.performance.prefillTokensPerSecond,
+                decodeTokensPerSecond: chunk.performance.decodeTokensPerSecond,
+              }
+            : null,
+        });
+        doneResolve?.();
+      } else {
+        post({ type: 'chunk', text: chunk.text, isReasoning: chunk.isReasoning ?? false });
+      }
+    });
+    void handle;
+    await doneP;
   } catch (e) {
     let message = String(e);
     let stack: string | undefined;

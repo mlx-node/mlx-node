@@ -112,7 +112,52 @@ export const enum RpcFn {
   // ARG2: srcHandle, ARG3: srcOffset (u32), ARG4: dstHandle, ARG5: dstOffset (u32), ARG6: size (u32)
   // Returns: new compute pass handle
   FUSED_COPY_BUFFER = 98,
+  // Phase 0 stats readback. Reads the gpu-worker's per-opcode RPC histogram
+  // (maintained at the top of the main dispatch switch) into the SAB and
+  // returns the total RPC count via RESULT.
+  //   ARG0: reset flag (1 = zero the histogram after readback, 0 = leave as-is)
+  //   RESULT (u32): total RPCs seen by gpu-worker since last reset
+  // SAB layout for the histogram readback (written by gpu-worker):
+  //   offsets 64..64 + 4*STATS_OPCODE_SLOTS hold one u32 per RpcFn slot
+  //   (slot index = RpcFn value; only slots 0..99 are used).
+  // This uses the CALLBACK_BASE region (64..187), which is 124 bytes =
+  // 31 u32 slots. 100 opcodes * 4 bytes = 400 bytes would overrun that
+  // region, so we reuse the inline-uniform area (192..447, 256 bytes = 64
+  // slots) *plus* the callback area (31 slots) for a total of 95 slots. We
+  // stripe opcode counts into a contiguous u32 array starting at offset
+  // CALLBACK_COUNT+0 for the first STATS_OPCODE_SLOTS_A slots, then the
+  // inline-uniform area for the remainder. See wasm-worker `readStatsFromSab`.
+  GET_STATS = 99,
+  // Batched buffer release. Lets the bridge accumulate wgpuBufferRelease calls
+  // and flush them in one RPC instead of one-per-buffer. This is the biggest
+  // lever for cutting RPC round-trips during decode (BUFFER_RELEASE is
+  // ~1006/tok on Qwen3.5-0.8B — 30% of all gpu-worker RPCs).
+  //   ARG0: count (1..MAX_RELEASE_BATCH)
+  //   Handles are packed as u32s starting at CMD_OFFSET.UNIFORM_DATA (offset 192).
+  //   The UNIFORM_DATA region is 256 bytes → 64 u32 slots → cap batch at 64.
+  // gpu-worker applies the existing single-release pool logic to each handle
+  // in the batch (no RESULT is written).
+  BUFFER_RELEASE_BATCH = 102,
 }
+
+// Maximum number of handles that fit in a single BUFFER_RELEASE_BATCH RPC.
+// UNIFORM_DATA region is 256 bytes = 64 u32 slots.
+export const MAX_RELEASE_BATCH = 64;
+
+// Phase 0: total number of RpcFn histogram slots readable via GET_STATS.
+// We split the storage across three regions of the SAB:
+//   - callback-ring region (64..187)   → 31 u32 slots  (slots 0..30)
+//   - inline-uniform region (192..447) → 64 u32 slots  (slots 31..94)
+//   - reserved region       (448..511) → 16 u32 slots  (slots 95..110)
+// This covers every RpcFn currently defined (max id = 99 including the
+// FUSED_FULL_DISPATCH=96 / FUSED_DISPATCH_WITH_UNIFORM=97 / FUSED_COPY_BUFFER=98
+// opcodes that issue real compute work).
+export const STATS_OPCODE_SLOTS = 111;
+export const STATS_CALLBACK_SLOTS = 31;
+export const STATS_INLINE_OFFSET = 192;
+export const STATS_INLINE_SLOTS = 64;
+export const STATS_RESERVED_OFFSET = 448;
+export const STATS_RESERVED_SLOTS = 16;
 
 // ---- Command Buffer Layout (SharedArrayBuffer) ----
 //
@@ -127,22 +172,22 @@ export const enum RpcFn {
 
 export const CMD_OFFSET = {
   // ---- Core command fields (0..63) ----
-  FN_ID: 0,       // u32: RpcFn function ID
-  STATUS: 4,      // i32: STATUS.IDLE / PENDING / DONE (Atomics target)
-  RESULT: 8,      // u32: return value (low 32 bits)
-  RESULT_HI: 12,  // u32: high 32 bits for i64/u64 returns
-  ARG0: 16,       // u32: argument 0 (or low bits of u64 arg)
-  ARG1: 20,       // u32: argument 1
-  ARG2: 24,       // u32: argument 2
-  ARG3: 28,       // u32: argument 3
-  ARG4: 32,       // u32: argument 4
-  ARG5: 36,       // u32: argument 5
-  ARG6: 40,       // u32: argument 6
-  ARG7: 44,       // u32: argument 7
-  ARG0_HI: 48,    // u32: high bits for u64 arg0
-  ARG1_HI: 52,    // u32: high bits for u64 arg1
-  ARG2_HI: 56,    // u32: high bits for u64 arg2
-  ARG3_HI: 60,    // u32: high bits for u64 arg3
+  FN_ID: 0, // u32: RpcFn function ID
+  STATUS: 4, // i32: STATUS.IDLE / PENDING / DONE (Atomics target)
+  RESULT: 8, // u32: return value (low 32 bits)
+  RESULT_HI: 12, // u32: high 32 bits for i64/u64 returns
+  ARG0: 16, // u32: argument 0 (or low bits of u64 arg)
+  ARG1: 20, // u32: argument 1
+  ARG2: 24, // u32: argument 2
+  ARG3: 28, // u32: argument 3
+  ARG4: 32, // u32: argument 4
+  ARG5: 36, // u32: argument 5
+  ARG6: 40, // u32: argument 6
+  ARG7: 44, // u32: argument 7
+  ARG0_HI: 48, // u32: high bits for u64 arg0
+  ARG1_HI: 52, // u32: high bits for u64 arg1
+  ARG2_HI: 56, // u32: high bits for u64 arg2
+  ARG3_HI: 60, // u32: high bits for u64 arg3
 
   // ---- Callback ring (64..187) ----
   // After POLL or BUFFER_MAP_ASYNC, gpu-worker writes pending callbacks here.
@@ -150,14 +195,14 @@ export const CMD_OFFSET = {
   // CALLBACK_COUNT tells wasm-worker how many entries to process.
   // For FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM, this region holds
   // bind group entries (bufHandle:u32, sizeLo:u32, sizeHi:u32) × entryCount.
-  CALLBACK_COUNT: 64,  // u32: number of pending callbacks (0..8) or entryCount
-  CALLBACK_BASE: 68,   // start of callback entries (each 16 bytes)
+  CALLBACK_COUNT: 64, // u32: number of pending callbacks (0..8) or entryCount
+  CALLBACK_BASE: 68, // start of callback entries (each 16 bytes)
   // Entry i: fnPtr at 68 + i*16, status at 72 + i*16, userdata at 76 + i*16
 
   // ---- Inline uniform data (188..447) ----
   // Used by FUSED_DISPATCH_WITH_UNIFORM to pack writeBuffer data inline.
-  UNIFORM_DATA_SIZE: 188,  // u32: size of inline uniform data (0 = none)
-  UNIFORM_DATA: 192,       // start of inline uniform data (up to 256 bytes)
+  UNIFORM_DATA_SIZE: 188, // u32: size of inline uniform data (0 = none)
+  UNIFORM_DATA: 192, // start of inline uniform data (up to 256 bytes)
 
   // ---- Total ----
   TOTAL: 512,

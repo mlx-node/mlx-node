@@ -22,13 +22,49 @@ import {
   STATUS_INDEX,
   MAX_CALLBACKS_PER_CALL,
   CALLBACK_ENTRY_SIZE,
+  STATS_OPCODE_SLOTS,
+  STATS_CALLBACK_SLOTS,
+  STATS_INLINE_OFFSET,
+  STATS_INLINE_SLOTS,
+  STATS_RESERVED_OFFSET,
+  STATS_RESERVED_SLOTS,
 } from './rpc-protocol.js';
+
+// ---------- Phase 0 RPC Histogram (?profile=1 observability) ----------
+//
+// Per-opcode count of RpcFn dispatches handled by this worker. Bumped at
+// the very top of processCommand's switch (before any case body runs) and
+// read + optionally reset by the GET_STATS handler. The array length is
+// STATS_OPCODE_SLOTS so the readback handler can assume a fixed layout
+// regardless of how many RpcFn values exist.
+const gpuRpcCounts = new Uint32Array(STATS_OPCODE_SLOTS);
+let gpuTotalRpcs = 0;
 
 // ---------- Handle Table (1H: sparse array for O(1) index lookup) ----------
 
 const handles: any[] = [null]; // index 0 unused — handles start at 1
 const bufferSizesArr: (number | undefined)[] = [undefined];
+const bufferUsagesArr: (number | undefined)[] = [undefined];
 let nextHandle = 1;
+
+// Buffer pool: (usage, size) → stack of free GPUBuffer handles. MLX's allocator
+// churns ~870 transient buffers/tok; reusing them eliminates Chrome's
+// createBuffer validation cost on the hot path.
+const BUFFER_POOL_CAP_PER_KEY = 32;
+const bufferPool = new Map<string, number[]>();
+let bufferPoolHitCount = 0;
+let bufferPoolMissCount = 0;
+// WebGPU usage flags — keep in sync with webgpu-bridge-stub.ts.
+const WGPU_USAGE_MAP_READ = 0x0001;
+const WGPU_USAGE_MAP_WRITE = 0x0002;
+function isPoolable(usage: number): boolean {
+  // Mapped buffers cannot be reused without unmapping, and their state is
+  // fragile — exclude them from the pool.
+  return (usage & (WGPU_USAGE_MAP_READ | WGPU_USAGE_MAP_WRITE)) === 0;
+}
+function poolKey(usage: number, size: number): string {
+  return `${usage}:${size}`;
+}
 
 function addHandle(obj: any): number {
   const id = nextHandle++;
@@ -45,6 +81,31 @@ function getHandle<T>(id: number): T {
 function releaseHandle(id: number): void {
   handles[id] = undefined;
   bufferSizesArr[id] = undefined;
+  bufferUsagesArr[id] = undefined;
+}
+
+// Pool-aware buffer release — shared by BUFFER_RELEASE and BUFFER_RELEASE_BATCH.
+// Never actually destroys GPUBuffers (see comment in BUFFER_RELEASE handler):
+// pooling is just handle-table bookkeeping.
+function releaseBufferHandle(handle: number): void {
+  const size = bufferSizesArr[handle];
+  const usage = bufferUsagesArr[handle];
+  if (size !== undefined && usage !== undefined && size > 0 && isPoolable(usage)) {
+    const key = poolKey(usage, size);
+    let stack = bufferPool.get(key);
+    if (stack === undefined) {
+      stack = [];
+      bufferPool.set(key, stack);
+    }
+    if (stack.length < BUFFER_POOL_CAP_PER_KEY) {
+      stack.push(handle);
+      // Keep handles[handle] / bufferSizesArr[handle] / bufferUsagesArr[handle]
+      // populated so a subsequent pool hit can return this handle with its
+      // metadata intact.
+      return;
+    }
+  }
+  releaseHandle(handle);
 }
 
 // ---------- Memory Helpers (1J: cached WASM DataView) ----------
@@ -114,11 +175,11 @@ let queueHandle: number;
 
 // ---------- Shared Memory ----------
 
-let cmdBuffer: SharedArrayBuffer;  // Raw SharedArrayBuffer for typed array views into command data
+let cmdBuffer: SharedArrayBuffer; // Raw SharedArrayBuffer for typed array views into command data
 let cmdView: Int32Array;
 let cmdDataView: DataView;
-let cmdU32: Uint32Array;  // Fast unsigned reads (avoids DataView overhead in hot path)
-let wasmMemoryObj: WebAssembly.Memory;  // Memory object — .buffer always reflects current size after grow()
+let cmdU32: Uint32Array; // Fast unsigned reads (avoids DataView overhead in hot path)
+let wasmMemoryObj: WebAssembly.Memory; // Memory object — .buffer always reflects current size after grow()
 let readbackView: Uint8Array;
 
 // Pending callbacks: accumulated during async operations (mapAsync, adapter/device request).
@@ -132,7 +193,9 @@ interface PendingCallback {
 const cbRing: PendingCallback[] = [];
 let cbHead = 0;
 let cbTail = 0;
-function pushCallback(cb: PendingCallback): void { cbRing[cbTail++] = cb; }
+function pushCallback(cb: PendingCallback): void {
+  cbRing[cbTail++] = cb;
+}
 
 // GPU-done callbacks: accumulated from QUEUE_ON_SUBMITTED_WORK_DONE (fn=22).
 // These must NOT fire until GPU work actually completes. They are moved to
@@ -144,7 +207,7 @@ const gpuDoneCallbacks: PendingCallback[] = [];
 // The gpu-worker holds the JS ArrayBuffer; on unmap, it copies WASM->JS (write path).
 interface MappedRangeInfo {
   jsRange: ArrayBuffer;
-  wasmPtr: number;   // WASM pointer allocated by wasm-worker (passed back as RESULT)
+  wasmPtr: number; // WASM pointer allocated by wasm-worker (passed back as RESULT)
   size: number;
   writeBack: boolean;
 }
@@ -155,7 +218,7 @@ const activeMappings = new Map<number, MappedRangeInfo>();
 self.onmessage = async (e: MessageEvent) => {
   if (e.data.type === 'init') {
     cmdBuffer = e.data.cmdBuffer;
-    wasmMemoryObj = e.data.wasmMemory;  // WebAssembly.Memory object
+    wasmMemoryObj = e.data.wasmMemory; // WebAssembly.Memory object
     readbackView = new Uint8Array(e.data.readbackBuffer);
 
     cmdView = new Int32Array(cmdBuffer);
@@ -184,7 +247,9 @@ self.onmessage = async (e: MessageEvent) => {
     if (hasShaderF16) requiredFeatures.push('shader-f16');
     if (hasSubgroups) requiredFeatures.push('subgroups');
     if (hasTimestampQuery) requiredFeatures.push('timestamp-query');
-    console.log(`[GPU Worker] Detected features: shader-f16=${hasShaderF16}, subgroups=${hasSubgroups}, timestamp-query=${hasTimestampQuery}`);
+    console.log(
+      `[GPU Worker] Detected features: shader-f16=${hasShaderF16}, subgroups=${hasSubgroups}, timestamp-query=${hasTimestampQuery}`,
+    );
 
     device = await adapter.requestDevice({
       requiredFeatures,
@@ -245,7 +310,14 @@ self.onmessage = async (e: MessageEvent) => {
       weightsSab: SharedArrayBuffer;
       mergedSab?: SharedArrayBuffer;
       dataOffset: number;
-      tensors: Array<{ name: string; byteOffset: number; byteSize: number; dtype: string; shape: number[]; fromMerged?: boolean }>;
+      tensors: Array<{
+        name: string;
+        byteOffset: number;
+        byteSize: number;
+        dtype: string;
+        shape: number[];
+        fromMerged?: boolean;
+      }>;
       packBf16?: boolean;
     };
 
@@ -398,22 +470,15 @@ self.onmessage = async (e: MessageEvent) => {
       // Each has its own min-elements threshold because the motivating
       // kernels have different feasibility floors.
       const matmulConsumed =
-        usePackBf16 &&
-        isBf16 &&
-        numElements >= PACKED_MIN_ELEMENTS &&
-        isMatmulConsumedWeight(tensor.name);
+        usePackBf16 && isBf16 && numElements >= PACKED_MIN_ELEMENTS && isMatmulConsumedWeight(tensor.name);
       const normConsumed =
-        usePackBf16 &&
-        isBf16 &&
-        numElements >= NORM_PACKED_MIN_ELEMENTS &&
-        isNormConsumedWeight(tensor.name);
+        usePackBf16 && isBf16 && numElements >= NORM_PACKED_MIN_ELEMENTS && isNormConsumedWeight(tensor.name);
       const packedEligible = matmulConsumed || normConsumed;
       if (
         isBf16 &&
         usePackBf16 &&
         (numElements >= PACKED_MIN_ELEMENTS ||
-          (numElements >= NORM_PACKED_MIN_ELEMENTS &&
-            isNormConsumedWeight(tensor.name)))
+          (numElements >= NORM_PACKED_MIN_ELEMENTS && isNormConsumedWeight(tensor.name)))
       ) {
         if (packedEligible) {
           packedNames.push(tensor.name);
@@ -494,6 +559,7 @@ self.onmessage = async (e: MessageEvent) => {
 
       const handle = addHandle(gpuBuffer);
       bufferSizesArr[handle] = alignedSize;
+      bufferUsagesArr[handle] = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
       handles.push(handle);
     }
 
@@ -564,7 +630,7 @@ function handleFusedDispatchWithUniform(): void {
   // Direct handle access — hot path, handles always valid
   const layout = handles[layoutHandle] as GPUBindGroupLayout;
   const entries: GPUBindGroupEntry[] = [];
-  let newBufferHandle = 0;  // set if we create a buffer inline
+  let newBufferHandle = 0; // set if we create a buffer inline
 
   // Check if uniform entry needs buffer creation (handle = 0)
   const uniformBufHandle = cmdU32[I_CB_BASE + uniformEntryIdx * 3];
@@ -572,12 +638,24 @@ function handleFusedDispatchWithUniform(): void {
   if (uniformBufHandle === 0 && uniformDataSize > 0) {
     // Deferred buffer creation: create buffer + write data inline
     // ARG7 has the buffer usage flags from the bridge stub
-    const usage = cmdU32[I_ARG0 + 7] || (0x0080 | 0x0008); // STORAGE | COPY_DST fallback
+    const usage = cmdU32[I_ARG0 + 7] || 0x0080 | 0x0008; // STORAGE | COPY_DST fallback
     const uniformData = new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformDataSize);
-    const buffer = device.createBuffer({ size: uniformDataSize, usage });
-    queue.writeBuffer(buffer, 0, uniformData);
-    const handle = addHandle(buffer);
-    bufferSizesArr[handle] = uniformDataSize;
+    let handle: number;
+    const stack = isPoolable(usage) ? bufferPool.get(poolKey(usage, uniformDataSize)) : undefined;
+    if (stack !== undefined && stack.length > 0) {
+      handle = stack.pop()!;
+      if (stack.length === 0) bufferPool.delete(poolKey(usage, uniformDataSize));
+      bufferPoolHitCount++;
+      const pooled = handles[handle] as GPUBuffer;
+      queue.writeBuffer(pooled, 0, uniformData);
+    } else {
+      if (isPoolable(usage)) bufferPoolMissCount++;
+      const buffer = device.createBuffer({ size: uniformDataSize, usage });
+      queue.writeBuffer(buffer, 0, uniformData);
+      handle = addHandle(buffer);
+      bufferSizesArr[handle] = uniformDataSize;
+      bufferUsagesArr[handle] = usage;
+    }
     newBufferHandle = handle;
     // Patch the entry handle for bind group creation below
     cmdU32[I_CB_BASE + uniformEntryIdx * 3] = handle;
@@ -646,8 +724,10 @@ function handleFusedCopyBuffer(): void {
   }
 
   encoder.copyBufferToBuffer(
-    handles[srcHandle] as GPUBuffer, srcOffset,
-    handles[dstHandle] as GPUBuffer, dstOffset,
+    handles[srcHandle] as GPUBuffer,
+    srcOffset,
+    handles[dstHandle] as GPUBuffer,
+    dstOffset,
     size,
   );
 
@@ -661,9 +741,9 @@ async function commandLoop(): Promise<void> {
   // Adaptive spin: after dispatch commands (likely followed by another dispatch),
   // spin longer to catch back-to-back commands without V8 event loop overhead.
   // After submit/readback, skip spin (long gap expected).
-  const SPIN_DISPATCH = 2000;  // optimal: 500→13.3, 1000→14.0, 1500→16.4, 2000→17.5, 4000→17.6
+  const SPIN_DISPATCH = 2000; // optimal: 500→13.3, 1000→14.0, 1500→16.4, 2000→17.5, 4000→17.6
   const SPIN_NONE = 0;
-  let spinBudget = SPIN_NONE;  // set after each command based on type
+  let spinBudget = SPIN_NONE; // set after each command based on type
 
   let currentStatus = Atomics.load(cmdView, STATUS_INDEX);
 
@@ -676,7 +756,10 @@ async function commandLoop(): Promise<void> {
       let spun = false;
       for (let s = 0; s < spinBudget; s++) {
         currentStatus = Atomics.load(cmdView, STATUS_INDEX);
-        if (currentStatus === STATUS.PENDING) { spun = true; break; }
+        if (currentStatus === STATUS.PENDING) {
+          spun = true;
+          break;
+        }
       }
 
       if (!spun) {
@@ -687,7 +770,7 @@ async function commandLoop(): Promise<void> {
           if (result.async) {
             await result.value;
           } else {
-            await new Promise(r => setTimeout(r, 0));
+            await new Promise((r) => setTimeout(r, 0));
           }
           currentStatus = Atomics.load(cmdView, STATUS_INDEX);
           waitLoops++;
@@ -699,6 +782,17 @@ async function commandLoop(): Promise<void> {
     }
 
     const fnId = cmdU32[0]; // CMD_OFFSET.FN_ID / 4 = 0
+
+    // Phase 0 observability: bump per-opcode histogram here — BEFORE the
+    // fast-path dispatch — so fused-dispatch opcodes (which short-circuit
+    // processCommand) are counted too. GET_STATS is excluded so a profile
+    // readback does not pollute its own numbers.
+    if (fnId !== RpcFn.GET_STATS) {
+      gpuTotalRpcs++;
+      if (fnId >= 0 && fnId < STATS_OPCODE_SLOTS) {
+        gpuRpcCounts[fnId]++;
+      }
+    }
 
     // Fast path: hot dispatch functions bypass processCommand entirely.
     if (fnId === RpcFn.FUSED_DISPATCH_WITH_UNIFORM) {
@@ -724,7 +818,7 @@ async function commandLoop(): Promise<void> {
         console.error(`[GPU Worker] Error in FUSED_COPY_BUFFER:`, err);
         cmdU32[I_RESULT] = 0;
       }
-      spinBudget = SPIN_DISPATCH;  // copy is followed by dispatches
+      spinBudget = SPIN_DISPATCH; // copy is followed by dispatches
     } else if (fnId === RpcFn.FUSED_SUBMIT) {
       try {
         handleFusedSubmit();
@@ -781,8 +875,8 @@ function flushCallbacks(): void {
 // ---------- Command Dispatch ----------
 
 // Uint32Array indices for direct reads (element index = byte offset / 4)
-const I_ARG0 = CMD_OFFSET.ARG0 >>> 2;     // 4
-const I_RESULT = CMD_OFFSET.RESULT >>> 2;  // 2
+const I_ARG0 = CMD_OFFSET.ARG0 >>> 2; // 4
+const I_RESULT = CMD_OFFSET.RESULT >>> 2; // 2
 const I_RESULT_HI = CMD_OFFSET.RESULT_HI >>> 2; // 3
 const I_CB_COUNT = CMD_OFFSET.CALLBACK_COUNT >>> 2;
 const I_CB_BASE = CMD_OFFSET.CALLBACK_BASE >>> 2;
@@ -802,7 +896,9 @@ async function processCommand(fnId: number): Promise<void> {
   const arg1Hi = () => cmdU32[CMD_OFFSET.ARG1_HI >>> 2];
   const arg2Hi = () => cmdU32[CMD_OFFSET.ARG2_HI >>> 2];
 
-  const setResult = (v: number) => { cmdU32[I_RESULT] = v; };
+  const setResult = (v: number) => {
+    cmdU32[I_RESULT] = v;
+  };
   const setResultBig = (lo: number, hi: number) => {
     cmdU32[I_RESULT] = lo;
     cmdU32[I_RESULT_HI] = hi;
@@ -812,6 +908,9 @@ async function processCommand(fnId: number): Promise<void> {
   // Cache invalidates automatically when buffer identity changes (memory.grow).
   const wasm = getWasmView;
   const wasmBytes = getWasmBytes;
+
+  // (Histogram bump lives at the top of the dispatch loop so that
+  // fast-path opcodes which bypass processCommand are still counted.)
 
   switch (fnId) {
     // ================================================================
@@ -893,13 +992,32 @@ async function processCommand(fnId: number): Promise<void> {
       const size = sizeLo + sizeHi * 0x100000000;
       const mappedAtCreation = view.getUint32(descPtr + 24, true) !== 0;
 
+      // Pool fast path: reuse a previously released GPUBuffer with the same
+      // (usage, size). Skip mappedAtCreation — we can't redeliver a
+      // pre-mapped state to the caller.
+      if (!mappedAtCreation && size > 0 && isPoolable(usage)) {
+        const stack = bufferPool.get(poolKey(usage, size));
+        if (stack !== undefined && stack.length > 0) {
+          const reused = stack.pop()!;
+          if (stack.length === 0) bufferPool.delete(poolKey(usage, size));
+          bufferPoolHitCount++;
+          setResult(reused);
+          break;
+        }
+        bufferPoolMissCount++;
+      }
+
       try {
         const buffer = device.createBuffer({ size, usage, mappedAtCreation });
         const handle = addHandle(buffer);
         bufferSizesArr[handle] = size;
+        bufferUsagesArr[handle] = usage;
         setResult(handle);
       } catch (e) {
-        console.error(`[GPU Worker] createBuffer failed: size=${size} usage=0x${usage.toString(16)} mapped=${mappedAtCreation}`, e);
+        console.error(
+          `[GPU Worker] createBuffer failed: size=${size} usage=0x${usage.toString(16)} mapped=${mappedAtCreation}`,
+          e,
+        );
         setResult(0);
       }
       break;
@@ -1029,8 +1147,15 @@ async function processCommand(fnId: number): Promise<void> {
       const L = device.limits;
       const base = limitsPtr + 4;
       let off = 0;
-      const w32 = (v: number) => { view.setUint32(base + off, v, true); off += 4; };
-      const w64 = (v: number) => { view.setUint32(base + off, v, true); view.setUint32(base + off + 4, 0, true); off += 8; };
+      const w32 = (v: number) => {
+        view.setUint32(base + off, v, true);
+        off += 4;
+      };
+      const w64 = (v: number) => {
+        view.setUint32(base + off, v, true);
+        view.setUint32(base + off + 4, 0, true);
+        off += 8;
+      };
       w32(L.maxTextureDimension1D);
       w32(L.maxTextureDimension2D);
       w32(L.maxTextureDimension3D);
@@ -1281,7 +1406,7 @@ async function processCommand(fnId: number): Promise<void> {
       // Returns: u64 size via RESULT + RESULT_HI
       const bufferHandle = arg0();
       const size = bufferSizesArr[bufferHandle] ?? 0;
-      setResultBig(size & 0xFFFFFFFF, Math.floor(size / 0x100000000));
+      setResultBig(size & 0xffffffff, Math.floor(size / 0x100000000));
       break;
     }
 
@@ -1394,8 +1519,26 @@ async function processCommand(fnId: number): Promise<void> {
     }
 
     case RpcFn.BUFFER_RELEASE: {
-      const handle = arg0();
-      releaseHandle(handle);
+      // Pool fast path: park the GPUBuffer for reuse instead of releasing.
+      // Safe because gpu-worker never actually destroys GPUBuffers on release
+      // (destroying them before queue.submit completes triggers "Buffer used
+      // in submit while destroyed" validation errors) — so pooling is just
+      // handle-table bookkeeping.
+      releaseBufferHandle(arg0());
+      setResult(0);
+      break;
+    }
+
+    case RpcFn.BUFFER_RELEASE_BATCH: {
+      // Phase 1' batch release: up to MAX_RELEASE_BATCH (64) handles packed
+      // as u32s into the UNIFORM_DATA region by the bridge stub. ARG0 holds
+      // the count. Each handle flows through the same pool logic as the
+      // single-release path.
+      const count = arg0();
+      const base = CMD_OFFSET.UNIFORM_DATA >>> 2;
+      for (let i = 0; i < count; i++) {
+        releaseBufferHandle(cmdU32[base + i]);
+      }
       setResult(0);
       break;
     }
@@ -1536,7 +1679,7 @@ async function processCommand(fnId: number): Promise<void> {
 
       const layout = getHandle<GPUBindGroupLayout>(layoutHandle);
       const entries: GPUBindGroupEntry[] = [];
-      let eIdx = I_CB_BASE;  // Uint32Array index for entry data (stride = 3 u32s = 12 bytes)
+      let eIdx = I_CB_BASE; // Uint32Array index for entry data (stride = 3 u32s = 12 bytes)
       for (let i = 0; i < entryCount; i++) {
         const buffer = getHandle<GPUBuffer>(cmdU32[eIdx]);
         const sizeLo = cmdU32[eIdx + 1];
@@ -1657,16 +1800,75 @@ async function processCommand(fnId: number): Promise<void> {
       const size = sizeLo + sizeHi * 0x100000000;
 
       try {
-        const buffer = device.createBuffer({ size, usage });
-        // Copy data from WASM memory into the buffer
-        const data = wasmBytes().slice(wasmDataPtr, wasmDataPtr + size);
-        queue.writeBuffer(buffer, 0, data);
-        const handle = addHandle(buffer);
-        bufferSizesArr[handle] = size;
+        let handle: number;
+        const stack = isPoolable(usage) ? bufferPool.get(poolKey(usage, size)) : undefined;
+        if (stack !== undefined && stack.length > 0) {
+          handle = stack.pop()!;
+          if (stack.length === 0) bufferPool.delete(poolKey(usage, size));
+          bufferPoolHitCount++;
+          // Overwrite the pooled buffer's contents with the new data.
+          const buffer = getHandle<GPUBuffer>(handle);
+          const data = wasmBytes().slice(wasmDataPtr, wasmDataPtr + size);
+          queue.writeBuffer(buffer, 0, data);
+        } else {
+          if (isPoolable(usage)) bufferPoolMissCount++;
+          const buffer = device.createBuffer({ size, usage });
+          const data = wasmBytes().slice(wasmDataPtr, wasmDataPtr + size);
+          queue.writeBuffer(buffer, 0, data);
+          handle = addHandle(buffer);
+          bufferSizesArr[handle] = size;
+          bufferUsagesArr[handle] = usage;
+        }
         setResult(handle);
       } catch (e) {
         console.error(`[GPU Worker] CREATE_BUFFER_FROM_DATA failed: size=${size} usage=0x${usage.toString(16)}`, e);
         setResult(0);
+      }
+      break;
+    }
+
+    // ================================================================
+    // Phase 0 stats (?profile=1 observability). Write the per-opcode
+    // histogram into the SAB so the wasm-worker can post it up to the
+    // main thread. Storage layout (see rpc-protocol.ts for the rationale):
+    //   - cmdU32[I_RESULT]  := gpuTotalRpcs (u32, since last reset)
+    //   - SAB bytes 64..64+STATS_CALLBACK_SLOTS*4:
+    //       opcode counts for slots 0..30
+    //   - SAB bytes STATS_INLINE_OFFSET..+STATS_INLINE_SLOTS*4:
+    //       opcode counts for slots 31..94
+    //   - SAB bytes STATS_RESERVED_OFFSET..+STATS_RESERVED_SLOTS*4:
+    //       opcode counts for slots 95..110 (covers FUSED_*_DISPATCH=96/97/98)
+    //
+    // ARG0 = reset flag: 1 = zero the histogram after readback.
+    // ================================================================
+    case RpcFn.GET_STATS: {
+      const resetAfter = arg0();
+      // Smuggle pool hit/miss into two unused reserved-region slots so the
+      // bridge's existing histogram readback picks them up with no protocol
+      // change. Slot 100 = hits, slot 101 = misses. Neither corresponds to
+      // a real RpcFn opcode (max opcode is 99 = GET_STATS).
+      const POOL_HITS_SLOT = 100;
+      const POOL_MISSES_SLOT = 101;
+      gpuRpcCounts[POOL_HITS_SLOT] = bufferPoolHitCount;
+      gpuRpcCounts[POOL_MISSES_SLOT] = bufferPoolMissCount;
+      const cbBase = CMD_OFFSET.CALLBACK_COUNT >>> 2;
+      for (let i = 0; i < STATS_CALLBACK_SLOTS; i++) {
+        cmdU32[cbBase + i] = gpuRpcCounts[i];
+      }
+      const inlineBase = STATS_INLINE_OFFSET >>> 2;
+      for (let i = 0; i < STATS_INLINE_SLOTS; i++) {
+        cmdU32[inlineBase + i] = gpuRpcCounts[STATS_CALLBACK_SLOTS + i];
+      }
+      const reservedBase = STATS_RESERVED_OFFSET >>> 2;
+      for (let i = 0; i < STATS_RESERVED_SLOTS; i++) {
+        cmdU32[reservedBase + i] = gpuRpcCounts[STATS_CALLBACK_SLOTS + STATS_INLINE_SLOTS + i];
+      }
+      setResult(gpuTotalRpcs);
+      if (resetAfter) {
+        gpuRpcCounts.fill(0);
+        gpuTotalRpcs = 0;
+        bufferPoolHitCount = 0;
+        bufferPoolMissCount = 0;
       }
       break;
     }
