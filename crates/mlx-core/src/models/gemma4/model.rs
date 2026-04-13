@@ -325,9 +325,13 @@ impl Gemma4Inner {
     /// state ensures a subsequent chat turn can't mistakenly claim a cache
     /// prefix hit against stale history.
     ///
-    /// Currently only called by Step 5c's session API (not yet wired),
-    /// hence the allow(dead_code).
-    #[allow(dead_code)]
+    /// Called by the legacy `chat_sync` / `chat_stream_sync` wrappers at
+    /// the top of every turn so that each `model.chat(...)` call starts
+    /// from an empty cache (matching pre-5b semantics). Step 5c's session
+    /// API will also call this when it needs an explicit reset — it does
+    /// NOT get called from `chat_sync_core` / `chat_stream_sync_core`
+    /// directly because those are re-entrant primitives that trust their
+    /// caller's cache-management.
     pub(crate) fn reset_caches_sync(&mut self) -> Result<()> {
         self.caches = None;
         self.clear_reuse_state();
@@ -365,6 +369,15 @@ impl Gemma4Inner {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
+        // Legacy semantics: every `model.chat(...)` call starts from an
+        // empty KV cache. Without this reset, the lazy-init guard in
+        // `chat_sync_core` (`if self.caches.is_none()`) would skip on
+        // call 2+ and append the new prompt's K/V onto the prior turn's
+        // stale cache — producing semantically wrong, non-byte-identical
+        // output. The session API in Step 5c will call `chat_sync_core`
+        // directly with its own cache-management, so only this legacy
+        // wrapper needs the reset.
+        self.reset_caches_sync()?;
         self.chat_sync_core(messages, config, None)
     }
 
@@ -883,6 +896,13 @@ impl Gemma4Inner {
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     ) {
+        // Legacy semantics: every `model.chatStream(...)` call starts
+        // from an empty KV cache. See `chat_sync` above for the full
+        // rationale — this mirrors the same fix for the streaming path.
+        if let Err(e) = self.reset_caches_sync() {
+            let _ = stream_tx.send(Err(e));
+            return;
+        }
         let cb = StreamSender(stream_tx.clone());
         let result = self.chat_stream_sync_core(messages, config, &cb, &cancelled, None);
         if let Err(e) = result {
