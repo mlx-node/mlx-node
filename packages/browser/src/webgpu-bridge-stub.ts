@@ -1200,11 +1200,19 @@ export function createBridgeStub(
       if (mapped) {
         mappedAtCreationBuffers.delete(bufferHandle);
         wasmFree(mapped.wasmPtr);
+        delete bufSizes[bufferHandle];
+        delete bufferUsages[bufferHandle];
       }
       const def = deferredCreations.get(bufferHandle);
       if (def) {
         deferredCreations.delete(bufferHandle);
         wasmFree(def.wasmPtr);
+        // Scrub fake-handle shadow metadata: deferredCreations inherits the fake
+        // handle from the mappedAtCreation phase, and bufSizes[fakeHandle] was
+        // set when the fake was first minted. Without this, destroying a small
+        // deferred buffer before its first dispatch leaks the shadow entry.
+        delete bufSizes[bufferHandle];
+        delete bufferUsages[bufferHandle];
       }
       const resolved = resolveBufferHandle(bufferHandle);
       if (resolved !== bufferHandle) {
@@ -1217,6 +1225,15 @@ export function createBridgeStub(
     },
 
     wgpuBufferRelease(handle: number): void {
+      // Drop any deferred writeBuffer keyed by this raw handle. MUST run before
+      // any early-return branch: for fake mappedAtCreation / deferred-creation
+      // handles, resolveBufferHandle() returns the raw fake id (no remap exists),
+      // so pendingWriteBuffers is keyed by the fake handle. If we deleted only
+      // after the resolve step below, fake-handle early returns would leave the
+      // entry behind, and the next flushPendingWrites would issue a bogus
+      // QUEUE_WRITE_BUFFER RPC against an id the gpu-worker can't resolve.
+      pendingWriteBuffers.delete(handle);
+
       // Clean up shadow state if this fake mapped-at-creation buffer was never unmapped.
       // Must run before any pool/RPC logic — the fake handle has no gpu-worker object,
       // and the WASM shadow allocation would otherwise leak.
@@ -1232,18 +1249,24 @@ export function createBridgeStub(
       if (def) {
         deferredCreations.delete(handle);
         wasmFree(def.wasmPtr);
+        // Scrub fake-handle shadow metadata: bufSizes[fakeHandle] was set when
+        // the fake was first minted, and the small-buffer unmap path transfers
+        // ownership into deferredCreations without cleaning it up. Without this,
+        // releasing a small deferred buffer before its first dispatch leaks the
+        // shadow entry. bufferUsages shouldn't normally have an entry for fake
+        // handles, but deleting it defensively is cheap.
+        delete bufSizes[handle];
+        delete bufferUsages[handle];
         return; // no GPU buffer was created, nothing to release
       }
       const resolved = resolveBufferHandle(handle);
       if (resolved !== handle) {
         deferredBufferRemap.delete(handle);
+        // A writeBuffer might also have been deferred on the resolved key
+        // (unlikely, but safe to handle). If the handle gets pooled and reused,
+        // a stale flush would clobber the new buffer's contents.
+        pendingWriteBuffers.delete(resolved);
       }
-
-      // Drop any deferred writeBuffer for this handle. If the user is releasing
-      // the buffer with a pending write still unflushed, that write was effectively
-      // discarded anyway — and if the handle gets pooled and reused, a stale flush
-      // would clobber the new buffer's contents. Clearing is safe in both cases.
-      pendingWriteBuffers.delete(resolved);
 
       // Try to pool the real handle instead of releasing to the gpu-worker.
       const size = bufSizes[resolved];
