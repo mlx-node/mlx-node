@@ -1063,6 +1063,111 @@ export declare class Qwen35MoeModel {
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
   /**
+   * Start a new chat session.
+   *
+   * Equivalent to `chat` but stops decoding on `<|im_end|>` and leaves
+   * the KV caches on a clean ChatML boundary so subsequent
+   * [`Self::chat_session_continue`] / [`Self::chat_session_continue_tool`]
+   * calls can append a raw delta on top without re-rendering the chat
+   * template.
+   *
+   * Requires `config.reuse_cache` to be enabled (the default).
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a new user message.
+   *
+   * Appends a raw ChatML user/assistant delta to the session's cached
+   * KV state, then decodes the assistant reply. Stops on `<|im_end|>`
+   * so the cache remains on a clean boundary for the next turn.
+   *
+   * Requires a live session started via [`Self::chat_session_start`].
+   * Errors if the session is empty, carries image state, or if
+   * `config.reuse_cache` is explicitly set to `false`.
+   *
+   * `images` is an opt-in guard parameter: when non-empty, the native
+   * side returns an error whose message begins with
+   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+   * `ChatSession` layer can catch the prefix and route image-changes
+   * back through a fresh `chatSessionStart`.
+   */
+  chatSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null | undefined,
+    config: ChatConfig | null | undefined,
+  ): Promise<ChatResult>;
+  /**
+   * Continue an existing chat session with a tool-result turn.
+   *
+   * Builds a ChatML `<tool_response>`-wrapped delta from `content` and
+   * prefills it on top of the live session caches, then decodes the
+   * assistant reply. Stops on `<|im_end|>` so the cache stays on a
+   * clean boundary for the next turn.
+   *
+   * The `tool_call_id` is currently dropped by the wire format —
+   * Qwen3.5's chat template identifies tool responses by position +
+   * wrapper tags, not an explicit id. Callers may still log it for
+   * their own bookkeeping.
+   *
+   * Requires a live session started via [`Self::chat_session_start`].
+   */
+  chatSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatResult>;
+  /**
+   * Streaming variant of [`Self::chat_session_start`].
+   *
+   * Dispatches to the dedicated model thread. Behaviourally identical
+   * to `chat_session_start` (text-only, resets caches, uses
+   * `<|im_end|>` as eos) but streams token deltas through the JS
+   * callback instead of returning a `ChatResult`. Used by the
+   * TypeScript `Qwen35Session.sendStream()` for turn 1 of a
+   * multi-round streaming conversation.
+   */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /**
+   * Streaming variant of [`Self::chat_session_continue`].
+   *
+   * Appends a ChatML user/assistant delta on top of the live session
+   * caches and streams the decoded reply. Requires a live session
+   * started via [`Self::chat_stream_session_start`] (or the
+   * non-streaming [`Self::chat_session_start`]). Used by the
+   * TypeScript `Qwen35Session.sendStream()` for turns 2..N of a
+   * multi-round streaming conversation.
+   *
+   * `images` is an opt-in guard parameter: when non-empty, the
+   * streaming path emits an error chunk whose message begins with
+   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+   * `ChatSession` layer can route image-changes through a fresh
+   * session start.
+   */
+  chatStreamSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null | undefined,
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /**
+   * Streaming variant of [`Self::chat_session_continue_tool`].
+   *
+   * Builds a ChatML tool-response delta on top of the live session
+   * caches and streams the decoded reply. Requires a live session
+   * started via [`Self::chat_session_start`] /
+   * [`Self::chat_stream_session_start`].
+   */
+  chatStreamSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /**
    * Get the number of parameters in the model.
    *
    * Pure config computation -- no model-thread dispatch needed.
