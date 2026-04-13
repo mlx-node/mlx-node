@@ -1192,16 +1192,14 @@ export function createBridgeStub(
         deferredCreations.delete(bufferHandle);
         wasmFree(def.wasmPtr);
       }
-      // Evict from pool by clearing the entire (usage, size) bucket — simpler
-      // and correct: any handle in that bucket with the destroyed handle is gone.
-      const size = bufSizes[bufferHandle];
-      const usage = bufferUsages[bufferHandle];
-      if (size !== undefined && usage !== undefined) {
-        const key = poolKey(usage, size);
-        bufferPool.delete(key);
-        delete bufSizes[bufferHandle];
-        delete bufferUsages[bufferHandle];
+      const resolved = resolveBufferHandle(bufferHandle);
+      if (resolved !== bufferHandle) {
+        deferredBufferRemap.delete(bufferHandle);
       }
+      // Destroy is a no-op on the gpu-worker side, so any pooled buddies at
+      // this (usage, size) key remain valid GPUBuffers. Leave the pool alone.
+      delete bufSizes[resolved];
+      delete bufferUsages[resolved];
     },
 
     wgpuBufferRelease(handle: number): void {
