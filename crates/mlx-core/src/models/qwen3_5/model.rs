@@ -134,8 +134,24 @@ pub(crate) enum Qwen35Cmd {
     /// [`Qwen35Inner::chat_session_continue_sync`] — builds a raw ChatML
     /// delta from `user_message`, tokenizes it, and prefills on top of
     /// the live caches.
+    ///
+    /// `images` is an opt-in guard parameter: non-empty input is rejected
+    /// with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error so
+    /// the TS `ChatSession` layer can route image-changes back through a
+    /// fresh `chat_session_start`.
     ChatSessionContinue {
         user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+        reply: ResponseTx<ChatResult>,
+    },
+    /// Continue an existing session with a tool-result delta. See
+    /// [`Qwen35Inner::chat_session_continue_tool_sync`] — builds a
+    /// ChatML `<tool_response>` delta and prefills on top of the live
+    /// caches.
+    ChatSessionContinueTool {
+        tool_call_id: String,
+        content: String,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
@@ -150,9 +166,21 @@ pub(crate) enum Qwen35Cmd {
     },
     /// Streaming session-continue: same semantics as
     /// [`ChatSessionContinue`](Self::ChatSessionContinue) but streams
-    /// token deltas through `stream_tx`.
+    /// token deltas through `stream_tx`. Carries the same opt-in
+    /// `images` guard parameter.
     ChatStreamSessionContinue {
         user_message: String,
+        images: Option<Vec<Uint8Array>>,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
+    /// Streaming tool-result continuation: same semantics as
+    /// [`ChatSessionContinueTool`](Self::ChatSessionContinueTool) but
+    /// streams token deltas through `stream_tx`.
+    ChatStreamSessionContinueTool {
+        tool_call_id: String,
+        content: String,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -270,10 +298,20 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         }
         Qwen35Cmd::ChatSessionContinue {
             user_message,
+            images,
             config,
             reply,
         } => {
-            let _ = reply.send(inner.chat_session_continue_sync(user_message, config));
+            let _ = reply.send(inner.chat_session_continue_sync(user_message, images, config));
+        }
+        Qwen35Cmd::ChatSessionContinueTool {
+            tool_call_id,
+            content,
+            config,
+            reply,
+        } => {
+            let _ =
+                reply.send(inner.chat_session_continue_tool_sync(tool_call_id, content, config));
         }
         Qwen35Cmd::ChatStreamSessionStart {
             messages,
@@ -285,11 +323,33 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         }
         Qwen35Cmd::ChatStreamSessionContinue {
             user_message,
+            images,
             config,
             stream_tx,
             cancelled,
         } => {
-            inner.chat_stream_session_continue_sync(user_message, config, stream_tx, cancelled);
+            inner.chat_stream_session_continue_sync(
+                user_message,
+                images,
+                config,
+                stream_tx,
+                cancelled,
+            );
+        }
+        Qwen35Cmd::ChatStreamSessionContinueTool {
+            tool_call_id,
+            content,
+            stream_tx,
+            config,
+            cancelled,
+        } => {
+            inner.chat_stream_session_continue_tool_sync(
+                tool_call_id,
+                content,
+                config,
+                stream_tx,
+                cancelled,
+            );
         }
         Qwen35Cmd::Generate {
             prompt_tokens,
@@ -832,7 +892,6 @@ impl Qwen35Inner {
     /// Session-aware variant of `chat_sync` used to START a new session.
     ///
     /// Unlike `chat_sync`, this path:
-    ///   - is text-only (errors if any message carries images),
     ///   - uses `<|im_end|>` (from the tokenizer vocab) as its stop token
     ///     instead of `config.eos_token_id`, so the cached history ends on a
     ///     clean ChatML boundary that subsequent `chat_session_continue_sync`
@@ -840,6 +899,13 @@ impl Qwen35Inner {
     ///   - resets the caches up-front so the session is guaranteed to start
     ///     from a known-clean state regardless of any prior `chat_sync`
     ///     invocations.
+    ///
+    /// Images are accepted on session start — the downstream `chat_sync_core`
+    /// already handles the VLM prefill path (vision encoder, image cache
+    /// key, expanded tokens). Subsequent turns in the same session MUST go
+    /// through `chat_session_continue_sync` which is text-only; changing
+    /// the image set mid-session requires starting a new session via
+    /// `chat_session_start_sync`.
     ///
     /// After this call, callers MUST use `chat_session_continue_sync` (or
     /// equivalently `chat_tokens_delta_sync`) for subsequent turns — going
@@ -850,15 +916,6 @@ impl Qwen35Inner {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
-        let has_images = messages
-            .iter()
-            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
-        if has_images {
-            return Err(Error::from_reason(
-                "chat_session_start_sync is text-only; session paths do not support images",
-            ));
-        }
-
         // Mirror the symmetric guard in `chat_tokens_delta_sync`. The session
         // API only makes sense with cache reuse enabled: if we silently accept
         // `reuse_cache = false` here, the post-decode `save_cache_state_direct`
@@ -1385,11 +1442,25 @@ impl Qwen35Inner {
     /// the prefix match that makes session reuse correct.
     ///
     /// Text-only; errors propagate from `chat_tokens_delta_sync`.
+    ///
+    /// `images` is an opt-in guard parameter: non-empty input is rejected
+    /// with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error so
+    /// the TS `ChatSession` layer can catch the prefix and route
+    /// image-changes back through a fresh `chat_session_start_sync`. A
+    /// `None`/empty vector takes the normal text-only delta path.
     pub(crate) fn chat_session_continue_sync(
         &mut self,
         user_message: String,
+        images: Option<Vec<Uint8Array>>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
+        if images.as_ref().is_some_and(|v| !v.is_empty()) {
+            return Err(Error::from_reason(format!(
+                "{} chat_session_continue is text-only; start a new session with chat_session_start to change the image",
+                chat_common::IMAGE_CHANGE_RESTART_PREFIX
+            )));
+        }
+
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -1412,6 +1483,40 @@ impl Qwen35Inner {
 
         // `add_special_tokens: Some(false)` — we do NOT want the tokenizer
         // auto-prepending BOS. The delta is already a raw ChatML snippet.
+        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
+
+        self.chat_tokens_delta_sync(delta_tokens, config)
+    }
+
+    /// Session-based chat continuation via a tool-result turn.
+    ///
+    /// Builds a ChatML `<tool_response>`-wrapped delta from `content`
+    /// (see [`chat_common::build_chatml_tool_delta_text`] for the exact
+    /// wire format) and prefills it on top of the live session caches.
+    /// The `tool_call_id` is currently ignored by the wire format —
+    /// Qwen3.5's chat template identifies tool responses by the
+    /// surrounding `<tool_response>` tags + position, not an explicit
+    /// id. Callers may still log it for their own bookkeeping.
+    ///
+    /// Text-only; delegates to [`Self::chat_tokens_delta_sync`] which
+    /// inherits the same text-only-delta invariant (errors if the
+    /// session currently holds image state).
+    pub(crate) fn chat_session_continue_tool_sync(
+        &mut self,
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+    ) -> Result<ChatResult> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let delta_text =
+            chat_common::build_chatml_tool_delta_text(&tool_call_id, &content, enable_thinking);
+
         let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
 
         self.chat_tokens_delta_sync(delta_tokens, config)
@@ -1707,6 +1812,12 @@ impl Qwen35Inner {
     /// [`Self::chat_session_start_sync`] but streams token deltas through
     /// `stream_tx` rather than returning a `ChatResult`. Stops on
     /// `<|im_end|>` and resets caches before prefill.
+    ///
+    /// Images are accepted on session start — the downstream
+    /// `chat_stream_sync_inner` already handles VLM prefill. Subsequent
+    /// turns in the same session go through
+    /// `chat_stream_session_continue_sync` which is text-only; changing
+    /// the image set mid-session requires starting a new session.
     pub(crate) fn chat_stream_session_start_sync(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -1721,18 +1832,6 @@ impl Qwen35Inner {
             send_stream_error(
                 &stream_tx,
                 "chat_stream_session_start cancelled before start",
-            );
-            return;
-        }
-
-        // Guard: text-only.
-        let has_images = messages
-            .iter()
-            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
-        if has_images {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_start is text-only; session paths do not support images",
             );
             return;
         }
@@ -1780,9 +1879,16 @@ impl Qwen35Inner {
     /// [`Self::chat_session_continue_sync`] but streams token deltas
     /// through `stream_tx`. Builds the ChatML delta, tokenizes it, and
     /// delegates to [`Self::chat_stream_tokens_delta_sync`].
+    ///
+    /// `images` is an opt-in guard parameter: non-empty input is
+    /// rejected via `send_stream_error` with an
+    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed message so
+    /// the TS `ChatSession` layer can catch the prefix and route
+    /// image-changes back through a fresh session start.
     pub(crate) fn chat_stream_session_continue_sync(
         &mut self,
         user_message: String,
+        images: Option<Vec<Uint8Array>>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -1791,6 +1897,17 @@ impl Qwen35Inner {
             send_stream_error(
                 &stream_tx,
                 "chat_stream_session_continue cancelled before start",
+            );
+            return;
+        }
+
+        if images.as_ref().is_some_and(|v| !v.is_empty()) {
+            send_stream_error(
+                &stream_tx,
+                &format!(
+                    "{} chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the image",
+                    chat_common::IMAGE_CHANGE_RESTART_PREFIX
+                ),
             );
             return;
         }
@@ -1820,6 +1937,50 @@ impl Qwen35Inner {
                 // signals generic errors via an error-result send rather
                 // than an error chunk, matching the `chat_stream_sync`
                 // final-catch behavior.
+                let _ = stream_tx.send(Err(e));
+                return;
+            }
+        };
+
+        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
+    }
+
+    /// Streaming analog of [`Self::chat_session_continue_tool_sync`].
+    ///
+    /// Builds a ChatML tool-response delta, tokenizes it, and delegates
+    /// to [`Self::chat_stream_tokens_delta_sync`]. Inherits the same
+    /// text-only-delta invariant.
+    pub(crate) fn chat_stream_session_continue_tool_sync(
+        &mut self,
+        tool_call_id: String,
+        content: String,
+        config: ChatConfig,
+        stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        if cancelled.load(Ordering::Relaxed) {
+            send_stream_error(
+                &stream_tx,
+                "chat_stream_session_continue_tool cancelled before start",
+            );
+            return;
+        }
+
+        let tokenizer = match self.tokenizer.as_ref() {
+            Some(t) => t.clone(),
+            None => {
+                send_stream_error(&stream_tx, "Tokenizer not loaded");
+                return;
+            }
+        };
+
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let delta_text =
+            chat_common::build_chatml_tool_delta_text(&tool_call_id, &content, enable_thinking);
+
+        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
+            Ok(t) => t,
+            Err(e) => {
                 let _ = stream_tx.send(Err(e));
                 return;
             }
@@ -4554,10 +4715,19 @@ impl Qwen3_5Model {
     /// Requires a live session started via [`chat_session_start`]. Errors
     /// if the session is empty, carries image state, or if
     /// `config.reuse_cache` is explicitly set to `false`.
-    #[napi]
+    ///
+    /// `images` is an opt-in guard parameter: when non-empty, the native
+    /// side returns an error whose message begins with
+    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+    /// `ChatSession` layer can catch the prefix and route image-changes
+    /// back through a fresh `chatSessionStart`.
+    #[napi(
+        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
+    )]
     pub async fn chat_session_continue(
         &self,
         user_message: String,
+        images: Option<Vec<Uint8Array>>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
         let config = config.unwrap_or(ChatConfig {
@@ -4585,8 +4755,63 @@ impl Qwen3_5Model {
 
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::ChatSessionContinue {
             user_message,
+            images,
             config,
             reply,
+        })
+        .await
+    }
+
+    /// Continue an existing chat session with a tool-result turn.
+    ///
+    /// Builds a ChatML `<tool_response>`-wrapped delta from `content` and
+    /// prefills it on top of the live session caches, then decodes the
+    /// assistant reply. Stops on `<|im_end|>` so the cache stays on a
+    /// clean boundary for the next turn.
+    ///
+    /// The `tool_call_id` is currently dropped by the wire format —
+    /// Qwen3.5's chat template identifies tool responses by position +
+    /// wrapper tags, not an explicit id. Callers may still log it for
+    /// their own bookkeeping.
+    ///
+    /// Requires a live session started via [`chat_session_start`].
+    #[napi]
+    pub async fn chat_session_continue_tool(
+        &self,
+        tool_call_id: String,
+        content: String,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatResult> {
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35Cmd::ChatSessionContinueTool {
+                tool_call_id,
+                content,
+                config,
+                reply,
+            }
         })
         .await
     }
@@ -4725,12 +4950,19 @@ impl Qwen3_5Model {
     /// non-streaming [`Self::chat_session_start`]). Used by the
     /// TypeScript `Qwen35Session.sendStream()` for turns 2..N of a
     /// multi-round streaming conversation.
+    ///
+    /// `images` is an opt-in guard parameter: when non-empty, the
+    /// streaming path emits an error chunk whose message begins with
+    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
+    /// `ChatSession` layer can route image-changes through a fresh
+    /// session start.
     #[napi(
-        ts_args_type = "userMessage: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
     pub async fn chat_stream_session_continue(
         &self,
         user_message: String,
+        images: Option<Vec<Uint8Array>>,
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
@@ -4764,6 +4996,69 @@ impl Qwen3_5Model {
 
         self.thread.send(Qwen35Cmd::ChatStreamSessionContinue {
             user_message,
+            images,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+
+        let callback = Arc::new(callback);
+        tokio::spawn(async move {
+            while let Some(result) = stream_rx.recv().await {
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        });
+
+        Ok(ChatStreamHandle { cancelled })
+    }
+
+    /// Streaming variant of [`Self::chat_session_continue_tool`].
+    ///
+    /// Builds a ChatML tool-response delta on top of the live session
+    /// caches and streams the decoded reply. Requires a live session
+    /// started via [`Self::chat_session_start`] /
+    /// [`Self::chat_stream_session_start`].
+    #[napi(
+        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+    )]
+    pub async fn chat_stream_session_continue_tool(
+        &self,
+        tool_call_id: String,
+        content: String,
+        config: Option<ChatConfig>,
+        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    ) -> Result<ChatStreamHandle> {
+        let config = config.unwrap_or(ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            reasoning_effort: None,
+            report_performance: None,
+            reuse_cache: None,
+        });
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+
+        self.thread.send(Qwen35Cmd::ChatStreamSessionContinueTool {
+            tool_call_id,
+            content,
             config,
             stream_tx,
             cancelled: cancelled_inner,
@@ -4821,6 +5116,7 @@ impl Qwen3_5Model {
     pub fn chat_stream_session_continue_for_test(
         &self,
         user_message: String,
+        images: Option<Vec<Uint8Array>>,
         config: Option<ChatConfig>,
     ) -> Result<(
         ChatStreamHandle,
@@ -4833,6 +5129,35 @@ impl Qwen3_5Model {
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
         self.thread.send(Qwen35Cmd::ChatStreamSessionContinue {
             user_message,
+            images,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+        Ok((ChatStreamHandle { cancelled }, stream_rx))
+    }
+
+    /// Test-only entry point that dispatches
+    /// `ChatStreamSessionContinueTool` and returns the raw mpsc
+    /// receiver the model thread writes into.
+    #[doc(hidden)]
+    pub fn chat_stream_session_continue_tool_for_test(
+        &self,
+        tool_call_id: String,
+        content: String,
+        config: Option<ChatConfig>,
+    ) -> Result<(
+        ChatStreamHandle,
+        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+    )> {
+        let config = config.unwrap_or_default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        self.thread.send(Qwen35Cmd::ChatStreamSessionContinueTool {
+            tool_call_id,
+            content,
             config,
             stream_tx,
             cancelled: cancelled_inner,

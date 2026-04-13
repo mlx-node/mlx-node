@@ -106,7 +106,10 @@ export class Qwen35Session {
         this.turnCount++;
         return result;
       }
-      const result = await this.model.chatSessionContinue(userMessage, mergedConfig);
+      // `null` for the new `images` guard parameter — this wrapper is
+      // text-only; Step T2 will surface an image-aware session API
+      // that threads image changes through a fresh session restart.
+      const result = await this.model.chatSessionContinue(userMessage, null, mergedConfig);
       this.turnCount++;
       return result;
     } finally {

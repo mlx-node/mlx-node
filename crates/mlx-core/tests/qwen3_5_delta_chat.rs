@@ -132,7 +132,7 @@ async fn session_path_keeps_ttft_flat_across_turns() {
         let turn_idx = idx + 2;
         let cfg = chat_config_default(64);
         let result = model
-            .chat_session_continue((*next_user).to_string(), Some(cfg))
+            .chat_session_continue((*next_user).to_string(), None, Some(cfg))
             .await
             .expect("delta chat failed");
         let ttft = result
@@ -339,7 +339,7 @@ async fn stream_session_path_keeps_ttft_flat_across_turns() {
         let turn_idx = idx + 2;
         let cfg = chat_config_default(64);
         let (_handle, rx) = model
-            .chat_stream_session_continue_for_test((*next_user).to_string(), Some(cfg))
+            .chat_stream_session_continue_for_test((*next_user).to_string(), None, Some(cfg))
             .expect("delta stream dispatch failed");
         let (chunks, ttft, done) = drain_stream_turn(rx).await;
         assert!(done, "turn {turn_idx} stream didn't reach done=true");
@@ -492,6 +492,7 @@ async fn stream_session_cancellation_preserves_cache_for_next_turn() {
     let (_handle2, rx2) = model
         .chat_stream_session_continue_for_test(
             "What number were you on?".to_string(),
+            None,
             Some(turn2_cfg),
         )
         .expect("follow-up continue after cancel failed to dispatch");
@@ -508,5 +509,177 @@ async fn stream_session_cancellation_preserves_cache_for_next_turn() {
         ),
         "unexpected follow-up finish_reason: {:?}",
         final2.finish_reason
+    );
+}
+
+// ---------------------------------------------------------------------
+// Step-1 coverage: image-in-continue rejection + tool-result round-trip
+// ---------------------------------------------------------------------
+//
+// These assertions guard the new `images` parameter on
+// `chat_session_continue` (must reject non-empty with a typed error
+// prefixed by `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`) and the new
+// `chat_session_continue_tool` entry point (must round-trip a
+// tool-response delta through the session path and return a non-empty
+// reply). Both are gated on `MLX_TEST_MODEL_PATH` the same way as the
+// tests above — no model, trivial pass.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint"]
+async fn session_continue_rejects_images_with_restart_prefix() {
+    let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
+        eprintln!("skipping: MLX_TEST_MODEL_PATH unset");
+        return;
+    };
+    let model_dir = Path::new(&model_path);
+    assert!(
+        model_dir.exists(),
+        "MLX_TEST_MODEL_PATH does not exist: {}",
+        model_path
+    );
+
+    let model = Qwen3_5Model::load(model_path.clone())
+        .await
+        .expect("failed to load Qwen3.5 model");
+
+    // Prime the session with a plain text-only start so the delta path
+    // has a live cache to reject against.
+    let turn1_cfg = chat_config_default(32);
+    let turn1_messages = vec![user_message("Say hi in one short word.")];
+    let _ = model
+        .chat_session_start(turn1_messages, Some(turn1_cfg))
+        .await
+        .expect("turn 1 chat_session_start failed");
+
+    // Dummy image bytes — the rejection fires before any image
+    // processing, so they don't need to be a valid image payload.
+    let dummy_image: napi::bindgen_prelude::Uint8Array =
+        napi::bindgen_prelude::Uint8Array::new(vec![0u8; 16]);
+    let images = Some(vec![dummy_image]);
+
+    let cfg = chat_config_default(32);
+    let err = model
+        .chat_session_continue("What now?".to_string(), images, Some(cfg))
+        .await
+        .expect_err("chat_session_continue with images should error");
+    let msg = err.reason.clone();
+    assert!(
+        msg.starts_with("IMAGE_CHANGE_REQUIRES_SESSION_RESTART:"),
+        "expected IMAGE_CHANGE_REQUIRES_SESSION_RESTART prefix, got: {msg}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint"]
+async fn session_continue_tool_round_trips() {
+    let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
+        eprintln!("skipping: MLX_TEST_MODEL_PATH unset");
+        return;
+    };
+    let model_dir = Path::new(&model_path);
+    assert!(
+        model_dir.exists(),
+        "MLX_TEST_MODEL_PATH does not exist: {}",
+        model_path
+    );
+
+    let model = Qwen3_5Model::load(model_path.clone())
+        .await
+        .expect("failed to load Qwen3.5 model");
+
+    // Start a session so the tool-result delta has a live cache to
+    // prefill on top of.
+    let turn1_cfg = chat_config_default(32);
+    let turn1_messages = vec![user_message("Say hi in one short word.")];
+    let _ = model
+        .chat_session_start(turn1_messages, Some(turn1_cfg))
+        .await
+        .expect("turn 1 chat_session_start failed");
+
+    let tool_cfg = chat_config_default(32);
+    let result = model
+        .chat_session_continue_tool(
+            "dummy_id".to_string(),
+            "result content".to_string(),
+            Some(tool_cfg),
+        )
+        .await
+        .expect("chat_session_continue_tool failed");
+
+    assert!(
+        !result.text.is_empty() || result.num_tokens > 0,
+        "tool-result continue returned an empty reply: {:?}",
+        result
+    );
+    assert!(
+        result.finish_reason == "stop" || result.finish_reason == "length",
+        "unexpected finish_reason: {}",
+        result.finish_reason
+    );
+}
+
+/// Gated VLM session-start smoke test: verifies that
+/// `chat_session_start` now accepts image messages and produces a reply.
+///
+/// Skipped unless `MLX_TEST_VLM_MODEL_PATH` AND
+/// `MLX_TEST_VLM_IMAGE_PATH` are set — the full VLM session coverage
+/// is deferred to a later step; this test exists only to lock in the
+/// fact that the text-only guard was actually removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_TEST_VLM_MODEL_PATH + MLX_TEST_VLM_IMAGE_PATH for a Qwen3.5 VLM checkpoint + test image"]
+async fn session_start_accepts_images_for_vlm() {
+    let Ok(model_path) = std::env::var("MLX_TEST_VLM_MODEL_PATH") else {
+        eprintln!("skipping: MLX_TEST_VLM_MODEL_PATH unset");
+        return;
+    };
+    let Ok(image_path) = std::env::var("MLX_TEST_VLM_IMAGE_PATH") else {
+        eprintln!("skipping: MLX_TEST_VLM_IMAGE_PATH unset");
+        return;
+    };
+    let model_dir = Path::new(&model_path);
+    assert!(
+        model_dir.exists(),
+        "MLX_TEST_VLM_MODEL_PATH does not exist: {}",
+        model_path
+    );
+    let img_file = Path::new(&image_path);
+    assert!(
+        img_file.exists(),
+        "MLX_TEST_VLM_IMAGE_PATH does not exist: {}",
+        image_path
+    );
+
+    let image_bytes = std::fs::read(&image_path).expect("failed to read image file");
+    let image_uint8: napi::bindgen_prelude::Uint8Array =
+        napi::bindgen_prelude::Uint8Array::new(image_bytes);
+
+    let model = Qwen3_5Model::load(model_path.clone())
+        .await
+        .expect("failed to load Qwen3.5 VLM model");
+
+    let message = ChatMessage {
+        role: "user".to_string(),
+        content: "Describe this image briefly.".to_string(),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+        images: Some(vec![image_uint8]),
+    };
+
+    let cfg = chat_config_default(32);
+    let result = model
+        .chat_session_start(vec![message], Some(cfg))
+        .await
+        .expect("chat_session_start with VLM image failed");
+
+    assert!(
+        result.finish_reason == "stop" || result.finish_reason == "length",
+        "unexpected finish_reason: {}",
+        result.finish_reason
+    );
+    assert!(
+        result.num_tokens > 0,
+        "VLM session-start returned zero generated tokens: {:?}",
+        result
     );
 }

@@ -38,7 +38,8 @@ function makeMockModel() {
       makeChatResult('turn-1-reply'),
   );
   const chatSessionContinue = vi.fn(
-    async (_userMessage: string, _config?: ChatConfig | null): Promise<ChatResult> => makeChatResult('turn-n-reply'),
+    async (_userMessage: string, _images?: Uint8Array[] | null, _config?: ChatConfig | null): Promise<ChatResult> =>
+      makeChatResult('turn-n-reply'),
   );
   const resetCaches = vi.fn(() => undefined);
 
@@ -99,7 +100,7 @@ describe('Qwen35Session', () => {
 
     // reuseCache forced on across continue calls as well.
     for (const call of chatSessionContinue.mock.calls) {
-      expect(call[1]?.reuseCache).toBe(true);
+      expect(call[2]?.reuseCache).toBe(true);
     }
   });
 
@@ -111,7 +112,7 @@ describe('Qwen35Session', () => {
     await session.send('Second', { reuseCache: false });
 
     expect(chatSessionStart.mock.calls[0][1]?.reuseCache).toBe(true);
-    expect(chatSessionContinue.mock.calls[0][1]?.reuseCache).toBe(true);
+    expect(chatSessionContinue.mock.calls[0][2]?.reuseCache).toBe(true);
   });
 
   it('merges defaultConfig and per-call config (with per-call taking precedence)', async () => {
@@ -240,7 +241,7 @@ describe('Qwen35Session', () => {
         makeChatResult('non-stream-turn-1'),
     );
     const chatSessionContinue = vi.fn(
-      async (_userMessage: string, _config?: ChatConfig | null): Promise<ChatResult> =>
+      async (_userMessage: string, _images?: Uint8Array[] | null, _config?: ChatConfig | null): Promise<ChatResult> =>
         makeChatResult('non-stream-turn-n'),
     );
     const resetCaches = vi.fn(() => undefined);

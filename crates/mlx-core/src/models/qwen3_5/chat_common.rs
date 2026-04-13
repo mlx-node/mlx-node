@@ -34,9 +34,7 @@ use super::model::{ChatConfig, ChatResult, ChatStreamChunk};
 /// change without a coordinated update on both sides of the NAPI
 /// boundary.
 ///
-/// Introduced as part of the chat_common helper promotion; wired up by
-/// later session-refactor steps, so `#[allow(dead_code)]` until then.
-#[allow(dead_code)]
+/// Introduced as part of the chat_common helper promotion.
 pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESSION_RESTART:";
 
 /// Hash raw image bytes to a u64 key for cache lookup.
@@ -159,18 +157,28 @@ pub(crate) fn build_chatml_continue_delta_text(
 /// Like `build_chatml_continue_delta_text`, this helper assumes the cached
 /// history ends on `<|im_end|>` and emits a leading `\n` to close that
 /// turn's line. After the tool response we open an assistant turn ready
-/// for the next generation step. Thinking-prefix handling is intentionally
-/// omitted here: a tool-result continuation by definition follows an
-/// assistant turn that just emitted tool calls, and the model is expected
-/// to resume normal content generation (not re-enter a fresh `<think>`
-/// block) for the tool reply.
+/// for the next generation step.
 ///
-/// Introduced as part of the chat_common helper promotion; wired up by
-/// later session-refactor steps, so `#[allow(dead_code)]` until then.
-#[allow(dead_code)]
-pub(crate) fn build_chatml_tool_delta_text(_tool_call_id: &str, content: &str) -> String {
+/// Thinking-prefix handling mirrors `build_chatml_continue_delta_text`:
+/// when thinking mode is explicitly disabled (`Some(false)`), omit the
+/// `<think>\n` prefix so the first generated token is a plain content
+/// token. Otherwise (`None` / `Some(true)`) emit the `<think>\n` prefix,
+/// matching what the Qwen3.5 jinja template does after the assistant
+/// opener. Callers resolve `enable_thinking` from the current
+/// `ChatConfig` via `resolve_enable_thinking` before calling this helper.
+pub(crate) fn build_chatml_tool_delta_text(
+    _tool_call_id: &str,
+    content: &str,
+    enable_thinking: Option<bool>,
+) -> String {
+    let thinking_prefix = match enable_thinking {
+        Some(false) => "",
+        // None = template default (Qwen3.5: thinking on) and
+        // Some(true) both take the thinking path.
+        _ => "<think>\n",
+    };
     format!(
-        "\n<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n<|im_start|>assistant\n",
+        "\n<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n<|im_start|>assistant\n{thinking_prefix}",
     )
 }
 

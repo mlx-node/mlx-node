@@ -188,8 +188,12 @@ export class Qwen35Model extends Qwen35ModelNative {
    */
   // @ts-expect-error — override callback-based native method with AsyncGenerator
   async *chatStreamSessionContinue(userMessage: string, config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
+    // `null` for the new `images` guard parameter — this wrapper is
+    // text-only; Step T2 will expose a higher-level image-aware
+    // ChatSession API that plumbs image changes through a fresh
+    // session restart.
     yield* _runChatStream((callback) =>
-      _nativeDenseChatStreamSessionContinue.call(this, userMessage, config ?? null, callback),
+      _nativeDenseChatStreamSessionContinue.call(this, userMessage, null, config ?? null, callback),
     );
   }
 }
