@@ -60,17 +60,19 @@ const handler = new MessageHandler({
           // Task 4's SabSink declares __wasm_i32_atomic_wait /
           // __wasm_atomic_notify as extern "C" — wasm-ld emits them as host
           // imports, so provide JS stubs wrapping Atomics.wait / notify.
-          // Cache the Int32Array view once per worker (shared memory never
-          // detaches, so the view stays valid for the lifetime of the worker).
-          __wasm_i32_atomic_wait: ((sharedI32) => (ptr, expected, timeoutNs) => {
-            const index = ptr >>> 2;
+          // Re-read wasmMemory.buffer each call because memory.grow() replaces
+          // the buffer object; a cached view would point at the old, smaller
+          // range and throw RangeError on indices beyond the old length.
+          __wasm_i32_atomic_wait: (ptr, expected, timeoutNs) => {
+            const view = new Int32Array(wasmMemory.buffer);
             const timeoutMs = timeoutNs === -1n ? Infinity : Number(timeoutNs / 1_000_000n);
-            const result = Atomics.wait(sharedI32, index, expected, timeoutMs);
+            const result = Atomics.wait(view, ptr >>> 2, expected, timeoutMs);
             return result === 'ok' ? 0 : result === 'not-equal' ? 1 : 2;
-          })(new Int32Array(wasmMemory.buffer)),
-          __wasm_atomic_notify: ((sharedI32) => (ptr, count) => {
-            return Atomics.notify(sharedI32, ptr >>> 2, count);
-          })(new Int32Array(wasmMemory.buffer)),
+          },
+          __wasm_atomic_notify: (ptr, count) => {
+            const view = new Int32Array(wasmMemory.buffer);
+            return Atomics.notify(view, ptr >>> 2, count);
+          },
           ...bridge.imports,
         };
       },

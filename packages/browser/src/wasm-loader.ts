@@ -5,11 +5,7 @@
  * via NAPI-RS's `overwriteImports` mechanism.
  */
 
-import {
-  instantiateNapiModule,
-  getDefaultContext,
-  WASI,
-} from '@napi-rs/wasm-runtime';
+import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-runtime';
 
 import { createWebGPUBridge } from './webgpu-bridge.js';
 
@@ -77,10 +73,7 @@ export async function initMLX(options: MLXBrowserOptions) {
     wasi,
     onCreateWorker() {
       // Workers get real WebGPU bridge (each creates its own GPUDevice)
-      return new Worker(
-        new URL('./webgpu-worker.mjs', import.meta.url),
-        { type: 'module' },
-      );
+      return new Worker(new URL('./webgpu-worker.mjs', import.meta.url), { type: 'module' });
     },
     overwriteImports(importObject: Record<string, Record<string, unknown>>) {
       importObject.env = {
@@ -89,6 +82,22 @@ export async function initMLX(options: MLXBrowserOptions) {
         ...importObject.emnapi,
         memory: sharedMemory,
         ...cxxStubs,
+        // Task 4's SabSink declares __wasm_i32_atomic_wait /
+        // __wasm_atomic_notify as extern "C" — wasm-ld emits them as host
+        // imports, so provide JS stubs wrapping Atomics.wait / notify.
+        // Re-read sharedMemory.buffer each call because memory.grow() replaces
+        // the buffer object; a cached view would point at the old, smaller
+        // range and throw RangeError on indices beyond the old length.
+        __wasm_i32_atomic_wait: (ptr: number, expected: number, timeoutNs: bigint) => {
+          const view = new Int32Array(sharedMemory.buffer);
+          const timeoutMs = timeoutNs === -1n ? Infinity : Number(timeoutNs / 1_000_000n);
+          const result = Atomics.wait(view, ptr >>> 2, expected, timeoutMs);
+          return result === 'ok' ? 0 : result === 'not-equal' ? 1 : 2;
+        },
+        __wasm_atomic_notify: (ptr: number, count: number) => {
+          const view = new Int32Array(sharedMemory.buffer);
+          return Atomics.notify(view, ptr >>> 2, count);
+        },
         // Real WebGPU bridge (not stubs)
         ...bridge.imports,
       };
