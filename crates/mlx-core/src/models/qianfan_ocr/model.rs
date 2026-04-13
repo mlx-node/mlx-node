@@ -329,21 +329,22 @@ impl QianfanOCRInner {
             .unwrap_or(0)
     }
 
-    /// Chat generation (non-streaming).
+    /// Core synchronous chat implementation with optional EOS override
+    /// (runs on the model thread).
     ///
-    /// Port of the legacy `chat()` body — preserves the exact InternViT
-    /// → bridge → language-model prefill/decode pipeline, KV cache reuse
-    /// via prefix matching, repetition/presence/frequency penalties,
-    /// thinking/tool call parsing, and optional performance metrics.
+    /// Shared InternViT -> bridge -> language-model prefill/decode
+    /// pipeline for the session surface: KV cache reuse via prefix
+    /// matching, repetition/presence/frequency penalties, thinking/tool
+    /// call parsing, and optional performance metrics.
     ///
-    /// `eos_override` controls which token terminates decoding:
-    ///   - `None`: legacy `chat_sync` behaviour — stops on
-    ///     `self.config.eos_token_id` (preserves byte-for-byte compat).
-    ///   - `Some(id)`: session-aware path (used by
-    ///     [`Self::chat_session_start_sync`]) — stops on the supplied id
-    ///     (typically `<|im_end|>`) so the cached history ends on a
-    ///     clean ChatML boundary that subsequent `chat_session_continue_*`
-    ///     calls can append a raw delta on top of.
+    /// `eos_override` lets session methods pass a custom EOS token
+    /// (`<|im_end|>` for ChatML boundaries) so the cached history ends on
+    /// a clean delimiter that subsequent `chat_session_continue_*` calls
+    /// can append a raw delta on top of. Passing `None` falls back to
+    /// `self.config.eos_token_id`.
+    ///
+    /// Only called from [`Self::chat_session_start_sync`] (with
+    /// `Some(im_end_id)`); there is no longer a non-session entry point.
     fn chat_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,

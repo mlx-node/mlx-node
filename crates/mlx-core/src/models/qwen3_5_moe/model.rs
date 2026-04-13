@@ -1704,22 +1704,21 @@ impl Qwen35MoeInner {
         Ok(())
     }
 
-    /// Session-aware variant of `chat_sync` used to START a new session.
+    /// Start a new chat session.
     ///
-    /// Unlike `chat_sync`, this path:
-    ///   - uses `<|im_end|>` (from the tokenizer vocab) as its stop token
-    ///     instead of `config.eos_token_id`, so the cached history ends on a
-    ///     clean ChatML boundary that subsequent `chat_session_continue_sync`
-    ///     deltas can append to without re-rendering the jinja template,
-    ///   - resets the caches up-front so the session is guaranteed to start
-    ///     from a known-clean state regardless of any prior `chat_sync`
-    ///     invocations.
+    /// Resets the caches up-front so the session is guaranteed to start
+    /// from a known-clean state, then delegates to [`Self::chat_sync_core`]
+    /// with `<|im_end|>` (from the tokenizer vocab) as the stop token so
+    /// the cached history ends on a clean ChatML boundary that subsequent
+    /// `chat_session_continue_sync` deltas can append to without
+    /// re-rendering the jinja template.
     ///
-    /// Images are accepted on session start — the downstream `chat_sync_core`
-    /// already handles the VLM prefill path via `vlm_prefill_moe`. Subsequent
-    /// turns in the same session MUST go through `chat_session_continue_sync`
-    /// which is text-only; changing the image set mid-session requires
-    /// starting a new session via `chat_session_start_sync`.
+    /// Images are accepted on session start — the downstream
+    /// [`Self::chat_sync_core`] already handles the VLM prefill path via
+    /// `vlm_prefill_moe`. Subsequent turns in the same session MUST go
+    /// through `chat_session_continue_sync` which is text-only; changing
+    /// the image set mid-session requires starting a new session via
+    /// this method again.
     pub(crate) fn chat_session_start_sync(
         &mut self,
         messages: Vec<ChatMessage>,

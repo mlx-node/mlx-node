@@ -853,28 +853,22 @@ impl Qwen35Inner {
         Ok(())
     }
 
-    /// Session-aware variant of `chat_sync_core` used to START a new session.
+    /// Start a new chat session.
     ///
-    /// Unlike `chat_sync`, this path:
-    ///   - uses `<|im_end|>` (from the tokenizer vocab) as its stop token
-    ///     instead of `config.eos_token_id`, so the cached history ends on a
-    ///     clean ChatML boundary that subsequent `chat_session_continue_sync`
-    ///     deltas can append to without re-rendering the jinja template,
-    ///   - resets the caches up-front so the session is guaranteed to start
-    ///     from a known-clean state regardless of any prior `chat_sync`
-    ///     invocations.
+    /// Resets the caches up-front so the session is guaranteed to start
+    /// from a known-clean state, then delegates to [`Self::chat_sync_core`]
+    /// with `<|im_end|>` (from the tokenizer vocab) as the stop token so
+    /// the cached history ends on a clean ChatML boundary that subsequent
+    /// `chat_session_continue_sync` / [`Self::chat_tokens_delta_sync`]
+    /// calls can append a raw delta on top of without re-rendering the
+    /// jinja template.
     ///
-    /// Images are accepted on session start — the downstream `chat_sync_core`
-    /// already handles the VLM prefill path (vision encoder, image cache
-    /// key, expanded tokens). Subsequent turns in the same session MUST go
-    /// through `chat_session_continue_sync` which is text-only; changing
-    /// the image set mid-session requires starting a new session via
-    /// `chat_session_start_sync`.
-    ///
-    /// After this call, callers MUST use `chat_session_continue_sync` (or
-    /// equivalently `chat_tokens_delta_sync`) for subsequent turns — going
-    /// back to `chat_sync` would retry prefix verification against a cached
-    /// history that ends on `<|im_end|>`, which no jinja template renders.
+    /// Images are accepted on session start — the downstream
+    /// [`Self::chat_sync_core`] already handles the VLM prefill path
+    /// (vision encoder, image cache key, expanded tokens). Subsequent
+    /// turns in the same session MUST go through `chat_session_continue_sync`
+    /// which is text-only; changing the image set mid-session requires
+    /// starting a new session via this method again.
     pub(crate) fn chat_session_start_sync(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -911,16 +905,17 @@ impl Qwen35Inner {
         self.chat_sync_core(messages, config, Some(im_end_id))
     }
 
-    /// Core implementation of `chat_sync` / `chat_session_start_sync`.
+    /// Core synchronous chat implementation with optional EOS override
+    /// (runs on the model thread).
     ///
-    /// Factored so both paths share the jinja rendering + prefill + decode
-    /// plumbing. The only behavioural difference is the EOS token:
+    /// Shared jinja rendering + prefill + decode plumbing for the session
+    /// surface. `eos_override` lets session methods pass a custom EOS token
+    /// (`<|im_end|>` for ChatML boundaries) so the cached history ends on a
+    /// clean delimiter that subsequent session-delta turns can append to.
+    /// Passing `None` falls back to `config.eos_token_id`.
     ///
-    ///   - `chat_sync` passes `eos_override = None`, so the decode loop
-    ///     stops on `config.eos_token_id` (matches legacy behaviour exactly).
-    ///   - `chat_session_start_sync` passes `eos_override = Some(im_end_id)`
-    ///     so the cached history ends on `<|im_end|>`, yielding clean
-    ///     ChatML boundaries for subsequent session deltas.
+    /// Only called from [`Self::chat_session_start_sync`] (with
+    /// `Some(im_end_id)`); there is no longer a non-session entry point.
     fn chat_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -1214,18 +1209,18 @@ impl Qwen35Inner {
     /// Session-based chat continuation via a pre-tokenized delta.
     ///
     /// Runs a text-only prefill of `delta_tokens` on top of the existing KV
-    /// caches and decodes the next reply. Unlike `chat_sync`, this path:
+    /// caches and decodes the next reply. This path:
     /// - skips the jinja chat template entirely (caller produces the delta),
     /// - skips prefix verification (caller owns cache coherence by construction),
     /// - uses `<|im_end|>` (from the tokenizer vocab) as its stop token instead
     ///   of `config.eos_token_id`, yielding clean cache boundaries for the next
     ///   turn's delta,
     /// - resolves `enable_thinking` from `config.reasoning_effort` via
-    ///   `chat_common::resolve_enable_thinking`, same as `chat_sync`,
+    ///   `chat_common::resolve_enable_thinking`,
     /// - is text-only: errors if the session has images.
     ///
     /// Requires a live session: `self.caches` must have been initialized by a
-    /// prior `chat_sync` / `chat_session_start_sync` call. Errors otherwise.
+    /// prior [`Self::chat_session_start_sync`] call. Errors otherwise.
     pub(crate) fn chat_tokens_delta_sync(
         &mut self,
         delta_tokens: Vec<u32>,

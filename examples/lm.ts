@@ -11,9 +11,11 @@
  * eos_token_id / eos_token mismatch, which caused a Metal GPU watchdog
  * hang on turn 4 of a 4-turn run.
  *
- * Gemma4, Qwen3 (legacy), Qianfan-OCR, and the VLM image branch still
- * go through `model.chat(messages, ...)` — those paths don't hit the
- * Qwen3.5-specific bug and the session API is currently text-only.
+ * All other branches (Gemma4, Qwen3, Qianfan-OCR, Qwen3.5 VLM image
+ * path) temporarily call `model.chat(messages, ...)` via an `any`-cast
+ * bridge because the legacy NAPI surface was removed in Step 7.
+ * TODO(T4): migrate every branch to its model's `ChatSession` API so
+ * the `any`-cast can be dropped.
  *
  * Usage:
  *   oxnode examples/lm.ts [model-name] [--image <path>]
