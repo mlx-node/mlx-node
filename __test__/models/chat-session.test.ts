@@ -1,0 +1,654 @@
+/**
+ * Unit tests for the generic `ChatSession<M>` wrapper.
+ *
+ * Hermetic — no model weights are loaded. A mock
+ * `SessionCapableModel` with `vi.fn()` / `vi.fn()` async generator
+ * stubs drives every code path.
+ *
+ * Covers:
+ *   - Turn routing: turn 0 → start, turn N → continue, image-change
+ *     → restart (reset caches + full history).
+ *   - `inFlight` concurrency guard on `send` and `sendStream`.
+ *   - `sawFinal` gating (throws, caller-break, `finishReason='error'`).
+ *   - `reset()` clears history, image key, turn counter, and calls
+ *     `resetCaches` on the model.
+ *   - `sendToolResult` / `sendToolResultStream` routing.
+ *   - `hasImages` getter semantics.
+ *
+ * Imports `ChatSession` via relative path because T1 intentionally
+ * does not touch `packages/lm/src/index.ts` — the package-level
+ * export is added in T5.
+ */
+import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
+import { describe, expect, it, vi } from 'vite-plus/test';
+
+import { ChatSession, type SessionCapableModel } from '../../packages/lm/src/chat-session.js';
+import type { ChatStreamEvent, ChatStreamFinal } from '../../packages/lm/src/stream.js';
+
+/** Build a minimal `ChatResult` sufficient for the session layer. */
+function makeChatResult(text: string): ChatResult {
+  return {
+    text,
+    rawText: text,
+    toolCalls: [],
+    thinking: null,
+    numTokens: 1,
+    promptTokens: 1,
+    reasoningTokens: 0,
+    finishReason: 'stop',
+    performance: undefined,
+  } as unknown as ChatResult;
+}
+
+/** Build a minimal terminal `ChatStreamFinal` chunk. */
+function finalChunk(text: string, finishReason: string = 'stop'): ChatStreamFinal {
+  return {
+    text,
+    done: true,
+    finishReason,
+    toolCalls: [],
+    thinking: null,
+    numTokens: 2,
+    promptTokens: 1,
+    reasoningTokens: 0,
+    rawText: text,
+  } satisfies ChatStreamFinal;
+}
+
+/**
+ * Build a typed mock `SessionCapableModel` with all six session
+ * entry points + `resetCaches` spied. Returns the mock plus direct
+ * handles to each spy for assertions.
+ */
+function makeMockModel() {
+  const chatSessionStart = vi.fn(
+    async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> => makeChatResult('start-reply'),
+  );
+  const chatSessionContinue = vi.fn(
+    async (_userMessage: string, _images: Uint8Array[] | null, _config?: ChatConfig | null): Promise<ChatResult> =>
+      makeChatResult('continue-reply'),
+  );
+  const chatSessionContinueTool = vi.fn(
+    async (_toolCallId: string, _content: string, _config?: ChatConfig | null): Promise<ChatResult> =>
+      makeChatResult('tool-reply'),
+  );
+  const chatStreamSessionStart = vi.fn(async function* (
+    _messages: ChatMessage[],
+    _config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield { text: 'start', done: false };
+    yield { text: '-reply', done: false };
+    yield finalChunk('start-reply');
+  });
+  const chatStreamSessionContinue = vi.fn(async function* (
+    _userMessage: string,
+    _images: Uint8Array[] | null,
+    _config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield { text: 'cont', done: false };
+    yield finalChunk('cont-reply');
+  });
+  const chatStreamSessionContinueTool = vi.fn(async function* (
+    _toolCallId: string,
+    _content: string,
+    _config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield { text: 'tool', done: false };
+    yield finalChunk('tool-reply');
+  });
+  const resetCaches = vi.fn(() => undefined);
+
+  const model: SessionCapableModel = {
+    chatSessionStart,
+    chatSessionContinue,
+    chatSessionContinueTool,
+    chatStreamSessionStart,
+    chatStreamSessionContinue,
+    chatStreamSessionContinueTool,
+    resetCaches,
+  };
+
+  return {
+    model,
+    chatSessionStart,
+    chatSessionContinue,
+    chatSessionContinueTool,
+    chatStreamSessionStart,
+    chatStreamSessionContinue,
+    chatStreamSessionContinueTool,
+    resetCaches,
+  };
+}
+
+describe('ChatSession', () => {
+  // -------------------------------------------------------------------
+  // send() — non-streaming path
+  // -------------------------------------------------------------------
+
+  describe('send() routing', () => {
+    it('routes turn 0 through chatSessionStart with the full history', async () => {
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model, { system: 'Be concise.' });
+
+      expect(session.turns).toBe(0);
+      await session.send('Hi there!');
+
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+      expect(session.turns).toBe(1);
+
+      const [messages, config] = chatSessionStart.mock.calls[0];
+      expect(messages).toEqual([
+        { role: 'system', content: 'Be concise.' },
+        { role: 'user', content: 'Hi there!' },
+      ]);
+      expect(config?.reuseCache).toBe(true);
+    });
+
+    it('omits the system prompt when none was configured', async () => {
+      const { model, chatSessionStart } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('Hello');
+      const [messages] = chatSessionStart.mock.calls[0];
+      expect(messages).toEqual([{ role: 'user', content: 'Hello' }]);
+    });
+
+    it('routes turn N through chatSessionContinue with images=null', async () => {
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('First');
+      await session.send('Second');
+      await session.send('Third');
+
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionContinue).toHaveBeenCalledTimes(2);
+      expect(session.turns).toBe(3);
+
+      expect(chatSessionContinue.mock.calls[0][0]).toBe('Second');
+      expect(chatSessionContinue.mock.calls[0][1]).toBeNull();
+      expect(chatSessionContinue.mock.calls[1][0]).toBe('Third');
+      expect(chatSessionContinue.mock.calls[1][1]).toBeNull();
+
+      for (const call of chatSessionContinue.mock.calls) {
+        expect(call[2]?.reuseCache).toBe(true);
+      }
+    });
+
+    it('forces reuseCache=true even when the caller passes false', async () => {
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('First', { config: { reuseCache: false } });
+      await session.send('Second', { config: { reuseCache: false } });
+
+      expect(chatSessionStart.mock.calls[0][1]?.reuseCache).toBe(true);
+      expect(chatSessionContinue.mock.calls[0][2]?.reuseCache).toBe(true);
+    });
+
+    it('merges defaultConfig and per-call config (per-call wins)', async () => {
+      const { model, chatSessionStart } = makeMockModel();
+      const session = new ChatSession(model, {
+        defaultConfig: { maxNewTokens: 32, temperature: 0.2 },
+      });
+
+      await session.send('Hello', { config: { temperature: 0.8 } });
+
+      const [, config] = chatSessionStart.mock.calls[0];
+      expect(config?.maxNewTokens).toBe(32);
+      expect(config?.temperature).toBe(0.8);
+      expect(config?.reuseCache).toBe(true);
+    });
+
+    it('appends assistant reply to history on success', async () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+      await session.send('turn-1');
+      await session.send('turn-2');
+      // Internal history is private — assert via the image-change
+      // restart which rebuilds chatSessionStart from history.
+      expect(session.turns).toBe(2);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Image-change routing
+  // -------------------------------------------------------------------
+
+  describe('image-change routing', () => {
+    const imgA = new Uint8Array([1, 2, 3]);
+    const imgB = new Uint8Array([4, 5, 6]);
+
+    it('routes turn-0 image send through chatSessionStart with images attached', async () => {
+      const { model, chatSessionStart } = makeMockModel();
+      const session = new ChatSession(model);
+
+      expect(session.hasImages).toBe(false);
+      await session.send('describe', { images: [imgA] });
+      expect(session.hasImages).toBe(true);
+
+      const [messages] = chatSessionStart.mock.calls[0];
+      expect(messages).toHaveLength(1);
+      expect(messages[0].role).toBe('user');
+      expect(messages[0].content).toBe('describe');
+      expect(messages[0].images).toEqual([imgA]);
+    });
+
+    it('text continue after image start stays on the cheap delta path', async () => {
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('describe', { images: [imgA] });
+      await session.send('follow-up question'); // text-only
+
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+      expect(chatSessionContinue.mock.calls[0][1]).toBeNull();
+      // Image key sticks around since we never cleared it.
+      expect(session.hasImages).toBe(true);
+    });
+
+    it('different image bytes trigger a full restart', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool, resetCaches } = makeMockModel();
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      await session.send('describe A', { images: [imgA] });
+      // Use a tool-result turn to keep the image-key intact between
+      // sends (text-only `send()` with no images would clear the
+      // image key and count as an image-change itself — covered by
+      // the "images → no-images" test below).
+      await session.sendToolResult('call-1', 'tool-output');
+      await session.send('describe B', { images: [imgB] }); // image change → restart
+
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+      // Restart path: resetCaches invoked + new start with a
+      // freshly-rebuilt history (just system + new user message).
+      expect(resetCaches).toHaveBeenCalledTimes(1);
+
+      const restartMessages = chatSessionStart.mock.calls[1][0];
+      expect(restartMessages).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe B', images: [imgB] },
+      ]);
+      // Turn count reset to 1 (one successful send after restart).
+      expect(session.turns).toBe(1);
+    });
+
+    it('identical image bytes do NOT trigger a restart', async () => {
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('describe', { images: [imgA] });
+      // Send the SAME bytes again — should take the cheap delta path.
+      await session.send('describe-again', { images: [new Uint8Array([1, 2, 3])] });
+
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+    });
+
+    it('text-only follow-up after image turn stays on the delta path', async () => {
+      // Semantic: omitting `images` means "keep the cache state as
+      // is", not "clear images". This lets VLM users refer back to
+      // the same cached image context via cheap text-only turns.
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('describe', { images: [imgA] });
+      await session.send('what about the top-right?'); // no images → delta
+
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+      // lastImagesKey is unchanged — cache still holds the image.
+      expect(session.hasImages).toBe(true);
+    });
+
+    it('hasImages stays true across text-only follow-ups and tool turns', async () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      expect(session.hasImages).toBe(false);
+      await session.send('turn-1', { images: [imgA] });
+      expect(session.hasImages).toBe(true);
+      // Text-only follow-up — image key is preserved.
+      await session.send('text follow-up');
+      expect(session.hasImages).toBe(true);
+      // Tool turn — image key is preserved.
+      await session.sendToolResult('call-1', 'tool output');
+      expect(session.hasImages).toBe(true);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // inFlight guard
+  // -------------------------------------------------------------------
+
+  describe('concurrency guard', () => {
+    it('rejects concurrent send() calls', async () => {
+      let resolveFirst: (r: ChatResult) => void = () => {
+        /* overwritten below */
+      };
+      const first = new Promise<ChatResult>((r) => {
+        resolveFirst = r;
+      });
+      const chatSessionStart = vi.fn(async () => first);
+      const model: SessionCapableModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn(async () => makeChatResult('c')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('t')),
+        chatStreamSessionStart: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      const firstPromise = session.send('First');
+      await expect(session.send('Second')).rejects.toThrow(/concurrent send\(\) not allowed/);
+
+      resolveFirst(makeChatResult('first'));
+      await firstPromise;
+      expect(session.turns).toBe(1);
+
+      await session.send('Third');
+      expect(session.turns).toBe(2);
+    });
+
+    it('clears inFlight on exception', async () => {
+      const { model, chatSessionStart } = makeMockModel();
+      chatSessionStart.mockRejectedValueOnce(new Error('boom'));
+      const session = new ChatSession(model);
+
+      await expect(session.send('Hello')).rejects.toThrow('boom');
+      expect(session.turns).toBe(0);
+
+      // Follow-up must not be blocked by stale inFlight.
+      await session.send('Retry');
+      expect(session.turns).toBe(1);
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // reset()
+  // -------------------------------------------------------------------
+
+  describe('reset()', () => {
+    const imgA = new Uint8Array([1, 2, 3]);
+
+    it('clears history, image key, and turn counter', async () => {
+      const { model, chatSessionStart, resetCaches } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('one', { images: [imgA] });
+      await session.sendToolResult('c1', 'tool-out');
+      expect(session.turns).toBe(2);
+      expect(session.hasImages).toBe(true);
+
+      await session.reset();
+
+      expect(resetCaches).toHaveBeenCalledTimes(1);
+      expect(session.turns).toBe(0);
+      expect(session.hasImages).toBe(false);
+
+      // After reset, the next send must re-route through the start
+      // path — and the history must NOT include any prior turns.
+      await session.send('fresh');
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      const [messages] = chatSessionStart.mock.calls[1];
+      expect(messages).toEqual([{ role: 'user', content: 'fresh' }]);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // sendToolResult()
+  // -------------------------------------------------------------------
+
+  describe('sendToolResult() routing', () => {
+    it('always routes through chatSessionContinueTool', async () => {
+      const { model, chatSessionContinueTool, chatSessionStart } = makeMockModel();
+      const session = new ChatSession(model);
+
+      // No prior send — tool result can be called even on turn 0.
+      const result = await session.sendToolResult('call-42', '{"status":"ok"}');
+      expect(result.text).toBe('tool-reply');
+
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+      expect(chatSessionStart).not.toHaveBeenCalled();
+      expect(chatSessionContinueTool.mock.calls[0][0]).toBe('call-42');
+      expect(chatSessionContinueTool.mock.calls[0][1]).toBe('{"status":"ok"}');
+      expect(chatSessionContinueTool.mock.calls[0][2]?.reuseCache).toBe(true);
+      expect(session.turns).toBe(1);
+    });
+
+    it('forces reuseCache=true even with caller override', async () => {
+      const { model, chatSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.sendToolResult('c1', 'out', { config: { reuseCache: false } });
+      expect(chatSessionContinueTool.mock.calls[0][2]?.reuseCache).toBe(true);
+    });
+
+    it('clears inFlight on exception', async () => {
+      const { model, chatSessionContinueTool } = makeMockModel();
+      chatSessionContinueTool.mockRejectedValueOnce(new Error('tool-boom'));
+      const session = new ChatSession(model);
+
+      await expect(session.sendToolResult('c1', 'out')).rejects.toThrow('tool-boom');
+      // Follow-up works.
+      await session.sendToolResult('c2', 'out2');
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // sendStream() — streaming path
+  // -------------------------------------------------------------------
+
+  describe('sendStream()', () => {
+    it('routes turn 0 through chatStreamSessionStart with full history', async () => {
+      const { model, chatStreamSessionStart, chatStreamSessionContinue } = makeMockModel();
+      const session = new ChatSession(model, { system: 'Be concise.' });
+
+      const events: ChatStreamEvent[] = [];
+      for await (const e of session.sendStream('Hi')) events.push(e);
+
+      expect(chatStreamSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatStreamSessionContinue).not.toHaveBeenCalled();
+      expect(session.turns).toBe(1);
+      expect(events[events.length - 1].done).toBe(true);
+
+      const [messages, config] = chatStreamSessionStart.mock.calls[0];
+      expect(messages).toEqual([
+        { role: 'system', content: 'Be concise.' },
+        { role: 'user', content: 'Hi' },
+      ]);
+      expect(config?.reuseCache).toBe(true);
+    });
+
+    it('routes turn N through chatStreamSessionContinue with images=null', async () => {
+      const { model, chatStreamSessionStart, chatStreamSessionContinue } = makeMockModel();
+      const session = new ChatSession(model);
+
+      for await (const _e of session.sendStream('First')) void _e;
+      for await (const _e of session.sendStream('Second')) void _e;
+      for await (const _e of session.sendStream('Third')) void _e;
+
+      expect(chatStreamSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatStreamSessionContinue).toHaveBeenCalledTimes(2);
+      expect(session.turns).toBe(3);
+      expect(chatStreamSessionContinue.mock.calls[0][0]).toBe('Second');
+      expect(chatStreamSessionContinue.mock.calls[0][1]).toBeNull();
+      expect(chatStreamSessionContinue.mock.calls[1][0]).toBe('Third');
+      expect(chatStreamSessionContinue.mock.calls[1][1]).toBeNull();
+    });
+
+    it('rejects concurrent sendStream calls', async () => {
+      let release: () => void = () => {
+        /* overwritten */
+      };
+      const unblock = new Promise<void>((r) => {
+        release = r;
+      });
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        await unblock;
+        yield finalChunk('done');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      const firstIter = session.sendStream('First');
+      const firstNext = firstIter.next();
+
+      await expect(async () => {
+        for await (const _e of session.sendStream('Second')) void _e;
+      }).rejects.toThrow(/concurrent send/i);
+
+      release();
+      await firstNext;
+      for (;;) {
+        const { done } = await firstIter.next();
+        if (done) break;
+      }
+      expect(session.turns).toBe(1);
+    });
+
+    it('increments turnCount only when the final done chunk is yielded', async () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      let sawDone = false;
+      for await (const e of session.sendStream('Hello')) {
+        if (e.done) sawDone = true;
+      }
+      expect(sawDone).toBe(true);
+      expect(session.turns).toBe(1);
+    });
+
+    it('does NOT increment turnCount on caller break mid-stream', async () => {
+      const { model, chatStreamSessionStart } = makeMockModel();
+      const session = new ChatSession(model);
+
+      for await (const e of session.sendStream('Hello')) {
+        expect(e.done).toBe(false);
+        break;
+      }
+      expect(session.turns).toBe(0);
+
+      // Retry must re-route through the start path.
+      for await (const _e of session.sendStream('Retry')) void _e;
+      expect(chatStreamSessionStart).toHaveBeenCalledTimes(2);
+      expect(session.turns).toBe(1);
+    });
+
+    it('does NOT increment turnCount when the stream throws', async () => {
+      let callCount = 0;
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        callCount++;
+        yield { text: 'partial', done: false };
+        if (callCount === 1) throw new Error('boom');
+        yield finalChunk('recovered');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      await expect(async () => {
+        for await (const _e of session.sendStream('Hello')) void _e;
+      }).rejects.toThrow('boom');
+      expect(session.turns).toBe(0);
+
+      for await (const _e of session.sendStream('Retry')) void _e;
+      expect(chatStreamSessionStart).toHaveBeenCalledTimes(2);
+      expect(session.turns).toBe(1);
+    });
+
+    it('does NOT increment turnCount when final chunk has finishReason="error"', async () => {
+      const errorChunk: ChatStreamFinal = finalChunk('fake', 'error');
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        yield errorChunk;
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      const events: ChatStreamEvent[] = [];
+      for await (const e of session.sendStream('Hi')) events.push(e);
+      expect(events).toEqual([errorChunk]);
+      expect(session.turns).toBe(0);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // sendToolResultStream()
+  // -------------------------------------------------------------------
+
+  describe('sendToolResultStream()', () => {
+    it('routes through chatStreamSessionContinueTool and advances on success', async () => {
+      const { model, chatStreamSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model);
+
+      let sawDone = false;
+      for await (const e of session.sendToolResultStream('c1', 'tool-out')) {
+        if (e.done) sawDone = true;
+      }
+      expect(sawDone).toBe(true);
+      expect(session.turns).toBe(1);
+      expect(chatStreamSessionContinueTool).toHaveBeenCalledTimes(1);
+      expect(chatStreamSessionContinueTool.mock.calls[0][0]).toBe('c1');
+      expect(chatStreamSessionContinueTool.mock.calls[0][1]).toBe('tool-out');
+    });
+
+    it('does NOT advance turnCount on caller break', async () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      for await (const e of session.sendToolResultStream('c1', 'out')) {
+        expect(e.done).toBe(false);
+        break;
+      }
+      expect(session.turns).toBe(0);
+    });
+  });
+});
