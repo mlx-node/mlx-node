@@ -124,6 +124,10 @@ pub(crate) struct Qwen3Inner {
     pub(crate) cached_kv_values: Vec<Option<MxArray>>,
     pub(crate) cached_cache_idx: i32,
     pub(crate) cached_token_history: Vec<u32>,
+    /// Structural uniformity with VLM-capable models. Always `None` for
+    /// text-only Qwen3 — the field exists so that future session helpers
+    /// share the same shape as dense/MoE/VLM inner structs.
+    pub(crate) cached_image_key: Option<u64>,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -533,6 +537,7 @@ impl Qwen3Inner {
             cached_kv_values: Vec::new(),
             cached_cache_idx: 0,
             cached_token_history: Vec::new(),
+            cached_image_key: None,
             training_state: None,
         })
     }
@@ -558,6 +563,7 @@ impl Qwen3Inner {
         self.cached_kv_values.clear();
         self.cached_cache_idx = 0;
         self.cached_token_history.clear();
+        self.cached_image_key = None;
         Ok(())
     }
 
@@ -566,6 +572,7 @@ impl Qwen3Inner {
         self.cached_kv_values.clear();
         self.cached_cache_idx = 0;
         self.cached_token_history.clear();
+        self.cached_image_key = None;
         Ok(())
     }
 
@@ -1195,8 +1202,26 @@ impl Qwen3Inner {
     }
 
     /// Chat synchronous (runs on model thread).
-    /// Wraps the existing chat logic using direct field access.
+    ///
+    /// Thin wrapper that delegates to [`Self::chat_sync_core`] with
+    /// `eos_override = None`, preserving byte-for-byte legacy behavior
+    /// for every existing caller (currently only `Qwen3Cmd::Chat`).
     fn chat_sync(&mut self, messages: Vec<ChatMessage>, config: ChatConfig) -> Result<ChatResult> {
+        self.chat_sync_core(messages, config, None)
+    }
+
+    /// Core synchronous chat implementation with optional EOS override.
+    ///
+    /// `eos_override` lets session methods pass a custom EOS token (e.g.
+    /// `<|im_end|>` for Qwen-style ChatML delimiters). Passing `None`
+    /// falls back to `gen_config.eos_token_id` and finally
+    /// `model_config.eos_token_id`, matching the pre-refactor behavior.
+    fn chat_sync_core(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        eos_override: Option<u32>,
+    ) -> Result<ChatResult> {
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -1323,7 +1348,13 @@ impl Qwen3Inner {
         let max_consecutive_tokens = gen_config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = gen_config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = gen_config.ngram_size.unwrap_or(64);
-        let eos_token_id = gen_config.eos_token_id.or(Some(model_config.eos_token_id));
+        // `eos_override` wins if set (session path uses this to close on
+        // `<|im_end|>`); otherwise preserve legacy chain:
+        // `gen_config.eos_token_id` → `model_config.eos_token_id`.
+        let eos_token_id = eos_override
+            .map(|id| id as i32)
+            .or(gen_config.eos_token_id)
+            .or(Some(model_config.eos_token_id));
         let return_logprobs = gen_config.return_logprobs.unwrap_or(false);
         let prefill_step_size = gen_config.prefill_step_size.unwrap_or(2048) as usize;
 
