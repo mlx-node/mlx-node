@@ -336,21 +336,31 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let sawFinal = false;
       let accumulated = '';
       let finalRaw: string | null = null;
-      for await (const event of this.model.chatStreamSessionContinue(userMessage, null, mergedConfig)) {
-        if (event.done) {
-          if (event.finishReason !== 'error') {
-            sawFinal = true;
-            finalRaw = event.text;
+      try {
+        for await (const event of this.model.chatStreamSessionContinue(userMessage, null, mergedConfig)) {
+          if (event.done) {
+            if (event.finishReason !== 'error') {
+              sawFinal = true;
+              finalRaw = event.text;
+            }
+          } else {
+            accumulated += event.text;
           }
-        } else {
-          accumulated += event.text;
+          yield event;
         }
-        yield event;
-      }
-      if (sawFinal) {
-        this.history.push({ role: 'user', content: userMessage });
-        this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
-        this.turnCount++;
+      } finally {
+        // finally runs for normal completion, mid-stream throw,
+        // caller `break` (which calls `iterator.return()` and
+        // short-circuits the suspended yield), and error-finish
+        // chunks alike. The delta path doesn't push to history until
+        // commit, so the rollback branch is a no-op: nothing to
+        // undo, and the native cache state is managed by the Rust
+        // save_cache_state path on its own.
+        if (sawFinal) {
+          this.history.push({ role: 'user', content: userMessage });
+          this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
+          this.turnCount++;
+        }
       }
     } finally {
       this.inFlight = false;
@@ -396,21 +406,28 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let sawFinal = false;
       let accumulated = '';
       let finalRaw: string | null = null;
-      for await (const event of this.model.chatStreamSessionContinueTool(toolCallId, content, mergedConfig)) {
-        if (event.done) {
-          if (event.finishReason !== 'error') {
-            sawFinal = true;
-            finalRaw = event.text;
+      try {
+        for await (const event of this.model.chatStreamSessionContinueTool(toolCallId, content, mergedConfig)) {
+          if (event.done) {
+            if (event.finishReason !== 'error') {
+              sawFinal = true;
+              finalRaw = event.text;
+            }
+          } else {
+            accumulated += event.text;
           }
-        } else {
-          accumulated += event.text;
+          yield event;
         }
-        yield event;
-      }
-      if (sawFinal) {
-        this.history.push({ role: 'tool', content, toolCallId });
-        this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
-        this.turnCount++;
+      } finally {
+        // finally runs for normal completion, mid-stream throw,
+        // caller `break` (iterator.return() short-circuits the yield),
+        // and error-finish chunks alike. Tool turns never touch
+        // history until commit, so the rollback branch is a no-op.
+        if (sawFinal) {
+          this.history.push({ role: 'tool', content, toolCallId });
+          this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
+          this.turnCount++;
+        }
       }
     } finally {
       this.inFlight = false;
@@ -546,33 +563,31 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         }
         yield event;
       }
-    } catch (err) {
-      // Roll back the tentative user-message push so the next retry
-      // sees a consistent history / turnCount pairing. If the wipe
-      // already happened, also drop turnCount + lastImagesKey so the
-      // next call re-routes through the start path with the preserved
-      // prior history.
-      this.history.length = historyLenBefore;
-      if (wasImageChangeRestart) {
-        this.turnCount = 0;
-        this.lastImagesKey = null;
-      }
-      throw err;
-    }
-
-    if (sawFinal) {
-      this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
-      this.turnCount++;
-      this.lastImagesKey = newImagesKey;
-    } else {
-      // Caller broke mid-stream or final chunk had finishReason=error.
-      // Drop the tentative user push so the next call re-routes
-      // through the start path with a clean slate. If the wipe
-      // already happened, also drop turnCount + lastImagesKey.
-      this.history.length = historyLenBefore;
-      if (wasImageChangeRestart) {
-        this.turnCount = 0;
-        this.lastImagesKey = null;
+    } finally {
+      // finally runs in ALL termination paths: normal completion,
+      // mid-stream throw, caller `break` (which calls
+      // `iterator.return()` on the generator and short-circuits the
+      // suspended `yield`, skipping any post-loop code), and
+      // error-finish chunks. The unified commit-or-rollback below
+      // makes restart fully transactional regardless of how the
+      // generator was wound down. Mid-stream throws still propagate
+      // naturally — finally runs first, then the error continues up.
+      if (sawFinal) {
+        this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
+        this.turnCount++;
+        this.lastImagesKey = newImagesKey;
+      } else {
+        // Roll back: drop the tentative user push so history stays
+        // consistent with turnCount.
+        this.history.length = historyLenBefore;
+        if (wasImageChangeRestart) {
+          // Caches were wiped by prepareStartPath() but the new
+          // prefill never reached a successful done:true. Force the
+          // next call to re-route through the start path with the
+          // preserved prior history.
+          this.turnCount = 0;
+          this.lastImagesKey = null;
+        }
       }
     }
   }

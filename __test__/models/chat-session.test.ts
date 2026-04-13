@@ -254,10 +254,11 @@ describe('ChatSession', () => {
       const session = new ChatSession(model, { system: 'You are helpful.' });
 
       await session.send('describe A', { images: [imgA] });
-      // Use a tool-result turn to keep the image-key intact between
-      // sends (text-only `send()` with no images would clear the
-      // image key and count as an image-change itself — covered by
-      // the "images → no-images" test below).
+      // Use a tool-result turn to keep the lastImagesKey stable across
+      // the gap between the two image sends. (sendToolResult never
+      // touches lastImagesKey, which is precisely what we need for the
+      // next send to be detected as an image-set change rather than a
+      // brand-new session.)
       await session.sendToolResult('call-1', 'tool-output');
       await session.send('describe B', { images: [imgB] }); // image change → restart
 
@@ -674,6 +675,13 @@ describe('ChatSession', () => {
       for await (const _e of session.sendStream('Retry')) void _e;
       expect(chatStreamSessionStart).toHaveBeenCalledTimes(2);
       expect(session.turns).toBe(1);
+
+      // The recovery call's chatStreamSessionStart payload must NOT
+      // contain the aborted 'Hello' user turn — the caller-break
+      // rollback (driven by the try/finally in runStartStreamPath)
+      // dropped it from the staged history before the retry started.
+      const recoveryMessages = chatStreamSessionStart.mock.calls[1][0];
+      expect(recoveryMessages).toEqual([{ role: 'user', content: 'Retry' }]);
     });
 
     it('does NOT increment turnCount when the stream throws', async () => {
@@ -733,6 +741,182 @@ describe('ChatSession', () => {
       for await (const e of session.sendStream('Hi')) events.push(e);
       expect(events).toEqual([errorChunk]);
       expect(session.turns).toBe(0);
+    });
+
+    it('caller break during turn-1 stream rolls back the user push (finally path)', async () => {
+      // Stream yields two deltas and then never reaches a final chunk —
+      // the caller will `break` out of the `for await` after the second.
+      // Since JS calls `iterator.return()` on caller break, only a
+      // `finally` block runs — the post-loop `if (sawFinal)` branch is
+      // SKIPPED. This test proves the try/finally rollback path does
+      // the right thing for the start-stream case.
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        yield { text: 'hello ', done: false };
+        yield { text: 'world', done: false };
+        yield { text: '!', done: false };
+        // No done:true — caller breaks out before getting here.
+      });
+      const chatSessionStart = vi.fn(
+        async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> =>
+          makeChatResult('recovery'),
+      );
+      const model: SessionCapableModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      let seen = 0;
+      for await (const _e of session.sendStream('hello')) {
+        if (++seen >= 2) break;
+      }
+      expect(seen).toBe(2);
+      expect(session.turns).toBe(0);
+
+      // Recovery: next send() must not see 'hello' in messages.
+      await session.send('hello again');
+      const lastCall = chatSessionStart.mock.calls[chatSessionStart.mock.calls.length - 1];
+      expect(lastCall[0]).toEqual([{ role: 'user', content: 'hello again' }]);
+      expect(session.turns).toBe(1);
+    });
+
+    it('caller break during image-change restart stream rolls back state (finally path)', async () => {
+      const imgA = new Uint8Array([10, 20, 30]);
+      const imgB = new Uint8Array([40, 50, 60]);
+
+      // First start stream yields a successful 3-event session for imgA.
+      // Second start stream (the image-change restart) yields ONE delta
+      // and then stops — caller will break after reading it. JS calls
+      // `iterator.return()`, only `finally` runs, and the rollback
+      // must drop turnCount + lastImagesKey (since caches were wiped).
+      let startCall = 0;
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        startCall++;
+        if (startCall === 1) {
+          yield { text: 'A-desc', done: false };
+          yield finalChunk('describe-A-reply');
+          return;
+        }
+        // Second call (restart): one delta, no done, caller breaks.
+        yield { text: 'partial-B', done: false };
+      });
+      const chatSessionStart = vi.fn(
+        async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> =>
+          makeChatResult('recovery-reply'),
+      );
+      const resetCaches = vi.fn();
+      const model: SessionCapableModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches,
+      };
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      // Turn 1: successful image start.
+      for await (const _e of session.sendStream('describe A', { images: [imgA] })) void _e;
+      expect(session.turns).toBe(1);
+      expect(session.hasImages).toBe(true);
+
+      // Turn 2: image-change restart, caller breaks after one delta.
+      let seen = 0;
+      for await (const _e of session.sendStream('describe B', { images: [imgB] })) {
+        seen++;
+        break;
+      }
+      expect(seen).toBe(1);
+      // resetCaches was called once (the image-change wipe at the top
+      // of the restart path).
+      expect(resetCaches).toHaveBeenCalledTimes(1);
+      // Rollback must have forced turnCount → 0 and cleared
+      // lastImagesKey so the next call re-routes through the start
+      // path with the preserved prior history.
+      expect(session.turns).toBe(0);
+      expect(session.hasImages).toBe(false);
+
+      // Recovery: next call must re-route through the start path with
+      // the preserved turn-1 conversation plus the new user turn.
+      const recoveryResult = await session.send('describe B again', { images: [imgB] });
+      expect(recoveryResult.text).toBe('recovery-reply');
+      const lastStartCall = chatSessionStart.mock.calls[chatSessionStart.mock.calls.length - 1];
+      const recoveryMessages = lastStartCall[0];
+      expect(recoveryMessages).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe A', images: [imgA] },
+        { role: 'assistant', content: 'describe-A-reply' },
+        { role: 'user', content: 'describe B again', images: [imgB] },
+      ]);
+      // Exactly one successful turn after the rollback (the recovery).
+      expect(session.turns).toBe(1);
+    });
+
+    it('caller break during delta-continue stream does NOT advance turnCount (finally path)', async () => {
+      // Turn 1 succeeds via a normal start stream. Turn 2 takes the
+      // delta path, and the stream yields two deltas with no done.
+      // Caller breaks after reading one, triggering `iterator.return()`
+      // so only the inner `finally` runs. Because the delta path never
+      // pushes to history before commit, the assertion here is purely
+      // "turnCount did NOT advance" — no start-path re-routing needed.
+      let continueCall = 0;
+      const chatStreamSessionContinue = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        continueCall++;
+        if (continueCall === 1) {
+          yield { text: 'partial', done: false };
+          yield { text: 'more', done: false };
+          // No done:true — caller breaks before getting here.
+          return;
+        }
+        // Subsequent continue call (the retry) — successful.
+        yield finalChunk('retry-reply');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart: vi.fn(async function* () {
+          yield finalChunk('turn-1-reply');
+        }),
+        chatStreamSessionContinue,
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      // Turn 1 (start stream) succeeds.
+      for await (const _e of session.sendStream('turn 1')) void _e;
+      expect(session.turns).toBe(1);
+
+      // Turn 2 (delta stream) — caller breaks after one delta.
+      let seen = 0;
+      for await (const _e of session.sendStream('turn 2')) {
+        seen++;
+        break;
+      }
+      expect(seen).toBe(1);
+      // turnCount stays at 1 — the abandoned turn must not count.
+      expect(session.turns).toBe(1);
+
+      // Retry succeeds: turnCount goes 1 → 2 (not 1 → 3).
+      for await (const _e of session.sendStream('turn 2 retry')) void _e;
+      expect(session.turns).toBe(2);
     });
   });
 
