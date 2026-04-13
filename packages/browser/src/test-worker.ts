@@ -158,6 +158,23 @@ async function initAndRun(wasmUrl: string) {
         ...bridge.imports,
         __cpp_exception: tag,
         _ZN3mlx4core3gpu4initEv: () => {},
+        // SabSink (crates/mlx-core/src/chat_stream/sab_sink.rs) declares
+        // __wasm_i32_atomic_wait / __wasm_atomic_notify as extern "C" —
+        // wasm-ld emits them as host imports, so provide JS stubs wrapping
+        // Atomics.wait / notify. Re-read wasmMem.buffer each call because
+        // memory.grow() replaces the buffer object; a cached Int32Array view
+        // would point at the old, smaller range and throw RangeError on
+        // indices beyond the old length.
+        __wasm_i32_atomic_wait: (ptr: number, expected: number, timeoutNs: bigint) => {
+          const view = new Int32Array(wasmMem.buffer);
+          const timeoutMs = timeoutNs === -1n ? Infinity : Number(timeoutNs / 1_000_000n);
+          const result = Atomics.wait(view, ptr >>> 2, expected, timeoutMs);
+          return result === 'ok' ? 0 : result === 'not-equal' ? 1 : 2;
+        },
+        __wasm_atomic_notify: (ptr: number, count: number) => {
+          const view = new Int32Array(wasmMem.buffer);
+          return Atomics.notify(view, ptr >>> 2, count);
+        },
       };
       return importObject;
     },

@@ -556,8 +556,10 @@ export function createBridgeStub(
     // (re-entrancy guard). FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM
     // are also exempt because the hot dispatch path in
     // wgpuComputePassEncoderDispatchWorkgroups tries to stage into the batch
-    // first and only falls through to rpcCall when staging is refused — in
-    // that fallback case there is no outstanding batch to worry about.
+    // first and only falls through to rpcCall when staging is refused. In
+    // that fallback case the hot path must flush any pending batch *before*
+    // invoking rpcCall so the fallback dispatch does not reorder ahead of
+    // earlier staged dispatches — see the two call sites below.
     if (
       batchActive &&
       batchCount > 0 &&
@@ -1254,6 +1256,13 @@ export function createBridgeStub(
             if (!deferredInfo && stageDispatchBatchRecord(RpcFn.FUSED_DISPATCH_WITH_UNIFORM)) {
               // staged — no RPC this call
             } else {
+              // Staging refused (e.g. entryCount > MAX_DISPATCH_BATCH_ENTRIES
+              // or uniformSize > MAX_DISPATCH_BATCH_UNIFORM, or a deferred
+              // buffer create expects a return value). Flush any pending
+              // batch first so the fallback dispatch does NOT reorder ahead
+              // of earlier staged dispatches — the flush guard at the top of
+              // rpcCall exempts FUSED_* opcodes, so we must flush by hand.
+              if (batchActive && batchCount > 0) flushDispatchBatchInner();
               const result = rpcCall(
                 RpcFn.FUSED_DISPATCH_WITH_UNIFORM,
                 pendingPass,
@@ -1313,6 +1322,13 @@ export function createBridgeStub(
             // is zero so any concurrent batch staging sees uniformSize=0.
             cmdU32[CMD_OFFSET.UNIFORM_DATA_SIZE >>> 2] = 0;
             if (!stageDispatchBatchRecord(RpcFn.FUSED_FULL_DISPATCH)) {
+              // Staging refused (e.g. entryCount > MAX_DISPATCH_BATCH_ENTRIES;
+              // the fake bind-group path accepts up to 10 entries but batching
+              // caps at MAX_DISPATCH_BATCH_ENTRIES). Flush any pending batch
+              // first so the fallback dispatch does NOT reorder ahead of
+              // earlier staged dispatches — the flush guard at the top of
+              // rpcCall exempts FUSED_* opcodes, so we must flush by hand.
+              if (batchActive && batchCount > 0) flushDispatchBatchInner();
               rpcCall(RpcFn.FUSED_FULL_DISPATCH, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z);
             }
           }
