@@ -88,7 +88,26 @@ export async function initMLX(options: MLXBrowserOptions) {
         // Re-read sharedMemory.buffer each call because memory.grow() replaces
         // the buffer object; a cached view would point at the old, smaller
         // range and throw RangeError on indices beyond the old length.
+        //
+        // initMLX() runs on the main/page thread, where Atomics.wait() is
+        // disallowed — calling it throws TypeError. The shim is only
+        // reachable from SAB-streaming paths (chat-stream-sab), which must
+        // run inside a Worker. Rather than silently throwing from deep
+        // inside the WASM, fail loud with an actionable message so the
+        // caller knows to move their MLX session into a worker. See codex
+        // review baz8oy567 P2.
         __wasm_i32_atomic_wait: (ptr: number, expected: number, timeoutNs: bigint) => {
+          const isWorker =
+            typeof WorkerGlobalScope !== 'undefined' &&
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (self as any) instanceof (WorkerGlobalScope as any);
+          if (!isWorker) {
+            throw new Error(
+              'MLX SAB streaming (chat-stream-sab) requires a Worker context — ' +
+                'Atomics.wait() is disallowed on the main thread. Run initMLX() ' +
+                'inside a Web Worker or use the mlx-worker.ts entry point.',
+            );
+          }
           const view = new Int32Array(sharedMemory.buffer);
           const timeoutMs = timeoutNs === -1n ? Infinity : Number(timeoutNs / 1_000_000n);
           const result = Atomics.wait(view, ptr >>> 2, expected, timeoutMs);

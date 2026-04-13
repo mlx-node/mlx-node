@@ -189,13 +189,21 @@ async function handleInit(data: {
         // poll_instance() which is a no-op on WASM — the event loop never
         // runs, the callback never fires, infinite loop.
         const w = new Worker(new URL('./webgpu-worker.mjs', import.meta.url), { type: 'module' });
+        // Child workers share the dispatchBatchBuffer SAB but deliberately
+        // run with batching *disabled*. The bridge stub keeps batchCount as
+        // per-instance JS closure state, so two stubs writing to the same
+        // SAB at offset 0 would race and corrupt staged dispatches. The
+        // main mlx-worker is the only hot decode driver; child workers run
+        // background emnapi async work and can take the single-dispatch
+        // fallback path without measurable loss. (See codex review
+        // baz8oy567 P1.)
         w.postMessage({
           type: '__mlx_rpc_config',
           cmdBuffer,
           readbackBuffer,
           poolStatsBuffer,
           dispatchBatchBuffer,
-          dispatchBatch,
+          dispatchBatch: false,
           handles: {
             instanceHandle: gpuReady.instanceHandle,
             adapterHandle: gpuReady.adapterHandle,

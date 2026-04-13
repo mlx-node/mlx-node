@@ -663,6 +663,19 @@ export function createBridgeStub(
    * hiArgs maps arg index -> high 32 bits.
    */
   function rpcCallWithHi(fnId: number, args: number[], hiArgs: Record<number, number>): number {
+    // Phase 2: same ordering guard as rpcCall(). rpcCallWithHi is used by
+    // wgpuCommandEncoderCopyBufferToBuffer and friends when an argument
+    // needs the u64 high-bits slot — e.g. copies against 64-bit offsets or
+    // sizes. Without this flush, a staged dispatch batch followed by such
+    // a copy would let the copy RPC overtake the pending dispatches. No
+    // opcode exemption is needed: rpcCallWithHi is never used for
+    // DISPATCH_BATCH / FUSED_*_DISPATCH / BUFFER_RELEASE_BATCH.
+    if (batchActive && batchCount > 0) {
+      flushDispatchBatchInner();
+    }
+    if (pendingReleases.length > 0) {
+      flushPendingReleases();
+    }
     bumpBridgeStats(fnId);
     cmdDataView.setUint32(CMD_OFFSET.FN_ID, fnId, true);
 
