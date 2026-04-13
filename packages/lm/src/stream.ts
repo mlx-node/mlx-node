@@ -13,6 +13,8 @@ import type {
   ToolCallResult,
 } from '@mlx-node/core';
 
+import type { SessionCapableModel } from './chat-session.js';
+
 export interface ChatStreamDelta {
   text: string;
   done: false;
@@ -38,10 +40,43 @@ export type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
 // before we override them. The legacy `chatStream` surface was removed in
 // the chat-session refactor; the remaining session entry points below
 // drive all streaming via the `ChatSession` API.
+//
+// Each wrapper class re-declares these three methods as
+// `AsyncGenerator<ChatStreamEvent>` overrides that delegate through the
+// shared `_runChatStream` bridge, so the wrapper structurally satisfies
+// `SessionCapableModel` and can be passed to `ChatSession<M>`.
+
+// Dense
 // oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeDenseChatStreamSessionStart = Qwen35ModelNative.prototype.chatStreamSessionStart;
 // oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeDenseChatStreamSessionContinue = Qwen35ModelNative.prototype.chatStreamSessionContinue;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeDenseChatStreamSessionContinueTool = Qwen35ModelNative.prototype.chatStreamSessionContinueTool;
+
+// MoE
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeMoeChatStreamSessionStart = Qwen35MoeModelNative.prototype.chatStreamSessionStart;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeMoeChatStreamSessionContinue = Qwen35MoeModelNative.prototype.chatStreamSessionContinue;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeMoeChatStreamSessionContinueTool = Qwen35MoeModelNative.prototype.chatStreamSessionContinueTool;
+
+// LFM2
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeLfm2ChatStreamSessionStart = Lfm2ModelNative.prototype.chatStreamSessionStart;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeLfm2ChatStreamSessionContinue = Lfm2ModelNative.prototype.chatStreamSessionContinue;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeLfm2ChatStreamSessionContinueTool = Lfm2ModelNative.prototype.chatStreamSessionContinueTool;
+
+// Gemma4
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeGemma4ChatStreamSessionStart = Gemma4ModelNative.prototype.chatStreamSessionStart;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeGemma4ChatStreamSessionContinue = Gemma4ModelNative.prototype.chatStreamSessionContinue;
+// oxlint-disable-next-line @typescript-eslint/unbound-method
+const _nativeGemma4ChatStreamSessionContinueTool = Gemma4ModelNative.prototype.chatStreamSessionContinueTool;
 
 /**
  * Shared AsyncGenerator adapter for callback-based native streaming methods.
@@ -53,8 +88,12 @@ const _nativeDenseChatStreamSessionContinue = Qwen35ModelNative.prototype.chatSt
  * transforms each chunk into a `ChatStreamEvent`, and calls `handle.cancel()`
  * in a `finally` block so early termination (user `break`, exception) still
  * cleans up native state.
+ *
+ * @internal Exported so the VLM wrapper (`@mlx-node/vlm`) can reuse the
+ * exact same bridge without duplicating the plumbing. Not part of the
+ * public API — may change without notice.
  */
-async function* _runChatStream(
+export async function* _runChatStream(
   startCall: (callback: (err: Error | null, chunk: ChatStreamChunk) => void) => Promise<ChatStreamHandle>,
 ): AsyncGenerator<ChatStreamEvent> {
   const queue: Array<{ chunk?: ChatStreamChunk; error?: Error }> = [];
@@ -136,9 +175,11 @@ export async function* _createChatStream(
 /**
  * Qwen3.5 dense model with AsyncGenerator-based session streaming.
  *
- * Streaming is driven through the session API — `chatStreamSessionStart`
- * and `chatStreamSessionContinue` below — which adapt the callback-based
- * native methods to `AsyncGenerator<ChatStreamEvent>`.
+ * Streaming is driven through the session API — `chatStreamSessionStart`,
+ * `chatStreamSessionContinue`, and `chatStreamSessionContinueTool` below —
+ * which adapt the callback-based native methods to
+ * `AsyncGenerator<ChatStreamEvent>` so the wrapper structurally satisfies
+ * `SessionCapableModel` and can be passed to `ChatSession<Qwen35Model>`.
  */
 export class Qwen35Model extends Qwen35ModelNative {
   static override async load(modelPath: string): Promise<Qwen35Model> {
@@ -170,15 +211,40 @@ export class Qwen35Model extends Qwen35ModelNative {
    * tokenizes it, prefills the delta, and streams the decoded reply.
    * Requires a live session started via `chatSessionStart` or
    * `chatStreamSessionStart`. Stops on `<|im_end|>`.
+   *
+   * `images` is the native opt-in guard parameter — callers that
+   * attach a new image set must restart the session via
+   * `chatStreamSessionStart` with the full history. The high-level
+   * `ChatSession` wrapper handles that routing; callers that drive
+   * the wrapper directly should pass `null` for text-only continues.
    */
   // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinue(userMessage: string, config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
-    // `null` for the new `images` guard parameter — this wrapper is
-    // text-only; Step T2 will expose a higher-level image-aware
-    // ChatSession API that plumbs image changes through a fresh
-    // session restart.
+  async *chatStreamSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null,
+    config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream((callback) =>
-      _nativeDenseChatStreamSessionContinue.call(this, userMessage, null, config ?? null, callback),
+      _nativeDenseChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+    );
+  }
+
+  /**
+   * Streaming variant of {@link Qwen35Model#chatSessionContinueTool}.
+   *
+   * Builds a ChatML `<tool_response>` delta on top of the live
+   * session caches and streams the decoded assistant reply. Requires
+   * a live session started via `chatSessionStart` /
+   * `chatStreamSessionStart`.
+   */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeDenseChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
     );
   }
 }
@@ -186,8 +252,10 @@ export class Qwen35Model extends Qwen35ModelNative {
 /**
  * Qwen3.5 MoE model wrapper.
  *
- * Streaming is driven through the `ChatSession` API — the legacy
- * `chatStream()` surface was removed in the chat-session refactor.
+ * Streaming is driven through the `ChatSession` API — overrides below
+ * adapt the callback-based native methods to
+ * `AsyncGenerator<ChatStreamEvent>` so the wrapper structurally
+ * satisfies `SessionCapableModel`.
  */
 export class Qwen35MoeModel extends Qwen35MoeModelNative {
   static override async load(modelPath: string): Promise<Qwen35MoeModel> {
@@ -195,13 +263,49 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
     Object.setPrototypeOf(instance, Qwen35MoeModel.prototype);
     return instance as unknown as Qwen35MoeModel;
   }
+
+  /** Streaming variant of {@link Qwen35MoeModel#chatSessionStart}. */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionStart(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeMoeChatStreamSessionStart.call(this, messages, config ?? null, callback),
+    );
+  }
+
+  /** Streaming variant of {@link Qwen35MoeModel#chatSessionContinue}. */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null,
+    config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeMoeChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+    );
+  }
+
+  /** Streaming variant of {@link Qwen35MoeModel#chatSessionContinueTool}. */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeMoeChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+    );
+  }
 }
 
 /**
  * LFM2 model wrapper.
  *
- * Streaming is driven through the `ChatSession` API — the legacy
- * `chatStream()` surface was removed in the chat-session refactor.
+ * Streaming is driven through the `ChatSession` API — overrides below
+ * adapt the callback-based native methods to
+ * `AsyncGenerator<ChatStreamEvent>` so the wrapper structurally
+ * satisfies `SessionCapableModel`. LFM2 is text-only; the native
+ * `images` guard rejects non-empty image sets with an
+ * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix.
  */
 export class Lfm2Model extends Lfm2ModelNative {
   static override async load(modelPath: string): Promise<Lfm2Model> {
@@ -209,13 +313,49 @@ export class Lfm2Model extends Lfm2ModelNative {
     Object.setPrototypeOf(instance, Lfm2Model.prototype);
     return instance as unknown as Lfm2Model;
   }
+
+  /** Streaming variant of {@link Lfm2Model#chatSessionStart}. */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionStart(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeLfm2ChatStreamSessionStart.call(this, messages, config ?? null, callback),
+    );
+  }
+
+  /** Streaming variant of {@link Lfm2Model#chatSessionContinue}. */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null,
+    config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeLfm2ChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+    );
+  }
+
+  /** Streaming variant of {@link Lfm2Model#chatSessionContinueTool}. */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeLfm2ChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+    );
+  }
 }
 
 /**
  * Gemma4 model wrapper.
  *
- * Streaming is driven through the `ChatSession` API — the legacy
- * `chatStream()` surface was removed in the chat-session refactor.
+ * Streaming is driven through the `ChatSession` API — overrides below
+ * adapt the callback-based native methods to
+ * `AsyncGenerator<ChatStreamEvent>` so the wrapper structurally
+ * satisfies `SessionCapableModel`. Gemma4 is text-only in the
+ * current refactor scope; the native `images` guard rejects non-empty
+ * image sets with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix.
  */
 export class Gemma4Model extends Gemma4ModelNative {
   static override async load(modelPath: string): Promise<Gemma4Model> {
@@ -223,4 +363,58 @@ export class Gemma4Model extends Gemma4ModelNative {
     Object.setPrototypeOf(instance, Gemma4Model.prototype);
     return instance as unknown as Gemma4Model;
   }
+
+  /** Streaming variant of {@link Gemma4Model#chatSessionStart}. */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionStart(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeGemma4ChatStreamSessionStart.call(this, messages, config ?? null, callback),
+    );
+  }
+
+  /** Streaming variant of {@link Gemma4Model#chatSessionContinue}. */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionContinue(
+    userMessage: string,
+    images: Uint8Array[] | null,
+    config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeGemma4ChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+    );
+  }
+
+  /** Streaming variant of {@link Gemma4Model#chatSessionContinueTool}. */
+  // @ts-expect-error — override callback-based native method with AsyncGenerator
+  async *chatStreamSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream((callback) =>
+      _nativeGemma4ChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+    );
+  }
 }
+
+// -------------------------------------------------------------------
+// Compile-time conformance check
+// -------------------------------------------------------------------
+//
+// Ensures each wrapper class structurally satisfies
+// `SessionCapableModel` so `ChatSession<XxxModel>` will type-check in
+// downstream code. The assignments are compile-only — the
+// `null as unknown as T` placeholder never runs. If a wrapper's
+// override signature drifts away from the interface, TypeScript will
+// fail to compile this block, surfacing the regression at build time.
+function _assertSessionCapable(): void {
+  const _qwen35: SessionCapableModel = null as unknown as Qwen35Model;
+  const _moe: SessionCapableModel = null as unknown as Qwen35MoeModel;
+  const _lfm2: SessionCapableModel = null as unknown as Lfm2Model;
+  const _gemma4: SessionCapableModel = null as unknown as Gemma4Model;
+  void _qwen35;
+  void _moe;
+  void _lfm2;
+  void _gemma4;
+}
+void _assertSessionCapable;

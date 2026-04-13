@@ -51,8 +51,16 @@ export type { ChatConfig, ChatResult, ChatMessage, ToolCallResult, PerformanceMe
 export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent } from './stream.js';
 export type { ChatStreamChunk, ChatStreamHandle } from '@mlx-node/core';
 // Internal: exported for testing the callback-to-AsyncGenerator bridge
-// Not part of the public API — may change without notice
-export { _createChatStream } from './stream.js';
+// Not part of the public API — may change without notice.
+// `_runChatStream` is the generic adapter used by every model wrapper
+// (and the VLM package's QianfanOCR wrapper) to turn a callback-based
+// native stream into an `AsyncGenerator<ChatStreamEvent>`.
+export { _createChatStream, _runChatStream } from './stream.js';
+// Structural interface matched by every generative model wrapper, used
+// as the upper-bound for `ChatSession<M>`. Exported so the VLM wrapper
+// can pin a compile-time conformance assertion. `ChatSession` itself
+// is still pending the T5 public-API sweep.
+export type { SessionCapableModel } from './chat-session.js';
 
 // Model utilities (TypeScript-only)
 export {

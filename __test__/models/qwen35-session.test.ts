@@ -309,7 +309,9 @@ describe('Qwen35Session', () => {
       expect(chatStreamSessionContinue.mock.calls[0][0]).toBe('Second');
       expect(chatStreamSessionContinue.mock.calls[1][0]).toBe('Third');
       for (const call of chatStreamSessionContinue.mock.calls) {
-        expect(call[1]?.reuseCache).toBe(true);
+        // With the T2 signature fix, position 1 is the `images` guard
+        // parameter and `config` now lives at position 2.
+        expect((call as unknown as [string, unknown, ChatConfig | null | undefined])[2]?.reuseCache).toBe(true);
       }
     });
 
@@ -325,7 +327,11 @@ describe('Qwen35Session', () => {
       }
 
       expect(chatStreamSessionStart.mock.calls[0][1]?.reuseCache).toBe(true);
-      expect(chatStreamSessionContinue.mock.calls[0][1]?.reuseCache).toBe(true);
+      // T2 signature fix: config is now at position 2 (images guard at 1).
+      expect(
+        (chatStreamSessionContinue.mock.calls[0] as unknown as [string, unknown, ChatConfig | null | undefined])[2]
+          ?.reuseCache,
+      ).toBe(true);
     });
 
     it('rejects concurrent sendStream calls while another send is in flight', async () => {

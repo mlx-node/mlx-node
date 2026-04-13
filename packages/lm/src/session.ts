@@ -182,7 +182,10 @@ export class Qwen35Session {
           yield event;
         }
       } else {
-        for await (const event of this.model.chatStreamSessionContinue(userMessage, mergedConfig)) {
+        // Pass `null` for `images` — the legacy `Qwen35Session` is
+        // text-only and doesn't expose an image-change path. T6 deletes
+        // this shim in favour of the generic `ChatSession<M>` wrapper.
+        for await (const event of this.model.chatStreamSessionContinue(userMessage, null, mergedConfig)) {
           if (event.done && event.finishReason !== 'error') sawFinal = true;
           yield event;
         }
