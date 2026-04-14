@@ -94,8 +94,8 @@ All generative wrappers share a uniform `ChatSession<M>` surface (`send` / `send
 | Model             | Lines | generate() | session | Training | Special                               |
 | ----------------- | ----- | :--------: | :-----: | :------: | ------------------------------------- |
 | **Qwen3**         | 7,061 |    Yes     |   Yes   | GRPO/SFT | Speculative decoding, Paged attention |
-| **Qwen3.5 Dense** | 6,768 |    Yes     |   Yes   |    No    | Compiled C++ forward, VLM variant     |
-| **Qwen3.5 MoE**   | 4,267 |    Yes     |   Yes   |    No    | Compiled C++ forward, VLM variant     |
+| **Qwen3.5 Dense** | 6,768 |    Yes     |   Yes   | GRPO/SFT | Compiled C++ forward, VLM variant     |
+| **Qwen3.5 MoE**   | 4,267 |    Yes     |   Yes   | GRPO/SFT | Compiled C++ forward, VLM variant     |
 | **Gemma4**        | —     |    Yes     |   Yes   |    No    | Session-driven streaming              |
 | **LFM2.5**        | —     |    Yes     |   Yes   |    No    | Hybrid conv + attention               |
 

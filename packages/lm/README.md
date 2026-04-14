@@ -83,23 +83,23 @@ for (const tc of validCalls) {
 
 ## Model Loading
 
-`loadModel()` auto-detects the model architecture from `config.json`. Use `loadSession()` when you want an ergonomic `ChatSession` handle in one step, or `new ChatSession(model)` when you need a reference to both the model and the session (e.g. for `generate()` calls, training, or model metadata):
+`loadModel()` auto-detects the model architecture from `config.json`. Use `loadSession()` when you want an ergonomic `ChatSession` handle in one step, or load a concrete model class and construct `new ChatSession(model)` when you need a reference to both the model and the session (e.g. for `generate()` calls, training, or model metadata):
 
 ```typescript
-import { loadModel, loadSession, ChatSession, Qwen35Model, Qwen35MoeModel } from '@mlx-node/lm';
+import { loadSession, ChatSession, Qwen35Model, Qwen35MoeModel } from '@mlx-node/lm';
 
 // Convenience: auto-detect architecture and wrap in a ChatSession.
-const session = await loadSession('./models/Qwen3-0.6B');
+const session = await loadSession('./models/Qwen3-0.6B', { system: 'Be concise.' });
 
-// Manual: hold references to both the model and the session.
-const model = await loadModel('./models/Qwen3-0.6B');
-const manualSession = new ChatSession(model, { system: 'Be concise.' });
-
-// Or load a specific architecture directly.
+// Or load a specific architecture directly — every generative model wrapper
+// structurally satisfies ChatSession's SessionCapableModel bound.
 const dense = await Qwen35Model.load('./models/Qwen3.5-0.8B');
 const moe = await Qwen35MoeModel.load('./models/Qwen3.5-35B-A3B');
 const denseSession = new ChatSession(dense);
+const moeSession = new ChatSession(moe);
 ```
+
+`loadSession()` rejects embedding models (`HarrierModel`) and the native `QianfanOCRModel` — for the VLM case, import `QianfanOCRModel` from `@mlx-node/vlm` and wrap it with `new ChatSession(...)` directly.
 
 `ChatSession` accepts an options bag with `{ system?, defaultConfig? }`. The system prompt is injected on the first turn and never re-sent. Per-call config passed to `send()` / `sendStream()` shallow-merges on top of `defaultConfig`. Call `session.reset()` to wipe the KV cache and start a fresh conversation.
 
@@ -111,8 +111,8 @@ import { QWEN3_CONFIGS, QWEN35_CONFIGS, getQwen3Config, getQwen35Config } from '
 // Available Qwen3 configs: 'qwen3-0.6b', 'qwen3-1.7b', 'qwen3-7b'
 const config = getQwen3Config('qwen3-0.6b');
 
-// Available Qwen3.5 configs: 'qwen3.5-0.8b'
-const config35 = getQwen35Config('qwen3.5-0.8b');
+// Available Qwen3.5 configs: 'qwen3.5-0.6b'
+const config35 = getQwen35Config('qwen3.5-0.6b');
 ```
 
 ## Profiling
@@ -208,8 +208,8 @@ Every generative model wrapper exposes the same `ChatSession<M>` surface — `se
 | Model         | `generate()` | `ChatSession` | Training | Notes                                 |
 | ------------- | :----------: | :-----------: | :------: | ------------------------------------- |
 | Qwen3         |     Yes      |      Yes      | GRPO/SFT | Paged attention, speculative decoding |
-| Qwen3.5 Dense |     Yes      |      Yes      |    No    | Compiled C++ forward, VLM variant     |
-| Qwen3.5 MoE   |     Yes      |      Yes      |    No    | Compiled C++ forward, expert routing  |
+| Qwen3.5 Dense |     Yes      |      Yes      | GRPO/SFT | Compiled C++ forward, VLM variant     |
+| Qwen3.5 MoE   |     Yes      |      Yes      | GRPO/SFT | Compiled C++ forward, expert routing  |
 | Gemma4        |     Yes      |      Yes      |    No    | Streaming chat via session            |
 | LFM2.5        |     Yes      |      Yes      |    No    | Hybrid conv + attention architecture  |
 
