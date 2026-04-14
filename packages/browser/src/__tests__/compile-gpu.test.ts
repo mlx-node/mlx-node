@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll } from 'vitest';
+
 import { getBridge, runTest } from './test-bridge';
 
 beforeAll(() => getBridge(), 60_000);
@@ -19,8 +20,24 @@ describe('Compile & GPU Buffers', () => {
     expect(r.passed, r.error).toBe(true);
   });
 
-  test('gpu buffer array: create from eval\'d buffer, matmul 3 rounds', async () => {
-    const r = await runTest('gpu buffer array: create from eval\'d buffer, matmul 3 rounds');
+  // Phase 6b: SwiGLU MLP compile fast path. Synthetic dispatch-count A/B
+  // test gating on (eager - compiled) >= 40 dispatches plus byte-level
+  // numerical parity. See test-worker.ts for the full assertion.
+  test('compile MLP dispatch delta (Phase 6b)', async () => {
+    const r = await runTest('compile MLP dispatch delta (Phase 6b)');
+    expect(r.passed, r.error).toBe(true);
+    // Surface the actual dispatch numbers to the test runner output so the
+    // commit message / phase report can quote them without a separate
+    // benchmark run. The test-worker returns { eager, compiled, delta,
+    // maxAbsErr, nIters } from the run() body via the new `info` channel.
+    if (r.info && typeof r.info === 'object') {
+      // eslint-disable-next-line no-console
+      console.log('[Phase 6b] stats =', JSON.stringify(r.info));
+    }
+  });
+
+  test("gpu buffer array: create from eval'd buffer, matmul 3 rounds", async () => {
+    const r = await runTest("gpu buffer array: create from eval'd buffer, matmul 3 rounds");
     expect(r.passed, r.error).toBe(true);
   });
 

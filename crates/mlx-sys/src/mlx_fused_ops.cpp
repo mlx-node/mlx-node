@@ -1,7 +1,117 @@
 #include "mlx_common.h"
 #include "mlx_qwen35_common.h"
 
+#include <atomic>
+#include <cstdlib>
+
+// =============================================================================
+// Phase 6b: mx::compile-wrapped SwiGLU MLP fast path
+//
+// When enabled, the matmul → matmul → sigmoid → multiply → multiply → matmul
+// chain is routed through `mlx::core::compile`. The compile pass leaves the
+// three matmuls as separate non-fusable primitives but collapses the
+// sigmoid + 2 multiplies into a single Compiled (fused element-wise) primitive
+// — saving 2 kernel launches per MLP forward (28 layers in Qwen3.5-0.8B
+// → ~56 dispatches/tok). The compiled tape is keyed by function-identity +
+// input shapes, so for Tq=1 decode the trace happens once and is reused on
+// every subsequent forward.
+//
+// Toggle: env var MLX_WGPU_COMPILE_MLP=1 OR runtime setter
+// `mlx_set_swiglu_compile_enabled(bool)` (called from Rust/JS during init).
+// Default OFF — this is a warm-up phase that de-risks compile for 6c/6d.
+//
+// Important subtleties:
+//   1. Weight transposes stay OUTSIDE the compiled body — they are
+//      metadata-only views, and putting them inside would pollute the
+//      compile cache key with view-flag noise.
+//   2. The body is a top-level non-capturing function (NOT a lambda), so
+//      `mlx::core::compile` keys it by stable function identity. A
+//      capturing lambda would create a new cache entry per call.
+//   3. The runtime flag is a `std::atomic<bool>` so the JS-side setter and
+//      env-var initial read can both feed it without a lock.
+// =============================================================================
+
+namespace {
+
+// Process-wide kill switch for the compile MLP fast path. Initialized lazily
+// from the MLX_WGPU_COMPILE_MLP env var on first read; can also be flipped
+// at runtime via mlx_set_swiglu_compile_enabled() from Rust/JS init code
+// (mirroring the wgpu_set_packed_bf16_enabled / wgpu_set_sdpa_fallback_forced
+// pattern used elsewhere in this TU).
+std::atomic<bool> g_compile_mlp_enabled{false};
+std::atomic<bool> g_compile_mlp_env_read{false};
+
+bool compile_mlp_enabled() {
+  // Read env var exactly once and OR it into the runtime flag. After this,
+  // any explicit setter calls override the env value because they store
+  // unconditionally.
+  if (!g_compile_mlp_env_read.exchange(true, std::memory_order_acq_rel)) {
+    if (const char* v = std::getenv("MLX_WGPU_COMPILE_MLP")) {
+      if (v[0] == '1') {
+        g_compile_mlp_enabled.store(true, std::memory_order_relaxed);
+      }
+    }
+  }
+  return g_compile_mlp_enabled.load(std::memory_order_relaxed);
+}
+
+// The compilable body. MUST be a top-level non-capturing function so
+// `mlx::core::compile` keys it by stable function identity (the template
+// overload in mlx/compile.h converts a capture-less lambda to a function
+// pointer for this exact reason — using a free function makes that
+// guarantee explicit).
+//
+// Inputs layout: [x, w_gate_t, w_up_t, w_down_t]
+//   x          : (B, T, hidden)        — pre-transposed activations
+//   w_gate_t   : (hidden, intermediate)
+//   w_up_t     : (hidden, intermediate)
+//   w_down_t   : (intermediate, hidden)
+// Returns: { output } where output is (B, T, hidden).
+std::vector<mlx::core::array> swiglu_mlp_body(
+    const std::vector<mlx::core::array>& inputs) {
+  using mlx::core::matmul;
+  using mlx::core::sigmoid;
+  const auto& x = inputs[0];
+  const auto& w_gate_t = inputs[1];
+  const auto& w_up_t = inputs[2];
+  const auto& w_down_t = inputs[3];
+  auto gate = matmul(x, w_gate_t);
+  auto up = matmul(x, w_up_t);
+  auto gate_act = gate * sigmoid(gate);  // silu(gate)
+  auto gated = gate_act * up;
+  auto output = matmul(gated, w_down_t);
+  return {output};
+}
+
+// Lazy-initialized compile cache. The first call traces swiglu_mlp_body for
+// the input-shape-set; subsequent calls with the same shapes hit the
+// internal CompilerCache (mlx/compile.cpp). For Qwen3.5-0.8B decode every
+// MLP layer in every step has Tq=1 + identical hidden/intermediate sizes,
+// so we get 1 trace + N reuses across the whole generation.
+auto& compiled_swiglu_mlp() {
+  static auto fn = mlx::core::compile(swiglu_mlp_body, /*shapeless=*/false);
+  return fn;
+}
+
+}  // namespace
+
 extern "C" {
+
+// Runtime setter for the compile MLP fast path. Mirrors the
+// `mlx_wgpu_set_packed_bf16_enabled` / `mlx_wgpu_set_sdpa_fallback_forced`
+// pattern in mlx_stream.cpp so the TS init message can flip it via
+// `wgpuSetSwigluCompileEnabled(true)` without rebuilding the wasm binary.
+//
+// Marking the env-as-read flag on every set ensures that an explicit
+// setter call always wins over a later env-var read.
+void mlx_set_swiglu_compile_enabled(bool enabled) {
+  g_compile_mlp_enabled.store(enabled, std::memory_order_relaxed);
+  g_compile_mlp_env_read.store(true, std::memory_order_release);
+}
+
+bool mlx_get_swiglu_compile_enabled() {
+  return compile_mlp_enabled();
+}
 
 // Fused SwiGLU MLP forward pass
 // Combines 5 operations into 1 FFI call:
@@ -10,6 +120,12 @@ extern "C" {
 // 3. gate_act = silu(gate) = gate * sigmoid(gate)
 // 4. gated = gate_act * up
 // 5. output = gated @ w_down.T
+//
+// Phase 6b: when MLX_WGPU_COMPILE_MLP=1 (or the runtime setter is on), the
+// element-wise tail is routed through `mlx::core::compile` so the
+// sigmoid + multiply + multiply chain collapses into a single Compiled
+// kernel. Matmuls remain separate non-fusable primitives. Numerics are
+// unchanged.
 mlx_array* mlx_swiglu_mlp_forward(mlx_array* x_handle,
                                    mlx_array* w_gate_handle,
                                    mlx_array* w_up_handle,
@@ -19,11 +135,21 @@ mlx_array* mlx_swiglu_mlp_forward(mlx_array* x_handle,
   auto w_up = reinterpret_cast<array*>(w_up_handle);
   auto w_down = reinterpret_cast<array*>(w_down_handle);
 
-  // Transpose weights: [out, in] -> [in, out] for matmul
+  // Transpose weights: [out, in] -> [in, out] for matmul.
+  // These are metadata-only view ops (no GPU dispatch) and stay OUTSIDE the
+  // compiled body so the compile cache key is keyed only on the dtype/shape
+  // of x and the transposed weights, not on view-flag noise.
   auto w_gate_t = transpose(*w_gate, {1, 0});
   auto w_up_t = transpose(*w_up, {1, 0});
   auto w_down_t = transpose(*w_down, {1, 0});
 
+  if (compile_mlp_enabled()) {
+    std::vector<array> ins{*x, w_gate_t, w_up_t, w_down_t};
+    auto outs = compiled_swiglu_mlp()(ins);
+    return reinterpret_cast<mlx_array*>(new array(std::move(outs[0])));
+  }
+
+  // Eager (default) path — unchanged from pre-Phase-6b.
   // gate = x @ w_gate.T
   auto gate = matmul(*x, w_gate_t);
 

@@ -58,11 +58,16 @@ async function handleInit(data: {
   sdpaFallback?: boolean;
   profile?: boolean;
   dispatchBatch?: boolean;
+  compileMlp?: boolean;
 }) {
   const packBf16 = data.packBf16 === true;
   const sdpaFallback = data.sdpaFallback === true;
   profileEnabled = data.profile === true;
   const dispatchBatch = data.dispatchBatch === true;
+  // Phase 6b: SwiGLU MLP compile fast path. Default OFF; enable via
+  // ?compile_mlp=1 on the demo URL. Plumbed through handleInit so the
+  // backend flag flips BEFORE any model forward pass runs.
+  const compileMlp = data.compileMlp === true;
   try {
     // 1. Spawn gpu-worker (owns GPUDevice, event loop free for GPU callbacks)
     post({ type: 'progress', step: 'gpu', message: 'Initializing WebGPU...' });
@@ -259,7 +264,18 @@ async function handleInit(data: {
     if (typeof mlxExports.wgpuSetSdpaFallbackForced === 'function') {
       mlxExports.wgpuSetSdpaFallbackForced(sdpaFallback);
     }
-    const flagSuffix = (packBf16 ? ' pack_bf16=1' : '') + (sdpaFallback ? ' sdpa_fallback=1' : '');
+    // Phase 6b SwiGLU MLP compile fast path. The setter flips a process-wide
+    // std::atomic<bool> in mlx_fused_ops.cpp so the next call to
+    // mlx_swiglu_mlp_forward routes the element-wise tail through
+    // mlx::core::compile. Default OFF — enable via ?compile_mlp=1 on the
+    // demo URL.
+    if (typeof mlxExports.wgpuSetSwigluCompileEnabled === 'function') {
+      mlxExports.wgpuSetSwigluCompileEnabled(compileMlp);
+    }
+    const flagSuffix =
+      (packBf16 ? ' pack_bf16=1' : '') +
+      (sdpaFallback ? ' sdpa_fallback=1' : '') +
+      (compileMlp ? ' compile_mlp=1' : '');
     post({
       type: 'progress',
       step: 'wasm',

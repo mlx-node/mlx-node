@@ -20,6 +20,70 @@ pub fn wgpu_set_sdpa_fallback_forced(enabled: bool) {
     unsafe { sys::mlx_wgpu_set_sdpa_fallback_forced(enabled) }
 }
 
+/// Phase 6b: toggle the SwiGLU MLP `mlx::core::compile` fast path.
+///
+/// When enabled, `mlx_swiglu_mlp_forward` routes the matmul → matmul →
+/// sigmoid → multiply → multiply → matmul chain through the compile pass
+/// so the three element-wise ops collapse into a single fused Compiled
+/// kernel — saving 2 dispatches per MLP layer per token.
+///
+/// Default OFF. Plumbed from the `?compile_mlp=1` demo URL param and the
+/// TS test harness so the browser can A/B without a rebuild. The C++ side
+/// also reads `MLX_WGPU_COMPILE_MLP=1` from the env on first use, so a
+/// native build can opt in via the shell environment.
+#[napi]
+pub fn wgpu_set_swiglu_compile_enabled(enabled: bool) {
+    unsafe { sys::mlx_set_swiglu_compile_enabled(enabled) }
+}
+
+/// Read the current state of the Phase 6b SwiGLU compile flag. Useful for
+/// the demo profile UI to display whether the run is on the compiled or
+/// eager path.
+#[napi]
+pub fn wgpu_get_swiglu_compile_enabled() -> bool {
+    unsafe { sys::mlx_get_swiglu_compile_enabled() }
+}
+
+/// Phase 6b dispatch-count A/B test. Runs the SwiGLU MLP forward N times
+/// eagerly, then N times through `mlx::core::compile`, and returns
+/// `[eager_dispatches, compiled_dispatches, max_abs_err, n_iters]`. Used
+/// by the browser test suite to gate the phase: dispatch count must drop
+/// by at least 40 between the two paths and `max_abs_err` must stay near
+/// zero. Returns an empty vec if the underlying C++ test fails.
+#[napi]
+pub fn wgpu_test_compile_mlp_dispatch_delta() -> Vec<f64> {
+    let mut out = [0.0_f64; 4];
+    let rc = unsafe { sys::mlx_test_compile_mlp_dispatch_delta(out.as_mut_ptr()) };
+    if rc != 0 {
+        return Vec::new();
+    }
+    out.to_vec()
+}
+
+/// Phase 0 dispatch-stats readout (observability only). Returns
+/// `[totalDispatches, totalPassEnds]` as `f64` so the numbers survive the
+/// NAPI boundary without needing bigint plumbing — both fit comfortably in
+/// a double for any realistic generation. Plumbed into the browser
+/// `?profile=1` path to expose dispatches/token on the demo page.
+#[napi]
+pub fn wgpu_get_dispatch_stats() -> Vec<f64> {
+    let mut dispatches: u64 = 0;
+    let mut pass_ends: u64 = 0;
+    unsafe {
+        sys::mlx_wgpu_get_dispatch_stats(&mut dispatches, &mut pass_ends);
+    }
+    vec![dispatches as f64, pass_ends as f64]
+}
+
+/// Phase 0 dispatch-stats reset. Zeros the cumulative counters read by
+/// `wgpu_get_dispatch_stats`. Called at the start of each chat/chatStream
+/// generation when `?profile=1` is active so per-generation stats are
+/// comparable.
+#[napi]
+pub fn wgpu_reset_dispatch_stats() {
+    unsafe { sys::mlx_wgpu_reset_dispatch_stats() }
+}
+
 /// Clear the MLX memory cache to prevent memory pressure buildup
 /// Should be called periodically during long-running operations
 /// Internal Rust-only function - memory management is handled automatically by the trainer

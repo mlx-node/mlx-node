@@ -1,6 +1,7 @@
 #include "mlx_common.h"
 #include "mlx/dtype.h"
 #include <cstdint>
+#include <limits>
 #include <new>
 #ifdef MLX_USE_WEBGPU
 // Forward-declare the WebGPU types we need (avoids webgpu.h include path issues)
@@ -8,6 +9,13 @@ typedef struct WGPUBufferImpl* WGPUBuffer;
 extern "C" void wgpuBufferDestroy(WGPUBuffer buffer);
 extern "C" void wgpuBufferRelease(WGPUBuffer buffer);
 namespace mlx::core::wgpu {
+// Phase 0 dispatch-stats accessors (defined in mlx/backend/webgpu/device.cpp).
+// Forward-declared here so the synthetic compile-MLP dispatch test below can
+// read counters without pulling in <webgpu/webgpu.h>.
+uint64_t get_total_dispatches();
+uint64_t get_total_pass_ends();
+void reset_dispatch_stats();
+
 // MUST match mlx/backend/webgpu/allocator.h exactly (field order + types).
 // Any drift is an ODR violation: `new WebGPUBuffer{}` here allocates the
 // layout defined below, but code in allocator.cpp reads/writes the real
@@ -1376,6 +1384,224 @@ bool mlx_test_compile_repeated() {
     } catch (const std::exception& e) {
         fprintf(stderr, "[mlx_test_compile_repeated] %s\n", e.what());
         return false;
+    }
+}
+
+// Cross-TU declarations for the Phase 6b SwiGLU MLP forward + its compile
+// kill switch. Real definitions live in mlx_fused_ops.cpp. Forward-declared
+// here (rather than via a shared header) to keep the touch surface of the
+// Phase 6b change minimal — both files are in the same crate and the test
+// below is the only consumer of the new APIs in this TU.
+extern "C" {
+mlx_array* mlx_swiglu_mlp_forward(mlx_array*, mlx_array*, mlx_array*, mlx_array*);
+void mlx_set_swiglu_compile_enabled(bool);
+bool mlx_get_swiglu_compile_enabled();
+}
+
+// Phase 6b dispatch-count A/B test for the SwiGLU MLP compile fast path.
+//
+// Runs the same MLP shape (mirroring Qwen3.5-0.8B: hidden=1024, intermediate
+// =3072, Tq=1) N times eagerly, then N times through `mlx::core::compile`,
+// counting WebGPU dispatches with `wgpu::get_total_dispatches()`. Writes
+// the deltas + a numerical-parity flag into `out`:
+//   out[0] = eager dispatch count    (uint64 → cast to f64; values are tiny)
+//   out[1] = compiled dispatch count
+//   out[2] = max abs error between eager and compiled outputs (float)
+//   out[3] = N (the loop count, for divisor convenience on the JS side)
+//
+// The brief gates the phase on a ≥40 dispatch reduction. With N=20 layers'
+// worth of forwards, eager fires 6 dispatches/layer (3 matmul + 3
+// element-wise) → 120, compiled fires 4/layer (3 matmul + 1 fused
+// element-wise) → 80, delta = 40. We use N=24 to leave headroom against
+// noise (extra eval/copy dispatches that count both paths the same).
+//
+// This is a synthetic in-process test rather than a browser tok/s
+// measurement so the warm-up phase doesn't have to drag in the demo
+// harness. The brief explicitly authorizes this fallback.
+//
+// On non-WebGPU builds the dispatch counters are zero, so the test still
+// runs the parity check but the dispatch-count gate is meaningless.
+int mlx_test_compile_mlp_dispatch_delta(double* out) {
+    using namespace mlx::core;
+    if (!out) return -1;
+    try {
+        constexpr int N_ITERS = 24;
+        constexpr int H = 1024;       // hidden dim
+        constexpr int I = 3072;       // intermediate (3x — Qwen3.5-0.8B-ish)
+
+        // Build representative inputs once.
+        // x: (1, 1, H), weights stored [out, in] (matching nn::Linear).
+        std::vector<float> x_data(H);
+        for (int i = 0; i < H; ++i) x_data[i] = (i % 17) * 0.0123f - 0.5f;
+
+        std::vector<float> w_gate_data(I * H);
+        std::vector<float> w_up_data(I * H);
+        std::vector<float> w_down_data(H * I);
+        for (size_t i = 0; i < w_gate_data.size(); ++i) {
+            w_gate_data[i] = (((i * 13) % 31) - 15) / 31.0f;
+        }
+        for (size_t i = 0; i < w_up_data.size(); ++i) {
+            w_up_data[i] = (((i * 17) % 29) - 14) / 29.0f;
+        }
+        for (size_t i = 0; i < w_down_data.size(); ++i) {
+            w_down_data[i] = (((i * 23) % 37) - 18) / 37.0f;
+        }
+
+        auto make_x = [&]() {
+            return new array(array(x_data.data(), {1, 1, H}, float32));
+        };
+        auto w_gate = new array(array(w_gate_data.data(), {I, H}, float32));
+        auto w_up = new array(array(w_up_data.data(), {I, H}, float32));
+        auto w_down = new array(array(w_down_data.data(), {H, I}, float32));
+
+        // Save current toggle so we don't leak state across tests.
+        bool prev_enabled = mlx_get_swiglu_compile_enabled();
+
+        // Make sure both paths see the same scratch state by warming up
+        // the eager path once before counting starts. Without this, the
+        // first call pays kernel-compile + buffer-pool churn that would
+        // skew the eager total.
+        {
+            auto* x_warm = make_x();
+            mlx_set_swiglu_compile_enabled(false);
+            auto* y_warm = mlx_swiglu_mlp_forward(
+                reinterpret_cast<mlx_array*>(x_warm),
+                reinterpret_cast<mlx_array*>(w_gate),
+                reinterpret_cast<mlx_array*>(w_up),
+                reinterpret_cast<mlx_array*>(w_down));
+            auto& y_warm_arr = *reinterpret_cast<array*>(y_warm);
+            eval_safe(y_warm_arr);
+            delete reinterpret_cast<array*>(y_warm);
+            delete x_warm;
+        }
+
+#ifdef MLX_USE_WEBGPU
+        wgpu::reset_dispatch_stats();
+#endif
+
+        // ----- Eager pass -----
+        mlx_set_swiglu_compile_enabled(false);
+        std::vector<float> eager_out_first;
+        eager_out_first.reserve(H);
+        for (int it = 0; it < N_ITERS; ++it) {
+            auto* x_arr = make_x();
+            auto* y = mlx_swiglu_mlp_forward(
+                reinterpret_cast<mlx_array*>(x_arr),
+                reinterpret_cast<mlx_array*>(w_gate),
+                reinterpret_cast<mlx_array*>(w_up),
+                reinterpret_cast<mlx_array*>(w_down));
+            auto& y_arr = *reinterpret_cast<array*>(y);
+            eval_safe(y_arr);
+            if (it == 0) {
+                auto* d = y_arr.data<float>();
+                if (d) {
+                    eager_out_first.assign(d, d + H);
+                }
+            }
+            delete reinterpret_cast<array*>(y);
+            delete x_arr;
+        }
+#ifdef MLX_USE_WEBGPU
+        uint64_t eager_dispatches = wgpu::get_total_dispatches();
+        wgpu::reset_dispatch_stats();
+#else
+        uint64_t eager_dispatches = 0;
+#endif
+
+        // Warm up the compile path once so the trace doesn't count toward
+        // the budget. On the very first call the compile pass fires its
+        // simplifier + WGSL codegen pipeline, which produces extra
+        // bookkeeping dispatches that wouldn't recur in steady state.
+        {
+            mlx_set_swiglu_compile_enabled(true);
+            auto* x_warm = make_x();
+            auto* y_warm = mlx_swiglu_mlp_forward(
+                reinterpret_cast<mlx_array*>(x_warm),
+                reinterpret_cast<mlx_array*>(w_gate),
+                reinterpret_cast<mlx_array*>(w_up),
+                reinterpret_cast<mlx_array*>(w_down));
+            auto& y_warm_arr = *reinterpret_cast<array*>(y_warm);
+            eval_safe(y_warm_arr);
+            delete reinterpret_cast<array*>(y_warm);
+            delete x_warm;
+        }
+#ifdef MLX_USE_WEBGPU
+        wgpu::reset_dispatch_stats();
+#endif
+
+        // ----- Compiled pass -----
+        std::vector<float> compiled_out_first;
+        compiled_out_first.reserve(H);
+        for (int it = 0; it < N_ITERS; ++it) {
+            auto* x_arr = make_x();
+            auto* y = mlx_swiglu_mlp_forward(
+                reinterpret_cast<mlx_array*>(x_arr),
+                reinterpret_cast<mlx_array*>(w_gate),
+                reinterpret_cast<mlx_array*>(w_up),
+                reinterpret_cast<mlx_array*>(w_down));
+            auto& y_arr = *reinterpret_cast<array*>(y);
+            eval_safe(y_arr);
+            if (it == 0) {
+                auto* d = y_arr.data<float>();
+                if (d) {
+                    compiled_out_first.assign(d, d + H);
+                }
+            }
+            delete reinterpret_cast<array*>(y);
+            delete x_arr;
+        }
+#ifdef MLX_USE_WEBGPU
+        uint64_t compiled_dispatches = wgpu::get_total_dispatches();
+#else
+        uint64_t compiled_dispatches = 0;
+#endif
+
+        // Restore previous toggle so other tests in the same suite are
+        // not affected.
+        mlx_set_swiglu_compile_enabled(prev_enabled);
+
+        // ---- Numerical parity ----
+        float max_abs_err = 0.0f;
+        if (eager_out_first.size() == compiled_out_first.size() &&
+            !eager_out_first.empty()) {
+            for (size_t i = 0; i < eager_out_first.size(); ++i) {
+                float diff = std::abs(eager_out_first[i] - compiled_out_first[i]);
+                if (diff > max_abs_err) max_abs_err = diff;
+            }
+        } else {
+            max_abs_err = std::numeric_limits<float>::infinity();
+        }
+
+        // Clean up the long-lived weight arrays.
+        delete w_gate;
+        delete w_up;
+        delete w_down;
+
+        out[0] = static_cast<double>(eager_dispatches);
+        out[1] = static_cast<double>(compiled_dispatches);
+        out[2] = static_cast<double>(max_abs_err);
+        out[3] = static_cast<double>(N_ITERS);
+
+        // Always emit the numbers to stderr so a single test-suite run
+        // surfaces the Phase 6b A/B without needing to rerun manually.
+        // Captured by the WASI printErr hook in mlx-worker.ts (which
+        // forwards [MLX-KERNEL]-prefixed lines to the main thread; we use
+        // a distinct prefix here so the demo log filter won't grab it).
+        fprintf(stderr,
+                "[Phase6b] eager_dispatches=%llu compiled_dispatches=%llu "
+                "delta=%lld max_abs_err=%g n_iters=%d\n",
+                static_cast<unsigned long long>(eager_dispatches),
+                static_cast<unsigned long long>(compiled_dispatches),
+                static_cast<long long>(eager_dispatches) -
+                    static_cast<long long>(compiled_dispatches),
+                static_cast<double>(max_abs_err),
+                N_ITERS);
+        fflush(stderr);
+
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_compile_mlp_dispatch_delta] %s\n", e.what());
+        return -2;
     }
 }
 

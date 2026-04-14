@@ -9,6 +9,7 @@
 export interface TestResult {
   passed: boolean;
   error?: string;
+  info?: unknown;
 }
 
 class TestBridge {
@@ -21,12 +22,12 @@ class TestBridge {
     this.testNames = testNames;
 
     worker.onmessage = (e: MessageEvent) => {
-      const { type, name, passed, error } = e.data;
+      const { type, name, passed, error, info } = e.data;
       if (type === 'result') {
         const p = this.pending.get(name);
         if (p) {
           this.pending.delete(name);
-          p.resolve({ passed, error });
+          p.resolve({ passed, error, info });
         }
       }
     };

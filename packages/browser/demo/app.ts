@@ -407,6 +407,11 @@ worker.addEventListener('messageerror', (e) => {
 // gpu-worker RPC histogram. The result lands in the log panel as a
 // single summary line so we can verify the decode dispatches-per-token
 // bottleneck without a rebuild.
+//
+// ?compile_mlp=1 enables the Phase 6b SwiGLU MLP `mlx::core::compile`
+// fast path. The compile pass collapses the sigmoid + 2 multiplies between
+// the three matmuls into a single fused element-wise kernel (saving 2
+// dispatches per layer per token). Default OFF — toggle here for an A/B.
 const urlParams = new URLSearchParams(location.search);
 const packBf16 = urlParams.get('pack_bf16') !== '0'; // enabled by default, ?pack_bf16=0 to disable
 const sdpaFallback = urlParams.get('sdpa_fallback') === '1';
@@ -415,6 +420,7 @@ const profile = urlParams.get('profile') === '1';
 // ordering is still shaking out — enable explicitly via ?dispatch_batch=1
 // and verify decode parity + RPCs/tok reduction in the profile readout.
 const dispatchBatch = urlParams.get('dispatch_batch') === '1';
+const compileMlp = urlParams.get('compile_mlp') === '1';
 const useSab = urlParams.get('stream_sab') !== '0'; // enabled by default, ?stream_sab=0 to fall back to TSFN
 // ?mode=baseline | sab | tsfn — diagnostic A/B for the streaming path.
 // baseline = non-streaming chat() (ground-truth compute, no sink overhead).
@@ -424,6 +430,7 @@ const flagBadges =
   (sdpaFallback ? ' (sdpa_fallback=1)' : '') +
   (profile ? ' (profile=1)' : '') +
   (dispatchBatch ? ' (dispatch_batch=1)' : '') +
+  (compileMlp ? ' (compile_mlp=1)' : '') +
   (useSab ? '' : ' (stream_sab=0)') +
   (modeParam ? ` (mode=${modeParam})` : '');
 log(`Starting MLX Worker${flagBadges}...`);
@@ -436,6 +443,7 @@ worker.postMessage({
   sdpaFallback,
   profile,
   dispatchBatch,
+  compileMlp,
 });
 
 // Chat handler

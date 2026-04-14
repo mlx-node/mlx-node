@@ -1441,6 +1441,19 @@ unsafe extern "C-unwind" {
     pub fn mlx_test_compile_matmul() -> bool;
     pub fn mlx_test_compile_repeated() -> bool;
 
+    // Phase 6b: SwiGLU MLP compile fast path. The setter mirrors the
+    // wgpu_set_packed_bf16_enabled / wgpu_set_sdpa_fallback_forced pattern —
+    // a process-wide std::atomic<bool> flag flipped from JS via the worker
+    // init message so the browser can A/B without rebuilding.
+    pub fn mlx_set_swiglu_compile_enabled(enabled: bool);
+    pub fn mlx_get_swiglu_compile_enabled() -> bool;
+
+    // Phase 6b dispatch-count A/B test. Runs the SwiGLU MLP forward N
+    // times eagerly, then N times through mlx::core::compile, and writes
+    // [eager_dispatches, compiled_dispatches, max_abs_err, N] into `out`
+    // (4 doubles). Returns 0 on success, negative on failure.
+    pub fn mlx_test_compile_mlp_dispatch_delta(out: *mut f64) -> i32;
+
     // GPU buffer array test — exercises mlx_array_from_gpu_buffer code path
     pub fn mlx_test_gpu_buffer_arrays() -> bool;
 
