@@ -35,6 +35,14 @@ impl RMSNormGated {
         self.weight.clone()
     }
 
+    /// Epsilon used by the underlying fast::rms_norm call.
+    ///
+    /// Exposed so the Phase 3b post-recurrence FFI fusion can reuse the exact
+    /// same eps instead of hardcoding one and drifting from the per-op path.
+    pub(crate) fn eps(&self) -> f32 {
+        self.eps
+    }
+
     pub fn set_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.weight = weight.clone();
         Ok(())

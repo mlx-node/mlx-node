@@ -523,4 +523,104 @@ int mlx_gdn_prefusion_forward(
     }
 }
 
+// Fused GDN post-recurrence forward pass.
+//
+// Collapses the RMSNormGated + swiglu + out_proj tail of
+// GatedDeltaNet::forward (crates/mlx-core/src/models/qwen3_5/gated_delta_net.rs
+// lines 393-413) into a single FFI call so the WebGPU backend sees one lazy
+// graph instead of 5 per-layer dispatches. Byte-identical greedy-decode
+// parity is preserved by mirroring the Rust fallback op-for-op:
+//
+//   // Rust (per-op fallback):
+//   let z = z.reshape(&[B, T, Hv, Dv]);                       // metadata
+//   let normed = fast::rms_norm(y_att, norm_weight, eps);     // 1 dispatch
+//   let sig = sigmoid(z_4d);                                  // 1 dispatch
+//   let silu_gate = z_4d * sig;                               // 1 dispatch
+//   let gated = silu_gate * normed;                           // 1 dispatch
+//   let gated_flat = gated.reshape(&[B, T, Hv * Dv]);         // metadata
+//   let y_out = matmul(gated_flat, out_proj_weight.T);        // 1 dispatch
+//   let y_out = y_out + bias;  // only if bias is not null    // 1 dispatch
+//
+// Order of ops (sigmoid → mul(z, sig) → mul(silu_gate, normed) → matmul → add)
+// is load-bearing — reordering would diverge bf16 accumulation and fail the
+// byte-identical token-ID gate.
+//
+// Writes the final output via out_y. Returns 0 on success, -1 on error
+// (out_y is set to null on error).
+int mlx_gdn_postfusion_forward(
+    mlx_array* y_att_handle,          // [B, T, Hv, Dv]
+    mlx_array* z_handle,              // [B, T, Hv * Dv]
+    mlx_array* norm_weight_handle,    // [Dv]
+    mlx_array* out_proj_weight_handle,// [hidden, Hv * Dv] (Linear layout: [out, in])
+    mlx_array* out_proj_bias_handle,  // [hidden] or nullptr
+    float rms_eps,
+    int batch_size,
+    int seq_len,
+    int n_v_heads,
+    int v_head_dim,
+    int intermediate_size,            // Hv * Dv
+    int hidden_size,
+    mlx_array** out_y) {
+    if (!out_y) {
+        std::cerr << "mlx_gdn_postfusion_forward error: out_y is null" << std::endl;
+        return -1;
+    }
+    *out_y = nullptr;
+    if (!y_att_handle || !z_handle || !norm_weight_handle || !out_proj_weight_handle) {
+        std::cerr << "mlx_gdn_postfusion_forward error: required input handle is null" << std::endl;
+        return -1;
+    }
+    try {
+        auto y_att = reinterpret_cast<array*>(y_att_handle);
+        auto z = reinterpret_cast<array*>(z_handle);
+        auto norm_weight = reinterpret_cast<array*>(norm_weight_handle);
+        auto out_proj_weight = reinterpret_cast<array*>(out_proj_weight_handle);
+
+        // 1. Reshape z from [B, T, Hv*Dv] to [B, T, Hv, Dv] (metadata only).
+        //    Rust caller reshapes z to per-head format before calling norm —
+        //    see gated_delta_net.rs:394-399.
+        auto z_4d = reshape(*z, {batch_size, seq_len, n_v_heads, v_head_dim});
+
+        // 2. RMSNormGated step 1 — rms_norm with weight [Dv] operates on the
+        //    last axis of y_att. Rust: rms_norm_gated.rs:26 calls
+        //    mlx::core::fast::rms_norm on the 4D y tensor.
+        auto normed = fast::rms_norm(*y_att, *norm_weight, rms_eps, {});
+
+        // 3. RMSNormGated step 2 — swiglu(gate=z, up=normed):
+        //      silu_gate = z * sigmoid(z)
+        //      result    = silu_gate * normed
+        //    Rust: nn/activations.rs:160-164 (Activations::swiglu) invokes
+        //    Self::silu(gate) which is
+        //    nn/activations.rs:16-26 (x * sigmoid(x)), then `silu_gate.mul(up)`.
+        auto sig = sigmoid(z_4d);
+        auto silu_gate = z_4d * sig;
+        auto gated = silu_gate * normed;
+
+        // 4. Flatten heads: [B, T, Hv, Dv] → [B, T, Hv*Dv] (metadata only).
+        //    Rust: gated_delta_net.rs:407 — `y_normed.reshape(&[B, T, value_dim])`.
+        auto gated_flat = reshape(gated, {batch_size, seq_len, intermediate_size});
+
+        // 5. Out-projection matmul. Linear stores weight as [out, in] and
+        //    computes y = x @ weight.T — see nn/linear.rs:114-117. We
+        //    transpose here to match exactly.
+        auto w_out_t = transpose(*out_proj_weight, {1, 0});
+        auto y_out = matmul(gated_flat, w_out_t);
+
+        // 6. Optional bias. The default Qwen3.5 GDN out_proj has no bias, but
+        //    we still support it for parity with Linear::forward when bias
+        //    is present.
+        if (out_proj_bias_handle) {
+            auto bias = reinterpret_cast<array*>(out_proj_bias_handle);
+            y_out = y_out + *bias;
+        }
+
+        *out_y = reinterpret_cast<mlx_array*>(new array(std::move(y_out)));
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_gdn_postfusion_forward error: " << e.what() << std::endl;
+        *out_y = nullptr;
+        return -1;
+    }
+}
+
 }  // extern "C"

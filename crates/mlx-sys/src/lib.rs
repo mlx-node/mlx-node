@@ -150,6 +150,38 @@ unsafe extern "C-unwind" {
         out_new_conv_state: *mut *mut mlx_array,
     ) -> i32;
 
+    // Fused GDN post-recurrence forward pass (Qwen3.5 GatedDeltaNet tail).
+    //
+    // Collapses reshape(z) + RMSNormGated (rms_norm + swiglu) + out_proj
+    // matmul into a single FFI call, returning the final [B, T, hidden]
+    // output via `out_y`. Mirrors the per-op Rust fallback at
+    // crates/mlx-core/src/models/qwen3_5/gated_delta_net.rs:393-413
+    // op-for-op so greedy-decode token IDs stay byte-identical.
+    //
+    // `out_proj_weight` follows the `[out_features, in_features]` Linear
+    // layout (out_proj_weight = [hidden, Hv * Dv]) and is transposed
+    // internally.
+    //
+    // `out_proj_bias` may be null (the default Qwen3.5 GDN out_proj has no
+    // bias). `out_y` is mandatory and is set to null on error.
+    //
+    // Returns 0 on success, -1 on error.
+    pub fn mlx_gdn_postfusion_forward(
+        y_att: *mut mlx_array,           // [B, T, Hv, Dv]
+        z: *mut mlx_array,               // [B, T, Hv * Dv]
+        norm_weight: *mut mlx_array,     // [Dv]
+        out_proj_weight: *mut mlx_array, // [hidden, Hv * Dv]
+        out_proj_bias: *mut mlx_array,   // Can be null
+        rms_eps: f32,
+        batch_size: i32,
+        seq_len: i32,
+        n_v_heads: i32,
+        v_head_dim: i32,
+        intermediate_size: i32, // Hv * Dv
+        hidden_size: i32,
+        out_y: *mut *mut mlx_array,
+    ) -> i32;
+
     // Fused Multi-Head Attention forward (without KV cache)
     pub fn mlx_fused_attention_forward(
         x: *mut mlx_array,

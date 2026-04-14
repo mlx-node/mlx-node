@@ -390,6 +390,68 @@ impl GatedDeltaNet {
             cache.set(1, new_state);
         }
 
+        // ----------------------------------------------------------------
+        // Phase 3b WASM fast path: single FFI call for the post-recurrence
+        // tail (reshape z + RMSNormGated + out_proj). Collapses 5 MLX ops
+        // (rms_norm + sigmoid + 2 mul + matmul) into one lazy graph in C++.
+        //
+        // Gated on Standard out_proj only; quantized out_proj falls through
+        // to the per-op path. Native build is untouched.
+        // ----------------------------------------------------------------
+        #[cfg(target_family = "wasm")]
+        {
+            if matches!(self.out_proj, LinearProj::Standard(_)) {
+                use std::ptr;
+
+                let norm_weight = self.norm.get_weight();
+                let out_proj_weight = self.out_proj.get_weight();
+                let out_proj_bias = self.out_proj.get_bias();
+                let bias_handle = out_proj_bias
+                    .as_ref()
+                    .map(|b| b.handle.0)
+                    .unwrap_or(ptr::null_mut());
+
+                // Match the per-op fallback exactly: use RMSNormGated's
+                // actual eps (populated from config.rms_norm_eps), not a
+                // hardcoded constant that would drift on config changes.
+                let rms_eps = self.norm.eps();
+                let intermediate_size = self.value_dim;
+                // hidden_size = out_proj output dim; out_proj_weight is
+                // [hidden, Hv * Dv] (Linear stores [out, in]).
+                let hidden_size = out_proj_weight.shape_at(0)? as i32;
+
+                let mut y_out_handle: *mut mlx_sys::mlx_array = ptr::null_mut();
+
+                let rc = unsafe {
+                    mlx_sys::mlx_gdn_postfusion_forward(
+                        y.handle.0,
+                        z.handle.0,
+                        norm_weight.handle.0,
+                        out_proj_weight.handle.0,
+                        bias_handle,
+                        rms_eps,
+                        batch as i32,
+                        seq_len as i32,
+                        self.num_v_heads,
+                        self.value_head_dim,
+                        intermediate_size,
+                        hidden_size,
+                        &mut y_out_handle,
+                    )
+                };
+
+                if rc != 0 || y_out_handle.is_null() {
+                    return Err(Error::from_reason(
+                        "mlx_gdn_postfusion_forward returned an error",
+                    ));
+                }
+
+                let out = MxArray::from_handle(y_out_handle, "gdn_postfusion_out")?;
+                log_tensor_stats(&format!("layer.{layer:02}.gdn.out"), &out);
+                return Ok(out);
+            }
+        }
+
         // Reshape z to per-head format: [B, T, value_dim] → [B, T, Hv, Dv]
         let z = z.reshape(&[
             batch,
