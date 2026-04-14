@@ -1,14 +1,20 @@
 /**
  * ModelRegistry -- maps friendly model names to loaded model instances.
  *
- * All models that expose a `chat()` method are eligible for serving.
- * Streaming support is detected by duck-typing the `chatStream` method.
+ * All models that expose the chat-session surface (see `SessionCapableModel`
+ * from `@mlx-node/lm`) are eligible for serving. Streaming support is
+ * detected by the presence of `chatStreamSessionStart` on the model.
+ *
+ * This interface intentionally mirrors `SessionCapableModel` one-to-one —
+ * the server always drives models through `ChatSession<M>` wrappers, never
+ * the low-level NAPI methods directly. Step S2 of the chat-session refactor
+ * migrates the endpoint layer to use a per-model `SessionRegistry` cache.
  */
 
-/** Minimal contract for a model that can be served. */
-export interface ServableModel {
-  chat(messages: unknown[], config?: unknown): Promise<unknown>;
-}
+import type { SessionCapableModel } from '@mlx-node/lm';
+
+/** Minimal contract for a model that can be served via chat sessions. */
+export type ServableModel = SessionCapableModel;
 
 /** Model entry stored in the registry. */
 export interface ModelEntry {
@@ -64,12 +70,15 @@ export class ModelRegistry {
   }
 
   /**
-   * Check whether a model supports streaming via `chatStream()`.
-   * Uses duck-typing: the model must have a `chatStream` method that returns an
-   * async iterable (2 params), not a callback-based stream (3 params).
+   * Check whether a model supports streaming.
+   *
+   * Every `SessionCapableModel` is expected to expose
+   * `chatStreamSessionStart`, so in practice this is universally true for
+   * any properly-typed model. We still duck-type the method so a partially
+   * stubbed test double can opt out of streaming by omitting it.
    */
   hasStreamSupport(model: ServableModel): boolean {
-    const fn = (model as unknown as Record<string, unknown>)['chatStream'];
-    return typeof fn === 'function' && (fn as Function).length <= 2;
+    const fn = (model as unknown as Record<string, unknown>)['chatStreamSessionStart'];
+    return typeof fn === 'function';
   }
 }

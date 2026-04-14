@@ -40,6 +40,10 @@ export type { HandlerOptions } from './handler.js';
 export { ModelRegistry } from './registry.js';
 export type { ServableModel, ModelEntry } from './registry.js';
 
+// Session registry
+export { SessionRegistry } from './session-registry.js';
+export type { SessionRegistryOptions } from './session-registry.js';
+
 // Types (Responses API)
 export type {
   ResponsesAPIRequest,
