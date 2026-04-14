@@ -416,9 +416,6 @@ impl GatedDeltaNet {
                 // hardcoded constant that would drift on config changes.
                 let rms_eps = self.norm.eps();
                 let intermediate_size = self.value_dim;
-                // hidden_size = out_proj output dim; out_proj_weight is
-                // [hidden, Hv * Dv] (Linear stores [out, in]).
-                let hidden_size = out_proj_weight.shape_at(0)? as i32;
 
                 let mut y_out_handle: *mut mlx_sys::mlx_array = ptr::null_mut();
 
@@ -435,7 +432,6 @@ impl GatedDeltaNet {
                         self.num_v_heads,
                         self.value_head_dim,
                         intermediate_size,
-                        hidden_size,
                         &mut y_out_handle,
                     )
                 };

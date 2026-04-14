@@ -154,9 +154,10 @@ unsafe extern "C-unwind" {
     //
     // Collapses reshape(z) + RMSNormGated (rms_norm + swiglu) + out_proj
     // matmul into a single FFI call, returning the final [B, T, hidden]
-    // output via `out_y`. Mirrors the per-op Rust fallback at
-    // crates/mlx-core/src/models/qwen3_5/gated_delta_net.rs:393-413
-    // op-for-op so greedy-decode token IDs stay byte-identical.
+    // output via `out_y`. Mirrors the per-op Rust fallback in the
+    // post-recurrence branch of `GatedDeltaNet::forward` (see
+    // crates/mlx-core/src/models/qwen3_5/gated_delta_net.rs) op-for-op so
+    // greedy-decode token IDs stay byte-identical.
     //
     // `out_proj_weight` follows the `[out_features, in_features]` Linear
     // layout (out_proj_weight = [hidden, Hv * Dv]) and is transposed
@@ -178,7 +179,6 @@ unsafe extern "C-unwind" {
         n_v_heads: i32,
         v_head_dim: i32,
         intermediate_size: i32, // Hv * Dv
-        hidden_size: i32,
         out_y: *mut *mut mlx_array,
     ) -> i32;
 

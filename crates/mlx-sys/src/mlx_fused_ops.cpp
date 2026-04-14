@@ -370,6 +370,23 @@ int mlx_gdn_prefusion_forward(
     mlx_array** out_a,
     mlx_array** out_b,
     mlx_array** out_new_conv_state) {
+    if (!out_q || !out_k || !out_v || !out_z || !out_a || !out_b || !out_new_conv_state) {
+        std::cerr << "mlx_gdn_prefusion_forward error: required out-pointer is null"
+                  << std::endl;
+        return -1;
+    }
+    *out_q = nullptr;
+    *out_k = nullptr;
+    *out_v = nullptr;
+    *out_z = nullptr;
+    *out_a = nullptr;
+    *out_b = nullptr;
+    *out_new_conv_state = nullptr;
+    if (!x_handle || !w_qkvz_handle || !w_ba_handle || !w_conv_handle) {
+        std::cerr << "mlx_gdn_prefusion_forward error: required input handle is null"
+                  << std::endl;
+        return -1;
+    }
     try {
         auto x = reinterpret_cast<array*>(x_handle);
         auto w_qkvz = reinterpret_cast<array*>(w_qkvz_handle);
@@ -526,10 +543,11 @@ int mlx_gdn_prefusion_forward(
 // Fused GDN post-recurrence forward pass.
 //
 // Collapses the RMSNormGated + swiglu + out_proj tail of
-// GatedDeltaNet::forward (crates/mlx-core/src/models/qwen3_5/gated_delta_net.rs
-// lines 393-413) into a single FFI call so the WebGPU backend sees one lazy
-// graph instead of 5 per-layer dispatches. Byte-identical greedy-decode
-// parity is preserved by mirroring the Rust fallback op-for-op:
+// GatedDeltaNet::forward (see the post-recurrence branch in
+// crates/mlx-core/src/models/qwen3_5/gated_delta_net.rs) into a single FFI
+// call so the WebGPU backend sees one lazy graph instead of 5 per-layer
+// dispatches. Byte-identical greedy-decode parity is preserved by mirroring
+// the Rust fallback op-for-op:
 //
 //   // Rust (per-op fallback):
 //   let z = z.reshape(&[B, T, Hv, Dv]);                       // metadata
@@ -559,7 +577,6 @@ int mlx_gdn_postfusion_forward(
     int n_v_heads,
     int v_head_dim,
     int intermediate_size,            // Hv * Dv
-    int hidden_size,
     mlx_array** out_y) {
     if (!out_y) {
         std::cerr << "mlx_gdn_postfusion_forward error: out_y is null" << std::endl;
@@ -584,7 +601,8 @@ int mlx_gdn_postfusion_forward(
         // 2. RMSNormGated step 1 — rms_norm with weight [Dv] operates on the
         //    last axis of y_att. Rust: rms_norm_gated.rs:26 calls
         //    mlx::core::fast::rms_norm on the 4D y tensor.
-        auto normed = fast::rms_norm(*y_att, *norm_weight, rms_eps, {});
+        auto normed = fast::rms_norm(
+            *y_att, std::optional<array>(*norm_weight), rms_eps, {});
 
         // 3. RMSNormGated step 2 — swiglu(gate=z, up=normed):
         //      silu_gate = z * sigmoid(z)
