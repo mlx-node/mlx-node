@@ -49,6 +49,20 @@ describe('Compile & GPU Buffers', () => {
     }
   });
 
+  // Phase 6d: GDN post-recurrence compile fast path. Synthetic
+  // dispatch-count A/B test gating on (eager - compiled) >= 48 dispatches
+  // plus byte-level numerical parity. Same mechanism as Phase 6c but on a
+  // smaller element-wise tail (sigmoid + two muls between rms_norm and
+  // out-proj matmul). See test-worker.ts for the full assertion.
+  test('compile GDN postfusion dispatch delta (Phase 6d)', async () => {
+    const r = await runTest('compile GDN postfusion dispatch delta (Phase 6d)');
+    expect(r.passed, r.error).toBe(true);
+    if (r.info && typeof r.info === 'object') {
+      // eslint-disable-next-line no-console
+      console.log('[Phase 6d] stats =', JSON.stringify(r.info));
+    }
+  });
+
   test('gpu buffer array: create from eval\'d buffer, matmul 3 rounds', async () => {
     const r = await runTest('gpu buffer array: create from eval\'d buffer, matmul 3 rounds');
     expect(r.passed, r.error).toBe(true);

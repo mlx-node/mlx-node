@@ -60,6 +60,7 @@ async function handleInit(data: {
   dispatchBatch?: boolean;
   compileMlp?: boolean;
   compileGdnPre?: boolean;
+  compileGdnPost?: boolean;
 }) {
   const packBf16 = data.packBf16 === true;
   const sdpaFallback = data.sdpaFallback === true;
@@ -74,6 +75,10 @@ async function handleInit(data: {
   // Phase 6b MLP flag — process-wide atomic flipped before any model
   // forward pass runs.
   const compileGdnPre = data.compileGdnPre === true;
+  // Phase 6d: GDN post-recurrence compile fast path. Default OFF; enable
+  // via ?compile_gdn_post=1 on the demo URL. Same pattern as 6b/6c —
+  // process-wide atomic flipped before any forward pass runs.
+  const compileGdnPost = data.compileGdnPost === true;
   try {
     // 1. Spawn gpu-worker (owns GPUDevice, event loop free for GPU callbacks)
     post({ type: 'progress', step: 'gpu', message: 'Initializing WebGPU...' });
@@ -284,11 +289,18 @@ async function handleInit(data: {
     if (typeof mlxExports.wgpuSetGdnPreCompileEnabled === 'function') {
       mlxExports.wgpuSetGdnPreCompileEnabled(compileGdnPre);
     }
+    // Phase 6d GDN post-recurrence compile fast path. Same pattern as
+    // Phase 6b/6c — process-wide atomic flag, flipped before any forward
+    // pass runs. Default OFF; enable via ?compile_gdn_post=1 on the demo URL.
+    if (typeof mlxExports.wgpuSetGdnPostCompileEnabled === 'function') {
+      mlxExports.wgpuSetGdnPostCompileEnabled(compileGdnPost);
+    }
     const flagSuffix =
       (packBf16 ? ' pack_bf16=1' : '') +
       (sdpaFallback ? ' sdpa_fallback=1' : '') +
       (compileMlp ? ' compile_mlp=1' : '') +
-      (compileGdnPre ? ' compile_gdn_pre=1' : '');
+      (compileGdnPre ? ' compile_gdn_pre=1' : '') +
+      (compileGdnPost ? ' compile_gdn_post=1' : '');
     post({
       type: 'progress',
       step: 'wasm',

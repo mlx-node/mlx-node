@@ -223,6 +223,112 @@ auto& compiled_gdn_prefusion() {
   return fn;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 6d: mx::compile-wrapped GDN post-recurrence fast path
+//
+// Same template as Phase 6b / 6c: atomic enable flag, env-var reader,
+// captureless free-function body, static-local compile accessor. The GDN
+// post-recurrence body does four element-wise ops (sigmoid, mul, mul,
+// optional add-bias) around one reduction (fast::rms_norm) and one matmul
+// (out-proj). The compile pass collapses the three element-wise ops between
+// the rms_norm and the matmul into a single fused Compiled kernel, saving
+// ~3 dispatches per call. Across Qwen3.5-0.8B's 18 linear-attention layers
+// that's ~54 dispatches/tok — smaller than Phase 6c's prefusion win, but
+// same mechanism.
+//
+// Env var: MLX_WGPU_COMPILE_GDN_POST=1
+// Setter : mlx_set_gdn_post_compile_enabled(bool)
+//
+// Trace-signature gating: only the no-bias path (the default Qwen3.5 GDN
+// out_proj layout) is routed through the compile pass. Models with an
+// out_proj bias fall through to the eager path. This keeps the compile
+// cache to a single entry and avoids shape-key churn from the optional
+// bias input.
+// ---------------------------------------------------------------------------
+std::atomic<bool> g_compile_gdn_post_enabled{false};
+std::atomic<bool> g_compile_gdn_post_env_read{false};
+
+bool compile_gdn_post_enabled() {
+  if (!g_compile_gdn_post_env_read.exchange(true, std::memory_order_acq_rel)) {
+    if (const char* v = std::getenv("MLX_WGPU_COMPILE_GDN_POST")) {
+      if (v[0] == '1') {
+        g_compile_gdn_post_enabled.store(true, std::memory_order_relaxed);
+      }
+    }
+  }
+  return g_compile_gdn_post_enabled.load(std::memory_order_relaxed);
+}
+
+// Captureless free function describing the GDN post-recurrence tape as MLX
+// sees it. Inputs layout MUST match exactly what the caller passes:
+//
+//   inputs[0] = y_att          [B, T, Hv, Dv]         post-recurrence output
+//   inputs[1] = z_4d           [B, T, Hv, Dv]         pre-reshaped gate
+//   inputs[2] = norm_weight    [Dv]                   RMSNorm gain
+//   inputs[3] = w_out_t        [Hv*Dv, hidden]        pre-transposed out_proj
+//
+// The z reshape (from [B, T, Hv*Dv] to [B, T, Hv, Dv]) and the out_proj
+// weight transpose are done OUTSIDE the compile body — they are
+// metadata-only view ops, and inside the body they'd pollute the compile
+// cache key with view-flag noise (same lesson as Phase 6b/6c).
+//
+// Returns: { y_out } where y_out is (B, T, hidden). Bias add is handled
+// outside the compile body in the caller (and is rare for Qwen3.5 GDN,
+// see the gating in mlx_gdn_postfusion_forward below).
+//
+// Op order matches the eager path below exactly so the resulting tape is
+// bit-identical — same reason as Phase 6c.
+std::vector<mlx::core::array> gdn_postfusion_body(
+    const std::vector<mlx::core::array>& inputs) {
+  using mlx::core::array;
+  const auto& y_att = inputs[0];
+  const auto& z_4d = inputs[1];
+  const auto& norm_weight = inputs[2];
+  const auto& w_out_t = inputs[3];
+
+  // Shape-derived config. We need the final flatten target from y_att's
+  // 4D shape. .shape() is metadata and safe on placeholder trace arrays.
+  int batch_size = static_cast<int>(y_att.shape()[0]);
+  int seq_len = static_cast<int>(y_att.shape()[1]);
+  int n_v_heads = static_cast<int>(y_att.shape()[2]);
+  int v_head_dim = static_cast<int>(y_att.shape()[3]);
+  int intermediate_size = n_v_heads * v_head_dim;
+  // rms_eps is a scalar — we must use the same value as the eager path so
+  // the two paths are byte-identical. Capturing it would break the
+  // captureless-function guarantee, so we hardcode the single value that
+  // ships in Qwen3.5 GDN (1e-6, see gated_delta_net.rs). If a future model
+  // uses a different rms_eps, it falls through to the eager path via a
+  // runtime check in the caller below.
+  const float RMS_EPS = 1e-6f;
+
+  // 1. RMSNorm over the last axis of y_att. fast::rms_norm is a reduction
+  //    and stays as its own tape node — the compile pass cannot fuse it.
+  auto normed = mlx::core::fast::rms_norm(
+      y_att, std::optional<mlx::core::array>(norm_weight), RMS_EPS, {});
+
+  // 2. swiglu(gate=z_4d, up=normed):
+  //      silu_gate = z_4d * sigmoid(z_4d)
+  //      gated     = silu_gate * normed
+  //    These three element-wise ops collapse into one fused Compiled kernel
+  //    under the compile pass — the Phase 6d win.
+  auto sig = sigmoid(z_4d);
+  auto silu_gate = z_4d * sig;
+  auto gated = silu_gate * normed;
+
+  // 3. Flatten heads: [B, T, Hv, Dv] → [B, T, Hv*Dv] (metadata only).
+  auto gated_flat = reshape(gated, {batch_size, seq_len, intermediate_size});
+
+  // 4. Out-proj matmul. Matmul stays as its own non-fusable primitive.
+  auto y_out = matmul(gated_flat, w_out_t);
+
+  return {y_out};
+}
+
+auto& compiled_gdn_postfusion() {
+  static auto fn = mlx::core::compile(gdn_postfusion_body, /*shapeless=*/false);
+  return fn;
+}
+
 // The compilable body. MUST be a top-level non-capturing function so
 // `mlx::core::compile` keys it by stable function identity (the template
 // overload in mlx/compile.h converts a capture-less lambda to a function
@@ -293,6 +399,20 @@ void mlx_set_gdn_pre_compile_enabled(bool enabled) {
 
 bool mlx_get_gdn_pre_compile_enabled() {
   return compile_gdn_pre_enabled();
+}
+
+// Phase 6d: runtime setter/getter for the GDN post-recurrence compile fast
+// path. Mirrors the Phase 6b/6c pairs above — flipping the process-wide
+// std::atomic<bool> that mlx_gdn_postfusion_forward checks before each call.
+// Marking env-as-read on set ensures explicit setter calls always win over
+// a later env-var read.
+void mlx_set_gdn_post_compile_enabled(bool enabled) {
+  g_compile_gdn_post_enabled.store(enabled, std::memory_order_relaxed);
+  g_compile_gdn_post_env_read.store(true, std::memory_order_release);
+}
+
+bool mlx_get_gdn_post_compile_enabled() {
+  return compile_gdn_post_enabled();
 }
 
 // Fused SwiGLU MLP forward pass
@@ -972,6 +1092,34 @@ int mlx_gdn_postfusion_forward(
         //    Rust caller reshapes z to per-head format before calling norm —
         //    see gated_delta_net.rs:394-399.
         auto z_4d = reshape(*z, {batch_size, seq_len, n_v_heads, v_head_dim});
+
+        // -----------------------------------------------------------------
+        // Phase 6d: mx::compile-wrapped fast path.
+        //
+        // Routed only when (a) the caller has the compile flag on, (b)
+        // there is no out_proj bias (the default Qwen3.5 GDN layout), and
+        // (c) rms_eps matches the hardcoded value in the body. Any other
+        // case falls through to the eager path below so the compile cache
+        // key stays on one stable trace per shape signature.
+        //
+        // The body returns { y_out } = matmul(gated_flat, w_out_t), so the
+        // optional bias add stays in the caller (and is unreachable here
+        // because we gate on bias == null anyway).
+        //
+        // w_out_t = transpose(out_proj_weight) is metadata-only and stays
+        // outside the compile body — same lesson as Phase 6b/6c.
+        // -----------------------------------------------------------------
+        constexpr float PHASE6D_RMS_EPS = 1e-6f;
+        if (compile_gdn_post_enabled() &&
+            out_proj_bias_handle == nullptr &&
+            rms_eps == PHASE6D_RMS_EPS) {
+            auto w_out_t = transpose(*out_proj_weight, {1, 0});
+            std::vector<array> ins{*y_att, z_4d, *norm_weight, w_out_t};
+            auto outs = compiled_gdn_postfusion()(ins);
+            auto y_out = std::move(outs[0]);
+            *out_y = reinterpret_cast<mlx_array*>(new array(std::move(y_out)));
+            return 0;
+        }
 
         // 2. RMSNormGated step 1 — rms_norm with weight [Dv] operates on the
         //    last axis of y_att. Rust: rms_norm_gated.rs:26 calls

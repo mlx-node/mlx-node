@@ -1470,6 +1470,22 @@ unsafe extern "C-unwind" {
     // Same output format and return semantics as the Phase 6b test.
     pub fn mlx_test_compile_gdn_pre_dispatch_delta(out: *mut f64) -> i32;
 
+    // Phase 6d: GDN post-recurrence compile fast path — mirrors the Phase
+    // 6b/6c pairs above. When enabled, mlx_gdn_postfusion_forward routes
+    // the no-bias Qwen3.5 GDN layout through mlx::core::compile so the
+    // sigmoid + two multiplies between fast::rms_norm and the out-proj
+    // matmul collapse into a single fused Compiled kernel. Default OFF;
+    // env var MLX_WGPU_COMPILE_GDN_POST=1 or the runtime setter from the
+    // worker init path will enable it.
+    pub fn mlx_set_gdn_post_compile_enabled(enabled: bool);
+    pub fn mlx_get_gdn_post_compile_enabled() -> bool;
+
+    // Phase 6d dispatch-count A/B test. Runs the GDN postfusion forward
+    // N times through each path (eager, compiled) and writes
+    // [eager_dispatches, compiled_dispatches, max_abs_err, N] into `out`.
+    // Same output format and return semantics as the Phase 6b/6c tests.
+    pub fn mlx_test_compile_gdn_post_dispatch_delta(out: *mut f64) -> i32;
+
     // Retrieve the last test-function exception message (set by the 6b/6c
     // dispatch A/B harnesses on rc != 0). Copies up to `buflen - 1` bytes
     // into `buf` and NUL-terminates; returns the number of bytes written.

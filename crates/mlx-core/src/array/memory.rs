@@ -101,6 +101,45 @@ pub fn wgpu_test_compile_gdn_pre_dispatch_delta() -> Vec<f64> {
     out.to_vec()
 }
 
+/// Phase 6d: toggle the GDN post-recurrence `mlx::core::compile` fast path.
+///
+/// When enabled, `mlx_gdn_postfusion_forward` routes the no-bias Qwen3.5
+/// GDN post-tail through the compile pass so the sigmoid + two multiplies
+/// between `fast::rms_norm` and the out-proj matmul collapse into a single
+/// fused Compiled kernel — saving ~3 dispatches per layer per token.
+///
+/// Default OFF. Plumbed from the `?compile_gdn_post=1` demo URL param and
+/// the TS test harness. The C++ side also reads `MLX_WGPU_COMPILE_GDN_POST=1`
+/// from the env on first use for native builds.
+#[napi]
+pub fn wgpu_set_gdn_post_compile_enabled(enabled: bool) {
+    unsafe { sys::mlx_set_gdn_post_compile_enabled(enabled) }
+}
+
+/// Read the current state of the Phase 6d GDN postfusion compile flag.
+/// Useful for the demo profile UI and for the TS test harness.
+#[napi]
+pub fn wgpu_get_gdn_post_compile_enabled() -> bool {
+    unsafe { sys::mlx_get_gdn_post_compile_enabled() }
+}
+
+/// Phase 6d dispatch-count A/B test. Runs the GDN postfusion forward N
+/// times eagerly, then N times through `mlx::core::compile`, and returns
+/// `[eager_dispatches, compiled_dispatches, max_abs_err, n_iters]`. Gate:
+/// delta must be at least the Phase 6d spec floor (see the TS harness for
+/// the exact threshold) and `max_abs_err` must be zero.
+#[napi]
+pub fn wgpu_test_compile_gdn_post_dispatch_delta() -> Vec<f64> {
+    let mut out = [0.0_f64; 4];
+    let rc = unsafe { sys::mlx_test_compile_gdn_post_dispatch_delta(out.as_mut_ptr()) };
+    if rc != 0 {
+        // Same [-9999, rc, 0, 0] sentinel as Phase 6c so the TS harness
+        // can surface the rc + last-test-error message.
+        return vec![-9999.0, rc as f64, 0.0, 0.0];
+    }
+    out.to_vec()
+}
+
 /// Retrieve the last-error message stashed by the Phase 6b/6c dispatch
 /// A/B test functions (set when their underlying C++ call throws). The
 /// browser test worker calls this on rc != 0 to include the C++ exception

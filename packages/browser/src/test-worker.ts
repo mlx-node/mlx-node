@@ -537,6 +537,73 @@ async function initAndRun(wasmUrl: string) {
       }
       return { eager, compiled, delta, maxAbsErr, nIters };
     }},
+    // ---- Phase 6d: GDN post-recurrence compile fast path ----
+    // Same A/B template as Phase 6b/6c. Runs mlx_gdn_postfusion_forward
+    // N=24 times with the compile flag off, then N=24 times with it on,
+    // and gates on (eager - compiled) >= 48 dispatches (spec target:
+    // ~3 element-wise ops fused per call × 24 iters = 72 expected) plus
+    // byte-level numerical parity. The postfusion body runs once per
+    // linear-attention layer per token — smaller win than Phase 6c but
+    // same mechanism.
+    { name: 'compile GDN postfusion dispatch delta (Phase 6d)', run() {
+      if (typeof mlxExports.wgpuTestCompileGdnPostDispatchDelta !== 'function') {
+        throw new Error('wgpuTestCompileGdnPostDispatchDelta not exported — was the C++ FFI rebuilt?');
+      }
+      const stats: number[] = mlxExports.wgpuTestCompileGdnPostDispatchDelta();
+      if (!Array.isArray(stats) || stats.length !== 4) {
+        throw new Error(`expected 4 stats, got ${JSON.stringify(stats)}`);
+      }
+      // Rust wrapper returns [-9999, rc, 0, 0] on underlying C++ failure —
+      // decode it and throw with the C++ exception text so vitest surfaces
+      // a debuggable message instead of an opaque numeric code.
+      if (stats[0] === -9999) {
+        let msg = '';
+        try {
+          if (typeof mlxExports.wgpuGetLastTestError === 'function') {
+            msg = mlxExports.wgpuGetLastTestError() as string;
+          }
+        } catch {
+          /* best-effort */
+        }
+        throw new Error(
+          `Phase 6d C++ test function returned rc=${stats[1]}: ${msg || '<no message>'}`,
+        );
+      }
+      const [eager, compiled, maxAbsErr, nIters] = stats;
+      // Numerical parity gate. The compile pass over the sigmoid + two
+      // multiplies between fast::rms_norm and the out-proj matmul should
+      // be byte-identical to the eager path on f32: same op order, same
+      // accumulators. Phase 6b/6c already proved this on element-wise
+      // tails; Phase 6d uses the same assertion floor.
+      if (!(maxAbsErr === 0)) {
+        throw new Error(
+          `Phase 6d numerical parity FAILED: maxAbsErr=${maxAbsErr} (expected byte-identical == 0) ` +
+          `(eager=${eager}, compiled=${compiled}, n=${nIters})`,
+        );
+      }
+      const delta = eager - compiled;
+      // eslint-disable-next-line no-console
+      console.log(
+        `[Phase 6d] eager=${eager} compiled=${compiled} delta=${delta} ` +
+        `maxAbsErr=${maxAbsErr.toExponential(2)} n=${nIters}`,
+      );
+      if (eager === 0 && compiled === 0) {
+        // Native non-WebGPU build: dispatch counters are zero.
+        return;
+      }
+      // Dispatch-count gate. Spec target is delta >= 48 per 24-iter run
+      // (~2-3 dispatches saved per postfusion call × 24 iters = 48-72).
+      // Phase 6d is smaller than 6c because the post-recurrence tail only
+      // has three element-wise ops between the rms_norm and the matmul.
+      if (delta < 48) {
+        throw new Error(
+          `Phase 6d dispatch-count gate FAILED: eager=${eager}, ` +
+          `compiled=${compiled}, delta=${delta} (need >= 48). ` +
+          `Compile pass may be silently falling back to eager eval.`,
+        );
+      }
+      return { eager, compiled, delta, maxAbsErr, nIters };
+    }},
     { name: 'gpu buffer array: create from eval\'d buffer, matmul 3 rounds', run() {
       if (!MxArray.testGpuBufferArrays()) throw new Error('gpu buffer array test failed');
     }},
