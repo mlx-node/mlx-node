@@ -96,6 +96,7 @@ async function runTurn(
       maxNewTokens: 2048,
       temperature: 0.6,
       reportPerformance: true,
+      reasoningEffort: 'low',
     },
   })) {
     if (event.done) {

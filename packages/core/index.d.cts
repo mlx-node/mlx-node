@@ -981,7 +981,9 @@ export declare class QianfanOCRModel {
   /**
    * Generate text tokens given pre-tokenized input.
    *
-   * Lower-level API — prefer chat() for typical usage.
+   * Lower-level API — prefer the session chat methods
+   * (`chatSessionStart` / `chatSessionContinue` and their streaming
+   * variants) for typical usage.
    */
   generate(
     inputIds: MxArray,
