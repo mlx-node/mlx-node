@@ -2,14 +2,19 @@
 /**
  * Chat API Example with Tool Calling
  *
- * Demonstrates how to use the model.chat() API for conversational AI with tools.
- * The model returns structured responses with tool calls and thinking extracted.
+ * Demonstrates the `ChatSession` API for conversational AI with tools.
+ * The session tracks its own history, KV cache, and tool-call state on
+ * the native side, so the JS caller only has to ship the first user
+ * prompt + a fan-out of `sendToolResult` calls — one per executed tool.
  *
- * This example shows the streamlined workflow:
- * 1. Define tools with OpenAI-compatible format (using createToolDefinition helper)
- * 2. Call model.chat() - returns ChatResult with structured tool calls and thinking
- * 3. Execute tools using the parsed arguments (already JS objects!)
- * 4. Continue conversation with tool results
+ * Workflow:
+ * 1. Define tools with OpenAI-compatible format (via createToolDefinition)
+ * 2. `session.send(userPrompt, { config: { tools, ... } })` — returns a
+ *    ChatResult with structured tool calls and thinking already parsed.
+ * 3. For each valid tool call, execute it and feed the result back via
+ *    `session.sendToolResult(call.id, result, { config: { tools, ... } })`.
+ *    The session handles appending the tool response to the live cache
+ *    and re-invoking the model for a follow-up reply.
  *
  * Usage:
  *   yarn oxnode examples/tool-use-example.ts [model-path]
@@ -23,8 +28,7 @@
 
 import { resolve } from 'node:path';
 
-import { Qwen35Model, type ChatMessage } from '@mlx-node/core';
-import { createToolDefinition } from '@mlx-node/lm';
+import { ChatSession, createToolDefinition, Qwen35Model } from '@mlx-node/lm';
 
 // Get model path from CLI args, environment, or default
 const DEFAULT_MODEL_PATH = resolve(process.cwd(), '.cache', 'models', 'qwen3.5-4B-mlx-bf16');
@@ -92,25 +96,21 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
   }
 }
 
-// NOTE: Step 7 of the chat-session refactor removed the legacy
-// `model.chat(...)` NAPI surface on Qwen35Model. Step T2 will expose a
-// tool-aware `ChatSession` entry point; until then this example uses an
-// `any` cast so it keeps typechecking. Running it would throw at
-// runtime because the method no longer exists.
-async function runToolConversation(model: Qwen35Model, userPrompt: string) {
+async function runToolConversation(session: ChatSession<Qwen35Model>, userPrompt: string) {
   console.log('='.repeat(75));
   console.log(`User: ${userPrompt}`);
   console.log('='.repeat(75));
 
-  let messages: ChatMessage[] = [{ role: 'user', content: userPrompt }];
-
-  // Use chat() API - returns ChatResult with structured tool calls and thinking
+  // Turn 1: hand the user prompt + tool definitions to the session.
+  // The session routes this through `chatSessionStart` on turn 0 and
+  // returns a parsed ChatResult.
   console.log('\n[->] Generating response with tools...');
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const result = await (model as any).chat(messages, {
-    tools,
-    maxNewTokens: 32768,
-    temperature: 0.7,
+  const result = await session.send(userPrompt, {
+    config: {
+      tools,
+      maxNewTokens: 32768,
+      temperature: 0.7,
+    },
   });
 
   // Show thinking if the model reasoned before responding
@@ -120,28 +120,15 @@ async function runToolConversation(model: Qwen35Model, userPrompt: string) {
   console.log(`\n[AI] ${result.text}`);
   console.log(`[INFO] Finish reason: ${result.finishReason}`);
 
-  // Check for tool calls - they're already parsed!
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const validCalls = result.toolCalls.filter((tc: any) => tc.status === 'ok');
+  // Check for tool calls — they're already parsed.
+  const validCalls = result.toolCalls.filter((tc) => tc.status === 'ok');
   if (validCalls.length > 0) {
     console.log(`\n[TOOL] Found ${validCalls.length} tool call(s):`);
 
-    // Add the assistant message with all tool calls
-    messages = [
-      ...messages,
-      {
-        role: 'assistant',
-        content: result.text,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        toolCalls: validCalls.map((tc: any) => ({
-          id: tc.id,
-          name: tc.name,
-          arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
-        })),
-      },
-    ];
-
-    // Execute each tool call and append results as role: 'tool' messages
+    // Execute each tool call and feed the result back through the
+    // session. The session owns the conversation history now — no
+    // manual message-array plumbing required.
+    let finalResult = result;
     for (const call of validCalls) {
       console.log(`   - ${call.name}(${JSON.stringify(call.arguments)})`);
 
@@ -149,21 +136,21 @@ async function runToolConversation(model: Qwen35Model, userPrompt: string) {
       const displayResult = toolResult.length > 200 ? toolResult.substring(0, 200) + '...' : toolResult;
       console.log(`   [<-] ${displayResult}`);
 
-      messages = [...messages, { role: 'tool', content: toolResult, toolCallId: call.id }];
+      console.log('\n[->] Generating follow-up response with tool result...');
+      finalResult = await session.sendToolResult(call.id, toolResult, {
+        config: {
+          tools,
+          maxNewTokens: 2048,
+          temperature: 0.9,
+        },
+      });
+
+      if (finalResult.thinking) {
+        console.log(`\n[THINK] ${finalResult.thinking}`);
+      }
+      console.log(`\n[AI] ${finalResult.text}`);
     }
 
-    // Generate final response with all tool results
-    console.log('\n[->] Generating final response...');
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const finalResult = await (model as any).chat(messages, {
-      tools,
-      maxNewTokens: 2048,
-      temperature: 0.9,
-    });
-
-    if (finalResult.thinking) {
-      console.log(`\n[THINK] ${finalResult.thinking}`);
-    }
     console.log(`\n[AI] Final response: ${finalResult.text}`);
 
     // Log any parsing errors
@@ -191,8 +178,10 @@ async function main() {
   // Example prompts that should trigger tool use
   const prompts = ['What time is it right now?', 'Can you fetch https://httpbin.org/json and tell me what it returns?'];
 
+  // Fresh session per prompt so each prompt starts from a clean cache.
   for (const prompt of prompts) {
-    await runToolConversation(model, prompt);
+    const session = new ChatSession(model);
+    await runToolConversation(session, prompt);
   }
 
   console.log('+' + '-'.repeat(58) + '+');
