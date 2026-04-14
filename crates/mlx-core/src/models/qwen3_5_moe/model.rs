@@ -11,8 +11,8 @@ use crate::model_thread::{ResponseTx, StreamTx};
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
     ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle, VisionCache, VisionCacheInner,
-    compute_num_image_tokens, extract_images_from_messages, inject_image_placeholders,
-    vlm_prepare_vision_features,
+    compute_num_image_tokens, eval_layer_caches, extract_images_from_messages,
+    inject_image_placeholders, vlm_prepare_vision_features,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
@@ -1057,6 +1057,15 @@ impl Qwen35MoeInner {
                         new_caches.push(lc);
                     }
                     self.caches = Some(new_caches);
+                    // Force-materialize the exported lazy cache handles
+                    // before `MoeResetGuard` drops at end of scope and tears
+                    // down `g_compiled_caches_moe`. Without this, the arrays
+                    // held by `self.caches` reference compiled-graph nodes
+                    // that get freed at guard drop, so the next turn's
+                    // compile init would feed stale handles to the GPU —
+                    // triggering Metal page-faults / innocent-victim hangs
+                    // on the first forward of the next turn.
+                    eval_layer_caches(&self.caches);
                 }
             }
             // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
@@ -1561,6 +1570,10 @@ impl Qwen35MoeInner {
                         new_caches.push(lc);
                     }
                     self.caches = Some(new_caches);
+                    // See the chat path for rationale: force-eval the
+                    // exported lazy handles before `MoeResetGuard` clears
+                    // `g_compiled_caches_moe` at end of scope.
+                    eval_layer_caches(&self.caches);
                 }
             }
             // _moe_guard dropped here
@@ -2017,6 +2030,10 @@ impl Qwen35MoeInner {
                         new_caches.push(lc);
                     }
                     self.caches = Some(new_caches);
+                    // See the chat path for rationale: force-eval the
+                    // exported lazy handles before `MoeResetGuard` clears
+                    // `g_compiled_caches_moe` at end of scope.
+                    eval_layer_caches(&self.caches);
                 }
             }
             // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
@@ -2641,6 +2658,10 @@ impl Qwen35MoeInner {
                         new_caches.push(lc);
                     }
                     self.caches = Some(new_caches);
+                    // See the chat path for rationale: force-eval the
+                    // exported lazy handles before `MoeResetGuard` clears
+                    // `g_compiled_caches_moe` at end of scope.
+                    eval_layer_caches(&self.caches);
                 }
             }
             // _moe_guard dropped here

@@ -1666,6 +1666,17 @@ impl Qwen35Inner {
                         new_caches.push(lc);
                     }
                     self.caches = Some(new_caches);
+                    // Force-materialize the exported cache arrays before
+                    // `CompiledResetGuard` drops at end of scope and tears
+                    // down `g_compiled_caches`. `mlx_qwen35_export_caches`
+                    // hands back lazy `array` copies whose compute graph
+                    // still references compiled-graph nodes; without this
+                    // eval those handles point at buffers that get freed
+                    // when the compile cache resets, and the next turn's
+                    // compile init would feed stale handles to the GPU —
+                    // triggering Metal page-faults / innocent-victim hangs
+                    // on the first forward of the next turn.
+                    eval_layer_caches(&self.caches);
                 }
             }
         } else {
@@ -2242,6 +2253,10 @@ impl Qwen35Inner {
                         new_caches.push(lc);
                     }
                     self.caches = Some(new_caches);
+                    // See `chat_with_caches_inner` for rationale: force-eval
+                    // the exported lazy handles before `CompiledResetGuard`
+                    // clears `g_compiled_caches` at end of scope.
+                    eval_layer_caches(&self.caches);
                 }
             }
         } else {
@@ -2775,6 +2790,10 @@ impl Qwen35Inner {
                         new_caches.push(lc);
                     }
                     self.caches = Some(new_caches);
+                    // See `chat_with_caches_inner` for rationale: force-eval
+                    // the exported lazy handles before `CompiledResetGuard`
+                    // clears `g_compiled_caches` at end of scope.
+                    eval_layer_caches(&self.caches);
                 }
             }
         } else {
@@ -5072,7 +5091,7 @@ const PREFILL_STEP_SIZE: i64 = 2048;
 
 /// Evaluate all cache arrays across all layers to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
-fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) {
+pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) {
     if let Some(caches) = caches {
         let mut arrays: Vec<&MxArray> = Vec::new();
         for cache in caches.iter() {
