@@ -562,6 +562,9 @@ async function runSessionNonStreaming(
 
   // Multi-message hot-path input: drop the cached session state and
   // re-run as a cold path. Correct but pays the full prefill cost.
+  // The caller re-keys this session under the newly allocated response
+  // id on success, so subsequent turns will resume from the cache that
+  // `startFromHistory` just warmed — the reset is amortized.
   await session.reset();
   session.primeHistory(messages);
   return await session.startFromHistory(config);
@@ -598,6 +601,9 @@ async function runSessionStreaming(
     throw new Error(`unsupported last message role on hot path: ${last.role}`);
   }
 
+  // Multi-message hot-path input: same reset-and-cold-restart as the
+  // non-streaming variant. See `runSessionNonStreaming` for the
+  // reasoning behind the post-success re-keying.
   await session.reset();
   session.primeHistory(messages);
   return session.startFromHistoryStream(config);
@@ -734,6 +740,15 @@ export async function handleCreateResponse(
   const instructionsOffset = body.instructions ? 1 : 0;
   const priorOffset = instructionsOffset + (priorMessages?.length ?? 0);
   const newInputMessages = messages.slice(priorOffset);
+
+  // Client-shape validation for the hot-path routing below: tool messages
+  // must carry a tool_call_id so sendToolResult() can bind them to a prior
+  // tool call. Catching this up front gives a clean 400 instead of letting
+  // runSession*() throw and be mapped to a generic 500.
+  if (newInputMessages.length === 1 && newInputMessages[0]!.role === 'tool' && !newInputMessages[0]!.toolCallId) {
+    sendBadRequest(res, 'tool message missing tool_call_id', 'input');
+    return;
+  }
 
   // Route the request through a `ChatSession` looked up by the prior
   // response id. A miss returns a fresh session; the hot path reuses
