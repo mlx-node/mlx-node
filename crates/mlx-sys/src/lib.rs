@@ -117,6 +117,39 @@ unsafe extern "C-unwind" {
         w_down: *mut mlx_array,
     ) -> *mut mlx_array;
 
+    // Fused GDN pre-recurrence forward pass (Qwen3.5 GatedDeltaNet).
+    //
+    // Collapses projections, mask, conv state prepend, conv1d, SiLU, split,
+    // reshape and no-weight RMS norm scaling into a single FFI call, returning
+    // q/k/v/z/a/b plus the new conv_state via out-pointers.
+    //
+    // Weights follow the `[out_features, in_features]` layout produced by
+    // Linear::get_weight() and are transposed internally.
+    //
+    // conv_state and mask may be null. Returns 0 on success, -1 on error
+    // (out-pointers are set to null on error).
+    pub fn mlx_gdn_prefusion_forward(
+        x: *mut mlx_array,
+        w_qkvz: *mut mlx_array,
+        w_ba: *mut mlx_array,
+        w_conv: *mut mlx_array,
+        conv_state: *mut mlx_array, // Can be null
+        mask: *mut mlx_array,       // Can be null
+        num_k_heads: i32,
+        num_v_heads: i32,
+        key_head_dim: i32,
+        value_head_dim: i32,
+        conv_kernel_dim: i32,
+        rms_eps: f32,
+        out_q: *mut *mut mlx_array,
+        out_k: *mut *mut mlx_array,
+        out_v: *mut *mut mlx_array,
+        out_z: *mut *mut mlx_array,
+        out_a: *mut *mut mlx_array,
+        out_b: *mut *mut mlx_array,
+        out_new_conv_state: *mut *mut mlx_array,
+    ) -> i32;
+
     // Fused Multi-Head Attention forward (without KV cache)
     pub fn mlx_fused_attention_forward(
         x: *mut mlx_array,
@@ -699,6 +732,22 @@ unsafe extern "C-unwind" {
     /// weight-upload path in gpu-worker.ts, which packs bf16 pairs into u32
     /// slots before creating the GPU buffer.
     pub fn mlx_wgpu_mark_buffer_packed_bf16(handle: *mut mlx_array) -> bool;
+
+    /// Phase 0 dispatch-stats readout: fills *out_dispatches and
+    /// *out_pass_ends with the cumulative counters maintained inside the
+    /// WebGPU backend's CommandEncoder (see
+    /// mlx/backend/webgpu/device.cpp). Plumbed into the browser's
+    /// `?profile=1` path so the demo page can display dispatches/token.
+    /// On non-WebGPU builds this writes zeros.
+    pub fn mlx_wgpu_get_dispatch_stats(
+        out_dispatches: *mut u64,
+        out_pass_ends: *mut u64,
+    );
+
+    /// Phase 0 dispatch-stats reset: zeros both counters. Called at the
+    /// start of each generation when ?profile=1 is active so the
+    /// per-generation stats are comparable.
+    pub fn mlx_wgpu_reset_dispatch_stats();
     pub fn mlx_array_nbytes(handle: *mut mlx_array) -> usize;
 
     // Fused generation loop - entire generation in one FFI call

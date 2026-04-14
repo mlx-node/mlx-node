@@ -124,136 +124,248 @@ impl GatedDeltaNet {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
 
-        // Project to qkvz: [B, T, key_dim*2 + value_dim*2]
-        let qkvz = self.in_proj_qkvz.forward(x)?;
+        // ----------------------------------------------------------------
+        // Phase 3a WASM fast path: single FFI call for the pre-recurrence
+        // portion of GatedDeltaNet::forward. Replaces ~15 MLX ops with one
+        // fused op that builds an identical lazy graph in C++.
+        //
+        // Byte-identical token IDs are required, so we skip this path when
+        // either projection is quantized (the fused C++ op only handles
+        // dense weights) or when the native build is running.
+        // ----------------------------------------------------------------
+        #[cfg(target_family = "wasm")]
+        let fused_pre = matches!(self.in_proj_qkvz, LinearProj::Standard(_))
+            && matches!(self.in_proj_ba, LinearProj::Standard(_));
+        #[cfg(not(target_family = "wasm"))]
+        let fused_pre = false;
 
-        // Project to ba: [B, T, num_v_heads*2]
-        let ba = self.in_proj_ba.forward(x)?;
+        let (q, k, v, z, a, b) = if fused_pre {
+            #[cfg(target_family = "wasm")]
+            {
+                use std::ptr;
 
-        // Split ba into b and a: each [B, T, num_v_heads]
-        let b = ba.slice_axis(2, 0, self.num_v_heads as i64)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.ba_b"), &b);
-        let a = ba.slice_axis(2, self.num_v_heads as i64, (self.num_v_heads * 2) as i64)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.ba_a"), &a);
+                let w_qkvz = self.in_proj_qkvz.get_weight();
+                let w_ba = self.in_proj_ba.get_weight();
+                let w_conv = self.conv1d.get_weight();
 
-        // Split qkvz: qkv goes through conv, z bypasses
-        // qkv: [B, T, key_dim*2 + value_dim] = [B, T, conv_dim]
-        // z: [B, T, value_dim]
-        let qkv = qkvz.slice_axis(2, 0, self.conv_dim as i64)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.qkv"), &qkv);
-        let z = qkvz.slice_axis(
-            2,
-            self.conv_dim as i64,
-            (self.key_dim * 2 + self.value_dim * 2) as i64,
-        )?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.z"), &z);
-        let conv1d_weight = self.conv1d.get_weight();
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.conv1d_weight"), &conv1d_weight);
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.dt_bias"), &self.dt_bias);
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.a_log"), &self.a_log);
+                let conv_state_handle = cache
+                    .as_deref()
+                    .and_then(|c| c.get(0))
+                    .map(|s| s.handle.0)
+                    .unwrap_or(ptr::null_mut());
+                let mask_handle = mask.map(|m| m.handle.0).unwrap_or(ptr::null_mut());
 
-        // Apply mask before conv to prevent masked values leaking through convolution
-        let qkv = if let Some(m) = mask {
-            // m: [B, T] → [B, T, 1] for broadcasting
-            let m_3d = m.reshape(&[batch, seq_len, 1])?;
-            // Use qkv's dtype to avoid f32 promotion for bf16/f16 models
-            m_3d.where_(&qkv, &MxArray::zeros(&[1], Some(qkv.dtype()?))?)?
-        } else {
-            qkv
-        };
+                let mut q_out: *mut mlx_sys::mlx_array = ptr::null_mut();
+                let mut k_out: *mut mlx_sys::mlx_array = ptr::null_mut();
+                let mut v_out: *mut mlx_sys::mlx_array = ptr::null_mut();
+                let mut z_out: *mut mlx_sys::mlx_array = ptr::null_mut();
+                let mut a_out: *mut mlx_sys::mlx_array = ptr::null_mut();
+                let mut b_out: *mut mlx_sys::mlx_array = ptr::null_mut();
+                let mut new_conv_state_out: *mut mlx_sys::mlx_array = ptr::null_mut();
 
-        // Handle conv_state: always prepend padding (zeros or cached state)
-        let conv_state = if let Some(ref cache) = cache {
-            cache.get(0).cloned()
-        } else {
-            None
-        };
+                let rc = unsafe {
+                    mlx_sys::mlx_gdn_prefusion_forward(
+                        x.handle.0,
+                        w_qkvz.handle.0,
+                        w_ba.handle.0,
+                        w_conv.handle.0,
+                        conv_state_handle,
+                        mask_handle,
+                        self.num_k_heads,
+                        self.num_v_heads,
+                        self.key_head_dim,
+                        self.value_head_dim,
+                        self.conv_kernel_dim,
+                        1e-6f32,
+                        &mut q_out,
+                        &mut k_out,
+                        &mut v_out,
+                        &mut z_out,
+                        &mut a_out,
+                        &mut b_out,
+                        &mut new_conv_state_out,
+                    )
+                };
 
-        let conv_input = match conv_state {
-            Some(state) => {
-                // Prepend cached conv_state: [B, kernel-1, conv_dim]
-                MxArray::concatenate(&state, &qkv, 1)?
+                if rc != 0
+                    || q_out.is_null()
+                    || k_out.is_null()
+                    || v_out.is_null()
+                    || z_out.is_null()
+                    || a_out.is_null()
+                    || b_out.is_null()
+                    || new_conv_state_out.is_null()
+                {
+                    return Err(Error::from_reason(
+                        "mlx_gdn_prefusion_forward returned an error",
+                    ));
+                }
+
+                let q = MxArray::from_handle(q_out, "gdn_prefusion_q")?;
+                let k = MxArray::from_handle(k_out, "gdn_prefusion_k")?;
+                let v = MxArray::from_handle(v_out, "gdn_prefusion_v")?;
+                let z = MxArray::from_handle(z_out, "gdn_prefusion_z")?;
+                let a = MxArray::from_handle(a_out, "gdn_prefusion_a")?;
+                let b = MxArray::from_handle(b_out, "gdn_prefusion_b")?;
+                let new_conv_state =
+                    MxArray::from_handle(new_conv_state_out, "gdn_prefusion_new_conv_state")?;
+
+                // The fused op already computed the new conv_state; persist it
+                // exactly like the per-op path does.
+                if let Some(cache) = cache.as_deref_mut() {
+                    cache.set(0, new_conv_state);
+                }
+
+                log_tensor_stats(&format!("layer.{layer:02}.gdn.q_normed"), &q);
+                log_tensor_stats(&format!("layer.{layer:02}.gdn.k_normed"), &k);
+
+                (q, k, v, z, a, b)
             }
-            None => {
-                // No cache: prepend zeros of size (kernel_size - 1)
+            #[cfg(not(target_family = "wasm"))]
+            unreachable!()
+        } else {
+            // Project to qkvz: [B, T, key_dim*2 + value_dim*2]
+            let qkvz = self.in_proj_qkvz.forward(x)?;
+
+            // Project to ba: [B, T, num_v_heads*2]
+            let ba = self.in_proj_ba.forward(x)?;
+
+            // Split ba into b and a: each [B, T, num_v_heads]
+            let b = ba.slice_axis(2, 0, self.num_v_heads as i64)?;
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.ba_b"), &b);
+            let a = ba.slice_axis(2, self.num_v_heads as i64, (self.num_v_heads * 2) as i64)?;
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.ba_a"), &a);
+
+            // Split qkvz: qkv goes through conv, z bypasses
+            // qkv: [B, T, key_dim*2 + value_dim] = [B, T, conv_dim]
+            // z: [B, T, value_dim]
+            let qkv = qkvz.slice_axis(2, 0, self.conv_dim as i64)?;
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.qkv"), &qkv);
+            let z = qkvz.slice_axis(
+                2,
+                self.conv_dim as i64,
+                (self.key_dim * 2 + self.value_dim * 2) as i64,
+            )?;
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.z"), &z);
+            let conv1d_weight = self.conv1d.get_weight();
+            log_tensor_stats(
+                &format!("layer.{layer:02}.gdn.conv1d_weight"),
+                &conv1d_weight,
+            );
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.dt_bias"), &self.dt_bias);
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.a_log"), &self.a_log);
+
+            // Apply mask before conv to prevent masked values leaking through convolution
+            let qkv = if let Some(m) = mask {
+                // m: [B, T] → [B, T, 1] for broadcasting
+                let m_3d = m.reshape(&[batch, seq_len, 1])?;
                 // Use qkv's dtype to avoid f32 promotion for bf16/f16 models
-                let pad_len = (self.conv_kernel_dim - 1) as i64;
-                let zeros =
-                    MxArray::zeros(&[batch, pad_len, self.conv_dim as i64], Some(qkv.dtype()?))?;
-                MxArray::concatenate(&zeros, &qkv, 1)?
+                m_3d.where_(&qkv, &MxArray::zeros(&[1], Some(qkv.dtype()?))?)?
+            } else {
+                qkv
+            };
+
+            // Handle conv_state: always prepend padding (zeros or cached state)
+            let conv_state = if let Some(ref cache) = cache {
+                cache.get(0).cloned()
+            } else {
+                None
+            };
+
+            let conv_input = match conv_state {
+                Some(state) => {
+                    // Prepend cached conv_state: [B, kernel-1, conv_dim]
+                    MxArray::concatenate(&state, &qkv, 1)?
+                }
+                None => {
+                    // No cache: prepend zeros of size (kernel_size - 1)
+                    // Use qkv's dtype to avoid f32 promotion for bf16/f16 models
+                    let pad_len = (self.conv_kernel_dim - 1) as i64;
+                    let zeros = MxArray::zeros(
+                        &[batch, pad_len, self.conv_dim as i64],
+                        Some(qkv.dtype()?),
+                    )?;
+                    MxArray::concatenate(&zeros, &qkv, 1)?
+                }
+            };
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.conv_input"), &conv_input);
+
+            // Update conv_state in cache
+            if let Some(cache) = cache.as_deref_mut() {
+                // Save last (kernel_size - 1) timesteps as new conv_state
+                let total_len = conv_input.shape_at(1)?;
+                let keep = (self.conv_kernel_dim - 1) as i64;
+                if total_len >= keep {
+                    let new_conv_state = conv_input.slice_axis(1, total_len - keep, total_len)?;
+                    cache.set(0, new_conv_state);
+                }
             }
+
+            // Conv1d: [B, T_in, conv_dim] → [B, T_out, conv_dim]
+            let conv_out = self.conv1d.forward(&conv_input)?;
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.conv_out"), &conv_out);
+
+            // Take last seq_len timesteps (conv may produce more than seq_len if conv_state was prepended)
+            let conv_out_len = conv_out.shape_at(1)?;
+            let conv_out = if conv_out_len > seq_len {
+                conv_out.slice_axis(1, conv_out_len - seq_len, conv_out_len)?
+            } else {
+                conv_out
+            };
+
+            // Apply SiLU activation
+            let conv_out_silu = Activations::silu(&conv_out)?;
+            log_tensor_stats(
+                &format!("layer.{layer:02}.gdn.conv_out_silu"),
+                &conv_out_silu,
+            );
+            let conv_out = conv_out_silu;
+
+            // Split into q, k, v
+            let q_flat = conv_out.slice_axis(2, 0, self.key_dim as i64)?;
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.q_flat"), &q_flat);
+            let k_flat = conv_out.slice_axis(2, self.key_dim as i64, (self.key_dim * 2) as i64)?;
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.k_flat"), &k_flat);
+            let v_flat =
+                conv_out.slice_axis(2, (self.key_dim * 2) as i64, self.conv_dim as i64)?;
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.v_flat"), &v_flat);
+
+            // Reshape to head format
+            // q, k: [B, T, key_dim] → [B, T, Hk, Dk]
+            let q = q_flat.reshape(&[
+                batch,
+                seq_len,
+                self.num_k_heads as i64,
+                self.key_head_dim as i64,
+            ])?;
+            let k = k_flat.reshape(&[
+                batch,
+                seq_len,
+                self.num_k_heads as i64,
+                self.key_head_dim as i64,
+            ])?;
+            // v: [B, T, value_dim] → [B, T, Hv, Dv]
+            let v = v_flat.reshape(&[
+                batch,
+                seq_len,
+                self.num_v_heads as i64,
+                self.value_head_dim as i64,
+            ])?;
+
+            // Apply RMS norm scaling to q and k (matching Python exactly):
+            //   inv_scale = head_k_dim^(-0.5)
+            //   q = (inv_scale^2) * rms_norm(q, None, 1e-6)
+            //   k = inv_scale * rms_norm(k, None, 1e-6)
+            let inv_scale = (self.key_head_dim as f64).powf(-0.5);
+            let q_normed = rms_norm_no_weight(&q, 1e-6)?;
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.q_normed"), &q_normed);
+            let k_normed = rms_norm_no_weight(&k, 1e-6)?;
+            log_tensor_stats(&format!("layer.{layer:02}.gdn.k_normed"), &k_normed);
+            let q = q_normed.mul_scalar(inv_scale * inv_scale)?;
+            let k = k_normed.mul_scalar(inv_scale)?;
+
+            (q, k, v, z, a, b)
         };
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.conv_input"), &conv_input);
-
-        // Update conv_state in cache
-        if let Some(cache) = cache.as_deref_mut() {
-            // Save last (kernel_size - 1) timesteps as new conv_state
-            let total_len = conv_input.shape_at(1)?;
-            let keep = (self.conv_kernel_dim - 1) as i64;
-            if total_len >= keep {
-                let new_conv_state = conv_input.slice_axis(1, total_len - keep, total_len)?;
-                cache.set(0, new_conv_state);
-            }
-        }
-
-        // Conv1d: [B, T_in, conv_dim] → [B, T_out, conv_dim]
-        let conv_out = self.conv1d.forward(&conv_input)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.conv_out"), &conv_out);
-
-        // Take last seq_len timesteps (conv may produce more than seq_len if conv_state was prepended)
-        let conv_out_len = conv_out.shape_at(1)?;
-        let conv_out = if conv_out_len > seq_len {
-            conv_out.slice_axis(1, conv_out_len - seq_len, conv_out_len)?
-        } else {
-            conv_out
-        };
-
-        // Apply SiLU activation
-        let conv_out_silu = Activations::silu(&conv_out)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.conv_out_silu"), &conv_out_silu);
-        let conv_out = conv_out_silu;
-
-        // Split into q, k, v
-        let q_flat = conv_out.slice_axis(2, 0, self.key_dim as i64)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.q_flat"), &q_flat);
-        let k_flat = conv_out.slice_axis(2, self.key_dim as i64, (self.key_dim * 2) as i64)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.k_flat"), &k_flat);
-        let v_flat = conv_out.slice_axis(2, (self.key_dim * 2) as i64, self.conv_dim as i64)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.v_flat"), &v_flat);
-
-        // Reshape to head format
-        // q, k: [B, T, key_dim] → [B, T, Hk, Dk]
-        let q = q_flat.reshape(&[
-            batch,
-            seq_len,
-            self.num_k_heads as i64,
-            self.key_head_dim as i64,
-        ])?;
-        let k = k_flat.reshape(&[
-            batch,
-            seq_len,
-            self.num_k_heads as i64,
-            self.key_head_dim as i64,
-        ])?;
-        // v: [B, T, value_dim] → [B, T, Hv, Dv]
-        let v = v_flat.reshape(&[
-            batch,
-            seq_len,
-            self.num_v_heads as i64,
-            self.value_head_dim as i64,
-        ])?;
-
-        // Apply RMS norm scaling to q and k (matching Python exactly):
-        //   inv_scale = head_k_dim^(-0.5)
-        //   q = (inv_scale^2) * rms_norm(q, None, 1e-6)
-        //   k = inv_scale * rms_norm(k, None, 1e-6)
-        let inv_scale = (self.key_head_dim as f64).powf(-0.5);
-        let q_normed = rms_norm_no_weight(&q, 1e-6)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.q_normed"), &q_normed);
-        let k_normed = rms_norm_no_weight(&k, 1e-6)?;
-        log_tensor_stats(&format!("layer.{layer:02}.gdn.k_normed"), &k_normed);
-        let q = q_normed.mul_scalar(inv_scale * inv_scale)?;
-        let k = k_normed.mul_scalar(inv_scale)?;
 
         // Run gated delta recurrence
         let recurrent_state = cache.as_deref().and_then(|c| c.get(1));
