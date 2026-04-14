@@ -5,7 +5,8 @@
     "outDir": "dist",
     "composite": true,
     "noEmit": false,
-    "resolveJsonModule": true
+    "resolveJsonModule": true,
+    "types": ["node"]
   },
   "include": ["src/**/*.ts"],
   "references": [{ "path": "../core" }]

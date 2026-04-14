@@ -4,7 +4,8 @@
     "rootDir": "src",
     "outDir": "dist",
     "composite": true,
-    "noEmit": false
+    "noEmit": false,
+    "types": ["node"]
   },
   "include": ["src/**/*.ts"],
   "references": [{ "path": "../core" }, { "path": "../lm" }]

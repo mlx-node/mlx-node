@@ -5,7 +5,8 @@
     "composite": false,
     "target": "ESNext",
     "module": "ESNext",
-    "moduleResolution": "Bundler"
+    "moduleResolution": "Bundler",
+    "types": ["node"]
   },
   "include": ["./**/*.ts"]
 }

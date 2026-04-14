@@ -525,7 +525,7 @@ __metadata:
   dependencies:
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
-    "@types/node": "npm:^25.6.0"
+    "@types/node": "catalog:"
   languageName: unknown
   linkType: soft
 
@@ -548,7 +548,7 @@ __metadata:
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@napi-rs/image": "npm:^1.12.0"
-    "@types/node": "npm:^25.6.0"
+    "@types/node": "catalog:"
   languageName: unknown
   linkType: soft
 
@@ -2710,6 +2710,15 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@types/node@npm:@types/node@24.12.2":
+  version: 24.12.2
+  resolution: "@types/node@npm:24.12.2"
+  dependencies:
+    undici-types: "npm:~7.16.0"
+  checksum: 10c0/710050c42f89075c4479e4e1e4c2532486b0c41b1e2a8a13ad88641c88b88cdaea87414e19224f30028719737bd70e327edcaa184d50e86b9418941edd7eb02b
+  languageName: node
+  linkType: hard
+
 "@types/responselike@npm:^1.0.0":
   version: 1.0.3
   resolution: "@types/responselike@npm:1.0.3"
@@ -4800,6 +4809,13 @@ __metadata:
     tsc: bin/tsc
     tsserver: bin/tsserver
   checksum: 10c0/ad09fdf7a756814dce65bc60c1657b40d44451346858eea230e10f2e95a289d9183b6e32e5c11e95acc0ccc214b4f36289dcad4bf1886b0adb84d711d336a430
+  languageName: node
+  linkType: hard
+
+"undici-types@npm:~7.16.0":
+  version: 7.16.0
+  resolution: "undici-types@npm:7.16.0"
+  checksum: 10c0/3033e2f2b5c9f1504bdc5934646cb54e37ecaca0f9249c983f7b1fc2e87c6d18399ebb05dc7fd5419e02b2e915f734d872a65da2e3eeed1813951c427d33cc9a
   languageName: node
   linkType: hard
 

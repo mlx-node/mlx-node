@@ -6,7 +6,8 @@
     "composite": true,
     "target": "ESNext",
     "module": "ESNext",
-    "moduleResolution": "Bundler"
+    "moduleResolution": "Bundler",
+    "types": ["node"]
   },
   "include": ["./**/*.ts"],
   "references": [{ "path": "../packages/lm" }, { "path": "../packages/trl" }, { "path": "../packages/vlm" }]
