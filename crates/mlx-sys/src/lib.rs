@@ -1454,6 +1454,29 @@ unsafe extern "C-unwind" {
     // (4 doubles). Returns 0 on success, negative on failure.
     pub fn mlx_test_compile_mlp_dispatch_delta(out: *mut f64) -> i32;
 
+    // Phase 6c: GDN pre-recurrence compile fast path — mirrors the Phase 6b
+    // pair above. When enabled, mlx_gdn_prefusion_forward routes the
+    // steady-state decode shape (mask absent, conv_state present) through
+    // mlx::core::compile so the 15+ element-wise primitives between the
+    // matmuls, slices, and fast::rms_norms collapse into fused Compiled
+    // kernels. Default OFF; env var MLX_WGPU_COMPILE_GDN_PRE=1 or the
+    // runtime setter from the worker init path will enable it.
+    pub fn mlx_set_gdn_pre_compile_enabled(enabled: bool);
+    pub fn mlx_get_gdn_pre_compile_enabled() -> bool;
+
+    // Phase 6c dispatch-count A/B test. Runs the GDN prefusion forward
+    // N times through each path (eager, compiled) and writes
+    // [eager_dispatches, compiled_dispatches, max_abs_err, N] into `out`.
+    // Same output format and return semantics as the Phase 6b test.
+    pub fn mlx_test_compile_gdn_pre_dispatch_delta(out: *mut f64) -> i32;
+
+    // Retrieve the last test-function exception message (set by the 6b/6c
+    // dispatch A/B harnesses on rc != 0). Copies up to `buflen - 1` bytes
+    // into `buf` and NUL-terminates; returns the number of bytes written.
+    // Used by the browser test worker to surface C++ exceptions (stderr
+    // is not piped through the WASM worker).
+    pub fn mlx_get_last_test_error(buf: *mut std::os::raw::c_char, buflen: i32) -> i32;
+
     // GPU buffer array test — exercises mlx_array_from_gpu_buffer code path
     pub fn mlx_test_gpu_buffer_arrays() -> bool;
 

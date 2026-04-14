@@ -951,6 +951,14 @@ async function commandLoop(): Promise<void> {
         await processCommand(fnId);
       } catch (err) {
         console.error(`[GPU Worker] Error processing fn ${fnId}:`, err);
+        // Phase 6c diag: forward RPC errors to parent so they surface in
+        // test output (browser console isn't piped into the test runner).
+        try {
+          const msg = err instanceof Error ? err.message : String(err);
+          self.postMessage({ type: 'rpc-error', fnId, message: msg });
+        } catch {
+          // ignore postMessage failures
+        }
         cmdU32[I_RESULT] = 0;
       }
       flushCallbacks();

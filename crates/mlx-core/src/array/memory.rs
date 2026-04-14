@@ -60,6 +60,69 @@ pub fn wgpu_test_compile_mlp_dispatch_delta() -> Vec<f64> {
     out.to_vec()
 }
 
+/// Phase 6c: toggle the GDN pre-recurrence `mlx::core::compile` fast path.
+///
+/// When enabled, `mlx_gdn_prefusion_forward` routes the steady-state decode
+/// shape (mask absent, conv_state present, Tq=1) through the compile pass
+/// so the 15+ element-wise ops between the matmuls, slices, and rms_norms
+/// collapse into fused Compiled kernels — the biggest single lever in the
+/// Phase 6 plan.
+///
+/// Default OFF. Plumbed from the `?compile_gdn_pre=1` demo URL param and
+/// the TS test harness. The C++ side also reads `MLX_WGPU_COMPILE_GDN_PRE=1`
+/// from the env on first use for native builds.
+#[napi]
+pub fn wgpu_set_gdn_pre_compile_enabled(enabled: bool) {
+    unsafe { sys::mlx_set_gdn_pre_compile_enabled(enabled) }
+}
+
+/// Read the current state of the Phase 6c GDN prefusion compile flag.
+/// Useful for the demo profile UI and for the TS test harness.
+#[napi]
+pub fn wgpu_get_gdn_pre_compile_enabled() -> bool {
+    unsafe { sys::mlx_get_gdn_pre_compile_enabled() }
+}
+
+/// Phase 6c dispatch-count A/B test. Runs the GDN prefusion forward N
+/// times eagerly, then N times through `mlx::core::compile`, and returns
+/// `[eager_dispatches, compiled_dispatches, max_abs_err, n_iters]`.
+/// Gate: delta must be at least the Phase 6c spec floor (see the TS
+/// harness for the exact threshold) and `max_abs_err` must be zero.
+#[napi]
+pub fn wgpu_test_compile_gdn_pre_dispatch_delta() -> Vec<f64> {
+    let mut out = [0.0_f64; 4];
+    let rc = unsafe { sys::mlx_test_compile_gdn_pre_dispatch_delta(out.as_mut_ptr()) };
+    if rc != 0 {
+        // Surface the rc code to JS (instead of returning an opaque empty
+        // vec) so the test harness can quote it in the failure message.
+        // The TS side checks for the `-9999.0` sentinel at index 0.
+        return vec![-9999.0, rc as f64, 0.0, 0.0];
+    }
+    out.to_vec()
+}
+
+/// Retrieve the last-error message stashed by the Phase 6b/6c dispatch
+/// A/B test functions (set when their underlying C++ call throws). The
+/// browser test worker calls this on rc != 0 to include the C++ exception
+/// text in the vitest failure output instead of an opaque numeric code.
+#[napi]
+pub fn wgpu_get_last_test_error() -> String {
+    let mut buf = vec![0_i8; 512];
+    let n = unsafe {
+        sys::mlx_get_last_test_error(buf.as_mut_ptr() as *mut _, buf.len() as i32)
+    };
+    if n <= 0 {
+        return String::new();
+    }
+    let end = (n as usize).min(buf.len() - 1);
+    // Safety: the C++ side wrote `end` bytes of UTF-8-ish data (it may be
+    // arbitrary std::exception::what() text; treat it as lossy UTF-8).
+    String::from_utf8_lossy(unsafe {
+        std::slice::from_raw_parts(buf.as_ptr() as *const u8, end)
+    })
+    .into_owned()
+}
+
 /// Clear the MLX memory cache to prevent memory pressure buildup
 /// Should be called periodically during long-running operations
 /// Internal Rust-only function - memory management is handled automatically by the trainer

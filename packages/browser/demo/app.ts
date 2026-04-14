@@ -412,6 +412,12 @@ worker.addEventListener('messageerror', (e) => {
 // fast path. The compile pass collapses the sigmoid + 2 multiplies between
 // the three matmuls into a single fused element-wise kernel (saving 2
 // dispatches per layer per token). Default OFF — toggle here for an A/B.
+//
+// ?compile_gdn_pre=1 enables the Phase 6c GDN pre-recurrence
+// `mlx::core::compile` fast path. The compile pass collapses the ~10
+// element-wise ops that surround the matmuls / slices / rms_norms in the
+// GDN pre-recurrence body into fused Compiled kernels — the single
+// biggest dispatch-count lever in the Phase 6 plan. Default OFF.
 const urlParams = new URLSearchParams(location.search);
 const packBf16 = urlParams.get('pack_bf16') !== '0'; // enabled by default, ?pack_bf16=0 to disable
 const sdpaFallback = urlParams.get('sdpa_fallback') === '1';
@@ -421,6 +427,7 @@ const profile = urlParams.get('profile') === '1';
 // and verify decode parity + RPCs/tok reduction in the profile readout.
 const dispatchBatch = urlParams.get('dispatch_batch') === '1';
 const compileMlp = urlParams.get('compile_mlp') === '1';
+const compileGdnPre = urlParams.get('compile_gdn_pre') === '1';
 const useSab = urlParams.get('stream_sab') !== '0'; // enabled by default, ?stream_sab=0 to fall back to TSFN
 // ?mode=baseline | sab | tsfn — diagnostic A/B for the streaming path.
 // baseline = non-streaming chat() (ground-truth compute, no sink overhead).
@@ -431,6 +438,7 @@ const flagBadges =
   (profile ? ' (profile=1)' : '') +
   (dispatchBatch ? ' (dispatch_batch=1)' : '') +
   (compileMlp ? ' (compile_mlp=1)' : '') +
+  (compileGdnPre ? ' (compile_gdn_pre=1)' : '') +
   (useSab ? '' : ' (stream_sab=0)') +
   (modeParam ? ` (mode=${modeParam})` : '');
 log(`Starting MLX Worker${flagBadges}...`);
@@ -444,6 +452,7 @@ worker.postMessage({
   profile,
   dispatchBatch,
   compileMlp,
+  compileGdnPre,
 });
 
 // Chat handler

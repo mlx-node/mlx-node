@@ -8,6 +8,23 @@ function post(data: any) { (self as any).postMessage(data); }
 let testMap: Map<string, () => void> | null = null;
 let wasmInstRef: WebAssembly.Instance | null = null;
 let wasmTagRef: WebAssembly.Tag | null = null;
+// Phase 6c diag: ring of last N GPU-worker RPC errors so we can append them
+// to the next test failure message (browser console output from the GPU
+// worker is not captured by Vitest in playwright provider mode).
+const lastGpuRpcErrors: string[] = [];
+const MAX_GPU_RPC_ERRORS = 8;
+function recordGpuRpcError(msg: string): void {
+  lastGpuRpcErrors.push(msg);
+  if (lastGpuRpcErrors.length > MAX_GPU_RPC_ERRORS) {
+    lastGpuRpcErrors.shift();
+  }
+}
+function drainGpuRpcErrors(): string {
+  if (lastGpuRpcErrors.length === 0) return '';
+  const joined = lastGpuRpcErrors.join(' | ');
+  lastGpuRpcErrors.length = 0;
+  return ` [gpu-rpc-errors: ${joined}]`;
+}
 
 // Register message handler IMMEDIATELY (before any async work)
 self.onmessage = async (e: MessageEvent) => {
@@ -38,6 +55,7 @@ self.onmessage = async (e: MessageEvent) => {
       if (err instanceof WebAssembly.Exception && wasmInstRef && wasmTagRef) {
         msg = extractWasmError(err, wasmInstRef, wasmTagRef) || msg;
       }
+      msg += drainGpuRpcErrors();
       post({ type: 'result', name: e.data.name, passed: false, error: msg });
     }
   }
@@ -103,9 +121,21 @@ async function initAndRun(wasmUrl: string) {
     gpuW.onmessage = (ev) => {
       if (ev.data.type === 'ready') { clearTimeout(timer); res(ev.data); }
       else if (ev.data.type === 'error') { clearTimeout(timer); rej(new Error(ev.data.message)); }
+      else if (ev.data.type === 'rpc-error') {
+        // Silently collect; drained by the test runner into the error msg.
+        recordGpuRpcError(`fn=${ev.data.fnId}: ${ev.data.message}`);
+      }
     };
     gpuW.postMessage({ type: 'init', cmdBuffer: cmdBuf, readbackBuffer: readbackBuf, wasmMemory: wasmMem });
   });
+
+  // Install a permanent post-init handler that keeps recording rpc-error
+  // messages. Overwrites the init-time handler above.
+  gpuW.onmessage = (ev) => {
+    if (ev.data.type === 'rpc-error') {
+      recordGpuRpcError(`fn=${ev.data.fnId}: ${ev.data.message}`);
+    }
+  };
 
   post({ type: 'status', message: 'WebGPU ready. Loading WASM...' });
 
@@ -436,6 +466,75 @@ async function initAndRun(wasmUrl: string) {
       // Return the stats as `info` so the main thread can surface the
       // numbers in the commit message / report without a worker→main
       // postMessage hand-roll.
+      return { eager, compiled, delta, maxAbsErr, nIters };
+    }},
+    // ---- Phase 6c: GDN pre-recurrence compile fast path ----
+    // Same A/B template as Phase 6b. Runs mlx_gdn_prefusion_forward N=24
+    // times with the compile flag off, then N=24 times with it on, and
+    // gates on (eager - compiled) >= 80 dispatches (spec-target ~120 per
+    // 24-iter run) plus byte-level numerical parity. The prefusion body
+    // fires once per linear-attention layer per token, and Phase 6c is
+    // the biggest single dispatch-count lever in the Phase 6 plan.
+    { name: 'compile GDN prefusion dispatch delta (Phase 6c)', run() {
+      if (typeof mlxExports.wgpuTestCompileGdnPreDispatchDelta !== 'function') {
+        throw new Error('wgpuTestCompileGdnPreDispatchDelta not exported — was the C++ FFI rebuilt?');
+      }
+      const stats: number[] = mlxExports.wgpuTestCompileGdnPreDispatchDelta();
+      if (!Array.isArray(stats) || stats.length !== 4) {
+        throw new Error(`expected 4 stats, got ${JSON.stringify(stats)}`);
+      }
+      // Rust wrapper returns [-9999, rc, 0, 0] on underlying C++ failure so
+      // the error code surfaces to JS instead of becoming an opaque empty
+      // vec. Decode that sentinel and throw with the rc + C++ exception
+      // message (fetched via the thread-local last-test-error buffer).
+      if (stats[0] === -9999) {
+        let msg = '';
+        try {
+          if (typeof mlxExports.wgpuGetLastTestError === 'function') {
+            msg = mlxExports.wgpuGetLastTestError() as string;
+          }
+        } catch {
+          /* best-effort */
+        }
+        throw new Error(
+          `Phase 6c C++ test function returned rc=${stats[1]}: ${msg || '<no message>'}`,
+        );
+      }
+      const [eager, compiled, maxAbsErr, nIters] = stats;
+      // Numerical parity gate. Compile over the element-wise chains in
+      // the GDN pre-recurrence body should be byte-identical to the eager
+      // path on f32 inputs: the matmuls, rms_norms, slices, and concat
+      // remain separate primitives in the compiled tape and the fused
+      // element-wise kernels execute the same math in the same order.
+      // Phase 6b proved this on the simpler SwiGLU MLP; Phase 6c uses
+      // the same assertion floor.
+      if (!(maxAbsErr === 0)) {
+        throw new Error(
+          `Phase 6c numerical parity FAILED: maxAbsErr=${maxAbsErr} (expected byte-identical == 0) ` +
+          `(eager=${eager}, compiled=${compiled}, n=${nIters})`,
+        );
+      }
+      const delta = eager - compiled;
+      // eslint-disable-next-line no-console
+      console.log(
+        `[Phase 6c] eager=${eager} compiled=${compiled} delta=${delta} ` +
+        `maxAbsErr=${maxAbsErr.toExponential(2)} n=${nIters}`,
+      );
+      if (eager === 0 && compiled === 0) {
+        // Native non-WebGPU build: dispatch counters are zero.
+        return;
+      }
+      // Dispatch-count gate. Spec target is delta >= 120 per 24-iter run
+      // (~5 ops saved per prefusion call × 24 iters). We set the floor
+      // at 80 so a moderate amount of per-call noise doesn't regress the
+      // suite while still catching a silent compile-pass fallback.
+      if (delta < 80) {
+        throw new Error(
+          `Phase 6c dispatch-count gate FAILED: eager=${eager}, ` +
+          `compiled=${compiled}, delta=${delta} (need >= 80). ` +
+          `Compile pass may be silently falling back to eager eval.`,
+        );
+      }
       return { eager, compiled, delta, maxAbsErr, nIters };
     }},
     { name: 'gpu buffer array: create from eval\'d buffer, matmul 3 rounds', run() {

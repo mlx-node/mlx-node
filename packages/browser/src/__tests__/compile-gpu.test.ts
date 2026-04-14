@@ -1,5 +1,4 @@
 import { describe, test, expect, beforeAll } from 'vitest';
-
 import { getBridge, runTest } from './test-bridge';
 
 beforeAll(() => getBridge(), 60_000);
@@ -36,8 +35,22 @@ describe('Compile & GPU Buffers', () => {
     }
   });
 
-  test("gpu buffer array: create from eval'd buffer, matmul 3 rounds", async () => {
-    const r = await runTest("gpu buffer array: create from eval'd buffer, matmul 3 rounds");
+  // Phase 6c: GDN pre-recurrence compile fast path. Synthetic dispatch-count
+  // A/B test gating on (eager - compiled) >= 80 dispatches plus byte-level
+  // numerical parity. The prefusion body fires once per linear-attention
+  // layer per token, so this is the single biggest dispatch-count lever
+  // in the Phase 6 plan. See test-worker.ts for the full assertion.
+  test('compile GDN prefusion dispatch delta (Phase 6c)', async () => {
+    const r = await runTest('compile GDN prefusion dispatch delta (Phase 6c)');
+    expect(r.passed, r.error).toBe(true);
+    if (r.info && typeof r.info === 'object') {
+      // eslint-disable-next-line no-console
+      console.log('[Phase 6c] stats =', JSON.stringify(r.info));
+    }
+  });
+
+  test('gpu buffer array: create from eval\'d buffer, matmul 3 rounds', async () => {
+    const r = await runTest('gpu buffer array: create from eval\'d buffer, matmul 3 rounds');
     expect(r.passed, r.error).toBe(true);
   });
 

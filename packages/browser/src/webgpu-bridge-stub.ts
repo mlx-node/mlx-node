@@ -931,18 +931,29 @@ export function createBridgeStub(
       }
 
       // Too many entries — fall through to direct RPC.
-      // Still need to patch fake buffer handles in entries.
-      if (deferredBufferRemap.size > 0) {
-        const ENTRY_SIZE = 40;
-        for (let i = 0; i < entryCount; i++) {
-          const ePtr = entriesPtr + i * ENTRY_SIZE;
-          const bufferHandle = view.getUint32(ePtr + 8, true);
-          if (bufferHandle !== 0) {
-            const real = deferredBufferRemap.get(bufferHandle);
-            if (real !== undefined) {
-              view.setUint32(ePtr + 8, real, true);
-            }
-          }
+      // Before issuing the RPC we must patch any fake buffer handles in
+      // the descriptor: both the deferred-created (mappedAtCreation small
+      // buffer, not yet materialized) and the already-materialized-but-
+      // remapped handles. The fast path (entryCount <= 10 →
+      // FUSED_*_DISPATCH) materializes deferredCreations inline, but the
+      // fall-through path previously only patched deferredBufferRemap,
+      // leaving unmaterialized fake handles in the descriptor. Those
+      // would reach the gpu-worker as bogus bufferHandles and fail the
+      // createBindGroup validation with no diagnostic. Phase 6c fix.
+      const ENTRY_SIZE = 40;
+      for (let i = 0; i < entryCount; i++) {
+        const ePtr = entriesPtr + i * ENTRY_SIZE;
+        const bufferHandle = view.getUint32(ePtr + 8, true);
+        if (bufferHandle === 0) continue;
+        // If this is a small mappedAtCreation buffer whose CREATE_BUFFER_FROM_DATA
+        // was deferred, materialize it now so we have a real handle to send.
+        if (deferredCreations.has(bufferHandle)) {
+          materializeDeferredBuffer(bufferHandle);
+        }
+        // Rewrite the entry with the resolved handle (fake → real).
+        const real = deferredBufferRemap.get(bufferHandle);
+        if (real !== undefined) {
+          view.setUint32(ePtr + 8, real, true);
         }
       }
       return rpcCall(RpcFn.DEVICE_CREATE_BIND_GROUP, descPtr);

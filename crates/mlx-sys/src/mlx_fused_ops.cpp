@@ -55,6 +55,174 @@ bool compile_mlp_enabled() {
   return g_compile_mlp_enabled.load(std::memory_order_relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 6c: mx::compile-wrapped GDN pre-recurrence fast path
+//
+// Same template as Phase 6b: an atomic enable flag, an env-var reader, a
+// captureless free-function body, and a static-local compile accessor. The
+// element-wise chains surrounding the non-fusable primitives (matmul, slice,
+// reshape, concat, fast::rms_norm) get collapsed into fused Compiled kernels
+// by the compile pass — the fused primitives themselves stay as one dispatch
+// each. For Qwen3.5-0.8B decode every linear-attention layer (18 of them)
+// fires this path once per token, so 1 trace + many reuses.
+//
+// Env var: MLX_WGPU_COMPILE_GDN_PRE=1
+// Setter : mlx_set_gdn_pre_compile_enabled(bool)
+//
+// The body is only traced for the common steady-state decode shape (mask
+// absent, conv_state present, Tq=1). Prefill and any other variant fall
+// through to the eager path — this keeps the compile cache to a single
+// entry and sidesteps the shape-keyed cache churn the plan warns about.
+// ---------------------------------------------------------------------------
+std::atomic<bool> g_compile_gdn_pre_enabled{false};
+std::atomic<bool> g_compile_gdn_pre_env_read{false};
+
+bool compile_gdn_pre_enabled() {
+  if (!g_compile_gdn_pre_env_read.exchange(true, std::memory_order_acq_rel)) {
+    if (const char* v = std::getenv("MLX_WGPU_COMPILE_GDN_PRE")) {
+      if (v[0] == '1') {
+        g_compile_gdn_pre_enabled.store(true, std::memory_order_relaxed);
+      }
+    }
+  }
+  return g_compile_gdn_pre_enabled.load(std::memory_order_relaxed);
+}
+
+// Captureless free function describing the GDN pre-recurrence tape as MLX
+// sees it. Inputs layout MUST match exactly what the caller passes:
+//
+//   inputs[0] = x                [B, T, hidden]         activations
+//   inputs[1] = w_qkvz_t         [hidden, qkvz_last]    pre-transposed
+//   inputs[2] = w_ba_t           [hidden, 2*num_v_heads] pre-transposed
+//   inputs[3] = w_conv_2d        [conv_dim, K]          pre-squeezed (axis=2)
+//   inputs[4] = conv_state       [B, K-1, conv_dim]     non-null (decode)
+//   inputs[5] = kh_hint          [num_k_heads, key_head_dim] uint8 zeros
+//                                 (shape-only — data is a dummy constant.
+//                                  encodes the head config that can't be
+//                                  derived from the weight shapes alone.)
+//
+// Outputs returned in order: { q, k, v, z, a, b, new_conv_state }.
+//
+// All non-shape-derived integer config (rms_eps, kernel_size) comes from
+// shape inspection of the inputs — the body captures NOTHING. This is what
+// makes the function pointer identity stable across calls, which is what
+// mlx::core::compile keys its cache on.
+//
+// Mirrors the eager path below op-for-op so the resulting tape is
+// bit-identical. No operation reordering, no extra ops, no skipped
+// metadata views.
+std::vector<mlx::core::array> gdn_prefusion_body(
+    const std::vector<mlx::core::array>& inputs) {
+  // Inputs layout:
+  //   [0] x          (B, T, hidden)
+  //   [1] w_qkvz_t   (hidden, key_dim*2 + value_dim*2)  — pre-transposed
+  //   [2] w_ba_t     (hidden, num_v_heads * 2)          — pre-transposed
+  //   [3] w_conv_2d  (conv_dim, kernel_dim)             — pre-squeezed
+  //   [4] conv_state (B, kernel_dim-1, conv_dim)
+  //
+  // All metadata-only view ops (transpose, squeeze) are done OUTSIDE this
+  // body so the compile cache key stays on concrete shape/dtype signatures
+  // — Phase 6b lesson.
+  //
+  // The body returns seven arrays in the same order as the eager path of
+  // `mlx_gdn_prefusion_forward`:
+  //   { q_flat, k_flat, v_flat, z, a, b, new_conv_state }
+  // Per-head reshape + rms_norm + scaling on q/k happens in the caller AFTER
+  // `compiled_gdn_prefusion()(ins)` returns, so the body does not need a
+  // separate "head config hint" input (shape-derived config is tricky with
+  // placeholder tracer arrays, and every extra input is a potential source
+  // of bind-group layout mismatch in the Compiled primitive).
+  const auto& x = inputs[0];
+  const auto& w_qkvz_t = inputs[1];
+  const auto& w_ba_t = inputs[2];
+  const auto& w_conv_2d = inputs[3];
+  const auto& conv_state = inputs[4];
+
+  // Shape-derived config. .shape() is metadata and is safe inside the
+  // traced body even on placeholder input arrays (which have nullptr data).
+  int batch = static_cast<int>(x.shape()[0]);
+  int seq_len = static_cast<int>(x.shape()[1]);
+  int num_v_heads_x2 = static_cast<int>(w_ba_t.shape()[1]);
+  int num_v_heads = num_v_heads_x2 / 2;
+  int conv_dim = static_cast<int>(w_conv_2d.shape()[0]);
+  int conv_kernel_dim = static_cast<int>(w_conv_2d.shape()[1]);
+  int qkvz_last = static_cast<int>(w_qkvz_t.shape()[1]);
+  // Sanity: qkvz_last = 2*key_dim + 2*value_dim. The conv_dim spans the
+  // "qkv" portion = 2*key_dim + value_dim, so value_dim = qkvz_last - conv_dim
+  // and key_dim = (conv_dim - value_dim) / 2. (Both are recoverable.)
+
+  // 1. Projections — matmul is NOT fusable, so each stays as its own tape
+  //    node, but the element-wise chains around them fuse into Compiled
+  //    primitives which is exactly the win we're after.
+  auto qkvz = matmul(x, w_qkvz_t);
+  auto ba = matmul(x, w_ba_t);
+
+  // 2. Split ba → b, a.
+  auto b = slice(ba, {0, 0, 0}, {batch, seq_len, num_v_heads});
+  auto a = slice(ba, {0, 0, num_v_heads}, {batch, seq_len, num_v_heads * 2});
+
+  // 3. Split qkvz → qkv, z.
+  auto qkv = slice(qkvz, {0, 0, 0}, {batch, seq_len, conv_dim});
+  auto z = slice(qkvz, {0, 0, conv_dim}, {batch, seq_len, qkvz_last});
+
+  // 4. Prepend conv_state to qkv (decode-only: conv_state is always present).
+  auto conv_input = concatenate({conv_state, qkv}, 1);
+
+  // 5. new_conv_state = last (K-1) rows of conv_input along axis 1.
+  int total_len = static_cast<int>(conv_input.shape()[1]);
+  int keep = conv_kernel_dim - 1;
+  auto new_conv_state = slice(
+      conv_input, {0, total_len - keep, 0}, {batch, total_len, conv_dim});
+
+  // 6. Depthwise conv1d — full loop restored (op-for-op mirror).
+  int conv_in_len = static_cast<int>(conv_input.shape()[1]);
+  int t_out = conv_in_len - conv_kernel_dim + 1;
+  array conv_out = [&]() {
+    auto input_slice0 = slice(
+        conv_input, {0, 0, 0}, {batch, t_out, conv_dim});
+    auto w_col0 = slice(w_conv_2d, {0, 0}, {conv_dim, 1});
+    auto w_k0 = reshape(w_col0, {1, 1, conv_dim});
+    return input_slice0 * w_k0;
+  }();
+  for (int k = 1; k < conv_kernel_dim; ++k) {
+    auto input_slice = slice(
+        conv_input, {0, k, 0}, {batch, k + t_out, conv_dim});
+    auto w_col = slice(w_conv_2d, {0, k}, {conv_dim, k + 1});
+    auto w_k = reshape(w_col, {1, 1, conv_dim});
+    auto term = input_slice * w_k;
+    conv_out = conv_out + term;
+  }
+
+  // 7. Trim to seq_len if the depthwise produced extra rows.
+  int conv_out_len = static_cast<int>(conv_out.shape()[1]);
+  if (conv_out_len > seq_len) {
+    conv_out = slice(conv_out,
+                     {0, conv_out_len - seq_len, 0},
+                     {batch, conv_out_len, conv_dim});
+  }
+
+  // 8. SiLU activation — the element-wise win that the compile pass fuses.
+  conv_out = conv_out * sigmoid(conv_out);
+
+  // 9. Split channels → q_flat, k_flat, v_flat. Per-head reshape + rms_norm
+  //    + scaling happen in the caller AFTER the compile pass returns.
+  // value_dim = qkvz_last - conv_dim   (invariant in the eager path)
+  int value_dim = qkvz_last - conv_dim;
+  int key_dim = (conv_dim - value_dim) / 2;
+  auto q_flat = slice(conv_out, {0, 0, 0}, {batch, seq_len, key_dim});
+  auto k_flat = slice(conv_out, {0, 0, key_dim}, {batch, seq_len, key_dim * 2});
+  auto v_flat = slice(conv_out, {0, 0, key_dim * 2}, {batch, seq_len, conv_dim});
+
+  // Return order matches the caller's out_* unpacking below:
+  //   q_flat, k_flat, v_flat, z, a, b, new_conv_state
+  return {q_flat, k_flat, v_flat, z, a, b, new_conv_state};
+}
+
+auto& compiled_gdn_prefusion() {
+  static auto fn = mlx::core::compile(gdn_prefusion_body, /*shapeless=*/false);
+  return fn;
+}
+
 // The compilable body. MUST be a top-level non-capturing function so
 // `mlx::core::compile` keys it by stable function identity (the template
 // overload in mlx/compile.h converts a capture-less lambda to a function
@@ -111,6 +279,20 @@ void mlx_set_swiglu_compile_enabled(bool enabled) {
 
 bool mlx_get_swiglu_compile_enabled() {
   return compile_mlp_enabled();
+}
+
+// Phase 6c: runtime setter/getter for the GDN pre-recurrence compile fast
+// path. Mirrors the Phase 6b pair above exactly — flipping the process-wide
+// std::atomic<bool> that mlx_gdn_prefusion_forward checks before each call.
+// Marking env-as-read on set ensures explicit setter calls always win over
+// a later env-var read.
+void mlx_set_gdn_pre_compile_enabled(bool enabled) {
+  g_compile_gdn_pre_enabled.store(enabled, std::memory_order_relaxed);
+  g_compile_gdn_pre_env_read.store(true, std::memory_order_release);
+}
+
+bool mlx_get_gdn_pre_compile_enabled() {
+  return compile_gdn_pre_enabled();
 }
 
 // Fused SwiGLU MLP forward pass
@@ -525,9 +707,76 @@ int mlx_gdn_prefusion_forward(
         int value_dim = num_v_heads * value_head_dim;
         int conv_dim = key_dim * 2 + value_dim;
 
-        // 1. Projections: qkvz = x @ w_qkvz.T, ba = x @ w_ba.T
+        // Transposes + squeeze are metadata-only — stay OUTSIDE the compile
+        // body so the trace key isn't poisoned with view-flag noise (same
+        // lesson learned in Phase 6b).
         auto w_qkvz_t = transpose(*w_qkvz, {1, 0});
         auto w_ba_t = transpose(*w_ba, {1, 0});
+
+        // -----------------------------------------------------------------
+        // Phase 6c: mx::compile-wrapped fast path.
+        //
+        // Only routed when the shape signature matches the stable
+        // steady-state decode case: mask absent AND conv_state present.
+        // Prefill (mask present OR conv_state null) falls through to the
+        // eager path below — that keeps the compile cache keyed on one
+        // shape signature, one trace per model, many reuses per token.
+        //
+        // The body returns { q_flat, k_flat, v_flat, z, a, b, new_conv_state }
+        // — per-head reshape, rms_norm, and scaling on q/k happen HERE
+        // in the caller (outside the compile body) for two reasons:
+        //   1. `fast::rms_norm` is not fusable, so lifting it out of the
+        //      body doesn't cost fused ops.
+        //   2. It removes the need for a shape-hint input into the body,
+        //      which was a source of bind-group layout mismatches in the
+        //      Compiled primitive on WebGPU.
+        // -----------------------------------------------------------------
+        if (compile_gdn_pre_enabled() && !mask_handle && conv_state_handle) {
+            auto conv_state = reinterpret_cast<array*>(conv_state_handle);
+            // Pre-squeeze w_conv (axis=2) — metadata op, stays outside the
+            // traced body for the same reason as the transposes above.
+            auto w_conv_2d = squeeze(*w_conv, std::vector<int>{2});
+            std::vector<array> ins{
+                *x, w_qkvz_t, w_ba_t, w_conv_2d, *conv_state};
+            auto outs = compiled_gdn_prefusion()(ins);
+            // outs order matches gdn_prefusion_body's return:
+            //   { q_flat, k_flat, v_flat, z, a, b, new_conv_state }
+            auto q_flat = std::move(outs[0]);
+            auto k_flat = std::move(outs[1]);
+            auto v_flat = std::move(outs[2]);
+            auto z = std::move(outs[3]);
+            auto a = std::move(outs[4]);
+            auto b = std::move(outs[5]);
+            auto new_conv_state = std::move(outs[6]);
+
+            // Per-head reshape + rms_norm (no weight) + inv_scale — the
+            // same post-conv tail as the eager path, byte-identical.
+            auto q_h = reshape(q_flat, {batch, seq_len, num_k_heads, key_head_dim});
+            auto k_h = reshape(k_flat, {batch, seq_len, num_k_heads, key_head_dim});
+            auto v_h = reshape(
+                v_flat, {batch, seq_len, num_v_heads, value_head_dim});
+            double inv_scale_d = std::pow(static_cast<double>(key_head_dim), -0.5);
+            float q_scale_f = static_cast<float>(inv_scale_d * inv_scale_d);
+            float k_scale_f = static_cast<float>(inv_scale_d);
+            auto q_dtype = q_h.dtype();
+            auto k_dtype = k_h.dtype();
+            auto q = fast::rms_norm(q_h, std::nullopt, rms_eps, {});
+            auto k = fast::rms_norm(k_h, std::nullopt, rms_eps, {});
+            q = q * array(q_scale_f, q_dtype);
+            k = k * array(k_scale_f, k_dtype);
+
+            *out_q = reinterpret_cast<mlx_array*>(new array(std::move(q)));
+            *out_k = reinterpret_cast<mlx_array*>(new array(std::move(k)));
+            *out_v = reinterpret_cast<mlx_array*>(new array(std::move(v_h)));
+            *out_z = reinterpret_cast<mlx_array*>(new array(std::move(z)));
+            *out_a = reinterpret_cast<mlx_array*>(new array(std::move(a)));
+            *out_b = reinterpret_cast<mlx_array*>(new array(std::move(b)));
+            *out_new_conv_state = reinterpret_cast<mlx_array*>(
+                new array(std::move(new_conv_state)));
+            return 0;
+        }
+
+        // 1. Projections: qkvz = x @ w_qkvz.T, ba = x @ w_ba.T
         auto qkvz = matmul(*x, w_qkvz_t);  // [B, T, key_dim*2 + value_dim*2]
         auto ba = matmul(*x, w_ba_t);      // [B, T, num_v_heads*2]
 
