@@ -60,30 +60,6 @@ pub fn wgpu_test_compile_mlp_dispatch_delta() -> Vec<f64> {
     out.to_vec()
 }
 
-/// Phase 0 dispatch-stats readout (observability only). Returns
-/// `[totalDispatches, totalPassEnds]` as `f64` so the numbers survive the
-/// NAPI boundary without needing bigint plumbing — both fit comfortably in
-/// a double for any realistic generation. Plumbed into the browser
-/// `?profile=1` path to expose dispatches/token on the demo page.
-#[napi]
-pub fn wgpu_get_dispatch_stats() -> Vec<f64> {
-    let mut dispatches: u64 = 0;
-    let mut pass_ends: u64 = 0;
-    unsafe {
-        sys::mlx_wgpu_get_dispatch_stats(&mut dispatches, &mut pass_ends);
-    }
-    vec![dispatches as f64, pass_ends as f64]
-}
-
-/// Phase 0 dispatch-stats reset. Zeros the cumulative counters read by
-/// `wgpu_get_dispatch_stats`. Called at the start of each chat/chatStream
-/// generation when `?profile=1` is active so per-generation stats are
-/// comparable.
-#[napi]
-pub fn wgpu_reset_dispatch_stats() {
-    unsafe { sys::mlx_wgpu_reset_dispatch_stats() }
-}
-
 /// Clear the MLX memory cache to prevent memory pressure buildup
 /// Should be called periodically during long-running operations
 /// Internal Rust-only function - memory management is handled automatically by the trainer
