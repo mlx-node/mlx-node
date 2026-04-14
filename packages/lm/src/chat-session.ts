@@ -1,9 +1,9 @@
 /**
  * Generic server-side chat session wrapper.
  *
- * `ChatSession<M>` is the cross-model replacement for the per-model
- * `Qwen35Session` shim. It works against any model that exposes the
- * uniform chat-session NAPI surface — `chatSessionStart`,
+ * `ChatSession<M>` is the cross-model chat-session wrapper. It works
+ * against any model that exposes the uniform chat-session NAPI
+ * surface — `chatSessionStart`,
  * `chatSessionContinue`, `chatSessionContinueTool`, and their
  * streaming variants plus `resetCaches`. See `SessionCapableModel`
  * below.
@@ -29,9 +29,9 @@
  *   - `sendToolResult` always dispatches `chatSessionContinueTool`,
  *     since tool turns never change image state.
  *
- *   - `sawFinal` gates `turnCount` advance on the streaming path —
- *     matches the dense `Qwen35Session` fix that refuses to advance
- *     when the stream throws mid-decode or yields a final chunk with
+ *   - `sawFinal` gates `turnCount` advance on the streaming path, so
+ *     the session refuses to advance when the stream throws
+ *     mid-decode or yields a final chunk with
  *     `finishReason: 'error'`.
  *
  *   - The `inFlight` guard rejects concurrent `send()` /

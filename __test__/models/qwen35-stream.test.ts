@@ -1,6 +1,6 @@
-import type { ChatStreamChunk, ChatStreamHandle } from '@mlx-node/core';
+import type { ChatMessage, ChatStreamChunk, ChatStreamHandle } from '@mlx-node/core';
 import type { ChatStreamEvent } from '@mlx-node/lm';
-import { _createChatStream } from '@mlx-node/lm';
+import { _runChatStream } from '@mlx-node/lm';
 import { describe, it, expect } from 'vite-plus/test';
 
 /**
@@ -42,10 +42,12 @@ function fakeNativeMethod(numTokens: number) {
   };
 }
 
-describe.sequential('_createChatStream bridge', () => {
+describe.sequential('_runChatStream bridge', () => {
   it('should yield delta chunks followed by a final chunk', async () => {
     const events: ChatStreamEvent[] = [];
-    const gen = _createChatStream(fakeNativeMethod(3), null, [{ role: 'user', content: 'Hi' }], null);
+    const messages: ChatMessage[] = [{ role: 'user', content: 'Hi' }];
+    const native = fakeNativeMethod(3);
+    const gen = _runChatStream((callback) => native(messages, null, callback));
 
     for await (const event of gen) {
       events.push(event);
@@ -60,7 +62,9 @@ describe.sequential('_createChatStream bridge', () => {
 
   it('should populate final chunk fields correctly', async () => {
     let finalEvent: ChatStreamEvent | null = null;
-    const gen = _createChatStream(fakeNativeMethod(2), null, [{ role: 'user', content: 'Hi' }], null);
+    const messages: ChatMessage[] = [{ role: 'user', content: 'Hi' }];
+    const native = fakeNativeMethod(2);
+    const gen = _runChatStream((callback) => native(messages, null, callback));
 
     for await (const event of gen) {
       if (event.done) finalEvent = event;
@@ -104,7 +108,8 @@ describe.sequential('_createChatStream bridge', () => {
     };
 
     const events: string[] = [];
-    for await (const event of _createChatStream(native, null, [{ role: 'user', content: 'Hi' }], null)) {
+    const messages: ChatMessage[] = [{ role: 'user', content: 'Hi' }];
+    for await (const event of _runChatStream((callback) => native(messages, null, callback))) {
       if (!event.done) {
         events.push(event.text);
         if (events.length >= 3) break;
@@ -127,8 +132,9 @@ describe.sequential('_createChatStream bridge', () => {
       return Promise.resolve({ cancel: () => {} } as ChatStreamHandle);
     };
 
+    const messages: ChatMessage[] = [{ role: 'user', content: 'Hi' }];
     await expect(async () => {
-      for await (const _event of _createChatStream(native, null, [{ role: 'user', content: 'Hi' }], null)) {
+      for await (const _event of _runChatStream((callback) => native(messages, null, callback))) {
         // Should throw
       }
     }).rejects.toThrow('generation failed');

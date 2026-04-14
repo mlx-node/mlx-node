@@ -161,27 +161,6 @@ export async function* _runChatStream(
 }
 
 /**
- * Legacy `_createChatStream` shape kept for the existing tests at
- * `__test__/models/qwen35-stream.test.ts`. New code should use
- * `_runChatStream` directly with a bound `startCall` closure.
- *
- * @internal Exported for testing only.
- */
-export async function* _createChatStream(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  nativeMethod: (
-    messages: ChatMessage[],
-    config: any,
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ) => Promise<ChatStreamHandle>,
-  self: unknown,
-  messages: ChatMessage[],
-  config: unknown,
-): AsyncGenerator<ChatStreamEvent> {
-  yield* _runChatStream((callback) => nativeMethod.call(self, messages, config ?? null, callback));
-}
-
-/**
  * Qwen3.5 dense model with AsyncGenerator-based session streaming.
  *
  * Streaming is driven through the session API — `chatStreamSessionStart`,
