@@ -4,7 +4,9 @@
  * Integrates InternViT vision encoder, MLP bridge, and Qwen3 language model
  * for OCR and document understanding tasks.
  *
- * Provides NAPI-exposed load(), chat(), chatStream(), and generate() APIs.
+ * Provides NAPI-exposed load(), session chat methods (chatSessionStart /
+ * chatSessionContinue / chatSessionContinueTool and streaming variants),
+ * generate(), and resetCaches() APIs.
  *
  * # Architecture
  *
@@ -12,9 +14,10 @@
  * on a dedicated OS thread owned by the `ModelThread<QianfanOCRCmd>` field on
  * [`QianfanOCRModel`]. NAPI methods are thin shells that marshal arguments
  * into a `QianfanOCRCmd` and dispatch them through the command channel —
- * responses flow back via oneshot channels (for `Chat`, `Generate`,
- * `ResetCaches`) or an mpsc stream (for `ChatStream`). This keeps MLX arrays
- * off the Tokio worker threads and removes the `Arc<RwLock<>>` plumbing the
+ * responses flow back via oneshot channels (for the non-streaming
+ * session commands, `Generate`, and `ResetCaches`) or an mpsc stream
+ * (for the streaming session commands). This keeps MLX arrays off the
+ * Tokio worker threads and removes the `Arc<RwLock<>>` plumbing the
  * legacy layout used to share mutable model state with `spawn_blocking`
  * closures.
  */
@@ -61,9 +64,9 @@ use crate::utils::safetensors::SafeTensorsFile;
 /// All fields are plain-owned (no `Arc<RwLock<>>`) because the model
 /// thread has sole mutable access. `kv_caches`, `cached_token_history`,
 /// `cached_image_key`, and `cached_cache_offset` are hoisted out of
-/// [`InternVLLanguageModel`] and the old NAPI struct so future session
-/// methods (Step 6b) can read/mutate them directly alongside the other
-/// per-turn metadata.
+/// [`InternVLLanguageModel`] and the old NAPI struct so the session
+/// methods can read/mutate them directly alongside the other per-turn
+/// metadata.
 pub(crate) struct QianfanOCRInner {
     pub(crate) config: QianfanOCRConfig,
     pub(crate) vision: InternViTModel,
@@ -71,22 +74,23 @@ pub(crate) struct QianfanOCRInner {
     pub(crate) language_model: InternVLLanguageModel,
     pub(crate) tokenizer: Arc<Qwen3Tokenizer>,
     /// Per-layer KV caches, promoted from [`InternVLLanguageModel`] so
-    /// the Step 6b session methods can inspect / clone / trim them in
-    /// place without going through a wrapper method.
+    /// the session methods can inspect / clone / trim them in place
+    /// without going through a wrapper method.
     pub(crate) kv_caches: Option<Vec<KVCache>>,
     /// Token history of the prompt + forwarded generated tokens from
-    /// the most recent chat() / chat_stream() call. Used for
-    /// prefix-match-based cache reuse on the next call.
+    /// the most recent session turn. Used for prefix-match-based cache
+    /// reuse on the next call.
     pub(crate) cached_token_history: Vec<u32>,
-    /// Cached image set hash from the most recent call. Always `None`
-    /// in Step 6a — session-aware image reuse comes with Step 6b.
-    /// Promoted up-front so the session variants can populate it
-    /// without re-plumbing the struct.
+    /// Cached image set hash from the most recent session-start turn.
+    /// Populated by the VLM-capable start path and cleared on reset —
+    /// the TS `ChatSession` layer watches for changes and routes
+    /// image-swap turns back through a fresh `chat_session_start`.
     pub(crate) cached_image_key: Option<u64>,
     /// Cache offset from the most recent call (number of tokens
     /// committed to the KV cache). Mirrors `kv_caches[0].get_offset()`
-    /// at the end of the previous turn and is used by Step 6b to
-    /// validate session continuity without touching the caches.
+    /// at the end of the previous turn and is used by the session
+    /// methods to validate session continuity without touching the
+    /// caches.
     pub(crate) cached_cache_offset: i32,
 }
 
@@ -275,8 +279,8 @@ pub struct QianfanOCRModel {
     /// Cloned from inner for pure-getter NAPI methods (no command
     /// dispatch needed). For uninitialized instances this holds the
     /// bare constructor argument. Marked `allow(dead_code)` because
-    /// Step 6a does not expose a config getter — session-aware Step T2
-    /// wiring will.
+    /// nothing on the NAPI surface currently exposes a config getter —
+    /// kept in place so one can be added without re-plumbing.
     #[allow(dead_code)]
     config: QianfanOCRConfig,
     /// Whether the model was loaded with real weights. `false` for
@@ -311,8 +315,8 @@ impl QianfanOCRInner {
     }
 
     /// Allocate a fresh per-layer KV cache vector sized to match the
-    /// current language model. Pre-Step 6a this lived on
-    /// [`InternVLLanguageModel`]; it was hoisted so future session
+    /// current language model. Previously this lived on
+    /// [`InternVLLanguageModel`]; it was hoisted so the session
     /// methods can share the same storage with other cached metadata.
     fn init_kv_caches(&mut self) {
         let num_layers = self.language_model.num_layers();
@@ -1126,7 +1130,7 @@ impl QianfanOCRInner {
     }
 
     // ========================================================================
-    // Session chat API (Step 6b)
+    // Session chat API
     // ========================================================================
 
     /// Resolve the tokenizer id of `<|im_end|>`, the Qwen3 ChatML end-of-turn
@@ -2166,7 +2170,9 @@ impl QianfanOCRModel {
 
     /// Generate text tokens given pre-tokenized input.
     ///
-    /// Lower-level API — prefer chat() for typical usage.
+    /// Lower-level API — prefer the session chat methods
+    /// (`chatSessionStart` / `chatSessionContinue` and their streaming
+    /// variants) for typical usage.
     #[napi]
     pub async fn generate(
         &self,
@@ -2546,7 +2552,11 @@ fn load_safetensors_weights(path: &Path) -> Result<HashMap<String, MxArray>> {
 ///
 /// A tokenizer is required — unlike the paddleocr_vl path, Qianfan-OCR
 /// has no `set_tokenizer()` NAPI method, so the model directory must
-/// contain `tokenizer.json` for `chat()` / `chat_stream()` to work.
+/// contain `tokenizer.json` for any of the session chat methods
+/// (`chat_session_start`, `chat_session_continue`, their streaming
+/// variants, and `chat_session_continue_tool`) to work. The loader
+/// returns an error up front if `tokenizer.json` is missing rather
+/// than deferring the failure to the first session call.
 fn load_qianfan_ocr_inner_from_dir(model_path: &str) -> Result<QianfanOCRInner> {
     let path = Path::new(model_path);
 
