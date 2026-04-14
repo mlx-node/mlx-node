@@ -4,24 +4,33 @@
  * Implements the OpenAI Responses API, dispatching to loaded models
  * via the ModelRegistry. Supports both streaming (SSE) and non-streaming
  * (JSON) response modes.
+ *
+ * All inference goes through a per-model `ChatSession` looked up or
+ * allocated via the model's `SessionRegistry`. Sessions are keyed by
+ * `previous_response_id`: on a cache hit the session's live KV cache
+ * is reused via `session.send()` / `sendStream()` / `sendToolResult()`.
+ * On a cache miss (no prior response, eviction, or restart) the full
+ * conversation is reconstructed from the `ResponseStore`, primed into
+ * a fresh session via `primeHistory()`, and replayed through
+ * `startFromHistory()` / `startFromHistoryStream()`.
  */
 
 import type { ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponseRecord } from '@mlx-node/core';
-import type { ChatStreamEvent } from '@mlx-node/lm';
+import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 
 import { sendBadRequest, sendInternalError, sendNotFound } from '../errors.js';
 import { mapRequest, reconstructMessagesFromChain } from '../mappers/request.js';
 import {
-  buildOutputItems,
   buildPartialResponse,
   buildResponseObject,
   computeOutputText,
   genId,
   mapFinishReasonToStatus,
 } from '../mappers/response.js';
-import type { ModelRegistry, ServableModel } from '../registry.js';
+import type { ModelRegistry } from '../registry.js';
+import type { SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import type {
@@ -42,16 +51,13 @@ const RESPONSE_TTL_SECONDS = 1800; // 30 minutes
 
 async function handleNonStreaming(
   res: ServerResponse,
-  model: ServableModel,
-  messages: ChatMessage[],
-  config: ChatConfig,
+  result: ChatResult,
   req: ResponsesAPIRequest,
   responseId: string,
   previousResponseId: string | undefined,
   store: ResponseStore | null,
   newInputMessages: ChatMessage[],
 ): Promise<void> {
-  const result = (await model.chat(messages, config)) as ChatResult;
   const response = buildResponseObject(result, req, responseId, previousResponseId);
 
   // Persist only the new input messages (not the full expanded conversation)
@@ -64,41 +70,18 @@ async function handleNonStreaming(
 }
 
 // ---------------------------------------------------------------------------
-// Streaming path -- model supports chatStream()
+// Streaming path
 // ---------------------------------------------------------------------------
 
 async function handleStreamingNative(
   res: ServerResponse,
-  model: ServableModel,
-  messages: ChatMessage[],
-  config: ChatConfig,
+  chatStream: AsyncGenerator<ChatStreamEvent>,
   req: ResponsesAPIRequest,
   responseId: string,
   previousResponseId: string | undefined,
   store: ResponseStore | null,
   newInputMessages: ChatMessage[],
 ): Promise<void> {
-  const chatStream = (
-    model as unknown as {
-      chatStream(m: ChatMessage[], c: unknown): AsyncGenerator<ChatStreamEvent>;
-    }
-  ).chatStream(messages, config);
-
-  if (!chatStream || typeof (chatStream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] !== 'function') {
-    // chatStream did not return an async iterable — fall back to simulated streaming
-    return handleStreamingSimulated(
-      res,
-      model,
-      messages,
-      config,
-      req,
-      responseId,
-      previousResponseId,
-      store,
-      newInputMessages,
-    );
-  }
-
   beginSSE(res);
 
   const partial = buildPartialResponse(req, responseId, previousResponseId);
@@ -538,109 +521,86 @@ async function handleStreamingNative(
 }
 
 // ---------------------------------------------------------------------------
-// Streaming path -- model does NOT support chatStream() (simulate from chat)
+// Session routing
 // ---------------------------------------------------------------------------
 
-async function handleStreamingSimulated(
-  res: ServerResponse,
-  model: ServableModel,
+/**
+ * Route a non-streaming request through a `ChatSession`.
+ *
+ * Cold path (fresh session): prime with the full mapped history and
+ * run `startFromHistory`. Hot path (cached session with a live KV
+ * cache): send only the last new input message via `send` or
+ * `sendToolResult`. Multi-message hot-path requests fall back to a
+ * reset + cold re-prime.
+ */
+async function runSessionNonStreaming(
+  session: ChatSession<SessionCapableModel>,
   messages: ChatMessage[],
-  config: ChatConfig,
-  req: ResponsesAPIRequest,
-  responseId: string,
-  previousResponseId: string | undefined,
-  store: ResponseStore | null,
   newInputMessages: ChatMessage[],
-): Promise<void> {
-  beginSSE(res);
+  config: ChatConfig,
+): Promise<ChatResult> {
+  if (session.turns === 0) {
+    session.primeHistory(messages);
+    return await session.startFromHistory(config);
+  }
 
-  const partial = buildPartialResponse(req, responseId, previousResponseId);
-  writeSSEEvent(res, 'response.created', { response: partial });
-  writeSSEEvent(res, 'response.in_progress', { response: partial });
-
-  // Run chat() to completion
-  const result = (await model.chat(messages, config)) as ChatResult;
-  const outputItems = buildOutputItems(result);
-
-  let outputIndex = 0;
-
-  for (const item of outputItems) {
-    const idx = outputIndex++;
-
-    if (item.type === 'reasoning') {
-      writeSSEEvent(res, 'response.output_item.added', { output_index: idx, item });
-      for (const s of item.summary) {
-        writeSSEEvent(res, 'response.reasoning_summary_text.delta', {
-          item_id: item.id,
-          output_index: idx,
-          summary_index: 0,
-          delta: s.text,
-        });
-        writeSSEEvent(res, 'response.reasoning_summary_text.done', {
-          item_id: item.id,
-          output_index: idx,
-          summary_index: 0,
-          text: s.text,
-        });
-      }
-      writeSSEEvent(res, 'response.output_item.done', { output_index: idx, item });
-    } else if (item.type === 'message') {
-      writeSSEEvent(res, 'response.output_item.added', { output_index: idx, item: { ...item, content: [] } });
-      for (let ci = 0; ci < item.content.length; ci++) {
-        const part = item.content[ci];
-        writeSSEEvent(res, 'response.content_part.added', {
-          item_id: item.id,
-          output_index: idx,
-          content_index: ci,
-          part: { type: 'output_text', text: '', annotations: [] },
-        });
-        writeSSEEvent(res, 'response.output_text.delta', {
-          item_id: item.id,
-          output_index: idx,
-          content_index: ci,
-          delta: part.text,
-        });
-        writeSSEEvent(res, 'response.output_text.done', {
-          item_id: item.id,
-          output_index: idx,
-          content_index: ci,
-          text: part.text,
-        });
-        writeSSEEvent(res, 'response.content_part.done', {
-          item_id: item.id,
-          output_index: idx,
-          content_index: ci,
-          part,
-        });
-      }
-      writeSSEEvent(res, 'response.output_item.done', { output_index: idx, item });
-    } else if (item.type === 'function_call') {
-      writeSSEEvent(res, 'response.output_item.added', { output_index: idx, item });
-      writeSSEEvent(res, 'response.function_call_arguments.delta', {
-        item_id: item.id,
-        output_index: idx,
-        delta: item.arguments,
-      });
-      writeSSEEvent(res, 'response.function_call_arguments.done', {
-        item_id: item.id,
-        output_index: idx,
-        arguments: item.arguments,
-      });
-      writeSSEEvent(res, 'response.output_item.done', { output_index: idx, item });
+  // Hot path — session's KV cache is already warmed for this chain.
+  if (newInputMessages.length === 1) {
+    const last = newInputMessages[0]!;
+    if (last.role === 'user') {
+      const images = last.images ?? undefined;
+      return await session.send(last.content, images ? { images, config } : { config });
     }
+    if (last.role === 'tool') {
+      if (!last.toolCallId) {
+        throw new Error('tool message missing toolCallId');
+      }
+      return await session.sendToolResult(last.toolCallId, last.content, { config });
+    }
+    throw new Error(`unsupported last message role on hot path: ${last.role}`);
   }
 
-  // Completed response
-  const response = buildResponseObject(result, req, responseId, previousResponseId);
+  // Multi-message hot-path input: drop the cached session state and
+  // re-run as a cold path. Correct but pays the full prefill cost.
+  await session.reset();
+  session.primeHistory(messages);
+  return await session.startFromHistory(config);
+}
 
-  // Persist only the new input messages
-  if (store && req.store !== false) {
-    await persistResponse(store, response, newInputMessages, previousResponseId);
+/**
+ * Streaming counterpart to {@link runSessionNonStreaming}. Returns the
+ * session's underlying async generator so the SSE loop can consume it
+ * directly.
+ */
+async function runSessionStreaming(
+  session: ChatSession<SessionCapableModel>,
+  messages: ChatMessage[],
+  newInputMessages: ChatMessage[],
+  config: ChatConfig,
+): Promise<AsyncGenerator<ChatStreamEvent>> {
+  if (session.turns === 0) {
+    session.primeHistory(messages);
+    return session.startFromHistoryStream(config);
   }
 
-  writeSSEEvent(res, 'response.completed', { response });
+  if (newInputMessages.length === 1) {
+    const last = newInputMessages[0]!;
+    if (last.role === 'user') {
+      const images = last.images ?? undefined;
+      return session.sendStream(last.content, images ? { images, config } : { config });
+    }
+    if (last.role === 'tool') {
+      if (!last.toolCallId) {
+        throw new Error('tool message missing toolCallId');
+      }
+      return session.sendToolResultStream(last.toolCallId, last.content, { config });
+    }
+    throw new Error(`unsupported last message role on hot path: ${last.role}`);
+  }
 
-  endSSE(res);
+  await session.reset();
+  session.primeHistory(messages);
+  return session.startFromHistoryStream(config);
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +680,15 @@ export async function handleCreateResponse(
     return;
   }
 
+  // Fetch the per-model session registry. `model` was just resolved
+  // from the same `ModelRegistry`, so this should always succeed — but
+  // guard anyway to surface a clear error rather than crashing.
+  const sessionReg: SessionRegistry | undefined = registry.getSessionRegistry(body.model);
+  if (!sessionReg) {
+    sendInternalError(res, 'session registry missing for registered model');
+    return;
+  }
+
   const responseId = genId('resp_');
 
   // Resolve previous_response_id chain
@@ -766,46 +735,28 @@ export async function handleCreateResponse(
   const priorOffset = instructionsOffset + (priorMessages?.length ?? 0);
   const newInputMessages = messages.slice(priorOffset);
 
+  // Route the request through a `ChatSession` looked up by the prior
+  // response id. A miss returns a fresh session; the hot path reuses
+  // an already-warmed KV cache when the caller passes the id we
+  // allocated on the previous turn.
+  const session = sessionReg.getOrCreate(previousResponseId ?? null);
+
   try {
     if (body.stream) {
-      if (registry.hasStreamSupport(model)) {
-        await handleStreamingNative(
-          res,
-          model,
-          messages,
-          config,
-          body,
-          responseId,
-          previousResponseId,
-          store,
-          newInputMessages,
-        );
-      } else {
-        await handleStreamingSimulated(
-          res,
-          model,
-          messages,
-          config,
-          body,
-          responseId,
-          previousResponseId,
-          store,
-          newInputMessages,
-        );
-      }
+      const chatStream = await runSessionStreaming(session, messages, newInputMessages, config);
+      await handleStreamingNative(res, chatStream, body, responseId, previousResponseId, store, newInputMessages);
     } else {
-      await handleNonStreaming(
-        res,
-        model,
-        messages,
-        config,
-        body,
-        responseId,
-        previousResponseId,
-        store,
-        newInputMessages,
-      );
+      const result = await runSessionNonStreaming(session, messages, newInputMessages, config);
+      await handleNonStreaming(res, result, body, responseId, previousResponseId, store, newInputMessages);
     }
+
+    // Success — re-key the (possibly just-primed) session under the
+    // newly allocated response id. Drop the prior id so the cache
+    // doesn't hold two entries for the same logical thread.
+    if (previousResponseId) {
+      sessionReg.drop(previousResponseId);
+    }
+    sessionReg.adopt(responseId, session);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error during inference';
     // If headers haven't been sent yet, send a proper error response

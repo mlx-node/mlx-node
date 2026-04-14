@@ -2,14 +2,21 @@
  * POST /v1/messages endpoint
  *
  * Implements the Anthropic Messages API, dispatching to loaded models
- * via the ModelRegistry. Supports both native streaming (SSE), simulated
- * streaming (from chat()), and non-streaming (JSON) response modes.
+ * via the ModelRegistry. Supports both streaming (SSE) and non-streaming
+ * (JSON) response modes.
+ *
+ * The Anthropic Messages API is stateless — every request carries the
+ * full conversation in `req.messages`, and no response store is
+ * consulted. We therefore allocate a brand-new `ChatSession` for each
+ * request (via `SessionRegistry.getOrCreate(null)`), prime it with the
+ * mapped messages, and run `startFromHistory` / `startFromHistoryStream`.
+ * No `adopt()` / `drop()` — the session's lifetime is this single call.
  */
 
 import type { ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
-import type { ChatStreamEvent } from '@mlx-node/lm';
+import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 
 import { sendAnthropicBadRequest, sendAnthropicInternalError, sendAnthropicNotFound } from '../errors.js';
 import { mapAnthropicRequest } from '../mappers/anthropic-request.js';
@@ -24,7 +31,8 @@ import {
   mapStopReason,
 } from '../mappers/anthropic-response.js';
 import { genId } from '../mappers/response.js';
-import type { ModelRegistry, ServableModel } from '../registry.js';
+import type { ModelRegistry } from '../registry.js';
+import type { SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import type { AnthropicMessagesRequest } from '../types-anthropic.js';
@@ -35,12 +43,9 @@ import type { AnthropicMessagesRequest } from '../types-anthropic.js';
 
 async function handleNonStreaming(
   res: ServerResponse,
-  model: ServableModel,
-  messages: ChatMessage[],
-  config: ChatConfig,
+  result: ChatResult,
   body: AnthropicMessagesRequest,
 ): Promise<void> {
-  const result = (await model.chat(messages, config)) as ChatResult;
   const messageId = genId('msg_');
   const response = buildAnthropicResponse(result, body, messageId);
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -48,27 +53,14 @@ async function handleNonStreaming(
 }
 
 // ---------------------------------------------------------------------------
-// Streaming path -- model supports chatStream()
+// Streaming path
 // ---------------------------------------------------------------------------
 
 async function handleStreamingNative(
   res: ServerResponse,
-  model: ServableModel,
-  messages: ChatMessage[],
-  config: ChatConfig,
+  chatStream: AsyncGenerator<ChatStreamEvent>,
   body: AnthropicMessagesRequest,
 ): Promise<void> {
-  const chatStream = (
-    model as unknown as {
-      chatStream(m: ChatMessage[], c: unknown): AsyncGenerator<ChatStreamEvent>;
-    }
-  ).chatStream(messages, config);
-
-  if (!chatStream || typeof (chatStream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator] !== 'function') {
-    // chatStream did not return an async iterable — fall back to simulated streaming
-    return handleStreamingSimulated(res, model, messages, config, body);
-  }
-
   const messageId = genId('msg_');
   beginSSE(res);
 
@@ -297,86 +289,32 @@ async function handleStreamingNative(
 }
 
 // ---------------------------------------------------------------------------
-// Streaming path -- simulated from chat()
+// Session routing
 // ---------------------------------------------------------------------------
 
-async function handleStreamingSimulated(
-  res: ServerResponse,
-  model: ServableModel,
+/**
+ * Run a stateless Anthropic request through a fresh `ChatSession`.
+ *
+ * The Anthropic API carries the full conversation in `req.messages`,
+ * so there's no cache hit path. Every request primes a new session
+ * and runs `startFromHistory`.
+ */
+async function runSessionNonStreaming(
+  session: ChatSession<SessionCapableModel>,
   messages: ChatMessage[],
   config: ChatConfig,
-  body: AnthropicMessagesRequest,
-): Promise<void> {
-  const messageId = genId('msg_');
+): Promise<ChatResult> {
+  session.primeHistory(messages);
+  return await session.startFromHistory(config);
+}
 
-  beginSSE(res);
-  writeSSEEvent(res, 'message_start', buildMessageStartEvent(body, messageId, 0));
-
-  const result = (await model.chat(messages, config)) as ChatResult;
-  const okToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
-  const hasToolCalls = okToolCalls.length > 0;
-
-  let contentBlockIndex = 0;
-
-  // Thinking block
-  if (result.thinking) {
-    writeSSEEvent(
-      res,
-      'content_block_start',
-      buildContentBlockStart(contentBlockIndex, { type: 'thinking', thinking: '' }),
-    );
-    writeSSEEvent(
-      res,
-      'content_block_delta',
-      buildContentBlockDelta(contentBlockIndex, { type: 'thinking_delta', thinking: result.thinking }),
-    );
-    writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-    contentBlockIndex++;
-  }
-
-  // Text block
-  if (result.text || !hasToolCalls) {
-    writeSSEEvent(res, 'content_block_start', buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }));
-    writeSSEEvent(
-      res,
-      'content_block_delta',
-      buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: result.text }),
-    );
-    writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-    contentBlockIndex++;
-  }
-
-  // Tool use blocks
-  for (const tc of okToolCalls) {
-    const toolId = tc.id ?? genId('toolu_');
-    const parsedInput =
-      typeof tc.arguments === 'string'
-        ? (JSON.parse(tc.arguments) as Record<string, unknown>)
-        : (tc.arguments as Record<string, unknown>);
-
-    writeSSEEvent(
-      res,
-      'content_block_start',
-      buildContentBlockStart(contentBlockIndex, { type: 'tool_use', id: toolId, name: tc.name, input: {} }),
-    );
-    writeSSEEvent(
-      res,
-      'content_block_delta',
-      buildContentBlockDelta(contentBlockIndex, {
-        type: 'input_json_delta',
-        partial_json: JSON.stringify(parsedInput),
-      }),
-    );
-    writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-    contentBlockIndex++;
-  }
-
-  // message_delta + message_stop
-  const stopReason = mapStopReason(result.finishReason, hasToolCalls);
-  writeSSEEvent(res, 'message_delta', buildMessageDelta(stopReason, result.numTokens, result.promptTokens));
-  writeSSEEvent(res, 'message_stop', buildMessageStop());
-
-  endSSE(res);
+function runSessionStreaming(
+  session: ChatSession<SessionCapableModel>,
+  messages: ChatMessage[],
+  config: ChatConfig,
+): AsyncGenerator<ChatStreamEvent> {
+  session.primeHistory(messages);
+  return session.startFromHistoryStream(config);
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +359,15 @@ export async function handleCreateMessage(
     return;
   }
 
+  // Fetch the per-model session registry. The Anthropic API is
+  // stateless — we allocate a fresh session for every request via
+  // `getOrCreate(null)` and never adopt it into the cache.
+  const sessionReg: SessionRegistry | undefined = registry.getSessionRegistry(body.model);
+  if (!sessionReg) {
+    sendAnthropicInternalError(res, 'session registry missing for registered model');
+    return;
+  }
+
   // Map request
   let messages: ChatMessage[];
   let config: ChatConfig;
@@ -431,15 +378,15 @@ export async function handleCreateMessage(
     return;
   }
 
+  const session = sessionReg.getOrCreate(null);
+
   try {
     if (body.stream === true) {
-      if (registry.hasStreamSupport(model)) {
-        await handleStreamingNative(res, model, messages, config, body);
-      } else {
-        await handleStreamingSimulated(res, model, messages, config, body);
-      }
+      const chatStream = runSessionStreaming(session, messages, config);
+      await handleStreamingNative(res, chatStream, body);
     } else {
-      await handleNonStreaming(res, model, messages, config, body);
+      const result = await runSessionNonStreaming(session, messages, config);
+      await handleNonStreaming(res, result, body);
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error during inference';

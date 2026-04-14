@@ -39,6 +39,15 @@
  *     serializes cache mutation on a single worker thread, so a
  *     second in-flight call would race the first's cache-save step.
  *
+ *   - **Cold-restart primitives.** `primeHistory()` plus
+ *     `startFromHistory()` / `startFromHistoryStream()` let a caller
+ *     seed a fresh session with an externally-reconstructed history
+ *     (e.g. a server `ResponseStore` chain) and replay it through the
+ *     native `chatSessionStart` path without going through `send()`.
+ *     These are intended for server-side `SessionRegistry` cache-miss
+ *     cold-start; normal usage stays on `send` / `sendStream` /
+ *     `sendToolResult` / `reset`.
+ *
  * ## Typical usage
  *
  * ```typescript
@@ -454,6 +463,125 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.turnCount = 0;
   }
 
+  /**
+   * Prime the session history without running inference.
+   *
+   * Used by the server-side `SessionRegistry` cold-start fallback: when
+   * a request arrives with a `previous_response_id` that the cache has
+   * missed, the endpoint reconstructs the full conversation from the
+   * `ResponseStore` and primes a fresh session with it, then calls
+   * `startFromHistory()` to replay it through the native KV cache.
+   *
+   * Rejects if the session is in flight or has already taken a turn.
+   * Replaces the internal history with a shallow copy of `messages`.
+   */
+  primeHistory(messages: ChatMessage[]): void {
+    if (this.inFlight) {
+      throw new Error('ChatSession: cannot primeHistory() while a send() is in flight');
+    }
+    if (this.turnCount > 0) {
+      throw new Error('ChatSession: primeHistory() can only be called on a fresh session (turn 0)');
+    }
+    this.history = messages.slice();
+    // lastImagesKey stays null until startFromHistory() / send() runs —
+    // the trailing-images hydration happens at commit time.
+  }
+
+  /**
+   * Run a cold-start `chatSessionStart` using the currently primed
+   * history.
+   *
+   * Intended pairing with {@link primeHistory}: call
+   * `primeHistory(fullHistory)` first, then `startFromHistory()` to
+   * replay the conversation through the native chat-session API. The
+   * final history entry must be a user or tool turn — this is what the
+   * native side treats as the "current input" to generate against.
+   *
+   * Pushes the assistant reply onto the history, advances `turnCount`
+   * to 1, and computes `lastImagesKey` from the most recent user
+   * message that carries images (so subsequent text-only continues
+   * stay on the delta path, and subsequent image turns correctly
+   * trigger restart).
+   */
+  async startFromHistory(config?: ChatConfig): Promise<ChatResult> {
+    if (this.inFlight) {
+      throw new Error('ChatSession: cannot startFromHistory() while a send() is in flight');
+    }
+    if (this.turnCount > 0) {
+      throw new Error('ChatSession: startFromHistory() can only be called on a fresh session');
+    }
+    if (this.history.length === 0) {
+      throw new Error('ChatSession: startFromHistory() requires a primed history');
+    }
+    this.inFlight = true;
+    try {
+      const mergedConfig = this.mergeConfig(config);
+      const result = await this.model.chatSessionStart(this.history.slice(), mergedConfig);
+      this.history.push({ role: 'assistant', content: result.text });
+      this.turnCount++;
+      this.lastImagesKey = this.computeTrailingImagesKey();
+      return result;
+    } finally {
+      this.inFlight = false;
+    }
+  }
+
+  /**
+   * Streaming counterpart to {@link startFromHistory}.
+   *
+   * Iterates `model.chatStreamSessionStart(history.slice(), config)`,
+   * accumulates text, and only commits history + `turnCount` +
+   * `lastImagesKey` in the `finally` block when a successful terminal
+   * chunk was observed (`done: true` with non-error finishReason).
+   * Because history is primed (not appended to), rollback on failure
+   * is a no-op: the primed state stays intact so the caller can retry.
+   */
+  async *startFromHistoryStream(config?: ChatConfig): AsyncGenerator<ChatStreamEvent> {
+    if (this.inFlight) {
+      throw new Error('ChatSession: cannot startFromHistoryStream() while a send() is in flight');
+    }
+    if (this.turnCount > 0) {
+      throw new Error('ChatSession: startFromHistoryStream() can only be called on a fresh session');
+    }
+    if (this.history.length === 0) {
+      throw new Error('ChatSession: startFromHistoryStream() requires a primed history');
+    }
+    this.inFlight = true;
+    try {
+      const mergedConfig = this.mergeConfig(config);
+      const historySnapshot = this.history.slice();
+      let sawFinal = false;
+      let accumulated = '';
+      let finalRaw: string | null = null;
+      try {
+        for await (const event of this.model.chatStreamSessionStart(historySnapshot, mergedConfig)) {
+          if (event.done) {
+            if (event.finishReason !== 'error') {
+              sawFinal = true;
+              finalRaw = event.text;
+            }
+          } else {
+            accumulated += event.text;
+          }
+          yield event;
+        }
+      } finally {
+        // finally runs on normal completion, mid-stream throw, caller
+        // `break` (iterator.return() short-circuits the yield), and
+        // error-finish chunks alike. The primed history is only
+        // mutated on a successful commit — on any non-success exit,
+        // the primed state is left intact so the caller can retry.
+        if (sawFinal) {
+          this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
+          this.turnCount++;
+          this.lastImagesKey = this.computeTrailingImagesKey();
+        }
+      }
+    } finally {
+      this.inFlight = false;
+    }
+  }
+
   // -------------------------------------------------------------------
   // Internal helpers
   // -------------------------------------------------------------------
@@ -622,5 +750,22 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       return { role: 'user', content: userMessage, images };
     }
     return { role: 'user', content: userMessage };
+  }
+
+  /**
+   * Walk the history backward to find the most recent user message
+   * with images and return its FNV-1a key. Used by
+   * {@link startFromHistory} and {@link startFromHistoryStream} to
+   * hydrate `lastImagesKey` after a cold replay, so subsequent delta
+   * continues correctly detect image changes.
+   */
+  private computeTrailingImagesKey(): string | null {
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      const msg = this.history[i];
+      if (msg?.role === 'user' && msg.images && msg.images.length > 0) {
+        return computeImagesKey(msg.images);
+      }
+    }
+    return null;
   }
 }

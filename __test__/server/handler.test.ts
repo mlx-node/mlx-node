@@ -1,6 +1,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Writable } from 'node:stream';
 
+import type { ChatResult, ToolCallResult } from '@mlx-node/core';
+import type { SessionCapableModel } from '@mlx-node/lm';
 import { createHandler, ModelRegistry } from '@mlx-node/server';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
@@ -103,45 +105,75 @@ function createMockRes(): {
   };
 }
 
-function createMockModel() {
+/**
+ * Minimal synthesizer of a ChatResult for mocks. Callers can override any
+ * subset of fields — the defaults produce a successful short response.
+ */
+function makeChatResult(overrides: Partial<ChatResult> = {}): ChatResult {
   return {
-    chat: vi.fn().mockResolvedValue({
-      text: 'Hello!',
-      toolCalls: [],
-      thinking: undefined,
-      numTokens: 5,
-      promptTokens: 10,
-      reasoningTokens: 0,
-      finishReason: 'stop',
-      rawText: 'Hello!',
-      performance: undefined,
-    }),
+    text: 'Hello!',
+    toolCalls: [] as ToolCallResult[],
+    numTokens: 5,
+    promptTokens: 10,
+    reasoningTokens: 0,
+    finishReason: 'stop',
+    rawText: 'Hello!',
+    performance: undefined,
+    ...overrides,
   };
 }
 
 /**
- * Create a mock model that supports chatStream() with configurable events.
- * Each event in `streamEvents` is yielded by the async generator.
+ * Build a session-capable mock model. By default every method resolves with
+ * the same `makeChatResult()` payload. Tests that care about specific results
+ * should override `chatSessionStart` / `chatStreamSessionStart` via vi spies.
  */
-function createMockStreamModel(streamEvents: Array<Record<string, unknown>>) {
+function createMockModel(result: ChatResult = makeChatResult()): SessionCapableModel {
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async function* emptyStream() {
+    yield {
+      done: true,
+      text: result.text,
+      finishReason: result.finishReason,
+      toolCalls: result.toolCalls,
+      thinking: result.thinking ?? null,
+      numTokens: result.numTokens,
+      promptTokens: result.promptTokens,
+      reasoningTokens: result.reasoningTokens,
+      rawText: result.rawText,
+    };
+  }
   return {
-    chat: vi.fn().mockResolvedValue({
-      text: '',
-      toolCalls: [],
-      thinking: undefined,
-      numTokens: 0,
-      promptTokens: 0,
-      reasoningTokens: 0,
-      finishReason: 'stop',
-      rawText: '',
-      performance: undefined,
-    }),
-    async *chatStream() {
-      for (const event of streamEvents) {
-        yield event;
-      }
-    },
-  };
+    chatSessionStart: vi.fn().mockResolvedValue(result),
+    chatSessionContinue: vi.fn().mockResolvedValue(result),
+    chatSessionContinueTool: vi.fn().mockResolvedValue(result),
+    chatStreamSessionStart: vi.fn(() => emptyStream()),
+    chatStreamSessionContinue: vi.fn(() => emptyStream()),
+    chatStreamSessionContinueTool: vi.fn(() => emptyStream()),
+    resetCaches: vi.fn(),
+  } as unknown as SessionCapableModel;
+}
+
+/**
+ * Session-capable mock that yields the supplied stream events from
+ * `chatStreamSessionStart`. `chatSessionStart` is stubbed to reject so tests
+ * that accidentally hit the non-streaming path surface the bug immediately.
+ */
+function createMockStreamModel(streamEvents: Array<Record<string, unknown>>): SessionCapableModel {
+  async function* makeStream() {
+    for (const event of streamEvents) {
+      yield event;
+    }
+  }
+  return {
+    chatSessionStart: vi.fn().mockRejectedValue(new Error('Should use chatStreamSessionStart')),
+    chatSessionContinue: vi.fn().mockRejectedValue(new Error('Should use chatStreamSessionContinue')),
+    chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('Should use chatStreamSessionContinueTool')),
+    chatStreamSessionStart: vi.fn(() => makeStream()),
+    chatStreamSessionContinue: vi.fn(() => makeStream()),
+    chatStreamSessionContinueTool: vi.fn(() => makeStream()),
+    resetCaches: vi.fn(),
+  } as unknown as SessionCapableModel;
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +357,7 @@ describe('createHandler', () => {
       expect(inputMessages[0].content).toBe('Hello');
     });
 
-    it('passes mapped messages and config to model.chat', async () => {
+    it('passes mapped messages and config to chatSessionStart on cold path', async () => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel();
       registry.register('test-model', mockModel);
@@ -342,8 +374,10 @@ describe('createHandler', () => {
       handler(req, res);
       await waitForEnd();
 
-      expect(mockModel.chat).toHaveBeenCalledTimes(1);
-      const [messages, config] = mockModel.chat.mock.calls[0];
+      // oxlint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      const [messages, config] = startSpy.mock.calls[0] as [unknown, { temperature?: number; maxNewTokens?: number }];
       expect(messages).toEqual([{ role: 'user', content: 'Hello' }]);
       expect(config.temperature).toBe(0.7);
       expect(config.maxNewTokens).toBe(100);

@@ -2,16 +2,21 @@
  * ModelRegistry -- maps friendly model names to loaded model instances.
  *
  * All models that expose the chat-session surface (see `SessionCapableModel`
- * from `@mlx-node/lm`) are eligible for serving. Streaming support is
- * detected by the presence of `chatStreamSessionStart` on the model.
+ * from `@mlx-node/lm`) are eligible for serving. Every registered model is
+ * paired with its own `SessionRegistry` — an LRU+TTL cache of live
+ * `ChatSession` instances keyed by the server-allocated response id. The
+ * endpoint layer fetches the per-model session registry via
+ * {@link ModelRegistry.getSessionRegistry} and routes each request through
+ * a session looked up or allocated there.
  *
  * This interface intentionally mirrors `SessionCapableModel` one-to-one —
  * the server always drives models through `ChatSession<M>` wrappers, never
- * the low-level NAPI methods directly. Step S2 of the chat-session refactor
- * migrates the endpoint layer to use a per-model `SessionRegistry` cache.
+ * the low-level NAPI methods directly.
  */
 
 import type { SessionCapableModel } from '@mlx-node/lm';
+
+import { SessionRegistry } from './session-registry.js';
 
 /** Minimal contract for a model that can be served via chat sessions. */
 export type ServableModel = SessionCapableModel;
@@ -21,6 +26,8 @@ export interface ModelEntry {
   id: string;
   model: ServableModel;
   createdAt: number;
+  /** Per-model LRU+TTL session cache. See `SessionRegistry`. */
+  sessionRegistry: SessionRegistry;
 }
 
 export class ModelRegistry {
@@ -28,13 +35,16 @@ export class ModelRegistry {
 
   /**
    * Register a model under a given name.
-   * If a model with the same name already exists, it is replaced.
+   * If a model with the same name already exists, it is replaced —
+   * including its SessionRegistry, which means any cached sessions
+   * under the old model are dropped.
    */
   register(name: string, model: ServableModel): void {
     this.models.set(name, {
       id: name,
       model,
       createdAt: Math.floor(Date.now() / 1000),
+      sessionRegistry: new SessionRegistry({ model }),
     });
   }
 
@@ -51,6 +61,23 @@ export class ModelRegistry {
    */
   get(name: string): ServableModel | undefined {
     return this.models.get(name)?.model;
+  }
+
+  /**
+   * Retrieve the session registry for a given model, or `undefined`
+   * if the model is not registered.
+   */
+  getSessionRegistry(name: string): SessionRegistry | undefined {
+    return this.models.get(name)?.sessionRegistry;
+  }
+
+  /** Iterate every registered session registry. */
+  listSessionRegistries(): SessionRegistry[] {
+    const out: SessionRegistry[] = [];
+    for (const entry of this.models.values()) {
+      out.push(entry.sessionRegistry);
+    }
+    return out;
   }
 
   /**
@@ -72,10 +99,12 @@ export class ModelRegistry {
   /**
    * Check whether a model supports streaming.
    *
-   * Every `SessionCapableModel` is expected to expose
-   * `chatStreamSessionStart`, so in practice this is universally true for
-   * any properly-typed model. We still duck-type the method so a partially
-   * stubbed test double can opt out of streaming by omitting it.
+   * Every `SessionCapableModel` structurally exposes
+   * `chatStreamSessionStart`, so this is universally `true` for any
+   * properly-typed model registered through the session-capable
+   * interface. Kept as a belt-and-suspenders duck-type so a partially
+   * stubbed test double (pre-migration or intentionally non-streaming)
+   * can still opt out by omitting the method.
    */
   hasStreamSupport(model: ServableModel): boolean {
     const fn = (model as unknown as Record<string, unknown>)['chatStreamSessionStart'];

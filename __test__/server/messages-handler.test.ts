@@ -1,5 +1,7 @@
 import type { ServerResponse } from 'node:http';
 
+import type { ChatResult, ToolCallResult } from '@mlx-node/core';
+import type { SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
@@ -67,31 +69,75 @@ function createMockRes(): {
   };
 }
 
-function createMockModel() {
+/**
+ * Synthesize a ChatResult. Tests override only the fields they care about.
+ */
+function makeChatResult(overrides: Partial<ChatResult> = {}): ChatResult {
   return {
-    chat: vi.fn().mockResolvedValue({
-      text: 'Hello!',
-      toolCalls: [],
-      thinking: null,
-      numTokens: 10,
-      promptTokens: 5,
-      reasoningTokens: 0,
-      finishReason: 'stop',
-      rawText: 'Hello!',
-      performance: undefined,
-    }),
+    text: 'Hello!',
+    toolCalls: [] as ToolCallResult[],
+    numTokens: 10,
+    promptTokens: 5,
+    reasoningTokens: 0,
+    finishReason: 'stop',
+    rawText: 'Hello!',
+    performance: undefined,
+    ...overrides,
   };
 }
 
-function createMockStreamModel(streamEvents: Array<Record<string, unknown>>) {
+/**
+ * Build a session-capable mock model that resolves `chatSessionStart` with
+ * the supplied `ChatResult`. The Anthropic endpoint is stateless so only the
+ * cold-path entry points (`chatSessionStart` / `chatStreamSessionStart`) are
+ * ever invoked; `chatSessionContinue` and friends are filled in with
+ * rejecting stubs so a mistaken hot-path call surfaces immediately.
+ */
+function createMockModel(result: ChatResult = makeChatResult()): SessionCapableModel {
+  async function* fallbackStream() {
+    yield {
+      done: true,
+      text: result.text,
+      finishReason: result.finishReason,
+      toolCalls: result.toolCalls,
+      thinking: result.thinking ?? null,
+      numTokens: result.numTokens,
+      promptTokens: result.promptTokens,
+      reasoningTokens: result.reasoningTokens,
+      rawText: result.rawText,
+    };
+  }
   return {
-    chat: vi.fn().mockRejectedValue(new Error('Should use chatStream')),
-    async *chatStream(_messages: unknown, _config: unknown) {
-      for (const event of streamEvents) {
-        yield event;
-      }
-    },
-  };
+    chatSessionStart: vi.fn().mockResolvedValue(result),
+    chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: chatSessionContinue not expected')),
+    chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: chatSessionContinueTool not expected')),
+    chatStreamSessionStart: vi.fn(() => fallbackStream()),
+    chatStreamSessionContinue: vi.fn(() => fallbackStream()),
+    chatStreamSessionContinueTool: vi.fn(() => fallbackStream()),
+    resetCaches: vi.fn(),
+  } as unknown as SessionCapableModel;
+}
+
+/**
+ * Session-capable mock whose `chatStreamSessionStart` yields the supplied
+ * stream events. `chatSessionStart` rejects so accidental non-streaming
+ * routing is caught immediately.
+ */
+function createMockStreamModel(streamEvents: Array<Record<string, unknown>>): SessionCapableModel {
+  async function* makeStream() {
+    for (const event of streamEvents) {
+      yield event;
+    }
+  }
+  return {
+    chatSessionStart: vi.fn().mockRejectedValue(new Error('Should use chatStreamSessionStart')),
+    chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: chatSessionContinue not expected')),
+    chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: chatSessionContinueTool not expected')),
+    chatStreamSessionStart: vi.fn(() => makeStream()),
+    chatStreamSessionContinue: vi.fn(() => makeStream()),
+    chatStreamSessionContinueTool: vi.fn(() => makeStream()),
+    resetCaches: vi.fn(),
+  } as unknown as SessionCapableModel;
 }
 
 /** Parse SSE body into an array of { event, data } objects. */
@@ -247,8 +293,8 @@ describe('handleCreateMessage', () => {
 
     it('returns thinking + text content blocks', async () => {
       const registry = new ModelRegistry();
-      const mockModel = {
-        chat: vi.fn().mockResolvedValue({
+      const mockModel = createMockModel(
+        makeChatResult({
           text: 'The answer is 42.',
           toolCalls: [],
           thinking: 'Let me think about this...',
@@ -257,9 +303,8 @@ describe('handleCreateMessage', () => {
           reasoningTokens: 5,
           finishReason: 'stop',
           rawText: 'The answer is 42.',
-          performance: undefined,
         }),
-      };
+      );
       registry.register('test-model', mockModel);
       const { res, getStatus, getBody } = createMockRes();
 
@@ -284,8 +329,8 @@ describe('handleCreateMessage', () => {
 
     it('returns tool_use content blocks', async () => {
       const registry = new ModelRegistry();
-      const mockModel = {
-        chat: vi.fn().mockResolvedValue({
+      const mockModel = createMockModel(
+        makeChatResult({
           text: '',
           toolCalls: [
             {
@@ -293,17 +338,15 @@ describe('handleCreateMessage', () => {
               id: 'toolu_abc123',
               name: 'get_weather',
               arguments: '{"location":"San Francisco"}',
-            },
+            } as ToolCallResult,
           ],
-          thinking: null,
           numTokens: 20,
           promptTokens: 10,
           reasoningTokens: 0,
           finishReason: 'stop',
           rawText: '',
-          performance: undefined,
         }),
-      };
+      );
       registry.register('test-model', mockModel);
       const { res, getStatus, getBody } = createMockRes();
 
@@ -699,133 +742,14 @@ describe('handleCreateMessage', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Streaming (simulated fallback)
-  // -----------------------------------------------------------------------
-
-  describe('streaming (simulated)', () => {
-    it('simulates streaming from chat() when chatStream is not available', async () => {
-      const registry = new ModelRegistry();
-      const mockModel = {
-        chat: vi.fn().mockResolvedValue({
-          text: 'Simulated response',
-          toolCalls: [],
-          thinking: null,
-          numTokens: 8,
-          promptTokens: 4,
-          reasoningTokens: 0,
-          finishReason: 'stop',
-          rawText: 'Simulated response',
-          performance: undefined,
-        }),
-      };
-      // No chatStream method -> simulated streaming
-      registry.register('test-model', mockModel);
-      const { res, getBody, getHeaders } = createMockRes();
-
-      await handleCreateMessage(
-        res,
-        {
-          model: 'test-model',
-          messages: [{ role: 'user', content: 'Hi' }],
-          max_tokens: 100,
-          stream: true,
-        },
-        registry,
-      );
-
-      expect(getHeaders()['content-type']).toBe('text/event-stream');
-
-      const events = parseSSE(getBody());
-
-      // message_start
-      expect(events[0].event).toBe('message_start');
-
-      // content_block_start for text
-      const textStart = events.find(
-        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'text',
-      );
-      expect(textStart).toBeDefined();
-
-      // text delta
-      const textDelta = events.find(
-        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
-      );
-      expect(textDelta).toBeDefined();
-      expect((textDelta!.data['delta'] as any).text).toBe('Simulated response');
-
-      // content_block_stop
-      const cbStop = events.find((e) => e.event === 'content_block_stop');
-      expect(cbStop).toBeDefined();
-
-      // message_delta + message_stop
-      expect(events.find((e) => e.event === 'message_delta')).toBeDefined();
-      expect(events.find((e) => e.event === 'message_stop')).toBeDefined();
-    });
-
-    it('simulates streaming with thinking + text + tool_use', async () => {
-      const registry = new ModelRegistry();
-      const mockModel = {
-        chat: vi.fn().mockResolvedValue({
-          text: 'I will look that up.',
-          toolCalls: [
-            {
-              status: 'ok',
-              id: 'toolu_sim',
-              name: 'lookup',
-              arguments: '{"key":"value"}',
-            },
-          ],
-          thinking: 'Reasoning here',
-          numTokens: 20,
-          promptTokens: 10,
-          reasoningTokens: 5,
-          finishReason: 'stop',
-          rawText: 'I will look that up.',
-          performance: undefined,
-        }),
-      };
-      registry.register('test-model', mockModel);
-      const { res, getBody } = createMockRes();
-
-      await handleCreateMessage(
-        res,
-        {
-          model: 'test-model',
-          messages: [{ role: 'user', content: 'Look up X' }],
-          max_tokens: 200,
-          stream: true,
-        },
-        registry,
-      );
-
-      const events = parseSSE(getBody());
-
-      // Check block types in order
-      const blockStarts = events.filter((e) => e.event === 'content_block_start');
-      expect(blockStarts).toHaveLength(3);
-      expect((blockStarts[0].data['content_block'] as any).type).toBe('thinking');
-      expect(blockStarts[0].data['index']).toBe(0);
-      expect((blockStarts[1].data['content_block'] as any).type).toBe('text');
-      expect(blockStarts[1].data['index']).toBe(1);
-      expect((blockStarts[2].data['content_block'] as any).type).toBe('tool_use');
-      expect(blockStarts[2].data['index']).toBe(2);
-
-      // Verify stop_reason is tool_use
-      const msgDelta = events.find((e) => e.event === 'message_delta');
-      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('tool_use');
-    });
-  });
-
-  // -----------------------------------------------------------------------
   // Error handling
   // -----------------------------------------------------------------------
 
   describe('error handling', () => {
-    it('returns 500 on model.chat() error (non-streaming)', async () => {
+    it('returns 500 when the session throws during non-streaming start', async () => {
       const registry = new ModelRegistry();
-      const mockModel = {
-        chat: vi.fn().mockRejectedValue(new Error('Model crashed')),
-      };
+      const mockModel = createMockModel();
+      (mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Model crashed'));
       registry.register('test-model', mockModel);
       const { res, getStatus, getBody } = createMockRes();
 
@@ -846,15 +770,21 @@ describe('handleCreateMessage', () => {
       expect(parsed.error.message).toContain('Model crashed');
     });
 
-    it('emits error SSE event on streaming error after headers sent', async () => {
+    it('emits error SSE event when the stream throws after headers are sent', async () => {
       const registry = new ModelRegistry();
+      async function* crashingStream() {
+        yield { text: 'partial', done: false, isReasoning: false };
+        throw new Error('Stream crashed');
+      }
       const mockModel = {
-        chat: vi.fn(),
-        async *chatStream() {
-          yield { text: 'partial', done: false, isReasoning: false };
-          throw new Error('Stream crashed');
-        },
-      };
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('should use stream')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: vi.fn(() => crashingStream()),
+        chatStreamSessionContinue: vi.fn(() => crashingStream()),
+        chatStreamSessionContinueTool: vi.fn(() => crashingStream()),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
       registry.register('test-model', mockModel);
       const { res, getBody } = createMockRes();
 

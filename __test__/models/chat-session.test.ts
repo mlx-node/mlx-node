@@ -951,4 +951,302 @@ describe('ChatSession', () => {
       expect(session.turns).toBe(0);
     });
   });
+
+  // -------------------------------------------------------------------
+  // Cold-restart primitives: primeHistory / startFromHistory / startFromHistoryStream
+  // -------------------------------------------------------------------
+
+  describe('primeHistory()', () => {
+    it('sets history on a fresh session without running inference', () => {
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model);
+
+      const primed: ChatMessage[] = [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'Hi' },
+        { role: 'assistant', content: 'Hello!' },
+        { role: 'user', content: 'Follow-up' },
+      ];
+      session.primeHistory(primed);
+
+      // primeHistory does not run inference.
+      expect(chatSessionStart).not.toHaveBeenCalled();
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+      expect(session.turns).toBe(0);
+    });
+
+    it('rejects when turnCount > 0', async () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('turn-1');
+      expect(() => session.primeHistory([{ role: 'user', content: 'prime' }])).toThrow(/fresh session/i);
+    });
+
+    it('rejects while a send() is in flight', async () => {
+      let resolveFirst: (r: ChatResult) => void = () => {
+        /* overwritten */
+      };
+      const pending = new Promise<ChatResult>((r) => {
+        resolveFirst = r;
+      });
+      const chatSessionStart = vi.fn(async () => pending);
+      const model: SessionCapableModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn(async () => makeChatResult('c')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('t')),
+        chatStreamSessionStart: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      const firstPromise = session.send('Hello');
+      expect(() => session.primeHistory([{ role: 'user', content: 'prime' }])).toThrow(/in flight/);
+
+      resolveFirst(makeChatResult('first'));
+      await firstPromise;
+    });
+
+    it('replaces any previously primed history (shallow copy)', () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      const original: ChatMessage[] = [{ role: 'user', content: 'first' }];
+      session.primeHistory(original);
+      // Mutating the original array after priming must not affect
+      // what the session holds.
+      original.push({ role: 'user', content: 'mutated' });
+
+      // Re-prime is allowed while turnCount is still 0.
+      session.primeHistory([{ role: 'user', content: 'new' }]);
+    });
+  });
+
+  describe('startFromHistory()', () => {
+    it('calls chatSessionStart with the primed history and returns its result', async () => {
+      const { model, chatSessionStart } = makeMockModel();
+      const session = new ChatSession(model);
+
+      const primed: ChatMessage[] = [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'hello!' },
+        { role: 'user', content: 'what is 2+2?' },
+      ];
+      session.primeHistory(primed);
+
+      const result = await session.startFromHistory();
+
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      const [messages, config] = chatSessionStart.mock.calls[0];
+      expect(messages).toEqual(primed);
+      expect(config?.reuseCache).toBe(true);
+      expect(result.text).toBe('start-reply');
+    });
+
+    it('rejects when history is empty', async () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await expect(session.startFromHistory()).rejects.toThrow(/primed history/);
+    });
+
+    it('rejects when turnCount > 0', async () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('turn-1');
+      await expect(session.startFromHistory()).rejects.toThrow(/fresh session/i);
+    });
+
+    it('rejects while a send() is in flight', async () => {
+      let resolveFirst: (r: ChatResult) => void = () => {
+        /* overwritten */
+      };
+      const pending = new Promise<ChatResult>((r) => {
+        resolveFirst = r;
+      });
+      const chatSessionStart = vi.fn(async () => pending);
+      const model: SessionCapableModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn(async () => makeChatResult('c')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('t')),
+        chatStreamSessionStart: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      const firstPromise = session.send('Hello');
+      await expect(session.startFromHistory()).rejects.toThrow(/in flight/);
+
+      resolveFirst(makeChatResult('first'));
+      await firstPromise;
+    });
+
+    it('advances turnCount and appends the assistant reply', async () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      session.primeHistory([{ role: 'user', content: 'hi' }]);
+      expect(session.turns).toBe(0);
+      const result = await session.startFromHistory();
+      expect(session.turns).toBe(1);
+      expect(result.text).toBe('start-reply');
+    });
+
+    it('hydrates lastImagesKey when the trailing user message has images', async () => {
+      const img = new Uint8Array([7, 8, 9]);
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      session.primeHistory([
+        { role: 'system', content: 'hi' },
+        { role: 'user', content: 'describe', images: [img] },
+      ]);
+      expect(session.hasImages).toBe(false);
+      await session.startFromHistory();
+      expect(session.hasImages).toBe(true);
+    });
+
+    it('does NOT set lastImagesKey when no user message has images', async () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      session.primeHistory([
+        { role: 'system', content: 'hi' },
+        { role: 'user', content: 'text only' },
+      ]);
+      await session.startFromHistory();
+      expect(session.hasImages).toBe(false);
+    });
+
+    it('routes subsequent send() through the delta chatSessionContinue path', async () => {
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model);
+
+      session.primeHistory([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'hello!' },
+        { role: 'user', content: 'follow-up?' },
+      ]);
+      await session.startFromHistory();
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+
+      // Next send() is turn 2 from the session's perspective — it should
+      // go through chatSessionContinue, not restart.
+      await session.send('another follow-up');
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('startFromHistoryStream()', () => {
+    it('yields events and commits on success', async () => {
+      const { model, chatStreamSessionStart } = makeMockModel();
+      const session = new ChatSession(model);
+
+      session.primeHistory([
+        { role: 'system', content: 'hi' },
+        { role: 'user', content: 'say hi' },
+      ]);
+
+      const events: ChatStreamEvent[] = [];
+      for await (const e of session.startFromHistoryStream()) events.push(e);
+
+      expect(chatStreamSessionStart).toHaveBeenCalledTimes(1);
+      expect(events[events.length - 1].done).toBe(true);
+      expect(session.turns).toBe(1);
+    });
+
+    it('rejects when history is empty', async () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await expect(async () => {
+        for await (const _e of session.startFromHistoryStream()) void _e;
+      }).rejects.toThrow(/primed history/);
+    });
+
+    it('does NOT advance turnCount on caller break (finally path leaves primed history intact)', async () => {
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        yield { text: 'partial', done: false };
+        yield { text: 'more', done: false };
+        // no done — caller will break.
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      session.primeHistory([{ role: 'user', content: 'hi' }]);
+      for await (const _e of session.startFromHistoryStream()) break;
+      expect(session.turns).toBe(0);
+      // Session is still on turn 0 with the primed history — retrying
+      // startFromHistory should succeed without needing a re-prime.
+      const result = await session.startFromHistory();
+      expect(result.text).toBe('x');
+      expect(session.turns).toBe(1);
+    });
+
+    it('does NOT advance turnCount when final chunk has finishReason="error"', async () => {
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        yield finalChunk('oops', 'error');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      session.primeHistory([{ role: 'user', content: 'hi' }]);
+      for await (const _e of session.startFromHistoryStream()) void _e;
+      expect(session.turns).toBe(0);
+    });
+
+    it('hydrates lastImagesKey when the trailing user message has images', async () => {
+      const img = new Uint8Array([1, 2, 3]);
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      session.primeHistory([{ role: 'user', content: 'describe', images: [img] }]);
+      for await (const _e of session.startFromHistoryStream()) void _e;
+      expect(session.hasImages).toBe(true);
+    });
+  });
 });

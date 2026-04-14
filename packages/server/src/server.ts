@@ -81,17 +81,21 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     store = await ResponseStore.open(storePath);
   }
 
-  // Periodic cleanup
-  let cleanupTimer: ReturnType<typeof setInterval> | null = null;
-  if (store) {
-    cleanupTimer = setInterval(() => {
-      store!.cleanupExpired().catch(() => {
+  // Periodic cleanup — always scheduled, regardless of whether a
+  // ResponseStore is configured. Sessions need periodic TTL sweeps
+  // even when responses are not persisted.
+  const cleanupTimer: ReturnType<typeof setInterval> = setInterval(() => {
+    if (store) {
+      store.cleanupExpired().catch(() => {
         // Silently ignore cleanup errors
       });
-    }, CLEANUP_INTERVAL_MS);
-    // Allow the process to exit even if the timer is still active
-    cleanupTimer.unref();
-  }
+    }
+    for (const sessReg of registry.listSessionRegistries()) {
+      sessReg.sweep();
+    }
+  }, CLEANUP_INTERVAL_MS);
+  // Allow the process to exit even if the timer is still active
+  cleanupTimer.unref();
 
   const handler = createHandler(registry, { cors, store });
   const server = httpCreateServer(handler);
@@ -113,10 +117,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     registry,
     store,
     async close() {
-      if (cleanupTimer) {
-        clearInterval(cleanupTimer);
-        cleanupTimer = null;
-      }
+      clearInterval(cleanupTimer);
       await new Promise<void>((resolve, reject) => {
         server.close((err) => {
           if (err) reject(err);
