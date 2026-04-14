@@ -1,6 +1,6 @@
 # @mlx-node/lm
 
-High-level language model inference for Node.js on Apple Silicon. Supports Qwen3 and Qwen3.5 (Dense and MoE) with streaming, tool calling, and profiling — all running locally on Metal GPU.
+High-level language model inference for Node.js on Apple Silicon. Supports Qwen3, Qwen3.5 (Dense and MoE), LFM2, and Gemma4 with streaming, multi-turn chat sessions, tool calling, and profiling — all running locally on Metal GPU.
 
 ## Requirements
 
@@ -15,26 +15,31 @@ npm install @mlx-node/lm
 
 ## Quick Start
 
+Multi-turn chat runs through `ChatSession`, which owns the server-side KV cache and hides the session bookkeeping behind `send()` / `sendStream()`. The `loadSession()` convenience wrapper loads the model and constructs the session in one step:
+
 ```typescript
-import { loadModel } from '@mlx-node/lm';
+import { loadSession } from '@mlx-node/lm';
 
-const model = await loadModel('./models/Qwen3-0.6B');
+const session = await loadSession('./models/Qwen3-0.6B');
 
-const result = await model.chat([{ role: 'user', content: 'What is the capital of France?' }]);
-
+const result = await session.send('What is the capital of France?');
 console.log(result.text);
+
+// Follow-ups reuse the live KV cache — no prompt replay.
+const followUp = await session.send('And its population?');
+console.log(followUp.text);
 ```
 
 ## Streaming
 
-Qwen3.5 models support token-by-token streaming via `AsyncGenerator`:
+Every generative model wrapper supports token-by-token streaming via `session.sendStream()`, which yields an `AsyncGenerator<ChatStreamEvent>`:
 
 ```typescript
-import { loadModel } from '@mlx-node/lm';
+import { loadSession } from '@mlx-node/lm';
 
-const model = await loadModel('./models/Qwen3.5-0.6B');
+const session = await loadSession('./models/Qwen3.5-0.8B');
 
-for await (const event of model.chatStream(messages, config)) {
+for await (const event of session.sendStream('Write a haiku about TypeScript.')) {
   if (!event.done) {
     process.stdout.write(event.text);
   } else {
@@ -43,16 +48,16 @@ for await (const event of model.chatStream(messages, config)) {
 }
 ```
 
-Breaking out of the loop automatically cancels generation.
+Breaking out of the loop automatically cancels generation. The session tracks its turn state so the next `send()` / `sendStream()` continues the same conversation against the live cache.
 
 ## Tool Calling
 
-OpenAI-compatible function calling with `createToolDefinition`:
+OpenAI-compatible function calling with `createToolDefinition`. Tool-result turns feed back through the same session via `sendToolResult()`, which dispatches a native `chatSessionContinueTool` against the live KV cache:
 
 ```typescript
-import { loadModel, createToolDefinition } from '@mlx-node/lm';
+import { loadSession, createToolDefinition } from '@mlx-node/lm';
 
-const model = await loadModel('./models/Qwen3-0.6B');
+const session = await loadSession('./models/Qwen3-0.6B');
 
 const tools = [
   createToolDefinition(
@@ -65,46 +70,38 @@ const tools = [
   ),
 ];
 
-const result = model.chat([{ role: 'user', content: 'What is the weather in Tokyo?' }], { tools });
+const result = await session.send('What is the weather in Tokyo?', { config: { tools } });
 
-// If the model calls tools, execute them and continue
+// If the model calls tools, execute them and feed results back through the session.
 const validCalls = result.toolCalls?.filter((tc) => tc.status === 'ok') ?? [];
-if (validCalls.length) {
-  // Add assistant message with structured tool calls
-  const toolMessages = [
-    {
-      role: 'assistant',
-      content: result.text,
-      toolCalls: validCalls.map((tc) => ({
-        id: tc.id,
-        name: tc.name,
-        arguments: JSON.stringify(tc.arguments),
-      })),
-    },
-    // Execute each tool and add results as role: 'tool' messages
-    ...validCalls.map((tc) => ({
-      role: 'tool' as const,
-      content: JSON.stringify(executeMyTool(tc)),
-    })),
-  ];
-  const followUp = model.chat([...messages, ...toolMessages], { tools });
+for (const tc of validCalls) {
+  const toolOutput = JSON.stringify(await executeMyTool(tc));
+  const followUp = await session.sendToolResult(tc.id, toolOutput, { config: { tools } });
+  console.log(followUp.text);
 }
 ```
 
 ## Model Loading
 
-`loadModel()` auto-detects the model architecture from `config.json`:
+`loadModel()` auto-detects the model architecture from `config.json`. Use `loadSession()` when you want an ergonomic `ChatSession` handle in one step, or `new ChatSession(model)` when you need a reference to both the model and the session (e.g. for `generate()` calls, training, or model metadata):
 
 ```typescript
-import { loadModel, Qwen35Model, Qwen35MoeModel } from '@mlx-node/lm';
+import { loadModel, loadSession, ChatSession, Qwen35Model, Qwen35MoeModel } from '@mlx-node/lm';
 
-// Auto-detect (reads config.json model_type field)
+// Convenience: auto-detect architecture and wrap in a ChatSession.
+const session = await loadSession('./models/Qwen3-0.6B');
+
+// Manual: hold references to both the model and the session.
 const model = await loadModel('./models/Qwen3-0.6B');
+const manualSession = new ChatSession(model, { system: 'Be concise.' });
 
-// Or load a specific architecture directly
+// Or load a specific architecture directly.
 const dense = await Qwen35Model.load('./models/Qwen3.5-0.8B');
 const moe = await Qwen35MoeModel.load('./models/Qwen3.5-35B-A3B');
+const denseSession = new ChatSession(dense);
 ```
+
+`ChatSession` accepts an options bag with `{ system?, defaultConfig? }`. The system prompt is injected on the first turn and never re-sent. Per-call config passed to `send()` / `sendStream()` shallow-merges on top of `defaultConfig`. Call `session.reset()` to wipe the KV cache and start a fresh conversation.
 
 ### Pre-defined Configs
 
@@ -138,12 +135,16 @@ Or set `MLX_PROFILE_DECODE=1` to auto-enable and write a report on exit.
 
 ### Classes
 
-| Class            | Description                                                                      |
-| ---------------- | -------------------------------------------------------------------------------- |
-| `loadModel()`    | Auto-detect and load any supported model from disk                               |
-| `Qwen3Model`     | Qwen3 inference — `generate()`, `chat()`, paged attention, speculative decoding  |
-| `Qwen35Model`    | Qwen3.5 Dense — `generate()`, `chat()`, `chatStream()` with compiled C++ forward |
-| `Qwen35MoeModel` | Qwen3.5 MoE — same API as Dense with expert routing                              |
+| Class            | Description                                                                       |
+| ---------------- | --------------------------------------------------------------------------------- |
+| `loadModel()`    | Auto-detect and load any supported model from disk                                |
+| `loadSession()`  | `loadModel()` + `new ChatSession(model)` in one step                              |
+| `ChatSession<M>` | Multi-turn chat wrapper — `send()`, `sendStream()`, `sendToolResult()`, `reset()` |
+| `Qwen3Model`     | Qwen3 inference — `generate()`, paged attention, speculative decoding             |
+| `Qwen35Model`    | Qwen3.5 Dense — `generate()` with compiled C++ forward                            |
+| `Qwen35MoeModel` | Qwen3.5 MoE — `generate()` with compiled C++ forward and expert routing           |
+| `Gemma4Model`    | Gemma4 inference — `generate()`                                                   |
+| `Lfm2Model`      | LFM2.5 hybrid conv+attention inference — `generate()`                             |
 
 ### Streaming Types
 
@@ -202,11 +203,15 @@ function createToolDefinition(
 
 ## Supported Models
 
-| Model         | `chat()` | `chatStream()` | Training | Notes                                 |
-| ------------- | :------: | :------------: | :------: | ------------------------------------- |
-| Qwen3         |   Yes    |       No       | GRPO/SFT | Paged attention, speculative decoding |
-| Qwen3.5 Dense |   Yes    |      Yes       | GRPO/SFT | Compiled C++ forward, VLM variant     |
-| Qwen3.5 MoE   |   Yes    |      Yes       | GRPO/SFT | Compiled C++ forward, expert routing  |
+Every generative model wrapper exposes the same `ChatSession<M>` surface — `send()`, `sendStream()`, and `sendToolResult()` all work against any of the models below.
+
+| Model         | `generate()` | `ChatSession` | Training | Notes                                 |
+| ------------- | :----------: | :-----------: | :------: | ------------------------------------- |
+| Qwen3         |     Yes      |      Yes      | GRPO/SFT | Paged attention, speculative decoding |
+| Qwen3.5 Dense |     Yes      |      Yes      |    No    | Compiled C++ forward, VLM variant     |
+| Qwen3.5 MoE   |     Yes      |      Yes      |    No    | Compiled C++ forward, expert routing  |
+| Gemma4        |     Yes      |      Yes      |    No    | Streaming chat via session            |
+| LFM2.5        |     Yes      |      Yes      |    No    | Hybrid conv + attention architecture  |
 
 ## Performance
 

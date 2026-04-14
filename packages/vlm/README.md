@@ -1,6 +1,6 @@
 # @mlx-node/vlm
 
-Vision-language models and document processing pipelines for Node.js on Apple Silicon. Extract text, tables, and structure from documents and images using PaddleOCR-VL and the PP-StructureV3 pipeline — all running locally on Metal GPU.
+Vision-language models and document processing pipelines for Node.js on Apple Silicon. Extract text, tables, and structure from documents and images using PaddleOCR-VL, Qianfan-OCR (InternVL), and the PP-StructureV3 pipeline — all running locally on Metal GPU.
 
 ## Requirements
 
@@ -12,6 +12,39 @@ Vision-language models and document processing pipelines for Node.js on Apple Si
 ```bash
 npm install @mlx-node/vlm
 ```
+
+## Multi-turn chat with VLMs
+
+`QianfanOCRModel` conforms to the same `ChatSession<M>` surface as the language models in `@mlx-node/lm`, so a single session handle drives both single-shot and multi-turn VLM conversations:
+
+```typescript
+import { ChatSession } from '@mlx-node/lm';
+import { QianfanOCRModel } from '@mlx-node/vlm';
+import { readFileSync } from 'node:fs';
+
+const model = await QianfanOCRModel.load('./models/Qianfan-VL');
+const session = new ChatSession(model, { system: 'You read documents precisely.' });
+
+// First turn with an image.
+const r1 = await session.send('Extract the text from this receipt.', {
+  images: [readFileSync('./receipt.jpg')],
+});
+console.log(r1.text);
+
+// Text-only follow-up reuses the same KV cache against the same image.
+const r2 = await session.send('What is the total price?');
+console.log(r2.text);
+
+// Swapping the image mid-session forcibly restarts the cache with the new image.
+const r3 = await session.send('And this one?', {
+  images: [readFileSync('./other-receipt.jpg')],
+});
+console.log(r3.text);
+```
+
+`loadSession()` from `@mlx-node/lm` cannot load Qianfan-OCR (that would introduce a circular package dependency), so construct the wrapper here with `QianfanOCRModel.load()` and pass it to `ChatSession` directly.
+
+The one-shot `VLModel.chat()` API shown below for PaddleOCR-VL is a single-turn OCR entry point and is intentionally kept out of the session surface.
 
 ## Quick Start
 

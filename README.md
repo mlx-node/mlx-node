@@ -50,10 +50,10 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 
 ### Model Inference
 
-- Qwen3 (0.6B, 1.7B, 4B, 8B, 14B, 32B)
-- Qwen3.5 (0.8B, 2B, 4B, 9B, 27B, 35B-A3B, 122B-A10B, 397B-A17B)
-- Streaming generation
-- Chat templates
+- Qwen3, Qwen3.5 Dense / MoE, LFM2.5, Gemma4
+- Multi-turn `ChatSession` with live KV cache reuse
+- Streaming generation via `sendStream()`
+- Tool calling and chat templates
 
 </td>
 <td width="33%" valign="top">

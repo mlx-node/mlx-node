@@ -89,11 +89,15 @@ MLX-Node is a high-performance machine learning framework for Node.js that bring
 
 ### Language Models
 
-| Model             | Lines | generate() | chat() | chatStream() | Training | Special                               |
-| ----------------- | ----- | :--------: | :----: | :----------: | :------: | ------------------------------------- |
-| **Qwen3**         | 7,061 |    Yes     |  Yes   |      No      | GRPO/SFT | Speculative decoding, Paged attention |
-| **Qwen3.5 Dense** | 6,768 |    Yes     |  Yes   |     Yes      |    No    | Compiled C++ forward, VLM variant     |
-| **Qwen3.5 MoE**   | 4,267 |    Yes     |  Yes   |     Yes      |    No    | Compiled C++ forward, VLM variant     |
+All generative wrappers share a uniform `ChatSession<M>` surface (`send` / `sendStream` / `sendToolResult` / `reset`) driven by the native `chatSessionStart` / `chatSessionContinue` / `chatSessionContinueTool` NAPI entry points. The legacy `model.chat()` / `model.chatStream()` methods have been removed.
+
+| Model             | Lines | generate() | session | Training | Special                               |
+| ----------------- | ----- | :--------: | :-----: | :------: | ------------------------------------- |
+| **Qwen3**         | 7,061 |    Yes     |   Yes   | GRPO/SFT | Speculative decoding, Paged attention |
+| **Qwen3.5 Dense** | 6,768 |    Yes     |   Yes   |    No    | Compiled C++ forward, VLM variant     |
+| **Qwen3.5 MoE**   | 4,267 |    Yes     |   Yes   |    No    | Compiled C++ forward, VLM variant     |
+| **Gemma4**        | —     |    Yes     |   Yes   |    No    | Session-driven streaming              |
+| **LFM2.5**        | —     |    Yes     |   Yes   |    No    | Hybrid conv + attention               |
 
 ### Vision-Language Models
 
@@ -152,14 +156,24 @@ Functional forward pass architecture — stateless transformer components enable
 
 ### Streaming API
 
-AsyncGenerator-based `chatStream()` for Qwen3.5 models:
+AsyncGenerator-based streaming for every generative model flows through `ChatSession.sendStream()`:
 
 ```typescript
-import { Qwen35Model } from '@mlx-node/lm';
-for await (const event of model.chatStream(messages, config)) {
+import { loadSession } from '@mlx-node/lm';
+
+const session = await loadSession('./models/Qwen3.5-0.8B');
+for await (const event of session.sendStream('Hello!')) {
   if (!event.done) process.stdout.write(event.text);
 }
 ```
+
+### ChatSession Architecture
+
+`ChatSession<M>` is the cross-model chat wrapper in `packages/lm/src/chat-session.ts`. It holds a `SessionCapableModel` and exposes `send`, `sendStream`, `sendToolResult`, `sendToolResultStream`, and `reset`, plus `primeHistory` / `startFromHistory` / `startFromHistoryStream` for server-side cold-start replay. All generative wrappers (Qwen3, Qwen3.5 Dense, Qwen3.5 MoE, Lfm2, Gemma4, and the VLM `QianfanOCRModel` in `@mlx-node/vlm`) structurally satisfy `SessionCapableModel` — any of them can be passed to `new ChatSession(model)`.
+
+Turn 0 (and any turn whose image set changed) dispatches through the native `chatSessionStart` with the full rebuilt history; later turns take the cheap `chatSessionContinue` delta path that reuses the live KV cache. Tool-result turns always use `chatSessionContinueTool`. The server-side `/v1/responses` and `/v1/messages` endpoints route through a per-model `SessionRegistry` that owns the `ChatSession` lifetimes — clients pass `previous_response_id` and the registry handles resume vs. cold-start replay internally.
+
+The legacy `.chat()` / `.chatStream()` surface is fully removed from all generative models. The only exception is PaddleOCR-VL's `VLModel.chat()`, which remains as a deliberate single-turn OCR entry point and is intentionally kept out of the session API.
 
 ### CLI Tool (`@mlx-node/cli`)
 
@@ -244,7 +258,8 @@ mlx-node/
 │   ├── core/                         # @mlx-node/core (native addon)
 │   ├── lm/                           # @mlx-node/lm (808 lines)
 │   │   └── src/
-│   │       ├── stream.ts             # AsyncGenerator chatStream wrapper
+│   │       ├── stream.ts             # Session-aware model wrappers + `_runChatStream` callback→AsyncGenerator bridge
+│   │       ├── chat-session.ts       # `ChatSession<M>` cross-model chat wrapper (send/sendStream/sendToolResult/reset)
 │   │       ├── profiling.ts          # JS profiling API
 │   │       ├── models/               # loadModel, Qwen3/3.5 configs
 │   │       └── tools/                # Tool definition types
@@ -329,18 +344,18 @@ yarn build:ts     → packages/*/dist/ (via tsc -b with project references)
 ## Import Patterns
 
 ```typescript
-// Inference
-import { Qwen3Model, Qwen35Model, loadModel, QWEN3_CONFIGS } from '@mlx-node/lm';
+// Inference + chat sessions
+import { Qwen3Model, Qwen35Model, loadModel, loadSession, ChatSession, QWEN3_CONFIGS } from '@mlx-node/lm';
 
 // Training
 import { GRPOTrainer, GRPOConfig, SFTTrainer } from '@mlx-node/trl';
 
 // Vision & Document Processing
-import { VLModel, StructureV3Pipeline, DocLayoutModel } from '@mlx-node/vlm';
+import { VLModel, QianfanOCRModel, StructureV3Pipeline, DocLayoutModel } from '@mlx-node/vlm';
 
-// Streaming
-import { Qwen35Model } from '@mlx-node/lm';
-for await (const event of model.chatStream(messages)) { ... }
+// Streaming chat via ChatSession
+const session = await loadSession('./model-path');
+for await (const event of session.sendStream('Hello!')) { ... }
 ```
 
 ---
