@@ -498,13 +498,13 @@ impl QianfanOCRInner {
         };
 
         let mut cache = self.kv_caches.take();
-
-        let prefill_logits = {
+        let prefill_result: Result<MxArray> = {
             let _ctx = StreamContext::new(generation_stream);
             self.language_model
-                .forward_from_embeddings(&prefill_embeds, &mut cache)?
+                .forward_from_embeddings(&prefill_embeds, &mut cache)
         };
         self.kv_caches = cache;
+        let prefill_logits = prefill_result?;
 
         // Eval prefill logits -- caches materialize through dependency graph
         prefill_logits.eval();
@@ -589,12 +589,12 @@ impl QianfanOCRInner {
             // Forward single token
             let token_2d = token.reshape(&[1, 1])?;
             let mut cache = self.kv_caches.take();
-
-            let logits = {
+            let step_result: Result<MxArray> = {
                 let _ctx = StreamContext::new(generation_stream);
-                self.language_model.forward(&token_2d, &mut cache)?
+                self.language_model.forward(&token_2d, &mut cache)
             };
             self.kv_caches = cache;
+            let logits = step_result?;
 
             let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
 
@@ -871,12 +871,13 @@ impl QianfanOCRInner {
             };
 
             let mut cache = self.kv_caches.take();
-            let prefill_logits = {
+            let prefill_result: Result<MxArray> = {
                 let _ctx = StreamContext::new(generation_stream);
                 self.language_model
-                    .forward_from_embeddings(&prefill_embeds, &mut cache)?
+                    .forward_from_embeddings(&prefill_embeds, &mut cache)
             };
             self.kv_caches = cache;
+            let prefill_logits = prefill_result?;
 
             prefill_logits.eval();
             synchronize_and_clear_cache();
@@ -988,11 +989,12 @@ impl QianfanOCRInner {
                 // Forward single token
                 let token_2d = token.reshape(&[1, 1])?;
                 let mut cache = self.kv_caches.take();
-                let logits = {
+                let step_result: Result<MxArray> = {
                     let _ctx = StreamContext::new(generation_stream);
-                    self.language_model.forward(&token_2d, &mut cache)?
+                    self.language_model.forward(&token_2d, &mut cache)
                 };
                 self.kv_caches = cache;
+                let logits = step_result?;
 
                 let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
 
@@ -1349,16 +1351,14 @@ impl QianfanOCRInner {
             self.language_model.get_embeddings(&input_ids)?
         };
 
-        // Follow the pre-existing `take()`+restore pattern from
-        // `chat_sync_core` for consistency; a follow-up task will fix
-        // all sites together.
         let mut cache = self.kv_caches.take();
-        let prefill_logits = {
+        let prefill_result: Result<MxArray> = {
             let _ctx = StreamContext::new(generation_stream);
             self.language_model
-                .forward_from_embeddings(&merged_embeds, &mut cache)?
+                .forward_from_embeddings(&merged_embeds, &mut cache)
         };
         self.kv_caches = cache;
+        let prefill_logits = prefill_result?;
 
         prefill_logits.eval();
         synchronize_and_clear_cache();
@@ -1431,11 +1431,12 @@ impl QianfanOCRInner {
 
             let token_2d = token.reshape(&[1, 1])?;
             let mut cache = self.kv_caches.take();
-            let logits = {
+            let step_result: Result<MxArray> = {
                 let _ctx = StreamContext::new(generation_stream);
-                self.language_model.forward(&token_2d, &mut cache)?
+                self.language_model.forward(&token_2d, &mut cache)
             };
             self.kv_caches = cache;
+            let logits = step_result?;
 
             let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
 
@@ -1799,12 +1800,13 @@ impl QianfanOCRInner {
         };
 
         let mut cache = self.kv_caches.take();
-        let prefill_logits = {
+        let prefill_result: Result<MxArray> = {
             let _ctx = StreamContext::new(generation_stream);
             self.language_model
-                .forward_from_embeddings(&merged_embeds, &mut cache)?
+                .forward_from_embeddings(&merged_embeds, &mut cache)
         };
         self.kv_caches = cache;
+        let prefill_logits = prefill_result?;
 
         prefill_logits.eval();
         synchronize_and_clear_cache();
@@ -1907,11 +1909,12 @@ impl QianfanOCRInner {
 
             let token_2d = token.reshape(&[1, 1])?;
             let mut cache = self.kv_caches.take();
-            let logits = {
+            let step_result: Result<MxArray> = {
                 let _ctx = StreamContext::new(generation_stream);
-                self.language_model.forward(&token_2d, &mut cache)?
+                self.language_model.forward(&token_2d, &mut cache)
             };
             self.kv_caches = cache;
+            let logits = step_result?;
 
             let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
 
@@ -2050,11 +2053,12 @@ impl QianfanOCRInner {
 
         // Prefill
         let mut cache = self.kv_caches.take();
-        let logits = {
+        let prefill_result: Result<MxArray> = {
             let _ctx = StreamContext::new(generation_stream);
-            self.language_model.forward(input_ids, &mut cache)?
+            self.language_model.forward(input_ids, &mut cache)
         };
         self.kv_caches = cache;
+        let logits = prefill_result?;
 
         // Eval prefill logits -- caches materialize through dependency graph
         logits.eval();
@@ -2081,11 +2085,12 @@ impl QianfanOCRInner {
 
             let token_2d = token.reshape(&[1, 1])?;
             let mut cache = self.kv_caches.take();
-            let logits = {
+            let step_result: Result<MxArray> = {
                 let _ctx = StreamContext::new(generation_stream);
-                self.language_model.forward(&token_2d, &mut cache)?
+                self.language_model.forward(&token_2d, &mut cache)
             };
             self.kv_caches = cache;
+            let logits = step_result?;
 
             let next_logits = logits.squeeze(Some(&[0, 1]))?;
             token = sample(&next_logits, Some(sampling_config))?;
