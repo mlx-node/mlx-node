@@ -140,6 +140,48 @@ pub fn wgpu_test_compile_gdn_post_dispatch_delta() -> Vec<f64> {
     out.to_vec()
 }
 
+/// Phase 6e: toggle the GDN decay-gate (compute_g) `mlx::core::compile`
+/// fast path.
+///
+/// When enabled, `mlx_gdn_compute_g_forward` routes the 9-op exp / add /
+/// log / where / negative / multiply chain through the compile pass so
+/// the whole softplus / exp tape collapses into one fused Compiled
+/// element-wise kernel. Across Qwen3.5-0.8B's 18 linear-attention layers
+/// this saves ~144 dispatches per decode token — the biggest single
+/// lever remaining after Phase 6b/6c/6d.
+///
+/// Default OFF. Plumbed from the `?compile_gdn_g=1` demo URL param and
+/// the TS test harness. The C++ side also reads `MLX_WGPU_COMPILE_GDN_G=1`
+/// from the env on first use for native builds.
+#[napi]
+pub fn wgpu_set_gdn_g_compile_enabled(enabled: bool) {
+    unsafe { sys::mlx_set_gdn_g_compile_enabled(enabled) }
+}
+
+/// Read the current state of the Phase 6e GDN compute_g compile flag.
+/// Useful for the demo profile UI and for the TS test harness.
+#[napi]
+pub fn wgpu_get_gdn_g_compile_enabled() -> bool {
+    unsafe { sys::mlx_get_gdn_g_compile_enabled() }
+}
+
+/// Phase 6e dispatch-count A/B test. Runs the GDN compute_g forward N
+/// times eagerly, then N times through `mlx::core::compile`, and returns
+/// `[eager_dispatches, compiled_dispatches, max_abs_err, n_iters]`. Gate:
+/// delta must be at least the Phase 6e spec floor (see the TS harness for
+/// the exact threshold) and `max_abs_err` must be zero.
+#[napi]
+pub fn wgpu_test_compile_gdn_g_dispatch_delta() -> Vec<f64> {
+    let mut out = [0.0_f64; 4];
+    let rc = unsafe { sys::mlx_test_compile_gdn_g_dispatch_delta(out.as_mut_ptr()) };
+    if rc != 0 {
+        // Same [-9999, rc, 0, 0] sentinel as Phase 6c/6d so the TS
+        // harness can surface the rc + last-test-error message.
+        return vec![-9999.0, rc as f64, 0.0, 0.0];
+    }
+    out.to_vec()
+}
+
 /// Retrieve the last-error message stashed by the Phase 6b/6c dispatch
 /// A/B test functions (set when their underlying C++ call throws). The
 /// browser test worker calls this on rc != 0 to include the C++ exception

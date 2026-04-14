@@ -1442,6 +1442,19 @@ int mlx_gdn_postfusion_forward(
     mlx_array** out_y);
 void mlx_set_gdn_post_compile_enabled(bool);
 bool mlx_get_gdn_post_compile_enabled();
+
+// Phase 6e: GDN decay-gate (compute_g) compile fast path. Same forward-
+// declare pattern as Phase 6b/6c/6d above — real definitions live in
+// mlx_fused_ops.cpp. Fuses exp/add/log/where/negative/multiply chain
+// from the Rust WASM inline path into one FFI call, which the compile
+// pass collapses into a single Compiled element-wise kernel.
+int mlx_gdn_compute_g_forward(
+    mlx_array* a_log_handle,
+    mlx_array* a_handle,
+    mlx_array* dt_bias_handle,
+    mlx_array** out_g_log);
+void mlx_set_gdn_g_compile_enabled(bool);
+bool mlx_get_gdn_g_compile_enabled();
 }
 
 // Phase 6b dispatch-count A/B test for the SwiGLU MLP compile fast path.
@@ -2109,6 +2122,219 @@ int mlx_test_compile_gdn_post_dispatch_delta(double* out) {
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[mlx_test_compile_gdn_post_dispatch_delta] %s\n", e.what());
+        extern void mlx_set_last_test_error(const char*);
+        mlx_set_last_test_error(e.what());
+        return -2;
+    }
+}
+
+// Phase 6e dispatch-count A/B test for the GDN decay-gate (compute_g)
+// compile fast path. Same harness pattern as Phase 6c/6d — runs
+// mlx_gdn_compute_g_forward N_ITERS times eagerly, then N_ITERS times
+// through mlx::core::compile, counting WebGPU dispatches with
+// wgpu::get_total_dispatches(). Writes four doubles into `out`:
+//   out[0] = eager dispatch count    (uint64 → cast to f64)
+//   out[1] = compiled dispatch count
+//   out[2] = max abs error between eager and compiled outputs (float)
+//   out[3] = N (the loop count, for divisor convenience on the JS side)
+//
+// Config mirrors a small-but-representative Qwen3.5-style GDN decay-gate
+// input: num_v_heads=32 (the [Hv] axis) with Tq=1 decode shape. a_log and
+// dt_bias are [Hv]; a is [1, 1, Hv]. Same [Hv] count as Qwen3.5-0.8B's
+// linear-attention layers.
+//
+// Expected delta: the eager path in mlx_gdn_compute_g_forward builds a
+// 9-element-wise-op tape (exp, add, exp, add-scalar, log, greater, where,
+// mul, negative). Under the compile pass every op is fusable so the tape
+// collapses into (best case) 1 Compiled kernel — saving ~8 dispatches per
+// call. N_ITERS=24 should see 24*8=192 fewer dispatches in theory; we
+// gate conservatively at >= 96 (4 dispatches saved per call) to leave
+// noise margin against scalar-arg reshuffling inside the compile pass.
+//
+// Parity gate scope: this A/B compares new-eager vs new-compile within
+// the new FFI — `maxAbsErr === 0` only directly proves the two new paths
+// agree. Parity with the pre-Phase-6e production path is guaranteed
+// *transitively* because `gdn_compute_g_body` and the eager branch of
+// `mlx_gdn_compute_g_forward` are op-for-op identical to the Rust
+// reference at `crates/mlx-core/src/models/qwen3_5/gated_delta.rs:45-56`
+// (non-WASM branch), which is still the source of truth for the clamp
+// semantics. If that Rust reference ever changes, this test will NOT
+// catch a drift against production — keep them in sync by hand.
+//
+// Uses std::unique_ptr for the persistent weight arrays so a mid-test
+// exception doesn't leak them (Phase 6d improvement).
+int mlx_test_compile_gdn_g_dispatch_delta(double* out) {
+    using namespace mlx::core;
+    if (!out) return -1;
+    try {
+        constexpr int N_ITERS = 24;
+        constexpr int B = 1;
+        constexpr int T = 1;
+        constexpr int NUM_V_HEADS = 32;  // [Hv] — matches Qwen3.5-0.8B GDN
+
+        // Build deterministic-but-non-trivial input buffers.
+        // a_log: [Hv]
+        std::vector<float> a_log_data(NUM_V_HEADS);
+        for (int i = 0; i < NUM_V_HEADS; ++i) {
+            a_log_data[i] = ((i * 7) % 13 - 6) / 13.0f;  // range roughly [-0.5, 0.5]
+        }
+        // dt_bias: [Hv]
+        std::vector<float> dt_bias_data(NUM_V_HEADS);
+        for (int i = 0; i < NUM_V_HEADS; ++i) {
+            dt_bias_data[i] = ((i * 5) % 11 - 5) / 11.0f;
+        }
+        // a: [B, T, Hv] — values deliberately chosen to exercise BOTH
+        // branches of `where(x > 20, x, log(exp(x)+1))`. Without the spike
+        // injection below the clamp branch is never entered and a
+        // regression that drops `where`/`greater` from the tape would slip
+        // through the parity gate (this is the exact bug Stage 1 caught
+        // in the first round of Phase 6e).
+        std::vector<float> a_data(B * T * NUM_V_HEADS);
+        for (size_t i = 0; i < a_data.size(); ++i) {
+            // Baseline: roughly [-10, 10], hits the log(exp(x)+1) branch.
+            float v = ((i * 11) % 41 - 20) / 2.0f;
+            // Every 7th element: push well above the 20.0 clamp threshold
+            // so `greater(x, thresh)` is true and `where` takes the x
+            // pass-through branch. Required for the Select/Greater ops to
+            // actually appear in the fused tape.
+            if ((i % 7) == 0) v += 25.0f;
+            a_data[i] = v;
+        }
+
+        auto make_a = [&]() {
+            return std::unique_ptr<array>(new array(
+                array(a_data.data(), {B, T, NUM_V_HEADS}, float32)));
+        };
+        // a_log and dt_bias are layer weights — construct once, reuse.
+        auto a_log = std::unique_ptr<array>(new array(
+            array(a_log_data.data(), {NUM_V_HEADS}, float32)));
+        auto dt_bias = std::unique_ptr<array>(new array(
+            array(dt_bias_data.data(), {NUM_V_HEADS}, float32)));
+
+        // Helper: run one compute_g forward, eval the output, optionally
+        // capture the flat buffer for parity diffing.
+        auto run_once = [&](bool capture_first, std::vector<float>& first_y) {
+            auto a_arr = make_a();
+            mlx_array* g_log_out = nullptr;
+            int rc = mlx_gdn_compute_g_forward(
+                reinterpret_cast<mlx_array*>(a_log.get()),
+                reinterpret_cast<mlx_array*>(a_arr.get()),
+                reinterpret_cast<mlx_array*>(dt_bias.get()),
+                &g_log_out);
+            if (rc != 0) {
+                throw std::runtime_error("mlx_gdn_compute_g_forward returned != 0");
+            }
+            auto* g_arr = reinterpret_cast<array*>(g_log_out);
+            eval_safe(*g_arr);
+            if (capture_first) {
+                size_t n = static_cast<size_t>(B) * T * NUM_V_HEADS;
+                auto* d = g_arr->data<float>();
+                if (d) first_y.assign(d, d + n);
+            }
+            delete g_arr;
+        };
+
+        bool prev_enabled = mlx_get_gdn_g_compile_enabled();
+
+        // Wrap each sub-phase in its own try-block so the TS failure
+        // message tells us exactly which phase (warmup-eager, eager,
+        // warmup-compile, compile) fired the exception.
+        auto run_phase = [&](const char* phase, auto&& fn) {
+            try {
+                fn();
+            } catch (const std::exception& e) {
+                throw std::runtime_error(std::string("[phase=") + phase +
+                                         "] " + e.what());
+            }
+        };
+
+        // Warm up eager path once before counting.
+        run_phase("warmup-eager", [&]() {
+            mlx_set_gdn_g_compile_enabled(false);
+            std::vector<float> scratch;
+            run_once(false, scratch);
+        });
+
+#ifdef MLX_USE_WEBGPU
+        wgpu::reset_dispatch_stats();
+#endif
+
+        // ----- Eager pass -----
+        std::vector<float> eager_first;
+        eager_first.reserve(B * T * NUM_V_HEADS);
+        run_phase("eager", [&]() {
+            mlx_set_gdn_g_compile_enabled(false);
+            for (int it = 0; it < N_ITERS; ++it) {
+                run_once(it == 0, eager_first);
+            }
+        });
+#ifdef MLX_USE_WEBGPU
+        uint64_t eager_dispatches = wgpu::get_total_dispatches();
+        wgpu::reset_dispatch_stats();
+#else
+        uint64_t eager_dispatches = 0;
+#endif
+
+        // Warm up compile path so the trace itself doesn't count.
+        run_phase("warmup-compile", [&]() {
+            mlx_set_gdn_g_compile_enabled(true);
+            std::vector<float> scratch;
+            run_once(false, scratch);
+        });
+#ifdef MLX_USE_WEBGPU
+        wgpu::reset_dispatch_stats();
+#endif
+
+        // ----- Compiled pass -----
+        std::vector<float> compiled_first;
+        compiled_first.reserve(B * T * NUM_V_HEADS);
+        run_phase("compile", [&]() {
+            for (int it = 0; it < N_ITERS; ++it) {
+                run_once(it == 0, compiled_first);
+            }
+        });
+#ifdef MLX_USE_WEBGPU
+        uint64_t compiled_dispatches = wgpu::get_total_dispatches();
+#else
+        uint64_t compiled_dispatches = 0;
+#endif
+
+        // Restore prior toggle so other tests see a clean process state.
+        mlx_set_gdn_g_compile_enabled(prev_enabled);
+
+        // ---- Numerical parity ----
+        float max_abs_err = 0.0f;
+        if (eager_first.size() == compiled_first.size() &&
+            !eager_first.empty()) {
+            for (size_t i = 0; i < eager_first.size(); ++i) {
+                float diff = std::abs(eager_first[i] - compiled_first[i]);
+                if (diff > max_abs_err) max_abs_err = diff;
+            }
+        } else {
+            max_abs_err = std::numeric_limits<float>::infinity();
+        }
+
+        // unique_ptr cleans up a_log / dt_bias automatically.
+
+        out[0] = static_cast<double>(eager_dispatches);
+        out[1] = static_cast<double>(compiled_dispatches);
+        out[2] = static_cast<double>(max_abs_err);
+        out[3] = static_cast<double>(N_ITERS);
+
+        fprintf(stderr,
+                "[Phase6e] eager_dispatches=%llu compiled_dispatches=%llu "
+                "delta=%lld max_abs_err=%g n_iters=%d\n",
+                static_cast<unsigned long long>(eager_dispatches),
+                static_cast<unsigned long long>(compiled_dispatches),
+                static_cast<long long>(eager_dispatches) -
+                    static_cast<long long>(compiled_dispatches),
+                static_cast<double>(max_abs_err),
+                N_ITERS);
+        fflush(stderr);
+
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[mlx_test_compile_gdn_g_dispatch_delta] %s\n", e.what());
         extern void mlx_set_last_test_error(const char*);
         mlx_set_last_test_error(e.what());
         return -2;

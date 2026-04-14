@@ -63,6 +63,22 @@ describe('Compile & GPU Buffers', () => {
     }
   });
 
+  // Phase 6e: GDN decay-gate (compute_g) compile fast path. Synthetic
+  // dispatch-count A/B test gating on (eager - compiled) >= 96 dispatches
+  // plus byte-level numerical parity. Fuses the 9-op softplus/exp chain
+  // from gated_delta.rs into one FFI call, which compile collapses into a
+  // single Compiled kernel. The biggest remaining dispatch lever — ~144
+  // saved per decode token across all 18 linear-attention layers. See
+  // test-worker.ts for the full assertion.
+  test('compile GDN compute_g dispatch delta (Phase 6e)', async () => {
+    const r = await runTest('compile GDN compute_g dispatch delta (Phase 6e)');
+    expect(r.passed, r.error).toBe(true);
+    if (r.info && typeof r.info === 'object') {
+      // eslint-disable-next-line no-console
+      console.log('[Phase 6e] stats =', JSON.stringify(r.info));
+    }
+  });
+
   test('gpu buffer array: create from eval\'d buffer, matmul 3 rounds', async () => {
     const r = await runTest('gpu buffer array: create from eval\'d buffer, matmul 3 rounds');
     expect(r.passed, r.error).toBe(true);

@@ -46,13 +46,12 @@ fn compute_g(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxArray>
 fn compute_g(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxArray> {
     // g = exp(-exp(A_log) * softplus(a + dt_bias))
     // softplus(x) = where(x > 20, x, log(1 + exp(x)))
-    let big_a = a_log.exp()?;                           // exp(A_log): [Hv]
-    let x = a.add(dt_bias)?;                            // a + dt_bias: [B, T, Hv]
-    let threshold = MxArray::from_float32(
-        &[20.0f32], &[1])?;                             // scalar 20.0
-    let sp = x.exp()?.add_scalar(1.0)?.log()?;          // log(1 + exp(x))
-    let sp = x.greater(&threshold)?.where_(&x, &sp)?;   // where(x > 20, x, sp)
-    let result = big_a.mul(&sp)?.negative()?.exp()?;     // exp(-(A * sp))
+    let big_a = a_log.exp()?; // exp(A_log): [Hv]
+    let x = a.add(dt_bias)?; // a + dt_bias: [B, T, Hv]
+    let threshold = MxArray::from_float32(&[20.0f32], &[1])?; // scalar 20.0
+    let sp = x.exp()?.add_scalar(1.0)?.log()?; // log(1 + exp(x))
+    let sp = x.greater(&threshold)?.where_(&x, &sp)?; // where(x > 20, x, sp)
+    let result = big_a.mul(&sp)?.negative()?.exp()?; // exp(-(A * sp))
     Ok(result)
 }
 
@@ -465,15 +464,34 @@ pub(crate) fn gated_delta_update_inner(
         }
     };
 
+    // Phase 6e: route the compute_g log-space tape through the fused
+    // `mlx_gdn_compute_g_forward` FFI. The FFI builds the same 9-op
+    // exp/add/log/where/negative/multiply chain that the inline Rust
+    // version did, but when the Phase 6e compile flag is on (via
+    // wgpuSetGdnGCompileEnabled or MLX_WGPU_COMPILE_GDN_G=1) the whole
+    // element-wise chain is routed through mlx::core::compile and fuses
+    // into a single Compiled kernel. Default OFF → the FFI runs its
+    // eager path, which is op-for-op equivalent to what the Rust inline
+    // used to build, so this is a zero-risk change on the cold path.
     #[cfg(target_family = "wasm")]
     let (beta, g_log) = {
+        use std::ptr;
         let beta = Activations::sigmoid(b)?;
-        let big_a = a_log.exp()?;
-        let x = a.add(dt_bias)?;
-        let threshold = MxArray::from_float32(&[20.0f32], &[1])?;
-        let sp = x.exp()?.add_scalar(1.0)?.log()?;
-        let sp = x.greater(&threshold)?.where_(&x, &sp)?;
-        let g_log = big_a.mul(&sp)?.negative()?;
+        let mut g_log_out: *mut sys::mlx_array = ptr::null_mut();
+        let rc = unsafe {
+            sys::mlx_gdn_compute_g_forward(
+                a_log.as_raw_ptr(),
+                a.as_raw_ptr(),
+                dt_bias.as_raw_ptr(),
+                &mut g_log_out,
+            )
+        };
+        if rc != 0 || g_log_out.is_null() {
+            return Err(Error::from_reason(
+                "mlx_gdn_compute_g_forward returned an error",
+            ));
+        }
+        let g_log = MxArray::from_handle(g_log_out, "gdn_compute_g_forward")?;
         (beta, g_log)
     };
 

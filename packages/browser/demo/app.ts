@@ -425,6 +425,13 @@ worker.addEventListener('messageerror', (e) => {
 // single fused Compiled kernel (~3 dispatches saved per linear-attention
 // layer per token). Smaller win than Phase 6c but same mechanism.
 // Default OFF.
+//
+// ?compile_gdn_g=1 enables the Phase 6e GDN decay-gate (compute_g)
+// `mlx::core::compile` fast path. The compile pass collapses the 9-op
+// softplus/exp chain (-exp(a_log) * softplus(a + dt_bias)) into a single
+// fused Compiled kernel — the biggest remaining dispatch lever at ~8
+// dispatches saved per linear-attention layer per token (~144 per decode
+// token across all 18 layers). Default OFF.
 const urlParams = new URLSearchParams(location.search);
 const packBf16 = urlParams.get('pack_bf16') !== '0'; // enabled by default, ?pack_bf16=0 to disable
 const sdpaFallback = urlParams.get('sdpa_fallback') === '1';
@@ -436,6 +443,7 @@ const dispatchBatch = urlParams.get('dispatch_batch') === '1';
 const compileMlp = urlParams.get('compile_mlp') === '1';
 const compileGdnPre = urlParams.get('compile_gdn_pre') === '1';
 const compileGdnPost = urlParams.get('compile_gdn_post') === '1';
+const compileGdnG = urlParams.get('compile_gdn_g') === '1';
 const useSab = urlParams.get('stream_sab') !== '0'; // enabled by default, ?stream_sab=0 to fall back to TSFN
 // ?mode=baseline | sab | tsfn — diagnostic A/B for the streaming path.
 // baseline = non-streaming chat() (ground-truth compute, no sink overhead).
@@ -448,6 +456,7 @@ const flagBadges =
   (compileMlp ? ' (compile_mlp=1)' : '') +
   (compileGdnPre ? ' (compile_gdn_pre=1)' : '') +
   (compileGdnPost ? ' (compile_gdn_post=1)' : '') +
+  (compileGdnG ? ' (compile_gdn_g=1)' : '') +
   (useSab ? '' : ' (stream_sab=0)') +
   (modeParam ? ` (mode=${modeParam})` : '');
 log(`Starting MLX Worker${flagBadges}...`);
@@ -463,6 +472,7 @@ worker.postMessage({
   compileMlp,
   compileGdnPre,
   compileGdnPost,
+  compileGdnG,
 });
 
 // Chat handler

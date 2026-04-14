@@ -61,6 +61,7 @@ async function handleInit(data: {
   compileMlp?: boolean;
   compileGdnPre?: boolean;
   compileGdnPost?: boolean;
+  compileGdnG?: boolean;
 }) {
   const packBf16 = data.packBf16 === true;
   const sdpaFallback = data.sdpaFallback === true;
@@ -79,6 +80,10 @@ async function handleInit(data: {
   // via ?compile_gdn_post=1 on the demo URL. Same pattern as 6b/6c —
   // process-wide atomic flipped before any forward pass runs.
   const compileGdnPost = data.compileGdnPost === true;
+  // Phase 6e: GDN decay-gate (compute_g) compile fast path. Default OFF;
+  // enable via ?compile_gdn_g=1 on the demo URL. Same pattern as
+  // 6b/6c/6d — process-wide atomic flipped before any forward pass runs.
+  const compileGdnG = data.compileGdnG === true;
   try {
     // 1. Spawn gpu-worker (owns GPUDevice, event loop free for GPU callbacks)
     post({ type: 'progress', step: 'gpu', message: 'Initializing WebGPU...' });
@@ -295,12 +300,19 @@ async function handleInit(data: {
     if (typeof mlxExports.wgpuSetGdnPostCompileEnabled === 'function') {
       mlxExports.wgpuSetGdnPostCompileEnabled(compileGdnPost);
     }
+    // Phase 6e GDN decay-gate (compute_g) compile fast path. Same pattern
+    // as 6b/6c/6d — process-wide atomic flag, flipped before any forward
+    // pass runs. Default OFF; enable via ?compile_gdn_g=1 on the demo URL.
+    if (typeof mlxExports.wgpuSetGdnGCompileEnabled === 'function') {
+      mlxExports.wgpuSetGdnGCompileEnabled(compileGdnG);
+    }
     const flagSuffix =
       (packBf16 ? ' pack_bf16=1' : '') +
       (sdpaFallback ? ' sdpa_fallback=1' : '') +
       (compileMlp ? ' compile_mlp=1' : '') +
       (compileGdnPre ? ' compile_gdn_pre=1' : '') +
-      (compileGdnPost ? ' compile_gdn_post=1' : '');
+      (compileGdnPost ? ' compile_gdn_post=1' : '') +
+      (compileGdnG ? ' compile_gdn_g=1' : '');
     post({
       type: 'progress',
       step: 'wasm',

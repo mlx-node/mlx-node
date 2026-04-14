@@ -329,6 +329,160 @@ auto& compiled_gdn_postfusion() {
   return fn;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 6e: mx::compile-wrapped GDN decay-gate (compute_g) fast path
+//
+// Same template as Phase 6b/6c/6d. The WASM decode path in Rust
+// (crates/mlx-core/src/models/qwen3_5/gated_delta.rs, use_kernel=true
+// branch) computes the decay gate in log-space as:
+//
+//   big_a  = exp(a_log)                              // dispatch 1
+//   x      = a + dt_bias                              // dispatch 2
+//   sp_raw = log(exp(x) + 1)                          // dispatches 3,4,5
+//   sp     = where(x > 20, x, sp_raw)                 // dispatches 6,7
+//   g_log  = -(big_a * sp)                            // dispatches 8,9
+//
+// That's ~9 element-wise dispatches per linear-attention layer per token.
+// Qwen3.5-0.8B has 18 such layers, so this is the single biggest remaining
+// source of non-FFI dispatch churn after Phase 6b/6c/6d. Every op here is
+// element-wise so the compile pass fuses the whole chain into (in the best
+// case) one Compiled kernel — an 8x-ish dispatch reduction per call.
+//
+// Env var: MLX_WGPU_COMPILE_GDN_G=1
+// Setter : mlx_set_gdn_g_compile_enabled(bool)
+//
+// The body is concrete-shape traced (`shapeless=false`) — see the
+// `compiled_gdn_compute_g()` accessor below for the full rationale. One
+// trace per distinct [B, T, Hv] signature: decode Tq=1 is the hot path
+// that gets reused across all tokens and layers; prefill Tq=prompt_len
+// gets its own cache entry. This matches Phase 6c/6d.
+//
+// The body returns g_log (pre-outer-exp), matching the semantics of the
+// existing WASM Rust inline path so the caller's `g = g_log.exp()` stays
+// unchanged and the downstream gated_delta_ops_inner sees bit-for-bit the
+// same tape as before (minus the fused element-wise chain).
+// ---------------------------------------------------------------------------
+std::atomic<bool> g_compile_gdn_g_enabled{false};
+std::atomic<bool> g_compile_gdn_g_env_read{false};
+
+bool compile_gdn_g_enabled() {
+  if (!g_compile_gdn_g_env_read.exchange(true, std::memory_order_acq_rel)) {
+    if (const char* v = std::getenv("MLX_WGPU_COMPILE_GDN_G")) {
+      if (v[0] == '1') {
+        g_compile_gdn_g_enabled.store(true, std::memory_order_relaxed);
+      }
+    }
+  }
+  return g_compile_gdn_g_enabled.load(std::memory_order_relaxed);
+}
+
+// Captureless free function describing the GDN decay-gate (compute_g) tape
+// in log-space. Inputs layout MUST match exactly what
+// mlx_gdn_compute_g_forward passes — note that ALL weight-shaped operands
+// AND the scalar clamp threshold are PRE-BROADCAST to [B, T, Hv] OUTSIDE
+// this body by the caller:
+//
+//   inputs[0] = big_a    [B, T, Hv]      pre-broadcast exp(a_log)
+//   inputs[1] = a        [B, T, Hv]      from prefusion split
+//   inputs[2] = dt_bias  [B, T, Hv]      pre-broadcast dt_bias
+//   inputs[3] = thresh   [B, T, Hv]      pre-broadcast 20.0 clamp threshold
+//
+// Why pre-broadcast OUTSIDE the compile body (vs. letting the implicit
+// broadcasts live inside): Phase 6e is the first compile-wrapped body in
+// this file whose weight-shaped operands ([Hv]) have to broadcast up to
+// per-token shape ([B, T, Hv]) inside the trace. Under `shapeless=true`
+// the WebGPU compile backend's `build_tape_expression`
+// (backend/webgpu/compiled.cpp:147-204) throws "static cast primitive
+// with != 1 inputs" on the resulting Broadcast nodes because the dynamic
+// `broadcast_arrays` branch (ops.cpp:1705-1740) emits multi-input
+// Broadcast primitives with the broadcasted array PLUS stop-gradient
+// references to every peer broadcast operand, and the CSE-collapsed
+// tape walks `is_static_cast` with `in_tmps.size() != 1`.
+//
+// The fix is two-fold:
+//   1. `shapeless=false` in `compiled_gdn_compute_g()` so broadcast_arrays
+//      takes the non-dynamic branch (ops.cpp:1655-1668), which emits
+//      single-input Broadcasts and early-outs when shapes match.
+//   2. Pre-broadcasting every non-`a` operand (big_a, dt_bias_b, thresh)
+//      to `a->shape()` before entering the trace so the non-dynamic
+//      branch's early-out fires for every one of them — the trace sees
+//      only same-shape element-wise ops (Exp, Add, Log, Multiply,
+//      Negative, Greater, Select) with zero Broadcast nodes inside.
+//
+// The pre-broadcasts themselves are metadata/stride-only ops in MLX
+// (zero-dispatch under the Phase 4 buffer-copy fast path) so there is
+// no added GPU cost.
+//
+// Returns: { g_log } where
+//     sp_raw = log(exp(x) + 1)
+//     sp     = where(x > 20, x, sp_raw)                // stability clamp
+//     g_log  = -(big_a * sp)
+// and x = a + dt_bias. This exactly mirrors the pre-Phase-6e Rust inline
+// path's softplus stability clamp, which is required for byte-identical
+// greedy decode on any input above ~20 (the A/B harness deliberately
+// injects +25 spikes into the >20 region to gate on the clamp).
+//
+// The tape is composed of unary + binary ops plus a Select ternary that
+// the WebGPU compile pass fuses:
+//   * Exp / Add / Log / Multiply / Negative — the original 6b/6c/6d
+//     pattern.
+//   * Greater + Select — Select handled at compiled.cpp:170-178, and
+//     Greater is a binary op with a WGSL expression in op_exprs.h:232.
+// `log1p` is intentionally NOT used: it would produce a Log1p primitive
+// that differs bit-for-bit from `log(exp(x)+1)` for small x, breaking
+// byte-identical greedy decode parity with the pre-Phase-6e Rust inline
+// reference at `gated_delta.rs:45-56` (which writes
+// `x.exp()?.add_scalar(1.0)?.log()?`).
+//
+// Op order mirrors the eager path in mlx_gdn_compute_g_forward below
+// exactly, so the compile pass sees a tape whose eager-path counterpart
+// is byte-for-byte equivalent — guaranteed by the A/B parity test in
+// mlx_nn_ops.cpp (maxAbsErr === 0 gate).
+std::vector<mlx::core::array> gdn_compute_g_body(
+    const std::vector<mlx::core::array>& inputs) {
+  using mlx::core::array;
+  // All four operands arrive at [B, T, Hv]. See the block comment above
+  // for the rationale (WebGPU compile backend's broadcast handling).
+  const auto& big_a = inputs[0];
+  const auto& a = inputs[1];
+  const auto& dt_bias_b = inputs[2];
+  const auto& thresh_b = inputs[3];
+
+  auto x = a + dt_bias_b;                             // [B, T, Hv]
+  // softplus via log(exp(x) + 1) with a where(x > 20, x, sp_raw)
+  // stability clamp — op-for-op identical to the pre-Phase-6e Rust
+  // inline path.
+  auto exp_x = exp(x);
+  auto one = array(1.0f, x.dtype());
+  auto sp_raw = log(exp_x + one);
+  auto sp = where(greater(x, thresh_b), x, sp_raw);
+  auto g_log = negative(big_a * sp);                  // -big_a * sp
+  return {g_log};
+}
+
+auto& compiled_gdn_compute_g() {
+  // shapeless=false: must be concrete-shape tracing, NOT dynamic tracing.
+  // Under dynamic tracing (shapeless=true) MLX's `broadcast_arrays` in
+  // ops.cpp:1705-1740 takes the dynamic branch which emits `Broadcast`
+  // primitives with multi-input layout (broadcasted array + stop-gradient
+  // references to all other broadcast operands). The WebGPU compile
+  // backend's build_tape_expression (backend/webgpu/compiled.cpp:147-204)
+  // then hits `is_static_cast(prim)` and throws
+  // "static cast primitive with != 1 inputs" because it assumes Broadcast
+  // is the unary primitive with exactly 1 input. Concrete-shape tracing
+  // uses the non-dynamic branch (ops.cpp:1655-1668) which creates unary
+  // single-input Broadcasts and, critically, early-outs when shapes
+  // already match — which they do in this body because the caller
+  // pre-broadcasts the small operands before entering the trace.
+  //
+  // Shape-key cost: each distinct [B, T, Hv] signature triggers a new
+  // trace + compile entry. In production decode T=1 is steady-state so
+  // one trace is reused across all tokens and layers — same cache
+  // behavior as Phase 6c/6d (which also use shapeless=false).
+  static auto fn = mlx::core::compile(gdn_compute_g_body, /*shapeless=*/false);
+  return fn;
+}
+
 // The compilable body. MUST be a top-level non-capturing function so
 // `mlx::core::compile` keys it by stable function identity (the template
 // overload in mlx/compile.h converts a capture-less lambda to a function
@@ -413,6 +567,20 @@ void mlx_set_gdn_post_compile_enabled(bool enabled) {
 
 bool mlx_get_gdn_post_compile_enabled() {
   return compile_gdn_post_enabled();
+}
+
+// Phase 6e: runtime setter/getter for the GDN decay-gate (compute_g)
+// compile fast path. Mirrors the Phase 6b/6c/6d pairs above — flipping
+// the process-wide std::atomic<bool> that mlx_gdn_compute_g_forward
+// checks before each call. Marking env-as-read on set ensures explicit
+// setter calls always win over a later env-var read.
+void mlx_set_gdn_g_compile_enabled(bool enabled) {
+  g_compile_gdn_g_enabled.store(enabled, std::memory_order_relaxed);
+  g_compile_gdn_g_env_read.store(true, std::memory_order_release);
+}
+
+bool mlx_get_gdn_g_compile_enabled() {
+  return compile_gdn_g_enabled();
 }
 
 // Fused SwiGLU MLP forward pass
@@ -1160,6 +1328,114 @@ int mlx_gdn_postfusion_forward(
     } catch (const std::exception& e) {
         std::cerr << "mlx_gdn_postfusion_forward error: " << e.what() << std::endl;
         *out_y = nullptr;
+        return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6e: Fused GDN decay-gate (compute_g) forward pass.
+//
+// Collapses the 9-op softplus / exp / multiply chain that the WASM Rust
+// decode path builds inline (gated_delta.rs, use_kernel=true branch) into
+// one FFI call. When the Phase 6e compile flag is on, the tape is routed
+// through mlx::core::compile so the entire element-wise chain fuses into
+// (best case) one Compiled kernel — ~8 dispatches saved per linear-
+// attention layer per token. Across Qwen3.5-0.8B's 18 such layers that is
+// ~144 dispatches/tok at the Phase 6e shape signature.
+//
+// Signature returns g_log (pre-outer-exp), matching the existing inline
+// WASM semantics. The caller's downstream `g = g_log.exp()` step stays as
+// its own dispatch so the surrounding decode tape is unchanged.
+//
+// Inputs:
+//   a_log_handle   : [Hv]                   learnable log decay
+//   a_handle       : [B, T, Hv]             from prefusion split
+//   dt_bias_handle : [Hv]                   learnable bias
+//
+// Returns: int rc (0 success, -1 error); writes *out_g_log on success.
+// Caller owns the returned mlx_array*.
+int mlx_gdn_compute_g_forward(
+    mlx_array* a_log_handle,
+    mlx_array* a_handle,
+    mlx_array* dt_bias_handle,
+    mlx_array** out_g_log) {
+    if (!out_g_log) {
+        std::cerr << "mlx_gdn_compute_g_forward error: out_g_log is null" << std::endl;
+        return -1;
+    }
+    *out_g_log = nullptr;
+    if (!a_log_handle || !a_handle || !dt_bias_handle) {
+        std::cerr << "mlx_gdn_compute_g_forward error: required input handle is null"
+                  << std::endl;
+        return -1;
+    }
+    try {
+        auto a_log = reinterpret_cast<array*>(a_log_handle);
+        auto a = reinterpret_cast<array*>(a_handle);
+        auto dt_bias = reinterpret_cast<array*>(dt_bias_handle);
+
+        // -----------------------------------------------------------------
+        // Phase 6e: mx::compile-wrapped fast path.
+        //
+        // The trace is shape-keyed (`shapeless=false`): decode Tq=1 is the
+        // steady-state hot path that gets reused across every token and
+        // every layer after the first call; prefill Tq=prompt_len produces
+        // its own cache entry. Same cache behavior as Phase 6c/6d.
+        //
+        // Pre-broadcast exp(a_log), dt_bias, and the scalar softplus
+        // clamp threshold from their native shapes ([Hv] or []) up to
+        // a->shape() BEFORE entering the compile body so the tape sees
+        // only same-shape element-wise ops. Without this, WebGPU
+        // compiled.cpp throws "static cast primitive with != 1 inputs"
+        // on the Broadcast primitives that the compile pass emits for
+        // the implicit rank-promotions — see the block comment on
+        // `gdn_compute_g_body` above. The broadcasts themselves are
+        // metadata/stride-only (zero-dispatch under Phase 4), so this
+        // costs nothing at runtime.
+        // -----------------------------------------------------------------
+        if (compile_gdn_g_enabled()) {
+            auto big_a_flat = exp(*a_log);                     // [Hv]
+            auto big_a = broadcast_to(big_a_flat, a->shape()); // [B, T, Hv]
+            auto dt_bias_b = broadcast_to(*dt_bias, a->shape());
+            auto thresh_scalar = array(20.0f, a->dtype());
+            auto thresh_b = broadcast_to(thresh_scalar, a->shape());
+            std::vector<array> ins{big_a, *a, dt_bias_b, thresh_b};
+            auto outs = compiled_gdn_compute_g()(ins);
+            *out_g_log = reinterpret_cast<mlx_array*>(new array(std::move(outs[0])));
+            return 0;
+        }
+
+        // Eager path — op-for-op mirror of `gdn_compute_g_body` above so
+        // the synthetic A/B parity gate (maxAbsErr === 0) holds trivially.
+        // The explicit pre-broadcasts match the compile-path shape
+        // discipline; broadcast_to is stride-only so result bits are
+        // identical to an implicit broadcast inside the following binary
+        // ops.
+        //
+        // Includes the `where(x > 20, x, log(exp(x)+1))` softplus
+        // stability clamp — this is the spec-required behavior that the
+        // pre-Phase-6e Rust inline path computed, and the A/B harness
+        // deliberately injects +25 spikes into the >20 region to gate
+        // on it. Without the clamp, `exp(x)` overflows to +inf for x
+        // beyond ~88 (f32) / ~11 (bf16), so the greedy decode path
+        // would diverge on the same inputs.
+        auto big_a_flat = exp(*a_log);
+        auto big_a = broadcast_to(big_a_flat, a->shape());
+        auto dt_bias_b = broadcast_to(*dt_bias, a->shape());
+        auto thresh_scalar = array(20.0f, a->dtype());
+        auto thresh_b = broadcast_to(thresh_scalar, a->shape());
+        auto x = *a + dt_bias_b;
+        auto exp_x = exp(x);
+        auto one = array(1.0f, x.dtype());
+        auto sp_raw = log(exp_x + one);
+        auto sp = where(greater(x, thresh_b), x, sp_raw);
+        auto g_log = negative(big_a * sp);
+
+        *out_g_log = reinterpret_cast<mlx_array*>(new array(std::move(g_log)));
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_gdn_compute_g_forward error: " << e.what() << std::endl;
+        *out_g_log = nullptr;
         return -1;
     }
 }

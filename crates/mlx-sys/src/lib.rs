@@ -1486,6 +1486,33 @@ unsafe extern "C-unwind" {
     // Same output format and return semantics as the Phase 6b/6c tests.
     pub fn mlx_test_compile_gdn_post_dispatch_delta(out: *mut f64) -> i32;
 
+    // Phase 6e: GDN decay-gate (compute_g) compile fast path — mirrors
+    // the Phase 6b/6c/6d pairs above. When enabled, mlx_gdn_compute_g_forward
+    // routes the 9-op exp/add/log/where/negative/multiply chain through
+    // mlx::core::compile so the whole element-wise softplus/exp tape
+    // collapses into one fused Compiled kernel. Default OFF; env var
+    // MLX_WGPU_COMPILE_GDN_G=1 or the runtime setter from the worker init
+    // path will enable it.
+    pub fn mlx_set_gdn_g_compile_enabled(enabled: bool);
+    pub fn mlx_get_gdn_g_compile_enabled() -> bool;
+
+    // Phase 6e FFI: fused GDN compute_g forward pass. Given a_log [Hv],
+    // a [B, T, Hv], dt_bias [Hv], returns g_log = -exp(a_log) * softplus(
+    // a + dt_bias) as a new array. Returns 0 on success (and writes
+    // *out_g_log), -1 on error.
+    pub fn mlx_gdn_compute_g_forward(
+        a_log_handle: *mut mlx_array,
+        a_handle: *mut mlx_array,
+        dt_bias_handle: *mut mlx_array,
+        out_g_log: *mut *mut mlx_array,
+    ) -> i32;
+
+    // Phase 6e dispatch-count A/B test. Runs the GDN compute_g forward
+    // N times through each path (eager, compiled) and writes
+    // [eager_dispatches, compiled_dispatches, max_abs_err, N] into `out`.
+    // Same output format and return semantics as the Phase 6b/6c/6d tests.
+    pub fn mlx_test_compile_gdn_g_dispatch_delta(out: *mut f64) -> i32;
+
     // Retrieve the last test-function exception message (set by the 6b/6c
     // dispatch A/B harnesses on rc != 0). Copies up to `buflen - 1` bytes
     // into `buf` and NUL-terminates; returns the number of bytes written.
