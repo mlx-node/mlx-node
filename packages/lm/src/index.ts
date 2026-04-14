@@ -57,11 +57,13 @@ export type { ChatStreamChunk, ChatStreamHandle } from '@mlx-node/core';
 // (and the VLM package's QianfanOCR wrapper) to turn a callback-based
 // native stream into an `AsyncGenerator<ChatStreamEvent>`.
 export { _createChatStream, _runChatStream } from './stream.js';
-// Structural interface matched by every generative model wrapper, used
-// as the upper-bound for `ChatSession<M>`. Exported so the VLM wrapper
-// can pin a compile-time conformance assertion. `ChatSession` itself
-// is still pending the T5 public-API sweep.
-export type { SessionCapableModel } from './chat-session.js';
+// Cross-model chat session wrapper (see chat-session.ts for design notes).
+// `SessionCapableModel` is the structural interface matched by every
+// generative model wrapper and used as the upper-bound for
+// `ChatSession<M>`; exported so the VLM wrapper can pin a compile-time
+// conformance assertion.
+export { ChatSession } from './chat-session.js';
+export type { ChatSessionOptions, SendOptions, SessionCapableModel } from './chat-session.js';
 
 // Model utilities (TypeScript-only)
 export {
@@ -73,7 +75,7 @@ export {
 } from './models/qwen3-configs.js';
 
 // Model loading
-export { loadModel, detectModelType, type ModelType } from './models/model-loader.js';
+export { loadModel, loadSession, detectModelType, type ModelType } from './models/model-loader.js';
 
 // Interfaces
 export type { TrainableModel, LoadableModel, EmbeddingModel } from './interfaces.js';

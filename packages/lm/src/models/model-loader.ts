@@ -9,6 +9,7 @@ import { join } from 'node:path';
 
 import { Gemma4Model, HarrierModel, QianfanOCRModel } from '@mlx-node/core';
 
+import { ChatSession, type SessionCapableModel } from '../chat-session.js';
 import type { LoadableModel, TrainableModel } from '../interfaces.js';
 import { Lfm2Model, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
@@ -59,6 +60,35 @@ export async function loadModel(modelPath: string): Promise<LoadableModel> {
     case 'lfm2':
       return Lfm2Model.load(modelPath) as unknown as Promise<LoadableModel>;
   }
+}
+
+/**
+ * Load a model and wrap it in a {@link ChatSession} for multi-turn chat.
+ *
+ * Convenience around `loadModel()` + `new ChatSession(model)` for the
+ * common case where a caller just wants an ergonomic session handle.
+ *
+ * Rejects models that cannot be driven by a `ChatSession`:
+ *   - Embedding models (`HarrierModel`) have no chat surface.
+ *   - The native `QianfanOCRModel` exposes callback-based streaming
+ *     methods that do not structurally satisfy `SessionCapableModel`'s
+ *     `AsyncGenerator` overloads. The VLM AsyncGenerator wrapper lives
+ *     in `@mlx-node/vlm` (importing it here would create a circular
+ *     package dependency), so callers who want a Qianfan-OCR session
+ *     must import `QianfanOCRModel` from `@mlx-node/vlm` and construct
+ *     `new ChatSession(model)` directly.
+ */
+export async function loadSession(modelPath: string): Promise<ChatSession<SessionCapableModel>> {
+  const m = await loadModel(modelPath);
+  if (m instanceof HarrierModel) {
+    throw new Error('loadSession: embedding models (Harrier) cannot be wrapped in a ChatSession');
+  }
+  if (m instanceof QianfanOCRModel) {
+    throw new Error(
+      'loadSession: Qianfan-OCR / InternVL session support lives in @mlx-node/vlm. Import QianfanOCRModel from @mlx-node/vlm and construct ChatSession(model) directly.',
+    );
+  }
+  return new ChatSession(m as unknown as SessionCapableModel);
 }
 
 export async function detectModelType(modelPath: string): Promise<ModelType> {
