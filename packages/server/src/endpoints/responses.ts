@@ -1112,8 +1112,9 @@ async function persistResponse(
   // a later `previous_response_id` continuation the responses endpoint
   // reads it back out of the trailing chain record and compares it
   // against the live id for `body.model`. See the endpoint's
-  // `readStoredModelInstanceId` helper and the guard block in
-  // `handleCreateResponse`.
+  // `readStoredModelIdentity` helper and the two-tier guard block in
+  // `handleCreateResponse` — records that predate this field fall
+  // back to friendly-name comparison via the compat path.
   const record: StoredResponseRecord = {
     id: response.id,
     createdAt: response.created_at,
@@ -1139,28 +1140,40 @@ async function persistResponse(
 }
 
 /**
- * Extract the persisted model instance id from a stored chain
- * record's `configJson` blob, or `undefined` if the record was
- * written before this field existed (pre-iter-21) or the blob is
- * malformed / missing.
+ * Two-tier identity signal extracted from a stored chain record's
+ * `configJson` blob:
  *
- * A parse failure or a missing field returns `undefined`, which the
- * caller treats identically to "id mismatch" and rejects the
- * continuation. This is intentional: a record we can't identify
- * might belong to any model, and silently falling back to the old
- * name comparison would re-open the hot-swap hole this field exists
- * to close.
+ *   - `{ kind: 'present', instanceId }` — the record carries an
+ *     explicit `modelInstanceId`. The caller runs the strict
+ *     instance-id comparison and rejects any mismatch as a
+ *     hot-swap / rebind.
+ *   - `{ kind: 'absent' }` — the record either has no `configJson`,
+ *     has a malformed blob, or has a blob that doesn't carry a
+ *     well-formed `modelInstanceId` field. The caller falls back
+ *     to comparing the stored friendly-name `model` string against
+ *     `body.model` (the pre-iter-21 behavior) and logs a warning
+ *     so the compat path is observable in telemetry.
+ *
+ * The split exists so iter-22 doesn't break upgrade: a pre-iter-21
+ * record (or one whose `configJson` was rewritten by a tool that
+ * didn't preserve unknown keys) would otherwise be uncontinueable
+ * until TTL expiry, because iter-21's strict-reject treated
+ * "id explicitly absent" identically to "id mismatch". New records
+ * always carry identity, so strict-reject is still the steady-state
+ * policy — the compat path only fires on the upgrade boundary.
  */
-function readStoredModelInstanceId(record: StoredResponseRecord): number | undefined {
-  if (record.configJson == null) return undefined;
+type StoredModelIdentity = { kind: 'present'; instanceId: number } | { kind: 'absent' };
+
+function readStoredModelIdentity(record: StoredResponseRecord): StoredModelIdentity {
+  if (record.configJson == null) return { kind: 'absent' };
   try {
     const parsed = JSON.parse(record.configJson) as { modelInstanceId?: unknown };
     if (typeof parsed.modelInstanceId === 'number' && Number.isFinite(parsed.modelInstanceId)) {
-      return parsed.modelInstanceId;
+      return { kind: 'present', instanceId: parsed.modelInstanceId };
     }
-    return undefined;
+    return { kind: 'absent' };
   } catch {
-    return undefined;
+    return { kind: 'absent' };
   }
 }
 
@@ -1205,22 +1218,28 @@ export async function handleCreateResponse(
     return;
   }
 
-  // Fetch the per-model session registry. `model` was just resolved
-  // from the same `ModelRegistry`, so this should always succeed — but
-  // guard anyway to surface a clear error rather than crashing.
-  const sessionReg: SessionRegistry | undefined = registry.getSessionRegistry(body.model);
-  if (!sessionReg) {
+  // Capture an initial snapshot of the live binding for `body.model`.
+  // These values are the INITIAL observation — on a
+  // `previous_response_id` continuation we re-read them after
+  // `await store.getChain(...)` and reject the request if the
+  // binding moved under us (see the hot-swap race guard below).
+  // Stateless requests never hit the store so the re-read is a
+  // no-op for them.
+  const initialSessionReg: SessionRegistry | undefined = registry.getSessionRegistry(body.model);
+  if (!initialSessionReg) {
     sendInternalError(res, 'session registry missing for registered model');
     return;
   }
+  const initialInstanceId = registry.getInstanceId(body.model);
 
-  // Monotonic per-instance id for the model currently bound to
-  // `body.model`. Stashed into each persisted record below and used
-  // on a later `previous_response_id` continuation to verify that
-  // the stored chain was produced by the SAME model object — see
-  // the guard block a few lines down for why we can't compare
-  // friendly names.
-  const currentInstanceId = registry.getInstanceId(body.model);
+  // Mutable handles for the registry binding that actually gets
+  // used for dispatch / persistence. For stateless requests these
+  // stay equal to the initial snapshot. For a `previous_response_id`
+  // continuation they are re-read after `await store.getChain()`
+  // and, if they match the initial snapshot, are used as the
+  // canonical current-binding values from that point forward.
+  let sessionReg: SessionRegistry = initialSessionReg;
+  let currentInstanceId: number | undefined = initialInstanceId;
 
   const responseId = genId('resp_');
 
@@ -1235,6 +1254,43 @@ export async function handleCreateResponse(
         sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
         return;
       }
+
+      // Hot-swap race guard (iter-22 finding 3).
+      //
+      // Between the pre-await snapshot above and this point a
+      // concurrent `registry.register(body.model, differentModel)`
+      // can re-point the friendly name at a new object. If we
+      // kept using `initialSessionReg` / `initialInstanceId` the
+      // request would dispatch through the stale session
+      // registry, compare the stored identity against the dead
+      // instance id, and persist the new record under the old
+      // binding — even though `body.model` now resolves to a
+      // different live model. Re-read the current binding and
+      // reject the request when anything changed so the caller
+      // can retry against the new identity.
+      const refreshedSessionReg = registry.getSessionRegistry(body.model);
+      const refreshedInstanceId = registry.getInstanceId(body.model);
+      if (
+        refreshedSessionReg === undefined ||
+        refreshedInstanceId === undefined ||
+        refreshedSessionReg !== initialSessionReg ||
+        refreshedInstanceId !== initialInstanceId
+      ) {
+        sendBadRequest(
+          res,
+          `Model "${body.model}" binding changed while the request was resolving its previous_response_id ` +
+            `chain. A concurrent register() re-pointed the name at a different model instance (or released ` +
+            `it entirely) during the store lookup, so the session registry and instance id captured before ` +
+            `the await no longer match the live binding. Dispatching anyway would replay the stored chain ` +
+            `through the wrong model. Retry the request — if the swap was intentional, the new binding will ` +
+            `service the retry cleanly.`,
+          'model',
+        );
+        return;
+      }
+      sessionReg = refreshedSessionReg;
+      currentInstanceId = refreshedInstanceId;
+
       // Cross-model continuation guard, keyed on MODEL-INSTANCE
       // IDENTITY, not friendly name. The stored trailing record
       // carries a monotonic `modelInstanceId` assigned by
@@ -1258,28 +1314,56 @@ export async function handleCreateResponse(
       //    `body.model = "beta"` against a chain stored under
       //    `"alpha"`.
       //
-      // Fail closed when the id is missing on EITHER side: a
-      // stored record written before this field existed is
-      // indistinguishable from any other model's record, and a
-      // `currentInstanceId === undefined` means `body.model` has
-      // no live binding (unreachable here because `registry.get`
-      // already succeeded — kept as a defence in depth in case the
-      // binding goes away under concurrent unregistration).
-      const storedInstanceId = readStoredModelInstanceId(chain[chain.length - 1]!);
-      if (currentInstanceId === undefined || storedInstanceId === undefined || currentInstanceId !== storedInstanceId) {
-        sendBadRequest(
-          res,
-          `previous_response_id "${body.previous_response_id}" belongs to a chain produced by a different ` +
-            `model instance than the one currently bound to "${body.model}". This happens when the named ` +
-            `model has been hot-swapped to a different underlying object since the chain was stored, when ` +
-            `the original binding has been released entirely, or when the stored record predates ` +
-            `model-instance tracking. Continuations cannot cross model boundaries — a stored chain is tied ` +
-            `to the tokenizer, chat template, and KV layout of the exact model object that produced it, ` +
-            `and replaying it through a different model would silently corrupt the conversation. Start a ` +
-            `new chain without previous_response_id.`,
-          'model',
+      // Two-tier identity policy (iter-22 finding 2). Records that
+      // carry an explicit `modelInstanceId` take the strict path:
+      // any mismatch is a hot-swap / rebind and the continuation
+      // is rejected. Records that DO NOT carry identity — either
+      // because they predate iter-21 or because a tool rewrote
+      // `configJson` without preserving unknown keys — take the
+      // COMPAT path: we fall back to comparing the stored
+      // friendly-name `model` string against `body.model` (the
+      // pre-iter-21 behavior) and log a warning. The compat path
+      // only runs for records without identity, which is exactly
+      // the upgrade boundary; new records always carry identity,
+      // so strict-reject is the steady-state policy.
+      const trailingRecord = chain[chain.length - 1]!;
+      const storedIdentity = readStoredModelIdentity(trailingRecord);
+      if (storedIdentity.kind === 'present') {
+        if (currentInstanceId === undefined || storedIdentity.instanceId !== currentInstanceId) {
+          sendBadRequest(
+            res,
+            `previous_response_id "${body.previous_response_id}" belongs to a chain produced by a different ` +
+              `model instance than the one currently bound to "${body.model}". This happens when the named ` +
+              `model has been hot-swapped to a different underlying object since the chain was stored or ` +
+              `when the original binding has been released entirely. Continuations cannot cross model ` +
+              `boundaries — a stored chain is tied to the tokenizer, chat template, and KV layout of the ` +
+              `exact model object that produced it, and replaying it through a different model would ` +
+              `silently corrupt the conversation. Start a new chain without previous_response_id.`,
+            'model',
+          );
+          return;
+        }
+      } else {
+        // Compat fallback: stored record carries no identity.
+        // Compare friendly names instead, and log a warning so
+        // the fallback is observable in telemetry.
+        if (trailingRecord.model !== body.model) {
+          sendBadRequest(
+            res,
+            `previous_response_id "${body.previous_response_id}" belongs to a chain stored under model ` +
+              `"${trailingRecord.model}", which differs from the current request's model "${body.model}". ` +
+              `Continuations cannot cross model boundaries — a stored chain is tied to the tokenizer, chat ` +
+              `template, and KV layout of the model that produced it, and replaying it through a different ` +
+              `model would silently corrupt the conversation. Start a new chain without previous_response_id.`,
+            'model',
+          );
+          return;
+        }
+        console.warn(
+          `[responses] previous_response_id "${body.previous_response_id}" has no persisted model instance id; ` +
+            `falling back to friendly-name comparison for backwards compat. This record likely predates ` +
+            `iter 21 or was rewritten without preserving modelInstanceId.`,
         );
-        return;
       }
       priorMessages = reconstructMessagesFromChain(chain);
       previousResponseId = body.previous_response_id;

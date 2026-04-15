@@ -89,21 +89,29 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
       if (typeof content === 'string') {
         messages.push({ role: 'user', content });
       } else {
-        // Emit messages in original block order, grouping consecutive text/image blocks
-        let pendingText: string[] = [];
-        let pendingImages: Uint8Array[] = [];
-
-        const flushUserBlock = (): void => {
-          if (pendingText.length > 0 || pendingImages.length > 0) {
-            const userMsg: ChatMessage = { role: 'user', content: pendingText.join('') };
-            if (pendingImages.length > 0) {
-              userMsg.images = pendingImages;
-            }
-            messages.push(userMsg);
-            pendingText = [];
-            pendingImages = [];
-          }
-        };
+        // Split the turn's content blocks into two passes:
+        //
+        //   1. A contiguous block of `tool_result` messages (if any),
+        //      emitted FIRST so they sit immediately after the
+        //      preceding assistant fan-out. `validateAndCanonicalizeHistoryToolOrder`
+        //      in `endpoints/responses.ts` (called from
+        //      `endpoints/messages.ts`) requires every fan-out's
+        //      resolution block to be contiguous — interposing a
+        //      user/text/image turn in the middle orphans the
+        //      fan-out and trips the walker's 400.
+        //   2. Any `text`/`image` blocks from the SAME user turn,
+        //      emitted AFTER the tool block as a trailing `user`
+        //      message. This preserves a legitimate Anthropic shape
+        //      like `[text, tool_result, tool_result]` — a
+        //      human-written follow-up that ships both its own
+        //      preamble and the tool results in one request.
+        //
+        // Within the tool block we preserve the caller's relative
+        // order. Downstream canonicalization will reorder against
+        // the assistant's declared sibling order if needed.
+        const toolResults: { toolCallId: string; content: string }[] = [];
+        const pendingText: string[] = [];
+        const pendingImages: Uint8Array[] = [];
 
         for (const block of content as AnthropicContentBlock[]) {
           if (block.type === 'text') {
@@ -111,20 +119,37 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
           } else if (block.type === 'image' && block.source.type === 'base64') {
             pendingImages.push(Buffer.from(block.source.data, 'base64'));
           } else if (block.type === 'tool_result') {
-            // Flush any pending text/images before the tool result
-            flushUserBlock();
-            messages.push({
-              role: 'tool',
-              content: resolveToolResultContent(block.content),
+            toolResults.push({
               toolCallId: block.tool_use_id,
+              content: resolveToolResultContent(block.content),
             });
           } else {
             throw new Error(`Unsupported content block type: "${block.type}"`);
           }
         }
 
-        // Flush any remaining text/images
-        flushUserBlock();
+        // Emit the tool block first so it sits contiguous with the
+        // preceding assistant fan-out.
+        for (const tr of toolResults) {
+          messages.push({
+            role: 'tool',
+            content: tr.content,
+            toolCallId: tr.toolCallId,
+          });
+        }
+
+        // Emit residual text/image content as a trailing user turn.
+        // When the turn carried no tool_result blocks at all this
+        // is the ONLY user message produced for the turn, matching
+        // the pre-fix behavior for plain `[text, image, ...]`
+        // turns.
+        if (pendingText.length > 0 || pendingImages.length > 0) {
+          const userMsg: ChatMessage = { role: 'user', content: pendingText.join('') };
+          if (pendingImages.length > 0) {
+            userMsg.images = pendingImages;
+          }
+          messages.push(userMsg);
+        }
       }
     } else if (role === 'assistant') {
       if (typeof content === 'string') {

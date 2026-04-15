@@ -78,7 +78,15 @@ describe('mapAnthropicRequest', () => {
     expect(messages).toEqual([{ role: 'tool', content: '72F and sunny', toolCallId: 'call_abc' }]);
   });
 
-  it('maps mixed user message (text + tool_result) → user message then tool messages', () => {
+  it('maps mixed user message (text + tool_result) → tool messages first, then residual user turn', () => {
+    // Iter-22 finding 1: a user turn that mixes a text preamble with
+    // `tool_result` blocks must emit the tool block FIRST so it sits
+    // immediately after the preceding assistant fan-out. The text is
+    // folded into a trailing `user` message so
+    // `validateAndCanonicalizeHistoryToolOrder` (called from both
+    // `/v1/responses` and `/v1/messages`) sees a contiguous
+    // assistant-fan-out -> tool-block shape and doesn't 400 the
+    // request as an orphaned fan-out.
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
@@ -95,9 +103,9 @@ describe('mapAnthropicRequest', () => {
     });
 
     expect(messages).toEqual([
-      { role: 'user', content: 'Here is the weather result:' },
       { role: 'tool', content: 'Rainy', toolCallId: 'call_123' },
       { role: 'tool', content: 'Sunny', toolCallId: 'call_456' },
+      { role: 'user', content: 'Here is the weather result:' },
     ]);
   });
 
