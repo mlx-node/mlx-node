@@ -3317,6 +3317,272 @@ describe('createHandler', () => {
       expect(swappedContinue).not.toHaveBeenCalled();
       expect(swappedContinueTool).not.toHaveBeenCalled();
     });
+
+    it('rejects previous_response_id continuation when the binding is re-registered while the mutex holds a prior dispatch', async () => {
+      // Iter-25 finding 1 regression: the handler snapshots
+      // `sessionReg` / `currentInstanceId` before entering
+      // `await sessionReg.withExclusive(...)`, and
+      // `ModelRegistry.register()` is NOT coordinated with that
+      // lock. A waiter queued behind a long-running dispatch
+      // for the same model would therefore execute against a
+      // stale `sessionReg` reference even if `register()` has
+      // already rebound the name mid-wait. The in-mutex re-read
+      // introduced for this finding catches the drift and
+      // rejects the request BEFORE any native dispatch runs.
+      //
+      // Simulate the race by making the blocker's dispatch
+      // resolve only after we have both:
+      //   1. Queued a second request on the same model, and
+      //   2. Swapped `race-model` to a different instance.
+      // When the second waiter finally wins the mutex, its
+      // pre-lock `sessionReg` snapshot is the ORIGINAL binding
+      // while the live binding is the swapped one. The guard
+      // must fire.
+      const registry = new ModelRegistry();
+      const originalModel = createMockModel(makeChatResult({ text: 'original' }));
+      const swappedModel = createMockModel(makeChatResult({ text: 'swapped' }));
+
+      // Pin the blocker's `chatSessionStart` on an externally
+      // controlled gate so we can choose exactly when it
+      // resolves. Also publish a "blocker has entered the
+      // mutex and is awaiting chatSessionStart" signal so the
+      // test can wait for the mutex to be held before firing
+      // the queued request.
+      let releaseBlocker!: () => void;
+      const blockerGate = new Promise<void>((resolve) => {
+        releaseBlocker = resolve;
+      });
+      let blockerEntered!: () => void;
+      const blockerEnteredPromise = new Promise<void>((resolve) => {
+        blockerEntered = resolve;
+      });
+      (originalModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+        // Signal that the blocker is now holding the mutex —
+        // this is the earliest point where the mutex is
+        // guaranteed to be acquired, since `getOrCreate` ran
+        // just before this call and the dispatch is inside
+        // the `withExclusive` closure.
+        blockerEntered();
+        await blockerGate;
+        return makeChatResult({ text: 'original' });
+      });
+
+      registry.register('race-model', originalModel);
+      const handler = createHandler(registry);
+
+      // Kick off the blocker. It acquires the mutex, calls
+      // `chatSessionStart`, and parks on `blockerGate`.
+      const req1 = createMockReq('POST', '/v1/responses', {
+        model: 'race-model',
+        input: 'blocking turn',
+      });
+      const { res: res1, waitForEnd: wait1 } = createMockRes();
+      const blockerDone = (async () => {
+        await handler(req1, res1);
+        await wait1();
+      })();
+
+      // Wait for the blocker to actually enter the mutex. Until
+      // `blockerEnteredPromise` resolves, the body-parser await
+      // chain has not yet reached `withExclusive` and a
+      // concurrent request would just interleave normally
+      // without exercising the race we are testing.
+      await blockerEnteredPromise;
+
+      // Fire the queued request. It will enter
+      // `withExclusive` and park on the chain's `prev` promise
+      // until the blocker releases the lock.
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'race-model',
+        input: 'queued turn',
+      });
+      const { res: res2, getStatus: getStatus2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
+      const queuedDone = (async () => {
+        await handler(req2, res2);
+        await wait2();
+      })();
+
+      // Yield enough real task ticks for the queued request's
+      // body parser to drain and reach the `withExclusive`
+      // await, where it parks behind the blocker. Body parse
+      // goes through `Readable.on('data')` which emits via
+      // setImmediate, not just microtasks — so we pump a few
+      // macrotask cycles before firing the swap.
+      for (let i = 0; i < 5; i++) {
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
+      }
+
+      // Hot-swap the binding STRICTLY between the queued
+      // request's pre-lock snapshot and the moment it wins the
+      // mutex. The queued request has already captured
+      // `sessionReg` (the original binding) — when it finally
+      // runs, the in-mutex re-read must detect the drift.
+      registry.register('race-model', swappedModel);
+
+      // Release the blocker so the mutex falls through to the
+      // queued request.
+      releaseBlocker();
+      await blockerDone;
+      await queuedDone;
+
+      // Queued request was rejected 400 by the in-lock guard.
+      expect(getStatus2()).toBe(400);
+      const err = JSON.parse(getBody2());
+      expect(err.error.type).toBe('invalid_request_error');
+      expect(err.error.message).toContain('race-model');
+      expect(err.error.message).toMatch(/binding changed/i);
+      expect(err.error.message).toMatch(/queued behind the per-model execution mutex/i);
+
+      // The swapped model must NOT have been dispatched — the
+      // queued request's closure aborted before `getOrCreate`.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const swappedStartNew = swappedModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const swappedContinueNew = swappedModel.chatSessionContinue as unknown as ReturnType<typeof vi.fn>;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const swappedContinueToolNew = swappedModel.chatSessionContinueTool as unknown as ReturnType<typeof vi.fn>;
+      expect(swappedStartNew).not.toHaveBeenCalled();
+      expect(swappedContinueNew).not.toHaveBeenCalled();
+      expect(swappedContinueToolNew).not.toHaveBeenCalled();
+
+      // Original model serviced the blocker (one call) and was
+      // NOT re-invoked by the queued request — the queued
+      // closure never reached the dispatch site.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const originalStartNew = originalModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(originalStartNew).toHaveBeenCalledTimes(1);
+    });
+
+    it('cold-replays a previous_response_id chain whose prior turn produced a successful blank assistant message', async () => {
+      // Iter-25 finding 3 integration regression: the server
+      // deliberately emits a `message` item with empty text
+      // when a turn completes with no tool calls and no
+      // output. Until iter-25, `reconstructMessagesFromChain`
+      // would silently drop that blank assistant turn on cold
+      // replay, so a `previous_response_id` continuation after
+      // TTL expiry / process restart would prime a DIFFERENT
+      // conversation than the live session saw.
+      //
+      // Drive turn 1 through the handler normally (mock model
+      // returns empty text). Persist it into the store. Force
+      // cold replay on turn 2 by clearing the warm
+      // `SessionRegistry` entry via the public `clear()`
+      // method. Then verify that `chatSessionStart` on the
+      // cold-replay path receives a primed history containing
+      // the blank assistant turn.
+      const registry = new ModelRegistry();
+      // Turn 1 resolves with empty text: a legitimate
+      // successful-blank completion.
+      // Turn 2 resolves with a plain reply so the test can pin
+      // the cold-replay dispatch with a cheap assertion.
+      const mockModel = {
+        chatSessionStart: vi
+          .fn()
+          .mockResolvedValueOnce(makeChatResult({ text: '', rawText: '' }))
+          .mockResolvedValueOnce(makeChatResult({ text: 'turn 2 reply' })),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('should not hit hot path after clear')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('not expected')),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('blank-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Turn 1: cold-start produces a blank assistant reply.
+      const req1 = createMockReq('POST', '/v1/responses', {
+        model: 'blank-model',
+        input: 'hello',
+      });
+      const { res: res1, getStatus: getStatus1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      expect(getStatus1()).toBe(200);
+      const resp1 = JSON.parse(getBody1());
+      expect(resp1.status).toBe('completed');
+      expect(resp1.output_text).toBe('');
+
+      // Verify the persisted output really does contain a
+      // `message` item (with empty text). This is the stored
+      // shape the iter-24 predicate silently dropped on cold
+      // replay; the integration assertion below rides on it.
+      const stored1 = storedRecords.get(resp1.id);
+      expect(stored1).toBeDefined();
+      const stored1Output = JSON.parse(stored1.outputJson) as Array<{
+        type: string;
+        content?: Array<{ text: string }>;
+      }>;
+      const messageItem = stored1Output.find((item) => item.type === 'message');
+      expect(messageItem).toBeDefined();
+      expect(messageItem!.content?.map((c) => c.text).join('')).toBe('');
+
+      // Force cold replay on turn 2 by clearing the warm
+      // session entry. `SessionRegistry.clear()` is the same
+      // public knob used by the shutdown path.
+      const sessionReg = registry.getSessionRegistry('blank-model');
+      expect(sessionReg).toBeDefined();
+      sessionReg!.clear();
+
+      // Turn 2: continuation against resp1 MUST cold-replay
+      // from the store. The cold replay path calls
+      // `startFromHistory` which dispatches `chatSessionStart`
+      // with the FULL primed history including the blank
+      // assistant turn.
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'blank-model',
+        previous_response_id: resp1.id,
+        input: 'follow up',
+      });
+      const { res: res2, getStatus: getStatus2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+      expect(getStatus2()).toBe(200);
+      const resp2 = JSON.parse(getBody2());
+      expect(resp2.status).toBe('completed');
+      expect(resp2.output_text).toBe('turn 2 reply');
+
+      // Inspect the cold-replay dispatch args. `chatSessionStart`
+      // is called TWICE across the test — once for turn 1, once
+      // for turn 2's cold replay. We care about the second
+      // call's primed history: it must contain the blank
+      // assistant turn between the turn-1 user message and the
+      // turn-2 user follow-up.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      const [primedMessages] = startSpy.mock.calls[1] as [ChatMessage[], unknown];
+      // Expected shape: [user 'hello', assistant '' (blank),
+      // user 'follow up']. Without the iter-25 fix the blank
+      // assistant would be missing and the array would be
+      // length 2, not 3.
+      expect(primedMessages.map((m: ChatMessage) => m.role)).toEqual(['user', 'assistant', 'user']);
+      expect(primedMessages[0]!.content).toBe('hello');
+      expect(primedMessages[1]!.content).toBe('');
+      expect(primedMessages[2]!.content).toBe('follow up');
+    });
   });
 
   describe('GET /v1/models', () => {

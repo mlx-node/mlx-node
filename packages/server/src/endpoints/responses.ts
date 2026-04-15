@@ -1522,7 +1522,60 @@ export async function handleCreateResponse(
   // releases it immediately for the next waiter — the fan-out
   // gate's `return` statements exit the closure without calling
   // any native decode entry points.
+  // Snapshot the pre-lock binding state. For stateless requests these
+  // are `initialSessionReg` / `initialInstanceId` (never updated). For
+  // `previous_response_id` continuations they were refreshed by the
+  // iter-22 re-read that fires after `store.getChain()`. The in-lock
+  // re-check compares against THIS snapshot so the guard catches a
+  // hot-swap that lands strictly between the pre-lock read and the
+  // moment this waiter wins the mutex.
+  const preLockSessionReg = sessionReg;
+  const preLockInstanceId = currentInstanceId;
+
   await sessionReg.withExclusive(async () => {
+    // Hot-swap race guard inside the mutex.
+    //
+    // `withExclusive` can park this waiter behind a long-running
+    // dispatch on the same model, and `ModelRegistry.register()` is
+    // NOT coordinated with that lock — a concurrent
+    // `registry.register(body.model, newModel)` can re-point the
+    // friendly name while we are parked. Without this in-lock re-read
+    // the closure would still lease a session out of the already-
+    // captured `preLockSessionReg`, adopt under the dead
+    // `preLockInstanceId`, and persist the new chain under a binding
+    // that `body.model` no longer resolves to. The iter-22 pre-lock
+    // re-read only covered the `store.getChain()` await window; the
+    // mutex-wait window is strictly later and equally unsafe.
+    //
+    // Compare the live binding to the pre-lock snapshot (captured
+    // just before entering the mutex — already iter-22-refreshed on
+    // the continuation path, identical to the handler-top snapshot
+    // on the stateless path). Any drift — nullable or value — is
+    // fatal and rejected with the same 400 envelope the iter-22
+    // guard uses, so clients see a consistent "binding changed"
+    // error regardless of which await window caught the race.
+    const lockedSessionReg = registry.getSessionRegistry(body.model);
+    const lockedInstanceId = registry.getInstanceId(body.model);
+    if (
+      lockedSessionReg === undefined ||
+      lockedInstanceId === undefined ||
+      lockedSessionReg !== preLockSessionReg ||
+      lockedInstanceId !== preLockInstanceId
+    ) {
+      sendBadRequest(
+        res,
+        `Model "${body.model}" binding changed while the request was queued behind the per-model ` +
+          `execution mutex. A concurrent register() re-pointed the name at a different model instance ` +
+          `(or released it entirely) while this waiter was parked, so the session registry and instance ` +
+          `id captured before the mutex wait no longer match the live binding. Dispatching anyway would ` +
+          `route the request through the wrong model — priming, decoding, and persisting under a dead ` +
+          `binding. Retry the request — if the swap was intentional, the new binding will service the ` +
+          `retry cleanly.`,
+        'model',
+      );
+      return;
+    }
+
     // Route the request through a `ChatSession` looked up by the prior
     // response id. A miss (null id, unknown id, expired entry, or
     // prefix-state mismatch) returns a fresh session; a hit leases the

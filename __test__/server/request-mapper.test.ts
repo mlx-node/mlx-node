@@ -599,4 +599,73 @@ describe('reconstructMessagesFromChain', () => {
       toolCalls: [{ name: 'get_weather', arguments: '{"city":"NYC"}', id: 'call_nyc' }],
     });
   });
+
+  it('preserves assistant turn when only an empty-text message item is present', () => {
+    // Iter-25 finding 3: the server deliberately emits a
+    // `message` item with empty text when a turn completes with no
+    // tool calls and no output (e.g. a tool-result continuation
+    // where the model acknowledged the result but produced
+    // nothing). `ChatSession` hot-path history always appends an
+    // assistant message for every completed turn. The iter-24
+    // predicate (`assistantText.length > 0 || thinkingText.length
+    // > 0 || toolCalls.length > 0`) silently dropped this shape
+    // on cold replay, so the reconstructed history primed a
+    // DIFFERENT conversation than the live session saw. The new
+    // predicate keys on item PRESENCE, not accumulated content,
+    // so the blank assistant turn is preserved verbatim.
+    const chain = [
+      {
+        inputJson: JSON.stringify([{ role: 'user', content: 'thanks' }]),
+        outputJson: JSON.stringify([
+          {
+            type: 'message',
+            content: [{ text: '' }],
+          },
+        ]),
+      },
+    ];
+
+    const messages = reconstructMessagesFromChain(chain);
+    expect(messages).toEqual([
+      { role: 'user', content: 'thanks' },
+      { role: 'assistant', content: '' },
+    ]);
+  });
+
+  it('preserves assistant turn when an empty message item accompanies an empty reasoning item', () => {
+    // Iter-25 finding 3 counterpart: the stored record carries
+    // BOTH a `message` item with empty text and a `reasoning`
+    // item with empty summary. The assistant turn must still be
+    // reconstructed (empty content, NO reasoningContent field —
+    // we omit empty reasoning so the reconstructed shape matches
+    // a plain blank successful turn byte-for-byte).
+    const chain = [
+      {
+        inputJson: JSON.stringify([{ role: 'user', content: 'thanks' }]),
+        outputJson: JSON.stringify([
+          {
+            type: 'reasoning',
+            summary: [{ text: '' }],
+          },
+          {
+            type: 'message',
+            content: [{ text: '' }],
+          },
+        ]),
+      },
+    ];
+
+    const messages = reconstructMessagesFromChain(chain);
+    // Assistant turn preserved, reasoningContent omitted because
+    // the stored reasoning summary was empty.
+    expect(messages).toEqual([
+      { role: 'user', content: 'thanks' },
+      { role: 'assistant', content: '' },
+    ]);
+    // Defensive: explicitly pin that `reasoningContent` is
+    // absent, not present-but-empty. Some downstream code paths
+    // distinguish `undefined` from `''` when deciding whether to
+    // emit a <think> block.
+    expect(messages[1]).not.toHaveProperty('reasoningContent');
+  });
 });

@@ -220,13 +220,28 @@ export function reconstructMessagesFromChain(chain: { inputJson: string; outputJ
 
     let assistantText = '';
     let thinkingText = '';
+    // Track item PRESENCE separately from accumulated content. The
+    // server deliberately emits `message` items with empty text for
+    // successful turns that produced no output, and `ChatSession`
+    // hot-path history always appends an assistant message even when
+    // `result.text === ''`. The predicate below must preserve those
+    // blank successful turns on cold replay — see the block comment
+    // on the predicate for the full rationale (iter-25 finding 3).
+    let hadMessageItem = false;
+    let hadReasoningItem = false;
     const toolCalls: { name: string; arguments: string; id?: string }[] = [];
 
     for (const item of outputItems) {
-      if (item.type === 'message' && item.content) {
-        assistantText += item.content.map((c) => c.text).join('');
-      } else if (item.type === 'reasoning' && item.summary) {
-        thinkingText += item.summary.map((s) => s.text).join('');
+      if (item.type === 'message') {
+        hadMessageItem = true;
+        if (item.content) {
+          assistantText += item.content.map((c) => c.text).join('');
+        }
+      } else if (item.type === 'reasoning') {
+        hadReasoningItem = true;
+        if (item.summary) {
+          thinkingText += item.summary.map((s) => s.text).join('');
+        }
       } else if (item.type === 'function_call') {
         toolCalls.push({
           name: item.name!,
@@ -236,31 +251,49 @@ export function reconstructMessagesFromChain(chain: { inputJson: string; outputJ
       }
     }
 
-    // Preserve the assistant turn whenever the stored record
-    // contained ANY assistant-facing item — text, reasoning, or a
-    // tool call. The iter-23 predicate (`assistantText ||
-    // toolCalls.length > 0`) dropped stored turns that carried a
-    // non-empty `reasoning` item but an empty `message` item,
-    // silently reconstructing a different conversation on cold
-    // replay after the session's TTL expired. A cold-replayed
-    // `previous_response_id` would then feed the model a history
-    // that skipped the reasoning summary entirely — producing
-    // different output from the hot-path resume of the same chain
-    // and corrupting any downstream tool-call gates that walked
-    // the reconstructed trailing assistant to compute outstanding
-    // tool-call ids (iter-24 finding 3).
+    // Preserve the assistant turn whenever the stored record carried
+    // ANY assistant-facing item — a `message` item (even one whose
+    // text is empty), a `reasoning` item, or a `function_call`. The
+    // iter-24 predicate keyed on accumulated content
+    // (`assistantText.length > 0 || thinkingText.length > 0 ||
+    // toolCalls.length > 0`), which silently dropped stored
+    // successful turns whose `message` item carried empty text —
+    // and such turns are a real stored shape, not an edge case:
     //
-    // An empty stored assistant turn with no reasoning and no
-    // tool calls is still skipped, because that shape is produced
-    // by legitimate no-op turns (e.g. a tool-result continuation
-    // where the model emitted nothing) and re-emitting it would
-    // clutter the replayed history with an empty assistant.
-    const hadAnyItem = assistantText.length > 0 || thinkingText.length > 0 || toolCalls.length > 0;
-    if (hadAnyItem) {
+    //  * The server emits a `message` item with empty content when
+    //    a turn completes with no tool calls and no text (e.g. a
+    //    tool-result continuation where the model acknowledged the
+    //    result but emitted nothing, or a turn interrupted at EOS).
+    //  * `ChatSession` hot-path history always appends an assistant
+    //    message for every completed turn, empty text included.
+    //
+    // After TTL expiry or a process restart, cold replay through
+    // `reconstructMessagesFromChain` would drop the blank assistant
+    // turn entirely, so the reconstructed history would primeHistory
+    // a different conversation shape than the live session saw —
+    // silently changing model output and corrupting any downstream
+    // tool-call gate that walks the reconstructed trailing assistant
+    // to compute outstanding tool-call ids (iter-25 finding 3).
+    //
+    // A record with NO assistant-facing items at all is still
+    // skipped. This is a distinct shape from "empty message item
+    // present" — it occurs on records that stored only the user
+    // input and no output items, and re-emitting a synthetic
+    // assistant there would clutter the replayed history with
+    // fake turns that the live session never generated.
+    if (hadMessageItem || hadReasoningItem || toolCalls.length > 0) {
       const assistantMsg: ChatMessage = {
         role: 'assistant',
         content: assistantText,
       };
+      // Emit `reasoningContent` only when the reasoning item
+      // carried non-empty text. A present-but-empty reasoning
+      // item (the server does not emit these today, but the
+      // walker above would tolerate them) is preserved through
+      // `hadReasoningItem` keeping the assistant turn alive; we
+      // just omit the empty `reasoningContent` field to keep the
+      // reconstructed message shape identical to a plain blank
+      // successful turn.
       if (thinkingText) {
         assistantMsg.reasoningContent = thinkingText;
       }

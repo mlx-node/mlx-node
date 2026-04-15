@@ -368,6 +368,17 @@ export async function handleCreateMessage(
     sendAnthropicInternalError(res, 'session registry missing for registered model');
     return;
   }
+  // Capture the monotonic instance id alongside the session registry
+  // so the in-mutex re-read can detect a hot-swap that lands after
+  // this read but before we acquire the per-model execution mutex.
+  // Unlike `/v1/responses`, the Anthropic handler has no stored
+  // identity check later in the pipeline to catch a mismatch, so this
+  // is the only defence against the race.
+  const preLockInstanceId = registry.getInstanceId(body.model);
+  if (preLockInstanceId === undefined) {
+    sendAnthropicInternalError(res, 'instance id missing for registered model');
+    return;
+  }
 
   // Map request
   let messages: ChatMessage[];
@@ -445,6 +456,46 @@ export async function handleCreateMessage(
   // releases the lock regardless of whether the closure threw, so a
   // failed dispatch cannot leave the next waiter stuck.
   await sessionReg.withExclusive(async () => {
+    // Hot-swap race guard inside the mutex.
+    //
+    // `withExclusive` can park this waiter behind a long-running
+    // dispatch on the same model, and `ModelRegistry.register()` is
+    // NOT coordinated with that lock — a concurrent
+    // `registry.register(body.model, newModel)` can re-point the
+    // friendly name while we are parked. Without this in-lock
+    // re-read the closure would dispatch through the already-
+    // captured `sessionReg`, running a session turn on a model
+    // object that `body.model` no longer resolves to. Unlike
+    // `/v1/responses` the Anthropic endpoint has no stored-identity
+    // check later in the pipeline to catch the mismatch — two
+    // requests for the same model name could silently be serviced
+    // by different underlying models based purely on queue timing.
+    //
+    // Compare the live binding to the pre-lock snapshot captured
+    // just before entering the mutex. Any drift — missing session
+    // registry, missing instance id, session registry identity
+    // change, or instance id change — is fatal and rejected with a
+    // 400 so the caller can retry against the new binding.
+    const lockedSessionReg = registry.getSessionRegistry(body.model);
+    const lockedInstanceId = registry.getInstanceId(body.model);
+    if (
+      lockedSessionReg === undefined ||
+      lockedInstanceId === undefined ||
+      lockedSessionReg !== sessionReg ||
+      lockedInstanceId !== preLockInstanceId
+    ) {
+      sendAnthropicBadRequest(
+        res,
+        `Model "${body.model}" binding changed while the request was queued behind the per-model ` +
+          `execution mutex. A concurrent register() re-pointed the name at a different model instance ` +
+          `(or released it entirely) while this waiter was parked, so the session registry and instance ` +
+          `id captured before the mutex wait no longer match the live binding. Dispatching anyway would ` +
+          `service this request through a stale model object — a silent cross-model handoff. Retry the ` +
+          `request — if the swap was intentional, the new binding will service the retry cleanly.`,
+      );
+      return;
+    }
+
     const session = sessionReg.getOrCreate(null, requestedSystem);
 
     try {

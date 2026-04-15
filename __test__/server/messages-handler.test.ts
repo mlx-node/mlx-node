@@ -1425,4 +1425,115 @@ describe('handleCreateMessage', () => {
       expect(parsed.content).toBe('boom: connection refused');
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Hot-swap race guard inside the per-model execution mutex
+  // -----------------------------------------------------------------------
+
+  describe('in-mutex binding re-read (iter-25 finding 2)', () => {
+    it('rejects a queued request when the binding is re-registered while the mutex holds a prior dispatch', async () => {
+      // Iter-25 finding 2 regression: the Anthropic handler
+      // captured `sessionReg = registry.getSessionRegistry(body.model)`
+      // once and then waited on
+      // `sessionReg.withExclusive(...)` with NO post-acquisition
+      // binding check. A request queued behind a long decode on
+      // the old registry would still execute through that stale
+      // registry even if `registry.register(body.model, newModel)`
+      // had already rebound the name mid-wait. Unlike
+      // `/v1/responses`, the Anthropic path has no stored
+      // identity check later to catch the mismatch — two
+      // requests for the same model name could silently be
+      // serviced by different underlying models based purely on
+      // queue timing. The in-mutex re-read added for this
+      // finding catches the drift and rejects 400.
+      const registry = new ModelRegistry();
+      const originalModel = createMockModel(makeChatResult({ text: 'original' }));
+      const swappedModel = createMockModel(makeChatResult({ text: 'swapped' }));
+
+      // Pin the blocker's `chatSessionStart` on an externally
+      // controlled gate so we can choose exactly when it
+      // resolves.
+      let releaseBlocker!: () => void;
+      const blockerGate = new Promise<void>((resolve) => {
+        releaseBlocker = resolve;
+      });
+      (originalModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+        await blockerGate;
+        return makeChatResult({ text: 'original' });
+      });
+
+      registry.register('race-model', originalModel);
+
+      // Kick off the blocker. It acquires the mutex, calls
+      // `chatSessionStart`, and parks on `blockerGate`.
+      const { res: res1 } = createMockRes();
+      const blockerDone = handleCreateMessage(
+        res1,
+        {
+          model: 'race-model',
+          messages: [{ role: 'user', content: 'blocking turn' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      // Yield so the blocker enters `withExclusive` and awaits
+      // `chatSessionStart`.
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Fire the queued request. It will enter
+      // `withExclusive` and park on the chain's `prev` promise
+      // until the blocker releases the lock.
+      const { res: res2, getStatus: getStatus2, getBody: getBody2 } = createMockRes();
+      const queuedDone = handleCreateMessage(
+        res2,
+        {
+          model: 'race-model',
+          messages: [{ role: 'user', content: 'queued turn' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      // Yield so the queued request reaches the mutex await.
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // Hot-swap the binding STRICTLY between the queued
+      // request's pre-lock snapshot and the moment it wins the
+      // mutex.
+      registry.register('race-model', swappedModel);
+
+      // Release the blocker so the mutex falls through to the
+      // queued request.
+      releaseBlocker();
+      await blockerDone;
+      await queuedDone;
+
+      // The queued request was rejected 400 by the in-lock
+      // guard, in the Anthropic error envelope.
+      expect(getStatus2()).toBe(400);
+      const err = JSON.parse(getBody2());
+      expect(err.type).toBe('error');
+      expect(err.error.type).toBe('invalid_request_error');
+      expect(err.error.message).toContain('race-model');
+      expect(err.error.message).toMatch(/binding changed/i);
+      expect(err.error.message).toMatch(/queued behind the per-model execution mutex/i);
+
+      // The swapped model must NOT have been dispatched — the
+      // queued request's closure aborted before `getOrCreate`.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const swappedStart = swappedModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(swappedStart).not.toHaveBeenCalled();
+
+      // Original model serviced the blocker exactly once and
+      // was not re-invoked by the queued request.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const originalStart = originalModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(originalStart).toHaveBeenCalledTimes(1);
+    });
+  });
 });
