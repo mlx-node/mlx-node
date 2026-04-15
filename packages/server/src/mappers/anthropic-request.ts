@@ -89,27 +89,36 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
       if (typeof content === 'string') {
         messages.push({ role: 'user', content });
       } else {
-        // Split the turn's content blocks into two passes:
+        // A single Anthropic user turn must carry either
         //
-        //   1. A contiguous block of `tool_result` messages (if any),
-        //      emitted FIRST so they sit immediately after the
-        //      preceding assistant fan-out. `validateAndCanonicalizeHistoryToolOrder`
-        //      in `endpoints/responses.ts` (called from
-        //      `endpoints/messages.ts`) requires every fan-out's
-        //      resolution block to be contiguous — interposing a
-        //      user/text/image turn in the middle orphans the
-        //      fan-out and trips the walker's 400.
-        //   2. Any `text`/`image` blocks from the SAME user turn,
-        //      emitted AFTER the tool block as a trailing `user`
-        //      message. This preserves a legitimate Anthropic shape
-        //      like `[text, tool_result, tool_result]` — a
-        //      human-written follow-up that ships both its own
-        //      preamble and the tool results in one request.
+        //   (a) ONLY text/image blocks — mapped to a single `user`
+        //       ChatMessage, OR
+        //   (b) ONLY `tool_result` blocks — mapped to a contiguous
+        //       `tool` block that sits immediately after the
+        //       preceding assistant fan-out.
         //
-        // Within the tool block we preserve the caller's relative
-        // order. Downstream canonicalization will reorder against
-        // the assistant's declared sibling order if needed.
-        const toolResults: { toolCallId: string; content: string }[] = [];
+        // Mixing the two in one turn is rejected (iter-23 finding
+        // 3). The iter-22 mapper hoisted tool results to the front
+        // and emitted the text/image content as a synthetic
+        // trailing `user` message; that silently reordered
+        // client-supplied blocks, so a turn like
+        // `[text("ignore this result"), tool_result(...)]` would
+        // reach the model as `tool(...)` followed by a new user
+        // turn the caller never authored. Instead of canonicalizing
+        // a lossy reorder we reject the mixed shape so the client
+        // must split the turn into one message containing only
+        // tool_result blocks and a separate message for the
+        // follow-up text/images.
+        //
+        // Within a pure-tool-result turn we preserve the caller's
+        // relative order. Downstream
+        // `validateAndCanonicalizeHistoryToolOrder` will reorder
+        // against the assistant's declared sibling order if needed.
+        const toolResults: {
+          toolCallId: string;
+          content: string;
+          isError: boolean;
+        }[] = [];
         const pendingText: string[] = [];
         const pendingImages: Uint8Array[] = [];
 
@@ -122,28 +131,51 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
             toolResults.push({
               toolCallId: block.tool_use_id,
               content: resolveToolResultContent(block.content),
+              isError: block.is_error === true,
             });
           } else {
             throw new Error(`Unsupported content block type: "${block.type}"`);
           }
         }
 
-        // Emit the tool block first so it sits contiguous with the
-        // preceding assistant fan-out.
-        for (const tr of toolResults) {
-          messages.push({
-            role: 'tool',
-            content: tr.content,
-            toolCallId: tr.toolCallId,
-          });
+        const hasToolResults = toolResults.length > 0;
+        const hasTextOrImage = pendingText.length > 0 || pendingImages.length > 0;
+        if (hasToolResults && hasTextOrImage) {
+          throw new Error(
+            'Unsupported: a single user turn cannot mix tool_result blocks with text or image ' +
+              'blocks. Split the turn into one message containing only tool_result blocks and a ' +
+              'separate message for the follow-up text/images.',
+          );
         }
 
-        // Emit residual text/image content as a trailing user turn.
-        // When the turn carried no tool_result blocks at all this
-        // is the ONLY user message produced for the turn, matching
-        // the pre-fix behavior for plain `[text, image, ...]`
-        // turns.
-        if (pendingText.length > 0 || pendingImages.length > 0) {
+        if (hasToolResults) {
+          // Emit the tool block. `ChatMessage` has no `isError`
+          // field — it is a NAPI-generated struct owned by Rust
+          // and cannot carry an extra boolean without a schema
+          // change. Instead we encode the Anthropic
+          // `tool_result.is_error` flag by prefixing the resolved
+          // content with a `[tool error] ` marker (iter-23
+          // finding 2). `primeHistory()` replays this content
+          // string verbatim through the chat template, so the
+          // model sees an explicit failure annotation for every
+          // tool call the client marked as errored; without this
+          // the flag was silently discarded. The marker string
+          // is the documented encoding boundary — any downstream
+          // reader that needs the structural bit can parse the
+          // prefix back out of `content`.
+          for (const tr of toolResults) {
+            const encoded = tr.isError ? `[tool error] ${tr.content}` : tr.content;
+            messages.push({
+              role: 'tool',
+              content: encoded,
+              toolCallId: tr.toolCallId,
+            });
+          }
+        } else {
+          // Pure text/image user turn. Always emit exactly one
+          // `user` message, even when both arrays are empty
+          // (matches the pre-iter-23 behavior for an empty
+          // content array).
           const userMsg: ChatMessage = { role: 'user', content: pendingText.join('') };
           if (pendingImages.length > 0) {
             userMsg.images = pendingImages;

@@ -805,11 +805,41 @@ function canonicalizeToolMessageOrder(
  * reorder is in place: `messages[i]` entries are swapped to match
  * the sibling order, nothing is inserted or deleted.
  *
+ * @param apiSurface Controls the vocabulary used in error
+ *   strings. Defaults to `'openai'` so the `/v1/responses`
+ *   endpoint returns `function_call_output` / `call_id`
+ *   wording. Pass `'anthropic'` from the `/v1/messages` endpoint
+ *   so callers who posted `tool_result` / `tool_use_id` get
+ *   remediation advice in their own request vocabulary (iter-23
+ *   finding 4). The validation logic and canonicalization are
+ *   identical between surfaces — only the error text differs.
+ *
  * @returns `null` on success, or a human-readable error string
  *   describing the first violation. Callers send the string back as
  *   a 400 `invalid_request_error`.
  */
-export function validateAndCanonicalizeHistoryToolOrder(messages: ChatMessage[]): string | null {
+export function validateAndCanonicalizeHistoryToolOrder(
+  messages: ChatMessage[],
+  apiSurface: 'openai' | 'anthropic' = 'openai',
+): string | null {
+  // Map surface-specific names so every error string below reads
+  // in the caller's own vocabulary. The OpenAI responses surface
+  // uses `function_call_output` / `call_id` / "assistant fan-out";
+  // the Anthropic messages surface uses `tool_result` /
+  // `tool_use_id` / "assistant turn with tool_use blocks".
+  const vocab =
+    apiSurface === 'anthropic'
+      ? {
+          toolResult: 'tool_result',
+          toolCallId: 'tool_use_id',
+          fanOut: 'assistant turn with tool_use blocks',
+        }
+      : {
+          toolResult: 'function_call_output',
+          toolCallId: 'call_id',
+          fanOut: 'assistant fan-out',
+        };
+
   // Walk forward. When we see an assistant fan-out, read the
   // contiguous tool block that follows and canonicalize it.
   // When we see a tool message outside such a block, that's an
@@ -819,9 +849,9 @@ export function validateAndCanonicalizeHistoryToolOrder(messages: ChatMessage[])
     const m = messages[i]!;
     if (m.role === 'tool') {
       return (
-        `tool message at index ${i} (tool_call_id "${m.toolCallId ?? ''}") is not preceded by an assistant ` +
-        `fan-out. Every function_call_output must immediately follow the assistant turn whose tool_calls ` +
-        `include its call_id.`
+        `tool message at index ${i} (${vocab.toolCallId} "${m.toolCallId ?? ''}") is not preceded by an ` +
+        `${vocab.fanOut}. Every ${vocab.toolResult} must immediately follow the assistant turn whose ` +
+        `tool calls include its ${vocab.toolCallId}.`
       );
     }
     if (m.role !== 'assistant' || !m.toolCalls || m.toolCalls.length === 0) {
@@ -840,14 +870,14 @@ export function validateAndCanonicalizeHistoryToolOrder(messages: ChatMessage[])
         // for this fan-out; without an id we cannot reorder
         // positionally by id.
         return (
-          `assistant fan-out at index ${i} declares a tool_call with no id, which cannot be paired ` +
-          `with its function_call_output positionally.`
+          `${vocab.fanOut} at index ${i} declares a tool call with no id, which cannot be paired ` +
+          `with its ${vocab.toolResult} positionally.`
         );
       }
       if (declaredSet.has(id)) {
         return (
-          `assistant fan-out at index ${i} declares duplicate tool_call id "${id}". Each sibling call ` +
-          `must have a unique id.`
+          `${vocab.fanOut} at index ${i} declares duplicate ${vocab.toolCallId} "${id}". Each sibling ` +
+          `call must have a unique ${vocab.toolCallId}.`
         );
       }
       declaredIds.push(id);
@@ -863,21 +893,21 @@ export function validateAndCanonicalizeHistoryToolOrder(messages: ChatMessage[])
       const id = typeof tool.toolCallId === 'string' ? tool.toolCallId : null;
       if (id === null || id.length === 0) {
         return (
-          `tool message at index ${blockEnd} is missing tool_call_id. Every function_call_output in an ` +
-          `assistant fan-out's resolution block must carry the call_id it resolves.`
+          `tool message at index ${blockEnd} is missing ${vocab.toolCallId}. Every ${vocab.toolResult} ` +
+          `in an ${vocab.fanOut}'s resolution block must carry the ${vocab.toolCallId} it resolves.`
         );
       }
       if (!declaredSet.has(id)) {
         return (
-          `tool message at index ${blockEnd} references call_id "${id}", which is not declared by the ` +
-          `preceding assistant fan-out at index ${i}. Submitting a tool_result for an undeclared call_id ` +
-          `would silently bind output to the wrong sibling.`
+          `tool message at index ${blockEnd} references ${vocab.toolCallId} "${id}", which is not ` +
+          `declared by the preceding ${vocab.fanOut} at index ${i}. Submitting a ${vocab.toolResult} ` +
+          `for an undeclared ${vocab.toolCallId} would silently bind output to the wrong sibling.`
         );
       }
       if (seenInBlock.has(id)) {
         return (
-          `duplicate tool message for call_id "${id}" inside the assistant fan-out's resolution block ` +
-          `(index ${blockEnd}). Each outstanding sibling must be resolved exactly once.`
+          `duplicate tool message for ${vocab.toolCallId} "${id}" inside the ${vocab.fanOut}'s ` +
+          `resolution block (index ${blockEnd}). Each outstanding sibling must be resolved exactly once.`
         );
       }
       seenInBlock.add(id);
@@ -894,24 +924,24 @@ export function validateAndCanonicalizeHistoryToolOrder(messages: ChatMessage[])
       // the chat-session API would have nothing to continue from.
       if (blockEnd === messages.length) {
         return (
-          `assistant fan-out at index ${i} is the trailing turn of the history but has no ` +
-          `function_call_output resolutions. A stateless cold-start history cannot end on an ` +
-          `unresolved tool_call fan-out because there is nothing for the model to continue from.`
+          `${vocab.fanOut} at index ${i} is the trailing turn of the history but has no ` +
+          `${vocab.toolResult} resolutions. A stateless cold-start history cannot end on an ` +
+          `unresolved tool-call fan-out because there is nothing for the model to continue from.`
         );
       }
       // Mid-history assistant fan-out followed directly by another
       // assistant/user/system message. This shape orphans the fan-out.
       return (
-        `assistant fan-out at index ${i} declares ${declaredIds.length} tool_call${declaredIds.length === 1 ? '' : 's'} but the ` +
-        `next message at index ${blockEnd} is a ${messages[blockEnd]!.role} turn. Every fan-out must be ` +
-        `fully resolved by function_call_output messages before the next assistant/user/system turn.`
+        `${vocab.fanOut} at index ${i} declares ${declaredIds.length} tool call${declaredIds.length === 1 ? '' : 's'} ` +
+        `but the next message at index ${blockEnd} is a ${messages[blockEnd]!.role} turn. Every fan-out ` +
+        `must be fully resolved by ${vocab.toolResult} messages before the next assistant/user/system turn.`
       );
     }
     if (blockLength < declaredIds.length) {
       const missing = declaredIds.filter((id) => !seenInBlock.has(id));
       return (
-        `assistant fan-out at index ${i} has unresolved sibling tool calls: ${missing.join(', ')}. ` +
-        `Every declared tool_call must be answered by a function_call_output before the next turn.`
+        `${vocab.fanOut} at index ${i} has unresolved sibling tool calls: ${missing.join(', ')}. ` +
+        `Every declared tool call must be answered by a ${vocab.toolResult} before the next turn.`
       );
     }
     // blockLength > declaredIds.length is impossible: every entry in
@@ -1112,9 +1142,11 @@ async function persistResponse(
   // a later `previous_response_id` continuation the responses endpoint
   // reads it back out of the trailing chain record and compares it
   // against the live id for `body.model`. See the endpoint's
-  // `readStoredModelIdentity` helper and the two-tier guard block in
-  // `handleCreateResponse` — records that predate this field fall
-  // back to friendly-name comparison via the compat path.
+  // `readStoredModelIdentity` helper and the guard block in
+  // `handleCreateResponse` — records without this field are rejected
+  // outright per iter-23 finding 1 (the iter-22 friendly-name
+  // compat fallback silently reopened same-name hot-swap corruption
+  // and has been removed).
   const record: StoredResponseRecord = {
     id: response.id,
     createdAt: response.created_at,
@@ -1140,7 +1172,7 @@ async function persistResponse(
 }
 
 /**
- * Two-tier identity signal extracted from a stored chain record's
+ * Identity signal extracted from a stored chain record's
  * `configJson` blob:
  *
  *   - `{ kind: 'present', instanceId }` — the record carries an
@@ -1149,18 +1181,13 @@ async function persistResponse(
  *     hot-swap / rebind.
  *   - `{ kind: 'absent' }` — the record either has no `configJson`,
  *     has a malformed blob, or has a blob that doesn't carry a
- *     well-formed `modelInstanceId` field. The caller falls back
- *     to comparing the stored friendly-name `model` string against
- *     `body.model` (the pre-iter-21 behavior) and logs a warning
- *     so the compat path is observable in telemetry.
- *
- * The split exists so iter-22 doesn't break upgrade: a pre-iter-21
- * record (or one whose `configJson` was rewritten by a tool that
- * didn't preserve unknown keys) would otherwise be uncontinueable
- * until TTL expiry, because iter-21's strict-reject treated
- * "id explicitly absent" identically to "id mismatch". New records
- * always carry identity, so strict-reject is still the steady-state
- * policy — the compat path only fires on the upgrade boundary.
+ *     well-formed `modelInstanceId` field. Per iter-23 finding 1
+ *     the caller rejects these outright with a 400 explaining the
+ *     upgrade boundary — the iter-22 friendly-name compat fallback
+ *     silently reopened same-name hot-swap corruption and has
+ *     been removed. The discriminated return is kept so the call
+ *     site explicitly handles the absent case rather than
+ *     implicitly allowing a legacy record to slip through.
  */
 type StoredModelIdentity = { kind: 'present'; instanceId: number } | { kind: 'absent' };
 
@@ -1314,56 +1341,47 @@ export async function handleCreateResponse(
       //    `body.model = "beta"` against a chain stored under
       //    `"alpha"`.
       //
-      // Two-tier identity policy (iter-22 finding 2). Records that
-      // carry an explicit `modelInstanceId` take the strict path:
-      // any mismatch is a hot-swap / rebind and the continuation
-      // is rejected. Records that DO NOT carry identity — either
-      // because they predate iter-21 or because a tool rewrote
-      // `configJson` without preserving unknown keys — take the
-      // COMPAT path: we fall back to comparing the stored
-      // friendly-name `model` string against `body.model` (the
-      // pre-iter-21 behavior) and log a warning. The compat path
-      // only runs for records without identity, which is exactly
-      // the upgrade boundary; new records always carry identity,
-      // so strict-reject is the steady-state policy.
+      // Strict instance-id policy (iter-23 finding 1). Every stored
+      // record must carry an explicit `modelInstanceId`. Records
+      // that lack the field — either because they predate iter-21
+      // or because a tool rewrote `configJson` without preserving
+      // unknown keys — are rejected outright. The iter-22 compat
+      // path that fell back to friendly-name comparison silently
+      // reopened the same-name hot-swap corruption window: any
+      // stored row without identity could be replayed through a
+      // different tokenizer / chat template / KV layout as long as
+      // the friendly name matched. This branch is an explicit
+      // breaking change in chain semantics — no production rows
+      // exist without identity on `feat/qwen35-chat-session`, so
+      // strict-reject is safe to land without a migration.
       const trailingRecord = chain[chain.length - 1]!;
       const storedIdentity = readStoredModelIdentity(trailingRecord);
-      if (storedIdentity.kind === 'present') {
-        if (currentInstanceId === undefined || storedIdentity.instanceId !== currentInstanceId) {
-          sendBadRequest(
-            res,
-            `previous_response_id "${body.previous_response_id}" belongs to a chain produced by a different ` +
-              `model instance than the one currently bound to "${body.model}". This happens when the named ` +
-              `model has been hot-swapped to a different underlying object since the chain was stored or ` +
-              `when the original binding has been released entirely. Continuations cannot cross model ` +
-              `boundaries — a stored chain is tied to the tokenizer, chat template, and KV layout of the ` +
-              `exact model object that produced it, and replaying it through a different model would ` +
-              `silently corrupt the conversation. Start a new chain without previous_response_id.`,
-            'model',
-          );
-          return;
-        }
-      } else {
-        // Compat fallback: stored record carries no identity.
-        // Compare friendly names instead, and log a warning so
-        // the fallback is observable in telemetry.
-        if (trailingRecord.model !== body.model) {
-          sendBadRequest(
-            res,
-            `previous_response_id "${body.previous_response_id}" belongs to a chain stored under model ` +
-              `"${trailingRecord.model}", which differs from the current request's model "${body.model}". ` +
-              `Continuations cannot cross model boundaries — a stored chain is tied to the tokenizer, chat ` +
-              `template, and KV layout of the model that produced it, and replaying it through a different ` +
-              `model would silently corrupt the conversation. Start a new chain without previous_response_id.`,
-            'model',
-          );
-          return;
-        }
-        console.warn(
-          `[responses] previous_response_id "${body.previous_response_id}" has no persisted model instance id; ` +
-            `falling back to friendly-name comparison for backwards compat. This record likely predates ` +
-            `iter 21 or was rewritten without preserving modelInstanceId.`,
+      if (storedIdentity.kind === 'absent') {
+        sendBadRequest(
+          res,
+          `previous_response_id "${body.previous_response_id}" belongs to a stored chain whose trailing ` +
+            `record does not carry a modelInstanceId. Such records predate the iter-21 identity scheme ` +
+            `(or were rewritten without preserving the identity field) and are not eligible for ` +
+            `continuation: a friendly-name comparison would silently reopen same-name hot-swap corruption, ` +
+            `replaying the chain through a potentially different tokenizer, chat template, or KV layout. ` +
+            `Start a new chain without previous_response_id.`,
+          'model',
         );
+        return;
+      }
+      if (currentInstanceId === undefined || storedIdentity.instanceId !== currentInstanceId) {
+        sendBadRequest(
+          res,
+          `previous_response_id "${body.previous_response_id}" belongs to a chain produced by a different ` +
+            `model instance than the one currently bound to "${body.model}". This happens when the named ` +
+            `model has been hot-swapped to a different underlying object since the chain was stored or ` +
+            `when the original binding has been released entirely. Continuations cannot cross model ` +
+            `boundaries — a stored chain is tied to the tokenizer, chat template, and KV layout of the ` +
+            `exact model object that produced it, and replaying it through a different model would ` +
+            `silently corrupt the conversation. Start a new chain without previous_response_id.`,
+          'model',
+        );
+        return;
       }
       priorMessages = reconstructMessagesFromChain(chain);
       previousResponseId = body.previous_response_id;

@@ -2798,6 +2798,53 @@ describe('createHandler', () => {
       expect(userMessages[userMessages.length - 1]!.content).toBe('summarize');
     });
 
+    it('uses OpenAI vocabulary in history validation errors on /v1/responses', async () => {
+      // Iter-23 finding 4 symmetry: the
+      // `validateAndCanonicalizeHistoryToolOrder` helper takes
+      // an `apiSurface` parameter that selects between
+      // OpenAI-flavored (`function_call_output` / `call_id` /
+      // `assistant fan-out`) and Anthropic-flavored
+      // (`tool_result` / `tool_use_id` / `assistant turn with
+      // tool_use blocks`) error strings. `/v1/responses` calls
+      // the helper with the OpenAI default; `/v1/messages`
+      // passes `'anthropic'` explicitly. Pin the OpenAI default
+      // here by sending a stateless history with an orphan
+      // `function_call_output` (no preceding `function_call`)
+      // and asserting the error text is OpenAI-flavored.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'should not fire' }));
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: 'kick things off' },
+          // Orphan function_call_output — no preceding
+          // function_call in the stateless history.
+          { type: 'function_call_output', call_id: 'call_orphan', output: '{"temp":68}' },
+          { type: 'message', role: 'user', content: 'continue' },
+        ],
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const err = JSON.parse(getBody());
+      expect(err.error.type).toBe('invalid_request_error');
+      // OpenAI vocabulary must be used — the helper is called
+      // WITHOUT the `apiSurface` argument from /v1/responses so
+      // it falls through to the 'openai' default.
+      expect(err.error.message).toMatch(/function_call_output/);
+      expect(err.error.message).toMatch(/\bcall_id\b/);
+      expect(err.error.message).not.toMatch(/tool_result|tool_use_id/);
+
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).not.toHaveBeenCalled();
+    });
+
     it('passes a well-formed stateless history through unchanged (canonicalization no-op)', async () => {
       // Happy-path sibling of the reversed-order test. A
       // well-formed stateless history with a single fan-out
@@ -2837,35 +2884,30 @@ describe('createHandler', () => {
       expect(toolMessages.map((m: ChatMessage) => m.toolCallId)).toEqual(['call_a', 'call_b']);
     });
 
-    it('allows previous_response_id continuation via the compat path when stored record lacks modelInstanceId', async () => {
-      // Iter-22 finding 2 regression: iter-21 stashed the monotonic
-      // `modelInstanceId` inside `configJson` and keyed the
-      // cross-model guard on strict instance-id equality. That
-      // left no compat story for records written before the field
-      // existed (pre-iter-21) or records whose `configJson` was
-      // rewritten by a tool that didn't preserve unknown keys —
-      // the guard would treat a missing id identically to a
-      // mismatched id and reject the continuation with 400 until
-      // TTL expiry.
-      //
-      // The compat path reads the identity via
-      // `readStoredModelIdentity`; when it returns `{ kind:
-      // 'absent' }` the handler falls back to comparing the
-      // stored friendly-name `model` string against `body.model`
-      // and logs a warning so the fallback is observable in
-      // telemetry. Seed a record whose `configJson` explicitly
-      // omits `modelInstanceId` (the post-iter-21 "rewritten"
-      // variant) and whose `model` string matches `body.model`.
-      // The continuation must succeed and a warning must fire.
+    it('rejects previous_response_id continuation when the stored record lacks modelInstanceId', async () => {
+      // Iter-23 finding 1: the iter-22 compat path fell back to
+      // friendly-name comparison when a stored record had no
+      // `modelInstanceId` inside `configJson`. That silently
+      // reopened the same-name hot-swap corruption window —
+      // `register("foo", modelB)` after `modelA` would still
+      // allow any identity-less stored row to be replayed
+      // through a different tokenizer / chat template / KV
+      // layout as long as the friendly name stayed `foo`. The
+      // fix is to strict-reject any record without identity
+      // with a 400 explaining that such rows predate the
+      // iter-21 identity scheme and are not eligible for
+      // continuation. This pins both of the compat-path cases
+      // the iter-22 guard accepted (same friendly name, valid
+      // turn 2) and the cross-name case the iter-22 guard
+      // rejected — after iter-23 they both hit the same
+      // `absent`-identity branch and return the same
+      // rejection.
       const registry = new ModelRegistry();
-      const mockModel = createMockModel(makeChatResult({ text: 'compat ok' }));
+      const mockModel = createMockModel(makeChatResult({ text: 'should not fire' }));
       registry.register('test-model', mockModel);
-      // Build a seeded record with NO modelInstanceId in the
-      // configJson blob. The field-absent case is what iter-22's
-      // compat path is meant to rescue.
       const storedRecords = new Map<string, any>();
-      storedRecords.set('resp_compat', {
-        id: 'resp_compat',
+      storedRecords.set('resp_legacy', {
+        id: 'resp_legacy',
         createdAt: Math.floor(Date.now() / 1000),
         model: 'test-model',
         status: 'completed',
@@ -2875,7 +2917,10 @@ describe('createHandler', () => {
         ]),
         outputText: 'first reply',
         usageJson: '{}',
-        // configJson deliberately contains NO modelInstanceId.
+        // configJson deliberately contains NO modelInstanceId —
+        // the post-iter-21 "rewritten" / pre-iter-21 legacy
+        // shape the iter-22 compat path was designed to
+        // rescue.
         configJson: JSON.stringify({ temperature: 0.7 }),
       });
       const mockStore = {
@@ -2897,106 +2942,30 @@ describe('createHandler', () => {
         cleanupExpired: vi.fn(),
       };
       const handler = createHandler(registry, { store: mockStore as any });
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      try {
-        const req = createMockReq('POST', '/v1/responses', {
-          model: 'test-model',
-          previous_response_id: 'resp_compat',
-          input: 'second turn via compat',
-        });
-        const { res, getStatus, getBody, waitForEnd } = createMockRes();
-        await handler(req, res);
-        await waitForEnd();
 
-        expect(getStatus()).toBe(200);
-        const parsed = JSON.parse(getBody());
-        expect(parsed.status).toBe('completed');
-        expect(parsed.output_text).toBe('compat ok');
-
-        // A warning must have been logged so the fallback is
-        // observable. The exact wording is load-bearing for
-        // telemetry — match on the key phrase.
-        expect(warnSpy).toHaveBeenCalled();
-        const warnArgs = warnSpy.mock.calls.map((call) => String(call[0] ?? '')).join(' ');
-        expect(warnArgs).toMatch(/no persisted model instance id/i);
-        expect(warnArgs).toMatch(/friendly-name comparison/i);
-      } finally {
-        warnSpy.mockRestore();
-      }
-    });
-
-    it('still rejects compat-path continuation when stored model name differs from body.model', async () => {
-      // Iter-22 finding 2 companion: the compat path is NOT a
-      // general escape hatch — when the stored record lacks
-      // `modelInstanceId` the handler still enforces friendly-
-      // name equality (the pre-iter-21 behavior). A record
-      // stored under `test-alpha` must not continue through a
-      // request bound to `test-beta` just because the identity
-      // field is absent.
-      const registry = new ModelRegistry();
-      const mockModel = createMockModel(makeChatResult({ text: 'should not fire' }));
-      registry.register('test-alpha', mockModel);
-      registry.register('test-beta', mockModel);
-      const storedRecords = new Map<string, any>();
-      storedRecords.set('resp_compat_cross', {
-        id: 'resp_compat_cross',
-        createdAt: Math.floor(Date.now() / 1000),
-        model: 'test-alpha',
-        status: 'completed',
-        inputJson: JSON.stringify([{ role: 'user', content: 'first turn' }]),
-        outputJson: JSON.stringify([
-          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'alpha reply' }] },
-        ]),
-        outputText: 'alpha reply',
-        usageJson: '{}',
-        // Again: no modelInstanceId in configJson.
-        configJson: JSON.stringify({ temperature: 0.7 }),
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: 'resp_legacy',
+        input: 'second turn against an identity-less record',
       });
-      const mockStore = {
-        store: vi.fn((record: any) => {
-          storedRecords.set(record.id, record);
-          return Promise.resolve();
-        }),
-        getChain: vi.fn((id: string) => {
-          const out: any[] = [];
-          let cursor: string | undefined = id;
-          while (cursor) {
-            const rec = storedRecords.get(cursor);
-            if (!rec) break;
-            out.unshift(rec);
-            cursor = rec.previousResponseId;
-          }
-          return Promise.resolve(out);
-        }),
-        cleanupExpired: vi.fn(),
-      };
-      const handler = createHandler(registry, { store: mockStore as any });
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      try {
-        const req = createMockReq('POST', '/v1/responses', {
-          model: 'test-beta',
-          previous_response_id: 'resp_compat_cross',
-          input: 'second turn via wrong name',
-        });
-        const { res, getStatus, getBody, waitForEnd } = createMockRes();
-        await handler(req, res);
-        await waitForEnd();
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
 
-        expect(getStatus()).toBe(400);
-        const err = JSON.parse(getBody());
-        expect(err.error.type).toBe('invalid_request_error');
-        expect(err.error.message).toContain('test-alpha');
-        expect(err.error.message).toContain('test-beta');
-        expect(err.error.message).toMatch(/Continuations cannot cross model boundaries/i);
+      expect(getStatus()).toBe(400);
+      const err = JSON.parse(getBody());
+      expect(err.error.type).toBe('invalid_request_error');
+      expect(err.error.message).toContain('resp_legacy');
+      expect(err.error.message).toMatch(/does not carry a modelInstanceId/);
+      expect(err.error.message).toMatch(/iter-21/);
+      expect(err.error.message).toMatch(/not eligible for continuation/i);
 
-        // eslint-disable-next-line @typescript-eslint/unbound-method
-        const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
-        // Turn 1 cold-start never ran — we seeded the record by
-        // hand — so no dispatch should have happened at all.
-        expect(startSpy).not.toHaveBeenCalled();
-      } finally {
-        warnSpy.mockRestore();
-      }
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const continueSpy = mockModel.chatSessionContinue as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).not.toHaveBeenCalled();
+      expect(continueSpy).not.toHaveBeenCalled();
     });
 
     it('rejects previous_response_id continuation when the model binding is re-registered during store.getChain', async () => {

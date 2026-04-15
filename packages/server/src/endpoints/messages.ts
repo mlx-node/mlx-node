@@ -396,7 +396,12 @@ export async function handleCreateMessage(
   // endpoint uses so a malformed block is rejected with a clear 400
   // and a reversed-but-valid block is rewritten to canonical
   // sibling order before dispatch.
-  const historyError = validateAndCanonicalizeHistoryToolOrder(messages);
+  //
+  // Pass `'anthropic'` so the helper's error strings reference
+  // `tool_result` / `tool_use_id` — the vocabulary the Anthropic
+  // caller actually posted — instead of OpenAI's
+  // `function_call_output` / `call_id`. See iter-23 finding 4.
+  const historyError = validateAndCanonicalizeHistoryToolOrder(messages, 'anthropic');
   if (historyError !== null) {
     sendAnthropicBadRequest(res, historyError);
     return;

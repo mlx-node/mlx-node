@@ -1152,6 +1152,12 @@ describe('handleCreateMessage', () => {
       // sibling that has no matching tool_result. Submitting only
       // `call_a`'s result when the assistant fanned out to both
       // [call_a, call_b] would orphan `call_b`. Reject with 400.
+      //
+      // The follow-up user turn carries a second `user` message
+      // with plain text AFTER the tool_result turn — a legal
+      // iter-23 shape (no mixing inside a single user turn) that
+      // still trips the validator because the assistant fan-out
+      // is never fully resolved.
       const registry = new ModelRegistry();
       const mockModel = createMockModel();
       registry.register('test-model', mockModel);
@@ -1173,12 +1179,13 @@ describe('handleCreateMessage', () => {
             {
               role: 'user',
               content: [
+                // Only call_a is resolved — call_b is missing.
                 { type: 'tool_result', tool_use_id: 'call_a', content: '{"temp":68}' },
-                // call_b's result is missing — and the trailing
-                // user content is a plain text continuation
-                // instead of the expected second tool_result.
-                { type: 'text', text: 'any updates?' },
               ],
+            },
+            {
+              role: 'user',
+              content: 'any updates?',
             },
           ],
           max_tokens: 100,
@@ -1190,13 +1197,18 @@ describe('handleCreateMessage', () => {
       const parsed = JSON.parse(getBody());
       expect(parsed.type).toBe('error');
       expect(parsed.error.type).toBe('invalid_request_error');
-      expect(parsed.error.message).toMatch(/unresolved sibling tool calls|fan-out at index .* declares .* tool_call/);
+      // Iter-23 finding 4: error vocabulary is Anthropic-flavored
+      // on `/v1/messages`, so the text references `tool_result`
+      // and `assistant turn with tool_use blocks`, not
+      // `function_call_output` or `assistant fan-out`.
+      expect(parsed.error.message).toMatch(/unresolved sibling tool calls|tool_result/);
+      expect(parsed.error.message).not.toMatch(/function_call_output|\bcall_id\b/);
       // eslint-disable-next-line @typescript-eslint/unbound-method
       const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
       expect(startSpy).not.toHaveBeenCalled();
     });
 
-    it('returns 400 on a tool_result referencing an unknown call_id', async () => {
+    it('returns 400 on a tool_result referencing an unknown tool_use_id', async () => {
       // Binding a tool_result to a call id not declared by the
       // preceding assistant fan-out would silently flow the output
       // to the wrong place (or to nothing at all). Reject.
@@ -1227,30 +1239,71 @@ describe('handleCreateMessage', () => {
 
       expect(getStatus()).toBe(400);
       const parsed = JSON.parse(getBody());
-      expect(parsed.error.message).toMatch(/not declared by the preceding assistant fan-out/);
+      // Iter-23 finding 4: Anthropic vocabulary — the validator
+      // returns "assistant turn with tool_use blocks" and
+      // `tool_use_id` for /v1/messages callers.
+      expect(parsed.error.message).toMatch(/not declared by the preceding assistant turn with tool_use blocks/);
+      expect(parsed.error.message).toMatch(/tool_use_id/);
+      expect(parsed.error.message).not.toMatch(/function_call_output|\bcall_id\b/);
     });
 
-    it('preserves text preamble alongside tool_result blocks as a trailing user turn', async () => {
-      // Iter-22 finding 1 regression: the pre-fix Anthropic mapper
-      // emitted any pending text/image content as its own `user`
-      // message BEFORE each `tool_result` block. For a legitimate
-      // Anthropic follow-up like
-      //
-      //   user: [text "here are outputs", tool_result call_b, tool_result call_a]
-      //
-      // the mapped `ChatMessage[]` became
-      //   [assistant(toolCalls), user("here are outputs"), tool(b), tool(a)]
-      //
-      // which breaks the contiguity invariant
-      // `validateAndCanonicalizeHistoryToolOrder` relies on — the
-      // walker sees the assistant fan-out followed by a `user`
-      // message (not a tool block), flags the fan-out as orphaned,
-      // and deterministically 400s the request.
-      //
-      // The fix emits the tool block FIRST so it sits contiguous
-      // with the assistant fan-out, then emits the text preamble
-      // as a trailing `user` message. Canonicalization reorders
-      // the reversed tool block to sibling order before dispatch.
+    it('rejects mixed text + tool_result in a single user turn with 400', async () => {
+      // Iter-23 finding 3: the iter-22 mapper silently hoisted
+      // tool_result blocks to the front of a mixed turn and
+      // emitted residual text/image content as a synthetic
+      // trailing user message — lossy reordering of
+      // caller-supplied blocks. The mapper now rejects the
+      // mixed shape; this test pins the 400 + guarantees no
+      // dispatch happens.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'should not fire' }));
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'run both tools' },
+            {
+              role: 'assistant',
+              content: [
+                { type: 'tool_use', id: 'call_a', name: 'get_weather', input: { city: 'SF' } },
+                { type: 'tool_use', id: 'call_b', name: 'get_news', input: { q: 'tech' } },
+              ],
+            },
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'here are outputs' },
+                { type: 'tool_result', tool_use_id: 'call_b', content: '{"v":"b"}' },
+                { type: 'tool_result', tool_use_id: 'call_a', content: '{"v":"a"}' },
+              ],
+            },
+          ],
+          max_tokens: 100,
+        } as any,
+        registry,
+      );
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.type).toBe('error');
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toMatch(/cannot mix tool_result blocks with text or image blocks/i);
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).not.toHaveBeenCalled();
+    });
+
+    it('accepts split turns: tool_result-only user turn followed by a separate text user turn', async () => {
+      // Positive counter-test for iter-23 finding 3: a caller
+      // that splits the mixed turn into two legal user turns
+      // (one carrying ONLY tool_result blocks, one carrying the
+      // follow-up text) must dispatch cleanly. Reversed tool
+      // order on the first turn verifies the canonicalization
+      // pass still runs end-to-end.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'followup ok' }));
       registry.register('test-model', mockModel);
@@ -1272,15 +1325,12 @@ describe('handleCreateMessage', () => {
             {
               role: 'user',
               content: [
-                { type: 'text', text: 'here are outputs' },
-                // Reversed tool order so the canonicalization pass
-                // also gets exercised — the contiguous-block fix
-                // is independent of the reorder but both must land
-                // for the dispatch to succeed.
+                // Reversed — canonicalization will reorder to [call_a, call_b].
                 { type: 'tool_result', tool_use_id: 'call_b', content: '{"v":"b"}' },
                 { type: 'tool_result', tool_use_id: 'call_a', content: '{"v":"a"}' },
               ],
             },
+            { role: 'user', content: 'here are outputs' },
           ],
           max_tokens: 100,
         } as any,
@@ -1298,34 +1348,76 @@ describe('handleCreateMessage', () => {
         Array<{ role: string; content: string; toolCallId?: string; toolCalls?: Array<{ id: string }> }>,
       ];
 
-      // Find the assistant fan-out and assert its declared ids.
       const assistantIdx = primedMessages.findIndex((m) => m.role === 'assistant');
       expect(assistantIdx).toBeGreaterThanOrEqual(0);
-      const assistant = primedMessages[assistantIdx]!;
-      expect(assistant.toolCalls).toBeDefined();
-      expect(assistant.toolCalls!.map((tc) => tc.id)).toEqual(['call_a', 'call_b']);
 
-      // Immediately after the assistant there must be TWO `tool`
-      // messages in canonical sibling order [call_a, call_b] —
-      // canonicalization reordered them from the reversed input.
-      const afterAssistant1 = primedMessages[assistantIdx + 1];
-      const afterAssistant2 = primedMessages[assistantIdx + 2];
-      expect(afterAssistant1).toBeDefined();
-      expect(afterAssistant2).toBeDefined();
-      expect(afterAssistant1!.role).toBe('tool');
-      expect(afterAssistant2!.role).toBe('tool');
-      expect(afterAssistant1!.toolCallId).toBe('call_a');
-      expect(afterAssistant1!.content).toBe('{"v":"a"}');
-      expect(afterAssistant2!.toolCallId).toBe('call_b');
-      expect(afterAssistant2!.content).toBe('{"v":"b"}');
+      // Canonicalization reordered [call_b, call_a] → [call_a, call_b].
+      const afterAssistant1 = primedMessages[assistantIdx + 1]!;
+      const afterAssistant2 = primedMessages[assistantIdx + 2]!;
+      expect(afterAssistant1.role).toBe('tool');
+      expect(afterAssistant2.role).toBe('tool');
+      expect(afterAssistant1.toolCallId).toBe('call_a');
+      expect(afterAssistant1.content).toBe('{"v":"a"}');
+      expect(afterAssistant2.toolCallId).toBe('call_b');
+      expect(afterAssistant2.content).toBe('{"v":"b"}');
 
-      // Immediately after the tool block there must be a `user`
-      // message whose content is the text preamble from the same
-      // Anthropic turn.
-      const afterTool = primedMessages[assistantIdx + 3];
-      expect(afterTool).toBeDefined();
-      expect(afterTool!.role).toBe('user');
-      expect(afterTool!.content).toContain('here are outputs');
+      const afterTool = primedMessages[assistantIdx + 3]!;
+      expect(afterTool.role).toBe('user');
+      expect(afterTool.content).toContain('here are outputs');
+    });
+
+    it('primes tool_result.is_error=true content with [tool error] marker through the full /v1/messages dispatch', async () => {
+      // Iter-23 finding 2 smoke test: the Anthropic mapper
+      // encodes `tool_result.is_error === true` as a `[tool
+      // error] ` prefix on the resolved content. Exercise the
+      // full /v1/messages handler end-to-end so the primed
+      // history passed to `chatSessionStart` reflects the
+      // marker. Without the fix `ChatMessage.content` would
+      // carry the raw tool output and the model would see a
+      // failed tool call as a successful one.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'ack' }));
+      registry.register('test-model', mockModel);
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'call the tool' },
+            {
+              role: 'assistant',
+              content: [{ type: 'tool_use', id: 'call_fail', name: 'get_weather', input: { city: 'SF' } }],
+            },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_fail',
+                  content: 'boom: connection refused',
+                  is_error: true,
+                },
+              ],
+            },
+          ],
+          max_tokens: 100,
+        } as any,
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      const [primedMessages] = startSpy.mock.calls[0] as [
+        Array<{ role: string; content: string; toolCallId?: string }>,
+      ];
+      const toolMsg = primedMessages.find((m) => m.role === 'tool' && m.toolCallId === 'call_fail');
+      expect(toolMsg).toBeDefined();
+      expect(toolMsg!.content).toBe('[tool error] boom: connection refused');
     });
   });
 });
