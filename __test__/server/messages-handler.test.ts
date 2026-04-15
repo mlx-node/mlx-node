@@ -877,13 +877,18 @@ describe('handleCreateMessage', () => {
       expect(systemMsg?.content).toBe('Be concise.');
     });
 
-    it('does not cache a session when a streaming turn emits a done event with finishReason error', async () => {
-      // Finding 3 parity: the streaming commit path must not leak a
-      // resumable cached session entry when the final chunk reports
-      // `finishReason: 'error'`. The Anthropic endpoint is stateless
-      // and never adopts, but this test pins that invariant and also
-      // verifies the endpoint emits SSE terminal events cleanly under
-      // an error finish instead of throwing.
+    it('emits a streaming error event (not message_stop) when the final chunk reports finishReason=error', async () => {
+      // Iter-27 finding 3 regression: the previous implementation
+      // emitted `message_stop` unconditionally as soon as a `done`
+      // event arrived, even when `finishReason: 'error'`. That
+      // reported a failed generation as a clean completion to the
+      // client — no `error` SSE frame, no way to distinguish a
+      // real success from a mid-decode failure. Mirror the
+      // `/v1/responses` commit gate: on an uncommitted terminal
+      // (ChatSession's `sawFinal` filter rolls back `turnCount`
+      // whenever `finishReason === 'error'`, so the post-drain
+      // `wasCommitted()` reads false), emit a single `error` SSE
+      // event in the Anthropic shape and omit `message_stop`.
       const streamEvents = [
         { text: 'partial', done: false, isReasoning: false },
         {
@@ -913,15 +918,135 @@ describe('handleCreateMessage', () => {
         registry,
       );
 
-      // The endpoint drained the stream without throwing. Minimum SSE
-      // expectation: at least one terminal event was written.
       const events = parseSSE(getBody());
-      const terminal = events.find((e) => e.event === 'message_stop' || e.event === 'error');
-      expect(terminal).toBeDefined();
 
-      // And the registry stayed empty — no adopt call leaked.
+      // Primary assertion: `message_stop` MUST NOT appear. Pairing
+      // `message_stop` with a failed turn is the bug we are fixing.
+      const msgStop = events.find((e) => e.event === 'message_stop');
+      expect(msgStop).toBeUndefined();
+
+      // And a `message_delta` with a non-error stop_reason must
+      // NOT appear either — `message_delta` is the
+      // usage/stop-reason announcement paired with `message_stop`.
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect(msgDelta).toBeUndefined();
+
+      // Primary assertion: an Anthropic streaming `error` event
+      // MUST be present with the conventional envelope shape.
+      const errorEvent = events.find((e) => e.event === 'error');
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent!.data['type']).toBe('error');
+      const errorBody = errorEvent!.data['error'] as { type: string; message: string };
+      expect(errorBody.type).toBe('api_error');
+      expect(errorBody.message).toMatch(/finishReason=error|did not commit/i);
+
+      // The registry stayed empty — no adopt call leaked. The
+      // Anthropic endpoint never adopts, but this pins the
+      // invariant: no cached session ever reaches the registry on
+      // a failed streaming turn.
       const sessionReg = registry.getSessionRegistry('test-model');
       expect(sessionReg!.size).toBe(0);
+    });
+
+    it('emits a streaming error event when the underlying async iterator exhausts without a done event', async () => {
+      // Iter-27 finding 3 regression: if the native stream
+      // exhausts mid-flight (producer throws, native crash, etc.)
+      // the session's `sawFinal` finally runs without a commit,
+      // so `wasCommitted()` reads false. Before the fix, the
+      // post-loop safety net emitted `message_delta('end_turn')`
+      // + `message_stop` unconditionally — again labelling a
+      // failed turn as a clean completion. The new code emits an
+      // Anthropic `error` SSE event instead.
+      //
+      // Use a stream that yields one delta and then exits cleanly
+      // without a `done: true` chunk (the iterator exhausts with
+      // no final frame). This simulates the producer terminating
+      // early without signalling completion.
+      const streamEvents = [{ text: 'partial', done: false, isReasoning: false }];
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+
+      // No clean terminal events.
+      expect(events.find((e) => e.event === 'message_stop')).toBeUndefined();
+      expect(events.find((e) => e.event === 'message_delta')).toBeUndefined();
+
+      // Exactly one `error` event — the uncommitted terminal.
+      const errorEvents = events.filter((e) => e.event === 'error');
+      expect(errorEvents).toHaveLength(1);
+      expect(errorEvents[0].data['type']).toBe('error');
+      const errorBody = errorEvents[0].data['error'] as { type: string; message: string };
+      expect(errorBody.type).toBe('api_error');
+      expect(errorBody.message).toMatch(/without a done event|stream ended/i);
+
+      // Content block that was opened mid-stream must be closed
+      // before the error frame so the client isn't left with a
+      // dangling in-progress text block.
+      const blockStops = events.filter((e) => e.event === 'content_block_stop');
+      expect(blockStops.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('still emits message_delta + message_stop on a clean streaming completion (counter-test)', async () => {
+      // Positive counter-test for iter-27 finding 3: a happy-path
+      // streaming turn — one that commits with a non-error
+      // `finishReason` — still produces `message_delta` +
+      // `message_stop` and NOT an `error` event. Pins the
+      // commit-gate's success branch so the new uncommitted
+      // handling can't accidentally swallow clean completions.
+      const streamEvents = [
+        { text: 'hello', done: false, isReasoning: false },
+        { text: ' world', done: false, isReasoning: false },
+        {
+          text: 'hello world',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 7,
+          promptTokens: 4,
+          reasoningTokens: 0,
+          rawText: 'hello world',
+        },
+      ];
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect(msgDelta).toBeDefined();
+      expect((msgDelta!.data['delta'] as { stop_reason: string }).stop_reason).toBe('end_turn');
+
+      const msgStop = events.find((e) => e.event === 'message_stop');
+      expect(msgStop).toBeDefined();
+
+      // No `error` SSE event on the happy path.
+      expect(events.find((e) => e.event === 'error')).toBeUndefined();
     });
   });
 

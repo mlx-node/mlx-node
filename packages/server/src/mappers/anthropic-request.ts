@@ -19,37 +19,62 @@ export interface MappedAnthropicRequest {
 }
 
 /**
- * Resolve the text (and any nested image) content of a tool_result
- * block. Anthropic's Messages API allows tool_result blocks to carry a
- * plain string, an array of text blocks, or an array that mixes text
- * and image blocks — the latter is common for tools that return
- * screenshots or rendered PDFs and was silently rejected by the
- * iter-25 mapper. The internal `ChatMessage` shape has no per-tool
- * image field, so the mapper returns the extracted images separately
- * and the caller appends them to a trailing `user` ChatMessage that
- * follows the tool block.
+ * Resolve the text content of a `tool_result` block. Anthropic's
+ * Messages API allows `tool_result.content` to carry a plain string,
+ * an array of text blocks, or an array that mixes text and image
+ * blocks. The internal `ChatMessage` shape is a NAPI-generated Rust
+ * struct: a `role: 'tool'` message has no `images` field, and
+ * altering the struct is out of scope for the TypeScript server
+ * layer. Iter-26 attempted to "hoist" nested images onto a trailing
+ * user message so they would at least reach the model, but that
+ * approach lost two invariants:
+ *
+ *   1. **Order.** `[tool_result(content=[image=1]), image=2]` produced
+ *      a user message whose `images` array was `[image=2, image=1]`
+ *      because the mapper appended top-level trailing images BEFORE
+ *      the hoisted tool images. Even a single-tool single-image
+ *      shape silently swapped image order relative to the caller's
+ *      declaration.
+ *   2. **Per-tool association.** When multiple `tool_result` blocks
+ *      each carried their own nested image, all of the hoisted
+ *      images flowed onto a single trailing user message. A
+ *      downstream canonicalization step that reorders the `tool`
+ *      messages (see `validateAndCanonicalizeHistoryToolOrder`) would
+ *      rearrange the tool-row order WITHOUT touching the hoisted
+ *      image list, so each image ended up bound to the wrong tool.
+ *
+ * Because neither issue is fixable without changing the NAPI
+ * `ChatMessage` shape, we refuse the shape outright (iter-27
+ * finding 2). Callers who need to send a screenshot as the result
+ * of a tool call should either (a) serialise the image into a
+ * `text` block — data URL, captioned reference, etc. — inside
+ * `tool_result.content` and then send the raw image as a
+ * `top-level` image block in a subsequent user turn that follows
+ * the tool_result prefix, or (b) send the image in a separate
+ * follow-up user turn altogether. Plain-text `tool_result.content`
+ * (single string, or an array of text blocks) remains fully
+ * supported.
  */
 function resolveToolResultContent(content?: string | (AnthropicTextContentBlock | AnthropicImageContentBlock)[]): {
   text: string;
-  images: Uint8Array[];
 } {
-  if (content == null) return { text: '', images: [] };
-  if (typeof content === 'string') return { text: content, images: [] };
+  if (content == null) return { text: '' };
+  if (typeof content === 'string') return { text: content };
   const parts: string[] = [];
-  const images: Uint8Array[] = [];
   for (const b of content) {
     if (b.type === 'text') {
       parts.push(b.text);
     } else if (b.type === 'image') {
-      if (b.source.type !== 'base64') {
-        throw new Error(`Unsupported tool_result image source: "${b.source.type as string}"`);
-      }
-      images.push(Buffer.from(b.source.data, 'base64'));
+      throw new Error(
+        'Unsupported: nested image content in tool_result blocks is not representable in the internal ' +
+          'message model. Send the image as a top-level image block in a separate user turn, and reference ' +
+          'it from the tool_result via text.',
+      );
     } else {
       throw new Error(`Unsupported tool_result content type: "${(b as { type: string }).type}"`);
     }
   }
-  return { text: parts.join(''), images };
+  return { text: parts.join('') };
 }
 
 /**
@@ -127,13 +152,14 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
         // that just answered the tool call) and is the shape the
         // iter-25 mapper was over-eagerly rejecting.
         //
-        // Nested image blocks inside `tool_result.content` — common
-        // for tools that return screenshots or rendered PDFs — are
-        // extracted by `resolveToolResultContent` and also appended
-        // to the trailing user message. The internal `ChatMessage`
-        // shape has no per-tool image field, so these images
-        // logically follow the tool result rather than accompanying
-        // it.
+        // Nested image blocks inside `tool_result.content` are
+        // rejected outright (iter-27 finding 2): the internal
+        // `ChatMessage` shape cannot represent images on a
+        // `role: 'tool'` message, and the iter-26 hoist-to-trailing-
+        // user workaround lost both relative order and per-tool
+        // association once downstream canonicalization reordered
+        // the tool rows. See `resolveToolResultContent` for the
+        // full rationale.
         //
         // Within a tool_result prefix we preserve the caller's
         // relative order. Downstream
@@ -146,10 +172,6 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
         }[] = [];
         const trailingText: string[] = [];
         const trailingImages: Uint8Array[] = [];
-        // Images hoisted out of nested `tool_result.content` arrays.
-        // They flow onto the trailing user message alongside any
-        // top-level text/image content the caller authored.
-        const hoistedToolImages: Uint8Array[] = [];
         let seenNonToolResult = false;
         let seenToolResult = false;
 
@@ -170,9 +192,6 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
               content: resolved.text,
               isError: block.is_error === true,
             });
-            if (resolved.images.length > 0) {
-              hoistedToolImages.push(...resolved.images);
-            }
           } else if (block.type === 'text') {
             seenNonToolResult = true;
             trailingText.push(block.text);
@@ -223,21 +242,18 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
           }
           // Append a trailing user message when the caller supplied
           // additional text/image content after the tool_result
-          // prefix OR when any tool_result carried nested image
-          // blocks that must flow onto a user turn. Both text and
-          // image may be empty individually — we still emit the
-          // message as long as AT LEAST ONE of the three sources
-          // (trailing text, trailing images, hoisted tool images)
-          // has content.
-          const hasTrailingContent =
-            trailingText.length > 0 || trailingImages.length > 0 || hoistedToolImages.length > 0;
+          // prefix. Nested image content inside tool_result blocks
+          // is rejected outright by `resolveToolResultContent`
+          // (iter-27 finding 2), so the only sources for a
+          // trailing user message are top-level trailing text and
+          // top-level trailing image blocks. Both may be empty
+          // individually — we still emit the message as long as
+          // at least one has content.
+          const hasTrailingContent = trailingText.length > 0 || trailingImages.length > 0;
           if (hasTrailingContent) {
             const trailingMsg: ChatMessage = { role: 'user', content: trailingText.join('') };
-            const combinedImages: Uint8Array[] = [];
-            if (trailingImages.length > 0) combinedImages.push(...trailingImages);
-            if (hoistedToolImages.length > 0) combinedImages.push(...hoistedToolImages);
-            if (combinedImages.length > 0) {
-              trailingMsg.images = combinedImages;
+            if (trailingImages.length > 0) {
+              trailingMsg.images = trailingImages;
             }
             messages.push(trailingMsg);
           }

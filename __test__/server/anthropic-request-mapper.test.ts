@@ -181,13 +181,84 @@ describe('mapAnthropicRequest', () => {
     expect(messages[2].images).toHaveLength(1);
   });
 
-  it('extracts nested image blocks from tool_result.content onto a trailing user message', () => {
-    // Anthropic allows `tool_result.content` to be an array mixing
-    // text and image blocks — common for tools that return
-    // screenshots or rendered PDFs. The internal `ChatMessage`
-    // shape has no per-tool image field, so the mapper hoists the
-    // images onto a trailing user message whose text is empty
-    // (unless the caller also supplied a trailing text block).
+  it('rejects a tool_result whose content array carries a nested image block', () => {
+    // Iter-27 finding 2: Anthropic allows `tool_result.content` to
+    // be an array mixing text and image blocks, but the internal
+    // `ChatMessage` shape is a NAPI-generated Rust struct with no
+    // `images` field on `role: 'tool'` messages. The iter-26
+    // "hoist to trailing user message" workaround silently
+    // reordered images relative to the caller's declaration AND
+    // lost the per-tool association once downstream
+    // canonicalization reordered the tool rows. We now refuse
+    // the shape outright. Callers who need to send a screenshot
+    // as a tool result should serialize a text reference inside
+    // the tool_result and then send the raw image as a top-level
+    // image block in a separate user turn.
+    const imageData =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'call_screenshot',
+                content: [
+                  { type: 'text', text: 'Here is the screenshot you asked for:' },
+                  { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow(/nested image content in tool_result blocks is not representable/i);
+  });
+
+  it('rejects a tool_result nested image even when another tool_result in the same turn is plain text', () => {
+    // Iter-27 finding 2 regression: when the caller mixes a
+    // plain-text tool_result with one that carries a nested image,
+    // we must reject the whole turn rather than silently hoisting
+    // the image onto a trailing user message that no longer has a
+    // clear owner after canonicalization reorders the tool rows.
+    const imageData =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_use_id: 'call_ok', content: 'ok' },
+              {
+                type: 'tool_result',
+                tool_use_id: 'call_shot',
+                content: [
+                  { type: 'text', text: 'screenshot:' },
+                  { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow(/nested image content in tool_result blocks is not representable/i);
+  });
+
+  it('preserves top-level trailing image ordering after a multi-tool_result prefix', () => {
+    // Iter-27 finding 2 counter-test: with nested tool_result
+    // images forbidden, top-level trailing images are the only
+    // source of images on the user turn answering a fan-out, and
+    // their order must exactly mirror the caller's declaration
+    // order. This pins the invariant the iter-26 hoist workaround
+    // broke by appending hoisted images AFTER top-level trailing
+    // images.
     const imageData =
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
     const { messages } = mapAnthropicRequest({
@@ -197,69 +268,22 @@ describe('mapAnthropicRequest', () => {
         {
           role: 'user',
           content: [
-            {
-              type: 'tool_result',
-              tool_use_id: 'call_screenshot',
-              content: [
-                { type: 'text', text: 'Here is the screenshot you asked for:' },
-                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
-              ],
-            },
+            { type: 'tool_result', tool_use_id: 'call_a', content: 'alpha' },
+            { type: 'tool_result', tool_use_id: 'call_b', content: 'beta' },
+            { type: 'text', text: 'now compare these two screenshots' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
           ],
         },
       ],
     });
 
-    expect(messages).toHaveLength(2);
-    expect(messages[0]).toEqual({
-      role: 'tool',
-      content: 'Here is the screenshot you asked for:',
-      toolCallId: 'call_screenshot',
-    });
-    expect(messages[1].role).toBe('user');
-    expect(messages[1].content).toBe('');
-    expect(messages[1].images).toHaveLength(1);
-  });
-
-  it('combines trailing user content with hoisted tool_result images onto one trailing user message', () => {
-    // If both a nested tool_result image and a trailing top-level
-    // text/image are present, they all flow onto a SINGLE user
-    // message — the hoisted images follow the top-level images in
-    // declaration order, and the text is the top-level text
-    // joined verbatim.
-    const imageA = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
-    const imageB = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
-    const { messages } = mapAnthropicRequest({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 1024,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'tool_result',
-              tool_use_id: 'call_mix',
-              content: [
-                { type: 'text', text: 'Screenshot:' },
-                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageA } },
-              ],
-            },
-            { type: 'text', text: 'Now explain this other image:' },
-            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageB } },
-          ],
-        },
-      ],
-    });
-
-    expect(messages).toHaveLength(2);
-    expect(messages[0]).toEqual({
-      role: 'tool',
-      content: 'Screenshot:',
-      toolCallId: 'call_mix',
-    });
-    expect(messages[1].role).toBe('user');
-    expect(messages[1].content).toBe('Now explain this other image:');
-    expect(messages[1].images).toHaveLength(2);
+    expect(messages).toHaveLength(3);
+    expect(messages[0]).toEqual({ role: 'tool', content: 'alpha', toolCallId: 'call_a' });
+    expect(messages[1]).toEqual({ role: 'tool', content: 'beta', toolCallId: 'call_b' });
+    expect(messages[2].role).toBe('user');
+    expect(messages[2].content).toBe('now compare these two screenshots');
+    expect(messages[2].images).toHaveLength(1);
+    expect(messages[2].images![0]).toEqual(Buffer.from(imageData, 'base64'));
   });
 
   it('maps a pure-tool_result user turn to a contiguous tool block (counter-test)', () => {

@@ -61,6 +61,7 @@ async function handleStreamingNative(
   res: ServerResponse,
   chatStream: AsyncGenerator<ChatStreamEvent>,
   body: AnthropicMessagesRequest,
+  wasCommitted: () => boolean,
 ): Promise<void> {
   const messageId = genId('msg_');
   beginSSE(res);
@@ -73,9 +74,45 @@ async function handleStreamingNative(
   let emittedTextLength = 0;
   const tagBuffer = new ToolCallTagBuffer();
 
+  // Terminal state captured inside the done branch (or left null if
+  // the iterator exhausts without a done event). The actual
+  // `message_stop` / streaming `error` emission is deferred until
+  // AFTER the loop drains so `wasCommitted()` can read an
+  // authoritative `session.turns` — otherwise we would emit a
+  // terminal event while the producer's finally has not yet run.
+  //
+  // Iter-27 finding 3: the previous implementation emitted
+  // `message_stop` unconditionally the moment a `done` event arrived,
+  // even when the final chunk carried `finishReason: 'error'`. That
+  // reported a failed generation as a successful one to Anthropic
+  // clients: no `error` SSE event, no way to distinguish a real
+  // completion from a mid-decode failure. Mirror the
+  // `/v1/responses` commit gate — on a committed (non-error) done
+  // chunk we emit `message_delta` + `message_stop`; on an
+  // uncommitted terminal (error finish or iterator exhaustion) we
+  // emit a single streaming `error` event in the Anthropic shape.
+  let sawDone = false;
+  let terminalStopReason: string | null = null;
+  let terminalNumTokens = 0;
+  let terminalPromptTokens: number | undefined;
+  let terminalErrorMessage: string | null = null;
+
   for await (const event of chatStream) {
     if (event.done) {
+      sawDone = true;
       // Final event
+
+      // Iter-27 finding 3: if the terminal chunk reports an error,
+      // short-circuit the content-flush/close sequence and hand off
+      // to the post-loop block. Emitting tool_use blocks or closing
+      // content blocks here would (a) race with the post-loop
+      // `content_block_stop` close on the error path and (b)
+      // advertise a clean tool-call fan-out to the client even
+      // though the session rolled back everything.
+      if (event.finishReason === 'error') {
+        terminalErrorMessage = 'model reported finishReason=error';
+        break;
+      }
 
       // Flush any remaining pending text
       const remainingText = tagBuffer.flush();
@@ -201,13 +238,17 @@ async function handleStreamingNative(
         contentBlockIndex++;
       }
 
-      // Emit message_delta and message_stop
-      const stopReason = mapStopReason(event.finishReason, hasToolCalls);
-      writeSSEEvent(res, 'message_delta', buildMessageDelta(stopReason, event.numTokens, event.promptTokens));
-      writeSSEEvent(res, 'message_stop', buildMessageStop());
-
-      endSSE(res);
-      return;
+      // Capture terminal state and break out of the loop. We do NOT
+      // emit `message_delta` / `message_stop` here — both are gated
+      // on the session's commit signal, which only becomes
+      // authoritative after the outer generator's finally has run.
+      // The post-loop block below reads `wasCommitted()` and emits
+      // the right terminal event (success: message_delta +
+      // message_stop; failure: a single `error` SSE event).
+      terminalStopReason = mapStopReason(event.finishReason, hasToolCalls);
+      terminalNumTokens = event.numTokens;
+      terminalPromptTokens = event.promptTokens;
+      break;
     }
 
     // Delta event
@@ -275,17 +316,49 @@ async function handleStreamingNative(
     }
   }
 
-  // Safety net: if the async iterator exhausted without a done event,
-  // emit terminal events so clients don't see a dangling stream.
-  if (hasEmittedThinking && !hasEmittedText) {
-    // Thinking block was opened but text block was never started — close thinking
-    writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+  // Post-loop terminal emission. The producer's finally has now run
+  // (either via the `break` after a done event or via natural
+  // iterator exhaustion), so `wasCommitted()` reads an authoritative
+  // `session.turns` baseline. Three cases:
+  //
+  //  1. sawDone && committed: happy path. Emit `message_delta` +
+  //     `message_stop` so clients see a clean completion.
+  //  2. sawDone && !committed: the final chunk carried
+  //     `finishReason: 'error'` (the ChatSession gates `turnCount`
+  //     on a non-error final chunk, so the session never committed).
+  //     Emit a single streaming `error` SSE event in the Anthropic
+  //     shape so the client can distinguish a real failure from a
+  //     clean `message_stop`. Do NOT emit `message_stop` — that
+  //     would report a failed generation as a successful one.
+  //  3. !sawDone: the iterator exhausted before a terminal chunk
+  //     arrived. The session also never committed in this path,
+  //     so we emit an `error` SSE event the same way.
+  //
+  // The Anthropic `/v1/messages` endpoint is stateless and never
+  // calls `sessionReg.adopt()`, so the registry cannot leak a
+  // cached session on failure. This gate's sole job is to make the
+  // client-visible event stream report failures accurately.
+  const committed = wasCommitted();
+
+  if (sawDone && committed) {
+    const stopReason = terminalStopReason ?? 'end_turn';
+    writeSSEEvent(res, 'message_delta', buildMessageDelta(stopReason, terminalNumTokens, terminalPromptTokens));
+    writeSSEEvent(res, 'message_stop', buildMessageStop());
+  } else {
+    // Uncommitted terminal. Close any dangling content block so the
+    // error frame arrives at a well-defined stream state, then emit
+    // the Anthropic streaming error event. We do NOT emit
+    // `message_stop` — pairing `message_stop` with an error would
+    // tell the client the turn completed cleanly.
+    if (hasEmittedThinking && !hasEmittedText) {
+      writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+    } else if (hasEmittedText) {
+      writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
+    }
+    const message =
+      terminalErrorMessage ?? (sawDone ? 'model refused to commit the turn' : 'stream ended without a done event');
+    writeSSEEvent(res, 'error', { type: 'error', error: { type: 'api_error', message } });
   }
-  if (hasEmittedText) {
-    writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-  }
-  writeSSEEvent(res, 'message_delta', buildMessageDelta('end_turn', 0));
-  writeSSEEvent(res, 'message_stop', buildMessageStop());
   endSSE(res);
 }
 
@@ -309,13 +382,31 @@ async function runSessionNonStreaming(
   return await session.startFromHistory(config);
 }
 
+/**
+ * Outcome of a streaming session dispatch. `wasCommitted()` is a
+ * closure that reports the commit signal AFTER the stream has been
+ * consumed by the SSE writer — it compares `session.turns` against
+ * the baseline captured AFTER `primeHistory`, mirroring the
+ * `/v1/responses` streaming commit gate. The SSE writer reads this
+ * post-drain to decide whether to emit `message_stop` (committed) or
+ * an `error` SSE event (uncommitted, e.g. finishReason=error).
+ */
+interface MessagesStreamingOutcome {
+  stream: AsyncGenerator<ChatStreamEvent>;
+  wasCommitted: () => boolean;
+}
+
 function runSessionStreaming(
   session: ChatSession<SessionCapableModel>,
   messages: ChatMessage[],
   config: ChatConfig,
-): AsyncGenerator<ChatStreamEvent> {
+): MessagesStreamingOutcome {
   session.primeHistory(messages);
-  return session.startFromHistoryStream(config);
+  const initialTurns = session.turns;
+  return {
+    stream: session.startFromHistoryStream(config),
+    wasCommitted: () => session.turns > initialTurns,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -510,8 +601,8 @@ export async function handleCreateMessage(
 
       try {
         if (body.stream === true) {
-          const chatStream = runSessionStreaming(session, messages, config);
-          await handleStreamingNative(res, chatStream, body);
+          const outcome = runSessionStreaming(session, messages, config);
+          await handleStreamingNative(res, outcome.stream, body, outcome.wasCommitted);
         } else {
           const result = await runSessionNonStreaming(session, messages, config);
           await handleNonStreaming(res, result, body);

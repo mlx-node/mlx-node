@@ -3305,26 +3305,23 @@ describe('createHandler', () => {
       expect(toolMessages.map((m: ChatMessage) => m.toolCallId)).toEqual(['call_a', 'call_b']);
     });
 
-    it('rejects previous_response_id continuation when the stored record lacks modelInstanceId', async () => {
-      // Iter-23 finding 1: the iter-22 compat path fell back to
-      // friendly-name comparison when a stored record had no
-      // `modelInstanceId` inside `configJson`. That silently
-      // reopened the same-name hot-swap corruption window —
-      // `register("foo", modelB)` after `modelA` would still
-      // allow any identity-less stored row to be replayed
-      // through a different tokenizer / chat template / KV
-      // layout as long as the friendly name stayed `foo`. The
-      // fix is to strict-reject any record without identity
-      // with a 400 explaining that such rows predate the
-      // iter-21 identity scheme and are not eligible for
-      // continuation. This pins both of the compat-path cases
-      // the iter-22 guard accepted (same friendly name, valid
-      // turn 2) and the cross-name case the iter-22 guard
-      // rejected — after iter-23 they both hit the same
-      // `absent`-identity branch and return the same
-      // rejection.
+    it('cold-replays a previous_response_id continuation when the stored record lacks modelInstanceId', async () => {
+      // Iter-27 finding 1: the iter-23 strict guard rejected any
+      // stored row whose trailing record lacked `modelInstanceId`
+      // with a 400, which was correct in isolation but
+      // catastrophic at deploy time. `main` never wrote
+      // `modelInstanceId`, so an in-place rollout of this branch
+      // would instantly 400 every still-live `previous_response_id`
+      // chain created pre-rollout — bricking every live client
+      // until the 30-minute TTL flushed the store. The compat
+      // behavior is to treat legacy rows as trusted and route
+      // them through the normal cold-replay path, reconstructing
+      // from the stored chain onto a fresh session. A row that
+      // DOES carry an instance id still runs the strict hot-swap
+      // check (see the separate regression below), so this compat
+      // only applies during the migration window.
       const registry = new ModelRegistry();
-      const mockModel = createMockModel(makeChatResult({ text: 'should not fire' }));
+      const mockModel = createMockModel(makeChatResult({ text: 'legacy continuation reply' }));
       registry.register('test-model', mockModel);
       const storedRecords = new Map<string, any>();
       storedRecords.set('resp_legacy', {
@@ -3339,9 +3336,8 @@ describe('createHandler', () => {
         outputText: 'first reply',
         usageJson: '{}',
         // configJson deliberately contains NO modelInstanceId —
-        // the post-iter-21 "rewritten" / pre-iter-21 legacy
-        // shape the iter-22 compat path was designed to
-        // rescue.
+        // the pre-rollout legacy shape that the iter-27 compat
+        // path services as cold replay.
         configJson: JSON.stringify({ temperature: 0.7 }),
       });
       const mockStore = {
@@ -3373,20 +3369,42 @@ describe('createHandler', () => {
       await handler(req, res);
       await waitForEnd();
 
-      expect(getStatus()).toBe(400);
-      const err = JSON.parse(getBody());
-      expect(err.error.type).toBe('invalid_request_error');
-      expect(err.error.message).toContain('resp_legacy');
-      expect(err.error.message).toMatch(/does not carry a modelInstanceId/);
-      expect(err.error.message).toMatch(/iter-21/);
-      expect(err.error.message).toMatch(/not eligible for continuation/i);
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.object).toBe('response');
+      expect(parsed.status).toBe('completed');
+      expect(parsed.output_text).toBe('legacy continuation reply');
 
+      // The request must have cold-replayed from the
+      // reconstructed history. `chatSessionStart` runs with a
+      // primed `messages[]` that carries the legacy row's prior
+      // user turn, the reconstructed assistant reply, and the
+      // new user turn — exactly the shape a post-TTL cold
+      // replay would produce. `chatSessionContinue` must NOT be
+      // invoked (there is no hot path on the first continuation
+      // after a cold-start).
       // eslint-disable-next-line @typescript-eslint/unbound-method
       const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
       // eslint-disable-next-line @typescript-eslint/unbound-method
       const continueSpy = mockModel.chatSessionContinue as unknown as ReturnType<typeof vi.fn>;
-      expect(startSpy).not.toHaveBeenCalled();
+      expect(startSpy).toHaveBeenCalledTimes(1);
       expect(continueSpy).not.toHaveBeenCalled();
+      const [primedMessages] = startSpy.mock.calls[0] as [ChatMessage[], unknown];
+      expect(primedMessages).toEqual([
+        { role: 'user', content: 'first turn' },
+        { role: 'assistant', content: 'first reply' },
+        { role: 'user', content: 'second turn against an identity-less record' },
+      ]);
+
+      // The new record persisted by this continuation MUST
+      // carry the live instance id — once the cold replay
+      // commits, the chain is upgraded to the iter-21 identity
+      // scheme and any future continuation gets the full
+      // hot-swap guard.
+      const storedNew = storedRecords.get(parsed.id) as { configJson: string };
+      const persistedConfig = JSON.parse(storedNew.configJson) as { modelInstanceId?: number };
+      expect(typeof persistedConfig.modelInstanceId).toBe('number');
+      expect(persistedConfig.modelInstanceId).toBe(registry.getInstanceId('test-model'));
     });
 
     it('rejects previous_response_id continuation when the model binding is re-registered during store.getChain', async () => {

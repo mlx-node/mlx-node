@@ -1360,35 +1360,32 @@ export async function handleCreateResponse(
         //    `body.model = "beta"` against a chain stored under
         //    `"alpha"`.
         //
-        // Strict instance-id policy (iter-23 finding 1). Every stored
-        // record must carry an explicit `modelInstanceId`. Records
-        // that lack the field — either because they predate iter-21
-        // or because a tool rewrote `configJson` without preserving
-        // unknown keys — are rejected outright. The iter-22 compat
-        // path that fell back to friendly-name comparison silently
-        // reopened the same-name hot-swap corruption window: any
-        // stored row without identity could be replayed through a
-        // different tokenizer / chat template / KV layout as long as
-        // the friendly name matched. This branch is an explicit
-        // breaking change in chain semantics — no production rows
-        // exist without identity on `feat/qwen35-chat-session`, so
-        // strict-reject is safe to land without a migration.
+        // Legacy-row compatibility (iter-27 finding 1). Stored rows
+        // that lack an explicit `modelInstanceId` are serviced on
+        // the cold-replay path WITHOUT running the identity
+        // comparison below. The iter-23 policy rejected identity-
+        // less rows outright, which was correct in isolation but
+        // catastrophic at deploy time: `main` never wrote
+        // `modelInstanceId`, so every still-live `previous_response_id`
+        // chain created pre-rollout returned 400 after an in-place
+        // deploy until the 30-minute TTL expired. Treating legacy
+        // rows as "trust on first use" narrowly reopens the same-
+        // name hot-swap hole FOR THOSE ROWS ONLY (a 30-minute
+        // migration window), while post-rollout rows — which every
+        // `persistResponse()` call below stamps with the live
+        // instance id — continue to enjoy the strict guard. The
+        // hot-swap race still rejects a mismatching identity on
+        // any row that DOES carry one, so the iter-22/23 defense
+        // holds for every row written on this branch. A separate
+        // admin tool can purge legacy rows on a schedule if a
+        // deployment wants stricter-than-TTL ejection; the endpoint
+        // layer does not assume one exists.
         const trailingRecord = chain[chain.length - 1]!;
         const storedIdentity = readStoredModelIdentity(trailingRecord);
-        if (storedIdentity.kind === 'absent') {
-          sendBadRequest(
-            res,
-            `previous_response_id "${body.previous_response_id}" belongs to a stored chain whose trailing ` +
-              `record does not carry a modelInstanceId. Such records predate the iter-21 identity scheme ` +
-              `(or were rewritten without preserving the identity field) and are not eligible for ` +
-              `continuation: a friendly-name comparison would silently reopen same-name hot-swap corruption, ` +
-              `replaying the chain through a potentially different tokenizer, chat template, or KV layout. ` +
-              `Start a new chain without previous_response_id.`,
-            'model',
-          );
-          return;
-        }
-        if (currentInstanceId === undefined || storedIdentity.instanceId !== currentInstanceId) {
+        if (
+          storedIdentity.kind === 'present' &&
+          (currentInstanceId === undefined || storedIdentity.instanceId !== currentInstanceId)
+        ) {
           sendBadRequest(
             res,
             `previous_response_id "${body.previous_response_id}" belongs to a chain produced by a different ` +
