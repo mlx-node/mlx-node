@@ -27,7 +27,30 @@
  *   - Text-only `send()` on turn >= 1 takes the cheap delta path.
  *
  *   - `sendToolResult` always dispatches `chatSessionContinueTool`,
- *     since tool turns never change image state.
+ *     since tool turns never change image state. The session enforces
+ *     a strict unresolved-ok-tool-call contract at runtime, driven by
+ *     `unresolvedOkToolCallCount` (derived from `ChatResult.toolCalls`
+ *     after each turn via `countOkToolCalls` /
+ *     `computeTrailingAssistantUnresolvedToolCallCount`):
+ *
+ *       * `null` — the trailing assistant turn has no outstanding ok
+ *         tool call. Plain `send()` / `sendStream()` are the only
+ *         valid entry points; `sendToolResult*()` throws because
+ *         there is nothing for the result to resolve.
+ *       * `1` — exactly one outstanding ok tool call. Plain `send()` /
+ *         `sendStream()` throw (they would orphan the call);
+ *         `sendToolResult*()` is the sole valid forward step and
+ *         dispatches the tool result through the native session.
+ *       * `>1` — a multi-tool-call fan-out that the chat-session API
+ *         cannot progress incrementally (each `sendToolResult*` would
+ *         re-open the assistant turn and weave new replies between
+ *         the sibling results). Both `send()` / `sendStream()` and
+ *         `sendToolResult*()` throw. The only valid recovery is
+ *         `reset()` or `primeHistory()` + `startFromHistory*()` with
+ *         a fully-resolved conversation — there is no "advance past
+ *         the broken turn" path. This mirrors the native ChatML delta
+ *         format which would otherwise silently corrupt multi-call
+ *         conversations.
  *
  *   - `sawFinal` gates `turnCount` advance on the streaming path, so
  *     the session refuses to advance when the stream throws
@@ -60,9 +83,28 @@
  * await session.reset();
  * ```
  */
-import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
+import type { ChatConfig, ChatMessage, ChatResult, ToolCallResult } from '@mlx-node/core';
 
 import type { ChatStreamEvent } from './stream.js';
+
+/**
+ * Count the `ok`-status tool calls in a `ChatResult.toolCalls` /
+ * terminal stream chunk. Used to detect the unsupported multi-call
+ * fan-out pattern — the chat-session API only serves one tool call
+ * per assistant turn because each `sendToolResult` dispatch
+ * immediately re-opens the assistant turn, so a second result would
+ * land after a new assistant reply and corrupt the conversation
+ * structure. Non-`ok` entries (`parse_error`, `invalid_json`, etc.)
+ * are ignored because the caller cannot respond to them anyway.
+ */
+function countOkToolCalls(toolCalls: readonly ToolCallResult[] | undefined): number {
+  if (!toolCalls || toolCalls.length === 0) return 0;
+  let n = 0;
+  for (const c of toolCalls) {
+    if (c.status === 'ok') n++;
+  }
+  return n;
+}
 
 /**
  * Structural interface matched by every generative model wrapper
@@ -247,6 +289,28 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   private turnCount = 0;
   private inFlight = false;
 
+  /**
+   * Count of `ok` tool calls emitted by the prior assistant turn, or
+   * `null` when the prior turn produced none. Gates every continuation
+   * entry point on the tool-call resolution invariant because each
+   * native `chat_session_continue*` dispatch re-opens the assistant
+   * turn:
+   *
+   *   - A plain text `send` / `sendStream` after ANY outstanding tool
+   *     call would orphan the call(s) by weaving a fresh user turn
+   *     between the assistant's `tool_call` and any response.
+   *   - A `sendToolResult` / `sendToolResultStream` is only servable
+   *     when exactly one tool call is outstanding. A multi-call
+   *     fan-out (`> 1`) cannot be resolved one result at a time — the
+   *     siblings would be separated by fresh assistant replies — so
+   *     those entry points also reject.
+   *
+   * Cleared on every successful commit whose new turn emits zero `ok`
+   * tool calls, and on `reset()`. See `assertCanSendPlain` /
+   * `assertCanSendToolResult` for the per-entry-point gate logic.
+   */
+  private unresolvedOkToolCallCount: number | null = null;
+
   constructor(model: M, options: ChatSessionOptions = {}) {
     this.model = model;
     this.system = options.system;
@@ -267,6 +331,27 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   }
 
   /**
+   * Count of `ok` tool calls from the most recent assistant turn, or
+   * `null` when the trailing turn produced none. Non-null means the
+   * session is parked on an unresolved tool-call turn and the only
+   * forward-progress move is `sendToolResult*()` against one of the
+   * outstanding ids — and only when the count is exactly 1. A
+   * multi-call fan-out (`> 1`) cannot be served by the chat-session
+   * API at all; server endpoints should pre-check this getter and
+   * route around a fan-out via `reset()` + `primeHistory()` +
+   * `startFromHistory()` cold replay that resolves every sibling in
+   * one atomic jinja render.
+   *
+   * The flag updates after every successful `send` / `sendStream` /
+   * `sendToolResult` / `sendToolResultStream` / `startFromHistory*`
+   * commit, and after `primeHistory()` (from the trailing assistant
+   * message's `toolCalls.length`). `reset()` clears it.
+   */
+  get pendingUnresolvedToolCallCount(): number | null {
+    return this.unresolvedOkToolCallCount;
+  }
+
+  /**
    * Send a user message and resolve with the assistant reply.
    *
    * Turn 0 and any turn whose image set has changed dispatch through
@@ -277,6 +362,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     if (this.inFlight) {
       throw new Error('ChatSession: concurrent send() not allowed; await the previous call first');
     }
+    this.assertCanSendPlain('send');
     this.inFlight = true;
     try {
       const mergedConfig = this.mergeConfig(opts.config);
@@ -302,6 +388,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.history.push({ role: 'user', content: userMessage });
       this.history.push({ role: 'assistant', content: result.text });
       this.turnCount++;
+      this.recordToolCallFanout(result.toolCalls);
       return result;
     } finally {
       this.inFlight = false;
@@ -323,6 +410,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     if (this.inFlight) {
       throw new Error('ChatSession: concurrent send() not allowed; await the previous call first');
     }
+    this.assertCanSendPlain('sendStream');
     this.inFlight = true;
     try {
       const mergedConfig = this.mergeConfig(opts.config);
@@ -345,12 +433,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let sawFinal = false;
       let accumulated = '';
       let finalRaw: string | null = null;
+      let finalToolCalls: readonly ToolCallResult[] | undefined;
       try {
         for await (const event of this.model.chatStreamSessionContinue(userMessage, null, mergedConfig)) {
           if (event.done) {
             if (event.finishReason !== 'error') {
               sawFinal = true;
               finalRaw = event.text;
+              finalToolCalls = event.toolCalls;
             }
           } else {
             accumulated += event.text;
@@ -369,6 +459,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           this.history.push({ role: 'user', content: userMessage });
           this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
           this.turnCount++;
+          this.recordToolCallFanout(finalToolCalls);
         }
       }
     } finally {
@@ -381,12 +472,22 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * `chatSessionContinueTool` — tool turns never change image state,
    * so there is no restart path here.
    *
+   * Rejects if the prior assistant turn emitted more than one `ok`
+   * tool call: the chat-session API only supports exactly one tool
+   * call per assistant turn because each `sendToolResult` dispatch
+   * immediately re-opens the assistant turn, so responding to the
+   * remaining calls would interleave new assistant replies between
+   * the results and corrupt the conversation structure. Callers that
+   * hit this must tighten the prompt / tool spec or reset the
+   * session.
+   *
    * Appends a `{ role: 'tool', ... }` message to history on success.
    */
   async sendToolResult(toolCallId: string, content: string, opts: { config?: ChatConfig } = {}): Promise<ChatResult> {
     if (this.inFlight) {
       throw new Error('ChatSession: concurrent send() not allowed; await the previous call first');
     }
+    this.assertCanSendToolResult('sendToolResult');
     this.inFlight = true;
     try {
       const mergedConfig = this.mergeConfig(opts.config);
@@ -394,6 +495,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.history.push({ role: 'tool', content, toolCallId });
       this.history.push({ role: 'assistant', content: result.text });
       this.turnCount++;
+      this.recordToolCallFanout(result.toolCalls);
       return result;
     } finally {
       this.inFlight = false;
@@ -409,18 +511,21 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     if (this.inFlight) {
       throw new Error('ChatSession: concurrent send() not allowed; await the previous call first');
     }
+    this.assertCanSendToolResult('sendToolResultStream');
     this.inFlight = true;
     try {
       const mergedConfig = this.mergeConfig(opts.config);
       let sawFinal = false;
       let accumulated = '';
       let finalRaw: string | null = null;
+      let finalToolCalls: readonly ToolCallResult[] | undefined;
       try {
         for await (const event of this.model.chatStreamSessionContinueTool(toolCallId, content, mergedConfig)) {
           if (event.done) {
             if (event.finishReason !== 'error') {
               sawFinal = true;
               finalRaw = event.text;
+              finalToolCalls = event.toolCalls;
             }
           } else {
             accumulated += event.text;
@@ -436,6 +541,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           this.history.push({ role: 'tool', content, toolCallId });
           this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
           this.turnCount++;
+          this.recordToolCallFanout(finalToolCalls);
         }
       }
     } finally {
@@ -461,6 +567,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.history = [];
     this.lastImagesKey = null;
     this.turnCount = 0;
+    this.unresolvedOkToolCallCount = null;
   }
 
   /**
@@ -483,6 +590,18 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       throw new Error('ChatSession: primeHistory() can only be called on a fresh session (turn 0)');
     }
     this.history = messages.slice();
+    // Derive the unresolved-tool-call guard from the trailing assistant
+    // turn in the primed history so an immediately-post-prime session
+    // exposes the same `pendingUnresolvedToolCallCount` state a live
+    // session would have been in at that point of the conversation.
+    // This lets the server endpoint layer (and any other caller)
+    // pre-check the guard before starting cold replay and route around
+    // unresolved turns instead of letting `startFromHistory*()` blindly
+    // advance past them. The flag is reset on commit in both sync and
+    // streaming start-from-history paths based on the new assistant
+    // reply, which is the correct semantics for the post-replay current
+    // position.
+    this.unresolvedOkToolCallCount = this.computeTrailingAssistantUnresolvedToolCallCount();
     // lastImagesKey stays null until startFromHistory() / send() runs —
     // the trailing-images hydration happens at commit time.
   }
@@ -520,6 +639,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.history.push({ role: 'assistant', content: result.text });
       this.turnCount++;
       this.lastImagesKey = this.computeTrailingImagesKey();
+      this.recordToolCallFanout(result.toolCalls);
       return result;
     } finally {
       this.inFlight = false;
@@ -553,12 +673,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let sawFinal = false;
       let accumulated = '';
       let finalRaw: string | null = null;
+      let finalToolCalls: readonly ToolCallResult[] | undefined;
       try {
         for await (const event of this.model.chatStreamSessionStart(historySnapshot, mergedConfig)) {
           if (event.done) {
             if (event.finishReason !== 'error') {
               sawFinal = true;
               finalRaw = event.text;
+              finalToolCalls = event.toolCalls;
             }
           } else {
             accumulated += event.text;
@@ -575,6 +697,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
           this.turnCount++;
           this.lastImagesKey = this.computeTrailingImagesKey();
+          this.recordToolCallFanout(finalToolCalls);
         }
       }
     } finally {
@@ -585,6 +708,105 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   // -------------------------------------------------------------------
   // Internal helpers
   // -------------------------------------------------------------------
+
+  /**
+   * Gate plain-text continuation entry points (`send`, `sendStream`)
+   * on the tool-call resolution invariant. Any outstanding `ok` tool
+   * call from the prior assistant turn — single or multi — makes a
+   * plain text continuation unsafe: the native chat-session API
+   * re-opens the assistant turn on each continue, so a new user delta
+   * would weave a fresh user message between the assistant's
+   * `tool_call` and any response, orphaning the call. Callers must
+   * resolve outstanding calls via `sendToolResult*()` (single-call
+   * case) or re-enter via `reset()` + `primeHistory()` +
+   * `startFromHistory()` with a resolved conversation (multi-call
+   * fan-out). `reset()` clears the flag and `startFromHistory*`
+   * overwrites it via `recordToolCallFanout` on the new response, so
+   * legitimate recovery paths are unaffected.
+   */
+  private assertCanSendPlain(entryPoint: string): void {
+    const n = this.unresolvedOkToolCallCount;
+    if (n !== null) {
+      const plural = n === 1 ? '' : 's';
+      const followUp =
+        n > 1
+          ? `multi-call fan-outs cannot be served one result at a time — re-enter through reset() + primeHistory() + startFromHistory() with a conversation that resolves every sibling in one atomic replay`
+          : `resolve the outstanding call via sendToolResult()`;
+      throw new Error(
+        `ChatSession.${entryPoint}: previous assistant turn has ${n} unresolved ok tool call${plural}; ` +
+          `a plain text continuation would orphan the call${plural} by weaving a new user turn between the ` +
+          `assistant's tool_call and any response. ${followUp}, reset() the session, or re-enter through ` +
+          `primeHistory() + startFromHistory() with a resolved conversation.`,
+      );
+    }
+  }
+
+  /**
+   * Gate tool-result entry points (`sendToolResult`,
+   * `sendToolResultStream`) on the single-tool-call-per-turn
+   * invariant. Exactly one outstanding tool call is servable — that
+   * is the case these methods exist for.
+   *
+   * Zero outstanding calls (`null`) is also unservable: without a
+   * preceding assistant turn that emitted a tool call, a tool-result
+   * dispatch would synthesize a `<tool_response>` delta for a call
+   * that never existed, corrupting the conversation structure. The
+   * native backends do not authenticate `tool_call_id` against prior
+   * state — several simply append the tool-response delta verbatim —
+   * so rejecting here is the only gate that prevents forged tool
+   * state from reaching the model. Callers that want to start a
+   * conversation on a resolved tool turn must prime an unresolved
+   * single-call assistant turn via `primeHistory()` +
+   * `startFromHistory()` first.
+   *
+   * A multi-call fan-out (`> 1`) cannot be resolved one result at a
+   * time because each `sendToolResult` dispatch immediately re-opens
+   * the assistant turn, so responding to the siblings would
+   * interleave new assistant replies between the results.
+   */
+  private assertCanSendToolResult(entryPoint: string): void {
+    const n = this.unresolvedOkToolCallCount;
+    if (n === null) {
+      throw new Error(
+        `ChatSession.${entryPoint}: no outstanding ok tool call on the previous assistant turn. ` +
+          `Tool-result entry points can only be called when the model has just emitted exactly one ` +
+          `ok tool call that has not yet been resolved — dispatching a tool result against an empty ` +
+          `or already-resolved turn would synthesize a <tool_response> delta for a call that never ` +
+          `existed and corrupt the conversation structure. Call send() / sendStream() for plain user ` +
+          `turns, or re-enter through primeHistory() + startFromHistory() with a conversation that ` +
+          `ends on an unresolved single-call assistant turn.`,
+      );
+    }
+    if (n > 1) {
+      throw new Error(
+        `ChatSession.${entryPoint}: previous assistant turn emitted ${n} ok tool calls; ` +
+          `the chat-session API only supports exactly one tool call per assistant turn because each tool-result ` +
+          `call immediately re-opens the assistant turn — responding to the siblings would interleave new assistant ` +
+          `replies between the results. Tighten the prompt / tool spec so the model produces at most one call per ` +
+          `turn, reset() the session, or re-enter through primeHistory() + startFromHistory() with a resolved ` +
+          `conversation.`,
+      );
+    }
+  }
+
+  /**
+   * Inspect a just-committed turn's tool calls and store the count of
+   * `ok` entries in `unresolvedOkToolCallCount`. Any non-zero count
+   * parks the session on an unresolved tool-call turn, which gates
+   * the next entry point:
+   *
+   *   - count === 0 → flag is `null`: `send`/`sendStream` ok,
+   *     `sendToolResult*` throws (no outstanding call to resolve)
+   *   - count === 1 → `send`/`sendStream` throw; `sendToolResult*` ok
+   *   - count >  1 → every entry point throws (fan-out unservable)
+   *
+   * See `assertCanSendPlain` / `assertCanSendToolResult` for the full
+   * rationale.
+   */
+  private recordToolCallFanout(toolCalls: readonly ToolCallResult[] | undefined): void {
+    const n = countOkToolCalls(toolCalls);
+    this.unresolvedOkToolCallCount = n > 0 ? n : null;
+  }
 
   /**
    * Merge default + per-call config and force `reuseCache: true`.
@@ -636,6 +858,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.history.push({ role: 'assistant', content: result.text });
       this.turnCount++;
       this.lastImagesKey = newImagesKey;
+      this.recordToolCallFanout(result.toolCalls);
       return result;
     } catch (err) {
       // Roll back: drop the tentative user push so history stays
@@ -676,6 +899,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     let sawFinal = false;
     let accumulated = '';
     let finalRaw: string | null = null;
+    let finalToolCalls: readonly ToolCallResult[] | undefined;
     // Snapshot the history before dispatch — see `runStartPath` for
     // the rationale.
     const historySnapshot = this.history.slice();
@@ -685,6 +909,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           if (event.finishReason !== 'error') {
             sawFinal = true;
             finalRaw = event.text;
+            finalToolCalls = event.toolCalls;
           }
         } else {
           accumulated += event.text;
@@ -704,6 +929,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
         this.turnCount++;
         this.lastImagesKey = newImagesKey;
+        this.recordToolCallFanout(finalToolCalls);
       } else {
         // Roll back: drop the tentative user push so history stays
         // consistent with turnCount.
@@ -767,5 +993,63 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       }
     }
     return null;
+  }
+
+  /**
+   * Derive the post-prime value of `unresolvedOkToolCallCount` from
+   * the primed history. Walks backward to the most recent assistant
+   * turn, then walks forward from that assistant to the end of history
+   * subtracting any `tool:` message that references one of the turn's
+   * `call_id`s. A fully-resolved history (every outstanding id matched
+   * by a sibling `tool:` message) returns `null`; any leftover count is
+   * the number of still-unresolved tool calls.
+   *
+   * Matches the runtime `recordToolCallFanout` semantics on the hot
+   * path: zero unresolved → `null` (no pending obligation); one →
+   * `1` (servable via `sendToolResult*()` only); two or more → the
+   * count itself (unservable fan-out — must be resolved via cold
+   * replay). The distinction between "ok" vs. other statuses only
+   * exists in the live `ToolCallResult[]` emitted by the native side —
+   * the persisted `ChatMessage.toolCalls` on an assistant message only
+   * carries successfully parsed calls (i.e. what would have been "ok"
+   * in the original live turn), so counting the array length is
+   * equivalent. Tool calls whose `id` is missing or empty can't be
+   * matched against subsequent `tool_call_id`s, so in that case we
+   * fall back to returning the raw `calls.length` (err safe).
+   */
+  private computeTrailingAssistantUnresolvedToolCallCount(): number | null {
+    let assistantIdx = -1;
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      if (this.history[i]?.role === 'assistant') {
+        assistantIdx = i;
+        break;
+      }
+    }
+    if (assistantIdx === -1) return null;
+
+    const assistant = this.history[assistantIdx]!;
+    const calls = assistant.toolCalls ?? [];
+    if (calls.length === 0) return null;
+
+    const outstanding = new Set<string>();
+    let missingIdCount = 0;
+    for (const tc of calls) {
+      if (typeof tc.id === 'string' && tc.id.length > 0) {
+        outstanding.add(tc.id);
+      } else {
+        missingIdCount++;
+      }
+    }
+    // Untracked calls (no id) can't be matched against resolutions —
+    // err safe by reporting the raw count.
+    if (missingIdCount > 0) return calls.length;
+
+    for (let j = assistantIdx + 1; j < this.history.length; j++) {
+      const msg = this.history[j];
+      if (msg?.role === 'tool' && typeof msg.toolCallId === 'string' && msg.toolCallId.length > 0) {
+        outstanding.delete(msg.toolCallId);
+      }
+    }
+    return outstanding.size > 0 ? outstanding.size : null;
   }
 }

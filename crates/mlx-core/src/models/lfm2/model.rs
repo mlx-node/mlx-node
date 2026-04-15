@@ -37,7 +37,7 @@ pub(crate) struct Lfm2Inner {
     pub(crate) lm_head: Option<Linear>,
     pub(crate) caches: Vec<Lfm2LayerCache>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
-    /// Cached token history for KV cache reuse across chat() calls.
+    /// Cached token history for KV cache reuse across chat-session turns.
     pub(crate) cached_token_history: Vec<u32>,
     /// Cached image key for structural uniformity with VLM-capable models.
     /// Always `None` for text-only LFM2; present so session-API code can treat
@@ -268,7 +268,7 @@ impl Lfm2Inner {
         }
     }
 
-    /// Save cache state for reuse in the next chat() call.
+    /// Save cache state for reuse in the next chat-session continue call.
     ///
     /// `last_token_in_cache` must reflect whether the final entry in
     /// `generated_tokens` was actually forwarded through the model and written
@@ -300,16 +300,16 @@ impl Lfm2Inner {
         }
     }
 
-    /// Core synchronous chat implementation with optional EOS override.
+    /// Core synchronous chat implementation.
     ///
-    /// `eos_override` lets session methods pass a custom EOS token (e.g.
-    /// `<|im_end|>` for Qwen-style ChatML delimiters). Passing `None`
-    /// falls back to `self.config.eos_token_id`.
+    /// `eos_token_id` is the caller-supplied stop-on token id (e.g.
+    /// `<|im_end|>` for Qwen-style ChatML delimiters). Session entry
+    /// points always supply this explicitly.
     fn chat_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        eos_override: Option<u32>,
+        eos_token_id: u32,
     ) -> Result<ChatResult> {
         let tokenizer = self
             .tokenizer
@@ -365,7 +365,7 @@ impl Lfm2Inner {
             (prefill_tokens, cached_prefix_len)
         };
 
-        let eos_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
+        let eos_id = eos_token_id;
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut token_history: Vec<u32> = tokens.clone();
         let mut finish_reason = String::from("length");
@@ -499,16 +499,16 @@ impl Lfm2Inner {
         )
     }
 
-    /// Core streaming chat implementation with optional EOS override.
+    /// Core streaming chat implementation.
     ///
-    /// `eos_override` lets session methods pass a custom EOS token (e.g.
-    /// `<|im_end|>` for Qwen-style ChatML delimiters). Passing `None`
-    /// falls back to `self.config.eos_token_id`.
+    /// `eos_token_id` is the caller-supplied stop-on token id (e.g.
+    /// `<|im_end|>` for Qwen-style ChatML delimiters). Session entry
+    /// points always supply this explicitly.
     fn chat_stream_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        eos_override: Option<u32>,
+        eos_token_id: u32,
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<()> {
@@ -559,7 +559,7 @@ impl Lfm2Inner {
             (prefill_tokens, cached_prefix_len)
         };
 
-        let eos_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
+        let eos_id = eos_token_id;
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut token_history: Vec<u32> = tokens.clone();
         let mut finish_reason = String::from("length");
@@ -809,7 +809,7 @@ impl Lfm2Inner {
         // state.
         self.reset_caches();
 
-        self.chat_sync_core(messages, config, Some(im_end_id))
+        self.chat_sync_core(messages, config, im_end_id)
     }
 
     /// Prefill a pre-tokenized delta on top of the existing LFM2 caches
@@ -835,7 +835,7 @@ impl Lfm2Inner {
         }
         if self.cached_token_history.is_empty() {
             return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires an initialized session (call chat_session_start first)",
+                "chat_tokens_delta_sync requires an initialized session (call chatSessionStart first)",
             ));
         }
         if delta_tokens.is_empty() {
@@ -1141,7 +1141,7 @@ impl Lfm2Inner {
         // Full reset: the session-start path always begins clean.
         self.reset_caches();
 
-        let result = self.chat_stream_sync_core(messages, config, Some(im_end_id), &cb, &cancelled);
+        let result = self.chat_stream_sync_core(messages, config, im_end_id, &cb, &cancelled);
         if let Err(e) = result {
             let _ = stream_tx.send(Err(e));
         }
@@ -1280,7 +1280,7 @@ impl Lfm2Inner {
         if self.cached_token_history.is_empty() {
             send_stream_error(
                 &stream_tx,
-                "chat_stream_tokens_delta requires an initialized session (call chat_stream_session_start first)",
+                "chat_stream_tokens_delta requires an initialized session (call chatStreamSessionStart first)",
             );
             return;
         }
@@ -1698,11 +1698,11 @@ impl Lfm2Model {
 
     /// Start a new chat session.
     ///
-    /// Equivalent to [`Self::chat`] but stops decoding on `<|im_end|>`
-    /// and leaves the KV/conv caches on a clean ChatML boundary so
-    /// subsequent [`Self::chat_session_continue`] /
-    /// [`Self::chat_session_continue_tool`] calls can append a raw
-    /// delta on top without re-rendering the chat template.
+    /// Runs the full jinja chat template once, decodes until
+    /// `<|im_end|>`, and leaves the KV/conv caches on a clean ChatML
+    /// boundary so subsequent `chatSessionContinue` /
+    /// `chatSessionContinueTool` calls can append a raw delta on top
+    /// without re-rendering the chat template.
     ///
     /// Requires `config.reuse_cache` to be enabled (the default).
     #[napi]
@@ -1711,6 +1711,15 @@ impl Lfm2Model {
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
+        if messages
+            .iter()
+            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
+        {
+            return Err(Error::from_reason(format!(
+                "{} LFM2 is text-only; image messages are not supported",
+                IMAGE_CHANGE_RESTART_PREFIX
+            )));
+        }
         let config = config.unwrap_or_default();
 
         crate::model_thread::send_and_await(&self.thread, |reply| Lfm2Cmd::ChatSessionStart {
@@ -1728,10 +1737,9 @@ impl Lfm2Model {
     /// on `<|im_end|>` so the cache remains on a clean boundary for
     /// the next turn.
     ///
-    /// Requires a live session started via
-    /// [`Self::chat_session_start`]. Errors if the session is empty,
-    /// carries image state, or if `config.reuse_cache` is explicitly
-    /// set to `false`.
+    /// Requires a live session started via `chatSessionStart`. Errors
+    /// if the session is empty, carries image state, or if
+    /// `config.reuse_cache` is explicitly set to `false`.
     ///
     /// LFM2 is text-only; `images` is an opt-in guard parameter: when
     /// non-empty the native side returns an error whose message begins
@@ -1772,8 +1780,7 @@ impl Lfm2Model {
     /// not via an explicit id. Callers may still log it for their own
     /// bookkeeping.
     ///
-    /// Requires a live session started via
-    /// [`Self::chat_session_start`].
+    /// Requires a live session started via `chatSessionStart`.
     #[napi]
     pub async fn chat_session_continue_tool(
         &self,
@@ -1794,7 +1801,7 @@ impl Lfm2Model {
         .await
     }
 
-    /// Streaming variant of [`Self::chat_session_start`].
+    /// Streaming variant of `chatSessionStart`.
     #[napi(
         ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
@@ -1804,6 +1811,15 @@ impl Lfm2Model {
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
+        if messages
+            .iter()
+            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
+        {
+            return Err(Error::from_reason(format!(
+                "{} LFM2 is text-only; image messages are not supported",
+                IMAGE_CHANGE_RESTART_PREFIX
+            )));
+        }
         let config = config.unwrap_or_default();
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1828,7 +1844,7 @@ impl Lfm2Model {
         Ok(ChatStreamHandle { cancelled })
     }
 
-    /// Streaming variant of [`Self::chat_session_continue`].
+    /// Streaming variant of `chatSessionContinue`.
     #[napi(
         ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
@@ -1864,7 +1880,7 @@ impl Lfm2Model {
         Ok(ChatStreamHandle { cancelled })
     }
 
-    /// Streaming variant of [`Self::chat_session_continue_tool`].
+    /// Streaming variant of `chatSessionContinueTool`.
     #[napi(
         ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]

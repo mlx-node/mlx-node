@@ -174,7 +174,8 @@ export interface ApplyChatTemplateOptions {
  * @param description - Description of what the function does
  * @param properties - Object defining the function parameters (will be JSON stringified)
  * @param required - Array of required parameter names
- * @returns A properly formatted ToolDefinition ready for use with model.chat()
+ * @returns A properly formatted ToolDefinition ready to pass via `ChatConfig.tools`
+ *   on `ChatSession.send()` / `sendToolResult()`.
  *
  * @example
  * ```typescript
@@ -183,12 +184,12 @@ export interface ApplyChatTemplateOptions {
  *   'Get weather information for a location',
  *   {
  *     location: { type: 'string', description: 'City name' },
- *     units: { type: 'string', enum: ['celsius', 'fahrenheit'] }
+ *     units: { type: 'string', enum: ['celsius', 'fahrenheit'] },
  *   },
- *   ['location']
+ *   ['location'],
  * );
  *
- * const result = await model.chat(messages, { tools: [weatherTool] });
+ * const result = await session.send(userPrompt, { config: { tools: [weatherTool] } });
  * ```
  */
 export function createToolDefinition(

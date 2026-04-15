@@ -40,6 +40,30 @@ function makeChatResult(text: string): ChatResult {
   } as unknown as ChatResult;
 }
 
+/**
+ * Build a `ChatResult` that carries a single outstanding `ok` tool
+ * call. Used to establish the pre-conditions for `sendToolResult*`
+ * tests: the chat-session API requires an unresolved single-call
+ * assistant turn before any tool-result dispatch is legal.
+ */
+function makeChatResultWithSingleToolCall(text: string, callId: string): ChatResult {
+  return {
+    ...makeChatResult(text),
+    toolCalls: [{ id: callId, name: 'tool_fn', arguments: '{}', status: 'ok' }],
+  } as unknown as ChatResult;
+}
+
+/**
+ * Build a terminal stream chunk carrying a single outstanding `ok`
+ * tool call. Streaming counterpart of `makeChatResultWithSingleToolCall`.
+ */
+function finalChunkWithSingleToolCall(text: string, callId: string): ChatStreamFinal {
+  return {
+    ...finalChunk(text),
+    toolCalls: [{ id: callId, name: 'tool_fn', arguments: '{}', status: 'ok' }],
+  } as unknown as ChatStreamFinal;
+}
+
 /** Build a minimal terminal `ChatStreamFinal` chunk. */
 function finalChunk(text: string, finishReason: string = 'stop'): ChatStreamFinal {
   return {
@@ -253,6 +277,11 @@ describe('ChatSession', () => {
       const { model, chatSessionStart, chatSessionContinueTool, resetCaches } = makeMockModel();
       const session = new ChatSession(model, { system: 'You are helpful.' });
 
+      // Seed the first turn so it emits a single ok tool call — the
+      // tool-result turn that follows needs a legal outstanding
+      // single-call state before the image-change restart can run.
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('start-reply', 'call-1'));
+
       await session.send('describe A', { images: [imgA] });
       // Use a tool-result turn to keep the lastImagesKey stable across
       // the gap between the two image sends. (sendToolResult never
@@ -314,13 +343,16 @@ describe('ChatSession', () => {
     });
 
     it('hasImages stays true across text-only follow-ups and tool turns', async () => {
-      const { model } = makeMockModel();
+      const { model, chatSessionContinue } = makeMockModel();
       const session = new ChatSession(model);
 
       expect(session.hasImages).toBe(false);
       await session.send('turn-1', { images: [imgA] });
       expect(session.hasImages).toBe(true);
-      // Text-only follow-up — image key is preserved.
+      // Text-only follow-up — mock the continue response as a
+      // single-call turn so the subsequent sendToolResult has a legal
+      // outstanding-call state.
+      chatSessionContinue.mockResolvedValueOnce(makeChatResultWithSingleToolCall('continue-with-call', 'call-1'));
       await session.send('text follow-up');
       expect(session.hasImages).toBe(true);
       // Tool turn — image key is preserved.
@@ -465,6 +497,9 @@ describe('ChatSession', () => {
 
     it('clears history, image key, and turn counter', async () => {
       const { model, chatSessionStart, resetCaches } = makeMockModel();
+      // Seed the first turn with an outstanding single-call so the
+      // sendToolResult that follows has a legal pre-state.
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('with-call', 'c1'));
       const session = new ChatSession(model);
 
       await session.send('one', { images: [imgA] });
@@ -529,39 +564,299 @@ describe('ChatSession', () => {
   // -------------------------------------------------------------------
 
   describe('sendToolResult() routing', () => {
-    it('always routes through chatSessionContinueTool', async () => {
+    it('routes an outstanding single-call turn through chatSessionContinueTool', async () => {
       const { model, chatSessionContinueTool, chatSessionStart } = makeMockModel();
+      // The chat-session API requires that a tool-result dispatch be
+      // preceded by an assistant turn that emitted exactly one `ok`
+      // tool call — turn 0 is not a valid entry point for
+      // sendToolResult because the native backends would synthesize a
+      // <tool_response> delta for a call that never existed. Seed the
+      // single outstanding call via `chatSessionStart` before the
+      // tool-result dispatch.
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'call-42'));
+      // Second turn (the tool-result resolution) keeps the tool mock
+      // result at its default 'tool-reply'.
       const session = new ChatSession(model);
 
-      // No prior send — tool result can be called even on turn 0.
+      await session.send('fire the tool call');
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
       const result = await session.sendToolResult('call-42', '{"status":"ok"}');
       expect(result.text).toBe('tool-reply');
 
       expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
-      expect(chatSessionStart).not.toHaveBeenCalled();
       expect(chatSessionContinueTool.mock.calls[0][0]).toBe('call-42');
       expect(chatSessionContinueTool.mock.calls[0][1]).toBe('{"status":"ok"}');
       expect(chatSessionContinueTool.mock.calls[0][2]?.reuseCache).toBe(true);
-      expect(session.turns).toBe(1);
+      expect(session.turns).toBe(2);
+      // Tool-reply has no further outstanding calls.
+      expect(session.pendingUnresolvedToolCallCount).toBeNull();
     });
 
-    it('forces reuseCache=true even with caller override', async () => {
+    it('rejects sendToolResult when no outstanding tool call exists', async () => {
+      // Regression for the zero-outstanding gate. A fresh session has
+      // never seen a tool call, so tool-result entry points must
+      // throw — the native backends do not authenticate tool_call_id
+      // against prior state, so the only defense against synthesizing
+      // a tool response for a non-existent call is to refuse the
+      // dispatch at the wrapper level.
       const { model, chatSessionContinueTool } = makeMockModel();
       const session = new ChatSession(model);
 
+      await expect(session.sendToolResult('call-phantom', '{}')).rejects.toThrow(
+        /ChatSession\.sendToolResult: no outstanding ok tool call/,
+      );
+      expect(chatSessionContinueTool).not.toHaveBeenCalled();
+    });
+
+    it('rejects sendToolResult after a plain assistant turn with no tool calls', async () => {
+      // A normal send that returns a pure-text assistant reply leaves
+      // the outstanding-call flag null. A subsequent sendToolResult
+      // must throw, since the model never emitted a call to resolve.
+      const { model, chatSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('say hi'); // returns 'start-reply' with 0 tool calls
+      expect(session.pendingUnresolvedToolCallCount).toBeNull();
+
+      await expect(session.sendToolResult('call-phantom', '{}')).rejects.toThrow(
+        /ChatSession\.sendToolResult: no outstanding ok tool call/,
+      );
+      expect(chatSessionContinueTool).not.toHaveBeenCalled();
+    });
+
+    it('rejects sendToolResultStream when no outstanding tool call exists', async () => {
+      const { model, chatStreamSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await expect(async () => {
+        for await (const _e of session.sendToolResultStream('call-phantom', '{}')) void _e;
+      }).rejects.toThrow(/ChatSession\.sendToolResultStream: no outstanding ok tool call/);
+      expect(chatStreamSessionContinueTool).not.toHaveBeenCalled();
+    });
+
+    it('forces reuseCache=true even with caller override', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      const session = new ChatSession(model);
+
+      await session.send('fire'); // establishes outstanding call 'c1'
       await session.sendToolResult('c1', 'out', { config: { reuseCache: false } });
       expect(chatSessionContinueTool.mock.calls[0][2]?.reuseCache).toBe(true);
     });
 
     it('clears inFlight on exception', async () => {
-      const { model, chatSessionContinueTool } = makeMockModel();
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      // Seed two successive outstanding single-call turns so both
+      // sendToolResult dispatches have a legal pre-state. The first
+      // chatSessionContinueTool call rejects (tool-boom), which must
+      // NOT consume the outstanding-call flag; the second dispatch
+      // proceeds against the same outstanding state.
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
       chatSessionContinueTool.mockRejectedValueOnce(new Error('tool-boom'));
+      chatSessionContinueTool.mockResolvedValueOnce(makeChatResult('recovered'));
       const session = new ChatSession(model);
 
+      await session.send('fire');
       await expect(session.sendToolResult('c1', 'out')).rejects.toThrow('tool-boom');
-      // Follow-up works.
-      await session.sendToolResult('c2', 'out2');
+      // Follow-up works against the same outstanding call — the
+      // failed dispatch rolled back the flag, so the second call
+      // still sees `unresolvedOkToolCallCount === 1`.
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+      await session.sendToolResult('c1', 'out2');
       expect(chatSessionContinueTool).toHaveBeenCalledTimes(2);
+    });
+
+    // ---------------------------------------------------------------
+    // Single-tool-call-per-turn enforcement
+    // ---------------------------------------------------------------
+
+    it('rejects sendToolResult after an assistant turn with multiple ok tool calls', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      // Turn 0: simulate the model emitting TWO ok tool calls in the
+      // same assistant turn — the chat-session API cannot serve this
+      // pattern because each sendToolResult dispatch immediately
+      // re-opens the assistant turn.
+      chatSessionStart.mockResolvedValueOnce({
+        ...makeChatResult('multi'),
+        toolCalls: [
+          { id: 'call-a', name: 'fa', arguments: {}, status: 'ok' },
+          { id: 'call-b', name: 'fb', arguments: {}, status: 'ok' },
+        ],
+      } as unknown as ChatResult);
+
+      const session = new ChatSession(model);
+      await session.send('fan out');
+      expect(session.turns).toBe(1);
+
+      await expect(session.sendToolResult('call-a', 'result-a')).rejects.toThrow(
+        /previous assistant turn emitted 2 ok tool calls/,
+      );
+      expect(chatSessionContinueTool).not.toHaveBeenCalled();
+    });
+
+    it('allows sendToolResult after an assistant turn with exactly one ok tool call', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      chatSessionStart.mockResolvedValueOnce({
+        ...makeChatResult('one-call'),
+        toolCalls: [{ id: 'call-a', name: 'fa', arguments: {}, status: 'ok' }],
+      } as unknown as ChatResult);
+
+      const session = new ChatSession(model);
+      await session.send('make one call');
+      // A single outstanding ok tool call leaves the guard at 1, but
+      // `sendToolResult` is the exact entry point it's meant to be
+      // resolved through, so dispatch is allowed.
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+      await session.sendToolResult('call-a', 'result-a');
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+      // The tool-result reply emits zero ok tool calls (default mock),
+      // so the flag clears and a plain text continuation is unblocked
+      // again.
+      expect(session.pendingUnresolvedToolCallCount).toBeNull();
+      await session.send('follow up');
+    });
+
+    it('blocks send()/sendStream() after a single unresolved ok tool call', async () => {
+      // The single-call case is the subtle one the earlier multi-call
+      // guard missed: a plain user delta after a single outstanding
+      // tool call would weave a new user turn between the assistant's
+      // tool_call and any response, orphaning the call. Every plain
+      // text entry point must reject until the call is resolved or the
+      // session is reset.
+      const { model, chatSessionStart, chatSessionContinue, chatStreamSessionContinue, chatSessionContinueTool } =
+        makeMockModel();
+      chatSessionStart.mockResolvedValueOnce({
+        ...makeChatResult('one-call'),
+        toolCalls: [{ id: 'call-a', name: 'fa', arguments: {}, status: 'ok' }],
+      } as unknown as ChatResult);
+
+      const session = new ChatSession(model);
+      await session.send('make one call');
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      await expect(session.send('orphan the call')).rejects.toThrow(
+        /ChatSession\.send: previous assistant turn has 1 unresolved ok tool call;/,
+      );
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+
+      await expect(async () => {
+        for await (const _e of session.sendStream('orphan via stream')) void _e;
+      }).rejects.toThrow(/ChatSession\.sendStream: previous assistant turn has 1 unresolved ok tool call;/);
+      expect(chatStreamSessionContinue).not.toHaveBeenCalled();
+
+      // Resolving via sendToolResult is the correct recovery and
+      // clears the flag so the subsequent plain `send` proceeds.
+      await session.sendToolResult('call-a', 'result-a');
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+      await session.send('follow up');
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+    });
+
+    it('ignores parse_error / invalid_json tool calls for fan-out detection', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      // One ok + several non-ok — only the ok call counts for the
+      // fan-out guard, so the session stays serviceable.
+      chatSessionStart.mockResolvedValueOnce({
+        ...makeChatResult('mixed'),
+        toolCalls: [
+          { id: 'call-a', name: 'fa', arguments: {}, status: 'ok' },
+          { id: 'call-b', name: 'fb', arguments: 'garbage', status: 'parse_error' },
+          { id: 'call-c', name: 'fc', arguments: '', status: 'invalid_json' },
+        ],
+      } as unknown as ChatResult);
+
+      const session = new ChatSession(model);
+      await session.send('mixed');
+      await session.sendToolResult('call-a', 'result-a');
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+    });
+
+    it('blocks send() and sendStream() after a multi-call turn until the session is reset', async () => {
+      // A pending multi-call fan-out must hard-stop every continuation
+      // entry point, not just sendToolResult*. A plain user `send` (or
+      // `sendStream`) would silently overwrite the fan-out flag with the
+      // new assistant reply and effectively orphan the sibling tool
+      // calls — the caller must either reset() the session or re-enter
+      // through primeHistory + startFromHistory with a resolved history.
+      const { model, chatSessionStart, chatSessionContinue, chatStreamSessionContinue, chatSessionContinueTool } =
+        makeMockModel();
+      chatSessionStart.mockResolvedValueOnce({
+        ...makeChatResult('multi'),
+        toolCalls: [
+          { id: 'call-a', name: 'fa', arguments: {}, status: 'ok' },
+          { id: 'call-b', name: 'fb', arguments: {}, status: 'ok' },
+        ],
+      } as unknown as ChatResult);
+
+      const session = new ChatSession(model);
+      await session.send('fan out');
+
+      await expect(session.send('orphan the siblings')).rejects.toThrow(
+        /ChatSession\.send: previous assistant turn has 2 unresolved ok tool calls/,
+      );
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+
+      await expect(async () => {
+        for await (const _e of session.sendStream('orphan via stream')) void _e;
+      }).rejects.toThrow(/ChatSession\.sendStream: previous assistant turn has 2 unresolved ok tool calls/);
+      expect(chatStreamSessionContinue).not.toHaveBeenCalled();
+
+      // reset() is one valid recovery path; the next plain `send`
+      // must succeed on the cleared session and route through the
+      // start path (since turnCount is back to 0).
+      await session.reset();
+      await session.send('fresh topic');
+      // chatSessionStart called twice: once for the initial fan-out
+      // turn, once for the post-reset fresh start.
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinueTool).not.toHaveBeenCalled();
+    });
+
+    it('reset() clears the pending tool-call flag', async () => {
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      chatSessionStart.mockResolvedValueOnce({
+        ...makeChatResult('multi'),
+        toolCalls: [
+          { id: 'call-a', name: 'fa', arguments: {}, status: 'ok' },
+          { id: 'call-b', name: 'fb', arguments: {}, status: 'ok' },
+        ],
+      } as unknown as ChatResult);
+
+      const session = new ChatSession(model);
+      await session.send('fan out');
+      await expect(session.sendToolResult('call-a', 'result-a')).rejects.toThrow(/previous assistant turn emitted/);
+      expect(session.pendingUnresolvedToolCallCount).toBe(2);
+
+      await session.reset();
+      // After reset, the pending flag is null — a plain send is the
+      // valid next entry point and routes through the start path
+      // since turnCount is back to 0.
+      expect(session.pendingUnresolvedToolCallCount).toBeNull();
+      await session.send('fresh topic');
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+    });
+
+    it('rejects sendToolResultStream after a multi-call turn', async () => {
+      const { model, chatSessionStart, chatStreamSessionContinueTool } = makeMockModel();
+      chatSessionStart.mockResolvedValueOnce({
+        ...makeChatResult('multi'),
+        toolCalls: [
+          { id: 'call-a', name: 'fa', arguments: {}, status: 'ok' },
+          { id: 'call-b', name: 'fb', arguments: {}, status: 'ok' },
+        ],
+      } as unknown as ChatResult);
+
+      const session = new ChatSession(model);
+      await session.send('fan out');
+      // Invoking the generator must throw BEFORE yielding anything —
+      // the caller cannot observe any stream events on a rejected
+      // dispatch.
+      await expect(async () => {
+        for await (const _e of session.sendToolResultStream('call-a', 'result-a')) void _e;
+      }).rejects.toThrow(/previous assistant turn emitted 2 ok tool calls/);
+      expect(chatStreamSessionContinueTool).not.toHaveBeenCalled();
     });
   });
 
@@ -926,29 +1221,49 @@ describe('ChatSession', () => {
 
   describe('sendToolResultStream()', () => {
     it('routes through chatStreamSessionContinueTool and advances on success', async () => {
-      const { model, chatStreamSessionContinueTool } = makeMockModel();
+      const { model, chatStreamSessionStart, chatStreamSessionContinueTool } = makeMockModel();
+      // Seed the opening streamed turn with a single ok tool call so
+      // the subsequent sendToolResultStream has a legal
+      // outstanding-call state.
+      chatStreamSessionStart.mockImplementationOnce(async function* () {
+        yield { text: 'opening', done: false };
+        yield finalChunkWithSingleToolCall('opening', 'c1');
+      });
       const session = new ChatSession(model);
+
+      for await (const _e of session.sendStream('fire')) void _e;
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
 
       let sawDone = false;
       for await (const e of session.sendToolResultStream('c1', 'tool-out')) {
         if (e.done) sawDone = true;
       }
       expect(sawDone).toBe(true);
-      expect(session.turns).toBe(1);
+      expect(session.turns).toBe(2);
       expect(chatStreamSessionContinueTool).toHaveBeenCalledTimes(1);
       expect(chatStreamSessionContinueTool.mock.calls[0][0]).toBe('c1');
       expect(chatStreamSessionContinueTool.mock.calls[0][1]).toBe('tool-out');
     });
 
     it('does NOT advance turnCount on caller break', async () => {
-      const { model } = makeMockModel();
+      const { model, chatStreamSessionStart } = makeMockModel();
+      chatStreamSessionStart.mockImplementationOnce(async function* () {
+        yield { text: 'opening', done: false };
+        yield finalChunkWithSingleToolCall('opening', 'c1');
+      });
       const session = new ChatSession(model);
+
+      // Establish outstanding single-call state.
+      for await (const _e of session.sendStream('fire')) void _e;
+      expect(session.turns).toBe(1);
 
       for await (const e of session.sendToolResultStream('c1', 'out')) {
         expect(e.done).toBe(false);
         break;
       }
-      expect(session.turns).toBe(0);
+      // The abandoned tool-result stream must not advance turnCount
+      // past the opening turn.
+      expect(session.turns).toBe(1);
     });
   });
 
@@ -1027,6 +1342,144 @@ describe('ChatSession', () => {
 
       // Re-prime is allowed while turnCount is still 0.
       session.primeHistory([{ role: 'user', content: 'new' }]);
+    });
+
+    // ---------------------------------------------------------------
+    // Unresolved-tool-call guard hydration on cold replay
+    // ---------------------------------------------------------------
+
+    it('leaves pendingUnresolvedToolCallCount null for histories with no trailing fan-out', () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+      expect(session.pendingUnresolvedToolCallCount).toBeNull();
+
+      // A trailing assistant turn whose single tool call was already
+      // resolved by a sibling `tool:` message should leave the guard
+      // null — the session is ready for a plain user follow-up.
+      session.primeHistory([
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'ok', toolCalls: [{ id: 'call-a', name: 'fa', arguments: '{}' }] },
+        { role: 'tool', content: 'result-a', toolCallId: 'call-a' },
+      ]);
+      expect(session.pendingUnresolvedToolCallCount).toBeNull();
+    });
+
+    it('hydrates pendingUnresolvedToolCallCount from an unresolved single-call assistant turn', () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      session.primeHistory([
+        { role: 'user', content: 'fetch weather' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call-a', name: 'fa', arguments: '{}' }],
+        },
+      ]);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+    });
+
+    it('hydrates pendingUnresolvedToolCallCount from a trailing multi-call assistant turn', () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      session.primeHistory([
+        { role: 'user', content: 'fan out' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [
+            { id: 'call-a', name: 'fa', arguments: '{}' },
+            { id: 'call-b', name: 'fb', arguments: '{}' },
+          ],
+        },
+      ]);
+      expect(session.pendingUnresolvedToolCallCount).toBe(2);
+    });
+
+    it('counts only unresolved siblings when a fan-out was partially resolved', () => {
+      // Primed chain saw one of two tool results before being
+      // preempted — only the still-unresolved call should remain in
+      // the guard count so the server can pick a correct recovery
+      // path (1 → sendToolResult for the remaining id).
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+      session.primeHistory([
+        { role: 'user', content: 'fan out' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [
+            { id: 'call-a', name: 'fa', arguments: '{}' },
+            { id: 'call-b', name: 'fb', arguments: '{}' },
+          ],
+        },
+        { role: 'tool', content: 'result-a', toolCallId: 'call-a' },
+      ]);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+    });
+
+    it('re-priming recomputes pendingUnresolvedToolCallCount from the new trailing assistant turn', () => {
+      const { model } = makeMockModel();
+      const session = new ChatSession(model);
+
+      session.primeHistory([
+        { role: 'user', content: 'fan out' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [
+            { id: 'call-a', name: 'fa', arguments: '{}' },
+            { id: 'call-b', name: 'fb', arguments: '{}' },
+          ],
+        },
+      ]);
+      expect(session.pendingUnresolvedToolCallCount).toBe(2);
+
+      session.primeHistory([
+        { role: 'user', content: 'plain' },
+        { role: 'assistant', content: 'plain-reply' },
+      ]);
+      expect(session.pendingUnresolvedToolCallCount).toBeNull();
+    });
+
+    it('rejects sendToolResult after a primed multi-call assistant turn', async () => {
+      const { model, chatSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model);
+
+      // primeHistory leaves turnCount=0, so we must run startFromHistory
+      // before sendToolResult can dispatch. Mock chatSessionStart to
+      // emit a multi-call final result so the post-commit
+      // recordToolCallFanout still carries a fan-out flag afterward.
+      const { chatSessionStart } = model as unknown as {
+        chatSessionStart: ReturnType<typeof vi.fn>;
+      };
+      chatSessionStart.mockResolvedValueOnce({
+        ...makeChatResult('replayed'),
+        toolCalls: [
+          { id: 'call-x', name: 'fx', arguments: {}, status: 'ok' },
+          { id: 'call-y', name: 'fy', arguments: {}, status: 'ok' },
+        ],
+      } as unknown as ChatResult);
+
+      session.primeHistory([
+        { role: 'user', content: 'fan out' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [
+            { id: 'call-a', name: 'fa', arguments: '{}' },
+            { id: 'call-b', name: 'fb', arguments: '{}' },
+          ],
+        },
+      ]);
+      expect(session.pendingUnresolvedToolCallCount).toBe(2);
+      await session.startFromHistory();
+      expect(session.pendingUnresolvedToolCallCount).toBe(2);
+      await expect(session.sendToolResult('call-x', 'result-x')).rejects.toThrow(
+        /previous assistant turn emitted 2 ok tool calls/,
+      );
+      expect(chatSessionContinueTool).not.toHaveBeenCalled();
     });
   });
 

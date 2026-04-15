@@ -1192,8 +1192,8 @@ impl Gemma4Inner {
 
         // Warmup: run dummy tokens through the full model to trigger
         // Metal shader compilation at load time rather than on the first real
-        // inference call. Without this, the first chat() call is ~100x slower
-        // than subsequent calls due to JIT shader compilation.
+        // inference call. Without this, the first chat-session turn is ~100x
+        // slower than subsequent turns due to JIT shader compilation.
         if std::env::var("GEMMA4_NO_WARMUP").is_err() {
             let warmup_start = std::time::Instant::now();
             warmup_forward(&inner)?;

@@ -1,5 +1,5 @@
 /**
- * SessionRegistry -- per-model LRU+TTL cache of live `ChatSession` instances.
+ * SessionRegistry -- per-model TTL cache of live `ChatSession` instances.
  *
  * Design notes:
  *
@@ -9,28 +9,68 @@
  *     allocated after a turn completes — there is no secondary keying on
  *     model name because the registry itself is already scoped.
  *
- *   - **Cache hit semantics.** `getOrCreate(previousResponseId)` is how
- *     endpoints look up a session mid-request. It returns a fresh
- *     `ChatSession` on miss (no caching) and the existing session on hit
- *     (LRU-promoted). The caller adopts the session under the new
- *     allocated response id via `adopt()` once the turn completes.
+ *   - **Single-use / lease semantics on hit.**
+ *     `getOrCreate(previousResponseId, requestedInstructions)` is how
+ *     endpoints look up a session mid-request. Every successful hit
+ *     **removes the entry from the cache** and returns the live
+ *     session to the caller as a lease. The caller then either adopts
+ *     it back under the freshly allocated response id via `adopt()`
+ *     after the turn commits, or drops it on the floor if the turn
+ *     did not commit (streaming error, iterator exhaustion, etc.).
+ *
+ *     This is deliberate. `ChatSession` is single-flight: concurrent
+ *     `send` / `sendStream` / `reset` calls throw. Two overlapping
+ *     requests that reference the same `previous_response_id` would
+ *     otherwise race on the same live object and one of them would
+ *     fail with a 500. Leasing on hit means the second request misses
+ *     on the now-empty slot and safely cold-replays from the
+ *     `ResponseStore` onto a fresh session — both requests succeed
+ *     independently under separate allocated ids.
+ *
+ *     As a consequence, the endpoint layer's post-turn
+ *     `sessionReg.drop(previousResponseId)` is effectively a no-op
+ *     (the entry was already leased out in `getOrCreate`) but is kept
+ *     for belt-and-braces clarity.
+ *
+ *   - **Instructions / prefix-state change also misses.** Each entry
+ *     records the `instructions` string that was used to adopt it. On
+ *     `getOrCreate` we compare the caller's `requestedInstructions`
+ *     against the cached entry's value. On mismatch the entry is
+ *     evicted and a fresh `ChatSession` is returned — so the caller
+ *     falls through to the cold-replay path, which re-primes the new
+ *     instructions via the full message list. Without this check, a
+ *     hot hit would silently keep using the stale warmed system
+ *     context while a cold miss would replay the new one, making
+ *     output depend on LRU state instead of request contents.
+ *
+ *     This is the single "prefix/system state" identity check — the
+ *     Anthropic endpoint passes its `system` field through the same
+ *     parameter, and the OpenAI endpoint passes its `instructions`
+ *     field. The registry does not care which is which.
  *
  *   - **Cache miss fallback.** If a client request arrives with a
  *     `previous_response_id` that the server does not have a cached
- *     session for (eviction, restart, or cross-node scale-out), the
- *     endpoint layer falls back to reconstructing the conversation from
- *     the `ResponseStore` history and calling
- *     `chatSessionStart(history)` on a fresh `ChatSession`. This
- *     fallback is wired at the endpoint layer (step S2 of the
- *     chat-session refactor), not here — `SessionRegistry` simply
- *     returns a bare `new ChatSession(model)` on miss.
+ *     session for (eviction, restart, cross-node scale-out, or the
+ *     lease-on-hit semantics above), the endpoint layer falls back to
+ *     reconstructing the conversation from the `ResponseStore`
+ *     history, priming it onto a fresh `ChatSession` via
+ *     `primeHistory()`, and then resuming the turn through
+ *     `startFromHistory()` (or `startFromHistoryStream()` for
+ *     streaming). That pair internally dispatches one
+ *     `chatSessionStart*` call that rebuilds the full KV cache and
+ *     atomically appends the new user turn, so cold replay is
+ *     indistinguishable from a hot hit as far as the model is
+ *     concerned. The fallback is wired at the endpoint layer (step S2
+ *     of the chat-session refactor), not here — `SessionRegistry`
+ *     simply returns a bare `new ChatSession(model)` on miss.
  *
  *   - **Eviction matches `ResponseStore`.** The default TTL of 1800
  *     seconds mirrors `RESPONSE_TTL_SECONDS` in
  *     `packages/server/src/endpoints/responses.ts`, so sessions age out
  *     alongside their stored response metadata. LRU eviction kicks in
  *     when the number of cached sessions exceeds `maxEntries` (default
- *     128).
+ *     128). LRU ordering is driven by `adopt()` — there is no in-place
+ *     promotion on hit because a hit removes the entry entirely.
  *
  *   - **Thread safety.** Node.js is single-threaded within one event
  *     loop tick, so the internal `Map` is safe against concurrent
@@ -53,6 +93,14 @@ export interface SessionRegistryOptions {
 
 interface SessionEntry {
   session: ChatSession<SessionCapableModel>;
+  /**
+   * The `instructions` / `system` string the caller adopted this
+   * session with. `null` if the caller did not supply any. Compared
+   * byte-for-byte against the caller's `requestedInstructions` in
+   * `getOrCreate` to detect prefix/system-state changes that would
+   * otherwise let a hot hit silently reuse a stale warmed prompt.
+   */
+  instructions: string | null;
   /** Unix seconds at which this entry becomes eligible for eviction. */
   expiresAt: number;
 }
@@ -67,9 +115,11 @@ export class SessionRegistry {
   private readonly ttlSec: number;
   private readonly maxEntries: number;
   /**
-   * Map insertion order == LRU order. On every hit we `delete` + re-set
-   * the entry to move it to the MRU position at the tail of the map.
-   * The LRU victim is the map's first key (`entries.keys().next().value`).
+   * Map insertion order == LRU order. `adopt()` inserts at the tail
+   * (MRU); the LRU victim is the map's first key
+   * (`entries.keys().next().value`). There is no in-place promotion
+   * on hit: a hit removes the entry entirely (lease semantics), so
+   * ordering is only ever driven by `adopt()`.
    */
   private readonly entries: Map<string, SessionEntry> = new Map();
 
@@ -87,16 +137,30 @@ export class SessionRegistry {
   /**
    * Look up or allocate a session for the given previous response id.
    *
-   * On cache miss (null id, unknown id, or expired entry) this returns a
-   * fresh `new ChatSession(model)` without caching it — the endpoint
-   * layer is responsible for adopting the session under the newly
-   * allocated response id after the turn completes.
+   * On a null id, a missing key, or an expired entry, returns a fresh
+   * `new ChatSession(model)` without caching it — the endpoint layer
+   * is responsible for adopting the session back under the newly
+   * allocated response id after the turn commits.
    *
-   * On cache hit the entry is LRU-promoted (deleted and re-inserted so
-   * it moves to the tail of the map's insertion order) and the live
-   * session is returned.
+   * On a hit, the entry is **removed from the cache (single-use
+   * lease)** and its live session is returned. Overlapping requests
+   * against the same `previous_response_id` therefore cannot share
+   * the same live `ChatSession`: the first caller wins the lease, the
+   * second misses and cold-replays from the `ResponseStore`. This is
+   * required because `ChatSession` is single-flight and concurrent
+   * dispatch throws.
+   *
+   * `requestedInstructions` is the caller's current prefix/system
+   * state (OpenAI `instructions`, Anthropic `system`, or `null` if
+   * the caller did not supply any). It is compared byte-for-byte
+   * against the cached entry's `instructions`; mismatch is treated
+   * as a miss so the caller falls through to cold replay and the
+   * new instructions are re-primed into the fresh session.
    */
-  getOrCreate(previousResponseId: string | null): ChatSession<SessionCapableModel> {
+  getOrCreate(
+    previousResponseId: string | null,
+    requestedInstructions: string | null,
+  ): ChatSession<SessionCapableModel> {
     if (previousResponseId === null) {
       return new ChatSession(this.model);
     }
@@ -108,9 +172,20 @@ export class SessionRegistry {
       this.entries.delete(previousResponseId);
       return new ChatSession(this.model);
     }
-    // LRU promotion: move to MRU position by delete + reinsert.
+    // Instructions / prefix-state mismatch: evict and force cold
+    // replay so the new instructions are re-primed. Without this
+    // guard, a hot hit would silently keep using the stale warmed
+    // system context while a cold miss would replay the new one,
+    // making output depend on LRU state instead of request contents.
+    if (entry.instructions !== requestedInstructions) {
+      this.entries.delete(previousResponseId);
+      return new ChatSession(this.model);
+    }
+    // Lease semantics: remove the entry from the cache before handing
+    // it back. A concurrent second request against the same id will
+    // miss here and cold-replay, so we never hand the same live
+    // ChatSession to two overlapping callers.
     this.entries.delete(previousResponseId);
-    this.entries.set(previousResponseId, entry);
     return entry.session;
   }
 
@@ -125,8 +200,14 @@ export class SessionRegistry {
    * least-recently-used entry is evicted before insertion. (An update
    * to an existing key does not trigger eviction — it does not grow
    * the map.)
+   *
+   * `instructions` is the prefix/system state the caller used for
+   * this turn (OpenAI `instructions`, Anthropic `system`, or `null`).
+   * It is stored on the entry and compared on the next
+   * `getOrCreate` to detect prefix-state changes that must force a
+   * cold replay.
    */
-  adopt(responseId: string, session: ChatSession<SessionCapableModel>): void {
+  adopt(responseId: string, session: ChatSession<SessionCapableModel>, instructions: string | null): void {
     const existed = this.entries.delete(responseId);
     if (!existed && this.entries.size >= this.maxEntries) {
       const victim = this.entries.keys().next().value;
@@ -136,6 +217,7 @@ export class SessionRegistry {
     }
     this.entries.set(responseId, {
       session,
+      instructions,
       expiresAt: nowSec() + this.ttlSec,
     });
   }

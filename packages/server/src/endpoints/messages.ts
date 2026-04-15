@@ -378,7 +378,31 @@ export async function handleCreateMessage(
     return;
   }
 
-  const session = sessionReg.getOrCreate(null);
+  // The Anthropic endpoint is stateless — every request allocates a
+  // fresh `ChatSession` (via `getOrCreate(null, ...)`) and never
+  // adopts it back into the cache. The `system` prompt is baked into
+  // `messages` by `mapAnthropicRequest` and replayed via
+  // `startFromHistory`, so there is no session-reuse path where a
+  // stale system context could leak across requests. We still pass
+  // the canonicalized system string to `getOrCreate` to keep the
+  // registry API contract uniform across both OpenAI and Anthropic
+  // endpoints — it is the caller's single "prefix/system state"
+  // identity field.
+  //
+  // Anthropic's `system` field may be a string OR an array of content
+  // blocks. We canonicalize to a deterministic JSON-stringified form
+  // when it is structured so the equality check on a hypothetical
+  // hit path would be stable across requests. Simple strings are
+  // passed through unchanged to keep the common case readable.
+  let requestedSystem: string | null;
+  if (typeof body.system === 'string') {
+    requestedSystem = body.system;
+  } else if (body.system != null) {
+    requestedSystem = JSON.stringify(body.system);
+  } else {
+    requestedSystem = null;
+  }
+  const session = sessionReg.getOrCreate(null, requestedSystem);
 
   try {
     if (body.stream === true) {

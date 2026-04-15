@@ -897,30 +897,30 @@ impl Qwen35Inner {
 
         // Full reset: the session-start path always begins from a clean
         // state. This matches the documented contract that the session is
-        // owned end-to-end by the `Qwen35Session`/`chat_session_*` surface
-        // and intentionally invalidates any prior legacy-chat cache.
+        // owned end-to-end by the `ChatSession<Qwen35Model>` /
+        // `chat_session_*` surface and intentionally invalidates any
+        // prior session cache.
         self.reset_caches_sync()?;
         self.init_caches_sync()?;
 
-        self.chat_sync_core(messages, config, Some(im_end_id))
+        self.chat_sync_core(messages, config, im_end_id)
     }
 
-    /// Core synchronous chat implementation with optional EOS override
-    /// (runs on the model thread).
+    /// Core synchronous chat implementation (runs on the model thread).
     ///
     /// Shared jinja rendering + prefill + decode plumbing for the session
-    /// surface. `eos_override` lets session methods pass a custom EOS token
-    /// (`<|im_end|>` for ChatML boundaries) so the cached history ends on a
-    /// clean delimiter that subsequent session-delta turns can append to.
-    /// Passing `None` falls back to `config.eos_token_id`.
+    /// surface. `eos_token_id` is the caller-supplied stop-on token id
+    /// (`<|im_end|>` for ChatML boundaries) so the cached history ends on
+    /// a clean delimiter that subsequent session-delta turns can append
+    /// to.
     ///
-    /// Only called from [`Self::chat_session_start_sync`] (with
-    /// `Some(im_end_id)`); there is no longer a non-session entry point.
+    /// Only called from [`Self::chat_session_start_sync`]; there is no
+    /// longer a non-session entry point.
     fn chat_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        eos_override: Option<u32>,
+        eos_token_id: u32,
     ) -> Result<ChatResult> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -1085,11 +1085,7 @@ impl Qwen35Inner {
             (prefill_tokens, cached_prefix_len)
         };
 
-        // Session-start paths pass `Some(<|im_end|>)` to yield clean ChatML
-        // cache boundaries for subsequent delta continuations; legacy
-        // `chat_sync` passes `None` and preserves config-driven EOS for
-        // byte-for-byte compatibility with existing callers.
-        let eos_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
+        let eos_id = eos_token_id;
 
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let generation_stream = Stream::new(DeviceType::Gpu);
@@ -1240,7 +1236,7 @@ impl Qwen35Inner {
         }
         if self.caches.is_none() {
             return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires an initialized session (call chat first)",
+                "chat_tokens_delta_sync requires an initialized session (call chatSessionStart first)",
             ));
         }
         if delta_tokens.is_empty() {
@@ -1823,8 +1819,7 @@ impl Qwen35Inner {
             return;
         }
 
-        let result =
-            self.chat_stream_sync_inner(messages, config, Some(im_end_id), &cb, &cancelled);
+        let result = self.chat_stream_sync_inner(messages, config, im_end_id, &cb, &cancelled);
         if let Err(e) = result {
             let _ = stream_tx.send(Err(e));
         }
@@ -1980,7 +1975,7 @@ impl Qwen35Inner {
         if self.caches.is_none() {
             send_stream_error(
                 &stream_tx,
-                "chat_stream_tokens_delta requires an initialized session (call chat_stream_session_start first)",
+                "chat_stream_tokens_delta requires an initialized session (call chatStreamSessionStart first)",
             );
             return;
         }
@@ -2401,7 +2396,7 @@ impl Qwen35Inner {
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        eos_override: Option<u32>,
+        eos_token_id: u32,
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<()> {
@@ -2563,11 +2558,7 @@ impl Qwen35Inner {
             (prefill_tokens, cached_prefix_len)
         };
 
-        // Session-start streaming paths pass `Some(<|im_end|>)` so the
-        // cached history ends on a clean ChatML boundary; the default
-        // `chat_stream` path passes `None` and preserves config-driven
-        // EOS for byte-for-byte compatibility with existing callers.
-        let eos_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
+        let eos_id = eos_token_id;
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
@@ -4394,11 +4385,11 @@ pub struct ChatConfig {
     /// When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result
     #[napi(ts_type = "boolean | undefined")]
     pub report_performance: Option<bool>,
-    /// Reuse KV cache across chat() calls for incremental prefill. Default: true.
+    /// Reuse KV cache across chat-session turns for incremental prefill. Default: true.
     /// When true, the model preserves its KV cache after generation. On the next
-    /// chat() call, it prefix-matches the new token sequence against the cached
-    /// tokens and only prefills the delta — avoiding redundant computation for
-    /// multi-turn conversations.
+    /// `chatSessionStart` / `chatSessionContinue` call, it prefix-matches the new
+    /// token sequence against the cached tokens and only prefills the delta —
+    /// avoiding redundant computation for multi-turn conversations.
     #[napi(ts_type = "boolean | undefined")]
     pub reuse_cache: Option<bool>,
 }
@@ -4441,7 +4432,10 @@ pub struct ChatStreamChunk {
     pub is_reasoning: Option<bool>,
 }
 
-/// Handle returned by `chat_stream()` to control an in-progress streaming generation.
+/// Handle returned by the streaming chat-session entry points
+/// (`chat_stream_session_start`, `chat_stream_session_continue`,
+/// `chat_stream_session_continue_tool`) to control an in-progress
+/// streaming generation.
 #[napi]
 pub struct ChatStreamHandle {
     pub(crate) cancelled: Arc<AtomicBool>,
@@ -4487,7 +4481,8 @@ impl Qwen3_5Model {
     ///
     /// The cache is moved out of the model — calling `takeCache()` twice
     /// returns `null` the second time. Pass the cache back via `setCache()`
-    /// before the next `chat()` call for incremental prefill.
+    /// before the next `chatSessionStart` / `chatSessionContinue` call for
+    /// incremental prefill.
     #[napi]
     pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
         crate::model_thread::send_and_block(&self.thread, |reply| Qwen35Cmd::TakeCache { reply })
@@ -4496,8 +4491,9 @@ impl Qwen3_5Model {
 
     /// Restore a previously taken `PromptCache` into the model.
     ///
-    /// On the next `chat()` call with `reuseCache: true`, the model will
-    /// prefix-match the new tokens against the cache and only prefill the delta.
+    /// On the next `chatSessionStart` / `chatSessionContinue` call with
+    /// `reuseCache: true`, the model will prefix-match the new tokens against
+    /// the cache and only prefill the delta.
     #[napi]
     pub fn set_cache(
         &self,
@@ -4581,12 +4577,18 @@ impl Qwen3_5Model {
 
     /// Start a new chat session.
     ///
-    /// Text-only entry point that uses `<|im_end|>` as its stop token so
-    /// the cached KV state ends on a clean ChatML boundary. Subsequent
-    /// turns in the same session MUST go through [`chat_session_continue`]
-    /// so the caller appends raw ChatML deltas on top of the live caches
-    /// without rerunning the jinja template. The session is owned
-    /// end-to-end by the `chat_session_*` surface.
+    /// Runs the full jinja chat template once and uses `<|im_end|>` as
+    /// its stop token so the cached KV state ends on a clean ChatML
+    /// boundary. Image support is conditional on the loaded
+    /// checkpoint: a Qwen3.5-VL dense model loaded with vision weights
+    /// accepts images in `messages` (the vision encoder handles
+    /// prefill), while a plain text Qwen3.5 checkpoint rejects them
+    /// with a runtime error. Subsequent turns in the same session MUST
+    /// go through `chatSessionContinue` so the caller appends raw
+    /// ChatML deltas on top of the live caches without rerunning the
+    /// jinja template; a mid-session image change requires a fresh
+    /// `chatSessionStart` call. The session is owned end-to-end by
+    /// the `chatSession*` surface.
     ///
     /// This method is the production entry point used by the TypeScript
     /// `ChatSession` wrapper for turn 1 of a multi-round conversation.
@@ -4633,7 +4635,7 @@ impl Qwen3_5Model {
     /// KV state, then decodes the assistant reply. Stops on `<|im_end|>`
     /// so the cache remains on a clean boundary for the next turn.
     ///
-    /// Requires a live session started via [`chat_session_start`]. Errors
+    /// Requires a live session started via `chatSessionStart`. Errors
     /// if the session is empty, carries image state, or if
     /// `config.reuse_cache` is explicitly set to `false`.
     ///
@@ -4695,7 +4697,7 @@ impl Qwen3_5Model {
     /// wrapper tags, not an explicit id. Callers may still log it for
     /// their own bookkeeping.
     ///
-    /// Requires a live session started via [`chat_session_start`].
+    /// Requires a live session started via `chatSessionStart`.
     #[napi]
     pub async fn chat_session_continue_tool(
         &self,
@@ -4737,14 +4739,15 @@ impl Qwen3_5Model {
         .await
     }
 
-    /// Streaming variant of [`Self::chat_session_start`].
+    /// Streaming variant of `chatSessionStart`.
     ///
     /// Dispatches to the dedicated model thread. Behaviourally identical
-    /// to `chat_session_start` (text-only, resets caches, uses
-    /// `<|im_end|>` as eos) but streams token deltas through the JS
-    /// callback instead of returning a `ChatResult`. Used by the
-    /// TypeScript `Qwen35Session.sendStream()` for turn 1 of a
-    /// multi-round streaming conversation.
+    /// to `chatSessionStart` (resets caches, uses `<|im_end|>` as
+    /// eos, inherits the same VLM-vs-text image-support contract) but
+    /// streams token deltas through the JS callback instead of
+    /// returning a `ChatResult`. Used by the TypeScript
+    /// `ChatSession.sendStream()` for turn 1 of a multi-round streaming
+    /// conversation.
     #[napi(
         ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
@@ -4799,14 +4802,14 @@ impl Qwen3_5Model {
         Ok(ChatStreamHandle { cancelled })
     }
 
-    /// Streaming variant of [`Self::chat_session_continue`].
+    /// Streaming variant of `chatSessionContinue`.
     ///
     /// Appends a ChatML user/assistant delta on top of the live session
     /// caches and streams the decoded reply. Requires a live session
-    /// started via [`Self::chat_stream_session_start`] (or the
-    /// non-streaming [`Self::chat_session_start`]). Used by the
-    /// TypeScript `Qwen35Session.sendStream()` for turns 2..N of a
-    /// multi-round streaming conversation.
+    /// started via `chatStreamSessionStart` (or the non-streaming
+    /// `chatSessionStart`). Used by the TypeScript
+    /// `ChatSession.sendStream()` for turns 2..N of a multi-round
+    /// streaming conversation.
     ///
     /// `images` is an opt-in guard parameter: when non-empty, the
     /// streaming path emits an error chunk whose message begins with
@@ -4869,12 +4872,11 @@ impl Qwen3_5Model {
         Ok(ChatStreamHandle { cancelled })
     }
 
-    /// Streaming variant of [`Self::chat_session_continue_tool`].
+    /// Streaming variant of `chatSessionContinueTool`.
     ///
     /// Builds a ChatML tool-response delta on top of the live session
     /// caches and streams the decoded reply. Requires a live session
-    /// started via [`Self::chat_session_start`] /
-    /// [`Self::chat_stream_session_start`].
+    /// started via `chatSessionStart` / `chatStreamSessionStart`.
     #[napi(
         ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]

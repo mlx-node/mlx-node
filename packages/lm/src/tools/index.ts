@@ -1,27 +1,54 @@
 /**
- * Tool calling utilities for Qwen3
+ * Tool calling utilities
  *
- * Provides types and helpers for working with tool/function calling in the chat() API.
+ * Provides types and helpers for working with tool/function calling
+ * through the `ChatSession` API. Tools are passed via `ChatConfig.tools`
+ * on `session.send()`, and a tool result is fed back through
+ * `session.sendToolResult()`.
+ *
+ * **Single tool call per assistant turn.** Each `sendToolResult(...)`
+ * call appends one tool message and immediately re-opens the assistant
+ * turn, so the session API only supports assistant turns that emit
+ * exactly one tool call. If the model emits multiple tool calls in a
+ * single turn, the caller must treat that as an unsupported state:
+ * throw, surface an error to the user, or tighten the system prompt /
+ * tool spec so the model produces at most one call per turn. Do **not**
+ * loop `sendToolResult` across the remaining calls — later results
+ * would be interleaved with a new assistant reply from the first, and
+ * the conversation state would become inconsistent (especially for
+ * stateful tools whose effects must land in order).
  *
  * @example
  * ```typescript
- * import { createToolDefinition } from '@mlx-node/lm';
+ * import { createToolDefinition, loadSession } from '@mlx-node/lm';
  *
  * const weatherTool = createToolDefinition(
  *   'get_weather',
  *   'Get weather for a location',
  *   { location: { type: 'string', description: 'City name' } },
- *   ['location']
+ *   ['location'],
  * );
  *
- * const result = await model.chat(messages, { tools: [weatherTool] });
+ * const session = await loadSession('./my-model');
  *
- * for (const call of result.toolCalls) {
- *   if (call.status === 'ok') {
- *     const toolResult = await executeMyTool(call.name, call.arguments);
- *     // Use role: 'tool' — the Jinja2 template wraps content in <tool_response> tags
- *     messages.push({ role: 'tool', content: JSON.stringify(toolResult) });
- *   }
+ * const result = await session.send('What is the weather in Tokyo?', {
+ *   config: { tools: [weatherTool] },
+ * });
+ *
+ * const okCalls = result.toolCalls.filter((c) => c.status === 'ok');
+ * if (okCalls.length > 1) {
+ *   throw new Error(
+ *     `ChatSession only supports one tool call per assistant turn; ` +
+ *       `model emitted ${okCalls.length}. Tighten the prompt or tool spec.`,
+ *   );
+ * }
+ * const call = okCalls[0];
+ * if (call) {
+ *   const toolOutput = await executeMyTool(call.name, call.arguments);
+ *   const followUp = await session.sendToolResult(call.id, JSON.stringify(toolOutput), {
+ *     config: { tools: [weatherTool] },
+ *   });
+ *   console.log(followUp.text);
  * }
  * ```
  *

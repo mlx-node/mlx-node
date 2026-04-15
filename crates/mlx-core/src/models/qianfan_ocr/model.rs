@@ -341,19 +341,18 @@ impl QianfanOCRInner {
     /// matching, repetition/presence/frequency penalties, thinking/tool
     /// call parsing, and optional performance metrics.
     ///
-    /// `eos_override` lets session methods pass a custom EOS token
+    /// `eos_token_id` is the caller-supplied stop-on token id
     /// (`<|im_end|>` for ChatML boundaries) so the cached history ends on
     /// a clean delimiter that subsequent `chat_session_continue_*` calls
-    /// can append a raw delta on top of. Passing `None` falls back to
-    /// `self.config.eos_token_id`.
+    /// can append a raw delta on top of.
     ///
-    /// Only called from [`Self::chat_session_start_sync`] (with
-    /// `Some(im_end_id)`); there is no longer a non-session entry point.
+    /// Only called from [`Self::chat_session_start_sync`]; there is no
+    /// longer a non-session entry point.
     fn chat_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        eos_override: Option<u32>,
+        eos_token_id: u32,
     ) -> Result<ChatResult> {
         let max_new_tokens = config.max_new_tokens.unwrap_or(512);
         let temperature = config.temperature.unwrap_or(0.0);
@@ -449,12 +448,6 @@ impl QianfanOCRInner {
         // Trim happens below after we know seq_len — see clamped_prefix
 
         // --- Step 6: Prefill ---
-        // Session-start paths pass `Some(<|im_end|>)` to yield a clean
-        // ChatML cache boundary for subsequent delta continuations;
-        // legacy `chat_sync` passes `None` and preserves config-driven
-        // EOS for byte-for-byte compatibility with existing callers.
-        let eos_token_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
-
         let merged_embeds = if let Some(ref vf) = vision_features {
             let text_embeds = {
                 let _ctx = StreamContext::new(generation_stream);
@@ -729,9 +722,9 @@ impl QianfanOCRInner {
     /// Drives the same hoisted cache state so prefix matching and
     /// repetition penalties behave identically to the non-streaming path.
     ///
-    /// `eos_override` threads through exactly as in
-    /// [`chat_sync_core`](Self::chat_sync_core): `None` for the legacy
-    /// stream path, `Some(<|im_end|>)` for
+    /// `eos_token_id` threads through exactly as in
+    /// [`chat_sync_core`](Self::chat_sync_core): session-start callers
+    /// supply `<|im_end|>` via
     /// [`chat_stream_session_start_sync`](Self::chat_stream_session_start_sync).
     fn chat_stream_sync_core(
         &mut self,
@@ -739,7 +732,7 @@ impl QianfanOCRInner {
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
-        eos_override: Option<u32>,
+        eos_token_id: u32,
     ) {
         let sender = StreamSender(stream_tx.clone());
         let emit = |chunk: ChatStreamChunk| {
@@ -826,11 +819,6 @@ impl QianfanOCRInner {
                 self.kv_caches = None;
                 self.init_kv_caches();
             }
-
-            // Session-aware eos routing — see `chat_sync_core` for the
-            // full contract. Legacy stream callers pass `None`, session
-            // starts pass `Some(<|im_end|>)`.
-            let eos_token_id = eos_override.unwrap_or(self.config.eos_token_id as u32);
 
             let merged_embeds = if let Some(ref vf) = vision_features {
                 let text_embeds = {
@@ -1183,7 +1171,7 @@ impl QianfanOCRInner {
         // intentionally invalidates any prior cache.
         self.reset_caches_sync();
 
-        self.chat_sync_core(messages, config, Some(im_end_id))
+        self.chat_sync_core(messages, config, im_end_id)
     }
 
     /// Continue an existing chat session with a user turn.
@@ -1290,7 +1278,7 @@ impl QianfanOCRInner {
         }
         if self.cached_token_history.is_empty() {
             return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires an initialized session (call chat_session_start first)",
+                "chat_tokens_delta_sync requires an initialized session (call chatSessionStart first)",
             ));
         }
         if delta_tokens.is_empty() {
@@ -1300,13 +1288,13 @@ impl QianfanOCRInner {
         }
         if self.cached_image_key.is_some() {
             return Err(Error::from_reason(format!(
-                "{}chat_tokens_delta_sync cannot be called while image state is cached; call chat_session_start with the new images instead",
+                "{}chat_tokens_delta_sync cannot be called while image state is cached; call chatSessionStart with the new images instead",
                 crate::models::qwen3_5::chat_common::IMAGE_CHANGE_RESTART_PREFIX
             )));
         }
         if self.kv_caches.is_none() {
             return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires live KV caches; call chat_session_start first",
+                "chat_tokens_delta_sync requires live KV caches; call chatSessionStart first",
             ));
         }
 
@@ -1586,7 +1574,7 @@ impl QianfanOCRInner {
         // Full reset: the session always starts clean.
         self.reset_caches_sync();
 
-        self.chat_stream_sync_core(messages, config, stream_tx, cancelled, Some(im_end_id));
+        self.chat_stream_sync_core(messages, config, stream_tx, cancelled, im_end_id);
     }
 
     /// Streaming variant of [`Self::chat_session_continue_sync`].
@@ -1712,7 +1700,7 @@ impl QianfanOCRInner {
         if self.cached_token_history.is_empty() {
             crate::models::qwen3_5::chat_common::send_stream_error(
                 &stream_tx,
-                "chat_stream_tokens_delta requires an initialized session (call chat_stream_session_start first)",
+                "chat_stream_tokens_delta requires an initialized session (call chatStreamSessionStart first)",
             );
             return;
         }
@@ -1727,7 +1715,7 @@ impl QianfanOCRInner {
             crate::models::qwen3_5::chat_common::send_stream_error(
                 &stream_tx,
                 &format!(
-                    "{}chat_stream_tokens_delta cannot be called while image state is cached; call chat_stream_session_start with the new images instead",
+                    "{}chat_stream_tokens_delta cannot be called while image state is cached; call chatStreamSessionStart with the new images instead",
                     crate::models::qwen3_5::chat_common::IMAGE_CHANGE_RESTART_PREFIX
                 ),
             );
@@ -1736,7 +1724,7 @@ impl QianfanOCRInner {
         if self.kv_caches.is_none() {
             crate::models::qwen3_5::chat_common::send_stream_error(
                 &stream_tx,
-                "chat_stream_tokens_delta requires live KV caches; call chat_stream_session_start first",
+                "chat_stream_tokens_delta requires live KV caches; call chatStreamSessionStart first",
             );
             return;
         }
@@ -2209,11 +2197,11 @@ impl QianfanOCRModel {
 
     /// Start a new chat session.
     ///
-    /// Equivalent to [`Self::chat`] but stops decoding on `<|im_end|>` and
-    /// leaves the KV caches on a clean turn boundary so subsequent
-    /// [`Self::chat_session_continue`] /
-    /// [`Self::chat_session_continue_tool`] calls can append a raw
-    /// ChatML delta on top without re-rendering the chat template.
+    /// Runs the full chat template once, decodes until `<|im_end|>`,
+    /// and leaves the KV caches on a clean turn boundary so subsequent
+    /// `chatSessionContinue` / `chatSessionContinueTool` calls can
+    /// append a raw ChatML delta on top without re-rendering the chat
+    /// template.
     ///
     /// Qianfan-OCR is always a VLM (InternViT + Qwen3 language model), so
     /// this entry point accepts images in `messages` without the text-only
@@ -2244,9 +2232,9 @@ impl QianfanOCRModel {
     /// KV state, then decodes the model reply. Stops on `<|im_end|>` so
     /// the cache remains on a clean turn boundary for the next turn.
     ///
-    /// Requires a live session started via
-    /// [`Self::chat_session_start`]. Errors if the session is empty or
-    /// if `config.reuse_cache` is explicitly set to `false`.
+    /// Requires a live session started via `chatSessionStart`. Errors
+    /// if the session is empty or if `config.reuse_cache` is
+    /// explicitly set to `false`.
     ///
     /// `images` is an opt-in guard parameter: when non-empty the native
     /// side returns an error whose message begins with
@@ -2287,8 +2275,7 @@ impl QianfanOCRModel {
     /// decodes the model reply. Stops on `<|im_end|>` so the cache stays
     /// on a clean turn boundary for the next turn.
     ///
-    /// Requires a live session started via
-    /// [`Self::chat_session_start`].
+    /// Requires a live session started via `chatSessionStart`.
     #[napi]
     pub async fn chat_session_continue_tool(
         &self,
@@ -2313,7 +2300,7 @@ impl QianfanOCRModel {
         .await
     }
 
-    /// Streaming variant of [`Self::chat_session_start`].
+    /// Streaming variant of `chatSessionStart`.
     #[napi(
         ts_args_type = "messages: ChatMessage[], config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
@@ -2351,7 +2338,7 @@ impl QianfanOCRModel {
         Ok(ChatStreamHandle { cancelled })
     }
 
-    /// Streaming variant of [`Self::chat_session_continue`].
+    /// Streaming variant of `chatSessionContinue`.
     #[napi(
         ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
@@ -2391,7 +2378,7 @@ impl QianfanOCRModel {
         Ok(ChatStreamHandle { cancelled })
     }
 
-    /// Streaming variant of [`Self::chat_session_continue_tool`].
+    /// Streaming variant of `chatSessionContinueTool`.
     #[napi(
         ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]

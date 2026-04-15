@@ -1343,17 +1343,16 @@ impl Qwen3Inner {
         tokenizer.decode_sync(token_ids, skip_special)
     }
 
-    /// Core synchronous chat implementation with optional EOS override.
+    /// Core synchronous chat implementation.
     ///
-    /// `eos_override` lets session methods pass a custom EOS token (e.g.
-    /// `<|im_end|>` for Qwen-style ChatML delimiters). Passing `None`
-    /// falls back to `gen_config.eos_token_id` and finally
-    /// `model_config.eos_token_id`, matching the pre-refactor behavior.
+    /// `eos_token_id` is the caller-supplied stop-on token id (e.g.
+    /// `<|im_end|>` for Qwen-style ChatML delimiters). Session entry
+    /// points always supply this explicitly.
     fn chat_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        eos_override: Option<u32>,
+        eos_token_id: u32,
     ) -> Result<ChatResult> {
         let tokenizer = self
             .tokenizer
@@ -1481,13 +1480,6 @@ impl Qwen3Inner {
         let max_consecutive_tokens = gen_config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = gen_config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = gen_config.ngram_size.unwrap_or(64);
-        // `eos_override` wins if set (session path uses this to close on
-        // `<|im_end|>`); otherwise preserve legacy chain:
-        // `gen_config.eos_token_id` → `model_config.eos_token_id`.
-        let eos_token_id = eos_override
-            .map(|id| id as i32)
-            .or(gen_config.eos_token_id)
-            .or(Some(model_config.eos_token_id));
         let return_logprobs = gen_config.return_logprobs.unwrap_or(false);
         let prefill_step_size = gen_config.prefill_step_size.unwrap_or(2048) as usize;
 
@@ -1693,9 +1685,7 @@ impl Qwen3Inner {
                 finish_reason = reason;
                 break;
             }
-            if let Some(eos_id) = eos_token_id
-                && token_value == eos_id as u32
-            {
+            if token_value == eos_token_id {
                 finish_reason = "stop";
                 break;
             }
@@ -1831,8 +1821,7 @@ impl Qwen3Inner {
         })
     }
 
-    /// Core synchronous streaming chat implementation with optional EOS
-    /// override.
+    /// Core synchronous streaming chat implementation.
     ///
     /// Mirrors the Qwen3.5 Dense `chat_stream_sync_inner` reference
     /// implementation but adapted to the Qwen3 legacy forward path:
@@ -1851,17 +1840,14 @@ impl Qwen3Inner {
     ///     no image-processing branch and the shared
     ///     `cached_image_key` field always remains `None`.
     ///
-    /// `eos_override` lets session methods pass a custom EOS token (e.g.
-    /// `<|im_end|>` for Qwen-style ChatML boundaries). Passing `None`
-    /// falls back to `self.config.eos_token_id`, matching the semantics
-    /// of the non-streaming [`Self::chat_sync_core`] when it is called
-    /// with the same override resolution and no explicit
-    /// `gen_config.eos_token_id`.
+    /// `eos_token_id` is the caller-supplied stop-on token id (session
+    /// paths feed `<|im_end|>` so generation halts on a clean ChatML
+    /// boundary).
     fn chat_stream_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        eos_override: Option<u32>,
+        eos_token_id: u32,
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<()> {
@@ -1880,11 +1866,6 @@ impl Qwen3Inner {
         let p = chat_common::extract_chat_params(&config);
         let reuse_cache = p.reuse_cache;
         let report_perf = p.report_performance;
-
-        // Qwen3 legacy is text-only; session-start streaming paths will
-        // feed `<|im_end|>` through `eos_override`, default path falls
-        // back to `self.config.eos_token_id`.
-        let eos_id: u32 = eos_override.unwrap_or(self.config.eos_token_id as u32);
 
         let token_ids_vec = tokenizer.apply_chat_template_sync(
             &messages,
@@ -2172,7 +2153,7 @@ impl Qwen3Inner {
                 reasoning_tracker: reasoning_tracker,
                 profiler: profiler,
                 max_new_tokens: p.max_new_tokens,
-                eos_id: eos_id,
+                eos_id: eos_token_id,
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
@@ -2332,7 +2313,7 @@ impl Qwen3Inner {
         // intentionally invalidates any prior cache.
         self.reset_kv_caches_sync()?;
 
-        self.chat_sync_core(messages, config, Some(im_end_id))
+        self.chat_sync_core(messages, config, im_end_id)
     }
 
     /// Prefill a pre-tokenized delta on top of the existing Qwen3 KV
@@ -2357,7 +2338,7 @@ impl Qwen3Inner {
         }
         if self.cached_token_history.is_empty() {
             return Err(napi::Error::from_reason(
-                "chat_tokens_delta_sync requires an initialized session (call chat_session_start first)",
+                "chat_tokens_delta_sync requires an initialized session (call chatSessionStart first)",
             ));
         }
         if delta_tokens.is_empty() {
@@ -2766,7 +2747,7 @@ impl Qwen3Inner {
             return;
         }
 
-        let result = self.chat_stream_sync_core(messages, config, Some(im_end_id), &cb, &cancelled);
+        let result = self.chat_stream_sync_core(messages, config, im_end_id, &cb, &cancelled);
         if let Err(e) = result {
             let _ = stream_tx.send(Err(e));
         }
@@ -2899,7 +2880,7 @@ impl Qwen3Inner {
         if self.cached_token_history.is_empty() {
             send_stream_error(
                 &stream_tx,
-                "chat_stream_tokens_delta requires an initialized session (call chat_stream_session_start first)",
+                "chat_stream_tokens_delta requires an initialized session (call chatStreamSessionStart first)",
             );
             return;
         }
@@ -5054,7 +5035,7 @@ pub struct Qwen3Model {
 
 #[napi]
 impl Qwen3Model {
-    /// Reset the KV cache used for cache reuse across chat() calls.
+    /// Reset the KV cache used for cache reuse across chat-session turns.
     /// Call this when starting a new conversation to ensure a full prefill.
     #[napi]
     pub fn reset_cache(&self) -> Result<()> {
@@ -5445,11 +5426,11 @@ impl Qwen3Model {
 
     /// Start a new chat session.
     ///
-    /// Equivalent to the legacy `chat()` entry point but stops decoding
-    /// on `<|im_end|>` and leaves the KV caches on a clean ChatML
-    /// boundary so subsequent [`Self::chat_session_continue`] /
-    /// [`Self::chat_session_continue_tool`] calls can append a raw
-    /// delta on top without re-rendering the chat template.
+    /// Runs the full jinja chat template once, decodes until `<|im_end|>`,
+    /// and leaves the KV caches on a clean ChatML boundary so subsequent
+    /// `chatSessionContinue` / `chatSessionContinueTool` calls can
+    /// append a raw delta on top without re-rendering the chat
+    /// template.
     ///
     /// Requires `config.reuse_cache` to be enabled (the default).
     #[napi]
@@ -5458,6 +5439,15 @@ impl Qwen3Model {
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
+        if messages
+            .iter()
+            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
+        {
+            return Err(Error::from_reason(format!(
+                "{} Qwen3 is text-only; image messages are not supported",
+                IMAGE_CHANGE_RESTART_PREFIX
+            )));
+        }
         let config = config.unwrap_or_default();
         send_and_await(&self.thread, |reply| Qwen3Cmd::ChatSessionStart {
             messages,
@@ -5474,10 +5464,9 @@ impl Qwen3Model {
     /// `<|im_end|>` so the cache remains on a clean boundary for the
     /// next turn.
     ///
-    /// Requires a live session started via
-    /// [`Self::chat_session_start`]. Errors if the session is empty,
-    /// carries image state, or if `config.reuse_cache` is explicitly
-    /// set to `false`.
+    /// Requires a live session started via `chatSessionStart`. Errors
+    /// if the session is empty, carries image state, or if
+    /// `config.reuse_cache` is explicitly set to `false`.
     ///
     /// Qwen3 legacy is text-only; `images` is an opt-in guard parameter:
     /// when non-empty the native side returns an error whose message
@@ -5511,8 +5500,7 @@ impl Qwen3Model {
     /// caches, then decodes the assistant reply. Stops on `<|im_end|>`
     /// so the cache stays on a clean boundary for the next turn.
     ///
-    /// Requires a live session started via
-    /// [`Self::chat_session_start`].
+    /// Requires a live session started via `chatSessionStart`.
     #[napi]
     pub async fn chat_session_continue_tool(
         &self,
@@ -5530,7 +5518,7 @@ impl Qwen3Model {
         .await
     }
 
-    /// Streaming variant of [`Self::chat_session_start`].
+    /// Streaming variant of `chatSessionStart`.
     #[napi(
         ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
@@ -5540,6 +5528,15 @@ impl Qwen3Model {
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
+        if messages
+            .iter()
+            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
+        {
+            return Err(Error::from_reason(format!(
+                "{} Qwen3 is text-only; image messages are not supported",
+                IMAGE_CHANGE_RESTART_PREFIX
+            )));
+        }
         let config = config.unwrap_or_default();
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -5564,7 +5561,7 @@ impl Qwen3Model {
         Ok(ChatStreamHandle { cancelled })
     }
 
-    /// Streaming variant of [`Self::chat_session_continue`].
+    /// Streaming variant of `chatSessionContinue`.
     #[napi(
         ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
@@ -5600,7 +5597,7 @@ impl Qwen3Model {
         Ok(ChatStreamHandle { cancelled })
     }
 
-    /// Streaming variant of [`Self::chat_session_continue_tool`].
+    /// Streaming variant of `chatSessionContinueTool`.
     #[napi(
         ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]

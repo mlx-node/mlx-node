@@ -30,12 +30,11 @@ export interface HandlerOptions {
 export function createHandler(
   registry: ModelRegistry,
   options?: HandlerOptions,
-): (req: IncomingMessage, res: ServerResponse) => void {
+): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   const cors = options?.cors ?? true;
   const store = options?.store ?? null;
 
-  return (req: IncomingMessage, res: ServerResponse) => {
-    // CORS preflight
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (cors) {
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -48,14 +47,20 @@ export function createHandler(
       }
     }
 
-    // Route the request (async)
-    routeRequest(req, res, registry, store).catch((err: unknown) => {
+    // Returning the promise lets tests await the full request lifecycle —
+    // including the post-`res.end()` synchronous bookkeeping that runs in
+    // the `routeRequest` async continuation (e.g. `SessionRegistry.adopt`).
+    // `http.createServer` ignores the return value, so this change is
+    // transparent to production callers.
+    try {
+      await routeRequest(req, res, registry, store);
+    } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Internal server error';
       if (!res.headersSent) {
         sendInternalError(res, message);
       } else {
         res.end();
       }
-    });
+    }
   };
 }

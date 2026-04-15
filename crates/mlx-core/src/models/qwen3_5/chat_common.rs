@@ -1,8 +1,11 @@
 //! Shared chat/decode infrastructure for Qwen3.5 Dense and MoE models.
 //!
-//! Extracts identical boilerplate from `chat()` and `chat_stream()` methods
-//! across both model variants: config extraction, penalty application,
-//! performance metrics, result finalization, and cache management.
+//! Extracts identical boilerplate from the session entry points
+//! (`chat_session_start_sync` / `chat_session_continue_sync` /
+//! `chat_session_continue_tool_sync` and their `chat_stream_*` streaming
+//! counterparts) across both model variants: config extraction, penalty
+//! application, performance metrics, result finalization, and cache
+//! management.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -71,7 +74,7 @@ pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
 /// mpsc so the NAPI forwarding task invokes the TS callback with
 /// `(err, null)`. On the TS side, `_runChatStream` pushes the error
 /// onto its queue and throws it from the async generator, which
-/// `Qwen35Session.sendStream` catches in its `try { ... } finally`
+/// `ChatSession.sendStream` catches in its `try { ... } finally`
 /// block. The finally clears `inFlight`, `sawFinal` stays false, and
 /// `turnCount` is NOT incremented — so the next `sendStream()` call
 /// re-routes through `chatStreamSessionStart` instead of trying to

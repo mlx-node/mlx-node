@@ -72,11 +72,24 @@ const tools = [
 
 const result = await session.send('What is the weather in Tokyo?', { config: { tools } });
 
-// If the model calls tools, execute them and feed results back through the session.
-const validCalls = result.toolCalls?.filter((tc) => tc.status === 'ok') ?? [];
-for (const tc of validCalls) {
-  const toolOutput = JSON.stringify(await executeMyTool(tc));
-  const followUp = await session.sendToolResult(tc.id, toolOutput, { config: { tools } });
+// The chat-session API only supports exactly one tool call per assistant turn:
+// each `sendToolResult` dispatch immediately re-opens the assistant turn, so
+// feeding a second result for the same turn would interleave a new assistant
+// reply between the two results. `ChatSession` enforces this at runtime — a
+// subsequent `sendToolResult*` after a multi-call turn throws with a clear
+// error — and the caller must refuse multi-call turns up front. Tighten the
+// prompt or tool spec so the model emits at most one call per turn.
+const okCalls = result.toolCalls?.filter((tc) => tc.status === 'ok') ?? [];
+if (okCalls.length > 1) {
+  throw new Error(
+    `ChatSession only supports one tool call per assistant turn; ` +
+      `model emitted ${okCalls.length}. Tighten the prompt or tool spec.`,
+  );
+}
+const call = okCalls[0];
+if (call) {
+  const toolOutput = JSON.stringify(await executeMyTool(call));
+  const followUp = await session.sendToolResult(call.id, toolOutput, { config: { tools } });
   console.log(followUp.text);
 }
 ```

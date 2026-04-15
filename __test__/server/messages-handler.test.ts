@@ -805,4 +805,123 @@ describe('handleCreateMessage', () => {
       expect((errorEvent!.data['error'] as any).message).toContain('Stream crashed');
     });
   });
+
+  // -----------------------------------------------------------------------
+  // SessionRegistry integration (findings 1-3 regressions)
+  // -----------------------------------------------------------------------
+
+  describe('session registry integration', () => {
+    it('forwards a top-level system string into the mapped chatSessionStart history', async () => {
+      // The Anthropic endpoint is stateless: every request allocates a
+      // fresh ChatSession via `getOrCreate(null, systemString)`. The
+      // registry parameter is unused on `null`, but the system prompt
+      // still needs to land in the primed history. Guard against a
+      // regression where the endpoint forgets to wire it through.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      registry.register('test-model', mockModel);
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          system: 'You are terse.',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      // oxlint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      const [messages] = startSpy.mock.calls[0] as [Array<{ role: string; content: string }>];
+      const systemMsg = messages.find((m) => m.role === 'system');
+      expect(systemMsg?.content).toBe('You are terse.');
+
+      // The Anthropic endpoint never adopts a session, so the registry
+      // stays empty regardless of the request outcome.
+      const sessionReg = registry.getSessionRegistry('test-model');
+      expect(sessionReg!.size).toBe(0);
+    });
+
+    it('handles a structured system field (array of content blocks)', async () => {
+      // Anthropic `system` may be an array of SystemBlocks. The
+      // mapper concatenates the text blocks into a single system
+      // message, and the endpoint stringifies the array for the
+      // registry identity check. Both paths must leave the request
+      // working end-to-end.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      registry.register('test-model', mockModel);
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          system: [{ type: 'text', text: 'Be concise.' } as any],
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      // oxlint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      const [messages] = startSpy.mock.calls[0] as [Array<{ role: string; content: string }>];
+      const systemMsg = messages.find((m) => m.role === 'system');
+      expect(systemMsg?.content).toBe('Be concise.');
+    });
+
+    it('does not cache a session when a streaming turn emits a done event with finishReason error', async () => {
+      // Finding 3 parity: the streaming commit path must not leak a
+      // resumable cached session entry when the final chunk reports
+      // `finishReason: 'error'`. The Anthropic endpoint is stateless
+      // and never adopts, but this test pins that invariant and also
+      // verifies the endpoint emits SSE terminal events cleanly under
+      // an error finish instead of throwing.
+      const streamEvents = [
+        { text: 'partial', done: false, isReasoning: false },
+        {
+          text: 'partial',
+          done: true,
+          finishReason: 'error',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 3,
+          reasoningTokens: 0,
+          rawText: 'partial',
+        },
+      ];
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      // The endpoint drained the stream without throwing. Minimum SSE
+      // expectation: at least one terminal event was written.
+      const events = parseSSE(getBody());
+      const terminal = events.find((e) => e.event === 'message_stop' || e.event === 'error');
+      expect(terminal).toBeDefined();
+
+      // And the registry stayed empty — no adopt call leaked.
+      const sessionReg = registry.getSessionRegistry('test-model');
+      expect(sessionReg!.size).toBe(0);
+    });
+  });
 });

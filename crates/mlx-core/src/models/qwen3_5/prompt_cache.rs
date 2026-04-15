@@ -2,13 +2,13 @@ use napi_derive::napi;
 
 use super::layer_cache::Qwen3_5LayerCache;
 
-/// Opaque handle to KV cache state from a previous chat() call.
+/// Opaque handle to KV cache state from a chat-session turn.
 ///
-/// Pass this back to the next chat() call via `model.setCache(cache)`
-/// to enable incremental prefill — only new tokens since the last turn
-/// are processed, avoiding redundant computation.
+/// Pass this back via `model.setCache(cache)` before the next
+/// chat-session call to enable incremental prefill — only new tokens
+/// since the last turn are processed, avoiding redundant computation.
 ///
-/// Created internally by the model when `reuseCache: true` (default).
+/// Created internally by the model during chat-session turns.
 /// Extract via `model.takeCache()`, restore via `model.setCache(cache)`.
 #[napi]
 pub struct PromptCache {

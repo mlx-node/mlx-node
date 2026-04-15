@@ -94,7 +94,8 @@ pub struct GenerationConfig {
     pub num_draft_tokens: Option<i32>,
 
     /// When true, record first-token timing for performance metrics.
-    /// Internal: set by chat() when reportPerformance is requested.
+    /// Internal: set by the chat-session entry points when
+    /// `reportPerformance` is requested.
     #[napi(skip)]
     pub report_performance: Option<bool>,
 }

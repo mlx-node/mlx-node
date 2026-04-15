@@ -425,18 +425,16 @@ impl Gemma4Inner {
     /// `max_ngram_repeats`, `ngram_size`, `thinking_token_budget`,
     /// `include_reasoning`.
     ///
-    /// `eos_override`:
-    ///   - `None`: stop on any of `config.eos_token_ids` (the pre-session
-    ///     legacy behaviour).
-    ///   - `Some(id)`: stop on `id` OR any of `config.eos_token_ids`, so
-    ///     the cached history ends on a caller-controlled boundary
-    ///     (typically a turn-terminator token). Used by the session-start
-    ///     path to leave the cache on a clean ChatML boundary.
+    /// `eos_token_id` is the caller-supplied stop-on token id. The decode
+    /// loop stops on this id OR any of `config.eos_token_ids`, so the
+    /// cached history ends on a caller-controlled boundary (typically a
+    /// turn-terminator token). Used by the session-start path to leave
+    /// the cache on a clean Gemma4 `<turn|>` boundary.
     pub(crate) fn chat_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        eos_override: Option<u32>,
+        eos_token_id: u32,
     ) -> Result<ChatResult> {
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
 
@@ -803,7 +801,7 @@ impl Gemma4Inner {
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
-                if is_eos_token(token_id, &eos_ids, eos_override) {
+                if is_eos_token(token_id, &eos_ids, eos_token_id) {
                     finish_reason = "stop".to_string();
                     break;
                 }
@@ -862,7 +860,7 @@ impl Gemma4Inner {
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
-                if is_eos_token(token_id, &eos_ids, eos_override) {
+                if is_eos_token(token_id, &eos_ids, eos_token_id) {
                     finish_reason = "stop".to_string();
                     break;
                 }
@@ -961,18 +959,16 @@ impl Gemma4Inner {
     /// `max_ngram_repeats`, `ngram_size`, `thinking_token_budget`,
     /// `include_reasoning`.
     ///
-    /// `eos_override`:
-    ///   - `None`: stop on any of `config.eos_token_ids` (the pre-session
-    ///     legacy behaviour).
-    ///   - `Some(id)`: stop on `id` OR any of `config.eos_token_ids`
-    ///     (used by streaming session-start to stop at `<end_of_turn>`).
+    /// `eos_token_id` is the caller-supplied stop-on token id. The decode
+    /// loop stops on this id OR any of `config.eos_token_ids` (used by
+    /// streaming session-start to stop at Gemma4's `<turn|>` delimiter).
     fn chat_stream_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
-        eos_override: Option<u32>,
+        eos_token_id: u32,
     ) -> Result<()> {
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
 
@@ -1306,7 +1302,7 @@ impl Gemma4Inner {
                     ThreadsafeFunctionCallMode::NonBlocking,
                 );
 
-                if is_eos_token(token_id, &eos_ids, eos_override) {
+                if is_eos_token(token_id, &eos_ids, eos_token_id) {
                     finish_reason = "stop".to_string();
                     break;
                 }
@@ -1385,7 +1381,7 @@ impl Gemma4Inner {
                     ThreadsafeFunctionCallMode::NonBlocking,
                 );
 
-                if is_eos_token(token_id, &eos_ids, eos_override) {
+                if is_eos_token(token_id, &eos_ids, eos_token_id) {
                     finish_reason = "stop".to_string();
                     break;
                 }
@@ -1503,7 +1499,7 @@ impl Gemma4Inner {
 
     /// Resolve the token id for Gemma4's `<turn|>` turn terminator.
     ///
-    /// Used as the `eos_override` in the session-start path so the
+    /// Used as the `eos_token_id` in the session-start path so the
     /// decode loop leaves the caches on a clean `<turn|>` boundary that
     /// subsequent `chat_session_continue_sync` /
     /// `chat_session_continue_tool_sync` calls can append a raw delta on
@@ -1557,7 +1553,7 @@ impl Gemma4Inner {
         // intentionally invalidates any prior cache.
         self.reset_caches_sync()?;
 
-        self.chat_sync_core(messages, config, Some(turn_end_id))
+        self.chat_sync_core(messages, config, turn_end_id)
     }
 
     /// Continue an existing chat session with a user turn.
@@ -1665,7 +1661,7 @@ impl Gemma4Inner {
         }
         if self.cached_token_history.is_empty() {
             return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires an initialized session (call chat_session_start first)",
+                "chat_tokens_delta_sync requires an initialized session (call chatSessionStart first)",
             ));
         }
         if delta_tokens.is_empty() {
@@ -1681,7 +1677,7 @@ impl Gemma4Inner {
         }
         if self.caches.is_none() {
             return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires a live cache (call chat_session_start first)",
+                "chat_tokens_delta_sync requires a live cache (call chatSessionStart first)",
             ));
         }
 
@@ -1795,7 +1791,7 @@ impl Gemma4Inner {
             let token_id = current_y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
 
-            if is_eos_token(token_id, &eos_ids, Some(turn_end_id)) {
+            if is_eos_token(token_id, &eos_ids, turn_end_id) {
                 finish_reason = "stop".to_string();
                 break;
             }
@@ -1896,8 +1892,7 @@ impl Gemma4Inner {
         }
 
         let cb = StreamSender(stream_tx.clone());
-        let result =
-            self.chat_stream_sync_core(messages, config, &cb, &cancelled, Some(turn_end_id));
+        let result = self.chat_stream_sync_core(messages, config, &cb, &cancelled, turn_end_id);
         if let Err(e) = result {
             let _ = stream_tx.send(Err(e));
         }
@@ -2030,7 +2025,7 @@ impl Gemma4Inner {
         if self.cached_token_history.is_empty() {
             chat_common::send_stream_error(
                 &stream_tx,
-                "chat_stream_tokens_delta requires an initialized session (call chat_stream_session_start first)",
+                "chat_stream_tokens_delta requires an initialized session (call chatStreamSessionStart first)",
             );
             return;
         }
@@ -2054,7 +2049,7 @@ impl Gemma4Inner {
         if self.caches.is_none() {
             chat_common::send_stream_error(
                 &stream_tx,
-                "chat_stream_tokens_delta requires a live cache (call chat_stream_session_start first)",
+                "chat_stream_tokens_delta requires a live cache (call chatStreamSessionStart first)",
             );
             return;
         }
@@ -2208,7 +2203,7 @@ impl Gemma4Inner {
                 ThreadsafeFunctionCallMode::NonBlocking,
             );
 
-            if is_eos_token(token_id, &eos_ids, Some(turn_end_id)) {
+            if is_eos_token(token_id, &eos_ids, turn_end_id) {
                 finish_reason = "stop".to_string();
                 break;
             }
@@ -2460,19 +2455,26 @@ impl Gemma4Model {
     /// Reset all caches and clear cached token history. Exposed so
     /// tests and session-management code can start from a known clean
     /// state between turns.
+    ///
+    /// Synchronous on the NAPI boundary — every other `SessionCapableModel`
+    /// exposes `resetCaches(): void` and the `ChatSession<M>` cross-model
+    /// wrapper calls this inline during the image-change restart and
+    /// `reset()` flows. Running it as an async NAPI method would break
+    /// that contract and silently drop reset failures because
+    /// `ChatSession.reset()` and the session-start restart path invoke
+    /// `model.resetCaches()` without awaiting.
     #[napi]
-    pub async fn reset_caches(&self) -> Result<()> {
-        crate::model_thread::send_and_await(&self.thread, |reply| Gemma4Cmd::ResetCaches { reply })
-            .await
+    pub fn reset_caches(&self) -> Result<()> {
+        crate::model_thread::send_and_block(&self.thread, |reply| Gemma4Cmd::ResetCaches { reply })
     }
 
     /// Start a new chat session.
     ///
-    /// Equivalent to [`Self::chat`] but stops decoding on `<turn|>` and
-    /// leaves the KV caches on a clean turn boundary so subsequent
-    /// [`Self::chat_session_continue`] /
-    /// [`Self::chat_session_continue_tool`] calls can append a raw
-    /// delta on top without re-rendering the chat template.
+    /// Runs the full jinja chat template once, decodes until Gemma4's
+    /// `<turn|>` delimiter, and leaves the KV caches on a clean turn
+    /// boundary so subsequent `chatSessionContinue` /
+    /// `chatSessionContinueTool` calls can append a raw delta on top
+    /// without re-rendering the chat template.
     #[napi]
     pub async fn chat_session_start(
         &self,
@@ -2506,10 +2508,9 @@ impl Gemma4Model {
     /// state, then decodes the model reply. Stops on `<turn|>` so the
     /// cache remains on a clean turn boundary for the next turn.
     ///
-    /// Requires a live session started via
-    /// [`Self::chat_session_start`]. Errors if the session is empty,
-    /// carries image state, or if `config.reuse_cache` is explicitly
-    /// set to `false`.
+    /// Requires a live session started via `chatSessionStart`. Errors
+    /// if the session is empty, carries image state, or if
+    /// `config.reuse_cache` is explicitly set to `false`.
     ///
     /// `images` is an opt-in guard parameter: when non-empty the native
     /// side returns an error whose message begins with
@@ -2550,8 +2551,7 @@ impl Gemma4Model {
     /// not via an explicit id. Callers may still log it for their own
     /// bookkeeping.
     ///
-    /// Requires a live session started via
-    /// [`Self::chat_session_start`].
+    /// Requires a live session started via `chatSessionStart`.
     #[napi]
     pub async fn chat_session_continue_tool(
         &self,
@@ -2572,7 +2572,7 @@ impl Gemma4Model {
         .await
     }
 
-    /// Streaming variant of [`Self::chat_session_start`].
+    /// Streaming variant of `chatSessionStart`.
     #[napi(
         ts_args_type = "messages: ChatMessage[], config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
@@ -2617,7 +2617,7 @@ impl Gemma4Model {
         Ok(ChatStreamHandle { cancelled })
     }
 
-    /// Streaming variant of [`Self::chat_session_continue`].
+    /// Streaming variant of `chatSessionContinue`.
     #[napi(
         ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
@@ -2653,7 +2653,7 @@ impl Gemma4Model {
         Ok(ChatStreamHandle { cancelled })
     }
 
-    /// Streaming variant of [`Self::chat_session_continue_tool`].
+    /// Streaming variant of `chatSessionContinueTool`.
     #[napi(
         ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
@@ -2781,18 +2781,18 @@ fn init_caches_for_config(config: &Gemma4Config) -> Vec<Gemma4LayerCache> {
 
 /// Check whether `token` should terminate decoding.
 ///
-/// The config-level `eos_token_ids` are always honored. When a session
-/// caller passes `eos_override`, that token id is treated as an additional
-/// stop token — it does NOT replace the config list. This matches the
-/// dense model's `chat_sync_core` semantics: session-start callers get
-/// their clean boundary token (e.g. `<|im_end|>`) while still respecting
+/// The config-level `eos_token_ids` are always honored. The caller-supplied
+/// `eos_token_id` is treated as an additional stop token — it does NOT
+/// replace the config list. This matches the dense model's
+/// `chat_sync_core` semantics: session-start callers get their clean
+/// boundary token (for Gemma4 that is `<turn|>`) while still respecting
 /// the underlying model's intrinsic eos set.
 #[inline]
-fn is_eos_token(token: u32, eos_ids: &[i32], eos_override: Option<u32>) -> bool {
+fn is_eos_token(token: u32, eos_ids: &[i32], eos_token_id: u32) -> bool {
     if eos_ids.contains(&(token as i32)) {
         return true;
     }
-    eos_override.is_some_and(|id| id == token)
+    eos_token_id == token
 }
 
 fn make_sampling_config(
