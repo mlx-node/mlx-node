@@ -360,161 +360,180 @@ export async function handleCreateMessage(
     return;
   }
 
-  // Fetch the per-model session registry. The Anthropic API is
-  // stateless — we allocate a fresh session for every request via
-  // `getOrCreate(null)` and never adopt it into the cache.
-  const sessionReg: SessionRegistry | undefined = registry.getSessionRegistry(body.model);
-  if (!sessionReg) {
+  // Acquire a dispatch lease on `body.model`'s session-registry
+  // binding. The lease keeps the binding (and its FIFO `execLock`
+  // mutex chain) alive across every await in this handler — crucial
+  // because a concurrent `unregister()` + `register(sameModel)`
+  // sequence would otherwise tear the old `SessionRegistry` down and
+  // allocate a fresh one, and the new request's `withExclusive`
+  // would race against this in-flight dispatch on one shared native
+  // model with two independent mutex chains. The lease MUST be
+  // released in a `finally` below so the binding's teardown (if
+  // deferred by `releaseBinding`) completes once the last dispatch
+  // finishes.
+  const lease = registry.acquireDispatchLease(body.model);
+  if (!lease) {
     sendAnthropicInternalError(res, 'session registry missing for registered model');
     return;
   }
-  // Capture the monotonic instance id alongside the session registry
-  // so the in-mutex re-read can detect a hot-swap that lands after
-  // this read but before we acquire the per-model execution mutex.
-  // Unlike `/v1/responses`, the Anthropic handler has no stored
-  // identity check later in the pipeline to catch a mismatch, so this
-  // is the only defence against the race.
-  const preLockInstanceId = registry.getInstanceId(body.model);
-  if (preLockInstanceId === undefined) {
-    sendAnthropicInternalError(res, 'instance id missing for registered model');
-    return;
-  }
-
-  // Map request
-  let messages: ChatMessage[];
-  let config: ChatConfig;
+  const leaseModel = lease.model;
   try {
-    ({ messages, config } = mapAnthropicRequest(body));
-  } catch (err) {
-    sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
-    return;
-  }
+    // Fetch the per-model session registry. The Anthropic API is
+    // stateless — we allocate a fresh session for every request via
+    // `getOrCreate(null)` and never adopt it into the cache.
+    const sessionReg: SessionRegistry = lease.registry;
+    // Capture the monotonic instance id alongside the session registry
+    // so the in-mutex re-read can detect a hot-swap that lands after
+    // this read but before we acquire the per-model execution mutex.
+    // Unlike `/v1/responses`, the Anthropic handler has no stored
+    // identity check later in the pipeline to catch a mismatch, so this
+    // is the only defence against the race.
+    const preLockInstanceId: number = lease.instanceId;
 
-  // Walk the stateless history and canonicalize every assistant
-  // fan-out's trailing tool block against its declared sibling order.
-  //
-  // The Anthropic `/v1/messages` endpoint is ALWAYS a stateless
-  // cold-start — there is no continuation gate, no stored prior
-  // chain, no `previous_response_id`. The caller ships a full
-  // self-contained conversation in `req.messages` and
-  // `mapAnthropicRequest` produces the `ChatMessage[]` verbatim.
-  // That leaves caller-supplied tool_result ordering flowing
-  // straight into `primeHistory()`, so a caller can reverse two
-  // sibling tool outputs inside one fan-out's `tool_result` block
-  // and silently bind each output to the wrong call because several
-  // native session backends pair tool results to fan-out calls
-  // POSITIONALLY (not by id). Run the same helper the `/v1/responses`
-  // endpoint uses so a malformed block is rejected with a clear 400
-  // and a reversed-but-valid block is rewritten to canonical
-  // sibling order before dispatch.
-  //
-  // Pass `'anthropic'` so the helper's error strings reference
-  // `tool_result` / `tool_use_id` — the vocabulary the Anthropic
-  // caller actually posted — instead of OpenAI's
-  // `function_call_output` / `call_id`. See iter-23 finding 4.
-  const historyError = validateAndCanonicalizeHistoryToolOrder(messages, 'anthropic');
-  if (historyError !== null) {
-    sendAnthropicBadRequest(res, historyError);
-    return;
-  }
-
-  // The Anthropic endpoint is stateless — every request allocates a
-  // fresh `ChatSession` (via `getOrCreate(null, ...)`) and never
-  // adopts it back into the cache. The `system` prompt is baked into
-  // `messages` by `mapAnthropicRequest` and replayed via
-  // `startFromHistory`, so there is no session-reuse path where a
-  // stale system context could leak across requests. We still pass
-  // the canonicalized system string to `getOrCreate` to keep the
-  // registry API contract uniform across both OpenAI and Anthropic
-  // endpoints — it is the caller's single "prefix/system state"
-  // identity field.
-  //
-  // Anthropic's `system` field may be a string OR an array of content
-  // blocks. We canonicalize to a deterministic JSON-stringified form
-  // when it is structured so the equality check on a hypothetical
-  // hit path would be stable across requests. Simple strings are
-  // passed through unchanged to keep the common case readable.
-  let requestedSystem: string | null;
-  if (typeof body.system === 'string') {
-    requestedSystem = body.system;
-  } else if (body.system != null) {
-    requestedSystem = JSON.stringify(body.system);
-  } else {
-    requestedSystem = null;
-  }
-
-  // Per-model execution mutex. Every dispatch through `/v1/messages`
-  // serializes with every dispatch through `/v1/responses` for the
-  // same model binding. The native `SessionCapableModel` is a single
-  // mutable resource — one shared `cached_token_history` / one
-  // `caches` vector per instance — so two concurrent `primeHistory`
-  // + `startFromHistory` calls would clobber each other's KV state
-  // even though each caller holds a distinct `ChatSession` wrapper.
-  // Holding the registry's exclusive lock across the full dispatch
-  // closes the race: at most one request at a time drives native
-  // decode on this model, and the `finally` inside `withExclusive`
-  // releases the lock regardless of whether the closure threw, so a
-  // failed dispatch cannot leave the next waiter stuck.
-  await sessionReg.withExclusive(async () => {
-    // Hot-swap race guard inside the mutex.
-    //
-    // `withExclusive` can park this waiter behind a long-running
-    // dispatch on the same model, and `ModelRegistry.register()` is
-    // NOT coordinated with that lock — a concurrent
-    // `registry.register(body.model, newModel)` can re-point the
-    // friendly name while we are parked. Without this in-lock
-    // re-read the closure would dispatch through the already-
-    // captured `sessionReg`, running a session turn on a model
-    // object that `body.model` no longer resolves to. Unlike
-    // `/v1/responses` the Anthropic endpoint has no stored-identity
-    // check later in the pipeline to catch the mismatch — two
-    // requests for the same model name could silently be serviced
-    // by different underlying models based purely on queue timing.
-    //
-    // Compare the live binding to the pre-lock snapshot captured
-    // just before entering the mutex. Any drift — missing session
-    // registry, missing instance id, session registry identity
-    // change, or instance id change — is fatal and rejected with a
-    // 400 so the caller can retry against the new binding.
-    const lockedSessionReg = registry.getSessionRegistry(body.model);
-    const lockedInstanceId = registry.getInstanceId(body.model);
-    if (
-      lockedSessionReg === undefined ||
-      lockedInstanceId === undefined ||
-      lockedSessionReg !== sessionReg ||
-      lockedInstanceId !== preLockInstanceId
-    ) {
-      sendAnthropicBadRequest(
-        res,
-        `Model "${body.model}" binding changed while the request was queued behind the per-model ` +
-          `execution mutex. A concurrent register() re-pointed the name at a different model instance ` +
-          `(or released it entirely) while this waiter was parked, so the session registry and instance ` +
-          `id captured before the mutex wait no longer match the live binding. Dispatching anyway would ` +
-          `service this request through a stale model object — a silent cross-model handoff. Retry the ` +
-          `request — if the swap was intentional, the new binding will service the retry cleanly.`,
-      );
+    // Map request
+    let messages: ChatMessage[];
+    let config: ChatConfig;
+    try {
+      ({ messages, config } = mapAnthropicRequest(body));
+    } catch (err) {
+      sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
       return;
     }
 
-    const session = sessionReg.getOrCreate(null, requestedSystem);
-
-    try {
-      if (body.stream === true) {
-        const chatStream = runSessionStreaming(session, messages, config);
-        await handleStreamingNative(res, chatStream, body);
-      } else {
-        const result = await runSessionNonStreaming(session, messages, config);
-        await handleNonStreaming(res, result, body);
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown error during inference';
-      if (!res.headersSent) {
-        sendAnthropicInternalError(res, message);
-      } else {
-        // Headers already sent (streaming) -- best effort: write error event and close
-        writeSSEEvent(res, 'error', { error: { type: 'api_error', message } });
-        endSSE(res);
-      }
+    // Walk the stateless history and canonicalize every assistant
+    // fan-out's trailing tool block against its declared sibling order.
+    //
+    // The Anthropic `/v1/messages` endpoint is ALWAYS a stateless
+    // cold-start — there is no continuation gate, no stored prior
+    // chain, no `previous_response_id`. The caller ships a full
+    // self-contained conversation in `req.messages` and
+    // `mapAnthropicRequest` produces the `ChatMessage[]` verbatim.
+    // That leaves caller-supplied tool_result ordering flowing
+    // straight into `primeHistory()`, so a caller can reverse two
+    // sibling tool outputs inside one fan-out's `tool_result` block
+    // and silently bind each output to the wrong call because several
+    // native session backends pair tool results to fan-out calls
+    // POSITIONALLY (not by id). Run the same helper the `/v1/responses`
+    // endpoint uses so a malformed block is rejected with a clear 400
+    // and a reversed-but-valid block is rewritten to canonical
+    // sibling order before dispatch.
+    //
+    // Pass `'anthropic'` so the helper's error strings reference
+    // `tool_result` / `tool_use_id` — the vocabulary the Anthropic
+    // caller actually posted — instead of OpenAI's
+    // `function_call_output` / `call_id`. See iter-23 finding 4.
+    const historyError = validateAndCanonicalizeHistoryToolOrder(messages, 'anthropic');
+    if (historyError !== null) {
+      sendAnthropicBadRequest(res, historyError);
+      return;
     }
-  });
+
+    // The Anthropic endpoint is stateless — every request allocates a
+    // fresh `ChatSession` (via `getOrCreate(null, ...)`) and never
+    // adopts it back into the cache. The `system` prompt is baked into
+    // `messages` by `mapAnthropicRequest` and replayed via
+    // `startFromHistory`, so there is no session-reuse path where a
+    // stale system context could leak across requests. We still pass
+    // the canonicalized system string to `getOrCreate` to keep the
+    // registry API contract uniform across both OpenAI and Anthropic
+    // endpoints — it is the caller's single "prefix/system state"
+    // identity field.
+    //
+    // Anthropic's `system` field may be a string OR an array of content
+    // blocks. We canonicalize to a deterministic JSON-stringified form
+    // when it is structured so the equality check on a hypothetical
+    // hit path would be stable across requests. Simple strings are
+    // passed through unchanged to keep the common case readable.
+    let requestedSystem: string | null;
+    if (typeof body.system === 'string') {
+      requestedSystem = body.system;
+    } else if (body.system != null) {
+      requestedSystem = JSON.stringify(body.system);
+    } else {
+      requestedSystem = null;
+    }
+
+    // Per-model execution mutex. Every dispatch through `/v1/messages`
+    // serializes with every dispatch through `/v1/responses` for the
+    // same model binding. The native `SessionCapableModel` is a single
+    // mutable resource — one shared `cached_token_history` / one
+    // `caches` vector per instance — so two concurrent `primeHistory`
+    // + `startFromHistory` calls would clobber each other's KV state
+    // even though each caller holds a distinct `ChatSession` wrapper.
+    // Holding the registry's exclusive lock across the full dispatch
+    // closes the race: at most one request at a time drives native
+    // decode on this model, and the `finally` inside `withExclusive`
+    // releases the lock regardless of whether the closure threw, so a
+    // failed dispatch cannot leave the next waiter stuck.
+    await sessionReg.withExclusive(async () => {
+      // Hot-swap race guard inside the mutex.
+      //
+      // `withExclusive` can park this waiter behind a long-running
+      // dispatch on the same model, and `ModelRegistry.register()` is
+      // NOT coordinated with that lock — a concurrent
+      // `registry.register(body.model, newModel)` can re-point the
+      // friendly name while we are parked. Without this in-lock
+      // re-read the closure would dispatch through the already-
+      // captured `sessionReg`, running a session turn on a model
+      // object that `body.model` no longer resolves to. Unlike
+      // `/v1/responses` the Anthropic endpoint has no stored-identity
+      // check later in the pipeline to catch the mismatch — two
+      // requests for the same model name could silently be serviced
+      // by different underlying models based purely on queue timing.
+      //
+      // Compare the live binding to the pre-lock snapshot captured
+      // just before entering the mutex. Any drift — missing session
+      // registry, missing instance id, session registry identity
+      // change, or instance id change — is fatal and rejected with a
+      // 400 so the caller can retry against the new binding.
+      const lockedSessionReg = registry.getSessionRegistry(body.model);
+      const lockedInstanceId = registry.getInstanceId(body.model);
+      if (
+        lockedSessionReg === undefined ||
+        lockedInstanceId === undefined ||
+        lockedSessionReg !== sessionReg ||
+        lockedInstanceId !== preLockInstanceId
+      ) {
+        sendAnthropicBadRequest(
+          res,
+          `Model "${body.model}" binding changed while the request was queued behind the per-model ` +
+            `execution mutex. A concurrent register() re-pointed the name at a different model instance ` +
+            `(or released it entirely) while this waiter was parked, so the session registry and instance ` +
+            `id captured before the mutex wait no longer match the live binding. Dispatching anyway would ` +
+            `service this request through a stale model object — a silent cross-model handoff. Retry the ` +
+            `request — if the swap was intentional, the new binding will service the retry cleanly.`,
+        );
+        return;
+      }
+
+      const session = sessionReg.getOrCreate(null, requestedSystem);
+
+      try {
+        if (body.stream === true) {
+          const chatStream = runSessionStreaming(session, messages, config);
+          await handleStreamingNative(res, chatStream, body);
+        } else {
+          const result = await runSessionNonStreaming(session, messages, config);
+          await handleNonStreaming(res, result, body);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown error during inference';
+        if (!res.headersSent) {
+          sendAnthropicInternalError(res, message);
+        } else {
+          // Headers already sent (streaming) -- best effort: write error event and close
+          writeSSEEvent(res, 'error', { error: { type: 'api_error', message } });
+          endSSE(res);
+        }
+      }
+    });
+  } finally {
+    // Release the dispatch lease on the ORIGINAL model object the
+    // lease was acquired against (not a re-read of `body.model`,
+    // which may have been hot-swapped while we held the mutex). A
+    // pending teardown — `releaseBinding()` called concurrently
+    // while this dispatch held the lease — finalises here once the
+    // in-flight counter drops to zero.
+    registry.releaseDispatchLease(leaseModel);
+  }
 }

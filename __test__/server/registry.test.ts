@@ -163,4 +163,152 @@ describe('ModelRegistry', () => {
     const registry = new ModelRegistry();
     expect(registry.listSessionRegistries()).toEqual([]);
   });
+
+  describe('dispatch lease (Finding 1)', () => {
+    it('defers binding teardown while a dispatch lease is held', () => {
+      // The in-flight counter must keep the binding (and its
+      // `SessionRegistry`, therefore its `execLock` FIFO mutex chain)
+      // alive past an unregister() call that would otherwise fire the
+      // final `releaseBinding` teardown. Without this guard, a
+      // subsequent re-registration of the SAME model object before the
+      // in-flight dispatch finishes would allocate a FRESH
+      // `SessionRegistry` with an empty mutex chain, and a concurrent
+      // request would race against the in-flight dispatch on the
+      // shared native model.
+      const registry = new ModelRegistry();
+      const model = createMockSessionModel();
+      registry.register('foo', model);
+
+      const lease = registry.acquireDispatchLease('foo');
+      expect(lease).toBeDefined();
+      const leasedRegistry = lease!.registry;
+
+      // Unregister mid-dispatch — refcount drops to zero but the
+      // binding stays alive because a lease is outstanding.
+      expect(registry.unregister('foo')).toBe(true);
+      // The name is gone (it's unregistered), but the underlying
+      // binding is still reachable to balance the lease.
+      expect(registry.get('foo')).toBeUndefined();
+
+      // Re-register the SAME model object under the same name: the
+      // registry must revive the existing binding instead of
+      // allocating a new one, so the session registry returned by
+      // `getSessionRegistry` is identical to the one the lease holds.
+      registry.register('foo', model);
+      const revivedRegistry = registry.getSessionRegistry('foo');
+      expect(revivedRegistry).toBe(leasedRegistry);
+
+      // Release the lease — binding stays alive because the
+      // re-registration bumped refCount back to 1.
+      registry.releaseDispatchLease(lease!.model);
+      expect(registry.getSessionRegistry('foo')).toBe(leasedRegistry);
+    });
+
+    it('finalizes teardown when the last lease releases after unregister', () => {
+      const registry = new ModelRegistry();
+      const model = createMockSessionModel();
+      registry.register('foo', model);
+
+      const lease = registry.acquireDispatchLease('foo');
+      expect(lease).toBeDefined();
+      const deferredRegistry = lease!.registry;
+
+      // Unregister — refcount hits zero but teardown is deferred
+      // because the lease is outstanding.
+      expect(registry.unregister('foo')).toBe(true);
+
+      // No re-registration. Release the lease: the deferred teardown
+      // finalises now, and a fresh registration allocates a NEW
+      // `SessionRegistry` because the previous binding has been
+      // dropped from the identity map.
+      registry.releaseDispatchLease(lease!.model);
+
+      registry.register('foo', model);
+      const freshRegistry = registry.getSessionRegistry('foo');
+      expect(freshRegistry).toBeDefined();
+      expect(freshRegistry).not.toBe(deferredRegistry);
+    });
+
+    it('shares the execLock mutex chain across lease + re-register so concurrent dispatches serialize', async () => {
+      // End-to-end regression: the whole point of deferring teardown
+      // is that the `withExclusive` mutex chain stays attached to the
+      // SAME `SessionRegistry` object across the
+      // unregister/re-register gap. Two overlapping dispatches — one
+      // that acquired its lease before unregister, and one that
+      // acquired after re-register — must therefore serialize on one
+      // shared mutex, not race on two independent chains.
+      const registry = new ModelRegistry();
+      const model = createMockSessionModel();
+      registry.register('foo', model);
+
+      const leaseA = registry.acquireDispatchLease('foo');
+      expect(leaseA).toBeDefined();
+      const sessionRegA = leaseA!.registry;
+
+      // Park a dispatch on sessionRegA.withExclusive via a gate.
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      let firstRan = false;
+      let firstFinished = false;
+      const firstPromise = sessionRegA.withExclusive(async () => {
+        firstRan = true;
+        await firstGate;
+        firstFinished = true;
+      });
+
+      // Give the first dispatch a microtask to actually start.
+      await Promise.resolve();
+      expect(firstRan).toBe(true);
+
+      // Unregister mid-dispatch and re-register the SAME model object.
+      // Teardown must be deferred and the binding reused.
+      expect(registry.unregister('foo')).toBe(true);
+      registry.register('foo', model);
+      const leaseB = registry.acquireDispatchLease('foo');
+      expect(leaseB).toBeDefined();
+      const sessionRegB = leaseB!.registry;
+      // Shared binding invariant: both leases must expose the SAME
+      // `SessionRegistry` object and therefore the SAME `execLock`.
+      expect(sessionRegB).toBe(sessionRegA);
+
+      // Fire a second dispatch on the revived registry. It must park
+      // behind the first dispatch, NOT run concurrently.
+      let secondStarted = false;
+      const secondPromise = sessionRegB.withExclusive(async () => {
+        secondStarted = true;
+      });
+
+      // Another microtask tick: the second dispatch should STILL be
+      // parked because the first is still holding the mutex.
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(secondStarted).toBe(false);
+      expect(firstFinished).toBe(false);
+
+      // Release the first dispatch. The second one should run now.
+      releaseFirst();
+      await firstPromise;
+      await secondPromise;
+      expect(firstFinished).toBe(true);
+      expect(secondStarted).toBe(true);
+
+      // Release leases.
+      registry.releaseDispatchLease(leaseA!.model);
+      registry.releaseDispatchLease(leaseB!.model);
+    });
+
+    it('acquireDispatchLease returns undefined for unknown model', () => {
+      const registry = new ModelRegistry();
+      expect(registry.acquireDispatchLease('unknown')).toBeUndefined();
+    });
+
+    it('releaseDispatchLease is a no-op on an unknown model object', () => {
+      const registry = new ModelRegistry();
+      const model = createMockSessionModel();
+      // Should not throw.
+      expect(() => registry.releaseDispatchLease(model)).not.toThrow();
+    });
+  });
 });

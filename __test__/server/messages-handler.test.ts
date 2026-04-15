@@ -1291,7 +1291,12 @@ describe('handleCreateMessage', () => {
       const parsed = JSON.parse(getBody());
       expect(parsed.type).toBe('error');
       expect(parsed.error.type).toBe('invalid_request_error');
-      expect(parsed.error.message).toMatch(/cannot mix tool_result blocks with text or image blocks/i);
+      // Iter-26 finding 2: the mapper now accepts tool_result blocks
+      // as a contiguous PREFIX of a user turn (followed by trailing
+      // text/image), but still rejects the inverse shape where a
+      // text/image block precedes a tool_result. This test pins the
+      // non-prefix rejection.
+      expect(parsed.error.message).toMatch(/tool_result blocks must appear as a contiguous prefix/i);
       // eslint-disable-next-line @typescript-eslint/unbound-method
       const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
       expect(startSpy).not.toHaveBeenCalled();

@@ -75,10 +75,27 @@ export interface ModelEntry {
  * currently referenced by at least one registered name; `refCount`
  * tracks how many names currently point at it so `unregister()` can
  * drop the binding once the last alias goes away.
+ *
+ * `inFlight` tracks how many dispatches are currently holding this
+ * binding through `acquireDispatchLease()`. `releaseBinding()` MUST
+ * NOT tear the binding (and its `SessionRegistry`, and therefore its
+ * FIFO `withExclusive` mutex chain) down while any dispatch still
+ * holds a lease — if a caller unregister()s the name mid-dispatch
+ * and then re-register()s the SAME model object, the map lookup
+ * would otherwise allocate a FRESH `SessionRegistry` with an empty
+ * `execLock` chain, and a new concurrent request would race against
+ * the in-flight dispatch on the same underlying native model.
+ * Teardown is deferred via `pendingTeardown` until the last lease
+ * releases; meanwhile a `register()` that sees the pending flag
+ * clears it, re-references the still-live binding, and the fresh
+ * request's mutex chain naturally serializes behind the in-flight
+ * dispatch because they share one `execLock`.
  */
 interface SessionRegistryBinding {
   registry: SessionRegistry;
   refCount: number;
+  inFlight: number;
+  pendingTeardown: boolean;
 }
 
 export class ModelRegistry {
@@ -134,10 +151,24 @@ export class ModelRegistry {
     }
 
     // Look up or allocate the shared binding for this model instance.
+    // If the binding is still alive but flagged `pendingTeardown` (its
+    // refcount previously hit zero while an in-flight dispatch still
+    // held a lease), clear the flag and reuse it — the fresh
+    // registration revives the binding before teardown runs, and the
+    // shared `SessionRegistry` / mutex chain stays identical so any
+    // new dispatch serializes behind the in-flight one instead of
+    // racing on a freshly allocated registry.
     let binding = this.sessionRegistriesByModel.get(model);
     if (!binding) {
-      binding = { registry: new SessionRegistry({ model }), refCount: 0 };
+      binding = {
+        registry: new SessionRegistry({ model }),
+        refCount: 0,
+        inFlight: 0,
+        pendingTeardown: false,
+      };
       this.sessionRegistriesByModel.set(model, binding);
+    } else if (binding.pendingTeardown) {
+      binding.pendingTeardown = false;
     }
     binding.refCount += 1;
     // Allocate a fresh monotonic instance id on first sight of this
@@ -175,22 +206,107 @@ export class ModelRegistry {
     return true;
   }
 
-  /** Decrement the refcount on a model binding; drop it at zero. */
+  /**
+   * Decrement the refcount on a model binding; drop it at zero IFF
+   * no dispatch currently holds a lease on it. When `inFlight > 0`
+   * the teardown is deferred via `pendingTeardown` so the in-flight
+   * dispatch's `SessionRegistry` (and therefore its `execLock` FIFO
+   * mutex chain) stays alive until the last lease releases. Any
+   * concurrent `register(sameModel)` that fires between
+   * `releaseBinding()` and the final lease release will see the
+   * still-present binding, clear `pendingTeardown`, and reuse it —
+   * so the next request's `withExclusive` naturally serializes
+   * behind the in-flight dispatch on one shared mutex.
+   */
   private releaseBinding(model: ServableModel): void {
     const binding = this.sessionRegistriesByModel.get(model);
     if (!binding) return;
     binding.refCount -= 1;
     if (binding.refCount <= 0) {
-      this.sessionRegistriesByModel.delete(model);
-      // Drop the instance id in lockstep with the binding. A
-      // subsequent re-registration of the SAME model object will
-      // therefore mint a FRESH id — intentional: once the last
-      // alias drops, any previously persisted stored record that
-      // references this id belongs to a logically dead binding,
-      // and a later `previous_response_id` continuation against it
-      // must fall through to the `currentInstanceId === undefined`
-      // rejection path so the stale chain cannot be replayed.
-      this.instanceIds.delete(model);
+      if (binding.inFlight > 0) {
+        // Defer teardown until the last dispatch lease releases.
+        // The binding and its instance id stay in the maps so a
+        // same-object re-registration before `releaseDispatchLease`
+        // can revive it in place.
+        binding.pendingTeardown = true;
+        return;
+      }
+      this.finalizeBindingTeardown(model);
+    }
+  }
+
+  /**
+   * Drop `model`'s binding and instance id from the registry.
+   * Internal teardown step shared by `releaseBinding()` and
+   * `releaseDispatchLease()`; see their doc comments for the full
+   * lifecycle. On drop, a subsequent re-registration of the SAME
+   * model object will mint a FRESH instance id — intentional: once
+   * the last alias AND the last in-flight lease drop, any
+   * previously persisted stored record that references this id
+   * belongs to a logically dead binding, and a later
+   * `previous_response_id` continuation against it must fall
+   * through to the `currentInstanceId === undefined` rejection path
+   * so the stale chain cannot be replayed.
+   */
+  private finalizeBindingTeardown(model: ServableModel): void {
+    this.sessionRegistriesByModel.delete(model);
+    this.instanceIds.delete(model);
+  }
+
+  /**
+   * Acquire a dispatch lease on the session registry bound to `name`.
+   *
+   * Returns the live `SessionRegistry` and the binding's current
+   * instance id, or `undefined` if the name is not registered. The
+   * caller MUST balance every successful acquisition with exactly one
+   * `releaseDispatchLease(model)` call, regardless of whether the
+   * dispatch body threw or returned normally — a typical pattern is
+   * `try { ...withExclusive(...) } finally { release(...); }`.
+   *
+   * The lease keeps the binding alive past a concurrent
+   * `unregister()`/`register(differentModel)` sequence: the
+   * `SessionRegistry` object and its FIFO `execLock` mutex chain
+   * remain valid as long as ANY lease is outstanding, so a newly
+   * registered same-model alias that fires a concurrent request
+   * will rebind to the SAME registry and its new `withExclusive`
+   * will serialize behind the in-flight dispatch instead of racing
+   * on a freshly allocated mutex.
+   *
+   * The returned `model` handle is what the caller passes to
+   * `releaseDispatchLease()` — binding the lease to the model
+   * OBJECT (not the friendly name) is deliberate: the name can be
+   * hot-swapped while the lease is held, but the lease must still
+   * release on the original binding.
+   */
+  acquireDispatchLease(
+    name: string,
+  ): { model: ServableModel; registry: SessionRegistry; instanceId: number } | undefined {
+    const entry = this.models.get(name);
+    if (!entry) return undefined;
+    const binding = this.sessionRegistriesByModel.get(entry.model);
+    if (!binding) return undefined;
+    const instanceId = this.instanceIds.get(entry.model);
+    if (instanceId === undefined) return undefined;
+    binding.inFlight += 1;
+    return { model: entry.model, registry: binding.registry, instanceId };
+  }
+
+  /**
+   * Release a dispatch lease previously obtained via
+   * `acquireDispatchLease()`. Decrements the binding's in-flight
+   * counter and, if the binding has been flagged for teardown (its
+   * refcount hit zero while the lease was held), drops it once the
+   * last lease releases. Safe to call exactly once per acquired
+   * lease; calling it on a model whose binding has already been
+   * fully torn down is a no-op.
+   */
+  releaseDispatchLease(model: ServableModel): void {
+    const binding = this.sessionRegistriesByModel.get(model);
+    if (!binding) return;
+    binding.inFlight -= 1;
+    if (binding.inFlight < 0) binding.inFlight = 0;
+    if (binding.pendingTeardown && binding.refCount <= 0 && binding.inFlight === 0) {
+      this.finalizeBindingTeardown(model);
     }
   }
 

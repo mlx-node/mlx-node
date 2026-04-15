@@ -379,6 +379,144 @@ describe('mapRequest', () => {
 
     expect(messages).toEqual([{ role: 'user', content: 'No explicit type' }]);
   });
+
+  describe('assistant message + function_call coalescing (Finding 3)', () => {
+    it('coalesces assistant message followed by function_call into a single assistant turn', () => {
+      // Finding 3: a single assistant turn that produced both text
+      // and tool calls is serialised by the OpenAI Responses API
+      // as `[message(assistant, text), function_call, ...]`. The
+      // mapper must coalesce that run into ONE `assistant`
+      // ChatMessage carrying both text and `toolCalls`, matching
+      // the hot-path `ChatSession` shape exactly. Splitting the
+      // run into two assistant messages would corrupt cold replay
+      // (different model output) and trip the history walker
+      // (orphaned leading assistant turn).
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: 'What is the weather?' },
+          { type: 'message', role: 'assistant', content: 'Let me check.' },
+          {
+            type: 'function_call',
+            id: 'fc-1',
+            call_id: 'call_abc',
+            name: 'get_weather',
+            arguments: '{"city":"SF"}',
+          },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'user', content: 'What is the weather?' },
+        {
+          role: 'assistant',
+          content: 'Let me check.',
+          toolCalls: [{ name: 'get_weather', arguments: '{"city":"SF"}', id: 'call_abc' }],
+        },
+      ]);
+    });
+
+    it('coalesces assistant message followed by multiple function_calls into one turn', () => {
+      // A fan-out shape: one assistant message then several
+      // parallel function_calls. All siblings end up on the SAME
+      // assistant turn.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'assistant', content: 'Fetching two cities.' },
+          {
+            type: 'function_call',
+            id: 'fc-1',
+            call_id: 'call_a',
+            name: 'get_weather',
+            arguments: '{"city":"SF"}',
+          },
+          {
+            type: 'function_call',
+            id: 'fc-2',
+            call_id: 'call_b',
+            name: 'get_weather',
+            arguments: '{"city":"NYC"}',
+          },
+        ],
+      });
+
+      expect(messages).toEqual([
+        {
+          role: 'assistant',
+          content: 'Fetching two cities.',
+          toolCalls: [
+            { name: 'get_weather', arguments: '{"city":"SF"}', id: 'call_a' },
+            { name: 'get_weather', arguments: '{"city":"NYC"}', id: 'call_b' },
+          ],
+        },
+      ]);
+    });
+
+    it('does not coalesce a function_call onto a preceding user message', () => {
+      // A function_call after a user message is not a valid
+      // fan-out head — the coalesce predicate is gated on the
+      // previous message being an assistant. The mapper opens a
+      // fresh assistant turn instead.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: 'Hello' },
+          {
+            type: 'function_call',
+            id: 'fc-1',
+            call_id: 'call_x',
+            name: 'do_thing',
+            arguments: '{}',
+          },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'user', content: 'Hello' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ name: 'do_thing', arguments: '{}', id: 'call_x' }],
+        },
+      ]);
+    });
+
+    it('does not absorb an assistant message that follows function_call into the same turn', () => {
+      // Only a message BEFORE a function_call run is coalesced.
+      // A message AFTER a function_call starts a fresh turn —
+      // that shape is a subsequent user/system/assistant turn,
+      // not a continuation of the fan-out.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'function_call',
+            id: 'fc-1',
+            call_id: 'call_a',
+            name: 'lookup',
+            arguments: '{}',
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_a',
+            output: 'done',
+          },
+          { type: 'message', role: 'assistant', content: 'All done.' },
+        ],
+      });
+
+      expect(messages).toEqual([
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ name: 'lookup', arguments: '{}', id: 'call_a' }],
+        },
+        { role: 'tool', content: 'done', toolCallId: 'call_a' },
+        { role: 'assistant', content: 'All done.' },
+      ]);
+    });
+  });
 });
 
 describe('reconstructMessagesFromChain', () => {

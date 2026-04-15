@@ -6,7 +6,9 @@ import type { ChatConfig, ChatMessage, ToolDefinition } from '@mlx-node/core';
 
 import type {
   AnthropicContentBlock,
+  AnthropicImageContentBlock,
   AnthropicMessagesRequest,
+  AnthropicTextContentBlock,
   AnthropicToolDefinition,
   SystemBlock,
 } from '../types-anthropic.js';
@@ -17,21 +19,37 @@ export interface MappedAnthropicRequest {
 }
 
 /**
- * Resolve the text content of a tool_result block, which can be a string,
- * an array of text blocks, or absent (empty string).
+ * Resolve the text (and any nested image) content of a tool_result
+ * block. Anthropic's Messages API allows tool_result blocks to carry a
+ * plain string, an array of text blocks, or an array that mixes text
+ * and image blocks — the latter is common for tools that return
+ * screenshots or rendered PDFs and was silently rejected by the
+ * iter-25 mapper. The internal `ChatMessage` shape has no per-tool
+ * image field, so the mapper returns the extracted images separately
+ * and the caller appends them to a trailing `user` ChatMessage that
+ * follows the tool block.
  */
-function resolveToolResultContent(content?: string | { type: 'text'; text: string }[]): string {
-  if (content == null) return '';
-  if (typeof content === 'string') return content;
+function resolveToolResultContent(content?: string | (AnthropicTextContentBlock | AnthropicImageContentBlock)[]): {
+  text: string;
+  images: Uint8Array[];
+} {
+  if (content == null) return { text: '', images: [] };
+  if (typeof content === 'string') return { text: content, images: [] };
   const parts: string[] = [];
+  const images: Uint8Array[] = [];
   for (const b of content) {
     if (b.type === 'text') {
       parts.push(b.text);
+    } else if (b.type === 'image') {
+      if (b.source.type !== 'base64') {
+        throw new Error(`Unsupported tool_result image source: "${b.source.type as string}"`);
+      }
+      images.push(Buffer.from(b.source.data, 'base64'));
     } else {
       throw new Error(`Unsupported tool_result content type: "${(b as { type: string }).type}"`);
     }
   }
-  return parts.join('');
+  return { text: parts.join(''), images };
 }
 
 /**
@@ -89,28 +107,35 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
       if (typeof content === 'string') {
         messages.push({ role: 'user', content });
       } else {
-        // A single Anthropic user turn must carry either
+        // A single Anthropic user turn may carry either
         //
         //   (a) ONLY text/image blocks — mapped to a single `user`
         //       ChatMessage, OR
-        //   (b) ONLY `tool_result` blocks — mapped to a contiguous
-        //       `tool` block that sits immediately after the
-        //       preceding assistant fan-out.
+        //   (b) a contiguous PREFIX of `tool_result` blocks,
+        //       optionally followed by trailing text/image blocks —
+        //       mapped to a contiguous `tool` ChatMessage run that
+        //       sits immediately after the preceding assistant
+        //       fan-out, optionally followed by a trailing `user`
+        //       ChatMessage carrying the text/images.
         //
-        // Mixing the two in one turn is rejected (iter-23 finding
-        // 3). The iter-22 mapper hoisted tool results to the front
-        // and emitted the text/image content as a synthetic
-        // trailing `user` message; that silently reordered
-        // client-supplied blocks, so a turn like
-        // `[text("ignore this result"), tool_result(...)]` would
-        // reach the model as `tool(...)` followed by a new user
-        // turn the caller never authored. Instead of canonicalizing
-        // a lossy reorder we reject the mixed shape so the client
-        // must split the turn into one message containing only
-        // tool_result blocks and a separate message for the
-        // follow-up text/images.
+        // Shapes that interleave text/image BEFORE a tool_result
+        // (e.g. `[text("ignore"), tool_result(...)]`) remain
+        // rejected: we cannot preserve both author intent and
+        // fan-out ordering without silently reordering the caller's
+        // blocks. A text-or-image suffix after the tool_result
+        // block is unambiguous (it belongs to the SAME user turn
+        // that just answered the tool call) and is the shape the
+        // iter-25 mapper was over-eagerly rejecting.
         //
-        // Within a pure-tool-result turn we preserve the caller's
+        // Nested image blocks inside `tool_result.content` — common
+        // for tools that return screenshots or rendered PDFs — are
+        // extracted by `resolveToolResultContent` and also appended
+        // to the trailing user message. The internal `ChatMessage`
+        // shape has no per-tool image field, so these images
+        // logically follow the tool result rather than accompanying
+        // it.
+        //
+        // Within a tool_result prefix we preserve the caller's
         // relative order. Downstream
         // `validateAndCanonicalizeHistoryToolOrder` will reorder
         // against the assistant's declared sibling order if needed.
@@ -119,36 +144,47 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
           content: string;
           isError: boolean;
         }[] = [];
-        const pendingText: string[] = [];
-        const pendingImages: Uint8Array[] = [];
+        const trailingText: string[] = [];
+        const trailingImages: Uint8Array[] = [];
+        // Images hoisted out of nested `tool_result.content` arrays.
+        // They flow onto the trailing user message alongside any
+        // top-level text/image content the caller authored.
+        const hoistedToolImages: Uint8Array[] = [];
+        let seenNonToolResult = false;
+        let seenToolResult = false;
 
         for (const block of content as AnthropicContentBlock[]) {
-          if (block.type === 'text') {
-            pendingText.push(block.text);
-          } else if (block.type === 'image' && block.source.type === 'base64') {
-            pendingImages.push(Buffer.from(block.source.data, 'base64'));
-          } else if (block.type === 'tool_result') {
+          if (block.type === 'tool_result') {
+            if (seenNonToolResult) {
+              throw new Error(
+                'Unsupported: tool_result blocks must appear as a contiguous prefix of the user ' +
+                  'turn, before any text or image blocks. Interleaving a text/image block before a ' +
+                  'tool_result would require reordering the caller-supplied blocks and silently ' +
+                  'changing authorship.',
+              );
+            }
+            seenToolResult = true;
+            const resolved = resolveToolResultContent(block.content);
             toolResults.push({
               toolCallId: block.tool_use_id,
-              content: resolveToolResultContent(block.content),
+              content: resolved.text,
               isError: block.is_error === true,
             });
+            if (resolved.images.length > 0) {
+              hoistedToolImages.push(...resolved.images);
+            }
+          } else if (block.type === 'text') {
+            seenNonToolResult = true;
+            trailingText.push(block.text);
+          } else if (block.type === 'image' && block.source.type === 'base64') {
+            seenNonToolResult = true;
+            trailingImages.push(Buffer.from(block.source.data, 'base64'));
           } else {
             throw new Error(`Unsupported content block type: "${block.type}"`);
           }
         }
 
-        const hasToolResults = toolResults.length > 0;
-        const hasTextOrImage = pendingText.length > 0 || pendingImages.length > 0;
-        if (hasToolResults && hasTextOrImage) {
-          throw new Error(
-            'Unsupported: a single user turn cannot mix tool_result blocks with text or image ' +
-              'blocks. Split the turn into one message containing only tool_result blocks and a ' +
-              'separate message for the follow-up text/images.',
-          );
-        }
-
-        if (hasToolResults) {
+        if (seenToolResult) {
           // Emit the tool block. `ChatMessage` has no `isError`
           // field — it is a NAPI-generated struct owned by Rust
           // and cannot carry an extra boolean without a schema
@@ -185,14 +221,34 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
               toolCallId: tr.toolCallId,
             });
           }
+          // Append a trailing user message when the caller supplied
+          // additional text/image content after the tool_result
+          // prefix OR when any tool_result carried nested image
+          // blocks that must flow onto a user turn. Both text and
+          // image may be empty individually — we still emit the
+          // message as long as AT LEAST ONE of the three sources
+          // (trailing text, trailing images, hoisted tool images)
+          // has content.
+          const hasTrailingContent =
+            trailingText.length > 0 || trailingImages.length > 0 || hoistedToolImages.length > 0;
+          if (hasTrailingContent) {
+            const trailingMsg: ChatMessage = { role: 'user', content: trailingText.join('') };
+            const combinedImages: Uint8Array[] = [];
+            if (trailingImages.length > 0) combinedImages.push(...trailingImages);
+            if (hoistedToolImages.length > 0) combinedImages.push(...hoistedToolImages);
+            if (combinedImages.length > 0) {
+              trailingMsg.images = combinedImages;
+            }
+            messages.push(trailingMsg);
+          }
         } else {
           // Pure text/image user turn. Always emit exactly one
           // `user` message, even when both arrays are empty
           // (matches the pre-iter-23 behavior for an empty
           // content array).
-          const userMsg: ChatMessage = { role: 'user', content: pendingText.join('') };
-          if (pendingImages.length > 0) {
-            userMsg.images = pendingImages;
+          const userMsg: ChatMessage = { role: 'user', content: trailingText.join('') };
+          if (trailingImages.length > 0) {
+            userMsg.images = trailingImages;
           }
           messages.push(userMsg);
         }

@@ -1245,621 +1245,719 @@ export async function handleCreateResponse(
     return;
   }
 
-  // Capture an initial snapshot of the live binding for `body.model`.
-  // These values are the INITIAL observation — on a
-  // `previous_response_id` continuation we re-read them after
-  // `await store.getChain(...)` and reject the request if the
-  // binding moved under us (see the hot-swap race guard below).
-  // Stateless requests never hit the store so the re-read is a
-  // no-op for them.
-  const initialSessionReg: SessionRegistry | undefined = registry.getSessionRegistry(body.model);
-  if (!initialSessionReg) {
+  // Acquire a dispatch lease on `body.model`'s session-registry
+  // binding. The lease keeps the binding (and its FIFO `execLock`
+  // mutex chain) alive across every await in this handler — crucial
+  // because a concurrent `unregister()` + `register(sameModel)`
+  // sequence would otherwise tear the old `SessionRegistry` down and
+  // allocate a fresh one, and the new request's `withExclusive`
+  // would race against this in-flight dispatch on one shared native
+  // model with two independent mutex chains. The lease MUST be
+  // released in a `finally` below so the binding's teardown (if
+  // deferred by `releaseBinding`) completes once the last dispatch
+  // finishes.
+  const lease = registry.acquireDispatchLease(body.model);
+  if (!lease) {
     sendInternalError(res, 'session registry missing for registered model');
     return;
   }
-  const initialInstanceId = registry.getInstanceId(body.model);
-
-  // Mutable handles for the registry binding that actually gets
-  // used for dispatch / persistence. For stateless requests these
-  // stay equal to the initial snapshot. For a `previous_response_id`
-  // continuation they are re-read after `await store.getChain()`
-  // and, if they match the initial snapshot, are used as the
-  // canonical current-binding values from that point forward.
-  let sessionReg: SessionRegistry = initialSessionReg;
-  let currentInstanceId: number | undefined = initialInstanceId;
-
-  const responseId = genId('resp_');
-
-  // Resolve previous_response_id chain
-  let priorMessages: ChatMessage[] | undefined;
-  let previousResponseId: string | undefined;
-
-  if (body.previous_response_id && store) {
-    try {
-      const chain = await store.getChain(body.previous_response_id);
-      if (chain.length === 0) {
-        sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
-        return;
-      }
-
-      // Hot-swap race guard (iter-22 finding 3).
-      //
-      // Between the pre-await snapshot above and this point a
-      // concurrent `registry.register(body.model, differentModel)`
-      // can re-point the friendly name at a new object. If we
-      // kept using `initialSessionReg` / `initialInstanceId` the
-      // request would dispatch through the stale session
-      // registry, compare the stored identity against the dead
-      // instance id, and persist the new record under the old
-      // binding — even though `body.model` now resolves to a
-      // different live model. Re-read the current binding and
-      // reject the request when anything changed so the caller
-      // can retry against the new identity.
-      const refreshedSessionReg = registry.getSessionRegistry(body.model);
-      const refreshedInstanceId = registry.getInstanceId(body.model);
-      if (
-        refreshedSessionReg === undefined ||
-        refreshedInstanceId === undefined ||
-        refreshedSessionReg !== initialSessionReg ||
-        refreshedInstanceId !== initialInstanceId
-      ) {
-        sendBadRequest(
-          res,
-          `Model "${body.model}" binding changed while the request was resolving its previous_response_id ` +
-            `chain. A concurrent register() re-pointed the name at a different model instance (or released ` +
-            `it entirely) during the store lookup, so the session registry and instance id captured before ` +
-            `the await no longer match the live binding. Dispatching anyway would replay the stored chain ` +
-            `through the wrong model. Retry the request — if the swap was intentional, the new binding will ` +
-            `service the retry cleanly.`,
-          'model',
-        );
-        return;
-      }
-      sessionReg = refreshedSessionReg;
-      currentInstanceId = refreshedInstanceId;
-
-      // Cross-model continuation guard, keyed on MODEL-INSTANCE
-      // IDENTITY, not friendly name. The stored trailing record
-      // carries a monotonic `modelInstanceId` assigned by
-      // `ModelRegistry` when the model object that serviced the
-      // original turn was first registered; we compare that id
-      // against the CURRENT instance id for `body.model`.
-      //
-      // A plain string comparison on the friendly name is not
-      // sufficient:
-      //
-      //  * `ModelRegistry.register(name, model)` explicitly supports
-      //    replacing the object bound to a name. A chain produced
-      //    by the OLD instance of `foo` would still pass a name
-      //    check after `foo` is hot-swapped to a different model,
-      //    and the continuation would silently replay through the
-      //    wrong tokenizer / chat template / KV layout.
-      //  * Conversely, two names aliasing the SAME model instance
-      //    are already safe because iter-19's per-instance
-      //    `SessionRegistry` sharing routes them through one
-      //    binding — but a name check would spuriously reject
-      //    `body.model = "beta"` against a chain stored under
-      //    `"alpha"`.
-      //
-      // Strict instance-id policy (iter-23 finding 1). Every stored
-      // record must carry an explicit `modelInstanceId`. Records
-      // that lack the field — either because they predate iter-21
-      // or because a tool rewrote `configJson` without preserving
-      // unknown keys — are rejected outright. The iter-22 compat
-      // path that fell back to friendly-name comparison silently
-      // reopened the same-name hot-swap corruption window: any
-      // stored row without identity could be replayed through a
-      // different tokenizer / chat template / KV layout as long as
-      // the friendly name matched. This branch is an explicit
-      // breaking change in chain semantics — no production rows
-      // exist without identity on `feat/qwen35-chat-session`, so
-      // strict-reject is safe to land without a migration.
-      const trailingRecord = chain[chain.length - 1]!;
-      const storedIdentity = readStoredModelIdentity(trailingRecord);
-      if (storedIdentity.kind === 'absent') {
-        sendBadRequest(
-          res,
-          `previous_response_id "${body.previous_response_id}" belongs to a stored chain whose trailing ` +
-            `record does not carry a modelInstanceId. Such records predate the iter-21 identity scheme ` +
-            `(or were rewritten without preserving the identity field) and are not eligible for ` +
-            `continuation: a friendly-name comparison would silently reopen same-name hot-swap corruption, ` +
-            `replaying the chain through a potentially different tokenizer, chat template, or KV layout. ` +
-            `Start a new chain without previous_response_id.`,
-          'model',
-        );
-        return;
-      }
-      if (currentInstanceId === undefined || storedIdentity.instanceId !== currentInstanceId) {
-        sendBadRequest(
-          res,
-          `previous_response_id "${body.previous_response_id}" belongs to a chain produced by a different ` +
-            `model instance than the one currently bound to "${body.model}". This happens when the named ` +
-            `model has been hot-swapped to a different underlying object since the chain was stored or ` +
-            `when the original binding has been released entirely. Continuations cannot cross model ` +
-            `boundaries — a stored chain is tied to the tokenizer, chat template, and KV layout of the ` +
-            `exact model object that produced it, and replaying it through a different model would ` +
-            `silently corrupt the conversation. Start a new chain without previous_response_id.`,
-          'model',
-        );
-        return;
-      }
-      priorMessages = reconstructMessagesFromChain(chain);
-      previousResponseId = body.previous_response_id;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '';
-      if (/not found/i.test(msg)) {
-        sendNotFound(res, `Previous response "${body.previous_response_id}" not found or expired`);
-      } else {
-        sendInternalError(res, `Failed to retrieve previous response: ${msg || 'unknown error'}`);
-      }
-      return;
-    }
-  } else if (body.previous_response_id && !store) {
-    sendBadRequest(res, 'previous_response_id requires a response store to be configured');
-    return;
-  }
-
-  // Echoed `function_call` items on a `previous_response_id` continuation
-  // are validated for ownership (call_id must belong to the stored
-  // trailing assistant turn) and then stripped unconditionally.
-  //
-  // Motivation: the common "round-trip `response.output` into the next
-  // `input`" shape sends the prior assistant's `function_call` items
-  // back alongside the new `function_call_output` results, which is a
-  // legitimate client pattern. But `mapRequest` rebuilds each echoed
-  // item into a synthetic assistant message at the tail of the
-  // augmented `messages` list, which would both duplicate stored state
-  // and (crucially) let a forged echo rewrite the trailing assistant
-  // turn — poisoning `primeHistory()` and bypassing the multi-tool gate
-  // below. Since `priorMessages` is the authoritative copy, the
-  // correct response is to verify ownership by `call_id`, then drop
-  // the echo so the stored view is used downstream.
-  //
-  // Name/arguments are NOT compared against stored — a client that
-  // parses and reserializes its own prior arguments (different JSON
-  // whitespace, key order, number formatting) would otherwise fail
-  // continuation even though the server never consumes the echoed
-  // payload. Any `call_id` absent from the stored index is still
-  // rejected as an unambiguous forgery attempt.
-  let effectiveInput = body.input;
-  if (previousResponseId && priorMessages && Array.isArray(body.input)) {
-    const storedCallIds = buildTrailingAssistantToolCallIds(priorMessages);
-    const filtered: typeof body.input = [];
-    for (const item of body.input) {
-      if (item != null && typeof item === 'object' && (item as { type?: string }).type === 'function_call') {
-        const fc = item as { call_id?: unknown };
-        const callId = typeof fc.call_id === 'string' ? fc.call_id : null;
-        if (!callId || !storedCallIds || !storedCallIds.has(callId)) {
-          sendBadRequest(
-            res,
-            `echoed function_call item references an unknown call_id "${callId ?? ''}" — the stored ` +
-              `trailing assistant turn is the authoritative copy, and any echoed function_call must ` +
-              `reference one of its outstanding tool calls. Drop the echoed item or resolve the ` +
-              `continuation against the correct previous_response_id.`,
-            'input',
-          );
-          return;
-        }
-        // Stored state is authoritative — drop the echo regardless of
-        // whether the client's `name`/`arguments` match byte-for-byte.
-        continue;
-      }
-      filtered.push(item);
-    }
-    effectiveInput = filtered;
-  }
-
-  // Map request — full messages include prior + new input.
-  // Feed mapRequest the echo-stripped input so no forged function_call
-  // item can sneak through into the augmented trailing assistant turn.
-  let messages: ChatMessage[];
-  let config: ChatConfig;
+  const leaseModel = lease.model;
   try {
-    const mappedBody = effectiveInput === body.input ? body : { ...body, input: effectiveInput };
-    ({ messages, config } = mapRequest(mappedBody, priorMessages));
-  } catch (err) {
-    sendBadRequest(res, err instanceof Error ? err.message : 'Invalid request input', 'input');
-    return;
-  }
+    // Capture an initial snapshot of the live binding for `body.model`.
+    // These values are the INITIAL observation — on a
+    // `previous_response_id` continuation we re-read them after
+    // `await store.getChain(...)` and reject the request if the
+    // binding moved under us (see the hot-swap race guard below).
+    // Stateless requests never hit the store so the re-read is a
+    // no-op for them.
+    const initialSessionReg: SessionRegistry = lease.registry;
+    const initialInstanceId: number = lease.instanceId;
 
-  // Compute the new-only messages (what this request added, excluding prior history
-  // and instructions). Instructions are stored separately and should not be persisted
-  // as input messages — otherwise chained calls replay stale system messages.
-  const instructionsOffset = body.instructions ? 1 : 0;
-  const priorOffset = instructionsOffset + (priorMessages?.length ?? 0);
-  let newInputMessages = messages.slice(priorOffset);
+    // Mutable handles for the registry binding that actually gets
+    // used for dispatch / persistence. For stateless requests these
+    // stay equal to the initial snapshot. For a `previous_response_id`
+    // continuation they are re-read after `await store.getChain()`
+    // and, if they match the initial snapshot, are used as the
+    // canonical current-binding values from that point forward.
+    let sessionReg: SessionRegistry = initialSessionReg;
+    let currentInstanceId: number | undefined = initialInstanceId;
 
-  // Client-shape validation: every tool message in the continuation delta
-  // must carry a non-empty `tool_call_id`. Catching this up front gives a
-  // clean 400 instead of letting `runSession*()` throw and be mapped to a
-  // generic 500, but the real reason is correctness: the multi-tool-call
-  // fan-out gate below authenticates submitted tool outputs against the
-  // stored outstanding call-id set, and `submittedIds` / the set gate
-  // silently ignores any tool message whose id is missing or empty. A
-  // malicious client can otherwise submit `[tool(call_a), tool(call_b),
-  // tool(/* anonymous */)]` against an outstanding pair `{call_a, call_b}`
-  // — the id-set check would pass because both expected ids are present,
-  // canonicalizeToolMessageOrder would also ignore the anonymous entry,
-  // and the extra tool turn would slip through into native dispatch /
-  // cold replay / persistence. Several native session backends identify
-  // tool responses positionally or drop the id on the wire, so the extra
-  // turn reopens tool-response injection despite the id-set gate. Reject
-  // every anonymous tool message here so the gate can safely assume
-  // every `role === 'tool'` item in `newInputMessages` carries a
-  // well-formed id.
-  for (const m of newInputMessages) {
-    if (m.role === 'tool' && (typeof m.toolCallId !== 'string' || m.toolCallId.length === 0)) {
-      sendBadRequest(res, 'tool message missing tool_call_id', 'input');
-      return;
-    }
-  }
+    const responseId = genId('resp_');
 
-  // Extract the caller's current `instructions` (prefix/system state).
-  // The session registry uses this to detect mid-chain changes — a hot
-  // hit against a session warmed with different instructions would
-  // silently keep using the stale system context, so we pass it to
-  // `getOrCreate` and let the registry force a cold replay on
-  // mismatch. Non-string values (including the field's absence) are
-  // normalized to `null` so the equality check against stored entries
-  // is byte-for-byte.
-  const requestedInstructions: string | null = typeof body.instructions === 'string' ? body.instructions : null;
+    // Resolve previous_response_id chain
+    let priorMessages: ChatMessage[] | undefined;
+    let previousResponseId: string | undefined;
+    // Inherited instructions from the trailing stored chain record —
+    // see Finding 4. Null when either the caller supplied their own
+    // `body.instructions`, when the continuation has no stored chain,
+    // or when the trailing record did not carry an instructions field.
+    let inheritedInstructions: string | null = null;
 
-  // Per-model execution mutex. Every dispatch through this endpoint
-  // serializes with every dispatch through `/v1/messages` for the
-  // same model binding. The native model is a single mutable
-  // resource — one `cached_token_history` / one `caches` vector per
-  // `SessionCapableModel` instance — so two concurrent `primeHistory`
-  // / `send*` calls would clobber each other's KV state even though
-  // `getOrCreate` hands out distinct `ChatSession` wrappers. The
-  // mutex restores correctness by making the entire
-  // `getOrCreate → dispatch → adopt/drop` span exclusive for this
-  // model, and the `finally` inside `withExclusive` releases the
-  // lock on both success and failure so a rejected dispatch cannot
-  // leave the next waiter stuck.
-  //
-  // Validation inside the exclusive block runs synchronously before
-  // any native work begins, so a 400 early return under the lock
-  // releases it immediately for the next waiter — the fan-out
-  // gate's `return` statements exit the closure without calling
-  // any native decode entry points.
-  // Snapshot the pre-lock binding state. For stateless requests these
-  // are `initialSessionReg` / `initialInstanceId` (never updated). For
-  // `previous_response_id` continuations they were refreshed by the
-  // iter-22 re-read that fires after `store.getChain()`. The in-lock
-  // re-check compares against THIS snapshot so the guard catches a
-  // hot-swap that lands strictly between the pre-lock read and the
-  // moment this waiter wins the mutex.
-  const preLockSessionReg = sessionReg;
-  const preLockInstanceId = currentInstanceId;
+    if (body.previous_response_id && store) {
+      try {
+        const chain = await store.getChain(body.previous_response_id);
+        if (chain.length === 0) {
+          sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
+          return;
+        }
 
-  await sessionReg.withExclusive(async () => {
-    // Hot-swap race guard inside the mutex.
-    //
-    // `withExclusive` can park this waiter behind a long-running
-    // dispatch on the same model, and `ModelRegistry.register()` is
-    // NOT coordinated with that lock — a concurrent
-    // `registry.register(body.model, newModel)` can re-point the
-    // friendly name while we are parked. Without this in-lock re-read
-    // the closure would still lease a session out of the already-
-    // captured `preLockSessionReg`, adopt under the dead
-    // `preLockInstanceId`, and persist the new chain under a binding
-    // that `body.model` no longer resolves to. The iter-22 pre-lock
-    // re-read only covered the `store.getChain()` await window; the
-    // mutex-wait window is strictly later and equally unsafe.
-    //
-    // Compare the live binding to the pre-lock snapshot (captured
-    // just before entering the mutex — already iter-22-refreshed on
-    // the continuation path, identical to the handler-top snapshot
-    // on the stateless path). Any drift — nullable or value — is
-    // fatal and rejected with the same 400 envelope the iter-22
-    // guard uses, so clients see a consistent "binding changed"
-    // error regardless of which await window caught the race.
-    const lockedSessionReg = registry.getSessionRegistry(body.model);
-    const lockedInstanceId = registry.getInstanceId(body.model);
-    if (
-      lockedSessionReg === undefined ||
-      lockedInstanceId === undefined ||
-      lockedSessionReg !== preLockSessionReg ||
-      lockedInstanceId !== preLockInstanceId
-    ) {
-      sendBadRequest(
-        res,
-        `Model "${body.model}" binding changed while the request was queued behind the per-model ` +
-          `execution mutex. A concurrent register() re-pointed the name at a different model instance ` +
-          `(or released it entirely) while this waiter was parked, so the session registry and instance ` +
-          `id captured before the mutex wait no longer match the live binding. Dispatching anyway would ` +
-          `route the request through the wrong model — priming, decoding, and persisting under a dead ` +
-          `binding. Retry the request — if the swap was intentional, the new binding will service the ` +
-          `retry cleanly.`,
-        'model',
-      );
-      return;
-    }
-
-    // Route the request through a `ChatSession` looked up by the prior
-    // response id. A miss (null id, unknown id, expired entry, or
-    // prefix-state mismatch) returns a fresh session; a hit leases the
-    // cached session out of the registry (single-use — the entry is
-    // removed on hit so overlapping requests against the same prior id
-    // cannot race on the same single-flight ChatSession).
-    const session = sessionReg.getOrCreate(previousResponseId ?? null, requestedInstructions);
-
-    // Multi-tool-call fan-out gate.
-    //
-    // The chat-session API cannot interleave tool results for a
-    // multi-call fan-out turn (each `sendToolResult` dispatch re-opens
-    // the assistant turn, so responding to the siblings would weave new
-    // assistant replies between the results — see
-    // `ChatSession.pendingUnresolvedToolCallCount`). The only valid forward
-    // progress from such a turn is an atomic replay that resolves every
-    // sibling call in one cold-restart, so we reject any continuation
-    // whose submitted `function_call_output` set does not exactly match
-    // the outstanding call ids.
-    //
-    // The gate only runs for `previous_response_id` continuations, where
-    // the STORED prior chain (`priorMessages`, reconstructed via
-    // `reconstructMessagesFromChain`) is the authoritative view of the
-    // trailing assistant turn and `newInputMessages` contains only the
-    // caller's continuation delta. Stateless requests (no
-    // `previous_response_id`) carry a full self-contained history in
-    // `input`, and historical tool outputs for prior resolved turns
-    // would otherwise be misclassified against the latest assistant's
-    // outstanding id set — leave cold-start histories to the jinja
-    // template / chat-session prefill to handle as-is.
-    const expectedOutstandingIds = priorMessages ? extractOutstandingToolCallIds(priorMessages) : null;
-
-    // Forged-tool-output guard. A `previous_response_id` continuation that
-    // submits any `function_call_output` when the stored prior chain has
-    // ZERO outstanding tool calls is structurally invalid: there is no
-    // assistant tool call for the result to resolve, so dispatching it
-    // would inject a synthetic `<tool_response>` delta into a thread the
-    // model never asked to call. Native backends do not authenticate
-    // `tool_call_id` against prior state — several just append the
-    // delta verbatim — so the gate must live here. Stateless requests
-    // (no `previous_response_id`) carry a full self-contained history
-    // and are left to the jinja template / chat-session prefill.
-    if (previousResponseId && expectedOutstandingIds === null) {
-      for (const m of newInputMessages) {
-        if (m.role === 'tool') {
+        // Hot-swap race guard (iter-22 finding 3).
+        //
+        // Between the pre-await snapshot above and this point a
+        // concurrent `registry.register(body.model, differentModel)`
+        // can re-point the friendly name at a new object. If we
+        // kept using `initialSessionReg` / `initialInstanceId` the
+        // request would dispatch through the stale session
+        // registry, compare the stored identity against the dead
+        // instance id, and persist the new record under the old
+        // binding — even though `body.model` now resolves to a
+        // different live model. Re-read the current binding and
+        // reject the request when anything changed so the caller
+        // can retry against the new identity.
+        const refreshedSessionReg = registry.getSessionRegistry(body.model);
+        const refreshedInstanceId = registry.getInstanceId(body.model);
+        if (
+          refreshedSessionReg === undefined ||
+          refreshedInstanceId === undefined ||
+          refreshedSessionReg !== initialSessionReg ||
+          refreshedInstanceId !== initialInstanceId
+        ) {
           sendBadRequest(
             res,
-            `function_call_output submitted against a thread with no outstanding tool call. ` +
-              `The prior assistant turn either never emitted a tool call or every sibling call has ` +
-              `already been resolved, so there is nothing for this function_call_output to answer. ` +
-              `Dispatching it anyway would synthesize a tool-response delta for a call the model ` +
-              `never made and corrupt the conversation structure. Drop the function_call_output, ` +
-              `or start a new chain without previous_response_id.`,
-            'input',
+            `Model "${body.model}" binding changed while the request was resolving its previous_response_id ` +
+              `chain. A concurrent register() re-pointed the name at a different model instance (or released ` +
+              `it entirely) during the store lookup, so the session registry and instance id captured before ` +
+              `the await no longer match the live binding. Dispatching anyway would replay the stored chain ` +
+              `through the wrong model. Retry the request — if the swap was intentional, the new binding will ` +
+              `service the retry cleanly.`,
+            'model',
           );
           return;
         }
+        sessionReg = refreshedSessionReg;
+        currentInstanceId = refreshedInstanceId;
+
+        // Cross-model continuation guard, keyed on MODEL-INSTANCE
+        // IDENTITY, not friendly name. The stored trailing record
+        // carries a monotonic `modelInstanceId` assigned by
+        // `ModelRegistry` when the model object that serviced the
+        // original turn was first registered; we compare that id
+        // against the CURRENT instance id for `body.model`.
+        //
+        // A plain string comparison on the friendly name is not
+        // sufficient:
+        //
+        //  * `ModelRegistry.register(name, model)` explicitly supports
+        //    replacing the object bound to a name. A chain produced
+        //    by the OLD instance of `foo` would still pass a name
+        //    check after `foo` is hot-swapped to a different model,
+        //    and the continuation would silently replay through the
+        //    wrong tokenizer / chat template / KV layout.
+        //  * Conversely, two names aliasing the SAME model instance
+        //    are already safe because iter-19's per-instance
+        //    `SessionRegistry` sharing routes them through one
+        //    binding — but a name check would spuriously reject
+        //    `body.model = "beta"` against a chain stored under
+        //    `"alpha"`.
+        //
+        // Strict instance-id policy (iter-23 finding 1). Every stored
+        // record must carry an explicit `modelInstanceId`. Records
+        // that lack the field — either because they predate iter-21
+        // or because a tool rewrote `configJson` without preserving
+        // unknown keys — are rejected outright. The iter-22 compat
+        // path that fell back to friendly-name comparison silently
+        // reopened the same-name hot-swap corruption window: any
+        // stored row without identity could be replayed through a
+        // different tokenizer / chat template / KV layout as long as
+        // the friendly name matched. This branch is an explicit
+        // breaking change in chain semantics — no production rows
+        // exist without identity on `feat/qwen35-chat-session`, so
+        // strict-reject is safe to land without a migration.
+        const trailingRecord = chain[chain.length - 1]!;
+        const storedIdentity = readStoredModelIdentity(trailingRecord);
+        if (storedIdentity.kind === 'absent') {
+          sendBadRequest(
+            res,
+            `previous_response_id "${body.previous_response_id}" belongs to a stored chain whose trailing ` +
+              `record does not carry a modelInstanceId. Such records predate the iter-21 identity scheme ` +
+              `(or were rewritten without preserving the identity field) and are not eligible for ` +
+              `continuation: a friendly-name comparison would silently reopen same-name hot-swap corruption, ` +
+              `replaying the chain through a potentially different tokenizer, chat template, or KV layout. ` +
+              `Start a new chain without previous_response_id.`,
+            'model',
+          );
+          return;
+        }
+        if (currentInstanceId === undefined || storedIdentity.instanceId !== currentInstanceId) {
+          sendBadRequest(
+            res,
+            `previous_response_id "${body.previous_response_id}" belongs to a chain produced by a different ` +
+              `model instance than the one currently bound to "${body.model}". This happens when the named ` +
+              `model has been hot-swapped to a different underlying object since the chain was stored or ` +
+              `when the original binding has been released entirely. Continuations cannot cross model ` +
+              `boundaries — a stored chain is tied to the tokenizer, chat template, and KV layout of the ` +
+              `exact model object that produced it, and replaying it through a different model would ` +
+              `silently corrupt the conversation. Start a new chain without previous_response_id.`,
+            'model',
+          );
+          return;
+        }
+        priorMessages = reconstructMessagesFromChain(chain);
+        previousResponseId = body.previous_response_id;
+        // Inherit the trailing stored record's `instructions` when
+        // the continuation request does NOT override it. Finding 4:
+        // the iter-25 cold-replay path dropped stored instructions
+        // entirely — the caller who originally sent the first turn
+        // with `instructions: "You are a pirate"` would see the
+        // pirate persona disappear on any cold-replay continuation
+        // (TTL expiry, process restart, lease-on-hit miss), because
+        // `reconstructMessagesFromChain()` only walked inputJson /
+        // outputJson and the endpoint re-read `body.instructions`
+        // from the fresh request. An `undefined` body.instructions
+        // means "keep the existing system context", not "forget it".
+        //
+        // The trailing record carries the effective instructions
+        // that were in force for that turn (either the caller's
+        // original value or a previously inherited one), so reading
+        // from it gives us the full prefix state without walking the
+        // whole chain. We apply the inheritance only when
+        // `body.instructions` is absent — any explicit value (even
+        // an empty string) means the caller is deliberately
+        // overriding the prefix state, and we surface that change to
+        // the `SessionRegistry` cache key below so a hot hit under
+        // the stale system context forces a cold replay.
+        if (typeof body.instructions !== 'string') {
+          const storedInstructions = chain[chain.length - 1]!.instructions;
+          if (typeof storedInstructions === 'string' && storedInstructions.length > 0) {
+            inheritedInstructions = storedInstructions;
+          }
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '';
+        if (/not found/i.test(msg)) {
+          sendNotFound(res, `Previous response "${body.previous_response_id}" not found or expired`);
+        } else {
+          sendInternalError(res, `Failed to retrieve previous response: ${msg || 'unknown error'}`);
+        }
+        return;
       }
+    } else if (body.previous_response_id && !store) {
+      sendBadRequest(res, 'previous_response_id requires a response store to be configured');
+      return;
     }
 
-    if (expectedOutstandingIds !== null) {
-      // Contiguous-prefix guard: function_call_output items must appear
-      // as an unbroken prefix of the continuation delta, before any
-      // user/assistant/system message. A shape like
-      // `[tool(call_a), user(hi), tool(call_b)]` would otherwise pass
-      // every id-set check below (both outstanding ids present, no
-      // duplicates, no stale ids) while still orphaning the fan-out,
-      // because the interleaved user turn re-opens the assistant turn
-      // between the two tool results. Reject early so the caller cannot
-      // smuggle a user turn into the middle of a resolved fan-out.
-      let seenNonTool = false;
-      for (const m of newInputMessages) {
-        if (m.role === 'tool') {
-          if (seenNonTool) {
+    // Echoed `function_call` items on a `previous_response_id` continuation
+    // are validated for ownership (call_id must belong to the stored
+    // trailing assistant turn) and then stripped unconditionally.
+    //
+    // Motivation: the common "round-trip `response.output` into the next
+    // `input`" shape sends the prior assistant's `function_call` items
+    // back alongside the new `function_call_output` results, which is a
+    // legitimate client pattern. But `mapRequest` rebuilds each echoed
+    // item into a synthetic assistant message at the tail of the
+    // augmented `messages` list, which would both duplicate stored state
+    // and (crucially) let a forged echo rewrite the trailing assistant
+    // turn — poisoning `primeHistory()` and bypassing the multi-tool gate
+    // below. Since `priorMessages` is the authoritative copy, the
+    // correct response is to verify ownership by `call_id`, then drop
+    // the echo so the stored view is used downstream.
+    //
+    // Name/arguments are NOT compared against stored — a client that
+    // parses and reserializes its own prior arguments (different JSON
+    // whitespace, key order, number formatting) would otherwise fail
+    // continuation even though the server never consumes the echoed
+    // payload. Any `call_id` absent from the stored index is still
+    // rejected as an unambiguous forgery attempt.
+    let effectiveInput = body.input;
+    if (previousResponseId && priorMessages && Array.isArray(body.input)) {
+      const storedCallIds = buildTrailingAssistantToolCallIds(priorMessages);
+      const filtered: typeof body.input = [];
+      for (const item of body.input) {
+        if (item != null && typeof item === 'object' && (item as { type?: string }).type === 'function_call') {
+          const fc = item as { call_id?: unknown };
+          const callId = typeof fc.call_id === 'string' ? fc.call_id : null;
+          if (!callId || !storedCallIds || !storedCallIds.has(callId)) {
             sendBadRequest(
               res,
-              `function_call_output items must appear as a contiguous prefix of the continuation ` +
-                `before any user, assistant, or system message. Interleaving a non-tool message ` +
-                `between sibling function_call_output items orphans the fan-out by weaving a new ` +
-                `assistant turn between the tool results. Reorder the submission so every ` +
-                `function_call_output precedes any subsequent message, or start a new chain ` +
-                `without previous_response_id.`,
+              `echoed function_call item references an unknown call_id "${callId ?? ''}" — the stored ` +
+                `trailing assistant turn is the authoritative copy, and any echoed function_call must ` +
+                `reference one of its outstanding tool calls. Drop the echoed item or resolve the ` +
+                `continuation against the correct previous_response_id.`,
               'input',
             );
             return;
           }
-        } else {
-          seenNonTool = true;
+          // Stored state is authoritative — drop the echo regardless of
+          // whether the client's `name`/`arguments` match byte-for-byte.
+          continue;
         }
+        filtered.push(item);
       }
-
-      const submittedIds: string[] = [];
-      for (const m of newInputMessages) {
-        if (m.role === 'tool' && typeof m.toolCallId === 'string' && m.toolCallId.length > 0) {
-          submittedIds.push(m.toolCallId);
-        }
-      }
-
-      // Short-circuit: a plain user continuation (zero tool results)
-      // would orphan the outstanding call(s) just as surely as a
-      // partial tool-result submission. Reject both paths with the
-      // same 400.
-      const plural = expectedOutstandingIds.length > 1;
-      if (submittedIds.length === 0) {
-        sendBadRequest(
-          res,
-          `Previous assistant turn has ${expectedOutstandingIds.length} unresolved tool call${plural ? 's' : ''} ` +
-            `(${expectedOutstandingIds.join(', ')}); the chat-session API requires every outstanding ` +
-            `function_call_output to be submitted before the thread can advance. A plain user turn ` +
-            `would orphan the unresolved call${plural ? 's' : ''}. Submit function_call_output items for ` +
-            `every outstanding id, or start a new chain without previous_response_id.`,
-          'input',
-        );
-        return;
-      }
-
-      const expectedSet = new Set(expectedOutstandingIds);
-      const seen = new Set<string>();
-      for (const id of submittedIds) {
-        if (seen.has(id)) {
-          sendBadRequest(
-            res,
-            `Duplicate function_call_output call_id "${id}" — each outstanding tool call must be answered exactly once.`,
-            'input',
-          );
-          return;
-        }
-        seen.add(id);
-        if (!expectedSet.has(id)) {
-          sendBadRequest(
-            res,
-            `Unexpected function_call_output call_id "${id}"; the outstanding multi-tool-call set is ` +
-              `${expectedOutstandingIds.join(', ')}. Submitting an unrelated or stale call_id would advance ` +
-              `the chain past an unresolved turn.`,
-            'input',
-          );
-          return;
-        }
-      }
-      if (seen.size !== expectedSet.size) {
-        const missing: string[] = [];
-        for (const id of expectedOutstandingIds) {
-          if (!seen.has(id)) missing.push(id);
-        }
-        sendBadRequest(
-          res,
-          `Missing function_call_output items for outstanding tool calls: ${missing.join(', ')}. ` +
-            `Partial submissions would orphan the sibling tool calls and advance the chain past an ` +
-            `unresolved turn. Resubmit with every sibling output, or start a new chain without ` +
-            `previous_response_id.`,
-          'input',
-        );
-        return;
-      }
-
-      // All outstanding ids are accounted for. Canonicalize the submitted
-      // tool-message order to the stored sibling order before the replay
-      // runs — both `messages` (primed into the fresh session on the cold
-      // path) and `newInputMessages` (persisted verbatim into the store
-      // for future chain reconstruction) must reflect the canonical
-      // order, otherwise a caller can swap outputs and silently poison
-      // replay even after the id-set gate passes.
-      //
-      // Compute the tool block's end as the contiguous-prefix run of
-      // `role === 'tool'` messages starting at `priorOffset`. The
-      // contiguous-prefix guard above already rejected any shape that
-      // interleaves a non-tool message inside the delta's tool block,
-      // so this simple forward scan matches the exact block the gate
-      // just authenticated. Passing an explicit `blockEnd` keeps the
-      // helper from accidentally walking into any later turn that
-      // `mapRequest` may have appended to `messages`.
-      let deltaBlockEnd = priorOffset;
-      while (deltaBlockEnd < messages.length && messages[deltaBlockEnd]!.role === 'tool') {
-        deltaBlockEnd++;
-      }
-      canonicalizeToolMessageOrder(messages, priorOffset, deltaBlockEnd, expectedOutstandingIds);
-      newInputMessages = messages.slice(priorOffset);
+      effectiveInput = filtered;
     }
 
-    // Walk the full merged history and canonicalize every assistant
-    // fan-out's trailing tool block against its declared sibling order.
+    // Compute the effective instructions for this turn. The caller's
+    // explicit `body.instructions` wins; otherwise we inherit the
+    // trailing stored record's value (Finding 4). The effective
+    // value is then used for mapping (prepends the system message
+    // via `mapRequest`'s existing logic), for the session-registry
+    // cache key (so a hot hit under the stale prefix still matches),
+    // for `buildResponseObject` (so the new response roundtrips the
+    // prefix), and for persistence (so the next cold replay can
+    // re-inherit).
     //
-    // The multi-tool-call gate above only fires on `previous_response_id`
-    // continuations, and even there it only handles the caller's delta
-    // block against the STORED prior chain's trailing assistant. That
-    // leaves two cases uncovered:
-    //
-    //   1. Stateless cold-start histories (no `previous_response_id`).
-    //      The caller ships a full self-contained conversation through
-    //      `input`; the gate is skipped entirely and the caller-supplied
-    //      tool-message order flows straight into `primeHistory()`. A
-    //      caller can reverse two sibling tool outputs, and since
-    //      several native session backends pair tool results to
-    //      fan-out calls POSITIONALLY (not by id), each result binds
-    //      to the wrong sibling call.
-    //   2. Earlier fan-outs embedded inside the stored prior history
-    //      on a continuation. Those came from the server's own store
-    //      so they should already be canonical, but defense in depth
-    //      is cheap — a single full-history walk covers every shape.
-    //
-    // Malformed histories (missing/duplicate/unknown ids, orphan tool
-    // messages, unresolved trailing fan-out in a stateless request)
-    // are rejected with a clear 400 instead of silently rewritten.
-    const historyError = validateAndCanonicalizeHistoryToolOrder(messages);
-    if (historyError !== null) {
-      sendBadRequest(res, historyError, 'input');
+    // We fold the inherited value into a fresh mapped body rather
+    // than mutating `body` so the mutation cannot leak to any other
+    // code path that still holds the original reference.
+    const effectiveInstructions: string | null =
+      typeof body.instructions === 'string' ? body.instructions : inheritedInstructions;
+
+    // Map request — full messages include prior + new input.
+    // Feed mapRequest the echo-stripped input so no forged function_call
+    // item can sneak through into the augmented trailing assistant turn.
+    let messages: ChatMessage[];
+    let config: ChatConfig;
+    const mappedBody: ResponsesAPIRequest =
+      effectiveInput === body.input && effectiveInstructions === (body.instructions ?? null)
+        ? body
+        : {
+            ...body,
+            input: effectiveInput,
+            instructions: effectiveInstructions ?? undefined,
+          };
+    try {
+      ({ messages, config } = mapRequest(mappedBody, priorMessages));
+    } catch (err) {
+      sendBadRequest(res, err instanceof Error ? err.message : 'Invalid request input', 'input');
       return;
     }
-    // Canonicalization may have reordered tool messages inside the
-    // continuation delta (on the stateless-history walk over the
-    // post-priorOffset portion), so recompute `newInputMessages` from
-    // the now-canonical `messages`.
-    newInputMessages = messages.slice(priorOffset);
 
-    try {
-      // `runSession*` plumbs an honest commit signal out of the helper:
-      // `ChatSession` only advances `turns` on a successful non-error
-      // final chunk (streaming) or a resolved native promise
-      // (non-streaming). The streaming safety-net path (generator
-      // exhausts without a `done` event, see `handleStreamingNative`
-      // fallback) and the `finishReason === 'error'` final chunk both
-      // leave `turns` unchanged. The helper captures its baseline
-      // AFTER any internal `session.reset()` on the multi-message
-      // reset-and-cold-restart branch, so the signal is honest there
-      // too — a pre-helper snapshot would be stale.
-      let committed: boolean;
-      if (body.stream) {
-        const outcome = await runSessionStreaming(session, messages, newInputMessages, config);
-        const streamingWasCommitted = () => outcome.wasCommitted();
-        await handleStreamingNative(
-          res,
-          outcome.stream,
-          body,
-          responseId,
-          previousResponseId,
-          store,
-          newInputMessages,
-          streamingWasCommitted,
-          currentInstanceId,
-        );
-        committed = streamingWasCommitted();
-      } else {
-        const outcome = await runSessionNonStreaming(session, messages, newInputMessages, config);
-        await handleNonStreaming(
-          res,
-          outcome.result,
-          body,
-          responseId,
-          previousResponseId,
-          store,
-          newInputMessages,
-          currentInstanceId,
-        );
-        committed = outcome.committed;
-      }
+    // Compute the new-only messages (what this request added, excluding prior history
+    // and instructions). Instructions are stored separately and should not be persisted
+    // as input messages — otherwise chained calls replay stale system messages.
+    //
+    // Use `mappedBody.instructions` (not `body.instructions`) so an
+    // inherited system message also contributes one offset — the
+    // reconstruction path prepended it via `mapRequest` above.
+    // Mirror `mapRequest`'s truthy check (an empty-string override
+    // does NOT push a system message and therefore contributes
+    // zero offset, matching the mapper's behavior byte-for-byte).
+    const instructionsOffset = mappedBody.instructions ? 1 : 0;
+    const priorOffset = instructionsOffset + (priorMessages?.length ?? 0);
+    let newInputMessages = messages.slice(priorOffset);
 
-      // Belt-and-braces: the prior id was already leased out of the
-      // registry at `getOrCreate` time (single-use lease semantics), so
-      // this drop is a no-op in the common case. It stays because a
-      // defensive `drop` keeps the bookkeeping readable and guards
-      // against future refactors that might re-introduce a non-lease
-      // hit path.
-      //
-      // Only adopt under the new id when the session actually committed
-      // — otherwise future chained requests must fall through to the
-      // cold-replay path, which reconstructs from `ResponseStore` on a
-      // fresh session, so the in-memory KV cache cannot diverge from
-      // the persisted chain.
-      if (previousResponseId) {
-        sessionReg.drop(previousResponseId);
-      }
-      if (committed) {
-        sessionReg.adopt(responseId, session, requestedInstructions);
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown error during inference';
-      // If headers haven't been sent yet, send a proper error response
-      if (!res.headersSent) {
-        sendInternalError(res, message);
-      } else {
-        // Headers already sent (streaming) -- best effort: write error event and close
-        writeSSEEvent(res, 'error', { error_type: 'server_error', message });
-        endSSE(res);
+    // Client-shape validation: every tool message in the continuation delta
+    // must carry a non-empty `tool_call_id`. Catching this up front gives a
+    // clean 400 instead of letting `runSession*()` throw and be mapped to a
+    // generic 500, but the real reason is correctness: the multi-tool-call
+    // fan-out gate below authenticates submitted tool outputs against the
+    // stored outstanding call-id set, and `submittedIds` / the set gate
+    // silently ignores any tool message whose id is missing or empty. A
+    // malicious client can otherwise submit `[tool(call_a), tool(call_b),
+    // tool(/* anonymous */)]` against an outstanding pair `{call_a, call_b}`
+    // — the id-set check would pass because both expected ids are present,
+    // canonicalizeToolMessageOrder would also ignore the anonymous entry,
+    // and the extra tool turn would slip through into native dispatch /
+    // cold replay / persistence. Several native session backends identify
+    // tool responses positionally or drop the id on the wire, so the extra
+    // turn reopens tool-response injection despite the id-set gate. Reject
+    // every anonymous tool message here so the gate can safely assume
+    // every `role === 'tool'` item in `newInputMessages` carries a
+    // well-formed id.
+    for (const m of newInputMessages) {
+      if (m.role === 'tool' && (typeof m.toolCallId !== 'string' || m.toolCallId.length === 0)) {
+        sendBadRequest(res, 'tool message missing tool_call_id', 'input');
+        return;
       }
     }
-  });
+
+    // Extract the EFFECTIVE `instructions` (caller-supplied OR
+    // inherited from the trailing stored record; see the block at
+    // `effectiveInstructions` above). The session registry uses this
+    // as its prefix/system state cache key — a hot hit against a
+    // session warmed with different instructions would silently keep
+    // using the stale system context, so we pass the effective value
+    // to `getOrCreate` and let the registry force a cold replay on
+    // mismatch. Inheriting the stored value on a continuation means a
+    // cold replay and a warm hit both converge on the SAME prefix
+    // state as the original turn, matching what the caller expects
+    // when they omit `instructions` on a follow-up request.
+    const requestedInstructions: string | null = effectiveInstructions;
+
+    // Per-model execution mutex. Every dispatch through this endpoint
+    // serializes with every dispatch through `/v1/messages` for the
+    // same model binding. The native model is a single mutable
+    // resource — one `cached_token_history` / one `caches` vector per
+    // `SessionCapableModel` instance — so two concurrent `primeHistory`
+    // / `send*` calls would clobber each other's KV state even though
+    // `getOrCreate` hands out distinct `ChatSession` wrappers. The
+    // mutex restores correctness by making the entire
+    // `getOrCreate → dispatch → adopt/drop` span exclusive for this
+    // model, and the `finally` inside `withExclusive` releases the
+    // lock on both success and failure so a rejected dispatch cannot
+    // leave the next waiter stuck.
+    //
+    // Validation inside the exclusive block runs synchronously before
+    // any native work begins, so a 400 early return under the lock
+    // releases it immediately for the next waiter — the fan-out
+    // gate's `return` statements exit the closure without calling
+    // any native decode entry points.
+    // Snapshot the pre-lock binding state. For stateless requests these
+    // are `initialSessionReg` / `initialInstanceId` (never updated). For
+    // `previous_response_id` continuations they were refreshed by the
+    // iter-22 re-read that fires after `store.getChain()`. The in-lock
+    // re-check compares against THIS snapshot so the guard catches a
+    // hot-swap that lands strictly between the pre-lock read and the
+    // moment this waiter wins the mutex.
+    const preLockSessionReg = sessionReg;
+    const preLockInstanceId = currentInstanceId;
+
+    await sessionReg.withExclusive(async () => {
+      // Hot-swap race guard inside the mutex.
+      //
+      // `withExclusive` can park this waiter behind a long-running
+      // dispatch on the same model, and `ModelRegistry.register()` is
+      // NOT coordinated with that lock — a concurrent
+      // `registry.register(body.model, newModel)` can re-point the
+      // friendly name while we are parked. Without this in-lock re-read
+      // the closure would still lease a session out of the already-
+      // captured `preLockSessionReg`, adopt under the dead
+      // `preLockInstanceId`, and persist the new chain under a binding
+      // that `body.model` no longer resolves to. The iter-22 pre-lock
+      // re-read only covered the `store.getChain()` await window; the
+      // mutex-wait window is strictly later and equally unsafe.
+      //
+      // Compare the live binding to the pre-lock snapshot (captured
+      // just before entering the mutex — already iter-22-refreshed on
+      // the continuation path, identical to the handler-top snapshot
+      // on the stateless path). Any drift — nullable or value — is
+      // fatal and rejected with the same 400 envelope the iter-22
+      // guard uses, so clients see a consistent "binding changed"
+      // error regardless of which await window caught the race.
+      const lockedSessionReg = registry.getSessionRegistry(body.model);
+      const lockedInstanceId = registry.getInstanceId(body.model);
+      if (
+        lockedSessionReg === undefined ||
+        lockedInstanceId === undefined ||
+        lockedSessionReg !== preLockSessionReg ||
+        lockedInstanceId !== preLockInstanceId
+      ) {
+        sendBadRequest(
+          res,
+          `Model "${body.model}" binding changed while the request was queued behind the per-model ` +
+            `execution mutex. A concurrent register() re-pointed the name at a different model instance ` +
+            `(or released it entirely) while this waiter was parked, so the session registry and instance ` +
+            `id captured before the mutex wait no longer match the live binding. Dispatching anyway would ` +
+            `route the request through the wrong model — priming, decoding, and persisting under a dead ` +
+            `binding. Retry the request — if the swap was intentional, the new binding will service the ` +
+            `retry cleanly.`,
+          'model',
+        );
+        return;
+      }
+
+      // Route the request through a `ChatSession` looked up by the prior
+      // response id. A miss (null id, unknown id, expired entry, or
+      // prefix-state mismatch) returns a fresh session; a hit leases the
+      // cached session out of the registry (single-use — the entry is
+      // removed on hit so overlapping requests against the same prior id
+      // cannot race on the same single-flight ChatSession).
+      const session = sessionReg.getOrCreate(previousResponseId ?? null, requestedInstructions);
+
+      // Multi-tool-call fan-out gate.
+      //
+      // The chat-session API cannot interleave tool results for a
+      // multi-call fan-out turn (each `sendToolResult` dispatch re-opens
+      // the assistant turn, so responding to the siblings would weave new
+      // assistant replies between the results — see
+      // `ChatSession.pendingUnresolvedToolCallCount`). The only valid forward
+      // progress from such a turn is an atomic replay that resolves every
+      // sibling call in one cold-restart, so we reject any continuation
+      // whose submitted `function_call_output` set does not exactly match
+      // the outstanding call ids.
+      //
+      // The gate only runs for `previous_response_id` continuations, where
+      // the STORED prior chain (`priorMessages`, reconstructed via
+      // `reconstructMessagesFromChain`) is the authoritative view of the
+      // trailing assistant turn and `newInputMessages` contains only the
+      // caller's continuation delta. Stateless requests (no
+      // `previous_response_id`) carry a full self-contained history in
+      // `input`, and historical tool outputs for prior resolved turns
+      // would otherwise be misclassified against the latest assistant's
+      // outstanding id set — leave cold-start histories to the jinja
+      // template / chat-session prefill to handle as-is.
+      const expectedOutstandingIds = priorMessages ? extractOutstandingToolCallIds(priorMessages) : null;
+
+      // Forged-tool-output guard. A `previous_response_id` continuation that
+      // submits any `function_call_output` when the stored prior chain has
+      // ZERO outstanding tool calls is structurally invalid: there is no
+      // assistant tool call for the result to resolve, so dispatching it
+      // would inject a synthetic `<tool_response>` delta into a thread the
+      // model never asked to call. Native backends do not authenticate
+      // `tool_call_id` against prior state — several just append the
+      // delta verbatim — so the gate must live here. Stateless requests
+      // (no `previous_response_id`) carry a full self-contained history
+      // and are left to the jinja template / chat-session prefill.
+      if (previousResponseId && expectedOutstandingIds === null) {
+        for (const m of newInputMessages) {
+          if (m.role === 'tool') {
+            sendBadRequest(
+              res,
+              `function_call_output submitted against a thread with no outstanding tool call. ` +
+                `The prior assistant turn either never emitted a tool call or every sibling call has ` +
+                `already been resolved, so there is nothing for this function_call_output to answer. ` +
+                `Dispatching it anyway would synthesize a tool-response delta for a call the model ` +
+                `never made and corrupt the conversation structure. Drop the function_call_output, ` +
+                `or start a new chain without previous_response_id.`,
+              'input',
+            );
+            return;
+          }
+        }
+      }
+
+      if (expectedOutstandingIds !== null) {
+        // Contiguous-prefix guard: function_call_output items must appear
+        // as an unbroken prefix of the continuation delta, before any
+        // user/assistant/system message. A shape like
+        // `[tool(call_a), user(hi), tool(call_b)]` would otherwise pass
+        // every id-set check below (both outstanding ids present, no
+        // duplicates, no stale ids) while still orphaning the fan-out,
+        // because the interleaved user turn re-opens the assistant turn
+        // between the two tool results. Reject early so the caller cannot
+        // smuggle a user turn into the middle of a resolved fan-out.
+        let seenNonTool = false;
+        for (const m of newInputMessages) {
+          if (m.role === 'tool') {
+            if (seenNonTool) {
+              sendBadRequest(
+                res,
+                `function_call_output items must appear as a contiguous prefix of the continuation ` +
+                  `before any user, assistant, or system message. Interleaving a non-tool message ` +
+                  `between sibling function_call_output items orphans the fan-out by weaving a new ` +
+                  `assistant turn between the tool results. Reorder the submission so every ` +
+                  `function_call_output precedes any subsequent message, or start a new chain ` +
+                  `without previous_response_id.`,
+                'input',
+              );
+              return;
+            }
+          } else {
+            seenNonTool = true;
+          }
+        }
+
+        const submittedIds: string[] = [];
+        for (const m of newInputMessages) {
+          if (m.role === 'tool' && typeof m.toolCallId === 'string' && m.toolCallId.length > 0) {
+            submittedIds.push(m.toolCallId);
+          }
+        }
+
+        // Short-circuit: a plain user continuation (zero tool results)
+        // would orphan the outstanding call(s) just as surely as a
+        // partial tool-result submission. Reject both paths with the
+        // same 400.
+        const plural = expectedOutstandingIds.length > 1;
+        if (submittedIds.length === 0) {
+          sendBadRequest(
+            res,
+            `Previous assistant turn has ${expectedOutstandingIds.length} unresolved tool call${plural ? 's' : ''} ` +
+              `(${expectedOutstandingIds.join(', ')}); the chat-session API requires every outstanding ` +
+              `function_call_output to be submitted before the thread can advance. A plain user turn ` +
+              `would orphan the unresolved call${plural ? 's' : ''}. Submit function_call_output items for ` +
+              `every outstanding id, or start a new chain without previous_response_id.`,
+            'input',
+          );
+          return;
+        }
+
+        const expectedSet = new Set(expectedOutstandingIds);
+        const seen = new Set<string>();
+        for (const id of submittedIds) {
+          if (seen.has(id)) {
+            sendBadRequest(
+              res,
+              `Duplicate function_call_output call_id "${id}" — each outstanding tool call must be answered exactly once.`,
+              'input',
+            );
+            return;
+          }
+          seen.add(id);
+          if (!expectedSet.has(id)) {
+            sendBadRequest(
+              res,
+              `Unexpected function_call_output call_id "${id}"; the outstanding multi-tool-call set is ` +
+                `${expectedOutstandingIds.join(', ')}. Submitting an unrelated or stale call_id would advance ` +
+                `the chain past an unresolved turn.`,
+              'input',
+            );
+            return;
+          }
+        }
+        if (seen.size !== expectedSet.size) {
+          const missing: string[] = [];
+          for (const id of expectedOutstandingIds) {
+            if (!seen.has(id)) missing.push(id);
+          }
+          sendBadRequest(
+            res,
+            `Missing function_call_output items for outstanding tool calls: ${missing.join(', ')}. ` +
+              `Partial submissions would orphan the sibling tool calls and advance the chain past an ` +
+              `unresolved turn. Resubmit with every sibling output, or start a new chain without ` +
+              `previous_response_id.`,
+            'input',
+          );
+          return;
+        }
+
+        // All outstanding ids are accounted for. Canonicalize the submitted
+        // tool-message order to the stored sibling order before the replay
+        // runs — both `messages` (primed into the fresh session on the cold
+        // path) and `newInputMessages` (persisted verbatim into the store
+        // for future chain reconstruction) must reflect the canonical
+        // order, otherwise a caller can swap outputs and silently poison
+        // replay even after the id-set gate passes.
+        //
+        // Compute the tool block's end as the contiguous-prefix run of
+        // `role === 'tool'` messages starting at `priorOffset`. The
+        // contiguous-prefix guard above already rejected any shape that
+        // interleaves a non-tool message inside the delta's tool block,
+        // so this simple forward scan matches the exact block the gate
+        // just authenticated. Passing an explicit `blockEnd` keeps the
+        // helper from accidentally walking into any later turn that
+        // `mapRequest` may have appended to `messages`.
+        let deltaBlockEnd = priorOffset;
+        while (deltaBlockEnd < messages.length && messages[deltaBlockEnd]!.role === 'tool') {
+          deltaBlockEnd++;
+        }
+        canonicalizeToolMessageOrder(messages, priorOffset, deltaBlockEnd, expectedOutstandingIds);
+        newInputMessages = messages.slice(priorOffset);
+      }
+
+      // Walk the full merged history and canonicalize every assistant
+      // fan-out's trailing tool block against its declared sibling order.
+      //
+      // The multi-tool-call gate above only fires on `previous_response_id`
+      // continuations, and even there it only handles the caller's delta
+      // block against the STORED prior chain's trailing assistant. That
+      // leaves two cases uncovered:
+      //
+      //   1. Stateless cold-start histories (no `previous_response_id`).
+      //      The caller ships a full self-contained conversation through
+      //      `input`; the gate is skipped entirely and the caller-supplied
+      //      tool-message order flows straight into `primeHistory()`. A
+      //      caller can reverse two sibling tool outputs, and since
+      //      several native session backends pair tool results to
+      //      fan-out calls POSITIONALLY (not by id), each result binds
+      //      to the wrong sibling call.
+      //   2. Earlier fan-outs embedded inside the stored prior history
+      //      on a continuation. Those came from the server's own store
+      //      so they should already be canonical, but defense in depth
+      //      is cheap — a single full-history walk covers every shape.
+      //
+      // Malformed histories (missing/duplicate/unknown ids, orphan tool
+      // messages, unresolved trailing fan-out in a stateless request)
+      // are rejected with a clear 400 instead of silently rewritten.
+      const historyError = validateAndCanonicalizeHistoryToolOrder(messages);
+      if (historyError !== null) {
+        sendBadRequest(res, historyError, 'input');
+        return;
+      }
+      // Canonicalization may have reordered tool messages inside the
+      // continuation delta (on the stateless-history walk over the
+      // post-priorOffset portion), so recompute `newInputMessages` from
+      // the now-canonical `messages`.
+      newInputMessages = messages.slice(priorOffset);
+
+      try {
+        // `runSession*` plumbs an honest commit signal out of the helper:
+        // `ChatSession` only advances `turns` on a successful non-error
+        // final chunk (streaming) or a resolved native promise
+        // (non-streaming). The streaming safety-net path (generator
+        // exhausts without a `done` event, see `handleStreamingNative`
+        // fallback) and the `finishReason === 'error'` final chunk both
+        // leave `turns` unchanged. The helper captures its baseline
+        // AFTER any internal `session.reset()` on the multi-message
+        // reset-and-cold-restart branch, so the signal is honest there
+        // too — a pre-helper snapshot would be stale.
+        let committed: boolean;
+        // Pass `mappedBody` (not the raw `body`) so the response
+        // object and the persisted record carry the EFFECTIVE
+        // instructions, including any value inherited from the
+        // trailing stored record via Finding 4. Using `body` here
+        // would re-drop the inherited value on the wire — the
+        // client's response would report `instructions: null` even
+        // though the turn was run against the inherited system
+        // context, and the next cold replay would have nothing to
+        // re-inherit from.
+        if (mappedBody.stream) {
+          const outcome = await runSessionStreaming(session, messages, newInputMessages, config);
+          const streamingWasCommitted = () => outcome.wasCommitted();
+          await handleStreamingNative(
+            res,
+            outcome.stream,
+            mappedBody,
+            responseId,
+            previousResponseId,
+            store,
+            newInputMessages,
+            streamingWasCommitted,
+            currentInstanceId,
+          );
+          committed = streamingWasCommitted();
+        } else {
+          const outcome = await runSessionNonStreaming(session, messages, newInputMessages, config);
+          await handleNonStreaming(
+            res,
+            outcome.result,
+            mappedBody,
+            responseId,
+            previousResponseId,
+            store,
+            newInputMessages,
+            currentInstanceId,
+          );
+          committed = outcome.committed;
+        }
+
+        // Belt-and-braces: the prior id was already leased out of the
+        // registry at `getOrCreate` time (single-use lease semantics), so
+        // this drop is a no-op in the common case. It stays because a
+        // defensive `drop` keeps the bookkeeping readable and guards
+        // against future refactors that might re-introduce a non-lease
+        // hit path.
+        //
+        // Only adopt under the new id when the session actually committed
+        // — otherwise future chained requests must fall through to the
+        // cold-replay path, which reconstructs from `ResponseStore` on a
+        // fresh session, so the in-memory KV cache cannot diverge from
+        // the persisted chain.
+        if (previousResponseId) {
+          sessionReg.drop(previousResponseId);
+        }
+        if (committed) {
+          sessionReg.adopt(responseId, session, requestedInstructions);
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown error during inference';
+        // If headers haven't been sent yet, send a proper error response
+        if (!res.headersSent) {
+          sendInternalError(res, message);
+        } else {
+          // Headers already sent (streaming) -- best effort: write error event and close
+          writeSSEEvent(res, 'error', { error_type: 'server_error', message });
+          endSSE(res);
+        }
+      }
+    });
+  } finally {
+    // Release the dispatch lease on the ORIGINAL model object the
+    // lease was acquired against (not a re-read of `body.model`,
+    // which may have been hot-swapped while we held the mutex). A
+    // pending teardown — `releaseBinding()` called concurrently
+    // while this dispatch held the lease — finalises here once the
+    // in-flight counter drops to zero.
+    registry.releaseDispatchLease(leaseModel);
+  }
 }

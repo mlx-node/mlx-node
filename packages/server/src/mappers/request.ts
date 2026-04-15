@@ -73,28 +73,49 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
 
   // Map input.
   //
-  // Consecutive `function_call` items from the same assistant turn
-  // are coalesced into ONE assistant message with multi-element
-  // `toolCalls`. The OpenAI Responses API serialises a multi-call
-  // assistant response as a RUN of sibling `function_call` input
-  // items, and iter-20's full-history walker (`responses.ts`,
-  // `validateAndCanonicalizeHistoryToolOrder`) requires each
-  // assistant fan-out's `toolCalls` array to match the trailing
-  // tool block one-for-one. Pushing each `function_call` item as
-  // its own `assistant` message would turn a single fan-out into
-  // `assistant(call_a)`, `assistant(call_b)` — the walker would
-  // then reject the first assistant turn as orphaned (its `next`
-  // message is another assistant, not a tool), so stateless
-  // multi-call replays would fail even when the caller shipped a
-  // perfectly valid history.
+  // A single assistant turn that produced both text AND tool calls
+  // is serialised by the OpenAI Responses API as a RUN of sibling
+  // input items: `message` (with the text content) immediately
+  // followed by one or more `function_call` items. The mapper must
+  // coalesce that run into ONE `assistant` ChatMessage whose
+  // `content` carries the text and whose `toolCalls` carries every
+  // sibling call — both because:
   //
-  // `prevItemType` is the exact coalescing invariant: a run ends
-  // the moment the loop sees anything other than `function_call`.
-  // The empty-content + existing-toolCalls check on the tail
-  // assistant message is a belt-and-braces guard so a previously
-  // pushed `message`-derived assistant turn can't accidentally
-  // absorb a later function_call, but `prevItemType` is the
-  // load-bearing predicate.
+  //   1. The hot-path `ChatSession.sendStream()` in
+  //      `packages/lm/src/chat-session.ts` appends a single
+  //      assistant message per completed turn, carrying both text
+  //      and `toolCalls`. The cold replay must reconstruct the same
+  //      shape or `primeHistory()` would reshape the conversation
+  //      and produce different model output.
+  //   2. The iter-20 full-history walker
+  //      (`validateAndCanonicalizeHistoryToolOrder`) requires each
+  //      assistant fan-out's `toolCalls` array to match the
+  //      trailing tool block one-for-one. Splitting the turn into
+  //      `assistant(text)` then `assistant('', toolCalls=[...])`
+  //      would make the walker reject the text-carrying assistant
+  //      as orphaned (its `next` message is another assistant, not
+  //      a tool).
+  //
+  // The coalescing rules are therefore:
+  //
+  //   * A `function_call` item ALWAYS attaches to the most recent
+  //     assistant message, IF that message is the current run's
+  //     head — detected via `prevItemType`. An assistant message
+  //     pushed by a `message` item immediately before a
+  //     `function_call` is the head of a `message + function_call+`
+  //     run; a prior `function_call` that already coalesced is also
+  //     the head (continuing a pure `function_call+` run from a
+  //     previous iteration). In either case `last.toolCalls` is
+  //     lazily initialised to `[]` before the push so the append is
+  //     uniform regardless of whether the head was pushed as
+  //     `assistant(text)` or `assistant('', toolCalls=[])`.
+  //   * Any other `prevItemType` (or an empty history) starts a
+  //     fresh assistant turn with `content = ''` and a new
+  //     `toolCalls` array.
+  //   * A `message` item that arrives RIGHT AFTER a
+  //     `function_call` is NOT coalesced — it starts a new turn.
+  //     That shape is a subsequent user/system turn, not a
+  //     continuation of the fan-out.
   if (typeof req.input === 'string') {
     messages.push({ role: 'user', content: req.input });
   } else {
@@ -117,20 +138,20 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
           content: resolveContent(msg.content),
         });
       } else if (itemType === 'function_call') {
-        // Reconstruct an assistant message with a tool call. Coalesce
-        // onto the immediately preceding function_call item's
-        // assistant turn when the previous input item was also a
-        // function_call — see the block comment above this loop.
+        // Reconstruct / extend an assistant message with a tool call.
+        // Coalesce onto the preceding `message` or `function_call`
+        // assistant turn — see the block comment above this loop.
         const fc = item as { name: string; arguments: string; call_id: string };
         const last = messages[messages.length - 1];
-        if (
-          prevItemType === 'function_call' &&
+        const canCoalesce =
+          (prevItemType === 'function_call' || prevItemType === 'message') &&
           last !== undefined &&
-          last.role === 'assistant' &&
-          last.content === '' &&
-          last.toolCalls !== undefined
-        ) {
-          last.toolCalls.push({ name: fc.name, arguments: fc.arguments, id: fc.call_id });
+          last.role === 'assistant';
+        if (canCoalesce) {
+          if (last!.toolCalls === undefined) {
+            last!.toolCalls = [];
+          }
+          last!.toolCalls!.push({ name: fc.name, arguments: fc.arguments, id: fc.call_id });
         } else {
           messages.push({
             role: 'assistant',

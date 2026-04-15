@@ -78,15 +78,14 @@ describe('mapAnthropicRequest', () => {
     expect(messages).toEqual([{ role: 'tool', content: '72F and sunny', toolCallId: 'call_abc' }]);
   });
 
-  it('rejects mixed user turns that combine tool_result with text or image blocks', () => {
-    // Iter-23 finding 3: the iter-22 mapper hoisted tool_result
-    // blocks to the front of a mixed turn and emitted residual
-    // text/image content as a synthetic trailing `user` message.
-    // That silently reordered client-supplied blocks, so a turn
-    // like `[text("ignore this result"), tool_result(...)]`
-    // reached the model as `tool(...)` followed by a
-    // caller-unauthored user message. The mapper now rejects the
-    // shape outright and the caller must split the turn.
+  it('rejects text/image blocks that precede a tool_result in the same user turn', () => {
+    // A tool_result must appear as a CONTIGUOUS PREFIX of the user
+    // turn. Text/image blocks that appear BEFORE any tool_result
+    // are still rejected — emitting them in-place would put a
+    // user `content` message between the preceding assistant
+    // fan-out and the tool_result it is answering, orphaning the
+    // fan-out. The mapper also cannot reorder blocks to satisfy
+    // the prefix invariant without silently changing authorship.
     expect(() =>
       mapAnthropicRequest({
         model: 'claude-3-5-sonnet-20241022',
@@ -102,13 +101,13 @@ describe('mapAnthropicRequest', () => {
           },
         ],
       }),
-    ).toThrow(/cannot mix tool_result blocks with text or image blocks/i);
+    ).toThrow(/tool_result blocks must appear as a contiguous prefix/i);
   });
 
-  it('rejects a user turn mixing tool_result with an image block', () => {
-    // Same invariant as the text-mixing case above — images are
-    // also rejected when combined with tool_result in a single
-    // user turn.
+  it('rejects an image block that precedes a tool_result in the same user turn', () => {
+    // Same prefix invariant as the text-before-tool_result case
+    // above — an image block before a tool_result is still
+    // rejected because it would orphan the fan-out.
     const imageData =
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
     expect(() =>
@@ -125,7 +124,142 @@ describe('mapAnthropicRequest', () => {
           },
         ],
       }),
-    ).toThrow(/cannot mix tool_result blocks with text or image blocks/i);
+    ).toThrow(/tool_result blocks must appear as a contiguous prefix/i);
+  });
+
+  it('accepts tool_result followed by trailing text and emits a tool block + user turn', () => {
+    // Finding 2: the common Anthropic shape
+    // `[tool_result, text("now do X")]` was rejected as "cannot
+    // mix tool_result with text" even though the text clearly
+    // follows the tool result and is the same user turn answering
+    // with a follow-up instruction. Accept the prefix shape: emit
+    // the tool message(s) first, then a trailing user message
+    // carrying the text/image content.
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call_123', content: 'Sunny, 72F' },
+            { type: 'text', text: 'Now tell me a joke about the weather.' },
+          ],
+        },
+      ],
+    });
+
+    expect(messages).toEqual([
+      { role: 'tool', content: 'Sunny, 72F', toolCallId: 'call_123' },
+      { role: 'user', content: 'Now tell me a joke about the weather.' },
+    ]);
+  });
+
+  it('accepts multiple tool_result blocks followed by a trailing image', () => {
+    const imageData =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call_a', content: 'one' },
+            { type: 'tool_result', tool_use_id: 'call_b', content: 'two' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
+          ],
+        },
+      ],
+    });
+
+    expect(messages).toHaveLength(3);
+    expect(messages[0]).toEqual({ role: 'tool', content: 'one', toolCallId: 'call_a' });
+    expect(messages[1]).toEqual({ role: 'tool', content: 'two', toolCallId: 'call_b' });
+    expect(messages[2].role).toBe('user');
+    expect(messages[2].content).toBe('');
+    expect(messages[2].images).toHaveLength(1);
+  });
+
+  it('extracts nested image blocks from tool_result.content onto a trailing user message', () => {
+    // Anthropic allows `tool_result.content` to be an array mixing
+    // text and image blocks — common for tools that return
+    // screenshots or rendered PDFs. The internal `ChatMessage`
+    // shape has no per-tool image field, so the mapper hoists the
+    // images onto a trailing user message whose text is empty
+    // (unless the caller also supplied a trailing text block).
+    const imageData =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_screenshot',
+              content: [
+                { type: 'text', text: 'Here is the screenshot you asked for:' },
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toEqual({
+      role: 'tool',
+      content: 'Here is the screenshot you asked for:',
+      toolCallId: 'call_screenshot',
+    });
+    expect(messages[1].role).toBe('user');
+    expect(messages[1].content).toBe('');
+    expect(messages[1].images).toHaveLength(1);
+  });
+
+  it('combines trailing user content with hoisted tool_result images onto one trailing user message', () => {
+    // If both a nested tool_result image and a trailing top-level
+    // text/image are present, they all flow onto a SINGLE user
+    // message — the hoisted images follow the top-level images in
+    // declaration order, and the text is the top-level text
+    // joined verbatim.
+    const imageA = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const imageB = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_mix',
+              content: [
+                { type: 'text', text: 'Screenshot:' },
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageA } },
+              ],
+            },
+            { type: 'text', text: 'Now explain this other image:' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageB } },
+          ],
+        },
+      ],
+    });
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toEqual({
+      role: 'tool',
+      content: 'Screenshot:',
+      toolCallId: 'call_mix',
+    });
+    expect(messages[1].role).toBe('user');
+    expect(messages[1].content).toBe('Now explain this other image:');
+    expect(messages[1].images).toHaveLength(2);
   });
 
   it('maps a pure-tool_result user turn to a contiguous tool block (counter-test)', () => {

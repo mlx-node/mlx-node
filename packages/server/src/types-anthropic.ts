@@ -26,7 +26,17 @@ export interface AnthropicImageContentBlock {
 export interface AnthropicToolResultContentBlock {
   type: 'tool_result';
   tool_use_id: string;
-  content?: string | AnthropicTextContentBlock[];
+  /**
+   * Anthropic's Messages API allows a `tool_result` block to carry a
+   * string, a text-block array, OR an array that mixes text and
+   * image blocks (common for tools that return screenshots or PDF
+   * renderings). The mapper handles the image path by splitting the
+   * tool result into a `tool` ChatMessage for the text payload and
+   * a trailing `user` ChatMessage whose `images` field carries the
+   * decoded image buffers — the internal `ChatMessage` shape has no
+   * per-tool image field.
+   */
+  content?: string | (AnthropicTextContentBlock | AnthropicImageContentBlock)[];
   is_error?: boolean;
 }
 

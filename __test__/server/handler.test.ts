@@ -2149,6 +2149,201 @@ describe('createHandler', () => {
       expect(systemMsg?.content).toBe('B');
     });
 
+    it('inherits stored instructions on cold replay when the continuation omits them (Finding 4)', async () => {
+      // Finding 4 regression: the iter-25 cold-replay path dropped
+      // stored `instructions` entirely. A caller who originally set
+      // `instructions: "You are a pirate"` on turn 1 and then omitted
+      // `instructions` on turn 2 would see the pirate persona
+      // silently disappear — the hot path still carried the warmed
+      // system context, but on TTL expiry / process restart /
+      // lease-on-hit miss the cold replay reconstructed history from
+      // the stored chain WITHOUT the original system message and
+      // primed the new turn against a blank system context. The fix
+      // reads the trailing stored record's `instructions` field and
+      // inherits it when the caller omits its own, so both the cold
+      // replay and the roundtripped response carry the original
+      // prefix state.
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'ahoy matey' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'still pirate' }));
+      // Force the cold replay on turn 2 by wiring
+      // `chatSessionContinue` to throw if the endpoint hot-paths.
+      // The registry's lease-on-hit semantics already dropped the
+      // warmed session at turn 2's getOrCreate, so the endpoint
+      // must fall through to cold replay.
+      const chatSessionContinue = vi
+        .fn()
+        .mockRejectedValue(new Error('chatSessionContinue must not be reached on cold replay'));
+      const chatSessionContinueTool = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool,
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Turn 1: caller supplies explicit instructions.
+      const req1 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'ahoy',
+        instructions: 'You are a pirate',
+      });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1 = JSON.parse(getBody1());
+      expect(resp1.status).toBe('completed');
+      expect(resp1.instructions).toBe('You are a pirate');
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+
+      // Evict the warm session so turn 2 must cold replay. We reach
+      // into the session registry and clear() it, simulating a TTL
+      // expiry or the lease-on-hit drop.
+      const sessionReg = registry.getSessionRegistry('test-model');
+      sessionReg!.clear();
+
+      // Turn 2: chained on resp1, NO explicit instructions. The
+      // endpoint must inherit "You are a pirate" from the stored
+      // trailing record, prepend it as a system message on the cold
+      // replay, and include it in the response's `instructions`.
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'still there?',
+        previous_response_id: resp1.id,
+      });
+      const { res: res2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+      const resp2 = JSON.parse(getBody2());
+      expect(resp2.status).toBe('completed');
+
+      // Cold replay landed on chatSessionStart, not chatSessionContinue.
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+
+      // The cold replay was primed with the INHERITED system message.
+      const coldReplayMessages = chatSessionStart.mock.calls[1]?.[0] as ChatMessage[];
+      expect(coldReplayMessages).toBeDefined();
+      const systemMsg = coldReplayMessages.find((m: ChatMessage) => m.role === 'system');
+      expect(systemMsg?.content).toBe('You are a pirate');
+
+      // The response object roundtrips the inherited instructions
+      // so the client can observe the effective prefix state.
+      expect(resp2.instructions).toBe('You are a pirate');
+
+      // The second stored record also inherits the instructions so
+      // a third continuation can re-inherit without walking the
+      // whole chain.
+      const storedResp2 = storedRecords.get(resp2.id);
+      expect(storedResp2?.instructions).toBe('You are a pirate');
+    });
+
+    it('caller-supplied instructions override any stored value on a continuation', async () => {
+      // Counter-test for Finding 4: when the caller EXPLICITLY
+      // sends instructions on a chained request, the stored value
+      // must NOT be inherited — the explicit value wins and the
+      // session registry detects the prefix-state change,
+      // triggering a cold replay (which is the same invariant as
+      // the "forces a cold replay when a chained request changes
+      // instructions" test above, re-stated for clarity against
+      // the inheritance path).
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'pirate ahoy' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'now a ninja' }));
+      const chatSessionContinue = vi
+        .fn()
+        .mockRejectedValue(new Error('chatSessionContinue must not be reached on instruction override'));
+      const chatSessionContinueTool = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool,
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req1 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'ahoy',
+        instructions: 'You are a pirate',
+      });
+      const { res: res1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1FromStore = Array.from(storedRecords.values())[0];
+
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'change persona',
+        instructions: 'You are a ninja',
+        previous_response_id: resp1FromStore.id,
+      });
+      const { res: res2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+      const resp2 = JSON.parse(getBody2());
+      expect(resp2.status).toBe('completed');
+      expect(resp2.instructions).toBe('You are a ninja');
+
+      // Cold replay primed with the OVERRIDE, not the stored value.
+      const coldReplayMessages = chatSessionStart.mock.calls[1]?.[0] as ChatMessage[];
+      const systemMsg = coldReplayMessages.find((m: ChatMessage) => m.role === 'system');
+      expect(systemMsg?.content).toBe('You are a ninja');
+    });
+
     it('overlapping chained requests against one prior id both succeed via cold replay', async () => {
       // Finding 2 regression: `ChatSession` is single-flight. Two
       // overlapping requests that pass the same `previous_response_id`
