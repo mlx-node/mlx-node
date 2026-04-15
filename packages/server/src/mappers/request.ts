@@ -71,10 +71,34 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
     messages.push(...priorMessages);
   }
 
-  // Map input
+  // Map input.
+  //
+  // Consecutive `function_call` items from the same assistant turn
+  // are coalesced into ONE assistant message with multi-element
+  // `toolCalls`. The OpenAI Responses API serialises a multi-call
+  // assistant response as a RUN of sibling `function_call` input
+  // items, and iter-20's full-history walker (`responses.ts`,
+  // `validateAndCanonicalizeHistoryToolOrder`) requires each
+  // assistant fan-out's `toolCalls` array to match the trailing
+  // tool block one-for-one. Pushing each `function_call` item as
+  // its own `assistant` message would turn a single fan-out into
+  // `assistant(call_a)`, `assistant(call_b)` — the walker would
+  // then reject the first assistant turn as orphaned (its `next`
+  // message is another assistant, not a tool), so stateless
+  // multi-call replays would fail even when the caller shipped a
+  // perfectly valid history.
+  //
+  // `prevItemType` is the exact coalescing invariant: a run ends
+  // the moment the loop sees anything other than `function_call`.
+  // The empty-content + existing-toolCalls check on the tail
+  // assistant message is a belt-and-braces guard so a previously
+  // pushed `message`-derived assistant turn can't accidentally
+  // absorb a later function_call, but `prevItemType` is the
+  // load-bearing predicate.
   if (typeof req.input === 'string') {
     messages.push({ role: 'user', content: req.input });
   } else {
+    let prevItemType: string | null = null;
     for (const item of req.input) {
       if (item == null || typeof item !== 'object') {
         throw new Error('Each input item must be a non-null object');
@@ -93,13 +117,27 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
           content: resolveContent(msg.content),
         });
       } else if (itemType === 'function_call') {
-        // Reconstruct an assistant message with a tool call
+        // Reconstruct an assistant message with a tool call. Coalesce
+        // onto the immediately preceding function_call item's
+        // assistant turn when the previous input item was also a
+        // function_call — see the block comment above this loop.
         const fc = item as { name: string; arguments: string; call_id: string };
-        messages.push({
-          role: 'assistant',
-          content: '',
-          toolCalls: [{ name: fc.name, arguments: fc.arguments, id: fc.call_id }],
-        });
+        const last = messages[messages.length - 1];
+        if (
+          prevItemType === 'function_call' &&
+          last !== undefined &&
+          last.role === 'assistant' &&
+          last.content === '' &&
+          last.toolCalls !== undefined
+        ) {
+          last.toolCalls.push({ name: fc.name, arguments: fc.arguments, id: fc.call_id });
+        } else {
+          messages.push({
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ name: fc.name, arguments: fc.arguments, id: fc.call_id }],
+          });
+        }
       } else if (itemType === 'function_call_output') {
         // Tool result message
         const fco = item as { call_id: string; output: string };
@@ -111,6 +149,8 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
       } else {
         throw new Error(`Unsupported input item type: "${itemType as string}"`);
       }
+
+      prevItemType = itemType;
     }
   }
 

@@ -2302,11 +2302,8 @@ describe('createHandler', () => {
       // bail, and a stored first block in non-canonical order would
       // pass straight through to `primeHistory()` uncorrected.
       //
-      // The `/v1/responses` input mapper splits each `function_call`
-      // item into its own single-sibling assistant message, so the
-      // multi-fan-out shape is unreachable through a cold-start
-      // input. The only way this bug surfaces on `/v1/responses` is
-      // via `previous_response_id` + `reconstructMessagesFromChain`
+      // The only way this bug surfaces on `/v1/responses` is via
+      // `previous_response_id` + `reconstructMessagesFromChain`
       // grouping stored output items into one assistant message per
       // stored record. We seed the store directly with two such
       // records — the first one's stored `inputJson` contains the
@@ -2318,6 +2315,15 @@ describe('createHandler', () => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'all fetched' }));
       registry.register('test-model', mockModel);
+      // Seed `configJson.modelInstanceId` with the SAME id the
+      // live registry assigned to `test-model` so the iter-21
+      // cross-chain guard accepts the continuation. Without this
+      // the hand-seeded records would look like a pre-iter-21
+      // write (no id in configJson) and the guard would reject
+      // the replay with 400 before the walker under test runs.
+      const testModelInstanceId = registry.getInstanceId('test-model');
+      expect(testModelInstanceId).toBeDefined();
+      const seededConfigJson = JSON.stringify({ modelInstanceId: testModelInstanceId });
 
       interface SeededRecord {
         id: string;
@@ -2347,6 +2353,7 @@ describe('createHandler', () => {
         ]),
         outputText: '',
         usageJson: '{}',
+        configJson: seededConfigJson,
       });
       // Record B: the follow-up turn whose stored `inputJson`
       // contains the previous fan-out's tool results in REVERSED
@@ -2372,6 +2379,7 @@ describe('createHandler', () => {
         outputText: '',
         usageJson: '{}',
         previousResponseId: 'resp_a',
+        configJson: seededConfigJson,
       });
       const mockStore = {
         store: vi.fn(() => Promise.resolve()),
@@ -2432,26 +2440,26 @@ describe('createHandler', () => {
     });
 
     it('rejects previous_response_id continuation when the stored chain was produced by a different model', async () => {
-      // Iteration-20 regression (finding 2): the endpoint resolves
-      // `body.model` through the live `ModelRegistry` binding and
-      // reconstructs the prior chain via `store.getChain()`, but it
-      // never verified that the stored chain's trailing record was
-      // produced by the SAME model the request targets. Because
-      // `ModelRegistry.register()` allows replacing a name with a
-      // different underlying model (hot-swap), AND per-instance
-      // registry sharing also lets the same chain be referenced
-      // under a different friendly name, a request carrying a
-      // `previous_response_id` pointing at one model's chain could
-      // silently replay that chain through a totally different
-      // model's tokenizer / chat template / KV layout — nonsense
-      // output at best, a corrupted continuation at worst.
+      // Iteration-20 regression (finding 2) / iter-21 rewrite: the
+      // cross-model guard is now keyed on the monotonic
+      // `modelInstanceId` that `ModelRegistry` assigns to each
+      // distinct model object (persisted into the stored record's
+      // `configJson` blob), NOT the friendly `model` name. See the
+      // module rustdoc on `ModelRegistry` and the guard block in
+      // `responses.ts` for the motivation.
       //
-      // Register two different mock models under `model-alpha` and
-      // `model-beta`, persist a chain produced by `model-alpha`,
-      // then POST a continuation that sets `body.model:
-      // 'model-beta'`. The endpoint must fail closed with 400,
-      // mention both model names in the error, and never dispatch
-      // either model.
+      // Register two DIFFERENT mock models under `model-alpha` and
+      // `model-beta` — two distinct model objects, two distinct
+      // instance ids. Persist a chain produced by `model-alpha`,
+      // then POST a continuation that targets `model-beta`. The
+      // stored id (alpha's) and the live id for `body.model`
+      // (beta's) differ, so the guard must reject 400 before any
+      // dispatch. Companion tests `rejects previous_response_id
+      // continuation when the named binding has been hot-swapped
+      // to a different model instance` and `accepts
+      // previous_response_id continuation through a different name
+      // that aliases the same model instance` cover the two cases
+      // the iter-20 name-based check couldn't express.
       const registry = new ModelRegistry();
       const alphaModel = createMockModel(makeChatResult({ text: 'alpha reply' }));
       const betaModel = createMockModel(makeChatResult({ text: 'beta reply' }));
@@ -2521,10 +2529,11 @@ describe('createHandler', () => {
       expect(getStatus2()).toBe(400);
       const err = JSON.parse(getBody2());
       expect(err.error.type).toBe('invalid_request_error');
-      // The error must mention BOTH the stored model and the
-      // requested model so the client can tell what mismatched.
-      expect(err.error.message).toContain('model-alpha');
+      // The error must name `body.model` so the client can tell
+      // which binding it asked to continue against, and explain
+      // that the mismatch is on model-instance identity.
       expect(err.error.message).toContain('model-beta');
+      expect(err.error.message).toMatch(/different model instance/i);
       expect(err.error.message).toMatch(/Continuations cannot cross model boundaries/i);
 
       // No dispatch on either model — the gate must fire before
@@ -2533,6 +2542,260 @@ describe('createHandler', () => {
       expect(betaStart).not.toHaveBeenCalled();
       expect(betaContinue).not.toHaveBeenCalled();
       expect(betaContinueTool).not.toHaveBeenCalled();
+    });
+
+    it('rejects previous_response_id continuation when the named binding has been hot-swapped to a different model instance', async () => {
+      // Iter-21 (finding 1 / test A): the iter-20 friendly-name
+      // check passed when `body.model` happened to string-match
+      // the stored record's `model` field — but `ModelRegistry`
+      // supports hot-swapping a name to a DIFFERENT model object,
+      // so a chain produced by the OLD binding would still pass a
+      // name check after the swap and be silently replayed
+      // through the new tokenizer / chat template / KV layout.
+      // The instance-id guard catches this: after `register("foo",
+      // modelB)` the live id for `"foo"` is fresh, and the stored
+      // record's id (modelA's) is the dead id dropped by
+      // `releaseBinding`.
+      //
+      // Register `modelA` under the name `my-model`, persist a
+      // chain, then re-register `my-model` pointing at `modelB`
+      // (a DIFFERENT object). Turn 2 continues against the same
+      // friendly name. Expect 400 and no dispatch on either model.
+      const registry = new ModelRegistry();
+      const modelA = createMockModel(makeChatResult({ text: 'A reply' }));
+      const modelB = createMockModel(makeChatResult({ text: 'B reply' }));
+      registry.register('my-model', modelA);
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Turn 1: cold-start against modelA populates the store
+      // with a chain whose trailing record carries modelA's
+      // instance id inside configJson.
+      const req1 = createMockReq('POST', '/v1/responses', {
+        model: 'my-model',
+        input: 'first turn',
+      });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1 = JSON.parse(getBody1());
+      expect(resp1.status).toBe('completed');
+
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const modelAStart = modelA.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const modelAContinue = modelA.chatSessionContinue as unknown as ReturnType<typeof vi.fn>;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const modelAContinueTool = modelA.chatSessionContinueTool as unknown as ReturnType<typeof vi.fn>;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const modelBStart = modelB.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const modelBContinue = modelB.chatSessionContinue as unknown as ReturnType<typeof vi.fn>;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const modelBContinueTool = modelB.chatSessionContinueTool as unknown as ReturnType<typeof vi.fn>;
+      expect(modelAStart).toHaveBeenCalledTimes(1);
+      modelAStart.mockClear();
+
+      // Hot swap: same name, different object. The stored
+      // record's modelInstanceId now points at a binding that no
+      // longer exists.
+      registry.register('my-model', modelB);
+
+      // Turn 2: continuation against `my-model` (now modelB).
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'my-model',
+        previous_response_id: resp1.id,
+        input: 'second turn',
+      });
+      const { res: res2, getStatus: getStatus2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+
+      expect(getStatus2()).toBe(400);
+      const err = JSON.parse(getBody2());
+      expect(err.error.type).toBe('invalid_request_error');
+      expect(err.error.message).toContain('my-model');
+      expect(err.error.message).toMatch(/different model instance/i);
+      expect(err.error.message).toMatch(/hot-swapped|start a new chain/i);
+
+      // Neither model was dispatched during the rejected turn.
+      expect(modelAStart).not.toHaveBeenCalled();
+      expect(modelAContinue).not.toHaveBeenCalled();
+      expect(modelAContinueTool).not.toHaveBeenCalled();
+      expect(modelBStart).not.toHaveBeenCalled();
+      expect(modelBContinue).not.toHaveBeenCalled();
+      expect(modelBContinueTool).not.toHaveBeenCalled();
+    });
+
+    it('accepts previous_response_id continuation through a different name that aliases the same model instance', async () => {
+      // Iter-21 (finding 1 / test B): iter-19's per-instance
+      // `SessionRegistry` sharing already makes two names that
+      // alias the SAME model object safe — they route through one
+      // registry and one warm session. The iter-20 friendly-name
+      // check nevertheless REJECTED such a continuation because
+      // the stored record's `model` field didn't string-match
+      // `body.model`. The iter-21 instance-id guard recognises
+      // the shared binding and lets it through.
+      //
+      // Register one `sharedModel` object under both `alpha` and
+      // `beta`. Persist a chain via `body.model = 'alpha'`, then
+      // continue via `body.model = 'beta'`. Expect 200 and
+      // dispatch on `sharedModel`.
+      const registry = new ModelRegistry();
+      const sharedModel = createMockModel(makeChatResult({ text: 'aliased ok' }));
+      registry.register('alpha', sharedModel);
+      registry.register('beta', sharedModel);
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Turn 1 via alpha.
+      const req1 = createMockReq('POST', '/v1/responses', {
+        model: 'alpha',
+        input: 'first turn',
+      });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1 = JSON.parse(getBody1());
+      expect(resp1.status).toBe('completed');
+
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const sharedStart = sharedModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const sharedContinue = sharedModel.chatSessionContinue as unknown as ReturnType<typeof vi.fn>;
+      expect(sharedStart).toHaveBeenCalledTimes(1);
+
+      // Turn 2 via beta, continuing the alpha chain. The shared
+      // binding means both names carry the same instance id, so
+      // the guard must pass.
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'beta',
+        previous_response_id: resp1.id,
+        input: 'second turn',
+      });
+      const { res: res2, getStatus: getStatus2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+
+      expect(getStatus2()).toBe(200);
+      const resp2 = JSON.parse(getBody2());
+      expect(resp2.status).toBe('completed');
+      expect(resp2.output_text).toBe('aliased ok');
+
+      // Turn 2 must have dispatched the shared model. The warm
+      // path would invoke chatSessionContinue; the cold-replay
+      // fallback would invoke chatSessionStart a second time.
+      // Either is acceptable — the point is that SOMETHING on
+      // sharedModel got called.
+      const continueCalls = sharedContinue.mock.calls.length;
+      const startCalls = sharedStart.mock.calls.length;
+      expect(continueCalls + startCalls).toBeGreaterThan(1);
+    });
+
+    it('round-trips a stateless multi-call replay without previous_response_id', async () => {
+      // Iter-21 (finding 2): the OpenAI Responses API serialises a
+      // multi-call assistant turn as a RUN of sibling
+      // `function_call` input items. `mapRequest` must coalesce
+      // that run into ONE assistant message with multi-element
+      // `toolCalls`, otherwise the iter-20 full-history walker
+      // (`validateAndCanonicalizeHistoryToolOrder`) rejects the
+      // first assistant turn as orphaned — its next message is
+      // another assistant, not a tool — so stateless multi-call
+      // histories fail even when the caller ships them correctly.
+      //
+      // Send a well-formed replay with two sibling function_call
+      // items followed by their tool outputs in REVERSED order
+      // (call_b first, then call_a) so the canonicalization path
+      // after the coalescing also gets exercised. Assert 200 and
+      // inspect the primed history for:
+      //  - exactly one assistant message
+      //  - `toolCalls` in canonical order [call_a, call_b]
+      //  - tool messages in canonical order [call_a, call_b]
+      //    (reordered from the reversed input)
+      //  - final user message intact
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'summary ok' }));
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: 'run both tools' },
+          { type: 'function_call', name: 'get_weather', arguments: '{"city":"sf"}', call_id: 'call_a' },
+          { type: 'function_call', name: 'get_time', arguments: '{"tz":"utc"}', call_id: 'call_b' },
+          { type: 'function_call_output', call_id: 'call_b', output: '{"t":"12:00"}' },
+          { type: 'function_call_output', call_id: 'call_a', output: '{"w":"sunny"}' },
+          { type: 'message', role: 'user', content: 'summarize' },
+        ],
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.output_text).toBe('summary ok');
+
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      const [primedMessages] = startSpy.mock.calls[0] as [ChatMessage[], unknown];
+
+      const assistantMessages = primedMessages.filter((m: ChatMessage) => m.role === 'assistant');
+      expect(assistantMessages).toHaveLength(1);
+      const assistant = assistantMessages[0]!;
+      expect(assistant.content).toBe('');
+      expect(assistant.toolCalls).toBeDefined();
+      expect(assistant.toolCalls!.map((tc) => tc.id)).toEqual(['call_a', 'call_b']);
+      expect(assistant.toolCalls!.map((tc) => tc.name)).toEqual(['get_weather', 'get_time']);
+
+      const toolMessages = primedMessages.filter((m: ChatMessage) => m.role === 'tool');
+      expect(toolMessages).toHaveLength(2);
+      // Canonicalized from the reversed submitted order.
+      expect(toolMessages.map((m: ChatMessage) => m.toolCallId)).toEqual(['call_a', 'call_b']);
+      expect(toolMessages[0]!.content).toBe('{"w":"sunny"}');
+      expect(toolMessages[1]!.content).toBe('{"t":"12:00"}');
+
+      // Final user message survives.
+      const userMessages = primedMessages.filter((m: ChatMessage) => m.role === 'user');
+      expect(userMessages[userMessages.length - 1]!.content).toBe('summarize');
     });
 
     it('passes a well-formed stateless history through unchanged (canonicalization no-op)', async () => {

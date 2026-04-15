@@ -57,12 +57,13 @@ async function handleNonStreaming(
   previousResponseId: string | undefined,
   store: ResponseStore | null,
   newInputMessages: ChatMessage[],
+  modelInstanceId: number | undefined,
 ): Promise<void> {
   const response = buildResponseObject(result, req, responseId, previousResponseId);
 
   // Persist only the new input messages (not the full expanded conversation)
   if (store && req.store !== false) {
-    await persistResponse(store, response, newInputMessages, previousResponseId);
+    await persistResponse(store, response, newInputMessages, previousResponseId, modelInstanceId);
   }
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -110,6 +111,7 @@ async function handleStreamingNative(
   store: ResponseStore | null,
   newInputMessages: ChatMessage[],
   wasCommitted: () => boolean,
+  modelInstanceId: number | undefined,
 ): Promise<void> {
   beginSSE(res);
 
@@ -586,7 +588,7 @@ async function handleStreamingNative(
 
   if (committed) {
     if (store && req.store !== false) {
-      await persistResponse(store, terminal, newInputMessages, previousResponseId);
+      await persistResponse(store, terminal, newInputMessages, previousResponseId, modelInstanceId);
     }
     writeSSEEvent(res, 'response.completed', { response: terminal });
   } else {
@@ -1098,10 +1100,20 @@ async function persistResponse(
   response: ResponseObject,
   newInputMessages: ChatMessage[],
   previousResponseId: string | undefined,
+  modelInstanceId: number | undefined,
 ): Promise<void> {
   // Store only the NEW input messages from this request, not the full
   // expanded conversation. Chain reconstruction re-derives the full history
   // by following previous_response_id links.
+  //
+  // `modelInstanceId` is the monotonic id `ModelRegistry` assigned to
+  // the model object that serviced this request. It is stashed inside
+  // the `configJson` blob so the Rust-side schema stays untouched; on
+  // a later `previous_response_id` continuation the responses endpoint
+  // reads it back out of the trailing chain record and compares it
+  // against the live id for `body.model`. See the endpoint's
+  // `readStoredModelInstanceId` helper and the guard block in
+  // `handleCreateResponse`.
   const record: StoredResponseRecord = {
     id: response.id,
     createdAt: response.created_at,
@@ -1119,10 +1131,37 @@ async function persistResponse(
       max_output_tokens: response.max_output_tokens,
       tools: response.tools,
       reasoning: response.reasoning,
+      modelInstanceId,
     }),
     expiresAt: Math.floor(Date.now() / 1000) + RESPONSE_TTL_SECONDS,
   };
   await store.store(record);
+}
+
+/**
+ * Extract the persisted model instance id from a stored chain
+ * record's `configJson` blob, or `undefined` if the record was
+ * written before this field existed (pre-iter-21) or the blob is
+ * malformed / missing.
+ *
+ * A parse failure or a missing field returns `undefined`, which the
+ * caller treats identically to "id mismatch" and rejects the
+ * continuation. This is intentional: a record we can't identify
+ * might belong to any model, and silently falling back to the old
+ * name comparison would re-open the hot-swap hole this field exists
+ * to close.
+ */
+function readStoredModelInstanceId(record: StoredResponseRecord): number | undefined {
+  if (record.configJson == null) return undefined;
+  try {
+    const parsed = JSON.parse(record.configJson) as { modelInstanceId?: unknown };
+    if (typeof parsed.modelInstanceId === 'number' && Number.isFinite(parsed.modelInstanceId)) {
+      return parsed.modelInstanceId;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,6 +1214,14 @@ export async function handleCreateResponse(
     return;
   }
 
+  // Monotonic per-instance id for the model currently bound to
+  // `body.model`. Stashed into each persisted record below and used
+  // on a later `previous_response_id` continuation to verify that
+  // the stored chain was produced by the SAME model object — see
+  // the guard block a few lines down for why we can't compare
+  // friendly names.
+  const currentInstanceId = registry.getInstanceId(body.model);
+
   const responseId = genId('resp_');
 
   // Resolve previous_response_id chain
@@ -1188,30 +1235,48 @@ export async function handleCreateResponse(
         sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
         return;
       }
-      // Cross-model continuation guard. The stored trailing record is
-      // the authoritative record of which model produced this chain;
-      // compare it against the model the caller requested and reject
-      // 400 on mismatch. A mismatch is never safe: `ModelRegistry`
-      // allows hot-swapping a name to a different underlying model,
-      // and per-instance registry sharing also lets the same chain be
-      // referenced under a different friendly name, so a request with
-      // `previous_response_id` pointing at one model's chain can
-      // otherwise silently replay that chain through a totally
-      // different model's tokenizer, chat template, and KV cache. The
-      // stored tokens would be re-tokenized by the wrong template and
-      // either be nonsense or — worse — be interpreted as a different
-      // conversation entirely. Fail closed: this is a client-authored
-      // mismatch (wrong `model` in the request body) so a 400 is the
-      // right shape, not a 500.
-      const storedModel = chain[chain.length - 1]!.model;
-      if (storedModel !== body.model) {
+      // Cross-model continuation guard, keyed on MODEL-INSTANCE
+      // IDENTITY, not friendly name. The stored trailing record
+      // carries a monotonic `modelInstanceId` assigned by
+      // `ModelRegistry` when the model object that serviced the
+      // original turn was first registered; we compare that id
+      // against the CURRENT instance id for `body.model`.
+      //
+      // A plain string comparison on the friendly name is not
+      // sufficient:
+      //
+      //  * `ModelRegistry.register(name, model)` explicitly supports
+      //    replacing the object bound to a name. A chain produced
+      //    by the OLD instance of `foo` would still pass a name
+      //    check after `foo` is hot-swapped to a different model,
+      //    and the continuation would silently replay through the
+      //    wrong tokenizer / chat template / KV layout.
+      //  * Conversely, two names aliasing the SAME model instance
+      //    are already safe because iter-19's per-instance
+      //    `SessionRegistry` sharing routes them through one
+      //    binding — but a name check would spuriously reject
+      //    `body.model = "beta"` against a chain stored under
+      //    `"alpha"`.
+      //
+      // Fail closed when the id is missing on EITHER side: a
+      // stored record written before this field existed is
+      // indistinguishable from any other model's record, and a
+      // `currentInstanceId === undefined` means `body.model` has
+      // no live binding (unreachable here because `registry.get`
+      // already succeeded — kept as a defence in depth in case the
+      // binding goes away under concurrent unregistration).
+      const storedInstanceId = readStoredModelInstanceId(chain[chain.length - 1]!);
+      if (currentInstanceId === undefined || storedInstanceId === undefined || currentInstanceId !== storedInstanceId) {
         sendBadRequest(
           res,
-          `previous_response_id "${body.previous_response_id}" was produced by model "${storedModel}" but the ` +
-            `request targets model "${body.model}". Continuations cannot cross model boundaries — a stored ` +
-            `chain is tied to the tokenizer, chat template, and KV layout of the model that produced it, and ` +
-            `replaying it through a different model would silently corrupt the conversation. Start a new ` +
-            `chain without previous_response_id, or resubmit against the original model.`,
+          `previous_response_id "${body.previous_response_id}" belongs to a chain produced by a different ` +
+            `model instance than the one currently bound to "${body.model}". This happens when the named ` +
+            `model has been hot-swapped to a different underlying object since the chain was stored, when ` +
+            `the original binding has been released entirely, or when the stored record predates ` +
+            `model-instance tracking. Continuations cannot cross model boundaries — a stored chain is tied ` +
+            `to the tokenizer, chat template, and KV layout of the exact model object that produced it, ` +
+            `and replaying it through a different model would silently corrupt the conversation. Start a ` +
+            `new chain without previous_response_id.`,
           'model',
         );
         return;
@@ -1575,11 +1640,21 @@ export async function handleCreateResponse(
         store,
         newInputMessages,
         streamingWasCommitted,
+        currentInstanceId,
       );
       committed = streamingWasCommitted();
     } else {
       const outcome = await runSessionNonStreaming(session, messages, newInputMessages, config);
-      await handleNonStreaming(res, outcome.result, body, responseId, previousResponseId, store, newInputMessages);
+      await handleNonStreaming(
+        res,
+        outcome.result,
+        body,
+        responseId,
+        previousResponseId,
+        store,
+        newInputMessages,
+        currentInstanceId,
+      );
       committed = outcome.committed;
     }
 

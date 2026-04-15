@@ -21,6 +21,30 @@
  * object up in an identity-keyed map and reuses the existing
  * registry on alias, or allocates a fresh one on first sight.
  *
+ * **Monotonic per-instance ids.** Every distinct model object the
+ * registry sees is also assigned a fresh monotonic integer
+ * `instanceId` on first registration, reused for every subsequent
+ * registration of the same object, and dropped when the binding's
+ * refcount falls to zero alongside the `SessionRegistry` itself.
+ * The responses endpoint persists the current instance id alongside
+ * each stored response record and, on a `previous_response_id`
+ * continuation, compares the stored id against the live id for
+ * `body.model`. This closes two holes that a friendly-name
+ * comparison left open:
+ *
+ *  1. A name hot-swap — `register("foo", modelA)` followed by
+ *     `register("foo", modelB)` — would pass a string check, so a
+ *     chain produced by `modelA` could be silently replayed through
+ *     `modelB`'s tokenizer / chat template / KV layout. With
+ *     instance ids the stored id (modelA's) no longer matches the
+ *     live id for `"foo"` (now modelB's) and the continuation is
+ *     rejected with a 400.
+ *  2. Two NAMES aliasing the SAME model object (already safe thanks
+ *     to per-instance `SessionRegistry` sharing) would be spuriously
+ *     rejected by a string check comparing the stored name against
+ *     `body.model`. Instance ids recognise them as the same binding
+ *     and the continuation is accepted.
+ *
  * This interface intentionally mirrors `SessionCapableModel` one-to-one —
  * the server always drives models through `ChatSession<M>` wrappers, never
  * the low-level NAPI methods directly.
@@ -68,6 +92,15 @@ export class ModelRegistry {
    * session cache and therefore its single-warm invariant.
    */
   private readonly sessionRegistriesByModel = new Map<ServableModel, SessionRegistryBinding>();
+  /**
+   * Identity-keyed map from a model instance to its monotonic
+   * instance id. Entries are allocated on first registration,
+   * reused across aliasing, and dropped when the last binding
+   * releases (mirrors `sessionRegistriesByModel` lifetime exactly).
+   */
+  private readonly instanceIds = new Map<ServableModel, number>();
+  /** Monotonic counter for `instanceIds`. Never reused. */
+  private nextInstanceId = 1;
 
   /**
    * Register a model under a given name.
@@ -107,6 +140,13 @@ export class ModelRegistry {
       this.sessionRegistriesByModel.set(model, binding);
     }
     binding.refCount += 1;
+    // Allocate a fresh monotonic instance id on first sight of this
+    // model object; reuse the existing id on every alias thereafter.
+    // The id lifetime mirrors the binding's — see `releaseBinding`.
+    if (!this.instanceIds.has(model)) {
+      this.instanceIds.set(model, this.nextInstanceId);
+      this.nextInstanceId += 1;
+    }
 
     this.models.set(name, {
       id: name,
@@ -142,6 +182,15 @@ export class ModelRegistry {
     binding.refCount -= 1;
     if (binding.refCount <= 0) {
       this.sessionRegistriesByModel.delete(model);
+      // Drop the instance id in lockstep with the binding. A
+      // subsequent re-registration of the SAME model object will
+      // therefore mint a FRESH id — intentional: once the last
+      // alias drops, any previously persisted stored record that
+      // references this id belongs to a logically dead binding,
+      // and a later `previous_response_id` continuation against it
+      // must fall through to the `currentInstanceId === undefined`
+      // rejection path so the stale chain cannot be replayed.
+      this.instanceIds.delete(model);
     }
   }
 
@@ -150,6 +199,27 @@ export class ModelRegistry {
    */
   get(name: string): ServableModel | undefined {
     return this.models.get(name)?.model;
+  }
+
+  /**
+   * Retrieve the monotonic instance id for the model currently bound
+   * to `name`, or `undefined` if the name isn't registered.
+   *
+   * Two names that alias the same model object return the SAME id
+   * (they share a binding), and a name that has been hot-swapped to
+   * a different model object returns a DIFFERENT id than before the
+   * swap (the prior binding's id was dropped by `releaseBinding`
+   * and a fresh id was minted for the new model on re-registration).
+   *
+   * The responses endpoint uses this to key the
+   * `previous_response_id` cross-chain guard on instance identity
+   * instead of friendly name, so hot swaps are caught and safe
+   * aliases are not spuriously rejected.
+   */
+  getInstanceId(name: string): number | undefined {
+    const entry = this.models.get(name);
+    if (!entry) return undefined;
+    return this.instanceIds.get(entry.model);
   }
 
   /**
