@@ -13,7 +13,7 @@
  * No `adopt()` / `drop()` — the session's lifetime is this single call.
  */
 
-import type { ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
@@ -62,6 +62,7 @@ async function handleStreamingNative(
   chatStream: AsyncGenerator<ChatStreamEvent>,
   body: AnthropicMessagesRequest,
   wasCommitted: () => boolean,
+  httpReq: IncomingMessage | undefined,
 ): Promise<void> {
   const messageId = genId('msg_');
   beginSSE(res);
@@ -97,30 +98,93 @@ async function handleStreamingNative(
   let terminalPromptTokens: number | undefined;
   let terminalErrorMessage: string | null = null;
 
-  for await (const event of chatStream) {
-    if (event.done) {
-      sawDone = true;
-      // Final event
+  // Iter-28 finding 2: fault state. A mid-decode throw from the
+  // underlying generator used to escape into the outer generic
+  // catch, bypassing the commit gate and emitting an `error` event
+  // AFTER SSE headers had already been flushed. A client disconnect
+  // (HTTP `close`/`error`) had no signal at all, so the consumer
+  // would happily keep streaming deltas to a dead socket and the
+  // post-loop block would run the success branch.
+  //
+  // `thrownError` sticks on a generator throw; `clientAborted`
+  // sticks on an HTTP request `close`/`error`. Either one diverts
+  // the post-loop block to the failure epilogue (single Anthropic
+  // streaming `error` SSE event, no `message_stop`). The underlying
+  // `chatStreamSessionStart` does not yet accept an AbortSignal, so
+  // on a client disconnect we can only stop consuming deltas and
+  // break out of the loop — the native decode runs to completion
+  // under the per-model mutex but nothing it emits reaches the
+  // client side.
+  let thrownError: Error | null = null;
+  let clientAborted = false;
+  const onClientClose = () => {
+    clientAborted = true;
+  };
+  const onClientError = (_err: unknown) => {
+    clientAborted = true;
+  };
+  if (httpReq) {
+    httpReq.once('close', onClientClose);
+    httpReq.once('error', onClientError);
+  }
 
-      // Iter-27 finding 3: if the terminal chunk reports an error,
-      // short-circuit the content-flush/close sequence and hand off
-      // to the post-loop block. Emitting tool_use blocks or closing
-      // content blocks here would (a) race with the post-loop
-      // `content_block_stop` close on the error path and (b)
-      // advertise a clean tool-call fan-out to the client even
-      // though the session rolled back everything.
-      if (event.finishReason === 'error') {
-        terminalErrorMessage = 'model reported finishReason=error';
-        break;
-      }
+  try {
+    for await (const event of chatStream) {
+      if (clientAborted) break;
+      if (event.done) {
+        sawDone = true;
+        // Final event
 
-      // Flush any remaining pending text
-      const remainingText = tagBuffer.flush();
-      if (!tagBuffer.suppressed && remainingText) {
-        if (!hasEmittedText) {
-          // Close thinking block if open
+        // Iter-27 finding 3: if the terminal chunk reports an error,
+        // short-circuit the content-flush/close sequence and hand off
+        // to the post-loop block. Emitting tool_use blocks or closing
+        // content blocks here would (a) race with the post-loop
+        // `content_block_stop` close on the error path and (b)
+        // advertise a clean tool-call fan-out to the client even
+        // though the session rolled back everything.
+        if (event.finishReason === 'error') {
+          terminalErrorMessage = 'model reported finishReason=error';
+          break;
+        }
+
+        // Flush any remaining pending text
+        const remainingText = tagBuffer.flush();
+        if (!tagBuffer.suppressed && remainingText) {
+          if (!hasEmittedText) {
+            // Close thinking block if open
+            if (hasEmittedThinking) {
+              writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+            }
+            hasEmittedText = true;
+            writeSSEEvent(
+              res,
+              'content_block_start',
+              buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
+            );
+          }
+          emittedTextLength += remainingText.length;
+          writeSSEEvent(
+            res,
+            'content_block_delta',
+            buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: remainingText }),
+          );
+        }
+
+        // Close thinking block if open and text was never emitted
+        if (hasEmittedThinking && !hasEmittedText) {
+          writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+        }
+
+        // Handle final text
+        const finalText = event.text;
+        const okToolCalls = event.toolCalls.filter((t) => t.status === 'ok');
+        const hasToolCalls = okToolCalls.length > 0;
+
+        // Recovery: if tool-call suppression was triggered but no tool calls were parsed,
+        // create a text block from the final event text (no text was streamed before suppression)
+        if (tagBuffer.suppressed && !hasToolCalls && finalText && !hasEmittedText) {
           if (hasEmittedThinking) {
-            writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+            // Thinking block already closed above
           }
           hasEmittedText = true;
           writeSSEEvent(
@@ -128,48 +192,29 @@ async function handleStreamingNative(
             'content_block_start',
             buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
           );
+          emittedTextLength += finalText.length;
+          writeSSEEvent(
+            res,
+            'content_block_delta',
+            buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: finalText }),
+          );
+        } else if (tagBuffer.suppressed && !hasToolCalls && finalText && hasEmittedText) {
+          // Recovery: text was already being streamed but got cut off by a false-alarm <tool_call>
+          // tag. Emit the portion of the final text that was never sent as a delta.
+          const unsent = finalText.slice(emittedTextLength);
+          if (unsent) {
+            emittedTextLength += unsent.length;
+            writeSSEEvent(
+              res,
+              'content_block_delta',
+              buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: unsent }),
+            );
+          }
         }
-        emittedTextLength += remainingText.length;
-        writeSSEEvent(
-          res,
-          'content_block_delta',
-          buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: remainingText }),
-        );
-      }
 
-      // Close thinking block if open and text was never emitted
-      if (hasEmittedThinking && !hasEmittedText) {
-        writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
-      }
-
-      // Handle final text
-      const finalText = event.text;
-      const okToolCalls = event.toolCalls.filter((t) => t.status === 'ok');
-      const hasToolCalls = okToolCalls.length > 0;
-
-      // Recovery: if tool-call suppression was triggered but no tool calls were parsed,
-      // create a text block from the final event text (no text was streamed before suppression)
-      if (tagBuffer.suppressed && !hasToolCalls && finalText && !hasEmittedText) {
-        if (hasEmittedThinking) {
-          // Thinking block already closed above
-        }
-        hasEmittedText = true;
-        writeSSEEvent(
-          res,
-          'content_block_start',
-          buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
-        );
-        emittedTextLength += finalText.length;
-        writeSSEEvent(
-          res,
-          'content_block_delta',
-          buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: finalText }),
-        );
-      } else if (tagBuffer.suppressed && !hasToolCalls && finalText && hasEmittedText) {
-        // Recovery: text was already being streamed but got cut off by a false-alarm <tool_call>
-        // tag. Emit the portion of the final text that was never sent as a delta.
-        const unsent = finalText.slice(emittedTextLength);
-        if (unsent) {
+        // Emit any unsent suffix when final text is longer than what was streamed
+        if (hasEmittedText && finalText && finalText.length > emittedTextLength) {
+          const unsent = finalText.slice(emittedTextLength);
           emittedTextLength += unsent.length;
           writeSSEEvent(
             res,
@@ -177,105 +222,112 @@ async function handleStreamingNative(
             buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: unsent }),
           );
         }
+
+        if (hasEmittedText) {
+          writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
+          contentBlockIndex++;
+        } else if (!finalText && hasToolCalls) {
+          // No text at all and tool calls present -- skip text block entirely
+        } else if (finalText) {
+          // Text was never emitted during streaming but final has text
+          // (possible if all text arrived in the final event somehow)
+          writeSSEEvent(
+            res,
+            'content_block_start',
+            buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
+          );
+          emittedTextLength += finalText.length;
+          writeSSEEvent(
+            res,
+            'content_block_delta',
+            buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: finalText }),
+          );
+          writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
+          contentBlockIndex++;
+        }
+
+        // Emit tool_use blocks
+        for (const tc of okToolCalls) {
+          const toolId = tc.id ?? genId('toolu_');
+          const parsedInput =
+            typeof tc.arguments === 'string'
+              ? (JSON.parse(tc.arguments) as Record<string, unknown>)
+              : (tc.arguments as Record<string, unknown>);
+
+          writeSSEEvent(
+            res,
+            'content_block_start',
+            buildContentBlockStart(contentBlockIndex, { type: 'tool_use', id: toolId, name: tc.name, input: {} }),
+          );
+          writeSSEEvent(
+            res,
+            'content_block_delta',
+            buildContentBlockDelta(contentBlockIndex, {
+              type: 'input_json_delta',
+              partial_json: JSON.stringify(parsedInput),
+            }),
+          );
+          writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
+          contentBlockIndex++;
+        }
+
+        // Capture terminal state and break out of the loop. We do NOT
+        // emit `message_delta` / `message_stop` here — both are gated
+        // on the session's commit signal, which only becomes
+        // authoritative after the outer generator's finally has run.
+        // The post-loop block below reads `wasCommitted()` and emits
+        // the right terminal event (success: message_delta +
+        // message_stop; failure: a single `error` SSE event).
+        terminalStopReason = mapStopReason(event.finishReason, hasToolCalls);
+        terminalNumTokens = event.numTokens;
+        terminalPromptTokens = event.promptTokens;
+        break;
       }
 
-      // Emit any unsent suffix when final text is longer than what was streamed
-      if (hasEmittedText && finalText && finalText.length > emittedTextLength) {
-        const unsent = finalText.slice(emittedTextLength);
-        emittedTextLength += unsent.length;
+      // Delta event
+      if (event.isReasoning) {
+        // Filter out </think> tag
+        const deltaText = event.text.replace(/<\/think>/g, '');
+        if (!deltaText) continue;
+
+        if (!hasEmittedThinking) {
+          hasEmittedThinking = true;
+          writeSSEEvent(
+            res,
+            'content_block_start',
+            buildContentBlockStart(contentBlockIndex, { type: 'thinking', thinking: '' }),
+          );
+          contentBlockIndex++;
+        }
         writeSSEEvent(
           res,
           'content_block_delta',
-          buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: unsent }),
+          buildContentBlockDelta(contentBlockIndex - 1, { type: 'thinking_delta', thinking: deltaText }),
         );
-      }
-
-      if (hasEmittedText) {
-        writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-        contentBlockIndex++;
-      } else if (!finalText && hasToolCalls) {
-        // No text at all and tool calls present -- skip text block entirely
-      } else if (finalText) {
-        // Text was never emitted during streaming but final has text
-        // (possible if all text arrived in the final event somehow)
-        writeSSEEvent(
-          res,
-          'content_block_start',
-          buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
-        );
-        emittedTextLength += finalText.length;
-        writeSSEEvent(
-          res,
-          'content_block_delta',
-          buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: finalText }),
-        );
-        writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-        contentBlockIndex++;
-      }
-
-      // Emit tool_use blocks
-      for (const tc of okToolCalls) {
-        const toolId = tc.id ?? genId('toolu_');
-        const parsedInput =
-          typeof tc.arguments === 'string'
-            ? (JSON.parse(tc.arguments) as Record<string, unknown>)
-            : (tc.arguments as Record<string, unknown>);
-
-        writeSSEEvent(
-          res,
-          'content_block_start',
-          buildContentBlockStart(contentBlockIndex, { type: 'tool_use', id: toolId, name: tc.name, input: {} }),
-        );
-        writeSSEEvent(
-          res,
-          'content_block_delta',
-          buildContentBlockDelta(contentBlockIndex, {
-            type: 'input_json_delta',
-            partial_json: JSON.stringify(parsedInput),
-          }),
-        );
-        writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-        contentBlockIndex++;
-      }
-
-      // Capture terminal state and break out of the loop. We do NOT
-      // emit `message_delta` / `message_stop` here — both are gated
-      // on the session's commit signal, which only becomes
-      // authoritative after the outer generator's finally has run.
-      // The post-loop block below reads `wasCommitted()` and emits
-      // the right terminal event (success: message_delta +
-      // message_stop; failure: a single `error` SSE event).
-      terminalStopReason = mapStopReason(event.finishReason, hasToolCalls);
-      terminalNumTokens = event.numTokens;
-      terminalPromptTokens = event.promptTokens;
-      break;
-    }
-
-    // Delta event
-    if (event.isReasoning) {
-      // Filter out </think> tag
-      const deltaText = event.text.replace(/<\/think>/g, '');
-      if (!deltaText) continue;
-
-      if (!hasEmittedThinking) {
-        hasEmittedThinking = true;
-        writeSSEEvent(
-          res,
-          'content_block_start',
-          buildContentBlockStart(contentBlockIndex, { type: 'thinking', thinking: '' }),
-        );
-        contentBlockIndex++;
-      }
-      writeSSEEvent(
-        res,
-        'content_block_delta',
-        buildContentBlockDelta(contentBlockIndex - 1, { type: 'thinking_delta', thinking: deltaText }),
-      );
-    } else {
-      // Text delta with tool_call tag buffering
-      const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
-      if (tagFound) {
-        if (cleanPrefix.trim()) {
+      } else {
+        // Text delta with tool_call tag buffering
+        const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
+        if (tagFound) {
+          if (cleanPrefix.trim()) {
+            if (!hasEmittedText) {
+              if (hasEmittedThinking) {
+                writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+              }
+              hasEmittedText = true;
+              writeSSEEvent(
+                res,
+                'content_block_start',
+                buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
+              );
+            }
+            emittedTextLength += cleanPrefix.length;
+            writeSSEEvent(
+              res,
+              'content_block_delta',
+              buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: cleanPrefix }),
+            );
+          }
+        } else if (safeText) {
           if (!hasEmittedText) {
             if (hasEmittedThinking) {
               writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
@@ -287,60 +339,51 @@ async function handleStreamingNative(
               buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
             );
           }
-          emittedTextLength += cleanPrefix.length;
+          emittedTextLength += safeText.length;
           writeSSEEvent(
             res,
             'content_block_delta',
-            buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: cleanPrefix }),
+            buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: safeText }),
           );
         }
-      } else if (safeText) {
-        if (!hasEmittedText) {
-          if (hasEmittedThinking) {
-            writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
-          }
-          hasEmittedText = true;
-          writeSSEEvent(
-            res,
-            'content_block_start',
-            buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
-          );
-        }
-        emittedTextLength += safeText.length;
-        writeSSEEvent(
-          res,
-          'content_block_delta',
-          buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: safeText }),
-        );
       }
+    }
+  } catch (err: unknown) {
+    // Iter-28 finding 2: a mid-decode throw from the underlying async
+    // generator used to escape out into the outer catch in
+    // `handleCreateMessage`, which emitted the error frame AFTER SSE
+    // headers were already flushed but without the commit-gate
+    // post-loop check. Capture the error into a sticky flag so the
+    // post-loop block below routes through the failure epilogue
+    // (single Anthropic streaming `error` SSE event, no
+    // `message_stop`).
+    thrownError = err instanceof Error ? err : new Error(String(err));
+  } finally {
+    if (httpReq) {
+      httpReq.off('close', onClientClose);
+      httpReq.off('error', onClientError);
     }
   }
 
   // Post-loop terminal emission. The producer's finally has now run
-  // (either via the `break` after a done event or via natural
-  // iterator exhaustion), so `wasCommitted()` reads an authoritative
-  // `session.turns` baseline. Three cases:
-  //
-  //  1. sawDone && committed: happy path. Emit `message_delta` +
-  //     `message_stop` so clients see a clean completion.
-  //  2. sawDone && !committed: the final chunk carried
-  //     `finishReason: 'error'` (the ChatSession gates `turnCount`
-  //     on a non-error final chunk, so the session never committed).
-  //     Emit a single streaming `error` SSE event in the Anthropic
-  //     shape so the client can distinguish a real failure from a
-  //     clean `message_stop`. Do NOT emit `message_stop` — that
-  //     would report a failed generation as a successful one.
-  //  3. !sawDone: the iterator exhausted before a terminal chunk
-  //     arrived. The session also never committed in this path,
-  //     so we emit an `error` SSE event the same way.
+  // (either via the `break` after a done event, via natural iterator
+  // exhaustion, via a mid-decode throw surfaced through the
+  // try/catch above, or via a client disconnect that flipped
+  // `clientAborted`), so `wasCommitted()` reads an authoritative
+  // `session.turns` baseline. Success requires ALL of: sawDone,
+  // committed, no thrown error, no client abort. Every failure path
+  // emits a single Anthropic streaming `error` SSE event and
+  // withholds `message_stop` so the client can distinguish a real
+  // completion from a mid-decode failure.
   //
   // The Anthropic `/v1/messages` endpoint is stateless and never
   // calls `sessionReg.adopt()`, so the registry cannot leak a
   // cached session on failure. This gate's sole job is to make the
   // client-visible event stream report failures accurately.
   const committed = wasCommitted();
+  const successful = sawDone && committed && thrownError == null && !clientAborted;
 
-  if (sawDone && committed) {
+  if (successful) {
     const stopReason = terminalStopReason ?? 'end_turn';
     writeSSEEvent(res, 'message_delta', buildMessageDelta(stopReason, terminalNumTokens, terminalPromptTokens));
     writeSSEEvent(res, 'message_stop', buildMessageStop());
@@ -355,8 +398,18 @@ async function handleStreamingNative(
     } else if (hasEmittedText) {
       writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
     }
-    const message =
-      terminalErrorMessage ?? (sawDone ? 'model refused to commit the turn' : 'stream ended without a done event');
+    let message: string;
+    if (thrownError != null) {
+      message = thrownError.message;
+    } else if (clientAborted) {
+      message = 'client disconnected before the stream completed';
+    } else if (terminalErrorMessage != null) {
+      message = terminalErrorMessage;
+    } else if (sawDone) {
+      message = 'model refused to commit the turn';
+    } else {
+      message = 'stream ended without a done event';
+    }
     writeSSEEvent(res, 'error', { type: 'error', error: { type: 'api_error', message } });
   }
   endSSE(res);
@@ -417,6 +470,7 @@ export async function handleCreateMessage(
   res: ServerResponse,
   body: AnthropicMessagesRequest,
   registry: ModelRegistry,
+  httpReq?: IncomingMessage,
 ): Promise<void> {
   // Validate required fields
   if (body == null || typeof body !== 'object') {
@@ -602,7 +656,7 @@ export async function handleCreateMessage(
       try {
         if (body.stream === true) {
           const outcome = runSessionStreaming(session, messages, config);
-          await handleStreamingNative(res, outcome.stream, body, outcome.wasCommitted);
+          await handleStreamingNative(res, outcome.stream, body, outcome.wasCommitted, httpReq);
         } else {
           const result = await runSessionNonStreaming(session, messages, config);
           await handleNonStreaming(res, result, body);

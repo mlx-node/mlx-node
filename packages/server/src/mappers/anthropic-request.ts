@@ -242,17 +242,65 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
           }
           // Append a trailing user message when the caller supplied
           // additional text/image content after the tool_result
-          // prefix. Nested image content inside tool_result blocks
-          // is rejected outright by `resolveToolResultContent`
-          // (iter-27 finding 2), so the only sources for a
-          // trailing user message are top-level trailing text and
-          // top-level trailing image blocks. Both may be empty
-          // individually — we still emit the message as long as
-          // at least one has content.
-          const hasTrailingContent = trailingText.length > 0 || trailingImages.length > 0;
-          if (hasTrailingContent) {
+          // prefix.
+          //
+          // Iter-28 finding 4: the iter-27 mapper allowed an
+          // arbitrary mix of trailing text and image blocks by
+          // concatenating every text block into one string and
+          // bucketing every image block into a single `images`
+          // array. That silently lost two ordering invariants:
+          //
+          //   1. A shape like `[tool_result, text="A", image=X,
+          //      text="B", image=Y]` produced a user message whose
+          //      `content` was `"AB"` and `images` were
+          //      `[X, Y]` — the interleaved text between the two
+          //      images was hoisted BEFORE both of them, and
+          //      there is no way to reconstruct "text A precedes
+          //      image X, which precedes text B, which precedes
+          //      image Y" from the flat NAPI `ChatMessage` shape.
+          //   2. A shape like `[tool_result, image=X, text="A"]`
+          //      produced a user message whose text appeared
+          //      BEFORE the image in the internal ordering, even
+          //      though the caller declared the image first.
+          //
+          // Neither issue is fixable without changing the NAPI
+          // `ChatMessage` shape, so we refuse the ambiguous
+          // shapes outright. The narrow set of trailing suffix
+          // shapes we still accept is:
+          //
+          //   * One or more trailing `text` blocks (concatenated
+          //     into a single `content` string, no images)
+          //   * Exactly one trailing `image` block (hoisted onto
+          //     `images`, no text)
+          //
+          // A tool-submitting turn that needs to also deliver a
+          // textual comment plus a new screenshot should send the
+          // comment as part of the tool_result's text content
+          // (already supported) and the screenshot as a separate
+          // follow-up user turn. The error message below spells
+          // this out for the caller.
+          const hasTrailingText = trailingText.length > 0;
+          const hasTrailingImages = trailingImages.length > 0;
+          if (hasTrailingText && hasTrailingImages) {
+            throw new Error(
+              'Unsupported: mixing trailing text and image blocks after a tool_result prefix is not ' +
+                'representable in the internal message model. The flat ChatMessage shape cannot preserve ' +
+                'the caller-declared relative order of interleaved text and images, so any mapping would ' +
+                'silently reorder your content. Send any commentary as part of the tool_result text, and ' +
+                'deliver additional images in a separate follow-up user turn.',
+            );
+          }
+          if (hasTrailingImages && trailingImages.length > 1) {
+            throw new Error(
+              'Unsupported: multiple trailing image blocks after a tool_result prefix are not ' +
+                'representable in the internal message model without silently reordering the images ' +
+                'relative to any surrounding text. Send at most one trailing image block, and deliver ' +
+                'additional images in a separate follow-up user turn.',
+            );
+          }
+          if (hasTrailingText || hasTrailingImages) {
             const trailingMsg: ChatMessage = { role: 'user', content: trailingText.join('') };
-            if (trailingImages.length > 0) {
+            if (hasTrailingImages) {
               trailingMsg.images = trailingImages;
             }
             messages.push(trailingMsg);

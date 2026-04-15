@@ -251,16 +251,78 @@ describe('mapAnthropicRequest', () => {
     ).toThrow(/nested image content in tool_result blocks is not representable/i);
   });
 
-  it('preserves top-level trailing image ordering after a multi-tool_result prefix', () => {
-    // Iter-27 finding 2 counter-test: with nested tool_result
-    // images forbidden, top-level trailing images are the only
-    // source of images on the user turn answering a fan-out, and
-    // their order must exactly mirror the caller's declaration
-    // order. This pins the invariant the iter-26 hoist workaround
-    // broke by appending hoisted images AFTER top-level trailing
-    // images.
-    const imageData =
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+  // Iter-28 finding 4: the iter-27 mapper silently concatenated
+  // trailing text blocks and bucketed trailing image blocks after a
+  // tool_result prefix, which reordered interleaved shapes like
+  // `[tool_result, text, image, text, image]` into a flat
+  // `content="AB", images=[X, Y]` user message that lost BOTH the
+  // caller-declared text/image interleaving and any
+  // image-immediately-before-text vs image-immediately-after-text
+  // distinction. The flat NAPI `ChatMessage` shape cannot represent
+  // the caller's intent, so the mapper now rejects ambiguous
+  // shapes outright. The tests below pin the narrow accepted set
+  // (pure trailing text, single trailing image) and pin rejection
+  // for every interleaved / multi-image shape.
+  const iter28Png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+  it('rejects trailing text followed by an image after a tool_result prefix', () => {
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_use_id: 'call_a', content: 'alpha' },
+              { type: 'text', text: 'see the attached screenshot' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: iter28Png } },
+            ],
+          },
+        ],
+      }),
+    ).toThrow(/mixing trailing text and image blocks after a tool_result prefix/i);
+  });
+
+  it('rejects trailing image followed by text after a tool_result prefix', () => {
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_use_id: 'call_a', content: 'alpha' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: iter28Png } },
+              { type: 'text', text: 'that was the screenshot' },
+            ],
+          },
+        ],
+      }),
+    ).toThrow(/mixing trailing text and image blocks after a tool_result prefix/i);
+  });
+
+  it('rejects multiple trailing image blocks after a tool_result prefix', () => {
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_use_id: 'call_a', content: 'alpha' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: iter28Png } },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: iter28Png } },
+            ],
+          },
+        ],
+      }),
+    ).toThrow(/multiple trailing image blocks after a tool_result prefix/i);
+  });
+
+  it('accepts a single trailing text block after a tool_result prefix', () => {
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
@@ -269,21 +331,59 @@ describe('mapAnthropicRequest', () => {
           role: 'user',
           content: [
             { type: 'tool_result', tool_use_id: 'call_a', content: 'alpha' },
-            { type: 'tool_result', tool_use_id: 'call_b', content: 'beta' },
-            { type: 'text', text: 'now compare these two screenshots' },
-            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
+            { type: 'text', text: 'now summarise the above' },
           ],
         },
       ],
     });
 
-    expect(messages).toHaveLength(3);
+    expect(messages).toHaveLength(2);
     expect(messages[0]).toEqual({ role: 'tool', content: 'alpha', toolCallId: 'call_a' });
-    expect(messages[1]).toEqual({ role: 'tool', content: 'beta', toolCallId: 'call_b' });
-    expect(messages[2].role).toBe('user');
-    expect(messages[2].content).toBe('now compare these two screenshots');
-    expect(messages[2].images).toHaveLength(1);
-    expect(messages[2].images![0]).toEqual(Buffer.from(imageData, 'base64'));
+    expect(messages[1]).toEqual({ role: 'user', content: 'now summarise the above' });
+  });
+
+  it('accepts a single trailing image block after a tool_result prefix', () => {
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call_a', content: 'alpha' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: iter28Png } },
+          ],
+        },
+      ],
+    });
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toEqual({ role: 'tool', content: 'alpha', toolCallId: 'call_a' });
+    expect(messages[1].role).toBe('user');
+    expect(messages[1].content).toBe('');
+    expect(messages[1].images).toHaveLength(1);
+    expect(messages[1].images![0]).toEqual(Buffer.from(iter28Png, 'base64'));
+  });
+
+  it('accepts multiple trailing text blocks after a tool_result prefix (concatenated)', () => {
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call_a', content: 'alpha' },
+            { type: 'text', text: 'part one ' },
+            { type: 'text', text: 'part two' },
+          ],
+        },
+      ],
+    });
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toEqual({ role: 'tool', content: 'alpha', toolCallId: 'call_a' });
+    expect(messages[1]).toEqual({ role: 'user', content: 'part one part two' });
   });
 
   it('maps a pure-tool_result user turn to a contiguous tool block (counter-test)', () => {

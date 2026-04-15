@@ -15,7 +15,7 @@
  * `startFromHistory()` / `startFromHistoryStream()`.
  */
 
-import type { ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponseRecord } from '@mlx-node/core';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
@@ -75,6 +75,62 @@ async function handleNonStreaming(
 // ---------------------------------------------------------------------------
 
 /**
+ * Build a dedicated failure terminal ResponseObject from an
+ * in-progress partial + the deltas captured so far. The returned
+ * object has:
+ *
+ *   * `status: 'failed'`
+ *   * `incomplete_details: { reason }` — the string passed by the
+ *     caller (`error`, `client_abort`, `stream_exhausted`, etc.).
+ *   * Every nested output item whose `status` is still `in_progress`
+ *     or `completed` normalized to `incomplete`, so a client that
+ *     inspects `response.output` on `response.failed` cannot see a
+ *     success-shaped item inside a failed envelope. Iter-28
+ *     finding 3: the previous implementation did `{ ...terminal,
+ *     status: 'failed' }`, which left nested messages marked
+ *     `completed` (on the finishReason=error path where the done
+ *     branch finalized them) or `in_progress` (on the exhaust path
+ *     where no item-closing ran at all). Both shapes contradicted
+ *     the top-level failure status.
+ *
+ * `ReasoningOutputItem` has no `status` field and is left alone.
+ * `FunctionCallOutputItem.status` is always `'completed'` in the
+ * current `types.ts` — we leave it alone too, because a
+ * function_call item only appears in `outputItems` after it has
+ * been fully flushed (args delta + done events), and its presence
+ * on the failure payload is only possible via the
+ * finishReason=error path, where the assistant committed the call
+ * inline. Narrowing that to `incomplete` would require widening
+ * `FunctionCallOutputItem.status`; keep the normalization to the
+ * message-item bucket so the public types stay stable.
+ */
+function buildFailedTerminal(
+  partial: ResponseObject,
+  outputItems: OutputItem[],
+  reason: string,
+  usage: ResponseObject['usage'],
+): ResponseObject {
+  const normalized: OutputItem[] = outputItems.map((item) => {
+    if (item.type === 'message') {
+      const prev = item.status;
+      if (prev === 'in_progress' || prev === 'completed') {
+        return { ...item, status: 'incomplete' };
+      }
+      return item;
+    }
+    return item;
+  });
+  return {
+    ...partial,
+    status: 'failed',
+    output: normalized,
+    output_text: computeOutputText(normalized),
+    incomplete_details: { reason },
+    usage,
+  };
+}
+
+/**
  * Stream a chat session's events to the SSE writer, gated on the
  * session's commit signal.
  *
@@ -83,13 +139,14 @@ async function handleNonStreaming(
  * successful non-error final chunk (see `ChatSession.sendStream`'s
  * `sawFinal` gate), so this closure returns `false` when the native
  * stream emits `done: true, finishReason: 'error'`, when the async
- * iterator exhausts without a `done` event, or when a mid-decode
- * throw propagates through. In every non-committed case we MUST skip
- * `persistResponse()` and emit `response.failed` instead of
- * `response.completed`, otherwise a later `previous_response_id`
- * continuation would cold-replay a turn the session never committed —
- * silently resurrecting failed or partial output as authoritative
- * history.
+ * iterator exhausts without a `done` event, when a mid-decode throw
+ * propagates through (caught by the try/catch added in iter-28
+ * finding 2), or when the client disconnect flag fires mid-iteration.
+ * In every non-committed case we MUST skip `persistResponse()` and
+ * emit `response.failed` instead of `response.completed`, otherwise
+ * a later `previous_response_id` continuation would cold-replay a
+ * turn the session never committed — silently resurrecting failed
+ * or partial output as authoritative history.
  *
  * The closure is called AFTER the `for await` loop has fully drained
  * (either via a `break` inside the done branch or because the
@@ -101,6 +158,35 @@ async function handleNonStreaming(
  * successful turn. The `runSessionStreaming` helper captures its
  * baseline AFTER any internal `session.reset()` too, so the signal is
  * honest for the multi-message reset-and-cold-restart branch as well.
+ *
+ * Iter-28 finding 2 — fault plumbing:
+ *
+ *   1. The `for await` loop is wrapped in try/catch/finally so a
+ *      mid-decode throw from the underlying generator no longer
+ *      escapes out into the outer handler's generic error catch.
+ *      Instead control reaches the post-loop block with a sticky
+ *      `thrownError` flag; the block routes the request through the
+ *      same failure epilogue that handles finishReason=error and
+ *      iterator exhaustion, so the session is NEVER adopted via
+ *      `wasCommitted()` on a faulted stream.
+ *   2. When the caller passes `httpReq`, we install `close`/`error`
+ *      listeners that flip a `clientAborted` flag checked at the
+ *      top of every loop iteration. The underlying
+ *      `chatStreamSessionStart` does not yet accept an AbortSignal,
+ *      so we cannot cancel the native decode in-flight — but we
+ *      CAN stop consuming deltas and route to the failure
+ *      epilogue, which prevents a disconnected client from keeping
+ *      the session under the adopt gate's happy path. Once the
+ *      native generator exposes an AbortSignal surface this hook
+ *      can be upgraded to plumb the controller through; until
+ *      then the flag-based opt-out is sufficient to keep the
+ *      registry and store in agreement with the client's view.
+ *   3. A single `buildFailedTerminal` helper normalizes every
+ *      failure path's payload so clients see a consistent envelope:
+ *      top-level status=failed, nested items with `in_progress` or
+ *      `completed` flipped to `incomplete`, and `incomplete_details`
+ *      populated with the specific reason (`error`, `client_abort`,
+ *      `stream_exhausted`, `finish_reason_error`, `not_committed`).
  */
 async function handleStreamingNative(
   res: ServerResponse,
@@ -112,6 +198,7 @@ async function handleStreamingNative(
   newInputMessages: ChatMessage[],
   wasCommitted: () => boolean,
   modelInstanceId: number | undefined,
+  httpReq: IncomingMessage | undefined,
 ): Promise<void> {
   beginSSE(res);
 
@@ -141,338 +228,42 @@ async function handleStreamingNative(
   let completedResponse: ResponseObject | null = null;
   let sawDone = false;
 
-  for await (const event of chatStream) {
-    if (event.done) {
-      sawDone = true;
-      // Final event -- close open items and emit completed
+  // Iter-28 finding 2: fault state. `thrownError` sticks when the
+  // underlying async generator throws; `clientAborted` sticks when
+  // the HTTP request emits `close`/`error` while we're mid-iteration.
+  // Either one diverts the post-loop block to the failure epilogue.
+  let thrownError: Error | null = null;
+  let clientAborted = false;
+  const onClientClose = () => {
+    clientAborted = true;
+  };
+  const onClientError = (_err: unknown) => {
+    clientAborted = true;
+  };
+  if (httpReq) {
+    httpReq.once('close', onClientClose);
+    httpReq.once('error', onClientError);
+  }
 
-      // Flush any remaining pending text (no tool call tag was found)
-      const remainingText = tagBuffer.flush();
-      if (!tagBuffer.suppressed && remainingText) {
-        if (!hasEmittedMessage) {
-          hasEmittedMessage = true;
-          messageItemId = genId('msg_');
-          const messageItem: MessageOutputItem = {
-            id: messageItemId,
-            type: 'message',
-            role: 'assistant',
-            status: 'in_progress',
-            content: [],
-          };
-          const miIndex = outputItems.length;
-          outputItems.push(messageItem);
-          outputIndex = miIndex;
-          writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
-          const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-          writeSSEEvent(res, 'response.content_part.added', {
-            item_id: messageItemId,
-            output_index: miIndex,
-            content_index: 0,
-            part: textPart,
-          });
-        }
-        messageText += remainingText;
-        writeSSEEvent(res, 'response.output_text.delta', {
-          item_id: messageItemId,
-          output_index: outputItems.findIndex((i) => i.id === messageItemId),
-          content_index: 0,
-          delta: remainingText,
-        });
-      }
+  try {
+    for await (const event of chatStream) {
+      // Iter-28 finding 2: honor a client disconnect at loop-top. The
+      // native generator does not yet accept an AbortSignal, so we
+      // cannot cancel in-flight decode; the best we can do is stop
+      // consuming deltas so the writer does not emit content to a
+      // dead socket and the post-loop failure epilogue runs instead
+      // of the commit/adopt path. Dropping the generator reference
+      // via `break` also triggers the producer's `finally`, which
+      // releases any per-model locks and lets the next dispatch in
+      // the mutex queue proceed.
+      if (clientAborted) break;
+      if (event.done) {
+        sawDone = true;
+        // Final event -- close open items and emit completed
 
-      // Close reasoning item if open
-      if (hasEmittedReasoning && reasoningItemId) {
-        writeSSEEvent(res, 'response.reasoning_summary_text.done', {
-          item_id: reasoningItemId,
-          output_index: outputItems.length - (hasEmittedMessage ? 1 : 0) - 1,
-          summary_index: 0,
-          text: event.thinking ?? reasoningText,
-        });
-        const reasoningItem: ReasoningOutputItem = {
-          id: reasoningItemId,
-          type: 'reasoning',
-          summary: [{ type: 'summary_text', text: event.thinking ?? reasoningText }],
-        };
-        const riIndex = outputItems.findIndex((i) => i.id === reasoningItemId);
-        if (riIndex >= 0) {
-          outputItems[riIndex] = reasoningItem;
-        }
-        writeSSEEvent(res, 'response.output_item.done', {
-          output_index: riIndex >= 0 ? riIndex : 0,
-          item: reasoningItem,
-        });
-      }
-
-      // Close message item if open.
-      // Use the final event's parsed text (markup-stripped) as the authoritative content.
-      // If the parsed text is empty and there are tool calls, skip the message item entirely
-      // (matching the non-streaming buildOutputItems behavior).
-      const finalText = event.text;
-      const hasToolCalls = event.toolCalls.some((t) => t.status === 'ok');
-      const skipMessageItem = !finalText && hasToolCalls;
-
-      // Recovery: if tool-call suppression was triggered but the final event has no
-      // parsed tool calls (false alarm — e.g., literal "<tool_call>" in model output),
-      // create a message item using the final parsed text.
-      if (tagBuffer.suppressed && !hasToolCalls && finalText && !hasEmittedMessage) {
-        hasEmittedMessage = true;
-        messageItemId = genId('msg_');
-        const messageItem: MessageOutputItem = {
-          id: messageItemId,
-          type: 'message',
-          role: 'assistant',
-          status: 'in_progress',
-          content: [],
-        };
-        const miIndex = outputItems.length;
-        outputItems.push(messageItem);
-        outputIndex = miIndex;
-        writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
-        const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-        writeSSEEvent(res, 'response.content_part.added', {
-          item_id: messageItemId,
-          output_index: miIndex,
-          content_index: 0,
-          part: textPart,
-        });
-        messageText = finalText;
-        writeSSEEvent(res, 'response.output_text.delta', {
-          item_id: messageItemId,
-          output_index: miIndex,
-          content_index: 0,
-          delta: finalText,
-        });
-      } else if (tagBuffer.suppressed && !hasToolCalls && finalText && hasEmittedMessage) {
-        // Recovery: text was already being streamed but got cut off by a false-alarm
-        // <tool_call> tag. Emit the unsent portion as a delta.
-        const unsent = finalText.slice(messageText.length);
-        if (unsent) {
-          messageText += unsent;
-          writeSSEEvent(res, 'response.output_text.delta', {
-            item_id: messageItemId,
-            output_index: outputItems.findIndex((i) => i.id === messageItemId),
-            content_index: 0,
-            delta: unsent,
-          });
-        }
-      }
-
-      // Emit any unsent suffix when final text is longer than what was streamed
-      if (hasEmittedMessage && finalText && finalText.length > messageText.length && !tagBuffer.suppressed) {
-        const unsent = finalText.slice(messageText.length);
-        messageText += unsent;
-        writeSSEEvent(res, 'response.output_text.delta', {
-          item_id: messageItemId,
-          output_index: outputItems.findIndex((i) => i.id === messageItemId),
-          content_index: 0,
-          delta: unsent,
-        });
-      }
-
-      // Recovery: text was never emitted during streaming but final has text
-      // (possible if all text arrived in the final event only)
-      if (!hasEmittedMessage && finalText && !skipMessageItem) {
-        hasEmittedMessage = true;
-        messageItemId = genId('msg_');
-        const messageItem: MessageOutputItem = {
-          id: messageItemId,
-          type: 'message',
-          role: 'assistant',
-          status: 'in_progress',
-          content: [],
-        };
-        const miIndex = outputItems.length;
-        outputItems.push(messageItem);
-        outputIndex = miIndex;
-        writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
-        const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-        writeSSEEvent(res, 'response.content_part.added', {
-          item_id: messageItemId,
-          output_index: miIndex,
-          content_index: 0,
-          part: textPart,
-        });
-        messageText = finalText;
-        writeSSEEvent(res, 'response.output_text.delta', {
-          item_id: messageItemId,
-          output_index: miIndex,
-          content_index: 0,
-          delta: finalText,
-        });
-      }
-
-      if (hasEmittedMessage && messageItemId && !skipMessageItem) {
-        const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
-        const contentIndex = 0;
-
-        writeSSEEvent(res, 'response.output_text.done', {
-          item_id: messageItemId,
-          output_index: miIndex >= 0 ? miIndex : outputIndex,
-          content_index: contentIndex,
-          text: finalText,
-        });
-
-        const textPart = { type: 'output_text' as const, text: finalText, annotations: [] as never[] };
-        writeSSEEvent(res, 'response.content_part.done', {
-          item_id: messageItemId,
-          output_index: miIndex >= 0 ? miIndex : outputIndex,
-          content_index: contentIndex,
-          part: textPart,
-        });
-
-        const messageItem: MessageOutputItem = {
-          id: messageItemId,
-          type: 'message',
-          role: 'assistant',
-          status: mapFinishReasonToStatus(event.finishReason),
-          content: [textPart],
-        };
-        if (miIndex >= 0) {
-          outputItems[miIndex] = messageItem;
-        }
-        writeSSEEvent(res, 'response.output_item.done', {
-          output_index: miIndex >= 0 ? miIndex : outputIndex,
-          item: messageItem,
-        });
-      } else if (hasEmittedMessage && messageItemId && skipMessageItem) {
-        // A message item was started (output_item.added / content_part.added events already
-        // sent to the client) but we now know it should be suppressed because the final
-        // text is empty and there are tool calls.  Send proper done events to close out
-        // the item gracefully so clients do not see a dangling in-progress item, then
-        // remove it from outputItems so it does not appear in the completed response.
-        const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
-        const miOutputIndex = miIndex >= 0 ? miIndex : outputIndex;
-
-        writeSSEEvent(res, 'response.output_text.done', {
-          item_id: messageItemId,
-          output_index: miOutputIndex,
-          content_index: 0,
-          text: '',
-        });
-
-        const emptyTextPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-        writeSSEEvent(res, 'response.content_part.done', {
-          item_id: messageItemId,
-          output_index: miOutputIndex,
-          content_index: 0,
-          part: emptyTextPart,
-        });
-
-        const closedMessageItem: MessageOutputItem = {
-          id: messageItemId,
-          type: 'message',
-          role: 'assistant',
-          status: 'completed',
-          content: [],
-        };
-        writeSSEEvent(res, 'response.output_item.done', {
-          output_index: miOutputIndex,
-          item: closedMessageItem,
-        });
-
-        // Track suppressed index for exclusion from final response
-        // but keep in array so subsequent output_index values remain unique.
-        if (miIndex >= 0) {
-          suppressedMessageIndex = miIndex;
-        }
-      }
-
-      // Emit function call items
-      for (const tc of event.toolCalls.filter((t) => t.status === 'ok')) {
-        const callId = tc.id ?? genId('call_');
-        const fcItem: FunctionCallOutputItem = {
-          id: genId('fc_'),
-          type: 'function_call',
-          call_id: callId,
-          name: tc.name,
-          arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
-          status: 'completed',
-        };
-        const fcIndex = outputItems.length;
-        outputItems.push(fcItem);
-
-        writeSSEEvent(res, 'response.output_item.added', { output_index: fcIndex, item: fcItem });
-
-        const argsStr = fcItem.arguments;
-        writeSSEEvent(res, 'response.function_call_arguments.delta', {
-          item_id: fcItem.id,
-          output_index: fcIndex,
-          delta: argsStr,
-        });
-        writeSSEEvent(res, 'response.function_call_arguments.done', {
-          item_id: fcItem.id,
-          output_index: fcIndex,
-          arguments: argsStr,
-        });
-
-        writeSSEEvent(res, 'response.output_item.done', { output_index: fcIndex, item: fcItem });
-      }
-
-      // Build the terminal response object but do NOT persist or emit
-      // `response.completed` yet — both actions are gated on the
-      // session's commit signal, which only becomes authoritative
-      // after the outer generator's finally has run. We `break` out
-      // of the loop so the for-await's cleanup runs the producer's
-      // finally (setting `turnCount` if the session committed), then
-      // defer persistence + emission to the post-loop block below.
-      const promptTokens = event.promptTokens ?? 0;
-      const reasoningTokens = event.reasoningTokens ?? 0;
-      const usage = {
-        input_tokens: promptTokens,
-        output_tokens: event.numTokens,
-        output_tokens_details: { reasoning_tokens: reasoningTokens },
-        total_tokens: promptTokens + event.numTokens,
-      };
-
-      const finalOutput = outputItems.filter((_, idx) => idx !== suppressedMessageIndex);
-      completedResponse = {
-        ...partial,
-        status: mapFinishReasonToStatus(event.finishReason),
-        output: finalOutput,
-        output_text: computeOutputText(finalOutput),
-        incomplete_details: event.finishReason === 'length' ? { reason: 'max_output_tokens' } : null,
-        usage,
-      };
-      break;
-    }
-
-    // Delta event
-    if (event.isReasoning) {
-      // Filter out </think> tag from reasoning deltas
-      const deltaText = event.text.replace(/<\/think>/g, '');
-      if (!deltaText) continue; // Skip empty deltas (e.g., just the </think> token)
-
-      if (!hasEmittedReasoning) {
-        // First reasoning chunk -- add reasoning item
-        hasEmittedReasoning = true;
-        reasoningItemId = genId('rs_');
-        const reasoningItem: ReasoningOutputItem = {
-          id: reasoningItemId,
-          type: 'reasoning',
-          summary: [],
-        };
-        const riIndex = outputItems.length;
-        outputItems.push(reasoningItem);
-
-        writeSSEEvent(res, 'response.output_item.added', { output_index: riIndex, item: reasoningItem });
-      }
-      reasoningText += deltaText;
-      writeSSEEvent(res, 'response.reasoning_summary_text.delta', {
-        item_id: reasoningItemId,
-        output_index: outputItems.findIndex((i) => i.id === reasoningItemId),
-        summary_index: 0,
-        delta: deltaText,
-      });
-    } else {
-      // Text delta with tool_call tag buffering
-      const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
-      if (tagFound) {
-        // Emit any clean text before the tag.
-        // Trim whitespace-only prefixes: whitespace immediately before <tool_call>
-        // is always markup-related (e.g. "\n<tool_call>"), not user-visible content.
-        // Emitting it would create a dangling message item that needs special-casing
-        // at finalization when skipMessageItem is true.
-        if (cleanPrefix.trim()) {
+        // Flush any remaining pending text (no tool call tag was found)
+        const remainingText = tagBuffer.flush();
+        if (!tagBuffer.suppressed && remainingText) {
           if (!hasEmittedMessage) {
             hasEmittedMessage = true;
             messageItemId = genId('msg_');
@@ -495,16 +286,50 @@ async function handleStreamingNative(
               part: textPart,
             });
           }
-          messageText += cleanPrefix;
+          messageText += remainingText;
           writeSSEEvent(res, 'response.output_text.delta', {
             item_id: messageItemId,
             output_index: outputItems.findIndex((i) => i.id === messageItemId),
             content_index: 0,
-            delta: cleanPrefix,
+            delta: remainingText,
           });
         }
-      } else if (safeText) {
-        if (!hasEmittedMessage) {
+
+        // Close reasoning item if open
+        if (hasEmittedReasoning && reasoningItemId) {
+          writeSSEEvent(res, 'response.reasoning_summary_text.done', {
+            item_id: reasoningItemId,
+            output_index: outputItems.length - (hasEmittedMessage ? 1 : 0) - 1,
+            summary_index: 0,
+            text: event.thinking ?? reasoningText,
+          });
+          const reasoningItem: ReasoningOutputItem = {
+            id: reasoningItemId,
+            type: 'reasoning',
+            summary: [{ type: 'summary_text', text: event.thinking ?? reasoningText }],
+          };
+          const riIndex = outputItems.findIndex((i) => i.id === reasoningItemId);
+          if (riIndex >= 0) {
+            outputItems[riIndex] = reasoningItem;
+          }
+          writeSSEEvent(res, 'response.output_item.done', {
+            output_index: riIndex >= 0 ? riIndex : 0,
+            item: reasoningItem,
+          });
+        }
+
+        // Close message item if open.
+        // Use the final event's parsed text (markup-stripped) as the authoritative content.
+        // If the parsed text is empty and there are tool calls, skip the message item entirely
+        // (matching the non-streaming buildOutputItems behavior).
+        const finalText = event.text;
+        const hasToolCalls = event.toolCalls.some((t) => t.status === 'ok');
+        const skipMessageItem = !finalText && hasToolCalls;
+
+        // Recovery: if tool-call suppression was triggered but the final event has no
+        // parsed tool calls (false alarm — e.g., literal "<tool_call>" in model output),
+        // create a message item using the final parsed text.
+        if (tagBuffer.suppressed && !hasToolCalls && finalText && !hasEmittedMessage) {
           hasEmittedMessage = true;
           messageItemId = genId('msg_');
           const messageItem: MessageOutputItem = {
@@ -525,81 +350,476 @@ async function handleStreamingNative(
             content_index: 0,
             part: textPart,
           });
+          messageText = finalText;
+          writeSSEEvent(res, 'response.output_text.delta', {
+            item_id: messageItemId,
+            output_index: miIndex,
+            content_index: 0,
+            delta: finalText,
+          });
+        } else if (tagBuffer.suppressed && !hasToolCalls && finalText && hasEmittedMessage) {
+          // Recovery: text was already being streamed but got cut off by a false-alarm
+          // <tool_call> tag. Emit the unsent portion as a delta.
+          const unsent = finalText.slice(messageText.length);
+          if (unsent) {
+            messageText += unsent;
+            writeSSEEvent(res, 'response.output_text.delta', {
+              item_id: messageItemId,
+              output_index: outputItems.findIndex((i) => i.id === messageItemId),
+              content_index: 0,
+              delta: unsent,
+            });
+          }
         }
-        messageText += safeText;
-        writeSSEEvent(res, 'response.output_text.delta', {
-          item_id: messageItemId,
-          output_index: outputItems.findIndex((i) => i.id === messageItemId),
-          content_index: 0,
-          delta: safeText,
-        });
+
+        // Emit any unsent suffix when final text is longer than what was streamed
+        if (hasEmittedMessage && finalText && finalText.length > messageText.length && !tagBuffer.suppressed) {
+          const unsent = finalText.slice(messageText.length);
+          messageText += unsent;
+          writeSSEEvent(res, 'response.output_text.delta', {
+            item_id: messageItemId,
+            output_index: outputItems.findIndex((i) => i.id === messageItemId),
+            content_index: 0,
+            delta: unsent,
+          });
+        }
+
+        // Recovery: text was never emitted during streaming but final has text
+        // (possible if all text arrived in the final event only)
+        if (!hasEmittedMessage && finalText && !skipMessageItem) {
+          hasEmittedMessage = true;
+          messageItemId = genId('msg_');
+          const messageItem: MessageOutputItem = {
+            id: messageItemId,
+            type: 'message',
+            role: 'assistant',
+            status: 'in_progress',
+            content: [],
+          };
+          const miIndex = outputItems.length;
+          outputItems.push(messageItem);
+          outputIndex = miIndex;
+          writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+          const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+          writeSSEEvent(res, 'response.content_part.added', {
+            item_id: messageItemId,
+            output_index: miIndex,
+            content_index: 0,
+            part: textPart,
+          });
+          messageText = finalText;
+          writeSSEEvent(res, 'response.output_text.delta', {
+            item_id: messageItemId,
+            output_index: miIndex,
+            content_index: 0,
+            delta: finalText,
+          });
+        }
+
+        if (hasEmittedMessage && messageItemId && !skipMessageItem) {
+          const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
+          const contentIndex = 0;
+
+          writeSSEEvent(res, 'response.output_text.done', {
+            item_id: messageItemId,
+            output_index: miIndex >= 0 ? miIndex : outputIndex,
+            content_index: contentIndex,
+            text: finalText,
+          });
+
+          const textPart = { type: 'output_text' as const, text: finalText, annotations: [] as never[] };
+          writeSSEEvent(res, 'response.content_part.done', {
+            item_id: messageItemId,
+            output_index: miIndex >= 0 ? miIndex : outputIndex,
+            content_index: contentIndex,
+            part: textPart,
+          });
+
+          const messageItem: MessageOutputItem = {
+            id: messageItemId,
+            type: 'message',
+            role: 'assistant',
+            status: mapFinishReasonToStatus(event.finishReason),
+            content: [textPart],
+          };
+          if (miIndex >= 0) {
+            outputItems[miIndex] = messageItem;
+          }
+          writeSSEEvent(res, 'response.output_item.done', {
+            output_index: miIndex >= 0 ? miIndex : outputIndex,
+            item: messageItem,
+          });
+        } else if (hasEmittedMessage && messageItemId && skipMessageItem) {
+          // A message item was started (output_item.added / content_part.added events already
+          // sent to the client) but we now know it should be suppressed because the final
+          // text is empty and there are tool calls.  Send proper done events to close out
+          // the item gracefully so clients do not see a dangling in-progress item, then
+          // remove it from outputItems so it does not appear in the completed response.
+          const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
+          const miOutputIndex = miIndex >= 0 ? miIndex : outputIndex;
+
+          writeSSEEvent(res, 'response.output_text.done', {
+            item_id: messageItemId,
+            output_index: miOutputIndex,
+            content_index: 0,
+            text: '',
+          });
+
+          const emptyTextPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+          writeSSEEvent(res, 'response.content_part.done', {
+            item_id: messageItemId,
+            output_index: miOutputIndex,
+            content_index: 0,
+            part: emptyTextPart,
+          });
+
+          const closedMessageItem: MessageOutputItem = {
+            id: messageItemId,
+            type: 'message',
+            role: 'assistant',
+            status: 'completed',
+            content: [],
+          };
+          writeSSEEvent(res, 'response.output_item.done', {
+            output_index: miOutputIndex,
+            item: closedMessageItem,
+          });
+
+          // Track suppressed index for exclusion from final response
+          // but keep in array so subsequent output_index values remain unique.
+          if (miIndex >= 0) {
+            suppressedMessageIndex = miIndex;
+          }
+        }
+
+        // Emit function call items
+        for (const tc of event.toolCalls.filter((t) => t.status === 'ok')) {
+          const callId = tc.id ?? genId('call_');
+          const fcItem: FunctionCallOutputItem = {
+            id: genId('fc_'),
+            type: 'function_call',
+            call_id: callId,
+            name: tc.name,
+            arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
+            status: 'completed',
+          };
+          const fcIndex = outputItems.length;
+          outputItems.push(fcItem);
+
+          writeSSEEvent(res, 'response.output_item.added', { output_index: fcIndex, item: fcItem });
+
+          const argsStr = fcItem.arguments;
+          writeSSEEvent(res, 'response.function_call_arguments.delta', {
+            item_id: fcItem.id,
+            output_index: fcIndex,
+            delta: argsStr,
+          });
+          writeSSEEvent(res, 'response.function_call_arguments.done', {
+            item_id: fcItem.id,
+            output_index: fcIndex,
+            arguments: argsStr,
+          });
+
+          writeSSEEvent(res, 'response.output_item.done', { output_index: fcIndex, item: fcItem });
+        }
+
+        // Build the terminal response object but do NOT persist or emit
+        // `response.completed` yet — both actions are gated on the
+        // session's commit signal, which only becomes authoritative
+        // after the outer generator's finally has run. We `break` out
+        // of the loop so the for-await's cleanup runs the producer's
+        // finally (setting `turnCount` if the session committed), then
+        // defer persistence + emission to the post-loop block below.
+        const promptTokens = event.promptTokens ?? 0;
+        const reasoningTokens = event.reasoningTokens ?? 0;
+        const usage = {
+          input_tokens: promptTokens,
+          output_tokens: event.numTokens,
+          output_tokens_details: { reasoning_tokens: reasoningTokens },
+          total_tokens: promptTokens + event.numTokens,
+        };
+
+        const finalOutput = outputItems.filter((_, idx) => idx !== suppressedMessageIndex);
+        completedResponse = {
+          ...partial,
+          status: mapFinishReasonToStatus(event.finishReason),
+          output: finalOutput,
+          output_text: computeOutputText(finalOutput),
+          incomplete_details: event.finishReason === 'length' ? { reason: 'max_output_tokens' } : null,
+          usage,
+        };
+        break;
       }
+
+      // Delta event
+      if (event.isReasoning) {
+        // Filter out </think> tag from reasoning deltas
+        const deltaText = event.text.replace(/<\/think>/g, '');
+        if (!deltaText) continue; // Skip empty deltas (e.g., just the </think> token)
+
+        if (!hasEmittedReasoning) {
+          // First reasoning chunk -- add reasoning item
+          hasEmittedReasoning = true;
+          reasoningItemId = genId('rs_');
+          const reasoningItem: ReasoningOutputItem = {
+            id: reasoningItemId,
+            type: 'reasoning',
+            summary: [],
+          };
+          const riIndex = outputItems.length;
+          outputItems.push(reasoningItem);
+
+          writeSSEEvent(res, 'response.output_item.added', { output_index: riIndex, item: reasoningItem });
+        }
+        reasoningText += deltaText;
+        writeSSEEvent(res, 'response.reasoning_summary_text.delta', {
+          item_id: reasoningItemId,
+          output_index: outputItems.findIndex((i) => i.id === reasoningItemId),
+          summary_index: 0,
+          delta: deltaText,
+        });
+      } else {
+        // Text delta with tool_call tag buffering
+        const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
+        if (tagFound) {
+          // Emit any clean text before the tag.
+          // Trim whitespace-only prefixes: whitespace immediately before <tool_call>
+          // is always markup-related (e.g. "\n<tool_call>"), not user-visible content.
+          // Emitting it would create a dangling message item that needs special-casing
+          // at finalization when skipMessageItem is true.
+          if (cleanPrefix.trim()) {
+            if (!hasEmittedMessage) {
+              hasEmittedMessage = true;
+              messageItemId = genId('msg_');
+              const messageItem: MessageOutputItem = {
+                id: messageItemId,
+                type: 'message',
+                role: 'assistant',
+                status: 'in_progress',
+                content: [],
+              };
+              const miIndex = outputItems.length;
+              outputItems.push(messageItem);
+              outputIndex = miIndex;
+              writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+              const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+              writeSSEEvent(res, 'response.content_part.added', {
+                item_id: messageItemId,
+                output_index: miIndex,
+                content_index: 0,
+                part: textPart,
+              });
+            }
+            messageText += cleanPrefix;
+            writeSSEEvent(res, 'response.output_text.delta', {
+              item_id: messageItemId,
+              output_index: outputItems.findIndex((i) => i.id === messageItemId),
+              content_index: 0,
+              delta: cleanPrefix,
+            });
+          }
+        } else if (safeText) {
+          if (!hasEmittedMessage) {
+            hasEmittedMessage = true;
+            messageItemId = genId('msg_');
+            const messageItem: MessageOutputItem = {
+              id: messageItemId,
+              type: 'message',
+              role: 'assistant',
+              status: 'in_progress',
+              content: [],
+            };
+            const miIndex = outputItems.length;
+            outputItems.push(messageItem);
+            outputIndex = miIndex;
+            writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
+            const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+            writeSSEEvent(res, 'response.content_part.added', {
+              item_id: messageItemId,
+              output_index: miIndex,
+              content_index: 0,
+              part: textPart,
+            });
+          }
+          messageText += safeText;
+          writeSSEEvent(res, 'response.output_text.delta', {
+            item_id: messageItemId,
+            output_index: outputItems.findIndex((i) => i.id === messageItemId),
+            content_index: 0,
+            delta: safeText,
+          });
+        }
+      }
+    }
+  } catch (err: unknown) {
+    // Iter-28 finding 2: a mid-decode throw from the underlying async
+    // generator (native model crash, tool-call parse throw, etc.)
+    // used to escape out into the outer generic handler catch,
+    // which sent a JSON error *after* SSE headers had been flushed
+    // — producing a partially-streamed response with no terminal
+    // event. Capture the error into a sticky flag so the post-loop
+    // block below routes the request through the failure epilogue
+    // and emits a proper `response.failed` terminal, and so the
+    // registry-level `adopt()` gate never sees a committed state
+    // for this session.
+    thrownError = err instanceof Error ? err : new Error(String(err));
+  } finally {
+    if (httpReq) {
+      httpReq.off('close', onClientClose);
+      httpReq.off('error', onClientError);
     }
   }
 
   // Post-loop terminal emission.
   //
   // The producer's finally has now run (either via the `break` after
-  // a done event or via natural iterator exhaustion), so
-  // `wasCommitted()` reads an authoritative `session.turns` baseline.
-  // Three cases:
+  // a done event, via natural iterator exhaustion, via a mid-decode
+  // throw surfaced through the try/catch above, or via a client
+  // disconnect that flipped `clientAborted`), so `wasCommitted()`
+  // reads an authoritative `session.turns` baseline. Four cases:
   //
-  //  1. sawDone && committed: happy path. Persist the terminal
-  //     response and emit `response.completed`. Future
-  //     `previous_response_id` continuations can hot-resume through
-  //     the registry or cold-replay from the store.
+  //  1. sawDone && committed && !thrownError && !clientAborted:
+  //     happy path. Persist the terminal response and emit
+  //     `response.completed`. Future `previous_response_id`
+  //     continuations can hot-resume through the registry or
+  //     cold-replay from the store.
   //  2. sawDone && !committed: the final chunk carried
-  //     `finishReason: 'error'` (the ChatSession gates `turnCount` on
-  //     a non-error final chunk, so the session never committed). We
-  //     skip persistence and emit `response.failed` so clients can't
-  //     chain off of output the session never accepted as history.
-  //  3. !sawDone: the iterator exhausted before a terminal chunk
-  //     arrived. The session also never committed in this path, so
-  //     we synthesize an incomplete fallback, skip persistence, and
-  //     emit `response.failed`.
+  //     `finishReason: 'error'` (the ChatSession gates `turnCount`
+  //     on a non-error final chunk, so the session never
+  //     committed). Route through the failure epilogue with reason
+  //     `finish_reason_error`.
+  //  3. thrownError != null: the underlying generator threw. Route
+  //     through the failure epilogue with reason `error`.
+  //  4. clientAborted: HTTP request emitted `close`/`error` mid
+  //     stream. Route through the failure epilogue with reason
+  //     `client_abort`. We still emit `response.failed` so a tee /
+  //     proxy that remains connected sees a terminal event rather
+  //     than a hung stream.
+  //  5. !sawDone && none of the above: the iterator exhausted
+  //     before a terminal chunk arrived. Reason `stream_exhausted`.
   //
   // In all non-committed paths the registry-level `adopt()` gate in
   // `handleCreateResponse` already skipped caching this session, so
   // the in-memory and persisted views agree: there is no authoritative
   // record of this turn anywhere.
   const committed = wasCommitted();
+  const successful = sawDone && committed && thrownError == null && !clientAborted;
 
-  if (!sawDone) {
-    const fallbackOutput = outputItems.filter((_, idx) => idx !== suppressedMessageIndex);
-    completedResponse = {
-      ...partial,
-      status: 'incomplete',
-      output: fallbackOutput,
-      output_text: computeOutputText(fallbackOutput),
-      incomplete_details: { reason: 'max_output_tokens' },
-      usage: {
-        input_tokens: 0,
-        output_tokens: 0,
-        output_tokens_details: { reasoning_tokens: 0 },
-        total_tokens: 0,
-      },
-    };
-  }
-
-  // `completedResponse` is non-null at this point: either the done
-  // branch set it, or the `!sawDone` fallback above set it. Assert
-  // for the type checker.
-  const terminal = completedResponse!;
-
-  if (committed) {
+  if (successful) {
+    // `completedResponse` is non-null on the success path (the done
+    // branch set it before breaking out of the loop). Assert for the
+    // type checker.
+    const terminal = completedResponse!;
     if (store && req.store !== false) {
       await persistResponse(store, terminal, newInputMessages, previousResponseId, modelInstanceId);
     }
     writeSSEEvent(res, 'response.completed', { response: terminal });
-  } else {
-    // Non-committed terminal. Do NOT persist — the ChatSession refused
-    // to advance its history, so the store must agree. Re-label the
-    // response status as `failed` so a client round-tripping the
-    // response into `previous_response_id` cannot accidentally
-    // resurrect partial output.
-    const failedResponse: ResponseObject = { ...terminal, status: 'failed' };
-    writeSSEEvent(res, 'response.failed', { response: failedResponse });
+    endSSE(res);
+    return;
   }
+
+  // Failure epilogue.
+  //
+  // Build the failure terminal through `buildFailedTerminal` so
+  // every nested message item is normalized to `status: 'incomplete'`
+  // (iter-28 finding 3 — the previous code did `{ ...terminal,
+  // status: 'failed' }`, which left nested items marked
+  // `completed`/`in_progress` inside a `failed` envelope).
+  //
+  // Emit `response.output_item.done` for any nested message items
+  // that are still dangling (the producer threw before the done
+  // branch closed them), so clients that track output_index state
+  // see a matching close for each open item BEFORE the terminal
+  // `response.failed`. Function-call items are always closed inline
+  // as soon as their args are flushed so no explicit done is
+  // needed here; reasoning items have no `status` field so they
+  // are left untouched.
+  const reason: string = thrownError
+    ? 'error'
+    : clientAborted
+      ? 'client_abort'
+      : sawDone
+        ? 'finish_reason_error'
+        : 'stream_exhausted';
+
+  // Build a synthetic usage block when we never reached a done
+  // event: no token counts are available. When we DID reach a done
+  // event but the session refused to commit, prefer the captured
+  // `completedResponse.usage` so clients still see what was spent.
+  const usage: ResponseObject['usage'] = completedResponse?.usage ?? {
+    input_tokens: 0,
+    output_tokens: 0,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: 0,
+  };
+
+  const finalOutput = outputItems.filter((_, idx) => idx !== suppressedMessageIndex);
+
+  // Flush still-open message items before the terminal event. A
+  // message item is considered still-open if it was started
+  // (`hasEmittedMessage && messageItemId != null`) but the done
+  // branch never ran (sawDone === false, or sawDone === true but
+  // the done branch broke out before emitting the item's close
+  // events on the finishReason=error path). We only emit the
+  // closing events on the non-sawDone path because the done branch
+  // already emits matching closes on the sawDone path before
+  // `break` fires.
+  if (!sawDone && hasEmittedMessage && messageItemId != null) {
+    const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
+    writeSSEEvent(res, 'response.output_text.done', {
+      item_id: messageItemId,
+      output_index: miIndex >= 0 ? miIndex : outputIndex,
+      content_index: 0,
+      text: messageText,
+    });
+    const textPart = { type: 'output_text' as const, text: messageText, annotations: [] as never[] };
+    writeSSEEvent(res, 'response.content_part.done', {
+      item_id: messageItemId,
+      output_index: miIndex >= 0 ? miIndex : outputIndex,
+      content_index: 0,
+      part: textPart,
+    });
+    const closedMessageItem: MessageOutputItem = {
+      id: messageItemId,
+      type: 'message',
+      role: 'assistant',
+      status: 'incomplete',
+      content: messageText ? [textPart] : [],
+    };
+    if (miIndex >= 0) {
+      outputItems[miIndex] = closedMessageItem;
+      finalOutput[miIndex] = closedMessageItem;
+    }
+    writeSSEEvent(res, 'response.output_item.done', {
+      output_index: miIndex >= 0 ? miIndex : outputIndex,
+      item: closedMessageItem,
+    });
+  }
+  if (!sawDone && hasEmittedReasoning && reasoningItemId != null) {
+    // Reasoning items have no `status` field; just emit the closing
+    // events so output_index bookkeeping stays consistent on the
+    // client side. The reasoning item shape is preserved verbatim.
+    writeSSEEvent(res, 'response.reasoning_summary_text.done', {
+      item_id: reasoningItemId,
+      output_index: outputItems.findIndex((i) => i.id === reasoningItemId),
+      summary_index: 0,
+      text: reasoningText,
+    });
+    const riIndex = outputItems.findIndex((i) => i.id === reasoningItemId);
+    if (riIndex >= 0) {
+      const reasoningItem: ReasoningOutputItem = {
+        id: reasoningItemId,
+        type: 'reasoning',
+        summary: [{ type: 'summary_text', text: reasoningText }],
+      };
+      outputItems[riIndex] = reasoningItem;
+      finalOutput[riIndex] = reasoningItem;
+      writeSSEEvent(res, 'response.output_item.done', { output_index: riIndex, item: reasoningItem });
+    }
+  }
+
+  const failedTerminal = buildFailedTerminal(partial, finalOutput, reason, usage);
+  writeSSEEvent(res, 'response.failed', { response: failedTerminal });
   endSSE(res);
 }
 
@@ -1179,29 +1399,40 @@ async function persistResponse(
  *     explicit `modelInstanceId`. The caller runs the strict
  *     instance-id comparison and rejects any mismatch as a
  *     hot-swap / rebind.
- *   - `{ kind: 'absent' }` — the record either has no `configJson`,
- *     has a malformed blob, or has a blob that doesn't carry a
- *     well-formed `modelInstanceId` field. Per iter-23 finding 1
- *     the caller rejects these outright with a 400 explaining the
- *     upgrade boundary — the iter-22 friendly-name compat fallback
- *     silently reopened same-name hot-swap corruption and has
- *     been removed. The discriminated return is kept so the call
- *     site explicitly handles the absent case rather than
- *     implicitly allowing a legacy record to slip through.
+ *   - `{ kind: 'absent' }` — the record has a parseable (or empty)
+ *     `configJson` blob that simply does not carry a well-formed
+ *     `modelInstanceId` field. This is the LEGACY shape written by
+ *     branches before iter-21 stamped an explicit instance id into
+ *     every row. Iter-28 finding 1: the caller services this shape
+ *     by cold-replaying under a narrow "trust on first use"
+ *     window — but ONLY when the stored `record.model` friendly
+ *     name exactly matches the incoming `body.model`, so a caller
+ *     cannot redirect a legacy chain through an unrelated model.
+ *     A legacy row whose friendly name differs from the incoming
+ *     request is rejected outright.
+ *   - `{ kind: 'malformed' }` — the `configJson` blob failed to
+ *     JSON-parse. Iter-28 finding 1: the iter-27 legacy compat
+ *     path silently classified malformed blobs as `absent`, which
+ *     meant the narrow friendly-name-equality check below would
+ *     happily cold-replay through a row whose stored config state
+ *     we cannot verify at all. Surface the parse failure as a
+ *     distinct variant so the caller can reject it with a clean
+ *     400 without opening the legacy window.
  */
-type StoredModelIdentity = { kind: 'present'; instanceId: number } | { kind: 'absent' };
+type StoredModelIdentity = { kind: 'present'; instanceId: number } | { kind: 'absent' } | { kind: 'malformed' };
 
 function readStoredModelIdentity(record: StoredResponseRecord): StoredModelIdentity {
   if (record.configJson == null) return { kind: 'absent' };
+  let parsed: { modelInstanceId?: unknown };
   try {
-    const parsed = JSON.parse(record.configJson) as { modelInstanceId?: unknown };
-    if (typeof parsed.modelInstanceId === 'number' && Number.isFinite(parsed.modelInstanceId)) {
-      return { kind: 'present', instanceId: parsed.modelInstanceId };
-    }
-    return { kind: 'absent' };
+    parsed = JSON.parse(record.configJson) as { modelInstanceId?: unknown };
   } catch {
-    return { kind: 'absent' };
+    return { kind: 'malformed' };
   }
+  if (typeof parsed.modelInstanceId === 'number' && Number.isFinite(parsed.modelInstanceId)) {
+    return { kind: 'present', instanceId: parsed.modelInstanceId };
+  }
+  return { kind: 'absent' };
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,6 +1444,7 @@ export async function handleCreateResponse(
   body: ResponsesAPIRequest,
   registry: ModelRegistry,
   store: ResponseStore | null,
+  httpReq?: IncomingMessage,
 ): Promise<void> {
   // Validate required fields
   if (body == null || typeof body !== 'object') {
@@ -1395,6 +1627,72 @@ export async function handleCreateResponse(
               `boundaries — a stored chain is tied to the tokenizer, chat template, and KV layout of the ` +
               `exact model object that produced it, and replaying it through a different model would ` +
               `silently corrupt the conversation. Start a new chain without previous_response_id.`,
+            'model',
+          );
+          return;
+        }
+        // Iter-28 finding 1 — malformed configJson.
+        //
+        // `readStoredModelIdentity` now distinguishes a row with a
+        // parseable-but-instance-id-less `configJson` (legacy shape,
+        // kind=absent) from a row whose `configJson` failed to
+        // JSON-parse (kind=malformed). The iter-27 compat code
+        // silently folded both into the `absent` bucket and routed
+        // them through the legacy cold-replay path — but a row whose
+        // stored config state we cannot even parse has no trustable
+        // fields at all. Any cold replay would rebuild the chain
+        // against an unreadable prior turn, so reject the request
+        // outright with a clean 400 instead of opening the legacy
+        // window on a row we cannot verify. An admin tool can purge
+        // malformed rows on its own schedule; the endpoint layer
+        // does not assume one exists.
+        if (storedIdentity.kind === 'malformed') {
+          sendBadRequest(
+            res,
+            `previous_response_id "${body.previous_response_id}" points at a stored record whose ` +
+              `configJson blob failed to parse — the server cannot verify the model identity or prior ` +
+              `config state it was produced under, so continuing the chain through any model would ` +
+              `silently replay against an unreadable prior turn. Start a new chain without ` +
+              `previous_response_id.`,
+            'previous_response_id',
+          );
+          return;
+        }
+        // Iter-28 finding 1 — legacy rows gated on friendly-name equality.
+        //
+        // Stored rows that lack an explicit `modelInstanceId` are
+        // the pre-iter-21 legacy shape. The iter-27 compat code
+        // serviced them via cold replay without ANY identity check
+        // — a 30-minute TTL hole left over from the initial rollout.
+        // Iter-28 finding 1: that hole silently allowed cross-model
+        // resume. A caller pointing at `body.model: "model-B"` with
+        // a legacy `previous_response_id` that was originally served
+        // by `model-A` slipped through the kind==='absent' branch,
+        // cold-replayed the chain under model-B, and then
+        // `persistResponse()` stamped the new row with model-B's
+        // live instance id — turning a one-shot cross-model replay
+        // into an authoritative chain forever.
+        //
+        // Narrow the window: legacy rows may only be resumed when
+        // the stored record's friendly `model` name equals
+        // `body.model` exactly. Friendly-name equality is not as
+        // strong as instance-id equality (an operator who rebinds
+        // the same friendly name to a new model during a deploy
+        // can still slip through within the TTL), but it IS a
+        // meaningful trust anchor the caller controls — and it
+        // closes the cross-name redirect vector, which is the
+        // catastrophic case.
+        if (storedIdentity.kind === 'absent' && trailingRecord.model !== body.model) {
+          sendBadRequest(
+            res,
+            `previous_response_id "${body.previous_response_id}" points at a legacy chain (no ` +
+              `modelInstanceId in the stored record) produced under model "${trailingRecord.model}", but the ` +
+              `current request targets "${body.model}". Legacy chains can only be resumed under the same ` +
+              `friendly model name the original turn was served by — cross-name resume on a row whose model ` +
+              `identity cannot be verified would let a caller silently replay the chain through an unrelated ` +
+              `model and then stamp a fresh instance id over it on persistence, turning a one-shot cross-model ` +
+              `replay into an authoritative chain forever. Start a new chain without previous_response_id, ` +
+              `or retry the request under "${trailingRecord.model}".`,
             'model',
           );
           return;
@@ -1901,6 +2199,7 @@ export async function handleCreateResponse(
             newInputMessages,
             streamingWasCommitted,
             currentInstanceId,
+            httpReq,
           );
           committed = streamingWasCommitted();
         } else {

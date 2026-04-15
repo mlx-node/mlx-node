@@ -84,7 +84,7 @@ export async function routeRequest(
       return;
     }
 
-    await handleCreateResponse(res, body, registry, store);
+    await handleCreateResponse(res, body, registry, store, req);
     return;
   }
 
@@ -106,7 +106,7 @@ export async function routeRequest(
       return;
     }
 
-    await handleCreateMessage(res, body, registry);
+    await handleCreateMessage(res, body, registry, req);
     return;
   }
 

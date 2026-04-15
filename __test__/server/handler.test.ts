@@ -1944,6 +1944,346 @@ describe('createHandler', () => {
       expect(failedResponse.status).toBe('failed');
     });
 
+    it('does not adopt the session when a streaming generator throws mid-decode', async () => {
+      // Iter-28 finding 2 regression: before the fix, a throw from
+      // the underlying async generator escaped out of the
+      // `for await` loop in `handleStreamingNative` straight into
+      // the outer generic error catch in `handleCreateResponse`.
+      // That bypassed the commit gate entirely — the writer never
+      // called `wasCommitted()`, so the session's adopt decision
+      // defaulted to the happy path and (on the iter-22+ adopt
+      // gate) could leak a committed state for a session the
+      // client never received a terminal event for. Worse, the
+      // outer catch tried to send a JSON error after SSE headers
+      // had already been flushed, producing a wire shape that no
+      // client could parse. The fix wraps the `for await` loop in
+      // a try/catch/finally that captures the throw into a
+      // sticky `thrownError` flag, routes the post-loop block
+      // through the failure epilogue, and emits a well-formed
+      // `response.failed` terminal event.
+      //
+      // Model a generator that yields a couple of deltas then
+      // throws. Every Finding 2 invariant must hold: the session
+      // is not adopted, the store is not written, the terminal
+      // event is `response.failed`, and `response.completed` is
+      // never emitted.
+      async function* throwingStream() {
+        yield { done: false, text: 'par', isReasoning: false };
+        yield { done: false, text: 'tial', isReasoning: false };
+        throw new Error('native decode crashed');
+      }
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('streaming should not use chatSessionStart')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('streaming should not use chatSessionContinue')),
+        chatSessionContinueTool: vi
+          .fn()
+          .mockRejectedValue(new Error('streaming should not use chatSessionContinueTool')),
+        chatStreamSessionStart: vi.fn(() => throwingStream()),
+        chatStreamSessionContinue: vi.fn(() => throwingStream()),
+        chatStreamSessionContinueTool: vi.fn(() => throwingStream()),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('stream-model', mockModel);
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      // Adopt gate: nothing adopted.
+      const sessionReg = registry.getSessionRegistry('stream-model');
+      expect(sessionReg).toBeDefined();
+      expect(sessionReg!.size).toBe(0);
+
+      // Persist gate: store untouched.
+      expect(mockStore.store).not.toHaveBeenCalled();
+
+      // SSE terminal-event gate: `response.failed` was emitted, not
+      // `response.completed`. Nested message items (if any) are
+      // normalised to `status: 'incomplete'` via `buildFailedTerminal`.
+      const body = getBody();
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1]!.data = JSON.parse(line.slice(6));
+        }
+      }
+      expect(events.find((e) => e.event === 'response.completed')).toBeUndefined();
+      const failedEvent = events.find((e) => e.event === 'response.failed');
+      expect(failedEvent).toBeDefined();
+      const failedResponse = failedEvent!.data.response as Record<string, unknown>;
+      expect(failedResponse.status).toBe('failed');
+      const incomplete = failedResponse.incomplete_details as { reason?: string } | null;
+      expect(incomplete?.reason).toBe('error');
+      // Every nested message item (the partial we streamed) must
+      // now be `status: 'incomplete'` — Finding 3 normalisation.
+      for (const item of (failedResponse.output as Array<{ type?: string; status?: string }>) ?? []) {
+        if (item.type === 'message') {
+          expect(item.status).toBe('incomplete');
+        }
+      }
+    });
+
+    it('does not adopt the session when the HTTP request aborts mid-stream', async () => {
+      // Iter-28 finding 2 regression, client-abort half. Before
+      // the fix, a client disconnect produced no signal inside
+      // the streaming helper: the `for await` loop kept pulling
+      // deltas, the writer kept calling `writeSSEEvent` into a
+      // dead socket, and the post-loop commit gate ran the
+      // success branch (which either adopted the session or
+      // emitted `response.completed` depending on whether the
+      // native generator eventually drained a done chunk). The
+      // fix installs `close`/`error` listeners on the HTTP
+      // request that flip a `clientAborted` flag checked at the
+      // top of every loop iteration. When the flag flips, the
+      // helper `break`s out of the loop and routes through the
+      // failure epilogue with `reason: 'client_abort'`.
+      //
+      // We cannot drive a true HTTP close from inside the
+      // `IncomingMessage` mock, so we simulate it by emitting a
+      // synthetic `close` event after the generator yields its
+      // first delta. The native stream is shaped so that the
+      // second iteration of the for-await loop sees the flag set
+      // and breaks out — exactly the shape the production code
+      // handles.
+      let proceedResolve: (() => void) | undefined;
+      const proceed = new Promise<void>((r) => {
+        proceedResolve = r;
+      });
+      async function* abortingStream() {
+        yield { done: false, text: 'partial', isReasoning: false };
+        // Pause until the test signals that the HTTP close has
+        // been dispatched. The helper's loop-top guard will flip
+        // `clientAborted` on the next iteration.
+        await proceed;
+        yield { done: false, text: 'should-be-ignored', isReasoning: false };
+        // If the helper's break hook does NOT fire, we fall
+        // through to a commit. The test asserts against the
+        // non-commit path, so this is only reached on
+        // regressions.
+        yield {
+          done: true,
+          text: 'should-be-ignored',
+          finishReason: 'stop',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 1,
+          reasoningTokens: 0,
+          rawText: 'should-be-ignored',
+        };
+      }
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('streaming should not use chatSessionStart')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('streaming should not use chatSessionContinue')),
+        chatSessionContinueTool: vi
+          .fn()
+          .mockRejectedValue(new Error('streaming should not use chatSessionContinueTool')),
+        chatStreamSessionStart: vi.fn(() => abortingStream()),
+        chatStreamSessionContinue: vi.fn(() => abortingStream()),
+        chatStreamSessionContinueTool: vi.fn(() => abortingStream()),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('stream-model', mockModel);
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      const inflight = handler(req, res);
+      // Emit a `close` event on the HTTP request after a micro
+      // delay so the streaming helper has registered its
+      // listeners and the producer has yielded at least one
+      // delta. Then release the generator so the second
+      // iteration runs and the loop-top `if (clientAborted)`
+      // guard trips.
+      await new Promise((r) => setImmediate(r));
+      (req as unknown as NodeJS.EventEmitter).emit('close');
+      proceedResolve?.();
+      await inflight;
+      await waitForEnd();
+
+      // Adopt gate: session not adopted (clientAborted diverts
+      // the post-loop block away from the success branch, and
+      // `runSessionStreaming`'s commit closure reads `false`).
+      const sessionReg = registry.getSessionRegistry('stream-model');
+      expect(sessionReg).toBeDefined();
+      expect(sessionReg!.size).toBe(0);
+
+      // Persist gate.
+      expect(mockStore.store).not.toHaveBeenCalled();
+
+      // SSE terminal-event gate: `response.failed` with
+      // `incomplete_details.reason === 'client_abort'`.
+      const body = getBody();
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1]!.data = JSON.parse(line.slice(6));
+        }
+      }
+      expect(events.find((e) => e.event === 'response.completed')).toBeUndefined();
+      const failedEvent = events.find((e) => e.event === 'response.failed');
+      expect(failedEvent).toBeDefined();
+      const failedResponse = failedEvent!.data.response as Record<string, unknown>;
+      expect(failedResponse.status).toBe('failed');
+      const incomplete = failedResponse.incomplete_details as { reason?: string } | null;
+      expect(incomplete?.reason).toBe('client_abort');
+    });
+
+    it('normalises nested message items to incomplete when a streaming turn fails mid-decode', async () => {
+      // Iter-28 finding 3 regression: the iter-27 writer built
+      // the failed terminal via `{ ...terminal, status: 'failed' }`,
+      // which re-used the object the happy-path done branch had
+      // already finalised. On the finishReason=error path that
+      // branch walked every message item through
+      // `mapFinishReasonToStatus`, which returns `'completed'` for
+      // anything other than `'length'` — including `'error'`. So
+      // a failed turn shipped `{ status: 'failed', output: [{
+      // status: 'completed' }, ...] }` on the wire: a contradiction
+      // between the top-level failure status and the nested
+      // success status. On the exhaust path the nested items
+      // never got closed at all, so they stayed `'in_progress'`
+      // inside a `failed` envelope.
+      //
+      // The fix routes every failure path through
+      // `buildFailedTerminal`, which maps `in_progress` and
+      // `completed` message-item statuses to `incomplete`. This
+      // regression exercises the finishReason=error flavour: a
+      // stream that emits a message delta and THEN a final error
+      // chunk. The terminal event must be `response.failed`, the
+      // top-level status must be `'failed'`, every nested
+      // message item must be `'incomplete'`, and
+      // `incomplete_details.reason` must be
+      // `'finish_reason_error'`.
+      const streamEvents = [
+        { done: false, text: 'partial text', isReasoning: false },
+        {
+          done: true,
+          text: 'partial text',
+          finishReason: 'error',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 2,
+          promptTokens: 3,
+          reasoningTokens: 0,
+          rawText: 'partial text',
+        },
+      ];
+      const registry = new ModelRegistry();
+      registry.register('stream-model', createMockStreamModel(streamEvents));
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(mockStore.store).not.toHaveBeenCalled();
+
+      const body = getBody();
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1]!.data = JSON.parse(line.slice(6));
+        }
+      }
+      expect(events.find((e) => e.event === 'response.completed')).toBeUndefined();
+      const failedEvent = events.find((e) => e.event === 'response.failed');
+      expect(failedEvent).toBeDefined();
+      const failedResponse = failedEvent!.data.response as Record<string, unknown>;
+      expect(failedResponse.status).toBe('failed');
+      const incomplete = failedResponse.incomplete_details as { reason?: string } | null;
+      expect(incomplete?.reason).toBe('finish_reason_error');
+      // Every nested message item must be `status: 'incomplete'`,
+      // not `'completed'` or `'in_progress'`. At least one
+      // message item must have been captured (the partial text
+      // delta).
+      const output = (failedResponse.output as Array<{ type?: string; status?: string }>) ?? [];
+      const messageItems = output.filter((it) => it.type === 'message');
+      expect(messageItems.length).toBeGreaterThan(0);
+      for (const item of messageItems) {
+        expect(item.status).toBe('incomplete');
+      }
+    });
+
     it('forces cold replay when two chains are interleaved (A -> B -> A)', async () => {
       // Iteration-18 finding 1 regression: the `SessionRegistry`
       // holds AT MOST one entry. Native KV state (cached token
@@ -3405,6 +3745,161 @@ describe('createHandler', () => {
       const persistedConfig = JSON.parse(storedNew.configJson) as { modelInstanceId?: number };
       expect(typeof persistedConfig.modelInstanceId).toBe('number');
       expect(persistedConfig.modelInstanceId).toBe(registry.getInstanceId('test-model'));
+    });
+
+    it('rejects a legacy previous_response_id continuation when the friendly model name differs', async () => {
+      // Iter-28 finding 1 regression: the iter-27 compat path for
+      // legacy rows (no `modelInstanceId` in the stored config
+      // blob) silently allowed cross-model resume. A caller that
+      // pointed `body.model: "model-B"` at a `previous_response_id`
+      // whose trailing record was originally served by `model-A`
+      // slipped through the kind==='absent' branch, cold-replayed
+      // the chain under `model-B`, and then `persistResponse()`
+      // stamped the new record with model-B's live instance id —
+      // turning a one-shot cross-model replay into an
+      // authoritative chain forever. The fix narrows the legacy
+      // window to friendly-name equality on the stored record's
+      // `model` field, which the caller already has to agree with
+      // up-front to even lease a session on the continuation.
+      const registry = new ModelRegistry();
+      const modelA = createMockModel(makeChatResult({ text: 'model A reply' }));
+      const modelB = createMockModel(makeChatResult({ text: 'model B reply' }));
+      registry.register('model-A', modelA);
+      registry.register('model-B', modelB);
+      const storedRecords = new Map<string, any>();
+      // Seed a legacy row whose `model` is `"model-A"`. The
+      // `configJson` deliberately carries NO `modelInstanceId`
+      // (the pre-iter-21 shape the legacy compat path services).
+      storedRecords.set('resp_legacy_A', {
+        id: 'resp_legacy_A',
+        createdAt: Math.floor(Date.now() / 1000),
+        model: 'model-A',
+        status: 'completed',
+        inputJson: JSON.stringify([{ role: 'user', content: 'first turn' }]),
+        outputJson: JSON.stringify([
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'first reply' }] },
+        ]),
+        outputText: 'first reply',
+        usageJson: '{}',
+        configJson: JSON.stringify({ temperature: 0.7 }),
+      });
+      const mockStore = {
+        store: vi.fn((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Continue the `model-A` legacy chain under `model-B`. The
+      // handler must reject the request with 400 and explicitly
+      // cite both friendly names in the error string. Neither
+      // model's session APIs may be invoked.
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'model-B',
+        previous_response_id: 'resp_legacy_A',
+        input: 'continue the chain under the wrong friendly name',
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toMatch(/legacy chain/i);
+      expect(parsed.error.message).toMatch(/model-A/);
+      expect(parsed.error.message).toMatch(/model-B/);
+      expect(parsed.error.param).toBe('model');
+      // Neither model's session APIs may have been touched.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(modelA.chatSessionStart).not.toHaveBeenCalled();
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(modelB.chatSessionStart).not.toHaveBeenCalled();
+      // Nothing persisted.
+      expect(storedRecords.size).toBe(1);
+    });
+
+    it('rejects a previous_response_id continuation when the stored configJson is malformed', async () => {
+      // Iter-28 finding 1 regression: the iter-27 legacy compat
+      // path silently classified a stored row whose `configJson`
+      // blob failed to JSON-parse as "absent" (kind==='absent'),
+      // which meant the narrow friendly-name-equality cold-replay
+      // window happily serviced a row whose stored config state
+      // we cannot read at all. Surface the parse failure as its
+      // own kind==='malformed' variant and reject with 400 so
+      // the caller has to start a new chain rather than silently
+      // cold-replay against an unreadable prior turn.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'unused reply' }));
+      registry.register('test-model', mockModel);
+      const storedRecords = new Map<string, any>();
+      storedRecords.set('resp_corrupt', {
+        id: 'resp_corrupt',
+        createdAt: Math.floor(Date.now() / 1000),
+        model: 'test-model',
+        status: 'completed',
+        inputJson: JSON.stringify([{ role: 'user', content: 'first turn' }]),
+        outputJson: JSON.stringify([
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'first reply' }] },
+        ]),
+        outputText: 'first reply',
+        usageJson: '{}',
+        // Deliberately malformed JSON — not a parseable object,
+        // not a parseable string, not `null`.
+        configJson: '{not-valid-json',
+      });
+      const mockStore = {
+        store: vi.fn((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: 'resp_corrupt',
+        input: 'continue the malformed chain',
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toMatch(/configJson blob failed to parse/i);
+      expect(parsed.error.param).toBe('previous_response_id');
+      // The native session APIs must not have been invoked.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(mockModel.chatSessionStart).not.toHaveBeenCalled();
+      // Nothing new persisted.
+      expect(storedRecords.size).toBe(1);
     });
 
     it('rejects previous_response_id continuation when the model binding is re-registered during store.getChain', async () => {

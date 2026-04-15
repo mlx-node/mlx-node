@@ -804,6 +804,203 @@ describe('handleCreateMessage', () => {
       expect(errorEvent).toBeDefined();
       expect((errorEvent!.data['error'] as any).message).toContain('Stream crashed');
     });
+
+    it('routes a mid-decode throw through the failure epilogue without adopting the session', async () => {
+      // Iter-28 finding 2 regression (Anthropic half): before the
+      // fix, a mid-decode throw from the underlying async
+      // generator escaped out of the `for await` loop in
+      // `handleStreamingNative` straight into the outer generic
+      // catch in `handleCreateMessage`. The outer catch emitted a
+      // single Anthropic `error` event AFTER SSE headers had been
+      // flushed, but did so WITHOUT consulting the commit gate
+      // or running the failure epilogue. The consequences were:
+      //
+      //   1. `message_stop` was sometimes still emitted by the
+      //      pre-break write path (labelling a crashed turn as
+      //      a clean completion).
+      //   2. The `content_block_stop` frame that pairs with any
+      //      open `content_block_start` was never emitted, so
+      //      clients tracking content_block_index state saw a
+      //      dangling in-progress block.
+      //   3. There was no signal the session had failed — the
+      //      commit gate's `wasCommitted()` was never read, so
+      //      the happy path's post-loop flow ran uninspected.
+      //
+      // The fix wraps the loop in a try/catch that captures the
+      // throw into a sticky `thrownError` flag and routes the
+      // post-loop block through the failure epilogue. Every
+      // invariant below pins that epilogue:
+      //
+      //   * `message_stop` / `message_delta` MUST NOT appear.
+      //   * A single Anthropic `error` event MUST be present
+      //     with `type: 'api_error'` and a message that cites
+      //     the thrown error.
+      //   * Any content block that was opened before the throw
+      //     MUST be closed with `content_block_stop` before the
+      //     error frame (so clients aren't left with dangling
+      //     state).
+      //   * The session registry stays empty (the Anthropic
+      //     endpoint never adopts, and the commit gate skips the
+      //     success branch on a throw).
+      async function* throwingStream() {
+        yield { text: 'par', done: false, isReasoning: false };
+        yield { text: 'tial', done: false, isReasoning: false };
+        throw new Error('native decode crashed mid-flight');
+      }
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('should use stream')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: vi.fn(() => throwingStream()),
+        chatStreamSessionContinue: vi.fn(() => throwingStream()),
+        chatStreamSessionContinueTool: vi.fn(() => throwingStream()),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+
+      // No clean terminal events.
+      expect(events.find((e) => e.event === 'message_stop')).toBeUndefined();
+      expect(events.find((e) => e.event === 'message_delta')).toBeUndefined();
+
+      // Exactly one `error` event, with the thrown error's
+      // message on the envelope.
+      const errorEvents = events.filter((e) => e.event === 'error');
+      expect(errorEvents).toHaveLength(1);
+      const errorBody = errorEvents[0].data['error'] as { type: string; message: string };
+      expect(errorBody.type).toBe('api_error');
+      expect(errorBody.message).toContain('native decode crashed mid-flight');
+
+      // Any content block that was opened before the throw must
+      // be closed BEFORE the error frame.
+      const orderedEvents = events.map((e) => e.event);
+      const errorIdx = orderedEvents.indexOf('error');
+      const anyBlockStopBeforeError = orderedEvents.slice(0, errorIdx).some((e) => e === 'content_block_stop');
+      const anyBlockStartBeforeError = orderedEvents.slice(0, errorIdx).some((e) => e === 'content_block_start');
+      if (anyBlockStartBeforeError) {
+        expect(anyBlockStopBeforeError).toBe(true);
+      }
+
+      // Session registry stays empty — the Anthropic endpoint
+      // never adopts, and no leak ever landed on the throw path.
+      const sessionReg = registry.getSessionRegistry('test-model');
+      expect(sessionReg!.size).toBe(0);
+    });
+
+    it('routes a client disconnect through the failure epilogue without adopting the session', async () => {
+      // Iter-28 finding 2 regression (Anthropic half, client
+      // abort path). Before the fix, a client disconnect while
+      // streaming had no signal inside the helper: the
+      // `for await` loop kept pulling deltas and the writer kept
+      // calling `writeSSEEvent` into a dead socket until the
+      // native generator drained a done chunk, at which point
+      // the commit gate ran the success branch and the writer
+      // emitted `message_delta` + `message_stop` into the void.
+      //
+      // The fix installs `close`/`error` listeners on the HTTP
+      // request that flip a `clientAborted` flag checked at
+      // loop-top. When the flag flips, the helper `break`s out
+      // of the loop and routes through the failure epilogue. We
+      // cannot physically close a socket in this unit test, so
+      // we emit a synthetic `close` event on a lightweight
+      // IncomingMessage-shaped mock after the generator yields
+      // its first delta. The helper's loop-top guard must fire
+      // on the next iteration and break out.
+      let proceedResolve: (() => void) | undefined;
+      const proceed = new Promise<void>((r) => {
+        proceedResolve = r;
+      });
+      async function* abortingStream() {
+        yield { text: 'partial', done: false, isReasoning: false };
+        await proceed;
+        // These events should not reach the client: the loop-top
+        // `if (clientAborted) break;` trips on the next iter.
+        yield { text: 'should-not-arrive', done: false, isReasoning: false };
+        yield {
+          text: 'should-not-arrive',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 1,
+          reasoningTokens: 0,
+          rawText: 'should-not-arrive',
+        };
+      }
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('should use stream')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: vi.fn(() => abortingStream()),
+        chatStreamSessionContinue: vi.fn(() => abortingStream()),
+        chatStreamSessionContinueTool: vi.fn(() => abortingStream()),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+      const { res, getBody } = createMockRes();
+
+      // Build a minimal IncomingMessage-shaped mock. Only
+      // `once('close'|'error', fn)` and `off(...)` need to work
+      // for the fault plumbing — the helper does not read body
+      // or headers from the `httpReq` argument.
+      const { EventEmitter } = require('node:events');
+      const reqEmitter = new EventEmitter();
+      const httpReqMock = Object.assign(reqEmitter, {
+        method: 'POST',
+        url: '/v1/messages',
+        headers: { 'content-type': 'application/json', host: 'localhost' },
+      });
+
+      const inflight = handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+        httpReqMock as any,
+      );
+      await new Promise((r) => setImmediate(r));
+      httpReqMock.emit('close');
+      proceedResolve?.();
+      await inflight;
+
+      const events = parseSSE(getBody());
+
+      // No clean terminal events.
+      expect(events.find((e) => e.event === 'message_stop')).toBeUndefined();
+      expect(events.find((e) => e.event === 'message_delta')).toBeUndefined();
+
+      // Exactly one `error` event, citing the client disconnect.
+      const errorEvents = events.filter((e) => e.event === 'error');
+      expect(errorEvents).toHaveLength(1);
+      const errorBody = errorEvents[0].data['error'] as { type: string; message: string };
+      expect(errorBody.type).toBe('api_error');
+      expect(errorBody.message).toMatch(/client disconnected/i);
+
+      // The session registry stays empty on a client abort,
+      // mirroring the other failure paths.
+      const sessionReg = registry.getSessionRegistry('test-model');
+      expect(sessionReg!.size).toBe(0);
+    });
   });
 
   // -----------------------------------------------------------------------
