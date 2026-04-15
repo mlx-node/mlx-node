@@ -746,6 +746,173 @@ function canonicalizeToolMessageOrder(
 }
 
 /**
+ * Walk `messages` and canonicalize every assistant fan-out's
+ * trailing tool-result block against the assistant's declared
+ * `toolCalls` order. Mutates `messages` in place.
+ *
+ * The existing `canonicalizeToolMessageOrder` only handles a single
+ * contiguous tool block at a known offset against a precomputed
+ * `expectedOrder` — it was built for the `previous_response_id`
+ * continuation path, where the stored prior chain supplies the
+ * trailing assistant's outstanding ids and only the caller's new
+ * delta needs to be reordered. This helper, by contrast, walks the
+ * FULL history and canonicalizes EVERY fan-out block in it, so it
+ * can be invoked on stateless cold-start histories (no
+ * `previous_response_id`) and on the Anthropic `/v1/messages`
+ * endpoint, both of which feed caller-supplied tool-message order
+ * straight into `primeHistory()` without the continuation gate
+ * running.
+ *
+ * Validation rules (checked BEFORE any reorder):
+ *
+ *   - Every `role === 'tool'` message in the history must appear
+ *     inside a contiguous block immediately following an assistant
+ *     fan-out turn. An orphan tool message (no preceding assistant,
+ *     or the preceding assistant has no `toolCalls`) is a violation.
+ *   - Inside a fan-out's tool block, every submitted `toolCallId`
+ *     must appear in the assistant's declared sibling-id set.
+ *   - The tool block must contain exactly one message per declared
+ *     sibling id — no missing ids, no extras, no duplicates.
+ *   - The final assistant turn in the history is not allowed to be
+ *     an unresolved fan-out: if the last assistant carries tool
+ *     calls and no resolutions follow it, the caller is submitting
+ *     a self-contained history whose trailing turn the chat-session
+ *     API cannot express as a continuation seed. Reject the request
+ *     rather than silently advancing into the model. (The
+ *     continuation path has its own gate for this shape — we do NOT
+ *     run the helper on the previous_response_id branch's delta,
+ *     see the call site for the invocation condition.)
+ *
+ * Canonicalization only runs once every precondition passes. The
+ * reorder is in place: `messages[i]` entries are swapped to match
+ * the sibling order, nothing is inserted or deleted.
+ *
+ * @returns `null` on success, or a human-readable error string
+ *   describing the first violation. Callers send the string back as
+ *   a 400 `invalid_request_error`.
+ */
+export function validateAndCanonicalizeHistoryToolOrder(messages: ChatMessage[]): string | null {
+  // Walk forward. When we see an assistant fan-out, read the
+  // contiguous tool block that follows and canonicalize it.
+  // When we see a tool message outside such a block, that's an
+  // orphan and we reject.
+  let i = 0;
+  while (i < messages.length) {
+    const m = messages[i]!;
+    if (m.role === 'tool') {
+      return (
+        `tool message at index ${i} (tool_call_id "${m.toolCallId ?? ''}") is not preceded by an assistant ` +
+        `fan-out. Every function_call_output must immediately follow the assistant turn whose tool_calls ` +
+        `include its call_id.`
+      );
+    }
+    if (m.role !== 'assistant' || !m.toolCalls || m.toolCalls.length === 0) {
+      i++;
+      continue;
+    }
+
+    // Assistant fan-out. Collect declared sibling ids.
+    const declaredIds: string[] = [];
+    const declaredSet = new Set<string>();
+    for (const tc of m.toolCalls) {
+      const id = typeof tc.id === 'string' ? tc.id : null;
+      if (id === null || id.length === 0) {
+        // Assistant tool call without an id — the server should never
+        // have produced one, but be defensive. Skip canonicalization
+        // for this fan-out; without an id we cannot reorder
+        // positionally by id.
+        return (
+          `assistant fan-out at index ${i} declares a tool_call with no id, which cannot be paired ` +
+          `with its function_call_output positionally.`
+        );
+      }
+      if (declaredSet.has(id)) {
+        return (
+          `assistant fan-out at index ${i} declares duplicate tool_call id "${id}". Each sibling call ` +
+          `must have a unique id.`
+        );
+      }
+      declaredIds.push(id);
+      declaredSet.add(id);
+    }
+
+    // Read the contiguous tool block following the fan-out.
+    const blockStart = i + 1;
+    let blockEnd = blockStart;
+    const seenInBlock = new Set<string>();
+    while (blockEnd < messages.length && messages[blockEnd]!.role === 'tool') {
+      const tool = messages[blockEnd]!;
+      const id = typeof tool.toolCallId === 'string' ? tool.toolCallId : null;
+      if (id === null || id.length === 0) {
+        return (
+          `tool message at index ${blockEnd} is missing tool_call_id. Every function_call_output in an ` +
+          `assistant fan-out's resolution block must carry the call_id it resolves.`
+        );
+      }
+      if (!declaredSet.has(id)) {
+        return (
+          `tool message at index ${blockEnd} references call_id "${id}", which is not declared by the ` +
+          `preceding assistant fan-out at index ${i}. Submitting a tool_result for an undeclared call_id ` +
+          `would silently bind output to the wrong sibling.`
+        );
+      }
+      if (seenInBlock.has(id)) {
+        return (
+          `duplicate tool message for call_id "${id}" inside the assistant fan-out's resolution block ` +
+          `(index ${blockEnd}). Each outstanding sibling must be resolved exactly once.`
+        );
+      }
+      seenInBlock.add(id);
+      blockEnd++;
+    }
+
+    const blockLength = blockEnd - blockStart;
+    if (blockLength === 0) {
+      // No resolutions at all. Allowed ONLY when the fan-out is the
+      // trailing assistant turn AND the caller intends to submit
+      // tool results in a follow-up request. In a self-contained
+      // stateless history (which is what this helper is invoked
+      // against) the chain cannot end with an unresolved fan-out —
+      // the chat-session API would have nothing to continue from.
+      if (blockEnd === messages.length) {
+        return (
+          `assistant fan-out at index ${i} is the trailing turn of the history but has no ` +
+          `function_call_output resolutions. A stateless cold-start history cannot end on an ` +
+          `unresolved tool_call fan-out because there is nothing for the model to continue from.`
+        );
+      }
+      // Mid-history assistant fan-out followed directly by another
+      // assistant/user/system message. This shape orphans the fan-out.
+      return (
+        `assistant fan-out at index ${i} declares ${declaredIds.length} tool_call${declaredIds.length === 1 ? '' : 's'} but the ` +
+        `next message at index ${blockEnd} is a ${messages[blockEnd]!.role} turn. Every fan-out must be ` +
+        `fully resolved by function_call_output messages before the next assistant/user/system turn.`
+      );
+    }
+    if (blockLength < declaredIds.length) {
+      const missing = declaredIds.filter((id) => !seenInBlock.has(id));
+      return (
+        `assistant fan-out at index ${i} has unresolved sibling tool calls: ${missing.join(', ')}. ` +
+        `Every declared tool_call must be answered by a function_call_output before the next turn.`
+      );
+    }
+    // blockLength > declaredIds.length is impossible: every entry in
+    // the block must have an id in declaredSet, and seenInBlock
+    // deduplicates by id, so seen.size == blockLength ≤ declaredIds.length.
+
+    // Canonicalize. The existing canonicalizeToolMessageOrder handles
+    // a single block cleanly — reuse it so the reorder logic lives
+    // in one place.
+    canonicalizeToolMessageOrder(messages, blockStart, declaredIds);
+
+    // Advance past the resolved block.
+    i = blockEnd;
+  }
+
+  return null;
+}
+
+/**
  * Outcome of a non-streaming session dispatch. `committed` is the
  * honest "did the session actually advance" signal, accounting for
  * any internal `session.reset()` the helper may have performed
@@ -1288,6 +1455,41 @@ export async function handleCreateResponse(
     canonicalizeToolMessageOrder(messages, priorOffset, expectedOutstandingIds);
     newInputMessages = messages.slice(priorOffset);
   }
+
+  // Walk the full merged history and canonicalize every assistant
+  // fan-out's trailing tool block against its declared sibling order.
+  //
+  // The multi-tool-call gate above only fires on `previous_response_id`
+  // continuations, and even there it only handles the caller's delta
+  // block against the STORED prior chain's trailing assistant. That
+  // leaves two cases uncovered:
+  //
+  //   1. Stateless cold-start histories (no `previous_response_id`).
+  //      The caller ships a full self-contained conversation through
+  //      `input`; the gate is skipped entirely and the caller-supplied
+  //      tool-message order flows straight into `primeHistory()`. A
+  //      caller can reverse two sibling tool outputs, and since
+  //      several native session backends pair tool results to
+  //      fan-out calls POSITIONALLY (not by id), each result binds
+  //      to the wrong sibling call.
+  //   2. Earlier fan-outs embedded inside the stored prior history
+  //      on a continuation. Those came from the server's own store
+  //      so they should already be canonical, but defense in depth
+  //      is cheap — a single full-history walk covers every shape.
+  //
+  // Malformed histories (missing/duplicate/unknown ids, orphan tool
+  // messages, unresolved trailing fan-out in a stateless request)
+  // are rejected with a clear 400 instead of silently rewritten.
+  const historyError = validateAndCanonicalizeHistoryToolOrder(messages);
+  if (historyError !== null) {
+    sendBadRequest(res, historyError, 'input');
+    return;
+  }
+  // Canonicalization may have reordered tool messages inside the
+  // continuation delta (on the stateless-history walk over the
+  // post-priorOffset portion), so recompute `newInputMessages` from
+  // the now-canonical `messages`.
+  newInputMessages = messages.slice(priorOffset);
 
   try {
     // `runSession*` plumbs an honest commit signal out of the helper:

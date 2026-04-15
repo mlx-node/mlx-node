@@ -2116,6 +2116,218 @@ describe('createHandler', () => {
       const resumed = sessionReg!.getOrCreate(resp2.id, null);
       expect(resumed.turns).toBeGreaterThan(0);
     });
+
+    it('shares one SessionRegistry across two names that alias the same model instance', async () => {
+      // Iteration-19 finding 1 regression: registering the same
+      // `SessionCapableModel` object under two friendly names must
+      // yield ONE shared `SessionRegistry`, not two. The
+      // single-warm-session invariant is a property of the
+      // underlying native KV cache (one per model instance), so
+      // if each alias got its own registry, each would enforce
+      // single-warm LOCALLY while the shared native state was
+      // silently stomped across alias boundaries. A turn through
+      // alias A would warm wrapper A in A's registry; a turn
+      // through alias B would warm wrapper B in B's (different)
+      // registry without evicting wrapper A; the next turn through
+      // A would hand back wrapper A, whose assumed native state
+      // has since been overwritten by B. The fix keys registries
+      // by model-object identity.
+      //
+      // Walk A -> B -> A using the `previous_response_id` chains
+      // routed through different alias names. All three turns must
+      // cold-replay through `chatSessionStart`; `chatSessionContinue`
+      // must never be reached. Identity equality on the shared
+      // registry is asserted directly so a regression on the
+      // aliasing mechanism (e.g. a per-name Map-of-Maps) fails
+      // before the behavioral test.
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'alias-A1' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'alias-B1' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'alias-A2-replay' }));
+      const chatSessionContinue = vi
+        .fn()
+        .mockRejectedValue(new Error('chatSessionContinue must not be reached under the alias invariant'));
+      const chatSessionContinueTool = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool,
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('model-a', mockModel);
+      registry.register('model-b', mockModel);
+
+      // Identity: both aliases resolve to the SAME SessionRegistry
+      // object. `===` is load-bearing here — a per-name copy of the
+      // registry would be structurally identical but physically
+      // distinct, and the single-warm invariant would not span the
+      // two aliases.
+      const sessionRegA = registry.getSessionRegistry('model-a');
+      const sessionRegB = registry.getSessionRegistry('model-b');
+      expect(sessionRegA).toBeDefined();
+      expect(sessionRegA).toBe(sessionRegB);
+      // listSessionRegistries must dedupe so the periodic sweeper
+      // in server.ts does not walk the same registry twice per tick.
+      expect(registry.listSessionRegistries()).toHaveLength(1);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Turn 1: fire on alias `model-a`, adopt sessA1 in the
+      // shared registry.
+      const reqA1 = createMockReq('POST', '/v1/responses', {
+        model: 'model-a',
+        input: 'hi via alias A',
+      });
+      const { res: resA1, getBody: getBodyA1, waitForEnd: waitA1 } = createMockRes();
+      await handler(reqA1, resA1);
+      await waitA1();
+      const respA1 = JSON.parse(getBodyA1());
+      expect(respA1.status).toBe('completed');
+      expect(respA1.output_text).toBe('alias-A1');
+      // The shared registry holds exactly one warm entry — the
+      // alias-A1 session. Under the pre-fix per-name registry shape
+      // this would also pass (A's registry has the entry, B's has
+      // none), so the next assertion is the meaningful one.
+      expect(sessionRegA!.size).toBe(1);
+
+      // Turn 2: fire on alias `model-b`, no previous_response_id.
+      // Under the single-warm invariant on the SHARED registry,
+      // adopting the alias-B1 session must evict the alias-A1
+      // wrapper (both aliases share the underlying native KV
+      // cache, so alias-A1's wrapper is now pointing at stomped
+      // state). Before the fix, alias-B1 would have adopted into
+      // its OWN registry and alias-A1 would still hold a live
+      // warm wrapper — that's the corruption path this test pins.
+      const reqB1 = createMockReq('POST', '/v1/responses', {
+        model: 'model-b',
+        input: 'hi via alias B',
+      });
+      const { res: resB1, getBody: getBodyB1, waitForEnd: waitB1 } = createMockRes();
+      await handler(reqB1, resB1);
+      await waitB1();
+      const respB1 = JSON.parse(getBodyB1());
+      expect(respB1.status).toBe('completed');
+      expect(respB1.output_text).toBe('alias-B1');
+      // Still exactly one warm entry — the alias-A1 wrapper has
+      // been evicted by the shared single-warm invariant.
+      expect(sessionRegA!.size).toBe(1);
+
+      // Turn 3: follow-up on alias-A1 via previous_response_id.
+      // The shared registry no longer has an entry for alias-A1,
+      // so `getOrCreate(respA1.id, null)` misses and the endpoint
+      // cold-replays from the store on a fresh session. The
+      // warm-path `chatSessionContinue` must NEVER fire — if it
+      // did, the test's rejecting stub would propagate as a 500.
+      const reqA2 = createMockReq('POST', '/v1/responses', {
+        model: 'model-a',
+        input: 'follow-up A',
+        previous_response_id: respA1.id,
+      });
+      const { res: resA2, getBody: getBodyA2, waitForEnd: waitA2 } = createMockRes();
+      await handler(reqA2, resA2);
+      await waitA2();
+      const respA2 = JSON.parse(getBodyA2());
+      expect(respA2.status).toBe('completed');
+      expect(respA2.output_text).toBe('alias-A2-replay');
+
+      expect(chatSessionStart).toHaveBeenCalledTimes(3);
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+    });
+
+    it('rejects a stateless history whose trailing assistant is an unresolved fan-out', async () => {
+      // Iteration-19 finding 2: the chat-session API cannot
+      // continue from an unresolved trailing fan-out in a
+      // stateless cold-start request — there is no mechanism to
+      // feed tool results back into a mid-turn state. The helper
+      // must reject with 400 rather than silently advancing into
+      // the model.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: 'need both' },
+          { type: 'function_call', name: 'get_weather', arguments: '{"city":"SF"}', call_id: 'call_a' },
+        ],
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toMatch(/trailing turn of the history but has no function_call_output resolutions/);
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).not.toHaveBeenCalled();
+    });
+
+    it('passes a well-formed stateless history through unchanged (canonicalization no-op)', async () => {
+      // Happy-path sibling of the reversed-order test. A
+      // well-formed stateless history with a single fan-out
+      // followed by tool resolutions in canonical order must
+      // flow through the helper without error and without
+      // reordering anything.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'both done' }));
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: 'need weather' },
+          { type: 'function_call', name: 'get_weather', arguments: '{"city":"SF"}', call_id: 'call_a' },
+          { type: 'function_call_output', call_id: 'call_a', output: '{"temp":68}' },
+          { type: 'message', role: 'user', content: 'now news' },
+          { type: 'function_call', name: 'get_news', arguments: '{"q":"tech"}', call_id: 'call_b' },
+          { type: 'function_call_output', call_id: 'call_b', output: '{"headlines":[]}' },
+        ],
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.output_text).toBe('both done');
+
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      const [primedMessages] = startSpy.mock.calls[0] as [ChatMessage[], unknown];
+      const toolMessages = primedMessages.filter((m: ChatMessage) => m.role === 'tool');
+      // Original order preserved — canonicalization was a no-op.
+      expect(toolMessages.map((m: ChatMessage) => m.toolCallId)).toEqual(['call_a', 'call_b']);
+    });
   });
 
   describe('GET /v1/models', () => {

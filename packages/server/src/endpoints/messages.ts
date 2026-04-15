@@ -36,6 +36,7 @@ import type { SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import type { AnthropicMessagesRequest } from '../types-anthropic.js';
+import { validateAndCanonicalizeHistoryToolOrder } from './responses.js';
 
 // ---------------------------------------------------------------------------
 // Non-streaming path
@@ -375,6 +376,29 @@ export async function handleCreateMessage(
     ({ messages, config } = mapAnthropicRequest(body));
   } catch (err) {
     sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
+    return;
+  }
+
+  // Walk the stateless history and canonicalize every assistant
+  // fan-out's trailing tool block against its declared sibling order.
+  //
+  // The Anthropic `/v1/messages` endpoint is ALWAYS a stateless
+  // cold-start — there is no continuation gate, no stored prior
+  // chain, no `previous_response_id`. The caller ships a full
+  // self-contained conversation in `req.messages` and
+  // `mapAnthropicRequest` produces the `ChatMessage[]` verbatim.
+  // That leaves caller-supplied tool_result ordering flowing
+  // straight into `primeHistory()`, so a caller can reverse two
+  // sibling tool outputs inside one fan-out's `tool_result` block
+  // and silently bind each output to the wrong call because several
+  // native session backends pair tool results to fan-out calls
+  // POSITIONALLY (not by id). Run the same helper the `/v1/responses`
+  // endpoint uses so a malformed block is rejected with a clear 400
+  // and a reversed-but-valid block is rewritten to canonical
+  // sibling order before dispatch.
+  const historyError = validateAndCanonicalizeHistoryToolOrder(messages);
+  if (historyError !== null) {
+    sendAnthropicBadRequest(res, historyError);
     return;
   }
 

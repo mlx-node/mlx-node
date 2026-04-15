@@ -924,4 +924,218 @@ describe('handleCreateMessage', () => {
       expect(sessionReg!.size).toBe(0);
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Iter-19 finding 2: canonicalize stateless fan-out tool order
+  // -----------------------------------------------------------------------
+
+  describe('stateless fan-out tool order', () => {
+    it('canonicalizes reversed sibling tool_result order to match the assistant fan-out', async () => {
+      // Iteration-19 finding 2 regression: the `/v1/messages`
+      // endpoint is ALWAYS a stateless cold-start. The caller
+      // ships a full conversation in `req.messages`, including
+      // `tool_use`/`tool_result` blocks that the Anthropic mapper
+      // folds into assistant fan-outs + subsequent `tool`
+      // ChatMessages. Without the new
+      // `validateAndCanonicalizeHistoryToolOrder` gate, caller-
+      // supplied tool_result ordering flowed straight into
+      // `primeHistory()`, and several native backends pair tool
+      // results to fan-out calls POSITIONALLY — so reversing two
+      // sibling tool_result blocks silently bound each output to
+      // the WRONG sibling call.
+      //
+      // Construct an assistant fan-out with tool_use ids
+      // [call_a, call_b], then submit reversed tool_result blocks
+      // [call_b, call_a] in the follow-up user turn. Spy on
+      // `chatSessionStart` to assert the handler reordered the
+      // tool messages to match the sibling declaration order
+      // BEFORE dispatching the primed history.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'both fetched' }));
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'get weather and news' },
+            {
+              role: 'assistant',
+              content: [
+                { type: 'tool_use', id: 'call_a', name: 'get_weather', input: { city: 'SF' } },
+                { type: 'tool_use', id: 'call_b', name: 'get_news', input: { q: 'tech' } },
+              ],
+            },
+            {
+              role: 'user',
+              content: [
+                // Intentionally reversed order — the handler must
+                // canonicalize to [call_a, call_b] before dispatch.
+                { type: 'tool_result', tool_use_id: 'call_b', content: '{"headlines":[]}' },
+                { type: 'tool_result', tool_use_id: 'call_a', content: '{"temp":68}' },
+              ],
+            },
+          ],
+          max_tokens: 100,
+        } as any,
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content[0].text).toBe('both fetched');
+
+      // Inspect the messages primed into chatSessionStart. The two
+      // tool messages must appear in canonical sibling order
+      // [call_a, call_b], with their contents moved along with the
+      // ids so each output is bound to the correct call.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      const [primedMessages] = startSpy.mock.calls[0] as [
+        Array<{ role: string; content: string; toolCallId?: string }>,
+      ];
+      const toolMessages = primedMessages.filter((m) => m.role === 'tool');
+      expect(toolMessages).toHaveLength(2);
+      expect(toolMessages[0]!.toolCallId).toBe('call_a');
+      expect(toolMessages[1]!.toolCallId).toBe('call_b');
+      expect(toolMessages[0]!.content).toBe('{"temp":68}');
+      expect(toolMessages[1]!.content).toBe('{"headlines":[]}');
+    });
+
+    it('passes a well-formed fan-out history through unchanged (canonicalization no-op)', async () => {
+      // Happy-path sibling of the reversed-order test. A
+      // well-formed fan-out with tool_result blocks already in
+      // sibling order must flow through without reordering.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'both fetched' }));
+      registry.register('test-model', mockModel);
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'get weather and news' },
+            {
+              role: 'assistant',
+              content: [
+                { type: 'tool_use', id: 'call_a', name: 'get_weather', input: { city: 'SF' } },
+                { type: 'tool_use', id: 'call_b', name: 'get_news', input: { q: 'tech' } },
+              ],
+            },
+            {
+              role: 'user',
+              content: [
+                { type: 'tool_result', tool_use_id: 'call_a', content: '{"temp":68}' },
+                { type: 'tool_result', tool_use_id: 'call_b', content: '{"headlines":[]}' },
+              ],
+            },
+          ],
+          max_tokens: 100,
+        } as any,
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      const [primedMessages] = startSpy.mock.calls[0] as [
+        Array<{ role: string; content: string; toolCallId?: string }>,
+      ];
+      const toolMessages = primedMessages.filter((m) => m.role === 'tool');
+      expect(toolMessages.map((m) => m.toolCallId)).toEqual(['call_a', 'call_b']);
+      // Contents must line up with their original ids — a naive
+      // swap that only moved ids without content would fail here.
+      expect(toolMessages[0]!.content).toBe('{"temp":68}');
+      expect(toolMessages[1]!.content).toBe('{"headlines":[]}');
+    });
+
+    it('returns 400 on a malformed fan-out missing a sibling tool_result', async () => {
+      // The helper must reject a history with a declared
+      // sibling that has no matching tool_result. Submitting only
+      // `call_a`'s result when the assistant fanned out to both
+      // [call_a, call_b] would orphan `call_b`. Reject with 400.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'get both' },
+            {
+              role: 'assistant',
+              content: [
+                { type: 'tool_use', id: 'call_a', name: 'get_weather', input: { city: 'SF' } },
+                { type: 'tool_use', id: 'call_b', name: 'get_news', input: { q: 'tech' } },
+              ],
+            },
+            {
+              role: 'user',
+              content: [
+                { type: 'tool_result', tool_use_id: 'call_a', content: '{"temp":68}' },
+                // call_b's result is missing — and the trailing
+                // user content is a plain text continuation
+                // instead of the expected second tool_result.
+                { type: 'text', text: 'any updates?' },
+              ],
+            },
+          ],
+          max_tokens: 100,
+        } as any,
+        registry,
+      );
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.type).toBe('error');
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toMatch(/unresolved sibling tool calls|fan-out at index .* declares .* tool_call/);
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 on a tool_result referencing an unknown call_id', async () => {
+      // Binding a tool_result to a call id not declared by the
+      // preceding assistant fan-out would silently flow the output
+      // to the wrong place (or to nothing at all). Reject.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'get weather' },
+            {
+              role: 'assistant',
+              content: [{ type: 'tool_use', id: 'call_a', name: 'get_weather', input: { city: 'SF' } }],
+            },
+            {
+              role: 'user',
+              content: [{ type: 'tool_result', tool_use_id: 'call_ghost', content: '{"temp":68}' }],
+            },
+          ],
+          max_tokens: 100,
+        } as any,
+        registry,
+      );
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.message).toMatch(/not declared by the preceding assistant fan-out/);
+    });
+  });
 });
