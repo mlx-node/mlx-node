@@ -2290,6 +2290,251 @@ describe('createHandler', () => {
       expect(startSpy).not.toHaveBeenCalled();
     });
 
+    it('canonicalizes an earlier stored fan-out block on a multi-turn previous_response_id replay', async () => {
+      // Iteration-20 regression (finding 1): before the fix,
+      // `canonicalizeToolMessageOrder` scanned all the way to
+      // `messages.length`, so the full-history walker's per-fan-out
+      // invocation would pull in tool messages from EVERY later
+      // block. For a reconstructed chain with two resolved
+      // multi-tool fan-outs, the first call would see tool messages
+      // from both blocks, the count gate
+      // (`toolPositions.length !== expectedOrder.length`) would
+      // bail, and a stored first block in non-canonical order would
+      // pass straight through to `primeHistory()` uncorrected.
+      //
+      // The `/v1/responses` input mapper splits each `function_call`
+      // item into its own single-sibling assistant message, so the
+      // multi-fan-out shape is unreachable through a cold-start
+      // input. The only way this bug surfaces on `/v1/responses` is
+      // via `previous_response_id` + `reconstructMessagesFromChain`
+      // grouping stored output items into one assistant message per
+      // stored record. We seed the store directly with two such
+      // records — the first one's stored `inputJson` contains the
+      // previous turn's tool results in REVERSED sibling order —
+      // and then submit a canonical continuation that fully resolves
+      // the trailing fan-out. The walker's defense-in-depth sweep
+      // must rewrite the stored first block into canonical sibling
+      // order before dispatch.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'all fetched' }));
+      registry.register('test-model', mockModel);
+
+      interface SeededRecord {
+        id: string;
+        createdAt: number;
+        model: string;
+        status: string;
+        inputJson: string;
+        outputJson: string;
+        outputText: string;
+        usageJson: string;
+        previousResponseId?: string;
+        configJson?: string;
+        expiresAt?: number;
+      }
+      const storedRecords = new Map<string, SeededRecord>();
+      // Record A: the initial user turn with a multi-tool fan-out response.
+      storedRecords.set('resp_a', {
+        id: 'resp_a',
+        createdAt: Math.floor(Date.now() / 1000),
+        model: 'test-model',
+        status: 'completed',
+        inputJson: JSON.stringify([{ role: 'user', content: 'call fn' }]),
+        outputJson: JSON.stringify([
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '' }] },
+          { type: 'function_call', name: 'get_a', arguments: '{"k":"a"}', call_id: 'call_1' },
+          { type: 'function_call', name: 'get_b', arguments: '{"k":"b"}', call_id: 'call_2' },
+        ]),
+        outputText: '',
+        usageJson: '{}',
+      });
+      // Record B: the follow-up turn whose stored `inputJson`
+      // contains the previous fan-out's tool results in REVERSED
+      // sibling order. This simulates either (a) a historical record
+      // stored before the continuation-path canonicalization landed,
+      // or (b) defense-in-depth coverage for any future regression
+      // that could store a non-canonical block.
+      storedRecords.set('resp_b', {
+        id: 'resp_b',
+        createdAt: Math.floor(Date.now() / 1000),
+        model: 'test-model',
+        status: 'completed',
+        inputJson: JSON.stringify([
+          { role: 'tool', content: '{"v":"b-result"}', toolCallId: 'call_2' },
+          { role: 'tool', content: '{"v":"a-result"}', toolCallId: 'call_1' },
+          { role: 'user', content: 'call again' },
+        ]),
+        outputJson: JSON.stringify([
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '' }] },
+          { type: 'function_call', name: 'get_c', arguments: '{"k":"c"}', call_id: 'call_3' },
+          { type: 'function_call', name: 'get_d', arguments: '{"k":"d"}', call_id: 'call_4' },
+        ]),
+        outputText: '',
+        usageJson: '{}',
+        previousResponseId: 'resp_a',
+      });
+      const mockStore = {
+        store: vi.fn(() => Promise.resolve()),
+        getChain: vi.fn((id: string) => {
+          const out: SeededRecord[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Turn C: continuation against `resp_b`, resolving the
+      // trailing fan-out {call_3, call_4} in canonical order so the
+      // delta canonicalization at the `priorOffset` call site is a
+      // no-op. The reorder under test is the one performed by the
+      // full-history walker over the stored prior chain.
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: 'resp_b',
+        input: [
+          { type: 'function_call_output', call_id: 'call_3', output: '{"v":"c-result"}' },
+          { type: 'function_call_output', call_id: 'call_4', output: '{"v":"d-result"}' },
+        ],
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.output_text).toBe('all fetched');
+
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      const [primedMessages] = startSpy.mock.calls[0] as [ChatMessage[], unknown];
+      const toolMessages = primedMessages.filter((m: ChatMessage) => m.role === 'tool');
+      expect(toolMessages).toHaveLength(4);
+      // First block: rewritten from the stored [call_2, call_1]
+      // order into canonical sibling order [call_1, call_2]. The
+      // CONTENT must move with the id — not just the id swap.
+      expect(toolMessages[0]!.toolCallId).toBe('call_1');
+      expect(toolMessages[0]!.content).toBe('{"v":"a-result"}');
+      expect(toolMessages[1]!.toolCallId).toBe('call_2');
+      expect(toolMessages[1]!.content).toBe('{"v":"b-result"}');
+      // Second block: the caller-submitted delta, already canonical.
+      expect(toolMessages[2]!.toolCallId).toBe('call_3');
+      expect(toolMessages[2]!.content).toBe('{"v":"c-result"}');
+      expect(toolMessages[3]!.toolCallId).toBe('call_4');
+      expect(toolMessages[3]!.content).toBe('{"v":"d-result"}');
+    });
+
+    it('rejects previous_response_id continuation when the stored chain was produced by a different model', async () => {
+      // Iteration-20 regression (finding 2): the endpoint resolves
+      // `body.model` through the live `ModelRegistry` binding and
+      // reconstructs the prior chain via `store.getChain()`, but it
+      // never verified that the stored chain's trailing record was
+      // produced by the SAME model the request targets. Because
+      // `ModelRegistry.register()` allows replacing a name with a
+      // different underlying model (hot-swap), AND per-instance
+      // registry sharing also lets the same chain be referenced
+      // under a different friendly name, a request carrying a
+      // `previous_response_id` pointing at one model's chain could
+      // silently replay that chain through a totally different
+      // model's tokenizer / chat template / KV layout — nonsense
+      // output at best, a corrupted continuation at worst.
+      //
+      // Register two different mock models under `model-alpha` and
+      // `model-beta`, persist a chain produced by `model-alpha`,
+      // then POST a continuation that sets `body.model:
+      // 'model-beta'`. The endpoint must fail closed with 400,
+      // mention both model names in the error, and never dispatch
+      // either model.
+      const registry = new ModelRegistry();
+      const alphaModel = createMockModel(makeChatResult({ text: 'alpha reply' }));
+      const betaModel = createMockModel(makeChatResult({ text: 'beta reply' }));
+      registry.register('model-alpha', alphaModel);
+      registry.register('model-beta', betaModel);
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Turn 1: cold-start request against `model-alpha` populates
+      // the store with a chain whose trailing record has
+      // `model: 'model-alpha'`.
+      const req1 = createMockReq('POST', '/v1/responses', {
+        model: 'model-alpha',
+        input: 'hi from alpha',
+      });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1 = JSON.parse(getBody1());
+      expect(resp1.status).toBe('completed');
+
+      // Sanity: alphaModel ran once, betaModel never.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const alphaStart = alphaModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const betaStart = betaModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const betaContinue = betaModel.chatSessionContinue as unknown as ReturnType<typeof vi.fn>;
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const betaContinueTool = betaModel.chatSessionContinueTool as unknown as ReturnType<typeof vi.fn>;
+      expect(alphaStart).toHaveBeenCalledTimes(1);
+      expect(betaStart).not.toHaveBeenCalled();
+
+      // Clear the alpha calls before turn 2 so the dispatch-count
+      // assertions below are scoped to the continuation only.
+      alphaStart.mockClear();
+
+      // Turn 2: continuation targets `model-beta` instead of
+      // `model-alpha`. The gate must reject 400.
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'model-beta',
+        previous_response_id: resp1.id,
+        input: 'continue the chain please',
+      });
+      const { res: res2, getStatus: getStatus2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+
+      expect(getStatus2()).toBe(400);
+      const err = JSON.parse(getBody2());
+      expect(err.error.type).toBe('invalid_request_error');
+      // The error must mention BOTH the stored model and the
+      // requested model so the client can tell what mismatched.
+      expect(err.error.message).toContain('model-alpha');
+      expect(err.error.message).toContain('model-beta');
+      expect(err.error.message).toMatch(/Continuations cannot cross model boundaries/i);
+
+      // No dispatch on either model — the gate must fire before
+      // any chatSessionStart / chatSessionContinue / chatSessionContinueTool.
+      expect(alphaStart).not.toHaveBeenCalled();
+      expect(betaStart).not.toHaveBeenCalled();
+      expect(betaContinue).not.toHaveBeenCalled();
+      expect(betaContinueTool).not.toHaveBeenCalled();
+    });
+
     it('passes a well-formed stateless history through unchanged (canonicalization no-op)', async () => {
       // Happy-path sibling of the reversed-order test. A
       // well-formed stateless history with a single fan-out

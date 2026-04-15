@@ -698,8 +698,9 @@ function buildTrailingAssistantToolCallIds(messages: ChatMessage[]): Set<string>
 }
 
 /**
- * Reorder the tool messages in `messages` starting at `startOffset`
- * so their relative positions match `expectedOrder`.
+ * Reorder the tool messages in `messages` across the half-open range
+ * `[startOffset, blockEnd)` so their relative positions match
+ * `expectedOrder`.
  *
  * Replay correctness for a multi-tool-call fan-out depends on POSITION,
  * not `tool_call_id` — several backends drop the id on the wire and
@@ -709,6 +710,20 @@ function buildTrailingAssistantToolCallIds(messages: ChatMessage[]): Set<string>
  * the id-set gate passes. This helper canonicalizes the submitted
  * ordering to the stored sibling order before the replay runs.
  *
+ * The `blockEnd` bound is load-bearing: callers MUST size it to a
+ * single contiguous tool block (i.e. the run of `role === 'tool'`
+ * messages that immediately follow one assistant fan-out). A history
+ * with multiple resolved fan-outs has several such blocks, and
+ * walking past the first block's end would pull in tool messages from
+ * a later, unrelated fan-out — the id-set gate below would then bail
+ * on `toolPositions.length !== expectedOrder.length` without
+ * reordering anything, silently leaving the first block misordered.
+ * The full-history walker at `validateAndCanonicalizeHistoryToolOrder`
+ * computes a `blockEnd` per fan-out and invokes this helper once per
+ * block; the `previous_response_id` continuation path computes its
+ * own `blockEnd` by scanning forward while the next message is a
+ * `tool` turn.
+ *
  * Assumes the call-id SET has already been validated against
  * `expectedOrder`; this helper is a no-op when any precondition does
  * not hold (missing id, count mismatch, etc.) so callers are safe to
@@ -717,11 +732,12 @@ function buildTrailingAssistantToolCallIds(messages: ChatMessage[]): Set<string>
 function canonicalizeToolMessageOrder(
   messages: ChatMessage[],
   startOffset: number,
+  blockEnd: number,
   expectedOrder: readonly string[],
 ): void {
   const toolPositions: number[] = [];
   const byId = new Map<string, ChatMessage>();
-  for (let i = startOffset; i < messages.length; i++) {
+  for (let i = startOffset; i < blockEnd; i++) {
     const m = messages[i]!;
     if (m.role === 'tool' && typeof m.toolCallId === 'string' && m.toolCallId.length > 0) {
       toolPositions.push(i);
@@ -902,8 +918,11 @@ export function validateAndCanonicalizeHistoryToolOrder(messages: ChatMessage[])
 
     // Canonicalize. The existing canonicalizeToolMessageOrder handles
     // a single block cleanly — reuse it so the reorder logic lives
-    // in one place.
-    canonicalizeToolMessageOrder(messages, blockStart, declaredIds);
+    // in one place. Pass `blockEnd` so the helper only inspects THIS
+    // fan-out's contiguous tool block and doesn't accidentally scan
+    // into a later fan-out's tool messages (which would cause the
+    // helper's count gate to bail without reordering anything).
+    canonicalizeToolMessageOrder(messages, blockStart, blockEnd, declaredIds);
 
     // Advance past the resolved block.
     i = blockEnd;
@@ -1167,6 +1186,34 @@ export async function handleCreateResponse(
       const chain = await store.getChain(body.previous_response_id);
       if (chain.length === 0) {
         sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
+        return;
+      }
+      // Cross-model continuation guard. The stored trailing record is
+      // the authoritative record of which model produced this chain;
+      // compare it against the model the caller requested and reject
+      // 400 on mismatch. A mismatch is never safe: `ModelRegistry`
+      // allows hot-swapping a name to a different underlying model,
+      // and per-instance registry sharing also lets the same chain be
+      // referenced under a different friendly name, so a request with
+      // `previous_response_id` pointing at one model's chain can
+      // otherwise silently replay that chain through a totally
+      // different model's tokenizer, chat template, and KV cache. The
+      // stored tokens would be re-tokenized by the wrong template and
+      // either be nonsense or — worse — be interpreted as a different
+      // conversation entirely. Fail closed: this is a client-authored
+      // mismatch (wrong `model` in the request body) so a 400 is the
+      // right shape, not a 500.
+      const storedModel = chain[chain.length - 1]!.model;
+      if (storedModel !== body.model) {
+        sendBadRequest(
+          res,
+          `previous_response_id "${body.previous_response_id}" was produced by model "${storedModel}" but the ` +
+            `request targets model "${body.model}". Continuations cannot cross model boundaries — a stored ` +
+            `chain is tied to the tokenizer, chat template, and KV layout of the model that produced it, and ` +
+            `replaying it through a different model would silently corrupt the conversation. Start a new ` +
+            `chain without previous_response_id, or resubmit against the original model.`,
+          'model',
+        );
         return;
       }
       priorMessages = reconstructMessagesFromChain(chain);
@@ -1452,7 +1499,20 @@ export async function handleCreateResponse(
     // for future chain reconstruction) must reflect the canonical
     // order, otherwise a caller can swap outputs and silently poison
     // replay even after the id-set gate passes.
-    canonicalizeToolMessageOrder(messages, priorOffset, expectedOutstandingIds);
+    //
+    // Compute the tool block's end as the contiguous-prefix run of
+    // `role === 'tool'` messages starting at `priorOffset`. The
+    // contiguous-prefix guard above already rejected any shape that
+    // interleaves a non-tool message inside the delta's tool block,
+    // so this simple forward scan matches the exact block the gate
+    // just authenticated. Passing an explicit `blockEnd` keeps the
+    // helper from accidentally walking into any later turn that
+    // `mapRequest` may have appended to `messages`.
+    let deltaBlockEnd = priorOffset;
+    while (deltaBlockEnd < messages.length && messages[deltaBlockEnd]!.role === 'tool') {
+      deltaBlockEnd++;
+    }
+    canonicalizeToolMessageOrder(messages, priorOffset, deltaBlockEnd, expectedOutstandingIds);
     newInputMessages = messages.slice(priorOffset);
   }
 

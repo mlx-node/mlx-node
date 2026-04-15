@@ -1005,6 +1005,98 @@ describe('handleCreateMessage', () => {
       expect(toolMessages[1]!.content).toBe('{"headlines":[]}');
     });
 
+    it('canonicalizes a reversed tool-result block when an earlier fan-out is already resolved', async () => {
+      // Iteration-20 regression (finding 1), Anthropic variant:
+      // before the fix `canonicalizeToolMessageOrder` scanned to
+      // `messages.length`, so when the full-history walker invoked
+      // it for the first fan-out in a history with multiple
+      // resolved fan-outs, the helper would see tool messages from
+      // every later block, fail its count gate
+      // (`toolPositions.length !== expectedOrder.length`), and
+      // silently leave a reversed first block uncorrected. The
+      // `/v1/messages` endpoint is the same user-facing risk
+      // surface as `/v1/responses` — both run the walker over a
+      // full self-contained history on every request — so the
+      // regression needs a twin assertion here.
+      //
+      // Build a two-fan-out Anthropic history where the FIRST
+      // fan-out's `tool_result` blocks are reversed and the
+      // SECOND fan-out is canonical. Assert that
+      // `chatSessionStart` is primed with both blocks in sibling
+      // order and that each output's content stayed bound to its
+      // call id through the swap.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'all fetched' }));
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'call fn' },
+            {
+              role: 'assistant',
+              content: [
+                { type: 'tool_use', id: 'call_1', name: 'get_a', input: { k: 'a' } },
+                { type: 'tool_use', id: 'call_2', name: 'get_b', input: { k: 'b' } },
+              ],
+            },
+            {
+              role: 'user',
+              content: [
+                // First fan-out's tool_result blocks reversed.
+                { type: 'tool_result', tool_use_id: 'call_2', content: '{"v":"b-result"}' },
+                { type: 'tool_result', tool_use_id: 'call_1', content: '{"v":"a-result"}' },
+              ],
+            },
+            {
+              role: 'assistant',
+              content: [
+                { type: 'tool_use', id: 'call_3', name: 'get_c', input: { k: 'c' } },
+                { type: 'tool_use', id: 'call_4', name: 'get_d', input: { k: 'd' } },
+              ],
+            },
+            {
+              role: 'user',
+              content: [
+                // Second fan-out already canonical.
+                { type: 'tool_result', tool_use_id: 'call_3', content: '{"v":"c-result"}' },
+                { type: 'tool_result', tool_use_id: 'call_4', content: '{"v":"d-result"}' },
+              ],
+            },
+          ],
+          max_tokens: 100,
+        } as any,
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content[0].text).toBe('all fetched');
+
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      const [primedMessages] = startSpy.mock.calls[0] as [
+        Array<{ role: string; content: string; toolCallId?: string }>,
+      ];
+      const toolMessages = primedMessages.filter((m) => m.role === 'tool');
+      expect(toolMessages).toHaveLength(4);
+      // First fan-out's tool block must now be in canonical sibling
+      // order [call_1, call_2] and each content must track its id.
+      expect(toolMessages[0]!.toolCallId).toBe('call_1');
+      expect(toolMessages[0]!.content).toBe('{"v":"a-result"}');
+      expect(toolMessages[1]!.toolCallId).toBe('call_2');
+      expect(toolMessages[1]!.content).toBe('{"v":"b-result"}');
+      // Second fan-out's tool block was already canonical.
+      expect(toolMessages[2]!.toolCallId).toBe('call_3');
+      expect(toolMessages[2]!.content).toBe('{"v":"c-result"}');
+      expect(toolMessages[3]!.toolCallId).toBe('call_4');
+      expect(toolMessages[3]!.content).toBe('{"v":"d-result"}');
+    });
+
     it('passes a well-formed fan-out history through unchanged (canonicalization no-op)', async () => {
       // Happy-path sibling of the reversed-order test. A
       // well-formed fan-out with tool_result blocks already in
