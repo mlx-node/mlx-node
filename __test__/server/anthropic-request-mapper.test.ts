@@ -180,14 +180,20 @@ describe('mapAnthropicRequest', () => {
     expect(messages[0].images).toHaveLength(1);
   });
 
-  it('prefixes tool_result.is_error=true content with [tool error] marker', () => {
-    // Iter-23 finding 2: `ChatMessage.content` is a string and
+  it('wraps tool_result.is_error=true content in a JSON envelope', () => {
+    // Iter-24 finding 2: `ChatMessage.content` is a string and
     // `ChatMessage` is a NAPI-generated struct with no `isError`
-    // field. The mapper encodes the Anthropic
-    // `tool_result.is_error` flag by prefixing the resolved
-    // content with a `[tool error] ` marker so `primeHistory` /
-    // `sendToolResult` can distinguish a failed tool call from a
-    // successful one through the chat template.
+    // field. The iter-23 encoding prefixed errored content with
+    // a `[tool error] ` marker, but that mutated the payload:
+    // JSON outputs became invalid JSON, successful outputs
+    // starting with `[tool error] ` were indistinguishable from
+    // errors, and errored outputs already carrying the prefix
+    // got double-prefixed. The mapper now wraps errored content
+    // in a JSON envelope — `{ "is_error": true, "content":
+    // <original> }` — so the encoding is unambiguous, lossless,
+    // and non-colliding: JSON escaping preserves the raw
+    // payload verbatim, and a successful tool_result is passed
+    // through untouched.
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
@@ -207,13 +213,80 @@ describe('mapAnthropicRequest', () => {
     });
 
     expect(messages).toEqual([
-      { role: 'tool', content: '[tool error] boom: connection refused', toolCallId: 'call_fail' },
+      {
+        role: 'tool',
+        content: JSON.stringify({ is_error: true, content: 'boom: connection refused' }),
+        toolCallId: 'call_fail',
+      },
     ]);
   });
 
+  it('preserves a JSON tool_result payload losslessly inside the is_error envelope', () => {
+    // Iter-24 finding 2 regression: a JSON payload would be
+    // shredded by the iter-23 `[tool error] ` prefix because
+    // prepending literal text to `{...}` produces a string
+    // that no longer parses as JSON. The envelope preserves
+    // the raw payload verbatim as the `content` field, so a
+    // downstream reader can either pass the whole envelope
+    // through or `JSON.parse` it and recover both the flag
+    // and the original JSON text.
+    const jsonPayload = '{"error_code":500,"message":"upstream unavailable"}';
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_json_fail',
+              content: jsonPayload,
+              is_error: true,
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(messages).toHaveLength(1);
+    const toolMsg = messages[0]!;
+    expect(toolMsg.role).toBe('tool');
+    expect(toolMsg.toolCallId).toBe('call_json_fail');
+    // The encoded content is itself valid JSON and `content` inside
+    // equals the untouched original payload.
+    const parsed = JSON.parse(toolMsg.content) as { is_error: boolean; content: string };
+    expect(parsed).toEqual({ is_error: true, content: jsonPayload });
+  });
+
+  it('does not wrap successful tool_result content that looks like a JSON envelope', () => {
+    // Iter-24 finding 2 counter-test: a successful tool_result
+    // whose content happens to be a JSON object — including one
+    // structurally resembling `{"is_error":true,"content":...}`
+    // — MUST NOT be rewrapped. Successful payloads are passed
+    // through verbatim, so the envelope shape is reserved
+    // exclusively for `is_error === true` on the mapper output.
+    const suspicious = '{"is_error":true,"content":"this was supplied by a tool that returned success"}';
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'call_ok', content: suspicious, is_error: false }],
+        },
+      ],
+    });
+
+    expect(messages).toEqual([{ role: 'tool', content: suspicious, toolCallId: 'call_ok' }]);
+  });
+
   it('leaves tool_result content untouched when is_error is absent or false', () => {
-    // Counter-test for iter-23 finding 2: the `[tool error] `
-    // prefix must NOT leak into successful tool_result content.
+    // Counter-test for iter-24 finding 2: the envelope MUST NOT
+    // leak into successful tool_result content — including
+    // content that starts with `[tool error] `, which under
+    // the iter-23 prefix encoding would have been
+    // indistinguishable from a real failure.
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
@@ -223,6 +296,7 @@ describe('mapAnthropicRequest', () => {
           content: [
             { type: 'tool_result', tool_use_id: 'call_ok_1', content: '72F and sunny', is_error: false },
             { type: 'tool_result', tool_use_id: 'call_ok_2', content: '68F and cloudy' },
+            { type: 'tool_result', tool_use_id: 'call_ok_3', content: '[tool error] this is a legitimate payload' },
           ],
         },
       ],
@@ -231,6 +305,7 @@ describe('mapAnthropicRequest', () => {
     expect(messages).toEqual([
       { role: 'tool', content: '72F and sunny', toolCallId: 'call_ok_1' },
       { role: 'tool', content: '68F and cloudy', toolCallId: 'call_ok_2' },
+      { role: 'tool', content: '[tool error] this is a legitimate payload', toolCallId: 'call_ok_3' },
     ]);
   });
 

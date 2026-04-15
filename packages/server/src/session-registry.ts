@@ -93,6 +93,35 @@
  *     `setInterval` and will synchronously walk the map (which holds
  *     at most one entry) without colliding with in-flight
  *     `getOrCreate`/`adopt`/`drop` calls.
+ *
+ *   - **Per-model execution mutex.** The internal `Map` is safe
+ *     within one event loop tick, but a dispatch that spans multiple
+ *     awaits (map → prefill → decode → map → persist → adopt) is NOT
+ *     atomic from the registry's point of view. Two requests that
+ *     reach `getOrCreate` for the same model in overlapping ticks —
+ *     either under the same `previous_response_id` or with different
+ *     ids (or `null`) — both receive a `ChatSession` pointing at the
+ *     SAME underlying native model. Even though the lease-on-hit
+ *     clear prevents two callers from ever sharing one `ChatSession`
+ *     object, the underlying native KV cache is a single mutable
+ *     resource: if both dispatches run in parallel the second
+ *     request's prefill clobbers the first's KV state, and whichever
+ *     request finishes last wins the `adopt()` — poisoning the hot
+ *     path for every subsequent chained turn.
+ *
+ *     `withExclusive(fn)` serializes every per-model dispatch. The
+ *     `/v1/responses` and `/v1/messages` endpoints each wrap the full
+ *     `getOrCreate → run → adopt/drop` span in a single `withExclusive`
+ *     so at most one request at a time holds the model. The lock
+ *     chain is FIFO: each call captures the current tail, publishes
+ *     a new pending promise as the new tail, and awaits the old tail
+ *     before running `fn`. Errors are caught in a `try/finally` so a
+ *     rejected dispatch still releases the lock for the next waiter.
+ *     This is semantically correct — the native model is a single
+ *     mutable resource anyway — and it is the only fix that
+ *     prevents concurrent native-state clobbering. A weaker
+ *     epoch-token scheme would let the losing dispatch's
+ *     `adopt()` no-op, but the native KV would already be wrong.
  */
 
 import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
@@ -135,6 +164,17 @@ export class SessionRegistry {
    * turn on another cached entry.
    */
   private readonly entries: Map<string, SessionEntry> = new Map();
+  /**
+   * Tail of the per-model execution FIFO. Every `withExclusive` call
+   * captures this value as its predecessor, then overwrites it with
+   * its own pending promise so the next waiter chains after it. The
+   * chain is resolved only when the current holder's `fn` has
+   * settled (success or failure), guaranteeing that at most one
+   * dispatch runs through this registry's native model at a time.
+   * Initialized to `Promise.resolve()` so the first caller proceeds
+   * without waiting.
+   */
+  private execLock: Promise<void> = Promise.resolve();
 
   constructor(opts: SessionRegistryOptions) {
     this.model = opts.model;
@@ -273,5 +313,46 @@ export class SessionRegistry {
   /** Empty the registry. Useful at shutdown and in tests. */
   clear(): void {
     this.entries.clear();
+  }
+
+  /**
+   * Serialize `fn` against every other dispatch that runs through
+   * this registry's model.
+   *
+   * The caller must hold the lock across the entire per-model
+   * dispatch span — `getOrCreate` → `primeHistory`/`send*` →
+   * `adopt`/`drop`. Two overlapping `/v1/responses` and `/v1/messages`
+   * requests targeting the same model both allocate a `ChatSession`
+   * that points at the SAME underlying native `SessionCapableModel`;
+   * the lease-on-hit clear prevents two callers from ever sharing
+   * one `ChatSession` object, but the native KV cache is a single
+   * mutable resource and two concurrent `primeHistory()` /
+   * `send*()` calls against it would race — whichever finished last
+   * would win, corrupting the hot path for the chain the other
+   * dispatch was supposed to service. The mutex restores correctness
+   * by making every dispatch exclusive: at most one request at a
+   * time holds the model, and the adopt/drop bookkeeping that runs
+   * just after the dispatch body cannot see a stale native state
+   * because no other dispatch can slip in between `fn`'s resolve
+   * and the `finally` that releases the lock.
+   *
+   * Implementation: FIFO chaining via a rolling `execLock` promise.
+   * Each caller captures the current tail, publishes a fresh pending
+   * promise as the new tail, awaits the old tail, then runs `fn`.
+   * The `finally` releases regardless of whether `fn` threw, so a
+   * rejected dispatch cannot leave the lock permanently held.
+   */
+  async withExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.execLock;
+    let release!: () => void;
+    this.execLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      await prev;
+      return await fn();
+    } finally {
+      release();
+    }
   }
 }

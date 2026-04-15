@@ -1497,6 +1497,232 @@ describe('createHandler', () => {
       expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
     });
 
+    it('cold-replays an assistant turn whose text is empty but reasoning is present', async () => {
+      // Iter-24 finding 3 integration regression: a stored
+      // response record containing a non-empty `reasoning`
+      // item and an empty `message` item MUST survive
+      // reconstruction on cold replay. With the iter-23
+      // predicate the assistant turn was dropped from the
+      // reconstructed chain entirely, so a subsequent
+      // `previous_response_id` continuation that fell through
+      // to the cold-replay path primed the model with a
+      // history that silently skipped the reasoning — a
+      // different conversation from the hot-path resume of
+      // the same chain.
+      //
+      // Force the cold-replay path by clearing the session
+      // registry between turns so the hot session cannot be
+      // reused. The second turn then reconstructs the chain
+      // from the store, and we inspect the primed history
+      // passed to `chatSessionStart` to confirm the assistant
+      // turn (with its reasoning) is present.
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        // Turn 1: empty text alongside reasoning-only output.
+        // `thinking` surfaces the reasoning item in the stored
+        // `outputJson` via `buildOutputItems`, and `text` is
+        // empty so the message item carries an empty string.
+        .mockResolvedValueOnce(
+          makeChatResult({
+            text: '',
+            thinking: 'I considered every option and chose to say nothing.',
+            reasoningTokens: 7,
+          }),
+        )
+        // Turn 2 (cold replay): returns a normal assistant reply.
+        .mockResolvedValueOnce(makeChatResult({ text: 'here is my real answer' }));
+      const chatSessionContinue = vi
+        .fn()
+        .mockRejectedValue(new Error('chatSessionContinue should not be reached on cold replay'));
+      const chatSessionContinueTool = vi
+        .fn()
+        .mockRejectedValue(new Error('chatSessionContinueTool should not be reached'));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool,
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Turn 1: emit a stored assistant turn with reasoning only.
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'think about this' });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1 = JSON.parse(getBody1());
+      expect(resp1.status).toBe('completed');
+      expect(resp1.output_text).toBe('');
+
+      // Sanity: the stored record actually contains a reasoning
+      // item alongside the empty message item. Otherwise the
+      // regression we're testing would be vacuous.
+      const stored = storedRecords.get(resp1.id);
+      expect(stored).toBeDefined();
+      const outputItems = JSON.parse(stored.outputJson) as Array<{ type: string }>;
+      expect(outputItems.some((i) => i.type === 'reasoning')).toBe(true);
+      expect(outputItems.some((i) => i.type === 'message')).toBe(true);
+
+      // Force cold replay by clearing the session cache so the
+      // second turn falls through to `primeHistory` + full
+      // history reconstruction via `reconstructMessagesFromChain`.
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+      sessionReg.clear();
+
+      // Turn 2: plain user continuation referencing turn 1.
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: resp1.id,
+        input: 'ok now answer',
+      });
+      const { res: res2, getBody: getBody2, waitForEnd: wait2, getStatus: getStatus2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+      expect(getStatus2()).toBe(200);
+      const resp2 = JSON.parse(getBody2());
+      expect(resp2.status).toBe('completed');
+      expect(resp2.output_text).toBe('here is my real answer');
+
+      // The cold-replay path must have dispatched via
+      // `chatSessionStart` (twice: once for turn 1, once for
+      // cold-replay on turn 2) — never via `chatSessionContinue`.
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+
+      // Inspect the history primed for the cold-replay call.
+      // The reconstructed chain MUST include the assistant turn
+      // with its reasoning summary, even though the message
+      // item's text was empty — otherwise the iter-23 predicate
+      // would have dropped the turn entirely and the model
+      // would see a silently different conversation.
+      const [primedMessages2] = chatSessionStart.mock.calls[1] as [
+        Array<{ role: string; content: string; reasoningContent?: string }>,
+      ];
+      const assistantInPrimed = primedMessages2.find((m) => m.role === 'assistant');
+      expect(assistantInPrimed).toBeDefined();
+      expect(assistantInPrimed!.content).toBe('');
+      expect(assistantInPrimed!.reasoningContent).toBe('I considered every option and chose to say nothing.');
+    });
+
+    it('serializes two overlapping /v1/responses dispatches on the same model', async () => {
+      // Iter-24 finding 1 integration regression: two
+      // concurrent requests against the same model — whether
+      // via `/v1/responses`, `/v1/messages`, or a mix — both
+      // receive a `ChatSession` pointing at the SAME underlying
+      // native model. The per-model execution mutex in
+      // `SessionRegistry` must serialize the entire dispatch
+      // span so their `primeHistory` / `send*` calls cannot
+      // clobber each other's KV state.
+      //
+      // To observe serialization through the real endpoint
+      // code path, gate the first mocked `chatSessionStart`
+      // behind an external promise and fire the second request
+      // while the first is still pending. If the mutex is
+      // present, the second dispatch does NOT record its own
+      // `chatSessionStart` invocation until the first has
+      // released — we assert that by inspecting the mock's
+      // invocation count from outside the gate.
+      const registry = new ModelRegistry();
+
+      let releaseFirst!: () => void;
+      const firstHeld = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const chatSessionStart = vi
+        .fn()
+        .mockImplementationOnce(async () => {
+          await firstHeld;
+          return makeChatResult({ text: 'first reply' });
+        })
+        .mockImplementationOnce(async () => makeChatResult({ text: 'second reply' }));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn(),
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'first' });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1, getStatus: getStatus1 } = createMockRes();
+      const req2 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'second' });
+      const { res: res2, getBody: getBody2, waitForEnd: wait2, getStatus: getStatus2 } = createMockRes();
+
+      const p1 = handler(req1, res1);
+      const p2 = handler(req2, res2);
+
+      // Wait for the first dispatch to actually reach the
+      // mocked `chatSessionStart` invocation. The endpoint
+      // goes through request validation, mapping, the mutex
+      // acquire, the history walk, and then the
+      // `await session.startFromHistory(...)` chain before the
+      // mock is called. We need to drain BOTH microtasks AND
+      // macrotasks, so yield via `setImmediate` (which lets the
+      // event loop fully advance one phase per tick).
+      const yieldMacrotask = () => new Promise<void>((resolve) => setImmediate(resolve));
+      const deadline = Date.now() + 2000;
+      while (chatSessionStart.mock.calls.length < 1) {
+        if (Date.now() > deadline) {
+          throw new Error('first dispatch never reached chatSessionStart within 2s');
+        }
+        await yieldMacrotask();
+      }
+      // Yield a few more macrotask ticks to prove the second
+      // dispatch is genuinely blocked on the mutex. If the
+      // mutex were missing, the second request would
+      // concurrently enter `session.startFromHistory` and the
+      // mock call count would already be 2.
+      for (let i = 0; i < 10; i++) {
+        await yieldMacrotask();
+      }
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+
+      // Release the first. The second should now observe its
+      // own `chatSessionStart` invocation and both dispatches
+      // resolve cleanly.
+      releaseFirst();
+      await p1;
+      await wait1();
+      await p2;
+      await wait2();
+
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(getStatus1()).toBe(200);
+      expect(getStatus2()).toBe(200);
+      const resp1 = JSON.parse(getBody1());
+      const resp2 = JSON.parse(getBody2());
+      expect(resp1.output_text).toBe('first reply');
+      expect(resp2.output_text).toBe('second reply');
+    });
+
     it('adopts the session into the registry after a successful non-streaming turn', async () => {
       // Baseline for the non-commit regression tests below: a turn
       // that returns cleanly must re-key the live session under the

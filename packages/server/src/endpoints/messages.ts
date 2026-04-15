@@ -431,24 +431,39 @@ export async function handleCreateMessage(
   } else {
     requestedSystem = null;
   }
-  const session = sessionReg.getOrCreate(null, requestedSystem);
 
-  try {
-    if (body.stream === true) {
-      const chatStream = runSessionStreaming(session, messages, config);
-      await handleStreamingNative(res, chatStream, body);
-    } else {
-      const result = await runSessionNonStreaming(session, messages, config);
-      await handleNonStreaming(res, result, body);
+  // Per-model execution mutex. Every dispatch through `/v1/messages`
+  // serializes with every dispatch through `/v1/responses` for the
+  // same model binding. The native `SessionCapableModel` is a single
+  // mutable resource — one shared `cached_token_history` / one
+  // `caches` vector per instance — so two concurrent `primeHistory`
+  // + `startFromHistory` calls would clobber each other's KV state
+  // even though each caller holds a distinct `ChatSession` wrapper.
+  // Holding the registry's exclusive lock across the full dispatch
+  // closes the race: at most one request at a time drives native
+  // decode on this model, and the `finally` inside `withExclusive`
+  // releases the lock regardless of whether the closure threw, so a
+  // failed dispatch cannot leave the next waiter stuck.
+  await sessionReg.withExclusive(async () => {
+    const session = sessionReg.getOrCreate(null, requestedSystem);
+
+    try {
+      if (body.stream === true) {
+        const chatStream = runSessionStreaming(session, messages, config);
+        await handleStreamingNative(res, chatStream, body);
+      } else {
+        const result = await runSessionNonStreaming(session, messages, config);
+        await handleNonStreaming(res, result, body);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error during inference';
+      if (!res.headersSent) {
+        sendAnthropicInternalError(res, message);
+      } else {
+        // Headers already sent (streaming) -- best effort: write error event and close
+        writeSSEEvent(res, 'error', { error: { type: 'api_error', message } });
+        endSSE(res);
+      }
     }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unknown error during inference';
-    if (!res.headersSent) {
-      sendAnthropicInternalError(res, message);
-    } else {
-      // Headers already sent (streaming) -- best effort: write error event and close
-      writeSSEEvent(res, 'error', { error: { type: 'api_error', message } });
-      endSSE(res);
-    }
-  }
+  });
 }

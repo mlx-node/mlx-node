@@ -152,19 +152,33 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
           // Emit the tool block. `ChatMessage` has no `isError`
           // field — it is a NAPI-generated struct owned by Rust
           // and cannot carry an extra boolean without a schema
-          // change. Instead we encode the Anthropic
-          // `tool_result.is_error` flag by prefixing the resolved
-          // content with a `[tool error] ` marker (iter-23
-          // finding 2). `primeHistory()` replays this content
-          // string verbatim through the chat template, so the
-          // model sees an explicit failure annotation for every
-          // tool call the client marked as errored; without this
-          // the flag was silently discarded. The marker string
-          // is the documented encoding boundary — any downstream
-          // reader that needs the structural bit can parse the
-          // prefix back out of `content`.
+          // change. Encoding the Anthropic `tool_result.is_error`
+          // flag into `content` is therefore unavoidable, but the
+          // iter-23 `[tool error] ` prefix (iter-24 finding 2)
+          // was ambiguous and lossy:
+          //
+          //   * A JSON tool payload is mutated into an invalid
+          //     JSON string by the prefix (`[tool error] {"err":1}`
+          //     parses as literal text, not an object).
+          //   * A successful payload that naturally starts with
+          //     `[tool error] ` is indistinguishable from an
+          //     errored one.
+          //   * An errored payload that already carries the
+          //     prefix gets double-prefixed on round-trip.
+          //
+          // Replace the prefix with a JSON envelope when
+          // `is_error === true`: `{ "is_error": true, "content":
+          // <original> }`. JSON escaping makes the encoding
+          // unambiguous and preserves the raw payload verbatim,
+          // and a successful tool_result whose content is already
+          // a JSON-shaped string is passed through untouched so
+          // callers that stream structured data keep exact
+          // fidelity. The encoding convention is: `is_error` is
+          // represented on tool messages ONLY when true, ONLY via
+          // this envelope shape; every other shape on the wire is
+          // a successful tool result.
           for (const tr of toolResults) {
-            const encoded = tr.isError ? `[tool error] ${tr.content}` : tr.content;
+            const encoded = tr.isError ? JSON.stringify({ is_error: true, content: tr.content }) : tr.content;
             messages.push({
               role: 'tool',
               content: encoded,

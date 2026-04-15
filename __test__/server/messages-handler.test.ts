@@ -1366,15 +1366,16 @@ describe('handleCreateMessage', () => {
       expect(afterTool.content).toContain('here are outputs');
     });
 
-    it('primes tool_result.is_error=true content with [tool error] marker through the full /v1/messages dispatch', async () => {
-      // Iter-23 finding 2 smoke test: the Anthropic mapper
-      // encodes `tool_result.is_error === true` as a `[tool
-      // error] ` prefix on the resolved content. Exercise the
-      // full /v1/messages handler end-to-end so the primed
+    it('primes tool_result.is_error=true content with a JSON envelope through the full /v1/messages dispatch', async () => {
+      // Iter-24 finding 2 smoke test: the Anthropic mapper now
+      // wraps `tool_result.is_error === true` content in a JSON
+      // envelope — `{"is_error":true,"content":<original>}` —
+      // instead of the iter-23 `[tool error] ` prefix. Exercise
+      // the full /v1/messages handler end-to-end so the primed
       // history passed to `chatSessionStart` reflects the
-      // marker. Without the fix `ChatMessage.content` would
-      // carry the raw tool output and the model would see a
-      // failed tool call as a successful one.
+      // envelope. Without the fix `ChatMessage.content` would
+      // carry either the raw tool output (losing the flag) or
+      // the ambiguous prefix (corrupting JSON payloads).
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'ack' }));
       registry.register('test-model', mockModel);
@@ -1417,7 +1418,11 @@ describe('handleCreateMessage', () => {
       ];
       const toolMsg = primedMessages.find((m) => m.role === 'tool' && m.toolCallId === 'call_fail');
       expect(toolMsg).toBeDefined();
-      expect(toolMsg!.content).toBe('[tool error] boom: connection refused');
+      expect(toolMsg!.content).toBe(JSON.stringify({ is_error: true, content: 'boom: connection refused' }));
+      // Envelope content is valid JSON and round-trips cleanly.
+      const parsed = JSON.parse(toolMsg!.content) as { is_error: boolean; content: string };
+      expect(parsed.is_error).toBe(true);
+      expect(parsed.content).toBe('boom: connection refused');
     });
   });
 });

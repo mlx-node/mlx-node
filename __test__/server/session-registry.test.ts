@@ -351,4 +351,117 @@ describe('SessionRegistry', () => {
     reg.clear();
     expect(reg.size).toBe(0);
   });
+
+  describe('withExclusive', () => {
+    beforeEach(() => {
+      // The withExclusive tests drive two concurrent dispatches
+      // through microtask interleaving — fake timers from the
+      // outer describe would stall the native-promise chain and
+      // produce false serialization. Restore real timers just for
+      // this block.
+      vi.useRealTimers();
+    });
+
+    it('serializes two overlapping dispatches against the same registry', async () => {
+      // Iter-24 finding 1 regression: `/v1/responses` and
+      // `/v1/messages` can both arrive for the same model in
+      // overlapping ticks, and each dispatch holds a
+      // `ChatSession` pointing at the SAME shared native model.
+      // Two concurrent `primeHistory` / `send*` calls would
+      // clobber each other's KV state — the mutex must serialize
+      // them so at most one dispatch owns the model at a time.
+      const model = makeMockModel();
+      const reg = new SessionRegistry({ model });
+
+      const events: string[] = [];
+      // The two closures both block on an externally controlled
+      // promise so the test can pin the ordering. If the mutex
+      // serialized correctly, the second dispatch does NOT
+      // observe its own start event before the first has
+      // resolved — only after `releaseA` fires.
+      let releaseA!: () => void;
+      const aDone = new Promise<void>((r) => {
+        releaseA = r;
+      });
+
+      const dispatchA = reg.withExclusive(async () => {
+        events.push('A:start');
+        await aDone;
+        events.push('A:end');
+      });
+
+      const dispatchB = reg.withExclusive(async () => {
+        events.push('B:start');
+        events.push('B:end');
+      });
+
+      // Yield to the microtask queue twice so any incorrect
+      // interleaving would already have recorded both "A:start"
+      // AND "B:start" here — B is still blocked on the chained
+      // `prev` promise from the mutex, so only "A:start" is
+      // visible.
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(events).toEqual(['A:start']);
+
+      // Resolving A's gate lets A end, then releases B.
+      releaseA();
+      await dispatchA;
+      await dispatchB;
+
+      expect(events).toEqual(['A:start', 'A:end', 'B:start', 'B:end']);
+    });
+
+    it('releases the mutex when the closure throws', async () => {
+      // A dispatch that errors out inside the lock must still
+      // release so the next waiter is not stuck forever. The
+      // `withExclusive` implementation uses a try/finally around
+      // the closure specifically to cover this path.
+      const model = makeMockModel();
+      const reg = new SessionRegistry({ model });
+
+      const events: string[] = [];
+
+      const failing = reg.withExclusive(async () => {
+        events.push('fail:start');
+        // Dummy await so the body is genuinely async.
+        await Promise.resolve();
+        throw new Error('boom');
+      });
+
+      const following = reg.withExclusive(async () => {
+        events.push('ok:start');
+        events.push('ok:end');
+      });
+
+      await expect(failing).rejects.toThrow('boom');
+      await following;
+
+      expect(events).toEqual(['fail:start', 'ok:start', 'ok:end']);
+    });
+
+    it('preserves FIFO ordering across three waiters', async () => {
+      // Sanity check: the mutex is a FIFO chain, not a
+      // "first-to-await-wins" race. Three overlapping dispatches
+      // must run in the exact order they called `withExclusive`.
+      const model = makeMockModel();
+      const reg = new SessionRegistry({ model });
+
+      const events: string[] = [];
+      const dispatches = [1, 2, 3].map((i) =>
+        reg.withExclusive(async () => {
+          events.push(`start:${i}`);
+          // Yield twice so an incorrect implementation has a
+          // chance to interleave with the other closures.
+          await Promise.resolve();
+          await Promise.resolve();
+          events.push(`end:${i}`);
+        }),
+      );
+
+      await Promise.all(dispatches);
+
+      expect(events).toEqual(['start:1', 'end:1', 'start:2', 'end:2', 'start:3', 'end:3']);
+    });
+  });
 });

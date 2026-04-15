@@ -490,22 +490,113 @@ describe('reconstructMessagesFromChain', () => {
     expect(messages).toEqual([]);
   });
 
-  it('skips assistant message when output has no text and no tool calls', () => {
+  it('preserves assistant turn when empty text accompanies reasoning', () => {
+    // Iter-24 finding 3: an empty assistant `message` item
+    // alongside a non-empty `reasoning` item must reconstruct
+    // the assistant turn. The iter-23 predicate
+    // (`assistantText || toolCalls.length > 0`) dropped the
+    // turn entirely, silently reconstructing a different
+    // conversation on cold replay after the session's TTL
+    // expired — downstream gates that walk the reconstructed
+    // trailing assistant would see the wrong structure.
     const chain = [
       {
         inputJson: JSON.stringify([{ role: 'user', content: 'Hello' }]),
         outputJson: JSON.stringify([
           {
             type: 'reasoning',
-            summary: [{ text: 'thinking...' }],
+            summary: [{ text: 'let me think about this...' }],
           },
-          // No message item, no function_call items
+          {
+            type: 'message',
+            content: [{ text: '' }],
+          },
         ]),
       },
     ];
 
     const messages = reconstructMessagesFromChain(chain);
-    // Only user message, no assistant since content is empty and no tool calls
+    expect(messages).toEqual([
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: '', reasoningContent: 'let me think about this...' },
+    ]);
+  });
+
+  it('preserves assistant turn with reasoning even when no message item is present', () => {
+    // Stronger variant of the iter-24 finding 3 regression:
+    // some stored records carry ONLY a `reasoning` item (no
+    // `message`). The reconstruction must still re-emit the
+    // assistant turn, carrying the reasoning summary through
+    // to any cold-replay path.
+    const chain = [
+      {
+        inputJson: JSON.stringify([{ role: 'user', content: 'Tell me a secret' }]),
+        outputJson: JSON.stringify([
+          {
+            type: 'reasoning',
+            summary: [{ text: 'I reasoned silently and produced nothing.' }],
+          },
+        ]),
+      },
+    ];
+
+    const messages = reconstructMessagesFromChain(chain);
+    expect(messages).toEqual([
+      { role: 'user', content: 'Tell me a secret' },
+      {
+        role: 'assistant',
+        content: '',
+        reasoningContent: 'I reasoned silently and produced nothing.',
+      },
+    ]);
+  });
+
+  it('skips assistant message when output has no text, no reasoning, and no tool calls', () => {
+    // Counter-test for iter-24 finding 3: a stored record with
+    // NO assistant-facing items at all (no message, no
+    // reasoning, no function_call) still produces no assistant
+    // turn on reconstruction. Legitimate no-op turns — e.g. a
+    // tool-result continuation where the model emitted
+    // nothing — would otherwise clutter the replayed history
+    // with an empty assistant.
+    const chain = [
+      {
+        inputJson: JSON.stringify([{ role: 'user', content: 'Hello' }]),
+        outputJson: JSON.stringify([]),
+      },
+    ];
+
+    const messages = reconstructMessagesFromChain(chain);
+    // Only user message, no assistant since ALL output items were absent.
     expect(messages).toEqual([{ role: 'user', content: 'Hello' }]);
+  });
+
+  it('preserves assistant turn driven purely by tool calls', () => {
+    // Counter-test for the iter-24 finding 3 fix: the new
+    // predicate still preserves tool-call-only assistant
+    // turns — the `toolCalls.length > 0` branch is the
+    // original behavior and MUST keep working after the
+    // predicate was widened to include reasoning.
+    const chain = [
+      {
+        inputJson: JSON.stringify([{ role: 'user', content: 'Get weather' }]),
+        outputJson: JSON.stringify([
+          {
+            type: 'function_call',
+            name: 'get_weather',
+            arguments: '{"city":"NYC"}',
+            call_id: 'call_nyc',
+          },
+        ]),
+      },
+    ];
+
+    const messages = reconstructMessagesFromChain(chain);
+    expect(messages).toHaveLength(2);
+    expect(messages[1]).toEqual({
+      role: 'assistant',
+      content: '',
+      toolCalls: [{ name: 'get_weather', arguments: '{"city":"NYC"}', id: 'call_nyc' }],
+    });
   });
 });

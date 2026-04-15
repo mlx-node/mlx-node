@@ -236,7 +236,27 @@ export function reconstructMessagesFromChain(chain: { inputJson: string; outputJ
       }
     }
 
-    if (assistantText || toolCalls.length > 0) {
+    // Preserve the assistant turn whenever the stored record
+    // contained ANY assistant-facing item — text, reasoning, or a
+    // tool call. The iter-23 predicate (`assistantText ||
+    // toolCalls.length > 0`) dropped stored turns that carried a
+    // non-empty `reasoning` item but an empty `message` item,
+    // silently reconstructing a different conversation on cold
+    // replay after the session's TTL expired. A cold-replayed
+    // `previous_response_id` would then feed the model a history
+    // that skipped the reasoning summary entirely — producing
+    // different output from the hot-path resume of the same chain
+    // and corrupting any downstream tool-call gates that walked
+    // the reconstructed trailing assistant to compute outstanding
+    // tool-call ids (iter-24 finding 3).
+    //
+    // An empty stored assistant turn with no reasoning and no
+    // tool calls is still skipped, because that shape is produced
+    // by legitimate no-op turns (e.g. a tool-result continuation
+    // where the model emitted nothing) and re-emitting it would
+    // clutter the replayed history with an empty assistant.
+    const hadAnyItem = assistantText.length > 0 || thinkingText.length > 0 || toolCalls.length > 0;
+    if (hadAnyItem) {
       const assistantMsg: ChatMessage = {
         role: 'assistant',
         content: assistantText,
