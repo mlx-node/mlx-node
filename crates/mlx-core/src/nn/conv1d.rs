@@ -162,8 +162,8 @@ impl Conv1d {
             let input_slice = input.slice_axis(1, k, k + t_out)?;
             // weight_2d[:, k] → [C, 1]
             let w_k = weight_2d.slice_axis(1, k, k + 1)?; // [C, 1]
-            let w_k = w_k.squeeze(Some(&[1]))?;           // [C]
-            let w_k = w_k.reshape(&[1, 1, -1])?;          // [1, 1, C]
+            let w_k = w_k.squeeze(Some(&[1]))?; // [C]
+            let w_k = w_k.reshape(&[1, 1, -1])?; // [1, 1, C]
 
             let term = input_slice.mul(&w_k)?;
             result = Some(match result {

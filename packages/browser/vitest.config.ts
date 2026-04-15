@@ -1,5 +1,6 @@
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
 import { defineConfig } from 'vite-plus';
 import { playwright } from 'vite-plus/test/browser-playwright';
 
@@ -14,10 +15,7 @@ export default defineConfig({
       provider: playwright({
         launchOptions: {
           channel: 'chrome',
-          args: [
-            '--enable-unsafe-webgpu',
-            '--enable-features=Vulkan',
-          ],
+          args: ['--enable-unsafe-webgpu', '--enable-features=Vulkan'],
         },
       }),
       headless: true,

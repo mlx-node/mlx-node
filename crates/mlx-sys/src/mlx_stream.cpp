@@ -9,6 +9,12 @@
 namespace mlx::core::wgpu {
 void set_packed_bf16_enabled(bool enabled);
 void set_sdpa_fallback_forced(bool enabled);
+// Phase 0 dispatch-stats accessors (defined in
+// mlx/backend/webgpu/device.cpp). Forward-declared here so we don't have to
+// include <webgpu/webgpu.h> from the FFI TU.
+uint64_t get_total_dispatches();
+uint64_t get_total_pass_ends();
+void reset_dispatch_stats();
 }  // namespace mlx::core::wgpu
 #endif
 
@@ -352,6 +358,40 @@ void mlx_wgpu_set_sdpa_fallback_forced(bool enabled) {
   mlx::core::wgpu::set_sdpa_fallback_forced(enabled);
 #else
   (void)enabled;
+#endif
+}
+
+// Phase 0 dispatch-stats readout. Fills *out_dispatches with the cumulative
+// number of wgpuComputePassEncoderDispatchWorkgroups calls issued by the
+// WebGPU backend and *out_pass_ends with the cumulative number of
+// wgpuComputePassEncoderEnd calls. Counters are process-wide, survive
+// encoder recreation, and are reset via mlx_wgpu_reset_dispatch_stats.
+// On non-WebGPU builds this writes zeros.
+void mlx_wgpu_get_dispatch_stats(
+    uint64_t* out_dispatches,
+    uint64_t* out_pass_ends) {
+#ifdef MLX_USE_WEBGPU
+  if (out_dispatches) {
+    *out_dispatches = mlx::core::wgpu::get_total_dispatches();
+  }
+  if (out_pass_ends) {
+    *out_pass_ends = mlx::core::wgpu::get_total_pass_ends();
+  }
+#else
+  if (out_dispatches) {
+    *out_dispatches = 0;
+  }
+  if (out_pass_ends) {
+    *out_pass_ends = 0;
+  }
+#endif
+}
+
+// Phase 0 dispatch-stats reset. Zeros both counters. Called at the start
+// of each chat/chatStream generation when ?profile=1 is active.
+void mlx_wgpu_reset_dispatch_stats() {
+#ifdef MLX_USE_WEBGPU
+  mlx::core::wgpu::reset_dispatch_stats();
 #endif
 }
 

@@ -142,8 +142,7 @@ impl MxArray {
         // NAPI call; u16 alignment isn't required here because the underlying
         // FFI just memcpy's `n_elem * 2` bytes into the mlx_array allocation.
         let u16_ptr = data.as_ptr() as *const u16;
-        let handle =
-            unsafe { sys::mlx_array_from_bfloat16(u16_ptr, shape.as_ptr(), shape.len()) };
+        let handle = unsafe { sys::mlx_array_from_bfloat16(u16_ptr, shape.as_ptr(), shape.len()) };
         let arr = MxArray::from_handle(handle, "array_from_bfloat16_bytes")?;
         // Opt into packed-bf16 storage when the runtime flag is enabled and
         // the buffer is weight-sized. A no-op if the flag is off or if the
@@ -325,21 +324,27 @@ impl MxArray {
     pub fn test_single_layer_forward() -> Vec<f64> {
         let mut buf = [0f32; 5];
         let ok = unsafe { sys::mlx_test_single_layer_forward(buf.as_mut_ptr(), 5) };
-        if !ok { return vec![-999.0]; }
+        if !ok {
+            return vec![-999.0];
+        }
         buf.iter().map(|v| *v as f64).collect()
     }
 
     /// Read first N float values from a C++ weight map entry
     #[napi]
     pub fn read_cpp_weight(name: String, count: i32) -> Vec<f64> {
-        if count <= 0 { return vec![-999.0]; }
+        if count <= 0 {
+            return vec![-999.0];
+        }
         let c_name = match std::ffi::CString::new(name) {
             Ok(s) => s,
             Err(_) => return vec![-999.0],
         };
         let mut buf = vec![0f32; count as usize];
         let n = unsafe { sys::mlx_qwen35_read_weight(c_name.as_ptr(), buf.as_mut_ptr(), count) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -349,7 +354,9 @@ impl MxArray {
     pub fn test_gdn_step(checkpoint: i32, max_count: i32) -> Vec<f64> {
         let mut buf = vec![0f32; max_count as usize];
         let n = unsafe { sys::mlx_test_gdn_step_by_step(checkpoint, buf.as_mut_ptr(), max_count) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -359,7 +366,9 @@ impl MxArray {
     pub fn test_gdn_recurrence_small() -> Vec<f64> {
         let mut buf = vec![0f32; 20];
         let n = unsafe { sys::mlx_test_gdn_recurrence_small(buf.as_mut_ptr(), 20) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -370,7 +379,9 @@ impl MxArray {
         let count = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; count];
         let n = unsafe { sys::mlx_test_sdpa_causal(buf.as_mut_ptr(), count as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -379,7 +390,9 @@ impl MxArray {
         let count = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; count];
         let n = unsafe { sys::mlx_test_sdpa_gqa(buf.as_mut_ptr(), count as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -388,7 +401,9 @@ impl MxArray {
         let count = max_count.unwrap_or(10) as usize;
         let mut buf = vec![0f32; count];
         let n = unsafe { sys::mlx_test_attention_layer_forward(buf.as_mut_ptr(), count as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -399,7 +414,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_rope_bf16(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -408,7 +425,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_qk_norm_rope(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -417,7 +436,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_sdpa_additive_mask(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -426,7 +447,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_sdpa_decode_gqa(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -439,7 +462,9 @@ impl MxArray {
         let c = max_count.unwrap_or(32) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_sdpa_tile_tq2_d64(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -448,10 +473,10 @@ impl MxArray {
     pub fn test_sdpa_tile_tq8_d128_causal_gqa(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(32) as usize;
         let mut buf = vec![0f32; c];
-        let n = unsafe {
-            sys::mlx_test_sdpa_tile_tq8_d128_causal_gqa(buf.as_mut_ptr(), c as i32)
-        };
-        if n <= 0 { return vec![-999.0]; }
+        let n = unsafe { sys::mlx_test_sdpa_tile_tq8_d128_causal_gqa(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -461,10 +486,10 @@ impl MxArray {
     pub fn test_sdpa_tile_tq32_d128_addmask(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(32) as usize;
         let mut buf = vec![0f32; c];
-        let n = unsafe {
-            sys::mlx_test_sdpa_tile_tq32_d128_addmask(buf.as_mut_ptr(), c as i32)
-        };
-        if n <= 0 { return vec![-999.0]; }
+        let n = unsafe { sys::mlx_test_sdpa_tile_tq32_d128_addmask(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -474,10 +499,10 @@ impl MxArray {
     pub fn test_sdpa_tile_tq33_d128_tailtile(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(32) as usize;
         let mut buf = vec![0f32; c];
-        let n = unsafe {
-            sys::mlx_test_sdpa_tile_tq33_d128_tailtile(buf.as_mut_ptr(), c as i32)
-        };
-        if n <= 0 { return vec![-999.0]; }
+        let n = unsafe { sys::mlx_test_sdpa_tile_tq33_d128_tailtile(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -488,10 +513,10 @@ impl MxArray {
     pub fn test_sdpa_tile_tq128_d128_l4096(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(32) as usize;
         let mut buf = vec![0f32; c];
-        let n = unsafe {
-            sys::mlx_test_sdpa_tile_tq128_d128_l4096(buf.as_mut_ptr(), c as i32)
-        };
-        if n <= 0 { return vec![-999.0]; }
+        let n = unsafe { sys::mlx_test_sdpa_tile_tq128_d128_l4096(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -501,10 +526,10 @@ impl MxArray {
     pub fn test_sdpa_tile_d256_gqa(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(32) as usize;
         let mut buf = vec![0f32; c];
-        let n = unsafe {
-            sys::mlx_test_sdpa_tile_d256_gqa(buf.as_mut_ptr(), c as i32)
-        };
-        if n <= 0 { return vec![-999.0]; }
+        let n = unsafe { sys::mlx_test_sdpa_tile_d256_gqa(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -513,10 +538,10 @@ impl MxArray {
     pub fn test_sdpa_tile_d256_simple(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(32) as usize;
         let mut buf = vec![0f32; c];
-        let n = unsafe {
-            sys::mlx_test_sdpa_tile_d256_simple(buf.as_mut_ptr(), c as i32)
-        };
-        if n <= 0 { return vec![-999.0]; }
+        let n = unsafe { sys::mlx_test_sdpa_tile_d256_simple(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -525,10 +550,10 @@ impl MxArray {
     pub fn test_sdpa_tile_d256_causal(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(32) as usize;
         let mut buf = vec![0f32; c];
-        let n = unsafe {
-            sys::mlx_test_sdpa_tile_d256_causal(buf.as_mut_ptr(), c as i32)
-        };
-        if n <= 0 { return vec![-999.0]; }
+        let n = unsafe { sys::mlx_test_sdpa_tile_d256_causal(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -537,10 +562,10 @@ impl MxArray {
     pub fn test_sdpa_tile_d256_gqa_nocausal(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(32) as usize;
         let mut buf = vec![0f32; c];
-        let n = unsafe {
-            sys::mlx_test_sdpa_tile_d256_gqa_nocausal(buf.as_mut_ptr(), c as i32)
-        };
-        if n <= 0 { return vec![-999.0]; }
+        let n = unsafe { sys::mlx_test_sdpa_tile_d256_gqa_nocausal(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -549,10 +574,11 @@ impl MxArray {
     pub fn test_sdpa_tile_d256_causal_gqa_minimal(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(32) as usize;
         let mut buf = vec![0f32; c];
-        let n = unsafe {
-            sys::mlx_test_sdpa_tile_d256_causal_gqa_minimal(buf.as_mut_ptr(), c as i32)
-        };
-        if n <= 0 { return vec![-999.0]; }
+        let n =
+            unsafe { sys::mlx_test_sdpa_tile_d256_causal_gqa_minimal(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -561,10 +587,10 @@ impl MxArray {
     pub fn test_sdpa_vector_d256(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(32) as usize;
         let mut buf = vec![0f32; c];
-        let n = unsafe {
-            sys::mlx_test_sdpa_vector_d256(buf.as_mut_ptr(), c as i32)
-        };
-        if n <= 0 { return vec![-999.0]; }
+        let n = unsafe { sys::mlx_test_sdpa_vector_d256(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -573,10 +599,10 @@ impl MxArray {
     pub fn test_sdpa_vector_d256_simple(max_count: Option<i32>) -> Vec<f64> {
         let c = max_count.unwrap_or(32) as usize;
         let mut buf = vec![0f32; c];
-        let n = unsafe {
-            sys::mlx_test_sdpa_vector_d256_simple(buf.as_mut_ptr(), c as i32)
-        };
-        if n <= 0 { return vec![-999.0]; }
+        let n = unsafe { sys::mlx_test_sdpa_vector_d256_simple(buf.as_mut_ptr(), c as i32) };
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -585,7 +611,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_full_attn_layer_bf16(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -594,7 +622,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_rms_norm_bf16(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -606,9 +636,8 @@ impl MxArray {
     /// `RMSNorm` layer in `nn/normalization.rs`.
     #[napi]
     pub fn fast_rms_norm(&self, weight: &MxArray, eps: f64) -> Result<Self> {
-        let handle = unsafe {
-            sys::mlx_fast_rms_norm(self.as_raw_ptr(), weight.as_raw_ptr(), eps as f32)
-        };
+        let handle =
+            unsafe { sys::mlx_fast_rms_norm(self.as_raw_ptr(), weight.as_raw_ptr(), eps as f32) };
         MxArray::from_handle(handle, "fast_rms_norm")
     }
 
@@ -617,7 +646,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_swiglu_mlp_bf16(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -626,7 +657,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_decode_step_with_cache(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -635,7 +668,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_attn_layer_bf16(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -644,7 +679,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_first_4_layers_bf16(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -653,7 +690,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_gdn_full_bf16(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -662,7 +701,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_gdn_multi_step_bf16(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -671,7 +712,9 @@ impl MxArray {
         let c = max_count.unwrap_or(10) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_categorical_sampling_bf16(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -680,7 +723,9 @@ impl MxArray {
         let c = max_count.unwrap_or(20) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_gdn_layer_bf16(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 
@@ -692,7 +737,9 @@ impl MxArray {
         let c = max_count.unwrap_or(128) as usize;
         let mut buf = vec![0f32; c];
         let n = unsafe { sys::mlx_test_matmul_broadcast_batch(buf.as_mut_ptr(), c as i32) };
-        if n <= 0 { return vec![-999.0]; }
+        if n <= 0 {
+            return vec![-999.0];
+        }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
     }
 }

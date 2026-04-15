@@ -1109,9 +1109,7 @@ pub fn load_safetensors_lazy<P: AsRef<std::path::Path>>(
 }
 
 /// Load safetensors from a memory buffer (works in both Node.js and browser).
-pub fn load_safetensors_from_buffer(
-    data: &[u8],
-) -> Result<HashMap<String, crate::array::MxArray>> {
+pub fn load_safetensors_from_buffer(data: &[u8]) -> Result<HashMap<String, crate::array::MxArray>> {
     use mlx_sys as sys;
 
     struct LoadCtx {

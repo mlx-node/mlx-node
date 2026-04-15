@@ -80,7 +80,9 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
         .arg("-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG")
         .arg(format!("-DCMAKE_C_FLAGS={c_flags}"))
         .arg(format!("-DCMAKE_CXX_FLAGS={cxx_flags}"))
-        .arg(format!("-DCMAKE_EXE_LINKER_FLAGS={wasm_target} {sysroot_flag} -pthread -Wl,--allow-undefined"))
+        .arg(format!(
+            "-DCMAKE_EXE_LINKER_FLAGS={wasm_target} {sysroot_flag} -pthread -Wl,--allow-undefined"
+        ))
         .arg("-DCMAKE_C_COMPILER_WORKS=ON")
         .arg("-DCMAKE_CXX_COMPILER_WORKS=ON")
         .arg("-DMLX_BUILD_TESTS=OFF")
@@ -165,8 +167,7 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
         // different visibility between libmlx.a and libmlx_ffi.a, causing
         // wasm-ld to pick inconsistent vtable thunks → call_indirect mismatch.
         .flag("-fvisibility=hidden")
-        .flag("-fvisibility-inlines-hidden")
-        ;
+        .flag("-fvisibility-inlines-hidden");
 
     if include_generated.exists() {
         bridge.include(&include_generated);
@@ -187,8 +188,7 @@ fn build_wasi(_manifest_dir: &Path, mlx_dir: &Path, src_dir: &Path) {
 
     // Link C++ standard library and ABI for WASI (provides operator new/delete,
     // exception handling, and RTTI — these are left as imports without this).
-    let sysroot_lib = wasi_sdk
-        .join("share/wasi-sysroot/lib/wasm32-wasip1-threads");
+    let sysroot_lib = wasi_sdk.join("share/wasi-sysroot/lib/wasm32-wasip1-threads");
     println!("cargo:rustc-link-search=native={}", sysroot_lib.display());
     println!("cargo:rustc-link-lib=static=c++");
     println!("cargo:rustc-link-lib=static=c++abi");
@@ -202,8 +202,7 @@ fn build_native(mlx_dir: &Path, src_dir: &Path) {
         );
     }
 
-    let target_arch =
-        env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is not set");
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is not set");
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is not set");
 
     let mut cfg = cmake::Config::new(mlx_dir);
@@ -212,10 +211,7 @@ fn build_native(mlx_dir: &Path, src_dir: &Path) {
         .define("MLX_BUILD_BENCHMARKS", "OFF")
         .define("MLX_BUILD_PYTHON_BINDINGS", "OFF")
         .define("BUILD_SHARED_LIBS", "OFF")
-        .define(
-            "MLX_BUILD_METAL",
-            if metal_disabled { "OFF" } else { "ON" },
-        )
+        .define("MLX_BUILD_METAL", if metal_disabled { "OFF" } else { "ON" })
         .define(
             "CMAKE_OSX_ARCHITECTURES",
             if target_arch == "aarch64" {
@@ -232,8 +228,7 @@ fn build_native(mlx_dir: &Path, src_dir: &Path) {
             .expect("Failed to get SDK path")
             .stdout
             .to_vec();
-        let sdk_path =
-            String::from_utf8(sdk_path).expect("Failed to convert SDK path to string");
+        let sdk_path = String::from_utf8(sdk_path).expect("Failed to convert SDK path to string");
         let sdk_path = sdk_path.trim();
         cfg.define("CMAKE_C_COMPILER", "clang")
             .define("CMAKE_CXX_COMPILER", "clang++")

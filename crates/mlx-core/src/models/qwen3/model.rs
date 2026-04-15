@@ -25,12 +25,12 @@ use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools;
 #[cfg(not(target_family = "wasm"))]
 use crate::training_model::ModelType;
-use crate::transformer::{KVCache, TransformerBlock};
 #[cfg(not(target_family = "wasm"))]
 use crate::transformer::{
     ContinuousBatchingScheduler, PagedAttentionConfig, PagedKVCache, PendingRequest,
     SchedulerConfig,
 };
+use crate::transformer::{KVCache, TransformerBlock};
 
 use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
 use crate::models::qwen3_5::chat_common::{

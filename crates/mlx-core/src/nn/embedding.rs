@@ -75,7 +75,12 @@ impl Embedding {
     /// Create without random init (lazy zeros).
     pub fn new_empty(num_embeddings: u32, embedding_dim: u32) -> Result<Self> {
         let weight = MxArray::zeros(&[num_embeddings as i64, embedding_dim as i64], None)?;
-        Ok(Self { weight, num_embeddings, embedding_dim, is_quantized_flag: false })
+        Ok(Self {
+            weight,
+            num_embeddings,
+            embedding_dim,
+            is_quantized_flag: false,
+        })
     }
 
     /// Create a new Embedding layer

@@ -3,29 +3,29 @@
 /** Descriptor for a single GPU-resident tensor (from JS gpu-worker). */
 export interface GpuTensorInfo {
   /** Weight name (e.g. "model.layers.0.mlp.gate_proj.weight") */
-  name: string
+  name: string;
   /** Opaque WGPUBuffer handle (u32 on WASM) */
-  handle: number
+  handle: number;
   /** C++ dtype code: 0=f32, 1=f16, 2=bf16, 3=i32, 4=u32, 5=i8, 6=u8 */
-  dtypeCode: number
+  dtypeCode: number;
   /** Tensor shape dimensions */
-  shape: Array<number>
+  shape: Array<number>;
   /** GPU buffer size in bytes */
-  byteSize: number
+  byteSize: number;
   /** Whether bf16 data is packed 2-per-u32 (PackedBf16 storage mode) */
-  packedBf16?: boolean | undefined | null
+  packedBf16?: boolean | undefined | null;
 }
 export interface CpuTensorInfo {
   /** Weight name (e.g. "model.layers.0.mlp.gate_proj.weight") */
-  name: string
+  name: string;
   /** WASM memory pointer (from malloc) where tensor bytes reside */
-  ptr: number
+  ptr: number;
   /** C++ dtype code: 0=f32, 1=f16, 2=bf16, 3=i32, 4=u32, 6=u8 */
-  dtypeCode: number
+  dtypeCode: number;
   /** Tensor shape dimensions */
-  shape: Array<number>
+  shape: Array<number>;
   /** Tensor size in bytes */
-  byteSize: number
+  byteSize: number;
 }
 /**
  * Result from batch text generation
@@ -38,24 +38,24 @@ export interface CpuTensorInfo {
  */
 export declare class BatchGenerationResult {
   /** Get all generated token arrays (N*G arrays) */
-  get tokens(): Array<MxArray>
+  get tokens(): Array<MxArray>;
   /** Get all log probability arrays (N*G arrays) */
-  get logprobs(): Array<MxArray>
+  get logprobs(): Array<MxArray>;
   /** Get all decoded texts (N*G strings) */
-  get texts(): Array<string>
+  get texts(): Array<string>;
   /** Get finish reasons grouped by prompt (N arrays of G finish reasons) */
-  get finishReasons(): Array<Array<string>>
+  get finishReasons(): Array<Array<string>>;
   /** Get token counts grouped by prompt (N arrays of G counts) */
-  get tokenCounts(): Array<Array<number>>
+  get tokenCounts(): Array<Array<number>>;
   /** Get number of prompts */
-  get numPrompts(): number
+  get numPrompts(): number;
   /** Get group size (completions per prompt) */
-  get groupSize(): number
+  get groupSize(): number;
 }
 
 /** Handle returned by `chat_stream()` to control an in-progress streaming generation. */
 export declare class ChatStreamHandle {
-  cancel(): void
+  cancel(): void;
 }
 
 /**
@@ -79,7 +79,7 @@ export declare class DocLayoutModel {
    * # Returns
    * * Initialized DocLayoutModel ready for inference
    */
-  static load(modelPath: string): DocLayoutModel
+  static load(modelPath: string): DocLayoutModel;
   /**
    * Detect document layout elements in an image.
    *
@@ -90,9 +90,9 @@ export declare class DocLayoutModel {
    * # Returns
    * * Vec of LayoutElements sorted by reading order
    */
-  detect(imageData: Uint8Array, threshold?: number | undefined | null): Array<LayoutElement>
+  detect(imageData: Uint8Array, threshold?: number | undefined | null): Array<LayoutElement>;
 }
-export type PPDocLayoutV3Model = DocLayoutModel
+export type PPDocLayoutV3Model = DocLayoutModel;
 
 /**
  * PP-LCNet_x1_0 Document Orientation Classification model.
@@ -102,19 +102,19 @@ export type PPDocLayoutV3Model = DocLayoutModel
  */
 export declare class DocOrientationModel {
   /** Load a DocOrientationModel from a directory containing model.safetensors and config.json. */
-  static load(modelPath: string): DocOrientationModel
+  static load(modelPath: string): DocOrientationModel;
   /**
    * Classify the orientation of a document image.
    *
    * Returns the detected orientation angle (0, 90, 180, 270) and confidence.
    */
-  classify(imageData: Buffer): OrientationResult
+  classify(imageData: Buffer): OrientationResult;
   /**
    * Classify orientation and return the corrected (upright) image bytes.
    *
    * Returns classification result plus corrected PNG image bytes.
    */
-  classifyAndRotate(imageData: Uint8Array): ClassifyRotateResult
+  classifyAndRotate(imageData: Uint8Array): ClassifyRotateResult;
 }
 
 /**
@@ -125,77 +125,92 @@ export declare class DocOrientationModel {
  */
 export declare class DocUnwarpModel {
   /** Load a DocUnwarpModel from a directory containing model.safetensors. */
-  static load(modelPath: string): DocUnwarpModel
+  static load(modelPath: string): DocUnwarpModel;
   /** Unwarp a document image and return the corrected image bytes. */
-  unwarp(imageData: Uint8Array): UnwarpResult
+  unwarp(imageData: Uint8Array): UnwarpResult;
 }
 
 /** Result from text generation with detailed metadata */
 export declare class GenerationResult {
   /** Get the decoded text */
-  get text(): string
+  get text(): string;
   /** Get the generated tokens */
-  get tokens(): MxArray
+  get tokens(): MxArray;
   /** Get the log probabilities */
-  get logprobs(): MxArray
+  get logprobs(): MxArray;
   /** Get the finish reason ("stop", "length", or "repetition") */
-  get finishReason(): 'stop' | 'length' | 'repetition'
+  get finishReason(): 'stop' | 'length' | 'repetition';
   /** Get the number of tokens generated */
-  get numTokens(): number
+  get numTokens(): number;
 }
 
 export declare class MxArray {
-  equal(other: MxArray): MxArray
-  notEqual(other: MxArray): MxArray
-  less(other: MxArray): MxArray
-  lessEqual(other: MxArray): MxArray
-  greater(other: MxArray): MxArray
-  greaterEqual(other: MxArray): MxArray
-  logicalAnd(other: MxArray): MxArray
-  logicalOr(other: MxArray): MxArray
-  logicalNot(): MxArray
-  where(x: MxArray, y: MxArray): MxArray
-  static fromInt32(data: Int32Array, shape: BigInt64Array): MxArray
-  static fromInt64(data: BigInt64Array, shape: BigInt64Array): MxArray
-  static fromUint32(data: Uint32Array, shape: BigInt64Array): MxArray
-  static fromFloat32(data: Float32Array, shape: BigInt64Array): MxArray
-  static zeros(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray
-  static scalarFloat(value: number): MxArray
-  static scalarInt(value: number): MxArray
-  static ones(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray
-  static full(shape: BigInt64Array, fillValue: number | MxArray, dtype?: DType | undefined | null): MxArray
-  static linspace(start: number, stop: number, num?: number | undefined | null, dtype?: DType | undefined | null): MxArray
-  static eye(n: number, m?: number | undefined | null, k?: number | undefined | null, dtype?: DType | undefined | null): MxArray
-  static arange(start: number, stop: number, step?: number | undefined | null, dtype?: DType | undefined | null): MxArray
-  astype(dtype: DType): MxArray
+  equal(other: MxArray): MxArray;
+  notEqual(other: MxArray): MxArray;
+  less(other: MxArray): MxArray;
+  lessEqual(other: MxArray): MxArray;
+  greater(other: MxArray): MxArray;
+  greaterEqual(other: MxArray): MxArray;
+  logicalAnd(other: MxArray): MxArray;
+  logicalOr(other: MxArray): MxArray;
+  logicalNot(): MxArray;
+  where(x: MxArray, y: MxArray): MxArray;
+  static fromInt32(data: Int32Array, shape: BigInt64Array): MxArray;
+  static fromInt64(data: BigInt64Array, shape: BigInt64Array): MxArray;
+  static fromUint32(data: Uint32Array, shape: BigInt64Array): MxArray;
+  static fromFloat32(data: Float32Array, shape: BigInt64Array): MxArray;
+  static zeros(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
+  static scalarFloat(value: number): MxArray;
+  static scalarInt(value: number): MxArray;
+  static ones(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
+  static full(shape: BigInt64Array, fillValue: number | MxArray, dtype?: DType | undefined | null): MxArray;
+  static linspace(
+    start: number,
+    stop: number,
+    num?: number | undefined | null,
+    dtype?: DType | undefined | null,
+  ): MxArray;
+  static eye(
+    n: number,
+    m?: number | undefined | null,
+    k?: number | undefined | null,
+    dtype?: DType | undefined | null,
+  ): MxArray;
+  static arange(
+    start: number,
+    stop: number,
+    step?: number | undefined | null,
+    dtype?: DType | undefined | null,
+  ): MxArray;
+  astype(dtype: DType): MxArray;
   /**
    * Create a copy of this array with a new handle.
    * This is useful for parameter loading to avoid handle aliasing issues.
    */
-  copy(): MxArray
-  eval(): void
-  evalAsync(): Promise<undefined>
-  size(): bigint
-  ndim(): number
-  shape(): BigInt64Array
+  copy(): MxArray;
+  eval(): void;
+  evalAsync(): Promise<undefined>;
+  size(): bigint;
+  ndim(): number;
+  shape(): BigInt64Array;
   /**
    * Get a single dimension from the array shape without copying the entire shape
    * This is more efficient when you only need one dimension
    *
    * Note: axis is u32 because NAPI doesn't support usize, but internally converted to usize
    */
-  shapeAt(axis: number): number
+  shapeAt(axis: number): number;
   /**
    * Get batch and sequence length for 2D arrays (common pattern in transformers)
    * More efficient than calling shape() and extracting dimensions
    */
-  getBatchSeqLen(): Array<number>
+  getBatchSeqLen(): Array<number>;
   /**
    * Get batch, sequence length, and hidden size for 3D arrays (common pattern in transformers)
    * More efficient than calling shape() and extracting dimensions
    */
-  getBatchSeqHidden(): Array<number>
-  dtype(): DType
+  getBatchSeqHidden(): Array<number>;
+  dtype(): DType;
   /**
    * Copy entire array from GPU to CPU as Float32Array
    *
@@ -216,7 +231,7 @@ export declare class MxArray {
    * - CPU-only operations (e.g., sorting for quantiles)
    * - Final output extraction
    */
-  toFloat32(): Float32Array
+  toFloat32(): Float32Array;
   /**
    * Copy entire array from GPU to CPU as Int32Array
    *
@@ -225,7 +240,7 @@ export declare class MxArray {
    * See `to_float32()` documentation for performance implications and alternatives.
    * Prefer `item_int32()` for scalars.
    */
-  toInt32(): Int32Array
+  toInt32(): Int32Array;
   /**
    * Copy entire array from GPU to CPU as Uint32Array
    *
@@ -233,128 +248,136 @@ export declare class MxArray {
    *
    * See `to_float32()` documentation for performance implications and alternatives.
    */
-  toUint32(): Uint32Array
-  logSoftmax(axis: number): MxArray
-  exp(): MxArray
-  log(): MxArray
-  clip(minimum?: number | undefined | null, maximum?: number | undefined | null): MxArray
-  minimum(other: MxArray): MxArray
-  maximum(other: MxArray): MxArray
-  add(other: MxArray): MxArray
-  sub(other: MxArray): MxArray
-  mul(other: MxArray): MxArray
-  div(other: MxArray): MxArray
-  addScalar(value: number): MxArray
-  mulScalar(value: number): MxArray
-  subScalar(value: number): MxArray
-  divScalar(value: number): MxArray
-  matmul(other: MxArray): MxArray
+  toUint32(): Uint32Array;
+  logSoftmax(axis: number): MxArray;
+  exp(): MxArray;
+  log(): MxArray;
+  clip(minimum?: number | undefined | null, maximum?: number | undefined | null): MxArray;
+  minimum(other: MxArray): MxArray;
+  maximum(other: MxArray): MxArray;
+  add(other: MxArray): MxArray;
+  sub(other: MxArray): MxArray;
+  mul(other: MxArray): MxArray;
+  div(other: MxArray): MxArray;
+  addScalar(value: number): MxArray;
+  mulScalar(value: number): MxArray;
+  subScalar(value: number): MxArray;
+  divScalar(value: number): MxArray;
+  matmul(other: MxArray): MxArray;
   /**
    * Fused matrix multiply-add: D = beta * C + alpha * (self @ B)
    * where self is A. More efficient than separate matmul and add operations.
    * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
    */
-  addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray
-  abs(): MxArray
-  negative(): MxArray
-  sign(): MxArray
-  sqrt(): MxArray
-  square(): MxArray
-  power(other: MxArray): MxArray
-  sin(): MxArray
-  cos(): MxArray
-  tan(): MxArray
-  sinh(): MxArray
-  cosh(): MxArray
-  tanh(): MxArray
-  floor(): MxArray
-  ceil(): MxArray
-  round(): MxArray
-  floorDivide(other: MxArray): MxArray
-  remainder(other: MxArray): MxArray
-  reciprocal(): MxArray
-  arcsin(): MxArray
-  arccos(): MxArray
-  arctan(): MxArray
-  log10(): MxArray
-  log2(): MxArray
-  log1p(): MxArray
+  addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray;
+  abs(): MxArray;
+  negative(): MxArray;
+  sign(): MxArray;
+  sqrt(): MxArray;
+  square(): MxArray;
+  power(other: MxArray): MxArray;
+  sin(): MxArray;
+  cos(): MxArray;
+  tan(): MxArray;
+  sinh(): MxArray;
+  cosh(): MxArray;
+  tanh(): MxArray;
+  floor(): MxArray;
+  ceil(): MxArray;
+  round(): MxArray;
+  floorDivide(other: MxArray): MxArray;
+  remainder(other: MxArray): MxArray;
+  reciprocal(): MxArray;
+  arcsin(): MxArray;
+  arccos(): MxArray;
+  arctan(): MxArray;
+  log10(): MxArray;
+  log2(): MxArray;
+  log1p(): MxArray;
   /**
    * Element-wise check for NaN values
    *
    * Returns a boolean array where True indicates the element is NaN.
    * This is a GPU-native operation that avoids CPU data transfer.
    */
-  isnan(): MxArray
+  isnan(): MxArray;
   /**
    * Element-wise check for Inf values
    *
    * Returns a boolean array where True indicates the element is +Inf or -Inf.
    * This is a GPU-native operation that avoids CPU data transfer.
    */
-  isinf(): MxArray
+  isinf(): MxArray;
   /**
    * Element-wise check for finite values
    *
    * Returns a boolean array where True indicates the element is finite (not NaN and not Inf).
    * This is a GPU-native operation that avoids CPU data transfer.
    */
-  isfinite(): MxArray
-  static randomUniform(shape: BigInt64Array, low: number, high: number, dtype?: DType | undefined | null): MxArray
-  static randomNormal(shape: BigInt64Array, mean: number, std: number, dtype?: DType | undefined | null): MxArray
-  static randomBernoulli(shape: BigInt64Array, prob: number): MxArray
-  static randint(shape: BigInt64Array, low: number, high: number): MxArray
+  isfinite(): MxArray;
+  static randomUniform(shape: BigInt64Array, low: number, high: number, dtype?: DType | undefined | null): MxArray;
+  static randomNormal(shape: BigInt64Array, mean: number, std: number, dtype?: DType | undefined | null): MxArray;
+  static randomBernoulli(shape: BigInt64Array, prob: number): MxArray;
+  static randint(shape: BigInt64Array, low: number, high: number): MxArray;
   /**
    * Sample from categorical distribution
    * Takes logits and returns sampled indices
    */
-  categorical(axis?: number | undefined | null): MxArray
-  sum(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray
-  mean(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray
-  argmax(axis: number, keepdims?: boolean | undefined | null): MxArray
-  argmin(axis: number, keepdims?: boolean | undefined | null): MxArray
-  max(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray
-  min(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray
-  prod(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray
-  var(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null, ddof?: number | undefined | null): MxArray
-  std(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null, ddof?: number | undefined | null): MxArray
-  logsumexp(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray
-  cumsum(axis: number): MxArray
-  cumprod(axis: number): MxArray
-  reshape(shape: BigInt64Array): MxArray
-  transpose(axes?: Int32Array | undefined | null): MxArray
-  take(indices: MxArray, axis: number): MxArray
-  takeAlongAxis(indices: MxArray, axis: number): MxArray
+  categorical(axis?: number | undefined | null): MxArray;
+  sum(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  mean(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  argmax(axis: number, keepdims?: boolean | undefined | null): MxArray;
+  argmin(axis: number, keepdims?: boolean | undefined | null): MxArray;
+  max(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  min(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  prod(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  var(
+    axes?: Int32Array | undefined | null,
+    keepdims?: boolean | undefined | null,
+    ddof?: number | undefined | null,
+  ): MxArray;
+  std(
+    axes?: Int32Array | undefined | null,
+    keepdims?: boolean | undefined | null,
+    ddof?: number | undefined | null,
+  ): MxArray;
+  logsumexp(axes?: Int32Array | undefined | null, keepdims?: boolean | undefined | null): MxArray;
+  cumsum(axis: number): MxArray;
+  cumprod(axis: number): MxArray;
+  reshape(shape: BigInt64Array): MxArray;
+  transpose(axes?: Int32Array | undefined | null): MxArray;
+  take(indices: MxArray, axis: number): MxArray;
+  takeAlongAxis(indices: MxArray, axis: number): MxArray;
   /**
    * Put values into array at specified indices along an axis
    * Equivalent to: result = array.copy(); result[..., indices] = values
    * This matches MLX's put_along_axis for efficient in-place-style updates
    */
-  putAlongAxis(indices: MxArray, values: MxArray, axis: number): MxArray
-  slice(starts: BigInt64Array, stops: BigInt64Array): MxArray
+  putAlongAxis(indices: MxArray, values: MxArray, axis: number): MxArray;
+  slice(starts: BigInt64Array, stops: BigInt64Array): MxArray;
   /**
    * Concatenate two arrays along an axis
    * Optimized for the common binary concatenation case
    */
-  static concatenate(a: MxArray, b: MxArray, axis: number): MxArray
+  static concatenate(a: MxArray, b: MxArray, axis: number): MxArray;
   /**
    * Concatenate multiple arrays along an axis
    * For concatenating 3 or more arrays
    */
-  static concatenateMany(arrays: Array<MxArray>, axis?: number | undefined | null): MxArray
-  sort(axis?: number | undefined | null): MxArray
-  argsort(axis?: number | undefined | null): MxArray
-  partition(kth: number, axis?: number | undefined | null): MxArray
-  argpartition(kth: number, axis?: number | undefined | null): MxArray
-  static stack(arrays: Array<MxArray>, axis?: number | undefined | null): MxArray
-  pad(padWidth: Int32Array, constantValue: number): MxArray
-  roll(shift: number, axis: number): MxArray
-  split(indicesOrSections: number, axis?: number | undefined | null): Array<MxArray>
-  tile(reps: Int32Array): MxArray
-  repeat(repeats: number, axis: number): MxArray
-  squeeze(axes?: Int32Array | undefined | null): MxArray
-  expandDims(axis: number): MxArray
-  broadcastTo(shape: BigInt64Array): MxArray
+  static concatenateMany(arrays: Array<MxArray>, axis?: number | undefined | null): MxArray;
+  sort(axis?: number | undefined | null): MxArray;
+  argsort(axis?: number | undefined | null): MxArray;
+  partition(kth: number, axis?: number | undefined | null): MxArray;
+  argpartition(kth: number, axis?: number | undefined | null): MxArray;
+  static stack(arrays: Array<MxArray>, axis?: number | undefined | null): MxArray;
+  pad(padWidth: Int32Array, constantValue: number): MxArray;
+  roll(shift: number, axis: number): MxArray;
+  split(indicesOrSections: number, axis?: number | undefined | null): Array<MxArray>;
+  tile(reps: Int32Array): MxArray;
+  repeat(repeats: number, axis: number): MxArray;
+  squeeze(axes?: Int32Array | undefined | null): MxArray;
+  expandDims(axis: number): MxArray;
+  broadcastTo(shape: BigInt64Array): MxArray;
 }
 
 /**
@@ -369,11 +392,11 @@ export declare class MxArray {
  */
 export declare class PromptCache {
   /** Number of tokens stored in this cache. */
-  get tokenCount(): number
+  get tokenCount(): number;
   /** Whether this cache has been consumed (caches moved out). */
-  get isEmpty(): boolean
+  get isEmpty(): boolean;
   /** Release GPU memory held by this cache. */
-  dispose(): void
+  dispose(): void;
 }
 
 /**
@@ -384,36 +407,44 @@ export declare class PromptCache {
  */
 export declare class QianfanOCRModel {
   /** Create a new QianfanOCRModel from config (uninitialized, no weights). */
-  constructor(config: QianfanOcrConfig)
+  constructor(config: QianfanOcrConfig);
   /** Returns true if weights have been loaded. */
-  get isInitialized(): boolean
+  get isInitialized(): boolean;
   /**
    * Load a QianfanOCRModel from a directory.
    *
    * Reads config.json, loads SafeTensors weights (single or sharded),
    * builds vision encoder, bridge, and language model, and loads tokenizer.
    */
-  static load(modelPath: string): Promise<QianfanOCRModel>
+  static load(modelPath: string): Promise<QianfanOCRModel>;
   /**
    * Chat with the model.
    *
    * High-level API: processes images, formats prompt, generates, and decodes.
    */
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<QianfanChatResult>
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<QianfanChatResult>;
   /**
    * Streaming chat with the model.
    *
    * Same as chat() but emits tokens incrementally via callback.
    */
-  chatStream(messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void): Promise<ChatStreamHandle>
+  chatStream(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
   /**
    * Generate text tokens given pre-tokenized input.
    *
    * Lower-level API — prefer chat() for typical usage.
    */
-  generate(inputIds: MxArray, maxNewTokens?: number | undefined | null, temperature?: number | undefined | null): Promise<Array<number>>
+  generate(
+    inputIds: MxArray,
+    maxNewTokens?: number | undefined | null,
+    temperature?: number | undefined | null,
+  ): Promise<Array<number>>;
   /** Reset KV caches and token history. */
-  resetCaches(): void
+  resetCaches(): void;
 }
 
 /**
@@ -425,11 +456,11 @@ export declare class QianfanOCRModel {
  */
 export declare class Qwen35Model {
   /** Create a new Qwen3.5 model with the given configuration. */
-  constructor(config: Qwen35Config)
+  constructor(config: Qwen35Config);
   /** Initialize caches for incremental generation. */
-  initCaches(): void
+  initCaches(): void;
   /** Reset all caches. */
-  resetCaches(): void
+  resetCaches(): void;
   /**
    * Take the KV cache from the model, returning a `PromptCache` handle.
    *
@@ -437,14 +468,14 @@ export declare class Qwen35Model {
    * returns `null` the second time. Pass the cache back via `setCache()`
    * before the next `chat()` call for incremental prefill.
    */
-  takeCache(): PromptCache | null
+  takeCache(): PromptCache | null;
   /**
    * Restore a previously taken `PromptCache` into the model.
    *
    * On the next `chat()` call with `reuseCache: true`, the model will
    * prefix-match the new tokens against the cache and only prefill the delta.
    */
-  setCache(cache: PromptCache): void
+  setCache(cache: PromptCache): void;
   /**
    * Forward pass through the model.
    *
@@ -454,9 +485,9 @@ export declare class Qwen35Model {
    * # Returns
    * Logits [B, T, vocab_size]
    */
-  forward(inputIds: MxArray): MxArray
+  forward(inputIds: MxArray): MxArray;
   /** Forward pass with cache for incremental generation. */
-  forwardWithCache(inputIds: MxArray): MxArray
+  forwardWithCache(inputIds: MxArray): MxArray;
   /**
    * Load a pretrained model from a directory.
    *
@@ -465,7 +496,7 @@ export declare class Qwen35Model {
    * - model.safetensors (or model-*.safetensors)
    * - tokenizer.json + tokenizer_config.json
    */
-  static load(path: string): Promise<Qwen35Model>
+  static load(path: string): Promise<Qwen35Model>;
   /**
    * Load a model from in-memory buffers (works in both Node.js and browser).
    *
@@ -475,7 +506,7 @@ export declare class Qwen35Model {
    * * `tokenizer_json` - Contents of tokenizer.json as a string
    * Load a model from in-memory buffers (works in both Node.js and browser).
    */
-  static loadFromMemory(configJson: string, weightBuffers: Array<Buffer>, tokenizerJson: string): Qwen35Model
+  static loadFromMemory(configJson: string, weightBuffers: Array<Buffer>, tokenizerJson: string): Qwen35Model;
   /**
    * Load a model from pre-created GPU buffers (zero-copy, for browser WebGPU).
    *
@@ -483,29 +514,38 @@ export declare class Qwen35Model {
    * fetch ArrayBuffer, and passes the buffer handles here. No weight data touches
    * WASM linear memory.
    */
-  static loadFromGpuBuffers(configJson: string, gpuTensors: Array<GpuTensorInfo>, tokenizerJson: string, tokenizerConfigJson?: string | undefined | null): Qwen35Model
+  static loadFromGpuBuffers(
+    configJson: string,
+    gpuTensors: Array<GpuTensorInfo>,
+    tokenizerJson: string,
+    tokenizerConfigJson?: string | undefined | null,
+  ): Qwen35Model;
   /** Store config and tokenizer strings before tensor accumulation (call before addCpuTensor). */
-  static setCpuModelConfig(configJson: string, tokenizerJson: string, tokenizerConfigJson?: string | undefined | null): void
+  static setCpuModelConfig(
+    configJson: string,
+    tokenizerJson: string,
+    tokenizerConfigJson?: string | undefined | null,
+  ): void;
   /** Add one CPU-resident tensor to the accumulator. C++ copies data from ptr immediately. */
-  static addCpuTensor(name: string, ptr: number, byteSize: number, shape: Array<number>, dtypeCode: number): void
+  static addCpuTensor(name: string, ptr: number, byteSize: number, shape: Array<number>, dtypeCode: number): void;
   /** Debug probe: test NAPI call after memory growth. step 0=noop, 1=check config, 2=check tensors, 3=full build */
-  static buildModelDebugProbe(step: number): string
+  static buildModelDebugProbe(step: number): string;
   /** Build model from stored config and accumulated CPU tensors (async — dispatched to emnapi worker). */
-  static buildModelFromCpuTensors(): Promise<Qwen35Model>
+  static buildModelFromCpuTensors(): Promise<Qwen35Model>;
   /**
    * Generate text from a prompt token sequence.
    *
    * Runs generation on a worker thread via spawn_blocking to avoid
    * blocking the Node.js event loop.
    */
-  generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>
+  generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
   /**
    * Chat API with tool calling support.
    *
    * Runs tokenization + generation on a worker thread via spawn_blocking
    * to avoid blocking the Node.js event loop.
    */
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Synchronous chat for WASM.
    *
@@ -514,7 +554,7 @@ export declare class Qwen35Model {
    * version bypasses the async machinery entirely. Safe because WASM user
    * code is single-threaded (no concurrent `chat()` calls possible).
    */
-  chatSync(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): ChatResult
+  chatSync(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): ChatResult;
   /**
    * Streaming chat API with tool calling support.
    *
@@ -522,9 +562,13 @@ export declare class Qwen35Model {
    * Returns a `ChatStreamHandle` immediately; generation runs in background.
    * Call `handle.cancel()` to abort generation early.
    */
-  chatStream(messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void): Promise<ChatStreamHandle>
+  chatStream(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
   /** Get the number of parameters in the model. */
-  numParameters(): number
+  numParameters(): number;
   /**
    * Save the model weights and configuration to a directory.
    *
@@ -536,9 +580,9 @@ export declare class Qwen35Model {
    * # Arguments
    * * `save_path` - Directory to save the model
    */
-  saveModel(savePath: string): Promise<undefined>
+  saveModel(savePath: string): Promise<undefined>;
 }
-export type Qwen3_5Model = Qwen35Model
+export type Qwen3_5Model = Qwen35Model;
 
 /**
  * Qwen3.5 MoE Model -- hybrid linear/full attention with Mixture-of-Experts.
@@ -548,7 +592,7 @@ export type Qwen3_5Model = Qwen35Model
  * Falls back to Rust forward_inner path for test models without stored weights.
  */
 export declare class Qwen35MoeModel {
-  constructor(config: Qwen35MoeConfig)
+  constructor(config: Qwen35MoeConfig);
   /**
    * Take the KV cache from the model, returning a `PromptCache` handle.
    *
@@ -556,21 +600,21 @@ export declare class Qwen35MoeModel {
    * returns `null` the second time. Pass the cache back via `setCache()`
    * before the next `chat()` call for incremental prefill.
    */
-  takeCache(): PromptCache | null
+  takeCache(): PromptCache | null;
   /**
    * Restore a previously taken `PromptCache` into the model.
    *
    * On the next `chat()` call with `reuseCache: true`, the model will
    * prefix-match the new tokens against the cache and only prefill the delta.
    */
-  setCache(cache: PromptCache): void
-  initCaches(): void
-  resetCaches(): void
-  forward(inputIds: MxArray): MxArray
-  forwardWithCache(inputIds: MxArray): MxArray
-  static load(path: string): Promise<Qwen35MoeModel>
-  generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>
+  setCache(cache: PromptCache): void;
+  initCaches(): void;
+  resetCaches(): void;
+  forward(inputIds: MxArray): MxArray;
+  forwardWithCache(inputIds: MxArray): MxArray;
+  static load(path: string): Promise<Qwen35MoeModel>;
+  generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Streaming chat API with tool calling support.
    *
@@ -578,8 +622,12 @@ export declare class Qwen35MoeModel {
    * Returns a `ChatStreamHandle` immediately; generation runs in background.
    * Call `handle.cancel()` to abort generation early.
    */
-  chatStream(messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void): Promise<ChatStreamHandle>
-  numParameters(): number
+  chatStream(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  numParameters(): number;
   /**
    * Save the model weights and configuration to a directory.
    *
@@ -591,9 +639,9 @@ export declare class Qwen35MoeModel {
    * # Arguments
    * * `save_path` - Directory to save the model
    */
-  saveModel(savePath: string): Promise<undefined>
+  saveModel(savePath: string): Promise<undefined>;
 }
-export type Qwen3_5MoeModel = Qwen35MoeModel
+export type Qwen3_5MoeModel = Qwen35MoeModel;
 
 /**
  * Qwen3 Model with automatic differentiation support
@@ -604,12 +652,12 @@ export type Qwen3_5MoeModel = Qwen35MoeModel
  */
 export declare class Qwen3Model {
   /** Create a new Qwen3 model with the given configuration */
-  constructor(config: Qwen3Config)
+  constructor(config: Qwen3Config);
   /**
    * Reset the KV cache used for cache reuse across chat() calls.
    * Call this when starting a new conversation to ensure a full prefill.
    */
-  resetCache(): void
+  resetCache(): void;
   /**
    * Forward pass through the model
    *
@@ -619,33 +667,33 @@ export declare class Qwen3Model {
    * # Returns
    * * Logits, shape: [batch_size, seq_len, vocab_size]
    */
-  forward(inputIds: MxArray): MxArray
+  forward(inputIds: MxArray): MxArray;
   /**
    * Initialize KV caches for incremental generation
    *
    * Creates one KV cache per transformer layer. Call this before starting generation.
    */
-  initKvCaches(): void
+  initKvCaches(): void;
   /**
    * Reset all KV caches
    *
    * Clears cached key-value states. Call this between different generation sequences.
    */
-  resetKvCaches(): void
+  resetKvCaches(): void;
   /** Check if paged attention is enabled for this model */
-  hasPagedAttention(): boolean
+  hasPagedAttention(): boolean;
   /**
    * Get paged attention memory statistics (if enabled)
    *
    * Returns memory usage statistics for the paged KV cache.
    */
-  pagedCacheStats(): PagedCacheStats | null
+  pagedCacheStats(): PagedCacheStats | null;
   /**
    * Get scheduler statistics (if paged attention is enabled)
    *
    * Returns the number of waiting, running, and completed sequences.
    */
-  schedulerStats(): SchedulerStatsNapi | null
+  schedulerStats(): SchedulerStatsNapi | null;
   /**
    * Forward pass with KV caching for incremental generation
    *
@@ -656,7 +704,7 @@ export declare class Qwen3Model {
    * # Returns
    * * Logits, shape: [batch_size, seq_len, vocab_size]
    */
-  forwardWithCache(inputIds: MxArray, useCache: boolean): MxArray
+  forwardWithCache(inputIds: MxArray, useCache: boolean): MxArray;
   /**
    * Forward pass with paged attention for memory-efficient inference.
    *
@@ -674,7 +722,7 @@ export declare class Qwen3Model {
    * # Returns
    * * Logits, shape: [num_seqs, 1, vocab_size] for decode
    */
-  forwardPaged(inputIds: MxArray, slotMapping: MxArray, seqIds: Array<number>, positions: MxArray): MxArray
+  forwardPaged(inputIds: MxArray, slotMapping: MxArray, seqIds: Array<number>, positions: MxArray): MxArray;
   /**
    * Prefill a sequence using standard attention and write K/V to paged cache.
    *
@@ -690,7 +738,7 @@ export declare class Qwen3Model {
    * # Returns
    * * Logits for the last token, shape: [1, vocab_size]
    */
-  prefillPaged(promptTokens: Array<number>, seqId: number): MxArray
+  prefillPaged(promptTokens: Array<number>, seqId: number): MxArray;
   /**
    * Add a request to the paged attention scheduler.
    *
@@ -710,7 +758,12 @@ export declare class Qwen3Model {
    * # Returns
    * * Number of pending requests in the queue
    */
-  addPagedRequest(requestId: string, promptTokens: Array<number>, maxNewTokens: number, priority?: number | undefined | null): number
+  addPagedRequest(
+    requestId: string,
+    promptTokens: Array<number>,
+    maxNewTokens: number,
+    priority?: number | undefined | null,
+  ): number;
   /**
    * Schedule and execute one step of paged generation.
    *
@@ -726,17 +779,17 @@ export declare class Qwen3Model {
    * # Returns
    * * `PagedGenerationStep` with token outputs for each sequence
    */
-  stepPagedGeneration(config?: GenerationConfig | undefined | null): PagedGenerationStep | null
+  stepPagedGeneration(config?: GenerationConfig | undefined | null): PagedGenerationStep | null;
   /**
    * Get completed sequences from the scheduler.
    *
    * Call this after `step_paged_generation()` returns outputs with `is_finished: true`.
    */
-  getCompletedSequences(): Array<PagedCompletedSequence>
+  getCompletedSequences(): Array<PagedCompletedSequence>;
   /** Check if the scheduler has pending work. */
-  hasPagedWork(): boolean
+  hasPagedWork(): boolean;
   /** Get model configuration */
-  getConfig(): Qwen3Config
+  getConfig(): Qwen3Config;
   /**
    * Generate tokens using speculative decoding with a draft model.
    *
@@ -771,17 +824,21 @@ export declare class Qwen3Model {
    * });
    * ```
    */
-  generateSpeculativeSync(draftModel: Qwen3Model, inputIds: MxArray, config?: GenerationConfig | undefined | null): GenerationResult
+  generateSpeculativeSync(
+    draftModel: Qwen3Model,
+    inputIds: MxArray,
+    config?: GenerationConfig | undefined | null,
+  ): GenerationResult;
   /** Count total number of parameters in the model */
-  numParameters(): number
+  numParameters(): number;
   /**
    * Get all model parameters as a dictionary mapping names to arrays
    *
    * This matches the TypeScript API for compatibility
    */
-  getParameters(): Record<string, MxArray>
+  getParameters(): Record<string, MxArray>;
   /** Load parameters from a dictionary */
-  loadParameters(params: Record<string, MxArray>): void
+  loadParameters(params: Record<string, MxArray>): void;
   /**
    * Compute forward pass and loss (for evaluation)
    *
@@ -792,7 +849,7 @@ export declare class Qwen3Model {
    * # Returns
    * * Scalar loss value
    */
-  computeLoss(inputIds: MxArray, labels: MxArray): MxArray
+  computeLoss(inputIds: MxArray, labels: MxArray): MxArray;
   /**
    * Compute loss and gradients using a hybrid approach
    *
@@ -814,7 +871,7 @@ export declare class Qwen3Model {
    *
    * Future: Full MLX autograd will compute exact gradients for all 250+ parameters
    */
-  computeLossAndGradients(inputIds: MxArray, labels: MxArray): [MxArray, Record<string, MxArray>]
+  computeLossAndGradients(inputIds: MxArray, labels: MxArray): [MxArray, Record<string, MxArray>];
   /**
    * Accumulate gradients into existing gradient dictionary
    *
@@ -828,7 +885,10 @@ export declare class Qwen3Model {
    * # Returns
    * * Updated gradient dictionary with accumulated values
    */
-  static accumulateGradients(accumulatedGradients: Record<string, MxArray>, newGradients: Record<string, MxArray>): Record<string, MxArray>
+  static accumulateGradients(
+    accumulatedGradients: Record<string, MxArray>,
+    newGradients: Record<string, MxArray>,
+  ): Record<string, MxArray>;
   /**
    * Apply gradients to model parameters
    *
@@ -843,7 +903,7 @@ export declare class Qwen3Model {
    * The learning rate scalar is cast to match param dtype to prevent
    * promotion to float32 during arithmetic operations.
    */
-  applyGradients(gradients: Record<string, MxArray>, learningRate: number): void
+  applyGradients(gradients: Record<string, MxArray>, learningRate: number): void;
   /**
    * Text-to-text generation with integrated tokenization
    *
@@ -874,7 +934,7 @@ export declare class Qwen3Model {
    * console.log(result.logprobs); // Log probabilities (for GRPO)
    * ```
    */
-  generate(messages: Array<ChatMessage>, config?: GenerationConfig | undefined | null): Promise<GenerationResult>
+  generate(messages: Array<ChatMessage>, config?: GenerationConfig | undefined | null): Promise<GenerationResult>;
   /**
    * High-level chat API with structured response parsing
    *
@@ -945,7 +1005,7 @@ export declare class Qwen3Model {
    * }
    * ```
    */
-  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>
+  chat(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
    * Generate multiple completions for multiple prompts in batch
    *
@@ -980,7 +1040,11 @@ export declare class Qwen3Model {
    * );
    * ```
    */
-  generateBatch(prompts: Array<Array<ChatMessage>>, groupSize: number, config?: GenerationConfig | undefined | null): Promise<BatchGenerationResult>
+  generateBatch(
+    prompts: Array<Array<ChatMessage>>,
+    groupSize: number,
+    config?: GenerationConfig | undefined | null,
+  ): Promise<BatchGenerationResult>;
   /**
    * Decode token IDs to text using the internal tokenizer
    *
@@ -994,7 +1058,7 @@ export declare class Qwen3Model {
    * # Returns
    * * Decoded text string
    */
-  decode(tokenIds: Uint32Array, skipSpecialTokens?: boolean | undefined | null): Promise<string>
+  decode(tokenIds: Uint32Array, skipSpecialTokens?: boolean | undefined | null): Promise<string>;
   /**
    * Apply chat template and encode to token IDs
    *
@@ -1010,7 +1074,12 @@ export declare class Qwen3Model {
    * # Returns
    * * Encoded token IDs as Uint32Array
    */
-  applyChatTemplate(messages: Array<ChatMessage>, addGenerationPrompt?: boolean | undefined | null, tools?: Array<ToolDefinition> | undefined | null, enableThinking?: boolean | undefined | null): Promise<Uint32Array>
+  applyChatTemplate(
+    messages: Array<ChatMessage>,
+    addGenerationPrompt?: boolean | undefined | null,
+    tools?: Array<ToolDefinition> | undefined | null,
+    enableThinking?: boolean | undefined | null,
+  ): Promise<Uint32Array>;
 }
 
 /** Qwen3 Tokenizer class with NAPI bindings */
@@ -1027,7 +1096,7 @@ export declare class Qwen3Tokenizer {
    * const tokens = tokenizer.encode("Hello, world!");
    * ```
    */
-  static fromPretrained(tokenizerPath: string): Promise<Qwen3Tokenizer>
+  static fromPretrained(tokenizerPath: string): Promise<Qwen3Tokenizer>;
   /**
    * Encode text to token IDs
    *
@@ -1044,7 +1113,7 @@ export declare class Qwen3Tokenizer {
    * console.log(tokens); // Int32Array [9906, 11, 1879, 0]
    * ```
    */
-  encode(text: string, addSpecialTokens?: boolean | undefined | null): Promise<Uint32Array>
+  encode(text: string, addSpecialTokens?: boolean | undefined | null): Promise<Uint32Array>;
   /**
    * Encode multiple texts in batch
    *
@@ -1055,7 +1124,7 @@ export declare class Qwen3Tokenizer {
    * # Returns
    * Array of Int32Arrays, one for each text
    */
-  encodeBatch(texts: Array<string>, addSpecialTokens?: boolean | undefined | null): Promise<Array<Uint32Array>>
+  encodeBatch(texts: Array<string>, addSpecialTokens?: boolean | undefined | null): Promise<Array<Uint32Array>>;
   /**
    * Decode token IDs to text
    *
@@ -1072,7 +1141,7 @@ export declare class Qwen3Tokenizer {
    * console.log(text); // "Hello, world!"
    * ```
    */
-  decode(tokenIds: Uint32Array, skipSpecialTokens?: boolean | undefined | null): Promise<string>
+  decode(tokenIds: Uint32Array, skipSpecialTokens?: boolean | undefined | null): Promise<string>;
   /**
    * Decode multiple token sequences in batch
    *
@@ -1083,7 +1152,10 @@ export declare class Qwen3Tokenizer {
    * # Returns
    * Array of decoded text strings
    */
-  decodeBatch(tokenIdsBatch: Array<Uint32Array>, skipSpecialTokens?: boolean | undefined | null): Promise<Array<string>>
+  decodeBatch(
+    tokenIdsBatch: Array<Uint32Array>,
+    skipSpecialTokens?: boolean | undefined | null,
+  ): Promise<Array<string>>;
   /**
    * Apply chat template to messages and encode
    *
@@ -1116,25 +1188,30 @@ export declare class Qwen3Tokenizer {
    * const tokens = tokenizer.applyChatTemplate(messages, true, tools);
    * ```
    */
-  applyChatTemplate(messages: Array<ChatMessage>, addGenerationPrompt?: boolean | undefined | null, tools?: Array<ToolDefinition> | undefined | null, enableThinking?: boolean | undefined | null): Promise<Uint32Array>
+  applyChatTemplate(
+    messages: Array<ChatMessage>,
+    addGenerationPrompt?: boolean | undefined | null,
+    tools?: Array<ToolDefinition> | undefined | null,
+    enableThinking?: boolean | undefined | null,
+  ): Promise<Uint32Array>;
   /** Get vocabulary size */
-  vocabSize(): number
+  vocabSize(): number;
   /** Get PAD token ID */
-  getPadTokenId(): number
+  getPadTokenId(): number;
   /** Get EOS token ID */
-  getEosTokenId(): number
+  getEosTokenId(): number;
   /** Get BOS token ID (if exists) */
-  getBosTokenId(): number | null
+  getBosTokenId(): number | null;
   /** Convert token ID to string */
-  idToToken(id: number): string | null
+  idToToken(id: number): string | null;
   /** Convert token string to ID */
-  tokenToId(token: string): number | null
+  tokenToId(token: string): number | null;
   /** Get the special token for IM_START */
-  getImStartToken(): string
+  getImStartToken(): string;
   /** Get the special token for IM_END */
-  getImEndToken(): string
+  getImEndToken(): string;
   /** Get the special token for ENDOFTEXT (used as PAD) */
-  getEndoftextToken(): string
+  getEndoftextToken(): string;
 }
 
 /**
@@ -1147,48 +1224,56 @@ export declare class Qwen3Tokenizer {
  */
 export declare class Tensor {
   /** Create a tensor from float32 data */
-  static fromFloat32(data: Float32Array, shape: BigInt64Array, requiresGrad?: boolean | undefined | null): Tensor
+  static fromFloat32(data: Float32Array, shape: BigInt64Array, requiresGrad?: boolean | undefined | null): Tensor;
   /** Create a tensor from int32 data */
-  static fromInt32(data: Int32Array, shape: BigInt64Array, requiresGrad?: boolean | undefined | null): Tensor
+  static fromInt32(data: Int32Array, shape: BigInt64Array, requiresGrad?: boolean | undefined | null): Tensor;
   /** Get the shape of the underlying data */
-  dataShape(): BigInt64Array
+  dataShape(): BigInt64Array;
   /** Get the shape of the gradient (if it exists) */
-  gradShape(): BigInt64Array | null
+  gradShape(): BigInt64Array | null;
   /** Check if gradient exists */
-  hasGrad(): boolean
+  hasGrad(): boolean;
   /** Check if this tensor requires gradients */
-  get requiresGrad(): boolean
+  get requiresGrad(): boolean;
   /** Set whether this tensor requires gradients */
-  set requiresGrad(requiresGrad: boolean)
+  set requiresGrad(requiresGrad: boolean);
   /** Zero out the gradient */
-  zeroGrad(): void
+  zeroGrad(): void;
   /**
    * Accumulate gradient
    *
    * If gradient already exists, add to it. Otherwise, set it.
    * Note: This takes ownership of the gradient array.
    */
-  accumulateGrad(grad: MxArray): void
+  accumulateGrad(grad: MxArray): void;
   /** Get the shape of the tensor */
-  shape(): BigInt64Array
+  shape(): BigInt64Array;
   /** Convert data to Float32 array */
-  toFloat32(): Float32Array
+  toFloat32(): Float32Array;
   /** Convert gradient to Float32 array (if it exists) */
-  gradToFloat32(): Float32Array | null
+  gradToFloat32(): Float32Array | null;
   /** Convert to Int32 array */
-  toInt32(): Int32Array
+  toInt32(): Int32Array;
   /**
    * Detach this tensor from the computation graph
    *
    * Returns a new tensor with the same data but no gradient tracking
    */
-  detach(): Tensor
+  detach(): Tensor;
   /** Create a tensor of zeros */
-  static zeros(shape: BigInt64Array, dtype?: DType | undefined | null, requiresGrad?: boolean | undefined | null): Tensor
+  static zeros(
+    shape: BigInt64Array,
+    dtype?: DType | undefined | null,
+    requiresGrad?: boolean | undefined | null,
+  ): Tensor;
   /** Create a tensor of ones */
-  static ones(shape: BigInt64Array, dtype?: DType | undefined | null, requiresGrad?: boolean | undefined | null): Tensor
+  static ones(
+    shape: BigInt64Array,
+    dtype?: DType | undefined | null,
+    requiresGrad?: boolean | undefined | null,
+  ): Tensor;
   /** Evaluate the underlying array */
-  eval(): void
+  eval(): void;
 }
 
 /**
@@ -1203,7 +1288,7 @@ export declare class TextDetModel {
    * # Arguments
    * * `model_path` - Path to model directory
    */
-  static load(modelPath: string): TextDetModel
+  static load(modelPath: string): TextDetModel;
   /**
    * Detect text lines in an image.
    *
@@ -1214,7 +1299,7 @@ export declare class TextDetModel {
    * # Returns
    * * Vec of TextBox with bounding boxes and confidence scores
    */
-  detect(imageData: Buffer, threshold?: number | undefined | null): Array<TextBox>
+  detect(imageData: Buffer, threshold?: number | undefined | null): Array<TextBox>;
   /**
    * Detect text lines from raw RGB pixel data.
    *
@@ -1227,7 +1312,7 @@ export declare class TextDetModel {
    * # Returns
    * * Vec of TextBox with bounding boxes and confidence scores
    */
-  detectCrop(rgbData: Uint8Array, width: number, height: number, threshold?: number | undefined | null): Array<TextBox>
+  detectCrop(rgbData: Uint8Array, width: number, height: number, threshold?: number | undefined | null): Array<TextBox>;
 }
 
 /**
@@ -1243,7 +1328,7 @@ export declare class TextRecModel {
    * * `model_path` - Path to model directory
    * * `dict_path` - Path to character dictionary text file
    */
-  static load(modelPath: string, dictPath: string): TextRecModel
+  static load(modelPath: string, dictPath: string): TextRecModel;
   /**
    * Recognize text from encoded image bytes.
    *
@@ -1253,7 +1338,7 @@ export declare class TextRecModel {
    * # Returns
    * * RecResult with recognized text and confidence score
    */
-  recognize(imageData: Buffer): RecResult
+  recognize(imageData: Buffer): RecResult;
   /**
    * Recognize text from multiple encoded images.
    *
@@ -1263,7 +1348,7 @@ export declare class TextRecModel {
    * # Returns
    * * Vec of RecResult with recognized text and confidence scores
    */
-  recognizeBatch(images: Array<Buffer>): Array<RecResult>
+  recognizeBatch(images: Array<Buffer>): Array<RecResult>;
   /**
    * Recognize text from raw RGB crop data.
    *
@@ -1275,23 +1360,23 @@ export declare class TextRecModel {
    * # Returns
    * * RecResult with recognized text and confidence score
    */
-  recognizeCrop(rgbData: Uint8Array, width: number, height: number): RecResult
+  recognizeCrop(rgbData: Uint8Array, width: number, height: number): RecResult;
 }
 
 /** Result from VLM chat */
 export declare class VlmChatResult {
   /** Get the response text */
-  get text(): string
+  get text(): string;
   /** Get the generated tokens */
-  get tokens(): MxArray
+  get tokens(): MxArray;
   /** Get the log probabilities */
-  get logprobs(): MxArray
+  get logprobs(): MxArray;
   /** Get the finish reason */
-  get finishReason(): 'stop' | 'length' | 'repetition'
+  get finishReason(): 'stop' | 'length' | 'repetition';
   /** Get the number of tokens generated */
-  get numTokens(): number
+  get numTokens(): number;
 }
-export type VLMChatResult = VlmChatResult
+export type VLMChatResult = VlmChatResult;
 
 /**
  * Vision-Language Model
@@ -1301,11 +1386,11 @@ export type VLMChatResult = VlmChatResult
  */
 export declare class VLModel {
   /** Create a new PaddleOCR-VL model */
-  constructor(config: ModelConfig)
+  constructor(config: ModelConfig);
   /** Set the tokenizer */
-  setTokenizer(tokenizer: Qwen3Tokenizer): void
+  setTokenizer(tokenizer: Qwen3Tokenizer): void;
   /** Check if tokenizer is available */
-  get hasTokenizer(): boolean
+  get hasTokenizer(): boolean;
   /**
    * Chat with the VLM model
    *
@@ -1326,7 +1411,7 @@ export declare class VLModel {
    * );
    * ```
    */
-  chat(messages: Array<VlmChatMessage>, config?: VlmChatConfig | undefined | null): Promise<VlmChatResult>
+  chat(messages: Array<VlmChatMessage>, config?: VlmChatConfig | undefined | null): Promise<VlmChatResult>;
   /**
    * Simple OCR: extract text from encoded image bytes
    *
@@ -1345,7 +1430,7 @@ export declare class VLModel {
    * console.log(text);
    * ```
    */
-  ocr(imageData: Buffer, prompt?: string | undefined | null): Promise<string>
+  ocr(imageData: Buffer, prompt?: string | undefined | null): Promise<string>;
   /**
    * Get input embeddings with vision features merged
    *
@@ -1357,7 +1442,11 @@ export declare class VLModel {
    * # Returns
    * * Input embeddings with vision features inserted at image token positions
    */
-  getInputEmbeddings(inputIds: MxArray, pixelValues?: MxArray | undefined | null, imageGridThw?: MxArray | undefined | null): MxArray
+  getInputEmbeddings(
+    inputIds: MxArray,
+    pixelValues?: MxArray | undefined | null,
+    imageGridThw?: MxArray | undefined | null,
+  ): MxArray;
   /**
    * Forward pass
    *
@@ -1370,7 +1459,12 @@ export declare class VLModel {
    * # Returns
    * * Logits [batch, seq_len, vocab_size]
    */
-  forward(inputIds: MxArray, pixelValues?: MxArray | undefined | null, imageGridThw?: MxArray | undefined | null, mask?: MxArray | undefined | null): MxArray
+  forward(
+    inputIds: MxArray,
+    pixelValues?: MxArray | undefined | null,
+    imageGridThw?: MxArray | undefined | null,
+    mask?: MxArray | undefined | null,
+  ): MxArray;
   /**
    * Generate text tokens given input tokens and optional image
    *
@@ -1387,7 +1481,12 @@ export declare class VLModel {
    * # Returns
    * * GenerationResult with tokens, logprobs, and finish reason
    */
-  generate(inputIds: MxArray, pixelValues?: MxArray | undefined | null, imageGridThw?: MxArray | undefined | null, config?: GenerationConfig | undefined | null): Promise<GenerationResult>
+  generate(
+    inputIds: MxArray,
+    pixelValues?: MxArray | undefined | null,
+    imageGridThw?: MxArray | undefined | null,
+    config?: GenerationConfig | undefined | null,
+  ): Promise<GenerationResult>;
   /**
    * Batch OCR: extract text from multiple images simultaneously
    *
@@ -1407,7 +1506,7 @@ export declare class VLModel {
    * const texts = await model.ocrBatch(images);
    * ```
    */
-  ocrBatch(images: Array<Buffer>, config?: VlmChatConfig | undefined | null): Promise<Array<string>>
+  ocrBatch(images: Array<Buffer>, config?: VlmChatConfig | undefined | null): Promise<Array<string>>;
   /**
    * Batch chat: process multiple items simultaneously
    *
@@ -1420,11 +1519,11 @@ export declare class VLModel {
    * # Returns
    * * Vec of VLMChatResult, one per batch item
    */
-  batch(batch: Array<VlmBatchItem>, config?: VlmChatConfig | undefined | null): Promise<Array<VlmChatResult>>
+  batch(batch: Array<VlmBatchItem>, config?: VlmChatConfig | undefined | null): Promise<Array<VlmChatResult>>;
   /** Get model configuration */
-  get config(): ModelConfig
+  get config(): ModelConfig;
   /** Check if model is fully initialized */
-  get isInitialized(): boolean
+  get isInitialized(): boolean;
   /**
    * Load a VLM from disk
    *
@@ -1445,7 +1544,7 @@ export declare class VLModel {
    * const result = await model.chat(messages, { images: [readFileSync('./image.jpg')] });
    * ```
    */
-  static load(modelPath: string): Promise<VLModel>
+  static load(modelPath: string): Promise<VLModel>;
   /**
    * Load model configuration from disk without loading weights
    *
@@ -1464,7 +1563,7 @@ export declare class VLModel {
    * console.log(config.visionConfig.hiddenSize);
    * ```
    */
-  static loadConfig(modelPath: string): Promise<ModelConfig>
+  static loadConfig(modelPath: string): Promise<ModelConfig>;
 }
 
 /**
@@ -1473,47 +1572,53 @@ export declare class VLModel {
  * Parses tool calls and thinking from completions, creating structured outputs
  * aligned with the ChatResult structure.
  */
-export declare function buildRewardOutputs(prompts: Array<string>, completions: Array<string>, tokenCounts: Array<number>, finishReasons: Array<string>, groupSize: number): Array<RewardOutput>
+export declare function buildRewardOutputs(
+  prompts: Array<string>,
+  completions: Array<string>,
+  tokenCounts: Array<number>,
+  finishReasons: Array<string>,
+  groupSize: number,
+): Array<RewardOutput>;
 
 /** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
-  maxNewTokens?: number | undefined
-  temperature?: number | undefined
-  topK?: number | undefined
-  topP?: number | undefined
-  minP?: number | undefined
+  maxNewTokens?: number | undefined;
+  temperature?: number | undefined;
+  topK?: number | undefined;
+  topP?: number | undefined;
+  minP?: number | undefined;
   /** Repetition penalty (1.0 = disabled). Penalizes tokens already in context. */
-  repetitionPenalty?: number | undefined
+  repetitionPenalty?: number | undefined;
   /** Size of the context window for repetition penalty (default: 256) */
-  repetitionContextSize?: number | undefined
+  repetitionContextSize?: number | undefined;
   /**
    * Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
    * token that appeared at least once in context. Matches OpenAI API semantics.
    */
-  presencePenalty?: number | undefined
+  presencePenalty?: number | undefined;
   /** Number of recent tokens to consider for presence penalty (default: 20) */
-  presenceContextSize?: number | undefined
+  presenceContextSize?: number | undefined;
   /**
    * Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
    * logits of each token in context. Matches OpenAI API semantics.
    */
-  frequencyPenalty?: number | undefined
+  frequencyPenalty?: number | undefined;
   /** Number of recent tokens to consider for frequency penalty (default: 20) */
-  frequencyContextSize?: number | undefined
+  frequencyContextSize?: number | undefined;
   /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
-  maxConsecutiveTokens?: number | undefined
+  maxConsecutiveTokens?: number | undefined;
   /** Max n-gram repetitions before stopping (default: 3, 0 = disabled) */
-  maxNgramRepeats?: number | undefined
+  maxNgramRepeats?: number | undefined;
   /** Max pattern size for n-gram repetition detection (default: 64) */
-  ngramSize?: number | undefined
-  tools?: Array<ToolDefinition>
+  ngramSize?: number | undefined;
+  tools?: Array<ToolDefinition>;
   /**
    * Enable thinking mode (Qwen3's <think> tags). Default: true (model thinks naturally).
    * Set to false to suppress thinking by injecting empty <think></think> tags.
    */
-  enableThinking?: boolean | undefined
+  enableThinking?: boolean | undefined;
   /** When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result */
-  reportPerformance?: boolean | undefined
+  reportPerformance?: boolean | undefined;
   /**
    * Reuse KV cache across chat() calls for incremental prefill. Default: true.
    * When true, the model preserves its KV cache after generation. On the next
@@ -1521,35 +1626,35 @@ export interface ChatConfig {
    * tokens and only prefills the delta — avoiding redundant computation for
    * multi-turn conversations.
    */
-  reuseCache?: boolean | undefined
+  reuseCache?: boolean | undefined;
 }
 
 /** Chat message with tool calling support */
 export interface ChatMessage {
   /** Role: "system", "user", "assistant", or "tool" */
-  role: 'system' | 'user' | 'assistant' | 'tool' | (string & {})
+  role: 'system' | 'user' | 'assistant' | 'tool' | (string & {});
   /** Message content */
-  content: string
+  content: string;
   /** Tool calls made by the assistant (for assistant messages) */
-  toolCalls?: Array<ToolCall>
+  toolCalls?: Array<ToolCall>;
   /** Tool call ID this message is responding to (for tool messages) */
-  toolCallId?: string
+  toolCallId?: string;
   /** Reasoning content for thinking mode (used with <think> tags) */
-  reasoningContent?: string
+  reasoningContent?: string;
   /** Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer) */
-  images?: Array<Uint8Array> | undefined
+  images?: Array<Uint8Array> | undefined;
 }
 
 /** Unified chat result shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatResult {
-  text: string
-  toolCalls: Array<ToolCallResult>
-  thinking?: string
-  numTokens: number
-  finishReason: string
-  rawText: string
+  text: string;
+  toolCalls: Array<ToolCallResult>;
+  thinking?: string;
+  numTokens: number;
+  finishReason: string;
+  rawText: string;
   /** Performance metrics (present when `reportPerformance: true` in config) */
-  performance?: PerformanceMetrics
+  performance?: PerformanceMetrics;
 }
 
 /** Chat message role (lowercase values matching standard convention) */
@@ -1561,32 +1666,32 @@ export declare const enum ChatRole {
   /** System prompt */
   System = 'System',
   /** Tool response */
-  Tool = 'Tool'
+  Tool = 'Tool',
 }
 
 /** A single chunk emitted during streaming chat generation. */
 export interface ChatStreamChunk {
-  text: string
-  done: boolean
-  finishReason?: string
-  toolCalls?: Array<ToolCallResult>
-  thinking?: string
-  numTokens?: number
-  rawText?: string
+  text: string;
+  done: boolean;
+  finishReason?: string;
+  toolCalls?: Array<ToolCallResult>;
+  thinking?: string;
+  numTokens?: number;
+  rawText?: string;
   /** Performance metrics (only present in the final chunk when `reportPerformance: true`) */
-  performance?: PerformanceMetrics
+  performance?: PerformanceMetrics;
 }
 
 /** Result from classify_and_rotate: orientation info + corrected image bytes. */
 export interface ClassifyRotateResult {
   /** Detected rotation angle (0, 90, 180, or 270 degrees) */
-  angle: number
+  angle: number;
   /** Confidence score */
-  score: number
+  score: number;
   /** Angle label as string */
-  label: string
+  label: string;
   /** Corrected image as PNG bytes (or original bytes if angle=0) */
-  image: Uint8Array
+  image: Uint8Array;
 }
 
 /**
@@ -1595,62 +1700,62 @@ export interface ClassifyRotateResult {
  */
 export interface CompletionInfo {
   /** Clean text with <tool_call> and <think> tags removed */
-  text: string
+  text: string;
   /** Raw output before tag stripping (for debugging/XML parsing) */
-  rawText: string
+  rawText: string;
   /** Parsed tool calls (arguments are already JS objects) */
-  toolCalls: Array<ToolCallResult>
+  toolCalls: Array<ToolCallResult>;
   /** Extracted thinking/reasoning from <think> tags (null if none) */
-  thinking?: string
+  thinking?: string;
   /** Number of tokens generated */
-  numTokens: number
+  numTokens: number;
   /** Finish reason: "stop" | "length" | "tool_calls" */
-  finishReason: string
+  finishReason: string;
 }
 
 export interface ConversionOptions {
   /** Input directory containing model files (config.json, model.safetensors) */
-  inputDir: string
+  inputDir: string;
   /** Output directory for converted model */
-  outputDir: string
+  outputDir: string;
   /** Target dtype for conversion (default: "float32") */
-  dtype?: string
+  dtype?: string;
   /** Whether to verbose logging (default: false) */
-  verbose?: boolean
+  verbose?: boolean;
   /** Model type for model-specific weight sanitization (e.g., "paddleocr-vl") */
-  modelType?: string
+  modelType?: string;
   /** Enable quantization of converted weights */
-  quantize?: boolean
+  quantize?: boolean;
   /** Quantization bits: 4 (default) or 8 */
-  quantBits?: number
+  quantBits?: number;
   /** Quantization group size (default: 64 for affine, 32 for mxfp8) */
-  quantGroupSize?: number
+  quantGroupSize?: number;
   /** Quantization mode: "affine" (default) or "mxfp8" */
-  quantMode?: string
+  quantMode?: string;
   /**
    * Quantization recipe for per-layer mixed-bit quantization.
    * Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5
    */
-  quantRecipe?: string
+  quantRecipe?: string;
   /**
    * Path to an imatrix GGUF file for AWQ-style pre-scaling.
    * Improves quantization quality by amplifying important weight channels.
    */
-  imatrixPath?: string
+  imatrixPath?: string;
 }
 
 export interface ConversionResult {
   /** Number of tensors converted */
-  numTensors: number
+  numTensors: number;
   /** Total number of parameters */
-  numParameters: number
+  numParameters: number;
   /** Output model path */
-  outputPath: string
+  outputPath: string;
   /** List of converted tensor names */
-  tensorNames: Array<string>
+  tensorNames: Array<string>;
 }
 
-export declare function convertForeignWeights(options: ForeignConversionOptions): ForeignConversionResult
+export declare function convertForeignWeights(options: ForeignConversionOptions): ForeignConversionResult;
 
 /**
  * Convert a HuggingFace SafeTensors model to MLX format
@@ -1681,21 +1786,21 @@ export declare function convertForeignWeights(options: ForeignConversionOptions)
  * console.log(`Converted ${result.numTensors} tensors (${result.numParameters} parameters)`);
  * ```
  */
-export declare function convertModel(options: ConversionOptions): Promise<ConversionResult>
+export declare function convertModel(options: ConversionOptions): Promise<ConversionResult>;
 
 /** Create a default PaddleOCR-VL 1.5 configuration (JS factory function) */
-export declare function createPaddleocrVlConfig(): ModelConfig
+export declare function createPaddleocrVlConfig(): ModelConfig;
 
 /** Create a default Qianfan-OCR configuration (JS factory function) */
-export declare function createQianfanOcrConfig(): QianfanOcrConfig
+export declare function createQianfanOcrConfig(): QianfanOcrConfig;
 
 /** Document element - either a table or paragraph */
 export interface DocumentElement {
-  elementType: ElementType
+  elementType: ElementType;
   /** Table data (only present if element_type is Table) */
-  table?: Table
+  table?: Table;
   /** Paragraph data (only present if element_type is Paragraph) */
-  paragraph?: Paragraph
+  paragraph?: Paragraph;
 }
 
 export declare const enum DType {
@@ -1704,116 +1809,116 @@ export declare const enum DType {
   Float16 = 2,
   BFloat16 = 3,
   Uint32 = 4,
-  Uint8 = 5
+  Uint8 = 5,
 }
 
 /** Document element type */
 export declare const enum ElementType {
   Table = 'Table',
-  Paragraph = 'Paragraph'
+  Paragraph = 'Paragraph',
 }
 
 export interface ForeignConversionOptions {
   /** Path to the input weights file (.pdparams, .pkl, .pt, .pth) */
-  inputPath: string
+  inputPath: string;
   /** Output directory for model.safetensors + config.json */
-  outputDir: string
+  outputDir: string;
   /** Model type: "pp-lcnet-ori" or "uvdoc" */
-  modelType: string
+  modelType: string;
   /** Enable verbose logging */
-  verbose?: boolean
+  verbose?: boolean;
 }
 
 export interface ForeignConversionResult {
-  numTensors: number
-  outputPath: string
-  tensorNames: Array<string>
+  numTensors: number;
+  outputPath: string;
+  tensorNames: Array<string>;
 }
 
 /** Format parsed document according to config */
-export declare function formatDocument(doc: ParsedDocument, config?: ParserConfig | undefined | null): string
+export declare function formatDocument(doc: ParsedDocument, config?: ParserConfig | undefined | null): string;
 
 /** Function definition for tool calling */
 export interface FunctionDefinition {
   /** Name of the function */
-  name: string
+  name: string;
   /** Description of what the function does */
-  description?: string
+  description?: string;
   /** Parameter schema */
-  parameters?: FunctionParameters
+  parameters?: FunctionParameters;
 }
 
 /** Function parameters schema (JSON Schema subset) */
 export interface FunctionParameters {
   /** Type (usually "object") */
-  type: string
+  type: string;
   /** JSON string of property definitions */
-  properties?: string
+  properties?: string;
   /** List of required parameter names */
-  required?: Array<string>
+  required?: Array<string>;
 }
 
 /** Configuration for text generation */
 export interface GenerationConfig {
   /** Maximum number of new tokens to generate (default: 2048) */
-  maxNewTokens?: number
+  maxNewTokens?: number;
   /** Sampling temperature (0 = greedy, higher = more random) (default: 1.0) */
-  temperature?: number
+  temperature?: number;
   /** Top-k sampling: keep only top k tokens (0 = disabled) (default: 0) */
-  topK?: number
+  topK?: number;
   /** Top-p (nucleus) sampling: keep tokens with cumulative prob < p (default: 1.0) */
-  topP?: number
+  topP?: number;
   /** Min-p sampling: keep tokens with prob > min_p * max_prob (default: 0.0) */
-  minP?: number
+  minP?: number;
   /** Repetition penalty factor (1.0 = no penalty, 1.1-1.5 typical) (default: 1.0) */
-  repetitionPenalty?: number
+  repetitionPenalty?: number;
   /**
    * Number of recent tokens to consider for repetition penalty (default: 20)
    * Matches mlx-lm default. Larger values catch longer patterns but use more memory
    */
-  repetitionContextSize?: number
+  repetitionContextSize?: number;
   /**
    * Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
    * token that appeared at least once in context. Matches OpenAI API semantics.
    */
-  presencePenalty?: number
+  presencePenalty?: number;
   /** Number of recent tokens to consider for presence penalty (default: 20) */
-  presenceContextSize?: number
+  presenceContextSize?: number;
   /**
    * Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
    * logits of each token in context. Matches OpenAI API semantics.
    */
-  frequencyPenalty?: number
+  frequencyPenalty?: number;
   /** Number of recent tokens to consider for frequency penalty (default: 20) */
-  frequencyContextSize?: number
+  frequencyContextSize?: number;
   /**
    * Stop if same token repeats this many times consecutively (default: 16)
    * Set to 0 to disable. Prevents OOM from degenerate repetitive generation.
    */
-  maxConsecutiveTokens?: number
+  maxConsecutiveTokens?: number;
   /**
    * Stop if a pattern repeats this many times consecutively (default: 3)
    * Set to 0 to disable. Detects patterns like "A B A B A B".
    * Uses range-based detection: checks all pattern sizes from 2 to ngram_size.
    */
-  maxNgramRepeats?: number
+  maxNgramRepeats?: number;
   /**
    * Maximum pattern size for repetition detection (default: 64)
    * All pattern sizes from 2 up to this value are checked each decode step.
    * Larger values catch long phrase-level repetition common in small models.
    */
-  ngramSize?: number
+  ngramSize?: number;
   /** EOS token ID (generation stops when this is generated) */
-  eosTokenId?: number
+  eosTokenId?: number;
   /** Whether to return log probabilities (always true for GRPO) */
-  returnLogprobs?: boolean
+  returnLogprobs?: boolean;
   /**
    * Prefill step size for chunked processing of long prompts (default: 2048)
    * When the prompt length exceeds this value, it will be processed in chunks
    * to improve memory efficiency and enable async pipelining.
    * Set to 0 to disable chunking and process the entire prompt at once.
    */
-  prefillStepSize?: number
+  prefillStepSize?: number;
   /**
    * KV cache quantization bits (default: 16 = no quantization)
    * - 16: Full precision (bfloat16/float16), no quantization
@@ -1823,123 +1928,123 @@ export interface GenerationConfig {
    * Quantized KV cache is useful for long sequences where memory becomes a bottleneck.
    * Note: Adds dequantization overhead per forward pass.
    */
-  kvCacheBits?: number
+  kvCacheBits?: number;
   /**
    * KV cache quantization group size (default: 64)
    * Number of elements per quantization group. Smaller groups = better accuracy
    * but more overhead from storing scales/biases.
    * Only used when kv_cache_bits is 4 or 8.
    */
-  kvCacheGroupSize?: number
+  kvCacheGroupSize?: number;
   /**
    * Number of draft tokens to generate speculatively (default: 5)
    * Only used when a draft model is provided for speculative decoding.
    * Higher values can increase throughput but may reduce acceptance rate.
    */
-  numDraftTokens?: number
+  numDraftTokens?: number;
 }
 
 /** Get expected weight keys for PaddleOCR-VL model */
-export declare function getExpectedWeightKeys(): Array<string>
+export declare function getExpectedWeightKeys(): Array<string>;
 
 export interface GgufConversionOptions {
   /** Path to the GGUF file */
-  inputPath: string
+  inputPath: string;
   /** Output directory for converted SafeTensors model */
-  outputDir: string
+  outputDir: string;
   /** Target dtype: "float32", "float16", "bfloat16" (default: keep original) */
-  dtype?: string
+  dtype?: string;
   /** Enable verbose logging */
-  verbose?: boolean
+  verbose?: boolean;
   /** Enable quantization of converted weights */
-  quantize?: boolean
+  quantize?: boolean;
   /** Quantization bits (default: 4) */
-  quantBits?: number
+  quantBits?: number;
   /** Quantization group size (default: 64) */
-  quantGroupSize?: number
+  quantGroupSize?: number;
   /** Quantization mode: "affine" or "mxfp8" */
-  quantMode?: string
+  quantMode?: string;
   /**
    * Quantization recipe for per-layer mixed-bit quantization.
    * Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
    */
-  quantRecipe?: string
+  quantRecipe?: string;
   /**
    * Path to an imatrix GGUF file for AWQ-style pre-scaling.
    * Improves quantization quality by amplifying important weight channels.
    */
-  imatrixPath?: string
+  imatrixPath?: string;
   /**
    * Output filename (default: "model.safetensors").
    * Useful for saving vision weights separately (e.g., "vision.safetensors").
    */
-  outputFilename?: string
+  outputFilename?: string;
   /**
    * When true, remap LLM weight keys for VLM compatibility:
    * "model.X" → "language_model.model.X", "lm_head.X" → "language_model.lm_head.X"
    * This makes the safetensors compatible with mlx-vlm.
    */
-  vlmKeyPrefix?: boolean
+  vlmKeyPrefix?: boolean;
 }
 
 export interface GgufConversionResult {
-  numTensors: number
-  numParameters: number
-  outputPath: string
-  tensorNames: Array<string>
-  sourceFormat: string
+  numTensors: number;
+  numParameters: number;
+  outputPath: string;
+  tensorNames: Array<string>;
+  sourceFormat: string;
 }
 
 /** InternViT vision encoder configuration */
 export interface InternVisionConfig {
-  hiddenSize: number
-  intermediateSize: number
-  numHiddenLayers: number
-  numAttentionHeads: number
-  numChannels: number
-  imageSize: number
-  patchSize: number
-  layerNormEps: number
-  qkvBias: boolean
+  hiddenSize: number;
+  intermediateSize: number;
+  numHiddenLayers: number;
+  numAttentionHeads: number;
+  numChannels: number;
+  imageSize: number;
+  patchSize: number;
+  layerNormEps: number;
+  qkvBias: boolean;
   /** Drop path rate (inference only, always 0) */
-  dropPathRate: number
+  dropPathRate: number;
 }
 
 /** A single detected layout element. */
 export interface LayoutElement {
   /** Detection confidence score */
-  score: number
+  score: number;
   /** Class label ID (0-24) */
-  label: number
+  label: number;
   /** Human-readable label name (e.g., "title", "text", "table") */
-  labelName: string
+  labelName: string;
   /** Bounding box in original image coordinates [x1, y1, x2, y2] */
-  bbox: Array<number>
+  bbox: Array<number>;
   /** Reading order index (0 = first element to read) */
-  order: number
+  order: number;
 }
 
 /** Full model configuration */
 export interface ModelConfig {
-  visionConfig: VisionConfig
-  textConfig: TextConfig
-  modelType: string
-  ignoreIndex: number
-  imageTokenId: number
-  videoTokenId: number
-  visionStartTokenId: number
-  visionEndTokenId: number
-  eosTokenId: number
+  visionConfig: VisionConfig;
+  textConfig: TextConfig;
+  modelType: string;
+  ignoreIndex: number;
+  imageTokenId: number;
+  videoTokenId: number;
+  visionStartTokenId: number;
+  visionEndTokenId: number;
+  eosTokenId: number;
 }
 
 /** Result from document orientation classification. */
 export interface OrientationResult {
   /** Detected rotation angle (0, 90, 180, or 270 degrees) */
-  angle: number
+  angle: number;
   /** Confidence score */
-  score: number
+  score: number;
   /** Angle label as string */
-  label: string
+  label: string;
 }
 
 /** Output format options */
@@ -1953,67 +2058,67 @@ export declare const enum OutputFormat {
   /** HTML tables */
   Html = 'Html',
   /** JSON structured output */
-  Json = 'Json'
+  Json = 'Json',
 }
 
 /** Paged attention memory statistics (NAPI-compatible) */
 export interface PagedCacheStats {
   /** Total number of blocks in the pool */
-  totalBlocks: number
+  totalBlocks: number;
   /** Number of free blocks */
-  freeBlocks: number
+  freeBlocks: number;
   /** Number of allocated blocks */
-  allocatedBlocks: number
+  allocatedBlocks: number;
   /** Total memory in MB */
-  totalMemoryMb: number
+  totalMemoryMb: number;
   /** Used memory in MB */
-  usedMemoryMb: number
+  usedMemoryMb: number;
   /** Utilization percentage */
-  utilizationPercent: number
+  utilizationPercent: number;
 }
 
 /** A completed sequence from paged generation */
 export interface PagedCompletedSequence {
   /** Original request ID */
-  requestId: string
+  requestId: string;
   /** All generated tokens (excluding prompt) */
-  tokens: Array<number>
+  tokens: Array<number>;
   /** Reason for completion ("stop", "length", "repetition", "tool_calls") */
-  finishReason: string
+  finishReason: string;
 }
 
 /** Result of a paged generation step */
 export interface PagedGenerationStep {
   /** Token outputs for each sequence in the batch */
-  outputs: Array<PagedTokenOutput>
+  outputs: Array<PagedTokenOutput>;
   /** Number of sequences that were in prefill phase */
-  numPrefill: number
+  numPrefill: number;
   /** Number of sequences that were in decode phase */
-  numDecode: number
+  numDecode: number;
 }
 
 /** Output from a single token generation step in paged attention */
 export interface PagedTokenOutput {
   /** Sequence ID in the scheduler */
-  seqId: number
+  seqId: number;
   /** Request ID for this sequence */
-  requestId: string
+  requestId: string;
   /** Generated token ID */
-  token: number
+  token: number;
   /** Log probability of the token (f64 for NAPI compatibility) */
-  logprob: number
+  logprob: number;
   /** Whether this sequence has finished */
-  isFinished: boolean
+  isFinished: boolean;
 }
 
 /** A text paragraph */
 export interface Paragraph {
-  content: string
+  content: string;
 }
 
 /** Parsed document structure */
 export interface ParsedDocument {
-  elements: Array<DocumentElement>
+  elements: Array<DocumentElement>;
 }
 
 /**
@@ -2043,77 +2148,77 @@ export interface ParsedDocument {
  * const plain = parsePaddleResponse(vlmResult.text, { format: 'plain' });
  * ```
  */
-export declare function parsePaddleResponse(text: string, config?: ParserConfig | undefined | null): string
+export declare function parsePaddleResponse(text: string, config?: ParserConfig | undefined | null): string;
 
 /** Parser configuration */
 export interface ParserConfig {
   /** Output format (default: 'markdown') */
-  format?: OutputFormat
+  format?: OutputFormat;
   /** Whether to trim whitespace from cells (default: true) */
-  trimCells?: boolean
+  trimCells?: boolean;
   /** Whether to collapse empty rows (default: true) */
-  collapseEmptyRows?: boolean
+  collapseEmptyRows?: boolean;
 }
 
 /** Parse tool calls from text (NAPI export) */
-export declare function parseToolCallsFromText(text: string): ParseToolCallsResult
+export declare function parseToolCallsFromText(text: string): ParseToolCallsResult;
 
 /** Result of parsing tool calls from text */
 export interface ParseToolCallsResult {
   /** Cleaned text with tool_call tags removed */
-  text: string
+  text: string;
   /** Parsed tool calls */
-  toolCalls: Array<ToolCallResult>
+  toolCalls: Array<ToolCallResult>;
 }
 
 /** Parse VLM output into structured document */
-export declare function parseVlmOutput(text: string): ParsedDocument
+export declare function parseVlmOutput(text: string): ParsedDocument;
 
 export interface PerformanceMetrics {
-  ttftMs: number
-  prefillTokensPerSecond: number
-  decodeTokensPerSecond: number
+  ttftMs: number;
+  prefillTokensPerSecond: number;
+  decodeTokensPerSecond: number;
 }
 
 /** Result from a Qianfan-OCR chat() call. */
 export interface QianfanChatResult {
   /** Generated text (with thinking/tool_call tags stripped) */
-  text: string
+  text: string;
   /** Parsed tool calls (if any) */
-  toolCalls: Array<ToolCallResult>
+  toolCalls: Array<ToolCallResult>;
   /** Thinking content (text inside <think>...</think> tags) */
-  thinking?: string
+  thinking?: string;
   /** Number of generated tokens */
-  numTokens: number
+  numTokens: number;
   /** Why generation stopped: "stop", "length", or "repetition" */
-  finishReason: string
+  finishReason: string;
   /** Raw generated text before parsing */
-  rawText: string
+  rawText: string;
   /** Performance metrics (only present when `reportPerformance: true`) */
-  performance?: PerformanceMetrics
+  performance?: PerformanceMetrics;
 }
 
 /** Full Qianfan-OCR model configuration */
 export interface QianfanOcrConfig {
-  visionConfig: InternVisionConfig
-  llmConfig: Qwen3LmConfig
-  modelType: string
-  imgContextTokenId: number
+  visionConfig: InternVisionConfig;
+  llmConfig: Qwen3LmConfig;
+  modelType: string;
+  imgContextTokenId: number;
   /** `<img>` token ID */
-  imgStartTokenId: number
+  imgStartTokenId: number;
   /** `</img>` token ID */
-  imgEndTokenId: number
+  imgEndTokenId: number;
   /** `<|im_end|>` token ID */
-  eosTokenId: number
+  eosTokenId: number;
   /** Which vision encoder layer to extract features from */
-  selectLayer: number
+  selectLayer: number;
   /** Pixel shuffle version */
-  psVersion: string
-  downsampleRatio: number
-  dynamicImageSize: boolean
-  useThumbnail: boolean
-  maxDynamicPatch: number
-  minDynamicPatch: number
+  psVersion: string;
+  downsampleRatio: number;
+  dynamicImageSize: boolean;
+  useThumbnail: boolean;
+  maxDynamicPatch: number;
+  minDynamicPatch: number;
 }
 
 /**
@@ -2122,45 +2227,45 @@ export interface QianfanOcrConfig {
  * For MoE models, use `Qwen3_5MoeConfig` from `qwen3_5_moe`.
  */
 export interface Qwen35Config {
-  vocabSize: number
-  hiddenSize: number
-  numLayers: number
-  numHeads: number
-  numKvHeads: number
-  intermediateSize: number
-  rmsNormEps: number
-  headDim: number
-  tieWordEmbeddings: boolean
-  attentionBias: boolean
-  maxPositionEmbeddings: number
-  padTokenId: number
-  eosTokenId: number
-  bosTokenId: number
-  linearNumValueHeads: number
-  linearNumKeyHeads: number
-  linearKeyHeadDim: number
-  linearValueHeadDim: number
-  linearConvKernelDim: number
-  fullAttentionInterval: number
-  partialRotaryFactor: number
-  ropeTheta: number
+  vocabSize: number;
+  hiddenSize: number;
+  numLayers: number;
+  numHeads: number;
+  numKvHeads: number;
+  intermediateSize: number;
+  rmsNormEps: number;
+  headDim: number;
+  tieWordEmbeddings: boolean;
+  attentionBias: boolean;
+  maxPositionEmbeddings: number;
+  padTokenId: number;
+  eosTokenId: number;
+  bosTokenId: number;
+  linearNumValueHeads: number;
+  linearNumKeyHeads: number;
+  linearKeyHeadDim: number;
+  linearValueHeadDim: number;
+  linearConvKernelDim: number;
+  fullAttentionInterval: number;
+  partialRotaryFactor: number;
+  ropeTheta: number;
 }
 
 /** Generation configuration for Qwen3.5 */
 export interface Qwen35GenerationConfig {
-  maxNewTokens: number
-  temperature?: number | undefined
-  topK?: number | undefined
-  topP?: number | undefined
-  minP?: number | undefined
+  maxNewTokens: number;
+  temperature?: number | undefined;
+  topK?: number | undefined;
+  topP?: number | undefined;
+  minP?: number | undefined;
 }
 
 /** Generation result */
 export interface Qwen35GenerationResult {
-  tokens: Array<number>
-  text: string
-  numTokens: number
-  finishReason: string
+  tokens: Array<number>;
+  text: string;
+  numTokens: number;
+  finishReason: string;
 }
 
 /**
@@ -2169,118 +2274,118 @@ export interface Qwen35GenerationResult {
  * Contains all fields including MoE-specific ones (num_experts, etc.).
  */
 export interface Qwen35MoeConfig {
-  vocabSize: number
-  hiddenSize: number
-  numLayers: number
-  numHeads: number
-  numKvHeads: number
-  intermediateSize: number
-  rmsNormEps: number
-  headDim: number
-  tieWordEmbeddings: boolean
-  attentionBias: boolean
-  maxPositionEmbeddings: number
-  padTokenId: number
-  eosTokenId: number
-  bosTokenId: number
-  linearNumValueHeads: number
-  linearNumKeyHeads: number
-  linearKeyHeadDim: number
-  linearValueHeadDim: number
-  linearConvKernelDim: number
-  fullAttentionInterval: number
-  partialRotaryFactor: number
-  ropeTheta: number
-  numExperts: number
-  numExpertsPerTok: number
-  decoderSparseStep: number
-  sharedExpertIntermediateSize?: number | undefined
-  moeIntermediateSize?: number | undefined
-  normTopkProb: boolean
-  mlpOnlyLayers?: number[] | undefined
+  vocabSize: number;
+  hiddenSize: number;
+  numLayers: number;
+  numHeads: number;
+  numKvHeads: number;
+  intermediateSize: number;
+  rmsNormEps: number;
+  headDim: number;
+  tieWordEmbeddings: boolean;
+  attentionBias: boolean;
+  maxPositionEmbeddings: number;
+  padTokenId: number;
+  eosTokenId: number;
+  bosTokenId: number;
+  linearNumValueHeads: number;
+  linearNumKeyHeads: number;
+  linearKeyHeadDim: number;
+  linearValueHeadDim: number;
+  linearConvKernelDim: number;
+  fullAttentionInterval: number;
+  partialRotaryFactor: number;
+  ropeTheta: number;
+  numExperts: number;
+  numExpertsPerTok: number;
+  decoderSparseStep: number;
+  sharedExpertIntermediateSize?: number | undefined;
+  moeIntermediateSize?: number | undefined;
+  normTopkProb: boolean;
+  mlpOnlyLayers?: number[] | undefined;
 }
 
 /** Generation configuration for Qwen3.5 MoE */
 export interface Qwen35MoeGenerationConfig {
-  maxNewTokens: number
-  temperature?: number | undefined
-  topK?: number | undefined
-  topP?: number | undefined
-  minP?: number | undefined
+  maxNewTokens: number;
+  temperature?: number | undefined;
+  topK?: number | undefined;
+  topP?: number | undefined;
+  minP?: number | undefined;
 }
 
 /** Generation result */
 export interface Qwen35MoeGenerationResult {
-  tokens: Array<number>
-  text: string
-  numTokens: number
-  finishReason: string
+  tokens: Array<number>;
+  text: string;
+  numTokens: number;
+  finishReason: string;
 }
 
 /** Qwen3 model configuration */
 export interface Qwen3Config {
-  vocabSize: number
-  hiddenSize: number
-  numLayers: number
-  numHeads: number
-  numKvHeads: number
-  intermediateSize: number
-  rmsNormEps: number
-  ropeTheta: number
-  maxPositionEmbeddings: number
-  headDim: number
-  useQkNorm: boolean
-  tieWordEmbeddings: boolean
-  padTokenId: number
-  eosTokenId: number
-  bosTokenId: number
+  vocabSize: number;
+  hiddenSize: number;
+  numLayers: number;
+  numHeads: number;
+  numKvHeads: number;
+  intermediateSize: number;
+  rmsNormEps: number;
+  ropeTheta: number;
+  maxPositionEmbeddings: number;
+  headDim: number;
+  useQkNorm: boolean;
+  tieWordEmbeddings: boolean;
+  padTokenId: number;
+  eosTokenId: number;
+  bosTokenId: number;
   /**
    * Enable paged attention for memory-efficient inference.
    * Default: false (use standard KVCache)
    */
-  usePagedAttention?: boolean | undefined
+  usePagedAttention?: boolean | undefined;
   /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when use_paged_attention is true.
    * Default: 2048 (2GB)
    */
-  pagedCacheMemoryMb?: number | undefined
+  pagedCacheMemoryMb?: number | undefined;
   /**
    * Block size for paged attention (tokens per block).
    * Only used when use_paged_attention is true.
    * Default: 16
    */
-  pagedBlockSize?: number | undefined
+  pagedBlockSize?: number | undefined;
   /**
    * Use FP8 cache for 2x memory reduction (experimental).
    * Only used when use_paged_attention is true.
    * Default: false
    */
-  useFp8Cache?: boolean | undefined
+  useFp8Cache?: boolean | undefined;
 }
 
 /** Qwen3 language model configuration */
 export interface Qwen3LmConfig {
-  hiddenSize: number
-  numHiddenLayers: number
-  intermediateSize: number
-  numAttentionHeads: number
-  numKeyValueHeads: number
-  headDim: number
-  rmsNormEps: number
-  vocabSize: number
-  maxPositionEmbeddings: number
-  ropeTheta: number
-  useQkNorm: boolean
-  tieWordEmbeddings: boolean
+  hiddenSize: number;
+  numHiddenLayers: number;
+  intermediateSize: number;
+  numAttentionHeads: number;
+  numKeyValueHeads: number;
+  headDim: number;
+  rmsNormEps: number;
+  vocabSize: number;
+  maxPositionEmbeddings: number;
+  ropeTheta: number;
+  useQkNorm: boolean;
+  tieWordEmbeddings: boolean;
 }
 
 /** Result of text recognition. */
 export interface RecResult {
   /** Recognized text */
-  text: string
+  text: string;
   /** Confidence score (mean character probability) */
-  score: number
+  score: number;
 }
 
 /**
@@ -2289,9 +2394,9 @@ export interface RecResult {
  */
 export interface RewardOutput {
   /** The input prompt text */
-  prompt: string
+  prompt: string;
   /** Structured completion data aligned with ChatResult */
-  completion: CompletionInfo
+  completion: CompletionInfo;
 }
 
 /**
@@ -2300,93 +2405,93 @@ export interface RewardOutput {
  */
 export interface SamplingConfig {
   /** Temperature for softmax (default: 1.0). Lower = more deterministic */
-  temperature?: number
+  temperature?: number;
   /** Number of top tokens to keep (top-k sampling). 0 = disabled */
-  topK?: number
+  topK?: number;
   /** Cumulative probability threshold (top-p/nucleus sampling). 1.0 = disabled */
-  topP?: number
+  topP?: number;
   /** Minimum probability threshold relative to max (min-p sampling). 0 = disabled */
-  minP?: number
+  minP?: number;
 }
 
 /** Scheduler statistics (NAPI-compatible) */
 export interface SchedulerStatsNapi {
   /** Number of requests waiting to be scheduled */
-  numWaiting: number
+  numWaiting: number;
   /** Number of sequences currently running */
-  numRunning: number
+  numRunning: number;
   /** Number of completed sequences */
-  numCompleted: number
+  numCompleted: number;
   /** Number of sequences in prefill phase */
-  numPrefill: number
+  numPrefill: number;
   /** Number of sequences in decode phase */
-  numDecode: number
+  numDecode: number;
   /** Total tokens across all running sequences */
-  totalRunningTokens: number
+  totalRunningTokens: number;
 }
 
 /** A table structure */
 export interface Table {
-  rows: Array<TableRow>
+  rows: Array<TableRow>;
 }
 
 /** A single cell in a table */
 export interface TableCell {
-  content: string
-  isEmpty: boolean
+  content: string;
+  isEmpty: boolean;
 }
 
 /** A row in a table */
 export interface TableRow {
-  cells: Array<TableCell>
+  cells: Array<TableCell>;
 }
 
 /** A detected text bounding box. */
 export interface TextBox {
   /** Bounding box in original image coordinates [x1, y1, x2, y2] */
-  bbox: Array<number>
+  bbox: Array<number>;
   /** Detection confidence score (mean probability inside box) */
-  score: number
+  score: number;
 }
 
 /** Language model (text decoder) configuration */
 export interface TextConfig {
-  modelType: string
-  hiddenSize: number
-  numHiddenLayers: number
-  intermediateSize: number
-  numAttentionHeads: number
-  rmsNormEps: number
-  vocabSize: number
-  numKeyValueHeads: number
-  maxPositionEmbeddings: number
-  ropeTheta: number
-  ropeTraditional: boolean
-  useBias: boolean
-  headDim: number
+  modelType: string;
+  hiddenSize: number;
+  numHiddenLayers: number;
+  intermediateSize: number;
+  numAttentionHeads: number;
+  rmsNormEps: number;
+  vocabSize: number;
+  numKeyValueHeads: number;
+  maxPositionEmbeddings: number;
+  ropeTheta: number;
+  ropeTraditional: boolean;
+  useBias: boolean;
+  headDim: number;
   /**
    * Multimodal RoPE sections: [temporal, height, width]
    * These define how the head_dim is split for 3D position encoding
    */
-  mropeSection: Array<number>
+  mropeSection: Array<number>;
 }
 
 /** Tool call made by an assistant */
 export interface ToolCall {
   /** Optional unique identifier for the tool call */
-  id?: string
+  id?: string;
   /** Name of the tool/function to call */
-  name: string
+  name: string;
   /** JSON string of arguments to pass to the tool */
-  arguments: string
+  arguments: string;
 }
 
 /** Structured tool call with parsed arguments */
 export interface ToolCallResult {
   /** Unique identifier for this tool call (format: call_<uuid>) */
-  id: string
+  id: string;
   /** Name of the tool/function to call */
-  name: string
+  name: string;
   /**
    * Parsed arguments as native object (serde_json::Value -> JS object)
    *
@@ -2394,7 +2499,7 @@ export interface ToolCallResult {
    * When status is "parse_error", this contains the original unparsed string.
    * Otherwise, this is an empty object {}.
    */
-  arguments: Record<string, unknown> | string
+  arguments: Record<string, unknown> | string;
   /**
    * Parsing status: "ok" | "invalid_json" | "missing_name" | "parse_error"
    *
@@ -2403,90 +2508,90 @@ export interface ToolCallResult {
    * - "missing_name": Valid JSON but no "name" field
    * - "parse_error": Valid JSON but the "arguments" string field couldn't be parsed as JSON
    */
-  status: string
+  status: string;
   /** Error message if status != "ok" */
-  error?: string
+  error?: string;
   /**
    * Raw content from <tool_call> tag (preserved for debugging/persistence)
    * Defaults to empty string for backward compatibility with older JSON
    */
-  rawContent: string
+  rawContent: string;
 }
 
 /** OpenAI-compatible tool definition */
 export interface ToolDefinition {
   /** Tool type (currently only "function" is supported) */
-  type: string
+  type: string;
   /** Function definition */
-  function: FunctionDefinition
+  function: FunctionDefinition;
 }
 
 /** Result from document unwarping. */
 export interface UnwarpResult {
   /** Unwarped image as PNG bytes */
-  image: Buffer
+  image: Buffer;
 }
 
 /** Vision encoder configuration */
 export interface VisionConfig {
-  modelType: string
-  hiddenSize: number
-  intermediateSize: number
-  numHiddenLayers: number
-  numAttentionHeads: number
-  numChannels: number
-  imageSize: number
-  patchSize: number
-  hiddenAct: string
-  layerNormEps: number
-  attentionDropout: number
-  spatialMergeSize: number
+  modelType: string;
+  hiddenSize: number;
+  intermediateSize: number;
+  numHiddenLayers: number;
+  numAttentionHeads: number;
+  numChannels: number;
+  imageSize: number;
+  patchSize: number;
+  hiddenAct: string;
+  layerNormEps: number;
+  attentionDropout: number;
+  spatialMergeSize: number;
 }
 
 /** A batch item for VLM batch inference */
 export interface VlmBatchItem {
   /** Chat messages for this item */
-  messages: Array<VlmChatMessage>
+  messages: Array<VlmChatMessage>;
   /** Encoded image buffers for this item (one image per item for OCR) */
-  images?: Array<Buffer>
+  images?: Array<Buffer>;
 }
 
 /** Configuration for VLM chat */
 export interface VlmChatConfig {
   /** Encoded image buffers to process (PNG/JPEG bytes) */
-  images?: Array<Buffer>
+  images?: Array<Buffer>;
   /** Maximum number of new tokens to generate (default: 512) */
-  maxNewTokens?: number
+  maxNewTokens?: number;
   /** Sampling temperature (0 = greedy, higher = more random) (default: 0.0 for OCR) */
-  temperature?: number
+  temperature?: number;
   /** Top-k sampling (default: 0) */
-  topK?: number
+  topK?: number;
   /** Top-p (nucleus) sampling (default: 1.0) */
-  topP?: number
+  topP?: number;
   /** Repetition penalty (default: 1.5) */
-  repetitionPenalty?: number
+  repetitionPenalty?: number;
   /**
    * Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
    * token that appeared at least once in context. Matches OpenAI API semantics.
    */
-  presencePenalty?: number
+  presencePenalty?: number;
   /** Number of recent tokens to consider for presence penalty (default: 20) */
-  presenceContextSize?: number
+  presenceContextSize?: number;
   /**
    * Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
    * logits of each token in context. Matches OpenAI API semantics.
    */
-  frequencyPenalty?: number
+  frequencyPenalty?: number;
   /** Number of recent tokens to consider for frequency penalty (default: 20) */
-  frequencyContextSize?: number
+  frequencyContextSize?: number;
   /** Whether to return log probabilities (default: false) */
-  returnLogprobs?: boolean
+  returnLogprobs?: boolean;
 }
 
 /** A chat message with optional image */
 export interface VlmChatMessage {
   /** Role of the message sender */
-  role: ChatRole
+  role: ChatRole;
   /** Text content of the message */
-  content: string
+  content: string;
 }

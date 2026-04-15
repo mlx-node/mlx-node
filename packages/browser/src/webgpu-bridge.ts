@@ -76,10 +76,7 @@ export interface WebGPUBridge {
   device: GPUDevice;
 }
 
-export function createWebGPUBridge(
-  adapter: GPUAdapter,
-  device: GPUDevice,
-): WebGPUBridge {
+export function createWebGPUBridge(adapter: GPUAdapter, device: GPUDevice): WebGPUBridge {
   const queue = device.queue;
 
   // Pre-register handles for pre-created objects
@@ -173,18 +170,14 @@ export function createWebGPUBridge(
       return instanceHandle;
     },
 
-    wgpuInstanceRequestAdapter(
-      _instance: number, _optsPtr: number, callbackPtr: number, userdataPtr: number,
-    ): void {
+    wgpuInstanceRequestAdapter(_instance: number, _optsPtr: number, callbackPtr: number, userdataPtr: number): void {
       callCallback(callbackPtr, 0, adapterHandle, 0, userdataPtr);
     },
 
     wgpuInstanceRelease(): void {},
 
     // ===== Adapter (pre-created) =====
-    wgpuAdapterRequestDevice(
-      _adapter: number, _descPtr: number, callbackPtr: number, userdataPtr: number,
-    ): void {
+    wgpuAdapterRequestDevice(_adapter: number, _descPtr: number, callbackPtr: number, userdataPtr: number): void {
       callCallback(callbackPtr, 0, deviceHandle, 0, userdataPtr);
     },
 
@@ -209,18 +202,18 @@ export function createWebGPUBridge(
       view.setUint32(base + 48, device.limits.maxUniformBuffersPerShaderStage, true);
       // maxUniformBufferBindingSize at +52 (u64)
       const ubbs = device.limits.maxUniformBufferBindingSize;
-      view.setUint32(base + 52, ubbs & 0xFFFFFFFF, true);
+      view.setUint32(base + 52, ubbs & 0xffffffff, true);
       view.setUint32(base + 56, 0, true);
       // maxStorageBufferBindingSize at +60 (u64)
       const sbbs = device.limits.maxStorageBufferBindingSize;
-      view.setUint32(base + 60, sbbs & 0xFFFFFFFF, true);
+      view.setUint32(base + 60, sbbs & 0xffffffff, true);
       view.setUint32(base + 64, 0, true);
       return 1; // success
     },
 
     wgpuAdapterHasFeature(_adapter: number, feature: number): number {
-      if (feature === 14 && adapter.features.has('shader-f16')) return 1;  // WGPUFeatureName_ShaderF16
-      if (feature === 0x3F1 && adapter.features.has('subgroups')) return 1; // WGPUFeatureName_Subgroups
+      if (feature === 14 && adapter.features.has('shader-f16')) return 1; // WGPUFeatureName_ShaderF16
+      if (feature === 0x3f1 && adapter.features.has('subgroups')) return 1; // WGPUFeatureName_Subgroups
       return 0;
     },
 
@@ -252,7 +245,10 @@ export function createWebGPUBridge(
         bufferSizes.set(handle, size);
         return handle;
       } catch (e) {
-        console.error(`[WebGPU Bridge] createBuffer failed: size=${size} usage=0x${usage.toString(16)} mapped=${mappedAtCreation}`, e);
+        console.error(
+          `[WebGPU Bridge] createBuffer failed: size=${size} usage=0x${usage.toString(16)} mapped=${mappedAtCreation}`,
+          e,
+        );
         return 0;
       }
     },
@@ -361,40 +357,47 @@ export function createWebGPUBridge(
       const L = device.limits;
       const base = limitsPtr + 4; // skip nextInChain
       let off = 0;
-      const w32 = (v: number) => { view.setUint32(base + off, v, true); off += 4; };
-      const w64 = (v: number) => { view.setUint32(base + off, v, true); view.setUint32(base + off + 4, 0, true); off += 8; };
-      w32(L.maxTextureDimension1D);             // +0
-      w32(L.maxTextureDimension2D);             // +4
-      w32(L.maxTextureDimension3D);             // +8
-      w32(L.maxTextureArrayLayers);             // +12
-      w32(L.maxBindGroups);                     // +16
+      const w32 = (v: number) => {
+        view.setUint32(base + off, v, true);
+        off += 4;
+      };
+      const w64 = (v: number) => {
+        view.setUint32(base + off, v, true);
+        view.setUint32(base + off + 4, 0, true);
+        off += 8;
+      };
+      w32(L.maxTextureDimension1D); // +0
+      w32(L.maxTextureDimension2D); // +4
+      w32(L.maxTextureDimension3D); // +8
+      w32(L.maxTextureArrayLayers); // +12
+      w32(L.maxBindGroups); // +16
       w32(L.maxBindGroupsPlusVertexBuffers ?? 0); // +20
-      w32(L.maxBindingsPerBindGroup);           // +24
+      w32(L.maxBindingsPerBindGroup); // +24
       w32(L.maxDynamicUniformBuffersPerPipelineLayout); // +28
       w32(L.maxDynamicStorageBuffersPerPipelineLayout); // +32
-      w32(L.maxSampledTexturesPerShaderStage);  // +36
-      w32(L.maxSamplersPerShaderStage);         // +40
-      w32(L.maxStorageBuffersPerShaderStage);   // +44
-      w32(L.maxStorageTexturesPerShaderStage);  // +48
-      w32(L.maxUniformBuffersPerShaderStage);   // +52
-      w64(L.maxUniformBufferBindingSize);       // +56
-      w64(L.maxStorageBufferBindingSize);       // +64
-      w32(L.minUniformBufferOffsetAlignment);   // +72
-      w32(L.minStorageBufferOffsetAlignment);   // +76
-      w32(L.maxVertexBuffers);                  // +80
-      w64(L.maxBufferSize);                     // +84
-      w32(L.maxVertexAttributes);               // +92
-      w32(L.maxVertexBufferArrayStride);        // +96
-      w32(L.maxInterStageShaderComponents);     // +100
-      w32(L.maxInterStageShaderVariables);      // +104
-      w32(L.maxColorAttachments);               // +108
+      w32(L.maxSampledTexturesPerShaderStage); // +36
+      w32(L.maxSamplersPerShaderStage); // +40
+      w32(L.maxStorageBuffersPerShaderStage); // +44
+      w32(L.maxStorageTexturesPerShaderStage); // +48
+      w32(L.maxUniformBuffersPerShaderStage); // +52
+      w64(L.maxUniformBufferBindingSize); // +56
+      w64(L.maxStorageBufferBindingSize); // +64
+      w32(L.minUniformBufferOffsetAlignment); // +72
+      w32(L.minStorageBufferOffsetAlignment); // +76
+      w32(L.maxVertexBuffers); // +80
+      w64(L.maxBufferSize); // +84
+      w32(L.maxVertexAttributes); // +92
+      w32(L.maxVertexBufferArrayStride); // +96
+      w32(L.maxInterStageShaderComponents); // +100
+      w32(L.maxInterStageShaderVariables); // +104
+      w32(L.maxColorAttachments); // +108
       w32(L.maxColorAttachmentBytesPerSample ?? 0); // +112
-      w32(L.maxComputeWorkgroupStorageSize);    // +116
+      w32(L.maxComputeWorkgroupStorageSize); // +116
       w32(L.maxComputeInvocationsPerWorkgroup); // +120
-      w32(L.maxComputeWorkgroupSizeX);          // +124
-      w32(L.maxComputeWorkgroupSizeY);          // +128
-      w32(L.maxComputeWorkgroupSizeZ);          // +132
-      w32(L.maxComputeWorkgroupsPerDimension);  // +136
+      w32(L.maxComputeWorkgroupSizeX); // +124
+      w32(L.maxComputeWorkgroupSizeY); // +128
+      w32(L.maxComputeWorkgroupSizeZ); // +132
+      w32(L.maxComputeWorkgroupsPerDimension); // +136
       return 1;
     },
 
@@ -425,8 +428,11 @@ export function createWebGPUBridge(
     },
 
     wgpuQueueWriteBuffer(
-      _queue: number, bufferHandle: number, bufferOffset: bigint,
-      dataPtr: number, size: number,
+      _queue: number,
+      bufferHandle: number,
+      bufferOffset: bigint,
+      dataPtr: number,
+      size: number,
     ): void {
       const buffer = getHandle<GPUBuffer>(bufferHandle);
       if (!buffer) {
@@ -437,9 +443,7 @@ export function createWebGPUBridge(
       queue.writeBuffer(buffer, Number(bufferOffset), data);
     },
 
-    wgpuQueueOnSubmittedWorkDone(
-      _queue: number, callbackPtr: number, userdataPtr: number,
-    ): void {
+    wgpuQueueOnSubmittedWorkDone(_queue: number, callbackPtr: number, userdataPtr: number): void {
       pendingCallbacks++;
       queue.onSubmittedWorkDone().then(() => {
         pendingCallbacks--;
@@ -464,8 +468,10 @@ export function createWebGPUBridge(
     // Signature: (i32 encoder, i32 src, i64 srcOffset, i32 dst, i64 dstOffset, i64 size)
     wgpuCommandEncoderCopyBufferToBuffer(
       encoderHandle: number,
-      srcHandle: number, srcOffset: bigint,
-      dstHandle: number, dstOffset: bigint,
+      srcHandle: number,
+      srcOffset: bigint,
+      dstHandle: number,
+      dstOffset: bigint,
       size: bigint,
     ): void {
       const encoder = getHandle<GPUCommandEncoder>(encoderHandle);
@@ -479,21 +485,26 @@ export function createWebGPUBridge(
       return addHandle(encoder.finish() as unknown as GPUObject);
     },
 
-    wgpuCommandEncoderRelease(handle: number): void { releaseHandle(handle); },
+    wgpuCommandEncoderRelease(handle: number): void {
+      releaseHandle(handle);
+    },
 
     // ===== Command Buffer =====
-    wgpuCommandBufferRelease(handle: number): void { releaseHandle(handle); },
+    wgpuCommandBufferRelease(handle: number): void {
+      releaseHandle(handle);
+    },
 
     // ===== Compute Pass Encoder =====
     wgpuComputePassEncoderSetPipeline(passHandle: number, pipelineHandle: number): void {
-      getHandle<GPUComputePassEncoder>(passHandle).setPipeline(
-        getHandle<GPUComputePipeline>(pipelineHandle),
-      );
+      getHandle<GPUComputePassEncoder>(passHandle).setPipeline(getHandle<GPUComputePipeline>(pipelineHandle));
     },
 
     wgpuComputePassEncoderSetBindGroup(
-      passHandle: number, groupIndex: number, bgHandle: number,
-      dynamicOffsetCount: number, dynamicOffsetsPtr: number,
+      passHandle: number,
+      groupIndex: number,
+      bgHandle: number,
+      dynamicOffsetCount: number,
+      dynamicOffsetsPtr: number,
     ): void {
       const pass = getHandle<GPUComputePassEncoder>(passHandle);
       const bindGroup = getHandle<GPUBindGroup>(bgHandle);
@@ -509,9 +520,7 @@ export function createWebGPUBridge(
       }
     },
 
-    wgpuComputePassEncoderDispatchWorkgroups(
-      passHandle: number, x: number, y: number, z: number,
-    ): void {
+    wgpuComputePassEncoderDispatchWorkgroups(passHandle: number, x: number, y: number, z: number): void {
       getHandle<GPUComputePassEncoder>(passHandle).dispatchWorkgroups(x, y, z);
     },
 
@@ -519,7 +528,9 @@ export function createWebGPUBridge(
       getHandle<GPUComputePassEncoder>(passHandle).end();
     },
 
-    wgpuComputePassEncoderRelease(handle: number): void { releaseHandle(handle); },
+    wgpuComputePassEncoderRelease(handle: number): void {
+      releaseHandle(handle);
+    },
 
     // ===== Buffer =====
     wgpuBufferGetSize(bufferHandle: number): bigint {
@@ -584,9 +595,12 @@ export function createWebGPUBridge(
     },
 
     wgpuBufferMapAsync(
-      bufferHandle: number, mode: number,
-      offset: number, size: number,
-      callbackPtr: number, userdataPtr: number,
+      bufferHandle: number,
+      mode: number,
+      offset: number,
+      size: number,
+      callbackPtr: number,
+      userdataPtr: number,
     ): void {
       const buffer = getHandle<GPUBuffer>(bufferHandle);
       const gpuMode = mode === 1 ? GPUMapMode.READ : GPUMapMode.WRITE;
@@ -618,7 +632,9 @@ export function createWebGPUBridge(
       getHandle<GPUBuffer>(bufferHandle).destroy();
     },
 
-    wgpuBufferRelease(handle: number): void { releaseHandle(handle); },
+    wgpuBufferRelease(handle: number): void {
+      releaseHandle(handle);
+    },
 
     // ===== Pipeline =====
     wgpuComputePipelineGetBindGroupLayout(pipelineHandle: number, index: number): number {
@@ -626,12 +642,20 @@ export function createWebGPUBridge(
       return addHandle(pipeline.getBindGroupLayout(index) as unknown as GPUObject);
     },
 
-    wgpuComputePipelineRelease(handle: number): void { releaseHandle(handle); },
+    wgpuComputePipelineRelease(handle: number): void {
+      releaseHandle(handle);
+    },
 
     // ===== Release =====
-    wgpuBindGroupRelease(handle: number): void { releaseHandle(handle); },
-    wgpuBindGroupLayoutRelease(handle: number): void { releaseHandle(handle); },
-    wgpuShaderModuleRelease(handle: number): void { releaseHandle(handle); },
+    wgpuBindGroupRelease(handle: number): void {
+      releaseHandle(handle);
+    },
+    wgpuBindGroupLayoutRelease(handle: number): void {
+      releaseHandle(handle);
+    },
+    wgpuShaderModuleRelease(handle: number): void {
+      releaseHandle(handle);
+    },
 
     // ===== Polling =====
     mlx_webgpu_poll() {

@@ -9,10 +9,10 @@ use napi_derive::napi;
 use tracing::{info, warn};
 
 use crate::chat_stream::ChatStreamSink;
-#[cfg(target_family = "wasm")]
-use crate::chat_stream::{MIN_SAB_LEN, SabSink};
 #[cfg(not(target_family = "wasm"))]
 use crate::chat_stream::TsfnSink;
+#[cfg(target_family = "wasm")]
+use crate::chat_stream::{MIN_SAB_LEN, SabSink};
 use crate::model_thread::ResponseTx;
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
@@ -5292,9 +5292,7 @@ impl Qwen3_5MoeModel {
     /// `sab` must be at least `MIN_SAB_LEN` bytes. The JS caller is
     /// responsible for keeping the SAB alive until the returned
     /// `ChatStreamHandle` is cancelled or generation finishes.
-    #[napi(
-        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, sab: Buffer"
-    )]
+    #[napi(ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, sab: Buffer")]
     pub async fn chat_stream_sab(
         &self,
         messages: Vec<ChatMessage>,
@@ -5340,8 +5338,7 @@ impl Qwen3_5MoeModel {
         // valid for as long as the JS side holds a reference to the Uint8Array.
         // The Arc<SabSink> lives on the model thread until decode finishes; the JS
         // caller is responsible for not reclaiming the SAB before cancellation.
-        let sink_inner =
-            unsafe { SabSink::from_raw(sab.as_ptr() as *mut u8, sab.len()) }?;
+        let sink_inner = unsafe { SabSink::from_raw(sab.as_ptr() as *mut u8, sab.len()) }?;
         let sink: Arc<dyn ChatStreamSink> = Arc::new(sink_inner);
 
         self.thread.send(Qwen35MoeCmd::ChatStream {

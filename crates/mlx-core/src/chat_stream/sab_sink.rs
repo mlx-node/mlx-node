@@ -50,12 +50,12 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::models::qwen3_5::model::ChatStreamChunk;
 
-use super::wire::{
-    classify_payload, write_record, EncodedPayload, RECORD_HEADER_BYTES, SAB_HEADER_BYTES,
-    SAB_HEADER_OFFSET_CANCELLED, SAB_HEADER_OFFSET_READ_CUR, SAB_HEADER_OFFSET_SEQ,
-    SAB_HEADER_OFFSET_WRITE_CUR,
-};
 use super::ChatStreamSink;
+use super::wire::{
+    EncodedPayload, RECORD_HEADER_BYTES, SAB_HEADER_BYTES, SAB_HEADER_OFFSET_CANCELLED,
+    SAB_HEADER_OFFSET_READ_CUR, SAB_HEADER_OFFSET_SEQ, SAB_HEADER_OFFSET_WRITE_CUR,
+    classify_payload, write_record,
+};
 
 // ---------------------------------------------------------------------------
 // Stable wasm32 atomic-wait / atomic-notify via LLVM compiler-rt builtins.
@@ -255,8 +255,7 @@ impl SabSink {
             //
             // SAFETY: ptr + SAB_HEADER_OFFSET_READ_CUR is 4-byte aligned and
             // within the SAB allocation (validated in from_raw).
-            let read_addr =
-                unsafe { self.ptr.add(SAB_HEADER_OFFSET_READ_CUR) } as *mut i32;
+            let read_addr = unsafe { self.ptr.add(SAB_HEADER_OFFSET_READ_CUR) } as *mut i32;
             // SAFETY: read_addr is valid and 4-byte aligned.
             unsafe { wasm_atomic_wait32(read_addr, read as i32, WAIT_TIMEOUT_NS) };
         }
@@ -424,8 +423,7 @@ impl ChatStreamSink for SabSink {
         self.write_record_at(write_cur_before, &payload);
 
         // 7. Advance write_cur (Release store — visibility fence for consumer).
-        let write_cur_after =
-            (write_cur_before + total_len as u32) % self.body_len as u32;
+        let write_cur_after = (write_cur_before + total_len as u32) % self.body_len as u32;
         self.store_write_cur(write_cur_after);
 
         // 8. Bump seq and wake the JS consumer.

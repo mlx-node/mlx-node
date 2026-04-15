@@ -116,7 +116,7 @@ export function createCxxStubs(memory: WebAssembly.Memory) {
 
     // ── MLX GPU Init ───────────────────────────────────────────────────
     // mlx::core::gpu::init() — GPU is pre-initialized via WebGPU bridge
-    '_ZN3mlx4core3gpu4initEv': () => {},
+    _ZN3mlx4core3gpu4initEv: () => {},
 
     // ── POSIX Dynamic Linking Stubs ──────────────────────────────────
     // Used by MLX distributed module to load MPI/ring plugins at runtime.

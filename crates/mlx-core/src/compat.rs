@@ -5,7 +5,9 @@
 pub mod decode_profiler {
     pub struct DecodeProfiler;
     impl DecodeProfiler {
-        pub fn new(_mode: &str, _model: &str) -> Self { Self }
+        pub fn new(_mode: &str, _model: &str) -> Self {
+            Self
+        }
         pub fn set_prompt_tokens(&mut self, _n: u32) {}
         pub fn set_label(&mut self, _label: &str) {}
         pub fn snapshot_memory_before(&mut self) {}

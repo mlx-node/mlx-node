@@ -15,7 +15,10 @@ impl RMSNorm {
     /// Create without allocation (lazy zeros).
     pub fn new_empty(dims: u32, eps: Option<f64>) -> Result<Self> {
         let weight = MxArray::zeros(&[dims as i64], None)?;
-        Ok(Self { weight, eps: eps.unwrap_or(1e-5) })
+        Ok(Self {
+            weight,
+            eps: eps.unwrap_or(1e-5),
+        })
     }
 
     /// Create a new RMSNorm layer

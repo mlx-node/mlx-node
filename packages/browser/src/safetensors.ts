@@ -14,16 +14,16 @@
 
 export interface TensorInfo {
   name: string;
-  dtype: string;  // "F32", "F16", "BF16", "I32", "U32", "I8", "U8", "I16", "U16", "I64", "BOOL"
+  dtype: string; // "F32", "F16", "BF16", "I32", "U32", "I8", "U8", "I16", "U16", "I64", "BOOL"
   shape: number[];
-  byteOffset: number;  // offset into the data region
+  byteOffset: number; // offset into the data region
   byteSize: number;
 }
 
 export interface ParsedSafeTensors {
   tensors: TensorInfo[];
   metadata: Record<string, string>;
-  dataOffset: number;  // offset where raw data starts in the ArrayBuffer
+  dataOffset: number; // offset where raw data starts in the ArrayBuffer
 }
 
 /** Parse SafeTensors header without copying any tensor data */
@@ -63,13 +63,20 @@ export function parseSafeTensorsHeader(buffer: ArrayBuffer): ParsedSafeTensors {
  */
 export function dtypeToCode(dtype: string): number {
   switch (dtype) {
-    case 'F32': return 0;  // DType::Float32
-    case 'I32': return 1;  // DType::Int32
-    case 'F16': return 2;  // DType::Float16
-    case 'BF16': return 3; // DType::BFloat16
-    case 'U32': return 4;  // DType::Uint32
-    case 'U8': return 5;   // DType::Uint8
-    default: return 0;     // fallback to float32
+    case 'F32':
+      return 0; // DType::Float32
+    case 'I32':
+      return 1; // DType::Int32
+    case 'F16':
+      return 2; // DType::Float16
+    case 'BF16':
+      return 3; // DType::BFloat16
+    case 'U32':
+      return 4; // DType::Uint32
+    case 'U8':
+      return 5; // DType::Uint8
+    default:
+      return 0; // fallback to float32
   }
 }
 

@@ -583,9 +583,13 @@ pub fn apply_sampling(logits: &MxArray, config: Option<SamplingConfig>) -> Resul
 /// Sampled token indices [1] or [batch]
 pub fn sample(logits: &MxArray, config: Option<SamplingConfig>) -> Result<MxArray> {
     #[cfg(target_os = "wasi")]
-    { return sample_uncompiled(logits, config); }
+    {
+        return sample_uncompiled(logits, config);
+    }
     #[cfg(not(target_os = "wasi"))]
-    { sample_compiled(logits, config) }
+    {
+        sample_compiled(logits, config)
+    }
 }
 
 /// Sample using non-compiled operations (fallback for WASM).
@@ -623,12 +627,18 @@ fn argmax_compat(logits: &MxArray, axis: i32) -> Result<MxArray> {
     // 2. mask = (logits == max_val) — bool array
     let mask = logits.equal(&max_val)?;
     // 3. indices = arange(0, dim_size) with shape for broadcasting
-    let dim_size = logits.shape_at(
-        if axis < 0 { (logits.ndim()? as i32 + axis) as u32 } else { axis as u32 }
-    )?;
+    let dim_size = logits.shape_at(if axis < 0 {
+        (logits.ndim()? as i32 + axis) as u32
+    } else {
+        axis as u32
+    })?;
     let indices = MxArray::arange(0.0, dim_size as f64, None, Some(crate::array::DType::Int32))?;
     // 4. big_val = dim_size (any value >= dim_size works as "not a valid index")
-    let big = MxArray::full(&[dim_size], Either::A(dim_size as f64), Some(crate::array::DType::Int32))?;
+    let big = MxArray::full(
+        &[dim_size],
+        Either::A(dim_size as f64),
+        Some(crate::array::DType::Int32),
+    )?;
     // 5. masked_indices = where(mask, indices, big_val)
     let masked = mask.where_(&indices, &big)?;
     // 6. result = min(masked, axis) — first matching index
@@ -684,7 +694,10 @@ fn cpu_categorical_sample(logits: &MxArray, temperature: f64) -> Result<MxArray>
         (*state as f64) / (u64::MAX as f64)
     });
 
-    let idx = cumsum.iter().position(|&c| c > r).unwrap_or(probs.len() - 1);
+    let idx = cumsum
+        .iter()
+        .position(|&c| c > r)
+        .unwrap_or(probs.len() - 1);
     MxArray::from_int32(&[idx as i32], &[1])
 }
 

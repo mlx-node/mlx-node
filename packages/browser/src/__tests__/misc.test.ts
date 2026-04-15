@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll } from 'vitest';
+
 import { getBridge, runTest } from './test-bridge';
 
 beforeAll(() => getBridge(), 60_000);

@@ -247,10 +247,7 @@ impl DecoderLayer {
 
         // Residual connection
         let out = h.add(&mlp_out)?;
-        log_tensor_stats(
-            &format!("layer.{:02}.decoder.out", self.layer_idx),
-            &out,
-        );
+        log_tensor_stats(&format!("layer.{:02}.decoder.out", self.layer_idx), &out);
         Ok(out)
     }
 

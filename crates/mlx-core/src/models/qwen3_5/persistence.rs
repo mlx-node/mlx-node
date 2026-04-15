@@ -1252,7 +1252,10 @@ pub async fn load_from_gpu_buffers(
 
     info!(
         "Qwen3.5 GPU-buffer load: {} layers, hidden={}, heads={}, kv_heads={}, tensors={}",
-        config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
+        config.num_layers,
+        config.hidden_size,
+        config.num_heads,
+        config.num_kv_heads,
         gpu_tensors.len(),
     );
 
@@ -1404,7 +1407,8 @@ pub async fn load_from_gpu_buffers(
 
 use std::sync::Mutex;
 
-pub(crate) static CPU_TENSOR_ACCUMULATOR: Mutex<Option<HashMap<String, MxArray>>> = Mutex::new(None);
+pub(crate) static CPU_TENSOR_ACCUMULATOR: Mutex<Option<HashMap<String, MxArray>>> =
+    Mutex::new(None);
 
 /// Config and tokenizer strings, stored before tensor accumulation begins
 /// (when WASM memory is still small, avoiding emnapi DataView stale bounds).
@@ -1418,13 +1422,13 @@ pub(crate) static CPU_MODEL_CONFIG: Mutex<Option<CpuModelConfig>> = Mutex::new(N
 /// Map JS dtype codes (Rust DType discriminant order) to C++ dtype codes.
 fn js_to_cpp_dtype(js_code: i32) -> i32 {
     match js_code {
-        0 => 0,  // Float32 → float32
-        1 => 3,  // Int32 → int32
-        2 => 1,  // Float16 → float16
-        3 => 2,  // BFloat16 → bfloat16
-        4 => 4,  // Uint32 → uint32
-        5 => 6,  // Uint8 → uint8
-        _ => 0,  // fallback float32
+        0 => 0, // Float32 → float32
+        1 => 3, // Int32 → int32
+        2 => 1, // Float16 → float16
+        3 => 2, // BFloat16 → bfloat16
+        4 => 4, // Uint32 → uint32
+        5 => 6, // Uint8 → uint8
+        _ => 0, // fallback float32
     }
 }
 
@@ -1514,7 +1518,10 @@ pub fn build_model_inner_from_cpu_tensors() -> Result<Qwen35Inner> {
     info!(
         "Qwen3.5 build from {} CPU tensors: {} layers, hidden={}, heads={}, kv_heads={}",
         raw_params.len(),
-        config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
+        config.num_layers,
+        config.hidden_size,
+        config.num_heads,
+        config.num_kv_heads,
     );
 
     // 3. Sanitize weights (strip prefixes, merge split projections, etc.)

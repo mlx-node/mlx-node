@@ -191,10 +191,7 @@ impl From<WireChunk> for ChatStreamChunk {
 #[derive(Debug, Clone)]
 pub enum EncodedPayload<'a> {
     /// Fast-path: raw UTF-8 text bytes and the `is_reasoning` flag.
-    Text {
-        bytes: &'a [u8],
-        is_reasoning: bool,
-    },
+    Text { bytes: &'a [u8], is_reasoning: bool },
     /// Full JSON encoding of the chunk (allocated by [`classify_payload`]).
     Json(Vec<u8>),
     /// UTF-8 error message.
@@ -290,7 +287,10 @@ pub fn classify_payload<'a>(
 /// * the payload exceeds [`MAX_PAYLOAD_BYTES`] (u16 overflow).
 pub fn write_record(out: &mut [u8], payload: &EncodedPayload<'_>) -> napi::Result<usize> {
     let (kind, flags, data): (u8, u8, &[u8]) = match payload {
-        EncodedPayload::Text { bytes, is_reasoning } => {
+        EncodedPayload::Text {
+            bytes,
+            is_reasoning,
+        } => {
             let flags = if *is_reasoning { FLAG_IS_REASONING } else { 0 };
             (KIND_TEXT, flags, bytes)
         }
@@ -449,7 +449,10 @@ mod tests {
         let result = Ok(chunk.clone());
         let payload = classify_payload(&result).unwrap();
         match payload {
-            EncodedPayload::Text { bytes, is_reasoning } => {
+            EncodedPayload::Text {
+                bytes,
+                is_reasoning,
+            } => {
                 assert_eq!(bytes, b"hello");
                 assert!(!is_reasoning);
             }
@@ -467,7 +470,10 @@ mod tests {
         let result = Ok(chunk.clone());
         let payload = classify_payload(&result).unwrap();
         match payload {
-            EncodedPayload::Text { bytes, is_reasoning } => {
+            EncodedPayload::Text {
+                bytes,
+                is_reasoning,
+            } => {
                 assert_eq!(bytes, b"thinking...");
                 assert!(is_reasoning, "FLAG_IS_REASONING should be set");
             }
@@ -536,8 +542,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_classify_error() {
-        let err: napi::Result<ChatStreamChunk> =
-            Err(napi::Error::from_reason("boom".to_string()));
+        let err: napi::Result<ChatStreamChunk> = Err(napi::Error::from_reason("boom".to_string()));
         match classify_payload(&err).unwrap() {
             EncodedPayload::Error(msg) => assert_eq!(msg, "boom"),
             other => panic!("expected Error, got {:?}", other),
@@ -773,7 +778,7 @@ mod tests {
         // Header present (claims payload_len = 10) but only 3 bytes of payload.
         let mut buf = [0u8; 7];
         buf[0] = 10; // payload_len low byte
-        buf[1] = 0;  // payload_len high byte
+        buf[1] = 0; // payload_len high byte
         buf[2] = KIND_TEXT;
         buf[3] = 0;
         // buf[4..7] — only 3 bytes where 10 are needed

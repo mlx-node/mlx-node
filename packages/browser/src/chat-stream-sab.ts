@@ -79,6 +79,17 @@ export interface SabRing {
   reader: (onChunk: (chunk: ChatStreamChunk) => void, onError: (e: Error) => void) => AbortController;
 }
 
+export interface SabRingOverHeap {
+  /**
+   * Start the async reader loop. Returns an AbortController whose `.abort()`
+   * stops the loop and notifies the WASM producer to stop writing.
+   *
+   * @param onChunk - Called for each decoded ChatStreamChunk.
+   * @param onError - Called on KIND_ERROR records or decode failures.
+   */
+  reader: (onChunk: (chunk: ChatStreamChunk) => void, onError: (e: Error) => void) => AbortController;
+}
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
@@ -116,6 +127,110 @@ export function createSabRing(sizeBytes: number = 262_144): SabRing {
   }
 
   return { sab, reader };
+}
+
+/**
+ * Build a ring reader over an existing memory region inside the WASM heap.
+ *
+ * Use this when the SAB backing must live inside the WASM instance's own
+ * memory so napi-rs can zero-copy it through to the Rust SabSink. The caller
+ * is responsible for `malloc`ing `byteLength` bytes at `heapOffset` before
+ * calling, and for `free`ing them after the stream finishes (typically after
+ * the reader's AbortController has fired on the done chunk).
+ *
+ * `memory.buffer` is re-fetched on every drain iteration so memory.grow does
+ * not leave us holding stale views.
+ */
+export function createSabRingOverHeap(
+  memory: WebAssembly.Memory,
+  heapOffset: number,
+  byteLength: number,
+): SabRingOverHeap {
+  if (byteLength < MIN_SAB_BYTES) {
+    throw new RangeError(`createSabRingOverHeap: byteLength (${byteLength}) < MIN_SAB_BYTES (${MIN_SAB_BYTES})`);
+  }
+  if (heapOffset % 4 !== 0) {
+    throw new RangeError(`createSabRingOverHeap: heapOffset must be 4-byte aligned (got ${heapOffset})`);
+  }
+
+  const bodyOffset = heapOffset + SAB_HEADER_BYTES;
+  const bodyLen = byteLength - SAB_HEADER_BYTES;
+
+  // Zero the 32-byte header so seq/write_cur/read_cur/cancelled start at 0.
+  new Uint8Array(memory.buffer, heapOffset, SAB_HEADER_BYTES).fill(0);
+
+  const headerView = (): Int32Array => new Int32Array(memory.buffer, heapOffset, SAB_HEADER_BYTES / 4);
+  const bodyView = (): Uint8Array => new Uint8Array(memory.buffer, bodyOffset, bodyLen);
+
+  function reader(onChunk: (chunk: ChatStreamChunk) => void, onError: (e: Error) => void): AbortController {
+    const abort = new AbortController();
+
+    abort.signal.addEventListener('abort', () => {
+      const h = headerView();
+      Atomics.store(h, CANCELLED_IDX, 1);
+      Atomics.notify(h, READ_CUR_IDX);
+      // Also wake the reader's waitAsync if it's sleeping on SEQ_IDX.
+      Atomics.notify(h, SEQ_IDX);
+    });
+
+    void runLoopHeap(headerView, bodyView, bodyLen, onChunk, onError, abort.signal);
+    return abort;
+  }
+
+  return { reader };
+}
+
+async function runLoopHeap(
+  headerView: () => Int32Array,
+  bodyView: () => Uint8Array,
+  bodyLen: number,
+  onChunk: (chunk: ChatStreamChunk) => void,
+  onError: (e: Error) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const scratch = new Uint8Array(RECORD_HEADER_BYTES + MAX_PAYLOAD_BYTES);
+  let lastSeq = Atomics.load(headerView(), SEQ_IDX);
+
+  while (!signal.aborted) {
+    while (!signal.aborted) {
+      const headerI32 = headerView();
+      const bodyU8 = bodyView();
+      const readCur = Atomics.load(headerI32, READ_CUR_IDX);
+      const writeCur = Atomics.load(headerI32, WRITE_CUR_IDX);
+      if (readCur === writeCur) break;
+
+      copyFromRing(bodyU8, readCur, bodyLen, scratch, 0, RECORD_HEADER_BYTES);
+      const payloadLen = scratch[0]! | (scratch[1]! << 8);
+      const kind = scratch[2]!;
+      const flags = scratch[3]!;
+      const totalLen = RECORD_HEADER_BYTES + payloadLen;
+
+      if (payloadLen > 0) {
+        const payloadStart = (readCur + RECORD_HEADER_BYTES) % bodyLen;
+        copyFromRing(bodyU8, payloadStart, bodyLen, scratch, RECORD_HEADER_BYTES, payloadLen);
+      }
+
+      try {
+        dispatchRecord(kind, flags, scratch.subarray(RECORD_HEADER_BYTES, totalLen), onChunk, onError);
+      } catch (e) {
+        onError(e instanceof Error ? e : new Error(String(e)));
+      }
+
+      const newReadCur = (readCur + totalLen) % bodyLen;
+      Atomics.store(headerI32, READ_CUR_IDX, newReadCur);
+      Atomics.notify(headerI32, READ_CUR_IDX);
+    }
+
+    if (signal.aborted) break;
+
+    const headerI32 = headerView();
+    const currentSeq = Atomics.load(headerI32, SEQ_IDX);
+    if (currentSeq === lastSeq) {
+      const { async, value } = Atomics.waitAsync(headerI32, SEQ_IDX, lastSeq, 1000);
+      const _result = async ? await value : (value as string);
+    }
+    lastSeq = Atomics.load(headerView(), SEQ_IDX);
+  }
 }
 
 // ---------------------------------------------------------------------------

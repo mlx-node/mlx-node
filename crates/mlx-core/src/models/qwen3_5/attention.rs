@@ -184,12 +184,8 @@ impl Qwen3_5Attention {
 
         // Fused scaled dot-product attention with causal masking.
         // The kernel handles GQA internally (no need to expand K/V heads).
-        let output = scaled_dot_product_attention_causal(
-            &queries,
-            &keys,
-            &values,
-            self.scale as f64,
-        )?;
+        let output =
+            scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?;
 
         // Transpose back: [B, H, T, D] → [B, T, H, D] → flatten to [B, T, H*D]
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;

@@ -17,28 +17,28 @@ Object.assign(buildOptions, {
   packageJsonPath: join(__dirname, 'package.json'),
   platform: true,
   outputDir: __dirname,
-})
+});
 
-const isWasmBuild = buildOptions.target === 'wasm32-wasip1-threads'
+const isWasmBuild = buildOptions.target === 'wasm32-wasip1-threads';
 
 if (isWasmBuild) {
   // tokio_unstable: enables multi-thread tokio runtime on WASM (requires
   // asyncWorkPoolSize > 0 in emnapi instantiation so wasi_thread_spawn works).
-  process.env.RUSTFLAGS = '--cfg tokio_unstable'
+  process.env.RUSTFLAGS = '--cfg tokio_unstable';
   // esaxx-rs (pulled in by tokenizers) uses C++ try/catch — needs -fexceptions
   // globally. mlx-sys/build.rs sets these for its own cmake/cc::Build, but
   // esaxx-rs uses its own cc::Build that reads TARGET_CXXFLAGS from env.
-  process.env.TARGET_CXXFLAGS = '-fwasm-exceptions -fexceptions'
+  process.env.TARGET_CXXFLAGS = '-fwasm-exceptions -fexceptions';
   Object.assign(buildOptions, {
     noJsBinding: true,
     noDefaultFeatures: true,
     features: ['browser'],
-  })
+  });
 } else {
   Object.assign(buildOptions, {
     jsBinding: 'index.cjs',
     dts: 'index.d.cts',
-  })
+  });
 }
 
 // Snapshot hand-written wasi-worker-browser.mjs BEFORE cli.build() overwrites it.
@@ -70,12 +70,17 @@ if (wasiWorkerBrowserSrc) {
 // Copy mlx.metallib for colocated Metal shader loading
 // MLX looks for metallib next to the binary, so we copy it here
 // Skip for WASM targets (no Metal shaders)
-const target = process.argv.find(a => a.includes('wasm32'));
+const target = process.argv.find((a) => a.includes('wasm32'));
 if (!target) {
   await copyMetallib();
 } else {
   // Copy raw WASM binary to the runtime location (symlinked by browser demo)
-  const rawWasm = join(__dirname, '../../target/wasm32-wasip1-threads', buildOptions.profile ?? 'release', 'mlx_core.wasm');
+  const rawWasm = join(
+    __dirname,
+    '../../target/wasm32-wasip1-threads',
+    buildOptions.profile ?? 'release',
+    'mlx_core.wasm',
+  );
   const runtimeWasm = join(__dirname, 'mlx-core.wasm32-wasi.opt.wasm');
   await copyFile(rawWasm, runtimeWasm);
   console.log(`Copied WASM: ${rawWasm} -> ${runtimeWasm}`);
