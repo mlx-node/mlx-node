@@ -35,6 +35,7 @@ const handler = new MessageHandler({
       rpcConfig.poolStatsBuffer, // may be undefined — guarded in stub
       rpcConfig.dispatchBatchBuffer, // Phase 2 — may be undefined
       rpcConfig.dispatchBatch === true,
+      rpcConfig.bufferMetadataBuffer, // Task 3 — shared (size, usage) table
     );
 
     const wasi = new WASI({

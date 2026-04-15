@@ -28,7 +28,12 @@ import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-ru
 import { createSabRingOverHeap } from './chat-stream-sab.js';
 import { CMD_OFFSET, READBACK_BUFFER_SIZE, DISPATCH_BATCH_BUFFER_SIZE } from './rpc-protocol.js';
 import { parseSafeTensorsHeader, dtypeToCode } from './safetensors.js';
-import { createBridgeStub, POOL_STATS_SIZE_BYTES, type BridgeStub } from './webgpu-bridge-stub.js';
+import {
+  createBridgeStub,
+  POOL_STATS_SIZE_BYTES,
+  BUFFER_METADATA_SIZE_BYTES,
+  type BridgeStub,
+} from './webgpu-bridge-stub.js';
 
 let model: any = null;
 let mlxExports: any = null;
@@ -95,6 +100,14 @@ async function handleInit(data: {
     // the workers; the bridge stub only starts writing records when
     // batchEnabled is true.
     const dispatchBatchBuffer = new SharedArrayBuffer(DISPATCH_BATCH_BUFFER_SIZE);
+    // Task 3: shared buffer-metadata SAB. Every bridge stub spawned against
+    // this wasmMemory (main + child pthread workers created by emnapi's
+    // asyncWorkPoolSize) reads and writes the same (size, usage) table,
+    // fixing the `unknownHandle=100%` pathology where handles created on
+    // one stub were released from another and the release-side metadata
+    // lookup came up empty. Sized for ~35 back-to-back Qwen3.5-0.8B
+    // decodes; see webgpu-bridge-stub.ts for the capacity calculation.
+    const bufferMetadataBuffer = new SharedArrayBuffer(BUFFER_METADATA_SIZE_BYTES);
     // WASM module requires min 1002 pages (~66 MB). We use 4096 (~268 MB)
     // for headroom during WASM init (thread stacks, emnapi, etc.) and let
     // memory.grow expand as needed — keeps total well under the 2 GB JS
@@ -140,6 +153,7 @@ async function handleInit(data: {
       poolStatsBuffer,
       dispatchBatchBuffer,
       dispatchBatch,
+      bufferMetadataBuffer,
     );
     // Retain for ?profile=1 readback (resetBridgeStats / fetchGpuWorkerStats
     // need the same BridgeStub instance that owns the SAB cmdBuffer view).
@@ -225,6 +239,7 @@ async function handleInit(data: {
           poolStatsBuffer,
           dispatchBatchBuffer,
           dispatchBatch: false,
+          bufferMetadataBuffer,
           handles: {
             instanceHandle: gpuReady.instanceHandle,
             adapterHandle: gpuReady.adapterHandle,

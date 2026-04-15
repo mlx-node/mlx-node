@@ -102,6 +102,30 @@ export interface BridgeStub {
 export const POOL_STATS_SLOTS = 10;
 export const POOL_STATS_SIZE_BYTES = POOL_STATS_SLOTS * 4;
 
+// Task 3: Shared buffer metadata SAB, indexed by real (gpu-worker) handle.
+// Each stub lives in its own Worker and therefore has its own JS closure —
+// per-stub Map<handle, size|usage> breaks when a handle is created in one
+// stub (e.g. main mlx-worker on startup) and released in another (pthread
+// workers, which actually drive decode — see the note in fetchGpuWorkerStats).
+// Moving the size/usage tables into a SAB makes them visible to every stub
+// instantiated against the same wasmMemory, so release can always look up
+// the original (size, usage) and route the handle into the local pool
+// instead of falling through to queueRelease as "unknown".
+//
+// Layout (interleaved u32 pairs): [size_0, usage_0, size_1, usage_1, ...].
+// Handle 0 is unused (gpu-worker's nextHandle starts at 1). Fake handles
+// (>= FAKE_HANDLE_BASE, ~2 GB) do NOT fit in the index range; they remain
+// stub-local via fallback Maps because they never cross workers anyway.
+//
+// Sizing: gpu-worker.ts allocates handles monotonically via `nextHandle++`
+// across the lifetime of the session (no recycling after release). A full
+// decode of 224 tok at ~120 fresh buffer creates/tok (post-pool-fix) is
+// ~27k new handles per gen. 2^20 = 1,048,576 handles = 8 MiB of SAB covers
+// ~35 back-to-back generations without overflow; the stub gracefully falls
+// back to local Maps for any handle beyond the range.
+export const BUFFER_METADATA_MAX_HANDLES = 1 << 20;
+export const BUFFER_METADATA_SIZE_BYTES = BUFFER_METADATA_MAX_HANDLES * 8;
+
 export function createBridgeStub(
   cmdBuffer: SharedArrayBuffer,
   wasmMemory: WebAssembly.Memory,
@@ -126,6 +150,15 @@ export function createBridgeStub(
   dispatchBatchBuffer?: SharedArrayBuffer,
   /** Phase 2: gate DISPATCH_BATCH (default: off). */
   batchEnabled?: boolean,
+  /**
+   * Task 3: shared SAB holding (size, usage) metadata for every real
+   * gpu-worker buffer handle. When provided, all stubs sharing the same
+   * buffer see a consistent view of size+usage on release, fixing the
+   * `unknownHandle=100%` pathology caused by per-stub closure isolation
+   * across child pthread workers. When undefined, each stub falls back
+   * to the legacy per-instance Record-based cache.
+   */
+  bufferMetadataBuffer?: SharedArrayBuffer,
 ): BridgeStub {
   const cmdView = new Int32Array(cmdBuffer);
   const cmdDataView = new DataView(cmdBuffer);
@@ -216,11 +249,75 @@ export function createBridgeStub(
   let lastFusedEncoder = -1;
   let fakeHandleCounter = 0x7f000000; // high range to avoid collision with real handles
 
-  // Buffer size cache: use plain object (faster than Map for integer keys)
-  // Caches buffer sizes to avoid BUFFER_GET_SIZE RPCs (~2.5x per dispatch)
-  const bufSizes: Record<number, number> = {};
-  // Per-handle usage flags — needed by the release path to key the pool.
-  const bufferUsages: Record<number, number> = {};
+  // Buffer metadata (size + usage) for real gpu-worker handles.
+  //
+  // Previously stored as per-stub `Record<number, number>`, which broke the
+  // release path under emnapi's multi-pthread worker pool: handles created
+  // in one stub (e.g. main mlx-worker during weight upload) were released
+  // from another stub (pthread worker driving decode), and each stub's
+  // private Record was empty from the other stub's perspective → every
+  // release fell through as `unknownHandle`, skipping the pool entirely.
+  //
+  // Task 3 moves this table into a SharedArrayBuffer keyed by the real
+  // handle index, so every stub against the same wasmMemory sees the same
+  // data. Fake handles (>= FAKE_HANDLE_BASE) never cross stubs (they're
+  // minted locally and resolved to real handles before any RPC), so they
+  // stay in stub-local fallback Maps to avoid having to size the SAB for
+  // the ~2 GB fake-handle index range.
+  const bufMetaSab =
+    bufferMetadataBuffer && bufferMetadataBuffer.byteLength >= BUFFER_METADATA_SIZE_BYTES
+      ? new Uint32Array(bufferMetadataBuffer, 0, BUFFER_METADATA_MAX_HANDLES * 2)
+      : null;
+  // Fallback / fake-handle storage. Used for handles that don't fit in the
+  // SAB index range (fakes) and for test paths that don't supply a SAB.
+  const fakeBufSizes: Record<number, number> = {};
+  const fakeBufUsages: Record<number, number> = {};
+
+  function setBufferMeta(handle: number, size: number, usage: number): void {
+    if (bufMetaSab && handle > 0 && handle < BUFFER_METADATA_MAX_HANDLES) {
+      // Interleaved layout: [size_i, usage_i] per handle.
+      // Write usage first so any racing reader that sees a non-zero size
+      // (the validity sentinel) is guaranteed to also see the matching usage.
+      const base = handle * 2;
+      Atomics.store(bufMetaSab, base + 1, usage >>> 0);
+      Atomics.store(bufMetaSab, base, size >>> 0);
+      return;
+    }
+    fakeBufSizes[handle] = size;
+    fakeBufUsages[handle] = usage;
+  }
+
+  function getBufferSize(handle: number): number | undefined {
+    if (bufMetaSab && handle > 0 && handle < BUFFER_METADATA_MAX_HANDLES) {
+      const v = Atomics.load(bufMetaSab, handle * 2);
+      return v === 0 ? undefined : v;
+    }
+    return fakeBufSizes[handle];
+  }
+
+  function getBufferUsage(handle: number): number | undefined {
+    if (bufMetaSab && handle > 0 && handle < BUFFER_METADATA_MAX_HANDLES) {
+      // Gate on size as the validity sentinel — a zero size means the slot
+      // was never written (or has been cleared), so there is no usage.
+      const base = handle * 2;
+      if (Atomics.load(bufMetaSab, base) === 0) return undefined;
+      return Atomics.load(bufMetaSab, base + 1);
+    }
+    return fakeBufUsages[handle];
+  }
+
+  function clearBufferMeta(handle: number): void {
+    if (bufMetaSab && handle > 0 && handle < BUFFER_METADATA_MAX_HANDLES) {
+      // Clear size first so any concurrent reader sees "unwritten" rather
+      // than a stale (size, 0-usage) pair.
+      const base = handle * 2;
+      Atomics.store(bufMetaSab, base, 0);
+      Atomics.store(bufMetaSab, base + 1, 0);
+      return;
+    }
+    delete fakeBufSizes[handle];
+    delete fakeBufUsages[handle];
+  }
 
   // Buffer pool: recycle real gpu-worker handles by usage+size key.
   // Key format: `${usage}:${size}`. Value: stack of live handles whose
@@ -318,11 +415,10 @@ export function createBridgeStub(
     const sizeHi = Math.floor(def.size / 0x100000000);
     const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, def.usage, sizeLo, sizeHi, def.wasmPtr);
     deferredBufferRemap.set(fakeHandle, realHandle);
-    bufSizes[realHandle] = def.size;
-    bufferUsages[realHandle] = def.usage;
+    setBufferMeta(realHandle, def.size, def.usage);
     // Scrub the fake handle's shadow size entry (set when the fake was created)
-    // so bufSizes doesn't accumulate stale fake-handle keys over time.
-    delete bufSizes[fakeHandle];
+    // so the metadata table doesn't accumulate stale fake-handle keys.
+    clearBufferMeta(fakeHandle);
     wasmFree(def.wasmPtr);
   }
 
@@ -856,7 +952,10 @@ export function createBridgeStub(
           // Allocate WASM shadow for C++ to write into via getMappedRange
           const wasmPtr = wasmMalloc(size);
           mappedAtCreationBuffers.set(fakeHandle, { wasmPtr, size, usage });
-          bufSizes[fakeHandle] = size;
+          // Fake handles (>= FAKE_HANDLE_BASE) are stub-local and outside the
+          // SAB index range, so stash size in the fake map directly. They are
+          // not poolable, so usage is tracked via mappedAtCreationBuffers.
+          fakeBufSizes[fakeHandle] = size;
           return fakeHandle;
         }
         diagCreateMappedNoCopyDst++;
@@ -878,8 +977,7 @@ export function createBridgeStub(
           if (stack.length === 0) bufferPool.delete(key);
           bufferPoolHits++;
           bumpPoolStat(POOL_STAT_HITS);
-          bufSizes[reused] = size;
-          bufferUsages[reused] = usage;
+          setBufferMeta(reused, size, usage);
           return reused;
         }
         bufferPoolMisses++;
@@ -888,8 +986,10 @@ export function createBridgeStub(
 
       const h2 = rpcCall(RpcFn.DEVICE_CREATE_BUFFER, descPtr);
       if (h2 > 0 && h2 < FAKE_HANDLE_BASE) {
-        bufSizes[h2] = size; // eager size cache (eliminates BUFFER_GET_SIZE RPCs)
-        bufferUsages[h2] = usage;
+        // Eager (size, usage) cache — drops BUFFER_GET_SIZE RPCs and gives
+        // the release path the data it needs to pool instead of falling
+        // through to queueRelease.
+        setBufferMeta(h2, size, usage);
       }
       return h2;
     },
@@ -1302,12 +1402,11 @@ export function createBridgeStub(
               if (deferredInfo && deferredFakeHandle >= 0) {
                 if (result > 0) {
                   deferredBufferRemap.set(deferredFakeHandle, result);
-                  bufSizes[result] = deferredInfo.size;
-                  bufferUsages[result] = deferredInfo.usage;
+                  setBufferMeta(result, deferredInfo.size, deferredInfo.usage);
                 }
                 // Scrub the fake handle's shadow size entry (set when the fake
-                // was created) so bufSizes doesn't accumulate stale keys.
-                delete bufSizes[deferredFakeHandle];
+                // was created) so the metadata table doesn't leak stale keys.
+                clearBufferMeta(deferredFakeHandle);
                 wasmFree(deferredInfo.wasmPtr);
               }
             }
@@ -1325,10 +1424,9 @@ export function createBridgeStub(
                 deferredInfo.wasmPtr,
               );
               deferredBufferRemap.set(deferredFakeHandle, realHandle);
-              bufSizes[realHandle] = deferredInfo.size;
-              bufferUsages[realHandle] = deferredInfo.usage;
+              setBufferMeta(realHandle, deferredInfo.size, deferredInfo.usage);
               // Scrub the fake handle's shadow size entry.
-              delete bufSizes[deferredFakeHandle];
+              clearBufferMeta(deferredFakeHandle);
               wasmFree(deferredInfo.wasmPtr);
               // Rewrite the entry with the real handle
               const base = (CMD_OFFSET.CALLBACK_BASE + uniformEntryIdx * 12) >>> 2;
@@ -1385,15 +1483,19 @@ export function createBridgeStub(
     // ===== Buffer =====
     wgpuBufferGetSize(bufferHandle: number): bigint {
       // Fast path: return cached size (no RPC) — check both fake and real handle
-      const cached = bufSizes[bufferHandle];
+      const cached = getBufferSize(bufferHandle);
       if (cached !== undefined) return BigInt(cached);
-      // Slow path: RPC to gpu-worker (resolve fake→real first)
+      // Slow path: RPC to gpu-worker (resolve fake→real first).
+      // Do NOT cache-fill the SAB here: we only know `size` and publishing a
+      // non-zero size lane without the matching usage would break the
+      // setBufferMeta invariant ("usage-first, then size sentinel") and let
+      // getBufferUsage return a stale/zero usage. Real handles normally get
+      // their metadata seeded at create time via setBufferMeta, so this slow
+      // path is rare in practice.
       const resolved = resolveBufferHandle(bufferHandle);
       rpcCall(RpcFn.BUFFER_GET_SIZE, resolved);
       const lo = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);
       const hi = cmdDataView.getUint32(CMD_OFFSET.RESULT_HI, true);
-      // Cache (assume sizes < 2^32 for typical buffers)
-      bufSizes[bufferHandle] = lo;
       return BigInt(lo) | (BigInt(hi) << 32n);
     },
 
@@ -1475,10 +1577,9 @@ export function createBridgeStub(
           const sizeHi = Math.floor(mapped.size / 0x100000000);
           const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, mapped.usage, sizeLo, sizeHi, mapped.wasmPtr);
           deferredBufferRemap.set(bufferHandle, realHandle);
-          bufSizes[realHandle] = mapped.size;
-          bufferUsages[realHandle] = mapped.usage;
+          setBufferMeta(realHandle, mapped.size, mapped.usage);
           // Scrub the fake handle's shadow size entry.
-          delete bufSizes[bufferHandle];
+          clearBufferMeta(bufferHandle);
           wasmFree(mapped.wasmPtr);
         }
         unmapPtrs.delete(bufferHandle);
@@ -1516,19 +1617,17 @@ export function createBridgeStub(
       if (mapped) {
         mappedAtCreationBuffers.delete(bufferHandle);
         wasmFree(mapped.wasmPtr);
-        delete bufSizes[bufferHandle];
-        delete bufferUsages[bufferHandle];
+        clearBufferMeta(bufferHandle);
       }
       const def = deferredCreations.get(bufferHandle);
       if (def) {
         deferredCreations.delete(bufferHandle);
         wasmFree(def.wasmPtr);
-        // Scrub fake-handle shadow metadata: deferredCreations inherits the fake
-        // handle from the mappedAtCreation phase, and bufSizes[fakeHandle] was
-        // set when the fake was first minted. Without this, destroying a small
-        // deferred buffer before its first dispatch leaks the shadow entry.
-        delete bufSizes[bufferHandle];
-        delete bufferUsages[bufferHandle];
+        // Scrub fake-handle shadow metadata: deferredCreations inherits the
+        // fake handle from the mappedAtCreation phase, and the size entry
+        // was set when the fake was first minted. Without this, destroying
+        // a small deferred buffer before its first dispatch leaks the entry.
+        clearBufferMeta(bufferHandle);
       }
       const resolved = resolveBufferHandle(bufferHandle);
       if (resolved !== bufferHandle) {
@@ -1539,8 +1638,14 @@ export function createBridgeStub(
       }
       // Destroy is a no-op on the gpu-worker side, so any pooled buddies at
       // this (usage, size) key remain valid GPUBuffers. Leave the pool alone.
-      delete bufSizes[resolved];
-      delete bufferUsages[resolved];
+      //
+      // Do NOT clear the (size, usage) metadata here: MLX's WebGPU allocator
+      // calls wgpuBufferDestroy BEFORE wgpuBufferRelease on the same handle
+      // during its normal teardown. If we wipe the SAB slot at destroy time,
+      // the release-time lookup finds size=0 and falls through the
+      // unknownHandle branch, which skips the client pool entirely. Leaving
+      // the metadata alive lets the subsequent release pool the real handle
+      // and suppress the BUFFER_RELEASE RPC.
     },
 
     wgpuBufferRelease(handle: number): void {
@@ -1562,11 +1667,7 @@ export function createBridgeStub(
       if (mapped) {
         mappedAtCreationBuffers.delete(handle);
         wasmFree(mapped.wasmPtr);
-        delete bufSizes[handle];
-        // Symmetry with every other cleanup site: benign for fake
-        // mappedAtCreation handles (no bufferUsages entry), but kept for
-        // consistency with the deferred/resolved branches below.
-        delete bufferUsages[handle];
+        clearBufferMeta(handle);
         return;
       }
       // Clean up deferred creation if buffer is released before dispatch
@@ -1574,14 +1675,12 @@ export function createBridgeStub(
       if (def) {
         deferredCreations.delete(handle);
         wasmFree(def.wasmPtr);
-        // Scrub fake-handle shadow metadata: bufSizes[fakeHandle] was set when
-        // the fake was first minted, and the small-buffer unmap path transfers
-        // ownership into deferredCreations without cleaning it up. Without this,
-        // releasing a small deferred buffer before its first dispatch leaks the
-        // shadow entry. bufferUsages shouldn't normally have an entry for fake
-        // handles, but deleting it defensively is cheap.
-        delete bufSizes[handle];
-        delete bufferUsages[handle];
+        // Scrub fake-handle shadow metadata: the size entry was set when
+        // the fake was first minted, and the small-buffer unmap path
+        // transfers ownership into deferredCreations without cleaning it
+        // up. Without this, releasing a small deferred buffer before its
+        // first dispatch leaks the entry.
+        clearBufferMeta(handle);
         return; // no GPU buffer was created, nothing to release
       }
       const resolved = resolveBufferHandle(handle);
@@ -1594,8 +1693,8 @@ export function createBridgeStub(
       }
 
       // Try to pool the real handle instead of releasing to the gpu-worker.
-      const size = bufSizes[resolved];
-      const usage = bufferUsages[resolved];
+      const size = getBufferSize(resolved);
+      const usage = getBufferUsage(resolved);
       if (size === undefined || usage === undefined) {
         diagReleaseUnknownHandle++;
         bumpPoolStat(POOL_STAT_RELEASE_UNKNOWN);
@@ -1618,15 +1717,13 @@ export function createBridgeStub(
         const evicted = stack.shift()!;
         bumpPoolStat(POOL_STAT_EVICTIONS);
         queueRelease(evicted);
-        delete bufSizes[evicted];
-        delete bufferUsages[evicted];
+        clearBufferMeta(evicted);
         stack.push(resolved);
         return;
       }
 
       queueRelease(resolved);
-      if (size !== undefined) delete bufSizes[resolved];
-      if (usage !== undefined) delete bufferUsages[resolved];
+      clearBufferMeta(resolved);
     },
 
     // ===== Pipeline =====
