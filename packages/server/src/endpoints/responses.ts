@@ -73,6 +73,34 @@ async function handleNonStreaming(
 // Streaming path
 // ---------------------------------------------------------------------------
 
+/**
+ * Stream a chat session's events to the SSE writer, gated on the
+ * session's commit signal.
+ *
+ * `wasCommitted` is a closure that reads `session.turns` at call
+ * time. On the streaming path the session only advances `turns` on a
+ * successful non-error final chunk (see `ChatSession.sendStream`'s
+ * `sawFinal` gate), so this closure returns `false` when the native
+ * stream emits `done: true, finishReason: 'error'`, when the async
+ * iterator exhausts without a `done` event, or when a mid-decode
+ * throw propagates through. In every non-committed case we MUST skip
+ * `persistResponse()` and emit `response.failed` instead of
+ * `response.completed`, otherwise a later `previous_response_id`
+ * continuation would cold-replay a turn the session never committed —
+ * silently resurrecting failed or partial output as authoritative
+ * history.
+ *
+ * The closure is called AFTER the `for await` loop has fully drained
+ * (either via a `break` inside the done branch or because the
+ * iterator exhausted). Draining is load-bearing: `ChatSession`
+ * increments `turns` in the generator's `finally` block, which only
+ * runs once the consumer's `.return()` / natural-exhaust cascade
+ * reaches the outer generator. A pre-drain `wasCommitted()` would
+ * read a stale baseline and falsely report "not committed" even on a
+ * successful turn. The `runSessionStreaming` helper captures its
+ * baseline AFTER any internal `session.reset()` too, so the signal is
+ * honest for the multi-message reset-and-cold-restart branch as well.
+ */
 async function handleStreamingNative(
   res: ServerResponse,
   chatStream: AsyncGenerator<ChatStreamEvent>,
@@ -81,6 +109,7 @@ async function handleStreamingNative(
   previousResponseId: string | undefined,
   store: ResponseStore | null,
   newInputMessages: ChatMessage[],
+  wasCommitted: () => boolean,
 ): Promise<void> {
   beginSSE(res);
 
@@ -101,8 +130,18 @@ async function handleStreamingNative(
   let suppressedMessageIndex = -1;
   const tagBuffer = new ToolCallTagBuffer();
 
+  // Terminal response captured inside the done branch (or synthesized
+  // in the fallback after the loop if the iterator exhausted). The
+  // actual `response.completed` / `response.failed` emission is
+  // deferred until AFTER the loop drains so `wasCommitted()` can read
+  // an authoritative `session.turns` — otherwise we would emit the
+  // terminal event while the producer's finally has not yet run.
+  let completedResponse: ResponseObject | null = null;
+  let sawDone = false;
+
   for await (const event of chatStream) {
     if (event.done) {
+      sawDone = true;
       // Final event -- close open items and emit completed
 
       // Flush any remaining pending text (no tool call tag was found)
@@ -367,7 +406,13 @@ async function handleStreamingNative(
         writeSSEEvent(res, 'response.output_item.done', { output_index: fcIndex, item: fcItem });
       }
 
-      // Build completed response
+      // Build the terminal response object but do NOT persist or emit
+      // `response.completed` yet — both actions are gated on the
+      // session's commit signal, which only becomes authoritative
+      // after the outer generator's finally has run. We `break` out
+      // of the loop so the for-await's cleanup runs the producer's
+      // finally (setting `turnCount` if the session committed), then
+      // defer persistence + emission to the post-loop block below.
       const promptTokens = event.promptTokens ?? 0;
       const reasoningTokens = event.reasoningTokens ?? 0;
       const usage = {
@@ -378,7 +423,7 @@ async function handleStreamingNative(
       };
 
       const finalOutput = outputItems.filter((_, idx) => idx !== suppressedMessageIndex);
-      const completedResponse: ResponseObject = {
+      completedResponse = {
         ...partial,
         status: mapFinishReasonToStatus(event.finishReason),
         output: finalOutput,
@@ -386,16 +431,7 @@ async function handleStreamingNative(
         incomplete_details: event.finishReason === 'length' ? { reason: 'max_output_tokens' } : null,
         usage,
       };
-
-      // Persist only the new input messages
-      if (store && req.store !== false) {
-        await persistResponse(store, completedResponse, newInputMessages, previousResponseId);
-      }
-
-      writeSSEEvent(res, 'response.completed', { response: completedResponse });
-
-      endSSE(res);
-      return;
+      break;
     }
 
     // Delta event
@@ -499,24 +535,69 @@ async function handleStreamingNative(
     }
   }
 
-  // Safety net: if the async iterator exhausted without a done event,
-  // emit a completed response with whatever partial state we have so
-  // clients and previous_response_id chaining don't see a dangling stream.
-  const fallbackOutput = outputItems.filter((_, idx) => idx !== suppressedMessageIndex);
-  const fallbackResponse: ResponseObject = {
-    ...partial,
-    status: 'incomplete',
-    output: fallbackOutput,
-    output_text: computeOutputText(fallbackOutput),
-    incomplete_details: { reason: 'max_output_tokens' },
-    usage: { input_tokens: 0, output_tokens: 0, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 0 },
-  };
+  // Post-loop terminal emission.
+  //
+  // The producer's finally has now run (either via the `break` after
+  // a done event or via natural iterator exhaustion), so
+  // `wasCommitted()` reads an authoritative `session.turns` baseline.
+  // Three cases:
+  //
+  //  1. sawDone && committed: happy path. Persist the terminal
+  //     response and emit `response.completed`. Future
+  //     `previous_response_id` continuations can hot-resume through
+  //     the registry or cold-replay from the store.
+  //  2. sawDone && !committed: the final chunk carried
+  //     `finishReason: 'error'` (the ChatSession gates `turnCount` on
+  //     a non-error final chunk, so the session never committed). We
+  //     skip persistence and emit `response.failed` so clients can't
+  //     chain off of output the session never accepted as history.
+  //  3. !sawDone: the iterator exhausted before a terminal chunk
+  //     arrived. The session also never committed in this path, so
+  //     we synthesize an incomplete fallback, skip persistence, and
+  //     emit `response.failed`.
+  //
+  // In all non-committed paths the registry-level `adopt()` gate in
+  // `handleCreateResponse` already skipped caching this session, so
+  // the in-memory and persisted views agree: there is no authoritative
+  // record of this turn anywhere.
+  const committed = wasCommitted();
 
-  if (store && req.store !== false) {
-    await persistResponse(store, fallbackResponse, newInputMessages, previousResponseId);
+  if (!sawDone) {
+    const fallbackOutput = outputItems.filter((_, idx) => idx !== suppressedMessageIndex);
+    completedResponse = {
+      ...partial,
+      status: 'incomplete',
+      output: fallbackOutput,
+      output_text: computeOutputText(fallbackOutput),
+      incomplete_details: { reason: 'max_output_tokens' },
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        output_tokens_details: { reasoning_tokens: 0 },
+        total_tokens: 0,
+      },
+    };
   }
 
-  writeSSEEvent(res, 'response.completed', { response: fallbackResponse });
+  // `completedResponse` is non-null at this point: either the done
+  // branch set it, or the `!sawDone` fallback above set it. Assert
+  // for the type checker.
+  const terminal = completedResponse!;
+
+  if (committed) {
+    if (store && req.store !== false) {
+      await persistResponse(store, terminal, newInputMessages, previousResponseId);
+    }
+    writeSSEEvent(res, 'response.completed', { response: terminal });
+  } else {
+    // Non-committed terminal. Do NOT persist — the ChatSession refused
+    // to advance its history, so the store must agree. Re-label the
+    // response status as `failed` so a client round-tripping the
+    // response into `previous_response_id` cannot accidentally
+    // resurrect partial output.
+    const failedResponse: ResponseObject = { ...terminal, status: 'failed' };
+    writeSSEEvent(res, 'response.failed', { response: failedResponse });
+  }
   endSSE(res);
 }
 
@@ -1222,8 +1303,18 @@ export async function handleCreateResponse(
     let committed: boolean;
     if (body.stream) {
       const outcome = await runSessionStreaming(session, messages, newInputMessages, config);
-      await handleStreamingNative(res, outcome.stream, body, responseId, previousResponseId, store, newInputMessages);
-      committed = outcome.wasCommitted();
+      const streamingWasCommitted = () => outcome.wasCommitted();
+      await handleStreamingNative(
+        res,
+        outcome.stream,
+        body,
+        responseId,
+        previousResponseId,
+        store,
+        newInputMessages,
+        streamingWasCommitted,
+      );
+      committed = streamingWasCommitted();
     } else {
       const outcome = await runSessionNonStreaming(session, messages, newInputMessages, config);
       await handleNonStreaming(res, outcome.result, body, responseId, previousResponseId, store, newInputMessages);

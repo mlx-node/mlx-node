@@ -1532,15 +1532,33 @@ describe('createHandler', () => {
     });
 
     it('does not adopt the session when a streaming turn exhausts without a done event', async () => {
-      // Iteration-16 fix 16.1: the streaming safety-net path
-      // (see `handleStreamingNative` fallback at responses.ts:502)
-      // persists an `incomplete` response when the native iterator
-      // stops yielding without a terminal `done` chunk, but
-      // `ChatSession.*Stream()` deliberately leaves `turnCount`
-      // unchanged on that exit. Adopting the session would re-key
-      // divergent in-memory state under the new response id, so the
-      // server must skip adopt and let the next chained request fall
-      // through to the cold-replay path.
+      // Iteration-16 adopt gate + iteration-18 persist/SSE gate:
+      //
+      // `ChatSession.*Stream()` only advances `turnCount` in its
+      // generator `finally` when the consumer saw a successful
+      // non-error final chunk. An iterator that just stops yielding
+      // deltas therefore leaves the session uncommitted. Three
+      // invariants must all hold:
+      //
+      //   1. `sessionReg.adopt()` is skipped (the adopt gate) so the
+      //      next chained request cold-replays on a fresh session.
+      //   2. `store.store()` is NOT called — the writer's post-loop
+      //      block consults `wasCommitted()` (which reads
+      //      `session.turns` AFTER the producer's finally has run via
+      //      the done-branch `break` or natural exhaust cascade) and
+      //      skips persistence on a false result. Without this the
+      //      store would resurrect the uncommitted turn on any future
+      //      `previous_response_id` cold-replay.
+      //   3. The terminal SSE event is `response.failed` with
+      //      `status: 'failed'` — NOT `response.completed` — so a
+      //      client that watches the stream cannot chain off of
+      //      output the session never accepted as history.
+      //
+      // Structurally: `handleStreamingNative`'s done branch now only
+      // captures `completedResponse` and breaks, the post-loop block
+      // calls `wasCommitted()` and branches on it, and no terminal
+      // emission or persist happens inline from inside the for-await
+      // loop.
       const streamEvents = [
         { done: false, text: 'partial ', isReasoning: false },
         { done: false, text: 'text', isReasoning: false },
@@ -1548,7 +1566,6 @@ describe('createHandler', () => {
       ];
       const registry = new ModelRegistry();
       registry.register('stream-model', createMockStreamModel(streamEvents));
-      const handler = createHandler(registry);
       const storedRecords = new Map<string, any>();
       const mockStore = {
         store: vi.fn().mockImplementation((record: any) => {
@@ -1575,27 +1592,61 @@ describe('createHandler', () => {
         input: 'hi',
         stream: true,
       });
-      const { res } = createMockRes();
+      const { res, getBody, waitForEnd } = createMockRes();
       await handlerWithStore(req, res);
+      await waitForEnd();
 
-      // The session registry must be empty: the streaming turn did
-      // not commit, so `sessionReg.adopt()` was skipped. Any future
-      // chained request will miss and cold-replay from the store.
+      // Adopt gate: the session registry must be empty because the
+      // streaming turn did not commit, so `sessionReg.adopt()` was
+      // skipped. Any future chained request will miss and cold-replay
+      // from the store.
       const sessionReg = registry.getSessionRegistry('stream-model');
       expect(sessionReg).toBeDefined();
       expect(sessionReg!.size).toBe(0);
-      void handler;
+
+      // Persist gate: the writer consulted `wasCommitted()` after
+      // the for-await loop drained and saw `false`, so
+      // `persistResponse()` was never called. The store is untouched.
+      expect(mockStore.store).not.toHaveBeenCalled();
+
+      // SSE terminal-event gate: the writer emitted `response.failed`
+      // with `status: 'failed'`, not `response.completed`. Parse the
+      // SSE body to pin both invariants.
+      const body = getBody();
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1]!.data = JSON.parse(line.slice(6));
+        }
+      }
+      expect(events.find((e) => e.event === 'response.completed')).toBeUndefined();
+      const failedEvent = events.find((e) => e.event === 'response.failed');
+      expect(failedEvent).toBeDefined();
+      const failedResponse = failedEvent!.data.response as Record<string, unknown>;
+      expect(failedResponse.status).toBe('failed');
     });
 
     it('does not adopt the session when a streaming turn emits an error final chunk', async () => {
-      // Iteration-16 fix 16.1: on `done: true` with
-      // `finishReason === 'error'`, `ChatSession.*Stream()` also
-      // leaves `turnCount` unchanged. The handler writes an error
-      // SSE event and closes the stream, and must NOT adopt — the
-      // session's in-memory state is out of sync with whatever the
-      // endpoint layer persisted, so the next chained request must
-      // cold-replay from the store rather than resume a stale
-      // session.
+      // Iteration-16 adopt gate + iteration-18 persist/SSE gate:
+      //
+      // On `done: true` with `finishReason === 'error'`,
+      // `ChatSession.*Stream()` gates `turnCount` on a non-error
+      // final chunk and does NOT advance — the session never
+      // committed this turn. Three invariants must all hold, exactly
+      // as in the iterator-exhaust sibling test:
+      //
+      //   1. `sessionReg.adopt()` is skipped so the next chained
+      //      request cold-replays on a fresh session.
+      //   2. `store.store()` is NOT called because the writer's
+      //      post-loop block reads an authoritative `wasCommitted()`
+      //      result of `false` — the done branch now only captures
+      //      the terminal response and breaks, which runs the
+      //      producer's finally before `wasCommitted()` is consulted.
+      //   3. The terminal SSE event is `response.failed` with
+      //      `status: 'failed'`, NOT `response.completed`, gated on
+      //      `wasCommitted()` returning false.
       const streamEvents = [
         { done: false, text: 'hmm', isReasoning: false },
         {
@@ -1612,19 +1663,172 @@ describe('createHandler', () => {
       ];
       const registry = new ModelRegistry();
       registry.register('stream-model', createMockStreamModel(streamEvents));
-      const handler = createHandler(registry);
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
 
       const req = createMockReq('POST', '/v1/responses', {
         model: 'stream-model',
         input: 'hi',
         stream: true,
       });
-      const { res } = createMockRes();
+      const { res, getBody, waitForEnd } = createMockRes();
       await handler(req, res);
+      await waitForEnd();
 
+      // Adopt gate.
       const sessionReg = registry.getSessionRegistry('stream-model');
       expect(sessionReg).toBeDefined();
       expect(sessionReg!.size).toBe(0);
+
+      // Persist gate.
+      expect(mockStore.store).not.toHaveBeenCalled();
+
+      // SSE terminal-event gate.
+      const body = getBody();
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1]!.data = JSON.parse(line.slice(6));
+        }
+      }
+      expect(events.find((e) => e.event === 'response.completed')).toBeUndefined();
+      const failedEvent = events.find((e) => e.event === 'response.failed');
+      expect(failedEvent).toBeDefined();
+      const failedResponse = failedEvent!.data.response as Record<string, unknown>;
+      expect(failedResponse.status).toBe('failed');
+    });
+
+    it('forces cold replay when two chains are interleaved (A -> B -> A)', async () => {
+      // Iteration-18 finding 1 regression: the `SessionRegistry`
+      // holds AT MOST one entry. Native KV state (cached token
+      // history, `caches` vector) is a single mutable resource per
+      // model, so any `ChatSession` wrapper other than the most
+      // recently used one is pointing at stomped state. Caching
+      // multiple wrappers per model is therefore an illusion — the
+      // registry enforces the invariant by clearing the map in both
+      // `getOrCreate` and `adopt`, which forces interleaved chains
+      // to cold-replay through `ResponseStore` rather than resume
+      // warm.
+      //
+      // Chain A is started (adopt #1), then chain B stomps it by
+      // starting a new session (adopt #2 clears the map first), then
+      // a follow-up on chain A tries to resume via
+      // `previous_response_id`. Under the invariant, A's follow-up
+      // MUST miss the registry (chain B evicted A) and cold-replay
+      // via `chatSessionStart` on a fresh session — the warm
+      // `chatSessionContinue` path must never be reached.
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'turn-A1' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'turn-B1' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'turn-A2-replay' }));
+      const chatSessionContinue = vi.fn().mockRejectedValue(new Error('continue must not be reached after interleave'));
+      const chatSessionContinueTool = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool,
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Turn 1: chain A, no previous_response_id → fresh session,
+      // adopted as respA1.
+      const reqA1 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'hello-A',
+      });
+      const { res: resA1, getBody: getBodyA1, waitForEnd: waitA1 } = createMockRes();
+      await handler(reqA1, resA1);
+      await waitA1();
+      const respA1 = JSON.parse(getBodyA1());
+      expect(respA1.status).toBe('completed');
+      expect(respA1.output_text).toBe('turn-A1');
+
+      // Turn 2: chain B, no previous_response_id. Under the
+      // single-warm invariant, the adopt for chain B clears chain A
+      // out of the registry — A's native state is about to be
+      // stomped anyway.
+      const reqB1 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'hello-B',
+      });
+      const { res: resB1, getBody: getBodyB1, waitForEnd: waitB1 } = createMockRes();
+      await handler(reqB1, resB1);
+      await waitB1();
+      const respB1 = JSON.parse(getBodyB1());
+      expect(respB1.status).toBe('completed');
+      expect(respB1.output_text).toBe('turn-B1');
+
+      // Turn 3: follow-up on chain A via previous_response_id.
+      // The registry only holds respB1's entry (chain A was evicted
+      // during the chain-B adopt), so `getOrCreate(respA1.id, null)`
+      // misses. The endpoint reconstructs chain A from the store and
+      // cold-replays through `chatSessionStart` on a fresh session —
+      // `chatSessionContinue` must NEVER be called.
+      const reqA2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'follow-up-A',
+        previous_response_id: respA1.id,
+      });
+      const { res: resA2, getBody: getBodyA2, waitForEnd: waitA2 } = createMockRes();
+      await handler(reqA2, resA2);
+      await waitA2();
+      const respA2 = JSON.parse(getBodyA2());
+      expect(respA2.status).toBe('completed');
+      expect(respA2.output_text).toBe('turn-A2-replay');
+
+      // Three cold starts, zero warm continues. This is the
+      // load-bearing invariant: the registry must NOT hand out a
+      // warm session to chain A once chain B has stomped the shared
+      // native KV state.
+      expect(chatSessionStart).toHaveBeenCalledTimes(3);
+      expect(chatSessionContinue).not.toHaveBeenCalled();
     });
 
     it('forces a cold replay when a chained request changes instructions', async () => {

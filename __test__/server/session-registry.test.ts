@@ -201,30 +201,67 @@ describe('SessionRegistry', () => {
     expect(reg.size).toBe(0);
   });
 
-  it('evicts the least-recently-adopted entry when maxEntries overflows', () => {
-    // With lease semantics, LRU ordering is driven entirely by
-    // `adopt()` — there is no in-place promotion on hit. This test
-    // adopts three entries in staggered order and verifies the oldest
-    // is the eviction victim.
+  it('adopt evicts any prior entry under the single-warm invariant', () => {
+    // Native KV state for one SessionCapableModel is a single shared
+    // mutable resource — at most ONE cached `ChatSession` wrapper can
+    // reflect that state at a time. `adopt` therefore clears the map
+    // before inserting so a later `getOrCreate` cannot hand out a
+    // wrapper whose assumed state has been stomped by a turn on
+    // another entry. This test pins that contract: adopting B MUST
+    // drop A, and a later lookup against A MUST miss and cold-replay.
     const model = makeMockModel();
-    const reg = new SessionRegistry({ model, maxEntries: 2 });
+    const reg = new SessionRegistry({ model });
     const sA = new ChatSession(model);
     const sB = new ChatSession(model);
-    const sC = new ChatSession(model);
 
     reg.adopt('a', sA, null);
-    reg.adopt('b', sB, null);
-    // 'c' displaces 'a' (the oldest adopt), leaving {b, c}.
-    reg.adopt('c', sC, null);
+    expect(reg.size).toBe(1);
 
-    expect(reg.size).toBe(2);
-    // 'a' was evicted — lookup returns a fresh miss.
+    reg.adopt('b', sB, null);
+    // B is live. A has been evicted.
+    expect(reg.size).toBe(1);
+
     const aMiss = reg.getOrCreate('a', null);
     expect(aMiss).not.toBe(sA);
     expect(aMiss).toBeInstanceOf(ChatSession);
-    // But only AFTER 'a' is gone — b and c are still there.
-    expect(reg.getOrCreate('b', null)).toBe(sB);
-    expect(reg.getOrCreate('c', null)).toBe(sC);
+    // Looking up 'a' cleared the map for the single-warm invariant
+    // (every `getOrCreate` hand-off drops any other entry so the next
+    // lookup cannot trip over a stale wrapper).
+    expect(reg.size).toBe(0);
+  });
+
+  it('getOrCreate(null) clears any prior entry', () => {
+    // The single-warm invariant: any `getOrCreate` call is about to
+    // run a turn that overwrites the model's shared native KV cache,
+    // so the registry drops whatever is left in the map.
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const sA = new ChatSession(model);
+
+    reg.adopt('a', sA, null);
+    expect(reg.size).toBe(1);
+
+    const fresh = reg.getOrCreate(null, null);
+    expect(fresh).toBeInstanceOf(ChatSession);
+    expect(fresh).not.toBe(sA);
+    expect(reg.size).toBe(0);
+  });
+
+  it('getOrCreate on a miss clears any prior entry', () => {
+    // Same invariant via the lookup-miss path: the caller is about to
+    // run a turn, so any leftover entry must be dropped regardless of
+    // whether the lookup hit or missed.
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const sA = new ChatSession(model);
+
+    reg.adopt('a', sA, null);
+    expect(reg.size).toBe(1);
+
+    const fresh = reg.getOrCreate('resp_unknown', null);
+    expect(fresh).toBeInstanceOf(ChatSession);
+    expect(fresh).not.toBe(sA);
+    expect(reg.size).toBe(0);
   });
 
   it('adopt overwrites an existing key and refreshes expiry', () => {
@@ -267,36 +304,50 @@ describe('SessionRegistry', () => {
     expect(() => reg.drop('nonexistent')).not.toThrow();
   });
 
-  it('sweep drops only the entries whose TTL has expired', () => {
+  it('sweep drops the entry when its TTL has expired', () => {
+    // Under the single-warm invariant the registry holds at most one
+    // entry, so `sweep()` is effectively "check if the one entry is
+    // stale and drop it if so". Scheduling sweep on an interval keeps
+    // the map bounded even when no `getOrCreate` / `adopt` traffic
+    // comes through after an entry goes stale.
     const model = makeMockModel();
     const reg = new SessionRegistry({ model, ttlSec: 60 });
     const sA = new ChatSession(model);
-    const sB = new ChatSession(model);
-    const sC = new ChatSession(model);
 
     reg.adopt('a', sA, null);
-    // Stagger the adopts so 'a' expires before 'b' and 'c'.
-    vi.advanceTimersByTime(30 * 1000);
-    reg.adopt('b', sB, null);
-    reg.adopt('c', sC, null);
-    // t=30s. 'a' expires at 60s, 'b' and 'c' at 90s.
-    vi.advanceTimersByTime(40 * 1000);
-    // t=70s. Sweep should drop 'a' but keep 'b' and 'c'.
+    expect(reg.size).toBe(1);
+
+    // Advance past the TTL window and sweep.
+    vi.advanceTimersByTime(61 * 1000);
     reg.sweep();
 
-    expect(reg.size).toBe(2);
-    expect(reg.getOrCreate('a', null)).not.toBe(sA);
-    expect(reg.getOrCreate('b', null)).toBe(sB);
-    expect(reg.getOrCreate('c', null)).toBe(sC);
+    expect(reg.size).toBe(0);
+    // Subsequent lookup misses and returns a fresh session.
+    const got = reg.getOrCreate('a', null);
+    expect(got).not.toBe(sA);
+    expect(got).toBeInstanceOf(ChatSession);
+  });
+
+  it('sweep is a no-op when the entry is still fresh', () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, ttlSec: 60 });
+    const sA = new ChatSession(model);
+
+    reg.adopt('a', sA, null);
+    // Advance partially through the TTL window.
+    vi.advanceTimersByTime(30 * 1000);
+    reg.sweep();
+
+    expect(reg.size).toBe(1);
+    expect(reg.getOrCreate('a', null)).toBe(sA);
   });
 
   it('clear empties the registry', () => {
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
     reg.adopt('a', new ChatSession(model), null);
-    reg.adopt('b', new ChatSession(model), null);
 
-    expect(reg.size).toBe(2);
+    expect(reg.size).toBe(1);
     reg.clear();
     expect(reg.size).toBe(0);
   });
