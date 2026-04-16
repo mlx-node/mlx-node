@@ -408,6 +408,14 @@ export class PendingResponseWrites {
           // lockstep with the pending promise so we never serve a
           // stale earliest-expiry value for a freshly-registered
           // id that happens to reuse the same string.
+          //
+          // Iter-56 note: when the wedged write crosses the
+          // hard-timeout breaker, `markHardTimedOut()` removes the
+          // pending entry synchronously, so this guard is already
+          // false by the time the write eventually settles. That
+          // case is handled authoritatively in `markHardTimedOut()`
+          // itself — this branch remains the cleanup for the clean
+          // no-timeout settlement path.
           this.earliestExpiresByPending.delete(id);
         }
         // Iter-50/51: the hard-timeout marker is also cleared here
@@ -541,6 +549,18 @@ export class PendingResponseWrites {
     // `sweepExpired()`.
     this.sweepExpired();
     const wasPending = this.pending.delete(id);
+    // Iter-56 (codex's iter-55 HIGH finding): the earliest-expiry
+    // side map is keyed on `pending`, so we MUST drain it here in
+    // lockstep with the `pending.delete(id)` above. The
+    // `.finally(...)` cleanup inside `track()` guards on
+    // `pending.get(id) === writePromise` — a guard that is already
+    // false by the time the wedged write eventually settles (we
+    // just removed the pending entry). For never-settling writes
+    // the `.finally` never fires at all. Either way, without this
+    // authoritative drain, the side map would retain the scalar
+    // forever, reintroducing the exact unbounded tracker growth
+    // the hard-timeout breaker is meant to bound.
+    this.earliestExpiresByPending.delete(id);
     if (wasPending) {
       // Iter-53 finding 1 fix: clamp initial expiry at the record's
       // absolute row expiry. If the row will disappear from

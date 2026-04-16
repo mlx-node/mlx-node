@@ -6630,6 +6630,133 @@ describe('createHandler', () => {
       expect(tracker.awaitPending('resp_d')).toBeUndefined();
     });
 
+    it('iter-56: markHardTimedOut drains earliestExpiresByPending so late-settling wedged writes do not leak (fulfill + reject paths)', async () => {
+      // Codex's iter-55 HIGH finding: `track()` records
+      // `earliestExpiresAtMs` in `earliestExpiresByPending`, but
+      // the `.finally(...)` cleanup inside `track()` only deletes
+      // the side-map entry when `pending.get(id) === writePromise`.
+      // `markHardTimedOut()` removes the pending entry synchronously
+      // when the breaker fires, so by the time the original wedged
+      // write eventually settles, the guard is already false and
+      // the side map is never drained. Under sustained traffic
+      // against a wedged backend this reintroduces the exact
+      // unbounded tracker growth the hard-timeout breaker is
+      // meant to bound. Fix: drain the side map authoritatively
+      // inside `markHardTimedOut()` itself.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+
+      // --- Fulfill path ---
+      let resolveFulfill!: () => void;
+      const fulfillPromise = new Promise<void>((resolve) => {
+        resolveFulfill = resolve;
+      });
+      const earliestFulfill = Date.now() + 1_000_000;
+      tracker.track('resp_fulfill', fulfillPromise, earliestFulfill);
+      expect(tracker.getEarliestExpiresAtMs('resp_fulfill')).toBe(earliestFulfill);
+
+      const farFuture = Date.now() + 60 * 60 * 1000;
+      expect(tracker.markHardTimedOut('resp_fulfill', 60_000, farFuture)).toBe(true);
+      // Immediately after `markHardTimedOut()` the side map must be
+      // drained — NOT deferred to promise settlement.
+      expect(tracker.getEarliestExpiresAtMs('resp_fulfill')).toBeUndefined();
+      // And after the original wedged write finally fulfills, still
+      // undefined (the `.finally` guard fails because pending is
+      // gone, so the authoritative cleanup was `markHardTimedOut`).
+      resolveFulfill();
+      await fulfillPromise;
+      await new Promise((r) => setImmediate(r));
+      expect(tracker.getEarliestExpiresAtMs('resp_fulfill')).toBeUndefined();
+
+      // --- Reject path ---
+      let rejectFn!: (err: Error) => void;
+      const rejectPromise = new Promise<void>((_, reject) => {
+        rejectFn = reject;
+      });
+      const earliestReject = Date.now() + 2_000_000;
+      tracker.track('resp_reject', rejectPromise, earliestReject);
+      expect(tracker.getEarliestExpiresAtMs('resp_reject')).toBe(earliestReject);
+
+      expect(tracker.markHardTimedOut('resp_reject', 60_000, farFuture)).toBe(true);
+      expect(tracker.getEarliestExpiresAtMs('resp_reject')).toBeUndefined();
+      rejectFn(new Error('wedged store finally gave up'));
+      await rejectPromise.catch(() => {});
+      await new Promise((r) => setImmediate(r));
+      expect(tracker.getEarliestExpiresAtMs('resp_reject')).toBeUndefined();
+    });
+
+    it('iter-56: earliestExpiresByPending stays drained for a never-settling wedged write across the marker TTL window', async () => {
+      // Codex's iter-55 HIGH finding (second half): for a truly
+      // never-settling `store.store(...)` the `.finally(...)` fork
+      // in `track()` never fires at all, so the side map would
+      // survive past the hard-timeout marker's TTL expiry and
+      // grow without bound. Fix: `markHardTimedOut()` drains the
+      // side map synchronously, so the earliest-expiry metadata
+      // is already gone before the TTL window opens, and remains
+      // gone after a subsequent `markHardTimedOut()` fires its
+      // bounded `sweepExpired()` sweep.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+
+      vi.useFakeTimers();
+      try {
+        // Register a wedged write that will never settle, with an
+        // earliest-expiry scalar pinned in the side map.
+        const neverSettles = new Promise<void>(() => {});
+        const earliest = Date.now() + 5_000_000;
+        tracker.track('resp_wedged', neverSettles, earliest);
+        expect(tracker.getEarliestExpiresAtMs('resp_wedged')).toBe(earliest);
+
+        // Cross the hard-timeout breaker with a short TTL. The
+        // side map must drop the entry immediately, not at TTL
+        // expiry — the .finally() guard would never fire for a
+        // never-settling promise.
+        tracker.markHardTimedOut('resp_wedged', 100, Date.now() + 60 * 60 * 1000);
+        expect(tracker.getEarliestExpiresAtMs('resp_wedged')).toBeUndefined();
+
+        // Advance past the marker TTL and drive another
+        // `markHardTimedOut()` for a different id to trigger the
+        // bounded `sweepExpired()` pass. The side map entry for
+        // `resp_wedged` must still be absent, confirming the fix
+        // is not relying on a TTL-driven sweep of the side map.
+        vi.advanceTimersByTime(500);
+        const other = new Promise<void>(() => {});
+        tracker.track('resp_other', other, Date.now() + 2_000_000);
+        tracker.markHardTimedOut('resp_other', 100, Date.now() + 60 * 60 * 1000);
+        expect(tracker.getEarliestExpiresAtMs('resp_wedged')).toBeUndefined();
+        // And the first marker should have been reaped by the
+        // opportunistic write-path sweep, so the hard-timeout
+        // bookkeeping is consistent with the side-map state.
+        expect(tracker.isHardTimedOut('resp_wedged')).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('iter-56: clean settlement without any hard-timeout still drains earliestExpiresByPending via the .finally() fallback', async () => {
+      // Sanity regression: the authoritative cleanup in
+      // `markHardTimedOut()` must not break the happy path. When
+      // no hard-timeout ever fires, the `.finally(...)` inside
+      // `track()` remains the cleanup hook — its `pending.get(id)
+      // === writePromise` guard is still true at settlement time.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+
+      let resolveFn!: () => void;
+      const promise = new Promise<void>((resolve) => {
+        resolveFn = resolve;
+      });
+      const earliest = Date.now() + 1_000_000;
+      tracker.track('resp_clean', promise, earliest);
+      expect(tracker.getEarliestExpiresAtMs('resp_clean')).toBe(earliest);
+
+      resolveFn();
+      await promise;
+      await new Promise((r) => setImmediate(r));
+      expect(tracker.getEarliestExpiresAtMs('resp_clean')).toBeUndefined();
+      expect(tracker.awaitPending('resp_clean')).toBeUndefined();
+    });
+
     it('iter-51: MLX_HARD_TIMEOUT_MARKER_TTL_MS parsing mirrors hard-timeout parser (empty/whitespace -> default, 0 -> zero, valid -> parsed)', async () => {
       // Iter-51 adds an independent TTL for hard-timed-out
       // markers (codex's iter-50 HIGH finding 1). The parser
