@@ -340,7 +340,15 @@ export function createBridgeStub(
   // flush them in one BUFFER_RELEASE_BATCH RPC instead of one-per-release.
   // BUFFER_RELEASE is ~1006/tok on Qwen3.5-0.8B; batching 32-64 per RPC
   // drops that to ~16-32 RPCs/tok.
-  const pendingReleases: number[] = [];
+  //
+  // IMPORTANT: this reference is reassigned inside flushPendingReleases
+  // via the detach-and-swap pattern (see the comment there for rationale).
+  // Every reader MUST go through this `let` binding, not capture the array
+  // by reference in a closure — otherwise re-entrant queueRelease calls
+  // (fired from callbacks drained inside flushDispatchBatchInner during a
+  // flush) would push into the stale pre-swap array and get their handles
+  // silently dropped when the swap clears it.
+  let pendingReleases: number[] = [];
   const poolStatsArr = poolStatsBuffer ? new Int32Array(poolStatsBuffer) : null;
   const POOL_STAT_HITS = 0;
   const POOL_STAT_MISSES = 1;
@@ -691,8 +699,7 @@ export function createBridgeStub(
   }
 
   function flushPendingReleases(): void {
-    const count = pendingReleases.length;
-    if (count === 0) return;
+    if (pendingReleases.length === 0) return;
     // Ordering invariant: BUFFER_RELEASE_BATCH must be observed by the
     // gpu-worker AFTER any staged DISPATCH_BATCH and AFTER any prior F&F
     // release.
@@ -716,19 +723,69 @@ export function createBridgeStub(
     //     flushDispatchBatchInner() itself uses rpcCall, which drains any
     //     F&F at its top before cmd-SAB writes, so ordering vs. the drain
     //     above stays consistent.
+    //
+    // Re-entrancy hazard: flushDispatchBatchInner → rpcCall(DISPATCH_BATCH)
+    // synchronously calls drainCallbacks on return. Those callbacks can
+    // invoke bridge imports (e.g. wgpuBufferRelease via a WASM-side free)
+    // which re-enter queueRelease. queueRelease pushes onto pendingReleases
+    // and, at MAX_RELEASE_BATCH, RECURSIVELY fires flushPendingReleases.
+    //
+    // Without the swap pattern below, the recursive flush would:
+    //   - write > MAX_RELEASE_BATCH u32s into UNIFORM_DATA (overruns the
+    //     64-slot / 256-byte region),
+    //   - fire its own F&F (STATUS=PENDING), then return,
+    //   - and the outer flush would resume with pendingReleases.length
+    //     still held in its `count` local, read undefined for every index
+    //     (coerces to 0), clobber UNIFORM_DATA back to zeros, and fire a
+    //     second PENDING that silently drops the real inner batch.
+    //
+    // The fix: detach pendingReleases into a local snapshot BEFORE we
+    // touch cmd-SAB. Reassign `pendingReleases` to a fresh empty array
+    // first so any re-entrant queueRelease after this point lands in the
+    // new array (picked up by a subsequent flush), never in ours.
     if (batchActive && batchCount > 0) {
       flushDispatchBatchInner();
     }
+    // (3) Second drainFireAndForget: if a callback invoked during
+    //     flushDispatchBatchInner triggered a nested flushPendingReleases
+    //     (via queueRelease's MAX_RELEASE_BATCH guard), that nested call
+    //     published its OWN F&F (ffPending=true) and returned. We must
+    //     drain THAT F&F before clobbering cmd SAB for our publish below,
+    //     otherwise STATUS=PENDING writes would race the gpu-worker still
+    //     reading the nested batch's UNIFORM_DATA. This is a no-op when
+    //     no nested flush fired.
+    drainFireAndForget();
+    // (4) Early-return if the nested flush drained everything we had. In
+    //     the common no-re-entrancy case this is always false.
+    if (pendingReleases.length === 0) return;
+    // (5) Detach & swap: from here on, any re-entrant queueRelease appends
+    //     to a fresh array that the next flush will handle. `batchToPublish`
+    //     holds the handles WE own and will publish atomically.
+    const batchToPublish = pendingReleases;
+    pendingReleases = [];
+    // (6) Defensive cap. With the swap above, batchToPublish cannot exceed
+    //     MAX_RELEASE_BATCH under normal paths (queueRelease auto-flushes
+    //     AT that size before reassigning). But future edits or reordered
+    //     call sites could push the length past the cap — publishing more
+    //     than 64 entries would overrun UNIFORM_DATA. If that happens,
+    //     push the tail back onto the fresh pendingReleases for the next
+    //     flush and publish only the first MAX_RELEASE_BATCH here.
+    if (batchToPublish.length > MAX_RELEASE_BATCH) {
+      for (let i = MAX_RELEASE_BATCH; i < batchToPublish.length; i++) {
+        pendingReleases.push(batchToPublish[i]!);
+      }
+      batchToPublish.length = MAX_RELEASE_BATCH;
+    }
+    const publishCount = batchToPublish.length;
     // Count the F&F release in the bridge histogram — keeps stats parity
     // with the old rpcCall(BUFFER_RELEASE_BATCH) path so diagnostics don't
     // spuriously drop after this optimization lands.
     bumpBridgeStats(RpcFn.BUFFER_RELEASE_BATCH);
-    for (let i = 0; i < count; i++) {
-      cmdU32[I_UNIFORM + i] = pendingReleases[i]! >>> 0;
+    for (let i = 0; i < publishCount; i++) {
+      cmdU32[I_UNIFORM + i] = batchToPublish[i]! >>> 0;
     }
-    pendingReleases.length = 0; // clear BEFORE firing to avoid re-entrant flush
     cmdU32[I_FN] = RpcFn.BUFFER_RELEASE_BATCH;
-    cmdU32[I_ARG0] = count >>> 0;
+    cmdU32[I_ARG0] = publishCount >>> 0;
     // Match rpcCall's "don't leak entry counts into next call" invariant —
     // BUFFER_RELEASE_BATCH produces no callbacks, but flushCallbacks() on
     // the gpu-worker writes I_CB_COUNT=0 when done, and a drain that lands

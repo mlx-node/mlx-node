@@ -178,4 +178,103 @@ describe('BUFFER_RELEASE_BATCH fire-and-forget (Task B)', () => {
       worker.terminate();
     }
   });
+
+  it('staged DISPATCH_BATCH is flushed BEFORE the BUFFER_RELEASE_BATCH F&F when both fire in the same flushPendingReleases', async () => {
+    // Regression test for Task B's ordering invariant. flushPendingReleases
+    // must drain any staged dispatch batch (batchCount > 0) via
+    // flushDispatchBatchInner → rpcCall(DISPATCH_BATCH) BEFORE it publishes
+    // the BUFFER_RELEASE_BATCH F&F. Otherwise the gpu-worker pools the
+    // released handles first, and the still-unsubmitted dispatch later
+    // runs against a recycled GPUBuffer.
+    //
+    // The drain-interlock test above builds a bridge with batching
+    // DISABLED (no dispatchBatchBuffer, batchEnabled=false), so it cannot
+    // exercise this branch. This test builds a bridge with batching
+    // ENABLED, stages one dispatch record into the batch SAB, then drives
+    // MAX_RELEASE_BATCH unknown-handle releases to trip queueRelease's
+    // auto-flush. The main thread acts as a fake gpu-worker (via
+    // Atomics.waitAsync), recording the FN_ID of every PENDING RPC it
+    // observes and asserting the sequence is [DISPATCH_BATCH,
+    // BUFFER_RELEASE_BATCH].
+    const worker = new Worker(new URL('./release-batch-dispatch-order-worker.ts', import.meta.url), {
+      type: 'module',
+    });
+    try {
+      const result = await new Promise<{
+        observedFnIds: number[];
+        workerResult: { ok: boolean; finalFnId?: number; finalArg0?: number; error?: string };
+      }>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('dispatch-order worker timeout (10s)')), 10_000);
+        const observed: number[] = [];
+        let fakeGpuWorkerPromise: Promise<void> | null = null;
+        let stopFakeWorker = false;
+
+        worker.onmessage = (e) => {
+          const msg = e.data;
+          if (msg?.type === 'arm') {
+            const sab = msg.cmdBuffer as SharedArrayBuffer;
+            const i32 = new Int32Array(sab);
+            const cmdU32 = new Uint32Array(sab);
+            const FN_ID_IDX = CMD_OFFSET.FN_ID >>> 2;
+
+            // Main-thread fake gpu-worker. Uses Atomics.waitAsync (the
+            // main-thread-safe flavor) to observe STATUS transitions. Each
+            // time STATUS flips to PENDING we record the RPC's FN_ID and
+            // flip STATUS -> DONE + notify so the worker's blocking
+            // rpcCall (for DISPATCH_BATCH) unblocks. The F&F
+            // BUFFER_RELEASE_BATCH does not wait, so we just record it.
+            let currentStatus: number = STATUS.IDLE;
+            fakeGpuWorkerPromise = (async () => {
+              while (!stopFakeWorker) {
+                const res = Atomics.waitAsync(i32, STATUS_INDEX, currentStatus, 2_000);
+                const outcome = res.async ? await res.value : (res.value as string);
+                if (stopFakeWorker) return;
+                if (outcome === 'timed-out') continue;
+                const loaded = Atomics.load(i32, STATUS_INDEX);
+                if (loaded === STATUS.PENDING) {
+                  const fnId = cmdU32[FN_ID_IDX];
+                  observed.push(fnId);
+                  Atomics.store(i32, STATUS_INDEX, STATUS.DONE);
+                  Atomics.notify(i32, STATUS_INDEX);
+                  currentStatus = STATUS.DONE;
+                } else {
+                  currentStatus = loaded;
+                }
+              }
+            })();
+
+            // Kick the worker: it blocks on 'go' before staging the
+            // dispatch + queueing releases.
+            worker.postMessage({ type: 'go' });
+            return;
+          }
+          if (msg?.type === 'done') {
+            clearTimeout(t);
+            stopFakeWorker = true;
+            // Give the fake worker loop one tick to notice stop and exit.
+            void fakeGpuWorkerPromise?.then(() => undefined).catch(() => undefined);
+            resolve({ observedFnIds: observed, workerResult: msg });
+          }
+        };
+        worker.onerror = (err) => {
+          clearTimeout(t);
+          stopFakeWorker = true;
+          reject(new Error(`worker error: ${err.message}`));
+        };
+        worker.postMessage({ type: 'run' });
+      });
+
+      expect(result.workerResult.ok, `worker result: ${JSON.stringify(result.workerResult)}`).toBe(true);
+      // The critical assertion: the staged DISPATCH_BATCH must be
+      // published BEFORE the BUFFER_RELEASE_BATCH F&F. Any other order
+      // (only BUFFER_RELEASE_BATCH, or BUFFER_RELEASE_BATCH first) means
+      // flushPendingReleases regressed the ordering invariant.
+      expect(result.observedFnIds).toEqual([RpcFn.DISPATCH_BATCH, RpcFn.BUFFER_RELEASE_BATCH]);
+      // Sanity-check the F&F payload landed intact (arg0 = handle count).
+      expect(result.workerResult.finalFnId).toBe(RpcFn.BUFFER_RELEASE_BATCH);
+      expect(result.workerResult.finalArg0).toBe(MAX_RELEASE_BATCH);
+    } finally {
+      worker.terminate();
+    }
+  });
 });
