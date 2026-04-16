@@ -201,6 +201,8 @@ worker.onmessage = (e) => {
         gpuPoolMisses?: number;
         bindGroupCacheHits?: number;
         bindGroupCacheMisses?: number;
+        uniformHotHits?: number;
+        uniformHotMisses?: number;
         diagCreateAll?: number;
         diagCreateMappedCopyDst?: number;
         diagCreateMappedNoCopyDst?: number;
@@ -254,6 +256,15 @@ worker.onmessage = (e) => {
         const bghRate = bgt > 0 ? ((bgh / bgt) * 100).toFixed(1) : '0.0';
         log(
           `[profile] bg-cache: hits=${bgh} (${(bgh / n).toFixed(1)}/tok) misses=${bgm} (${(bgm / n).toFixed(1)}/tok) hitRate=${bghRate}%`,
+        );
+      }
+      if (s.uniformHotHits != null && s.uniformHotMisses != null) {
+        const uhh = s.uniformHotHits;
+        const uhm = s.uniformHotMisses;
+        const uht = uhh + uhm;
+        const uhhRate = uht > 0 ? ((uhh / uht) * 100).toFixed(1) : '0.0';
+        log(
+          `[profile] uniform-hot: hits=${uhh} (${(uhh / n).toFixed(1)}/tok) misses=${uhm} (${(uhm / n).toFixed(1)}/tok) hitRate=${uhhRate}%`,
         );
       }
       log(

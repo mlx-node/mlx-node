@@ -79,6 +79,10 @@ export interface GpuWorkerStats {
   bindGroupCacheHits: number;
   /** Task C: bind-group cache misses (created a fresh GPUBindGroup for a dispatch). */
   bindGroupCacheMisses: number;
+  /** Task E: deferred-uniform dispatches that reused the pipeline's dedicated uniform buffer. */
+  uniformHotHits: number;
+  /** Task E: deferred-uniform dispatches that had to allocate the pipeline's dedicated uniform buffer for the first time. */
+  uniformHotMisses: number;
 }
 
 export interface BridgeStub {
@@ -2148,11 +2152,24 @@ export function createBridgeStub(
     const gpuPoolMisses = byFn[101] ?? 0;
     const bindGroupCacheHits = byFn[102] ?? 0;
     const bindGroupCacheMisses = byFn[103] ?? 0;
+    const uniformHotHits = byFn[104] ?? 0;
+    const uniformHotMisses = byFn[105] ?? 0;
     delete byFn[100];
     delete byFn[101];
     delete byFn[102];
     delete byFn[103];
-    return { totalRpcs, byFn, gpuPoolHits, gpuPoolMisses, bindGroupCacheHits, bindGroupCacheMisses };
+    delete byFn[104];
+    delete byFn[105];
+    return {
+      totalRpcs,
+      byFn,
+      gpuPoolHits,
+      gpuPoolMisses,
+      bindGroupCacheHits,
+      bindGroupCacheMisses,
+      uniformHotHits,
+      uniformHotMisses,
+    };
   }
 
   return {

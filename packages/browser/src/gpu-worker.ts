@@ -93,10 +93,27 @@ interface BindGroupCacheEntry {
   entryCount: number;
   sig: string;
   bindGroup: GPUBindGroup;
+  // Task E: dedicated 256B uniform buffer owned by this cache entry. On the
+  // first FUSED_DISPATCH_WITH_UNIFORM dispatch that would otherwise acquire a
+  // uniform buffer from the pool, we allocate one here and reuse it on every
+  // subsequent dispatch through queue.writeBuffer — skipping the pool churn
+  // and the BUFFER_RELEASE_BATCH round-trip from the bridge stub. Destruction
+  // happens in PIPELINE_RELEASE.
+  uniformBuffer: GPUBuffer | null;
+  uniformHandle: number;
 }
 const bindGroupCache = new Map<number, BindGroupCacheEntry>();
 let bindGroupCacheHits = 0;
 let bindGroupCacheMisses = 0;
+// Task E: hot-path uniform counters — dispatches that reused the pipeline's
+// dedicated uniform buffer vs. had to allocate one for the first time.
+let uniformHotHits = 0;
+let uniformHotMisses = 0;
+// Task E: handles owned by a BindGroupCacheEntry's uniformBuffer. The bridge
+// stub enqueues a BUFFER_RELEASE_BATCH for the handle we return from the
+// deferred-uniform path; we short-circuit releaseBufferHandle for these so
+// the dedicated buffer survives until PIPELINE_RELEASE destroys it.
+const dedicatedUniformHandles = new Set<number>();
 // WebGPU usage flags — keep in sync with webgpu-bridge-stub.ts.
 const WGPU_USAGE_MAP_READ = 0x0001;
 const WGPU_USAGE_MAP_WRITE = 0x0002;
@@ -132,6 +149,12 @@ function releaseHandle(id: number): void {
 // Never actually destroys GPUBuffers (see comment in BUFFER_RELEASE handler):
 // pooling is just handle-table bookkeeping.
 function releaseBufferHandle(handle: number): void {
+  // Task E: dedicated uniform buffers attached to a BindGroupCacheEntry are
+  // owned by the pipeline's lifecycle, not by a per-dispatch pool release.
+  // The bridge stub emits a BUFFER_RELEASE_BATCH entry for the monotonic
+  // handle we returned from the deferred-uniform HOT MISS path; swallow it
+  // here so the GPUBuffer survives until PIPELINE_RELEASE.
+  if (dedicatedUniformHandles.has(handle)) return;
   const size = bufferSizesArr[handle];
   const usage = bufferUsagesArr[handle];
   if (size !== undefined && usage !== undefined && size > 0 && isPoolable(usage)) {
@@ -668,6 +691,12 @@ function dispatchFusedRecord(
 ): number {
   const layout = handles[layoutHandle] as GPUBindGroupLayout;
   let newBufferHandle = 0;
+  // Task E: if this dispatch's deferred-uniform path allocated a dedicated
+  // uniform buffer (HOT MISS), remember it so the bind-group-cache insert
+  // below can attach it to the new BindGroupCacheEntry. HOT HIT reuses the
+  // already-attached buffer and skips the pool entirely.
+  let hotNewUniformBuffer: GPUBuffer | null = null;
+  let hotNewUniformHandle = 0;
 
   // Stage 1: optional uniform write (only for FUSED_DISPATCH_WITH_UNIFORM).
   // Must run BEFORE createBindGroup so the patched handle (for deferred
@@ -676,38 +705,49 @@ function dispatchFusedRecord(
     const uniformBufHandle = entrySrc[entrySrcBase + uniformEntryIdx * 3];
     const uniformData = new Uint8Array(uniformBuffer, uniformByteOffset, uniformDataSize);
     if (uniformBufHandle === 0) {
-      // Deferred buffer creation (inline): create buffer + write data.
-      const usage = uniformUsage || 0x0080 | 0x0008; // STORAGE | COPY_DST fallback
-      const poolable = isPoolable(usage);
-      // Only bucket for poolable usages (see CREATE_BUFFER_FROM_DATA).
-      const physicalSize = poolable ? roundUpBucket(uniformDataSize) : uniformDataSize;
-      let handle: number;
-      const stack = poolable ? bufferPool.get(poolKey(usage, physicalSize)) : undefined;
-      if (stack !== undefined && stack.length > 0) {
-        handle = stack.pop()!;
-        if (stack.length === 0) bufferPool.delete(poolKey(usage, physicalSize));
-        bufferPoolHitCount++;
-        const pooled = handles[handle] as GPUBuffer;
-        queue.writeBuffer(pooled, 0, uniformData);
-        // Update the logical size for this new owner — the previous owner's
-        // logical size could differ even though they share a bucket.
-        bufferLogicalSizesArr[handle] = uniformDataSize;
+      // Task E: deferred-uniform hot path. Instead of acquiring a buffer from
+      // the main pool (and incurring a BUFFER_RELEASE_BATCH round-trip on the
+      // next dispatch), try to reuse the dedicated 256B uniform buffer that
+      // lives on this pipeline's BindGroupCacheEntry. On the first dispatch
+      // through the pipeline we allocate one and pin it for the pipeline's
+      // lifetime. The cache entry for this dispatch is built in Stage 2 below
+      // and records the (buffer, handle) pair for future HOT HITs.
+      const cachedEntry = bindGroupCache.get(pipelineHandle);
+      if (cachedEntry !== undefined && cachedEntry.uniformBuffer !== null) {
+        // HOT HIT: reuse the pipeline's dedicated uniform buffer. No pool
+        // traffic, no new handle — the Stage 2 sig will see the dedicated
+        // handle and stay cache-stable across dispatches.
+        queue.writeBuffer(cachedEntry.uniformBuffer, 0, uniformData);
+        uniformHotHits++;
+        entrySrc[entrySrcBase + uniformEntryIdx * 3] = cachedEntry.uniformHandle;
+        entrySrc[entrySrcBase + uniformEntryIdx * 3 + 1] = 256;
+        entrySrc[entrySrcBase + uniformEntryIdx * 3 + 2] = 0;
+        // newBufferHandle stays 0 so the bridge stub does not enqueue a
+        // BUFFER_RELEASE_BATCH entry for the dedicated handle.
       } else {
-        if (poolable) bufferPoolMissCount++;
-        const buffer = device.createBuffer({ size: physicalSize, usage });
-        queue.writeBuffer(buffer, 0, uniformData);
-        handle = addHandle(buffer);
-        bufferSizesArr[handle] = physicalSize;
-        bufferLogicalSizesArr[handle] = uniformDataSize;
-        bufferUsagesArr[handle] = usage;
+        // HOT MISS: allocate a dedicated 256B uniform buffer for this
+        // pipeline. Use exactly the same usage the pool-miss path used to
+        // pick so the bind group layout's UNIFORM / STORAGE requirement is
+        // satisfied identically.
+        const usage = uniformUsage || (0x0080 | 0x0008); // STORAGE | COPY_DST fallback
+        const buf = device.createBuffer({ size: 256, usage });
+        const h = addHandle(buf);
+        bufferSizesArr[h] = 256;
+        bufferLogicalSizesArr[h] = uniformDataSize;
+        bufferUsagesArr[h] = usage;
+        queue.writeBuffer(buf, 0, uniformData);
+        dedicatedUniformHandles.add(h);
+        uniformHotMisses++;
+        entrySrc[entrySrcBase + uniformEntryIdx * 3] = h;
+        entrySrc[entrySrcBase + uniformEntryIdx * 3 + 1] = 256;
+        entrySrc[entrySrcBase + uniformEntryIdx * 3 + 2] = 0;
+        // Record the dedicated buffer so the Stage 2 bind-group-cache insert
+        // attaches it to the new entry, and so the bridge stub's eventual
+        // BUFFER_RELEASE_BATCH for this handle is short-circuited.
+        hotNewUniformBuffer = buf;
+        hotNewUniformHandle = h;
+        newBufferHandle = h;
       }
-      newBufferHandle = handle;
-      // Patch the entry handle so the bind group build below picks up the
-      // new GPUBuffer. When `entrySrc === cmdU32` this mutates the main
-      // cmdBuffer in place (as the single-dispatch path used to do);
-      // otherwise it mutates the batch SAB (harmless — the bridge stub
-      // only reuses that SAB from offset 0 on the next batch).
-      entrySrc[entrySrcBase + uniformEntryIdx * 3] = handle;
     } else {
       const existing = handles[uniformBufHandle] as GPUBuffer;
       queue.writeBuffer(existing, 0, uniformData);
@@ -755,7 +795,28 @@ function dispatchFusedRecord(
       entries.push({ binding: i, resource });
     }
     bindGroup = device.createBindGroup({ layout, entries });
-    bindGroupCache.set(pipelineHandle, { layoutHandle, entryCount, sig, bindGroup });
+    // Task E: preserve the pipeline's dedicated uniform buffer across
+    // bind-group-cache replacements. If this dispatch's Stage 1 allocated a
+    // fresh buffer (HOT MISS), attach it. Otherwise carry forward the prior
+    // entry's buffer (so a weight-handle change that causes a cache MISS
+    // does not orphan the uniform buffer we allocated on the first dispatch).
+    let newUniformBuffer: GPUBuffer | null = null;
+    let newUniformHandle = 0;
+    if (hotNewUniformBuffer !== null) {
+      newUniformBuffer = hotNewUniformBuffer;
+      newUniformHandle = hotNewUniformHandle;
+    } else if (cached !== undefined && cached.uniformBuffer !== null) {
+      newUniformBuffer = cached.uniformBuffer;
+      newUniformHandle = cached.uniformHandle;
+    }
+    bindGroupCache.set(pipelineHandle, {
+      layoutHandle,
+      entryCount,
+      sig,
+      bindGroup,
+      uniformBuffer: newUniformBuffer,
+      uniformHandle: newUniformHandle,
+    });
     bindGroupCacheMisses++;
   }
 
@@ -1819,6 +1880,18 @@ async function processCommand(fnId: number): Promise<void> {
       // reference to the pipeline's layout (webgpu keeps that alive), so
       // leaving the entry would not crash, but it would leak one slot per
       // released pipeline until the cache is cleared wholesale.
+      //
+      // Task E: the cache entry may also own a dedicated uniform GPUBuffer
+      // (the hot-path buffer allocated on the first deferred-uniform
+      // dispatch). Release it explicitly — releaseBufferHandle would
+      // short-circuit because the handle is in dedicatedUniformHandles, so
+      // we call the low-level releaseHandle after popping the skip-set.
+      const cachedEntry = bindGroupCache.get(handle);
+      if (cachedEntry !== undefined && cachedEntry.uniformBuffer !== null) {
+        dedicatedUniformHandles.delete(cachedEntry.uniformHandle);
+        cachedEntry.uniformBuffer.destroy?.();
+        releaseHandle(cachedEntry.uniformHandle);
+      }
       bindGroupCache.delete(handle);
       releaseHandle(handle);
       setResult(0);
@@ -2127,10 +2200,14 @@ async function processCommand(fnId: number): Promise<void> {
       const POOL_MISSES_SLOT = 101;
       const BG_CACHE_HITS_SLOT = 102;
       const BG_CACHE_MISSES_SLOT = 103;
+      const UNIFORM_HOT_HITS_SLOT = 104;
+      const UNIFORM_HOT_MISSES_SLOT = 105;
       gpuRpcCounts[POOL_HITS_SLOT] = bufferPoolHitCount;
       gpuRpcCounts[POOL_MISSES_SLOT] = bufferPoolMissCount;
       gpuRpcCounts[BG_CACHE_HITS_SLOT] = bindGroupCacheHits;
       gpuRpcCounts[BG_CACHE_MISSES_SLOT] = bindGroupCacheMisses;
+      gpuRpcCounts[UNIFORM_HOT_HITS_SLOT] = uniformHotHits;
+      gpuRpcCounts[UNIFORM_HOT_MISSES_SLOT] = uniformHotMisses;
       const cbBase = CMD_OFFSET.CALLBACK_COUNT >>> 2;
       for (let i = 0; i < STATS_CALLBACK_SLOTS; i++) {
         cmdU32[cbBase + i] = gpuRpcCounts[i];
@@ -2151,6 +2228,8 @@ async function processCommand(fnId: number): Promise<void> {
         bufferPoolMissCount = 0;
         bindGroupCacheHits = 0;
         bindGroupCacheMisses = 0;
+        uniformHotHits = 0;
+        uniformHotMisses = 0;
       }
       break;
     }
