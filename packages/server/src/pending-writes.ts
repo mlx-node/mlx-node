@@ -51,6 +51,35 @@
  * `getChain()`, because the tracker promise's rejection is already
  * surfaced through the registering handler's separate awaiter.
  *
+ * ## Hard-timeout marker state (iter-50)
+ *
+ * Iter-49 added a `PendingResponseWrites.evict(id)` primitive so the
+ * hard-timeout breaker in `responses.ts` could drop a wedged persist's
+ * tracker entry without waiting for the promise to settle. That bounded
+ * tracker memory under a truly stuck store, but it also removed the
+ * ONLY signal a `previous_response_id` continuation uses to classify a
+ * miss as "retryable storage slowness" vs. "permanent 404": after
+ * eviction `awaitPending(id)` returned `undefined`, the continuation
+ * took the 404 branch, and slow-but-eventual persists that crossed the
+ * hard timeout were misclassified as permanent history loss.
+ *
+ * Iter-50 replaces the outright eviction with a two-phase pending
+ * state. `markHardTimedOut(id)` removes the id from the `pending`
+ * promise tracker (so `awaitPending` stops handing out the stale
+ * promise and the closure chain is reclaimable) AND adds the id to a
+ * lightweight `hardTimedOut` `Set<string>` marker. The continuation
+ * path consults `isHardTimedOut(id)` before falling through to
+ * `sendNotFound(...)`: when the marker is set it returns the same
+ * retryable 503 `storage_timeout` shape the normal `awaitPending`
+ * timeout path already uses, so clients keep retrying rather than
+ * discarding the conversation branch.
+ *
+ * The marker lifetime is bounded by the underlying write's lifetime:
+ * the existing `.finally(...)` in `track()` unconditionally clears the
+ * marker when the promise settles. Memory is therefore O(in-flight +
+ * hard-timed-out writes), and drops to O(in-flight) as soon as a
+ * wedged store unwedges — no manual cleanup required.
+ *
  * ## Scope
  *
  * One tracker per `ResponseStore` instance is attached via a
@@ -70,6 +99,27 @@
  */
 export class PendingResponseWrites {
   private readonly pending: Map<string, Promise<void>> = new Map();
+
+  /**
+   * Ids that crossed the hard-timeout breaker in responses.ts while
+   * their `store.store(...)` promise was still unresolved (iter-50).
+   * The entry is cleared either by the underlying promise's
+   * `.finally(...)` (fires in `track`) when the write eventually
+   * settles, or by a later `markHardTimedOut(id)` call becoming a
+   * no-op once the promise already drained.
+   *
+   * Invariant: a marker is only meaningful for the SPECIFIC write
+   * that was live when `markHardTimedOut` was called. If a later
+   * `track(id, newPromise)` re-uses the same id after a marker was
+   * set, the original promise's `.finally(...)` will still clear the
+   * marker on its settlement (clearing the wrong state for the new
+   * promise). Callers that mix hard-timed-out ids with brand-new
+   * writes under the same id MUST call `markHardTimedOut(id)` again
+   * after the new `track(id, ...)` if they want the marker to
+   * persist — in practice the responses endpoint scopes response ids
+   * to a single persist each, so this collision cannot arise.
+   */
+  private readonly hardTimedOut: Set<string> = new Set();
 
   /**
    * Register an in-flight write under `id`. The caller must pass the
@@ -105,6 +155,17 @@ export class PendingResponseWrites {
         if (this.pending.get(id) === writePromise) {
           this.pending.delete(id);
         }
+        // Iter-50: the hard-timeout marker is scoped to the
+        // promise's settlement. Once this specific `writePromise`
+        // resolves or rejects, any marker set against its id
+        // during its lifetime is no longer meaningful — the
+        // continuation path's retryable-503 window closes here.
+        // We clear unconditionally because the marker is a `Set`
+        // (not a promise reference), so there is no "entry
+        // replaced" concern: whoever later re-registers the id
+        // must explicitly re-mark if they want the retryable
+        // window open again.
+        this.hardTimedOut.delete(id);
       })
       .catch(() => {
         // Rejection already handled by the caller that awaits the
@@ -125,26 +186,67 @@ export class PendingResponseWrites {
   }
 
   /**
-   * Explicitly remove the pending-write entry for `id` without waiting
-   * for the promise to settle. Used by the hard-timeout breaker in
-   * responses.ts when a wedged store.store(...) would otherwise pin the
-   * tracker entry (and its promise closure) forever.
+   * Transition a pending entry to the hard-timed-out marker state.
    *
-   * The raw write promise is unaffected — it continues running in the
-   * background but nobody references it through this tracker anymore.
-   * If the promise eventually settles, its own `.finally(...)` cleanup
-   * above becomes a no-op because `this.pending.get(id) === writePromise`
-   * is false (the entry was already evicted or replaced).
+   * Called by the hard-timeout breaker in `responses.ts` when an
+   * in-flight `store.store(...)` has crossed the hard timeout and
+   * is presumed wedged. The `pending` entry is removed so that:
    *
-   * Returns true if an entry was evicted, false if `id` was not tracked.
+   *   * `awaitPending(id)` stops handing out the stale promise
+   *     (continuations no longer block on it).
+   *   * The promise closure chain referenced through the tracker is
+   *     reclaimable — iter-49's memory bound is preserved.
+   *
+   * The id is added to the `hardTimedOut` marker set so the
+   * `previous_response_id` continuation path can distinguish a
+   * hard-timed-out slow persist from a genuinely missing chain:
+   * `isHardTimedOut(id) === true` means the write may still land
+   * eventually, so the continuation returns retryable 503
+   * `storage_timeout` instead of permanent 404.
+   *
+   * The marker stays alive until the underlying write promise
+   * settles. The existing `.finally(...)` cleanup inside `track()`
+   * clears the marker for THIS id whenever the original promise
+   * resolves or rejects, so the marker lifetime is bounded by the
+   * real write's lifetime rather than by the breaker.
+   *
+   * Returns true if the id was an active pending entry (and has
+   * been moved into the hard-timed-out marker), false if no pending
+   * entry existed at call time. A false return does NOT add the id
+   * to the marker — a marker without a backing promise has no
+   * cleanup signal and could leak if the caller mis-routes ids.
    */
-  evict(id: string): boolean {
-    return this.pending.delete(id);
+  markHardTimedOut(id: string): boolean {
+    const wasPending = this.pending.delete(id);
+    if (wasPending) {
+      this.hardTimedOut.add(id);
+    }
+    return wasPending;
+  }
+
+  /**
+   * Whether `id` is currently flagged as hard-timed-out. Used by the
+   * `previous_response_id` continuation path to classify a missing
+   * chain as retryable 503 `storage_timeout` vs. permanent 404.
+   */
+  isHardTimedOut(id: string): boolean {
+    return this.hardTimedOut.has(id);
   }
 
   /** Number of writes currently in flight. Primarily for tests. */
   get size(): number {
     return this.pending.size;
+  }
+
+  /**
+   * Number of ids currently in the hard-timed-out marker state.
+   * Primarily for tests — exposes iter-50's bookkeeping so
+   * regressions can assert both that the marker is set after a
+   * hard-timeout fires AND that it drains when the underlying write
+   * eventually settles.
+   */
+  get hardTimedOutSize(): number {
+    return this.hardTimedOut.size;
   }
 }
 

@@ -4656,27 +4656,30 @@ describe('createHandler', () => {
       expect(idAfterSpuriousRelease).not.toBe(idBefore);
     }, 5000);
 
-    it('iter-49: PendingResponseWrites.evict removes entry without awaiting settlement', async () => {
-      // Iter-48 bounded tombstone state via per-model refcount, but
-      // the hard-timeout breaker in responses.ts only retired the
-      // instance id and released the binding retain — it did NOT
-      // free the persist promise or the pending-write tracker
-      // entry. Under a truly wedged `store.store(...)`:
+    it('iter-50: PendingResponseWrites.markHardTimedOut moves id to hard-timed-out marker without awaiting settlement', async () => {
+      // Iter-49's first primitive was `evict(id)` — remove the
+      // pending entry without waiting for settlement so a wedged
+      // `store.store(...)` stops pinning tracker memory. But codex's
+      // iter-49 review flagged that eviction ALSO erased the only
+      // signal a `previous_response_id` continuation uses to
+      // distinguish "slow-but-eventual persist across the breaker"
+      // from "genuinely missing chain". Continuations for
+      // hard-timed-out ids would fall through to permanent 404 even
+      // though the write was still running and could land moments
+      // later.
       //
-      //   - `initiatePersist(store, record)` registers
-      //     `writePromise` in
-      //     `getPendingWritesFor(store).track(record.id, writePromise)`.
-      //   - `PendingResponseWrites` only removes the entry when the
-      //     promise settles (via `.finally(...)` inside `track`).
-      //   - If the promise NEVER settles, the tracker entry lives
-      //     forever. N wedged requests -> N permanent tracker
-      //     entries -> O(N) memory growth. Future continuations
-      //     hitting `awaitPending(id)` on those ids would hang.
+      // Iter-50 replaces `evict` with a two-phase marker:
+      //   * Phase 1 (active pending): `awaitPending(id)` returns the
+      //     promise — existing behaviour.
+      //   * Phase 2 (hard-timed-out): the pending entry is dropped
+      //     (so `awaitPending` no longer hands out a wedged promise
+      //     and memory is reclaimable), but the id stays in a
+      //     lightweight `hardTimedOut` marker so the continuation
+      //     path can return retryable 503 `storage_timeout` instead
+      //     of 404.
       //
-      // Iter-49 adds `PendingResponseWrites.evict(id)` which
-      // removes the entry without waiting for settlement. This
-      // focused unit test pins the primitive before the handler-
-      // level regression below drives it end-to-end.
+      // This focused unit test pins the primitive before the
+      // end-to-end regression below drives it through the handler.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
       let resolveFn: (() => void) | undefined;
@@ -4685,40 +4688,61 @@ describe('createHandler', () => {
       });
       tracker.track('resp_1', neverResolves);
       expect(tracker.size).toBe(1);
-      const evicted = tracker.evict('resp_1');
-      expect(evicted).toBe(true);
+      expect(tracker.hardTimedOutSize).toBe(0);
+      expect(tracker.isHardTimedOut('resp_1')).toBe(false);
+
+      // Transition to the hard-timed-out marker state.
+      const transitioned = tracker.markHardTimedOut('resp_1');
+      expect(transitioned).toBe(true);
+      // Pending drained — wedged promise closure is reclaimable.
       expect(tracker.size).toBe(0);
-      // Idempotent: a no-op second evict returns false.
-      expect(tracker.evict('resp_1')).toBe(false);
-      // Resolving the original promise after eviction is a no-op
-      // and does not re-add the entry. The `.finally(...)` cleanup
-      // inside `track` short-circuits because
-      // `this.pending.get(id) === writePromise` is false after
-      // eviction.
+      // Marker is live — continuations will see the retryable-503
+      // signal instead of falling through to 404.
+      expect(tracker.isHardTimedOut('resp_1')).toBe(true);
+      expect(tracker.hardTimedOutSize).toBe(1);
+      // awaitPending no longer hands out the wedged promise.
+      expect(tracker.awaitPending('resp_1')).toBeUndefined();
+
+      // Idempotent: a second call with no backing pending entry
+      // returns false (we do not add markers without a real
+      // settlement signal to clear them).
+      expect(tracker.markHardTimedOut('resp_1')).toBe(false);
+      expect(tracker.isHardTimedOut('resp_1')).toBe(true);
+      expect(tracker.hardTimedOutSize).toBe(1);
+
+      // Resolving the original promise clears the marker via the
+      // `.finally(...)` cleanup inside `track`. The marker lifetime
+      // is bounded by the underlying write's lifetime — no manual
+      // cleanup required.
       expect(resolveFn).toBeDefined();
       resolveFn!();
       await Promise.resolve();
       await new Promise((r) => setImmediate(r));
       expect(tracker.size).toBe(0);
+      expect(tracker.isHardTimedOut('resp_1')).toBe(false);
+      expect(tracker.hardTimedOutSize).toBe(0);
     });
 
-    it('iter-49: hard-timeout breaker evicts pending-write tracker so wedged persists do not accumulate O(N) entries', async () => {
-      // Codex's iter-48 review flagged the leak described in the
-      // unit test above — under a wedged `store.store(...)` the
-      // pending-write tracker's settlement-only cleanup left one
-      // entry per hard-timed-out request, growing O(N) with
-      // traffic. Worse, future `previous_response_id`
-      // continuations hitting `awaitPending(id)` on those ids
-      // would hang forever awaiting a promise that never settles.
+    it('iter-50: hard-timeout breaker moves pending-write tracker entries into hard-timed-out marker state', async () => {
+      // Codex's iter-48 review flagged the leak fixed by iter-49 —
+      // under a wedged `store.store(...)` the pending-write
+      // tracker's settlement-only cleanup left one entry per
+      // hard-timed-out request, growing O(N) with traffic. Codex's
+      // iter-49 review then flagged that `evict`-on-breaker
+      // regressed `previous_response_id` recovery: slow-but-eventual
+      // persists crossing the hard timeout had their tracker entry
+      // evicted too, leaving continuations with no signal to
+      // distinguish "retryable storage slowness" from "permanent
+      // 404".
       //
-      // Iter-49 fix: the hard-timeout breaker calls
-      // `getPendingWritesFor(store).evict(record.id)` BEFORE
-      // releasing the binding retain. The raw store promise keeps
-      // running in the background but the tracker no longer holds
-      // a reference, so the closure chain is reclaimable. Future
-      // continuations for hard-timed-out responses now fall
-      // through to `getChain()` directly and 404 cleanly instead
-      // of hanging on `awaitPending`.
+      // Iter-50 fix: the hard-timeout breaker calls
+      // `markHardTimedOut(record.id)` BEFORE releasing the binding
+      // retain. The pending entry is dropped (iter-49 memory bound
+      // preserved — the raw store promise keeps running in the
+      // background but the tracker no longer holds a reference, so
+      // the closure chain is reclaimable) AND the id is added to a
+      // lightweight `hardTimedOut` marker so the continuation path
+      // can return retryable 503 `storage_timeout` instead of 404.
       //
       // Shape:
       //   - `store.store(...)` returns a promise that NEVER
@@ -4728,12 +4752,13 @@ describe('createHandler', () => {
       //   - Drive five requests through the non-streaming handler
       //     end-to-end. Each handler call completes around the
       //     soft timeout (~50ms); the hard timer fires shortly
-      //     after and evicts the tracker entry for that response.
+      //     after and transitions the tracker entry for that
+      //     response to the hard-timed-out marker state.
       //   - Sleep long enough for every hard timer to fire.
       //   - Assert: `getPendingWritesFor(mockStore).size === 0`
-      //     — every tracker entry has been evicted. Under iter-48
-      //     this would be 5 (one per wedged write) and growing
-      //     linearly with traffic.
+      //     (pending drained — iter-49 memory bound preserved)
+      //     AND `isHardTimedOut(id) === true` for every response id
+      //     (iter-50 retryable signal preserved).
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
       try {
@@ -4757,7 +4782,7 @@ describe('createHandler', () => {
           resetCaches: vi.fn(),
         } as unknown as SessionCapableModel;
         const registry = new ModelRegistry();
-        const MODEL_NAME = 'iter-49-wedged-eviction';
+        const MODEL_NAME = 'iter-50-wedged-marker';
         registry.register(MODEL_NAME, mockModel);
 
         expect(process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS).toBe('50');
@@ -4771,10 +4796,11 @@ describe('createHandler', () => {
         const handler = createHandler(registry, { store: mockStore as any });
 
         const N = 5;
+        const responseIds: string[] = [];
         for (let i = 0; i < N; i += 1) {
           const req = createMockReq('POST', '/v1/responses', {
             model: MODEL_NAME,
-            input: `hello wedged-eviction world ${i}`,
+            input: `hello wedged-marker world ${i}`,
             stream: false,
           });
           const { res, waitForEnd, getBody } = createMockRes();
@@ -4782,6 +4808,8 @@ describe('createHandler', () => {
           await waitForEnd();
           const body = JSON.parse(getBody());
           expect(body.status).toBe('completed');
+          expect(typeof body.id).toBe('string');
+          responseIds.push(body.id as string);
         }
 
         // The store was called exactly N times — every request
@@ -4792,10 +4820,10 @@ describe('createHandler', () => {
         // is 50ms and the soft-timeout detach path inside the
         // handler already elapses ~50ms per request, so by the
         // time we reach this point some earlier entries may have
-        // already been evicted by their hard timers. The
+        // already transitioned to the hard-timed-out marker. The
         // observable contract we care about is the FINAL steady
-        // state: after every hard timer has fired, the tracker
-        // has drained.
+        // state: after every hard timer has fired, the pending
+        // map has drained AND every id has a live marker.
         expect(mockStore.store).toHaveBeenCalledTimes(N);
 
         // Wait for any pending hard timers to fire on every
@@ -4805,15 +4833,26 @@ describe('createHandler', () => {
         await new Promise((r) => setTimeout(r, 200));
         await new Promise((r) => setImmediate(r));
 
-        // Primary iter-49 invariant: every hard-timeout breaker
-        // evicted its pending-write tracker entry. The tracker
+        // Primary iter-50 invariant A: every hard-timeout breaker
+        // dropped its pending-write tracker entry. The pending map
         // has drained to zero even though not a single
         // `store.store(...)` promise has settled — the raw
         // promises are still hanging in the background but no
-        // longer pinned through the tracker. Under iter-48 this
-        // would be N (5) and growing linearly with future wedged
-        // requests.
-        expect(getPendingWritesFor(mockStore).size).toBe(0);
+        // longer pinned through the tracker. Under iter-48 (before
+        // iter-49) this would be N (5) and growing linearly with
+        // future wedged requests.
+        const tracker = getPendingWritesFor(mockStore);
+        expect(tracker.size).toBe(0);
+
+        // Primary iter-50 invariant B: every hard-timed-out id is
+        // now in the marker set so a concurrent `previous_response_id`
+        // continuation can return retryable 503 instead of
+        // permanent 404. Under iter-49's `evict`-outright policy
+        // this set would not exist and continuations would 404.
+        expect(tracker.hardTimedOutSize).toBe(N);
+        for (const id of responseIds) {
+          expect(tracker.isHardTimedOut(id)).toBe(true);
+        }
 
         // Sanity: the server continued responding normally
         // throughout. Every request received a completed JSON
@@ -4821,6 +4860,205 @@ describe('createHandler', () => {
         // called exactly N times — once per request — and no
         // unhandled rejections escaped the breaker path.
         expect(mockStore.store).toHaveBeenCalledTimes(N);
+        expect(unhandled).toHaveLength(0);
+        process.off('unhandledRejection', onUnhandled);
+      } finally {
+        if (originalHard === undefined) {
+          delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+        } else {
+          process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
+        }
+      }
+    }, 10000);
+
+    it('iter-50: hard-timed-out persist that later resolves — continuations get retryable 503 in window, then succeed after settle', async () => {
+      // Codex's iter-49 review flagged that `evict`-on-breaker
+      // regressed slow-but-eventual persist recovery: once the
+      // breaker evicted the tracker entry, a concurrent
+      // `previous_response_id` continuation for that id had no
+      // signal to distinguish "write is still running, retry" from
+      // "genuinely 404". The continuation took the 404 branch and
+      // the client discarded `previous_response_id` as invalid,
+      // permanently breaking the conversation chain even though
+      // the write was ~50-100ms from landing.
+      //
+      // Iter-50 fix: the breaker calls `markHardTimedOut(id)`
+      // instead. The pending entry is dropped (iter-49 memory
+      // bound preserved) but the id stays in a lightweight
+      // `hardTimedOut` marker. The continuation path consults
+      // `isHardTimedOut(id)` before falling through to
+      // `sendNotFound(...)` and returns the same retryable 503
+      // `storage_timeout` shape the normal `awaitPending` timeout
+      // branch above uses, so clients keep retrying.
+      //
+      // This end-to-end regression drives:
+      //   1. A write whose completion is controlled by an
+      //      external `resolveStore()` handle, so the test can
+      //      choreograph "hard timeout fires, THEN write lands".
+      //   2. Original POST → gets response_id A. The write is
+      //      tracked as pending under A but never resolves.
+      //   3. Wait for the hard timeout (50ms + margin) — the
+      //      breaker fires and transitions A from pending to the
+      //      hard-timed-out marker.
+      //   4. Before resolving the store promise, POST a
+      //      continuation with `previous_response_id: A`. Assert
+      //      the response is retryable 503 `storage_timeout`, NOT
+      //      404.
+      //   5. Resolve the store promise. The marker clears via the
+      //      `.finally(...)` inside `track()`.
+      //   6. POST another continuation. Since the store is a
+      //      test mock whose `store()` does NOT populate a
+      //      backing map (only signals completion), the retry
+      //      still misses `getChain` — but critically it is NO
+      //      LONGER the 503 path (marker drained) nor the
+      //      stale-hard-timeout path. It falls through to the
+      //      normal 404 only AFTER the marker window closes,
+      //      which is the correct behaviour.
+      const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+      process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
+      try {
+        const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
+
+        // One-shot `store.store(...)` promise we control
+        // externally. The first invocation captures
+        // `resolveStore` so the test can choreograph settlement.
+        let resolveStore: (() => void) | undefined;
+        const pending = new Promise<void>((resolve) => {
+          resolveStore = resolve;
+        });
+        const mockStore = {
+          store: vi.fn().mockImplementation(() => pending),
+          // `getChain` unconditionally rejects with "not found"
+          // — the mock does not build a backing map, so
+          // `getChain(A)` misses both before AND after settle.
+          // We are specifically testing the retryable-503
+          // window, not the chain-lookup success path.
+          getChain: vi.fn().mockImplementation((id: string) => {
+            return Promise.reject(new Error(`Response not found: ${id}`));
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const chatSessionStart = vi.fn().mockResolvedValue(makeChatResult({ text: 'slow-eventual reply' }));
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue: vi.fn().mockResolvedValue(makeChatResult({ text: 'continuation reply' })),
+          chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        const registry = new ModelRegistry();
+        const MODEL_NAME = 'iter-50-slow-eventual-persist';
+        registry.register(MODEL_NAME, mockModel);
+
+        expect(process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS).toBe('50');
+
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => {
+          unhandled.push(reason);
+        };
+        process.on('unhandledRejection', onUnhandled);
+
+        const handler = createHandler(registry, { store: mockStore as any });
+
+        // (1) Original POST — collect response_id A.
+        const req1 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'slow-eventual hello',
+          stream: false,
+        });
+        const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
+        await handler(req1, res1);
+        await wait1();
+        const body1 = JSON.parse(getBody1());
+        expect(body1.status).toBe('completed');
+        const responseIdA: string = body1.id;
+
+        // Sanity: A is currently tracked as pending.
+        const tracker = getPendingWritesFor(mockStore);
+        // Note: by the time the handler returns the hard timer
+        // (50ms) may or may not have fired yet depending on test
+        // wall-clock, so we don't assert the exact pending size
+        // here. We only care about the post-timeout steady state.
+
+        // (2) Let the hard timer fire. 200ms is plenty of margin
+        // for the 50ms timer plus a macrotask drain.
+        await new Promise((r) => setTimeout(r, 200));
+        await new Promise((r) => setImmediate(r));
+
+        // Invariant: the breaker fired and transitioned A into
+        // the hard-timed-out marker. Pending drained, marker set.
+        expect(tracker.size).toBe(0);
+        expect(tracker.isHardTimedOut(responseIdA)).toBe(true);
+        expect(tracker.hardTimedOutSize).toBe(1);
+
+        // (3) Continuation arrives DURING the retryable window —
+        // the store promise is still unresolved. MUST return
+        // retryable 503 `storage_timeout`, NOT permanent 404.
+        const req2 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation during retryable window',
+          previous_response_id: responseIdA,
+          stream: false,
+        });
+        const { res: res2, getStatus: status2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
+        await handler(req2, res2);
+        await wait2();
+
+        // Retryable-503 response shape, mirrored verbatim from
+        // the normal `awaitPending` timeout branch: HTTP 503,
+        // `type: 'storage_timeout'`, message referencing the
+        // previous_response_id.
+        expect(status2()).toBe(503);
+        const parsed2 = JSON.parse(getBody2());
+        expect(parsed2.error.type).toBe('storage_timeout');
+        expect(parsed2.error.message).toContain(responseIdA);
+
+        // (4) Resolve the underlying store promise. The
+        // `.finally(...)` inside `track()` will clear both the
+        // (already-dropped) pending entry and the marker.
+        expect(resolveStore).toBeDefined();
+        resolveStore!();
+        // Drain microtasks so the `.finally(...)` runs.
+        await Promise.resolve();
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setImmediate(r));
+
+        // Invariant: marker cleared — the retryable window closed
+        // because the underlying write finally settled.
+        expect(tracker.isHardTimedOut(responseIdA)).toBe(false);
+        expect(tracker.hardTimedOutSize).toBe(0);
+
+        // (5) Continuation arrives AFTER the marker drained.
+        // The mock `getChain` still misses (the mock does not
+        // build a backing map), so this request now takes the
+        // permanent 404 branch cleanly — the retryable-503
+        // contract no longer applies because the write's
+        // lifetime has ended. This proves the marker is not
+        // stuck once the underlying promise settles.
+        const req3 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation after marker drained',
+          previous_response_id: responseIdA,
+          stream: false,
+        });
+        const { res: res3, getStatus: status3, getBody: getBody3, waitForEnd: wait3 } = createMockRes();
+        await handler(req3, res3);
+        await wait3();
+        // The mock getChain throws "not found" and there is no
+        // pending entry and no marker, so this takes the
+        // rethrow-to-outer-catch path, which routes to
+        // `sendNotFound(...)` with the "not found or expired"
+        // copy.
+        expect(status3()).toBe(404);
+        const parsed3 = JSON.parse(getBody3());
+        // Accept either 404 copy — both indicate the retryable
+        // window is closed. The iter-50 contract we are pinning
+        // is "retryable 503 WHILE the marker is live, then NOT
+        // 503 once it drains".
+        expect(parsed3.error.type).not.toBe('storage_timeout');
+
         expect(unhandled).toHaveLength(0);
         process.off('unhandledRejection', onUnhandled);
       } finally {
