@@ -77,53 +77,6 @@ function poolKey(usage: number, size: number): string {
   return `${usage}:${size}`;
 }
 
-// ===== Task D diagnosis: size-distribution histogram (TEMPORARY) =====
-// Mirrors the bridge-stub histogram. Recorded at every gpu-worker pool
-// call-site (DEVICE_CREATE_BUFFER, FUSED_DISPATCH_WITH_UNIFORM deferred
-// uniform, CREATE_BUFFER_FROM_DATA). Dumped by the GET_STATS handler so
-// the output appears in the devtools console alongside the pool hit/miss
-// summary at the end of each decode.
-interface DiagHistSlot {
-  req: number;
-  hit: number;
-  miss: number;
-}
-const poolSizeHistGpu = new Map<number, DiagHistSlot>();
-const poolBucketHistGpu = new Map<number, DiagHistSlot>();
-let poolHistTotalReqsGpu = 0;
-function recordPoolHistGpu(size: number, bucketSize: number, hit: boolean): void {
-  const sz = poolSizeHistGpu.get(size) ?? { req: 0, hit: 0, miss: 0 };
-  sz.req++;
-  if (hit) sz.hit++;
-  else sz.miss++;
-  poolSizeHistGpu.set(size, sz);
-  const bk = poolBucketHistGpu.get(bucketSize) ?? { req: 0, hit: 0, miss: 0 };
-  bk.req++;
-  if (hit) bk.hit++;
-  else bk.miss++;
-  poolBucketHistGpu.set(bucketSize, bk);
-  poolHistTotalReqsGpu++;
-}
-function dumpPoolHistGpu(reason: string): void {
-  const topSizes = [...poolSizeHistGpu.entries()].sort((a, b) => b[1].req - a[1].req).slice(0, 20);
-  for (const [size, slot] of topSizes) {
-    const pct = slot.req > 0 ? ((slot.hit / slot.req) * 100).toFixed(1) : '0.0';
-    console.log(
-      `[profile] gpu-hist[${reason}]: size=${size} reqs=${slot.req} hits=${slot.hit} (${pct}%) misses=${slot.miss}`,
-    );
-  }
-  const topBuckets = [...poolBucketHistGpu.entries()].sort((a, b) => b[1].req - a[1].req).slice(0, 20);
-  for (const [bucket, slot] of topBuckets) {
-    const pct = slot.req > 0 ? ((slot.hit / slot.req) * 100).toFixed(1) : '0.0';
-    console.log(
-      `[profile] gpu-hist-bucket[${reason}]: bucket=${bucket} reqs=${slot.req} hits=${slot.hit} (${pct}%) misses=${slot.miss}`,
-    );
-  }
-  console.log(
-    `[profile] gpu-hist-summary[${reason}]: distinctSizes=${poolSizeHistGpu.size} distinctBuckets=${poolBucketHistGpu.size} totalReqs=${poolHistTotalReqsGpu}`,
-  );
-}
-
 function addHandle(obj: any): number {
   const id = nextHandle++;
   handles[id] = obj;
@@ -703,17 +656,13 @@ function dispatchFusedRecord(
         handle = stack.pop()!;
         if (stack.length === 0) bufferPool.delete(poolKey(usage, physicalSize));
         bufferPoolHitCount++;
-        if (poolable) recordPoolHistGpu(uniformDataSize, physicalSize, true);
         const pooled = handles[handle] as GPUBuffer;
         queue.writeBuffer(pooled, 0, uniformData);
         // Update the logical size for this new owner — the previous owner's
         // logical size could differ even though they share a bucket.
         bufferLogicalSizesArr[handle] = uniformDataSize;
       } else {
-        if (poolable) {
-          bufferPoolMissCount++;
-          recordPoolHistGpu(uniformDataSize, physicalSize, false);
-        }
+        if (poolable) bufferPoolMissCount++;
         const buffer = device.createBuffer({ size: physicalSize, usage });
         queue.writeBuffer(buffer, 0, uniformData);
         handle = addHandle(buffer);
@@ -1212,7 +1161,6 @@ async function processCommand(fnId: number): Promise<void> {
           const reused = stack.pop()!;
           if (stack.length === 0) bufferPool.delete(poolKey(usage, bucketSize));
           bufferPoolHitCount++;
-          recordPoolHistGpu(size, bucketSize, true);
           // Update the logical size so a subsequent BUFFER_GET_SIZE on the
           // reused handle returns the NEW caller's logical size, not a
           // stale value from the previous owner.
@@ -1221,7 +1169,6 @@ async function processCommand(fnId: number): Promise<void> {
           break;
         }
         bufferPoolMissCount++;
-        recordPoolHistGpu(size, bucketSize, false);
         // Pool miss: allocate the physical (bucketed) size so this buffer
         // can later rejoin its bucket on release. Every buffer in bucket B
         // has physical size B — that invariant is what makes bucket-reuse
@@ -2058,7 +2005,6 @@ async function processCommand(fnId: number): Promise<void> {
           handle = stack.pop()!;
           if (stack.length === 0) bufferPool.delete(poolKey(usage, physicalSize));
           bufferPoolHitCount++;
-          if (poolable) recordPoolHistGpu(size, physicalSize, true);
           // Overwrite the pooled buffer's contents with the new data (only
           // the first `size` bytes; the tail of physicalSize is don't-care
           // padding — no read path is allowed to touch beyond logical size).
@@ -2069,10 +2015,7 @@ async function processCommand(fnId: number): Promise<void> {
           // have had a smaller logical size within the same bucket.
           bufferLogicalSizesArr[handle] = size;
         } else {
-          if (poolable) {
-            bufferPoolMissCount++;
-            recordPoolHistGpu(size, physicalSize, false);
-          }
+          if (poolable) bufferPoolMissCount++;
           // Allocate physicalSize so poolable buffers can be bucket-reused
           // on release. The data write below copies only logical `size`
           // bytes — any tail padding stays as the initial zero contents.
@@ -2129,21 +2072,11 @@ async function processCommand(fnId: number): Promise<void> {
         cmdU32[reservedBase + i] = gpuRpcCounts[STATS_CALLBACK_SLOTS + STATS_INLINE_SLOTS + i];
       }
       setResult(gpuTotalRpcs);
-      // Task D diagnosis: dump histogram EVERY GET_STATS so both the pre-
-      // reset probe (beginning of decode) and the post-decode probe in
-      // postProfileSnapshot fire a dump. Pre-reset dumps will be empty
-      // during first run; subsequent resetAfter runs will zero + restart.
-      if (poolHistTotalReqsGpu > 0) {
-        dumpPoolHistGpu(resetAfter ? 'reset' : 'snapshot');
-      }
       if (resetAfter) {
         gpuRpcCounts.fill(0);
         gpuTotalRpcs = 0;
         bufferPoolHitCount = 0;
         bufferPoolMissCount = 0;
-        poolSizeHistGpu.clear();
-        poolBucketHistGpu.clear();
-        poolHistTotalReqsGpu = 0;
       }
       break;
     }

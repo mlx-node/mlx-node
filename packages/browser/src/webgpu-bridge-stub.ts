@@ -382,68 +382,6 @@ export function createBridgeStub(
     return true;
   }
 
-  // ===== Task D diagnosis: size-distribution histogram (TEMPORARY) =====
-  // Per-worker histogram of buffer-create requests. Lets us see whether
-  // Task D bucketing actually helps — keyed on BOTH the caller's logical
-  // size and the bucketed size, so we can compare pre-bucket vs post-bucket
-  // hit rates. Dumped to console.log when the per-worker request count
-  // crosses DIAG_HIST_DUMP_THRESHOLD (fires once per worker per decode
-  // session, giving each pthread stub a chance to report without any
-  // cross-worker plumbing). Also dumped on resetBridgeStats (only reaches
-  // the mlx-worker's stub but useful for correlating with post-decode
-  // profile snapshots).
-  interface DiagHistSlot {
-    req: number;
-    hit: number;
-    miss: number;
-  }
-  const poolSizeHistBridge = new Map<number, DiagHistSlot>();
-  const poolBucketHistBridge = new Map<number, DiagHistSlot>();
-  const DIAG_HIST_DUMP_THRESHOLD = 3000;
-  let diagHistTotalReqs = 0;
-  let diagHistDumped = false;
-  function recordDiagHist(size: number, bucketSize: number, hit: boolean): void {
-    const sz = poolSizeHistBridge.get(size) ?? { req: 0, hit: 0, miss: 0 };
-    sz.req++;
-    if (hit) sz.hit++;
-    else sz.miss++;
-    poolSizeHistBridge.set(size, sz);
-    const bk = poolBucketHistBridge.get(bucketSize) ?? { req: 0, hit: 0, miss: 0 };
-    bk.req++;
-    if (hit) bk.hit++;
-    else bk.miss++;
-    poolBucketHistBridge.set(bucketSize, bk);
-    diagHistTotalReqs++;
-    if (!diagHistDumped && diagHistTotalReqs >= DIAG_HIST_DUMP_THRESHOLD) {
-      diagHistDumped = true;
-      dumpDiagHist('tripwire');
-    }
-  }
-  function dumpDiagHist(reason: string): void {
-    const workerTag = typeof self !== 'undefined' && (self as any).name ? (self as any).name : 'anon';
-    const topSizes = [...poolSizeHistBridge.entries()]
-      .sort((a, b) => b[1].req - a[1].req)
-      .slice(0, 20);
-    for (const [size, slot] of topSizes) {
-      const pct = slot.req > 0 ? ((slot.hit / slot.req) * 100).toFixed(1) : '0.0';
-      console.log(
-        `[profile] bridge-hist[${workerTag}/${reason}]: size=${size} reqs=${slot.req} hits=${slot.hit} (${pct}%) misses=${slot.miss}`,
-      );
-    }
-    const topBuckets = [...poolBucketHistBridge.entries()]
-      .sort((a, b) => b[1].req - a[1].req)
-      .slice(0, 20);
-    for (const [bucket, slot] of topBuckets) {
-      const pct = slot.req > 0 ? ((slot.hit / slot.req) * 100).toFixed(1) : '0.0';
-      console.log(
-        `[profile] bridge-hist-bucket[${workerTag}/${reason}]: bucket=${bucket} reqs=${slot.req} hits=${slot.hit} (${pct}%) misses=${slot.miss}`,
-      );
-    }
-    console.log(
-      `[profile] bridge-hist-summary[${workerTag}/${reason}]: distinctSizes=${poolSizeHistBridge.size} distinctBuckets=${poolBucketHistBridge.size} totalReqs=${diagHistTotalReqs}`,
-    );
-  }
-
   // Deferred mappedAtCreation buffers: skip getMappedRange + unmap RPCs.
   // Instead of sending 3 RPCs (createBuffer+getMappedRange+unmap), we:
   //   1. Return a FAKE handle (no RPC at all)
@@ -1070,7 +1008,6 @@ export function createBridgeStub(
           if (stack.length === 0) bufferPool.delete(key);
           bufferPoolHits++;
           bumpPoolStat(POOL_STAT_HITS);
-          recordDiagHist(size, bucketSize, true);
           // Publish the caller's LOGICAL size via setBufferMeta — the stub
           // fast path for wgpuBufferGetSize reads this and must return the
           // size the caller actually asked for, not the bucket size.
@@ -1079,7 +1016,6 @@ export function createBridgeStub(
         }
         bufferPoolMisses++;
         bumpPoolStat(POOL_STAT_MISSES);
-        recordDiagHist(size, bucketSize, false);
         // Pool miss: tell the gpu-worker to allocate the full bucketSize so
         // the resulting handle can later be reused by any request that
         // bucket-maps to the same bin. This is the piece that keeps the
@@ -1959,17 +1895,6 @@ export function createBridgeStub(
   }
 
   function resetBridgeStats(): void {
-    // Task D diagnosis: dump histogram (if any) before zeroing so every
-    // decode run gets a fresh window. Runs only on the mlx-worker's stub
-    // (pthread stubs never see resetBridgeStats) — pthread stubs rely on
-    // the request-count tripwire inside recordDiagHist.
-    if (diagHistTotalReqs > 0) {
-      dumpDiagHist('reset');
-    }
-    poolSizeHistBridge.clear();
-    poolBucketHistBridge.clear();
-    diagHistTotalReqs = 0;
-    diagHistDumped = false;
     bridgeRpcCount = 0;
     bridgeFnCounts.fill(0);
     bufferPoolHits = 0;
