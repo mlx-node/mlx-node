@@ -163,16 +163,41 @@ export class ModelRegistry {
    * `retireInstanceIdForForceRelease` returns the id it retired,
    * and the responses endpoint captures it in the same closure
    * that owns the breaker timer. The persist's `.finally(...)`
-   * then calls `clearTombstoneIfMatches(model, retiredId)` so
-   * that when a slow-but-eventual write eventually settles
-   * (fulfills or rejects) the tombstone is dropped and any
-   * subsequent re-registration correctly mints a fresh id. This
-   * closes the iter-45 hole where a past hard-timeout event
-   * permanently re-enabled id inheritance for a model object
-   * across unrelated later lifecycles — reopening stale-chain
-   * replay across what should be logically dead bindings.
+   * then calls `clearTombstone(model, token)` so that when a
+   * slow-but-eventual write eventually settles (fulfills or
+   * rejects) the tombstone is dropped and any subsequent
+   * re-registration correctly mints a fresh id. This closes the
+   * iter-45 hole where a past hard-timeout event permanently
+   * re-enabled id inheritance for a model object across
+   * unrelated later lifecycles — reopening stale-chain replay
+   * across what should be logically dead bindings.
+   *
+   * Iter-47 (codex's iter-46 HIGH finding): when two hard-
+   * timeouts overlap on the SAME live binding they both retire
+   * the same numeric instance id. Under iter-46's
+   * WeakMap<Model, number> layout the second breaker overwrote
+   * the first with the identical value, so whichever persist
+   * settled first would `clearTombstoneIfMatches(model, id)`,
+   * match, and delete — wiping the tombstone the OTHER still-
+   * wedged persist was relying on. A subsequent unregister/
+   * re-register could then mint a fresh id while the hung
+   * persist was still out there stamped with the retired id,
+   * reopening the exact instance-mismatch gap iter-45/46 closed.
+   *
+   * Iter-47 switches to WeakMap<Model, Map<symbol, number>> so
+   * every breaker fire mints its own unique `symbol` token and
+   * each persist's `.finally(...)` clears only its own token.
+   * Overlapping tombstones share the same id but occupy
+   * independent slots; one settling cannot clobber another's
+   * survival. The register-inherit path reads any entry from
+   * the per-model map (they all share the same id because
+   * register-inherit preserves it) — so inheritance works as
+   * long as ANY breaker's tombstone is still outstanding. Once
+   * the last pending persist clears its token the map is empty
+   * and the WeakMap entry is deleted, so the next teardown
+   * behaves like the pre-iter-45 default and mints fresh.
    */
-  private readonly retiredInstanceIds = new WeakMap<ServableModel, number>();
+  private readonly retiredInstanceIds = new WeakMap<ServableModel, Map<symbol, number>>();
 
   /**
    * Register a model under a given name.
@@ -255,10 +280,20 @@ export class ModelRegistry {
     // the tombstone exists — otherwise the aliasing path above has
     // already preserved the id naturally.
     if (!this.instanceIds.has(model)) {
-      const retired = this.retiredInstanceIds.get(model);
-      if (retired !== undefined) {
-        this.instanceIds.set(model, retired);
-        this.retiredInstanceIds.delete(model);
+      // Iter-47: the retired-id tombstone map may hold multiple
+      // entries for the same model object (one per still-wedged
+      // persist's breaker fire). Every entry's value is the
+      // SAME numeric id — register-inherit preserves it across
+      // overlapping breakers — so reading any one of them
+      // yields the inheritable id. We do NOT delete the
+      // tombstones here: the still-pending persists own their
+      // tokens and must clear them in their own `.finally(...)`
+      // so that overlapping hard-timeouts each get exact
+      // settlement-scoped cleanup.
+      const tombstones = this.retiredInstanceIds.get(model);
+      const firstTombstone = tombstones?.values().next();
+      if (firstTombstone && !firstTombstone.done) {
+        this.instanceIds.set(model, firstTombstone.value);
       } else {
         this.instanceIds.set(model, this.nextInstanceId);
         this.nextInstanceId += 1;
@@ -504,8 +539,7 @@ export class ModelRegistry {
    *
    * Iter-46: returns the retired id so the caller (the breaker
    * closure in `endpoints/responses.ts`) can capture it and,
-   * inside the SAME persist's `.finally(...)`, call
-   * `clearTombstoneIfMatches(model, retiredId)` to scope the
+   * inside the SAME persist's `.finally(...)`, scope the
    * tombstone's lifetime to the specific wedged persist that
    * installed it. Returns `undefined` when the binding has
    * already fully torn down (caller raced the natural teardown
@@ -513,34 +547,55 @@ export class ModelRegistry {
    * instance id assignment — nothing was retired, so there is
    * nothing to clean up later.
    *
-   * Safe to call repeatedly — the tombstone simply overwrites
-   * itself with the same value.
+   * Iter-47: each call mints a fresh `Symbol('tombstone')` token
+   * and records the retired id under that token in the per-
+   * model map. The returned `{ token, instanceId }` lets the
+   * breaker's `.finally(...)` clear EXACTLY its own token via
+   * `clearTombstone(model, token)` — overlapping breakers on
+   * the same live instance id therefore do not clobber each
+   * other: settling one persist's tombstone leaves the other
+   * still-wedged persist's tombstone in place, so register-
+   * inherit keeps returning the retired id until every pending
+   * persist has settled.
    */
-  retireInstanceIdForForceRelease(model: ServableModel): number | undefined {
+  retireInstanceIdForForceRelease(model: ServableModel): { token: symbol; instanceId: number } | undefined {
     const id = this.instanceIds.get(model);
     if (id === undefined) return undefined;
-    this.retiredInstanceIds.set(model, id);
-    return id;
+    let tombstones = this.retiredInstanceIds.get(model);
+    if (!tombstones) {
+      tombstones = new Map<symbol, number>();
+      this.retiredInstanceIds.set(model, tombstones);
+    }
+    const token = Symbol('tombstone');
+    tombstones.set(token, id);
+    return { token, instanceId: id };
   }
 
   /**
-   * Iter-46 tombstone cleanup. Called from the post-commit
-   * persist's `.finally(...)` to drop the retired id IFF it still
-   * matches the value this persist installed via
-   * `retireInstanceIdForForceRelease`. Scoping tombstone lifetime
-   * to the pending persist prevents a hard-timeout event from
-   * permanently altering the model object's future lifecycle —
-   * once the late persist settles, the logical binding is dead
-   * and subsequent re-registrations MUST mint a fresh id, matching
-   * the pre-iter-45 teardown semantics for non-wedged cases. The
-   * `expectedId` guard is defense in depth: if a second breaker
-   * fires in between and reinstalls a different id, this cleanup
-   * is a no-op and the newer tombstone stays in place for its
-   * own settlement path.
+   * Iter-47 tombstone cleanup. Called from the post-commit
+   * persist's `.finally(...)` to drop EXACTLY the token this
+   * persist installed via `retireInstanceIdForForceRelease`.
+   * Scoping tombstone lifetime per-token (not per-numeric-id)
+   * guarantees that overlapping hard-timeouts which retire the
+   * SAME live instance id do not clobber each other on
+   * settlement — each persist clears only its own slot, and
+   * the register-inherit path keeps returning the retired id
+   * as long as ANY breaker's tombstone is still outstanding.
+   *
+   * When the per-model map becomes empty we also drop the
+   * outer WeakMap entry so the next natural teardown mints
+   * fresh, matching the pre-iter-45 semantics for fully
+   * settled lifecycles. No-op if the token is unknown (the
+   * caller raced a different cleanup path, e.g. a
+   * register-inherit that drained the map — see the iter-47
+   * note on the WeakMap field for why register-inherit does
+   * NOT delete tombstones).
    */
-  clearTombstoneIfMatches(model: ServableModel, expectedId: number): void {
-    const current = this.retiredInstanceIds.get(model);
-    if (current === expectedId) {
+  clearTombstone(model: ServableModel, token: symbol): void {
+    const tombstones = this.retiredInstanceIds.get(model);
+    if (!tombstones) return;
+    tombstones.delete(token);
+    if (tombstones.size === 0) {
       this.retiredInstanceIds.delete(model);
     }
   }

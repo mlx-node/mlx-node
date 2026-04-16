@@ -193,13 +193,16 @@ function getPostCommitPersistTimeoutMs(): number {
  * leading/trailing whitespace around an otherwise-valid numeric
  * value is trimmed before parsing (`'  100  '` -> 100).
  *
- * Iter-46 also scopes the hard-timeout tombstone's lifetime to
- * the pending persist: the tombstone installed by the breaker is
- * cleared by the same persist's `.finally(...)` via
- * `registry.clearTombstoneIfMatches(...)` — inheritance is
+ * Iter-46/47 also scopes the hard-timeout tombstone's lifetime
+ * to the pending persist: the tombstone installed by the breaker
+ * is cleared by the same persist's `.finally(...)` via
+ * `registry.clearTombstone(model, token)` — inheritance is
  * scoped to the narrow window where a late-landing write is
  * still unresolved; after settlement the binding is treated as
- * logically dead and re-registrations mint fresh ids.
+ * logically dead and re-registrations mint fresh ids. Iter-47
+ * further mints a unique per-fire `symbol` token so overlapping
+ * hard-timeouts on the same live instance id do not clobber
+ * each other on settlement.
  *
  * Exported for direct unit testing in `__test__/server/handler.test.ts`
  * (iter-45 env-parsing coverage). Not part of the public API —
@@ -2966,10 +2969,10 @@ export async function handleCreateResponse(
               // `instanceIds.get(model)` still returns the live
               // id the record carries.
               //
-              // Iter-46 (codex's iter-45 HIGH finding): the
-              // tombstone's lifetime is scoped to THIS persist —
-              // the `.finally(...)` calls
-              // `registry.clearTombstoneIfMatches(leaseModel, retiredTombstoneId)`
+              // Iter-46/47 (codex's iter-45/46 HIGH findings):
+              // the tombstone's lifetime is scoped to THIS
+              // persist — the `.finally(...)` calls
+              // `registry.clearTombstone(leaseModel, retiredTombstone.token)`
               // so that when the late write eventually settles
               // (fulfills or rejects), the tombstone is dropped
               // and any subsequent re-registration correctly
@@ -2977,7 +2980,14 @@ export async function handleCreateResponse(
               // hard-timeout event would permanently re-enable
               // id inheritance across unrelated later lifecycles
               // — reopening stale-chain replay across what
-              // should be logically dead bindings.
+              // should be logically dead bindings. Iter-47's
+              // per-token scoping additionally prevents
+              // OVERLAPPING hard-timeouts on the same live
+              // instance id from clobbering each other: each
+              // breaker mints its own unique `symbol` token
+              // and clears only its own slot on settlement, so
+              // one persist settling cannot delete another
+              // still-wedged persist's tombstone.
               registry.retainBinding(leaseModel);
               let persistRetainReleased = false;
               persistRetainBox.release = () => {
@@ -2987,7 +2997,7 @@ export async function handleCreateResponse(
               };
               const streamingPersistMode = 'streaming' as const;
               const streamingHardTimeoutMs = getPostCommitPersistHardTimeoutMs();
-              let retiredTombstoneId: number | undefined;
+              let retiredTombstone: { token: symbol; instanceId: number } | undefined;
               const streamingHardTimeoutHandle: ReturnType<typeof setTimeout> | null =
                 streamingHardTimeoutMs > 0
                   ? setTimeout(() => {
@@ -3008,8 +3018,14 @@ export async function handleCreateResponse(
                       // capture the retired id so the persist's
                       // `.finally(...)` can clean up the
                       // tombstone once the late write eventually
-                      // settles.
-                      retiredTombstoneId = registry.retireInstanceIdForForceRelease(leaseModel);
+                      // settles. Iter-47: the registry mints a
+                      // unique `symbol` token per breaker fire so
+                      // overlapping hard-timeouts on the same
+                      // live instance id do not clobber each
+                      // other on settlement — we capture the
+                      // `{ token, instanceId }` pair and pass
+                      // only our own token to `clearTombstone`.
+                      retiredTombstone = registry.retireInstanceIdForForceRelease(leaseModel);
                       persistRetainBox.release?.();
                     }, streamingHardTimeoutMs)
                   : null;
@@ -3017,14 +3033,17 @@ export async function handleCreateResponse(
                 if (streamingHardTimeoutHandle !== null) {
                   clearTimeout(streamingHardTimeoutHandle);
                 }
-                // Iter-46: if the hard-timeout breaker fired and
-                // installed a tombstone on `leaseModel`, drop it
-                // now that the late persist has settled — the
-                // guard `clearTombstoneIfMatches` ensures we
-                // never clobber a tombstone installed by a
-                // different (later) breaker event.
-                if (retiredTombstoneId !== undefined) {
-                  registry.clearTombstoneIfMatches(leaseModel, retiredTombstoneId);
+                // Iter-46/47: if the hard-timeout breaker fired
+                // and installed a tombstone on `leaseModel`,
+                // drop THIS persist's token now that the late
+                // write has settled. Iter-47's per-token scoping
+                // means overlapping breakers' tombstones each
+                // own their own slot — clearing only our token
+                // leaves any concurrent hard-timeout's
+                // tombstone intact so its own settlement can
+                // clean up its own slot.
+                if (retiredTombstone !== undefined) {
+                  registry.clearTombstone(leaseModel, retiredTombstone.token);
                 }
                 persistRetainBox.release?.();
               });
@@ -3107,10 +3126,10 @@ export async function handleCreateResponse(
               // correct. See the streaming branch for the full
               // rationale.
               //
-              // Iter-46 (codex's iter-45 HIGH finding): the
-              // tombstone's lifetime is scoped to THIS persist —
-              // the `.finally(...)` calls
-              // `registry.clearTombstoneIfMatches(leaseModel, retiredTombstoneId)`
+              // Iter-46/47 (codex's iter-45/46 HIGH findings):
+              // the tombstone's lifetime is scoped to THIS
+              // persist — the `.finally(...)` calls
+              // `registry.clearTombstone(leaseModel, retiredTombstone.token)`
               // so that when the late write eventually settles
               // (fulfills or rejects), the tombstone is dropped
               // and any subsequent re-registration correctly
@@ -3118,7 +3137,14 @@ export async function handleCreateResponse(
               // hard-timeout event would permanently re-enable
               // id inheritance across unrelated later lifecycles
               // — reopening stale-chain replay across what
-              // should be logically dead bindings.
+              // should be logically dead bindings. Iter-47's
+              // per-token scoping additionally prevents
+              // OVERLAPPING hard-timeouts on the same live
+              // instance id from clobbering each other: each
+              // breaker mints its own unique `symbol` token
+              // and clears only its own slot on settlement, so
+              // one persist settling cannot delete another
+              // still-wedged persist's tombstone.
               registry.retainBinding(leaseModel);
               let persistRetainReleased = false;
               persistRetainBox.release = () => {
@@ -3128,7 +3154,7 @@ export async function handleCreateResponse(
               };
               const nonStreamingPersistMode = 'non-streaming' as const;
               const nonStreamingHardTimeoutMs = getPostCommitPersistHardTimeoutMs();
-              let retiredTombstoneId: number | undefined;
+              let retiredTombstone: { token: symbol; instanceId: number } | undefined;
               const nonStreamingHardTimeoutHandle: ReturnType<typeof setTimeout> | null =
                 nonStreamingHardTimeoutMs > 0
                   ? setTimeout(() => {
@@ -3149,8 +3175,14 @@ export async function handleCreateResponse(
                       // capture the retired id so the persist's
                       // `.finally(...)` can clean up the
                       // tombstone once the late write eventually
-                      // settles.
-                      retiredTombstoneId = registry.retireInstanceIdForForceRelease(leaseModel);
+                      // settles. Iter-47: the registry mints a
+                      // unique `symbol` token per breaker fire so
+                      // overlapping hard-timeouts on the same
+                      // live instance id do not clobber each
+                      // other on settlement — we capture the
+                      // `{ token, instanceId }` pair and pass
+                      // only our own token to `clearTombstone`.
+                      retiredTombstone = registry.retireInstanceIdForForceRelease(leaseModel);
                       persistRetainBox.release?.();
                     }, nonStreamingHardTimeoutMs)
                   : null;
@@ -3158,14 +3190,17 @@ export async function handleCreateResponse(
                 if (nonStreamingHardTimeoutHandle !== null) {
                   clearTimeout(nonStreamingHardTimeoutHandle);
                 }
-                // Iter-46: if the hard-timeout breaker fired and
-                // installed a tombstone on `leaseModel`, drop it
-                // now that the late persist has settled — the
-                // guard `clearTombstoneIfMatches` ensures we
-                // never clobber a tombstone installed by a
-                // different (later) breaker event.
-                if (retiredTombstoneId !== undefined) {
-                  registry.clearTombstoneIfMatches(leaseModel, retiredTombstoneId);
+                // Iter-46/47: if the hard-timeout breaker fired
+                // and installed a tombstone on `leaseModel`,
+                // drop THIS persist's token now that the late
+                // write has settled. Iter-47's per-token scoping
+                // means overlapping breakers' tombstones each
+                // own their own slot — clearing only our token
+                // leaves any concurrent hard-timeout's
+                // tombstone intact so its own settlement can
+                // clean up its own slot.
+                if (retiredTombstone !== undefined) {
+                  registry.clearTombstone(leaseModel, retiredTombstone.token);
                 }
                 persistRetainBox.release?.();
               });

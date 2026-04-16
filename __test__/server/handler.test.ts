@@ -4298,12 +4298,13 @@ describe('createHandler', () => {
       //
       // Iter-46 fix: scope the tombstone's lifetime to the
       // PENDING persist that installed it. The breaker captures
-      // the retired id returned by
+      // the `{ token, instanceId }` pair returned by
       // `retireInstanceIdForForceRelease` in a local variable,
       // and the persist's `.finally(...)` drops the tombstone
-      // via `registry.clearTombstoneIfMatches(model, retiredId)`
-      // — with a defense-in-depth guard so a second breaker
-      // event's tombstone is not clobbered by this settlement.
+      // via `registry.clearTombstone(model, token)`. Iter-47
+      // extends this to per-token scoping so overlapping
+      // breakers on the same live instance id do not clobber
+      // each other — each persist owns its own tombstone slot.
       //
       // Shape (Deferred<void> pattern):
       //   - `store.store(...)` returns a promise we control —
@@ -4317,7 +4318,7 @@ describe('createHandler', () => {
       //     the tombstone.
       //   - Resolve the Deferred — this forces the persist's
       //     `.finally(...)` to run, which clears the tombstone
-      //     via `clearTombstoneIfMatches`.
+      //     via `clearTombstone`.
       //   - Drain microtasks + one macrotask so the `.finally`
       //     body has definitely executed.
       //   - `unregister(MODEL_NAME)` + `register(MODEL_NAME, sameModel)`
@@ -4390,11 +4391,11 @@ describe('createHandler', () => {
         await new Promise((r) => setTimeout(r, 150));
         await new Promise((r) => setImmediate(r));
 
-        // NOW settle the pending persist. Under iter-46 the
+        // NOW settle the pending persist. Under iter-46/47 the
         // persist's `.finally(...)` immediately drops the
-        // tombstone via `clearTombstoneIfMatches`. Drain
-        // microtasks + one macrotask so the `.finally` body
-        // has definitely executed.
+        // tombstone via `clearTombstone`. Drain microtasks +
+        // one macrotask so the `.finally` body has definitely
+        // executed.
         expect(resolvePersist).toBeDefined();
         resolvePersist!();
         await Promise.resolve();
@@ -4429,6 +4430,128 @@ describe('createHandler', () => {
           process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
         }
       }
+    }, 5000);
+
+    it('iter-47: overlapping hard-timeouts use per-persist tokens; settling one does not clear the other', async () => {
+      // Codex's iter-46 review flagged a HIGH finding: the
+      // iter-46 tombstone storage keyed retired ids by
+      // `WeakMap<Model, number>`, so two overlapping hard-
+      // timeouts on the SAME live binding both retired the
+      // SAME numeric instance id and the second breaker simply
+      // overwrote the first with the identical value. Whichever
+      // persist settled first ran
+      // `clearTombstoneIfMatches(model, id)`, matched, and
+      // DELETED the only tombstone entry — wiping out the
+      // tombstone that the OTHER still-hung persist was
+      // relying on to keep its late-landing row chainable.
+      //
+      // Concrete failing sequence under iter-46:
+      //   t=0:    register(model) -> instanceId = N.
+      //   t=0:    persist A starts, wedges.
+      //   t=5s:   persist A hard-timeout fires, tombstones[model] = N.
+      //   t=10s:  persist B starts on the still-live binding,
+      //           wedges, hard-timeout fires, tombstones[model] = N
+      //           (overwrites with the same numeric value).
+      //   t=15s:  persist A settles -> finally() runs
+      //           clearTombstoneIfMatches(model, N) -> matches N,
+      //           deletes the tombstone. But persist B is STILL hung.
+      //   t=16s:  unregister + register -> no tombstone in the
+      //           WeakMap -> mints fresh id N+1.
+      //   t=20s:  persist B finally settles and writes its
+      //           stored row stamped with the old N -> a future
+      //           `previous_response_id` continuation rejects
+      //           with 400 instance-mismatch, silently breaking
+      //           the chain.
+      //
+      // Iter-47 fix: store per-model tombstones as
+      // `Map<symbol, number>` and mint a unique `Symbol('tombstone')`
+      // per breaker fire. Each persist's `.finally(...)` clears
+      // only its own token via `clearTombstone(model, token)`;
+      // overlapping breakers own independent slots. Register-
+      // inherit reads any entry from the per-model map (all
+      // entries carry the same numeric id because register-
+      // inherit preserves it), so inheritance works as long as
+      // ANY breaker's tombstone is still outstanding. Only when
+      // the LAST pending persist clears its token does the map
+      // empty out and the next teardown mint fresh.
+      //
+      // We drive this through the registry's public API
+      // directly (installing two tombstones without spinning
+      // up live handler state) — the endpoint-level tests
+      // above already cover the dispatch integration, and
+      // driving the bug directly via the registry keeps the
+      // assertion load-bearing on the observable outcome:
+      // `getInstanceId` after a same-object register.
+      const mockModel = {
+        chatSessionStart: vi.fn(),
+        chatSessionContinue: vi.fn(),
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      const MODEL_NAME = 'iter-47-overlapping-hard-timeouts';
+      registry.register(MODEL_NAME, mockModel);
+
+      const idBefore = registry.getInstanceId(MODEL_NAME);
+      expect(typeof idBefore).toBe('number');
+
+      // Simulate two overlapping hard-timeouts by retiring the
+      // same live instance id twice. Each call mints a fresh
+      // token; both tombstones reference the same numeric id
+      // (they share a single live binding).
+      const tombstoneA = registry.retireInstanceIdForForceRelease(mockModel);
+      const tombstoneB = registry.retireInstanceIdForForceRelease(mockModel);
+      expect(tombstoneA).toBeDefined();
+      expect(tombstoneB).toBeDefined();
+      expect(tombstoneA!.instanceId).toBe(idBefore);
+      expect(tombstoneB!.instanceId).toBe(idBefore);
+      // Tokens MUST be distinct so settlement of one cannot
+      // accidentally clear the other.
+      expect(tombstoneA!.token).not.toBe(tombstoneB!.token);
+
+      // Persist A "settles" -> clears ONLY its own token.
+      // Under iter-46 the numeric-keyed `clearTombstoneIfMatches`
+      // would have wiped the sole map entry here, so the
+      // register-inherit path below would have missed. Under
+      // iter-47 the per-token cleanup leaves B's slot intact.
+      registry.clearTombstone(mockModel, tombstoneA!.token);
+
+      // Unregister + re-register the SAME model object. With
+      // persist B's tombstone still in place, the fresh
+      // binding MUST inherit `idBefore` — NOT mint fresh.
+      // Observable outcome only; we don't peek into the
+      // WeakMap directly.
+      expect(registry.unregister(MODEL_NAME)).toBe(true);
+      registry.register(MODEL_NAME, mockModel);
+      const idAfterASettled = registry.getInstanceId(MODEL_NAME);
+      expect(typeof idAfterASettled).toBe('number');
+      expect(idAfterASettled).toBe(idBefore);
+
+      // Persist B "settles" -> clears its own token. The map
+      // is now empty, so the WeakMap entry is dropped (iter-47
+      // contract).
+      registry.clearTombstone(mockModel, tombstoneB!.token);
+
+      // Now unregister + re-register the SAME model object
+      // AGAIN. With every tombstone settled, this is a
+      // logically dead binding and re-registration MUST mint
+      // a FRESH id (different from `idBefore`) — matching the
+      // pre-iter-45 teardown semantics for non-wedged cases.
+      // Under iter-46 the single shared slot was already gone
+      // by now (cleared by A's settlement above) and B's
+      // settlement would be a no-op; the iter-46 bug was the
+      // INTERMEDIATE state, not this final one. The pair of
+      // assertions together (idAfterASettled === idBefore AND
+      // idAfterBSettled !== idBefore) is what fingerprints
+      // iter-47's per-token scoping.
+      expect(registry.unregister(MODEL_NAME)).toBe(true);
+      registry.register(MODEL_NAME, mockModel);
+      const idAfterBSettled = registry.getInstanceId(MODEL_NAME);
+      expect(typeof idAfterBSettled).toBe('number');
+      expect(idAfterBSettled).not.toBe(idBefore);
     }, 5000);
 
     it('iter-45/46: MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS parsing: empty/whitespace -> default, "0" -> disabled, valid -> parsed', async () => {
