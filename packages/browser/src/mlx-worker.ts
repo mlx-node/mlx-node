@@ -25,7 +25,6 @@ TextDecoder.prototype.decode = function (input?: BufferSource | null, options?: 
 
 import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-runtime';
 
-import { createSabRingOverHeap } from './chat-stream-sab.js';
 import { CMD_OFFSET, READBACK_BUFFER_SIZE, DISPATCH_BATCH_BUFFER_SIZE } from './rpc-protocol.js';
 import { parseSafeTensorsHeader, dtypeToCode } from './safetensors.js';
 import {
@@ -441,7 +440,18 @@ async function handleInit(data: {
     await model.chat([{ role: 'user', content: 'hi' }], { maxNewTokens: 2, temperature: 0 });
     post({ type: 'progress', step: 'warmup', message: 'Warmup complete' });
 
-    post({ type: 'ready' });
+    // Ship the shared WASM memory to the main thread so it can mount the
+    // SAB chat-stream reader directly over the WASM heap. A shared
+    // WebAssembly.Memory is structured-cloneable and the clone refers to
+    // the SAME underlying SharedArrayBuffer, so main-thread Int32Array
+    // views over memory.buffer see every byte the Rust SabSink writes.
+    // This is required to avoid delivering tokens in a single burst at
+    // end-of-decode: WASM-side chatStreamSab synchronously blocks this
+    // mlx-worker on Atomics.wait round-trips to gpu-worker, so a reader
+    // whose Atomics.waitAsync promise resolves on this thread cannot
+    // actually run its microtask until chatStreamSab returns. The main
+    // thread is never blocked during decode, so the reader drains live.
+    post({ type: 'ready', sharedMemory });
   } catch (e) {
     post({ type: 'error', message: String(e), stack: e instanceof Error ? e.stack : undefined });
   }
@@ -544,6 +554,12 @@ function postProfileSnapshot(numTokens: number): void {
   }
 }
 
+// Pending stream-finalize resolver. The main-thread SAB reader posts
+// {type:'stream-finalize', numTokens} when it has seen the done-chunk;
+// handleChatStreamSab awaits this so it can call postProfileSnapshot with
+// the correct token count before freeing the ring.
+let streamFinalizeResolve: ((numTokens: number) => void) | null = null;
+
 async function handleChat(data: {
   messages: any[];
   config?: any;
@@ -586,6 +602,12 @@ async function handleChat(data: {
     freeFn(ringOffset);
   };
 
+  // Register the finalize-resolver BEFORE we tell main to start reading so the
+  // main-thread reader's 'stream-finalize' message can't land before we listen.
+  const finalizePromise = new Promise<number>((resolve) => {
+    streamFinalizeResolve = resolve;
+  });
+
   try {
     const chatConfig = {
       ...data.config,
@@ -593,71 +615,46 @@ async function handleChat(data: {
       reportPerformance: true,
     };
 
-    const sabRing = createSabRingOverHeap(memory, ringOffset, SAB_RING_SIZE);
-
     // Buffer.from(arrayBuffer, offset, length) returns a zero-copy VIEW over
     // the WASM heap. Because the underlying ArrayBuffer IS the WASM memory,
     // napi-rs can pass the pointer through without copying — Rust's SabSink
     // and the JS reader see the same bytes.
     const sabBuf = Buffer.from(memory.buffer, ringOffset, SAB_RING_SIZE);
 
+    // Zero the 32-byte SAB header so seq/write_cur/read_cur/cancelled start
+    // at 0 for this stream. Previously createSabRingOverHeap did this as a
+    // side-effect of its constructor; now the reader runs on the main
+    // thread so we must zero it ourselves before the producer writes.
+    new Uint8Array(memory.buffer, ringOffset, 32).fill(0);
+
     const t0 = performance.now();
-    let streamResolve: (() => void) | null = null;
-    const streamDone = new Promise<void>((resolve) => {
-      streamResolve = resolve;
-    });
 
     // Phase 0: zero all counters before the generation starts. We reset
     // here rather than at the top of handleChat so the SAB-ring alloc
     // doesn't skew the numbers.
     resetProfileCounters();
 
-    const abortController = sabRing.reader(
-      (chunk) => {
-        if (chunk.done) {
-          const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-          post({ type: 'progress', step: 'chat', message: `chatStream completed in ${elapsed}s` });
-          postProfileSnapshot(chunk.numTokens ?? 0);
-          post({
-            type: 'result',
-            text: chunk.text,
-            rawText: chunk.rawText,
-            numTokens: chunk.numTokens,
-            finishReason: chunk.finishReason,
-            toolCalls: chunk.toolCalls,
-            thinking: chunk.thinking,
-            performance: chunk.performance
-              ? {
-                  ttftMs: chunk.performance.ttftMs,
-                  prefillTokensPerSecond: chunk.performance.prefillTokensPerSecond,
-                  decodeTokensPerSecond: chunk.performance.decodeTokensPerSecond,
-                }
-              : null,
-          });
-          abortController.abort();
-          streamResolve?.();
-        } else {
-          post({
-            type: 'chunk',
-            text: chunk.text,
-            isReasoning: chunk.isReasoning ?? false,
-          });
-        }
-      },
-      (e) => {
-        post({ type: 'error', message: e.message, stack: e.stack });
-        abortController.abort();
-        streamResolve?.();
-      },
-    );
+    // Tell the main thread where the SAB ring lives. The main thread mounts
+    // a reader over the WASM heap at this offset and decodes records as
+    // SabSink writes them. Main thread NEVER blocks during WASM decode (this
+    // worker does), so its Atomics.waitAsync microtasks run immediately and
+    // tokens render live. See the 'stream-finalize' handler below.
+    post({ type: 'stream-sab-open', ringOffset, size: SAB_RING_SIZE });
 
     // chatStreamSab writes directly into the heap-backed ring — no TSFN on the
-    // hot decode path. It returns a handle once the stream is running; the
-    // reader resolves streamDone on the done chunk or on error.
+    // hot decode path. It returns a handle once the stream is running and
+    // resolves when the producer has written the done record.
     const handle = await model.chatStreamSab(data.messages, chatConfig, sabBuf);
     void handle;
 
-    await streamDone;
+    // Wait for the main-thread reader to drain the done-chunk and send us
+    // back its numTokens so we can emit the profile snapshot with correct
+    // ratios. This also serialises the ring free — we don't free until the
+    // reader has consumed everything.
+    const numTokens = await finalizePromise;
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+    post({ type: 'progress', step: 'chat', message: `chatStream completed in ${elapsed}s` });
+    postProfileSnapshot(numTokens);
   } catch (e) {
     let message = String(e);
     let stack: string | undefined;
@@ -667,6 +664,7 @@ async function handleChat(data: {
     }
     post({ type: 'error', message, stack });
   } finally {
+    streamFinalizeResolve = null;
     freeRing();
   }
 }
@@ -783,6 +781,14 @@ self.onmessage = (e: MessageEvent) => {
       break;
     case 'chat':
       handleChat(e.data);
+      break;
+    case 'stream-finalize':
+      // Main-thread SAB reader saw the done-chunk and is handing us the
+      // token count so we can emit the profile snapshot with correct
+      // ratios before freeing the ring. See handleChat above.
+      if (streamFinalizeResolve) {
+        streamFinalizeResolve(e.data.numTokens ?? 0);
+      }
       break;
   }
 };

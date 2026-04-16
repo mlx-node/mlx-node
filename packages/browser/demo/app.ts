@@ -2,8 +2,18 @@
  * MLX Browser Demo — Streaming chat with thinking rendering
  *
  * All heavy work (WASM, WebGPU, model, inference) runs on a dedicated worker.
- * Main thread handles UI, postMessage communication, and streaming token rendering.
+ * Main thread handles UI, postMessage communication, and streaming token
+ * rendering. The SAB chat-stream reader also runs on the main thread: its
+ * Atomics.waitAsync microtask only fires when the hosting event loop is idle,
+ * and the mlx-worker is fully blocked inside chatStreamSab on synchronous
+ * Atomics.wait round-trips to the gpu-worker during decode. Hosting the
+ * reader here lets tokens render live as SabSink writes them instead of
+ * arriving in a single burst at end-of-decode.
  */
+
+import type { ChatStreamChunk } from '@mlx-node/core';
+
+import { createSabRingOverHeap } from '../src/chat-stream-sab.js';
 
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
@@ -37,6 +47,17 @@ let currentResponseDiv: HTMLDivElement | null = null;
 let isInThinking = false;
 let streamedText = ''; // Accumulates all streamed tokens
 let streamTokenCount = 0;
+
+// Shared WASM memory, received once on 'ready' from mlx-worker. Used to mount
+// a chat-stream-sab reader over the heap region the worker mallocs per chat.
+let sharedWasmMemory: WebAssembly.Memory | null = null;
+// Active SAB reader's abort controller — set when 'stream-sab-open' lands,
+// aborted when the done-chunk (or error) is seen. Also aborted defensively if
+// the worker reports an error without our having consumed a done-chunk first.
+let activeReaderAbort: AbortController | null = null;
+// Timestamp when the current stream started (on 'stream-sab-open'). Used to
+// log the client-visible elapsed time alongside the perf metrics from SAB.
+let streamT0 = 0;
 
 function createAssistantMessage(): HTMLDivElement {
   const assistantDiv = document.createElement('div');
@@ -132,16 +153,40 @@ function finalizeAssistantMessage(text: string, thinking: string | null) {
 // Create the MLX Worker
 const worker = new Worker(new URL('../src/mlx-worker.ts', import.meta.url), { type: 'module' });
 
+// Finalize the UI after the SAB reader has seen a done-chunk. Shared between
+// the streaming path (done-chunk via SAB) and non-SAB fallback modes (tsfn /
+// baseline) which still deliver a 'result' postMessage from the worker.
+function finalizeFromResult(result: {
+  text?: string;
+  rawText?: string;
+  thinking?: string | null;
+  numTokens?: number;
+  performance?: {
+    ttftMs: number;
+    prefillTokensPerSecond: number;
+    decodeTokensPerSecond: number;
+  } | null;
+}) {
+  finalizeAssistantMessage(result.text ?? '', result.thinking ?? null);
+  messages.push({ role: 'assistant', content: result.rawText ?? '' });
+
+  if (result.performance) {
+    log(
+      `${result.numTokens} tokens | TTFT ${result.performance.ttftMs.toFixed(0)}ms | Decode ${result.performance.decodeTokensPerSecond.toFixed(1)} tok/s`,
+    );
+  }
+  setStatus('Qwen 3.5 0.8B — Ready', 'ready');
+  sendBtn.disabled = false;
+  promptEl.disabled = false;
+  promptEl.focus();
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
 // Handle messages from worker
 worker.onmessage = (e) => {
   const { type, ...data } = e.data;
 
   switch (type) {
-    case 'chunk':
-      // Per-token streaming chunk from chatStream callback
-      appendStreamedToken(data.text, data.isReasoning);
-      break;
-
     case 'log':
       // Forwarded log from the worker (e.g. PACKBF16 debug from gpu-worker).
       // Routed through the main-thread console so DevTools / MCP capture it.
@@ -160,27 +205,76 @@ worker.onmessage = (e) => {
     case 'ready':
       log('Model ready!');
       setStatus('Qwen 3.5 0.8B — Ready', 'ready');
+      // Capture the shared WASM memory so later chat requests can mount a
+      // SAB reader directly over the heap region the worker allocates.
+      // A shared WebAssembly.Memory is structured-cloneable; the clone we
+      // receive here refers to the SAME SharedArrayBuffer the WASM producer
+      // writes into, so views we build over it see every byte SabSink writes.
+      sharedWasmMemory = (data as any).sharedMemory ?? null;
       promptEl.disabled = false;
       sendBtn.disabled = false;
       imageBtn.disabled = false;
       break;
 
-    case 'result': {
-      finalizeAssistantMessage(data.text, data.thinking);
-      messages.push({ role: 'assistant', content: data.rawText });
-
-      if (data.performance) {
-        log(
-          `${data.numTokens} tokens | TTFT ${data.performance.ttftMs.toFixed(0)}ms | Decode ${data.performance.decodeTokensPerSecond.toFixed(1)} tok/s`,
-        );
+    case 'stream-sab-open': {
+      // Worker allocated a SAB ring inside the WASM heap and is about to
+      // call chatStreamSab. Mount a reader here on the main thread so its
+      // Atomics.waitAsync microtasks can actually run while the worker
+      // synchronously blocks on gpu-rpc round-trips during decode.
+      if (!sharedWasmMemory) {
+        log('Error: received stream-sab-open before shared WASM memory');
+        break;
       }
-      setStatus('Qwen 3.5 0.8B — Ready', 'ready');
-      sendBtn.disabled = false;
-      promptEl.disabled = false;
-      promptEl.focus();
-      chatEl.scrollTop = chatEl.scrollHeight;
+      streamT0 = performance.now();
+      const ringOffset: number = data.ringOffset;
+      const size: number = data.size;
+      const ring = createSabRingOverHeap(sharedWasmMemory, ringOffset, size);
+      activeReaderAbort = ring.reader(
+        (chunk: ChatStreamChunk) => {
+          if (chunk.done) {
+            const elapsed = ((performance.now() - streamT0) / 1000).toFixed(1);
+            log(`chatStream completed in ${elapsed}s`);
+            finalizeFromResult({
+              text: chunk.text,
+              rawText: chunk.rawText,
+              thinking: chunk.thinking ?? null,
+              numTokens: chunk.numTokens,
+              performance: chunk.performance ?? null,
+            });
+            activeReaderAbort?.abort();
+            activeReaderAbort = null;
+            worker.postMessage({ type: 'stream-finalize', numTokens: chunk.numTokens ?? 0 });
+          } else {
+            appendStreamedToken(chunk.text, chunk.isReasoning ?? false);
+          }
+        },
+        (err: Error) => {
+          log(`Stream error: ${err.message}`);
+          if (currentResponseDiv) {
+            currentResponseDiv.textContent = `Error: ${err.message}`;
+          }
+          setStatus('Error', 'error');
+          sendBtn.disabled = false;
+          promptEl.disabled = false;
+          currentAssistantDiv = null;
+          currentThinkingDiv = null;
+          currentResponseDiv = null;
+          activeReaderAbort?.abort();
+          activeReaderAbort = null;
+          // Unblock the worker's handleChat() so it can free the ring.
+          worker.postMessage({ type: 'stream-finalize', numTokens: 0 });
+        },
+      );
       break;
     }
+
+    case 'result':
+      // Non-SAB fallback modes (mode=tsfn / mode=baseline) still deliver
+      // results via a 'result' postMessage — the SAB path handles its own
+      // result inside the reader above. Keep this branch so the A/B toggles
+      // continue to work without a rebuild.
+      finalizeFromResult(data as any);
+      break;
 
     case 'profile': {
       // Phase 0 observability readout. The payload is a cumulative snapshot
@@ -291,6 +385,13 @@ worker.onmessage = (e) => {
       currentAssistantDiv = null;
       currentThinkingDiv = null;
       currentResponseDiv = null;
+      // If a SAB reader is live, tear it down — the worker already hit an
+      // error path (which bypasses the post-await finalize wait) so we
+      // release the reader's AbortController without sending stream-finalize.
+      if (activeReaderAbort) {
+        activeReaderAbort.abort();
+        activeReaderAbort = null;
+      }
       break;
   }
 };
