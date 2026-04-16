@@ -472,9 +472,33 @@ export class PendingResponseWrites {
    * against its own wall-clock at call time, so the scalar reflects
    * the state observed when the write was initiated, which is the
    * latest honest snapshot the pre-breaker path can check against.
+   *
+   * Iter-57 (codex's iter-56 MEDIUM finding): `responses.ts` does
+   * not snapshot this scalar when it grabs `awaitPending(id)`; it
+   * re-reads it from the tracker in the post-`Promise.race(...)`
+   * timeout branch to decide 404 vs. retryable 503. Iter-56's
+   * authoritative drain inside `markHardTimedOut()` closed a leak
+   * but also erased the scalar for any continuation that straddled
+   * the `pending` -> `hardTimedOut` transition: a waiter entered
+   * `awaitPending()` while pending, the breaker fired mid-wait,
+   * the waiter then timed out and looked the scalar up — and saw
+   * `undefined`, so fell through to retryable 503 for an
+   * unrecoverable chain.
+   *
+   * Fix: fall back to the marker's `absoluteExpiresAt` when the
+   * pending-side entry is absent. The marker stores the same
+   * scalar `track()` received (both sites are fed
+   * `min(recordExpiresAtMs, chainEarliestExpiresAtMs)` by
+   * `initiatePersist` in `responses.ts`), so this is lossless.
+   * Once both maps drain (promise settlement via `.finally()` OR
+   * marker TTL elapses + `sweepExpired()` / `isHardTimedOut()`
+   * reap it), this method returns `undefined` as before — the
+   * iter-55 leak fix is not resurrected.
    */
   getEarliestExpiresAtMs(id: string): number | undefined {
-    return this.earliestExpiresByPending.get(id);
+    const pendingValue = this.earliestExpiresByPending.get(id);
+    if (pendingValue !== undefined) return pendingValue;
+    return this.hardTimedOut.get(id)?.absoluteExpiresAt;
   }
 
   /**
@@ -722,6 +746,21 @@ export class PendingResponseWrites {
   get hardTimedOutSize(): number {
     this.sweepExpired();
     return this.hardTimedOut.size;
+  }
+
+  /**
+   * Number of ids currently holding a scalar entry in the
+   * pending-side earliest-expiry map. Primarily for tests — iter-56
+   * fixed a leak where this map retained its entry past a
+   * hard-timeout transition for never-settling wedged writes, and
+   * iter-57 shifted the `getEarliestExpiresAtMs()` observable to
+   * fall back to the marker map. Regressions that want to validate
+   * the underlying leak-fix invariant (the pending-side map itself
+   * is drained, independent of the marker fallback) need a direct
+   * readout; this is it.
+   */
+  get earliestExpiresByPendingSize(): number {
+    return this.earliestExpiresByPending.size;
   }
 }
 

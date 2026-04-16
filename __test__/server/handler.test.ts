@@ -6657,16 +6657,24 @@ describe('createHandler', () => {
 
       const farFuture = Date.now() + 60 * 60 * 1000;
       expect(tracker.markHardTimedOut('resp_fulfill', 60_000, farFuture)).toBe(true);
-      // Immediately after `markHardTimedOut()` the side map must be
-      // drained — NOT deferred to promise settlement.
-      expect(tracker.getEarliestExpiresAtMs('resp_fulfill')).toBeUndefined();
-      // And after the original wedged write finally fulfills, still
-      // undefined (the `.finally` guard fails because pending is
-      // gone, so the authoritative cleanup was `markHardTimedOut`).
+      // Iter-57 update: `getEarliestExpiresAtMs()` now falls back
+      // to the marker's `absoluteExpiresAt` so the
+      // classification-signal stays live across the pending ->
+      // hardTimedOut transition. To validate the underlying
+      // iter-56 leak fix we probe the pending-side map size
+      // directly via the test-only `earliestExpiresByPendingSize`
+      // getter: zero means the side map has been drained
+      // authoritatively inside `markHardTimedOut()`, independent
+      // of eventual promise settlement.
+      expect(tracker.earliestExpiresByPendingSize).toBe(0);
+      // And after the original wedged write finally fulfills, the
+      // pending-side map remains drained (the `.finally` guard
+      // fails because pending is gone, so the authoritative
+      // cleanup was `markHardTimedOut`).
       resolveFulfill();
       await fulfillPromise;
       await new Promise((r) => setImmediate(r));
-      expect(tracker.getEarliestExpiresAtMs('resp_fulfill')).toBeUndefined();
+      expect(tracker.earliestExpiresByPendingSize).toBe(0);
 
       // --- Reject path ---
       let rejectFn!: (err: Error) => void;
@@ -6676,13 +6684,14 @@ describe('createHandler', () => {
       const earliestReject = Date.now() + 2_000_000;
       tracker.track('resp_reject', rejectPromise, earliestReject);
       expect(tracker.getEarliestExpiresAtMs('resp_reject')).toBe(earliestReject);
+      expect(tracker.earliestExpiresByPendingSize).toBe(1);
 
       expect(tracker.markHardTimedOut('resp_reject', 60_000, farFuture)).toBe(true);
-      expect(tracker.getEarliestExpiresAtMs('resp_reject')).toBeUndefined();
+      expect(tracker.earliestExpiresByPendingSize).toBe(0);
       rejectFn(new Error('wedged store finally gave up'));
       await rejectPromise.catch(() => {});
       await new Promise((r) => setImmediate(r));
-      expect(tracker.getEarliestExpiresAtMs('resp_reject')).toBeUndefined();
+      expect(tracker.earliestExpiresByPendingSize).toBe(0);
     });
 
     it('iter-56: earliestExpiresByPending stays drained for a never-settling wedged write across the marker TTL window', async () => {
@@ -6708,22 +6717,33 @@ describe('createHandler', () => {
         expect(tracker.getEarliestExpiresAtMs('resp_wedged')).toBe(earliest);
 
         // Cross the hard-timeout breaker with a short TTL. The
-        // side map must drop the entry immediately, not at TTL
-        // expiry — the .finally() guard would never fire for a
-        // never-settling promise.
+        // pending-side map must drop the entry immediately, not
+        // at TTL expiry — the .finally() guard would never fire
+        // for a never-settling promise. Iter-57 update: we probe
+        // `earliestExpiresByPendingSize` directly because
+        // `getEarliestExpiresAtMs()` now falls back to the
+        // marker's `absoluteExpiresAt` (which is still live
+        // here) and thus would return a value. The leak-fix
+        // invariant is about the pending-side map being drained,
+        // not about the getter returning undefined.
         tracker.markHardTimedOut('resp_wedged', 100, Date.now() + 60 * 60 * 1000);
-        expect(tracker.getEarliestExpiresAtMs('resp_wedged')).toBeUndefined();
+        expect(tracker.earliestExpiresByPendingSize).toBe(0);
 
         // Advance past the marker TTL and drive another
         // `markHardTimedOut()` for a different id to trigger the
-        // bounded `sweepExpired()` pass. The side map entry for
-        // `resp_wedged` must still be absent, confirming the fix
-        // is not relying on a TTL-driven sweep of the side map.
+        // bounded `sweepExpired()` pass. The pending-side entry
+        // for `resp_wedged` must still be absent, confirming the
+        // fix is not relying on a TTL-driven sweep of the side
+        // map.
         vi.advanceTimersByTime(500);
         const other = new Promise<void>(() => {});
         tracker.track('resp_other', other, Date.now() + 2_000_000);
         tracker.markHardTimedOut('resp_other', 100, Date.now() + 60 * 60 * 1000);
-        expect(tracker.getEarliestExpiresAtMs('resp_wedged')).toBeUndefined();
+        // Only `resp_other`'s freshly-marked entry was drained
+        // in place by `markHardTimedOut()`, so the total
+        // pending-side count stays at zero — `resp_wedged`
+        // never resurfaced.
+        expect(tracker.earliestExpiresByPendingSize).toBe(0);
         // And the first marker should have been reaped by the
         // opportunistic write-path sweep, so the hard-timeout
         // bookkeeping is consistent with the side-map state.
@@ -6755,6 +6775,112 @@ describe('createHandler', () => {
       await new Promise((r) => setImmediate(r));
       expect(tracker.getEarliestExpiresAtMs('resp_clean')).toBeUndefined();
       expect(tracker.awaitPending('resp_clean')).toBeUndefined();
+    });
+
+    it('iter-57: getEarliestExpiresAtMs survives the pending -> hardTimedOut transition by falling back to the marker absoluteExpiresAt', async () => {
+      // Codex's iter-56 MEDIUM finding: `responses.ts` does not
+      // snapshot the earliest-expiry scalar when it grabs
+      // `awaitPending(id)`; it re-reads it from the tracker in
+      // the post-`Promise.race(...)` timeout branch to decide
+      // 404 vs. retryable 503. Iter-56's authoritative drain
+      // inside `markHardTimedOut()` fixed the iter-55 leak but
+      // also erased the scalar for any continuation that
+      // straddled the `pending` -> `hardTimedOut` transition —
+      // a waiter entered `awaitPending()` while pending, the
+      // breaker fired mid-wait, the waiter then timed out and
+      // looked the scalar up, saw `undefined`, and fell through
+      // to retryable 503 on an unrecoverable chain.
+      //
+      // Fix: `getEarliestExpiresAtMs()` falls back to the
+      // marker's `absoluteExpiresAt`. Both sites receive the
+      // same `min(recordExpiresAtMs, chainEarliestExpiresAtMs)`
+      // scalar from `initiatePersist` in `responses.ts`, so the
+      // fallback is lossless. After promise settlement the
+      // fallback returns `undefined` again — the iter-55 leak
+      // fix is not resurrected.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+
+      let resolveFn!: () => void;
+      const promise = new Promise<void>((resolve) => {
+        resolveFn = resolve;
+      });
+      const earliestMs = Date.now() + 5_000_000;
+      tracker.track('resp_iter57_a', promise, earliestMs);
+      expect(tracker.getEarliestExpiresAtMs('resp_iter57_a')).toBe(earliestMs);
+
+      // Simulate the hard-timeout breaker firing while a
+      // continuation is still blocked inside `awaitPending`.
+      // Both sites receive the same scalar in production
+      // (`initiatePersist` threads `absoluteExpiresAtMs`
+      // through `track()` and `responses.ts` passes the same
+      // value to `markHardTimedOut()`), so we pass `earliestMs`
+      // for the marker's absolute cap too.
+      expect(tracker.markHardTimedOut('resp_iter57_a', 60_000, earliestMs)).toBe(true);
+
+      // Post-transition lookup: the pending side-map entry is
+      // gone (iter-56 drains it authoritatively — verified
+      // directly via the test-only size getter), but the scalar
+      // is still recoverable from the marker. A waiter that
+      // entered `awaitPending()` before the breaker fired and
+      // now hits its `Promise.race` timeout can still classify
+      // the failure correctly.
+      expect(tracker.earliestExpiresByPendingSize).toBe(0);
+      expect(tracker.getEarliestExpiresAtMs('resp_iter57_a')).toBe(earliestMs);
+
+      // After the original write eventually settles, the
+      // `.finally(...)` inside `track()` unconditionally clears
+      // the hard-timeout marker (this is the pre-existing
+      // settlement-clears-marker invariant — the retryable-503
+      // window closes the moment the wedged store unwedges).
+      // Once the marker is gone, iter-57's fallback returns
+      // `undefined` too, so the end-state matches the pre-iter-57
+      // contract for a settled chain.
+      resolveFn();
+      await promise;
+      await new Promise((r) => setImmediate(r));
+      expect(tracker.isHardTimedOut('resp_iter57_a')).toBe(false);
+      expect(tracker.getEarliestExpiresAtMs('resp_iter57_a')).toBeUndefined();
+    });
+
+    it('iter-57: getEarliestExpiresAtMs returns undefined once the marker has been reaped (no fallback leak)', async () => {
+      // Companion to the previous test: after both maps drain
+      // (here via the marker TTL + the bounded `sweepExpired()`
+      // pass that every `markHardTimedOut()` triggers), the
+      // fallback must return `undefined`. This pins the
+      // invariant that iter-57's fallback is a PASSTHROUGH —
+      // it mirrors whatever the marker map says, and doesn't
+      // keep a separate shadow of the scalar after reclamation.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+
+      vi.useFakeTimers();
+      try {
+        const neverSettles = new Promise<void>(() => {});
+        const earliestMs = Date.now() + 60_000;
+        tracker.track('resp_iter57_b', neverSettles, earliestMs);
+        tracker.markHardTimedOut('resp_iter57_b', 1000, earliestMs);
+        // Still live — both the hard-timeout classification
+        // and the iter-57 fallback scalar agree the chain is
+        // recoverable-retry.
+        expect(tracker.isHardTimedOut('resp_iter57_b')).toBe(true);
+        expect(tracker.getEarliestExpiresAtMs('resp_iter57_b')).toBe(earliestMs);
+
+        // Advance past the marker's TTL and trigger a sweep
+        // via a second `markHardTimedOut()` on a different id.
+        // The bounded `sweepExpired()` pass reaps the first
+        // marker; after that the fallback must return
+        // `undefined`.
+        vi.advanceTimersByTime(1500);
+        const otherNeverSettles = new Promise<void>(() => {});
+        const otherEarliestMs = Date.now() + 60_000;
+        tracker.track('resp_iter57_b_other', otherNeverSettles, otherEarliestMs);
+        tracker.markHardTimedOut('resp_iter57_b_other', 1000, otherEarliestMs);
+        expect(tracker.isHardTimedOut('resp_iter57_b')).toBe(false);
+        expect(tracker.getEarliestExpiresAtMs('resp_iter57_b')).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('iter-51: MLX_HARD_TIMEOUT_MARKER_TTL_MS parsing mirrors hard-timeout parser (empty/whitespace -> default, 0 -> zero, valid -> parsed)', async () => {
