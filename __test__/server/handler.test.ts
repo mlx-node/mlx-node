@@ -5643,5 +5643,141 @@ describe('createHandler', () => {
       expect(sessionReg).toBeDefined();
       expect(sessionReg!.size).toBe(0);
     });
+
+    it('non-streaming: destroyed socket before end rejects endJson and does not hang', async () => {
+      // Iter-34 regression. `ServerResponse.end(payload, cb)` does
+      // NOT invoke the callback when `socket.destroyed === true`
+      // but `res.destroyed === false` — Node's internal
+      // `_writeRaw()` returns without queuing the write. The iter-
+      // 33 helper awaited that callback forever, pinning the per-
+      // model `withExclusive` mutex on a dead client.
+      //
+      // The fix pre-checks `res.destroyed || res.socket?.destroyed`
+      // and rejects the endJson promise synchronously if either is
+      // already destroyed. This test drives exactly that shape:
+      // mark the underlying socket destroyed before the handler
+      // runs, then verify the handler completes within a timeout
+      // bound (no hang), no session is adopted, and no SSE frame
+      // leaks into the JSON-declared body.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'trigger destroyed-socket rejection',
+      });
+      const { res, getBody, wasDestroyed } = createMockRes();
+
+      // Install a fake destroyed socket. The `endJson` helper's
+      // pre-check reads `res.socket?.destroyed`; mirror that shape.
+      Object.defineProperty(res, 'socket', {
+        configurable: true,
+        get: () => ({
+          destroyed: true,
+          once: () => {},
+          removeListener: () => {},
+          off: () => {},
+        }),
+      });
+
+      // If the helper regressed to parking on a callback that
+      // never fires, this would hang indefinitely. Race against a
+      // short timeout to surface the hang as a test failure.
+      const handlerPromise = handler(req, res);
+      await Promise.race([
+        handlerPromise,
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error('handler hung waiting for destroyed-socket endJson callback')), 1000),
+        ),
+      ]);
+
+      // Primary invariant: no session adopted under an id the
+      // client never saw.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(mockModel.chatSessionStart).toHaveBeenCalledTimes(1);
+      const sessionReg = registry.getSessionRegistry('test-model');
+      expect(sessionReg).toBeDefined();
+      expect(sessionReg!.size).toBe(0);
+
+      // Outer catch destroyed the socket and wrote no SSE frame.
+      expect(wasDestroyed()).toBe(true);
+      const body = getBody();
+      expect(body).not.toContain('event: ');
+      expect(body).not.toMatch(/^data: /m);
+    });
+
+    it('non-streaming: socket close event during end rejects endJson and does not hang', async () => {
+      // Iter-34 regression. If the peer disconnects AFTER
+      // `res.end()` returns but BEFORE the kernel acks, Node emits
+      // `'close'` on the response (or its socket) and the end
+      // callback is NEVER invoked. The iter-33 helper awaited that
+      // callback forever.
+      //
+      // The fix attaches `res.once('close', …)` (and the socket's
+      // equivalent) to reject the promise on peer disconnect. This
+      // test drives exactly that shape: replace `res.end` with an
+      // implementation that never fires the callback, emit
+      // `'close'` on the next tick, and verify the handler
+      // completes within a timeout bound.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'trigger close-during-end rejection',
+      });
+      const { res, getBody, wasDestroyed } = createMockRes();
+
+      // Replace `res.end` with an implementation whose callback is
+      // dropped on the floor — mirrors the real `_writeRaw()`
+      // silent-drop path on a dead peer. After a microtask emit
+      // `'close'` so the helper's close listener fires.
+      let endCallCount = 0;
+      const originalEnd = res.end.bind(res);
+      (res as unknown as { end: (...args: unknown[]) => unknown }).end = (
+        chunkArg?: unknown,
+        encodingOrCbArg?: unknown,
+        maybeCbArg?: unknown,
+      ) => {
+        endCallCount++;
+        if (endCallCount === 1) {
+          // Drop the callback entirely, then emit `'close'` on the
+          // next tick so the helper's close listener is the only
+          // path that can settle the promise.
+          setTimeout(() => {
+            res.emit('close');
+          }, 0);
+          return res;
+        }
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+        return originalEnd(chunkArg as any, encodingOrCbArg as any, maybeCbArg as any);
+      };
+
+      const handlerPromise = handler(req, res);
+      await Promise.race([
+        handlerPromise,
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error('handler hung waiting for close-driven endJson rejection')), 1000),
+        ),
+      ]);
+
+      // Primary invariant: adopt gate refused the unseen turn.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(mockModel.chatSessionStart).toHaveBeenCalledTimes(1);
+      const sessionReg = registry.getSessionRegistry('test-model');
+      expect(sessionReg).toBeDefined();
+      expect(sessionReg!.size).toBe(0);
+
+      // Outer catch destroyed the socket on the JSON-mode failure
+      // path and did not leak any SSE frame into the JSON body.
+      expect(wasDestroyed()).toBe(true);
+      const body = getBody();
+      expect(body).not.toContain('event: ');
+      expect(body).not.toMatch(/^data: /m);
+    });
   });
 });

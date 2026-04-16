@@ -266,8 +266,18 @@ async function handleStreamingNative(
 
   // Iter-28 finding 2: fault state. `thrownError` sticks when the
   // underlying async generator throws; `clientAborted` sticks when
-  // the HTTP request emits `close`/`error` while we're mid-iteration.
-  // Either one diverts the post-loop block to the failure epilogue.
+  // the HTTP request OR the response socket emits `close`/`error`
+  // while we're mid-iteration. Either one diverts the post-loop
+  // block to the failure epilogue.
+  //
+  // Iter-34: also listen on `res` and `res.socket`. Non-terminal
+  // SSE writes are fire-and-forget through `writeSSEEvent` — on a
+  // destroyed socket they can silently "succeed" while decode keeps
+  // burning work under the per-model mutex. Attaching the listener
+  // here lets the next loop iteration observe the disconnect and
+  // break out, so native decode still runs to completion (no
+  // AbortSignal plumbed yet) but nothing it emits reaches a dead
+  // socket and the post-loop block routes to the failure epilogue.
   let thrownError: Error | null = null;
   let clientAborted = false;
   const onClientClose = () => {
@@ -276,9 +286,21 @@ async function handleStreamingNative(
   const onClientError = (_err: unknown) => {
     clientAborted = true;
   };
+  const onResClose = () => {
+    clientAborted = true;
+  };
+  const onResError = (_err: unknown) => {
+    clientAborted = true;
+  };
+  const resSocketForAbort = res.socket;
   if (httpReq) {
     httpReq.once('close', onClientClose);
     httpReq.once('error', onClientError);
+  }
+  res.once('close', onResClose);
+  res.once('error', onResError);
+  if (resSocketForAbort != null) {
+    resSocketForAbort.once('close', onResClose);
   }
 
   try {
@@ -689,6 +711,11 @@ async function handleStreamingNative(
     if (httpReq) {
       httpReq.off('close', onClientClose);
       httpReq.off('error', onClientError);
+    }
+    res.off('close', onResClose);
+    res.off('error', onResError);
+    if (resSocketForAbort != null) {
+      resSocketForAbort.off('close', onResClose);
     }
   }
 

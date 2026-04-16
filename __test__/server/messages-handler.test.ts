@@ -2035,5 +2035,104 @@ describe('handleCreateMessage', () => {
       expect(body).toContain('event: error');
       expect(body).toContain('api_error');
     });
+
+    it('non-streaming: destroyed socket before end rejects endJson and does not hang', async () => {
+      // Iter-34 regression on /v1/messages. `res.end(payload, cb)`
+      // does not invoke the callback when the underlying socket is
+      // already destroyed. The iter-33 helper awaited that
+      // callback forever, pinning the per-model `withExclusive`
+      // mutex on a dead client. The fix pre-checks
+      // `res.destroyed || res.socket?.destroyed` and rejects
+      // synchronously.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'hi' }));
+      registry.register('test-model', mockModel);
+      const { res, getBody, wasDestroyed } = createMockRes();
+
+      Object.defineProperty(res, 'socket', {
+        configurable: true,
+        get: () => ({
+          destroyed: true,
+          once: () => {},
+          removeListener: () => {},
+          off: () => {},
+        }),
+      });
+
+      const handlerPromise = handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        } as any,
+        registry,
+      );
+      await Promise.race([
+        handlerPromise,
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error('handler hung waiting for destroyed-socket endJson callback')), 1000),
+        ),
+      ]);
+
+      // JSON-mode failure destroyed the socket and emitted no SSE
+      // frame into the JSON body.
+      expect(wasDestroyed()).toBe(true);
+      const body = getBody();
+      expect(body).not.toContain('event: ');
+      expect(body).not.toMatch(/^data: /m);
+    });
+
+    it('non-streaming: close event during end rejects endJson and does not hang', async () => {
+      // Iter-34 regression on /v1/messages. If the peer
+      // disconnects AFTER `res.end()` returns but BEFORE the
+      // kernel acks, Node emits `'close'` on the response (or its
+      // socket) and the end callback is never invoked. The fix
+      // attaches `res.once('close', …)` so peer disconnect
+      // rejects the helper's promise.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'hi' }));
+      registry.register('test-model', mockModel);
+      const { res, getBody, wasDestroyed } = createMockRes();
+
+      let endCallCount = 0;
+      const originalEnd = res.end.bind(res);
+      (res as unknown as { end: (...args: unknown[]) => unknown }).end = (
+        chunkArg?: unknown,
+        encodingOrCbArg?: unknown,
+        maybeCbArg?: unknown,
+      ) => {
+        endCallCount++;
+        if (endCallCount === 1) {
+          setTimeout(() => {
+            res.emit('close');
+          }, 0);
+          return res;
+        }
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+        return originalEnd(chunkArg as any, encodingOrCbArg as any, maybeCbArg as any);
+      };
+
+      const handlerPromise = handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        } as any,
+        registry,
+      );
+      await Promise.race([
+        handlerPromise,
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error('handler hung waiting for close-driven endJson rejection')), 1000),
+        ),
+      ]);
+
+      expect(wasDestroyed()).toBe(true);
+      const body = getBody();
+      expect(body).not.toContain('event: ');
+      expect(body).not.toMatch(/^data: /m);
+    });
   });
 });
