@@ -2808,6 +2808,261 @@ describe('createHandler', () => {
       expect(abortSignal.emit).toBe(true);
     });
 
+    it('iter-37 finding 1: a native ResponseStore that THROWS "Response not found" on the first getChain does not 404 when the pending write lands on retry', async () => {
+      // The production `ResponseStore` is the native mlx-db
+      // implementation; its `get_chain` throws
+      // `"Response not found: <id>"` on a miss (see
+      // `crates/mlx-db/src/response_store/reader.rs:57-59`). The
+      // iter-36 retry path only fired when `getChain` returned an
+      // empty array, so against the real native contract the
+      // pending-writes retry was dead — the outer catch's
+      // `/not found/i` check turned every native miss into a 404
+      // immediately, never consulting the pending-writes tracker.
+      //
+      // Iter-37 fix: the continuation lookup now wraps the first
+      // `getChain` call in a try/catch. On a thrown "not found"
+      // it consults the pending-writes tracker; if a write is in
+      // flight the handler awaits it and retries `getChain`. The
+      // retry branch also has its own try/catch so a genuine
+      // second-time miss still escalates to a 404 cleanly.
+      //
+      // This test shapes the mock store to faithfully mirror the
+      // native contract: `getChain(id)` throws on the FIRST call
+      // for `responseIdA` (the race window), and only returns the
+      // row after the pending `store.store()` for `responseIdA`
+      // resolves. Request B must NOT see a 404 — it must cold-
+      // replay through the landed chain entry and emit a clean
+      // `response.completed`.
+      let releasePersistA: (() => void) | undefined;
+      const persistAGate = new Promise<void>((r) => {
+        releasePersistA = r;
+      });
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation(async (record: any) => {
+          if (storedRecords.size === 0) {
+            await persistAGate;
+          }
+          storedRecords.set(record.id, record);
+        }),
+        // Native contract: throw on miss, never return `[]`.
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          if (out.length === 0) {
+            return Promise.reject(new Error(`Response not found: ${id}`));
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'first reply' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'second reply' }));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('native-persist-model', mockModel);
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const reqA = createMockReq('POST', '/v1/responses', {
+        model: 'native-persist-model',
+        input: 'hello A',
+        stream: false,
+      });
+      const { res: resA, getBody: bodyA, waitForEnd: waitA } = createMockRes();
+      const inflightA = handler(reqA, resA);
+      await waitA();
+      const responseA = JSON.parse(bodyA());
+      expect(responseA.status).toBe('completed');
+      const responseIdA: string = responseA.id;
+
+      // Spin the event loop until A's `initiatePersist` reached
+      // the pending-write tracker registration site. This is the
+      // state under which B must observe a pending write instead
+      // of an immediate native-throw 404.
+      while (mockStore.store.mock.calls.length === 0) {
+        await new Promise((r) => setImmediate(r));
+      }
+      expect(storedRecords.has(responseIdA)).toBe(false);
+
+      // Drop the hot session so the cold-replay path (chain lookup)
+      // is the one that hits the native throw contract.
+      registry.getSessionRegistry('native-persist-model')!.drop(responseIdA);
+
+      const reqB = createMockReq('POST', '/v1/responses', {
+        model: 'native-persist-model',
+        input: 'hello B',
+        previous_response_id: responseIdA,
+        stream: false,
+      });
+      const { res: resB, getBody: bodyB, waitForEnd: waitB } = createMockRes();
+      const inflightB = handler(reqB, resB);
+
+      // Yield so B's `getChain` runs and throws "Response not
+      // found", drops into the retry path, and blocks on the
+      // pending-write promise for A.
+      await new Promise((r) => setImmediate(r));
+
+      // Release A's persist so the tracked promise resolves.
+      // B's retry `getChain` then succeeds.
+      releasePersistA?.();
+
+      await Promise.all([inflightA, inflightB]);
+      await waitB();
+
+      const responseB = JSON.parse(bodyB());
+      // Critical assertion: NOT 404. The regression shape (first
+      // `getChain` throw escaping directly into the outer catch)
+      // would show up here as an error envelope with
+      // `type: 'not_found_error'`.
+      expect(responseB.status).toBe('completed');
+      expect(responseB.id).not.toBe(responseIdA);
+      expect(mockStore.store).toHaveBeenCalledTimes(2);
+      expect(storedRecords.has(responseIdA)).toBe(true);
+
+      // `getChain(responseIdA)` must have been called at least
+      // twice on B's behalf: once before `awaitPending` (the
+      // throw), and once after. If the retry had not fired, only
+      // one call would be recorded.
+      const getChainCallIdsForA = (mockStore.getChain.mock.calls as Array<[string]>).filter(
+        ([id]) => id === responseIdA,
+      ).length;
+      expect(getChainCallIdsForA).toBeGreaterThanOrEqual(2);
+    });
+
+    it('iter-37 finding 2: adopt gate rejects streaming turns whose post-final teardown threw (failureMode === "error")', async () => {
+      // Iter-36 finding 2 closed the `client_abort` hole but the
+      // `committed && safeToSuppress && failureMode !== 'client_abort'`
+      // gate still adopted sessions when `failureMode === 'error'`
+      // — the path triggered when the stream adapter's `finally`
+      // (or any post-final teardown) throws AFTER the decode loop
+      // has committed. In that scenario `terminalToPersist` is
+      // null, the client saw `response.failed`, and the
+      // responseId is unreachable from the client's perspective;
+      // adopting the session under it would evict the single
+      // warm hot slot for no useful reason.
+      //
+      // Iter-37 fix: the adopt gate now requires
+      // `failureMode === null` outright. Any non-null failure
+      // mode (`client_abort`, `error`, `finish_reason_error`,
+      // `stream_exhausted`) blocks adoption.
+      //
+      // Shape: emit a successful `done: true` chunk so the
+      // ChatSession wrapper's finally runs and flips
+      // `turnCount++` (committing the turn), then throw from the
+      // generator's own finally. That throw propagates up through
+      // the for-await as `thrownError`, so the streaming handler
+      // returns `failureMode: 'error'` — the exact path the new
+      // gate must veto.
+      async function* commitThenTeardownThrow() {
+        try {
+          yield {
+            done: true,
+            text: 'committed before teardown throw',
+            finishReason: 'stop',
+            toolCalls: [] as ToolCallResult[],
+            thinking: null,
+            numTokens: 3,
+            promptTokens: 5,
+            reasoningTokens: 0,
+            rawText: 'committed before teardown throw',
+          };
+        } finally {
+          // The intentional point of this test: simulate a
+          // post-final teardown failure in the stream adapter's
+          // `finally`. `no-unsafe-finally` normally flags this
+          // because it overrides non-throw completions, but that
+          // is exactly the control-flow pattern we need to
+          // reproduce `failureMode === 'error'`.
+          // oxlint-disable-next-line no-unsafe-finally
+          // eslint-disable-next-line no-unsafe-finally
+          throw new Error('post-final teardown failure');
+        }
+      }
+
+      const chatStreamSessionStart = vi.fn(() => commitThenTeardownThrow());
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('streaming should not use chatSessionStart')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('streaming should not use chatSessionContinue')),
+        chatSessionContinueTool: vi
+          .fn()
+          .mockRejectedValue(new Error('streaming should not use chatSessionContinueTool')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('teardown-throw-model', mockModel);
+      const mockStore = {
+        store: vi.fn().mockResolvedValue(undefined),
+        getChain: vi.fn().mockResolvedValue([]),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Spy on the live SessionRegistry's `adopt` method so we
+      // can positively assert that the adopt gate vetoed the
+      // commit. The single-warm invariant clears the map on
+      // every `getOrCreate(null)` at the top of the handler, so
+      // `sessionReg.size === 0` alone is ambiguous: it would
+      // read 0 even under the buggy code in some races (the
+      // next `getOrCreate` would clear the entry adopt had
+      // inserted). Spying on `adopt` directly is unambiguous —
+      // the bug would show up as exactly one call with the
+      // responseId of the aborted-after-commit turn.
+      const sessionReg = registry.getSessionRegistry('teardown-throw-model')!;
+      const adoptSpy = vi.spyOn(sessionReg, 'adopt');
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'teardown-throw-model',
+        input: 'trigger teardown throw after commit',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      // The wire observed `response.failed` (failureMode='error'
+      // path). Confirm the terminal artefact shape so we know we
+      // actually took the failure epilogue — otherwise the adopt
+      // assertion below would be vacuous.
+      const body = getBody();
+      expect(body).toContain('event: response.failed');
+      expect(body).not.toContain('event: response.completed');
+
+      // Primary assertion: adopt was never called. Under the
+      // buggy iter-36 gate
+      // (`failureMode !== 'client_abort'`), a committed-but-
+      // error turn still passed through `sessionReg.adopt(
+      // responseId, session, instructions)` even though the
+      // responseId is unreachable from the client. The iter-37
+      // fix ANDs the gate with `failureMode === null`, so any
+      // non-null failure mode — including `'error'` — blocks
+      // adoption.
+      expect(adoptSpy).not.toHaveBeenCalled();
+
+      // Secondary assertion: the hot slot is empty (no session
+      // leaked into the cache under an unreachable responseId).
+      expect(sessionReg.size).toBe(0);
+    });
+
     it('normalises nested message items to incomplete when a streaming turn fails mid-decode', async () => {
       // Iter-28 finding 3 regression: the iter-27 writer built
       // the failed terminal via `{ ...terminal, status: 'failed' }`,

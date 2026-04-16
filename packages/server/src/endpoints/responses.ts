@@ -1763,32 +1763,58 @@ export async function handleCreateResponse(
 
     if (body.previous_response_id && store) {
       try {
-        let chain = await store.getChain(body.previous_response_id);
+        // Iter-36 finding 1 / iter-37 finding 1: iter-35 moved the
+        // `store.store(...)` write OUT of `withExclusive` so a slow
+        // SQLite flush would not pin the per-model mutex on the next
+        // waiter. That opened a 404 window: a client that received
+        // `response.completed` with `responseId = A` and
+        // immediately fires a follow-up request carrying
+        // `previous_response_id: A` can reach this `getChain`
+        // BEFORE the off-lock write for A has landed in SQLite —
+        // the chain is missing and we would spuriously 404 on a
+        // response id the client was just handed.
+        //
+        // The production `ResponseStore` is the native mlx-db
+        // implementation; its `get_chain` THROWS `"Response not
+        // found: <id>"` on a miss rather than returning `[]` (see
+        // `crates/mlx-db/src/response_store/reader.rs`). The
+        // in-memory mock used by tests returns `[]`. Handle BOTH
+        // shapes: a thrown "not found" AND an empty array both
+        // drop through the pending-writes retry path.
+        //
+        // `initiatePersist` registers every in-flight write in a
+        // per-store pending-write tracker synchronously, BEFORE
+        // the producing request's mutex releases. If the tracker
+        // reports a pending write for the requested id, await it
+        // and retry `getChain`. The retry is guaranteed to see
+        // the row because the tracked promise only resolves after
+        // the store's own serialization queue has accepted the
+        // insert. Swallow any rejection from the tracked promise —
+        // the producer's own awaiter already surfaces write
+        // failures to the log, and a failed write correctly
+        // leaves the store empty so the second `getChain` still
+        // throws / returns `[]` and we fall through to the
+        // original 404.
+        let chain: StoredResponseRecord[];
+        let firstAttemptError: unknown = null;
+        try {
+          chain = await store.getChain(body.previous_response_id);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          // Case-insensitive substring match is intentionally
+          // lenient: we only want to route "the row is not
+          // present" throws into the retry path. A genuine
+          // infrastructure error (connection refused, SQL parse
+          // error, etc.) should still bubble out to the outer
+          // catch as an internal error.
+          if (!/not found/i.test(msg)) {
+            throw err;
+          }
+          firstAttemptError = err;
+          chain = [];
+        }
+
         if (chain.length === 0) {
-          // Iter-36 finding 1: iter-35 moved the `store.store(...)`
-          // write OUT of `withExclusive` so a slow SQLite flush
-          // would not pin the per-model mutex on the next waiter.
-          // That opened a 404 window: a client that received
-          // `response.completed` with `responseId = A` and
-          // immediately fires a follow-up request carrying
-          // `previous_response_id: A` can reach this `getChain`
-          // BEFORE the off-lock write for A has landed in SQLite —
-          // the chain comes back empty and we would spuriously 404
-          // on a response id the client was just handed.
-          //
-          // `initiatePersist` registers every in-flight write in a
-          // per-store pending-write tracker synchronously, BEFORE
-          // the producing request's mutex releases. If the
-          // tracker reports a pending write for the requested id,
-          // await it and retry `getChain`. The retry is guaranteed
-          // to see the row because the tracked promise only
-          // resolves after the store's own serialization queue
-          // has accepted the insert. Swallow any rejection from
-          // the tracked promise — the producer's own awaiter
-          // already surfaces write failures to the log, and a
-          // failed write correctly leaves the store empty so the
-          // second `getChain` still returns `[]` and we fall
-          // through to the original 404.
           const pending = getPendingWritesFor(store).awaitPending(body.previous_response_id);
           if (pending !== undefined) {
             try {
@@ -1798,7 +1824,26 @@ export async function handleCreateResponse(
               // with the retry so the 404 epilogue matches the
               // true store state.
             }
-            chain = await store.getChain(body.previous_response_id);
+            try {
+              chain = await store.getChain(body.previous_response_id);
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              if (!/not found/i.test(msg)) {
+                throw err;
+              }
+              // Retry also missed the row — this is a genuine
+              // 404. Fall through to the empty-chain handler
+              // below.
+              chain = [];
+            }
+          } else if (firstAttemptError !== null) {
+            // First call threw "not found", no pending write is
+            // tracked for this id, and the mock-compatible empty
+            // branch does not apply because the native store
+            // would not return `[]` alongside a throw. Rethrow
+            // the original error so the outer catch turns it
+            // into the proper 404 response.
+            throw firstAttemptError;
           }
           if (chain.length === 0) {
             sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
@@ -2644,33 +2689,40 @@ export async function handleCreateResponse(
         // the session under it creates a permanently dangling warm
         // session.
         //
-        // Iter-36 finding 2: additionally refuse to adopt when
-        // streaming took the `client_abort` failure epilogue even
-        // if the session committed and `response.failed` landed
-        // cleanly. That scenario looks like this:
+        // Iter-36 finding 2 / iter-37 finding 2: refuse to adopt
+        // whenever the streaming handler took ANY failure
+        // epilogue, not just `client_abort`. The streaming
+        // handler writes `failureMode` for every path that does
+        // not produce a clean `response.completed`:
         //
-        //   1. decode loop emits its final chunk → native session
-        //      advances `turns` → `committed = true`
-        //   2. the client drops the connection BEFORE the post-
-        //      loop success branch runs; `res.once('close')` flips
-        //      `clientAborted`
-        //   3. handler routes to the failure epilogue, flushes
-        //      `response.failed` cleanly (kernel ack), sets
-        //      `visibility.terminalEmitted = true`
-        //   4. under the old gate `committed && safeToSuppress`
-        //      the outer handler would adopt the session under a
-        //      response id the client has explicitly abandoned —
-        //      evicting the last good hot session for this model
-        //      under the single-warm invariant.
+        //   * `'client_abort'`  — client dropped the socket after
+        //     the decode loop committed but before the success
+        //     terminal was flushed; `response.failed` goes on the
+        //     wire under a responseId the client has abandoned.
         //
-        // `failureMode === 'client_abort'` is the direct signal
-        // for "the handler decided this response will not be
-        // advertised to the client" even if the session-turn
-        // counter advanced. Skipping adopt here preserves the
-        // prior hot session (the single-warm invariant keeps
-        // exactly one entry and the new aborted session never
-        // replaces it).
-        if (committed && (handlerError == null || safeToSuppress) && streamFailureMode !== 'client_abort') {
+        //   * `'error'`         — post-final teardown threw in
+        //     the stream adapter's `finally` after the decode
+        //     loop had already committed; `terminalToPersist` is
+        //     null and the client saw `response.failed`, so the
+        //     responseId is not a chainable artefact from the
+        //     client's perspective.
+        //
+        //   * `'finish_reason_error'` / `'stream_exhausted'` —
+        //     terminal derived from a non-clean end of stream.
+        //     Same reasoning: `response.failed` on the wire, no
+        //     chainable success terminal.
+        //
+        // In every non-null `failureMode` case the session
+        // committed at the native level but the observable wire
+        // state is a failure, so adopting the session under the
+        // responseId would evict the last good hot session for
+        // this model under the single-warm invariant even
+        // though the adopted slot is unreachable.
+        //
+        // `failureMode === null` is the sole signal that the
+        // stream path completed cleanly and the adopted session
+        // is genuinely reachable via the responseId.
+        if (committed && (handlerError == null || safeToSuppress) && streamFailureMode === null) {
           sessionReg.adopt(responseId, session, requestedInstructions);
         }
 
