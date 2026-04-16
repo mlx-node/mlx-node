@@ -5105,6 +5105,57 @@ describe('createHandler', () => {
       expect(sessionReg!.size).toBe(1);
     });
 
+    it('committed non-streaming handler crash before response write does not adopt under unseen id', async () => {
+      // When the model commits a turn but the handler throws before
+      // writing any response bytes (res.headersSent is false), the
+      // session must NOT be adopted under the responseId the client
+      // never saw. The client should receive a 500 error.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
+      registry.register('test-model', mockModel);
+
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'trigger a committed turn with handler crash',
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      // Make res.writeHead throw on the first call (inside
+      // handleNonStreaming, before any response bytes are on the
+      // wire), but succeed on subsequent calls (inside
+      // sendInternalError from the outer catch).
+      let writeHeadCallCount = 0;
+      const originalWriteHead = res.writeHead.bind(res);
+      res.writeHead = ((...args: Parameters<ServerResponse['writeHead']>) => {
+        writeHeadCallCount++;
+        if (writeHeadCallCount === 1) {
+          throw new Error('simulated writeHead crash');
+        }
+        return originalWriteHead(...args);
+      }) as ServerResponse['writeHead'];
+
+      await handler(req, res);
+      await waitForEnd();
+
+      // The model was called and committed.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(mockModel.chatSessionStart).toHaveBeenCalledTimes(1);
+
+      // The client must receive a 500 error (not a hung/empty request).
+      expect(getStatus()).toBe(500);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error).toBeDefined();
+      expect(parsed.error.type).toBe('server_error');
+
+      // The session registry must NOT have adopted the session
+      // under the unseen responseId.
+      const sessionReg = registry.getSessionRegistry('test-model');
+      expect(sessionReg).toBeDefined();
+      expect(sessionReg!.size).toBe(0);
+    });
+
     it('streaming post-commit store failure still emits response.completed', async () => {
       // Same scenario as the non-streaming variant but with
       // `stream: true`. The SSE stream must contain a

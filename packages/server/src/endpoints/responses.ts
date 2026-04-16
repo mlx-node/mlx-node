@@ -2194,14 +2194,13 @@ export async function handleCreateResponse(
         // re-inherit from.
         // Wrap the handler call in its own try/catch so that a
         // post-commit persistence failure does not prevent adopt.
-        // Iter-29 finding 3: if the handler commits the session
-        // internally and then `store.store()` throws, the outer
-        // catch would fire without ever calling `sessionReg.adopt`,
-        // stranding the committed session — neither cached nor
-        // persisted. By catching handler errors separately and
-        // always running adopt/drop based on the commit state, the
-        // session stays reachable in the registry for hot-resume
-        // even when persistence is transiently broken.
+        // Post-commit store failures are caught inside the handlers
+        // themselves (handleNonStreaming / handleStreamingNative) and
+        // demoted to log-only. A handlerError at this level therefore
+        // comes from non-persistence failures (response construction,
+        // SSE write, res.writeHead/end crash). Adopt/rethrow logic
+        // below uses res.headersSent to distinguish "response already
+        // on the wire" from "client never saw the responseId".
         let handlerError: Error | null = null;
 
         if (mappedBody.stream) {
@@ -2243,29 +2242,31 @@ export async function handleCreateResponse(
           committed = outcome.committed;
         }
 
-        // Always adopt/drop based on commit state, even if the
-        // handler threw during post-commit persistence. A post-
-        // commit store failure is survivable: the session stays
-        // reachable in the registry for hot-resume while the
-        // binding lives. The worst case: a transient store failure
-        // means the turn is not cold-replayable from disk, but it
-        // IS resumable from memory while the binding lives.
         if (previousResponseId) {
           sessionReg.drop(previousResponseId);
         }
-        if (committed) {
+        // Only adopt if the turn committed AND either the handler
+        // succeeded or the response is already on the wire. A
+        // committed turn where the handler threw before writing
+        // any response bytes must NOT be adopted — the client
+        // never saw the responseId, so caching the session under
+        // that id creates an unreachable committed turn.
+        if (committed && (handlerError == null || res.headersSent)) {
           sessionReg.adopt(responseId, session, requestedInstructions);
         }
 
-        // Only rethrow handler errors from uncommitted turns.
-        // Post-commit persistence failures are now caught inside the
-        // handlers (handleNonStreaming / handleStreamingNative) and
-        // demoted to log-only, so handlerError on a committed turn
-        // would be a genuine handler crash where the response is
-        // already on the wire — rethrowing would send a duplicate
-        // error. Guard on both committed and headersSent.
-        if (handlerError && !committed) {
+        // Rethrow handler errors when the client hasn't received
+        // a response yet, regardless of commit state. The outer
+        // catch will send a proper 500.
+        if (handlerError && !res.headersSent) {
           throw handlerError;
+        }
+        // If headersSent but handlerError: the response is partially
+        // or fully on the wire. Rethrowing would produce a malformed
+        // double-response. Log and move on — the client already has
+        // what they need.
+        if (handlerError) {
+          console.error('[responses] handler error after response headers already sent:', handlerError);
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error during inference';
