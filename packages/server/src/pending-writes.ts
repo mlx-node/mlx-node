@@ -51,7 +51,7 @@
  * `getChain()`, because the tracker promise's rejection is already
  * surfaced through the registering handler's separate awaiter.
  *
- * ## Hard-timeout marker state (iter-50 / iter-51)
+ * ## Hard-timeout marker state (iter-50 / iter-51 / iter-52)
  *
  * Iter-49 added a `PendingResponseWrites.evict(id)` primitive so the
  * hard-timeout breaker in `responses.ts` could drop a wedged persist's
@@ -82,22 +82,60 @@
  * continuations returned retryable 503 for those ids forever (a
  * steady memory leak and an incorrect eventual classification).
  *
- * The fix is an independent TTL with lazy expiry. Markers are now
- * stored as `Map<string, { expiresAt }>`. `markHardTimedOut(id,
+ * Iter-51 introduced an independent TTL with lazy expiry. Markers are
+ * stored as `Map<string, { expiresAt, ttlMs }>`. `markHardTimedOut(id,
  * ttlMs)` computes `expiresAt = Date.now() + ttlMs` at call time;
  * `isHardTimedOut(id)` treats any entry whose `expiresAt <=
- * Date.now()` as absent and deletes it on the way out. Steady-state
- * marker memory is bounded at O(requestRate × TTL) regardless of how
- * long the store stays wedged. Caller (`responses.ts`) reads the TTL
- * from `MLX_HARD_TIMEOUT_MARKER_TTL_MS` (default 300_000ms) and passes
- * it in explicitly so this module stays env-free.
+ * Date.now()` as absent and deletes it on the way out. The caller
+ * (`responses.ts`) reads the TTL from `MLX_HARD_TIMEOUT_MARKER_TTL_MS`
+ * (default 300_000ms) and passes it in explicitly so this module
+ * stays env-free.
  *
- * The underlying-promise `.finally(...)` path is preserved: if a
- * wedged write does eventually settle the marker is cleared
- * immediately (fast path), otherwise the TTL closes the retryable
- * window after a bounded wall-clock interval (slow path). Marker
- * lifetime is therefore bounded by min(write settlement, TTL expiry),
- * which is finite in every scenario.
+ * Iter-52 (codex's iter-51 two HIGH findings):
+ *
+ *   * Finding 1 — expired markers only drained on continuation reads.
+ *     An id that was hard-timed-out and then never retried by the
+ *     client still occupied one entry until something eventually
+ *     called `isHardTimedOut(id)` or `hardTimedOutSize`. Under a
+ *     wedged backend serving new top-level requests (no continuations
+ *     at all) this leaked one marker per hard-timed-out write
+ *     indefinitely. Fix: `markHardTimedOut()` now opportunistically
+ *     sweeps every expired entry on the map BEFORE inserting the new
+ *     one, via `sweepExpired()`. Steady-state memory is now bounded
+ *     even when no continuation traffic ever arrives.
+ *
+ *   * Finding 2 — the fixed TTL turned unresolved writes into
+ *     permanent 404s. Once the 300s TTL elapsed, the retryable-503
+ *     classification flipped to 404 even though the underlying
+ *     `store.store(...)` was still running and might still land.
+ *     A backend stall longer than the default TTL became an
+ *     irreversible chain break. Fix: `isHardTimedOut(id)` now
+ *     REFRESHES `entry.expiresAt = Date.now() + entry.ttlMs` on every
+ *     live hit. As long as the client keeps retrying the
+ *     continuation, the retryable window slides forward and the
+ *     chain remains recoverable if the write eventually lands.
+ *     Only genuinely abandoned markers (no continuation traffic AND
+ *     no eventual settlement) age out. Each entry stores its
+ *     original `ttlMs` so the refresh knows the interval.
+ *
+ * Cleanup paths in effect after iter-52:
+ *
+ *   1. Fast path — the underlying write promise's `.finally(...)`
+ *      inside `track()` deletes the marker as soon as the wedged
+ *      store unwedges.
+ *   2. Read-refresh path — live continuations slide the TTL
+ *      forward so the retryable-503 window stays open while the
+ *      client is actively retrying.
+ *   3. Read-expire path — a full TTL elapse without any refresh
+ *      lazily deletes the entry and returns `false` (permanent
+ *      404 classification).
+ *   4. Write-sweep path — `markHardTimedOut()` drains expired
+ *      entries on insert, so memory is bounded even without
+ *      read traffic.
+ *
+ * Marker lifetime is therefore bounded by:
+ *
+ *   min(write settlement, last continuation + TTL, next write-sweep after expiry)
  *
  * ## Scope
  *
@@ -122,18 +160,30 @@ export class PendingResponseWrites {
   /**
    * Ids that crossed the hard-timeout breaker in responses.ts while
    * their `store.store(...)` promise was still unresolved (iter-50,
-   * TTL-bounded in iter-51).
+   * TTL-bounded in iter-51, sweep-on-write + refresh-on-read in
+   * iter-52).
    *
-   * Each entry records `{ expiresAt }` in epoch-ms. Two cleanup paths:
+   * Each entry records `{ expiresAt, ttlMs }` in epoch-ms. Four
+   * cleanup/refresh paths:
    *
    *   1. Fast path — the underlying write promise's `.finally(...)`
    *      inside `track()` deletes the entry as soon as the wedged
    *      store unwedges. Observable latency: as fast as the write
    *      itself settles.
-   *   2. Slow path — `isHardTimedOut(id)` lazily deletes any entry
-   *      whose `expiresAt` has passed. No timers, no orphan state.
-   *      Bounds steady-state memory under a permanently wedged store
-   *      at O(requestRate × TTL).
+   *   2. Read-refresh path (iter-52) — `isHardTimedOut(id)` pushes
+   *      `expiresAt` forward by the original `ttlMs` on every live
+   *      hit. Continuations that keep retrying keep the
+   *      retryable-503 window open; only abandoned markers age
+   *      out. This addresses iter-51 finding 2 (permanent 404 for
+   *      slow-but-eventual persists crossing the fixed TTL).
+   *   3. Read-expire path — `isHardTimedOut(id)` lazily deletes any
+   *      entry whose `expiresAt` has already passed at call time
+   *      (no refresh on a dead entry). Returns false.
+   *   4. Write-sweep path (iter-52) — `markHardTimedOut()` calls
+   *      `sweepExpired()` BEFORE inserting a new marker, so even a
+   *      workload with zero continuation reads bounds memory on
+   *      every new hard-timeout event. This addresses iter-51
+   *      finding 1 (leak when no retries ever arrive).
    *
    * Invariant: a marker is only meaningful for the SPECIFIC write
    * that was live when `markHardTimedOut` was called. If a later
@@ -146,7 +196,7 @@ export class PendingResponseWrites {
    * persist — in practice the responses endpoint scopes response ids
    * to a single persist each, so this collision cannot arise.
    */
-  private readonly hardTimedOut: Map<string, { expiresAt: number }> = new Map();
+  private readonly hardTimedOut: Map<string, { expiresAt: number; ttlMs: number }> = new Map();
 
   /**
    * Register an in-flight write under `id`. The caller must pass the
@@ -246,6 +296,15 @@ export class PendingResponseWrites {
    * `MLX_HARD_TIMEOUT_MARKER_TTL_MS` env var; passing it in here
    * keeps this module env-free.
    *
+   * Iter-52: this method also calls `sweepExpired()` BEFORE the
+   * insert so memory reclamation does not depend on a later
+   * continuation read. Under a wedged store serving new top-level
+   * traffic (without any retries of old response ids), every new
+   * hard-timeout event drains the expired tail of the map. The
+   * per-entry `ttlMs` field is persisted alongside `expiresAt` so
+   * `isHardTimedOut()` can refresh the window without the caller
+   * re-threading the interval.
+   *
    * Returns true if the id was an active pending entry (and has
    * been moved into the hard-timed-out marker), false if no pending
    * entry existed at call time. A false return does NOT add the id
@@ -256,11 +315,33 @@ export class PendingResponseWrites {
    * signal.
    */
   markHardTimedOut(id: string, ttlMs: number): boolean {
+    // Iter-52 finding 1 fix: drain expired entries on the write path
+    // so bounded memory does not depend on any continuation ever
+    // reading this map. Runs BEFORE the insert so the new entry is
+    // not considered for expiry (its `expiresAt` is in the future by
+    // construction).
+    this.sweepExpired();
     const wasPending = this.pending.delete(id);
     if (wasPending) {
-      this.hardTimedOut.set(id, { expiresAt: Date.now() + ttlMs });
+      this.hardTimedOut.set(id, { expiresAt: Date.now() + ttlMs, ttlMs });
     }
     return wasPending;
+  }
+
+  /**
+   * Drain every marker whose `expiresAt` is at or before `Date.now()`.
+   * Private helper used by `markHardTimedOut()` (iter-52 finding 1
+   * fix: opportunistic sweep on the write path so memory is bounded
+   * without continuation traffic) and by `hardTimedOutSize` (keeps
+   * the reported count consistent with the next read-path sweep).
+   */
+  private sweepExpired(): void {
+    const now = Date.now();
+    for (const [id, entry] of this.hardTimedOut) {
+      if (entry.expiresAt <= now) {
+        this.hardTimedOut.delete(id);
+      }
+    }
   }
 
   /**
@@ -269,17 +350,36 @@ export class PendingResponseWrites {
    * chain as retryable 503 `storage_timeout` vs. permanent 404.
    *
    * Iter-51: lazily expires the marker on read. If an entry's
-   * `expiresAt` has passed, it is deleted and the method returns
-   * false. This is the slow cleanup path — it bounds steady-state
-   * marker memory even if the underlying write promise never settles.
+   * `expiresAt` has already passed, it is deleted and the method
+   * returns false. This is the read-expire cleanup path — it bounds
+   * steady-state marker memory even if the underlying write promise
+   * never settles (paired with the write-sweep path in iter-52).
+   *
+   * Iter-52 finding 2 fix: on a live hit (entry present AND
+   * `expiresAt > Date.now()`) this method REFRESHES the expiry by
+   * pushing `expiresAt = Date.now() + entry.ttlMs` before returning
+   * true. Semantic: as long as the client keeps retrying the
+   * continuation, the retryable-503 window slides forward and the
+   * chain stays recoverable if the underlying write eventually
+   * lands. Only genuinely abandoned markers (no read traffic in a
+   * full TTL window AND no eventual settlement) age out. Without
+   * this refresh a slow-but-eventual persist that crossed the fixed
+   * 300s default TTL would flip to a permanent 404 even though the
+   * write was still running — an irreversible chain break.
    */
   isHardTimedOut(id: string): boolean {
     const entry = this.hardTimedOut.get(id);
     if (entry === undefined) return false;
-    if (entry.expiresAt <= Date.now()) {
+    const now = Date.now();
+    if (entry.expiresAt <= now) {
       this.hardTimedOut.delete(id);
       return false;
     }
+    // Iter-52 finding 2 fix: refresh the expiry on every live hit so
+    // active continuations slide the retryable window forward. The
+    // original `ttlMs` was persisted on the entry at insertion time
+    // so we don't need the caller to re-thread it here.
+    entry.expiresAt = now + entry.ttlMs;
     return true;
   }
 
@@ -301,14 +401,12 @@ export class PendingResponseWrites {
    * a wedged store + TTL bound" regression: the test asserts that
    * after the TTL window elapses, the tracker reports zero markers
    * even though no underlying write has settled.
+   *
+   * Iter-52: delegates to the shared `sweepExpired()` helper so
+   * read-count and write-sweep stay in lockstep.
    */
   get hardTimedOutSize(): number {
-    const now = Date.now();
-    for (const [id, entry] of this.hardTimedOut) {
-      if (entry.expiresAt <= now) {
-        this.hardTimedOut.delete(id);
-      }
-    }
+    this.sweepExpired();
     return this.hardTimedOut.size;
   }
 }

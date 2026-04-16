@@ -4656,6 +4656,115 @@ describe('createHandler', () => {
       expect(idAfterSpuriousRelease).not.toBe(idBefore);
     }, 5000);
 
+    it('iter-52: markHardTimedOut sweeps expired markers on the write path (no continuation-read required)', async () => {
+      // Codex's iter-51 review HIGH finding 1: expired markers were
+      // only reclaimed when something later called `isHardTimedOut(id)`
+      // or `hardTimedOutSize`. For a wedged backend serving new
+      // top-level traffic (zero continuation retries), the map grew
+      // one entry per hard-timed-out response forever because no
+      // reader ever drained the tail.
+      //
+      // Iter-52 fix: `markHardTimedOut()` calls `sweepExpired()`
+      // BEFORE its insert so every new hard-timeout event drains
+      // the expired entries left by previous events. This is the
+      // write-path cleanup that complements iter-51's read-path
+      // expiry. Memory is bounded even when zero continuations
+      // arrive.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+
+      vi.useFakeTimers();
+      try {
+        // Stage two wedged writes A and B. Mark both hard-timed-out
+        // with a short TTL.
+        tracker.track('A', new Promise<void>(() => {}));
+        tracker.track('B', new Promise<void>(() => {}));
+        tracker.markHardTimedOut('A', 100);
+        tracker.markHardTimedOut('B', 100);
+        // Pre-expiry: both markers are live.
+        expect(tracker.isHardTimedOut('A')).toBe(true);
+        expect(tracker.isHardTimedOut('B')).toBe(true);
+
+        // Advance time past the TTL. Both markers have expired but
+        // neither has been explicitly read — in iter-51 this was
+        // the leak: without a read, the entries sat in the map
+        // forever.
+        vi.advanceTimersByTime(10_000);
+
+        // Now stage C and mark it hard-timed-out. Iter-52's
+        // `sweepExpired()` on the write path should drain A and B
+        // during this call, so the final `hardTimedOutSize` is 1
+        // (only C remains).
+        tracker.track('C', new Promise<void>(() => {}));
+        tracker.markHardTimedOut('C', 100);
+
+        // The iter-52 invariant: write-path sweep drained the
+        // expired tail, so memory is bounded even though no
+        // continuation has ever retried A or B.
+        expect(tracker.hardTimedOutSize).toBe(1);
+        expect(tracker.isHardTimedOut('A')).toBe(false);
+        expect(tracker.isHardTimedOut('B')).toBe(false);
+        expect(tracker.isHardTimedOut('C')).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('iter-52: isHardTimedOut refreshes TTL on live hits so active continuations keep the retryable window open', async () => {
+      // Codex's iter-51 review HIGH finding 2: the fixed TTL turned
+      // unresolved writes into permanent 404s. Once the default
+      // 300s TTL elapsed, the retryable-503 classification flipped
+      // to 404 even though the underlying `store.store(...)` was
+      // still running and might still land — an irreversible chain
+      // break caused by pure marker GC timing.
+      //
+      // Iter-52 fix: `isHardTimedOut(id)` REFRESHES `expiresAt =
+      // now + ttlMs` on every live hit. Active continuations slide
+      // the retryable window forward; only genuinely abandoned
+      // markers age out.
+      //
+      // This focused unit test pins the refresh semantics:
+      //   - t=80ms: read while live → returns true AND refreshes
+      //     `expiresAt` to 180 (80 + 100).
+      //   - t=150ms: read — would have expired at 100 with no
+      //     refresh, but the t=80 refresh pushed expiry to 180.
+      //     Returns true AND refreshes to 250.
+      //   - t=280ms: read — previous refresh expired at 250.
+      //     Returns false and lazily deletes the entry.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+
+      vi.useFakeTimers();
+      try {
+        tracker.track('X', new Promise<void>(() => {}));
+        tracker.markHardTimedOut('X', 100);
+        // t=0: live, no refresh needed.
+        expect(tracker.isHardTimedOut('X')).toBe(true);
+
+        // t=80: still live. The refresh pushes expiresAt to 180
+        // (now + ttlMs = 80 + 100). Without iter-52 the next
+        // read at t=150 would already be past the t=100 expiry.
+        vi.advanceTimersByTime(80);
+        expect(tracker.isHardTimedOut('X')).toBe(true);
+
+        // t=150: beyond the ORIGINAL t=100 expiry but inside the
+        // t=180 refreshed expiry. Iter-52 refresh makes this still
+        // return true (and refreshes again to t=250).
+        vi.advanceTimersByTime(70);
+        expect(tracker.isHardTimedOut('X')).toBe(true);
+
+        // t=280: beyond the last refresh (t=250). The marker is
+        // now genuinely stale — no read has touched it in a full
+        // TTL window — so `isHardTimedOut` returns false and
+        // deletes the entry lazily.
+        vi.advanceTimersByTime(130);
+        expect(tracker.isHardTimedOut('X')).toBe(false);
+        expect(tracker.hardTimedOutSize).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('iter-51: markHardTimedOut marker expires after TTL and is cleared on settlement', async () => {
       // Iter-49's first primitive was `evict(id)` — remove the
       // pending entry without waiting for settlement so a wedged
@@ -5344,6 +5453,241 @@ describe('createHandler', () => {
           delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         } else {
           process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
+        }
+      }
+    }, 10000);
+
+    it('iter-52: slow-but-eventual persist across the marker TTL keeps 503 via refresh-on-read, then succeeds once it lands', async () => {
+      // Codex's iter-51 review HIGH finding 2: with a fixed TTL,
+      // once enough wall-clock elapsed the marker flipped to
+      // `false` and the same request path returned permanent 404
+      // even though the underlying `store.store(...)` was still
+      // running. A backend stall longer than the default 300s TTL
+      // therefore became an irreversible chain break — purely a
+      // marker-GC timing artefact, not a real error.
+      //
+      // Iter-52 fix: `isHardTimedOut(id)` refreshes `expiresAt` on
+      // every live hit. As long as continuations keep arriving,
+      // the retryable-503 window slides forward indefinitely. When
+      // the write eventually settles, `.finally(...)` inside
+      // `track()` clears the marker AND (in this end-to-end shape)
+      // the row is now queryable via `getChain`, so the next
+      // continuation proceeds along the happy path.
+      //
+      // Shape (condensed into wall-clock units we can actually
+      // exercise — TTL=200ms, hard-timeout=50ms, so the total
+      // test runs well under two seconds):
+      //   t≈50ms:  hard-timeout breaker fires, marker set, TTL=200
+      //   t≈150ms: continuation #1 arrives — original expiry
+      //            would be 50+200=250, still well within. Refresh
+      //            pushes to 150+200=350. Returns 503.
+      //   t≈300ms: continuation #2 arrives — past the ORIGINAL
+      //            250ms expiry. Refresh from the t=150 read
+      //            extended it to 350 — still live. Refreshes to
+      //            500. Returns 503.
+      //   t≈450ms: continuation #3 arrives — well past the
+      //            original 250ms expiry. The chain of refreshes
+      //            keeps the window open. Returns 503.
+      //   t≈600ms: resolve `store.store(...)` — `.finally(...)`
+      //            clears the marker AND synchronously-populated
+      //            `storedRecords[A]` means `getChain(A)` now
+      //            returns a real record.
+      //   t≈650ms: continuation #4 arrives — marker is gone but
+      //            the chain lookup now succeeds. Returns 200
+      //            completed.
+      //
+      // Under iter-51 (no refresh): the marker would have EXPIRED
+      // at t=250ms exactly, so continuation #2 at t=300 would have
+      // flipped to 404 and the chain would be permanently broken.
+      const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+      const originalTtl = process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS;
+      process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
+      process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = '200';
+      try {
+        const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
+
+        // `storedRecords` is only populated AFTER the pending
+        // promise resolves — simulating a wedged SQLite writer
+        // whose commit does not become queryable until the write
+        // observably settles. Pre-settle, every `getChain` call
+        // reliably misses (the real "wedged writer" shape); only
+        // the post-settle continuation sees the landed row.
+        const storedRecords = new Map<string, any>();
+        let resolveStore: (() => void) | undefined;
+        const pending = new Promise<void>((resolve) => {
+          resolveStore = resolve;
+        });
+        const mockStore = {
+          store: vi.fn().mockImplementation((record: any) => {
+            void pending.then(() => {
+              storedRecords.set(record.id, record);
+            });
+            return pending;
+          }),
+          getChain: vi.fn().mockImplementation((id: string) => {
+            const rec = storedRecords.get(id);
+            if (!rec) return Promise.reject(new Error(`Response not found: ${id}`));
+            return Promise.resolve([rec]);
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const chatSessionStart = vi.fn().mockResolvedValue(makeChatResult({ text: 'long-stall reply' }));
+        const chatSessionContinue = vi.fn().mockResolvedValue(makeChatResult({ text: 'continuation after settle' }));
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue,
+          chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        const registry = new ModelRegistry();
+        const MODEL_NAME = 'iter-52-refresh-on-read';
+        registry.register(MODEL_NAME, mockModel);
+
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => {
+          unhandled.push(reason);
+        };
+        process.on('unhandledRejection', onUnhandled);
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const handler = createHandler(registry, { store: mockStore as any });
+
+        // Original POST — collect response_id A. The store write
+        // starts, is tracked as pending under A, but never resolves
+        // until we call `resolveStore()` much later.
+        const req1 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'original message',
+          stream: false,
+        });
+        const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
+        await handler(req1, res1);
+        await wait1();
+        const body1 = JSON.parse(getBody1());
+        expect(body1.status).toBe('completed');
+        const responseIdA: string = body1.id;
+
+        // Wait for the hard-timeout breaker to fire (50ms + margin)
+        // so A is now in the marker state. The initial check here
+        // ALSO refreshes the marker, but the refresh only extends
+        // it by the configured TTL (200ms) — the retryable-503
+        // window is indefinite by chain-of-refreshes, not by any
+        // single read.
+        while (mockStore.store.mock.calls.length === 0) {
+          await new Promise((r) => setImmediate(r));
+        }
+        await new Promise((r) => setTimeout(r, 80));
+        await new Promise((r) => setImmediate(r));
+
+        const tracker = getPendingWritesFor(mockStore);
+        expect(tracker.size).toBe(0);
+        expect(tracker.isHardTimedOut(responseIdA)).toBe(true);
+
+        // Continuation #1 — well within the ORIGINAL 200ms TTL
+        // (marker set at ~50ms, checked at ~130ms). The refresh
+        // here pushes the expiry forward to ~330, which is what
+        // keeps continuation #2 alive.
+        await new Promise((r) => setTimeout(r, 50));
+        const req2 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation #1 at TTL boundary',
+          previous_response_id: responseIdA,
+          stream: false,
+        });
+        const { res: res2, getStatus: status2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
+        await handler(req2, res2);
+        await wait2();
+        expect(status2()).toBe(503);
+        const parsed2 = JSON.parse(getBody2());
+        expect(parsed2.error.type).toBe('storage_timeout');
+
+        // Continuation #2 — past the original 250ms expiry
+        // (store call + 50ms breaker + 200ms TTL). Without
+        // iter-52 refresh the marker would already be gone and
+        // this would 404. The refresh at continuation #1 kept it
+        // alive, and this read extends it again.
+        await new Promise((r) => setTimeout(r, 180));
+        const req3 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation #2 past original TTL',
+          previous_response_id: responseIdA,
+          stream: false,
+        });
+        const { res: res3, getStatus: status3, getBody: getBody3, waitForEnd: wait3 } = createMockRes();
+        await handler(req3, res3);
+        await wait3();
+        expect(status3()).toBe(503);
+        const parsed3 = JSON.parse(getBody3());
+        expect(parsed3.error.type).toBe('storage_timeout');
+
+        // Continuation #3 — another hop past the would-have-been
+        // expiry. The refresh chain keeps the window open. With
+        // a fixed 200ms TTL and no refresh, we're now hundreds of
+        // ms past the would-be-absent-without-refresh expiry.
+        await new Promise((r) => setTimeout(r, 180));
+        const req4 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation #3 many refreshes later',
+          previous_response_id: responseIdA,
+          stream: false,
+        });
+        const { res: res4, getStatus: status4, getBody: getBody4, waitForEnd: wait4 } = createMockRes();
+        await handler(req4, res4);
+        await wait4();
+        expect(status4()).toBe(503);
+        const parsed4 = JSON.parse(getBody4());
+        expect(parsed4.error.type).toBe('storage_timeout');
+
+        // The marker is still live at this point, three refreshes
+        // deep past the original fixed-TTL expiry.
+        expect(tracker.isHardTimedOut(responseIdA)).toBe(true);
+
+        // Finally, resolve the underlying store promise. The
+        // `.finally(...)` inside `track()` clears the marker.
+        expect(resolveStore).toBeDefined();
+        resolveStore!();
+        await Promise.resolve();
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setImmediate(r));
+
+        expect(tracker.isHardTimedOut(responseIdA)).toBe(false);
+
+        // Continuation #4 — post-settle. `storedRecords[A]` has
+        // been populated synchronously since step 1, so
+        // `getChain(A)` now returns the real record and the
+        // continuation proceeds along the happy path.
+        const req5 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation after settle',
+          previous_response_id: responseIdA,
+          stream: false,
+        });
+        const { res: res5, getStatus: status5, getBody: getBody5, waitForEnd: wait5 } = createMockRes();
+        await handler(req5, res5);
+        await wait5();
+        expect(status5()).not.toBe(503);
+        expect(status5()).not.toBe(404);
+        const parsed5 = JSON.parse(getBody5());
+        expect(parsed5.error?.type).not.toBe('storage_timeout');
+        expect(parsed5.status).toBe('completed');
+        expect(parsed5.previous_response_id).toBe(responseIdA);
+
+        expect(unhandled).toHaveLength(0);
+        process.off('unhandledRejection', onUnhandled);
+        warnSpy.mockRestore();
+      } finally {
+        if (originalHard === undefined) {
+          delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+        } else {
+          process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
+        }
+        if (originalTtl === undefined) {
+          delete process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS;
+        } else {
+          process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = originalTtl;
         }
       }
     }, 10000);
