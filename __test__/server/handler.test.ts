@@ -3732,42 +3732,43 @@ describe('createHandler', () => {
       await inflight;
     }, 10000);
 
-    it('iter-42: timed-out post-commit persist releases binding retain so unregister can reclaim', async () => {
+    it('iter-43: wedged post-commit persist keeps binding pinned so same-object re-register preserves instance id', async () => {
       // Iter-40 finding 1 introduced a `retainBinding` /
       // `releaseBinding` counter around the off-lock persist
       // so the binding's `modelInstanceId` survives a
       // same-model unregister + re-register that races a slow
-      // `store.store(...)`. The release was wired solely from
-      // the persist promise's `.finally(...)` — which means a
-      // TRULY wedged write (one whose promise NEVER settles)
-      // leaves `pendingPersists > 0` forever. Any subsequent
-      // `unregister()` then parks the binding in
-      // `pendingTeardown`, pinning the model object, its
-      // SessionRegistry, and the instance id for the lifetime
-      // of the process. A same-object re-register would then
-      // reuse the dead binding's state instead of reclaiming
-      // a fresh identity.
+      // `store.store(...)`.
       //
-      // Iter-42 fix: the post-commit-persist wait's timeout
-      // arm FORCE-RELEASES the retain. The release is
-      // idempotent, so a late settlement of the detached
-      // persist still fires its `.finally(...)` hook but does
-      // nothing on the second release.
+      // Iter-42 tried to bound the worst case of a TRULY
+      // never-settling persist by FORCE-RELEASING the retain
+      // from the post-commit-persist timeout arm. That was
+      // reverted in iter-43 (see the corresponding comment in
+      // `responses.ts`): a slow-but-eventual write can still
+      // land AFTER the timeout, and force-releasing the retain
+      // during the window between timeout and actual
+      // settlement reopens the iter-40 user-visible chain
+      // break.
+      //
+      // Iter-43 invariant (this test): when the post-commit
+      // persist has not settled by the time the handler
+      // returns, a same-object unregister + re-register must
+      // reuse the SAME binding and the SAME instance id
+      // (because `pendingPersists > 0` pins the binding and
+      // `register(name, sameModel)` on a binding flagged
+      // `pendingTeardown` clears the flag and keeps the
+      // existing id — see `ModelRegistry.register`).
       //
       // Shape:
       //   - `store.store(...)` returns a promise that never
-      //     resolves.
-      //   - The file-wide
-      //     `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS=50` shrinks the
-      //     timeout to 50ms so the handler returns without
-      //     wedging the test.
-      //   - After the handler returns,
-      //     `registry.unregister(modelName)` must actually
-      //     reclaim the binding. Under the fix, a subsequent
-      //     `register` with the SAME model object mints a
-      //     DIFFERENT instance id. Without the fix, the
-      //     pinned binding keeps the old id alive and the
-      //     re-register reuses it.
+      //     resolves (simulating a pathologically wedged
+      //     SQLite writer).
+      //   - The file-wide `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS=50`
+      //     shrinks the post-commit wait to 50ms so the
+      //     handler returns without wedging the test.
+      //   - After the handler returns, `registry.unregister`
+      //     plus a same-model `register` MUST preserve the
+      //     instance id — this is the iter-40 invariant
+      //     iter-43 reaffirms.
       const mockStore = {
         // Promise that NEVER resolves. This simulates a
         // wedged SQLite writer or a stuck native backend.
@@ -3788,29 +3789,22 @@ describe('createHandler', () => {
         resetCaches: vi.fn(),
       } as unknown as SessionCapableModel;
       const registry = new ModelRegistry();
-      const MODEL_NAME = 'iter-42-wedged-persist';
+      const MODEL_NAME = 'iter-43-wedged-persist';
       registry.register(MODEL_NAME, mockModel);
       // Sanity-verify the suite-wide env var is in effect so
       // the handler doesn't sit on a 5s default timeout — a
       // regression here would make this test appear to hang.
       expect(process.env.MLX_POST_COMMIT_PERSIST_TIMEOUT_MS).toBe('50');
 
-      // Capture the pre-swap instance id. Under the buggy
-      // iter-41 shape this id survives the subsequent
-      // `unregister` + `register` dance because the wedged
-      // persist pins `pendingPersists > 0`; under the iter-42
-      // fix the timeout arm force-releases the retain and the
-      // re-register mints a fresh id.
+      // Capture the pre-swap instance id.
       const idBefore = registry.getInstanceId(MODEL_NAME);
       expect(typeof idBefore).toBe('number');
 
-      // Collect unhandled-rejection diagnostics so we can
-      // prove the fix does not produce any. The handler's
-      // internal `.catch` arm on the detached persist promise
-      // is supposed to suppress the eventual rejection
-      // (here: never — the promise is wedged), but the
-      // timeout arm must not introduce new unhandled
-      // rejections either.
+      // Collect unhandled-rejection diagnostics. The detached
+      // persist is wedged (never settles, never rejects), so
+      // this list should stay empty — any regression that
+      // introduced a raw throw-through on the timeout path
+      // would trip this.
       const unhandled: unknown[] = [];
       const onUnhandled = (reason: unknown) => {
         unhandled.push(reason);
@@ -3826,41 +3820,187 @@ describe('createHandler', () => {
       const { res, waitForEnd, getBody } = createMockRes();
 
       // The handler itself should complete within the 50ms
-      // post-commit timeout — i.e. the force-release ran and
-      // the `finally` block fell through. `await handler()`
-      // must NOT depend on the wedged promise settling.
+      // post-commit timeout — i.e. the timeout arm fires,
+      // logs the warning, and the `finally` block falls
+      // through. `await handler()` must NOT depend on the
+      // wedged promise settling.
       await handler(req, res);
       await waitForEnd();
       const body = JSON.parse(getBody());
       expect(body.status).toBe('completed');
 
-      // Give the micro/macrotask queue a single yield so the
-      // post-commit `clearTimeout` and
-      // `releaseBinding`-driven `finalize*` paths have a
-      // chance to run.
+      // Give the micro/macrotask queue a single yield so any
+      // synchronous teardown work has a chance to run.
       await new Promise((r) => setImmediate(r));
 
-      // Primary invariant: `unregister` followed by a fresh
-      // `register` on the SAME model object reclaims the
-      // binding and mints a DIFFERENT instance id. Under the
-      // bug the binding would be pinned in `pendingTeardown`
-      // by the still-elevated `pendingPersists` counter and
-      // the re-register would reuse the old id.
+      // Primary iter-43 invariant: `unregister` followed by a
+      // fresh `register` on the SAME model object preserves
+      // the instance id, because `pendingPersists > 0` keeps
+      // the binding alive in `pendingTeardown` state and
+      // same-object `register` clears the flag and reuses the
+      // existing binding (see `ModelRegistry.register` at
+      // `packages/server/src/registry.ts:190-192`).
       expect(registry.unregister(MODEL_NAME)).toBe(true);
       registry.register(MODEL_NAME, mockModel);
       const idAfter = registry.getInstanceId(MODEL_NAME);
       expect(typeof idAfter).toBe('number');
-      expect(idAfter).not.toBe(idBefore);
+      expect(idAfter).toBe(idBefore);
 
-      // Sanity: no unhandled rejections were raised during
-      // the force-release path. The wedged promise is still
-      // pending (it never resolves or rejects), so there is
-      // nothing for Node to escalate — but a regression that
-      // swapped the detached `.catch(...)` with a raw
-      // throw-through would trip this assertion.
+      // Sanity: the timeout path did not introduce any
+      // unhandled rejections. (The wedged promise is still
+      // pending — nothing to reject — but a regression that
+      // stripped the `.catch` off the detached persist would
+      // escalate differently.)
       expect(unhandled).toHaveLength(0);
       process.off('unhandledRejection', onUnhandled);
     }, 5000);
+
+    it('iter-43: slow-but-eventual persist across unregister+re-register preserves chain continuity', async () => {
+      // This is the exact failure codex flagged against the
+      // iter-42 force-release. A persist that simply takes
+      // longer than `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS` is
+      // the realistic common case (slow SQLite I/O, back-
+      // pressure, cold cache), NOT the pathologically wedged
+      // case. Under iter-42's force-release, the timeout arm
+      // would drop `pendingPersists` to 0 before the write
+      // actually lands. If a same-object unregister +
+      // register happened in that window, `ModelRegistry`
+      // would finalise the old binding and mint a fresh
+      // instance id, then the late write would record the
+      // OLD `modelInstanceId` that `buildResponseRecord`
+      // stamped in — and the next `previous_response_id`
+      // continuation would hit the instance-mismatch guard.
+      //
+      // Iter-43 closes that window by leaving the retain
+      // pinned until actual settlement. This test asserts:
+      //   1. The handler returns around ~timeout (not
+      //      around ~settlement).
+      //   2. After unregister+re-register, the instance id is
+      //      preserved (same binding reused because
+      //      `pendingPersists > 0` kept it alive).
+      //   3. When the slow write actually lands, the row it
+      //      records carries the ORIGINAL instance id —
+      //      which still matches the live binding, so a
+      //      chained continuation would succeed.
+      //
+      // Timings:
+      //   - `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS=50` (suite-
+      //     wide).
+      //   - `store.store(...)` resolves after 200ms — well
+      //     past timeout so the timeout arm fires, but still
+      //     finite so the retain does eventually release.
+      // `buildResponseRecord` stamps the binding's monotonic
+      // id into `configJson` as a JSON field; extract it here
+      // so the test can assert the row's modelInstanceId
+      // matches the binding id that was live at dispatch.
+      const extractInstanceId = (record: any): number | undefined => {
+        try {
+          const parsed = JSON.parse(record.configJson) as { modelInstanceId?: unknown };
+          return typeof parsed.modelInstanceId === 'number' ? parsed.modelInstanceId : undefined;
+        } catch {
+          return undefined;
+        }
+      };
+      const storedRecords: { id: string; modelInstanceId: number | undefined }[] = [];
+      let storeSettledAt: number | null = null;
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          const capturedId = extractInstanceId(record);
+          return new Promise<void>((resolve) => {
+            setTimeout(() => {
+              storedRecords.push({ id: record.id, modelInstanceId: capturedId });
+              storeSettledAt = Date.now();
+              resolve();
+            }, 200);
+          });
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          return Promise.reject(new Error(`Response not found: ${id}`));
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const chatSessionStart = vi.fn().mockResolvedValue(makeChatResult({ text: 'slow-persist reply' }));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      const MODEL_NAME = 'iter-43-slow-persist';
+      registry.register(MODEL_NAME, mockModel);
+      expect(process.env.MLX_POST_COMMIT_PERSIST_TIMEOUT_MS).toBe('50');
+
+      const idAtDispatch = registry.getInstanceId(MODEL_NAME);
+      expect(typeof idAtDispatch).toBe('number');
+
+      const handler = createHandler(registry, { store: mockStore as any });
+      const req = createMockReq('POST', '/v1/responses', {
+        model: MODEL_NAME,
+        input: 'hello slow world',
+        stream: false,
+      });
+      const { res, waitForEnd, getBody } = createMockRes();
+
+      const handlerStart = Date.now();
+      await handler(req, res);
+      await waitForEnd();
+      const handlerElapsed = Date.now() - handlerStart;
+      const body = JSON.parse(getBody());
+      expect(body.status).toBe('completed');
+
+      // Sanity: the handler returned around the timeout, not
+      // around the 200ms settlement. Give generous slack for
+      // CI scheduling — anything under 180ms proves the
+      // handler did not wait for the full settlement.
+      expect(handlerElapsed).toBeLessThan(180);
+
+      // The in-flight write has NOT yet settled at this
+      // point.
+      expect(storeSettledAt).toBeNull();
+
+      // Let the micro/macrotask queue drain once so any
+      // synchronous teardown work runs.
+      await new Promise((r) => setImmediate(r));
+
+      // Iter-43 invariant: even though the timeout arm fired,
+      // `pendingPersists` is still > 0 (the write is pending,
+      // its `.finally(...)` has not run yet). So
+      // `unregister` flags the binding `pendingTeardown` but
+      // does NOT finalise, and a same-object `register`
+      // immediately reuses the still-live binding.
+      expect(registry.unregister(MODEL_NAME)).toBe(true);
+      registry.register(MODEL_NAME, mockModel);
+      const idAfterReregister = registry.getInstanceId(MODEL_NAME);
+      expect(idAfterReregister).toBe(idAtDispatch);
+
+      // Wait for the slow write to actually land (200ms total
+      // from dispatch; we've already consumed ~50-100ms).
+      const waitStart = Date.now();
+      while (storeSettledAt == null && Date.now() - waitStart < 500) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(storeSettledAt).not.toBeNull();
+
+      // Post-settlement assertion: the row that landed
+      // carries the ORIGINAL instance id (the one in effect
+      // at dispatch), and that id still matches the live
+      // binding because the retain kept it pinned across the
+      // unregister+re-register dance. If iter-42's force-
+      // release had stayed in place, the re-register would
+      // have minted a fresh id and this assertion would fail.
+      expect(storedRecords).toHaveLength(1);
+      expect(storedRecords[0].modelInstanceId).toBe(idAtDispatch);
+      expect(registry.getInstanceId(MODEL_NAME)).toBe(storedRecords[0].modelInstanceId);
+
+      // Final drain: give the persist's `.finally(...)` a
+      // tick to release the retain so the binding unwinds
+      // cleanly if the test tears down the registry.
+      await new Promise((r) => setImmediate(r));
+    }, 10000);
 
     it('iter-37 finding 2: adopt gate rejects streaming turns whose post-final teardown threw (failureMode === "error")', async () => {
       // Iter-36 finding 2 closed the `client_abort` hole but the

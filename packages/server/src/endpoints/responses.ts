@@ -2429,23 +2429,34 @@ export async function handleCreateResponse(
     // the iter-35 code had.
     let pendingPersistOuter: Promise<void> | null = null;
     let persistMode: 'streaming' | 'non-streaming' | null = null;
-    // Iter-42: force-release hook for the binding retain paired
+    // Iter-43: structural scaffolding for the binding retain paired
     // with the in-flight persist. The persist's `.finally(...)`
-    // still calls this on settlement, but the post-commit persist
-    // wait's timeout arm also invokes it to guarantee that a wedged
-    // `store.store(...)` (one whose promise never settles) cannot
-    // pin the binding's `pendingPersists` counter above zero
-    // forever — which would otherwise strand the modelInstanceId,
-    // SessionRegistry, and model object in `pendingTeardown` until
-    // process exit after a subsequent `unregister()` / hot-swap.
-    // The closure flips an idempotency flag so a LATE settlement of
-    // the detached persist fires its `.finally(...)` harmlessly as
-    // a no-op.
+    // still calls this closure on settlement to balance the
+    // iter-40 `retainBinding` — the closure's idempotency flag
+    // matters only to that one call site today.
+    //
+    // The box shape is retained from iter-42 deliberately even
+    // though the post-commit timeout arm no longer invokes it:
+    //   - Iter-42 introduced a force-release in the timeout arm
+    //     to prevent a wedged `store.store(...)` from pinning
+    //     `pendingPersists` forever. That force-release was
+    //     reverted in iter-43 (see the timeout arm below) because
+    //     it reopened iter-40: a slow-but-eventual persist could
+    //     still land after timeout, and releasing the retain
+    //     before the write actually settled let an intervening
+    //     same-object `unregister()` + `register()` finalise the
+    //     old binding and mint a fresh instance id, so the late
+    //     write recorded a stale id and broke the next
+    //     `previous_response_id` continuation.
+    //   - The scaffolding stays so a future iteration can
+    //     reintroduce a surgical "split teardown" (e.g. release
+    //     heavy resources on timeout while keeping identity
+    //     pinned until settlement) without rewiring the retain
+    //     wrappers in both dispatch branches.
     //
     // Held in a box because TypeScript's control-flow analysis
-    // otherwise narrows the in-closure assignment to `never` across
-    // the intervening `await` / try-catch boundaries, which would
-    // reject the force-release call in the timeout arm.
+    // otherwise narrows the in-closure assignment to `never`
+    // across the intervening `await` / try-catch boundaries.
     const persistRetainBox: { release: (() => void) | null } = { release: null };
     // `failureMode` carries the streaming failure-epilogue reason
     // from `handleStreamingNative` out to the outer adopt gate.
@@ -2813,17 +2824,16 @@ export async function handleCreateResponse(
               // post-commit write. `releaseBinding` runs in the
               // persist's `.finally(...)` regardless of outcome,
               // so the retention counter stays balanced whether
-              // the write fulfils, rejects, or (in the wedged
-              // case) is abandoned by the iter-39 timeout.
+              // the write fulfils or rejects.
               //
-              // Iter-42: wrap the release in an idempotent closure
-              // so the post-commit-persist timeout arm can FORCE
-              // the release when `store.store(...)` hangs forever.
-              // A wedged promise never fires `.finally(...)`, so
-              // without this the binding would stay pinned in
-              // `pendingPersists > 0` state forever, blocking
-              // teardown across every subsequent
-              // `unregister()` / hot-swap.
+              // Iter-43: the idempotent wrapper is kept from
+              // iter-42 as structural scaffolding, but the
+              // post-commit-persist timeout arm no longer force-
+              // fires it — see the timeout handler below for the
+              // rationale (short version: force-releasing on
+              // timeout reopens iter-40 for the slow-but-eventual
+              // case, which is strictly more common than the
+              // truly-wedged case iter-42 was trying to bound).
               registry.retainBinding(leaseModel);
               let persistRetainReleased = false;
               persistRetainBox.release = () => {
@@ -2881,11 +2891,11 @@ export async function handleCreateResponse(
               // must not mint a fresh `modelInstanceId` that
               // invalidates the row this write is about to land.
               //
-              // Iter-42: see the streaming branch — the release is
-              // wrapped in an idempotent closure so the
-              // post-commit-persist timeout arm can force-fire it
-              // when the underlying `store.store(...)` promise
-              // never settles.
+              // Iter-43: see the streaming branch — the
+              // idempotent-release scaffolding is retained from
+              // iter-42 as a structural hook for a future split
+              // teardown, but the post-commit timeout arm no
+              // longer force-fires it.
               registry.retainBinding(leaseModel);
               let persistRetainReleased = false;
               persistRetainBox.release = () => {
@@ -3123,27 +3133,45 @@ export async function handleCreateResponse(
             `[responses] post-commit persistence did not settle within ${postCommitPersistTimeoutMs}ms ` +
               `(${capturedMode ?? 'unknown'}, off-lock); detaching the handler and leaving the write in the ` +
               `background. The pending-writes tracker still holds a reference so chained continuations can ` +
-              `observe the in-flight write; this condition usually signals a wedged SQLite writer or stuck ` +
-              `native backend.`,
+              `observe the in-flight write, and the iter-40 binding retain stays live until the write truly ` +
+              `settles so the binding's modelInstanceId cannot be recycled under the late write. This ` +
+              `condition usually signals a wedged SQLite writer or stuck native backend.`,
           );
-          // Iter-42: FORCE-RELEASE the iter-40 `retainBinding`
-          // retain now that we have given up waiting. A truly
-          // wedged `store.store(...)` promise will NEVER fire its
-          // `.finally(...)`, so without this path the binding's
-          // `pendingPersists` counter stays above zero forever and
-          // any later `unregister()` / hot-swap is stuck in
-          // `pendingTeardown` for the lifetime of the process —
-          // stranding the model object, its SessionRegistry, and
-          // the modelInstanceId that a same-object re-register
-          // would otherwise reuse. `persistRetainBox.release` is
-          // idempotent: a LATE settlement of the detached promise
-          // still triggers its `.finally(...)` hook, but the
-          // closure's early-exit guard makes that a no-op. The
-          // pending-writes tracker keeps its OWN reference to the
-          // backgrounded promise, so chained continuations can
-          // still observe the in-flight write — only model
-          // teardown is un-pinned.
-          persistRetainBox.release?.();
+          // Iter-43: do NOT force-release the iter-40
+          // `retainBinding` here. Iter-42 added a
+          // `persistRetainBox.release?.()` on this branch to
+          // bound the worst case of a truly never-settling
+          // `store.store(...)` so a later `unregister()` +
+          // `register()` could reclaim the binding. That fix was
+          // wrong: `Promise.race` treats any write that EXCEEDS
+          // the timeout as "safe to unpin", but most timeouts in
+          // practice are slow-but-eventual writes — the promise
+          // still fulfils later, and the iter-40 invariant has
+          // to hold for the entire interval until it does. If a
+          // same-object unregister + re-register happens in the
+          // window between timeout and actual settlement, force-
+          // releasing the retain lets `pendingPersists` drop to
+          // 0, the binding fully tears down, the re-register
+          // mints a fresh `modelInstanceId`, and the late write
+          // lands with the stale id that `buildResponseRecord`
+          // stamped into `configJson` — exactly the iter-40
+          // chain-break the retain was introduced to prevent.
+          //
+          // We accept the bounded cost of a TRULY wedged persist
+          // leaking one binding (counters + registry reference)
+          // until process exit. A wedged SQLite writer already
+          // means the server is compromised, and one lingering
+          // binding is much smaller than a user-visible 400
+          // instance-mismatch on the next continuation. The
+          // idempotent `release` stays wired from the persist's
+          // own `.finally(...)`, so the moment the slow write
+          // actually settles — even minutes later — the retain
+          // drops and teardown proceeds normally.
+          //
+          // The pending-writes tracker keeps its own reference
+          // to the detached promise, so chained continuations
+          // can still observe the in-flight write via the
+          // cold-replay path.
         }
       } finally {
         if (timeoutHandle !== undefined) {
