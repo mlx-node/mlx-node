@@ -2,12 +2,30 @@
  * Worker helper for release-batch-faf.test.ts.
  *
  * Runs the drain-interlock scenario entirely inside a Worker (where
- * Atomics.wait is permitted, unlike the browser main thread). See the test
- * file for the scenario description.
+ * Atomics.wait is permitted, unlike the browser main thread).
+ *
+ * Scenario (proves drainFireAndForget() actually blocks):
+ *   1. Fire F&F #1 with 64 handles (1..64). STATUS flips to PENDING.
+ *      Record T1 = performance.now() right after this returns.
+ *   2. Signal the main thread we are about to fire F&F #2. The main
+ *      thread starts a ~50ms timer that, when it fires, writes STATUS=DONE
+ *      and Atomics.notify's the worker.
+ *   3. Immediately fire F&F #2 (64 more handles, 100..163). This triggers
+ *      flushPendingReleases → drainFireAndForget, which Atomics.wait's for
+ *      STATUS to leave PENDING. The worker must BLOCK here until the main
+ *      thread flips STATUS to DONE.
+ *   4. Record T2 = performance.now() after F&F #2 returns.
+ *   5. elapsed = T2 - T1 must be >= the delay (proving the drain blocked).
+ *      If drainFireAndForget() is removed from production, F&F #2 returns
+ *      in microseconds and elapsed would be < 1 ms.
+ *
+ * The test file asserts elapsed >= 40 ms (allowing slack below the 50 ms
+ * delay for scheduler / timer jitter) AND that F&F #2 landed correctly
+ * in the SAB.
  */
 
-import { createBridgeStub } from '../webgpu-bridge-stub';
 import { CMD_OFFSET, STATUS, STATUS_INDEX, RpcFn, MAX_RELEASE_BATCH } from '../rpc-protocol';
+import { createBridgeStub } from '../webgpu-bridge-stub';
 
 self.onmessage = (e: MessageEvent) => {
   const { type } = e.data;
@@ -26,7 +44,7 @@ self.onmessage = (e: MessageEvent) => {
     const uniformBase = CMD_OFFSET.UNIFORM_DATA >>> 2;
     const release = stub.imports.wgpuBufferRelease as (h: number) => void;
 
-    // Fire F&F #1: 64 handles starting at 1.
+    // ---- Step 1: Fire F&F #1 (handles 1..64), leaves STATUS=PENDING. ----
     for (let i = 0; i < MAX_RELEASE_BATCH; i++) release(1 + i);
 
     if (cmdI32[STATUS_INDEX] !== STATUS.PENDING) {
@@ -34,58 +52,69 @@ self.onmessage = (e: MessageEvent) => {
       return;
     }
 
-    // Snapshot UNIFORM_DATA as it looks while F&F #1 is "in flight". A
-    // real gpu-worker would be reading these bytes right now. If the
-    // upcoming F&F #2 skips the drain, it will overwrite these slots
-    // before the gpu-worker is done — the snapshot proves this does NOT
-    // happen by showing the pre-drain contents are the #1 handles.
-    const observedBeforeDrain = Array.from<number>({ length: MAX_RELEASE_BATCH });
-    for (let i = 0; i < MAX_RELEASE_BATCH; i++) {
-      observedBeforeDrain[i] = cmdU32[uniformBase + i]!;
+    // Handoff the cmdBuffer to the main thread so it can schedule the
+    // delayed STATUS=DONE write while we are blocked in Atomics.wait.
+    // The SAB is shared memory: the main thread sees writes immediately
+    // without transferring. We just need to tell it "go now".
+    (self as any).postMessage({ type: 'arm', cmdBuffer });
+
+    // Small busy yield to let the main thread receive the 'arm' message
+    // and start its setTimeout BEFORE we enter the drain. Atomics.wait
+    // on STATUS=PENDING will return immediately if STATUS is already not
+    // PENDING, so we do NOT want the main thread to race ahead and flip
+    // STATUS=DONE before we even enter drainFireAndForget.
+    //
+    // Use a short tight loop to give the main thread one event-loop tick.
+    // 2 ms busy-wait is enough for any reasonable scheduler — and because
+    // the main thread's setTimeout will fire ~50 ms AFTER it processes
+    // the 'arm' message (not NOW), this brief delay only pushes out the
+    // start of that 50 ms window. The assertion tolerates up to 50 ms.
+    const yieldUntil = performance.now() + 2;
+    while (performance.now() < yieldUntil) {
+      // spin
     }
 
-    // Flip STATUS to DONE synchronously — as if the gpu-worker finished
-    // processing F&F #1. The drain's Atomics.wait will observe STATUS is
-    // no longer PENDING and return 'not-equal' immediately. This tests
-    // the drain *mechanics* without needing a second worker to ack.
-    Atomics.store(cmdI32, STATUS_INDEX, STATUS.DONE);
-
-    // Fire F&F #2. The auto-flush calls flushPendingReleases, which calls
-    // drainFireAndForget() at the top. Correct drain behavior:
-    //   1. ffPending is true → enter wait
-    //   2. Atomics.wait(STATUS=PENDING) → 'not-equal' (STATUS is DONE now)
-    //   3. Atomics.store(STATUS=IDLE), clear ffPending
-    //   4. proceed to stage the next 64 handles into UNIFORM_DATA
+    // ---- Step 2: Fire F&F #2 and time how long it blocks. ----
+    // At this instant STATUS is still PENDING (we set it above, main
+    // thread's setTimeout has NOT fired yet). flushPendingReleases
+    // entering drainFireAndForget will Atomics.wait until the main
+    // thread flips STATUS to something other than PENDING.
+    const t1 = performance.now();
     for (let i = 0; i < MAX_RELEASE_BATCH; i++) release(100 + i);
+    const t2 = performance.now();
+    const elapsedMs = t2 - t1;
 
-    // Verify F&F #2 landed correctly.
-    const ok2 =
-      cmdI32[STATUS_INDEX] === STATUS.PENDING &&
-      cmdU32[CMD_OFFSET.FN_ID >>> 2] === RpcFn.BUFFER_RELEASE_BATCH &&
-      cmdU32[CMD_OFFSET.ARG0 >>> 2] === MAX_RELEASE_BATCH &&
-      cmdU32[uniformBase] === 100 &&
-      cmdU32[uniformBase + 63] === 163;
-
-    // Before-drain observation must be the #1 handles 1..64.
-    let priorOk = true;
-    for (let i = 0; i < MAX_RELEASE_BATCH; i++) {
-      if (observedBeforeDrain[i] !== 1 + i) {
-        priorOk = false;
-        break;
-      }
-    }
+    // ---- Step 3: Verify F&F #2 landed correctly. ----
+    // After F&F #2: STATUS is PENDING again (the new batch is live),
+    // FN_ID = BUFFER_RELEASE_BATCH, ARG0 = 64, UNIFORM_DATA[0..63] =
+    // 100..163. If the drain actually ran, UNIFORM_DATA was rewritten
+    // ONLY after the main thread flipped STATUS to DONE.
+    const post = {
+      status: cmdI32[STATUS_INDEX],
+      fnId: cmdU32[CMD_OFFSET.FN_ID >>> 2],
+      arg0: cmdU32[CMD_OFFSET.ARG0 >>> 2],
+      first: cmdU32[uniformBase],
+      last: cmdU32[uniformBase + 63],
+    };
 
     const stats = stub.getBridgeStats();
     const batchCount = stats.byFn[RpcFn.BUFFER_RELEASE_BATCH] ?? 0;
 
     (self as any).postMessage({
-      ok: ok2 && priorOk && batchCount === 2,
-      ok2,
-      priorOk,
+      type: 'done',
+      ok:
+        post.status === STATUS.PENDING &&
+        post.fnId === RpcFn.BUFFER_RELEASE_BATCH &&
+        post.arg0 === MAX_RELEASE_BATCH &&
+        post.first === 100 &&
+        post.last === 163 &&
+        batchCount === 2,
+      elapsedMs,
+      post,
       batchCount,
     });
   } catch (err) {
     const msg = err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : String(err);
-    (self as any).postMessage({ ok: false, error: msg });
+    (self as any).postMessage({ type: 'done', ok: false, error: msg });
   }
 };

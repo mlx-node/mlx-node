@@ -694,21 +694,31 @@ export function createBridgeStub(
     const count = pendingReleases.length;
     if (count === 0) return;
     // Ordering invariant: BUFFER_RELEASE_BATCH must be observed by the
-    // gpu-worker after any staged DISPATCH_BATCH and after any prior F&F
-    // release. We do NOT need to flush a pending DISPATCH_BATCH here: the
-    // existing ordering rule (see rpcCall's top-of-function flush) sends
-    // releases BEFORE the next non-release RPC but AFTER any pending
-    // dispatches, and this helper is only called via that path or via
-    // queueRelease's auto-flush at MAX_RELEASE_BATCH. In the auto-flush case
-    // we're already past the dispatch (a release happens after the call that
-    // freed a buffer), so any staged batch is serialized naturally by the
-    // drain: the next dispatch site will flush the batch before its own
-    // writes. Releases themselves do not interact with DISPATCH_BATCH state.
+    // gpu-worker AFTER any staged DISPATCH_BATCH and AFTER any prior F&F
+    // release.
     //
-    // We DO need to drain any prior F&F: only one F&F can be in flight at a
-    // time, and we're about to clobber UNIFORM_DATA + FN_ID + ARG0 for the
-    // next one.
+    // (1) Drain prior F&F: only one F&F can be in flight at a time, and
+    //     we're about to clobber UNIFORM_DATA + FN_ID + ARG0 for the next
+    //     one. Cheap no-op when nothing is in flight.
     drainFireAndForget();
+    // (2) Flush any staged DISPATCH_BATCH BEFORE publishing the new F&F
+    //     release. This preserves the "dispatches that reference a buffer
+    //     must submit before the buffer's handle is returned to the pool"
+    //     invariant that rpcCall previously provided for us (its top-of-
+    //     function flush guard runs before any non-DISPATCH_BATCH RPC).
+    //     Since Task B's F&F path bypasses rpcCall, we must do this by
+    //     hand — otherwise a release-batch auto-flush (via queueRelease
+    //     at MAX_RELEASE_BATCH, or via the threshold flush inside the
+    //     dispatch hot path) publishes the release first, the gpu-worker
+    //     pools those handles, and the still-unsubmitted DISPATCH_BATCH
+    //     later runs against a handle whose underlying GPUBuffer has been
+    //     recycled by a subsequent allocation.
+    //     flushDispatchBatchInner() itself uses rpcCall, which drains any
+    //     F&F at its top before cmd-SAB writes, so ordering vs. the drain
+    //     above stays consistent.
+    if (batchActive && batchCount > 0) {
+      flushDispatchBatchInner();
+    }
     // Count the F&F release in the bridge histogram — keeps stats parity
     // with the old rpcCall(BUFFER_RELEASE_BATCH) path so diagnostics don't
     // spuriously drop after this optimization lands.

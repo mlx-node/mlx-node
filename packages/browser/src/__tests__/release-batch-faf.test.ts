@@ -14,8 +14,8 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { createBridgeStub } from '../webgpu-bridge-stub';
 import { CMD_OFFSET, STATUS, STATUS_INDEX, RpcFn, MAX_RELEASE_BATCH } from '../rpc-protocol';
+import { createBridgeStub } from '../webgpu-bridge-stub';
 
 /** Allocate a fresh cmd SAB + a minimal wasmMemory for the bridge. */
 function makeBridgeHarness() {
@@ -103,35 +103,77 @@ describe('BUFFER_RELEASE_BATCH fire-and-forget (Task B)', () => {
     expect(stats.byFn[RpcFn.BUFFER_RELEASE_BATCH] ?? 0).toBe(0);
   });
 
-  it('drain interlock: next F&F drains prior F&F before clobbering UNIFORM_DATA', async () => {
-    // Atomics.wait is only allowed inside a Worker, so delegate the whole
-    // scenario to release-batch-faf-worker.ts. The helper runs:
-    //   1. Fire F&F #1 with handles 1..64.
-    //   2. Snapshot UNIFORM_DATA (proves the #1 handles are staged).
-    //   3. Flip STATUS=DONE manually — simulates the gpu-worker finishing.
-    //   4. Fire F&F #2 (handles 100..163). flushPendingReleases at the top
-    //      calls drainFireAndForget(), which Atomics.wait's — but STATUS is
-    //      DONE so wait returns 'not-equal' immediately, then the drain
-    //      resets STATUS to IDLE and clears ffPending.
-    //   5. After the drain, #2 stages its own UNIFORM_DATA, flips STATUS to
-    //      PENDING.
-    // Assertions: the pre-drain snapshot shows the #1 handles (no clobber
-    // before drain) AND #2 fires correctly afterward.
+  it('drain interlock: F&F #2 blocks in drainFireAndForget until gpu-worker flips STATUS', async () => {
+    // Real-blocking drain interlock test. Atomics.wait is only allowed
+    // inside a Worker, so delegate the scenario. Protocol:
+    //
+    //   Main thread (this test)             Worker (worker helper)
+    //   ----------------------               ------------------------
+    //   postMessage({type:'run'})  -------->  fire F&F #1 (STATUS=PENDING)
+    //                                         postMessage({type:'arm',
+    //                                                      cmdBuffer})
+    //   start setTimeout(DELAY_MS,       <--  [worker enters F&F #2,
+    //     () => STATUS=DONE,notify)           blocks in drainFireAndForget]
+    //   [after DELAY_MS fires:]
+    //     Atomics.store(STATUS, DONE)
+    //     Atomics.notify(STATUS)      ----->  [drain unblocks, F&F #2
+    //                                          publishes; worker measures
+    //                                          elapsed between t1 (just
+    //                                          after F&F #1) and t2 (just
+    //                                          after F&F #2)]
+    //                                         postMessage({type:'done',
+    //                                                      ok, elapsedMs})
+    //
+    // Critical assertion: elapsedMs >= THRESHOLD_MS. If the production
+    // path omits drainFireAndForget(), the worker does NOT block — F&F #2
+    // returns in microseconds and elapsedMs would be well below THRESHOLD.
+    // This is the property the old test lacked: the old test manually
+    // flipped STATUS=DONE BEFORE firing F&F #2, so the drain's Atomics.wait
+    // returned 'not-equal' immediately and removing the drain call left the
+    // test green.
+    const DELAY_MS = 50;
+    const THRESHOLD_MS = 40; // allow ~10ms slack for scheduler / timer jitter
+
     const worker = new Worker(new URL('./release-batch-faf-worker.ts', import.meta.url), { type: 'module' });
     try {
-      const result = await new Promise<{ ok: boolean; error?: string; [k: string]: unknown }>((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error('drain-interlock worker timeout (10s)')), 10_000);
-        worker.onmessage = (e) => {
-          clearTimeout(t);
-          resolve(e.data);
-        };
-        worker.onerror = (err) => {
-          clearTimeout(t);
-          reject(new Error(`worker error: ${err.message}`));
-        };
-        worker.postMessage({ type: 'run' });
-      });
+      const result = await new Promise<{ ok: boolean; elapsedMs?: number; error?: string; [k: string]: unknown }>(
+        (resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('drain-interlock worker timeout (10s)')), 10_000);
+          let armed = false;
+          worker.onmessage = (e) => {
+            const msg = e.data;
+            if (msg?.type === 'arm' && !armed) {
+              armed = true;
+              // The worker has fired F&F #1 (STATUS=PENDING) and is about
+              // to enter F&F #2. Schedule the gpu-worker simulation: after
+              // DELAY_MS, flip STATUS to DONE and notify the worker so its
+              // Atomics.wait unblocks.
+              const sab = msg.cmdBuffer as SharedArrayBuffer;
+              const i32 = new Int32Array(sab);
+              setTimeout(() => {
+                Atomics.store(i32, STATUS_INDEX, STATUS.DONE);
+                Atomics.notify(i32, STATUS_INDEX);
+              }, DELAY_MS);
+              return;
+            }
+            if (msg?.type === 'done') {
+              clearTimeout(t);
+              resolve(msg);
+            }
+          };
+          worker.onerror = (err) => {
+            clearTimeout(t);
+            reject(new Error(`worker error: ${err.message}`));
+          };
+          worker.postMessage({ type: 'run' });
+        },
+      );
       expect(result.ok, `worker result: ${JSON.stringify(result)}`).toBe(true);
+      // The assertion that proves the drain blocked.
+      expect(
+        result.elapsedMs,
+        `F&F #2 returned in ${result.elapsedMs} ms; expected >= ${THRESHOLD_MS} ms (drain did not block — is drainFireAndForget() being called?)`,
+      ).toBeGreaterThanOrEqual(THRESHOLD_MS);
     } finally {
       worker.terminate();
     }
