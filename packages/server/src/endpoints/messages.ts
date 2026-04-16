@@ -35,6 +35,14 @@ import type { ModelRegistry } from '../registry.js';
 import type { SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
+import {
+  createVisibility,
+  endJson,
+  flushTerminalSSE,
+  markSSEMode,
+  type TransportVisibility,
+  writeFallbackErrorSSE,
+} from '../transport-visibility.js';
 import type { AnthropicMessagesRequest } from '../types-anthropic.js';
 import { validateAndCanonicalizeHistoryToolOrder } from './responses.js';
 
@@ -46,11 +54,17 @@ async function handleNonStreaming(
   res: ServerResponse,
   result: ChatResult,
   body: AnthropicMessagesRequest,
+  visibility: TransportVisibility,
 ): Promise<void> {
   const messageId = genId('msg_');
   const response = buildAnthropicResponse(result, body, messageId);
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(response));
+  // `endJson` commits `responseMode = 'json'` synchronously and
+  // only flips `responseBodyWritten` once the kernel has
+  // acknowledged the final chunk. The outer catch branches on
+  // `responseMode`, so a crash between `writeHead` and the end-
+  // callback routes to the JSON error path (or a socket destroy)
+  // rather than emitting SSE frames into a JSON-declared response.
+  await endJson(res, JSON.stringify(response), visibility);
 }
 
 // ---------------------------------------------------------------------------
@@ -63,9 +77,15 @@ async function handleStreamingNative(
   body: AnthropicMessagesRequest,
   wasCommitted: () => boolean,
   httpReq: IncomingMessage | undefined,
+  visibility: TransportVisibility,
 ): Promise<void> {
   const messageId = genId('msg_');
   beginSSE(res);
+  // Commit to SSE wire format synchronously. The outer catch branches
+  // on `responseMode` — any throw from `writeSSEEvent` between here
+  // and the terminal event routes to the streaming `error` epilogue
+  // instead of corrupting the JSON path.
+  markSSEMode(visibility);
 
   writeSSEEvent(res, 'message_start', buildMessageStartEvent(body, messageId, 0));
 
@@ -386,7 +406,10 @@ async function handleStreamingNative(
   if (successful) {
     const stopReason = terminalStopReason ?? 'end_turn';
     writeSSEEvent(res, 'message_delta', buildMessageDelta(stopReason, terminalNumTokens, terminalPromptTokens));
-    writeSSEEvent(res, 'message_stop', buildMessageStop());
+    // `flushTerminalSSE` gates `terminalEmitted` on the write
+    // callback firing without error — proving the kernel accepted
+    // `message_stop`, not just that ServerResponse buffered it.
+    await flushTerminalSSE(res, 'message_stop', buildMessageStop(), visibility);
   } else {
     // Uncommitted terminal. Close any dangling content block so the
     // error frame arrives at a well-defined stream state, then emit
@@ -410,7 +433,11 @@ async function handleStreamingNative(
     } else {
       message = 'stream ended without a done event';
     }
-    writeSSEEvent(res, 'error', { type: 'error', error: { type: 'api_error', message } });
+    // The streaming `error` event IS the Anthropic terminal on the
+    // failure path. Gate `terminalEmitted` on its kernel-ack so the
+    // outer catch can correctly distinguish "client already got a
+    // terminal, log-only" from "early write crash, emit fallback".
+    await flushTerminalSSE(res, 'error', { type: 'error', error: { type: 'api_error', message } }, visibility);
   }
   endSSE(res);
 }
@@ -653,22 +680,55 @@ export async function handleCreateMessage(
 
       const session = sessionReg.getOrCreate(null, requestedSystem);
 
+      // Visibility / wire-format tracker shared between the handler
+      // body and the outer catch. The catch branches on
+      // `responseMode` (JSON vs SSE) instead of `res.headersSent`,
+      // which flips synchronously in `writeHead` before the body
+      // lands and therefore lies about whether the client is
+      // actually consuming JSON or SSE. Iter-33 finding 3: this is
+      // the same wire-contract fix as `/v1/responses`; the
+      // Anthropic handler is stateless so there is no session to
+      // adopt, but the outer catch can still corrupt the response
+      // by emitting an SSE frame into a JSON-declared body (or
+      // hang the request by misclassifying an early SSE-write
+      // crash).
+      const visibility = createVisibility();
+
       try {
         if (body.stream === true) {
           const outcome = runSessionStreaming(session, messages, config);
-          await handleStreamingNative(res, outcome.stream, body, outcome.wasCommitted, httpReq);
+          await handleStreamingNative(res, outcome.stream, body, outcome.wasCommitted, httpReq, visibility);
         } else {
           const result = await runSessionNonStreaming(session, messages, config);
-          await handleNonStreaming(res, result, body);
+          await handleNonStreaming(res, result, body, visibility);
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error during inference';
-        if (!res.headersSent) {
+        if (visibility.responseMode === null) {
           sendAnthropicInternalError(res, message);
+        } else if (visibility.responseMode === 'json') {
+          // Already committed to JSON on the wire; emitting anything
+          // else would corrupt the response. Destroy the socket so
+          // the client sees a truncated JSON body instead of a
+          // mismatched-MIME-type frame.
+          try {
+            res.destroy(err instanceof Error ? err : new Error(message));
+          } catch {
+            // Socket may already be gone.
+          }
         } else {
-          // Headers already sent (streaming) -- best effort: write error event and close
-          writeSSEEvent(res, 'error', { error: { type: 'api_error', message } });
-          endSSE(res);
+          // `responseMode === 'sse'`: best-effort streaming `error`
+          // event, but only if no terminal already landed. A double
+          // terminal would confuse the client's event-stream state
+          // machine.
+          if (!visibility.terminalEmitted) {
+            writeFallbackErrorSSE(res, 'error', { error: { type: 'api_error', message } });
+          }
+          try {
+            endSSE(res);
+          } catch {
+            // Already closed / destroyed.
+          }
         }
       }
     });

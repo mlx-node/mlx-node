@@ -33,6 +33,14 @@ import type { ModelRegistry } from '../registry.js';
 import type { SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
+import {
+  createVisibility,
+  endJson,
+  flushTerminalSSE,
+  markSSEMode,
+  type TransportVisibility,
+  writeFallbackErrorSSE,
+} from '../transport-visibility.js';
 import type {
   FunctionCallOutputItem,
   MessageOutputItem,
@@ -44,43 +52,6 @@ import type {
 
 /** How long stored responses live (seconds). */
 const RESPONSE_TTL_SECONDS = 1800; // 30 minutes
-
-/**
- * Mutable visibility flags shared between the per-handler
- * (non-streaming / streaming) path and the outer
- * `handleCreateResponse` error block. Distinct from `res.headersSent`
- * because Node's `ServerResponse.writeHead()` flips `headersSent`
- * synchronously BEFORE any body bytes leave the buffer. A handler
- * that throws inside `res.end()` after `writeHead()` has a
- * `headersSent === true` but the client never actually observed the
- * response — adopting the committed session under that unseen
- * responseId would leak a warm session into the registry that no
- * caller can ever reach.
- *
- * Each handler flips the flag that corresponds to "the client has
- * actually seen a terminal artefact for this responseId" on its own
- * success path:
- *
- *   * `responseBodyWritten` — non-streaming: set ONLY after
- *     `res.end(JSON.stringify(response))` completes without throwing.
- *   * `terminalEmitted` — streaming: set ONLY after a terminal SSE
- *     event (`response.completed` on the success path, or
- *     `response.failed` on the failure epilogue) has been written to
- *     the wire without throwing.
- *
- * The outer catch computes `safeToSuppress = responseBodyWritten ||
- * terminalEmitted`. A committed turn whose handler threw WITHOUT
- * setting either flag is NOT adopted and the handler error is
- * rethrown (so the outer `sendInternalError` path sends a 500 the
- * client can parse, and the registry stays in sync with the client's
- * view of the world).
- */
-interface ResponseVisibility {
-  /** Non-streaming: `res.end(body)` returned without throwing. */
-  responseBodyWritten: boolean;
-  /** Streaming: a terminal SSE event was written to the wire. */
-  terminalEmitted: boolean;
-}
 
 // ---------------------------------------------------------------------------
 // Non-streaming path
@@ -95,7 +66,7 @@ async function handleNonStreaming(
   store: ResponseStore | null,
   newInputMessages: ChatMessage[],
   modelInstanceId: number | undefined,
-  visibility: ResponseVisibility,
+  visibility: TransportVisibility,
 ): Promise<void> {
   const response = buildResponseObject(result, req, responseId, previousResponseId);
 
@@ -111,16 +82,16 @@ async function handleNonStreaming(
     }
   }
 
-  // `writeHead` flips `res.headersSent` synchronously, but the client
-  // has not actually received the JSON body yet — if `res.end()`
-  // below throws, `res.headersSent` alone cannot tell the outer
-  // handler whether the response made it to the wire. Only flip
-  // `responseBodyWritten` AFTER `res.end()` returns cleanly, so the
-  // adopt-on-visibility gate treats an end-time crash the same way
-  // as a writeHead-time crash (no adopt, rethrow).
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(response));
-  visibility.responseBodyWritten = true;
+  // `endJson` commits `responseMode = 'json'` synchronously so the
+  // outer catch knows to emit a clean JSON error (or destroy the
+  // socket) rather than an SSE frame if anything below throws. The
+  // `responseBodyWritten` flag is flipped only from inside `res.end`'s
+  // write callback — proving the kernel accepted the final chunk,
+  // not just that ServerResponse buffered it. An async socket
+  // failure surfaced through the callback rejects this promise so
+  // the caller's catch can refuse to adopt the committed session
+  // under an unreachable responseId.
+  await endJson(res, JSON.stringify(response), visibility);
 }
 
 // ---------------------------------------------------------------------------
@@ -257,9 +228,15 @@ async function handleStreamingNative(
   wasCommitted: () => boolean,
   modelInstanceId: number | undefined,
   httpReq: IncomingMessage | undefined,
-  visibility: ResponseVisibility,
+  visibility: TransportVisibility,
 ): Promise<void> {
   beginSSE(res);
+  // Commit to SSE wire format synchronously. The outer catch branches
+  // on `responseMode` — not on `headersSent` — so an early throw from
+  // `writeSSEEvent` below (e.g. socket died between `beginSSE` and
+  // the first event) routes to the streaming `error` epilogue
+  // instead of corrupting the JSON path.
+  markSSEMode(visibility);
 
   const partial = buildPartialResponse(req, responseId, previousResponseId);
   writeSSEEvent(res, 'response.created', { response: partial });
@@ -790,14 +767,15 @@ async function handleStreamingNative(
         console.error('[responses] post-commit persistence failed (streaming), terminal will still be emitted:', err);
       }
     }
-    writeSSEEvent(res, 'response.completed', { response: terminal });
-    // Flip only AFTER the terminal event successfully left the wire.
-    // `writeSSEEvent` forwards to `res.write`, which throws
-    // synchronously on a dead socket / aborted stream; if the throw
-    // escapes here, the outer handler catch must still see
-    // `terminalEmitted === false` so it does NOT adopt a session the
-    // client never got a terminal event for.
-    visibility.terminalEmitted = true;
+    // Gate `terminalEmitted` on the terminal SSE event's write
+    // callback firing without error — `flushTerminalSSE` only flips
+    // the flag once the kernel has accepted the frame. A synchronous
+    // `res.write` return does not prove the client saw it (backpressure
+    // can defer flushing, and a socket error surfaces via the callback
+    // AFTER the write returned). An early throw or a callback-reported
+    // error here rejects the promise so the outer catch refuses to
+    // adopt under an unseen responseId.
+    await flushTerminalSSE(res, 'response.completed', { response: terminal }, visibility);
     endSSE(res);
     return;
   }
@@ -905,13 +883,12 @@ async function handleStreamingNative(
   }
 
   const failedTerminal = buildFailedTerminal(partial, finalOutput, reason, usage);
-  writeSSEEvent(res, 'response.failed', { response: failedTerminal });
-  // Flip only AFTER `response.failed` successfully left the wire.
-  // An SSE write that throws against a dead socket must NOT count
-  // as a terminal the client saw; in that case the outer catch
-  // rethrows so the request fails loudly instead of silently
-  // suppressing an uncommitted error under a responseId no one saw.
-  visibility.terminalEmitted = true;
+  // `flushTerminalSSE` only flips `terminalEmitted` after
+  // `response.failed` is acknowledged by the kernel. If the write
+  // callback reports a socket error the promise rejects here, the
+  // flag stays false, and the outer catch refuses to adopt under an
+  // unseen responseId.
+  await flushTerminalSSE(res, 'response.failed', { response: failedTerminal }, visibility);
   endSSE(res);
 }
 
@@ -2231,6 +2208,13 @@ export async function handleCreateResponse(
       // the now-canonical `messages`.
       newInputMessages = messages.slice(priorOffset);
 
+      // Visibility / wire-format tracker shared between the handler
+      // body and the outer catch. Declared outside the `try` so the
+      // catch can branch on `responseMode` (JSON vs SSE) and know
+      // whether a terminal artefact already landed — both signals
+      // are authoritative, unlike `res.headersSent`.
+      const visibility = createVisibility();
+
       try {
         // `runSession*` plumbs an honest commit signal out of the helper:
         // `ChatSession` only advances `turns` on a successful non-error
@@ -2260,24 +2244,32 @@ export async function handleCreateResponse(
         // comes from non-persistence failures (response construction,
         // SSE write, res.writeHead/end crash).
         //
-        // Iter-32 finding 1 & 2: the adopt/rethrow decision used to
-        // key on `res.headersSent`, which is a LIE for "the client
-        // received the response". Node's `ServerResponse.writeHead()`
-        // flips `headersSent = true` synchronously before any body
-        // bytes leave the buffer, so a throw from `res.end()` on the
-        // non-streaming path (or a throw from `writeSSEEvent` before
-        // any terminal SSE event on the streaming path) looked like
-        // the happy "already on the wire" case under the old gate
-        // and silently adopted / swallowed the error. The handlers
-        // now flip explicit visibility flags (`responseBodyWritten`
-        // / `terminalEmitted`) strictly AFTER the terminal artefact
-        // the client depends on is known to have left the wire, and
-        // the gate below keys on those flags instead.
+        // Iter-32 finding 1 & 2 / iter-33 adversarial review:
+        //
+        //   * The "safe to suppress" gate used to key on
+        //     `res.headersSent`, which is a LIE for "the client
+        //     received the response". Node's `writeHead` flips
+        //     `headersSent = true` synchronously before any body
+        //     bytes leave the buffer, and the sync return of
+        //     `res.end()` / `writeSSEEvent` only proves the bytes
+        //     were queued — an async socket failure after the queue
+        //     could still leave the client with no terminal.
+        //   * The outer catch used to pick "JSON vs SSE fallback"
+        //     from `res.headersSent`, so a `writeHead(200,
+        //     'application/json')` → `res.end()` crash would emit
+        //     SSE frames into a JSON-declared response.
+        //
+        // The fix threads a `TransportVisibility` record that
+        // tracks both the wire format the handler committed to
+        // (`responseMode`) AND whether the client observed a
+        // terminal artefact (`responseBodyWritten` /
+        // `terminalEmitted`). Both flags are flipped only from the
+        // kernel-ack callback of the underlying `res.end` /
+        // `res.write` — synchronous return is NOT treated as proof
+        // of visibility. The outer catch branches on
+        // `responseMode` to choose the clean-up shape (JSON error,
+        // SSE `error` frame, or socket destroy).
         let handlerError: Error | null = null;
-        const visibility: ResponseVisibility = {
-          responseBodyWritten: false,
-          terminalEmitted: false,
-        };
 
         if (mappedBody.stream) {
           const outcome = await runSessionStreaming(session, messages, newInputMessages, config);
@@ -2365,13 +2357,49 @@ export async function handleCreateResponse(
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error during inference';
-        // If headers haven't been sent yet, send a proper error response
-        if (!res.headersSent) {
+        // Iter-33 finding 2: branch on `responseMode` (the wire
+        // format the handler committed to), NOT `res.headersSent`
+        // (which flips synchronously in `writeHead` and lies about
+        // which format the client is consuming). Each branch
+        // produces output that matches the Content-Type the client
+        // already received — or no output at all if the terminal
+        // already landed.
+        if (visibility.responseMode === null) {
+          // Headers never went out. Safe to emit a clean 500 JSON
+          // error.
           sendInternalError(res, message);
+        } else if (visibility.responseMode === 'json') {
+          // We already wrote `Content-Type: application/json` and
+          // possibly some body bytes; emitting an SSE frame here
+          // would corrupt the response. Best we can do is destroy
+          // the socket so the client sees a truncated JSON
+          // response instead of a malformed document with an
+          // unexpected MIME type. If the body was fully written
+          // (`responseBodyWritten === true`) the outcome gate
+          // above already returned without rethrowing, so reaching
+          // this branch means the JSON never fully landed.
+          try {
+            res.destroy(err instanceof Error ? err : new Error(message));
+          } catch {
+            // Socket may already be gone; nothing more we can do.
+          }
         } else {
-          // Headers already sent (streaming) -- best effort: write error event and close
-          writeSSEEvent(res, 'error', { error_type: 'server_error', message });
-          endSSE(res);
+          // `responseMode === 'sse'`: headers advertise SSE and
+          // some (or all) of the stream already went out. If a
+          // terminal event already landed, emitting another frame
+          // is a no-op from the client's perspective but we still
+          // close the stream cleanly. If no terminal landed (early
+          // `writeSSEEvent` crash before `response.created`), emit
+          // a best-effort streaming `error` frame so the client
+          // sees SOMETHING it can parse.
+          if (!visibility.terminalEmitted) {
+            writeFallbackErrorSSE(res, 'error', { error_type: 'server_error', message });
+          }
+          try {
+            endSSE(res);
+          } catch {
+            // Already closed / destroyed.
+          }
         }
       }
     });

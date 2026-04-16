@@ -49,10 +49,14 @@ function createMockRes(): {
   getBody: () => string;
   getHeaders: () => Record<string, string | string[]>;
   waitForEnd: () => Promise<void>;
+  wasDestroyed: () => boolean;
+  getDestroyError: () => Error | null;
 } {
   let status = 200;
   let body = '';
   const headers: Record<string, string | string[]> = {};
+  let destroyed = false;
+  let destroyError: Error | null = null;
   let endResolve: () => void;
   const endPromise = new Promise<void>((resolve) => {
     endResolve = resolve;
@@ -94,14 +98,70 @@ function createMockRes(): {
   writable.headersSent = false;
 
   const origEnd = writable.end.bind(writable);
-  // @ts-expect-error
-  writable.end = (chunk: string | Uint8Array, encoding: BufferEncoding, cb?: () => void) => {
-    if (chunk) body += chunk.toString();
+  // Mirrors Node's overloaded `end()` signature
+  // (chunk?, encoding? | cb?, cb?): the callback slot floats
+  // depending on whether `encoding` was passed. Iter-33 regression
+  // tests call `res.end(body, cb)` via `endJson`, so the mock MUST
+  // hoist the callback out of the `encoding` slot when it is a
+  // function — otherwise the cb never fires and `endJson` hangs.
+  (writable as unknown as { end: (...args: unknown[]) => unknown }).end = (
+    chunkArg?: unknown,
+    encodingArg?: unknown,
+    cbArg?: unknown,
+  ) => {
+    let chunk: string | Uint8Array | undefined;
+    let encoding: BufferEncoding = 'utf8';
+    let cb: ((err?: Error | null) => void) | undefined;
+    if (typeof chunkArg === 'function') {
+      cb = chunkArg as (err?: Error | null) => void;
+    } else {
+      chunk = chunkArg as string | Uint8Array | undefined;
+      if (typeof encodingArg === 'function') {
+        cb = encodingArg as (err?: Error | null) => void;
+      } else {
+        if (typeof encodingArg === 'string') {
+          encoding = encodingArg as BufferEncoding;
+        }
+        if (typeof cbArg === 'function') {
+          cb = cbArg as (err?: Error | null) => void;
+        }
+      }
+    }
+    if (chunk != null) body += chunk.toString();
     // Node flips `headersSent` inside `writeHead`, but `end()` may
     // be called without an explicit `writeHead` (the implicit-header
     // path), so set it here defensively too.
     writable.headersSent = true;
-    origEnd(undefined, encoding, cb);
+    origEnd(undefined, encoding, (err?: Error | null) => {
+      if (cb) cb(err ?? null);
+    });
+    endResolve();
+    return writable;
+  };
+
+  // Track `res.destroy()` calls from the outer catch. The iter-33
+  // fix replaces the SSE-fallback-on-JSON-failure path with a
+  // `res.destroy(err)`, so the JSON-request end-callback-error
+  // regression test needs a signal for "the request was torn down"
+  // that is distinct from `end()` being called. Resolve `endPromise`
+  // here too so `waitForEnd()` returns even on the destroy path.
+  // Swallow any `'error'` emitted by the underlying Writable's
+  // destroy path. Node's real `ServerResponse` handles its own
+  // socket error listeners; the mock has none, so a bare
+  // `writable.destroy(err)` would blow up as an uncaught error.
+  writable.on('error', () => {});
+  const origDestroy = writable.destroy.bind(writable);
+  writable.destroy = (err?: Error) => {
+    destroyed = true;
+    destroyError = err ?? null;
+    writable.headersSent = true;
+    try {
+      origDestroy(err);
+    } catch {
+      // Destroying a writable that is already being torn down is
+      // fine; the iter-33 outer catch already swallows secondary
+      // throws here.
+    }
     endResolve();
     return writable;
   };
@@ -112,6 +172,8 @@ function createMockRes(): {
     getBody: () => body,
     getHeaders: () => headers,
     waitForEnd: () => endPromise,
+    wasDestroyed: () => destroyed,
+    getDestroyError: () => destroyError,
   };
 }
 
@@ -5195,14 +5257,15 @@ describe('createHandler', () => {
         model: 'test-model',
         input: 'trigger a committed turn with end crash',
       });
-      const { res, getBody, waitForEnd } = createMockRes();
+      const { res, getBody, waitForEnd, wasDestroyed } = createMockRes();
 
       // `writeHead` succeeds — `headersSent` flips to `true` per
       // Node's real semantics (now mirrored in `createMockRes`). The
       // FIRST `res.end()` throws, simulating a socket crash between
-      // headers and body. Subsequent `end()` calls (from the outer
-      // `sendInternalError`) succeed so the client still gets a 500
-      // and `waitForEnd()` resolves.
+      // headers and body. Under iter-33 the outer catch destroys
+      // the socket instead of emitting SSE frames into a JSON body,
+      // so later `end()` calls are not expected on this path; the
+      // mock's `destroy()` resolves `waitForEnd()` for us.
       let endCallCount = 0;
       const originalEnd = res.end.bind(res);
       // @ts-expect-error overriding the narrow overload signature
@@ -5237,16 +5300,18 @@ describe('createHandler', () => {
       expect(sessionReg).toBeDefined();
       expect(sessionReg!.size).toBe(0);
 
-      // Secondary: the error propagated to the outer catch. Since
-      // `writeHead` already flushed 200 headers before `end` threw,
-      // the outer catch has no way to undo that — it falls through
-      // to the SSE-style error epilogue (`writeSSEEvent(res,
-      // 'error', ...)`). The exact wire shape there is a pre-
-      // existing non-streaming quirk, but we can still prove the
-      // outer catch ran by looking for the `server_error` marker
-      // in whatever landed on the wire.
+      // Iter-33 finding 2 tightening: the outer catch used to
+      // `writeSSEEvent(res, 'error', ...)` when `res.headersSent`
+      // was true, which emitted SSE-formatted frames INTO a
+      // `Content-Type: application/json` body. The new outer catch
+      // branches on `responseMode` (committed by `endJson`), not
+      // `headersSent`, and destroys the socket on a JSON-mode
+      // failure instead of corrupting the wire format. Verify the
+      // socket was torn down and no SSE frame leaked into the body.
+      expect(wasDestroyed()).toBe(true);
       const body = getBody();
-      expect(body).toMatch(/server_error/);
+      expect(body).not.toContain('event: error');
+      expect(body).not.toMatch(/^data: /m);
     });
 
     it('streaming early SSE write crash before any terminal rethrows and does not adopt', async () => {
@@ -5417,6 +5482,166 @@ describe('createHandler', () => {
       const sessionReg = registry.getSessionRegistry('test-model');
       expect(sessionReg).toBeDefined();
       expect(sessionReg!.size).toBe(1);
+    });
+
+    it('non-streaming: async res.end callback error does NOT adopt or corrupt the wire', async () => {
+      // Iter-33 finding 1 regression: `responseBodyWritten` used to
+      // flip the moment `res.end()` returned synchronously, but
+      // that only proves Node buffered the bytes — NOT that the
+      // kernel accepted them. An async socket failure surfaced via
+      // `res.end`'s write callback (err != null) meant the client
+      // never received the JSON body, yet the gate saw
+      // `responseBodyWritten === true` and happily adopted the
+      // committed session under an unseen responseId.
+      //
+      // Also covers finding 2: the outer catch used to branch on
+      // `res.headersSent` and would therefore emit SSE frames into
+      // a `Content-Type: application/json` response on this same
+      // failure shape. The fix destroys the socket instead, so the
+      // wire contract is honoured regardless of which mode failed.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
+      registry.register('test-model', mockModel);
+
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'trigger an async end-callback failure',
+      });
+      const { res, getBody, waitForEnd, wasDestroyed } = createMockRes();
+
+      // Override `res.end` so the write callback fires with an
+      // Error — the classic shape of a late socket failure that
+      // `end()` itself returns from synchronously. This is the
+      // specific bug iter-33 finding 1 calls out.
+      let endCallCount = 0;
+      const originalEnd = res.end.bind(res);
+      (res as unknown as { end: (...args: unknown[]) => unknown }).end = (
+        chunk?: unknown,
+        encodingOrCb?: unknown,
+        maybeCb?: unknown,
+      ) => {
+        endCallCount++;
+        if (endCallCount === 1) {
+          const cb = typeof encodingOrCb === 'function' ? encodingOrCb : maybeCb;
+          // Simulate Node accepting the sync return but asynchronously
+          // reporting an error to the callback.
+          if (typeof cb === 'function') {
+            queueMicrotask(() => (cb as (err: Error) => void)(new Error('simulated late socket failure')));
+          }
+          return res;
+        }
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+        return originalEnd(chunk as any, encodingOrCb as any, maybeCb as any);
+      };
+
+      await handler(req, res);
+      await waitForEnd();
+
+      // The model committed, but the client NEVER saw the body —
+      // the adopt gate must refuse.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(mockModel.chatSessionStart).toHaveBeenCalledTimes(1);
+      const sessionReg = registry.getSessionRegistry('test-model');
+      expect(sessionReg).toBeDefined();
+      expect(sessionReg!.size).toBe(0);
+
+      // Outer catch on a JSON-mode failure destroys the socket
+      // (finding 2). No SSE frame leaked into the JSON-declared
+      // response.
+      expect(wasDestroyed()).toBe(true);
+      const body = getBody();
+      expect(body).not.toContain('event: error');
+      expect(body).not.toMatch(/^data: /m);
+    });
+
+    it('streaming: async terminal-SSE write-callback error keeps terminalEmitted false', async () => {
+      // Iter-33 finding 1 regression on the streaming path. The
+      // old code flipped `terminalEmitted = true` the moment
+      // `writeSSEEvent` returned synchronously from emitting
+      // `response.completed`. If the underlying socket failed
+      // asynchronously (write returned but the callback later
+      // reported an error), the gate thought a terminal had landed
+      // and adopted — even though the client never got an ack.
+      //
+      // The fix writes the terminal through `flushTerminalSSE`,
+      // which gates the flag on the write callback firing without
+      // an error. This test drives exactly that shape.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { done: false, text: 'hi' },
+        {
+          done: true,
+          text: 'hi',
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 2,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: 'hi',
+        },
+      ];
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockResolvedValue([]),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'trigger streaming async-terminal failure',
+        stream: true,
+      });
+      const { res } = createMockRes();
+
+      // Intercept `res.write` so the SYNCHRONOUS return looks
+      // happy, but the write callback fires with an error. We only
+      // poison the terminal write (the one carrying
+      // `response.completed`); every other write goes through
+      // normally so the pre-terminal stream lands on the client.
+      const originalWrite = res.write.bind(res);
+      res.write = ((chunk: Uint8Array | string, encodingOrCb?: unknown, maybeCb?: unknown): boolean => {
+        const chunkStr = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+        const cb = typeof encodingOrCb === 'function' ? encodingOrCb : maybeCb;
+        if (chunkStr.startsWith('event: response.completed')) {
+          // Buffer accepted the bytes (return true so the caller
+          // believes the sync write succeeded) but report an async
+          // error to the callback.
+          if (typeof cb === 'function') {
+            queueMicrotask(() => (cb as (err: Error) => void)(new Error('simulated async terminal write failure')));
+          }
+          return true;
+        }
+        // Non-terminal writes: delegate to the real writer so the
+        // body accumulator captures them.
+        return (originalWrite as unknown as (...a: unknown[]) => boolean)(
+          chunk,
+          encodingOrCb as unknown,
+          maybeCb as unknown,
+        );
+      }) as ServerResponse['write'];
+
+      await handler(req, res);
+      // Allow the queued microtask to fire.
+      await new Promise((r) => setTimeout(r, 0));
+
+      // The session committed on the native side, but the client
+      // never acked the terminal. The adopt gate must refuse so a
+      // later `previous_response_id` chain does not resume from a
+      // responseId no one actually received.
+      const sessionReg = registry.getSessionRegistry('test-model');
+      expect(sessionReg).toBeDefined();
+      expect(sessionReg!.size).toBe(0);
     });
   });
 });

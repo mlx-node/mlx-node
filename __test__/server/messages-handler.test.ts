@@ -19,11 +19,13 @@ function createMockRes(): {
   getStatus: () => number;
   getBody: () => string;
   getHeaders: () => Record<string, string | string[]>;
+  wasDestroyed: () => boolean;
 } {
   const { Writable } = require('node:stream');
   let status = 200;
   let body = '';
   const headers: Record<string, string | string[]> = {};
+  let destroyed = false;
 
   const writable = new Writable({
     write(chunk: Uint8Array | string, _encoding: string, callback: () => void) {
@@ -31,6 +33,10 @@ function createMockRes(): {
       callback();
     },
   });
+  // Swallow any `'error'` emitted by the underlying Writable's
+  // destroy path — the mock has no error listeners, so a real
+  // `writable.destroy(err)` would blow up as an uncaught error.
+  writable.on('error', () => {});
 
   writable.writeHead = (s: number, h?: Record<string, string>) => {
     status = s;
@@ -54,10 +60,45 @@ function createMockRes(): {
   writable.headersSent = false;
 
   const origEnd = writable.end.bind(writable);
-  writable.end = (chunk?: string | Uint8Array, ...args: any[]) => {
-    if (chunk) body += chunk.toString();
+  // Mirror Node's overloaded `end()` signature (chunk?, encoding? |
+  // cb?, cb?). Iter-33 regression tests call `res.end(body, cb)`
+  // via `endJson`, so the mock MUST hoist the callback out of the
+  // `encoding` slot when it is a function — otherwise the cb never
+  // fires and `endJson` hangs.
+  writable.end = (chunkArg?: unknown, encodingArg?: unknown, cbArg?: unknown) => {
+    let chunk: string | Uint8Array | undefined;
+    let encoding: unknown;
+    let cb: ((err?: Error | null) => void) | undefined;
+    if (typeof chunkArg === 'function') {
+      cb = chunkArg as (err?: Error | null) => void;
+    } else {
+      chunk = chunkArg as string | Uint8Array | undefined;
+      if (typeof encodingArg === 'function') {
+        cb = encodingArg as (err?: Error | null) => void;
+      } else {
+        encoding = encodingArg;
+        if (typeof cbArg === 'function') {
+          cb = cbArg as (err?: Error | null) => void;
+        }
+      }
+    }
+    if (chunk != null) body += chunk.toString();
     writable.headersSent = true;
-    origEnd(undefined, ...args);
+    origEnd(undefined, encoding, (err?: Error | null) => {
+      if (cb) cb(err ?? null);
+    });
+    return writable;
+  };
+
+  const origDestroy = writable.destroy.bind(writable);
+  writable.destroy = (err?: Error) => {
+    destroyed = true;
+    writable.headersSent = true;
+    try {
+      origDestroy(err);
+    } catch {
+      // Already torn down.
+    }
     return writable;
   };
 
@@ -66,6 +107,7 @@ function createMockRes(): {
     getStatus: () => status,
     getBody: () => body,
     getHeaders: () => headers,
+    wasDestroyed: () => destroyed,
   };
 }
 
@@ -1861,6 +1903,137 @@ describe('handleCreateMessage', () => {
       // eslint-disable-next-line @typescript-eslint/unbound-method
       const originalStart = originalModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
       expect(originalStart).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Iter-33 finding 3: wire-contract / visibility fixes on /v1/messages
+  // -----------------------------------------------------------------------
+
+  describe('transport visibility (iter-33 finding 3)', () => {
+    it('non-streaming: JSON-mode async end-callback failure destroys the socket instead of emitting SSE', async () => {
+      // Iter-33 finding 3 regression. The Anthropic handler is
+      // stateless (no session to adopt) but its outer catch still
+      // keyed "JSON vs SSE fallback" on `res.headersSent`. A JSON
+      // request whose `res.end()` reported an async callback
+      // failure — happens when the underlying socket breaks AFTER
+      // Node queued the payload but BEFORE the flush completes —
+      // would then emit an SSE frame INTO a `Content-Type:
+      // application/json` body.
+      //
+      // The fix commits the wire format in `endJson` via
+      // `responseMode = 'json'` and switches the outer catch to
+      // branch on that. On a JSON-mode failure we destroy the
+      // socket so the client sees a truncated JSON body rather
+      // than a malformed document with unexpected MIME frames.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'hi' }));
+      registry.register('test-model', mockModel);
+      const { res, getBody, wasDestroyed } = createMockRes();
+
+      // Poison the end callback. First call: report an async error
+      // to the callback; the handler must see that as
+      // responseBodyWritten = false and route to the outer catch.
+      const originalEnd = res.end.bind(res);
+      let endCallCount = 0;
+      (res as unknown as { end: (...args: unknown[]) => unknown }).end = (
+        chunk?: unknown,
+        encodingOrCb?: unknown,
+        maybeCb?: unknown,
+      ) => {
+        endCallCount++;
+        if (endCallCount === 1) {
+          const cb = typeof encodingOrCb === 'function' ? encodingOrCb : maybeCb;
+          if (typeof cb === 'function') {
+            queueMicrotask(() => (cb as (err: Error) => void)(new Error('simulated late socket failure')));
+          }
+          return res;
+        }
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+        return originalEnd(chunk as any, encodingOrCb as any, maybeCb as any);
+      };
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        } as any,
+        registry,
+      );
+      // Allow the queued microtask to fire.
+      await new Promise((r) => setTimeout(r, 0));
+
+      // Wire contract: socket destroyed, body contains NO SSE
+      // frame. `event: error` or `data: ` in a JSON response is
+      // exactly the corruption finding 3 prevents.
+      expect(wasDestroyed()).toBe(true);
+      const body = getBody();
+      expect(body).not.toContain('event: error');
+      expect(body).not.toMatch(/^data: /m);
+    });
+
+    it('streaming: early SSE write crash before any terminal emits an error frame and does not hang', async () => {
+      // Iter-33 finding 3 regression on the streaming path. A
+      // mid-decode `res.write` crash BEFORE any terminal
+      // (`message_stop` / streaming `error`) used to land in the
+      // old outer-catch branch that keyed on `headersSent` — which
+      // would STILL try to emit an SSE error frame but would NOT
+      // know whether a terminal had already arrived, so a race
+      // could leak a double terminal. The fix gates
+      // `terminalEmitted` on the actual terminal write callback
+      // and branches the outer catch on `responseMode` +
+      // `terminalEmitted`, so the fallback frame only fires when
+      // the client has not already observed a terminal.
+      const registry = new ModelRegistry();
+      async function* stream() {
+        yield { done: false, text: 'never emitted', isReasoning: false };
+      }
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('should not be called')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('should not be called')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('should not be called')),
+        chatStreamSessionStart: vi.fn(() => stream()),
+        chatStreamSessionContinue: vi.fn(() => stream()),
+        chatStreamSessionContinueTool: vi.fn(() => stream()),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const { res, getBody } = createMockRes();
+
+      // First `res.write` throws (the `message_start` SSE frame
+      // never lands). Subsequent writes succeed so the fallback
+      // error frame from the outer catch can be emitted.
+      let writeCallCount = 0;
+      const originalWrite = res.write.bind(res);
+      res.write = ((chunk: Uint8Array | string, ...rest: unknown[]) => {
+        writeCallCount++;
+        if (writeCallCount === 1) {
+          throw new Error('simulated early SSE write crash');
+        }
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+        return (originalWrite as unknown as (...a: unknown[]) => boolean)(chunk, ...rest);
+      }) as ServerResponse['write'];
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stream: true,
+        } as any,
+        registry,
+      );
+
+      // The outer catch ran: a best-effort `error` SSE frame
+      // landed on the wire AFTER the first write crashed. The
+      // exact payload follows Anthropic's error envelope.
+      const body = getBody();
+      expect(body).toContain('event: error');
+      expect(body).toContain('api_error');
     });
   });
 });
