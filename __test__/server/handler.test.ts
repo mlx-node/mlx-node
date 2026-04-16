@@ -4298,13 +4298,16 @@ describe('createHandler', () => {
       //
       // Iter-46 fix: scope the tombstone's lifetime to the
       // PENDING persist that installed it. The breaker captures
-      // the `{ token, instanceId }` pair returned by
+      // the `{ instanceId }` returned by
       // `retireInstanceIdForForceRelease` in a local variable,
-      // and the persist's `.finally(...)` drops the tombstone
-      // via `registry.clearTombstone(model, token)`. Iter-47
-      // extends this to per-token scoping so overlapping
-      // breakers on the same live instance id do not clobber
-      // each other — each persist owns its own tombstone slot.
+      // and the persist's `.finally(...)` releases the
+      // tombstone via `registry.releaseTombstone(model)`.
+      // Iter-48 stores one refcounted entry per model so
+      // overlapping breakers on the same live instance id
+      // share one slot — each retire increments, each release
+      // decrements, and the entry survives until every pending
+      // persist has released (bounded memory under wedged
+      // stores).
       //
       // Shape (Deferred<void> pattern):
       //   - `store.store(...)` returns a promise we control —
@@ -4317,8 +4320,8 @@ describe('createHandler', () => {
       //   - Sleep ~150ms so the hard timer fires and installs
       //     the tombstone.
       //   - Resolve the Deferred — this forces the persist's
-      //     `.finally(...)` to run, which clears the tombstone
-      //     via `clearTombstone`.
+      //     `.finally(...)` to run, which releases the
+      //     tombstone via `releaseTombstone`.
       //   - Drain microtasks + one macrotask so the `.finally`
       //     body has definitely executed.
       //   - `unregister(MODEL_NAME)` + `register(MODEL_NAME, sameModel)`
@@ -4391,11 +4394,12 @@ describe('createHandler', () => {
         await new Promise((r) => setTimeout(r, 150));
         await new Promise((r) => setImmediate(r));
 
-        // NOW settle the pending persist. Under iter-46/47 the
-        // persist's `.finally(...)` immediately drops the
-        // tombstone via `clearTombstone`. Drain microtasks +
-        // one macrotask so the `.finally` body has definitely
-        // executed.
+        // NOW settle the pending persist. Under iter-46/48 the
+        // persist's `.finally(...)` releases the tombstone via
+        // `releaseTombstone`; since this is the only pending
+        // retire, its refcount drains to zero and the entry
+        // is dropped. Drain microtasks + one macrotask so the
+        // `.finally` body has definitely executed.
         expect(resolvePersist).toBeDefined();
         resolvePersist!();
         await Promise.resolve();
@@ -4432,48 +4436,38 @@ describe('createHandler', () => {
       }
     }, 5000);
 
-    it('iter-47: overlapping hard-timeouts use per-persist tokens; settling one does not clear the other', async () => {
+    it('iter-47/48: overlapping hard-timeouts are reference-counted; tombstone survives until all outstanding persists release', async () => {
       // Codex's iter-46 review flagged a HIGH finding: the
       // iter-46 tombstone storage keyed retired ids by
       // `WeakMap<Model, number>`, so two overlapping hard-
       // timeouts on the SAME live binding both retired the
       // SAME numeric instance id and the second breaker simply
       // overwrote the first with the identical value. Whichever
-      // persist settled first ran
-      // `clearTombstoneIfMatches(model, id)`, matched, and
-      // DELETED the only tombstone entry — wiping out the
-      // tombstone that the OTHER still-hung persist was
+      // persist settled first ran `clearTombstoneIfMatches`,
+      // matched, and DELETED the only tombstone entry — wiping
+      // out the tombstone that the OTHER still-hung persist was
       // relying on to keep its late-landing row chainable.
       //
-      // Concrete failing sequence under iter-46:
-      //   t=0:    register(model) -> instanceId = N.
-      //   t=0:    persist A starts, wedges.
-      //   t=5s:   persist A hard-timeout fires, tombstones[model] = N.
-      //   t=10s:  persist B starts on the still-live binding,
-      //           wedges, hard-timeout fires, tombstones[model] = N
-      //           (overwrites with the same numeric value).
-      //   t=15s:  persist A settles -> finally() runs
-      //           clearTombstoneIfMatches(model, N) -> matches N,
-      //           deletes the tombstone. But persist B is STILL hung.
-      //   t=16s:  unregister + register -> no tombstone in the
-      //           WeakMap -> mints fresh id N+1.
-      //   t=20s:  persist B finally settles and writes its
-      //           stored row stamped with the old N -> a future
-      //           `previous_response_id` continuation rejects
-      //           with 400 instance-mismatch, silently breaking
-      //           the chain.
+      // Iter-47 addressed that by minting a unique `symbol`
+      // token per breaker fire and keeping one map entry per
+      // token. Codex's iter-47 review then flagged a follow-up:
+      // under a truly wedged store, persists never settle, so
+      // each hard-timeout appends a new Symbol slot that is
+      // never cleared — memory grows O(timeouts) per wedged
+      // model and the retired id stays pinned across
+      // subsequent unregister/re-register cycles indefinitely.
       //
-      // Iter-47 fix: store per-model tombstones as
-      // `Map<symbol, number>` and mint a unique `Symbol('tombstone')`
-      // per breaker fire. Each persist's `.finally(...)` clears
-      // only its own token via `clearTombstone(model, token)`;
-      // overlapping breakers own independent slots. Register-
-      // inherit reads any entry from the per-model map (all
-      // entries carry the same numeric id because register-
-      // inherit preserves it), so inheritance works as long as
-      // ANY breaker's tombstone is still outstanding. Only when
-      // the LAST pending persist clears its token does the map
-      // empty out and the next teardown mint fresh.
+      // Iter-48 fix: store ONE
+      // `{ instanceId, outstandingCount }` entry per model.
+      // Overlapping breakers on the same live binding target
+      // the SAME retired id (the register-inherit path keeps
+      // using it while the tombstone is alive), so they can
+      // safely share a single refcount. Each retire
+      // increments; each release decrements; the entry is
+      // dropped once the count hits zero. Memory stays O(1)
+      // per model and tombstone survival still requires EVERY
+      // outstanding persist to settle before teardown mints a
+      // fresh id.
       //
       // We drive this through the registry's public API
       // directly (installing two tombstones without spinning
@@ -4492,35 +4486,34 @@ describe('createHandler', () => {
         resetCaches: vi.fn(),
       } as unknown as SessionCapableModel;
       const registry = new ModelRegistry();
-      const MODEL_NAME = 'iter-47-overlapping-hard-timeouts';
+      const MODEL_NAME = 'iter-48-overlapping-hard-timeouts';
       registry.register(MODEL_NAME, mockModel);
 
       const idBefore = registry.getInstanceId(MODEL_NAME);
       expect(typeof idBefore).toBe('number');
 
       // Simulate two overlapping hard-timeouts by retiring the
-      // same live instance id twice. Each call mints a fresh
-      // token; both tombstones reference the same numeric id
-      // (they share a single live binding).
+      // same live instance id twice. Both retires target the
+      // same numeric id and collapse into one refcounted
+      // entry with outstandingCount = 2.
       const tombstoneA = registry.retireInstanceIdForForceRelease(mockModel);
       const tombstoneB = registry.retireInstanceIdForForceRelease(mockModel);
       expect(tombstoneA).toBeDefined();
       expect(tombstoneB).toBeDefined();
       expect(tombstoneA!.instanceId).toBe(idBefore);
       expect(tombstoneB!.instanceId).toBe(idBefore);
-      // Tokens MUST be distinct so settlement of one cannot
-      // accidentally clear the other.
-      expect(tombstoneA!.token).not.toBe(tombstoneB!.token);
 
-      // Persist A "settles" -> clears ONLY its own token.
-      // Under iter-46 the numeric-keyed `clearTombstoneIfMatches`
-      // would have wiped the sole map entry here, so the
-      // register-inherit path below would have missed. Under
-      // iter-47 the per-token cleanup leaves B's slot intact.
-      registry.clearTombstone(mockModel, tombstoneA!.token);
+      // Persist A "settles" -> releases its retire. The
+      // shared refcount drops to 1 so the tombstone survives.
+      // Under iter-46 the numeric-keyed
+      // `clearTombstoneIfMatches` would have wiped the sole
+      // entry here, so the register-inherit path below would
+      // have missed. Under iter-48 refcounting keeps the
+      // entry alive while B is still outstanding.
+      registry.releaseTombstone(mockModel);
 
       // Unregister + re-register the SAME model object. With
-      // persist B's tombstone still in place, the fresh
+      // persist B's retire still outstanding, the fresh
       // binding MUST inherit `idBefore` — NOT mint fresh.
       // Observable outcome only; we don't peek into the
       // WeakMap directly.
@@ -4530,13 +4523,12 @@ describe('createHandler', () => {
       expect(typeof idAfterASettled).toBe('number');
       expect(idAfterASettled).toBe(idBefore);
 
-      // Persist B "settles" -> clears its own token. The map
-      // is now empty, so the WeakMap entry is dropped (iter-47
-      // contract).
-      registry.clearTombstone(mockModel, tombstoneB!.token);
+      // Persist B "settles" -> releases its retire. The
+      // refcount drains to zero and the entry is dropped.
+      registry.releaseTombstone(mockModel);
 
       // Now unregister + re-register the SAME model object
-      // AGAIN. With every tombstone settled, this is a
+      // AGAIN. With every tombstone released, this is a
       // logically dead binding and re-registration MUST mint
       // a FRESH id (different from `idBefore`) — matching the
       // pre-iter-45 teardown semantics for non-wedged cases.
@@ -4546,12 +4538,122 @@ describe('createHandler', () => {
       // INTERMEDIATE state, not this final one. The pair of
       // assertions together (idAfterASettled === idBefore AND
       // idAfterBSettled !== idBefore) is what fingerprints
-      // iter-47's per-token scoping.
+      // the shared refcount's drain semantics.
       expect(registry.unregister(MODEL_NAME)).toBe(true);
       registry.register(MODEL_NAME, mockModel);
       const idAfterBSettled = registry.getInstanceId(MODEL_NAME);
       expect(typeof idAfterBSettled).toBe('number');
       expect(idAfterBSettled).not.toBe(idBefore);
+    }, 5000);
+
+    it('iter-48: wedged-store tombstone state stays O(1); N unreleased retires share one entry', async () => {
+      // Codex's iter-47 review flagged that the iter-47
+      // WeakMap<Model, Map<symbol, number>> layout — one
+      // Symbol entry per breaker fire — was only bounded by
+      // persist settlements. Under a truly wedged store the
+      // persists never settle, so each fresh hard-timeout
+      // appended a new Symbol slot that stayed live for the
+      // process lifetime. Memory grew O(timeouts) per wedged
+      // model and the retired id stayed pinned across
+      // unregister/re-register cycles indefinitely.
+      //
+      // Iter-48 replaces that with a single refcounted
+      // `{ instanceId, outstandingCount }` entry per model.
+      // Every retire increments the counter; every release
+      // decrements it. The entry is dropped once the count
+      // drains to zero. Regardless of how many hard-timeouts
+      // have fired (even thousands, against a wedged store),
+      // the tombstone's memory footprint is O(1) per model.
+      //
+      // This test exercises the wedged-store shape directly
+      // against the registry's public API. We fire N retires
+      // WITHOUT releasing any of them, confirm every retire
+      // reports the same `instanceId`, confirm the tombstone
+      // stays alive across unregister/re-register (same id
+      // inherited), release only K of the N, confirm the
+      // tombstone STILL survives, then release the remaining
+      // (N - K) and confirm the next teardown mints fresh.
+      // Observable outcomes only — we don't peek into the
+      // registry's internal WeakMap shape; the O(1) bound is
+      // established by the behavior contract (all retires
+      // collapse into one shared refcount).
+      const mockModel = {
+        chatSessionStart: vi.fn(),
+        chatSessionContinue: vi.fn(),
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      const MODEL_NAME = 'iter-48-wedged-store-bounded-tombstone';
+      registry.register(MODEL_NAME, mockModel);
+
+      const idBefore = registry.getInstanceId(MODEL_NAME);
+      expect(typeof idBefore).toBe('number');
+
+      // Simulate N hard-timeouts firing against a wedged
+      // store: N retires with no releases. Each retire MUST
+      // report the same retired id (they all target the same
+      // live binding, and the register-inherit path preserves
+      // it while the tombstone is alive).
+      const N = 32;
+      const K = 10;
+      const retireResults: { instanceId: number }[] = [];
+      for (let i = 0; i < N; i += 1) {
+        const result = registry.retireInstanceIdForForceRelease(mockModel);
+        expect(result).toBeDefined();
+        expect(result!.instanceId).toBe(idBefore);
+        retireResults.push(result!);
+      }
+      expect(retireResults).toHaveLength(N);
+
+      // Tombstone alive with N outstanding retires -> an
+      // unregister + same-object register inherits the
+      // retired id. Under iter-47 this would also pass, but
+      // at the cost of an N-entry Symbol map.
+      expect(registry.unregister(MODEL_NAME)).toBe(true);
+      registry.register(MODEL_NAME, mockModel);
+      expect(registry.getInstanceId(MODEL_NAME)).toBe(idBefore);
+
+      // Release K out of N (K < N). Tombstone still alive
+      // because (N - K) retires remain outstanding. Another
+      // unregister + same-object register MUST still inherit
+      // the same retired id.
+      for (let i = 0; i < K; i += 1) {
+        registry.releaseTombstone(mockModel);
+      }
+      expect(registry.unregister(MODEL_NAME)).toBe(true);
+      registry.register(MODEL_NAME, mockModel);
+      expect(registry.getInstanceId(MODEL_NAME)).toBe(idBefore);
+
+      // Release the remaining (N - K). The refcount drains
+      // to zero and the tombstone entry is dropped. Now a
+      // fresh unregister + same-object register MUST mint a
+      // FRESH id.
+      for (let i = 0; i < N - K; i += 1) {
+        registry.releaseTombstone(mockModel);
+      }
+      expect(registry.unregister(MODEL_NAME)).toBe(true);
+      registry.register(MODEL_NAME, mockModel);
+      const idAfterAllReleased = registry.getInstanceId(MODEL_NAME);
+      expect(typeof idAfterAllReleased).toBe('number');
+      expect(idAfterAllReleased).not.toBe(idBefore);
+
+      // Defensive: a spurious extra release against a drained
+      // tombstone MUST NOT underflow or otherwise re-enable
+      // inheritance on the freshly-minted id. Unregister +
+      // re-register MUST mint yet another fresh id — the new
+      // live id is NOT pinned by a phantom tombstone from an
+      // earlier lifecycle.
+      registry.releaseTombstone(mockModel);
+      expect(registry.unregister(MODEL_NAME)).toBe(true);
+      registry.register(MODEL_NAME, mockModel);
+      const idAfterSpuriousRelease = registry.getInstanceId(MODEL_NAME);
+      expect(typeof idAfterSpuriousRelease).toBe('number');
+      expect(idAfterSpuriousRelease).not.toBe(idAfterAllReleased);
+      expect(idAfterSpuriousRelease).not.toBe(idBefore);
     }, 5000);
 
     it('iter-45/46: MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS parsing: empty/whitespace -> default, "0" -> disabled, valid -> parsed', async () => {
