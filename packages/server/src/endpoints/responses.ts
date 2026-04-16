@@ -29,6 +29,7 @@ import {
   genId,
   mapFinishReasonToStatus,
 } from '../mappers/response.js';
+import { getPendingWritesFor } from '../pending-writes.js';
 import type { ModelRegistry } from '../registry.js';
 import type { SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
@@ -95,9 +96,10 @@ async function handleNonStreaming(
   // catch expects — the JSON-mode branch destroys the socket, the
   // adopt gate refuses to cache the session under an unreachable
   // responseId (because the handler threw before
-  // `responseBodyWritten` flipped), and the outer persist gate
-  // sees `pendingNonStreamingPersistOuter === null` so no store
-  // record gets written for a turn the client never observed.
+  // `responseBodyWritten` flipped), and the persist-initiator
+  // path inside `withExclusive` never runs (`handlerError` set,
+  // no `initiatePersist` call) so no store record gets written
+  // for a turn the client never observed.
   //
   // `endJson` commits `responseMode = 'json'` synchronously so the
   // outer catch knows to emit a clean JSON error (or destroy the
@@ -189,7 +191,7 @@ function buildFailedTerminal(
  * iterator exhausts without a `done` event, when a mid-decode throw
  * propagates through (caught by the try/catch added in iter-28
  * finding 2), or when the client disconnect flag fires mid-iteration.
- * In every non-committed case we MUST skip `persistResponse()` and
+ * In every non-committed case we MUST skip `initiatePersist()` and
  * emit `response.failed` instead of `response.completed`, otherwise
  * a later `previous_response_id` continuation would cold-replay a
  * turn the session never committed — silently resurrecting failed
@@ -254,6 +256,33 @@ interface StreamingHandlerOutcome {
    * decided not to advertise this turn to future continuations.
    */
   terminalToPersist: ResponseObject | null;
+  /**
+   * Which failure epilogue the handler took, or `null` on the
+   * committed-success path. Iter-36 finding 2: the outer adopt gate
+   * used to key purely on `committed && (handlerError == null ||
+   * safeToSuppress)`, but `committed` only reports whether the
+   * underlying session's turn counter advanced — it does NOT report
+   * whether the response is safe to advertise as the new chain
+   * head. A `res.close` that fires AFTER the final chunk has been
+   * emitted (client dropped the last byte but the producer already
+   * committed) takes the `client_abort` failure epilogue and
+   * flushes `response.failed` successfully, which flips
+   * `safeToSuppress = true` via `visibility.terminalEmitted` — and
+   * the previous gate would then call `sessionReg.adopt(responseId,
+   * …)` on a responseId the client will never chain off of,
+   * evicting the last good hot session for the model in the
+   * process. The outer gate now checks this signal explicitly and
+   * refuses to adopt when the handler took the `client_abort`
+   * branch even if the session committed.
+   *
+   * Legal values:
+   *  - `null`                   success path (`response.completed`)
+   *  - `'client_abort'`         HTTP peer dropped mid or post stream
+   *  - `'error'`                underlying generator threw
+   *  - `'finish_reason_error'`  terminal chunk carried `finishReason: 'error'`
+   *  - `'stream_exhausted'`     iterator ended without a done event
+   */
+  failureMode: 'client_abort' | 'error' | 'finish_reason_error' | 'stream_exhausted' | null;
 }
 
 async function handleStreamingNative(
@@ -840,7 +869,7 @@ async function handleStreamingNative(
     // adopt under an unseen responseId.
     await flushTerminalSSE(res, 'response.completed', { response: terminal }, visibility);
     endSSE(res);
-    return { terminalToPersist: terminal };
+    return { terminalToPersist: terminal, failureMode: null };
   }
 
   // Failure epilogue.
@@ -861,7 +890,7 @@ async function handleStreamingNative(
   // in outputItems for the terminal payload, normalized to
   // `incomplete` by `buildFailedTerminal`. Reasoning items have no
   // `status` field so they are left untouched.
-  const reason: string = thrownError
+  const reason: 'error' | 'client_abort' | 'finish_reason_error' | 'stream_exhausted' = thrownError
     ? 'error'
     : clientAborted
       ? 'client_abort'
@@ -958,7 +987,16 @@ async function handleStreamingNative(
   // either. A later `previous_response_id` continuation that landed
   // on this record would cold-replay a turn the session rolled back,
   // silently resurrecting failed output as authoritative history.
-  return { terminalToPersist: null };
+  //
+  // Iter-36 finding 2: `failureMode` carries the reason out to the
+  // outer adopt gate, which uses `client_abort` specifically to
+  // veto adoption even when the session's internal `turns`
+  // counter advanced (a final-chunk commit followed by a post-
+  // terminal `res.close`). Carrying every reason — not just the
+  // abort case — keeps the signal complete for future gating that
+  // might want to distinguish e.g. a stream-exhausted turn from a
+  // finish_reason-error turn at the adopt site.
+  return { terminalToPersist: null, failureMode: reason };
 }
 
 // ---------------------------------------------------------------------------
@@ -1484,29 +1522,46 @@ async function runSessionStreaming(
 // Storage helper
 // ---------------------------------------------------------------------------
 
-async function persistResponse(
-  store: ResponseStore,
+/**
+ * Build the `StoredResponseRecord` for a committed response.
+ *
+ * Pure function — constructs the record payload from the inputs and
+ * does not touch the store. Split out from the initiate-persist site
+ * so `handleCreateResponse` can (a) construct the record SYNCHRONOUSLY
+ * inside `withExclusive`, (b) kick off the SQLite write through
+ * `initiatePersist` on the in-lock side so the in-flight write is
+ * registered in the per-store pending tracker BEFORE the mutex
+ * releases, and (c) await the write off-lock just to surface errors
+ * to the log. This closes the iter-35 race window where a
+ * back-to-back continuation could fire `store.getChain(id)` before
+ * the off-lock `await store.store(id)` had landed in SQLite —
+ * returning 404 on a response id the client had just received in
+ * `response.completed`. See `initiatePersist` and
+ * `packages/server/src/pending-writes.ts` for the full rationale.
+ *
+ * Store only the NEW input messages from this request, not the full
+ * expanded conversation. Chain reconstruction re-derives the full
+ * history by following previous_response_id links.
+ *
+ * `modelInstanceId` is the monotonic id `ModelRegistry` assigned to
+ * the model object that serviced this request. It is stashed inside
+ * the `configJson` blob so the Rust-side schema stays untouched; on
+ * a later `previous_response_id` continuation the responses endpoint
+ * reads it back out of the trailing chain record and compares it
+ * against the live id for `body.model`. See the endpoint's
+ * `readStoredModelIdentity` helper and the guard block in
+ * `handleCreateResponse` — records without this field are rejected
+ * outright per iter-23 finding 1 (the iter-22 friendly-name
+ * compat fallback silently reopened same-name hot-swap corruption
+ * and has been removed).
+ */
+function buildResponseRecord(
   response: ResponseObject,
   newInputMessages: ChatMessage[],
   previousResponseId: string | undefined,
   modelInstanceId: number | undefined,
-): Promise<void> {
-  // Store only the NEW input messages from this request, not the full
-  // expanded conversation. Chain reconstruction re-derives the full history
-  // by following previous_response_id links.
-  //
-  // `modelInstanceId` is the monotonic id `ModelRegistry` assigned to
-  // the model object that serviced this request. It is stashed inside
-  // the `configJson` blob so the Rust-side schema stays untouched; on
-  // a later `previous_response_id` continuation the responses endpoint
-  // reads it back out of the trailing chain record and compares it
-  // against the live id for `body.model`. See the endpoint's
-  // `readStoredModelIdentity` helper and the guard block in
-  // `handleCreateResponse` — records without this field are rejected
-  // outright per iter-23 finding 1 (the iter-22 friendly-name
-  // compat fallback silently reopened same-name hot-swap corruption
-  // and has been removed).
-  const record: StoredResponseRecord = {
+): StoredResponseRecord {
+  return {
     id: response.id,
     createdAt: response.created_at,
     model: response.model,
@@ -1527,7 +1582,34 @@ async function persistResponse(
     }),
     expiresAt: Math.floor(Date.now() / 1000) + RESPONSE_TTL_SECONDS,
   };
-  await store.store(record);
+}
+
+/**
+ * Initiate an off-lock `store.store(record)` write.
+ *
+ * SYNCHRONOUSLY kicks off the native `store.store(record)` promise,
+ * registers it in the per-store pending-write tracker under the
+ * record's id, and returns the promise to the caller. The caller
+ * MUST await the returned promise off-lock — the caller is
+ * responsible for catching errors and logging them.
+ *
+ * The crucial property for iter-36 finding 1 is that this function
+ * is called SYNCHRONOUSLY from inside `withExclusive` so that the
+ * tracker registration happens before the per-model mutex releases.
+ * Any back-to-back continuation that slips in immediately after the
+ * mutex release will observe the in-flight write through
+ * `getPendingWritesFor(store).awaitPending(previous_response_id)`
+ * and can await it before retrying `store.getChain(...)`, closing
+ * the 404-before-store-landed race window.
+ *
+ * Even though `store.store(...)` returns an already-pending promise,
+ * we never await it here — the whole point of this function is to
+ * keep the SQLite flush off the critical path.
+ */
+function initiatePersist(store: ResponseStore, record: StoredResponseRecord): Promise<void> {
+  const writePromise = store.store(record);
+  getPendingWritesFor(store).track(record.id, writePromise);
+  return writePromise;
 }
 
 /**
@@ -1681,10 +1763,47 @@ export async function handleCreateResponse(
 
     if (body.previous_response_id && store) {
       try {
-        const chain = await store.getChain(body.previous_response_id);
+        let chain = await store.getChain(body.previous_response_id);
         if (chain.length === 0) {
-          sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
-          return;
+          // Iter-36 finding 1: iter-35 moved the `store.store(...)`
+          // write OUT of `withExclusive` so a slow SQLite flush
+          // would not pin the per-model mutex on the next waiter.
+          // That opened a 404 window: a client that received
+          // `response.completed` with `responseId = A` and
+          // immediately fires a follow-up request carrying
+          // `previous_response_id: A` can reach this `getChain`
+          // BEFORE the off-lock write for A has landed in SQLite —
+          // the chain comes back empty and we would spuriously 404
+          // on a response id the client was just handed.
+          //
+          // `initiatePersist` registers every in-flight write in a
+          // per-store pending-write tracker synchronously, BEFORE
+          // the producing request's mutex releases. If the
+          // tracker reports a pending write for the requested id,
+          // await it and retry `getChain`. The retry is guaranteed
+          // to see the row because the tracked promise only
+          // resolves after the store's own serialization queue
+          // has accepted the insert. Swallow any rejection from
+          // the tracked promise — the producer's own awaiter
+          // already surfaces write failures to the log, and a
+          // failed write correctly leaves the store empty so the
+          // second `getChain` still returns `[]` and we fall
+          // through to the original 404.
+          const pending = getPendingWritesFor(store).awaitPending(body.previous_response_id);
+          if (pending !== undefined) {
+            try {
+              await pending;
+            } catch {
+              // Write failure is the producer's problem; proceed
+              // with the retry so the 404 epilogue matches the
+              // true store state.
+            }
+            chain = await store.getChain(body.previous_response_id);
+          }
+          if (chain.length === 0) {
+            sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
+            return;
+          }
         }
 
         // Hot-swap race guard (iter-22 finding 3).
@@ -2062,15 +2181,46 @@ export async function handleCreateResponse(
     abortListenersAttached = true;
     const streamSignal: AbortSignal = abortController.signal;
 
-    // Persistence captured inside the mutex, flushed to the store
-    // AFTER the mutex releases. See the handler-return types for the
-    // full rationale — persistence is best-effort and does not touch
-    // native model state, so it does not belong on the critical path.
-    // Populated only on the happy path (client observed a terminal);
-    // left `null` on every failure path so the outer persist gate
-    // does not write a record the client could not see.
-    let pendingStreamingPersistOuter: ResponseObject | null = null;
-    let pendingNonStreamingPersistOuter: ResponseObject | null = null;
+    // Iter-36 finding 1: persistence is a two-step dance.
+    //
+    //   (1) INSIDE the per-model mutex (on the happy path only):
+    //       synchronously kick off `store.store(record)` via
+    //       `initiatePersist` — which registers the in-flight
+    //       promise in a per-store pending-write tracker keyed on
+    //       the response id. The mutex releases BEFORE the write
+    //       lands in SQLite.
+    //
+    //   (2) AFTER the mutex releases: await the in-flight promise
+    //       just to surface errors to the log. The write is
+    //       already on its way; the caller waits purely for
+    //       logging completeness.
+    //
+    // A back-to-back `previous_response_id` continuation that fires
+    // between mutex release and SQLite land observes the pending
+    // write through the tracker (see the `getChain`-empty retry at
+    // the top of this handler) and awaits it before falling
+    // through to the 404 epilogue. That closes the iter-35 race
+    // where a fresh response id on the wire could transiently
+    // 404 under `getChain`.
+    //
+    // `pendingPersistOuter` is the in-flight promise captured
+    // inside the lock; the out-of-lock awaiter just catches errors
+    // and logs them. `persistMode` is populated alongside so the
+    // log line keeps the streaming / non-streaming discrimination
+    // the iter-35 code had.
+    let pendingPersistOuter: Promise<void> | null = null;
+    let persistMode: 'streaming' | 'non-streaming' | null = null;
+    // `failureMode` carries the streaming failure-epilogue reason
+    // from `handleStreamingNative` out to the outer adopt gate.
+    // Iter-36 finding 2: a final-chunk commit followed by a
+    // post-terminal `res.close` takes the `client_abort` branch
+    // and flushes `response.failed` successfully, which would
+    // otherwise flip `safeToSuppress = true` and let the adopt
+    // gate cache a session under a response id the client will
+    // never chain off of. The gate now refuses to adopt when
+    // `failureMode === 'client_abort'` regardless of how
+    // `committed` / `safeToSuppress` landed.
+    let streamFailureMode: StreamingHandlerOutcome['failureMode'] = null;
 
     await sessionReg.withExclusive(async () => {
       // Hot-swap race guard inside the mutex.
@@ -2407,7 +2557,21 @@ export async function handleCreateResponse(
               httpReq,
               visibility,
             );
-            pendingStreamingPersistOuter = handlerOutcome.terminalToPersist;
+            streamFailureMode = handlerOutcome.failureMode;
+            if (handlerOutcome.terminalToPersist != null && store && body.store !== false) {
+              // Iter-36 finding 1: initiate the write SYNCHRONOUSLY
+              // inside the mutex so the pending-write tracker
+              // observes it before the mutex releases. The promise
+              // is awaited off-lock in the outer finally block.
+              const record = buildResponseRecord(
+                handlerOutcome.terminalToPersist,
+                newInputMessages,
+                previousResponseId,
+                currentInstanceId,
+              );
+              pendingPersistOuter = initiatePersist(store, record);
+              persistMode = 'streaming';
+            }
           } catch (err) {
             handlerError = err instanceof Error ? err : new Error(String(err));
           }
@@ -2433,7 +2597,23 @@ export async function handleCreateResponse(
               previousResponseId,
               visibility,
             );
-            pendingNonStreamingPersistOuter = handlerOutcome.response;
+            if (store && body.store !== false) {
+              // Iter-36 finding 1: same in-lock-initiate /
+              // off-lock-await split as the streaming branch. The
+              // non-streaming handler only returns when the JSON
+              // body's `res.end()` callback has fired, so reaching
+              // this point means the client observed the turn —
+              // the pending-write tracker protects a back-to-back
+              // continuation from a transient 404.
+              const record = buildResponseRecord(
+                handlerOutcome.response,
+                newInputMessages,
+                previousResponseId,
+                currentInstanceId,
+              );
+              pendingPersistOuter = initiatePersist(store, record);
+              persistMode = 'non-streaming';
+            }
           } catch (err) {
             handlerError = err instanceof Error ? err : new Error(String(err));
           }
@@ -2463,7 +2643,34 @@ export async function handleCreateResponse(
         // the responseId is unreachable from the client, so caching
         // the session under it creates a permanently dangling warm
         // session.
-        if (committed && (handlerError == null || safeToSuppress)) {
+        //
+        // Iter-36 finding 2: additionally refuse to adopt when
+        // streaming took the `client_abort` failure epilogue even
+        // if the session committed and `response.failed` landed
+        // cleanly. That scenario looks like this:
+        //
+        //   1. decode loop emits its final chunk → native session
+        //      advances `turns` → `committed = true`
+        //   2. the client drops the connection BEFORE the post-
+        //      loop success branch runs; `res.once('close')` flips
+        //      `clientAborted`
+        //   3. handler routes to the failure epilogue, flushes
+        //      `response.failed` cleanly (kernel ack), sets
+        //      `visibility.terminalEmitted = true`
+        //   4. under the old gate `committed && safeToSuppress`
+        //      the outer handler would adopt the session under a
+        //      response id the client has explicitly abandoned —
+        //      evicting the last good hot session for this model
+        //      under the single-warm invariant.
+        //
+        // `failureMode === 'client_abort'` is the direct signal
+        // for "the handler decided this response will not be
+        // advertised to the client" even if the session-turn
+        // counter advanced. Skipping adopt here preserves the
+        // prior hot session (the single-warm invariant keeps
+        // exactly one entry and the new aborted session never
+        // replaces it).
+        if (committed && (handlerError == null || safeToSuppress) && streamFailureMode !== 'client_abort') {
           sessionReg.adopt(responseId, session, requestedInstructions);
         }
 
@@ -2532,28 +2739,33 @@ export async function handleCreateResponse(
       }
     });
 
-    // Iter-35 finding 2 (part b): persist the response AFTER the
-    // per-model mutex releases. The captured payload is best-effort
-    // output — any error is swallowed with a log line — and does
-    // not touch native model state, so running it inside
-    // `withExclusive` only pins the next waiter on a slow SQLite
-    // flush. Both handlers populate their `pending…PersistOuter`
-    // slot ONLY on the happy path (streaming: committed-success
-    // branch; non-streaming: JSON body written to the peer). A
-    // client-abort or mid-decode failure leaves the slot `null` so
-    // we never write a store record the client could not observe —
-    // persisting one anyway would let a later
-    // `previous_response_id` continuation resurrect a turn the
-    // session never handed out.
-    if (store && body.store !== false) {
-      const toPersist = pendingStreamingPersistOuter ?? pendingNonStreamingPersistOuter;
-      if (toPersist != null) {
-        const mode = pendingStreamingPersistOuter != null ? 'streaming' : 'non-streaming';
-        try {
-          await persistResponse(store, toPersist, newInputMessages, previousResponseId, currentInstanceId);
-        } catch (err) {
-          console.error(`[responses] post-commit persistence failed (${mode}, off-lock):`, err);
-        }
+    // Iter-35 finding 2 (part b) / iter-36 finding 1: the persist
+    // write was INITIATED synchronously inside `withExclusive` via
+    // `initiatePersist` — which registers the in-flight promise
+    // in the per-store pending-write tracker BEFORE the mutex
+    // releases. Here we only await the same promise off-lock to
+    // surface errors to the log. The SQLite flush is already on
+    // its way; a back-to-back continuation observing the tracker
+    // will block on the same promise instead of spuriously
+    // returning 404 under `getChain` (see the `getChain`-empty
+    // retry at the top of this handler).
+    //
+    // Persistence is best-effort — a failed write demotes to a
+    // log line. The pending-write tracker's `.finally(...)`
+    // handler removes the entry regardless of fulfill / reject,
+    // so a rejected write correctly leaves the store empty AND
+    // clears the tracker, and a subsequent `getChain()` then
+    // returns empty legitimately.
+    if (pendingPersistOuter != null) {
+      try {
+        // The local narrowed reference convinces the type-aware
+        // lint that we're awaiting a real Promise; assigning
+        // through `let` loses that narrowing because the closure
+        // above could (in principle) reassign it.
+        const promise: Promise<void> = pendingPersistOuter;
+        await promise;
+      } catch (err) {
+        console.error(`[responses] post-commit persistence failed (${persistMode ?? 'unknown'}, off-lock):`, err);
       }
     }
   } finally {

@@ -2498,6 +2498,316 @@ describe('createHandler', () => {
       expect(mockStore.store).toHaveBeenCalledTimes(2);
     });
 
+    it('iter-36 finding 1: a back-to-back previous_response_id continuation does not race the off-lock store.store() into a spurious 404', async () => {
+      // Iter-35 moved `store.store(record)` OUTSIDE `withExclusive`
+      // so a slow SQLite flush would not pin the per-model mutex
+      // on the next waiter. That opened a window: a client that
+      // received `response.completed` with `responseId = A` could
+      // immediately fire a follow-up request carrying
+      // `previous_response_id: A`. Request B reaches
+      // `store.getChain(A)` BEFORE request A's off-lock
+      // `store.store` write has landed in SQLite — the chain is
+      // empty, and the old code returned 404 on a response id the
+      // client was just handed.
+      //
+      // Iter-36 fix: `initiatePersist` registers the in-flight
+      // `store.store(record)` promise in a per-store pending-write
+      // tracker SYNCHRONOUSLY inside `withExclusive`, so the
+      // tracker is populated before the mutex releases. Request
+      // B's chain-lookup gate, on seeing an empty `getChain(A)`,
+      // consults the tracker; if a write is in flight it awaits
+      // the same promise and retries `getChain`. The retry is
+      // guaranteed to see the row because the pending-write
+      // promise only resolves after SQLite has accepted the
+      // insert.
+      //
+      // This test holds the first request's `store.store()` in a
+      // gated async state (so from the store's point of view the
+      // write is in flight), fires request B immediately after
+      // the mutex releases, and asserts B does NOT 404 — instead
+      // it observes the just-landed chain entry and cold-replays
+      // through it, producing a clean `response.completed`.
+      let releasePersistA: (() => void) | undefined;
+      const persistAGate = new Promise<void>((r) => {
+        releasePersistA = r;
+      });
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation(async (record: any) => {
+          // The FIRST write stays in flight until the test
+          // releases it. The second write lands normally.
+          if (storedRecords.size === 0) {
+            await persistAGate;
+          }
+          storedRecords.set(record.id, record);
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'first reply' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'second reply' }));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('persist-model', mockModel);
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Request A: stateless create. Forces the session to
+      // commit and initiates a pending `store.store()` that
+      // stays gated. We do NOT await the full handler promise
+      // yet — it will block in the outer finally's
+      // `await pendingPersistOuter` until we release the gate,
+      // but the response body has already been flushed to the
+      // client from inside `handleNonStreaming`'s `endJson`
+      // call. `waitA()` resolves on `res.end()`, which fires
+      // BEFORE the outer finally's off-lock await, so we can
+      // safely read the responseId from the body while A's
+      // persist is still pending.
+      const reqA = createMockReq('POST', '/v1/responses', {
+        model: 'persist-model',
+        input: 'hello A',
+        stream: false,
+      });
+      const { res: resA, getBody: bodyA, waitForEnd: waitA } = createMockRes();
+      const inflightA = handler(reqA, resA);
+      await waitA();
+      const responseA = JSON.parse(bodyA());
+      expect(responseA.status).toBe('completed');
+      const responseIdA: string = responseA.id;
+      expect(responseIdA).toMatch(/^resp_/);
+
+      // Spin the event loop until A's `initiatePersist` has
+      // actually run (observed via `store.store` being called).
+      // This is the point at which the per-store pending-write
+      // tracker has registered A's in-flight promise — exactly
+      // the state under which B must observe a pending write
+      // instead of a plain empty-chain 404. Polling
+      // `mockStore.store` is the simplest proxy for "the
+      // producer reached the tracker registration site"; A's
+      // mutex may not be released yet (the outer finally is
+      // still blocking on `persistAGate`), but that is fine —
+      // B's chain-lookup gate is BEFORE `withExclusive`, so it
+      // is not gated on A's mutex.
+      while (mockStore.store.mock.calls.length === 0) {
+        await new Promise((r) => setImmediate(r));
+      }
+      // A's body has been delivered but the store.store() promise
+      // is still pending behind `persistAGate`. A sync-resolving
+      // mock would mask the race.
+      expect(storedRecords.has(responseIdA)).toBe(false);
+
+      // Sibling evict: the single-warm registry would let the
+      // second request's `previous_response_id` miss anyway. That
+      // is not the scenario iter-36 is testing — we are testing
+      // that the CHAIN LOOKUP GATE (which runs BEFORE session
+      // cache lookup) no longer 404s when a write is in flight.
+      // Drop the adopted session so the cold-replay path runs.
+      registry.getSessionRegistry('persist-model')!.drop(responseIdA);
+
+      // Request B: continuation with previous_response_id = A.
+      // Under the iter-35 race this would 404 because the off-lock
+      // write has not yet landed.
+      const reqB = createMockReq('POST', '/v1/responses', {
+        model: 'persist-model',
+        input: 'hello B',
+        previous_response_id: responseIdA,
+        stream: false,
+      });
+      const { res: resB, getBody: bodyB, waitForEnd: waitB } = createMockRes();
+      const inflightB = handler(reqB, resB);
+
+      // Hand control back so B's `getChain` runs and finds the
+      // empty chain, consults the tracker, and blocks on the
+      // pending promise.
+      await new Promise((r) => setImmediate(r));
+
+      // Now release A's persist so the pending promise resolves
+      // and the store row lands. B's tracker-await then wakes,
+      // retries `getChain`, finds the row, and proceeds through
+      // cold replay.
+      releasePersistA?.();
+
+      await Promise.all([inflightA, inflightB]);
+      await waitB();
+
+      const responseB = JSON.parse(bodyB());
+      // The critical assertion: B got a full 200 response — NOT a
+      // 404 on a response id that was already on the wire. A
+      // regression would show up here as an `error` envelope
+      // saying "Previous response ... not found".
+      expect(responseB.status).toBe('completed');
+      expect(responseB.id).not.toBe(responseIdA);
+      expect(mockStore.store).toHaveBeenCalledTimes(2);
+      expect(storedRecords.has(responseIdA)).toBe(true);
+    });
+
+    it('iter-36 finding 2: close-after-final-chunk does not adopt the session despite committed=true', async () => {
+      // Iter-35 landed an adopt gate of
+      // `committed && (handlerError == null || safeToSuppress)`.
+      // That turned out to be wrong when the client drops the
+      // connection AFTER the producer has committed its final
+      // chunk but BEFORE the post-loop success branch runs:
+      //
+      //   1. decode loop emits its final chunk → native session
+      //      advances `turns` → `committed = true`
+      //   2. the client closes the connection synchronously;
+      //      `res.once('close')` fires and flips `clientAborted`
+      //   3. handler takes the FAILURE epilogue (because
+      //      `successful = sawDone && committed && !clientAborted`),
+      //      flushes `response.failed` cleanly (kernel ack →
+      //      `terminalEmitted = true`)
+      //   4. outer gate sees `committed && safeToSuppress` → the
+      //      OLD code would adopt under a responseId the client
+      //      explicitly abandoned, evicting whatever good hot
+      //      session was previously cached for this model (the
+      //      single-warm registry holds exactly one entry).
+      //
+      // Iter-36 fix: the streaming handler returns a
+      // `failureMode` signal. The outer adopt gate refuses to
+      // adopt when `failureMode === 'client_abort'` regardless of
+      // the committed / safeToSuppress combination.
+      //
+      // We shape the stream so that its final chunk is emitted
+      // and its producer's finally has run (so `wasCommitted()`
+      // returns true in the post-loop block) — but we fire a
+      // `close` event on `res` immediately after the final
+      // yield so `clientAborted` flips before the post-loop
+      // branch picks a path.
+      const abortSignal = { emit: false };
+      // The stream emits its `done` chunk with `finishReason:
+      // 'stop'` — this is what flips the ChatSession wrapper's
+      // `turnCount` in the wrapper's own `finally` block (see
+      // `startFromHistoryStream`). The wrapper runs the finally
+      // ONLY after the consumer breaks / returns; at that point
+      // it sets `turnCount++`, so `wasCommitted()` reads `true`
+      // in the post-loop block.
+      //
+      // To trigger the race we need the HTTP peer to drop
+      // AFTER `committed = true` but BEFORE the post-loop
+      // `successful = sawDone && committed && … && !clientAborted`
+      // gate runs. The cleanest way is to fire `res.emit('close')`
+      // from the generator's FINALLY — which the outer for-await
+      // loop unwinds after processing the done event's `break`.
+      // `ChatSession.startFromHistoryStream`'s finally runs
+      // BEFORE our generator's finally (the outer generator's
+      // unwind happens last), so by the time our close fires the
+      // wrapper has already done `turnCount++`. The post-loop
+      // block then reads `committed = true` AND
+      // `clientAborted = true`, exactly the race iter-36
+      // finding 2 describes.
+      async function* committingAbortedStream(onClose: () => void) {
+        try {
+          yield {
+            done: true,
+            text: 'complete-but-aborted',
+            finishReason: 'stop',
+            toolCalls: [] as ToolCallResult[],
+            thinking: null,
+            numTokens: 3,
+            promptTokens: 5,
+            reasoningTokens: 0,
+            rawText: 'complete-but-aborted',
+          };
+        } finally {
+          onClose();
+          abortSignal.emit = true;
+        }
+      }
+
+      const chatSessionStart = vi.fn().mockRejectedValue(new Error('streaming should not use chatSessionStart'));
+      const chatStreamSessionStart = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('streaming should not use chatSessionContinue')),
+        chatSessionContinueTool: vi
+          .fn()
+          .mockRejectedValue(new Error('streaming should not use chatSessionContinueTool')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('abort-model', mockModel);
+      const mockStore = {
+        store: vi.fn().mockResolvedValue(undefined),
+        getChain: vi.fn().mockResolvedValue([]),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Build the request. `chatStreamSessionStart` is invoked
+      // by the ChatSession wrapper; we provide a mock that
+      // yields our abort-after-commit stream shape. The stream
+      // emits `close` on `res` synchronously between the done
+      // chunk and the post-loop block.
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'abort-model',
+        input: 'trigger abort-after-commit',
+        stream: true,
+      });
+      const { res, waitForEnd } = createMockRes();
+
+      chatStreamSessionStart.mockImplementationOnce(() =>
+        committingAbortedStream(() => {
+          // Fire the close event from OUR generator's finally —
+          // which runs AFTER the consumer's `break` from the
+          // done branch and AFTER the ChatSession wrapper's
+          // finally has set `turnCount++`. At that point the
+          // post-loop block will observe `committed = true`
+          // AND `clientAborted = true` — the exact race
+          // iter-36 finding 2 describes.
+          (res as unknown as NodeJS.EventEmitter).emit('close');
+        }),
+      );
+
+      await handler(req, res);
+      await waitForEnd();
+
+      // Primary assertion: the registry is empty. Under the
+      // buggy iter-35 gate, the post-commit abort path would
+      // have called `sessionReg.adopt(responseId, session, …)`
+      // — the new session would then sit under a responseId
+      // the client has explicitly abandoned, occupying the
+      // single hot-slot for the model and blocking any genuinely
+      // useful session from being cached later.
+      //
+      // The `getOrCreate(null, …)` call at the top of the
+      // handler clears the map unconditionally (single-warm
+      // invariant), so a correctly-fixed handler leaves the
+      // map empty: size 0 is the success assertion.
+      const sessionReg = registry.getSessionRegistry('abort-model')!;
+      expect(sessionReg.size).toBe(0);
+
+      // Persist gate: no record written. The committed-but-
+      // aborted path returns `terminalToPersist: null` from the
+      // streaming handler so `initiatePersist` is never called.
+      expect(mockStore.store).not.toHaveBeenCalled();
+
+      // Sanity: the close listener fired before the producer
+      // returned.
+      expect(abortSignal.emit).toBe(true);
+    });
+
     it('normalises nested message items to incomplete when a streaming turn fails mid-decode', async () => {
       // Iter-28 finding 3 regression: the iter-27 writer built
       // the failed terminal via `{ ...terminal, status: 'failed' }`,
