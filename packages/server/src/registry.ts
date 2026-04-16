@@ -137,6 +137,27 @@ export class ModelRegistry {
   private readonly instanceIds = new Map<ServableModel, number>();
   /** Monotonic counter for `instanceIds`. Never reused. */
   private nextInstanceId = 1;
+  /**
+   * Iter-45 tombstone: when the responses endpoint's hard-timeout
+   * breaker force-releases the iter-40 `retainBinding` on a
+   * pathologically wedged persist, the binding's instance id is
+   * retired here before the retain is dropped. A subsequent
+   * `register()` of the SAME model object that arrives AFTER final
+   * teardown (i.e. when the binding is no longer in
+   * `sessionRegistriesByModel`) inherits the retired id instead of
+   * minting a fresh one. This keeps same-model chain continuity for
+   * a late-landing persist whose record was already stamped with
+   * the retired id, while a true hot-swap (re-register with a
+   * DIFFERENT model object) still mints a fresh id — there is no
+   * entry in this map for the new model, so nothing to inherit.
+   *
+   * `WeakMap`-keyed on the model object so entries do not keep the
+   * model alive; if the model is GC'd the tombstone is cleaned up
+   * automatically, which is the desired behavior (no registrar can
+   * ever re-observe the tombstone without re-registering the same
+   * live object).
+   */
+  private readonly retiredInstanceIds = new WeakMap<ServableModel, number>();
 
   /**
    * Register a model under a given name.
@@ -152,6 +173,23 @@ export class ModelRegistry {
    * `SessionRegistry` is allocated for it. When it has (via an
    * existing alias) the existing registry is reused so the
    * single-warm invariant spans both names.
+   *
+   * Iter-45 tombstone-inherit path: if the binding was previously
+   * torn down AND the hard-timeout breaker called
+   * `retireInstanceIdForForceRelease(model)` before the teardown
+   * fired, the fresh binding inherits the retired instance id from
+   * `retiredInstanceIds` instead of minting a new one. This keeps a
+   * late-landing persist's record chainable through the same model
+   * object. A true hot-swap (re-register with a DIFFERENT model
+   * object) has no tombstone for the new model, so a fresh id is
+   * minted and the stale stored record fails
+   * `previous_response_id` with 400 instance-mismatch — the
+   * correct semantic outcome for a genuinely different model.
+   *
+   * The aliasing path (binding still live in
+   * `sessionRegistriesByModel`) is unchanged — it naturally
+   * preserves the id because `instanceIds.has(model)` is already
+   * true.
    */
   register(name: string, model: ServableModel): void {
     const existing = this.models.get(name);
@@ -194,9 +232,22 @@ export class ModelRegistry {
     // Allocate a fresh monotonic instance id on first sight of this
     // model object; reuse the existing id on every alias thereafter.
     // The id lifetime mirrors the binding's — see `finalizeBindingTeardown`.
+    //
+    // Iter-45 tombstone-inherit: if the binding was fully torn down
+    // but the hard-timeout breaker retired the previous id for this
+    // same model object, inherit it here. Only fires when
+    // `instanceIds.has(model)` is false (binding genuinely gone) AND
+    // the tombstone exists — otherwise the aliasing path above has
+    // already preserved the id naturally.
     if (!this.instanceIds.has(model)) {
-      this.instanceIds.set(model, this.nextInstanceId);
-      this.nextInstanceId += 1;
+      const retired = this.retiredInstanceIds.get(model);
+      if (retired !== undefined) {
+        this.instanceIds.set(model, retired);
+        this.retiredInstanceIds.delete(model);
+      } else {
+        this.instanceIds.set(model, this.nextInstanceId);
+        this.nextInstanceId += 1;
+      }
     }
 
     this.models.set(name, {
@@ -269,14 +320,24 @@ export class ModelRegistry {
    * Internal teardown step shared by `dropNameReference()`,
    * `releaseDispatchLease()`, and `releaseBinding()`; see their doc
    * comments for the full lifecycle. On drop, a subsequent
-   * re-registration of the SAME model object will mint a FRESH
-   * instance id — intentional: once the last alias, the last
-   * in-flight lease, AND the last post-commit persist retention
-   * all release, any previously persisted stored record that
-   * references this id belongs to a logically dead binding, and a
-   * later `previous_response_id` continuation against it must fall
-   * through to the `currentInstanceId === undefined` rejection path
-   * so the stale chain cannot be replayed.
+   * re-registration of the SAME model object will usually mint a
+   * FRESH instance id — intentional: once the last alias, the
+   * last in-flight lease, AND the last post-commit persist
+   * retention all release, any previously persisted stored record
+   * that references this id belongs to a logically dead binding,
+   * and a later `previous_response_id` continuation against it
+   * must fall through to the `currentInstanceId === undefined`
+   * rejection path so the stale chain cannot be replayed.
+   *
+   * Iter-45 exception: if the hard-timeout breaker retired the
+   * previous id via `retireInstanceIdForForceRelease` before the
+   * forced release landed here, a subsequent same-object
+   * `register()` inherits the retired id from `retiredInstanceIds`
+   * instead of minting fresh — see `register()`. This path is
+   * reached ONLY when the natural lifecycle (retain/release) was
+   * interrupted by the safety breaker, so it specifically
+   * preserves chain continuity for late-landing persists past the
+   * hard bound.
    */
   private finalizeBindingTeardown(model: ServableModel): void {
     this.sessionRegistriesByModel.delete(model);
@@ -400,6 +461,42 @@ export class ModelRegistry {
     if (binding.pendingTeardown && binding.refCount <= 0 && binding.inFlight === 0 && binding.pendingPersists === 0) {
       this.finalizeBindingTeardown(model);
     }
+  }
+
+  /**
+   * Iter-45 tombstone installer.
+   *
+   * Invoked EXCLUSIVELY by the responses endpoint's hard-timeout
+   * breaker (see `getPostCommitPersistHardTimeoutMs` in
+   * `endpoints/responses.ts`) at the moment it decides to force-
+   * release the iter-40 `retainBinding` on a pathologically wedged
+   * persist. Must be called BEFORE the idempotent
+   * `persistRetainBox.release?.()` so `instanceIds.get(model)`
+   * still returns the live id that the already-stamped record
+   * carries.
+   *
+   * The retired id is stored in `retiredInstanceIds` keyed on the
+   * model object. If a subsequent `register()` (or alias thereof)
+   * for the SAME model object arrives AFTER the binding has fully
+   * torn down, it inherits the retired id from the tombstone
+   * instead of minting a fresh one — so the late-landing persist's
+   * record (stamped with the retired id) still matches the live
+   * binding's id and a `previous_response_id` continuation remains
+   * chainable. A true hot-swap — `register(name, differentModel)`
+   * — has no tombstone for the new model object, so a fresh id is
+   * minted and the stale stored record is correctly rejected with
+   * 400 instance-mismatch.
+   *
+   * No-op if the binding has already fully torn down (the caller
+   * raced the natural teardown path and the tombstone is moot) or
+   * if the model has no current instance id assignment. Safe to
+   * call repeatedly — the tombstone simply overwrites itself with
+   * the same value.
+   */
+  retireInstanceIdForForceRelease(model: ServableModel): void {
+    const id = this.instanceIds.get(model);
+    if (id === undefined) return;
+    this.retiredInstanceIds.set(model, id);
   }
 
   /**

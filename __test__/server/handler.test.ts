@@ -4011,7 +4011,7 @@ describe('createHandler', () => {
       await new Promise((r) => setImmediate(r));
     }, 10000);
 
-    it('iter-44: hard timeout force-releases binding retain when persist is truly wedged', async () => {
+    it('iter-44/45: hard timeout force-releases retain but tombstones instance id for same-model re-registration', async () => {
       // Iter-43 left the iter-40 `retainBinding` pinned past
       // the soft `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS` so that a
       // slow-but-eventual write could still land its row
@@ -4024,7 +4024,7 @@ describe('createHandler', () => {
       // pinning the model object, its `SessionRegistry`, and
       // native KV/cache state indefinitely.
       //
-      // Iter-44 adds a SECOND-STAGE hard-timeout breaker
+      // Iter-44 added a SECOND-STAGE hard-timeout breaker
       // alongside the soft timeout. The hard timer is armed at
       // the same moment as the persist, independently of the
       // handler's await path, and fires only if the persist has
@@ -4032,15 +4032,32 @@ describe('createHandler', () => {
       // releases the iter-40 retain via the existing idempotent
       // `persistRetainBox` so the binding can unwind.
       //
-      // Iter-44 invariant (this test): when the persist is
+      // But codex's iter-44 review flagged that dropping the
+      // retain on elapsed TIME alone is not enough: a slow-but-
+      // eventual persist could still settle AFTER the hard
+      // bound, and if an `unregister + register(same_model)`
+      // fired in that window, the fresh register would mint a
+      // NEW instance id while the pending write still carries
+      // the OLD id — silently breaking `previous_response_id`
+      // continuations.
+      //
+      // Iter-45 fix: the breaker pairs the force-release with
+      // `registry.retireInstanceIdForForceRelease(leaseModel)`
+      // FIRST, which tombstones the current id on the model
+      // object. A subsequent `register()` of the SAME model
+      // object inherits the retired id from the tombstone
+      // instead of minting fresh — so a late-landing persist
+      // (stamped with the retired id) stays chainable.
+      //
+      // Iter-45 invariant (this test): when the persist is
       // TRULY wedged (never settles) and the hard timeout has
       // fired, a same-object `unregister` + `register` MUST
-      // mint a FRESH `modelInstanceId` (because
-      // `pendingPersists` dropped to 0, the binding fully tore
-      // down, and the re-register creates a new binding). This
-      // is the opposite of the iter-43 pin-forever behavior
-      // that holds when the hard timeout is disabled / not yet
-      // fired — proof that the breaker reclaimed the binding.
+      // INHERIT the retired `modelInstanceId` — NOT mint a
+      // fresh one. This is exactly the property that keeps a
+      // slow-but-eventual write chainable past the hard bound.
+      // The companion hot-swap test below covers the other
+      // side: re-register with a DIFFERENT model object MUST
+      // mint a fresh id.
       //
       // Shape:
       //   - `store.store(...)` returns a promise that NEVER
@@ -4052,7 +4069,8 @@ describe('createHandler', () => {
       //     `'100'` locally and restores on exit.
       //   - After the handler returns and the hard timeout
       //     fires (~100ms), `unregister` + same-object
-      //     `register` must produce a NEW instance id.
+      //     `register` must REUSE the retired id (tombstone
+      //     inherit).
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '100';
       try {
@@ -4076,12 +4094,13 @@ describe('createHandler', () => {
           resetCaches: vi.fn(),
         } as unknown as SessionCapableModel;
         const registry = new ModelRegistry();
-        const MODEL_NAME = 'iter-44-wedged-persist-hard-timeout';
+        const MODEL_NAME = 'iter-45-wedged-persist-hard-timeout-same-model';
         registry.register(MODEL_NAME, mockModel);
 
         // Sanity: the local override is in effect (else this
         // test silently reverts to iter-43 pin-forever and the
-        // final id-mismatch assertion would flip).
+        // final id-inherit assertion would still pass but for
+        // the wrong reason).
         expect(process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS).toBe('100');
         expect(process.env.MLX_POST_COMMIT_PERSIST_TIMEOUT_MS).toBe('50');
 
@@ -4128,16 +4147,22 @@ describe('createHandler', () => {
         await new Promise((r) => setTimeout(r, 150));
         await new Promise((r) => setImmediate(r));
 
-        // Primary iter-44 invariant: the hard timer fired and
-        // force-released the retain. `pendingPersists` is now
-        // 0, so a fresh `unregister` fully tears the binding
-        // down, and the next `register` on the same model
-        // object mints a FRESH `modelInstanceId`.
+        // Primary iter-45 invariant: the hard timer fired,
+        // retired the id via the tombstone, THEN force-released
+        // the retain. `pendingPersists` dropped to 0 so a fresh
+        // `unregister` tears the binding down — but the next
+        // `register` on the SAME model object reads the retired
+        // id from the tombstone and INHERITS it. The late-
+        // landing persist's record (still carrying the old id)
+        // thus remains chainable. This is the opposite of the
+        // broken iter-44 behaviour where the same register
+        // would have minted a fresh id and silently broken
+        // chains.
         expect(registry.unregister(MODEL_NAME)).toBe(true);
         registry.register(MODEL_NAME, mockModel);
         const idAfterBreaker = registry.getInstanceId(MODEL_NAME);
         expect(typeof idAfterBreaker).toBe('number');
-        expect(idAfterBreaker).not.toBe(idBefore);
+        expect(idAfterBreaker).toBe(idBefore);
 
         // Sanity: the breaker path did not introduce any
         // unhandled rejections. The wedged promise is still
@@ -4154,6 +4179,157 @@ describe('createHandler', () => {
         }
       }
     }, 5000);
+
+    it('iter-45 hot-swap: hard timeout retires id but a DIFFERENT model object on re-registration mints fresh id (semantic mismatch)', async () => {
+      // Iter-45 tombstone-inherit ONLY applies to same-object
+      // re-registration. When the operator hot-swaps the name
+      // to a genuinely DIFFERENT model object (different
+      // tokenizer, different KV layout, different chat template)
+      // the stale stored record SHOULD not chain through — a
+      // `previous_response_id` continuation against the old id
+      // must correctly fail with 400 instance-mismatch because
+      // the new model is semantically different from the one
+      // that produced the record.
+      //
+      // This test drives the wedged-persist + hard-timeout
+      // sequence exactly like the iter-44/45 same-model test
+      // above, then AFTER the breaker fires does:
+      //   - `unregister(MODEL_NAME)`
+      //   - `register(MODEL_NAME, /* different model object */)`
+      // and asserts the new instance id is FRESH — NOT
+      // inherited from the tombstone. The tombstone is keyed on
+      // the model OBJECT, so a different object lookup misses
+      // and the fresh-id path runs.
+      const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+      process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '100';
+      try {
+        const mockStore = {
+          store: vi.fn().mockImplementation(() => new Promise<void>(() => {})),
+          getChain: vi.fn().mockImplementation((id: string) => {
+            return Promise.reject(new Error(`Response not found: ${id}`));
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const makeMockModel = (label: string): SessionCapableModel => {
+          return {
+            chatSessionStart: vi.fn().mockResolvedValue(makeChatResult({ text: `${label} reply` })),
+            chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+            chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+            chatStreamSessionStart: vi.fn(),
+            chatStreamSessionContinue: vi.fn(),
+            chatStreamSessionContinueTool: vi.fn(),
+            resetCaches: vi.fn(),
+          } as unknown as SessionCapableModel;
+        };
+        const originalModel = makeMockModel('original');
+        const differentModel = makeMockModel('different');
+        const registry = new ModelRegistry();
+        const MODEL_NAME = 'iter-45-wedged-persist-hard-timeout-hot-swap';
+        registry.register(MODEL_NAME, originalModel);
+
+        expect(process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS).toBe('100');
+        const idBefore = registry.getInstanceId(MODEL_NAME);
+        expect(typeof idBefore).toBe('number');
+
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => {
+          unhandled.push(reason);
+        };
+        process.on('unhandledRejection', onUnhandled);
+
+        const handler = createHandler(registry, { store: mockStore as any });
+        const req = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'hello wedged-breaker hot-swap world',
+          stream: false,
+        });
+        const { res, waitForEnd, getBody } = createMockRes();
+        await handler(req, res);
+        await waitForEnd();
+        const body = JSON.parse(getBody());
+        expect(body.status).toBe('completed');
+
+        // Wait for the hard timeout to fire and retire the id.
+        await new Promise((r) => setTimeout(r, 150));
+        await new Promise((r) => setImmediate(r));
+
+        // Hot-swap to a DIFFERENT model object under the same
+        // name. The tombstone is keyed on `originalModel`, not
+        // `differentModel`, so lookup misses and a fresh id is
+        // minted. A stored record stamped with `idBefore`
+        // (belonging to `originalModel`) will then correctly
+        // fail a `previous_response_id` continuation with 400
+        // instance-mismatch — the right outcome for a
+        // semantic model swap.
+        expect(registry.unregister(MODEL_NAME)).toBe(true);
+        registry.register(MODEL_NAME, differentModel);
+        const idAfterSwap = registry.getInstanceId(MODEL_NAME);
+        expect(typeof idAfterSwap).toBe('number');
+        expect(idAfterSwap).not.toBe(idBefore);
+
+        expect(unhandled).toHaveLength(0);
+        process.off('unhandledRejection', onUnhandled);
+      } finally {
+        if (originalHard === undefined) {
+          delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+        } else {
+          process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
+        }
+      }
+    }, 5000);
+
+    it('iter-45: MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS parsing: empty string -> default, "0" -> disabled, valid -> parsed', async () => {
+      // Codex's iter-44 review flagged a MEDIUM finding: the
+      // original parser accepted any finite >= 0 value, so
+      // `Number('')` returned `0` and silently disabled the
+      // breaker. In deployments where config templating renders
+      // absent values as empty strings (e.g. `${UNSET_VAR}`)
+      // this reintroduced iter-41's unreclaimable leak without
+      // surfacing any error.
+      //
+      // Iter-45 parser change: empty string is treated as
+      // UNSET (falls back to the 60000ms default). Explicit
+      // `'0'` still disables. Any non-numeric value also falls
+      // back to the default — deliberate so a typo cannot
+      // silently disable the safety breaker.
+      //
+      // We test via the exported `getPostCommitPersistHardTimeoutMs`
+      // directly (cleanest, most readable). Env state is saved
+      // and restored around each case so the file-level
+      // `'0'` default doesn't bleed into other tests.
+      const { getPostCommitPersistHardTimeoutMs } = await import('../../packages/server/src/endpoints/responses.js');
+      const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+      try {
+        // Empty string -> default (NOT 0). This is the iter-45
+        // fix's primary invariant.
+        process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '';
+        expect(getPostCommitPersistHardTimeoutMs()).toBe(60_000);
+
+        // Explicit '0' -> disabled (returns 0). This stays the
+        // operator's escape hatch for strict iter-43
+        // pin-forever semantics.
+        process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '0';
+        expect(getPostCommitPersistHardTimeoutMs()).toBe(0);
+
+        // Valid numeric -> parsed.
+        process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '100';
+        expect(getPostCommitPersistHardTimeoutMs()).toBe(100);
+
+        // Non-numeric garbage -> default.
+        process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = 'bad';
+        expect(getPostCommitPersistHardTimeoutMs()).toBe(60_000);
+
+        // Undefined -> default.
+        delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+        expect(getPostCommitPersistHardTimeoutMs()).toBe(60_000);
+      } finally {
+        if (originalHard === undefined) {
+          delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+        } else {
+          process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
+        }
+      }
+    });
 
     it('iter-37 finding 2: adopt gate rejects streaming turns whose post-final teardown threw (failureMode === "error")', async () => {
       // Iter-36 finding 2 closed the `client_abort` hole but the

@@ -147,24 +147,51 @@ function getPostCommitPersistTimeoutMs(): number {
  * The bounded leak duration is capped at this value instead of
  * process lifetime.
  *
+ * Iter-45 (codex's iter-44 HIGH finding): dropping the retain on
+ * elapsed time alone is not enough. A SLOW-BUT-EVENTUAL persist
+ * whose wall-clock exceeds the hard bound could still settle
+ * naturally, and if an `unregister + register(same_model)` fires
+ * between the force-release and that late settlement, the fresh
+ * `register()` would mint a NEW instance id while the pending
+ * write still carries the OLD id — silently breaking
+ * `previous_response_id` continuations. The iter-45 fix pairs the
+ * force-release with
+ * `registry.retireInstanceIdForForceRelease(leaseModel)` (called
+ * FIRST, while the binding is still alive). The retired id is
+ * tombstoned keyed on the model object, and a subsequent
+ * `register()` of the SAME model object inherits it from the
+ * tombstone — so the late-landing persist remains chainable. A
+ * true hot-swap (re-register with a DIFFERENT model object) still
+ * mints a fresh id, and its stale stored record is correctly
+ * rejected with 400 instance-mismatch — the right semantic
+ * outcome for a genuinely different model.
+ *
  * The default is intentionally an order of magnitude larger than
  * any realistic SQLite commit window and well past the soft
  * timeout: the slow-but-eventual case iter-42 broke has to be
  * well-separated from the pathologically-wedged case that triggers
- * this breaker. Setting the value to `0` disables the hard timeout
- * entirely and reverts to strict iter-43 pin-forever semantics —
- * useful for tests that want to assert the iter-40 invariant
- * without the second-stage safety net.
+ * this breaker. Setting the value to `'0'` disables the hard
+ * timeout entirely and reverts to strict iter-43 pin-forever
+ * semantics — useful for tests that want to assert the iter-40
+ * invariant without the second-stage safety net.
  *
- * Override via `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS`. A same-
- * object `previous_response_id` continuation issued after the hard
- * timeout fires will receive a 400 instance-mismatch against the
- * stale id — a clean, user-visible failure rather than an
- * unbounded memory leak.
+ * Override via `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS`. An EMPTY
+ * string is treated as unset (falls back to the 60000ms default).
+ * Explicit `'0'` disables. Any non-numeric value also falls back
+ * to the default with no error — this is deliberate so a config-
+ * templating typo (e.g. `${SOME_UNSET_VAR}` rendering to empty or
+ * garbage) cannot silently disable the safety breaker and
+ * reintroduce iter-41's unreclaimable leak.
+ *
+ * Exported for direct unit testing in `__test__/server/handler.test.ts`
+ * (iter-45 env-parsing coverage). Not part of the public API —
+ * consumers should drive behavior via the env var, not this
+ * function.
  */
-function getPostCommitPersistHardTimeoutMs(): number {
+export function getPostCommitPersistHardTimeoutMs(): number {
   const raw = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
-  const parsed = raw != null ? Number(raw) : Number.NaN;
+  if (raw == null || raw === '') return 60_000;
+  const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 60_000;
 }
 
@@ -2899,6 +2926,26 @@ export async function handleCreateResponse(
               // `persistRetainBox`. The hard timer is ALSO armed
               // off the handler's await path, so the response is
               // never delayed by it.
+              //
+              // Iter-45: before the hard timeout force-releases
+              // the retain (which unblocks binding teardown), we
+              // also call
+              // `registry.retireInstanceIdForForceRelease(leaseModel)`
+              // to tombstone the binding's current instance id on
+              // the model object. A subsequent `register()` of
+              // the SAME model object inherits that retired id
+              // rather than minting fresh — so the late-landing
+              // persist's record (stamped with the retired id)
+              // still matches the live binding and stays
+              // chainable through `previous_response_id`. Only a
+              // true hot-swap (re-register with a DIFFERENT model
+              // object) mints a fresh id, and the 400 instance-
+              // mismatch that results is the correct semantic
+              // outcome because the new model is semantically
+              // different from the one that produced the stored
+              // record. Retirement MUST happen BEFORE release so
+              // `instanceIds.get(model)` still returns the live
+              // id the record carries.
               registry.retainBinding(leaseModel);
               let persistRetainReleased = false;
               persistRetainBox.release = () => {
@@ -2916,10 +2963,16 @@ export async function handleCreateResponse(
                         `[responses] post-commit persist HARD timeout (${streamingHardTimeoutMs}ms, ` +
                           `${streamingPersistMode}): underlying store.store(...) has not settled; assuming ` +
                           `wedged backend, force-releasing the iter-40 retain so the binding can be torn ` +
-                          `down. A subsequent previous_response_id continuation against the stale instance ` +
-                          `id will receive a 400 instance-mismatch — clean user-visible failure rather than ` +
-                          `unbounded memory leak.`,
+                          `down. Retiring the current instance id via tombstone so a same-object ` +
+                          `re-registration inherits it and a late-landing persist remains chainable; a ` +
+                          `hot-swap to a DIFFERENT model object will mint a fresh id and the stale chain ` +
+                          `will correctly fail with 400 instance-mismatch.`,
                       );
+                      // Iter-45: retire the id FIRST (binding is
+                      // still alive here — retirement reads the
+                      // live id) then drop the retain, which may
+                      // trigger the deferred teardown.
+                      registry.retireInstanceIdForForceRelease(leaseModel);
                       persistRetainBox.release?.();
                     }, streamingHardTimeoutMs)
                   : null;
@@ -2991,8 +3044,22 @@ export async function handleCreateResponse(
               // settles naturally, and fires a force-release
               // through the idempotent `persistRetainBox`
               // otherwise. Default 60s, override via
-              // `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS`, `0`
-              // disables.
+              // `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS`, `'0'`
+              // disables. Empty string is treated as unset (falls
+              // back to the 60000ms default) so a config-
+              // templating typo cannot silently disable the
+              // breaker.
+              //
+              // Iter-45: the force-release path also calls
+              // `registry.retireInstanceIdForForceRelease(leaseModel)`
+              // BEFORE releasing the retain so a same-object
+              // re-registration AFTER teardown inherits the
+              // retired instance id from the tombstone — a late-
+              // landing persist against the retired id stays
+              // chainable. A hot-swap to a DIFFERENT model object
+              // mints fresh id and the 400 instance-mismatch is
+              // correct. See the streaming branch for the full
+              // rationale.
               registry.retainBinding(leaseModel);
               let persistRetainReleased = false;
               persistRetainBox.release = () => {
@@ -3010,10 +3077,16 @@ export async function handleCreateResponse(
                         `[responses] post-commit persist HARD timeout (${nonStreamingHardTimeoutMs}ms, ` +
                           `${nonStreamingPersistMode}): underlying store.store(...) has not settled; ` +
                           `assuming wedged backend, force-releasing the iter-40 retain so the binding can ` +
-                          `be torn down. A subsequent previous_response_id continuation against the stale ` +
-                          `instance id will receive a 400 instance-mismatch — clean user-visible failure ` +
-                          `rather than unbounded memory leak.`,
+                          `be torn down. Retiring the current instance id via tombstone so a same-object ` +
+                          `re-registration inherits it and a late-landing persist remains chainable; a ` +
+                          `hot-swap to a DIFFERENT model object will mint a fresh id and the stale chain ` +
+                          `will correctly fail with 400 instance-mismatch.`,
                       );
+                      // Iter-45: retire the id FIRST (binding is
+                      // still alive here — retirement reads the
+                      // live id) then drop the retain, which may
+                      // trigger the deferred teardown.
+                      registry.retireInstanceIdForForceRelease(leaseModel);
                       persistRetainBox.release?.();
                     }, nonStreamingHardTimeoutMs)
                   : null;
