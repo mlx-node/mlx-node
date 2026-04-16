@@ -2255,6 +2255,249 @@ describe('createHandler', () => {
       expect(incomplete?.reason).toBe('client_abort');
     });
 
+    it('iter-35 finding 1: AbortSignal is propagated through the session to the streaming entry point on client disconnect', async () => {
+      // Iter-35 finding 1 fix: the outer handler installs an
+      // `AbortController` on `res.once('close', …)` /
+      // `httpReq.once('close', …)` and plumbs its signal through
+      // `ChatSession.sendStream` → `chatStreamSession*` → the
+      // `_runChatStream` adapter. In the real-model path the
+      // adapter calls `handle.cancel()` on the native stream
+      // handle the moment the signal fires and wakes the pending
+      // `await waitForItem()` with a synthetic abort marker, so a
+      // client drop mid-eval unwinds within milliseconds instead
+      // of waiting for the next native chunk.
+      //
+      // This test verifies the plumbing contract end-to-end: the
+      // native streaming entry point receives an AbortSignal whose
+      // `aborted` flag flips the moment the request's `'close'`
+      // event fires. We use a mock that observes the third
+      // argument (signal) and yields a completion event the
+      // moment the signal aborts — modelling the real adapter's
+      // fast-abort behaviour without depending on the native
+      // addon.
+      let observedSignal: AbortSignal | undefined;
+      let resolveAbortSeen: (() => void) | undefined;
+      const abortSeen = new Promise<void>((r) => {
+        resolveAbortSeen = r;
+      });
+      async function* signalAwareStream(
+        _messages: unknown,
+        _config: unknown,
+        signal: AbortSignal | undefined,
+      ): AsyncGenerator<Record<string, unknown>> {
+        observedSignal = signal;
+        yield { done: false, text: 'first', isReasoning: false };
+        // Wait for abort. A real `_runChatStream` would be parked
+        // in `waitForItem()` here — same pattern, different layer.
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
+          }
+          signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        resolveAbortSeen?.();
+        // Model the adapter's fast-abort exit: a synthetic
+        // terminal event with `finishReason: 'error'` so the
+        // handler writes a `response.failed` terminal and unwinds
+        // without adopting the session.
+        yield {
+          done: true,
+          text: '',
+          finishReason: 'error',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 0,
+          promptTokens: 0,
+          reasoningTokens: 0,
+          rawText: '',
+        };
+      }
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('should use streaming path')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('should use streaming path')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('should use streaming path')),
+        chatStreamSessionStart: vi.fn(signalAwareStream),
+        chatStreamSessionContinue: vi.fn(signalAwareStream),
+        chatStreamSessionContinueTool: vi.fn(signalAwareStream),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('stall-model', mockModel);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stall-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, waitForEnd } = createMockRes();
+      const start = Date.now();
+      const inflight = handler(req, res);
+
+      // Let the handler install listeners and enter the first
+      // yield so the generator is parked awaiting abort.
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+
+      // Fire the client-close event. The handler's
+      // AbortController flips its signal, which propagates
+      // through `ChatSession.sendStream` into the streaming
+      // wrapper (`chatStreamSessionStart`) and the mock observes
+      // the abort immediately.
+      (req as unknown as NodeJS.EventEmitter).emit('close');
+
+      // The mock's abort listener MUST fire — this is the
+      // central invariant of the fix. Pre-fix, the signal never
+      // reached the native entry point and this promise would
+      // never resolve.
+      await abortSeen;
+      await inflight;
+      await waitForEnd();
+      const elapsed = Date.now() - start;
+      expect(elapsed).toBeLessThan(500);
+      expect(observedSignal).toBeDefined();
+      expect(observedSignal?.aborted).toBe(true);
+    });
+
+    it('iter-35 finding 2: non-streaming skips endJson and persistResponse on a dead peer', async () => {
+      // The non-streaming native path has no AbortSignal surface
+      // (plain `chatSession*` resolves with a full result), so a
+      // client that disconnects mid-generation still burns every
+      // remaining token under the per-model mutex. Once native
+      // decode returns, though, the handler must NOT try to write
+      // the JSON body to a dead socket and must NOT persist a
+      // response record the client never saw — persisting would
+      // leave a dangling store entry that a later
+      // `previous_response_id` continuation could resurrect. The
+      // iter-35 fix checks `res.destroyed || res.socket?.destroyed`
+      // in `handleNonStreaming` before both calls.
+      const model = createMockModel(makeChatResult({ text: 'late reply' }));
+      const registry = new ModelRegistry();
+      registry.register('nonstream-model', model);
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockResolvedValue([]),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'nonstream-model',
+        input: 'hi',
+        stream: false,
+      });
+      const { res, waitForEnd, getBody } = createMockRes();
+      // Mark the response destroyed BEFORE invoking the handler
+      // so the disconnect-aware skip fires the moment the handler
+      // tries to flush.
+      (res as unknown as { destroyed: boolean }).destroyed = true;
+
+      await handler(req, res);
+      await waitForEnd();
+
+      // No body written (the skip branch returns early) and no
+      // persisted record (the outer persist gate reads
+      // `clientObservedOrDisconnected === false`).
+      expect(getBody()).toBe('');
+      expect(mockStore.store).not.toHaveBeenCalled();
+    });
+
+    it('iter-35 finding 2: persistResponse runs OUTSIDE the per-model mutex', async () => {
+      // Before iter-35 the `/v1/responses` handlers called
+      // `persistResponse()` from inside `withExclusive`, so a
+      // slow SQLite write pinned the per-model mutex on the next
+      // waiter. The fix captures the terminal ResponseObject
+      // inside the handler, returns it to the outer body, and
+      // writes it to the store AFTER `withExclusive` releases.
+      //
+      // This test serialises two back-to-back non-streaming
+      // requests on the same model and asserts the second
+      // request's native dispatch STARTS before the first
+      // request's slow `store.store()` call resolves — proving
+      // the persist write is off the mutex.
+      let persistReleaseB: (() => void) | undefined;
+      const persistGate = new Promise<void>((r) => {
+        persistReleaseB = r;
+      });
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation(async (record: any) => {
+          storedRecords.set(record.id, record);
+          // The first store() call blocks until the test
+          // releases it. If persist ran UNDER the mutex, the
+          // second request's chatSessionStart spy would not
+          // fire until after `persistReleaseB()`.
+          if (storedRecords.size === 1) {
+            await persistGate;
+          }
+        }),
+        getChain: vi.fn().mockResolvedValue([]),
+        cleanupExpired: vi.fn(),
+      };
+
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'first reply' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'second reply' }));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('persist-model', mockModel);
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const reqA = createMockReq('POST', '/v1/responses', {
+        model: 'persist-model',
+        input: 'hello A',
+        stream: false,
+      });
+      const reqB = createMockReq('POST', '/v1/responses', {
+        model: 'persist-model',
+        input: 'hello B',
+        stream: false,
+      });
+      const { res: resA, waitForEnd: waitA } = createMockRes();
+      const { res: resB, waitForEnd: waitB } = createMockRes();
+
+      const inflightA = handler(reqA, resA);
+      // Hand control back so A acquires the mutex and starts
+      // decode before B is queued.
+      await new Promise((r) => setImmediate(r));
+      const inflightB = handler(reqB, resB);
+
+      // Poll up to a short budget for B's native dispatch to
+      // start. If persist were inside the mutex, this would never
+      // happen — A's store.store() is blocked on `persistGate`.
+      let bStarted = false;
+      const deadline = Date.now() + 500;
+      while (Date.now() < deadline) {
+        if (chatSessionStart.mock.calls.length >= 2) {
+          bStarted = true;
+          break;
+        }
+        await new Promise((r) => setImmediate(r));
+      }
+      expect(bStarted).toBe(true);
+
+      // Release A's persist gate so both requests complete cleanly.
+      persistReleaseB?.();
+      await Promise.all([inflightA, inflightB, waitA(), waitB()]);
+
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(mockStore.store).toHaveBeenCalledTimes(2);
+    });
+
     it('normalises nested message items to incomplete when a streaming turn fails mid-decode', async () => {
       // Iter-28 finding 3 regression: the iter-27 writer built
       // the failed terminal via `{ ...terminal, status: 'failed' }`,

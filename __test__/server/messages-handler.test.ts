@@ -1043,6 +1043,105 @@ describe('handleCreateMessage', () => {
       const sessionReg = registry.getSessionRegistry('test-model');
       expect(sessionReg!.size).toBe(0);
     });
+
+    it('iter-35 finding 1: AbortSignal is propagated through the session to the streaming entry point on client disconnect', async () => {
+      // Iter-35 finding 1 fix: the outer handler installs an
+      // `AbortController` on `res.once('close', …)` /
+      // `httpReq.once('close', …)` and plumbs its signal through
+      // `ChatSession.startFromHistoryStream` →
+      // `chatStreamSessionStart` → `_runChatStream`. On the real
+      // model path, `_runChatStream` calls `handle.cancel()` on
+      // the native stream the instant the signal flips AND wakes
+      // the pending `waitForItem()` with a synthetic abort marker
+      // so the consumer breaks out at the next iteration boundary
+      // instead of waiting for the next native chunk.
+      //
+      // This test verifies the plumbing contract end-to-end: the
+      // streaming entry point receives an AbortSignal whose
+      // `aborted` flag flips the moment `httpReq`'s `'close'`
+      // event fires. We use a mock that observes the third
+      // argument (signal) and completes the instant the signal
+      // aborts — modelling the real adapter's fast-abort
+      // behaviour without depending on the native addon.
+      let observedSignal: AbortSignal | undefined;
+      let resolveAbortSeen: (() => void) | undefined;
+      const abortSeen = new Promise<void>((r) => {
+        resolveAbortSeen = r;
+      });
+      async function* signalAwareStream(
+        _messages: unknown,
+        _config: unknown,
+        signal: AbortSignal | undefined,
+      ): AsyncGenerator<Record<string, unknown>> {
+        observedSignal = signal;
+        yield { done: false, text: 'first', isReasoning: false };
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
+          }
+          signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        resolveAbortSeen?.();
+        // Synthetic failure terminal: the handler writes a
+        // streaming `error` event, not `message_stop`, which is
+        // exactly the failure-epilogue shape the real
+        // `_runChatStream` abort path produces.
+        yield {
+          done: true,
+          text: '',
+          finishReason: 'error',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 0,
+          promptTokens: 0,
+          reasoningTokens: 0,
+          rawText: '',
+        };
+      }
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('should use stream')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: vi.fn(signalAwareStream),
+        chatStreamSessionContinue: vi.fn(signalAwareStream),
+        chatStreamSessionContinueTool: vi.fn(signalAwareStream),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('stall-model', mockModel);
+      const { res } = createMockRes();
+
+      const { EventEmitter } = require('node:events');
+      const reqEmitter = new EventEmitter();
+      const httpReqMock = Object.assign(reqEmitter, {
+        method: 'POST',
+        url: '/v1/messages',
+        headers: { 'content-type': 'application/json', host: 'localhost' },
+      });
+
+      const start = Date.now();
+      const inflight = handleCreateMessage(
+        res,
+        {
+          model: 'stall-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+        httpReqMock as any,
+      );
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+      httpReqMock.emit('close');
+      await abortSeen;
+      await inflight;
+      const elapsed = Date.now() - start;
+      expect(elapsed).toBeLessThan(500);
+      expect(observedSignal).toBeDefined();
+      expect(observedSignal?.aborted).toBe(true);
+    });
   });
 
   // -----------------------------------------------------------------------

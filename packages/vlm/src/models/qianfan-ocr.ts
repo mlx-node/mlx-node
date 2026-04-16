@@ -39,9 +39,14 @@ export class QianfanOCRModel extends QianfanOCRModelNative {
 
   /** Streaming variant of {@link QianfanOCRModel#chatSessionStart}. */
   // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionStart(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeQianfanOcrChatStreamSessionStart.call(this, messages, config ?? null, callback),
+  async *chatStreamSessionStart(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream(
+      (callback) => _nativeQianfanOcrChatStreamSessionStart.call(this, messages, config ?? null, callback),
+      signal,
     );
   }
 
@@ -51,9 +56,12 @@ export class QianfanOCRModel extends QianfanOCRModelNative {
     userMessage: string,
     images: Uint8Array[] | null,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeQianfanOcrChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+    yield* _runChatStream(
+      (callback) =>
+        _nativeQianfanOcrChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+      signal,
     );
   }
 
@@ -63,9 +71,12 @@ export class QianfanOCRModel extends QianfanOCRModelNative {
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeQianfanOcrChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+    yield* _runChatStream(
+      (callback) =>
+        _nativeQianfanOcrChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+      signal,
     );
   }
 }

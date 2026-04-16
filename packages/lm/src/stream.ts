@@ -98,14 +98,34 @@ const _nativeQwen3ChatStreamSessionContinueTool = Qwen3ModelNative.prototype.cha
  * in a `finally` block so early termination (user `break`, exception) still
  * cleans up native state.
  *
+ * ## Signal-driven fast-abort
+ *
+ * When an optional `AbortSignal` is supplied and fires, the adapter:
+ *   1. Calls `handle.cancel()` immediately so the native decode stops
+ *      on the next safepoint rather than running to completion.
+ *   2. Wakes the pending `waitForItem()` await by pushing a synthetic
+ *      "aborted" marker into the queue and calling `notify()`. Without
+ *      this wake-up the generator would stay parked on the `await`
+ *      until the next native chunk arrived, which on a fast-abort
+ *      path (client disconnect before first token) never happens.
+ *   3. The generator sees the marker, breaks out of its loop, and the
+ *      finally block runs a second idempotent `handle.cancel()`.
+ *
+ * The finally block is also the landing site for the consumer calling
+ * `.return()` on the outer generator — the existing `yield` cleanup
+ * covers that case. Signal-driven abort covers the window where the
+ * consumer cannot reach `.return()` because they are blocked waiting
+ * for the very `yield` that `waitForItem()` is gating.
+ *
  * @internal Exported so the VLM wrapper (`@mlx-node/vlm`) can reuse the
  * exact same bridge without duplicating the plumbing. Not part of the
  * public API — may change without notice.
  */
 export async function* _runChatStream(
   startCall: (callback: (err: Error | null, chunk: ChatStreamChunk) => void) => Promise<ChatStreamHandle>,
+  signal?: AbortSignal,
 ): AsyncGenerator<ChatStreamEvent> {
-  const queue: Array<{ chunk?: ChatStreamChunk; error?: Error }> = [];
+  const queue: Array<{ chunk?: ChatStreamChunk; error?: Error; aborted?: boolean }> = [];
   let resolve: (() => void) | null = null;
 
   const waitForItem = () =>
@@ -130,11 +150,56 @@ export async function* _runChatStream(
 
   const handle = await startCall(callback);
 
+  // Signal-driven fast-abort. If the signal is already aborted at
+  // attach time we still arm the listener so the synchronous abort
+  // dispatch path runs below (calling `handle.cancel()` after the
+  // handle is in hand, not before — there is nothing to cancel
+  // pre-start). For an already-fired signal Node delivers the
+  // `'abort'` event on the next microtask.
+  let onAbort: (() => void) | null = null;
+  if (signal != null) {
+    const triggerAbort = (): void => {
+      // Cancel the native side first so any work-in-flight winds
+      // down ASAP. `handle.cancel()` is idempotent — the finally
+      // block will call it again after the generator unwinds.
+      try {
+        handle.cancel();
+      } catch {
+        // A double-cancel can throw on some backends; swallow so
+        // the wake-up still runs.
+      }
+      // Push a synthetic abort marker so the consumer-visible
+      // generator breaks out of its loop at the next iteration
+      // rather than waiting for a native chunk that will never
+      // arrive (e.g. client disconnect before first token).
+      queue.push({ aborted: true });
+      notify();
+    };
+    if (signal.aborted) {
+      // Signal already fired before we could attach — dispatch
+      // synchronously so the waitForItem below resolves immediately.
+      triggerAbort();
+    } else {
+      onAbort = triggerAbort;
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  }
+
   try {
-    while (true) {
+    loop: while (true) {
       await waitForItem();
       while (queue.length > 0) {
         const item = queue.shift()!;
+        if (item.aborted) {
+          // Consumer asked us to stop before the next chunk landed.
+          // Break out so the finally block runs `handle.cancel()`
+          // (idempotent — `triggerAbort` already called it) and the
+          // consumer-side `for await` unblocks cleanly. We do NOT
+          // throw an AbortError: callers (e.g. server endpoints that
+          // flag client disconnect) have already decided this is not
+          // an error from their perspective, just an early stop.
+          break loop;
+        }
         if (item.error) throw item.error;
         const chunk = item.chunk!;
         if (chunk.done) {
@@ -156,6 +221,14 @@ export async function* _runChatStream(
       }
     }
   } finally {
+    if (signal != null && onAbort != null) {
+      try {
+        signal.removeEventListener('abort', onAbort);
+      } catch {
+        // removeEventListener shouldn't throw, but stay defensive —
+        // a misbehaving signal must not leak out of the finally.
+      }
+    }
     handle.cancel();
   }
 }
@@ -184,11 +257,21 @@ export class Qwen35Model extends Qwen35ModelNative {
    * token. Stops on `<|im_end|>` so the cached history ends on a
    * clean ChatML boundary that subsequent `chatStreamSessionContinue`
    * deltas can append to. Text-only.
+   *
+   * The optional `signal` parameter wires an AbortSignal into the
+   * `_runChatStream` adapter's fast-abort path. Callers that need
+   * client-disconnect-aware cancellation (e.g. HTTP endpoints) pass
+   * one here and the native decode winds down at the next safepoint.
    */
   // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionStart(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeDenseChatStreamSessionStart.call(this, messages, config ?? null, callback),
+  async *chatStreamSessionStart(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream(
+      (callback) => _nativeDenseChatStreamSessionStart.call(this, messages, config ?? null, callback),
+      signal,
     );
   }
 
@@ -211,9 +294,11 @@ export class Qwen35Model extends Qwen35ModelNative {
     userMessage: string,
     images: Uint8Array[] | null,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeDenseChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+    yield* _runChatStream(
+      (callback) => _nativeDenseChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+      signal,
     );
   }
 
@@ -230,9 +315,11 @@ export class Qwen35Model extends Qwen35ModelNative {
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeDenseChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+    yield* _runChatStream(
+      (callback) => _nativeDenseChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+      signal,
     );
   }
 }
@@ -254,9 +341,14 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
 
   /** Streaming variant of {@link Qwen35MoeModel#chatSessionStart}. */
   // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionStart(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeMoeChatStreamSessionStart.call(this, messages, config ?? null, callback),
+  async *chatStreamSessionStart(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream(
+      (callback) => _nativeMoeChatStreamSessionStart.call(this, messages, config ?? null, callback),
+      signal,
     );
   }
 
@@ -266,9 +358,11 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
     userMessage: string,
     images: Uint8Array[] | null,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeMoeChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+    yield* _runChatStream(
+      (callback) => _nativeMoeChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+      signal,
     );
   }
 
@@ -278,9 +372,11 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeMoeChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+    yield* _runChatStream(
+      (callback) => _nativeMoeChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+      signal,
     );
   }
 }
@@ -304,9 +400,14 @@ export class Lfm2Model extends Lfm2ModelNative {
 
   /** Streaming variant of {@link Lfm2Model#chatSessionStart}. */
   // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionStart(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeLfm2ChatStreamSessionStart.call(this, messages, config ?? null, callback),
+  async *chatStreamSessionStart(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream(
+      (callback) => _nativeLfm2ChatStreamSessionStart.call(this, messages, config ?? null, callback),
+      signal,
     );
   }
 
@@ -316,9 +417,11 @@ export class Lfm2Model extends Lfm2ModelNative {
     userMessage: string,
     images: Uint8Array[] | null,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeLfm2ChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+    yield* _runChatStream(
+      (callback) => _nativeLfm2ChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+      signal,
     );
   }
 
@@ -328,9 +431,11 @@ export class Lfm2Model extends Lfm2ModelNative {
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeLfm2ChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+    yield* _runChatStream(
+      (callback) => _nativeLfm2ChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+      signal,
     );
   }
 }
@@ -354,9 +459,14 @@ export class Gemma4Model extends Gemma4ModelNative {
 
   /** Streaming variant of {@link Gemma4Model#chatSessionStart}. */
   // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionStart(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeGemma4ChatStreamSessionStart.call(this, messages, config ?? null, callback),
+  async *chatStreamSessionStart(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream(
+      (callback) => _nativeGemma4ChatStreamSessionStart.call(this, messages, config ?? null, callback),
+      signal,
     );
   }
 
@@ -366,9 +476,11 @@ export class Gemma4Model extends Gemma4ModelNative {
     userMessage: string,
     images: Uint8Array[] | null,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeGemma4ChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+    yield* _runChatStream(
+      (callback) => _nativeGemma4ChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+      signal,
     );
   }
 
@@ -378,9 +490,12 @@ export class Gemma4Model extends Gemma4ModelNative {
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeGemma4ChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+    yield* _runChatStream(
+      (callback) =>
+        _nativeGemma4ChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+      signal,
     );
   }
 }
@@ -404,9 +519,14 @@ export class Qwen3Model extends Qwen3ModelNative {
 
   /** Streaming variant of {@link Qwen3Model#chatSessionStart}. */
   // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionStart(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeQwen3ChatStreamSessionStart.call(this, messages, config ?? null, callback),
+  async *chatStreamSessionStart(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* _runChatStream(
+      (callback) => _nativeQwen3ChatStreamSessionStart.call(this, messages, config ?? null, callback),
+      signal,
     );
   }
 
@@ -416,9 +536,11 @@ export class Qwen3Model extends Qwen3ModelNative {
     userMessage: string,
     images: Uint8Array[] | null,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeQwen3ChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+    yield* _runChatStream(
+      (callback) => _nativeQwen3ChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
+      signal,
     );
   }
 
@@ -428,9 +550,11 @@ export class Qwen3Model extends Qwen3ModelNative {
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream((callback) =>
-      _nativeQwen3ChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+    yield* _runChatStream(
+      (callback) => _nativeQwen3ChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+      signal,
     );
   }
 }

@@ -57,31 +57,48 @@ const RESPONSE_TTL_SECONDS = 1800; // 30 minutes
 // Non-streaming path
 // ---------------------------------------------------------------------------
 
+/**
+ * Outcome of the non-streaming handler. `response` is the committed
+ * response object (non-null when `committed` — always, since the
+ * non-streaming path only runs after `runSessionNonStreaming` resolves)
+ * that the outer handler will persist AFTER releasing the per-model
+ * mutex. Persistence is deliberately kept off the critical path so a
+ * slow store does not pin the mutex on the next waiter.
+ */
+interface NonStreamingHandlerOutcome {
+  /** Response object to persist once the outer `withExclusive` block exits. */
+  response: ResponseObject;
+}
+
 async function handleNonStreaming(
   res: ServerResponse,
   result: ChatResult,
   req: ResponsesAPIRequest,
   responseId: string,
   previousResponseId: string | undefined,
-  store: ResponseStore | null,
-  newInputMessages: ChatMessage[],
-  modelInstanceId: number | undefined,
   visibility: TransportVisibility,
-): Promise<void> {
+): Promise<NonStreamingHandlerOutcome> {
   const response = buildResponseObject(result, req, responseId, previousResponseId);
 
-  // Persist only the new input messages (not the full expanded conversation).
-  // Persistence is best-effort: the turn is already committed in the
-  // session's KV cache, so a store failure must not prevent the client
-  // from receiving the response (with its responseId for hot-resume).
-  if (store && req.store !== false) {
-    try {
-      await persistResponse(store, response, newInputMessages, previousResponseId, modelInstanceId);
-    } catch (err) {
-      console.error('[responses] post-commit persistence failed, response will still be sent:', err);
-    }
-  }
-
+  // Iter-35 finding 2 (part a): the non-streaming native path has
+  // no AbortSignal surface on `chatSession*`, so a client that
+  // disconnects mid-decode still burns every token under the per-
+  // model mutex — we only learn about the peer loss once native
+  // decode resolves. TODO(iter35): add a native cancellation
+  // surface for `chatSession*` so the dispatch can bail at the
+  // next safepoint rather than running to completion.
+  //
+  // Disconnect-aware handling is delegated to `endJson`'s own
+  // pre-entry `isSocketGone(res)` check (iter-34): on a dead peer
+  // it synchronously rejects after `writeHead` has already flipped
+  // `responseMode = 'json'`, which is exactly the shape the outer
+  // catch expects — the JSON-mode branch destroys the socket, the
+  // adopt gate refuses to cache the session under an unreachable
+  // responseId (because the handler threw before
+  // `responseBodyWritten` flipped), and the outer persist gate
+  // sees `pendingNonStreamingPersistOuter === null` so no store
+  // record gets written for a turn the client never observed.
+  //
   // `endJson` commits `responseMode = 'json'` synchronously so the
   // outer catch knows to emit a clean JSON error (or destroy the
   // socket) rather than an SSE frame if anything below throws. The
@@ -92,6 +109,7 @@ async function handleNonStreaming(
   // the caller's catch can refuse to adopt the committed session
   // under an unreachable responseId.
   await endJson(res, JSON.stringify(response), visibility);
+  return { response };
 }
 
 // ---------------------------------------------------------------------------
@@ -217,19 +235,37 @@ function buildFailedTerminal(
  *      populated with the specific reason (`error`, `client_abort`,
  *      `stream_exhausted`, `finish_reason_error`, `not_committed`).
  */
+/**
+ * Outcome of the streaming handler. `terminalToPersist` is non-null
+ * only on the committed-success path — the outer handler writes it to
+ * the `ResponseStore` AFTER releasing the per-model mutex so a slow
+ * store write does not pin the lock on the next waiter. Every failure
+ * path (mid-decode throw, finishReason=error, iterator exhaustion,
+ * client disconnect) leaves `terminalToPersist` null — the turn never
+ * committed in the session, so there is nothing authoritative to
+ * persist and nothing for a later `previous_response_id` continuation
+ * to cold-replay.
+ */
+interface StreamingHandlerOutcome {
+  /**
+   * Terminal response object captured on the committed-success
+   * branch. The outer handler persists this once `withExclusive`
+   * exits. `null` on every failure path — the commit gate already
+   * decided not to advertise this turn to future continuations.
+   */
+  terminalToPersist: ResponseObject | null;
+}
+
 async function handleStreamingNative(
   res: ServerResponse,
   chatStream: AsyncGenerator<ChatStreamEvent>,
   req: ResponsesAPIRequest,
   responseId: string,
   previousResponseId: string | undefined,
-  store: ResponseStore | null,
-  newInputMessages: ChatMessage[],
   wasCommitted: () => boolean,
-  modelInstanceId: number | undefined,
   httpReq: IncomingMessage | undefined,
   visibility: TransportVisibility,
-): Promise<void> {
+): Promise<StreamingHandlerOutcome> {
   beginSSE(res);
   // Commit to SSE wire format synchronously. The outer catch branches
   // on `responseMode` — not on `headersSent` — so an early throw from
@@ -783,17 +819,17 @@ async function handleStreamingNative(
       }
     }
 
-    // Persistence is best-effort: the turn is already committed in the
-    // session's KV cache, so a store failure must not prevent the client
-    // from receiving the terminal `response.completed` event (with its
-    // responseId for hot-resume).
-    if (store && req.store !== false) {
-      try {
-        await persistResponse(store, terminal, newInputMessages, previousResponseId, modelInstanceId);
-      } catch (err) {
-        console.error('[responses] post-commit persistence failed (streaming), terminal will still be emitted:', err);
-      }
-    }
+    // Iter-35 finding 2: persistence moved OUT of the per-model
+    // mutex. The terminal `response.completed` event still flushes
+    // inside this critical section (the client expects it ordered
+    // against the prior SSE deltas), but the `ResponseStore` write
+    // that lets a future `previous_response_id` continuation cold-
+    // replay this turn is deferred to the outer `handleCreateResponse`
+    // body — AFTER `withExclusive` releases. Persistence is
+    // best-effort (store failures are log-only) and does not touch
+    // native model state, so holding the mutex across a slow SQLite
+    // write only pins the next waiter for no reason.
+    //
     // Gate `terminalEmitted` on the terminal SSE event's write
     // callback firing without error — `flushTerminalSSE` only flips
     // the flag once the kernel has accepted the frame. A synchronous
@@ -804,7 +840,7 @@ async function handleStreamingNative(
     // adopt under an unseen responseId.
     await flushTerminalSSE(res, 'response.completed', { response: terminal }, visibility);
     endSSE(res);
-    return;
+    return { terminalToPersist: terminal };
   }
 
   // Failure epilogue.
@@ -917,6 +953,12 @@ async function handleStreamingNative(
   // unseen responseId.
   await flushTerminalSSE(res, 'response.failed', { response: failedTerminal }, visibility);
   endSSE(res);
+  // Uncommitted terminal — the registry-level adopt gate already
+  // skips caching this session, and the store must not be written
+  // either. A later `previous_response_id` continuation that landed
+  // on this record would cold-replay a turn the session rolled back,
+  // silently resurrecting failed output as authoritative history.
+  return { terminalToPersist: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,12 +1434,13 @@ async function runSessionStreaming(
   messages: ChatMessage[],
   newInputMessages: ChatMessage[],
   config: ChatConfig,
+  signal: AbortSignal | undefined,
 ): Promise<StreamingOutcome> {
   if (session.turns === 0) {
     session.primeHistory(messages);
     const initialTurns = session.turns;
     return {
-      stream: session.startFromHistoryStream(config),
+      stream: session.startFromHistoryStream(config, signal),
       wasCommitted: () => session.turns > initialTurns,
     };
   }
@@ -1408,7 +1451,7 @@ async function runSessionStreaming(
     if (last.role === 'user') {
       const images = last.images ?? undefined;
       return {
-        stream: session.sendStream(last.content, images ? { images, config } : { config }),
+        stream: session.sendStream(last.content, images ? { images, config, signal } : { config, signal }),
         wasCommitted: () => session.turns > initialTurns,
       };
     }
@@ -1417,7 +1460,7 @@ async function runSessionStreaming(
         throw new Error('tool message missing toolCallId');
       }
       return {
-        stream: session.sendToolResultStream(last.toolCallId, last.content, { config }),
+        stream: session.sendToolResultStream(last.toolCallId, last.content, { config, signal }),
         wasCommitted: () => session.turns > initialTurns,
       };
     }
@@ -1432,7 +1475,7 @@ async function runSessionStreaming(
   session.primeHistory(messages);
   const initialTurns = session.turns;
   return {
-    stream: session.startFromHistoryStream(config),
+    stream: session.startFromHistoryStream(config, signal),
     wasCommitted: () => session.turns > initialTurns,
   };
 }
@@ -1590,6 +1633,21 @@ export async function handleCreateResponse(
     return;
   }
   const leaseModel = lease.model;
+  // Iter-35 finding 1: AbortController wired to the HTTP request's
+  // disconnect events, declared at this scope so the outer `finally`
+  // can always detach the listeners even on an early `return` from
+  // inside the try. Listeners are attached only after we pass the
+  // pre-lock validation gates — the `let` holders default to `null`
+  // so the detach loop safely no-ops on the early-return path.
+  const abortController = new AbortController();
+  const abortSocket = res.socket;
+  const onAbortClose = (): void => {
+    abortController.abort();
+  };
+  const onAbortError = (_err: unknown): void => {
+    abortController.abort();
+  };
+  let abortListenersAttached = false;
   try {
     // Capture an initial snapshot of the live binding for `body.model`.
     // These values are the INITIAL observation — on a
@@ -1977,6 +2035,43 @@ export async function handleCreateResponse(
     const preLockSessionReg = sessionReg;
     const preLockInstanceId = currentInstanceId;
 
+    // Iter-35 finding 1: arm the AbortController wired at function
+    // scope above. The streaming wrappers in `@mlx-node/lm` plumb
+    // this signal into `_runChatStream`, which calls
+    // `handle.cancel()` on the native ChatStreamHandle AND pushes a
+    // synthetic abort marker into the queue so the
+    // `await waitForItem()` blocking on the NEXT native chunk
+    // unblocks immediately. Without the signal a client that dropped
+    // mid-eval would still keep this handler (and the per-model
+    // mutex) pinned until the next token arrived from native decode
+    // — on a long eval that can be hundreds of milliseconds, during
+    // which no other request on the same model makes any forward
+    // progress. Listeners are attached HERE (not at function
+    // entry) so early-return validation gates above do not need to
+    // pair an install with a detach — the outer `finally` detaches
+    // unconditionally, gated on `abortListenersAttached`.
+    res.once('close', onAbortClose);
+    res.once('error', onAbortError);
+    if (abortSocket != null) {
+      abortSocket.once('close', onAbortClose);
+    }
+    if (httpReq) {
+      httpReq.once('close', onAbortClose);
+      httpReq.once('error', onAbortError);
+    }
+    abortListenersAttached = true;
+    const streamSignal: AbortSignal = abortController.signal;
+
+    // Persistence captured inside the mutex, flushed to the store
+    // AFTER the mutex releases. See the handler-return types for the
+    // full rationale — persistence is best-effort and does not touch
+    // native model state, so it does not belong on the critical path.
+    // Populated only on the happy path (client observed a terminal);
+    // left `null` on every failure path so the outer persist gate
+    // does not write a record the client could not see.
+    let pendingStreamingPersistOuter: ResponseObject | null = null;
+    let pendingNonStreamingPersistOuter: ResponseObject | null = null;
+
     await sessionReg.withExclusive(async () => {
       // Hot-swap race guard inside the mutex.
       //
@@ -2299,40 +2394,46 @@ export async function handleCreateResponse(
         let handlerError: Error | null = null;
 
         if (mappedBody.stream) {
-          const outcome = await runSessionStreaming(session, messages, newInputMessages, config);
+          const outcome = await runSessionStreaming(session, messages, newInputMessages, config, streamSignal);
           const streamingWasCommitted = () => outcome.wasCommitted();
           try {
-            await handleStreamingNative(
+            const handlerOutcome = await handleStreamingNative(
               res,
               outcome.stream,
               mappedBody,
               responseId,
               previousResponseId,
-              store,
-              newInputMessages,
               streamingWasCommitted,
-              currentInstanceId,
               httpReq,
               visibility,
             );
+            pendingStreamingPersistOuter = handlerOutcome.terminalToPersist;
           } catch (err) {
             handlerError = err instanceof Error ? err : new Error(String(err));
           }
           committed = streamingWasCommitted();
         } else {
+          // Iter-35 finding 2 (part a): the non-streaming native
+          // path has NO AbortSignal surface (plain
+          // `chatSession*` returns a Promise, no cancel), so a
+          // client that disconnects mid-generation still burns
+          // the full decode budget under this mutex. TODO(iter35):
+          // native cancellation for `chatSession*` — until then
+          // the best we can do is the disconnect-aware skip inside
+          // `handleNonStreaming` (short-circuits `endJson` and
+          // signals the outer persist gate) plus this documented
+          // limitation.
           const outcome = await runSessionNonStreaming(session, messages, newInputMessages, config);
           try {
-            await handleNonStreaming(
+            const handlerOutcome = await handleNonStreaming(
               res,
               outcome.result,
               mappedBody,
               responseId,
               previousResponseId,
-              store,
-              newInputMessages,
-              currentInstanceId,
               visibility,
             );
+            pendingNonStreamingPersistOuter = handlerOutcome.response;
           } catch (err) {
             handlerError = err instanceof Error ? err : new Error(String(err));
           }
@@ -2430,7 +2531,49 @@ export async function handleCreateResponse(
         }
       }
     });
+
+    // Iter-35 finding 2 (part b): persist the response AFTER the
+    // per-model mutex releases. The captured payload is best-effort
+    // output — any error is swallowed with a log line — and does
+    // not touch native model state, so running it inside
+    // `withExclusive` only pins the next waiter on a slow SQLite
+    // flush. Both handlers populate their `pending…PersistOuter`
+    // slot ONLY on the happy path (streaming: committed-success
+    // branch; non-streaming: JSON body written to the peer). A
+    // client-abort or mid-decode failure leaves the slot `null` so
+    // we never write a store record the client could not observe —
+    // persisting one anyway would let a later
+    // `previous_response_id` continuation resurrect a turn the
+    // session never handed out.
+    if (store && body.store !== false) {
+      const toPersist = pendingStreamingPersistOuter ?? pendingNonStreamingPersistOuter;
+      if (toPersist != null) {
+        const mode = pendingStreamingPersistOuter != null ? 'streaming' : 'non-streaming';
+        try {
+          await persistResponse(store, toPersist, newInputMessages, previousResponseId, currentInstanceId);
+        } catch (err) {
+          console.error(`[responses] post-commit persistence failed (${mode}, off-lock):`, err);
+        }
+      }
+    }
   } finally {
+    // Iter-35 finding 1: drop the AbortController's socket/request
+    // listeners so they do not keep the request object alive past
+    // the handler's return. Only detach when listeners were actually
+    // installed — early-return validation failures exit the outer
+    // try before the installation site, so an unconditional detach
+    // would pull listeners that were never attached.
+    if (abortListenersAttached) {
+      res.removeListener('close', onAbortClose);
+      res.removeListener('error', onAbortError);
+      if (abortSocket != null) {
+        abortSocket.removeListener('close', onAbortClose);
+      }
+      if (httpReq) {
+        httpReq.removeListener('close', onAbortClose);
+        httpReq.removeListener('error', onAbortError);
+      }
+    }
     // Release the dispatch lease on the ORIGINAL model object the
     // lease was acquired against (not a re-read of `body.model`,
     // which may have been hot-swapped while we held the mutex). A

@@ -123,16 +123,31 @@ export interface SessionCapableModel {
     config?: ChatConfig | null,
   ): Promise<ChatResult>;
   chatSessionContinueTool(toolCallId: string, content: string, config?: ChatConfig | null): Promise<ChatResult>;
-  chatStreamSessionStart(messages: ChatMessage[], config?: ChatConfig | null): AsyncGenerator<ChatStreamEvent>;
+  /**
+   * The optional `signal` parameter on every streaming entry point is
+   * plumbed into the `_runChatStream` fast-abort path in the wrapper
+   * implementations. Callers that need client-disconnect-aware
+   * cancellation (e.g. HTTP endpoints flipping an AbortController on
+   * socket close) can attach one here and the native decode unwinds
+   * at the next safepoint via `ChatStreamHandle.cancel()`. Non-signal
+   * callers (the common direct-use path) just omit it.
+   */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ChatStreamEvent>;
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent>;
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
+    signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent>;
   resetCaches(): void;
 }
@@ -151,6 +166,23 @@ export interface SendOptions {
    * what the caller passes.
    */
   config?: ChatConfig;
+  /**
+   * Optional AbortSignal plumbed into the streaming fast-abort path.
+   *
+   * Only honored by the streaming entry points (`sendStream`,
+   * `sendToolResultStream`, `startFromHistoryStream`) — the
+   * non-streaming `send` / `sendToolResult` / `startFromHistory`
+   * calls have NO native cancel surface, so a signal passed to them
+   * is ignored. Pass one here and the inner `_runChatStream`
+   * adapter wakes from `waitForItem()` on abort, calls
+   * `handle.cancel()` on the native handle, and unwinds the stream
+   * without throwing an AbortError — the outer consumer's `for await`
+   * just ends early. Intended for HTTP endpoints that flip a
+   * controller on `res.once('close', …)` so client disconnect stops
+   * the native decode at the next safepoint rather than running it
+   * to completion under the per-model mutex.
+   */
+  signal?: AbortSignal;
 }
 
 /** Constructor options for {@link ChatSession}. */
@@ -425,7 +457,15 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const isFirstTurn = this.turnCount === 0;
 
       if (isFirstTurn || imageChanged) {
-        yield* this.runStartStreamPath(userMessage, opts.images, newImagesKey, imageChanged, isFirstTurn, mergedConfig);
+        yield* this.runStartStreamPath(
+          userMessage,
+          opts.images,
+          newImagesKey,
+          imageChanged,
+          isFirstTurn,
+          mergedConfig,
+          opts.signal,
+        );
         return;
       }
 
@@ -435,7 +475,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let finalRaw: string | null = null;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       try {
-        for await (const event of this.model.chatStreamSessionContinue(userMessage, null, mergedConfig)) {
+        for await (const event of this.model.chatStreamSessionContinue(userMessage, null, mergedConfig, opts.signal)) {
           if (event.done) {
             if (event.finishReason !== 'error') {
               sawFinal = true;
@@ -506,7 +546,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   async *sendToolResultStream(
     toolCallId: string,
     content: string,
-    opts: { config?: ChatConfig } = {},
+    opts: { config?: ChatConfig; signal?: AbortSignal } = {},
   ): AsyncGenerator<ChatStreamEvent> {
     if (this.inFlight) {
       throw new Error('ChatSession: concurrent send() not allowed; await the previous call first');
@@ -520,7 +560,12 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let finalRaw: string | null = null;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       try {
-        for await (const event of this.model.chatStreamSessionContinueTool(toolCallId, content, mergedConfig)) {
+        for await (const event of this.model.chatStreamSessionContinueTool(
+          toolCallId,
+          content,
+          mergedConfig,
+          opts.signal,
+        )) {
           if (event.done) {
             if (event.finishReason !== 'error') {
               sawFinal = true;
@@ -656,7 +701,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * Because history is primed (not appended to), rollback on failure
    * is a no-op: the primed state stays intact so the caller can retry.
    */
-  async *startFromHistoryStream(config?: ChatConfig): AsyncGenerator<ChatStreamEvent> {
+  async *startFromHistoryStream(config?: ChatConfig, signal?: AbortSignal): AsyncGenerator<ChatStreamEvent> {
     if (this.inFlight) {
       throw new Error('ChatSession: cannot startFromHistoryStream() while a send() is in flight');
     }
@@ -675,7 +720,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let finalRaw: string | null = null;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       try {
-        for await (const event of this.model.chatStreamSessionStart(historySnapshot, mergedConfig)) {
+        for await (const event of this.model.chatStreamSessionStart(historySnapshot, mergedConfig, signal)) {
           if (event.done) {
             if (event.finishReason !== 'error') {
               sawFinal = true;
@@ -883,6 +928,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     imageChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
+    signal: AbortSignal | undefined,
   ): AsyncGenerator<ChatStreamEvent> {
     // Capture pre-state so any non-successful exit can roll back.
     // See `runStartPath` for the full rationale.
@@ -904,7 +950,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     // the rationale.
     const historySnapshot = this.history.slice();
     try {
-      for await (const event of this.model.chatStreamSessionStart(historySnapshot, config)) {
+      for await (const event of this.model.chatStreamSessionStart(historySnapshot, config, signal)) {
         if (event.done) {
           if (event.finishReason !== 'error') {
             sawFinal = true;

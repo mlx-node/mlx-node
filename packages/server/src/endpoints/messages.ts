@@ -58,6 +58,25 @@ async function handleNonStreaming(
 ): Promise<void> {
   const messageId = genId('msg_');
   const response = buildAnthropicResponse(result, body, messageId);
+
+  // Iter-35 finding 2 (part a): the non-streaming Anthropic path
+  // has no AbortSignal surface on `chatSession*`, so a client that
+  // disconnects mid-decode still burns every token under the per-
+  // model mutex — we only learn about the peer loss once native
+  // decode resolves. TODO(iter35): add a native cancellation
+  // surface for `chatSession*` so the dispatch can bail at the
+  // next safepoint rather than running to completion.
+  //
+  // Disconnect-aware handling is delegated to `endJson`'s own
+  // pre-entry destroyed check (iter-34): on a dead peer it rejects
+  // synchronously after `writeHead` has already flipped
+  // `responseMode = 'json'`, which is exactly the shape the outer
+  // catch expects — the JSON-mode branch destroys the socket
+  // cleanly. Short-circuiting here with an early return would
+  // leave `responseMode === null`, routing the error through the
+  // clean-500 path instead, which tests (and production
+  // expectations) rely on destroying the socket.
+
   // `endJson` commits `responseMode = 'json'` synchronously and
   // only flips `responseBodyWritten` once the kernel has
   // acknowledged the final chunk. The outer catch branches on
@@ -507,11 +526,12 @@ function runSessionStreaming(
   session: ChatSession<SessionCapableModel>,
   messages: ChatMessage[],
   config: ChatConfig,
+  signal: AbortSignal | undefined,
 ): MessagesStreamingOutcome {
   session.primeHistory(messages);
   const initialTurns = session.turns;
   return {
-    stream: session.startFromHistoryStream(config),
+    stream: session.startFromHistoryStream(config, signal),
     wasCommitted: () => session.turns > initialTurns,
   };
 }
@@ -576,6 +596,21 @@ export async function handleCreateMessage(
     return;
   }
   const leaseModel = lease.model;
+  // Iter-35 finding 1: AbortController wired to the HTTP request's
+  // disconnect events, declared at function scope so the outer
+  // `finally` can always detach listeners even on an early `return`.
+  // Listeners attach only after we pass pre-lock validation — the
+  // holder variables default to the no-op state so the detach loop
+  // safely skips on the early-return path.
+  const abortController = new AbortController();
+  const abortSocket = res.socket;
+  const onAbortClose = (): void => {
+    abortController.abort();
+  };
+  const onAbortError = (_err: unknown): void => {
+    abortController.abort();
+  };
+  let abortListenersAttached = false;
   try {
     // Fetch the per-model session registry. The Anthropic API is
     // stateless — we allocate a fresh session for every request via
@@ -664,6 +699,28 @@ export async function handleCreateMessage(
     // decode on this model, and the `finally` inside `withExclusive`
     // releases the lock regardless of whether the closure threw, so a
     // failed dispatch cannot leave the next waiter stuck.
+    // Iter-35 finding 1: arm the AbortController now — we are past
+    // every validation gate, so listeners have a matching detach in
+    // the outer `finally` guarded by `abortListenersAttached`. The
+    // streaming wrappers in `@mlx-node/lm` plumb this signal into
+    // `_runChatStream`, which calls `handle.cancel()` on the native
+    // ChatStreamHandle AND pushes a synthetic abort marker so the
+    // pending `await waitForItem()` unblocks immediately on a dead
+    // peer. Without the signal a client that dropped mid-eval would
+    // pin this handler (and the per-model mutex) until the next
+    // native chunk arrived.
+    res.once('close', onAbortClose);
+    res.once('error', onAbortError);
+    if (abortSocket != null) {
+      abortSocket.once('close', onAbortClose);
+    }
+    if (httpReq) {
+      httpReq.once('close', onAbortClose);
+      httpReq.once('error', onAbortError);
+    }
+    abortListenersAttached = true;
+    const streamSignal: AbortSignal = abortController.signal;
+
     await sessionReg.withExclusive(async () => {
       // Hot-swap race guard inside the mutex.
       //
@@ -723,9 +780,18 @@ export async function handleCreateMessage(
 
       try {
         if (body.stream === true) {
-          const outcome = runSessionStreaming(session, messages, config);
+          const outcome = runSessionStreaming(session, messages, config, streamSignal);
           await handleStreamingNative(res, outcome.stream, body, outcome.wasCommitted, httpReq, visibility);
         } else {
+          // Iter-35 finding 2 (part a): the non-streaming Anthropic
+          // path has NO AbortSignal surface (native
+          // `chatSessionStart` is a plain Promise, no cancel), so a
+          // client that disconnects mid-generation still burns every
+          // remaining token under this mutex. TODO(iter35): native
+          // cancellation for `chatSession*` — until then the
+          // disconnect-aware skip inside `handleNonStreaming`
+          // short-circuits the JSON write on a dead peer so the
+          // handler exits the mutex as soon as native decode returns.
           const result = await runSessionNonStreaming(session, messages, config);
           await handleNonStreaming(res, result, body, visibility);
         }
@@ -760,6 +826,21 @@ export async function handleCreateMessage(
       }
     });
   } finally {
+    // Iter-35 finding 1: drop the AbortController's socket/request
+    // listeners so they do not keep the request object alive past
+    // handler return. Only detach if we reached the installation
+    // site — early-return validation gates exit before that point.
+    if (abortListenersAttached) {
+      res.removeListener('close', onAbortClose);
+      res.removeListener('error', onAbortError);
+      if (abortSocket != null) {
+        abortSocket.removeListener('close', onAbortClose);
+      }
+      if (httpReq) {
+        httpReq.removeListener('close', onAbortClose);
+        httpReq.removeListener('error', onAbortError);
+      }
+    }
     // Release the dispatch lease on the ORIGINAL model object the
     // lease was acquired against (not a re-read of `body.model`,
     // which may have been hot-swapped while we held the mutex). A
