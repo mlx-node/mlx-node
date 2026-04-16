@@ -37,6 +37,28 @@
         padding: 4px 10px;
         border-radius: 4px;
       }
+      /* Reasoning toggle (Bug #2): opt-in because Qwen 3.5 0.8B frequently
+         stays inside <think> until EOS when thinking is forced ON, which
+         produces empty responses. */
+      #toggle-reasoning {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        color: #9ca3af;
+        cursor: pointer;
+        user-select: none;
+      }
+      #toggle-reasoning input[type='checkbox'] {
+        width: 14px;
+        height: 14px;
+        accent-color: #7c3aed;
+        cursor: pointer;
+      }
+      #toggle-reasoning:hover {
+        color: #d4d4d4;
+      }
       #status.info {
         background: #1e293b;
         color: #93c5fd;
@@ -230,6 +252,13 @@
     <header>
       <h1>MLX Browser</h1>
       <span id="status" class="info">Initializing...</span>
+      <label
+        id="toggle-reasoning"
+        title="Show the model's thinking process (slower, may produce empty answers on small models)"
+      >
+        <input id="enable-thinking" type="checkbox" />
+        Reasoning
+      </label>
     </header>
     <div id="main">
       <div id="chat"></div>

@@ -565,6 +565,7 @@ async function handleChat(data: {
   config?: any;
   useSab?: boolean;
   mode?: 'sab' | 'tsfn' | 'baseline';
+  enableThinking?: boolean;
 }) {
   if (!wasmMemory || !wasmMalloc || !wasmFree) {
     post({ type: 'error', message: 'handleChat called before WASM init complete' });
@@ -580,6 +581,16 @@ async function handleChat(data: {
     await handleChatBaseline(data);
     return;
   }
+  // Resolve the reasoning flag. Qwen 3.5 0.8B frequently stays inside <think>
+  // until EOS/max_tokens when reasoning is forced ON (see Bug #2: the chat
+  // finalizer then returns text="" because all output is treated as
+  // reasoning), so we default to OFF and let the demo UI opt in.
+  //
+  // NB: Qwen3.5's ChatConfig has no `enableThinking` field — the real control
+  // is `reasoningEffort` ("none"/"low" => thinking off, otherwise on). Setting
+  // `enableThinking: true/false` on the NAPI object would be silently ignored.
+  const enableThinking = data.enableThinking === true;
+  const reasoningEffort = enableThinking ? 'high' : 'none';
   const memory = wasmMemory;
   const mallocFn = wasmMalloc;
   const freeFn = wasmFree;
@@ -611,7 +622,7 @@ async function handleChat(data: {
   try {
     const chatConfig = {
       ...data.config,
-      enableThinking: true,
+      reasoningEffort,
       reportPerformance: true,
     };
 
@@ -669,11 +680,11 @@ async function handleChat(data: {
   }
 }
 
-async function handleChatBaseline(data: { messages: any[]; config?: any }) {
+async function handleChatBaseline(data: { messages: any[]; config?: any; enableThinking?: boolean }) {
   try {
     const chatConfig = {
       ...data.config,
-      enableThinking: true,
+      reasoningEffort: data.enableThinking === true ? 'high' : 'none',
       reportPerformance: true,
     };
     resetProfileCounters();
@@ -709,11 +720,11 @@ async function handleChatBaseline(data: { messages: any[]; config?: any }) {
   }
 }
 
-async function handleChatTsfn(data: { messages: any[]; config?: any }) {
+async function handleChatTsfn(data: { messages: any[]; config?: any; enableThinking?: boolean }) {
   try {
     const chatConfig = {
       ...data.config,
-      enableThinking: true,
+      reasoningEffort: data.enableThinking === true ? 'high' : 'none',
       reportPerformance: true,
     };
     resetProfileCounters();

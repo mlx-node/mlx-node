@@ -22,6 +22,7 @@ const promptEl = document.getElementById('prompt') as HTMLTextAreaElement;
 const sendBtn = document.getElementById('send') as HTMLButtonElement;
 const imageBtn = document.getElementById('image-btn') as HTMLButtonElement;
 const imageInput = document.getElementById('image-input') as HTMLInputElement;
+const enableThinkingEl = document.getElementById('enable-thinking') as HTMLInputElement;
 
 function setStatus(text: string, state: 'info' | 'ready' | 'error' = 'info') {
   statusEl.textContent = text;
@@ -47,6 +48,24 @@ let currentResponseDiv: HTMLDivElement | null = null;
 let isInThinking = false;
 let streamedText = ''; // Accumulates all streamed tokens
 let streamTokenCount = 0;
+
+// ---------------------------------------------------------------------------
+// Typewriter render queue
+// ---------------------------------------------------------------------------
+// The Rust producer (HF ByteLevel BPE) emits deltas of wildly varying size
+// (empty, empty, "word") and the SAB reader drains multiple records in a
+// single task. Writing textContent synchronously per-record produces visible
+// multi-word "chunks". To smooth this out, each delta is appended to an
+// in-memory queue and an rAF loop reveals a small slice per frame (~60 fps).
+//
+// The drain rate adapts to queue depth so we don't fall far behind generation:
+// charsThisFrame = max(1, ceil(queueLen / 20)). On a 100-char backlog that's
+// 5 chars/frame ≈ 300 chars/s; short queues drain at 1 char/frame ≈ 60 cps,
+// which is the "smooth typewriter" feel the user expects.
+let reasoningQueue = '';
+let contentQueue = '';
+let rafHandle: number | null = null;
+let scrollDirty = false;
 
 // Shared WASM memory, received once on 'ready' from mlx-worker. Used to mount
 // a chat-stream-sab reader over the heap region the worker mallocs per chat.
@@ -90,41 +109,138 @@ function createAssistantMessage(): HTMLDivElement {
   // Hide thinking section initially — only show if model produces thinking
   thinkingDiv.style.display = 'none';
 
+  // Reset the typewriter queue for this new message.
+  reasoningQueue = '';
+  contentQueue = '';
+  if (rafHandle != null) {
+    cancelAnimationFrame(rafHandle);
+    rafHandle = null;
+  }
+  scrollDirty = false;
+
   return assistantDiv;
 }
 
 function appendStreamedToken(deltaText: string, isReasoning: boolean) {
   if (!currentAssistantDiv || !currentThinkingDiv || !currentResponseDiv) return;
+  if (!deltaText) return; // Rust emits empty deltas while BPE holds back partial bytes
 
   streamedText += deltaText;
   streamTokenCount++;
   setStatus(`Generating... ${streamTokenCount} tokens`, 'info');
 
   if (isReasoning) {
-    // Model is in thinking mode — show thinking content
-    isInThinking = true;
-    currentThinkingDiv.style.display = '';
-    currentThinkingDiv.open = true;
-    const thinkingContentEl = currentThinkingDiv.querySelector('.thinking-content') as HTMLElement;
-    if (thinkingContentEl) thinkingContentEl.textContent += deltaText;
-    const summary = currentThinkingDiv.querySelector('summary') as HTMLElement;
-    if (summary) summary.textContent = 'Thinking...';
+    reasoningQueue += deltaText;
   } else {
-    // Transition from thinking → response
+    contentQueue += deltaText;
+  }
+  scheduleFlush();
+}
+
+function scheduleFlush() {
+  if (rafHandle != null) return;
+  rafHandle = requestAnimationFrame(flushTick);
+}
+
+function flushTick() {
+  rafHandle = null;
+
+  // Message may have been finalized or errored out between frames — drop
+  // the queues so we don't leak chars into the next message.
+  if (!currentAssistantDiv || !currentThinkingDiv || !currentResponseDiv) {
+    reasoningQueue = '';
+    contentQueue = '';
+    return;
+  }
+
+  // Drain reasoning first so the "thinking → response" transition below
+  // fires in the same frame as the first content char.
+  if (reasoningQueue.length > 0) {
+    const reveal = Math.max(1, Math.ceil(reasoningQueue.length / 20));
+    const slice = reasoningQueue.slice(0, reveal);
+    reasoningQueue = reasoningQueue.slice(reveal);
+
+    if (!isInThinking) {
+      isInThinking = true;
+      currentThinkingDiv.style.display = '';
+      currentThinkingDiv.open = true;
+      const summary = currentThinkingDiv.querySelector('summary') as HTMLElement;
+      if (summary) summary.textContent = 'Thinking...';
+    }
+    const thinkingContentEl = currentThinkingDiv.querySelector('.thinking-content') as HTMLElement;
+    if (thinkingContentEl) thinkingContentEl.textContent += slice;
+    scrollDirty = true;
+  }
+
+  if (contentQueue.length > 0) {
+    const reveal = Math.max(1, Math.ceil(contentQueue.length / 20));
+    const slice = contentQueue.slice(0, reveal);
+    contentQueue = contentQueue.slice(reveal);
+
+    // Transition from thinking → response, done once on the first content char.
     if (isInThinking) {
       isInThinking = false;
       const summary = currentThinkingDiv.querySelector('summary') as HTMLElement;
       if (summary) summary.textContent = 'Thought process';
       currentThinkingDiv.open = false;
     }
-    currentResponseDiv.textContent += deltaText;
+    currentResponseDiv.textContent += slice;
+    scrollDirty = true;
   }
 
-  chatEl.scrollTop = chatEl.scrollHeight;
+  // Coalesce scroll writes to once per frame — per-token scroll was
+  // triggering a reflow storm that amplified the "chunky" perception.
+  if (scrollDirty) {
+    chatEl.scrollTop = chatEl.scrollHeight;
+    scrollDirty = false;
+  }
+
+  // Keep running the loop while there's pending text.
+  if (reasoningQueue.length > 0 || contentQueue.length > 0) {
+    scheduleFlush();
+  }
+}
+
+function drainQueuesSync() {
+  // Flush any pending queued text directly into the DOM. Used before
+  // finalizeAssistantMessage overwrites textContent with the final text, so
+  // tail characters that were still sitting in the rAF queue don't get lost.
+  if (currentAssistantDiv && currentThinkingDiv && currentResponseDiv) {
+    if (reasoningQueue.length > 0) {
+      if (!isInThinking) {
+        isInThinking = true;
+        currentThinkingDiv.style.display = '';
+        currentThinkingDiv.open = true;
+      }
+      const thinkingContentEl = currentThinkingDiv.querySelector('.thinking-content') as HTMLElement;
+      if (thinkingContentEl) thinkingContentEl.textContent += reasoningQueue;
+    }
+    if (contentQueue.length > 0) {
+      if (isInThinking) {
+        isInThinking = false;
+        const summary = currentThinkingDiv.querySelector('summary') as HTMLElement;
+        if (summary) summary.textContent = 'Thought process';
+        currentThinkingDiv.open = false;
+      }
+      currentResponseDiv.textContent += contentQueue;
+    }
+  }
+  reasoningQueue = '';
+  contentQueue = '';
+  if (rafHandle != null) {
+    cancelAnimationFrame(rafHandle);
+    rafHandle = null;
+  }
+  scrollDirty = false;
 }
 
 function finalizeAssistantMessage(text: string, thinking: string | null) {
   if (!currentAssistantDiv || !currentThinkingDiv || !currentResponseDiv) return;
+
+  // Drain any queued text to the DOM synchronously before we overwrite with
+  // the final strings. Otherwise, if the rAF hasn't caught up to the tail of
+  // the stream, those trailing chars get stomped.
+  drainQueuesSync();
 
   const trimmedThinking = thinking?.trim() || '';
   // Only show thinking section if it contains substantial content (not just punctuation)
@@ -141,7 +257,15 @@ function finalizeAssistantMessage(text: string, thinking: string | null) {
     currentThinkingDiv.style.display = 'none';
   }
 
-  currentResponseDiv.textContent = text || '';
+  // Defensive overwrite safeguard (Bug #2):
+  // The Rust finalizer returns text="" when the model stays inside <think>
+  // until EOS/max_tokens (reasoning mode, no </think> emitted). If that
+  // happens we must NOT stomp whatever streamed content is already in the
+  // DOM — otherwise the user sees a completely blank assistant bubble.
+  // Only overwrite when Rust produced a non-empty final text.
+  if (text && text.length > 0) {
+    currentResponseDiv.textContent = text;
+  }
   currentAssistantDiv.classList.add('done'); // Remove cursor animation
   chatEl.scrollTop = chatEl.scrollHeight;
 
@@ -250,6 +374,14 @@ worker.onmessage = (e) => {
         },
         (err: Error) => {
           log(`Stream error: ${err.message}`);
+          // Drop queued text and cancel the rAF before we clear the DOM refs.
+          reasoningQueue = '';
+          contentQueue = '';
+          if (rafHandle != null) {
+            cancelAnimationFrame(rafHandle);
+            rafHandle = null;
+          }
+          scrollDirty = false;
           if (currentResponseDiv) {
             currentResponseDiv.textContent = `Error: ${err.message}`;
           }
@@ -368,14 +500,20 @@ worker.onmessage = (e) => {
       const bs = s.diagBatchStaged ?? 0;
       const bdb = s.diagBatchDeferredBlock ?? 0;
       const bsr = s.diagBatchStageRefused ?? 0;
-      log(
-        `[profile] batch: attempt=${ba} staged=${bs} deferredBlock=${bdb} stageRefused=${bsr}`,
-      );
+      log(`[profile] batch: attempt=${ba} staged=${bs} deferredBlock=${bdb} stageRefused=${bsr}`);
       break;
     }
 
     case 'error':
       log(`Error: ${data.message}`);
+      // Drop queued text and cancel the rAF before we clear the DOM refs.
+      reasoningQueue = '';
+      contentQueue = '';
+      if (rafHandle != null) {
+        cancelAnimationFrame(rafHandle);
+        rafHandle = null;
+      }
+      scrollDirty = false;
       if (currentResponseDiv) {
         currentResponseDiv.textContent = `Error: ${data.message}`;
       }
@@ -646,13 +784,16 @@ function handleSend() {
   isInThinking = false;
   createAssistantMessage();
 
-  // Send to worker
+  // Send to worker. enableThinking is opt-in via the header checkbox — see
+  // Bug #2: Qwen 3.5 0.8B frequently stays inside <think> until EOS when
+  // thinking is ON, producing empty final responses.
   worker.postMessage({
     type: 'chat',
     messages: [...messages],
     config: { maxNewTokens: 512, temperature: 0, reportPerformance: true },
     useSab,
     mode: modeParam ?? undefined,
+    enableThinking: enableThinkingEl.checked,
   });
 }
 
