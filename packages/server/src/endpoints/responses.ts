@@ -54,6 +54,22 @@ import type {
 /** How long stored responses live (seconds). */
 const RESPONSE_TTL_SECONDS = 1800; // 30 minutes
 
+/**
+ * Upper bound on how long the native-miss recovery path will wait for
+ * an in-flight `store.store(...)` write to land before giving up and
+ * returning a 404. Iter-38 finding 1: the iter-37 recovery path called
+ * `awaitPending(id)` with no timeout, so a wedged SQLite write (or any
+ * never-settling write promise) would pin the continuation request
+ * forever — no cancellation, no observability, a silent request hang.
+ *
+ * 2000ms is short enough that a stuck native backend fails fast from
+ * the client's perspective (a 404 is better than a hang) and long
+ * enough that a healthy SQLite write — which ordinarily completes in
+ * single-digit milliseconds on warm disks — has ample headroom to
+ * resolve before the timer fires.
+ */
+const CHAIN_WRITE_WAIT_TIMEOUT_MS = 2000;
+
 // ---------------------------------------------------------------------------
 // Non-streaming path
 // ---------------------------------------------------------------------------
@@ -1817,12 +1833,55 @@ export async function handleCreateResponse(
         if (chain.length === 0) {
           const pending = getPendingWritesFor(store).awaitPending(body.previous_response_id);
           if (pending !== undefined) {
+            // Iter-38 finding 1: bound the wait. `awaitPending`
+            // returns the raw `store.store(...)` promise, and if
+            // the native backend is wedged (SQLite lock held by
+            // a stuck writer, FFI hang, etc.) that promise may
+            // never settle. Without a ceiling the continuation
+            // request pins forever. Race it against a short
+            // timer; on timeout, log a warning and fall through
+            // to the 404 path — a clean bounded error is always
+            // better than a silent hang.
+            //
+            // TIMED_OUT is a unique sentinel so callers can
+            // distinguish "pending wait timed out" from "pending
+            // wait rejected" without relying on exception text.
+            // A rejection from the pending promise propagates
+            // naturally through the `await` and the subsequent
+            // catch below (the tracker's `.finally(...)` has
+            // already cleared the entry, so the retry `getChain`
+            // will see the store's true post-failure state and
+            // 404 cleanly).
+            type PendingOutcome = 'landed' | 'timeout';
+            let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+            const timeoutPromise = new Promise<PendingOutcome>((resolve) => {
+              timeoutHandle = setTimeout(() => {
+                resolve('timeout');
+              }, CHAIN_WRITE_WAIT_TIMEOUT_MS);
+            });
+            const pendingOutcome: Promise<PendingOutcome> = pending.then(() => 'landed' as const);
+            let timedOut = false;
             try {
-              await pending;
+              const outcome = await Promise.race([pendingOutcome, timeoutPromise]);
+              timedOut = outcome === 'timeout';
             } catch {
               // Write failure is the producer's problem; proceed
               // with the retry so the 404 epilogue matches the
               // true store state.
+            } finally {
+              if (timeoutHandle !== undefined) {
+                clearTimeout(timeoutHandle);
+              }
+            }
+            if (timedOut) {
+              console.warn(
+                `[responses] timed out after ${CHAIN_WRITE_WAIT_TIMEOUT_MS}ms waiting for pending store write ` +
+                  `for previous_response_id "${body.previous_response_id}"; returning 404 instead of hanging. ` +
+                  `The underlying store.store(...) promise did not settle in time — likely a wedged SQLite ` +
+                  `writer or stuck native backend.`,
+              );
+              sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
+              return;
             }
             try {
               chain = await store.getChain(body.previous_response_id);

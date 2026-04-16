@@ -2945,6 +2945,178 @@ describe('createHandler', () => {
       expect(getChainCallIdsForA).toBeGreaterThanOrEqual(2);
     });
 
+    it('iter-38 finding 1: native-miss retry aborts in bounded time when pending write never settles', async () => {
+      // Iter-37 finding 1 added a retry path that awaits the
+      // raw `store.store(...)` promise registered in the
+      // pending-writes tracker. That unconditional await had
+      // no upper bound: a wedged SQLite writer (or any other
+      // never-settling write promise) would pin the
+      // continuation request forever. No timeout, no
+      // cancellation, no observability — the request just
+      // hung.
+      //
+      // Iter-38 fix: the retry `awaitPending` is wrapped in
+      // `Promise.race` against a short timer
+      // (`CHAIN_WRITE_WAIT_TIMEOUT_MS = 2000ms`). On timeout
+      // the handler logs a warning and falls through to the
+      // clean 404 path instead of hanging.
+      //
+      // Shape of the test:
+      //   1. Mock store's `getChain` throws "Response not
+      //      found: <id>" on every call (so the retry path
+      //      is entered on the first miss).
+      //   2. Mock store's `store(...)` returns a promise
+      //      built from `new Promise(() => {})` — i.e. it
+      //      NEVER resolves and NEVER rejects. This is the
+      //      wedged-writer shape.
+      //   3. We kick off request A (which will register its
+      //      never-settling write in the tracker), then fire
+      //      request B with `previous_response_id` pointing
+      //      at A's id. Under the pre-fix shape, B's
+      //      `awaitPending` would block forever; under the
+      //      fix, it times out within
+      //      `CHAIN_WRITE_WAIT_TIMEOUT_MS` and returns a
+      //      clean 404.
+      //   4. We wrap the whole interaction in a sanity-check
+      //      `Promise.race` against 5000ms so the test
+      //      itself cannot hang indefinitely if the fix
+      //      regresses.
+      const neverSettling: Promise<void> = new Promise<void>(() => {
+        // Intentionally never resolve/reject — models a wedged
+        // SQLite writer. The pending-writes tracker's own
+        // `.finally(...)` registers but also never fires.
+      });
+      // Silence the `console.warn` the fix emits on timeout
+      // so the test output stays clean. The assertion below
+      // verifies it was invoked.
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const mockStore = {
+          store: vi.fn().mockReturnValue(neverSettling),
+          // Always throw the native "Response not found"
+          // contract so the iter-37 retry path is entered.
+          getChain: vi.fn().mockImplementation((id: string) => {
+            return Promise.reject(new Error(`Response not found: ${id}`));
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const chatSessionStart = vi.fn().mockResolvedValue(makeChatResult({ text: 'first reply' }));
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+          chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        const registry = new ModelRegistry();
+        registry.register('wedged-persist-model', mockModel);
+        const handler = createHandler(registry, { store: mockStore as any });
+
+        // Request A: ordinary POST. Its `store.store(...)`
+        // call returns `neverSettling`, so the tracker gets
+        // an id→never-resolving-promise entry. `handler`
+        // itself returns as soon as the off-lock persist is
+        // kicked off (the outer catch for iter-35 finding 2
+        // explicitly does not await the write), so A's
+        // response body lands normally.
+        const reqA = createMockReq('POST', '/v1/responses', {
+          model: 'wedged-persist-model',
+          input: 'hello A',
+          stream: false,
+        });
+        const { res: resA, getBody: bodyA, waitForEnd: waitA } = createMockRes();
+        // NOTE: we deliberately do NOT `await handler(reqA, resA)` —
+        // the handler's final `await pendingPersistOuter` would
+        // block forever on our never-settling promise. `waitA()`
+        // resolves when the handler has written the JSON response
+        // and flushed it, which happens before the off-lock
+        // persist-await site. That is all we need to prove A has
+        // populated the pending-writes tracker.
+        const inflightA = handler(reqA, resA);
+        // Suppress the unhandled-rejection diagnostic for the
+        // abandoned handler promise. Since the never-settling
+        // promise never rejects, nothing will actually reject here,
+        // but adding `.catch(() => {})` keeps static analyzers
+        // happy.
+        void inflightA.catch(() => {});
+        await waitA();
+        const responseA = JSON.parse(bodyA());
+        expect(responseA.status).toBe('completed');
+        const responseIdA: string = responseA.id;
+
+        // Spin until A's persist has registered with the
+        // tracker — mirrors the iter-37 test's setup.
+        while (mockStore.store.mock.calls.length === 0) {
+          await new Promise((r) => setImmediate(r));
+        }
+
+        // Drop the hot session so B has to go through the
+        // cold-replay chain-lookup path (the path under
+        // test).
+        registry.getSessionRegistry('wedged-persist-model')!.drop(responseIdA);
+
+        // Request B: continuation pointing at A. Under the
+        // fix this must complete within
+        // CHAIN_WRITE_WAIT_TIMEOUT_MS (2000ms) plus a little
+        // overhead — certainly well under the 5000ms
+        // sanity-check race below.
+        const reqB = createMockReq('POST', '/v1/responses', {
+          model: 'wedged-persist-model',
+          input: 'hello B',
+          previous_response_id: responseIdA,
+          stream: false,
+        });
+        const { res: resB, getStatus: statusB, getBody: bodyB, waitForEnd: waitB } = createMockRes();
+        const handlerPromise = handler(reqB, resB);
+
+        // Sanity-check timer: if the fix regresses and
+        // `awaitPending` blocks forever, this surfaces a
+        // test-level timeout instead of hanging the whole
+        // suite. Resolve to a unique sentinel so we can
+        // detect the regression shape.
+        const SANITY_TIMED_OUT = Symbol('handler-hang');
+        const sanityTimer = new Promise<typeof SANITY_TIMED_OUT>((resolve) => {
+          setTimeout(() => resolve(SANITY_TIMED_OUT), 5000);
+        });
+        const t0 = Date.now();
+        const outcome = await Promise.race([
+          Promise.all([handlerPromise, waitB()]).then(() => 'ok' as const),
+          sanityTimer,
+        ]);
+        const elapsed = Date.now() - t0;
+
+        // Primary assertion: the request resolved (did NOT
+        // hit the 5s sanity-timer). A regression would show
+        // up here as `outcome === SANITY_TIMED_OUT`.
+        expect(outcome).toBe('ok');
+        // Ergonomic bound: the fix's 2000ms ceiling plus
+        // reasonable scheduling overhead must fit well under
+        // the 5000ms sanity cap. Use 4500ms to leave a
+        // margin for loaded CI machines.
+        expect(elapsed).toBeLessThan(4500);
+
+        // Error shape: clean bounded 404, not a 500 or an
+        // unhandled-rejection blow-up.
+        expect(statusB()).toBe(404);
+        const parsed = JSON.parse(bodyB());
+        expect(parsed.error.type).toBe('not_found_error');
+        expect(parsed.error.message).toContain(responseIdA);
+
+        // The fix must log a warning so operators can see
+        // the wedged-writer condition in the logs rather
+        // than a silent 404.
+        expect(warnSpy).toHaveBeenCalled();
+        const warnCall = warnSpy.mock.calls.find(
+          (args) => typeof args[0] === 'string' && (args[0] as string).includes(responseIdA),
+        );
+        expect(warnCall).toBeTruthy();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     it('iter-37 finding 2: adopt gate rejects streaming turns whose post-final teardown threw (failureMode === "error")', async () => {
       // Iter-36 finding 2 closed the `client_abort` hole but the
       // `committed && safeToSuppress && failureMode !== 'client_abort'`
