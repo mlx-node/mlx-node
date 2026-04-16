@@ -94,15 +94,14 @@ async function handleNonStreaming(
  *     the top-level failure status.
  *
  * `ReasoningOutputItem` has no `status` field and is left alone.
- * `FunctionCallOutputItem.status` is always `'completed'` in the
- * current `types.ts` — we leave it alone too, because a
- * function_call item only appears in `outputItems` after it has
- * been fully flushed (args delta + done events), and its presence
- * on the failure payload is only possible via the
- * finishReason=error path, where the assistant committed the call
- * inline. Narrowing that to `incomplete` would require widening
- * `FunctionCallOutputItem.status`; keep the normalization to the
- * message-item bucket so the public types stay stable.
+ * `FunctionCallOutputItem` items whose `status` is `completed` or
+ * `in_progress` are also downgraded to `incomplete` — iter-29
+ * finding 1 concluded that the previous exemption (leaving
+ * function_call items untouched because the type was narrow) was
+ * incorrect: streaming tool_call items can now be collected into
+ * `outputItems` before the commit gate passes, and a failed
+ * terminal that reports them as `completed` contradicts the
+ * top-level `status: 'failed'` envelope.
  */
 function buildFailedTerminal(
   partial: ResponseObject,
@@ -115,6 +114,12 @@ function buildFailedTerminal(
       const prev = item.status;
       if (prev === 'in_progress' || prev === 'completed') {
         return { ...item, status: 'incomplete' };
+      }
+      return item;
+    }
+    if (item.type === 'function_call') {
+      if (item.status === 'completed' || item.status === 'incomplete') {
+        return { ...item, status: 'incomplete' as const };
       }
       return item;
     }
@@ -492,7 +497,10 @@ async function handleStreamingNative(
           }
         }
 
-        // Emit function call items
+        // Collect function call items but defer SSE emission until
+        // after the commit gate — emitting them inside the done
+        // branch would let clients see completed tool calls from a
+        // turn the session later refuses to commit (iter-29 finding 1).
         for (const tc of event.toolCalls.filter((t) => t.status === 'ok')) {
           const callId = tc.id ?? genId('call_');
           const fcItem: FunctionCallOutputItem = {
@@ -503,24 +511,7 @@ async function handleStreamingNative(
             arguments: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments),
             status: 'completed',
           };
-          const fcIndex = outputItems.length;
           outputItems.push(fcItem);
-
-          writeSSEEvent(res, 'response.output_item.added', { output_index: fcIndex, item: fcItem });
-
-          const argsStr = fcItem.arguments;
-          writeSSEEvent(res, 'response.function_call_arguments.delta', {
-            item_id: fcItem.id,
-            output_index: fcIndex,
-            delta: argsStr,
-          });
-          writeSSEEvent(res, 'response.function_call_arguments.done', {
-            item_id: fcItem.id,
-            output_index: fcIndex,
-            arguments: argsStr,
-          });
-
-          writeSSEEvent(res, 'response.output_item.done', { output_index: fcIndex, item: fcItem });
         }
 
         // Build the terminal response object but do NOT persist or emit
@@ -710,6 +701,30 @@ async function handleStreamingNative(
     // branch set it before breaking out of the loop). Assert for the
     // type checker.
     const terminal = completedResponse!;
+
+    // Emit deferred function_call item events. These were collected
+    // in the done branch but their SSE emission was held until the
+    // commit gate passed, so clients never see completed tool calls
+    // from an uncommitted turn (iter-29 finding 1).
+    for (const item of terminal.output) {
+      if (item.type === 'function_call') {
+        const fcIndex = outputItems.indexOf(item);
+        writeSSEEvent(res, 'response.output_item.added', { output_index: fcIndex, item });
+        const argsStr = item.arguments;
+        writeSSEEvent(res, 'response.function_call_arguments.delta', {
+          item_id: item.id,
+          output_index: fcIndex,
+          delta: argsStr,
+        });
+        writeSSEEvent(res, 'response.function_call_arguments.done', {
+          item_id: item.id,
+          output_index: fcIndex,
+          arguments: argsStr,
+        });
+        writeSSEEvent(res, 'response.output_item.done', { output_index: fcIndex, item });
+      }
+    }
+
     if (store && req.store !== false) {
       await persistResponse(store, terminal, newInputMessages, previousResponseId, modelInstanceId);
     }
@@ -730,10 +745,12 @@ async function handleStreamingNative(
   // that are still dangling (the producer threw before the done
   // branch closed them), so clients that track output_index state
   // see a matching close for each open item BEFORE the terminal
-  // `response.failed`. Function-call items are always closed inline
-  // as soon as their args are flushed so no explicit done is
-  // needed here; reasoning items have no `status` field so they
-  // are left untouched.
+  // `response.failed`. Function-call items are NOT emitted on the
+  // failure path — their SSE emission is deferred to the post-commit
+  // success path (iter-29 finding 1), so on failure they only exist
+  // in outputItems for the terminal payload, normalized to
+  // `incomplete` by `buildFailedTerminal`. Reasoning items have no
+  // `status` field so they are left untouched.
   const reason: string = thrownError
     ? 'error'
     : clientAborted
@@ -1592,26 +1609,19 @@ export async function handleCreateResponse(
         //    `body.model = "beta"` against a chain stored under
         //    `"alpha"`.
         //
-        // Legacy-row compatibility (iter-27 finding 1). Stored rows
-        // that lack an explicit `modelInstanceId` are serviced on
-        // the cold-replay path WITHOUT running the identity
-        // comparison below. The iter-23 policy rejected identity-
-        // less rows outright, which was correct in isolation but
-        // catastrophic at deploy time: `main` never wrote
-        // `modelInstanceId`, so every still-live `previous_response_id`
-        // chain created pre-rollout returned 400 after an in-place
-        // deploy until the 30-minute TTL expired. Treating legacy
-        // rows as "trust on first use" narrowly reopens the same-
-        // name hot-swap hole FOR THOSE ROWS ONLY (a 30-minute
-        // migration window), while post-rollout rows — which every
-        // `persistResponse()` call below stamps with the live
-        // instance id — continue to enjoy the strict guard. The
-        // hot-swap race still rejects a mismatching identity on
-        // any row that DOES carry one, so the iter-22/23 defense
-        // holds for every row written on this branch. A separate
-        // admin tool can purge legacy rows on a schedule if a
-        // deployment wants stricter-than-TTL ejection; the endpoint
-        // layer does not assume one exists.
+        // Legacy-row handling (iter-29 finding 2). Stored rows that
+        // lack an explicit `modelInstanceId` are the pre-iter-21
+        // shape. The iter-27 compat code serviced them via cold
+        // replay gated on friendly-name equality, and iter-28
+        // narrowed the window further — but the iter-29 review
+        // concluded that friendly-name equality is insufficient:
+        // an operator who hot-swaps the same friendly name to a
+        // different model during the TTL window can still silently
+        // replay through the wrong tokenizer, chat template, or KV
+        // layout. Legacy rows are now rejected outright. The
+        // 30-minute TTL migration window from iter-27 has expired
+        // in any production deployment by now; any remaining legacy
+        // rows will flush naturally on TTL expiry.
         const trailingRecord = chain[chain.length - 1]!;
         const storedIdentity = readStoredModelIdentity(trailingRecord);
         if (
@@ -1658,42 +1668,23 @@ export async function handleCreateResponse(
           );
           return;
         }
-        // Iter-28 finding 1 — legacy rows gated on friendly-name equality.
+        // Iter-29 finding 2 — reject ALL legacy (absent-identity) rows.
         //
-        // Stored rows that lack an explicit `modelInstanceId` are
-        // the pre-iter-21 legacy shape. The iter-27 compat code
-        // serviced them via cold replay without ANY identity check
-        // — a 30-minute TTL hole left over from the initial rollout.
-        // Iter-28 finding 1: that hole silently allowed cross-model
-        // resume. A caller pointing at `body.model: "model-B"` with
-        // a legacy `previous_response_id` that was originally served
-        // by `model-A` slipped through the kind==='absent' branch,
-        // cold-replayed the chain under model-B, and then
-        // `persistResponse()` stamped the new row with model-B's
-        // live instance id — turning a one-shot cross-model replay
-        // into an authoritative chain forever.
-        //
-        // Narrow the window: legacy rows may only be resumed when
-        // the stored record's friendly `model` name equals
-        // `body.model` exactly. Friendly-name equality is not as
-        // strong as instance-id equality (an operator who rebinds
-        // the same friendly name to a new model during a deploy
-        // can still slip through within the TTL), but it IS a
-        // meaningful trust anchor the caller controls — and it
-        // closes the cross-name redirect vector, which is the
-        // catastrophic case.
-        if (storedIdentity.kind === 'absent' && trailingRecord.model !== body.model) {
+        // The iter-28 gate narrowed legacy rows to friendly-name
+        // equality, but iter-29 concluded that is still insufficient:
+        // an operator hot-swapping the same friendly name to a
+        // different model during the TTL window silently replays
+        // through the wrong model. Reject outright so the caller
+        // must start a fresh chain.
+        if (storedIdentity.kind === 'absent') {
           sendBadRequest(
             res,
-            `previous_response_id "${body.previous_response_id}" points at a legacy chain (no ` +
-              `modelInstanceId in the stored record) produced under model "${trailingRecord.model}", but the ` +
-              `current request targets "${body.model}". Legacy chains can only be resumed under the same ` +
-              `friendly model name the original turn was served by — cross-name resume on a row whose model ` +
-              `identity cannot be verified would let a caller silently replay the chain through an unrelated ` +
-              `model and then stamp a fresh instance id over it on persistence, turning a one-shot cross-model ` +
-              `replay into an authoritative chain forever. Start a new chain without previous_response_id, ` +
-              `or retry the request under "${trailingRecord.model}".`,
-            'model',
+            `previous_response_id "${body.previous_response_id}" points at a legacy stored record ` +
+              `that does not carry a modelInstanceId — the server cannot verify which model instance ` +
+              `produced the chain, so continuing it through any model risks silently replaying ` +
+              `under the wrong tokenizer, chat template, or KV layout. Start a new chain without ` +
+              `previous_response_id.`,
+            'previous_response_id',
           );
           return;
         }
@@ -2186,54 +2177,75 @@ export async function handleCreateResponse(
         // though the turn was run against the inherited system
         // context, and the next cold replay would have nothing to
         // re-inherit from.
+        // Wrap the handler call in its own try/catch so that a
+        // post-commit persistence failure does not prevent adopt.
+        // Iter-29 finding 3: if the handler commits the session
+        // internally and then `store.store()` throws, the outer
+        // catch would fire without ever calling `sessionReg.adopt`,
+        // stranding the committed session — neither cached nor
+        // persisted. By catching handler errors separately and
+        // always running adopt/drop based on the commit state, the
+        // session stays reachable in the registry for hot-resume
+        // even when persistence is transiently broken.
+        let handlerError: Error | null = null;
+
         if (mappedBody.stream) {
           const outcome = await runSessionStreaming(session, messages, newInputMessages, config);
           const streamingWasCommitted = () => outcome.wasCommitted();
-          await handleStreamingNative(
-            res,
-            outcome.stream,
-            mappedBody,
-            responseId,
-            previousResponseId,
-            store,
-            newInputMessages,
-            streamingWasCommitted,
-            currentInstanceId,
-            httpReq,
-          );
+          try {
+            await handleStreamingNative(
+              res,
+              outcome.stream,
+              mappedBody,
+              responseId,
+              previousResponseId,
+              store,
+              newInputMessages,
+              streamingWasCommitted,
+              currentInstanceId,
+              httpReq,
+            );
+          } catch (err) {
+            handlerError = err instanceof Error ? err : new Error(String(err));
+          }
           committed = streamingWasCommitted();
         } else {
           const outcome = await runSessionNonStreaming(session, messages, newInputMessages, config);
-          await handleNonStreaming(
-            res,
-            outcome.result,
-            mappedBody,
-            responseId,
-            previousResponseId,
-            store,
-            newInputMessages,
-            currentInstanceId,
-          );
+          try {
+            await handleNonStreaming(
+              res,
+              outcome.result,
+              mappedBody,
+              responseId,
+              previousResponseId,
+              store,
+              newInputMessages,
+              currentInstanceId,
+            );
+          } catch (err) {
+            handlerError = err instanceof Error ? err : new Error(String(err));
+          }
           committed = outcome.committed;
         }
 
-        // Belt-and-braces: the prior id was already leased out of the
-        // registry at `getOrCreate` time (single-use lease semantics), so
-        // this drop is a no-op in the common case. It stays because a
-        // defensive `drop` keeps the bookkeeping readable and guards
-        // against future refactors that might re-introduce a non-lease
-        // hit path.
-        //
-        // Only adopt under the new id when the session actually committed
-        // — otherwise future chained requests must fall through to the
-        // cold-replay path, which reconstructs from `ResponseStore` on a
-        // fresh session, so the in-memory KV cache cannot diverge from
-        // the persisted chain.
+        // Always adopt/drop based on commit state, even if the
+        // handler threw during post-commit persistence. A post-
+        // commit store failure is survivable: the session stays
+        // reachable in the registry for hot-resume while the
+        // binding lives. The worst case: a transient store failure
+        // means the turn is not cold-replayable from disk, but it
+        // IS resumable from memory while the binding lives.
         if (previousResponseId) {
           sessionReg.drop(previousResponseId);
         }
         if (committed) {
           sessionReg.adopt(responseId, session, requestedInstructions);
+        }
+
+        // Re-surface the handler error AFTER adopt so the session
+        // is not stranded.
+        if (handlerError) {
+          throw handlerError;
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error during inference';

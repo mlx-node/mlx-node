@@ -108,7 +108,7 @@ export interface FunctionCallOutputItem {
   call_id: string;
   name: string;
   arguments: string;
-  status: 'completed';
+  status: 'completed' | 'incomplete';
 }
 
 export type OutputItem = MessageOutputItem | ReasoningOutputItem | FunctionCallOutputItem;

@@ -3645,21 +3645,13 @@ describe('createHandler', () => {
       expect(toolMessages.map((m: ChatMessage) => m.toolCallId)).toEqual(['call_a', 'call_b']);
     });
 
-    it('cold-replays a previous_response_id continuation when the stored record lacks modelInstanceId', async () => {
-      // Iter-27 finding 1: the iter-23 strict guard rejected any
-      // stored row whose trailing record lacked `modelInstanceId`
-      // with a 400, which was correct in isolation but
-      // catastrophic at deploy time. `main` never wrote
-      // `modelInstanceId`, so an in-place rollout of this branch
-      // would instantly 400 every still-live `previous_response_id`
-      // chain created pre-rollout — bricking every live client
-      // until the 30-minute TTL flushed the store. The compat
-      // behavior is to treat legacy rows as trusted and route
-      // them through the normal cold-replay path, reconstructing
-      // from the stored chain onto a fresh session. A row that
-      // DOES carry an instance id still runs the strict hot-swap
-      // check (see the separate regression below), so this compat
-      // only applies during the migration window.
+    it('rejects a previous_response_id continuation when the stored record lacks modelInstanceId (same name)', async () => {
+      // Iter-29 finding 2: legacy rows (no `modelInstanceId` in
+      // the stored config blob) are now rejected outright, even
+      // when the friendly model name matches. The iter-27/28
+      // compat window that allowed same-name cold replay has been
+      // closed because friendly-name equality is insufficient
+      // against hot-swap during TTL.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'legacy continuation reply' }));
       registry.register('test-model', mockModel);
@@ -3676,8 +3668,7 @@ describe('createHandler', () => {
         outputText: 'first reply',
         usageJson: '{}',
         // configJson deliberately contains NO modelInstanceId —
-        // the pre-rollout legacy shape that the iter-27 compat
-        // path services as cold replay.
+        // the pre-rollout legacy shape.
         configJson: JSON.stringify({ temperature: 0.7 }),
       });
       const mockStore = {
@@ -3709,58 +3700,23 @@ describe('createHandler', () => {
       await handler(req, res);
       await waitForEnd();
 
-      expect(getStatus()).toBe(200);
+      expect(getStatus()).toBe(400);
       const parsed = JSON.parse(getBody());
-      expect(parsed.object).toBe('response');
-      expect(parsed.status).toBe('completed');
-      expect(parsed.output_text).toBe('legacy continuation reply');
-
-      // The request must have cold-replayed from the
-      // reconstructed history. `chatSessionStart` runs with a
-      // primed `messages[]` that carries the legacy row's prior
-      // user turn, the reconstructed assistant reply, and the
-      // new user turn — exactly the shape a post-TTL cold
-      // replay would produce. `chatSessionContinue` must NOT be
-      // invoked (there is no hot path on the first continuation
-      // after a cold-start).
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toMatch(/legacy stored record/i);
+      expect(parsed.error.message).toMatch(/modelInstanceId/i);
+      expect(parsed.error.param).toBe('previous_response_id');
+      // The native session APIs must not have been invoked.
       // eslint-disable-next-line @typescript-eslint/unbound-method
-      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
-      // eslint-disable-next-line @typescript-eslint/unbound-method
-      const continueSpy = mockModel.chatSessionContinue as unknown as ReturnType<typeof vi.fn>;
-      expect(startSpy).toHaveBeenCalledTimes(1);
-      expect(continueSpy).not.toHaveBeenCalled();
-      const [primedMessages] = startSpy.mock.calls[0] as [ChatMessage[], unknown];
-      expect(primedMessages).toEqual([
-        { role: 'user', content: 'first turn' },
-        { role: 'assistant', content: 'first reply' },
-        { role: 'user', content: 'second turn against an identity-less record' },
-      ]);
-
-      // The new record persisted by this continuation MUST
-      // carry the live instance id — once the cold replay
-      // commits, the chain is upgraded to the iter-21 identity
-      // scheme and any future continuation gets the full
-      // hot-swap guard.
-      const storedNew = storedRecords.get(parsed.id) as { configJson: string };
-      const persistedConfig = JSON.parse(storedNew.configJson) as { modelInstanceId?: number };
-      expect(typeof persistedConfig.modelInstanceId).toBe('number');
-      expect(persistedConfig.modelInstanceId).toBe(registry.getInstanceId('test-model'));
+      expect(mockModel.chatSessionStart).not.toHaveBeenCalled();
+      // Nothing new persisted.
+      expect(storedRecords.size).toBe(1);
     });
 
     it('rejects a legacy previous_response_id continuation when the friendly model name differs', async () => {
-      // Iter-28 finding 1 regression: the iter-27 compat path for
-      // legacy rows (no `modelInstanceId` in the stored config
-      // blob) silently allowed cross-model resume. A caller that
-      // pointed `body.model: "model-B"` at a `previous_response_id`
-      // whose trailing record was originally served by `model-A`
-      // slipped through the kind==='absent' branch, cold-replayed
-      // the chain under `model-B`, and then `persistResponse()`
-      // stamped the new record with model-B's live instance id —
-      // turning a one-shot cross-model replay into an
-      // authoritative chain forever. The fix narrows the legacy
-      // window to friendly-name equality on the stored record's
-      // `model` field, which the caller already has to agree with
-      // up-front to even lease a session on the continuation.
+      // Iter-29 finding 2: legacy rows (no `modelInstanceId`) are
+      // rejected outright regardless of friendly-name match. This
+      // test verifies the cross-name case also gets the same 400.
       const registry = new ModelRegistry();
       const modelA = createMockModel(makeChatResult({ text: 'model A reply' }));
       const modelB = createMockModel(makeChatResult({ text: 'model B reply' }));
@@ -3769,7 +3725,7 @@ describe('createHandler', () => {
       const storedRecords = new Map<string, any>();
       // Seed a legacy row whose `model` is `"model-A"`. The
       // `configJson` deliberately carries NO `modelInstanceId`
-      // (the pre-iter-21 shape the legacy compat path services).
+      // (the pre-iter-21 shape).
       storedRecords.set('resp_legacy_A', {
         id: 'resp_legacy_A',
         createdAt: Math.floor(Date.now() / 1000),
@@ -3803,10 +3759,7 @@ describe('createHandler', () => {
       };
       const handler = createHandler(registry, { store: mockStore as any });
 
-      // Continue the `model-A` legacy chain under `model-B`. The
-      // handler must reject the request with 400 and explicitly
-      // cite both friendly names in the error string. Neither
-      // model's session APIs may be invoked.
+      // Continue the `model-A` legacy chain under `model-B`.
       const req = createMockReq('POST', '/v1/responses', {
         model: 'model-B',
         previous_response_id: 'resp_legacy_A',
@@ -3819,10 +3772,9 @@ describe('createHandler', () => {
       expect(getStatus()).toBe(400);
       const parsed = JSON.parse(getBody());
       expect(parsed.error.type).toBe('invalid_request_error');
-      expect(parsed.error.message).toMatch(/legacy chain/i);
-      expect(parsed.error.message).toMatch(/model-A/);
-      expect(parsed.error.message).toMatch(/model-B/);
-      expect(parsed.error.param).toBe('model');
+      expect(parsed.error.message).toMatch(/legacy stored record/i);
+      expect(parsed.error.message).toMatch(/modelInstanceId/i);
+      expect(parsed.error.param).toBe('previous_response_id');
       // Neither model's session APIs may have been touched.
       // eslint-disable-next-line @typescript-eslint/unbound-method
       expect(modelA.chatSessionStart).not.toHaveBeenCalled();
@@ -4959,6 +4911,216 @@ describe('createHandler', () => {
       const textDone = events.find((e) => e.event === 'response.output_text.done');
       expect(textDone).toBeDefined();
       expect(textDone!.data.text).toBe('Value is 5 < 10');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Iter-29 finding regressions
+  // ---------------------------------------------------------------------------
+
+  describe('iter-29 findings', () => {
+    it('streaming failed response normalizes function_call items to incomplete', async () => {
+      // Iter-29 finding 1: when the stream emits a done event with
+      // finishReason: 'error' and toolCalls, the function_call items
+      // collected in the done branch must be normalized to
+      // status: 'incomplete' in the response.failed terminal, and
+      // NO function_call SSE events should have been emitted before
+      // the commit gate checked (since the session did not commit).
+      const streamEvents = [
+        {
+          done: true,
+          text: '',
+          finishReason: 'error',
+          toolCalls: [{ id: 'call_err', name: 'get_weather', arguments: '{"city":"SF"}', status: 'ok' }],
+          thinking: null,
+          numTokens: 5,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          rawText: '<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('stream-model', mockModel);
+
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'What is the weather?',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      const body = getBody();
+
+      // Parse SSE events
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      // No function_call SSE events should have been emitted —
+      // they are gated on commit and the session did not commit.
+      const fcAdded = events
+        .filter((e) => e.event === 'response.output_item.added')
+        .filter((e) => {
+          const item = e.data.item as { type?: string } | undefined;
+          return item?.type === 'function_call';
+        });
+      expect(fcAdded).toHaveLength(0);
+
+      const fcArgsDelta = events.filter((e) => e.event === 'response.function_call_arguments.delta');
+      expect(fcArgsDelta).toHaveLength(0);
+
+      const fcArgsDone = events.filter((e) => e.event === 'response.function_call_arguments.done');
+      expect(fcArgsDone).toHaveLength(0);
+
+      // The terminal event should be response.failed
+      const failedEvent = events.find((e) => e.event === 'response.failed');
+      expect(failedEvent).toBeDefined();
+      const failedResponse = failedEvent!.data.response as {
+        status: string;
+        output: Array<{ type: string; status?: string }>;
+        incomplete_details?: { reason: string };
+      };
+      expect(failedResponse.status).toBe('failed');
+      expect(failedResponse.incomplete_details?.reason).toBe('finish_reason_error');
+
+      // The function_call item in the terminal output must be
+      // normalized to status: 'incomplete', not 'completed'.
+      const fcItems = failedResponse.output.filter((i) => i.type === 'function_call');
+      expect(fcItems).toHaveLength(1);
+      expect(fcItems[0].status).toBe('incomplete');
+    });
+
+    it('rejects legacy previous_response_id with absent modelInstanceId', async () => {
+      // Iter-29 finding 2: store a response record WITHOUT
+      // modelInstanceId in configJson. A continuation request
+      // pointing at it must be rejected with 400 regardless of
+      // whether the friendly model name matches.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'should not be reached' }));
+      registry.register('test-model', mockModel);
+      const storedRecords = new Map<string, any>();
+      storedRecords.set('resp_no_identity', {
+        id: 'resp_no_identity',
+        createdAt: Math.floor(Date.now() / 1000),
+        model: 'test-model',
+        status: 'completed',
+        inputJson: JSON.stringify([{ role: 'user', content: 'hello' }]),
+        outputJson: JSON.stringify([
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'world' }] },
+        ]),
+        outputText: 'world',
+        usageJson: '{}',
+        // No modelInstanceId in configJson — legacy shape.
+        configJson: JSON.stringify({ temperature: 0.5 }),
+      });
+      const mockStore = {
+        store: vi.fn((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: 'resp_no_identity',
+        input: 'continue',
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toMatch(/legacy stored record/i);
+      expect(parsed.error.message).toMatch(/modelInstanceId/i);
+      expect(parsed.error.param).toBe('previous_response_id');
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(mockModel.chatSessionStart).not.toHaveBeenCalled();
+    });
+
+    it('post-commit store failure still adopts session', async () => {
+      // Iter-29 finding 3: when the handler commits the session
+      // but persistence (store.store()) then throws, the session
+      // must still be adopted into the registry so it is
+      // reachable for hot-resume on the next request.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
+      registry.register('test-model', mockModel);
+
+      const mockStore = {
+        store: vi.fn().mockRejectedValueOnce(new Error('simulated store failure')),
+        getChain: vi.fn().mockResolvedValue([]),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'trigger a committed turn',
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      // The store was called and threw.
+      expect(mockStore.store).toHaveBeenCalledTimes(1);
+
+      // Despite the store failure, the response body should
+      // contain the response id (the handler's outer catch may
+      // have emitted an error, but the key invariant is the
+      // session registry).
+      const bodyText = getBody();
+      // Extract the response id from the body if parseable.
+      let responseId: string | null = null;
+      try {
+        const parsed = JSON.parse(bodyText);
+        responseId = parsed.id ?? null;
+      } catch {
+        // If the body is not JSON (e.g., the error handler wrote
+        // something else), we still check the registry below.
+      }
+
+      // The session registry must have adopted the session under
+      // the response id allocated for this turn. Since we cannot
+      // easily predict the exact id, check that the registry has
+      // exactly one entry (size === 1).
+      const sessionReg = registry.getSessionRegistry('test-model');
+      expect(sessionReg).toBeDefined();
+      expect(sessionReg!.size).toBe(1);
+
+      // If we got a response id, verify it is the one in the registry.
+      if (responseId) {
+        const session = sessionReg!.getOrCreate(responseId, null);
+        // getOrCreate on a hit returns the session and clears the
+        // entry, so after the call size should be 0.
+        expect(session).toBeDefined();
+      }
     });
   });
 });
