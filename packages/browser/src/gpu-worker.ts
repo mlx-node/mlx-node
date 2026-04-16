@@ -67,6 +67,37 @@ function poolKey(usage: number, size: number): string {
   return `${usage}:${size}`;
 }
 
+// Size binning for the buffer pool. Exact-size keying misses when requests
+// differ by a few bytes (e.g., 513 vs 512). Bucketing coalesces near-size
+// requests into shared pool bins so they can reuse each other's buffers.
+//
+// Scheme:
+//   - size <= 4096:  round up to next multiple of 256  (waste <= 256 B)
+//   - size >  4096:  round up to next power of two     (waste <= 2x)
+//
+// Rationale:
+//   256-B granule caps small-buffer waste at 256 B (tight for uniforms, tiny
+//   params). Power-of-two for large buffers caps waste at 2x, which is fine
+//   on M3's 18 GB unified memory and gives broad coalescing across nearby
+//   allocation sizes (e.g., KV cache rows of various seq lengths).
+//
+// Correctness: pure function, no side effects. Always returns size >= input,
+// always a multiple of 4 (WebGPU minimum alignment). For size <= 0 returns 0
+// — callers already guard against pooling empty buffers.
+function roundUpBucket(size: number): number {
+  if (size <= 0) return 0;
+  if (size <= 4096) {
+    // Round up to next multiple of 256.
+    return (size + 255) & ~255;
+  }
+  // Round up to next power of two. For 32-bit sizes this is safe; WebGPU
+  // buffer size limits bound us well below 2^31. Math.clz32 returns the
+  // leading-zero count of size-1 when viewed as u32.
+  const v = size - 1;
+  const shift = 32 - Math.clz32(v);
+  return 1 << shift;
+}
+
 function addHandle(obj: any): number {
   const id = nextHandle++;
   handles[id] = obj;
@@ -636,20 +667,23 @@ function dispatchFusedRecord(
     if (uniformBufHandle === 0) {
       // Deferred buffer creation (inline): create buffer + write data.
       const usage = uniformUsage || 0x0080 | 0x0008; // STORAGE | COPY_DST fallback
+      const poolable = isPoolable(usage);
+      // Only bucket for poolable usages (see CREATE_BUFFER_FROM_DATA).
+      const physicalSize = poolable ? roundUpBucket(uniformDataSize) : uniformDataSize;
       let handle: number;
-      const stack = isPoolable(usage) ? bufferPool.get(poolKey(usage, uniformDataSize)) : undefined;
+      const stack = poolable ? bufferPool.get(poolKey(usage, physicalSize)) : undefined;
       if (stack !== undefined && stack.length > 0) {
         handle = stack.pop()!;
-        if (stack.length === 0) bufferPool.delete(poolKey(usage, uniformDataSize));
+        if (stack.length === 0) bufferPool.delete(poolKey(usage, physicalSize));
         bufferPoolHitCount++;
         const pooled = handles[handle] as GPUBuffer;
         queue.writeBuffer(pooled, 0, uniformData);
       } else {
-        if (isPoolable(usage)) bufferPoolMissCount++;
-        const buffer = device.createBuffer({ size: uniformDataSize, usage });
+        if (poolable) bufferPoolMissCount++;
+        const buffer = device.createBuffer({ size: physicalSize, usage });
         queue.writeBuffer(buffer, 0, uniformData);
         handle = addHandle(buffer);
-        bufferSizesArr[handle] = uniformDataSize;
+        bufferSizesArr[handle] = physicalSize;
         bufferUsagesArr[handle] = usage;
       }
       newBufferHandle = handle;
@@ -1120,20 +1154,45 @@ async function processCommand(fnId: number): Promise<void> {
       const mappedAtCreation = view.getUint32(descPtr + 24, true) !== 0;
 
       // Pool fast path: reuse a previously released GPUBuffer with the same
-      // (usage, size). Skip mappedAtCreation — we can't redeliver a
-      // pre-mapped state to the caller.
+      // (usage, bucketSize). Skip mappedAtCreation — we can't redeliver a
+      // pre-mapped state to the caller, and the caller will write exactly
+      // `size` bytes into the mapped range, so the physical allocation on
+      // that path MUST stay at logical `size` (a bucket-sized shadow would
+      // cause an overrun on unmap copy-back).
       if (!mappedAtCreation && size > 0 && isPoolable(usage)) {
-        const stack = bufferPool.get(poolKey(usage, size));
+        const bucketSize = roundUpBucket(size);
+        const stack = bufferPool.get(poolKey(usage, bucketSize));
         if (stack !== undefined && stack.length > 0) {
           const reused = stack.pop()!;
-          if (stack.length === 0) bufferPool.delete(poolKey(usage, size));
+          if (stack.length === 0) bufferPool.delete(poolKey(usage, bucketSize));
           bufferPoolHitCount++;
           setResult(reused);
           break;
         }
         bufferPoolMissCount++;
+        // Pool miss: allocate the physical (bucketed) size so this buffer
+        // can later rejoin its bucket on release. Every buffer in bucket B
+        // has physical size B — that invariant is what makes bucket-reuse
+        // correctness-safe for later popped handles.
+        try {
+          const buffer = device.createBuffer({ size: bucketSize, usage });
+          const handle = addHandle(buffer);
+          bufferSizesArr[handle] = bucketSize;
+          bufferUsagesArr[handle] = usage;
+          setResult(handle);
+        } catch (e) {
+          console.error(
+            `[GPU Worker] createBuffer failed: size=${size} bucket=${bucketSize} usage=0x${usage.toString(16)} mapped=false`,
+            e,
+          );
+          setResult(0);
+        }
+        break;
       }
 
+      // mappedAtCreation OR non-poolable (MAP_READ/MAP_WRITE) OR size<=0:
+      // use logical size verbatim. These buffers never enter the pool, so
+      // bucketing buys nothing and would break mappedAtCreation semantics.
       try {
         const buffer = device.createBuffer({ size, usage, mappedAtCreation });
         const handle = addHandle(buffer);
@@ -1928,22 +1987,32 @@ async function processCommand(fnId: number): Promise<void> {
 
       try {
         let handle: number;
-        const stack = isPoolable(usage) ? bufferPool.get(poolKey(usage, size)) : undefined;
+        const poolable = isPoolable(usage);
+        // Only bucket for poolable usages — non-poolable buffers never
+        // re-enter the pool, so bucketing would just waste memory with no
+        // reuse payoff.
+        const physicalSize = poolable ? roundUpBucket(size) : size;
+        const stack = poolable ? bufferPool.get(poolKey(usage, physicalSize)) : undefined;
         if (stack !== undefined && stack.length > 0) {
           handle = stack.pop()!;
-          if (stack.length === 0) bufferPool.delete(poolKey(usage, size));
+          if (stack.length === 0) bufferPool.delete(poolKey(usage, physicalSize));
           bufferPoolHitCount++;
-          // Overwrite the pooled buffer's contents with the new data.
+          // Overwrite the pooled buffer's contents with the new data (only
+          // the first `size` bytes; the tail of physicalSize is don't-care
+          // padding — no read path is allowed to touch beyond logical size).
           const buffer = getHandle<GPUBuffer>(handle);
           const data = wasmBytes().slice(wasmDataPtr, wasmDataPtr + size);
           queue.writeBuffer(buffer, 0, data);
         } else {
-          if (isPoolable(usage)) bufferPoolMissCount++;
-          const buffer = device.createBuffer({ size, usage });
+          if (poolable) bufferPoolMissCount++;
+          // Allocate physicalSize so poolable buffers can be bucket-reused
+          // on release. The data write below copies only logical `size`
+          // bytes — any tail padding stays as the initial zero contents.
+          const buffer = device.createBuffer({ size: physicalSize, usage });
           const data = wasmBytes().slice(wasmDataPtr, wasmDataPtr + size);
           queue.writeBuffer(buffer, 0, data);
           handle = addHandle(buffer);
-          bufferSizesArr[handle] = size;
+          bufferSizesArr[handle] = physicalSize;
           bufferUsagesArr[handle] = usage;
         }
         setResult(handle);
