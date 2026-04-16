@@ -951,23 +951,33 @@ export function createBridgeStub(
       //   +16 size lo (u32)
       //   +20 size hi (u32)
       //   +24 mappedAtCreation (WGPUBool = u32)
+      //
+      // Parse the descriptor ONCE at function entry. Prior revisions parsed
+      // it inline in each branch, which drifted — one branch read `size` as
+      // a full 64-bit value while another truncated to 32 bits, producing
+      // wrong bucketSize RPCs for buffers > 4 GiB (see commit 7c4f451).
+      // Read the full 64-bit size (sizeLo + sizeHi); the pool invariant
+      // physical >= bucketSize relies on this being accurate. mappedAtCreation
+      // is a WGPUBool (u32), so read it through the DataView for consistency.
       const h = heap();
-      if (h[descPtr + 24]) {
-        // mappedAtCreation=true: read usage to determine if we can defer.
+      const view = new DataView(h.buffer, h.byteOffset, h.byteLength);
+      const usage = view.getUint32(descPtr + 8, true);
+      const sizeLo = view.getUint32(descPtr + 16, true);
+      const sizeHi = view.getUint32(descPtr + 20, true);
+      const size = sizeLo + sizeHi * 0x100000000;
+      const mappedAtCreation = view.getUint32(descPtr + 24, true) !== 0;
+
+      if (mappedAtCreation) {
+        // mappedAtCreation=true: check usage to determine if we can defer.
         // We can only use writeBuffer on unmap if the buffer has COPY_DST
         // (WGPUBufferUsage_CopyDst = 0x0008). Buffers with only CopySrc must use
         // the original approach (createBuffer with mappedAtCreation intact).
-        const view = new DataView(h.buffer, h.byteOffset, h.byteLength);
-        const usage = view.getUint32(descPtr + 8, true);
         const COPY_DST = 0x0008;
         if (usage & COPY_DST) {
           diagCreateMappedCopyDst++;
           bumpPoolStat(POOL_STAT_CREATE_MAPPED_COPY_DST);
           // Fully deferred: return a FAKE handle (0 RPCs).
           // The real GPU buffer is created during wgpuBufferUnmap via CREATE_BUFFER_FROM_DATA.
-          const sizeLo = view.getUint32(descPtr + 16, true);
-          const sizeHi = view.getUint32(descPtr + 20, true);
-          const size = sizeLo + sizeHi * 0x100000000;
           const fakeHandle = fakeBufferCounter++;
           // Allocate WASM shadow for C++ to write into via getMappedRange
           const wasmPtr = wasmMalloc(size);
@@ -982,17 +992,6 @@ export function createBridgeStub(
         bumpPoolStat(POOL_STAT_CREATE_MAPPED_NO_COPY_DST);
         // No COPY_DST: fall through to normal RPC (gpu-worker handles mapping)
       }
-
-      // Non-mapped create: try pool first, else RPC with eager cache populate.
-      // Read the full 64-bit size (sizeLo + sizeHi) — truncating to 32 bits
-      // would send a wrong bucketSize for buffers > 4 GiB (e.g., large KV
-      // caches), breaking the invariant that physical >= bucketSize.
-      const view2 = new DataView(h.buffer, h.byteOffset, h.byteLength);
-      const usage = view2.getUint32(descPtr + 8, true);
-      const sizeLo2 = view2.getUint32(descPtr + 16, true);
-      const sizeHi2 = view2.getUint32(descPtr + 20, true);
-      const size = sizeLo2 + sizeHi2 * 0x100000000;
-      const mappedAtCreation = h[descPtr + 24] !== 0;
 
       if (!mappedAtCreation && size > 0) {
         // Bucket the stub pool so that creates with slightly different
