@@ -280,49 +280,14 @@ export function getHardTimedOutMarkerTtlMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 300_000;
 }
 
-/**
- * Compute the `absoluteExpiresAt` (epoch-ms) for a hard-timed-out marker
- * based on the record AND its resolved chain.
- *
- * ## Why this helper exists (iter-54 codex HIGH finding 1)
- *
- * Iter-53 capped the marker at `record.expiresAt * 1000` — the NEW
- * response row's own TTL. But `ResponseStore.getChain()`
- * (`crates/mlx-db/src/response_store/reader.rs:44-59`) walks the chain
- * back via `previous_response_id` and aborts on the first row whose
- * `expires_at <= unixepoch()`. So a child whose parent expires earlier
- * becomes unrecoverable at the parent's expiry, NOT the child's. A
- * marker capped only by the child's row expiry would keep emitting
- * retryable 503 for a chain that has already aged out of `getChain()`.
- *
- * This helper clamps to the MINIMUM `expiresAt` across the whole
- * resolved chain so the marker can never outlive the earliest link —
- * which is exactly the row whose expiry fires the reader's abort.
- *
- * Returns epoch-ms (the unit `pending-writes.ts` expects for
- * `absoluteExpiresAt`). Returns `Number.POSITIVE_INFINITY` when no
- * chain-record carried an expiry (legacy rows that predate the
- * `expiresAt` column) — the iter-53 safety rail for "row with no
- * visible expiry falls back to TTL-only bounding".
- */
-function computeChainEarliestExpiresAtMs(
-  record: StoredResponseRecord,
-  chain: StoredResponseRecord[] | undefined,
-): number {
-  const secondsCandidates: number[] = [];
-  if (record.expiresAt != null && Number.isFinite(record.expiresAt)) {
-    secondsCandidates.push(record.expiresAt);
-  }
-  if (chain !== undefined) {
-    for (const link of chain) {
-      if (link.expiresAt != null && Number.isFinite(link.expiresAt)) {
-        secondsCandidates.push(link.expiresAt);
-      }
-    }
-  }
-  if (secondsCandidates.length === 0) return Number.POSITIVE_INFINITY;
-  return Math.min(...secondsCandidates) * 1000;
-}
+// Iter-55: the iter-54 `computeChainEarliestExpiresAtMs` helper was
+// removed in favour of inline scalar computation at the per-request
+// site (see `chainEarliestExpiresAtMs` in the request handler
+// below). The scalar is computed ONCE when `getChain()` resolves and
+// threaded through both the pending-write tracker and the hard-
+// timeout marker, so no further helper is needed and the background
+// hard-timeout closure no longer has to re-walk the resolved chain
+// at breaker-fire time.
 
 // ---------------------------------------------------------------------------
 // Non-streaming path
@@ -1876,9 +1841,24 @@ function buildResponseRecord(
  * we never await it here — the whole point of this function is to
  * keep the SQLite flush off the critical path.
  */
-function initiatePersist(store: ResponseStore, record: StoredResponseRecord): Promise<void> {
+function initiatePersist(
+  store: ResponseStore,
+  record: StoredResponseRecord,
+  absoluteExpiresAtMs?: number,
+): Promise<void> {
   const writePromise = store.store(record);
-  getPendingWritesFor(store).track(record.id, writePromise);
+  // Iter-55: thread the scalar earliest-recoverable expiry through
+  // to the tracker so the pre-breaker `awaitPending` timeout/probe
+  // path in the responses endpoint can short-circuit to 404 once
+  // `Date.now() >= absoluteExpiresAtMs` rather than keep emitting
+  // retryable 503 for a chain whose earliest ancestor has already
+  // aged out. `absoluteExpiresAtMs` is computed by the caller as
+  // `min(record.expiresAt * 1000, chainEarliestExpiresAtMs)`; when
+  // the caller passes `undefined` (e.g. legacy call site, no
+  // finite expiry available) the tracker simply does not record a
+  // bound and the pre-iter-55 retryable-503 behaviour is
+  // preserved.
+  getPendingWritesFor(store).track(record.id, writePromise, absoluteExpiresAtMs);
   return writePromise;
 }
 
@@ -2038,23 +2018,26 @@ export async function handleCreateResponse(
     // `body.instructions`, when the continuation has no stored chain,
     // or when the trailing record did not carry an instructions field.
     let inheritedInstructions: string | null = null;
-    // Iter-54 (codex's iter-53 HIGH finding 1): the resolved ancestor
-    // chain is captured here so the post-commit hard-timeout breaker
-    // can clamp its marker at the EARLIEST `expiresAt` across the
-    // whole chain, not just the newly produced row's `expiresAt`. The
-    // native `ResponseStore.getChain()`
-    // (`crates/mlx-db/src/response_store/reader.rs:44-59`) aborts on
-    // the first expired ancestor, so a child whose parent expires
-    // sooner becomes unrecoverable at the parent's expiry — not at
-    // its own. Without this visibility the breaker capped only at
-    // `record.expiresAt * 1000`, which is arbitrarily in the future
-    // compared to an older parent that is about to age out.
+    // Iter-55 (codex's iter-54 HIGH finding 1 + MEDIUM finding 2):
+    // precompute the EARLIEST wall-clock expiry (epoch-ms) across
+    // the resolved ancestor chain as a scalar, rather than
+    // retaining the full `StoredResponseRecord[]` on the outer
+    // scope. The native `ResponseStore.getChain()`
+    // (`crates/mlx-db/src/response_store/reader.rs:44-59`) aborts
+    // on the first expired ancestor, so a child whose parent
+    // expires sooner becomes unrecoverable at the parent's expiry.
+    // Threading only the scalar through `track()` and the hard-
+    // timeout marker avoids capturing each `StoredResponseRecord`
+    // (with its full stored JSON payload) in the background
+    // closures — heap growth stays bounded even under a wedged
+    // backend with many pending continuations.
     //
-    // Captured only for continuations (`body.previous_response_id`
-    // with a `store`); stateless requests leave this as `undefined`
-    // and `computeChainEarliestExpiresAtMs` falls back to the
-    // record-only cap.
-    let resolvedChain: StoredResponseRecord[] | undefined;
+    // The scalar is populated only for continuations
+    // (`body.previous_response_id` with a `store`); stateless
+    // requests leave it as `undefined` and the downstream
+    // `track()` / `markHardTimedOut` fall back to the record-only
+    // cap.
+    let chainEarliestExpiresAtMs: number | undefined = undefined;
 
     if (body.previous_response_id && store) {
       try {
@@ -2202,6 +2185,33 @@ export async function handleCreateResponse(
                 );
                 chain = probed;
               } else {
+                // Iter-55 (codex's iter-54 HIGH finding 1): before
+                // declaring this a transient storage slowdown,
+                // consult the tracker's per-pending earliest-
+                // recoverable expiry. When `track()` was called we
+                // stored the scalar `min(record.expiresAt * 1000,
+                // chainEarliestExpiresAtMs)` for the still-pending
+                // write under this id. If `Date.now()` has crossed
+                // that bound, `ResponseStore.getChain()` can never
+                // succeed (the earliest ancestor has aged out of
+                // the reader's ancestor-expiry walk at
+                // `crates/mlx-db/src/response_store/reader.rs:44-59`),
+                // so looping the client on retryable 503 for up to
+                // `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS` before
+                // the hard breaker fires is wasted. Short-circuit
+                // to permanent 404 so the client stops retrying an
+                // unrecoverable chain.
+                const earliestMs = getPendingWritesFor(store).getEarliestExpiresAtMs(body.previous_response_id);
+                if (earliestMs !== undefined && Date.now() >= earliestMs) {
+                  console.warn(
+                    `[responses] timed out after ${chainWriteWaitTimeoutMs}ms waiting for pending store write ` +
+                      `for previous_response_id "${body.previous_response_id}"; last-probe getChain still missed. ` +
+                      `Earliest recoverable expiry (${earliestMs}ms) already crossed — returning 404 NotFound ` +
+                      `rather than retryable 503 because getChain() can no longer succeed for this chain.`,
+                  );
+                  sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
+                  return;
+                }
                 console.warn(
                   `[responses] timed out after ${chainWriteWaitTimeoutMs}ms waiting for pending store write ` +
                     `for previous_response_id "${body.previous_response_id}"; last-probe getChain still missed. ` +
@@ -2507,16 +2517,32 @@ export async function handleCreateResponse(
         }
         priorMessages = reconstructMessagesFromChain(chain);
         previousResponseId = body.previous_response_id;
-        // Iter-54: expose the resolved chain to the post-commit
-        // hard-timeout breaker so it can clamp its marker's absolute
-        // expiry at the earliest `expiresAt` across the whole chain
-        // (see `computeChainEarliestExpiresAtMs`). The chain array
-        // here is the authoritative one the request is about to
-        // dispatch against — by the time the breaker fires, any
-        // concurrent store mutation is irrelevant because
+        // Iter-55: precompute the EARLIEST wall-clock expiry across
+        // the resolved chain as a scalar (epoch-ms). We fold the
+        // minimum over `link.expiresAt` here — the chain array is
+        // the authoritative one the request will dispatch against.
+        // By the time the hard-timeout breaker fires, any concurrent
+        // store mutation is irrelevant because
         // `ResponseStore.getChain()` evaluates row expiries against
-        // `unixepoch()` at its OWN call time, not at store time.
-        resolvedChain = chain;
+        // its own wall-clock at read time, not at store time.
+        //
+        // Iter-55 capture-scope fix: the full `chain` is NOT
+        // retained on outer scope — only the scalar — so the
+        // background hard-timeout closure below no longer holds a
+        // reference to every ancestor record's stored JSON payload.
+        // `link.expiresAt` is epoch-seconds (see
+        // `buildResponseRecord`), so the scalar must be multiplied
+        // by 1000. `Number.isFinite(...)` guards legacy rows whose
+        // `expiresAt` column is missing or malformed — those rows
+        // are skipped entirely (they do not contribute a finite
+        // bound, and an all-missing chain leaves the scalar as
+        // `undefined`, matching the pre-iter-55 record-only cap
+        // behaviour at the call site).
+        const chainExpirySeconds =
+          chain.length > 0
+            ? Math.min(...chain.map((r) => r.expiresAt).filter((v): v is number => v != null && Number.isFinite(v)))
+            : Number.POSITIVE_INFINITY;
+        chainEarliestExpiresAtMs = Number.isFinite(chainExpirySeconds) ? chainExpirySeconds * 1000 : undefined;
         // Inherit the trailing stored record's `instructions` when
         // the continuation request does NOT override it. Finding 4:
         // the iter-25 cold-replay path dropped stored instructions
@@ -3258,6 +3284,34 @@ export async function handleCreateResponse(
               const streamingPersistMode = 'streaming' as const;
               const streamingHardTimeoutMs = getPostCommitPersistHardTimeoutMs();
               let retiredTombstone: { instanceId: number } | undefined;
+              // Iter-55: compute the scalar `absoluteExpiresAtMs`
+              // ONCE up front — the MINIMUM of the newly produced
+              // record's own row expiry and the earliest expiry
+              // across any resolved ancestor chain. This value is
+              // threaded into both the pending-write tracker at
+              // `initiatePersist()` time (so the pre-breaker
+              // `awaitPending` path can short-circuit to 404 once
+              // the bound is crossed) AND the hard-timeout marker
+              // at breaker-fire time (iter-53 absolute cap). The
+              // hard-timeout closure captures ONLY this scalar —
+              // NOT the full resolved chain — so the closure's
+              // retained heap stays O(1) under sustained pending
+              // continuations against a degraded backend.
+              //
+              // `record.expiresAt` is epoch-seconds (see
+              // `buildResponseRecord` — it adds
+              // `RESPONSE_TTL_SECONDS` to `Math.floor(Date.now() /
+              // 1000)`); convert to ms at this boundary. If both
+              // the record and the chain lack a finite expiry
+              // (legacy rows), fall back to
+              // `Number.POSITIVE_INFINITY` at the marker call site
+              // so the pre-iter-55 TTL-only bounding still holds.
+              const recordExpiresAtMs =
+                record.expiresAt != null && Number.isFinite(record.expiresAt) ? record.expiresAt * 1000 : undefined;
+              const absoluteExpiresAtMs =
+                recordExpiresAtMs !== undefined && chainEarliestExpiresAtMs !== undefined
+                  ? Math.min(recordExpiresAtMs, chainEarliestExpiresAtMs)
+                  : (recordExpiresAtMs ?? chainEarliestExpiresAtMs);
               const streamingHardTimeoutHandle: ReturnType<typeof setTimeout> | null =
                 streamingHardTimeoutMs > 0
                   ? setTimeout(() => {
@@ -3310,21 +3364,29 @@ export async function handleCreateResponse(
                       // wrong — the marker must flip to 404 regardless
                       // of ongoing client retries.
                       //
-                      // Iter-54 (codex's iter-53 HIGH finding 1):
-                      // clamp at the MINIMUM `expiresAt` across the
-                      // resolved chain, not just the child record.
-                      // `ResponseStore.getChain()` walks ancestors
-                      // and aborts on the first expired link
-                      // (`crates/mlx-db/src/response_store/reader.rs:44-59`);
-                      // a child whose parent expires sooner becomes
-                      // unrecoverable at the parent's expiry, not
-                      // its own. `computeChainEarliestExpiresAtMs`
-                      // folds both record + resolved chain, so the
-                      // marker can never outlive the earliest link.
+                      // Iter-55 (codex's iter-54 MEDIUM finding 2):
+                      // capture ONLY the precomputed scalar
+                      // `absoluteExpiresAtMs` in this closure — NOT
+                      // the full resolved chain. The scalar is
+                      // `min(record.expiresAt * 1000,
+                      // chainEarliestExpiresAtMs)`, computed once
+                      // when the hard-timeout handle was armed
+                      // above. `ResponseStore.getChain()` walks
+                      // ancestors and aborts on the first expired
+                      // link
+                      // (`crates/mlx-db/src/response_store/reader.rs:44-59`),
+                      // so clamping the marker at whichever link
+                      // would disappear from `getChain()` first is
+                      // the authoritative bound. Capturing only
+                      // the scalar means background pending
+                      // continuations under a degraded store do
+                      // not retain ancestor transcripts —
+                      // heap growth stays O(1) per hard-timed-out
+                      // persist regardless of chain length.
                       getPendingWritesFor(store).markHardTimedOut(
                         record.id,
                         getHardTimedOutMarkerTtlMs(),
-                        computeChainEarliestExpiresAtMs(record, resolvedChain),
+                        absoluteExpiresAtMs ?? Number.POSITIVE_INFINITY,
                       );
                       // Iter-45: retire the id FIRST (binding is
                       // still alive here — retirement reads the
@@ -3346,7 +3408,7 @@ export async function handleCreateResponse(
                       persistRetainBox.release?.();
                     }, streamingHardTimeoutMs)
                   : null;
-              pendingPersistOuter = initiatePersist(store, record).finally(() => {
+              pendingPersistOuter = initiatePersist(store, record, absoluteExpiresAtMs).finally(() => {
                 if (streamingHardTimeoutHandle !== null) {
                   clearTimeout(streamingHardTimeoutHandle);
                 }
@@ -3475,6 +3537,18 @@ export async function handleCreateResponse(
               const nonStreamingPersistMode = 'non-streaming' as const;
               const nonStreamingHardTimeoutMs = getPostCommitPersistHardTimeoutMs();
               let retiredTombstone: { instanceId: number } | undefined;
+              // Iter-55: see the matching streaming-path comment
+              // above — precompute the scalar `absoluteExpiresAtMs`
+              // (`min(record.expiresAt * 1000,
+              // chainEarliestExpiresAtMs)`) ONCE, thread it into
+              // the tracker at `initiatePersist()` time, and capture
+              // ONLY this scalar in the hard-timeout closure.
+              const recordExpiresAtMs =
+                record.expiresAt != null && Number.isFinite(record.expiresAt) ? record.expiresAt * 1000 : undefined;
+              const absoluteExpiresAtMs =
+                recordExpiresAtMs !== undefined && chainEarliestExpiresAtMs !== undefined
+                  ? Math.min(recordExpiresAtMs, chainEarliestExpiresAtMs)
+                  : (recordExpiresAtMs ?? chainEarliestExpiresAtMs);
               const nonStreamingHardTimeoutHandle: ReturnType<typeof setTimeout> | null =
                 nonStreamingHardTimeoutMs > 0
                   ? setTimeout(() => {
@@ -3527,21 +3601,17 @@ export async function handleCreateResponse(
                       // wrong — the marker must flip to 404 regardless
                       // of ongoing client retries.
                       //
-                      // Iter-54 (codex's iter-53 HIGH finding 1):
-                      // clamp at the MINIMUM `expiresAt` across the
-                      // resolved chain, not just the child record.
-                      // `ResponseStore.getChain()` walks ancestors
-                      // and aborts on the first expired link
-                      // (`crates/mlx-db/src/response_store/reader.rs:44-59`);
-                      // a child whose parent expires sooner becomes
-                      // unrecoverable at the parent's expiry, not
-                      // its own. `computeChainEarliestExpiresAtMs`
-                      // folds both record + resolved chain, so the
-                      // marker can never outlive the earliest link.
+                      // Iter-55 (codex's iter-54 MEDIUM finding 2):
+                      // capture ONLY the precomputed scalar
+                      // `absoluteExpiresAtMs` in this closure — see
+                      // the matching streaming-path comment for the
+                      // full rationale. The scalar was computed
+                      // above when the hard-timeout handle was
+                      // armed.
                       getPendingWritesFor(store).markHardTimedOut(
                         record.id,
                         getHardTimedOutMarkerTtlMs(),
-                        computeChainEarliestExpiresAtMs(record, resolvedChain),
+                        absoluteExpiresAtMs ?? Number.POSITIVE_INFINITY,
                       );
                       // Iter-45: retire the id FIRST (binding is
                       // still alive here — retirement reads the
@@ -3563,7 +3633,7 @@ export async function handleCreateResponse(
                       persistRetainBox.release?.();
                     }, nonStreamingHardTimeoutMs)
                   : null;
-              pendingPersistOuter = initiatePersist(store, record).finally(() => {
+              pendingPersistOuter = initiatePersist(store, record, absoluteExpiresAtMs).finally(() => {
                 if (nonStreamingHardTimeoutHandle !== null) {
                   clearTimeout(nonStreamingHardTimeoutHandle);
                 }

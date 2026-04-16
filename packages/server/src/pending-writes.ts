@@ -168,9 +168,12 @@
  *
  *   * Iter-54 also clamps the marker's `absoluteExpiresAt` at the
  *     MINIMUM `expiresAt` across the whole resolved chain, not
- *     just the child record (see `responses.ts`
- *     `computeChainEarliestExpiresAtMs`). `ResponseStore.getChain()`
- *     walks ancestors and aborts on the first expired link
+ *     just the child record. Iter-55 refactored the caller-side
+ *     helper into an inline scalar (`chainEarliestExpiresAtMs`)
+ *     computed once when `getChain()` resolves, and threads that
+ *     scalar through both `track()` and `markHardTimedOut()`.
+ *     `ResponseStore.getChain()` walks ancestors and aborts on the
+ *     first expired link
  *     (`crates/mlx-db/src/response_store/reader.rs:44-59`), so a
  *     child whose parent expires sooner is unrecoverable at the
  *     parent's expiry — not the child's. That change lives on the
@@ -206,6 +209,31 @@
  *
  *   min(write settlement, last continuation + TTL, absoluteExpiresAt)
  *
+ * ## Pending-entry earliest-expiry metadata (iter-55)
+ *
+ * Iter-54 (codex's iter-54 HIGH finding 1) observed that the
+ * chain-earliest cap lives inside the hard-timeout branch — the
+ * pre-breaker `awaitPending` timeout/probe path in `responses.ts`
+ * was still blindly classifying any unresolved pending write as
+ * retryable `storage_timeout`, even when the resolved chain's
+ * earliest ancestor had already expired. A continuation whose
+ * parent is already past its row TTL cannot ever succeed via
+ * `getChain()`, so looping the client on 503 for up to
+ * `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS` (60s default) before
+ * the hard breaker converts the entry to a marker was wasted.
+ *
+ * Iter-55 stores the earliest recoverable expiry ALONGSIDE each
+ * tracked promise in a separate per-id side map
+ * (`earliestExpiresByPending`). `track(id, promise,
+ * earliestExpiresAtMs?)` records the scalar at registration
+ * time; `getEarliestExpiresAtMs(id)` exposes it to the pre-
+ * breaker `awaitPending` path so the endpoint can short-circuit
+ * to 404 once `Date.now() >= earliestExpiresAtMs` rather than
+ * keep emitting retryable 503. The side map is keyed identically
+ * to `pending` and cleared on the same `.finally(...)` hook, so
+ * no extra lifecycle surface is added — only the scalar we need
+ * to consult during the timeout branch.
+ *
  * ## Scope
  *
  * One tracker per `ResponseStore` instance is attached via a
@@ -225,6 +253,28 @@
  */
 export class PendingResponseWrites {
   private readonly pending: Map<string, Promise<void>> = new Map();
+
+  /**
+   * Iter-55: per-pending-entry scalar `earliestExpiresAtMs`
+   * recording the EARLIEST recoverable wall-clock expiry across
+   * (record + resolved ancestor chain) at the time `track()` was
+   * called. Keyed identically to `pending` and cleared on the same
+   * `.finally(...)` settlement hook so no extra lifecycle surface
+   * is introduced.
+   *
+   * The pre-breaker `awaitPending` timeout/probe path in
+   * `responses.ts` consults this via `getEarliestExpiresAtMs(id)`:
+   * once `Date.now()` has passed the earliest ancestor expiry,
+   * `getChain()` can never succeed, so the continuation short-
+   * circuits to 404 rather than looping the client on retryable
+   * 503 for up to the hard-breaker window.
+   *
+   * Optional: legacy calls that pass `undefined` (e.g. tests or
+   * pre-iter-55 helpers) simply do not populate this side map;
+   * `getEarliestExpiresAtMs(id)` returns `undefined` and the caller
+   * falls back to the pre-iter-55 behaviour (emit retryable 503).
+   */
+  private readonly earliestExpiresByPending: Map<string, number> = new Map();
 
   /**
    * Ids that crossed the hard-timeout breaker in responses.ts while
@@ -314,9 +364,27 @@ export class PendingResponseWrites {
    * the promise (await / catch / log) is unaffected because
    * `.finally` returns a new promise chain that does not steal the
    * rejection.
+   *
+   * Iter-55: `earliestExpiresAtMs` is the EARLIEST wall-clock expiry
+   * (epoch-ms) across the record being persisted AND every resolved
+   * ancestor in its chain. When provided, it is stored in a per-id
+   * side map (`earliestExpiresByPending`) so the pre-breaker
+   * `awaitPending` timeout/probe path can short-circuit to 404 once
+   * `Date.now() >= earliestExpiresAtMs` rather than keep emitting
+   * retryable 503 for a chain that cannot ever be recovered via
+   * `getChain()`. The argument is optional so legacy callers (tests,
+   * pre-iter-55 helpers) remain compatible; an unset value leaves
+   * the pre-iter-55 behaviour in place.
+   *
+   * `Number.isFinite(...)` guards for rows lacking explicit
+   * `expiresAt` — in that case the caller passes `undefined` and
+   * no entry is added to the side map.
    */
-  track(id: string, writePromise: Promise<void>): void {
+  track(id: string, writePromise: Promise<void>, earliestExpiresAtMs?: number): void {
     this.pending.set(id, writePromise);
+    if (earliestExpiresAtMs !== undefined && Number.isFinite(earliestExpiresAtMs)) {
+      this.earliestExpiresByPending.set(id, earliestExpiresAtMs);
+    }
     // Use `.finally` rather than `then`+`catch` so the registration
     // lifetime is symmetric across fulfill/reject — a failed SQLite
     // write should still clear the tracker so subsequent chain
@@ -336,6 +404,11 @@ export class PendingResponseWrites {
         // only remove if WE are still the registered entry.
         if (this.pending.get(id) === writePromise) {
           this.pending.delete(id);
+          // Iter-55: drop the scalar earliest-expiry side entry in
+          // lockstep with the pending promise so we never serve a
+          // stale earliest-expiry value for a freshly-registered
+          // id that happens to reuse the same string.
+          this.earliestExpiresByPending.delete(id);
         }
         // Iter-50/51: the hard-timeout marker is also cleared here
         // as the fast path. Once this specific `writePromise`
@@ -371,6 +444,29 @@ export class PendingResponseWrites {
    */
   awaitPending(id: string): Promise<void> | undefined {
     return this.pending.get(id);
+  }
+
+  /**
+   * Iter-55: return the scalar EARLIEST wall-clock expiry (epoch-ms)
+   * that was captured alongside the in-flight write for `id` at
+   * `track()` time, or `undefined` if either no pending write is
+   * tracked under `id` or the caller did not pass an
+   * `earliestExpiresAtMs` argument.
+   *
+   * Consulted by the pre-breaker `awaitPending` timeout/probe path
+   * in `responses.ts` to distinguish a transient storage slowdown
+   * (retryable 503) from an unrecoverable chain where the earliest
+   * ancestor has already aged out (permanent 404).
+   *
+   * The returned value is the caller-provided scalar; this module
+   * does not interpret it beyond storing it under the entry's
+   * lifetime. `ResponseStore.getChain()` evaluates row expiries
+   * against its own wall-clock at call time, so the scalar reflects
+   * the state observed when the write was initiated, which is the
+   * latest honest snapshot the pre-breaker path can check against.
+   */
+  getEarliestExpiresAtMs(id: string): number | undefined {
+    return this.earliestExpiresByPending.get(id);
   }
 
   /**

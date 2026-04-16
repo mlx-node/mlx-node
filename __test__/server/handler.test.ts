@@ -6362,6 +6362,274 @@ describe('createHandler', () => {
       }
     });
 
+    it('iter-55: pre-breaker awaitPending path returns 404 (not 503) once chain earliest expiry has been crossed', async () => {
+      // Codex's iter-54 review HIGH finding 1: iter-54's chain-
+      // earliest cap only applied once the hard-timeout breaker
+      // converted the pending write to a marker. The pre-breaker
+      // `awaitPending` timeout/probe branch in `responses.ts` still
+      // classified any unresolved pending write as transient
+      // `storage_timeout` — even when the resolved chain's earliest
+      // ancestor had already expired and `getChain()` could never
+      // succeed. Result: continuations whose parent had aged out
+      // got retryable 503 for up to
+      // `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS` (60s default)
+      // before the hard breaker converted to a marker with the
+      // correct absolute cap.
+      //
+      // Iter-55 fix: `track()` now accepts an optional
+      // `earliestExpiresAtMs`; the pre-breaker path consults
+      // `getEarliestExpiresAtMs(id)` after the final probe miss and
+      // short-circuits to 404 once `Date.now() >=
+      // earliestExpiresAtMs`. No hard-breaker involvement needed.
+      //
+      // Shape:
+      //   1. POST #1 (no previous_response_id) → record A persisted
+      //      with a soon-to-expire `expiresAt`.
+      //   2. POST #2 (previous_response_id=A) → chain = [A], creates
+      //      record B. B's persist wedges (never resolves) but the
+      //      hard breaker is set to a LONG value so we stay in the
+      //      pre-breaker `awaitPending` path.
+      //   3. Wait past A's expiry so `getEarliestExpiresAtMs(B) <=
+      //      Date.now()`. Then fire a continuation against B.
+      //   4. Continuation's awaitPending wait times out, final probe
+      //      misses, and the earliest-expiry scalar is already in
+      //      the past → `sendNotFound` (404), NOT `sendStorageTimeout`
+      //      (503).
+      const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+      const originalChainWait = process.env.MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS;
+      // Long hard breaker so the pre-breaker path is the one we
+      // exercise. Short chain-write timeout so the pre-breaker
+      // `awaitPending` race resolves to `timeout` quickly.
+      process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '5000';
+      process.env.MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS = '50';
+      try {
+        const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
+
+        // See iter-54 test for the mock-store shape; same walk of
+        // previousResponseId with the reader.rs:44-59 ancestor-
+        // expiry semantics.
+        const storedRecords = new Map<string, any>();
+        const storeCallCount = { n: 0 };
+        const mockStore = {
+          store: vi.fn().mockImplementation((record: any) => {
+            storeCallCount.n += 1;
+            if (storeCallCount.n === 1) {
+              storedRecords.set(record.id, record);
+              return Promise.resolve();
+            }
+            // POST #2's persist wedges: never resolves and never
+            // populates `storedRecords`, so concurrent getChain(B)
+            // misses.
+            return new Promise<void>(() => {});
+          }),
+          getChain: vi.fn().mockImplementation((id: string) => {
+            const nowSeconds = Math.floor(Date.now() / 1000);
+            const chain: any[] = [];
+            let currentId: string | undefined = id;
+            while (currentId !== undefined) {
+              const rec = storedRecords.get(currentId);
+              if (rec === undefined) {
+                return Promise.reject(new Error(`Response not found: ${currentId}`));
+              }
+              if (rec.expiresAt != null && rec.expiresAt <= nowSeconds) {
+                return Promise.reject(new Error(`Response not found: ${currentId}`));
+              }
+              chain.push(rec);
+              currentId = rec.previousResponseId;
+            }
+            chain.reverse();
+            return Promise.resolve(chain);
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const mockModel = {
+          chatSessionStart: vi.fn().mockResolvedValue(makeChatResult({ text: 'iter-55 reply' })),
+          chatSessionContinue: vi.fn().mockResolvedValue(makeChatResult({ text: 'continuation reply' })),
+          chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        const registry = new ModelRegistry();
+        const MODEL_NAME = 'iter-55-pre-breaker-earliest-expiry';
+        registry.register(MODEL_NAME, mockModel);
+
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => {
+          unhandled.push(reason);
+        };
+        process.on('unhandledRejection', onUnhandled);
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const handler = createHandler(registry, { store: mockStore as any });
+
+        // (1) POST #1 — creates record A, persists cleanly.
+        const req1 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'original (ancestor)',
+          stream: false,
+        });
+        const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
+        await handler(req1, res1);
+        await wait1();
+        const body1 = JSON.parse(getBody1());
+        const responseIdA: string = body1.id;
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setImmediate(r));
+        expect(storedRecords.has(responseIdA)).toBe(true);
+
+        // Shrink A's expiresAt to 1 second from now. The iter-55
+        // pre-breaker path uses `earliestExpiresAtMs` captured when
+        // `track(B, ...)` is called, which folds A's (modified)
+        // expiry into `chainEarliestExpiresAtMs`.
+        const shortenedExpiresAt = Math.floor(Date.now() / 1000) + 1;
+        storedRecords.get(responseIdA)!.expiresAt = shortenedExpiresAt;
+
+        // (2) POST #2 — previous_response_id = A. chain = [A]. B's
+        // persist wedges, but the hard breaker is 5s so we stay in
+        // the pre-breaker path. The tracker side map now carries
+        // `earliestExpiresByPending[B] = shortenedExpiresAt * 1000`.
+        const req2 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation (child)',
+          previous_response_id: responseIdA,
+          stream: false,
+        });
+        const { res: res2, waitForEnd: wait2, getBody: getBody2 } = createMockRes();
+        await handler(req2, res2);
+        await wait2();
+        const body2 = JSON.parse(getBody2());
+        const responseIdB: string = body2.id;
+
+        // Wait for the pending tracker to be populated with B's
+        // wedged promise.
+        while (mockStore.store.mock.calls.length < 2) {
+          await new Promise((r) => setImmediate(r));
+        }
+        const tracker = getPendingWritesFor(mockStore);
+        const earliestB = tracker.getEarliestExpiresAtMs(responseIdB);
+        expect(earliestB).toBeDefined();
+        // Earliest must be clamped at A's shortened expiry, not B's
+        // 30-min default.
+        expect(earliestB).toBe(shortenedExpiresAt * 1000);
+
+        // (3) Wait past A's shortened expiry (1.2 seconds). A now
+        // ages out of getChain(); the pending earliest-expiry for B
+        // has been crossed.
+        await new Promise((r) => setTimeout(r, 1300));
+
+        // (4) Continuation against B. `getChain(B)` throws "not
+        // found" (B isn't persisted). `awaitPending(B)` returns the
+        // wedged promise, the race against the 50ms chain-wait
+        // timer resolves to 'timeout', the last-probe `getChain(B)`
+        // still misses, and the iter-55 check consults
+        // `getEarliestExpiresAtMs(B)`: `Date.now() >= earliestB`
+        // → `sendNotFound` (404), NOT `sendStorageTimeout` (503).
+        //
+        // Under iter-54 this would have returned 503 for up to the
+        // 5s hard-breaker window — the regression this test pins.
+        const req3 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation past earliest expiry',
+          previous_response_id: responseIdB,
+          stream: false,
+        });
+        const { res: res3, getStatus: status3, getBody: getBody3, waitForEnd: wait3 } = createMockRes();
+        await handler(req3, res3);
+        await wait3();
+        expect(status3()).toBe(404);
+        const parsed3 = JSON.parse(getBody3());
+        expect(parsed3.error.type).not.toBe('storage_timeout');
+
+        expect(unhandled).toHaveLength(0);
+        process.off('unhandledRejection', onUnhandled);
+        warnSpy.mockRestore();
+      } finally {
+        if (originalHard === undefined) {
+          delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+        } else {
+          process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
+        }
+        if (originalChainWait === undefined) {
+          delete process.env.MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS;
+        } else {
+          process.env.MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS = originalChainWait;
+        }
+      }
+    }, 10000);
+
+    it('iter-55: PendingResponseWrites exposes getEarliestExpiresAtMs; track() records the scalar and settlement clears it', async () => {
+      // Codex's iter-54 review MEDIUM finding 2 regression unit:
+      // the scalar side map is the mechanism that both (a) lets
+      // the pre-breaker short-circuit to 404 and (b) keeps the
+      // hard-timeout background closure from capturing full chain
+      // transcripts. Pin the contract directly so future refactors
+      // to either path cannot drift.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+
+      // (1) track() with an earliest-expiry scalar — getter
+      // returns exactly the scalar.
+      let resolveA!: () => void;
+      const promiseA = new Promise<void>((resolve) => {
+        resolveA = resolve;
+      });
+      const earliestA = Date.now() + 1_000_000;
+      tracker.track('resp_a', promiseA, earliestA);
+      expect(tracker.getEarliestExpiresAtMs('resp_a')).toBe(earliestA);
+
+      // (2) track() WITHOUT an earliest-expiry scalar — getter
+      // returns undefined (legacy-compat path for callers that
+      // don't supply the optional arg).
+      let resolveB!: () => void;
+      const promiseB = new Promise<void>((resolve) => {
+        resolveB = resolve;
+      });
+      tracker.track('resp_b', promiseB);
+      expect(tracker.getEarliestExpiresAtMs('resp_b')).toBeUndefined();
+
+      // (3) Unknown id → undefined.
+      expect(tracker.getEarliestExpiresAtMs('resp_nope')).toBeUndefined();
+
+      // (4) Non-finite scalars (Infinity / NaN) are not recorded —
+      // `Number.isFinite` guard guarantees we never read back a
+      // useless bound.
+      let resolveC!: () => void;
+      const promiseC = new Promise<void>((resolve) => {
+        resolveC = resolve;
+      });
+      tracker.track('resp_c', promiseC, Number.POSITIVE_INFINITY);
+      expect(tracker.getEarliestExpiresAtMs('resp_c')).toBeUndefined();
+
+      let resolveD!: () => void;
+      const promiseD = new Promise<void>((resolve) => {
+        resolveD = resolve;
+      });
+      tracker.track('resp_d', promiseD, Number.NaN);
+      expect(tracker.getEarliestExpiresAtMs('resp_d')).toBeUndefined();
+
+      // (5) Settlement clears the scalar in lockstep with the
+      // pending promise.
+      resolveA();
+      await promiseA;
+      // Let the `.finally(...)` microtask run.
+      await new Promise((r) => setImmediate(r));
+      expect(tracker.getEarliestExpiresAtMs('resp_a')).toBeUndefined();
+      expect(tracker.awaitPending('resp_a')).toBeUndefined();
+
+      // And settling a track() call that had no scalar does not
+      // throw — just cleans up the pending entry.
+      resolveB();
+      resolveC();
+      resolveD();
+      await Promise.all([promiseB, promiseC, promiseD]);
+      await new Promise((r) => setImmediate(r));
+      expect(tracker.awaitPending('resp_b')).toBeUndefined();
+      expect(tracker.awaitPending('resp_c')).toBeUndefined();
+      expect(tracker.awaitPending('resp_d')).toBeUndefined();
+    });
+
     it('iter-51: MLX_HARD_TIMEOUT_MARKER_TTL_MS parsing mirrors hard-timeout parser (empty/whitespace -> default, 0 -> zero, valid -> parsed)', async () => {
       // Iter-51 adds an independent TTL for hard-timed-out
       // markers (codex's iter-50 HIGH finding 1). The parser
