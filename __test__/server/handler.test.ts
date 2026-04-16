@@ -9,6 +9,15 @@
 // same code paths — only the wall-clock wait shrinks.
 process.env.MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS = '50';
 process.env.MLX_POST_COMMIT_PERSIST_TIMEOUT_MS = '50';
+// Iter-44: the second-stage hard-timeout breaker defaults to 60s
+// production-wide. For the test suite the default is DISABLED
+// (`'0'`) so the iter-43 pin-forever invariant — the retain
+// stays elevated past the soft timeout until the persist's own
+// `.finally(...)` releases it — can be asserted without racing
+// the hard-timeout timer. The iter-44 regression test that
+// specifically exercises the breaker flips this to a small
+// value locally via save/restore.
+process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '0';
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Writable } from 'node:stream';
@@ -4001,6 +4010,150 @@ describe('createHandler', () => {
       // cleanly if the test tears down the registry.
       await new Promise((r) => setImmediate(r));
     }, 10000);
+
+    it('iter-44: hard timeout force-releases binding retain when persist is truly wedged', async () => {
+      // Iter-43 left the iter-40 `retainBinding` pinned past
+      // the soft `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS` so that a
+      // slow-but-eventual write could still land its row
+      // against the live `modelInstanceId`. Codex's iter-43
+      // review pointed out that this left a HIGH-severity leak
+      // behind: for a TRULY wedged write (promise that never
+      // settles), the retain is pinned for the lifetime of the
+      // process. `unregister()` can only park the binding in
+      // `pendingTeardown` and never reaches final teardown —
+      // pinning the model object, its `SessionRegistry`, and
+      // native KV/cache state indefinitely.
+      //
+      // Iter-44 adds a SECOND-STAGE hard-timeout breaker
+      // alongside the soft timeout. The hard timer is armed at
+      // the same moment as the persist, independently of the
+      // handler's await path, and fires only if the persist has
+      // not settled by a much longer bound. On fire it force-
+      // releases the iter-40 retain via the existing idempotent
+      // `persistRetainBox` so the binding can unwind.
+      //
+      // Iter-44 invariant (this test): when the persist is
+      // TRULY wedged (never settles) and the hard timeout has
+      // fired, a same-object `unregister` + `register` MUST
+      // mint a FRESH `modelInstanceId` (because
+      // `pendingPersists` dropped to 0, the binding fully tore
+      // down, and the re-register creates a new binding). This
+      // is the opposite of the iter-43 pin-forever behavior
+      // that holds when the hard timeout is disabled / not yet
+      // fired — proof that the breaker reclaimed the binding.
+      //
+      // Shape:
+      //   - `store.store(...)` returns a promise that NEVER
+      //     settles (truly wedged backend).
+      //   - The file-wide default is
+      //     `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS=0`
+      //     (disabled) so every other test observes the
+      //     iter-43 pin-forever contract. This test flips it to
+      //     `'100'` locally and restores on exit.
+      //   - After the handler returns and the hard timeout
+      //     fires (~100ms), `unregister` + same-object
+      //     `register` must produce a NEW instance id.
+      const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+      process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '100';
+      try {
+        const mockStore = {
+          // Promise that NEVER resolves. This simulates a
+          // pathologically wedged SQLite writer.
+          store: vi.fn().mockImplementation(() => new Promise<void>(() => {})),
+          getChain: vi.fn().mockImplementation((id: string) => {
+            return Promise.reject(new Error(`Response not found: ${id}`));
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const chatSessionStart = vi.fn().mockResolvedValue(makeChatResult({ text: 'pre-breaker reply' }));
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+          chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        const registry = new ModelRegistry();
+        const MODEL_NAME = 'iter-44-wedged-persist-hard-timeout';
+        registry.register(MODEL_NAME, mockModel);
+
+        // Sanity: the local override is in effect (else this
+        // test silently reverts to iter-43 pin-forever and the
+        // final id-mismatch assertion would flip).
+        expect(process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS).toBe('100');
+        expect(process.env.MLX_POST_COMMIT_PERSIST_TIMEOUT_MS).toBe('50');
+
+        const idBefore = registry.getInstanceId(MODEL_NAME);
+        expect(typeof idBefore).toBe('number');
+
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => {
+          unhandled.push(reason);
+        };
+        process.on('unhandledRejection', onUnhandled);
+
+        const handler = createHandler(registry, { store: mockStore as any });
+        const req = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'hello wedged-breaker world',
+          stream: false,
+        });
+        const { res, waitForEnd, getBody } = createMockRes();
+
+        // Handler itself returns around the SOFT timeout
+        // (~50ms). It must not wait for the 100ms hard timer.
+        await handler(req, res);
+        await waitForEnd();
+        const body = JSON.parse(getBody());
+        expect(body.status).toBe('completed');
+
+        // Sanity check #1: immediately after the handler
+        // returns, the hard timer has NOT yet fired (50ms soft
+        // < 100ms hard). A same-object `unregister` + register
+        // here should still reuse the binding — this is the
+        // iter-43 invariant on the slow-but-eventual side of
+        // the hard bound, and it must continue to hold under
+        // iter-44 until the hard timer fires.
+        expect(registry.unregister(MODEL_NAME)).toBe(true);
+        registry.register(MODEL_NAME, mockModel);
+        const idImmediately = registry.getInstanceId(MODEL_NAME);
+        expect(idImmediately).toBe(idBefore);
+
+        // Wait for the hard timeout (100ms from dispatch) plus
+        // a macrotask drain so the `setTimeout` callback runs.
+        // 150ms is enough margin to prove the breaker fired
+        // without being flaky on CI.
+        await new Promise((r) => setTimeout(r, 150));
+        await new Promise((r) => setImmediate(r));
+
+        // Primary iter-44 invariant: the hard timer fired and
+        // force-released the retain. `pendingPersists` is now
+        // 0, so a fresh `unregister` fully tears the binding
+        // down, and the next `register` on the same model
+        // object mints a FRESH `modelInstanceId`.
+        expect(registry.unregister(MODEL_NAME)).toBe(true);
+        registry.register(MODEL_NAME, mockModel);
+        const idAfterBreaker = registry.getInstanceId(MODEL_NAME);
+        expect(typeof idAfterBreaker).toBe('number');
+        expect(idAfterBreaker).not.toBe(idBefore);
+
+        // Sanity: the breaker path did not introduce any
+        // unhandled rejections. The wedged promise is still
+        // pending — nothing to reject — but a regression that
+        // stripped the `.catch` off the detached persist would
+        // escalate differently.
+        expect(unhandled).toHaveLength(0);
+        process.off('unhandledRejection', onUnhandled);
+      } finally {
+        if (originalHard === undefined) {
+          delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+        } else {
+          process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
+        }
+      }
+    }, 5000);
 
     it('iter-37 finding 2: adopt gate rejects streaming turns whose post-final teardown threw (failureMode === "error")', async () => {
       // Iter-36 finding 2 closed the `client_abort` hole but the

@@ -121,6 +121,53 @@ function getPostCommitPersistTimeoutMs(): number {
   return parsed;
 }
 
+/**
+ * Second-stage ("hard") timeout for the off-lock post-commit persist.
+ *
+ * Iter-43 intentionally left the iter-40 `retainBinding` pinned past
+ * the soft `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS` so that a SLOW-BUT-
+ * EVENTUAL `store.store(...)` — the common case under SQLite back-
+ * pressure — could still land its row against the live
+ * `modelInstanceId` even if the handler returned first. That fix
+ * closed iter-42's chain-break regression, but codex's iter-43
+ * adversarial review flagged the corollary HIGH-severity leak: a
+ * TRULY wedged write (promise that never settles) pins the retain
+ * for the lifetime of the process, so `unregister()` can only park
+ * the binding in `pendingTeardown` and never reaches final
+ * teardown — pinning the model object, its `SessionRegistry`, and
+ * the native KV/cache state until the server restarts.
+ *
+ * The fix is a second-stage breaker: start a hard-timeout timer at
+ * the same moment we start waiting on the persist, armed OFF the
+ * handler's await path so the response is never delayed by it. If
+ * the persist settles naturally, the `.finally(...)` cancels the
+ * timer via `clearTimeout`. If the persist is still wedged past
+ * this much longer bound, the timer fires and force-releases the
+ * iter-40 retain via the existing idempotent `persistRetainBox`.
+ * The bounded leak duration is capped at this value instead of
+ * process lifetime.
+ *
+ * The default is intentionally an order of magnitude larger than
+ * any realistic SQLite commit window and well past the soft
+ * timeout: the slow-but-eventual case iter-42 broke has to be
+ * well-separated from the pathologically-wedged case that triggers
+ * this breaker. Setting the value to `0` disables the hard timeout
+ * entirely and reverts to strict iter-43 pin-forever semantics —
+ * useful for tests that want to assert the iter-40 invariant
+ * without the second-stage safety net.
+ *
+ * Override via `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS`. A same-
+ * object `previous_response_id` continuation issued after the hard
+ * timeout fires will receive a 400 instance-mismatch against the
+ * stale id — a clean, user-visible failure rather than an
+ * unbounded memory leak.
+ */
+function getPostCommitPersistHardTimeoutMs(): number {
+  const raw = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+  const parsed = raw != null ? Number(raw) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 60_000;
+}
+
 // ---------------------------------------------------------------------------
 // Non-streaming path
 // ---------------------------------------------------------------------------
@@ -2828,12 +2875,30 @@ export async function handleCreateResponse(
               //
               // Iter-43: the idempotent wrapper is kept from
               // iter-42 as structural scaffolding, but the
-              // post-commit-persist timeout arm no longer force-
-              // fires it — see the timeout handler below for the
-              // rationale (short version: force-releasing on
-              // timeout reopens iter-40 for the slow-but-eventual
-              // case, which is strictly more common than the
-              // truly-wedged case iter-42 was trying to bound).
+              // post-commit-persist SOFT timeout arm no longer
+              // force-fires it — see the timeout handler below
+              // for the rationale (short version: force-releasing
+              // on the soft timeout reopens iter-40 for the slow-
+              // but-eventual case, which is strictly more common
+              // than the truly-wedged case iter-42 was trying to
+              // bound).
+              //
+              // Iter-44 second-stage breaker: codex's iter-43
+              // review called out that leaving the retain pinned
+              // forever on a wedged write makes the binding
+              // unreclaimable until process restart. We arm an
+              // INDEPENDENT hard-timeout timer alongside the
+              // persist (see `getPostCommitPersistHardTimeoutMs`
+              // for the rationale on the default). If the persist
+              // settles naturally the timer is cancelled via
+              // `clearTimeout` inside the same `.finally(...)` —
+              // so slow-but-eventual writes are unaffected. If
+              // the persist is still wedged past the hard bound,
+              // the timer fires and force-releases the iter-40
+              // retain via the existing idempotent
+              // `persistRetainBox`. The hard timer is ALSO armed
+              // off the handler's await path, so the response is
+              // never delayed by it.
               registry.retainBinding(leaseModel);
               let persistRetainReleased = false;
               persistRetainBox.release = () => {
@@ -2841,10 +2906,30 @@ export async function handleCreateResponse(
                 persistRetainReleased = true;
                 registry.releaseBinding(leaseModel);
               };
+              const streamingPersistMode = 'streaming' as const;
+              const streamingHardTimeoutMs = getPostCommitPersistHardTimeoutMs();
+              const streamingHardTimeoutHandle: ReturnType<typeof setTimeout> | null =
+                streamingHardTimeoutMs > 0
+                  ? setTimeout(() => {
+                      if (persistRetainReleased) return;
+                      console.error(
+                        `[responses] post-commit persist HARD timeout (${streamingHardTimeoutMs}ms, ` +
+                          `${streamingPersistMode}): underlying store.store(...) has not settled; assuming ` +
+                          `wedged backend, force-releasing the iter-40 retain so the binding can be torn ` +
+                          `down. A subsequent previous_response_id continuation against the stale instance ` +
+                          `id will receive a 400 instance-mismatch — clean user-visible failure rather than ` +
+                          `unbounded memory leak.`,
+                      );
+                      persistRetainBox.release?.();
+                    }, streamingHardTimeoutMs)
+                  : null;
               pendingPersistOuter = initiatePersist(store, record).finally(() => {
+                if (streamingHardTimeoutHandle !== null) {
+                  clearTimeout(streamingHardTimeoutHandle);
+                }
                 persistRetainBox.release?.();
               });
-              persistMode = 'streaming';
+              persistMode = streamingPersistMode;
             }
           } catch (err) {
             handlerError = err instanceof Error ? err : new Error(String(err));
@@ -2894,8 +2979,20 @@ export async function handleCreateResponse(
               // Iter-43: see the streaming branch — the
               // idempotent-release scaffolding is retained from
               // iter-42 as a structural hook for a future split
-              // teardown, but the post-commit timeout arm no
+              // teardown, but the post-commit SOFT timeout arm no
               // longer force-fires it.
+              //
+              // Iter-44 second-stage breaker: see the streaming
+              // branch for the full rationale — a wedged persist
+              // would otherwise leak the iter-40 retain for the
+              // lifetime of the process. The hard-timeout timer
+              // is armed here in the same shape, cancelled from
+              // the persist's own `.finally(...)` when the write
+              // settles naturally, and fires a force-release
+              // through the idempotent `persistRetainBox`
+              // otherwise. Default 60s, override via
+              // `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS`, `0`
+              // disables.
               registry.retainBinding(leaseModel);
               let persistRetainReleased = false;
               persistRetainBox.release = () => {
@@ -2903,10 +3000,30 @@ export async function handleCreateResponse(
                 persistRetainReleased = true;
                 registry.releaseBinding(leaseModel);
               };
+              const nonStreamingPersistMode = 'non-streaming' as const;
+              const nonStreamingHardTimeoutMs = getPostCommitPersistHardTimeoutMs();
+              const nonStreamingHardTimeoutHandle: ReturnType<typeof setTimeout> | null =
+                nonStreamingHardTimeoutMs > 0
+                  ? setTimeout(() => {
+                      if (persistRetainReleased) return;
+                      console.error(
+                        `[responses] post-commit persist HARD timeout (${nonStreamingHardTimeoutMs}ms, ` +
+                          `${nonStreamingPersistMode}): underlying store.store(...) has not settled; ` +
+                          `assuming wedged backend, force-releasing the iter-40 retain so the binding can ` +
+                          `be torn down. A subsequent previous_response_id continuation against the stale ` +
+                          `instance id will receive a 400 instance-mismatch — clean user-visible failure ` +
+                          `rather than unbounded memory leak.`,
+                      );
+                      persistRetainBox.release?.();
+                    }, nonStreamingHardTimeoutMs)
+                  : null;
               pendingPersistOuter = initiatePersist(store, record).finally(() => {
+                if (nonStreamingHardTimeoutHandle !== null) {
+                  clearTimeout(nonStreamingHardTimeoutHandle);
+                }
                 persistRetainBox.release?.();
               });
-              persistMode = 'non-streaming';
+              persistMode = nonStreamingPersistMode;
             }
           } catch (err) {
             handlerError = err instanceof Error ? err : new Error(String(err));
