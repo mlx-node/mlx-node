@@ -55,6 +55,14 @@ export interface BridgeStats {
   diagReleaseUnknownHandle: number;
   /** DIAG: release rejected by isPoolable (fake handle, MAP_* usage). */
   diagReleaseUnpoolable: number;
+  /** DIAG: total FUSED_DISPATCH_WITH_UNIFORM calls that reached the batch gate. */
+  diagBatchAttempt: number;
+  /** DIAG: dispatches successfully staged into DISPATCH_BATCH. */
+  diagBatchStaged: number;
+  /** DIAG: dispatches blocked from batching because deferredInfo was non-null. */
+  diagBatchDeferredBlock: number;
+  /** DIAG: dispatches where stageDispatchBatchRecord returned false. */
+  diagBatchStageRefused: number;
 }
 
 export interface GpuWorkerStats {
@@ -541,11 +549,22 @@ export function createBridgeStub(
   // as a single DISPATCH_BATCH RPC either when the batch fills up or when any
   // non-dispatch RPC is about to fire (via the flush-before-any-other-RPC
   // guard at the top of rpcCall).
+  //
+  // NOTE 2026-04-16: batching is currently only enabled on the main worker
+  // (child emnapi workers pass dispatchBatch=false because concurrent stubs
+  // would race on this shared SAB). The main worker's bridge is idle during
+  // decode (bridgeRPCs=1/tok measured), so in the current architecture this
+  // path accumulates zero hits in the hot path. Diagnostic counters below
+  // make that measurable.
   const batchActive = batchEnabled === true && dispatchBatchBuffer !== undefined;
   const batchU32 = batchActive ? new Uint32Array(dispatchBatchBuffer!) : null;
   const batchU8 = batchActive ? new Uint8Array(dispatchBatchBuffer!) : null;
   let batchCount = 0;
   let batchBytes = 0;
+  let diagBatchAttempt = 0;
+  let diagBatchStaged = 0;
+  let diagBatchDeferredBlock = 0;
+  let diagBatchStageRefused = 0;
 
   function flushDispatchBatchInner(): void {
     if (batchCount === 0) return;
@@ -1377,9 +1396,12 @@ export function createBridgeStub(
             // Batching path: only safe when the call has NO return value
             // to consume (no deferred buffer creation that expects a new
             // handle back from the gpu-worker).
+            diagBatchAttempt++;
             if (!deferredInfo && stageDispatchBatchRecord(RpcFn.FUSED_DISPATCH_WITH_UNIFORM)) {
-              // staged — no RPC this call
+              diagBatchStaged++;
             } else {
+              if (deferredInfo) diagBatchDeferredBlock++;
+              else diagBatchStageRefused++;
               // Staging refused (e.g. entryCount > MAX_DISPATCH_BATCH_ENTRIES
               // or uniformSize > MAX_DISPATCH_BATCH_UNIFORM, or a deferred
               // buffer create expects a return value). Flush any pending
@@ -1444,9 +1466,8 @@ export function createBridgeStub(
             // is zero so any concurrent batch staging sees uniformSize=0.
             cmdU32[CMD_OFFSET.UNIFORM_DATA_SIZE >>> 2] = 0;
             if (!stageDispatchBatchRecord(RpcFn.FUSED_FULL_DISPATCH)) {
-              // Staging refused (e.g. entryCount > MAX_DISPATCH_BATCH_ENTRIES;
-              // the fake bind-group path accepts up to 10 entries but batching
-              // caps at MAX_DISPATCH_BATCH_ENTRIES). Flush any pending batch
+              // Staging refused (e.g. entryCount > MAX_DISPATCH_BATCH_ENTRIES
+              // or buffer overflow). Flush any pending batch
               // first so the fallback dispatch does NOT reorder ahead of
               // earlier staged dispatches — the flush guard at the top of
               // rpcCall exempts FUSED_* opcodes, so we must flush by hand.
@@ -1828,6 +1849,10 @@ export function createBridgeStub(
       diagReleaseAll: dRelAll,
       diagReleaseUnknownHandle: dRelUnk,
       diagReleaseUnpoolable: dRelUnp,
+      diagBatchAttempt,
+      diagBatchStaged,
+      diagBatchDeferredBlock,
+      diagBatchStageRefused,
     };
   }
 
@@ -1842,6 +1867,10 @@ export function createBridgeStub(
     diagReleaseAll = 0;
     diagReleaseUnknownHandle = 0;
     diagReleaseUnpoolable = 0;
+    diagBatchAttempt = 0;
+    diagBatchStaged = 0;
+    diagBatchDeferredBlock = 0;
+    diagBatchStageRefused = 0;
     if (poolStatsArr) {
       for (let i = 0; i < POOL_STATS_SLOTS; i++) Atomics.store(poolStatsArr, i, 0);
     }

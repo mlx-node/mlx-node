@@ -174,12 +174,12 @@ export const MAX_RELEASE_BATCH = 64;
 //   offset 40: entries[entryCount] × 12 bytes (bufHandle, sizeLo, sizeHi)
 //   offset 40 + 12*entryCount: uniformData, padded up to next 4-byte boundary
 //
-// Max record size: 40 + 12*MAX_BATCH_ENTRIES + MAX_INLINE_UNIFORM = 40 + 96 + 256 = 392 bytes.
-// With a 16 KiB buffer that leaves room for ~40 records worst case. We cap
+// Max record size: 40 + 12*MAX_BATCH_ENTRIES + MAX_INLINE_UNIFORM = 40 + 120 + 256 = 416 bytes.
+// With a 16 KiB buffer that leaves room for ~39 records worst case. We cap
 // the batch at MAX_DISPATCH_BATCH=16 records for ordering-latency safety.
 export const DISPATCH_BATCH_BUFFER_SIZE = 16 * 1024;
 export const MAX_DISPATCH_BATCH = 16;
-export const MAX_DISPATCH_BATCH_ENTRIES = 8;
+export const MAX_DISPATCH_BATCH_ENTRIES = 10;
 export const MAX_DISPATCH_BATCH_UNIFORM = 256;
 // Fixed record header size (opcode + 9 u32 fields = 40 bytes).
 export const DISPATCH_BATCH_HEADER_BYTES = 40;

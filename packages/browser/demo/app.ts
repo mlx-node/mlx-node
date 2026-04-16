@@ -205,6 +205,10 @@ worker.onmessage = (e) => {
         diagReleaseAll?: number;
         diagReleaseUnknownHandle?: number;
         diagReleaseUnpoolable?: number;
+        diagBatchAttempt?: number;
+        diagBatchStaged?: number;
+        diagBatchDeferredBlock?: number;
+        diagBatchStageRefused?: number;
       };
       const n = Math.max(1, s.numTokens);
       const dpt = s.totalDispatches / n;
@@ -243,6 +247,13 @@ worker.onmessage = (e) => {
       );
       log(
         `[profile] diag: createAll=${s.diagCreateAll ?? 0} (mappedCopyDst=${s.diagCreateMappedCopyDst ?? 0}, mappedNoCopyDst=${s.diagCreateMappedNoCopyDst ?? 0}) | releaseAll=${s.diagReleaseAll ?? 0} (unknownHandle=${s.diagReleaseUnknownHandle ?? 0}, unpoolable=${s.diagReleaseUnpoolable ?? 0})`,
+      );
+      const ba = s.diagBatchAttempt ?? 0;
+      const bs = s.diagBatchStaged ?? 0;
+      const bdb = s.diagBatchDeferredBlock ?? 0;
+      const bsr = s.diagBatchStageRefused ?? 0;
+      log(
+        `[profile] batch: attempt=${ba} staged=${bs} deferredBlock=${bdb} stageRefused=${bsr}`,
       );
       break;
     }
@@ -436,10 +447,11 @@ const urlParams = new URLSearchParams(location.search);
 const packBf16 = urlParams.get('pack_bf16') !== '0'; // enabled by default, ?pack_bf16=0 to disable
 const sdpaFallback = urlParams.get('sdpa_fallback') === '1';
 const profile = urlParams.get('profile') === '1';
-// Phase 2: DISPATCH_BATCH gating. Default off because the batch-flush
-// ordering is still shaking out — enable explicitly via ?dispatch_batch=1
-// and verify decode parity + RPCs/tok reduction in the profile readout.
-const dispatchBatch = urlParams.get('dispatch_batch') === '1';
+// Phase 2: DISPATCH_BATCH gating. Enabled by default — batches up to 16
+// FUSED_*_DISPATCH RPCs into a single DISPATCH_BATCH RPC, cutting ~765
+// blocking Atomics.wait round-trips per token.  Disable with
+// ?dispatch_batch=0 for A/B comparison.
+const dispatchBatch = urlParams.get('dispatch_batch') !== '0';
 const compileMlp = urlParams.get('compile_mlp') === '1';
 const compileGdnPre = urlParams.get('compile_gdn_pre') === '1';
 const compileGdnPost = urlParams.get('compile_gdn_post') === '1';

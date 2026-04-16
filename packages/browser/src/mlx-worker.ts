@@ -224,14 +224,16 @@ async function handleInit(data: {
         // poll_instance() which is a no-op on WASM — the event loop never
         // runs, the callback never fires, infinite loop.
         const w = new Worker(new URL('./webgpu-worker.mjs', import.meta.url), { type: 'module' });
-        // Child workers share the dispatchBatchBuffer SAB but deliberately
-        // run with batching *disabled*. The bridge stub keeps batchCount as
-        // per-instance JS closure state, so two stubs writing to the same
-        // SAB at offset 0 would race and corrupt staged dispatches. The
-        // main mlx-worker is the only hot decode driver; child workers run
-        // background emnapi async work and can take the single-dispatch
-        // fallback path without measurable loss. (See codex review
-        // baz8oy567 P1.)
+        // Child workers share the dispatchBatchBuffer SAB. Batching stays
+        // *disabled* here for safety: multiple stubs writing to the same SAB
+        // offsets race even when the forward pass is serialized (pipeline
+        // creation, warmup, and buffer-map callbacks can fire on different
+        // worker threads concurrently). The child workers are where the
+        // decode hot path actually runs (main worker's bridgeRPCs=1 during
+        // decode — measured 2026-04-16), so batching on the main worker is
+        // effectively a no-op. Leaving the main worker's batching enabled
+        // anyway so future architecture changes that move work back to the
+        // main worker inherit the benefit automatically.
         w.postMessage({
           type: '__mlx_rpc_config',
           cmdBuffer,
@@ -523,6 +525,10 @@ function postProfileSnapshot(numTokens: number): void {
         diagReleaseAll: (bridgeStats as any).diagReleaseAll ?? 0,
         diagReleaseUnknownHandle: (bridgeStats as any).diagReleaseUnknownHandle ?? 0,
         diagReleaseUnpoolable: (bridgeStats as any).diagReleaseUnpoolable ?? 0,
+        diagBatchAttempt: (bridgeStats as any).diagBatchAttempt ?? 0,
+        diagBatchStaged: (bridgeStats as any).diagBatchStaged ?? 0,
+        diagBatchDeferredBlock: (bridgeStats as any).diagBatchDeferredBlock ?? 0,
+        diagBatchStageRefused: (bridgeStats as any).diagBatchStageRefused ?? 0,
       },
     });
   } catch (e) {
