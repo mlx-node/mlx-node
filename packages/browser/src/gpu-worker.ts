@@ -65,6 +65,38 @@ const BUFFER_POOL_CAP_PER_KEY = 32;
 const bufferPool = new Map<string, number[]>();
 let bufferPoolHitCount = 0;
 let bufferPoolMissCount = 0;
+
+// Task C: single-entry LRU bind group cache per pipeline.
+//
+// FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM / DISPATCH_BATCH create a
+// fresh GPUBindGroup per dispatch (~80+/tok on Qwen3.5-0.8B decode). A decode
+// step reuses the same pipelines against (mostly) the same weight handles; the
+// uniform buffer handle recycles through the buffer pool. When all bound
+// handles, sizes, and the layout are unchanged, the prior GPUBindGroup is
+// still valid and can be reused.
+//
+// Safety rests on one invariant: gpu-worker handles are monotonic
+// (addHandle = nextHandle++) and never recycled. A pool release keeps
+// handles[h] alive pointing at the same GPUBuffer, so identical (handle,
+// sizeLo, sizeHi) triples across two dispatches are guaranteed to reference
+// the same GPUBuffer with the same binding geometry. Contents may differ
+// (writeBuffer re-stamps the uniform bytes per dispatch) but a bind group
+// is a binding *descriptor*, not a content snapshot.
+//
+// One slot per pipeline: simplest correct policy with no eviction bookkeeping.
+// A pipeline that alternates between two bind-group signatures (e.g. two
+// distinct weight sets in the same step) will thrash on this one slot; that's
+// the LRU tradeoff, and the single-pipeline hot path (matmul vs compiled vs
+// attention) dominates the measurable work.
+interface BindGroupCacheEntry {
+  layoutHandle: number;
+  entryCount: number;
+  sig: string;
+  bindGroup: GPUBindGroup;
+}
+const bindGroupCache = new Map<number, BindGroupCacheEntry>();
+let bindGroupCacheHits = 0;
+let bindGroupCacheMisses = 0;
 // WebGPU usage flags — keep in sync with webgpu-bridge-stub.ts.
 const WGPU_USAGE_MAP_READ = 0x0001;
 const WGPU_USAGE_MAP_WRITE = 0x0002;
@@ -635,7 +667,6 @@ function dispatchFusedRecord(
   uniformUsage: number,
 ): number {
   const layout = handles[layoutHandle] as GPUBindGroupLayout;
-  const entries: GPUBindGroupEntry[] = [];
   let newBufferHandle = 0;
 
   // Stage 1: optional uniform write (only for FUSED_DISPATCH_WITH_UNIFORM).
@@ -683,21 +714,52 @@ function dispatchFusedRecord(
     }
   }
 
-  // Stage 2: build bind group entries from the inline entry array.
-  let eIdx = entrySrcBase;
-  for (let i = 0; i < entryCount; i++) {
-    const buffer = handles[entrySrc[eIdx]] as GPUBuffer;
-    const sizeLo = entrySrc[eIdx + 1];
-    const sizeHi = entrySrc[eIdx + 2];
-    eIdx += 3;
-    const size = sizeLo + sizeHi * 0x100000000;
-    const resource: GPUBufferBinding = { buffer, offset: 0 };
-    if (size !== 0 && size < 2 ** 53) resource.size = size;
-    entries.push({ binding: i, resource });
+  // Stage 2: probe the bind group cache. We compute sig *after* Stage 1 so the
+  // deferred-uniform handle patch at entries[uniformEntryIdx] is included —
+  // otherwise every pool-hit dispatch would spuriously cache-miss because sig
+  // would see "0" while the post-patch handle is the real pooled one.
+  //
+  // sig format: `${h0}:${sl0}:${sh0};${h1}:${sl1}:${sh1};...`
+  // Packed as a string because Map keys on string identity are fast in V8 and
+  // the whole concat is cheaper than allocating a per-entry descriptor array.
+  let sig = '';
+  {
+    let s = entrySrcBase;
+    for (let i = 0; i < entryCount; i++) {
+      sig += entrySrc[s] + ':' + entrySrc[s + 1] + ':' + entrySrc[s + 2] + ';';
+      s += 3;
+    }
+  }
+
+  const cached = bindGroupCache.get(pipelineHandle);
+  let bindGroup: GPUBindGroup;
+  if (
+    cached !== undefined &&
+    cached.layoutHandle === layoutHandle &&
+    cached.entryCount === entryCount &&
+    cached.sig === sig
+  ) {
+    bindGroup = cached.bindGroup;
+    bindGroupCacheHits++;
+  } else {
+    const entries: GPUBindGroupEntry[] = [];
+    let eIdx = entrySrcBase;
+    for (let i = 0; i < entryCount; i++) {
+      const buffer = handles[entrySrc[eIdx]] as GPUBuffer;
+      const sizeLo = entrySrc[eIdx + 1];
+      const sizeHi = entrySrc[eIdx + 2];
+      eIdx += 3;
+      const size = sizeLo + sizeHi * 0x100000000;
+      const resource: GPUBufferBinding = { buffer, offset: 0 };
+      if (size !== 0 && size < 2 ** 53) resource.size = size;
+      entries.push({ binding: i, resource });
+    }
+    bindGroup = device.createBindGroup({ layout, entries });
+    bindGroupCache.set(pipelineHandle, { layoutHandle, entryCount, sig, bindGroup });
+    bindGroupCacheMisses++;
   }
 
   // Stage 3: issue the dispatch on the cached compute pass.
-  const bindGroup = device.createBindGroup({ layout, entries });
   const pass = handles[passHandle] as GPUComputePassEncoder;
   pass.setPipeline(handles[pipelineHandle] as GPUComputePipeline);
   pass.setBindGroup(0, bindGroup);
@@ -1752,6 +1814,12 @@ async function processCommand(fnId: number): Promise<void> {
 
     case RpcFn.PIPELINE_RELEASE: {
       const handle = arg0();
+      // Task C: drop any cached bind group keyed by this pipeline before the
+      // pipeline itself is released. The cached GPUBindGroup has its own
+      // reference to the pipeline's layout (webgpu keeps that alive), so
+      // leaving the entry would not crash, but it would leak one slot per
+      // released pipeline until the cache is cleared wholesale.
+      bindGroupCache.delete(handle);
       releaseHandle(handle);
       setResult(0);
       break;
@@ -2057,8 +2125,12 @@ async function processCommand(fnId: number): Promise<void> {
       // a real RpcFn opcode (max opcode is 99 = GET_STATS).
       const POOL_HITS_SLOT = 100;
       const POOL_MISSES_SLOT = 101;
+      const BG_CACHE_HITS_SLOT = 102;
+      const BG_CACHE_MISSES_SLOT = 103;
       gpuRpcCounts[POOL_HITS_SLOT] = bufferPoolHitCount;
       gpuRpcCounts[POOL_MISSES_SLOT] = bufferPoolMissCount;
+      gpuRpcCounts[BG_CACHE_HITS_SLOT] = bindGroupCacheHits;
+      gpuRpcCounts[BG_CACHE_MISSES_SLOT] = bindGroupCacheMisses;
       const cbBase = CMD_OFFSET.CALLBACK_COUNT >>> 2;
       for (let i = 0; i < STATS_CALLBACK_SLOTS; i++) {
         cmdU32[cbBase + i] = gpuRpcCounts[i];
@@ -2077,6 +2149,8 @@ async function processCommand(fnId: number): Promise<void> {
         gpuTotalRpcs = 0;
         bufferPoolHitCount = 0;
         bufferPoolMissCount = 0;
+        bindGroupCacheHits = 0;
+        bindGroupCacheMisses = 0;
       }
       break;
     }

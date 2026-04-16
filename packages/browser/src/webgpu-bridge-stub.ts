@@ -75,6 +75,10 @@ export interface GpuWorkerStats {
   gpuPoolHits: number;
   /** Cumulative GPU-worker-side buffer pool misses since its last reset. */
   gpuPoolMisses: number;
+  /** Task C: bind-group cache hits (reused a cached GPUBindGroup for a dispatch). */
+  bindGroupCacheHits: number;
+  /** Task C: bind-group cache misses (created a fresh GPUBindGroup for a dispatch). */
+  bindGroupCacheMisses: number;
 }
 
 export interface BridgeStub {
@@ -2137,13 +2141,18 @@ export function createBridgeStub(
       if (v > 0) byFn[STATS_CALLBACK_SLOTS + STATS_INLINE_SLOTS + i] = v;
     }
     // Pool hit/miss counters smuggled by the gpu-worker into reserved slots
-    // 100 and 101 (max real RpcFn opcode is 99). Remove them from byFn so
-    // they don't render as fake opcodes in the histogram.
+    // 100 and 101 (max real RpcFn opcode is 99). Task C also smuggles bind-
+    // group cache hits/misses into 102/103. Remove them from byFn so they
+    // don't render as fake opcodes in the histogram.
     const gpuPoolHits = byFn[100] ?? 0;
     const gpuPoolMisses = byFn[101] ?? 0;
+    const bindGroupCacheHits = byFn[102] ?? 0;
+    const bindGroupCacheMisses = byFn[103] ?? 0;
     delete byFn[100];
     delete byFn[101];
-    return { totalRpcs, byFn, gpuPoolHits, gpuPoolMisses };
+    delete byFn[102];
+    delete byFn[103];
+    return { totalRpcs, byFn, gpuPoolHits, gpuPoolMisses, bindGroupCacheHits, bindGroupCacheMisses };
   }
 
   return {

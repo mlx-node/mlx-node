@@ -199,6 +199,8 @@ worker.onmessage = (e) => {
         poolMisses?: number;
         gpuPoolHits?: number;
         gpuPoolMisses?: number;
+        bindGroupCacheHits?: number;
+        bindGroupCacheMisses?: number;
         diagCreateAll?: number;
         diagCreateMappedCopyDst?: number;
         diagCreateMappedNoCopyDst?: number;
@@ -245,6 +247,15 @@ worker.onmessage = (e) => {
       log(
         `[profile] gpu-pool: hits=${gph} (${(gph / n).toFixed(1)}/tok) misses=${gpm} (${(gpm / n).toFixed(1)}/tok) hitRate=${gphRate}%`,
       );
+      if (s.bindGroupCacheHits != null && s.bindGroupCacheMisses != null) {
+        const bgh = s.bindGroupCacheHits;
+        const bgm = s.bindGroupCacheMisses;
+        const bgt = bgh + bgm;
+        const bghRate = bgt > 0 ? ((bgh / bgt) * 100).toFixed(1) : '0.0';
+        log(
+          `[profile] bg-cache: hits=${bgh} (${(bgh / n).toFixed(1)}/tok) misses=${bgm} (${(bgm / n).toFixed(1)}/tok) hitRate=${bghRate}%`,
+        );
+      }
       log(
         `[profile] diag: createAll=${s.diagCreateAll ?? 0} (mappedCopyDst=${s.diagCreateMappedCopyDst ?? 0}, mappedNoCopyDst=${s.diagCreateMappedNoCopyDst ?? 0}) | releaseAll=${s.diagReleaseAll ?? 0} (unknownHandle=${s.diagReleaseUnknownHandle ?? 0}, unpoolable=${s.diagReleaseUnpoolable ?? 0})`,
       );
