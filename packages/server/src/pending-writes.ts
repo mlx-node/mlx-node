@@ -124,6 +124,24 @@ export class PendingResponseWrites {
     return this.pending.get(id);
   }
 
+  /**
+   * Explicitly remove the pending-write entry for `id` without waiting
+   * for the promise to settle. Used by the hard-timeout breaker in
+   * responses.ts when a wedged store.store(...) would otherwise pin the
+   * tracker entry (and its promise closure) forever.
+   *
+   * The raw write promise is unaffected — it continues running in the
+   * background but nobody references it through this tracker anymore.
+   * If the promise eventually settles, its own `.finally(...)` cleanup
+   * above becomes a no-op because `this.pending.get(id) === writePromise`
+   * is false (the entry was already evicted or replaced).
+   *
+   * Returns true if an entry was evicted, false if `id` was not tracked.
+   */
+  evict(id: string): boolean {
+    return this.pending.delete(id);
+  }
+
   /** Number of writes currently in flight. Primarily for tests. */
   get size(): number {
     return this.pending.size;

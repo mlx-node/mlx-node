@@ -4656,6 +4656,182 @@ describe('createHandler', () => {
       expect(idAfterSpuriousRelease).not.toBe(idBefore);
     }, 5000);
 
+    it('iter-49: PendingResponseWrites.evict removes entry without awaiting settlement', async () => {
+      // Iter-48 bounded tombstone state via per-model refcount, but
+      // the hard-timeout breaker in responses.ts only retired the
+      // instance id and released the binding retain — it did NOT
+      // free the persist promise or the pending-write tracker
+      // entry. Under a truly wedged `store.store(...)`:
+      //
+      //   - `initiatePersist(store, record)` registers
+      //     `writePromise` in
+      //     `getPendingWritesFor(store).track(record.id, writePromise)`.
+      //   - `PendingResponseWrites` only removes the entry when the
+      //     promise settles (via `.finally(...)` inside `track`).
+      //   - If the promise NEVER settles, the tracker entry lives
+      //     forever. N wedged requests -> N permanent tracker
+      //     entries -> O(N) memory growth. Future continuations
+      //     hitting `awaitPending(id)` on those ids would hang.
+      //
+      // Iter-49 adds `PendingResponseWrites.evict(id)` which
+      // removes the entry without waiting for settlement. This
+      // focused unit test pins the primitive before the handler-
+      // level regression below drives it end-to-end.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+      let resolveFn: (() => void) | undefined;
+      const neverResolves = new Promise<void>((resolve) => {
+        resolveFn = resolve;
+      });
+      tracker.track('resp_1', neverResolves);
+      expect(tracker.size).toBe(1);
+      const evicted = tracker.evict('resp_1');
+      expect(evicted).toBe(true);
+      expect(tracker.size).toBe(0);
+      // Idempotent: a no-op second evict returns false.
+      expect(tracker.evict('resp_1')).toBe(false);
+      // Resolving the original promise after eviction is a no-op
+      // and does not re-add the entry. The `.finally(...)` cleanup
+      // inside `track` short-circuits because
+      // `this.pending.get(id) === writePromise` is false after
+      // eviction.
+      expect(resolveFn).toBeDefined();
+      resolveFn!();
+      await Promise.resolve();
+      await new Promise((r) => setImmediate(r));
+      expect(tracker.size).toBe(0);
+    });
+
+    it('iter-49: hard-timeout breaker evicts pending-write tracker so wedged persists do not accumulate O(N) entries', async () => {
+      // Codex's iter-48 review flagged the leak described in the
+      // unit test above — under a wedged `store.store(...)` the
+      // pending-write tracker's settlement-only cleanup left one
+      // entry per hard-timed-out request, growing O(N) with
+      // traffic. Worse, future `previous_response_id`
+      // continuations hitting `awaitPending(id)` on those ids
+      // would hang forever awaiting a promise that never settles.
+      //
+      // Iter-49 fix: the hard-timeout breaker calls
+      // `getPendingWritesFor(store).evict(record.id)` BEFORE
+      // releasing the binding retain. The raw store promise keeps
+      // running in the background but the tracker no longer holds
+      // a reference, so the closure chain is reclaimable. Future
+      // continuations for hard-timed-out responses now fall
+      // through to `getChain()` directly and 404 cleanly instead
+      // of hanging on `awaitPending`.
+      //
+      // Shape:
+      //   - `store.store(...)` returns a promise that NEVER
+      //     settles (truly wedged backend).
+      //   - Hard-timeout override is set to `'50'` locally; file-
+      //     wide default is `'0'` (disabled).
+      //   - Drive five requests through the non-streaming handler
+      //     end-to-end. Each handler call completes around the
+      //     soft timeout (~50ms); the hard timer fires shortly
+      //     after and evicts the tracker entry for that response.
+      //   - Sleep long enough for every hard timer to fire.
+      //   - Assert: `getPendingWritesFor(mockStore).size === 0`
+      //     — every tracker entry has been evicted. Under iter-48
+      //     this would be 5 (one per wedged write) and growing
+      //     linearly with traffic.
+      const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+      process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
+      try {
+        const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
+        const mockStore = {
+          // Promise that NEVER resolves — wedged SQLite writer.
+          store: vi.fn().mockImplementation(() => new Promise<void>(() => {})),
+          getChain: vi.fn().mockImplementation((id: string) => {
+            return Promise.reject(new Error(`Response not found: ${id}`));
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const chatSessionStart = vi.fn().mockResolvedValue(makeChatResult({ text: 'wedged-eviction reply' }));
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+          chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        const registry = new ModelRegistry();
+        const MODEL_NAME = 'iter-49-wedged-eviction';
+        registry.register(MODEL_NAME, mockModel);
+
+        expect(process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS).toBe('50');
+
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => {
+          unhandled.push(reason);
+        };
+        process.on('unhandledRejection', onUnhandled);
+
+        const handler = createHandler(registry, { store: mockStore as any });
+
+        const N = 5;
+        for (let i = 0; i < N; i += 1) {
+          const req = createMockReq('POST', '/v1/responses', {
+            model: MODEL_NAME,
+            input: `hello wedged-eviction world ${i}`,
+            stream: false,
+          });
+          const { res, waitForEnd, getBody } = createMockRes();
+          await handler(req, res);
+          await waitForEnd();
+          const body = JSON.parse(getBody());
+          expect(body.status).toBe('completed');
+        }
+
+        // The store was called exactly N times — every request
+        // synchronously populated a tracker entry under
+        // `record.id` before the mutex released (iter-36/48
+        // invariant via `initiatePersist`). We can't assert
+        // `size === N` between requests because the hard timer
+        // is 50ms and the soft-timeout detach path inside the
+        // handler already elapses ~50ms per request, so by the
+        // time we reach this point some earlier entries may have
+        // already been evicted by their hard timers. The
+        // observable contract we care about is the FINAL steady
+        // state: after every hard timer has fired, the tracker
+        // has drained.
+        expect(mockStore.store).toHaveBeenCalledTimes(N);
+
+        // Wait for any pending hard timers to fire on every
+        // wedged persist. 200ms is enough margin for every 50ms
+        // timer to elapse plus a macrotask drain so the
+        // `setTimeout` callback runs.
+        await new Promise((r) => setTimeout(r, 200));
+        await new Promise((r) => setImmediate(r));
+
+        // Primary iter-49 invariant: every hard-timeout breaker
+        // evicted its pending-write tracker entry. The tracker
+        // has drained to zero even though not a single
+        // `store.store(...)` promise has settled — the raw
+        // promises are still hanging in the background but no
+        // longer pinned through the tracker. Under iter-48 this
+        // would be N (5) and growing linearly with future wedged
+        // requests.
+        expect(getPendingWritesFor(mockStore).size).toBe(0);
+
+        // Sanity: the server continued responding normally
+        // throughout. Every request received a completed JSON
+        // response (asserted above per-iteration). The store was
+        // called exactly N times — once per request — and no
+        // unhandled rejections escaped the breaker path.
+        expect(mockStore.store).toHaveBeenCalledTimes(N);
+        expect(unhandled).toHaveLength(0);
+        process.off('unhandledRejection', onUnhandled);
+      } finally {
+        if (originalHard === undefined) {
+          delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+        } else {
+          process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
+        }
+      }
+    }, 10000);
+
     it('iter-45/46: MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS parsing: empty/whitespace -> default, "0" -> disabled, valid -> parsed', async () => {
       // Codex's iter-44 review flagged a MEDIUM finding: the
       // original parser accepted any finite >= 0 value, so

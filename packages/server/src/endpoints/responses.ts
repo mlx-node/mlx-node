@@ -3020,6 +3020,20 @@ export async function handleCreateResponse(
                           `hot-swap to a DIFFERENT model object will mint a fresh id and the stale chain ` +
                           `will correctly fail with 400 instance-mismatch.`,
                       );
+                      // Iter-49: evict the pending-write tracker
+                      // entry for this response id so a wedged
+                      // store.store(...) does not pin one promise
+                      // closure + tracker entry per hard-timed-out
+                      // request. The raw write promise keeps
+                      // running in the background but nobody
+                      // references it through the tracker anymore.
+                      // If the store later unwedges and the row
+                      // lands, future continuations read it via
+                      // getChain() directly — they no longer need
+                      // awaitPending because the pending-write
+                      // race window closed when the hard-timeout
+                      // fired.
+                      getPendingWritesFor(store).evict(record.id);
                       // Iter-45: retire the id FIRST (binding is
                       // still alive here — retirement reads the
                       // live id) then drop the retain, which may
@@ -3182,6 +3196,20 @@ export async function handleCreateResponse(
                           `hot-swap to a DIFFERENT model object will mint a fresh id and the stale chain ` +
                           `will correctly fail with 400 instance-mismatch.`,
                       );
+                      // Iter-49: evict the pending-write tracker
+                      // entry for this response id so a wedged
+                      // store.store(...) does not pin one promise
+                      // closure + tracker entry per hard-timed-out
+                      // request. The raw write promise keeps
+                      // running in the background but nobody
+                      // references it through the tracker anymore.
+                      // If the store later unwedges and the row
+                      // lands, future continuations read it via
+                      // getChain() directly — they no longer need
+                      // awaitPending because the pending-write
+                      // race window closed when the hard-timeout
+                      // fired.
+                      getPendingWritesFor(store).evict(record.id);
                       // Iter-45: retire the id FIRST (binding is
                       // still alive here — retirement reads the
                       // live id) then drop the retain, which may
