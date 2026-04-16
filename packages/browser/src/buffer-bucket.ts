@@ -24,17 +24,29 @@
  * Correctness: pure function, no side effects. Always returns size >= input,
  * always a multiple of 4 (WebGPU minimum alignment). For size <= 0 returns 0
  * — callers already guard against pooling empty buffers.
+ *
+ * 64-bit-safety: buffers CAN exceed 2^31 bytes (KV caches, large weight
+ * tensors, > 4 GiB allocations). The large-size branch uses non-bitwise
+ * arithmetic (iterative doubling starting at 8192) so it is correct for all
+ * finite JS integer sizes up to Number.MAX_SAFE_INTEGER (2^53). Bitwise
+ * operators must NOT be used on values that may exceed 2^31, since JS
+ * coerces them to int32 and silently truncates.
  */
 export function roundUpBucket(size: number): number {
   if (size <= 0) return 0;
   if (size <= 4096) {
-    // Round up to next multiple of 256.
+    // Round up to next multiple of 256. `(size + 255) & ~255` is safe here
+    // because size <= 4096 is well within int32 range.
     return (size + 255) & ~255;
   }
-  // Round up to next power of two. For 32-bit sizes this is safe; WebGPU
-  // buffer size limits bound us well below 2^31. Math.clz32 returns the
-  // leading-zero count of size-1 when viewed as u32.
-  const v = size - 1;
-  const shift = 32 - Math.clz32(v);
-  return 1 << shift;
+  // Round up to next power of two via iterative doubling. 4096 is the
+  // small-branch ceiling, so the first large bucket is 8192. Max ~41
+  // iterations to reach 2^53 — negligible cost vs. a GPU RPC. Uses plain
+  // multiplication to avoid the 32-bit overflow that `1 << shift` would
+  // incur for shifts >= 31 (e.g., a 2 GiB buffer would wrap to 1 byte).
+  let bucket = 8192;
+  while (bucket < size) {
+    bucket *= 2;
+  }
+  return bucket;
 }

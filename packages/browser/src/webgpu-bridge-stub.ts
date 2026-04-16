@@ -984,8 +984,14 @@ export function createBridgeStub(
       }
 
       // Non-mapped create: try pool first, else RPC with eager cache populate.
-      const usage = new DataView(h.buffer, h.byteOffset, h.byteLength).getUint32(descPtr + 8, true);
-      const size = new DataView(h.buffer, h.byteOffset, h.byteLength).getUint32(descPtr + 16, true);
+      // Read the full 64-bit size (sizeLo + sizeHi) — truncating to 32 bits
+      // would send a wrong bucketSize for buffers > 4 GiB (e.g., large KV
+      // caches), breaking the invariant that physical >= bucketSize.
+      const view2 = new DataView(h.buffer, h.byteOffset, h.byteLength);
+      const usage = view2.getUint32(descPtr + 8, true);
+      const sizeLo2 = view2.getUint32(descPtr + 16, true);
+      const sizeHi2 = view2.getUint32(descPtr + 20, true);
+      const size = sizeLo2 + sizeHi2 * 0x100000000;
       const mappedAtCreation = h[descPtr + 24] !== 0;
 
       if (!mappedAtCreation && size > 0) {
