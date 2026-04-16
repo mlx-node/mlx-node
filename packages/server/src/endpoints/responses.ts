@@ -61,9 +61,16 @@ async function handleNonStreaming(
 ): Promise<void> {
   const response = buildResponseObject(result, req, responseId, previousResponseId);
 
-  // Persist only the new input messages (not the full expanded conversation)
+  // Persist only the new input messages (not the full expanded conversation).
+  // Persistence is best-effort: the turn is already committed in the
+  // session's KV cache, so a store failure must not prevent the client
+  // from receiving the response (with its responseId for hot-resume).
   if (store && req.store !== false) {
-    await persistResponse(store, response, newInputMessages, previousResponseId, modelInstanceId);
+    try {
+      await persistResponse(store, response, newInputMessages, previousResponseId, modelInstanceId);
+    } catch (err) {
+      console.error('[responses] post-commit persistence failed, response will still be sent:', err);
+    }
   }
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -725,8 +732,16 @@ async function handleStreamingNative(
       }
     }
 
+    // Persistence is best-effort: the turn is already committed in the
+    // session's KV cache, so a store failure must not prevent the client
+    // from receiving the terminal `response.completed` event (with its
+    // responseId for hot-resume).
     if (store && req.store !== false) {
-      await persistResponse(store, terminal, newInputMessages, previousResponseId, modelInstanceId);
+      try {
+        await persistResponse(store, terminal, newInputMessages, previousResponseId, modelInstanceId);
+      } catch (err) {
+        console.error('[responses] post-commit persistence failed (streaming), terminal will still be emitted:', err);
+      }
     }
     writeSSEEvent(res, 'response.completed', { response: terminal });
     endSSE(res);
@@ -2242,9 +2257,14 @@ export async function handleCreateResponse(
           sessionReg.adopt(responseId, session, requestedInstructions);
         }
 
-        // Re-surface the handler error AFTER adopt so the session
-        // is not stranded.
-        if (handlerError) {
+        // Only rethrow handler errors from uncommitted turns.
+        // Post-commit persistence failures are now caught inside the
+        // handlers (handleNonStreaming / handleStreamingNative) and
+        // demoted to log-only, so handlerError on a committed turn
+        // would be a genuine handler crash where the response is
+        // already on the wire — rethrowing would send a duplicate
+        // error. Guard on both committed and headersSent.
+        if (handlerError && !committed) {
           throw handlerError;
         }
       } catch (err) {

@@ -5063,11 +5063,12 @@ describe('createHandler', () => {
       expect(mockModel.chatSessionStart).not.toHaveBeenCalled();
     });
 
-    it('post-commit store failure still adopts session', async () => {
-      // Iter-29 finding 3: when the handler commits the session
-      // but persistence (store.store()) then throws, the session
-      // must still be adopted into the registry so it is
-      // reachable for hot-resume on the next request.
+    it('post-commit store failure still returns committed response (non-streaming)', async () => {
+      // When the handler commits the session but persistence
+      // (store.store()) then throws, the client must still receive
+      // a 200 JSON response with the committed payload and its
+      // responseId. The session must also be adopted into the
+      // registry for hot-resume.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
       registry.register('test-model', mockModel);
@@ -5083,6 +5084,62 @@ describe('createHandler', () => {
         model: 'test-model',
         input: 'trigger a committed turn',
       });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      // The store was called and threw.
+      expect(mockStore.store).toHaveBeenCalledTimes(1);
+
+      // The client must receive a 200 with a valid JSON response.
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.id).toBeDefined();
+      expect(typeof parsed.id).toBe('string');
+      expect(parsed.status).toBe('completed');
+
+      // The session registry must have adopted the session.
+      const sessionReg = registry.getSessionRegistry('test-model');
+      expect(sessionReg).toBeDefined();
+      expect(sessionReg!.size).toBe(1);
+    });
+
+    it('streaming post-commit store failure still emits response.completed', async () => {
+      // Same scenario as the non-streaming variant but with
+      // `stream: true`. The SSE stream must contain a
+      // `response.completed` event (not an error event) and the
+      // terminal payload must carry the correct responseId.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { done: false, text: 'hi' },
+        {
+          done: true,
+          text: 'hi',
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 2,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: 'hi',
+        },
+      ];
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('test-model', mockModel);
+
+      const mockStore = {
+        store: vi.fn().mockRejectedValueOnce(new Error('simulated store failure')),
+        getChain: vi.fn().mockResolvedValue([]),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'trigger a streaming committed turn',
+        stream: true,
+      });
       const { res, getBody, waitForEnd } = createMockRes();
 
       await handler(req, res);
@@ -5091,36 +5148,27 @@ describe('createHandler', () => {
       // The store was called and threw.
       expect(mockStore.store).toHaveBeenCalledTimes(1);
 
-      // Despite the store failure, the response body should
-      // contain the response id (the handler's outer catch may
-      // have emitted an error, but the key invariant is the
-      // session registry).
-      const bodyText = getBody();
-      // Extract the response id from the body if parseable.
-      let responseId: string | null = null;
-      try {
-        const parsed = JSON.parse(bodyText);
-        responseId = parsed.id ?? null;
-      } catch {
-        // If the body is not JSON (e.g., the error handler wrote
-        // something else), we still check the registry below.
-      }
+      const body = getBody();
 
-      // The session registry must have adopted the session under
-      // the response id allocated for this turn. Since we cannot
-      // easily predict the exact id, check that the registry has
-      // exactly one entry (size === 1).
+      // Must NOT contain an error event.
+      expect(body).not.toContain('event: error');
+
+      // Must contain a response.completed event.
+      expect(body).toContain('event: response.completed');
+
+      // Extract the response.completed payload and verify it has a
+      // responseId and completed status.
+      const completedMatch = body.match(/event: response\.completed\ndata: (.+)\n/);
+      expect(completedMatch).not.toBeNull();
+      const terminal = JSON.parse(completedMatch![1]!);
+      expect(terminal.response.id).toBeDefined();
+      expect(typeof terminal.response.id).toBe('string');
+      expect(terminal.response.status).toBe('completed');
+
+      // The session registry must have adopted the session.
       const sessionReg = registry.getSessionRegistry('test-model');
       expect(sessionReg).toBeDefined();
       expect(sessionReg!.size).toBe(1);
-
-      // If we got a response id, verify it is the one in the registry.
-      if (responseId) {
-        const session = sessionReg!.getOrCreate(responseId, null);
-        // getOrCreate on a hit returns the session and clears the
-        // entry, so after the call size should be 0.
-        expect(session).toBeDefined();
-      }
     });
   });
 });
