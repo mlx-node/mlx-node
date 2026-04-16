@@ -156,6 +156,21 @@ export class ModelRegistry {
    * automatically, which is the desired behavior (no registrar can
    * ever re-observe the tombstone without re-registering the same
    * live object).
+   *
+   * Iter-46 (codex's iter-45 HIGH finding): tombstone lifetime is
+   * now scoped to the PENDING persist that installed it, not to
+   * "forever until the next matching register inherits it".
+   * `retireInstanceIdForForceRelease` returns the id it retired,
+   * and the responses endpoint captures it in the same closure
+   * that owns the breaker timer. The persist's `.finally(...)`
+   * then calls `clearTombstoneIfMatches(model, retiredId)` so
+   * that when a slow-but-eventual write eventually settles
+   * (fulfills or rejects) the tombstone is dropped and any
+   * subsequent re-registration correctly mints a fresh id. This
+   * closes the iter-45 hole where a past hard-timeout event
+   * permanently re-enabled id inheritance for a model object
+   * across unrelated later lifecycles — reopening stale-chain
+   * replay across what should be logically dead bindings.
    */
   private readonly retiredInstanceIds = new WeakMap<ServableModel, number>();
 
@@ -487,16 +502,47 @@ export class ModelRegistry {
    * minted and the stale stored record is correctly rejected with
    * 400 instance-mismatch.
    *
-   * No-op if the binding has already fully torn down (the caller
-   * raced the natural teardown path and the tombstone is moot) or
-   * if the model has no current instance id assignment. Safe to
-   * call repeatedly — the tombstone simply overwrites itself with
-   * the same value.
+   * Iter-46: returns the retired id so the caller (the breaker
+   * closure in `endpoints/responses.ts`) can capture it and,
+   * inside the SAME persist's `.finally(...)`, call
+   * `clearTombstoneIfMatches(model, retiredId)` to scope the
+   * tombstone's lifetime to the specific wedged persist that
+   * installed it. Returns `undefined` when the binding has
+   * already fully torn down (caller raced the natural teardown
+   * path and the tombstone is moot) or the model has no current
+   * instance id assignment — nothing was retired, so there is
+   * nothing to clean up later.
+   *
+   * Safe to call repeatedly — the tombstone simply overwrites
+   * itself with the same value.
    */
-  retireInstanceIdForForceRelease(model: ServableModel): void {
+  retireInstanceIdForForceRelease(model: ServableModel): number | undefined {
     const id = this.instanceIds.get(model);
-    if (id === undefined) return;
+    if (id === undefined) return undefined;
     this.retiredInstanceIds.set(model, id);
+    return id;
+  }
+
+  /**
+   * Iter-46 tombstone cleanup. Called from the post-commit
+   * persist's `.finally(...)` to drop the retired id IFF it still
+   * matches the value this persist installed via
+   * `retireInstanceIdForForceRelease`. Scoping tombstone lifetime
+   * to the pending persist prevents a hard-timeout event from
+   * permanently altering the model object's future lifecycle —
+   * once the late persist settles, the logical binding is dead
+   * and subsequent re-registrations MUST mint a fresh id, matching
+   * the pre-iter-45 teardown semantics for non-wedged cases. The
+   * `expectedId` guard is defense in depth: if a second breaker
+   * fires in between and reinstalls a different id, this cleanup
+   * is a no-op and the newer tombstone stays in place for its
+   * own settlement path.
+   */
+  clearTombstoneIfMatches(model: ServableModel, expectedId: number): void {
+    const current = this.retiredInstanceIds.get(model);
+    if (current === expectedId) {
+      this.retiredInstanceIds.delete(model);
+    }
   }
 
   /**

@@ -4278,7 +4278,160 @@ describe('createHandler', () => {
       }
     }, 5000);
 
-    it('iter-45: MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS parsing: empty string -> default, "0" -> disabled, valid -> parsed', async () => {
+    it('iter-46: tombstone is cleared when the slow-but-eventual persist eventually settles', async () => {
+      // Codex's iter-45 review flagged a HIGH finding: the
+      // iter-45 tombstone is installed by the breaker but
+      // removed ONLY when a future `register()` inherits it.
+      // There is no settlement-path cleanup. A truly pathological
+      // case is the `SLOW-BUT-EVENTUAL` persist: the hard timer
+      // fires and installs the tombstone, but the underlying
+      // `store.store(...)` still fulfils (or rejects) some time
+      // later. Under iter-45 the tombstone then stays in the
+      // `WeakMap` indefinitely — so a LATER `unregister()` +
+      // `register(sameModel)` that happens long after the late
+      // write has already landed (i.e. an unrelated subsequent
+      // lifecycle) inherits the old id instead of minting fresh.
+      // That reopens stale-chain replay across what should be
+      // logically dead bindings: reload/rollback safety now
+      // depends on whether a past hard-timeout event ever
+      // occurred.
+      //
+      // Iter-46 fix: scope the tombstone's lifetime to the
+      // PENDING persist that installed it. The breaker captures
+      // the retired id returned by
+      // `retireInstanceIdForForceRelease` in a local variable,
+      // and the persist's `.finally(...)` drops the tombstone
+      // via `registry.clearTombstoneIfMatches(model, retiredId)`
+      // — with a defense-in-depth guard so a second breaker
+      // event's tombstone is not clobbered by this settlement.
+      //
+      // Shape (Deferred<void> pattern):
+      //   - `store.store(...)` returns a promise we control —
+      //     a `Deferred<void>` that stays pending until the
+      //     test resolves it.
+      //   - Hard-timeout override is set to 100ms locally;
+      //     file-wide default is `'0'`.
+      //   - Register model, dispatch request, wait for handler
+      //     to return.
+      //   - Sleep ~150ms so the hard timer fires and installs
+      //     the tombstone.
+      //   - Resolve the Deferred — this forces the persist's
+      //     `.finally(...)` to run, which clears the tombstone
+      //     via `clearTombstoneIfMatches`.
+      //   - Drain microtasks + one macrotask so the `.finally`
+      //     body has definitely executed.
+      //   - `unregister(MODEL_NAME)` + `register(MODEL_NAME, sameModel)`
+      //     — because the tombstone is gone, the fresh
+      //     `register()` MUST mint a fresh id (different from
+      //     `idBefore`). Under iter-45 the tombstone would
+      //     still be present and the id would be inherited,
+      //     which is the exact bug iter-46 fixes.
+      //
+      // The iter-45 same-object inherit test above is NOT
+      // affected by this fix: in that test the persist NEVER
+      // settles, so the tombstone is never cleared, and the
+      // same-model re-registration still correctly inherits
+      // the retired id.
+      const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+      process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '100';
+      try {
+        let resolvePersist: (() => void) | undefined;
+        const persistPromise = new Promise<void>((resolve) => {
+          resolvePersist = resolve;
+        });
+        const mockStore = {
+          store: vi.fn().mockImplementation(() => persistPromise),
+          getChain: vi.fn().mockImplementation((id: string) => {
+            return Promise.reject(new Error(`Response not found: ${id}`));
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const chatSessionStart = vi.fn().mockResolvedValue(makeChatResult({ text: 'eventual-settle reply' }));
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+          chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        const registry = new ModelRegistry();
+        const MODEL_NAME = 'iter-46-tombstone-cleared-on-settle';
+        registry.register(MODEL_NAME, mockModel);
+
+        expect(process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS).toBe('100');
+
+        const idBefore = registry.getInstanceId(MODEL_NAME);
+        expect(typeof idBefore).toBe('number');
+
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => {
+          unhandled.push(reason);
+        };
+        process.on('unhandledRejection', onUnhandled);
+
+        const handler = createHandler(registry, { store: mockStore as any });
+        const req = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'hello eventual-settle world',
+          stream: false,
+        });
+        const { res, waitForEnd, getBody } = createMockRes();
+
+        await handler(req, res);
+        await waitForEnd();
+        const body = JSON.parse(getBody());
+        expect(body.status).toBe('completed');
+
+        // Wait for the hard timer (100ms from dispatch) to fire
+        // and install the tombstone. 150ms is enough margin to
+        // prove the breaker fired without being flaky on CI.
+        await new Promise((r) => setTimeout(r, 150));
+        await new Promise((r) => setImmediate(r));
+
+        // NOW settle the pending persist. Under iter-46 the
+        // persist's `.finally(...)` immediately drops the
+        // tombstone via `clearTombstoneIfMatches`. Drain
+        // microtasks + one macrotask so the `.finally` body
+        // has definitely executed.
+        expect(resolvePersist).toBeDefined();
+        resolvePersist!();
+        await Promise.resolve();
+        await new Promise((r) => setImmediate(r));
+
+        // Primary iter-46 invariant: the tombstone has been
+        // cleared by the persist's `.finally(...)`, so a fresh
+        // `unregister` + same-object `register` MUST mint a
+        // FRESH instance id — NOT inherit the retired one.
+        // This matches the pre-iter-45 teardown semantics for
+        // non-wedged cases: once the persist has settled the
+        // binding is treated as logically dead and any
+        // subsequent re-registration gets a fresh id.
+        //
+        // Under iter-45 the tombstone would still be present
+        // at this point (no settlement-path cleanup) and this
+        // assertion would fail — the new id would equal
+        // `idBefore`. That is the exact stale-chain hazard
+        // iter-46 eliminates.
+        expect(registry.unregister(MODEL_NAME)).toBe(true);
+        registry.register(MODEL_NAME, mockModel);
+        const idAfterSettle = registry.getInstanceId(MODEL_NAME);
+        expect(typeof idAfterSettle).toBe('number');
+        expect(idAfterSettle).not.toBe(idBefore);
+
+        expect(unhandled).toHaveLength(0);
+        process.off('unhandledRejection', onUnhandled);
+      } finally {
+        if (originalHard === undefined) {
+          delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+        } else {
+          process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
+        }
+      }
+    }, 5000);
+
+    it('iter-45/46: MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS parsing: empty/whitespace -> default, "0" -> disabled, valid -> parsed', async () => {
       // Codex's iter-44 review flagged a MEDIUM finding: the
       // original parser accepted any finite >= 0 value, so
       // `Number('')` returned `0` and silently disabled the
@@ -4292,6 +4445,15 @@ describe('createHandler', () => {
       // `'0'` still disables. Any non-numeric value also falls
       // back to the default — deliberate so a typo cannot
       // silently disable the safety breaker.
+      //
+      // Iter-46 (codex's iter-45 MEDIUM finding): the iter-45
+      // parser only treated the LITERAL empty string as unset.
+      // `Number(' ')` is `0`, so padded values (`' '`, `'\n'`,
+      // `'\t'`, config-templating artefacts like a trailing
+      // `\r` on Windows) still silently disabled the breaker.
+      // Iter-46 trims whitespace first, so any whitespace-only
+      // input falls back to the default and any valid numeric
+      // padded with whitespace parses correctly.
       //
       // We test via the exported `getPostCommitPersistHardTimeoutMs`
       // directly (cleanest, most readable). Env state is saved
@@ -4322,6 +4484,24 @@ describe('createHandler', () => {
         // Undefined -> default.
         delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         expect(getPostCommitPersistHardTimeoutMs()).toBe(60_000);
+
+        // Iter-46 whitespace cases: whitespace-only input is
+        // treated as unset and falls back to the default. Under
+        // the iter-45 parser `Number(' ')` was `0` and silently
+        // disabled the breaker.
+        process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = ' ';
+        expect(getPostCommitPersistHardTimeoutMs()).toBe(60_000);
+        process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '\n';
+        expect(getPostCommitPersistHardTimeoutMs()).toBe(60_000);
+        process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '\t';
+        expect(getPostCommitPersistHardTimeoutMs()).toBe(60_000);
+        process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '   ';
+        expect(getPostCommitPersistHardTimeoutMs()).toBe(60_000);
+
+        // Iter-46: padding around a valid numeric is trimmed
+        // before parsing, so the valid number survives.
+        process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '  100  ';
+        expect(getPostCommitPersistHardTimeoutMs()).toBe(100);
       } finally {
         if (originalHard === undefined) {
           delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
