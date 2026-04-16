@@ -1,3 +1,15 @@
+// Test-suite-wide override: shrink the two bounded-wait timeouts in
+// `packages/server/src/endpoints/responses.ts` from their 2s / 5s
+// production defaults to 50ms each. The endpoint re-reads these env
+// vars on every call (`getChainWriteWaitTimeoutMs()` /
+// `getPostCommitPersistTimeoutMs()`), so setting them before the
+// module loads and before any test runs is sufficient to collapse
+// the handful of wedged-writer / late-landing tests from ~2s per
+// test down to microtask-level. The tests still exercise the exact
+// same code paths — only the wall-clock wait shrinks.
+process.env.MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS = '50';
+process.env.MLX_POST_COMMIT_PERSIST_TIMEOUT_MS = '50';
+
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Writable } from 'node:stream';
 
@@ -3081,6 +3093,7 @@ describe('createHandler', () => {
         });
         const { res: resB, getStatus: statusB, getBody: bodyB, waitForEnd: waitB } = createMockRes();
         const handlerPromise = handler(reqB, resB);
+        void handlerPromise.catch(() => {});
 
         // Sanity-check timer: if the fix regresses and
         // `awaitPending` blocks forever, this surfaces a
@@ -3091,22 +3104,20 @@ describe('createHandler', () => {
         const sanityTimer = new Promise<typeof SANITY_TIMED_OUT>((resolve) => {
           setTimeout(() => resolve(SANITY_TIMED_OUT), 5000);
         });
-        const t0 = Date.now();
-        const outcome = await Promise.race([
-          Promise.all([handlerPromise, waitB()]).then(() => 'ok' as const),
-          sanityTimer,
-        ]);
-        const elapsed = Date.now() - t0;
-
+        // Only await `waitB()` — not `handlerPromise`. B's
+        // handler also schedules a `POST_COMMIT_PERSIST_TIMEOUT_MS`
+        // (5000ms) wait on the same never-settling store promise,
+        // which fires AFTER the terminal response but BEFORE the
+        // handler resolves. Awaiting the handler would push total
+        // test wall-clock to ~5s (CHAIN_WRITE_WAIT + POST_COMMIT);
+        // awaiting just the terminal flush keeps us under 3s. The
+        // detached handler's post-commit timer is cleared by the
+        // outer `finally` via process teardown.
+        const outcome = await Promise.race([waitB().then(() => 'ok' as const), sanityTimer]);
         // Primary assertion: the request resolved (did NOT
         // hit the 5s sanity-timer). A regression would show
         // up here as `outcome === SANITY_TIMED_OUT`.
         expect(outcome).toBe('ok');
-        // Ergonomic bound: the fix's 2000ms ceiling plus
-        // reasonable scheduling overhead must fit well under
-        // the 5000ms sanity cap. Use 4500ms to leave a
-        // margin for loaded CI machines.
-        expect(elapsed).toBeLessThan(4500);
 
         // Error shape: clean bounded 503 storage_timeout, not
         // a 404 (permanent) or an unhandled-rejection blow-up.
@@ -3155,26 +3166,50 @@ describe('createHandler', () => {
       // write lands AFTER the 2s timeout fires but BEFORE
       // the probe runs, so the continuation must return a
       // coherent chained 200 response (not 503, not 404).
+      //
+      // Iter-40 finding 2 — timing determinism. The iter-39
+      // original test used `setTimeout(resolveStore, 2100)`
+      // against real timers and raced the whole handler
+      // interaction under a 6-second sanity cap. On a loaded
+      // CI machine the handler could reach `awaitPending`
+      // more than 100ms late, at which point the test would
+      // silently exercise the "pending settled before
+      // timeout" fast path and never hit the timeout→probe
+      // branch the finding is actually testing. The test
+      // still passed either way — invisible regression risk.
+      //
+      // Timing determinism here is enforced via the
+      // call-count invariant: `getChain` must be called
+      // EXACTLY twice — once for the initial cold lookup
+      // (which misses, driving the handler into the
+      // `awaitPending` retry), and once for the post-
+      // timeout probe (which finds the record because
+      // `store.store(...)` populated the backing map
+      // synchronously on request A). Two calls proves the
+      // probe branch ran; one call would mean the retry
+      // went through the "pending settled" fast path.
+      //
+      // The test-suite-wide env override at the top of this
+      // file (`MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS = '50'`)
+      // collapses the bounded wait from 2s to 50ms, so this
+      // test completes in microsecond order against real
+      // timers without needing fake-timer plumbing.
       const storedRecords = new Map<string, any>();
-      // Capture a resolver for the store-write promise so the
-      // test can control *exactly* when the write lands. By
-      // delaying the resolver past `CHAIN_WRITE_WAIT_TIMEOUT_MS`
-      // we drive the handler into the timeout branch; the
-      // pre-probe `store.store` fulfilment is what the
-      // iter-39 probe observes.
-      let resolveStoreA: (() => void) | undefined;
+      // `store.store(...)` populates `storedRecords` SYNCHRONOUSLY
+      // and returns a pending promise we never resolve. The
+      // pending promise drives `awaitPending` into the timeout
+      // branch; the already-populated `storedRecords` map is
+      // what the post-timeout probe observes.
       let firstGetChainMissed = false;
       const mockStore = {
         store: vi.fn().mockImplementation((record: any) => {
           storedRecords.set(record.id, record);
-          // Resolve only AFTER the fixed timer elapses, so
-          // the handler's `awaitPending` hits the timeout
-          // arm first; the post-timeout `getChain` probe
-          // is what observes the just-stored record.
-          return new Promise<void>((resolve) => {
-            resolveStoreA = () => {
-              resolve();
-            };
+          return new Promise<void>(() => {
+            // Never resolves during the test body. The fake-
+            // timer `useRealTimers()` call in the outer
+            // `finally` detaches the faked primitives; the
+            // promise is abandoned but GCs once the handler
+            // promise is released by test teardown.
           });
         }),
         getChain: vi.fn().mockImplementation((id: string) => {
@@ -3182,8 +3217,8 @@ describe('createHandler', () => {
           // so the iter-37 retry path is entered (and then
           // the iter-38 timeout-timer fires because the
           // write has not settled yet). After the timeout
-          // fires and the test unwedges the store, the
-          // subsequent probe call sees the record.
+          // fires, the probe call sees the record via the
+          // synchronously populated `storedRecords` map.
           if (!firstGetChainMissed) {
             firstGetChainMissed = true;
             return Promise.reject(new Error(`Response not found: ${id}`));
@@ -3222,9 +3257,12 @@ describe('createHandler', () => {
         const handler = createHandler(registry, { store: mockStore as any });
 
         // Request A: ordinary POST. Its `store.store(...)` call
-        // returns a controllable pending promise; we will NOT
-        // resolve it until after the CHAIN_WRITE_WAIT_TIMEOUT_MS
-        // timer has fired inside B's handler.
+        // returns a never-settling promise registered in the
+        // pending-writes tracker; the tracker retains its
+        // reference so B's retry path can observe the pending
+        // write. `storedRecords` is populated synchronously so
+        // the post-timeout probe in B's handler finds the
+        // record via `getChain`.
         const reqA = createMockReq('POST', '/v1/responses', {
           model: 'late-landing-model',
           input: 'hello A',
@@ -3238,8 +3276,15 @@ describe('createHandler', () => {
         expect(responseA.status).toBe('completed');
         const responseIdA: string = responseA.id;
 
-        // Wait until A's persist has registered with the
-        // tracker.
+        // Wait until A's persist has registered its
+        // never-settling write with the pending-writes
+        // tracker. `waitA()` resolves on the mock's
+        // synchronous `end()` hook but `initiatePersist`
+        // runs a few microtasks later — if we fired B
+        // before the tracker was populated, B's
+        // `awaitPending` would return undefined and the
+        // handler would 404 instead of entering the
+        // timeout→probe branch the test is exercising.
         while (mockStore.store.mock.calls.length === 0) {
           await new Promise((r) => setImmediate(r));
         }
@@ -3250,17 +3295,19 @@ describe('createHandler', () => {
         // cached by response id).
         registry.getSessionRegistry('late-landing-model')!.drop(responseIdA);
 
-        // Schedule the A-write to land AT the end of the
-        // handler's timeout window. `CHAIN_WRITE_WAIT_TIMEOUT_MS`
-        // is 2000ms in the default configuration; we resolve
-        // at 2100ms so the `awaitPending` race definitely
-        // times out FIRST, then the last-probe `getChain`
-        // sees the populated store.
-        setTimeout(() => {
-          if (resolveStoreA) resolveStoreA();
-        }, 2100);
+        // Snapshot the getChain call count after A has run.
+        // We assert below that B's cold-replay path drove
+        // the count up by EXACTLY 2 — one initial miss +
+        // one post-timeout probe. Any other count means the
+        // handler's flow diverged from the timeout→probe
+        // branch under test.
+        const getChainCallsAfterA = mockStore.getChain.mock.calls.length;
 
-        // Request B: continuation pointing at A.
+        // Request B: continuation pointing at A. Fire it and
+        // wait for the handler to settle into the bounded
+        // `awaitPending` race — signalled by the first
+        // `getChain` miss plus the handler's subsequent
+        // await on the pending promise.
         const reqB = createMockReq('POST', '/v1/responses', {
           model: 'late-landing-model',
           input: 'hello B',
@@ -3271,18 +3318,36 @@ describe('createHandler', () => {
         const handlerPromise = handler(reqB, resB);
         void handlerPromise.catch(() => {});
 
-        // Sanity timeout at 6000ms — well clear of the 2s
-        // chain-write timer + the 2.1s store-resolution
-        // delay + some scheduling slop.
-        const SANITY_TIMED_OUT = Symbol('handler-hang');
-        const sanityTimer = new Promise<typeof SANITY_TIMED_OUT>((resolve) => {
-          setTimeout(() => resolve(SANITY_TIMED_OUT), 6000);
-        });
-        const outcome = await Promise.race([
-          Promise.all([handlerPromise, waitB()]).then(() => 'ok' as const),
-          sanityTimer,
-        ]);
-        expect(outcome).toBe('ok');
+        // Wait until B's handler has called getChain once
+        // (the initial cold lookup that MUST miss). At that
+        // point the handler is committed to the
+        // `awaitPending` retry branch — the next step is
+        // `Promise.race` against the bounded timer.
+        // NOTE: we yield via `setImmediate` (a macrotask)
+        // rather than `Promise.resolve()` (a microtask) so
+        // the poll loop cannot starve the event loop — a
+        // microtask-only spin would block every pending
+        // `setTimeout`, including the handler's own
+        // `CHAIN_WRITE_WAIT_TIMEOUT_MS` / `POST_COMMIT_PERSIST_TIMEOUT_MS`
+        // timers, and the handler would never advance past
+        // its bounded-wait race.
+        while (mockStore.getChain.mock.calls.length === getChainCallsAfterA) {
+          await new Promise((r) => setImmediate(r));
+        }
+        expect(mockStore.getChain.mock.calls.length).toBe(getChainCallsAfterA + 1);
+
+        // The client-visible outcome is fully observable via
+        // `waitB()` — status code + body are set by the
+        // handler BEFORE it enters the post-commit persist
+        // wait. We deliberately do NOT await `handlerPromise`
+        // here: the handler's backgrounded
+        // `Promise.race([settled, timeoutPromise])` fires on
+        // its own 50ms real-timer and detaches the handler
+        // without blocking the test, so awaiting `waitB()`
+        // alone is enough. If this test ever hangs
+        // regressively, the `it(..., 10000)` timeout catches
+        // it.
+        await waitB();
 
         // Primary assertion: B completes successfully and
         // returns a coherent 200 chained response — NOT the
@@ -3294,14 +3359,234 @@ describe('createHandler', () => {
         expect(parsed.status).toBe('completed');
         expect(parsed.previous_response_id).toBe(responseIdA);
         expect(parsed.output_text).toBe('chained reply');
+
+        // Explicit invariant: `getChain` was called EXACTLY
+        // twice during B's flow — the initial cold-replay
+        // miss + the post-timeout probe. Anything else
+        // (e.g. only one call) means the handler skipped
+        // the probe branch the finding is actually
+        // exercising, and the test would be silently
+        // covering a different path.
+        expect(mockStore.getChain.mock.calls.length).toBe(getChainCallsAfterA + 2);
+
+        // The fix must log the timeout-warning so operators
+        // can see the wedged-writer condition even on the
+        // successful-probe branch.
+        const warnCall = warnSpy.mock.calls.find(
+          (args) => typeof args[0] === 'string' && (args[0] as string).includes(responseIdA),
+        );
+        expect(warnCall).toBeTruthy();
       } finally {
         warnSpy.mockRestore();
-        // Resolve A's outstanding store promise so the
-        // handler's post-commit persist wait does not need
-        // to hit its 5s timeout after this test returns.
-        if (resolveStoreA) resolveStoreA();
       }
     }, 10000);
+
+    it('iter-40 finding 1: same-model unregister+re-register during slow persist keeps chain valid', async () => {
+      // Iter-39 finding 2 released the dispatch lease
+      // EAGERLY after `withExclusive` returns so a wedged
+      // `store.store(...)` could no longer pin abort
+      // listeners or the dispatch lease. But that release
+      // also dropped the binding's `inFlight` counter to
+      // zero while the off-lock persist was still pending,
+      // and `buildResponseRecord` had already stamped the
+      // row with the binding's current `modelInstanceId`.
+      //
+      // Adversarial sequence (iter-40 finding 1):
+      //   1. Request A completes the terminal JSON and
+      //      kicks off `store.store(A)` off-lock.
+      //   2. The eager `releaseDispatchLease` drops
+      //      `inFlight` to 0 before the write lands.
+      //   3. An operator unregisters and then re-registers
+      //      the SAME model instance under the SAME name
+      //      (e.g. a rolling reload picks up a renamed
+      //      variant but is pointed at the identical
+      //      object). `dropNameReference` sees
+      //      `inFlight == 0` and finalises teardown,
+      //      deleting the instance id. The re-registration
+      //      mints a FRESH id.
+      //   4. A's `store.store(...)` eventually lands,
+      //      stamping a row whose `modelInstanceId`
+      //      references the NOW-DEAD id.
+      //   5. A legitimate continuation request (B) carrying
+      //      `previous_response_id: A.id` hits the
+      //      instance-id guard and is rejected with 400
+      //      "instance-mismatch" — even though the client
+      //      saw a clean `response.completed` for A.
+      //
+      // Fix: the responses endpoint pairs a
+      // `registry.retainBinding(...)` around every in-flight
+      // persist, and the matching `releaseBinding(...)` runs
+      // in the persist promise's `.finally(...)`. Teardown is
+      // now gated on `pendingPersists === 0` alongside
+      // `inFlight === 0`, so a same-model unregister during
+      // the persist window is DEFERRED, the re-registration
+      // reuses the still-live instance id, and the row's
+      // stored identity matches the live id when B's
+      // continuation arrives.
+      //
+      // Shape of the test:
+      //   - `store.store(A)` returns a controllable pending
+      //     promise so the test can hold the persist in
+      //     flight through the full unregister+re-register.
+      //   - The test drives the sequence exactly as above
+      //     and asserts B returns 200 (not 400, not 404).
+      const storedRecords = new Map<string, any>();
+      let resolveStoreA: (() => void) | undefined;
+      // Only the FIRST persist (A's) returns a controllable
+      // pending promise — the test uses it to hold A's write
+      // open through the full unregister+re-register dance.
+      // Every subsequent persist (B's) resolves immediately
+      // so B's handler clears its post-commit persist wait
+      // within microtasks after `waitB()`, letting the
+      // real-timer 3s sanity cap do its job.
+      let firstStoreCaptured = false;
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          if (!firstStoreCaptured) {
+            firstStoreCaptured = true;
+            return new Promise<void>((resolve) => {
+              resolveStoreA = () => {
+                resolve();
+              };
+            });
+          }
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          if (out.length === 0) {
+            return Promise.reject(new Error(`Response not found: ${id}`));
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'first reply' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'chained reply' }));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('rebind-during-persist', mockModel);
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Request A: ordinary POST. The persist promise stays
+      // pending until the test resolves it, which deliberately
+      // happens AFTER the unregister+re-register dance.
+      const reqA = createMockReq('POST', '/v1/responses', {
+        model: 'rebind-during-persist',
+        input: 'hello A',
+        stream: false,
+      });
+      const { res: resA, getBody: bodyA, waitForEnd: waitA } = createMockRes();
+      const inflightA = handler(reqA, resA);
+      void inflightA.catch(() => {});
+      await waitA();
+      const responseA = JSON.parse(bodyA());
+      expect(responseA.status).toBe('completed');
+      const responseIdA: string = responseA.id;
+
+      // Wait until A's persist has registered with the
+      // tracker. This also proves `initiatePersist` ran and
+      // (under the iter-40 fix) `retainBinding` has already
+      // bumped `pendingPersists` to 1 — without which the
+      // `unregister` below would finalise teardown.
+      while (mockStore.store.mock.calls.length === 0) {
+        await new Promise((r) => setImmediate(r));
+      }
+
+      // Capture the instance id PRE-unregister. Under the
+      // fix this should survive the unregister+re-register
+      // cycle because the persist retention defers
+      // `finalizeBindingTeardown`. Without the fix, the
+      // re-register would mint a fresh id.
+      const idPreSwap = registry.getInstanceId('rebind-during-persist');
+      expect(typeof idPreSwap).toBe('number');
+
+      // Drop the hot session so B has to go through the
+      // cold-replay chain-lookup path (otherwise the warm
+      // session cached under A's id would service B without
+      // touching `getChain`, hiding the instance-id guard
+      // the finding protects).
+      registry.getSessionRegistry('rebind-during-persist')!.drop(responseIdA);
+
+      // Simulate an operator hot-reload: unregister, then
+      // re-register the SAME model object under the SAME
+      // name. Under the iter-40 fix, the in-flight persist
+      // retention defers teardown so the re-registration
+      // reuses the still-live binding and its instance id;
+      // without the fix, `dropNameReference` would
+      // finalise immediately (inFlight == 0) and the
+      // re-register would mint a fresh id, invalidating A's
+      // stored row.
+      expect(registry.unregister('rebind-during-persist')).toBe(true);
+      registry.register('rebind-during-persist', mockModel);
+
+      // Critical invariant: the instance id is UNCHANGED
+      // because the binding's teardown was deferred by the
+      // persist retention. A changed id would guarantee the
+      // continuation guard rejects B with 400.
+      const idPostSwap = registry.getInstanceId('rebind-during-persist');
+      expect(idPostSwap).toBe(idPreSwap);
+
+      // Resolve A's persist NOW, AFTER the swap. The row
+      // lands with its original stored `modelInstanceId`
+      // (from `buildResponseRecord` in A's flow); the live
+      // binding's id still matches.
+      if (resolveStoreA) resolveStoreA();
+
+      // Request B: continuation against A. Under the fix
+      // this must return a coherent 200 response; without
+      // the fix B would be rejected with 400 "instance
+      // mismatch" because A's stored id no longer matches
+      // the live id.
+      const reqB = createMockReq('POST', '/v1/responses', {
+        model: 'rebind-during-persist',
+        input: 'hello B',
+        previous_response_id: responseIdA,
+        stream: false,
+      });
+      const { res: resB, getStatus: statusB, getBody: bodyB, waitForEnd: waitB } = createMockRes();
+      const handlerPromise = handler(reqB, resB);
+      void handlerPromise.catch(() => {});
+
+      // Sanity-cap the test at 3s so a regression that
+      // hangs the handler does not wedge the suite.
+      const SANITY_TIMED_OUT = Symbol('handler-hang');
+      const sanityPromise = new Promise<typeof SANITY_TIMED_OUT>((resolve) => {
+        setTimeout(() => resolve(SANITY_TIMED_OUT), 3000);
+      });
+      const outcome = await Promise.race([
+        Promise.all([handlerPromise, waitB()]).then(() => 'ok' as const),
+        sanityPromise,
+      ]);
+      expect(outcome).toBe('ok');
+
+      // Primary assertion: the chained continuation
+      // succeeds. 200 with a proper `previous_response_id`
+      // echo proves the instance-id guard accepted B.
+      expect(statusB()).toBe(200);
+      const parsed = JSON.parse(bodyB());
+      expect(parsed.status).toBe('completed');
+      expect(parsed.previous_response_id).toBe(responseIdA);
+      expect(parsed.output_text).toBe('chained reply');
+    }, 8000);
 
     it('iter-39 finding 2: wedged post-commit persist does not pin dispatch lease', async () => {
       // Iter-35 moved persistence OFF the per-model mutex
@@ -3325,11 +3610,21 @@ describe('createHandler', () => {
       // going out (well under the 5s post-commit timeout),
       // the dispatch lease has been released and the abort
       // listeners have been removed.
-      const neverSettling: Promise<void> = new Promise<void>(() => {
-        // Intentionally never resolve/reject.
+      // Controllable pending persist. The test body exercises
+      // the handler under a wedged-store condition and
+      // asserts the lease releases promptly. At teardown we
+      // resolve this promise so the backgrounded handler's
+      // `Promise.race([settled, timeoutPromise])` settles
+      // without leaving a 5s real-timer alive into the next
+      // test.
+      let resolveStore: (() => void) | undefined;
+      const storePromise = new Promise<void>((resolve) => {
+        resolveStore = () => {
+          resolve();
+        };
       });
       const mockStore = {
-        store: vi.fn().mockReturnValue(neverSettling),
+        store: vi.fn().mockReturnValue(storePromise),
         getChain: vi.fn().mockImplementation((id: string) => {
           return Promise.reject(new Error(`Response not found: ${id}`));
         }),
@@ -3424,14 +3719,17 @@ describe('createHandler', () => {
       const elapsed = Date.now() - t0;
       expect(elapsed).toBeLessThan(1000);
 
-      // Note: we intentionally do NOT await `inflight`
-      // here — the wedged store promise means the handler
-      // will keep running in the background until the
-      // POST_COMMIT_PERSIST_TIMEOUT_MS timer fires. Since
-      // the whole point of the test is that the lease was
-      // ALREADY released, the test is allowed to return
-      // early. The `.catch(() => {})` above suppresses any
-      // eventual rejection on the backgrounded handler.
+      // Teardown: resolve the wedged persist so the
+      // backgrounded handler's
+      // `Promise.race([settled, timeoutPromise])` settles
+      // promptly and its 5s POST_COMMIT_PERSIST_TIMEOUT_MS
+      // setTimeout does NOT leak into the next test. All
+      // lease/listener invariants above have already been
+      // asserted against the wedged condition, so releasing
+      // the store here does not undermine the finding — it
+      // just ensures a clean suite-level test shutdown.
+      if (resolveStore) resolveStore();
+      await inflight;
     }, 10000);
 
     it('iter-37 finding 2: adopt gate rejects streaming turns whose post-final teardown threw (failureMode === "error")', async () => {

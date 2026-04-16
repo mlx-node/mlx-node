@@ -77,24 +77,43 @@ export interface ModelEntry {
  * drop the binding once the last alias goes away.
  *
  * `inFlight` tracks how many dispatches are currently holding this
- * binding through `acquireDispatchLease()`. `releaseBinding()` MUST
- * NOT tear the binding (and its `SessionRegistry`, and therefore its
- * FIFO `withExclusive` mutex chain) down while any dispatch still
- * holds a lease — if a caller unregister()s the name mid-dispatch
- * and then re-register()s the SAME model object, the map lookup
- * would otherwise allocate a FRESH `SessionRegistry` with an empty
- * `execLock` chain, and a new concurrent request would race against
- * the in-flight dispatch on the same underlying native model.
+ * binding through `acquireDispatchLease()`. The private name-reference
+ * drop path MUST NOT tear the binding (and its `SessionRegistry`, and
+ * therefore its FIFO `withExclusive` mutex chain) down while any
+ * dispatch still holds a lease — if a caller unregister()s the name
+ * mid-dispatch and then re-register()s the SAME model object, the map
+ * lookup would otherwise allocate a FRESH `SessionRegistry` with an
+ * empty `execLock` chain, and a new concurrent request would race
+ * against the in-flight dispatch on the same underlying native model.
  * Teardown is deferred via `pendingTeardown` until the last lease
  * releases; meanwhile a `register()` that sees the pending flag
  * clears it, re-references the still-live binding, and the fresh
  * request's mutex chain naturally serializes behind the in-flight
  * dispatch because they share one `execLock`.
+ *
+ * `pendingPersists` tracks how many post-commit persist writes are
+ * still in flight under this binding's instance identity. It is
+ * INTENTIONALLY orthogonal to `inFlight` (dispatch exclusivity) so the
+ * iter-39 optimisation — releasing the dispatch lease eagerly after
+ * `withExclusive` returns, so a wedged `store.store(...)` cannot pin
+ * the request's abort listeners / lease — can still coexist with the
+ * iter-40 invariant that the binding's `modelInstanceId` stays valid
+ * until every row it stamped has durably landed. When a dispatch
+ * enters the post-commit persist window it calls `retainBinding()` to
+ * bump this counter; its `.finally(...)` balances that with
+ * `releaseBinding()`. `finalizeBindingTeardown` now additionally
+ * requires `pendingPersists === 0`, so a same-model unregister +
+ * re-register sequence that fires during a slow persist cannot mint
+ * a fresh `modelInstanceId` that would invalidate the row the
+ * persist is about to land — the row's stored identity still matches
+ * the live id when the client's next `previous_response_id`
+ * continuation arrives.
  */
 interface SessionRegistryBinding {
   registry: SessionRegistry;
   refCount: number;
   inFlight: number;
+  pendingPersists: number;
   pendingTeardown: boolean;
 }
 
@@ -147,7 +166,7 @@ export class ModelRegistry {
       // Same name, different model: release the old model's refcount
       // before installing the new binding. If no other alias still
       // points at the old model, drop its registry entirely.
-      this.releaseBinding(existing.model);
+      this.dropNameReference(existing.model);
     }
 
     // Look up or allocate the shared binding for this model instance.
@@ -164,6 +183,7 @@ export class ModelRegistry {
         registry: new SessionRegistry({ model }),
         refCount: 0,
         inFlight: 0,
+        pendingPersists: 0,
         pendingTeardown: false,
       };
       this.sessionRegistriesByModel.set(model, binding);
@@ -173,7 +193,7 @@ export class ModelRegistry {
     binding.refCount += 1;
     // Allocate a fresh monotonic instance id on first sight of this
     // model object; reuse the existing id on every alias thereafter.
-    // The id lifetime mirrors the binding's — see `releaseBinding`.
+    // The id lifetime mirrors the binding's — see `finalizeBindingTeardown`.
     if (!this.instanceIds.has(model)) {
       this.instanceIds.set(model, this.nextInstanceId);
       this.nextInstanceId += 1;
@@ -202,32 +222,41 @@ export class ModelRegistry {
     const entry = this.models.get(name);
     if (!entry) return false;
     this.models.delete(name);
-    this.releaseBinding(entry.model);
+    this.dropNameReference(entry.model);
     return true;
   }
 
   /**
    * Decrement the refcount on a model binding; drop it at zero IFF
-   * no dispatch currently holds a lease on it. When `inFlight > 0`
+   * no dispatch currently holds a lease on it AND no post-commit
+   * persist is still retaining it. When either counter is non-zero
    * the teardown is deferred via `pendingTeardown` so the in-flight
    * dispatch's `SessionRegistry` (and therefore its `execLock` FIFO
-   * mutex chain) stays alive until the last lease releases. Any
+   * mutex chain) stays alive until the last holder releases. Any
    * concurrent `register(sameModel)` that fires between
-   * `releaseBinding()` and the final lease release will see the
+   * `dropNameReference()` and the final release will see the
    * still-present binding, clear `pendingTeardown`, and reuse it —
    * so the next request's `withExclusive` naturally serializes
-   * behind the in-flight dispatch on one shared mutex.
+   * behind the in-flight dispatch on one shared mutex, and the
+   * binding's `modelInstanceId` is preserved (not re-minted) so
+   * any stored row the pending persist is about to land still
+   * resolves to a live id when the client's next continuation
+   * references it. This is the iter-40 invariant that closes the
+   * window where a same-model unregister + re-register during a
+   * slow persist would otherwise have produced a row referencing
+   * a dead instance id.
    */
-  private releaseBinding(model: ServableModel): void {
+  private dropNameReference(model: ServableModel): void {
     const binding = this.sessionRegistriesByModel.get(model);
     if (!binding) return;
     binding.refCount -= 1;
     if (binding.refCount <= 0) {
-      if (binding.inFlight > 0) {
-        // Defer teardown until the last dispatch lease releases.
-        // The binding and its instance id stay in the maps so a
-        // same-object re-registration before `releaseDispatchLease`
-        // can revive it in place.
+      if (binding.inFlight > 0 || binding.pendingPersists > 0) {
+        // Defer teardown until the last dispatch lease releases AND
+        // the last persist retention drops. The binding and its
+        // instance id stay in the maps so a same-object
+        // re-registration before finalisation can revive it in
+        // place.
         binding.pendingTeardown = true;
         return;
       }
@@ -237,14 +266,15 @@ export class ModelRegistry {
 
   /**
    * Drop `model`'s binding and instance id from the registry.
-   * Internal teardown step shared by `releaseBinding()` and
-   * `releaseDispatchLease()`; see their doc comments for the full
-   * lifecycle. On drop, a subsequent re-registration of the SAME
-   * model object will mint a FRESH instance id — intentional: once
-   * the last alias AND the last in-flight lease drop, any
-   * previously persisted stored record that references this id
-   * belongs to a logically dead binding, and a later
-   * `previous_response_id` continuation against it must fall
+   * Internal teardown step shared by `dropNameReference()`,
+   * `releaseDispatchLease()`, and `releaseBinding()`; see their doc
+   * comments for the full lifecycle. On drop, a subsequent
+   * re-registration of the SAME model object will mint a FRESH
+   * instance id — intentional: once the last alias, the last
+   * in-flight lease, AND the last post-commit persist retention
+   * all release, any previously persisted stored record that
+   * references this id belongs to a logically dead binding, and a
+   * later `previous_response_id` continuation against it must fall
    * through to the `currentInstanceId === undefined` rejection path
    * so the stale chain cannot be replayed.
    */
@@ -305,7 +335,69 @@ export class ModelRegistry {
     if (!binding) return;
     binding.inFlight -= 1;
     if (binding.inFlight < 0) binding.inFlight = 0;
-    if (binding.pendingTeardown && binding.refCount <= 0 && binding.inFlight === 0) {
+    if (binding.pendingTeardown && binding.refCount <= 0 && binding.inFlight === 0 && binding.pendingPersists === 0) {
+      this.finalizeBindingTeardown(model);
+    }
+  }
+
+  /**
+   * Retain the binding for the duration of a post-commit persist.
+   *
+   * The responses endpoint kicks off `store.store(record)` synchronously
+   * inside `withExclusive` so the pending-writes tracker observes the
+   * in-flight write before the per-model mutex releases. Iter-39
+   * moved the eventual error-logging `await` OUT of the request's
+   * critical path — so a wedged backend no longer pins abort
+   * listeners or the dispatch lease — but the write still carries
+   * the binding's `modelInstanceId` as stamped into `configJson`
+   * by `buildResponseRecord`. If a same-model unregister +
+   * re-register sequence were allowed to run to completion while
+   * that write is still in flight, the binding's
+   * `finalizeBindingTeardown` step would delete the instance id
+   * from the registry, the re-registration would mint a FRESH id,
+   * and the row — when it finally lands — would reference a dead
+   * id. The very next `previous_response_id` continuation the
+   * client issues would then be rejected with a 400
+   * "instance-mismatch", even though the client saw a clean
+   * `response.completed` for the ancestor.
+   *
+   * `retainBinding()` increments a separate retention counter that
+   * is CHECKED in every teardown gate (see `dropNameReference`,
+   * `releaseDispatchLease`, and `releaseBinding`). The counter is
+   * orthogonal to `inFlight` so iter-39's eager
+   * `releaseDispatchLease` path remains lossless: the dispatch can
+   * release, the request can return control to the client, and
+   * the binding is still pinned against teardown long enough for
+   * the backgrounded `store.store(...)` to settle.
+   *
+   * Safe to call on a model whose binding has already been fully
+   * torn down (no-op) — for example, a caller that retained inside
+   * the lock and then lost the race with a forced teardown
+   * elsewhere. The matching `releaseBinding(model)` MUST still
+   * run in the persist's `.finally(...)` so the counter stays
+   * balanced across future re-registrations of the same object.
+   */
+  retainBinding(model: ServableModel): void {
+    const binding = this.sessionRegistriesByModel.get(model);
+    if (!binding) return;
+    binding.pendingPersists += 1;
+  }
+
+  /**
+   * Balance a prior `retainBinding()` call. Decrements the persist
+   * retention counter and, if the binding has been flagged for
+   * teardown (refcount hit zero while the retention was held AND
+   * every dispatch lease has already released), drops it once the
+   * last retention releases. Safe to call exactly once per retain;
+   * calling it on a model whose binding has already been fully torn
+   * down is a no-op.
+   */
+  releaseBinding(model: ServableModel): void {
+    const binding = this.sessionRegistriesByModel.get(model);
+    if (!binding) return;
+    binding.pendingPersists -= 1;
+    if (binding.pendingPersists < 0) binding.pendingPersists = 0;
+    if (binding.pendingTeardown && binding.refCount <= 0 && binding.inFlight === 0 && binding.pendingPersists === 0) {
       this.finalizeBindingTeardown(model);
     }
   }
@@ -324,7 +416,7 @@ export class ModelRegistry {
    * Two names that alias the same model object return the SAME id
    * (they share a binding), and a name that has been hot-swapped to
    * a different model object returns a DIFFERENT id than before the
-   * swap (the prior binding's id was dropped by `releaseBinding`
+   * swap (the prior binding's id was dropped by `dropNameReference`
    * and a fresh id was minted for the new model on re-registration).
    *
    * The responses endpoint uses this to key the

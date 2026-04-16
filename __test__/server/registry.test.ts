@@ -169,7 +169,7 @@ describe('ModelRegistry', () => {
       // The in-flight counter must keep the binding (and its
       // `SessionRegistry`, therefore its `execLock` FIFO mutex chain)
       // alive past an unregister() call that would otherwise fire the
-      // final `releaseBinding` teardown. Without this guard, a
+      // final teardown. Without this guard, a
       // subsequent re-registration of the SAME model object before the
       // in-flight dispatch finishes would allocate a FRESH
       // `SessionRegistry` with an empty mutex chain, and a concurrent
@@ -309,6 +309,119 @@ describe('ModelRegistry', () => {
       const model = createMockSessionModel();
       // Should not throw.
       expect(() => registry.releaseDispatchLease(model)).not.toThrow();
+    });
+  });
+
+  describe('persist retention (iter-40 Finding 1)', () => {
+    it('retainBinding defers teardown across unregister/re-register so the instance id survives', () => {
+      // The persist retention counter is ORTHOGONAL to the
+      // dispatch lease. Iter-39 releases the dispatch lease
+      // eagerly after `withExclusive` returns so a wedged
+      // `store.store(...)` cannot pin abort listeners or the
+      // lease; iter-40 adds retainBinding so the binding's
+      // `modelInstanceId` still survives until every row the
+      // persist stamped has landed. This is the behaviour
+      // under test.
+      const registry = new ModelRegistry();
+      const model = createMockSessionModel();
+      registry.register('foo', model);
+      const originalId = registry.getInstanceId('foo');
+      expect(typeof originalId).toBe('number');
+
+      // Acquire + release the dispatch lease to model the
+      // iter-39 eager-release path: the dispatch is done, but
+      // retainBinding was called from the persist initiation
+      // and we still hold a pending persist against the binding.
+      const lease = registry.acquireDispatchLease('foo');
+      expect(lease).toBeDefined();
+      registry.retainBinding(lease!.model);
+      registry.releaseDispatchLease(lease!.model);
+
+      // Unregister then re-register the SAME model object.
+      // Without retainBinding this would finalise teardown
+      // (inFlight==0, refCount<=0) and the re-register would
+      // mint a fresh id. With retainBinding teardown is
+      // deferred and the re-register reuses the existing id.
+      expect(registry.unregister('foo')).toBe(true);
+      registry.register('foo', model);
+      expect(registry.getInstanceId('foo')).toBe(originalId);
+
+      // Release the persist retention. The binding stays
+      // alive because the re-registration bumped refCount
+      // back to 1; the id therefore remains stable.
+      registry.releaseBinding(lease!.model);
+      expect(registry.getInstanceId('foo')).toBe(originalId);
+    });
+
+    it('finalizes teardown only after BOTH the lease and the persist retention release', () => {
+      const registry = new ModelRegistry();
+      const model = createMockSessionModel();
+      registry.register('foo', model);
+      const originalId = registry.getInstanceId('foo');
+
+      const lease = registry.acquireDispatchLease('foo');
+      expect(lease).toBeDefined();
+      registry.retainBinding(lease!.model);
+
+      // Unregister with BOTH counters non-zero: teardown is
+      // deferred on both axes.
+      expect(registry.unregister('foo')).toBe(true);
+
+      // Release the dispatch lease first. Teardown MUST stay
+      // deferred because the persist retention is still held
+      // — the row the persist is about to land still
+      // references this id.
+      registry.releaseDispatchLease(lease!.model);
+      // Re-registering now must reuse the existing binding's
+      // instance id because teardown has NOT finalised.
+      registry.register('foo', model);
+      expect(registry.getInstanceId('foo')).toBe(originalId);
+
+      // Now unregister again, then drop the persist
+      // retention. With refCount==0, inFlight==0, AND
+      // pendingPersists reaching 0, teardown finalises and a
+      // future registration mints a fresh id.
+      expect(registry.unregister('foo')).toBe(true);
+      registry.releaseBinding(lease!.model);
+      registry.register('foo', model);
+      expect(registry.getInstanceId('foo')).not.toBe(originalId);
+    });
+
+    it('retainBinding is a no-op on an unknown model object', () => {
+      const registry = new ModelRegistry();
+      const model = createMockSessionModel();
+      expect(() => registry.retainBinding(model)).not.toThrow();
+    });
+
+    it('releaseBinding is a no-op on an unknown model object', () => {
+      const registry = new ModelRegistry();
+      const model = createMockSessionModel();
+      expect(() => registry.releaseBinding(model)).not.toThrow();
+    });
+
+    it('releaseBinding without a matching retain is clamped to zero', () => {
+      // Defensive invariant: a double-release (or an
+      // unmatched release) must not drive pendingPersists
+      // negative. The floor is clamped so an extra call is
+      // a no-op rather than leaving the counter stuck below
+      // zero (which would delay future legitimate teardown).
+      const registry = new ModelRegistry();
+      const model = createMockSessionModel();
+      registry.register('foo', model);
+      const originalId = registry.getInstanceId('foo');
+
+      // Balanced retain/release — counter returns to 0.
+      registry.retainBinding(model);
+      registry.releaseBinding(model);
+      // Extra releases beyond the matched pair must not
+      // drop the counter negative, so a subsequent
+      // unregister-only teardown STILL finalises (fresh id
+      // on re-register proves teardown actually ran).
+      registry.releaseBinding(model);
+      registry.releaseBinding(model);
+      expect(registry.unregister('foo')).toBe(true);
+      registry.register('foo', model);
+      expect(registry.getInstanceId('foo')).not.toBe(originalId);
     });
   });
 });

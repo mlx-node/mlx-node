@@ -588,8 +588,8 @@ export async function handleCreateMessage(
   // would race against this in-flight dispatch on one shared native
   // model with two independent mutex chains. The lease MUST be
   // released in a `finally` below so the binding's teardown (if
-  // deferred by `releaseBinding`) completes once the last dispatch
-  // finishes.
+  // deferred by a concurrent `unregister()`) completes once the last
+  // dispatch lease finishes.
   const lease = registry.acquireDispatchLease(body.model);
   if (!lease) {
     sendAnthropicInternalError(res, 'session registry missing for registered model');
@@ -844,9 +844,11 @@ export async function handleCreateMessage(
     // Release the dispatch lease on the ORIGINAL model object the
     // lease was acquired against (not a re-read of `body.model`,
     // which may have been hot-swapped while we held the mutex). A
-    // pending teardown — `releaseBinding()` called concurrently
-    // while this dispatch held the lease — finalises here once the
-    // in-flight counter drops to zero.
+    // pending teardown — `unregister()` called concurrently while
+    // this dispatch held the lease — finalises here once the
+    // in-flight counter drops to zero (the messages endpoint is
+    // stateless, so it takes no `retainBinding` against the
+    // post-commit persist counter).
     registry.releaseDispatchLease(leaseModel);
   }
 }

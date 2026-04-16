@@ -80,13 +80,13 @@ const RESPONSE_TTL_SECONDS = 1800; // 30 minutes
  * `MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS`; non-positive / non-finite /
  * empty values fall back to the default.
  */
-const CHAIN_WRITE_WAIT_TIMEOUT_MS: number = (() => {
+function getChainWriteWaitTimeoutMs(): number {
   const raw = process.env.MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS;
   if (raw == null || raw === '') return 2000;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) return 2000;
   return parsed;
-})();
+}
 
 /**
  * Upper bound on how long the outer handler's `finally` block will
@@ -97,8 +97,7 @@ const CHAIN_WRITE_WAIT_TIMEOUT_MS: number = (() => {
  * pinned the request's socket/abort listeners and its dispatch lease
  * until the promise settled. A never-settling write would leak
  * listeners, keep the binding's `inFlight` counter elevated, and
- * block `releaseBinding()` from finalising teardown after a
- * hot-swap.
+ * block teardown from finalising after a hot-swap.
  *
  * Iter-39 finding 2: decouples post-commit persist from the request
  * lifetime. Abort listeners are removed and `releaseDispatchLease` is
@@ -114,13 +113,13 @@ const CHAIN_WRITE_WAIT_TIMEOUT_MS: number = (() => {
  * received its terminal response by this point. Override via
  * `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS`.
  */
-const POST_COMMIT_PERSIST_TIMEOUT_MS: number = (() => {
+function getPostCommitPersistTimeoutMs(): number {
   const raw = process.env.MLX_POST_COMMIT_PERSIST_TIMEOUT_MS;
   if (raw == null || raw === '') return 5000;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) return 5000;
   return parsed;
-})();
+}
 
 // ---------------------------------------------------------------------------
 // Non-streaming path
@@ -1775,8 +1774,8 @@ export async function handleCreateResponse(
   // would race against this in-flight dispatch on one shared native
   // model with two independent mutex chains. The lease MUST be
   // released in a `finally` below so the binding's teardown (if
-  // deferred by `releaseBinding`) completes once the last dispatch
-  // finishes.
+  // deferred by a concurrent `unregister()`) completes once the last
+  // dispatch lease AND the last persist retention releases.
   const lease = registry.acquireDispatchLease(body.model);
   if (!lease) {
     sendInternalError(res, 'session registry missing for registered model');
@@ -1913,11 +1912,12 @@ export async function handleCreateResponse(
             // will see the store's true post-failure state and
             // 404 cleanly).
             type PendingOutcome = 'landed' | 'timeout';
+            const chainWriteWaitTimeoutMs = getChainWriteWaitTimeoutMs();
             let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
             const timeoutPromise = new Promise<PendingOutcome>((resolve) => {
               timeoutHandle = setTimeout(() => {
                 resolve('timeout');
-              }, CHAIN_WRITE_WAIT_TIMEOUT_MS);
+              }, chainWriteWaitTimeoutMs);
             });
             const pendingOutcome: Promise<PendingOutcome> = pending.then(() => 'landed' as const);
             let timedOut = false;
@@ -1964,10 +1964,26 @@ export async function handleCreateResponse(
                 probed = null;
               }
               if (probed !== null && probed.length > 0) {
+                // Iter-39 finding 1: the write slipped in between
+                // timer-fire and the probe. Log this so operators
+                // can still see the wedged-writer condition that
+                // triggered the slow path, even when the client
+                // got a coherent 200 via the probe. Without this
+                // log the only observable signal for "the bounded
+                // wait fired" is the `sendStorageTimeout` 503
+                // branch below, which fires on a legitimate miss;
+                // the successful-probe path would otherwise be
+                // silent.
+                console.warn(
+                  `[responses] pending store write for previous_response_id "${body.previous_response_id}" did ` +
+                    `not settle within ${chainWriteWaitTimeoutMs}ms, but a last-probe getChain found the record. ` +
+                    `Continuing with the probed chain — likely a slow SQLite writer that landed just after the ` +
+                    `timeout fired.`,
+                );
                 chain = probed;
               } else {
                 console.warn(
-                  `[responses] timed out after ${CHAIN_WRITE_WAIT_TIMEOUT_MS}ms waiting for pending store write ` +
+                  `[responses] timed out after ${chainWriteWaitTimeoutMs}ms waiting for pending store write ` +
                     `for previous_response_id "${body.previous_response_id}"; last-probe getChain still missed. ` +
                     `Returning 503 storage_timeout — the underlying store.store(...) promise did not settle in time, ` +
                     `likely a wedged SQLite writer or stuck native backend. The client may retry with the same ` +
@@ -1975,7 +1991,7 @@ export async function handleCreateResponse(
                 );
                 sendStorageTimeout(
                   res,
-                  `Storage write for "${body.previous_response_id}" did not settle within ${CHAIN_WRITE_WAIT_TIMEOUT_MS}ms. ` +
+                  `Storage write for "${body.previous_response_id}" did not settle within ${chainWriteWaitTimeoutMs}ms. ` +
                     `This is a transient backend condition — retry the request with the same previous_response_id.`,
                 );
                 return;
@@ -2772,7 +2788,19 @@ export async function handleCreateResponse(
                 previousResponseId,
                 currentInstanceId,
               );
-              pendingPersistOuter = initiatePersist(store, record);
+              // Iter-40 finding 1: pair a `retainBinding` against
+              // the persist promise so the binding's
+              // `modelInstanceId` survives a concurrent same-model
+              // unregister + re-register that races the
+              // post-commit write. `releaseBinding` runs in the
+              // persist's `.finally(...)` regardless of outcome,
+              // so the retention counter stays balanced whether
+              // the write fulfils, rejects, or (in the wedged
+              // case) is abandoned by the iter-39 timeout.
+              registry.retainBinding(leaseModel);
+              pendingPersistOuter = initiatePersist(store, record).finally(() => {
+                registry.releaseBinding(leaseModel);
+              });
               persistMode = 'streaming';
             }
           } catch (err) {
@@ -2814,7 +2842,15 @@ export async function handleCreateResponse(
                 previousResponseId,
                 currentInstanceId,
               );
-              pendingPersistOuter = initiatePersist(store, record);
+              // Iter-40 finding 1: see the streaming branch for
+              // the retain/release rationale — a same-model
+              // unregister + re-register during the slow persist
+              // must not mint a fresh `modelInstanceId` that
+              // invalidates the row this write is about to land.
+              registry.retainBinding(leaseModel);
+              pendingPersistOuter = initiatePersist(store, record).finally(() => {
+                registry.releaseBinding(leaseModel);
+              });
               persistMode = 'non-streaming';
             }
           } catch (err) {
@@ -2956,8 +2992,19 @@ export async function handleCreateResponse(
     // wait that follows must NOT pin the request's lifecycle — a
     // wedged `store.store(...)` would otherwise leak socket/abort
     // listeners, keep the binding's `inFlight` counter elevated,
-    // and block `releaseBinding()` from finalising teardown after a
-    // hot-swap for the lifetime of the wedged write.
+    // and block teardown after a hot-swap for the lifetime of the
+    // wedged write.
+    //
+    // Iter-40 finding 1: the binding's `modelInstanceId` still needs
+    // to survive until the post-commit write has actually landed —
+    // otherwise a same-model unregister + re-register sequence
+    // during a slow persist would mint a fresh id, and the row
+    // (when it finally lands) would reference a dead id that the
+    // very next `previous_response_id` continuation would reject.
+    // That lifetime is covered by the ORTHOGONAL `retainBinding` /
+    // `releaseBinding` retention counter paired around
+    // `initiatePersist` below, so the eager dispatch-lease release
+    // here stays lossless.
     //
     // The outer `finally` below re-runs both cleanups idempotently
     // so an early-return validation failure (before the
@@ -3017,17 +3064,18 @@ export async function handleCreateResponse(
           console.error(`[responses] post-commit persistence failed (${capturedMode ?? 'unknown'}, off-lock):`, err);
           return 'settled' as const;
         });
+      const postCommitPersistTimeoutMs = getPostCommitPersistTimeoutMs();
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
       const timeoutPromise: Promise<'timeout'> = new Promise<'timeout'>((resolve) => {
         timeoutHandle = setTimeout(() => {
           resolve('timeout');
-        }, POST_COMMIT_PERSIST_TIMEOUT_MS);
+        }, postCommitPersistTimeoutMs);
       });
       try {
         const outcome = await Promise.race([settled, timeoutPromise]);
         if (outcome === 'timeout') {
           console.warn(
-            `[responses] post-commit persistence did not settle within ${POST_COMMIT_PERSIST_TIMEOUT_MS}ms ` +
+            `[responses] post-commit persistence did not settle within ${postCommitPersistTimeoutMs}ms ` +
               `(${capturedMode ?? 'unknown'}, off-lock); detaching the handler and leaving the write in the ` +
               `background. The pending-writes tracker still holds a reference so chained continuations can ` +
               `observe the in-flight write; this condition usually signals a wedged SQLite writer or stuck ` +
@@ -3077,14 +3125,17 @@ export async function handleCreateResponse(
     // Release the dispatch lease on the ORIGINAL model object the
     // lease was acquired against (not a re-read of `body.model`,
     // which may have been hot-swapped while we held the mutex). A
-    // pending teardown — `releaseBinding()` called concurrently
-    // while this dispatch held the lease — finalises here once the
-    // in-flight counter drops to zero.
+    // pending teardown — `unregister()` called concurrently while
+    // this dispatch held the lease — finalises here once the
+    // in-flight counter drops to zero AND the post-commit persist
+    // retention has also released (see iter-40 below).
     //
     // Iter-39 finding 2: this now runs BEFORE the post-commit
     // persist wait, not after, so a wedged `store.store(...)` no
-    // longer pins the lease and `releaseBinding` can finalise
-    // teardown while the write continues in the background.
+    // longer pins the lease. Teardown of a same-model unregister is
+    // still deferred by the iter-40 `retainBinding` counter so the
+    // binding's `modelInstanceId` survives until the pending write
+    // has stamped its row durably — see `initiatePersist`.
     if (!leaseReleased) {
       leaseReleased = true;
       registry.releaseDispatchLease(leaseModel);
